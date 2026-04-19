@@ -1,0 +1,63 @@
+# Go build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories (uncomment if vendoring)
+# /vendor/
+
+# Local build / release artifacts
+/build/dist/
+*.tar.gz
+*.zip
+SHA256SUMS
+SHA256SUMS.asc
+
+# Local runtime / test data
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+/var/
+/tmp/
+
+# Secrets & keys — never commit
+*.pem
+*.key
+*.nk
+*.crt
+.env
+.env.*
+!.env.example
+
+# Logs & scratch
+/logs/
+*.log
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local agent scratchpad / notes
+/.codex
+/.claude/
