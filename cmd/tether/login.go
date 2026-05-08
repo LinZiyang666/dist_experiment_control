@@ -46,7 +46,7 @@ performs a real NATS CONNECT and only writes current_session on success.
 					return fmt.Errorf("login: %w", err)
 				}
 				nc.Close()
-				fmt.Fprintf(out,
+				_, _ = fmt.Fprintf(out,
 					"authenticated — pubkey=%s\n              fp=%s\n",
 					id.PublicKey, id.Fingerprint)
 				return nil
@@ -72,7 +72,7 @@ performs a real NATS CONNECT and only writes current_session on success.
 			if err := cli.WriteCurrentSession(home, sid); err != nil {
 				return fmt.Errorf("write current_session: %w", err)
 			}
-			fmt.Fprintf(out,
+			_, _ = fmt.Fprintf(out,
 				"activated session %q\n  also run: export TETHER_SESSION=%s\n",
 				sid, sid)
 			return nil
@@ -95,7 +95,7 @@ func newLogoutCmd() *cobra.Command {
 			if err := cli.WriteCurrentSession(home, ""); err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(),
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(),
 				"current session cleared (TETHER_SESSION env, if set, still wins)")
 			return nil
 		},
@@ -112,7 +112,7 @@ func newCtxCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			if s := cli.ReadCurrentSession(home); s != "" {
-				fmt.Fprintln(cmd.OutOrStdout(), s)
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), s)
 			}
 		},
 	}

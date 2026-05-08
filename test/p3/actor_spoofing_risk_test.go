@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -66,5 +65,3 @@ func TestForgedActorCannotTombstoneVictimSession(t *testing.T) {
 	}
 }
 
-// Force the import to be used in this file.
-var _ = cli.CtlNameUnactivated

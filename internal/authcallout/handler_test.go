@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
@@ -116,13 +115,13 @@ func TestHandleAllowsUnactivated(t *testing.T) {
 	// Pub allow must be locked to the CLIENT's nkey, not the ephemeral.
 	want := "tether.v1.ctrl.by." + client + ".session.create.req"
 	found := false
-	for _, p := range uc.Permissions.Pub.Allow {
+	for _, p := range uc.Pub.Allow {
 		if p == want {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected pub allow %q in unactivated perms; got %v", want, uc.Permissions.Pub.Allow)
+		t.Errorf("expected pub allow %q in unactivated perms; got %v", want, uc.Pub.Allow)
 	}
 }
 
@@ -199,5 +198,3 @@ func TestHandleWildcardAgentRoleDenied(t *testing.T) {
 	}
 }
 
-// PermissionsForUnactivated reference, used by callers — pin import.
-var _ = auth.PermissionsForUnactivated

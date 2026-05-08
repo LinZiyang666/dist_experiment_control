@@ -4,7 +4,10 @@ BIN               := $(BIN_DIR)/tether
 PKG               := github.com/LinZiyang666/tether
 VERSION           ?= v0.0.0-dev
 LDFLAGS           := -s -w -X $(PKG)/internal/proto.ReleaseVersion=$(VERSION)
-GOLANGCI_VERSION  ?= v1.62.2
+# golangci-lint v2 is required because golangci-lint v1.x is built with Go 1.23
+# and refuses to lint a Go 1.25 module ("language version ... is lower than the
+# targeted Go version"). go.mod is at Go 1.25 because nats-io/jwt/v2 needs it.
+GOLANGCI_VERSION  ?= v2.5.0
 
 .PHONY: all build test lint tools tidy clean nats-server-install nats-dev
 
@@ -23,7 +26,9 @@ lint:
 	golangci-lint run
 
 tools:
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_VERSION)
+	@command -v curl >/dev/null || { echo "error: curl is required for tools install"; exit 1; }
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+	  | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_VERSION)
 
 # nats-server is a development-time dependency (only needed to manually exercise
 # `tether serve` against a real broker; the Go test suite uses an embedded

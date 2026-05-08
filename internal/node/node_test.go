@@ -8,6 +8,9 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
+// openDB returns a fresh in-memory SQLite seeded with a single ACTIVE
+// session "lab" so node.Register can target it (Register requires the
+// session row to exist; FK enforced).
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := storage.Open(":memory:")
@@ -15,6 +18,12 @@ func openDB(t *testing.T) *sql.DB {
 		t.Fatalf("storage.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(
+		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
+		"lab", "lab", "SHA256:test-owner", "test-hash",
+	); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
 	return db
 }
 
@@ -47,20 +56,12 @@ func TestStateForAge(t *testing.T) {
 	}
 }
 
-func TestRegisterAutoCreatesSession(t *testing.T) {
+func TestRegisterHappyPath(t *testing.T) {
 	db := openDB(t)
 	now := time.Now().UTC()
 
 	if err := Register(db, sampleInput(), now); err != nil {
 		t.Fatalf("Register: %v", err)
-	}
-
-	var sid, ph string
-	if err := db.QueryRow(`SELECT sid, pin_hash FROM sessions WHERE sid='lab'`).Scan(&sid, &ph); err != nil {
-		t.Fatalf("session row missing: %v", err)
-	}
-	if sid != "lab" || ph != "P2-NO-AUTH" {
-		t.Errorf("session row = (%q, %q), want (lab, P2-NO-AUTH placeholder)", sid, ph)
 	}
 
 	snaps, err := List(db)
@@ -70,6 +71,25 @@ func TestRegisterAutoCreatesSession(t *testing.T) {
 	if len(snaps) != 1 || snaps[0].SID != "lab" || snaps[0].NID != "lab-1" || snaps[0].Status != string(StateOnline) {
 		t.Fatalf("List() = %+v, want one ONLINE node lab/lab-1", snaps)
 	}
+}
+
+// Register MUST refuse to insert a node into a session that doesn't exist.
+// The owner is responsible for creating the session first.
+func TestRegisterRejectsMissingSession(t *testing.T) {
+	db := openDB(t)
+	in := sampleInput()
+	in.SID = "ghost-session"
+	err := Register(db, in, time.Now())
+	if err == nil {
+		t.Fatal("Register must error when session row is missing")
+	}
+	if !errorsIsSessionMissing(err) {
+		t.Errorf("expected ErrSessionMissing, got %v", err)
+	}
+}
+
+func errorsIsSessionMissing(err error) bool {
+	return err != nil && err == ErrSessionMissing
 }
 
 func TestRegisterIsIdempotentUpsert(t *testing.T) {

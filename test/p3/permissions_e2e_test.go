@@ -1,7 +1,6 @@
 package p3_test
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -44,10 +43,8 @@ func TestNATSDeniesCrossSessionEvSubscribe(t *testing.T) {
 	defer nc.Close()
 
 	if _, err := nc.Subscribe(proto.SubjectPrefix+".s.prod.ev.>", func(*nats.Msg) {}); err != nil {
-		// Some NATS versions surface the perm violation synchronously here.
-		if !errors.Is(err, nats.ErrPermissionViolation) && err.Error() != "" {
-			// any error means denied, OK.
-		}
+		// Synchronous denial is a perfectly valid outcome. Any non-nil
+		// error here means NATS rejected the subscribe — attack prevented.
 		return
 	}
 	_ = nc.Flush()

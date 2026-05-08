@@ -61,7 +61,7 @@ func TestStorageForeignKeysHoldAcrossPooledConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage.Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	db.SetMaxOpenConns(2)
 
@@ -69,7 +69,7 @@ func TestStorageForeignKeysHoldAcrossPooledConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin held connection: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = db.Exec(
 		`INSERT INTO members(sid, pubkey_fp, role, via) VALUES (?,?,?,?)`,

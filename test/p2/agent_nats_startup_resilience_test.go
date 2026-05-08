@@ -89,7 +89,7 @@ func reserveTCPPort(t *testing.T) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	_, portText, err := net.SplitHostPort(ln.Addr().String())
 	if err != nil {

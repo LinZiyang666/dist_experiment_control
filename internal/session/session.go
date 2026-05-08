@@ -154,7 +154,7 @@ func ListVisible(db *sql.DB, pubkeyFP string) ([]Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: list: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []Session
 	for rows.Next() {

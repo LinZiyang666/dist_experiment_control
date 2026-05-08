@@ -1,20 +1,23 @@
-// Package broker is the in-process tether daemon that backs `tether serve`:
-// a NATS subscriber for register / heartbeat plus a periodic reconcile
-// ticker that drives the node state machine (ONLINE → STALE → OFFLINE).
+// Package broker is the in-process tether daemon that backs `tether serve`.
+// It owns three responsibilities:
 //
-// P2 scope (no auth, no full ctl wiring):
+//  1. Node lifecycle: subscribes to register/heartbeat and drives the
+//     state machine (ONLINE → STALE → OFFLINE) via internal/node.
+//  2. Session management: subscribes to ctrl.by.<actor>.session.* and
+//     applies CRUD via internal/session.
+//  3. Authorization: when Config.AuthCallout is non-nil, runs a NATS
+//     auth_callout service (issues per-connection user JWTs based on
+//     CLI role + PIN). Without it, the broker is a pure P2 anonymous
+//     hub — agent registers and heartbeat still work.
 //
-//   - Subscribes wildcard `tether.v1.ctrl.s.*.node.*.register.req` (req/reply).
-//   - Subscribes wildcard `tether.v1.ctrl.s.*.node.*.heartbeat`     (no reply).
-//   - Reconciles state every cfg.ReconcileInterval (default 1s).
-//
-// Auth (auth_callout) and `cmd.*` forwarding (architecture C.4) land in P3/P4.
+// `cmd.*.req.forwarded` (architecture C.4) command-routing lands in P4.
 package broker
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -210,6 +213,11 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		BootID:         req.BootID,
 	}
 	if err := node.Register(b.cfg.DB, in, b.cfg.Now()); err != nil {
+		if errors.Is(err, node.ErrSessionMissing) {
+			b.replyErr(msg, "session_not_found",
+				fmt.Sprintf("session %q does not exist; have an owner run `tether session create %s` first", sid, sid))
+			return
+		}
 		b.replyErr(msg, "store_error", err.Error())
 		return
 	}

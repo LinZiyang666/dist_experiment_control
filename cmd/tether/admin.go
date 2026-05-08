@@ -37,18 +37,18 @@ func newAdminCmd() *cobra.Command {
 			}
 
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "SESSION\tNODE\tSTATE\tHEARTBEAT\tPROTO\tRELEASE")
+			_, _ = fmt.Fprintln(tw, "SESSION\tNODE\tSTATE\tHEARTBEAT\tPROTO\tRELEASE")
 			now := time.Now()
 			for _, s := range snaps {
 				age := "-"
 				if !s.LastHeartbeatAt.IsZero() {
 					age = humaneAge(now.Sub(s.LastHeartbeatAt))
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
 					s.SID, s.NID, s.Status, age, s.ProtoVersion, s.ReleaseVersion)
 			}
 			if len(snaps) == 0 {
-				fmt.Fprintln(tw, "(no nodes registered)")
+				_, _ = fmt.Fprintln(tw, "(no nodes registered)")
 			}
 			return tw.Flush()
 		},

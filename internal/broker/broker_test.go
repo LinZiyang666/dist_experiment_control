@@ -33,16 +33,35 @@ func startNATS(t *testing.T) string {
 	return ns.ClientURL()
 }
 
+// openDB returns a fresh in-memory SQLite. Some broker tests want the
+// "lab" session pre-seeded so node.Register has a valid FK target;
+// callers that need session-create flow itself should NOT use this.
+//
+// Use :memory: in unit tests — modernc.org/sqlite occasionally leaves a
+// transient -journal file behind that races t.TempDir's RemoveAll. The
+// full-file path is exercised by test/p2 e2e instead.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	// Use :memory: in unit tests — modernc.org/sqlite occasionally leaves
-	// a transient -journal file behind that races t.TempDir's RemoveAll.
-	// The full-file path is exercised by test/p2 e2e instead.
 	db, err := storage.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// openDBWithSession returns openDB(t) plus a single ACTIVE session row
+// for `sid`, so node.Register can target it. Use this in tests that
+// don't go through `tether session create`.
+func openDBWithSession(t *testing.T, sid string) *sql.DB {
+	t.Helper()
+	db := openDB(t)
+	if _, err := db.Exec(
+		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
+		sid, sid, "SHA256:test-owner", "test-hash",
+	); err != nil {
+		t.Fatalf("seed session %q: %v", sid, err)
+	}
 	return db
 }
 
@@ -65,7 +84,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 // integration end-to-end (within one process).
 func TestBrokerRegisterAndHeartbeat(t *testing.T) {
 	url := startNATS(t)
-	db := openDB(t)
+	db := openDBWithSession(t, "lab")
 
 	b, err := New(Config{
 		NATSURL:           url,

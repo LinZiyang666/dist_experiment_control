@@ -34,7 +34,7 @@ func newAgentCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			fmt.Fprintf(cmd.OutOrStdout(),
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"tether agent: NATS=%s sid=%s nid=%s\n(press Ctrl-C to quit)\n",
 				natsURL, sid, nid)
 

@@ -125,6 +125,10 @@ func startNATS(t *testing.T) string {
 	return ns.ClientURL()
 }
 
+// openDB returns a fresh on-disk SQLite seeded with the "lab" session row
+// so the agent's register.req has a valid FK target. The on-disk path
+// (vs :memory:) exercises the production code path; broker unit tests in
+// internal/broker use :memory: instead.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := storage.Open("file:" + filepath.Join(t.TempDir(), "state.db"))
@@ -132,6 +136,12 @@ func openDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(
+		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
+		"lab", "lab", "SHA256:p2-test-owner", "p2-test-hash",
+	); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
 	return db
 }
 

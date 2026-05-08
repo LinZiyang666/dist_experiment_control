@@ -58,7 +58,7 @@ func TestVerifyPINRejectsTamperedPHC(t *testing.T) {
 		strings.Replace(phc, "v=19", "v=18", 1),
 		strings.Replace(phc, "t=3", "t=4", 1),
 		strings.Replace(phc, "m=65536", "m=32768", 1),
-		strings.Replace(phc, "$", "@", -1),
+		strings.ReplaceAll(phc, "$", "@"),
 	}
 	for _, p := range tampered {
 		if err := VerifyPIN("hello", p); err == nil {

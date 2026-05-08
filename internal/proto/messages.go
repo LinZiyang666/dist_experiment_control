@@ -5,7 +5,10 @@ import "time"
 // SessionCreateReq — ctl pub on ctrl.by.<A>.session.create.req.
 type SessionCreateReq struct {
 	Name string `json:"name"`
-	PIN  string `json:"pin,omitempty"` // optional: tetherd random-generates if empty
+	// PIN is required (must be ASCII-printable). Empty PIN is rejected by
+	// the broker with code "pin_invalid". Server-side random PIN generation
+	// is a future feature; for v1 the caller supplies it.
+	PIN string `json:"pin,omitempty"`
 }
 
 // SessionCreateResp — tetherd reply.

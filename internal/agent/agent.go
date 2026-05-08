@@ -1,9 +1,18 @@
-// Package agent is the in-process daemon that backs `tether agent`: connects
-// to NATS, sends one `register.req`, then publishes heartbeat at a fixed
-// interval until the context is canceled.
+// Package agent is the in-process daemon that backs `tether agent`:
+// connects to NATS, sends one `register.req`, then publishes heartbeat at
+// a fixed interval until the context is canceled.
 //
-// P2 scope: no auth nkey yet (P3), no managed-process RPCs (P4+). The
-// register payload carries proto/release version + nid + os/arch + boot_id.
+// Connection-level resilience (architecture C.3) is implemented at two
+// layers, both ctx-aware with exponential backoff:
+//   1. connectNATS retries the initial CONNECT,
+//   2. register retries the request/reply.
+//
+// In v1 the agent connects ANONYMOUSLY (no nkey credentials). The P3
+// auth_callout flow exists but its `tether-agent:*:*` role is hard-denied
+// — agent identity provisioning lands in P4. Until then the agent
+// continues to work against a broker started with
+// `broker.Config.AuthCallout=nil`. Managed-process RPCs (run / exec /
+// expose) also land in P4+.
 package agent
 
 import (
@@ -191,28 +200,27 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 		msg, err := nc.RequestWithContext(reqCtx, subject, payload)
 		cancel()
 
-		switch {
-		case err == nil:
+		if err == nil {
 			var resp proto.NodeRegisterResp
-			if jerr := json.Unmarshal(msg.Data, &resp); jerr != nil {
+			switch {
+			case json.Unmarshal(msg.Data, &resp) != nil:
 				// Garbled reply — treat as transient (broker bug or
 				// concurrent partial deploy). Retry.
 				a.cfg.Logger.Warn("agent: register reply parse failed; retrying",
-					"attempt", attempt, "err", jerr)
-			} else if resp.OK {
+					"attempt", attempt)
+			case resp.OK:
 				if attempt > 1 {
 					a.cfg.Logger.Info("agent: register succeeded after retry",
 						"attempts", attempt)
 				}
 				return nil
-			} else {
+			default:
 				// Authoritative reject from broker. Don't retry; the operator
 				// must fix config (proto, nid uniqueness, etc.).
 				return fmt.Errorf("agent: register rejected (code=%s): %s",
 					resp.Code, resp.Error)
 			}
-
-		default:
+		} else {
 			// Parent ctx canceled mid-request — exit cleanly.
 			if ctx.Err() != nil {
 				return ctx.Err()

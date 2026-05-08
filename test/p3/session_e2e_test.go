@@ -6,7 +6,6 @@ package p3_test
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"testing"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/nats-io/nats.go"
 )
 
 // ---- Happy paths -----------------------------------------------------------
@@ -249,17 +247,3 @@ func readWithEnv(t *testing.T, key, val, home string) string {
 	return cli.ReadCurrentSession(home)
 }
 
-// connectFails returns true iff nats.Connect fails or the auth response
-// produced a non-OK token. Used by negative tests when we don't care which
-// of the two layers (network / auth) caused the rejection.
-func connectFails(_ *testing.T, err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, nats.ErrAuthorization) ||
-		errors.Is(err, nats.ErrTimeout) ||
-		errors.Is(err, nats.ErrNoServers) {
-		return true
-	}
-	return true // any non-nil err counts
-}

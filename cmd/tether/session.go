@@ -63,7 +63,7 @@ func newSessionCmd() *cobra.Command {
 			if err := cli.WriteCurrentSession(home, resp.SID); err != nil {
 				return fmt.Errorf("write current_session: %w", err)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(),
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"session %q created (owner=%s)\nactivated locally — also run:\n    export TETHER_SESSION=%s\n",
 				resp.SID, resp.OwnerFP, resp.SID)
 			return nil
@@ -105,7 +105,7 @@ func newSessionCmd() *cobra.Command {
 
 			active := cli.ReadCurrentSession(home)
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "ACTIVE\tSID\tNAME\tSTATE\tROLE\tCREATED")
+			_, _ = fmt.Fprintln(tw, "ACTIVE\tSID\tNAME\tSTATE\tROLE\tCREATED")
 			for _, s := range resp.Sessions {
 				marker := " "
 				if s.SID == active {
@@ -115,12 +115,12 @@ func newSessionCmd() *cobra.Command {
 				if s.IsOwner {
 					role = "owner"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 					marker, s.SID, s.Name, s.State, role,
 					s.CreatedAt.Format("2006-01-02 15:04"))
 			}
 			if len(resp.Sessions) == 0 {
-				fmt.Fprintln(tw, "(no sessions; create one with `tether session create <name> --pin <pin>`)")
+				_, _ = fmt.Fprintln(tw, "(no sessions; create one with `tether session create <name> --pin <pin>`)")
 			}
 			return tw.Flush()
 		},
@@ -161,7 +161,7 @@ func newSessionCmd() *cobra.Command {
 				}
 				return errors.New(resp.Error)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "session %q tombstoned (state=DELETING)\n", args[0])
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "session %q tombstoned (state=DELETING)\n", args[0])
 			return nil
 		},
 	}

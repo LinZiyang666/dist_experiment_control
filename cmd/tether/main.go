@@ -33,7 +33,7 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print version",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintf(cmd.OutOrStdout(),
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"tether %s (proto v%d)\n%s/%s\n%s\n",
 				proto.ReleaseVersion, proto.ProtoVersion,
 				runtime.GOOS, runtime.GOARCH, runtime.Version())

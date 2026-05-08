@@ -106,11 +106,11 @@ func SubjCtrlSessionRm(actor, sid string) string {
 // ParseCtrlBy extracts the actor segment from any "tether.v1.ctrl.by.<actor>.<rest...>"
 // subject. Returns leaf = the dot-joined remainder after the actor segment.
 //
-// Trust note: in P3 (no auth_callout) the actor returned here is not yet
-// proven to be the connection's identity — NATS doesn't verify it. Callers
-// must treat the returned actor as a routing label only, not authoritative
-// identity. P3.5 + auth_callout makes this trustworthy by pinning the
-// actor segment in the connection's JWT.
+// Authority: with the P3 auth_callout in place, the JWT permissions
+// pin every connection's allowed `by.<A>` segment to its own real nkey
+// (architecture B.2). Therefore an actor parsed out of a subject the
+// broker actually receives is NATS-proven — no second-guessing needed
+// at the broker layer.
 func ParseCtrlBy(subject string) (actor, leaf string, ok bool) {
 	parts := strings.Split(subject, ".")
 	// 0:tether 1:v1 2:ctrl 3:by 4:<actor> 5+:leaf

@@ -82,10 +82,10 @@ func TestIssueAndDecodeUserJWT(t *testing.T) {
 		t.Errorf("issuer: got %q want %q", uc.Issuer, wantIssuer)
 	}
 
-	if got := uc.Permissions.Pub.Allow; len(got) != 1 || got[0] != pubAllow {
+	if got := uc.Pub.Allow; len(got) != 1 || got[0] != pubAllow {
 		t.Errorf("pub.allow: got %v want [%q]", got, pubAllow)
 	}
-	if got := uc.Permissions.Sub.Allow; len(got) != 1 || got[0] != "_INBOX.>" {
+	if got := uc.Sub.Allow; len(got) != 1 || got[0] != "_INBOX.>" {
 		t.Errorf("sub.allow: got %v want [_INBOX.>]", got)
 	}
 }

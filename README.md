@@ -5,17 +5,25 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P3** — sessions + login). On top of P2's heartbeat loop,
+Pre-alpha (phase **P3 complete**). On top of P2's heartbeat loop, P3
 adds session CRUD (`tether session create / ls / rm`), per-user nkey
-identity (`tether login`), and the broker handlers for
-`ctrl.by.<actor>.session.*.req`. Multi-session isolation is per CLI shell
-via the `TETHER_SESSION` env var.
+identity (`tether login`), and full NATS `auth_callout` (architecture
+B.2 / E.2):
 
-Note: NATS-level JWT permission enforcement (auth_callout, architecture
-B.2 / E.2) is staged for a P3 follow-up — clients connect anonymously to
-NATS today; the actor token in subjects is a routing label, not yet proof
-of identity. Application-layer owner / member / PIN checks ARE enforced
-by the broker.
+- ctl CONNECTs use `nats.Nkey` + signed challenge.
+- The broker subscribes to `$SYS.REQ.USER.AUTH` and issues per-connection
+  user JWTs whose permissions pin the `by.<actor>` segment to the real
+  client nkey — forged-actor publishes are denied at NATS, not at the
+  broker.
+- Multi-session isolation is per CLI shell via the `TETHER_SESSION` env
+  var; cross-session subscribes / `.req.forwarded` publishes / forged
+  actor publishes are all rejected at NATS.
+- First-time PIN join happens at NATS CONNECT (`nats.Token(pin)`); the
+  transitional `session.join.req` business subject is gone.
+
+Agent role in `auth_callout` is **hard-denied** until P4 wires real
+agent provisioning (architecture K.1). P2 anonymous agent path remains
+available when `broker.Config.AuthCallout=nil`.
 
 Full control plane (`run` / `exec` / `expose`) lands in P4+.
 

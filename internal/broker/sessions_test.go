@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,7 +128,7 @@ func TestHandleSessionCreateRejectsBadPayloads(t *testing.T) {
 			if resp.Error == "" {
 				t.Fatalf("expected error containing %q, got empty", c.wantErr)
 			}
-			if !contains(resp.Error, c.wantErr) {
+			if !strings.Contains(resp.Error, c.wantErr) {
 				t.Errorf("error %q missing substring %q", resp.Error, c.wantErr)
 			}
 		})
@@ -194,20 +195,6 @@ func TestHandleSessionRmOwnerOnly(t *testing.T) {
 	if !rresp.OK {
 		t.Fatalf("owner rm: %+v", rresp)
 	}
-}
-
-// Tiny string helper local to these tests so we don't pull in the strings
-// package just for one Contains call.
-func contains(s, sub string) bool {
-	if sub == "" {
-		return true
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 func mustJSONBytes(v any) []byte {

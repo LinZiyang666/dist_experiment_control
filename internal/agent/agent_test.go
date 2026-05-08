@@ -111,10 +111,7 @@ func TestAgentRegisterAndHeartbeats(t *testing.T) {
 	go func() { done <- a.Run(ctx) }()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if registerSeen.Load() >= 1 && heartbeatSeen.Load() >= 2 {
-			break
-		}
+	for registerSeen.Load() < 1 || heartbeatSeen.Load() < 2 {
 		if time.Now().After(deadline) {
 			t.Fatalf("expected ≥1 register and ≥2 heartbeats; got reg=%d hb=%d",
 				registerSeen.Load(), heartbeatSeen.Load())

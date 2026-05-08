@@ -12,6 +12,7 @@ package node
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -56,12 +57,17 @@ type RegisterInput struct {
 	BootID         string
 }
 
+// ErrSessionMissing is returned by Register when the agent's target sid
+// has no row in the sessions table. The caller (broker) replies with
+// `code=session_not_found` so the agent surfaces a clear error and the
+// operator knows to create the session first.
+var ErrSessionMissing = errors.New("node: target session does not exist")
+
 // Register inserts (or updates) the node row and forces status to ONLINE.
 //
-// P2 transitional: the sessions row is auto-created with a placeholder
-// pin_hash if it doesn't exist. This sidesteps the missing PIN/login flow
-// (lands in P3) while keeping the FK contract honest. Once P3 lands, this
-// shortcut must be removed and Register should fail on unknown sid.
+// The target session MUST already exist (caller responsibility — owner
+// creates it via `tether session create`). Foreign-key cascade in
+// 0001_init.sql guarantees the row will be cleaned up with the session.
 func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -69,11 +75,16 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
-		in.SID, in.SID, "P2-NO-AUTH", "P2-NO-AUTH",
-	); err != nil {
-		return fmt.Errorf("node: ensure session: %w", err)
+	var existsSid string
+	switch err := tx.QueryRow(
+		`SELECT sid FROM sessions WHERE sid = ?`, in.SID,
+	).Scan(&existsSid); err {
+	case nil:
+		// row found
+	case sql.ErrNoRows:
+		return ErrSessionMissing
+	default:
+		return fmt.Errorf("node: lookup session: %w", err)
 	}
 
 	if _, err := tx.Exec(`
@@ -184,7 +195,7 @@ func List(db *sql.DB) ([]Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("node: list: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []Snapshot
 	for rows.Next() {
