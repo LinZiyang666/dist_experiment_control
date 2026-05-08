@@ -82,16 +82,16 @@ func New(cfg Config) (*Agent, error) {
 	return &Agent{cfg: cfg}, nil
 }
 
-// Run connects to NATS, performs one register round-trip, then publishes
-// heartbeat on a ticker until ctx is canceled. The NATS connection is
-// drained on exit.
+// Run is the agent's main loop:
+//  1. connect NATS (retried until ctx cancels — see connectNATS),
+//  2. register with the broker (retried per `register`),
+//  3. heartbeat ticker until ctx cancels.
+//
+// The NATS connection is drained on exit.
 func (a *Agent) Run(ctx context.Context) error {
-	nc, err := nats.Connect(a.cfg.NATSURL,
-		nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)),
-		nats.MaxReconnects(-1),
-	)
+	nc, err := a.connectNATS(ctx)
 	if err != nil {
-		return fmt.Errorf("agent: NATS connect: %w", err)
+		return err
 	}
 	defer func() { _ = nc.Drain() }()
 
@@ -104,6 +104,53 @@ func (a *Agent) Run(ctx context.Context) error {
 	)
 
 	return a.heartbeatLoop(ctx, nc)
+}
+
+// connectNATS retries nats.Connect on transient failures (server not up
+// yet, DNS not yet resolvable, port closed) until ctx is canceled.
+//
+// Architecture C.3 explicitly requires unbounded connection-level retry.
+// nats.MaxReconnects(-1) only covers reconnect after the FIRST successful
+// connect; the initial CONNECT itself can still fail-fast with ErrNoServers
+// when the server is reachable later but not yet now (the common deployment
+// case where nats-server / tetherd / agent are independent processes).
+//
+// Backoff reuses the same RegisterRetry knobs as register-retry — a single
+// pair of dials governs all transient-NATS-interaction backoff in v1.
+func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
+	connOpts := []nats.Option{
+		nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)),
+		nats.MaxReconnects(-1),
+	}
+	backoff := a.cfg.RegisterRetryInitial
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		nc, err := nats.Connect(a.cfg.NATSURL, connOpts...)
+		if err == nil {
+			if attempt > 1 {
+				a.cfg.Logger.Info("agent: NATS connect succeeded after retry",
+					"attempts", attempt)
+			}
+			return nc, nil
+		}
+		a.cfg.Logger.Warn("agent: NATS connect failed; retrying",
+			"attempt", attempt, "err", err, "next_backoff", backoff)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < a.cfg.RegisterRetryMax {
+			backoff *= 2
+			if backoff > a.cfg.RegisterRetryMax {
+				backoff = a.cfg.RegisterRetryMax
+			}
+		}
+	}
 }
 
 // register loops, retrying on transient failures (no responders / per-attempt

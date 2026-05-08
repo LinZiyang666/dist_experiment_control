@@ -280,16 +280,26 @@ func TestAgentRetriesOnGarbledReply(t *testing.T) {
 	<-done
 }
 
-// Bad NATS URL: New accepts it (no connect at New time), Run fails fast.
-func TestAgentRunFailsOnBadNATSURL(t *testing.T) {
+// Architecture C.3: connection-level reconnect is unbounded. When NATS is
+// unreachable at start (closed port, server not up yet), the agent must
+// keep retrying nats.Connect rather than fast-failing. Verify by setting
+// a tight ctx timeout and asserting the surfaced error is
+// context.DeadlineExceeded — not a fast-fail from nats.ErrNoServers.
+//
+// Replaces the previous TestAgentRunFailsOnBadNATSURL, which encoded the
+// (incorrect) fast-fail expectation.
+func TestAgentRetriesUntilCtxCancelOnUnreachableNATS(t *testing.T) {
 	a, _ := New(Config{
-		NATSURL: "nats://127.0.0.1:1", // no broker on port 1
-		SID:     "lab",
-		NID:     "lab-1",
+		NATSURL:              "nats://127.0.0.1:1", // port 1 — closed
+		SID:                  "lab",
+		NID:                  "lab-1",
+		RegisterRetryInitial: 30 * time.Millisecond,
+		RegisterRetryMax:     100 * time.Millisecond,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if err := a.Run(ctx); err == nil {
-		t.Fatal("expected NATS connect to fail")
+	err := a.Run(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded after retries, got %v", err)
 	}
 }
