@@ -116,6 +116,37 @@ func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
 	}
 }
 
+func TestParseSidNidFromCtrl(t *testing.T) {
+	cases := []struct {
+		subject       string
+		wantSid       string
+		wantNid       string
+		wantOK        bool
+	}{
+		{SubjNodeRegister("lab", "lab-1"), "lab", "lab-1", true},
+		{SubjNodeUnregister("prod", "node-007"), "prod", "node-007", true},
+		{SubjNodeHeartbeat("lab", "1gpu"), "lab", "1gpu", true},
+		// Wrong tree (per-session ev., not ctrl) → reject.
+		{SubjEvNodeState("lab", "lab-1"), "", "", false},
+		// Wrong prefix.
+		{"foo.bar.ctrl.s.lab.node.lab-1.register.req", "", "", false},
+		// Too short.
+		{"tether.v1.ctrl.s.lab.node.lab-1", "", "", false},
+		// Wrong segment names.
+		{"tether.v1.ctrl.x.lab.node.lab-1.register.req", "", "", false},
+		{"tether.v1.ctrl.s.lab.x.lab-1.register.req", "", "", false},
+		// Empty.
+		{"", "", "", false},
+	}
+	for _, c := range cases {
+		gotSid, gotNid, ok := ParseSidNidFromCtrl(c.subject)
+		if ok != c.wantOK || gotSid != c.wantSid || gotNid != c.wantNid {
+			t.Errorf("ParseSidNidFromCtrl(%q) = (%q, %q, %v); want (%q, %q, %v)",
+				c.subject, gotSid, gotNid, ok, c.wantSid, c.wantNid, c.wantOK)
+		}
+	}
+}
+
 // newOf returns a pointer to a freshly-zeroed value of the same dynamic type
 // as v (which itself must be a pointer).
 func newOf(v any) any {

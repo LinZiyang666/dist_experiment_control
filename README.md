@@ -5,9 +5,11 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P1** — foundation packages: `internal/proto`,
-`internal/schema`, `internal/auth`, `internal/storage`). No runtime control
-plane yet — P2 wires up the broker + agent heartbeat loop.
+Pre-alpha (phase **P2** — broker + agent heartbeat loop). `tether serve`
+runs the broker daemon (NATS subscriber + node state machine), `tether
+agent` runs the agent daemon (register + 5s heartbeat), and `tether admin
+nodes` lists registered nodes by reading SQLite directly. Auth and full
+control plane (`run` / `exec` / `expose`) land in P3+.
 
 ## Build
 
@@ -27,3 +29,20 @@ Install the version pinned by CI:
 make tools         # go install ...@v1.62.2
 make lint
 ```
+
+## P2 quick-start (manual)
+
+```bash
+make nats-server-install        # one-time install of nats-server binary
+make nats-dev                   # terminal A: starts nats-server -js
+
+make build && ./bin/tether serve --db ./tether.db          # terminal B
+./bin/tether agent --session lab --nid lab-1               # terminal C
+./bin/tether admin nodes --db ./tether.db                  # terminal D
+
+# kill agent in C → wait 5s → admin nodes shows STALE
+# wait 60s total → admin nodes shows OFFLINE
+```
+
+The Go test suite does **not** require an external `nats-server`; it embeds
+one via `nats-server/v2/test`.

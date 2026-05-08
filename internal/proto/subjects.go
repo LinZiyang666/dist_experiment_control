@@ -1,6 +1,9 @@
 package proto
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Subjects with no actor segment (broker-pub or agent-self).
 const (
@@ -87,4 +90,22 @@ func SubjPtyReady(sid, pid string) string {
 }
 func SubjPtyFailed(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.failed", SubjectPrefix, sid, pid)
+}
+
+// ParseSidNidFromCtrl extracts (sid, nid) from any ctrl-tree subject of the
+// shape "tether.v1.ctrl.s.<sid>.node.<nid>.<rest...>". Returns ok=false when
+// the subject doesn't match this layout.
+//
+// Used by the broker's wildcard subscription handlers
+// (".ctrl.s.*.node.*.register.req" / ".heartbeat") to recover the session
+// and node identifiers without trusting the message body.
+func ParseSidNidFromCtrl(subject string) (sid, nid string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:ctrl 3:s 4:<sid> 5:node 6:<nid> 7:<verb> [8:req]
+	if len(parts) < 8 ||
+		parts[0] != "tether" || parts[1] != "v1" || parts[2] != "ctrl" ||
+		parts[3] != "s" || parts[5] != "node" {
+		return "", "", false
+	}
+	return parts[4], parts[6], true
 }

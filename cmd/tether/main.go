@@ -17,6 +17,9 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newServeCmd())
+	root.AddCommand(newAgentCmd())
+	root.AddCommand(newAdminCmd())
 	return root
 }
 
