@@ -1,1 +1,17 @@
-# dist_experiment_control
+# tether
+
+Distributed node control: an "SSH + 端口暴露" control plane for nodes behind
+NAT, with a single public broker. Designed in `docs/architecture.md`.
+
+## Status
+
+Pre-alpha (phase **P0** — scaffold). No runtime functionality yet.
+
+## Build
+
+```bash
+make build
+./bin/tether version
+```
+
+Requires Go 1.23+.
