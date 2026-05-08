@@ -15,3 +15,13 @@ make build
 ```
 
 Requires Go 1.23+.
+
+## Development tools
+
+`make lint` requires [`golangci-lint`](https://github.com/golangci/golangci-lint).
+Install the version pinned by CI:
+
+```bash
+make tools         # go install ...@v1.62.2
+make lint
+```

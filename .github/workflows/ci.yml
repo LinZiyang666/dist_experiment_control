@@ -17,6 +17,14 @@ jobs:
           go-version: '1.23.4'
           cache: true
       - run: make build
+      - name: verify built binary version output
+        run: |
+          out=$(./bin/tether version)
+          echo "$out"
+          # P0 exit assertion: default build prints "tether v0.0.0-dev" on line 1.
+          # When VERSION is overridden (release builds), this step is updated
+          # alongside the release workflow.
+          [ "$(echo "$out" | head -n1)" = "tether v0.0.0-dev" ]
       - run: make test
 
   lint:
