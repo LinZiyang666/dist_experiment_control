@@ -6,7 +6,25 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nkeys"
 )
+
+func freshAccountSeed(t *testing.T) []byte {
+	t.Helper()
+	kp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	seed, err := kp.Seed()
+	if err != nil {
+		kp.Wipe()
+		t.Fatalf("Seed: %v", err)
+	}
+	out := append([]byte(nil), seed...)
+	kp.Wipe()
+	return out
+}
 
 func TestAccountSignerRejectsUserSeed(t *testing.T) {
 	seed, err := auth.GenerateUserSeed()
@@ -18,6 +36,22 @@ func TestAccountSignerRejectsUserSeed(t *testing.T) {
 	if err == nil {
 		pub, _ := signer.AccountPublicKey()
 		t.Fatalf("LoadAccountSigner accepted a user seed as an account signer; derived public key %q", pub)
+	}
+}
+
+func TestIssueUserJWTRejectsEmptySubjectWithoutPanic(t *testing.T) {
+	signer, err := auth.LoadAccountSigner(freshAccountSeed(t))
+	if err != nil {
+		t.Fatalf("LoadAccountSigner: %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("IssueUserJWT panicked for empty user public key: %v", r)
+		}
+	}()
+
+	if _, err := signer.IssueUserJWT("", jwt.Permissions{}, 0); err == nil {
+		t.Fatal("IssueUserJWT must reject an empty user public key")
 	}
 }
 

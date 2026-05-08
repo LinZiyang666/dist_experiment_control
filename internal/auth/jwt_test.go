@@ -147,3 +147,30 @@ func TestLoadAccountSignerRejectsUserSeed(t *testing.T) {
 		t.Fatal("LoadAccountSigner must reject a user seed (would silently produce wrong-kind issuer)")
 	}
 }
+
+// IssueUserJWT must reject malformed user public keys with an ordinary error,
+// not a nil-deref panic. jwt.NewUserClaims("") returns nil and would crash
+// at the first field write (round-2 review F1).
+func TestIssueUserJWTRejectsBadUserPub(t *testing.T) {
+	signer, err := LoadAccountSigner(freshAccountSeed(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("IssueUserJWT must not panic; recovered %v", r)
+		}
+	}()
+
+	bad := []string{
+		"",                                    // empty
+		"hello",                               // garbage
+		strings.Repeat("U", 56),               // looks like a user pub but invalid checksum
+		"A" + strings.Repeat("A", 55),         // account pub, not user
+	}
+	for _, p := range bad {
+		if _, err := signer.IssueUserJWT(p, jwt.Permissions{}, 0); err == nil {
+			t.Errorf("IssueUserJWT(%q) must return an error, got nil", p)
+		}
+	}
+}
