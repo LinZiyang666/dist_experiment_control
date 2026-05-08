@@ -14,7 +14,7 @@ make build
 ./bin/tether version
 ```
 
-Requires Go 1.23+.
+Requires Go 1.25+ (pinned by `go.mod` because `github.com/nats-io/jwt/v2` ≥ v2.8.1 needs it).
 
 ## Development tools
 

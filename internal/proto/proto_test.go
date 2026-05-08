@@ -1,0 +1,137 @@
+package proto
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestProtoVersionPositive(t *testing.T) {
+	if ProtoVersion < 1 {
+		t.Fatalf("ProtoVersion must be ≥ 1, got %d", ProtoVersion)
+	}
+}
+
+func TestReleaseVersionDefault(t *testing.T) {
+	if ReleaseVersion == "" {
+		t.Fatal("ReleaseVersion default must not be empty")
+	}
+}
+
+func TestSubjectPrefixStable(t *testing.T) {
+	// Bumping SubjectPrefix without a ProtoVersion bump would silently break
+	// every subscriber. Pin them together.
+	if SubjectPrefix != "tether.v1" {
+		t.Fatalf("SubjectPrefix must equal 'tether.v1' for ProtoVersion=1, got %q", SubjectPrefix)
+	}
+}
+
+// Golden subject layouts. Any change here is a wire break — bump ProtoVersion
+// and update fixtures.
+func TestSubjectGolden(t *testing.T) {
+	cases := []struct {
+		got, want string
+	}{
+		{SubjVersionAnnounce, "tether.v1.ctrl.version.announce"},
+		{SubjSysEvents, "tether.v1.sys.events"},
+		{SubjCtrlBy("UABCD", "session.create.req"), "tether.v1.ctrl.by.UABCD.session.create.req"},
+		{SubjCmdBy("lab", "UABCD", "lab-1", "run"), "tether.v1.s.lab.cmd.by.UABCD.node.lab-1.run.req"},
+		{SubjCmdForwarded("lab", "lab-1", "run"), "tether.v1.s.lab.cmd.node.lab-1.run.req.forwarded"},
+		{SubjNodeRegister("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.register.req"},
+		{SubjNodeUnregister("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.unregister.req"},
+		{SubjNodeHeartbeat("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.heartbeat"},
+		{SubjEvNodeState("lab", "lab-1"), "tether.v1.s.lab.ev.node.lab-1.state"},
+		{SubjEvProc("lab", "lab-1", "01hzxk", "exit"), "tether.v1.s.lab.ev.node.lab-1.proc.01hzxk.exit"},
+		{SubjEvPort("lab", 14022, "allocated"), "tether.v1.s.lab.ev.port.14022.allocated"},
+		{SubjAuditCall("lab"), "tether.v1.s.lab.audit.call"},
+		{SubjAuditProc("lab"), "tether.v1.s.lab.audit.proc"},
+		{SubjAuditPort("lab"), "tether.v1.s.lab.audit.port"},
+		{SubjPtyOut("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.out"},
+		{SubjPtyIn("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.in"},
+		{SubjPtyResize("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.resize"},
+		{SubjPtyAttach("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.attach"},
+		{SubjPtyReady("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.ready"},
+		{SubjPtyFailed("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.failed"},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("subject mismatch: got %q, want %q", c.got, c.want)
+		}
+	}
+}
+
+// `cmd.by.<A>.node.*.*.req` and `cmd.node.*.*.req.forwarded` must have a
+// different token count so a NATS subscription on one cannot accidentally
+// match the other. (architecture B.1 / B.2 固定 token 数 不变式)
+func TestForwardedTokenCountDiffers(t *testing.T) {
+	a := SubjCmdBy("lab", "UABCD", "lab-1", "run")
+	b := SubjCmdForwarded("lab", "lab-1", "run")
+	na := strings.Count(a, ".") + 1
+	nb := strings.Count(b, ".") + 1
+	if na == nb {
+		t.Fatalf("cmd.by.* and cmd.*.req.forwarded must differ in token count, both = %d", na)
+	}
+}
+
+// JSON round-trip equivalence: Marshal → Unmarshal → Marshal yields the same
+// bytes. Catches map ordering / time formatting / pointer-vs-value drift.
+func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
+	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+
+	cases := []any{
+		&SessionCreateReq{Name: "lab", PIN: "123456"},
+		&SessionCreateResp{SID: "lab", OwnerFP: "SHA256:xxx=", CreatedAt: t0},
+		&NodeRegisterReq{
+			ProtoVersion:   ProtoVersion,
+			ReleaseVersion: ReleaseVersion,
+			NID:            "lab-1",
+			OS:             "linux",
+			Arch:           "amd64",
+			BootID:         "deadbeef",
+		},
+		&NodeRegisterResp{OK: true},
+		&NodeRegisterResp{OK: false, Code: "proto_mismatch", Error: "client_proto=2 server_proto=1"},
+		&HeartbeatPayload{Ts: t0},
+		&ErrorReply{Code: "session_not_found_or_deleting", Message: "session lab is being deleted"},
+	}
+	for i, v := range cases {
+		first, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("case %d: marshal: %v", i, err)
+		}
+		// Unmarshal into a fresh value of the same dynamic type.
+		dec := newOf(v)
+		if err := json.Unmarshal(first, dec); err != nil {
+			t.Fatalf("case %d: unmarshal: %v\nbytes=%s", i, err, first)
+		}
+		second, err := json.Marshal(dec)
+		if err != nil {
+			t.Fatalf("case %d: re-marshal: %v", i, err)
+		}
+		if !bytes.Equal(first, second) {
+			t.Errorf("case %d: round-trip mismatch:\n  first:  %s\n  second: %s", i, first, second)
+		}
+	}
+}
+
+// newOf returns a pointer to a freshly-zeroed value of the same dynamic type
+// as v (which itself must be a pointer).
+func newOf(v any) any {
+	switch v.(type) {
+	case *SessionCreateReq:
+		return &SessionCreateReq{}
+	case *SessionCreateResp:
+		return &SessionCreateResp{}
+	case *NodeRegisterReq:
+		return &NodeRegisterReq{}
+	case *NodeRegisterResp:
+		return &NodeRegisterResp{}
+	case *HeartbeatPayload:
+		return &HeartbeatPayload{}
+	case *ErrorReply:
+		return &ErrorReply{}
+	}
+	panic("newOf: unknown type")
+}

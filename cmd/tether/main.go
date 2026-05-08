@@ -5,10 +5,9 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
 )
-
-var Version = "v0.0.0-dev"
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -28,8 +27,9 @@ func newVersionCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.OutOrStdout(),
-				"tether %s\n%s/%s\n%s\n",
-				Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+				"tether %s (proto v%d)\n%s/%s\n%s\n",
+				proto.ReleaseVersion, proto.ProtoVersion,
+				runtime.GOOS, runtime.GOARCH, runtime.Version())
 			return nil
 		},
 	}

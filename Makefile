@@ -3,7 +3,7 @@ BIN_DIR           := bin
 BIN               := $(BIN_DIR)/tether
 PKG               := github.com/LinZiyang666/tether
 VERSION           ?= v0.0.0-dev
-LDFLAGS           := -s -w -X main.Version=$(VERSION)
+LDFLAGS           := -s -w -X $(PKG)/internal/proto.ReleaseVersion=$(VERSION)
 GOLANGCI_VERSION  ?= v1.62.2
 
 .PHONY: all build test lint tools tidy clean
