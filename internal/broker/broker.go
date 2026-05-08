@@ -49,6 +49,13 @@ type Config struct {
 	// (architecture D.2). Defaults: 5s / 60s.
 	StaleAfter   time.Duration
 	OfflineAfter time.Duration
+
+	// AuthCallout, if non-nil, makes the broker connect with the configured
+	// nkey credentials AND subscribe to $SYS.REQ.USER.AUTH to issue per-
+	// connection user JWTs. Required for the architecture B.2 NATS-level
+	// permissions invariant. When nil (P2 default), the broker connects
+	// anonymously and no auth_callout is installed.
+	AuthCallout *AuthCalloutConfig
 }
 
 // Broker holds the running state of one `tether serve` instance.
@@ -85,15 +92,26 @@ func New(cfg Config) (*Broker, error) {
 
 // Run connects to NATS, installs subscriptions, runs the reconcile ticker,
 // and blocks until ctx is canceled. The NATS connection is drained on exit.
+//
+// If cfg.AuthCallout is non-nil, the broker presents its pre-configured
+// nkey credentials on CONNECT (so it bypasses auth_callout itself) AND
+// subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
 func (b *Broker) Run(ctx context.Context) error {
-	nc, err := nats.Connect(b.cfg.NATSURL,
-		nats.Name("tetherd"),
-		nats.MaxReconnects(-1),
-	)
+	connOpts, err := b.brokerConnectOptions()
+	if err != nil {
+		return err
+	}
+	nc, err := nats.Connect(b.cfg.NATSURL, connOpts...)
 	if err != nil {
 		return fmt.Errorf("broker: NATS connect: %w", err)
 	}
 	defer func() { _ = nc.Drain() }()
+
+	if subAuth, err := b.installAuthCallout(nc); err != nil {
+		return err
+	} else if subAuth != nil {
+		defer func() { _ = subAuth.Unsubscribe() }()
+	}
 
 	subRegister, err := nc.Subscribe(
 		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
@@ -121,7 +139,6 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".ctrl.by.*.session.create.req", b.handleSessionCreate},
 		{proto.SubjectPrefix + ".ctrl.by.*.session.list.req", b.handleSessionList},
 		{proto.SubjectPrefix + ".ctrl.by.*.session.*.rm.req", b.handleSessionRm},
-		{proto.SubjectPrefix + ".ctrl.by.*.session.*.join.req", b.handleSessionJoin},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {

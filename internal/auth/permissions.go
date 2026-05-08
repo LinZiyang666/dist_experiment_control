@@ -90,7 +90,8 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 }
 
 // PermissionsForBroker returns the permissions tetherd's own NATS connection
-// uses (broad subscribe for routing + pub for forwarded/ev/audit).
+// uses (broad subscribe for routing + pub for forwarded/ev/audit + auth
+// reply on `$SYS._INBOX.>`).
 //
 // Note the wildcards here are intentional — only tetherd is allowed `s.*.>`
 // reach (the broker has cross-session authority). The static guard test
@@ -104,6 +105,8 @@ func PermissionsForBroker() jwt.Permissions {
 			subjectPrefix + ".ctrl.version.announce",
 			subjectPrefix + ".sys.events",
 			"_INBOX.>",
+			// auth_callout responses (msg.Respond → $SYS._INBOX.<server>.<rand>).
+			"$SYS._INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
 			subjectPrefix + ".ctrl.by.*.>",

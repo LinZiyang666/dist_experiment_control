@@ -8,7 +8,6 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
 
@@ -197,65 +196,6 @@ func TestHandleSessionRmOwnerOnly(t *testing.T) {
 	}
 }
 
-func TestHandleSessionJoinHappyAndBad(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
-	defer stop()
-	owner, member, ghost := freshUserActor(t), freshUserActor(t), freshUserActor(t)
-
-	cbody, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "shh"})
-	_, _ = nc.Request(proto.SubjCtrlSessionCreate(owner), cbody, 2*time.Second)
-
-	// Wrong PIN.
-	jbody, _ := json.Marshal(proto.SessionJoinReq{PIN: "bad"})
-	msg, _ := nc.Request(proto.SubjCtrlSessionJoin(member, "lab"), jbody, 2*time.Second)
-	var jresp proto.SessionJoinResp
-	_ = json.Unmarshal(msg.Data, &jresp)
-	if jresp.Code != "invalid_pin" {
-		t.Errorf("wrong PIN code: got %q want invalid_pin", jresp.Code)
-	}
-
-	// Right PIN.
-	jbody, _ = json.Marshal(proto.SessionJoinReq{PIN: "shh"})
-	msg, _ = nc.Request(proto.SubjCtrlSessionJoin(member, "lab"), jbody, 2*time.Second)
-	jresp = proto.SessionJoinResp{}
-	_ = json.Unmarshal(msg.Data, &jresp)
-	if !jresp.OK || jresp.IsOwner {
-		t.Errorf("good join: got %+v want OK/!owner", jresp)
-	}
-
-	// Missing session.
-	msg, _ = nc.Request(proto.SubjCtrlSessionJoin(ghost, "no-such"), jbody, 2*time.Second)
-	jresp = proto.SessionJoinResp{}
-	_ = json.Unmarshal(msg.Data, &jresp)
-	if jresp.Code != "not_found" {
-		t.Errorf("missing session: got code %q want not_found", jresp.Code)
-	}
-}
-
-// After tombstone, join must reject with code=deleting.
-func TestHandleSessionJoinRejectsAfterTombstone(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
-	defer stop()
-	owner, newcomer := freshUserActor(t), freshUserActor(t)
-
-	cbody, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "p"})
-	_, _ = nc.Request(proto.SubjCtrlSessionCreate(owner), cbody, 2*time.Second)
-	_, _ = nc.Request(proto.SubjCtrlSessionRm(owner, "lab"), []byte("{}"), 2*time.Second)
-
-	jbody, _ := json.Marshal(proto.SessionJoinReq{PIN: "p"})
-	msg, _ := nc.Request(proto.SubjCtrlSessionJoin(newcomer, "lab"), jbody, 2*time.Second)
-	var jresp proto.SessionJoinResp
-	_ = json.Unmarshal(msg.Data, &jresp)
-	if jresp.Code != "deleting" {
-		t.Errorf("post-tombstone join: code=%q want deleting", jresp.Code)
-	}
-
-	// Also assert via session.IsActive — defensive.
-	db := getBrokerDBFromNC(t, nc) // we don't have direct DB handle; reach through DB-less assertion below
-	_ = db
-	_ = session.StateDeleting // pin import
-}
-
 // Tiny string helper local to these tests so we don't pull in the strings
 // package just for one Contains call.
 func contains(s, sub string) bool {
@@ -278,9 +218,3 @@ func mustJSONBytes(v any) []byte {
 	return b
 }
 
-// We don't actually have a way to fish out the broker's DB from a NATS conn;
-// session.IsActive verification stays inside the e2e test/p3.
-func getBrokerDBFromNC(t *testing.T, _ *nats.Conn) any {
-	t.Helper()
-	return nil
-}

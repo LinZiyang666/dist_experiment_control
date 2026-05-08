@@ -10,6 +10,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
 
@@ -38,7 +39,7 @@ func newSessionCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id)
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
 				return err
 			}
@@ -79,7 +80,9 @@ func newSessionCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id)
+			// Listing uses the unactivated template — its pub allow already
+			// includes session.list.req. No active session required.
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
 				return err
 			}
@@ -132,9 +135,11 @@ func newSessionCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id)
+			// rm needs the activated-member template (it grants pub allow
+			// for session.<sid>.rm.req). Require active session = arg sid.
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(args[0])))
 			if err != nil {
-				return err
+				return fmt.Errorf("session rm: connect: %w", err)
 			}
 			defer nc.Close()
 

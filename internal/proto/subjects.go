@@ -103,16 +103,6 @@ func SubjCtrlSessionRm(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.rm.req", SubjectPrefix, actor, sid)
 }
 
-// SubjCtrlSessionJoin returns the per-actor, per-session join subject.
-//
-// P3 transitional: this subject is here to give first-time PIN join an RPC
-// path in v1 without auth_callout. P3.5+ will replace it with the standard
-// NATS auth_callout flow over `$SYS.REQ.USER.AUTH`, and this subject will
-// be removed (architecture B.1 / E.2 — login is NOT a business subject).
-func SubjCtrlSessionJoin(actor, sid string) string {
-	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.join.req", SubjectPrefix, actor, sid)
-}
-
 // ParseCtrlBy extracts the actor segment from any "tether.v1.ctrl.by.<actor>.<rest...>"
 // subject. Returns leaf = the dot-joined remainder after the actor segment.
 //

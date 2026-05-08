@@ -136,48 +136,6 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	b.replyJSON(msg, proto.SessionRmResp{OK: true})
 }
 
-// handleSessionJoin handles ctrl.by.<actor>.session.<sid>.join.req.
-//
-// P3 transitional path for first-time PIN join. P3.5+ replaces this with the
-// standard NATS auth_callout flow over $SYS.REQ.USER.AUTH (architecture E.2).
-func (b *Broker) handleSessionJoin(msg *nats.Msg) {
-	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
-	if !ok {
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "subject_malformed"})
-		return
-	}
-	parts := strings.Split(leaf, ".")
-	if len(parts) != 4 || parts[0] != "session" || parts[2] != "join" || parts[3] != "req" {
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "subject_malformed", Error: leaf})
-		return
-	}
-	sid := parts[1]
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "actor_invalid", Error: err.Error()})
-		return
-	}
-	var req proto.SessionJoinReq
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "json_parse", Error: err.Error()})
-		return
-	}
-	switch err := session.JoinWithPIN(b.cfg.DB, sid, fp, req.PIN, auth.VerifyPIN, b.cfg.Now()); {
-	case err == nil:
-		isOwner, _ := session.IsOwner(b.cfg.DB, sid, fp)
-		b.cfg.Logger.Info("broker: session join", "sid", sid, "fp", fp, "actor", actor)
-		b.replyJSON(msg, proto.SessionJoinResp{OK: true, IsOwner: isOwner})
-	case errors.Is(err, session.ErrNotFound):
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "not_found"})
-	case errors.Is(err, session.ErrDeleting):
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "deleting"})
-	case errors.Is(err, session.ErrInvalidPIN):
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "invalid_pin"})
-	default:
-		b.replyJSON(msg, proto.SessionJoinResp{Code: "store_error", Error: err.Error()})
-	}
-}
-
 // replyJSON marshals v and replies on msg.Reply if set. JSON marshal errors
 // for these tetherd-controlled types are programming bugs, not runtime
 // errors — drop with a warn log if it ever happens.

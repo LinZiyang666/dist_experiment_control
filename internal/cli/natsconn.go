@@ -4,30 +4,53 @@ import (
 	"fmt"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
-// ConnectNATSWithNkey opens a NATS connection associated with the given
-// identity.
+// ConnectNATSWithNkey opens a NATS connection using the identity's user
+// nkey for the CONNECT challenge.
 //
-// **P3 transitional**: a default NATS server doesn't accept nkey-style
-// CONNECT unless it has been configured with either an Nkeys user list
-// (decentralized creds JWT) or auth_callout. P3 doesn't yet wire any of
-// those, so this function intentionally does NOT pass `nats.Nkey(...)` —
-// the connection is anonymous at the NATS layer and the identity's actor
-// token (id.PublicKey) is only used to construct subjects.
+// Callers add `nats.Name(...)` (carrying role + session — see
+// internal/authcallout.parseRole) and optionally `nats.Token(pin)` for
+// first-time PIN join via `opts`.
 //
-// P3.5+ will add `nats.Nkey(id.PublicKey, signFromSeed(id.Seed))` here so
-// the broker (via auth_callout) can authoritatively identify the
-// connection. Until then, by.<actor> in subjects is a routing label, not
-// proof of identity (architecture B.2 trust note).
+// With auth_callout enabled on the broker side (architecture B.2 / E.2),
+// the CONNECT triggers a server→broker auth callout. NATS pins the
+// user's nkey into the issued JWT permissions, so subject `by.<actor>`
+// segments published from this conn are unforgeable.
 func ConnectNATSWithNkey(url string, id *Identity, opts ...nats.Option) (*nats.Conn, error) {
 	if id == nil {
 		return nil, fmt.Errorf("cli: nil identity")
 	}
+	seed := append([]byte(nil), id.Seed...) // captured by sigCB closure
+	sigCB := func(nonce []byte) ([]byte, error) {
+		kp, err := nkeys.FromSeed(seed)
+		if err != nil {
+			return nil, fmt.Errorf("cli: nkey from seed: %w", err)
+		}
+		defer kp.Wipe()
+		return kp.Sign(nonce)
+	}
 	all := []nats.Option{
-		nats.Name(fmt.Sprintf("tether-cli/%s", id.Fingerprint)),
+		nats.Nkey(id.PublicKey, sigCB),
 		nats.MaxReconnects(-1),
 	}
 	all = append(all, opts...)
 	return nats.Connect(url, all...)
 }
+
+// CtlNameUnactivated is the connection-Name a CLI uses before activating
+// a session. The broker auth_callout decodes this and grants the
+// "unactivated" permission template (architecture B.2).
+const CtlNameUnactivated = "tether-cli"
+
+// CtlNameForSession is the connection-Name a CLI uses to activate a
+// session. The broker auth_callout extracts <sid> and grants the
+// "activated member" permission template after a membership check (or
+// PIN verify if a Token is also presented).
+func CtlNameForSession(sid string) string { return "tether-cli:" + sid }
+
+// AgentName is the connection-Name an agent uses. P3 transitional —
+// auth_callout grants agent permissions without a membership check.
+// P4+ tightens this when full agent identity lands.
+func AgentName(sid, nid string) string { return "tether-agent:" + sid + ":" + nid }

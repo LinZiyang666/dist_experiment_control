@@ -1,14 +1,10 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
-	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
 
@@ -31,6 +27,9 @@ activate a session.
 
 Activation persists to ~/.tether/current_session and is also displayed as
 'export TETHER_SESSION=<sid>' so the user can copy/paste into their shell.
+
+Membership / PIN are verified server-side via NATS auth_callout — login -s
+performs a real NATS CONNECT and only writes current_session on success.
 `,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -41,43 +40,34 @@ Activation persists to ~/.tether/current_session and is also displayed as
 			out := cmd.OutOrStdout()
 
 			if sid == "" {
+				// Pure auth, no activation.
+				nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
+				if err != nil {
+					return fmt.Errorf("login: %w", err)
+				}
+				nc.Close()
 				fmt.Fprintf(out,
 					"authenticated — pubkey=%s\n              fp=%s\n",
 					id.PublicKey, id.Fingerprint)
 				return nil
 			}
 
+			// Activate sid. CONNECT triggers auth_callout, which:
+			//   - if pin != "" : verify PIN, add to members, allow connect
+			//   - if pin == "" : check membership, allow only if already a member
+			//   - else (deleting / unknown sid / wrong pin) : reject CONNECT
+			//
+			// nats.Connect surfaces the rejection as an error. We do NOT
+			// write current_session unless CONNECT succeeded.
+			opts := []nats.Option{nats.Name(cli.CtlNameForSession(sid))}
 			if pin != "" {
-				nc, err := cli.ConnectNATSWithNkey(natsURL, id)
-				if err != nil {
-					return err
-				}
-				defer nc.Close()
-
-				body, _ := json.Marshal(proto.SessionJoinReq{PIN: pin})
-				ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
-				defer cancel()
-				msg, err := nc.RequestWithContext(ctx,
-					proto.SubjCtrlSessionJoin(id.PublicKey, sid), body)
-				if err != nil {
-					return fmt.Errorf("login: %w", err)
-				}
-				var resp proto.SessionJoinResp
-				if err := json.Unmarshal(msg.Data, &resp); err != nil {
-					return err
-				}
-				if !resp.OK {
-					if resp.Code != "" {
-						return fmt.Errorf("join rejected (%s): %s", resp.Code, resp.Error)
-					}
-					return errors.New(resp.Error)
-				}
-				role := "member"
-				if resp.IsOwner {
-					role = "owner"
-				}
-				fmt.Fprintf(out, "joined session %q as %s\n", sid, role)
+				opts = append(opts, nats.Token(pin))
 			}
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, opts...)
+			if err != nil {
+				return fmt.Errorf("login: activation refused for session %q: %w", sid, err)
+			}
+			nc.Close()
 
 			if err := cli.WriteCurrentSession(home, sid); err != nil {
 				return fmt.Errorf("write current_session: %w", err)

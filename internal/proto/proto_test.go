@@ -102,9 +102,6 @@ func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
 		&SessionRmReq{},
 		&SessionRmResp{OK: true},
 		&SessionRmResp{Code: "not_owner"},
-		&SessionJoinReq{PIN: "secret"},
-		&SessionJoinResp{OK: true, IsOwner: false},
-		&SessionJoinResp{Code: "invalid_pin"},
 	}
 	for i, v := range cases {
 		first, err := json.Marshal(v)
@@ -131,7 +128,6 @@ func TestSessionSubjects(t *testing.T) {
 		{SubjCtrlSessionCreate("UABCD"), "tether.v1.ctrl.by.UABCD.session.create.req"},
 		{SubjCtrlSessionList("UABCD"), "tether.v1.ctrl.by.UABCD.session.list.req"},
 		{SubjCtrlSessionRm("UABCD", "lab"), "tether.v1.ctrl.by.UABCD.session.lab.rm.req"},
-		{SubjCtrlSessionJoin("UABCD", "lab"), "tether.v1.ctrl.by.UABCD.session.lab.join.req"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -149,7 +145,6 @@ func TestParseCtrlBy(t *testing.T) {
 		{SubjCtrlSessionCreate("UABCD"), "UABCD", "session.create.req", true},
 		{SubjCtrlSessionList("UABCD"), "UABCD", "session.list.req", true},
 		{SubjCtrlSessionRm("UABCD", "lab"), "UABCD", "session.lab.rm.req", true},
-		{SubjCtrlSessionJoin("UABCD", "lab"), "UABCD", "session.lab.join.req", true},
 		// negatives
 		{"", "", "", false},
 		{"tether.v1.ctrl", "", "", false},
@@ -221,10 +216,6 @@ func newOf(v any) any {
 		return &SessionRmReq{}
 	case *SessionRmResp:
 		return &SessionRmResp{}
-	case *SessionJoinReq:
-		return &SessionJoinReq{}
-	case *SessionJoinResp:
-		return &SessionJoinResp{}
 	}
 	panic("newOf: unknown type")
 }

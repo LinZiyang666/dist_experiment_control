@@ -79,15 +79,3 @@ type SessionRmResp struct {
 	Error string `json:"error,omitempty"`
 }
 
-// SessionJoinReq — ctl pub on ctrl.by.<A>.session.<sid>.join.req
-// (P3 transitional; replaced by NATS $SYS.REQ.USER.AUTH in P3.5+).
-type SessionJoinReq struct {
-	PIN string `json:"pin"`
-}
-
-type SessionJoinResp struct {
-	OK      bool   `json:"ok"`
-	IsOwner bool   `json:"is_owner,omitempty"`
-	Code    string `json:"code,omitempty"` // not_found | deleting | invalid_pin | store_error
-	Error   string `json:"error,omitempty"`
-}
