@@ -47,17 +47,13 @@ func ValidateSID(s string) error {
 	return nil
 }
 
-// ValidateNID applies the per-session node-id syntax. Uniqueness is per
-// session (sid, nid) and enforced by tetherd.
+// ValidateNID applies the per-session node-id syntax from architecture B.5:
+// `[a-z0-9-]{1,32}`. No leading-letter or no-trailing-dash rule (those are
+// sid-only, per requirements §7.4). Uniqueness is per session (sid, nid) and
+// enforced by tetherd.
 func ValidateNID(s string) error {
 	if !idCharset.MatchString(s) {
 		return fmt.Errorf("nid %q: must match [a-z0-9-]{1,32}", s)
-	}
-	if !isLowerAlpha(s[0]) {
-		return fmt.Errorf("nid %q: must start with [a-z]", s)
-	}
-	if s[len(s)-1] == '-' {
-		return fmt.Errorf("nid %q: must not end with '-'", s)
 	}
 	return nil
 }

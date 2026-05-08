@@ -774,9 +774,10 @@ NATS ─── $SYS.REQ.USER.AUTH ──>  tetherd (auth_callout)
 
 ### E.4 PIN 与密钥运维
 
-**PIN 参数**：
-- 长度 6–12 位（数字或字母数字），owner 创建 session 时设定或系统随机生成。
-- 存储：Argon2id + 随机 salt，PHC 格式（`$argon2id$v=19$m=...`），OWASP 推荐参数。
+**PIN 参数**（与 requirements §6.3 对齐）：
+- 字符集：ASCII 可打印（`0x20–0x7E`），拒绝中文 / emoji / 控制字符。
+- **v1 不做长度 / 复杂度校验**——owner 自定，可任意 ASCII 可打印串；系统随机生成时默认给一段易输入的字母数字。
+- 存储：Argon2id + 随机 salt，PHC 格式（`$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>`），参数固定为 `m=64MiB, t=3, p=2`（OWASP 推荐基线）。
 - 可用次数：不限。泄漏即由 owner `rotate-pin` 刷新（老 PIN 立即失效，已 join 成员不受影响）。
 - owner 自担扩散责任（requirements A3）。
 
@@ -1477,7 +1478,9 @@ const (
 func SubjCtrlBy(actor, leaf string) string {
     return fmt.Sprintf("tether.v1.ctrl.by.%s.%s", actor, leaf)
 }
-func SubjCmdBy(actor, sid, nid, verb string) string {
+// Args ordered as the subject reads ("s.<sid>.cmd.by.<actor>.node.<nid>.<verb>"),
+// matching every other per-session builder which takes sid first.
+func SubjCmdBy(sid, actor, nid, verb string) string {
     return fmt.Sprintf("tether.v1.s.%s.cmd.by.%s.node.%s.%s.req", sid, actor, nid, verb)
 }
 

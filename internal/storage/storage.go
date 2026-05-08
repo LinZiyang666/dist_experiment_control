@@ -19,6 +19,22 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// SQLite PRAGMAs are connection-local. A one-shot `PRAGMA foreign_keys = ON`
+// on *sql.DB after Open only affects whichever pooled connection happened to
+// run it; new connections (e.g. from another goroutine, or after the first is
+// returned to the pool) start with FK off again.
+//
+// Two safeguards together (belt + suspenders):
+//   1. URI parameter `_pragma=foreign_keys(1)` baked into the DSN — modernc
+//      runs it at every sqlite3_open_v2(), so every conn in the pool starts
+//      with FK on regardless of how the *sql.DB pool is later configured.
+//   2. SetMaxOpenConns(1) — SQLite is a single-writer engine; serializing
+//      writes also closes the door on any "second conn missed the pragma"
+//      class of bug.
+//
+// Plain ":memory:" isn't URI-style; promote it to "file::memory:" so the
+// query parameter is honored.
+
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
@@ -26,28 +42,39 @@ var migrationsFS embed.FS
 // been applied. Created lazily by applyMigrations.
 const migrationsTable = "schema_migrations"
 
-// Open opens (and creates if absent) a SQLite database at dsn, enables foreign
-// keys, applies all embedded migrations idempotently, and returns the *sql.DB.
+// Open opens (and creates if absent) a SQLite database at dsn, enforces
+// foreign keys on every pooled connection (see comment above), serializes
+// writes via SetMaxOpenConns(1), applies all embedded migrations
+// idempotently, and returns the *sql.DB.
 //
 // dsn examples:
-//   - ":memory:"                    in-process testing
-//   - "file:/var/lib/tether/state.db"   production
+//   - ":memory:"                          in-process testing
+//   - "file:/var/lib/tether/state.db"     production
 //
 // On any failure the partially-opened DB is closed before returning.
 func Open(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", withForeignKeysPragma(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("storage: open: %w", err)
 	}
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("storage: enable foreign keys: %w", err)
-	}
+	db.SetMaxOpenConns(1)
 	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+func withForeignKeysPragma(dsn string) string {
+	base := dsn
+	if dsn == ":memory:" {
+		base = "file::memory:"
+	}
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return base + sep + "_pragma=foreign_keys(1)"
 }
 
 // applyMigrations applies every embedded migration file (sorted by filename)

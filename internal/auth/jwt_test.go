@@ -122,3 +122,28 @@ func TestLoadAccountSignerRejectsBadSeed(t *testing.T) {
 		t.Fatal("LoadAccountSigner must reject malformed seed")
 	}
 }
+
+func TestLoadAccountSignerAcceptsAccountSeed(t *testing.T) {
+	seed := freshAccountSeed(t)
+	signer, err := LoadAccountSigner(seed)
+	if err != nil {
+		t.Fatalf("LoadAccountSigner with account seed: %v", err)
+	}
+	pub, err := signer.AccountPublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(pub, "A") {
+		t.Fatalf("account public key must start with 'A', got %q", pub)
+	}
+}
+
+func TestLoadAccountSignerRejectsUserSeed(t *testing.T) {
+	seed, err := GenerateUserSeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAccountSigner(seed); err == nil {
+		t.Fatal("LoadAccountSigner must reject a user seed (would silently produce wrong-kind issuer)")
+	}
+}

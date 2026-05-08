@@ -5,7 +5,9 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P0** — scaffold). No runtime functionality yet.
+Pre-alpha (phase **P1** — foundation packages: `internal/proto`,
+`internal/schema`, `internal/auth`, `internal/storage`). No runtime control
+plane yet — P2 wires up the broker + agent heartbeat loop.
 
 ## Build
 

@@ -44,18 +44,15 @@ func TestValidateSID(t *testing.T) {
 }
 
 func TestValidateNID(t *testing.T) {
-	good := []string{"a", "lab-1", "node-007"}
+	// B.5 only constrains the character class; leading-digit, trailing-dash,
+	// and reserved names (which apply to sid) are intentionally allowed for nid.
+	good := []string{"a", "lab-1", "node-007", "1gpu", "node-", "default"}
 	for _, s := range good {
 		if err := ValidateNID(s); err != nil {
 			t.Errorf("ValidateNID(%q) unexpected error: %v", s, err)
 		}
 	}
-	// nid intentionally has NO global reserved-name list (uniqueness is
-	// per-session, enforced by tetherd).
-	if err := ValidateNID("default"); err != nil {
-		t.Errorf("ValidateNID(\"default\") should pass syntax check, got %v", err)
-	}
-	bad := []string{"", "Lab", "1lab", "node-", "lab_1", strings.Repeat("a", 33)}
+	bad := []string{"", "Lab", "lab_1", strings.Repeat("a", 33)}
 	for _, s := range bad {
 		if err := ValidateNID(s); err == nil {
 			t.Errorf("ValidateNID(%q): expected error, got nil", s)

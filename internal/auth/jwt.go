@@ -14,13 +14,26 @@ import (
 type AccountSigner struct{ seed []byte }
 
 // LoadAccountSigner accepts a raw account nkey seed (the "SA..." form's
-// bytes) and validates that it parses.
+// bytes) and validates both that it parses AND that the derived public key is
+// an account key (A...). User seeds (SU.../U...) are rejected: the
+// auth_callout flow only makes sense when tetherd signs JWTs from an account
+// identity, so accepting a user seed here would silently produce JWTs with a
+// wrong-kind issuer.
 func LoadAccountSigner(seed []byte) (*AccountSigner, error) {
 	kp, err := nkeys.FromSeed(seed)
 	if err != nil {
 		return nil, fmt.Errorf("auth: invalid account seed: %w", err)
 	}
-	defer kp.Wipe()
+	pub, err := kp.PublicKey()
+	if err != nil {
+		kp.Wipe()
+		return nil, fmt.Errorf("auth: derive account public key: %w", err)
+	}
+	if !nkeys.IsValidPublicAccountKey(pub) {
+		kp.Wipe()
+		return nil, fmt.Errorf("auth: seed is not an account seed (derived public key %q does not start with 'A')", pub)
+	}
+	kp.Wipe()
 	dup := make([]byte, len(seed))
 	copy(dup, seed)
 	return &AccountSigner{seed: dup}, nil
