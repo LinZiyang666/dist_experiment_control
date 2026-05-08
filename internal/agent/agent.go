@@ -32,9 +32,20 @@ type Config struct {
 	// HeartbeatInterval defaults to 5 seconds (architecture / requirements §6.5).
 	HeartbeatInterval time.Duration
 
-	// RegisterTimeout bounds the initial request/reply round-trip.
-	// Defaults to 10 seconds.
+	// RegisterTimeout bounds each individual register request/reply round-trip.
+	// Defaults to 10 seconds. The agent retries on transient failures (no
+	// responders / NATS reconnect / per-attempt timeout) until the parent
+	// context is canceled — this timeout governs ONE attempt, not the whole
+	// boot.
 	RegisterTimeout time.Duration
+
+	// RegisterRetryInitial is the first inter-attempt backoff after a failed
+	// register attempt. Defaults to 100ms. Each subsequent failure doubles
+	// the backoff up to RegisterRetryMax.
+	RegisterRetryInitial time.Duration
+
+	// RegisterRetryMax caps the inter-attempt backoff. Defaults to 2s.
+	RegisterRetryMax time.Duration
 }
 
 type Agent struct {
@@ -61,6 +72,12 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if cfg.RegisterTimeout == 0 {
 		cfg.RegisterTimeout = 10 * time.Second
+	}
+	if cfg.RegisterRetryInitial == 0 {
+		cfg.RegisterRetryInitial = 100 * time.Millisecond
+	}
+	if cfg.RegisterRetryMax == 0 {
+		cfg.RegisterRetryMax = 2 * time.Second
 	}
 	return &Agent{cfg: cfg}, nil
 }
@@ -89,6 +106,19 @@ func (a *Agent) Run(ctx context.Context) error {
 	return a.heartbeatLoop(ctx, nc)
 }
 
+// register loops, retrying on transient failures (no responders / per-attempt
+// timeout / NATS reconnect), until either the broker accepts the registration
+// or it returns an explicit OK=false rejection.
+//
+// Why retry: in deployment, nats-server, tetherd, and the agent are three
+// separate processes started independently. NATS is often reachable before
+// tetherd has installed its register subscription, in which case nc.Request
+// returns ErrNoResponders. Treating that as fatal makes the agent flap on
+// every broker restart; retry makes startup ordering moot.
+//
+// Permanent rejections (proto_mismatch, nid_mismatch, store_error) come back
+// as a real reply with OK=false — those are configuration / deployment bugs
+// no amount of retry will fix, so they bubble up immediately.
 func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 	req := proto.NodeRegisterReq{
 		ProtoVersion:   proto.ProtoVersion,
@@ -102,25 +132,61 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 	if err != nil {
 		return fmt.Errorf("agent: marshal register: %w", err)
 	}
+	subject := proto.SubjNodeRegister(a.cfg.SID, a.cfg.NID)
 
-	// Use ctx-bounded request so cancel during boot exits cleanly.
-	reqCtx, cancel := context.WithTimeout(ctx, a.cfg.RegisterTimeout)
-	defer cancel()
+	backoff := a.cfg.RegisterRetryInitial
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-	msg, err := nc.RequestWithContext(reqCtx,
-		proto.SubjNodeRegister(a.cfg.SID, a.cfg.NID), payload)
-	if err != nil {
-		return fmt.Errorf("agent: register request: %w", err)
-	}
+		reqCtx, cancel := context.WithTimeout(ctx, a.cfg.RegisterTimeout)
+		msg, err := nc.RequestWithContext(reqCtx, subject, payload)
+		cancel()
 
-	var resp proto.NodeRegisterResp
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return fmt.Errorf("agent: register reply parse: %w", err)
+		switch {
+		case err == nil:
+			var resp proto.NodeRegisterResp
+			if jerr := json.Unmarshal(msg.Data, &resp); jerr != nil {
+				// Garbled reply — treat as transient (broker bug or
+				// concurrent partial deploy). Retry.
+				a.cfg.Logger.Warn("agent: register reply parse failed; retrying",
+					"attempt", attempt, "err", jerr)
+			} else if resp.OK {
+				if attempt > 1 {
+					a.cfg.Logger.Info("agent: register succeeded after retry",
+						"attempts", attempt)
+				}
+				return nil
+			} else {
+				// Authoritative reject from broker. Don't retry; the operator
+				// must fix config (proto, nid uniqueness, etc.).
+				return fmt.Errorf("agent: register rejected (code=%s): %s",
+					resp.Code, resp.Error)
+			}
+
+		default:
+			// Parent ctx canceled mid-request — exit cleanly.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			a.cfg.Logger.Warn("agent: register attempt failed; retrying",
+				"attempt", attempt, "err", err, "next_backoff", backoff)
+		}
+
+		// Sleep with backoff, but wake immediately on context cancel.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < a.cfg.RegisterRetryMax {
+			backoff *= 2
+			if backoff > a.cfg.RegisterRetryMax {
+				backoff = a.cfg.RegisterRetryMax
+			}
+		}
 	}
-	if !resp.OK {
-		return fmt.Errorf("agent: register rejected (code=%s): %s", resp.Code, resp.Error)
-	}
-	return nil
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {

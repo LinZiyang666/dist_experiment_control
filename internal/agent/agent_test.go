@@ -168,6 +168,118 @@ func TestAgentSurfacesRegisterRejection(t *testing.T) {
 	}
 }
 
+// Register must retry on transient failures (no responders, garbled reply,
+// per-attempt timeout) until the parent context is canceled or the broker
+// returns a real OK reply. Mirrors the reviewer's e2e regression test
+// (test/p2/agent_startup_resilience_test.go) at the package level so the
+// retry branches are covered by `go test -cover ./internal/agent`.
+func TestAgentRegisterRetriesUntilResponderAppears(t *testing.T) {
+	url := startNATS(t)
+
+	a, err := New(Config{
+		NATSURL:              url,
+		SID:                  "lab",
+		NID:                  "lab-1",
+		HeartbeatInterval:    50 * time.Millisecond,
+		RegisterTimeout:      100 * time.Millisecond,
+		RegisterRetryInitial: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	// Agent must keep running while no responder is up.
+	select {
+	case err := <-done:
+		t.Fatalf("agent exited too early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Now stand up the broker stub mid-flight.
+	stub, _ := nats.Connect(url)
+	defer stub.Close()
+	var registerSeen atomic.Int32
+	if _, err := stub.Subscribe(
+		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
+		func(msg *nats.Msg) {
+			registerSeen.Add(1)
+			resp, _ := json.Marshal(proto.NodeRegisterResp{OK: true})
+			_ = msg.Respond(resp)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for registerSeen.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("register did not retry after responder appeared")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not exit after cancel")
+	}
+}
+
+// Garbled JSON reply is treated as transient (broker bug or partial deploy);
+// agent retries instead of bailing out.
+func TestAgentRetriesOnGarbledReply(t *testing.T) {
+	url := startNATS(t)
+	stub, _ := nats.Connect(url)
+	defer stub.Close()
+
+	var attempts atomic.Int32
+	if _, err := stub.Subscribe(
+		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
+		func(msg *nats.Msg) {
+			n := attempts.Add(1)
+			if n == 1 {
+				_ = msg.Respond([]byte("not json"))
+				return
+			}
+			resp, _ := json.Marshal(proto.NodeRegisterResp{OK: true})
+			_ = msg.Respond(resp)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+
+	a, _ := New(Config{
+		NATSURL:              url,
+		SID:                  "lab",
+		NID:                  "lab-1",
+		HeartbeatInterval:    50 * time.Millisecond,
+		RegisterTimeout:      200 * time.Millisecond,
+		RegisterRetryInitial: 30 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for attempts.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected ≥ 2 attempts, got %d", attempts.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+}
+
 // Bad NATS URL: New accepts it (no connect at New time), Run fails fast.
 func TestAgentRunFailsOnBadNATSURL(t *testing.T) {
 	a, _ := New(Config{
