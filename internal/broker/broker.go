@@ -64,7 +64,27 @@ type Config struct {
 // Broker holds the running state of one `tether serve` instance.
 type Broker struct {
 	cfg Config
+
+	// nc is the active NATS connection. Set by Run; nil before Run /
+	// after shutdown. Used by helpers (audit pubs) that need to publish
+	// outside the request handler scope.
+	nc *nats.Conn
 }
+
+// publishOnConn pubs through the broker's persistent NATS connection.
+// Used by audit / event broadcast helpers that don't sit on a msg.Reply.
+func (b *Broker) publishOnConn(subject string, payload []byte) error {
+	if b.nc == nil {
+		return errBrokerNotConnected
+	}
+	return b.nc.Publish(subject, payload)
+}
+
+var errBrokerNotConnected = errBrokerSentinel("broker: not connected")
+
+type errBrokerSentinel string
+
+func (e errBrokerSentinel) Error() string { return string(e) }
 
 // New validates the config and returns a Broker not yet connected. Run
 // performs the actual NATS connect and blocks until ctx is canceled.
@@ -108,7 +128,11 @@ func (b *Broker) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("broker: NATS connect: %w", err)
 	}
-	defer func() { _ = nc.Drain() }()
+	b.nc = nc
+	defer func() {
+		b.nc = nil
+		_ = nc.Drain()
+	}()
 
 	if subAuth, err := b.installAuthCallout(nc); err != nil {
 		return err
@@ -142,6 +166,12 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".ctrl.by.*.session.create.req", b.handleSessionCreate},
 		{proto.SubjectPrefix + ".ctrl.by.*.session.list.req", b.handleSessionList},
 		{proto.SubjectPrefix + ".ctrl.by.*.session.*.rm.req", b.handleSessionRm},
+		// P4 control plane.
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.exec.req",
+			func(msg *nats.Msg) { b.handleExecReq(nc, msg) }},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.ps.req", b.handlePsReq},
+		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.started", b.handleProcEvent},
+		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.exit", b.handleProcEvent},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {

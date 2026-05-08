@@ -92,6 +92,15 @@ func SubjPtyFailed(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.failed", SubjectPrefix, sid, pid)
 }
 
+// SubjCtrlPs returns the per-actor, per-session ps subject.
+//
+// `tether ps` is read-only (no agent forwarding) — the broker answers
+// directly out of the SQLite `processes` table. Therefore lives under
+// `ctrl.by.<A>.s.<S>.ps.req`, not under `cmd.by.<A>.node.<N>...`.
+func SubjCtrlPs(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.ps.req", SubjectPrefix, actor, sid)
+}
+
 // Session-management subjects (ctl pub, broker handle).
 func SubjCtrlSessionCreate(actor string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.session.create.req", SubjectPrefix, actor)
@@ -101,6 +110,38 @@ func SubjCtrlSessionList(actor string) string {
 }
 func SubjCtrlSessionRm(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.rm.req", SubjectPrefix, actor, sid)
+}
+
+// ParseEvProc extracts (sid, nid, pid, kind) from a process-lifecycle
+// event subject `tether.v1.s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`.
+// kind ∈ {"started", "exit"}.
+func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:proc 8:<pid> 9:<kind>
+	if len(parts) != 10 ||
+		parts[0] != "tether" || parts[1] != "v1" || parts[2] != "s" ||
+		parts[4] != "ev" || parts[5] != "node" || parts[7] != "proc" {
+		return "", "", "", "", false
+	}
+	return parts[3], parts[6], parts[8], parts[9], true
+}
+
+// ParseCmdBy extracts (sid, actor, nid, verb) from any
+// `tether.v1.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req` subject.
+// Returns ok=false when the subject doesn't match this layout.
+//
+// Same NATS-proven authority for `actor` as ParseCtrlBy (B.2): the JWT
+// permissions pin the `by.<A>` segment to the connection's real nkey.
+func ParseCmdBy(subject string) (sid, actor, nid, verb string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:s 3:<sid> 4:cmd 5:by 6:<actor> 7:node 8:<nid> 9:<verb> 10:req
+	if len(parts) != 11 ||
+		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[2] != "s" || parts[4] != "cmd" || parts[5] != "by" ||
+		parts[7] != "node" || parts[10] != "req" {
+		return "", "", "", "", false
+	}
+	return parts[3], parts[6], parts[8], parts[9], true
 }
 
 // ParseCtrlBy extracts the actor segment from any "tether.v1.ctrl.by.<actor>.<rest...>"

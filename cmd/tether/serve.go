@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -31,6 +33,7 @@ func newServeCmd() *cobra.Command {
 			b, err := broker.New(broker.Config{
 				NATSURL: natsURL,
 				DB:      db,
+				Logger:  slog.New(slog.NewTextHandler(os.Stderr, nil)),
 			})
 			if err != nil {
 				return err

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -26,6 +28,7 @@ func newAgentCmd() *cobra.Command {
 				NATSURL: natsURL,
 				SID:     sid,
 				NID:     nid,
+				Logger:  slog.New(slog.NewTextHandler(os.Stderr, nil)),
 			})
 			if err != nil {
 				return err

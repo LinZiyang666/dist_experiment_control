@@ -82,3 +82,74 @@ type SessionRmResp struct {
 	Error string `json:"error,omitempty"`
 }
 
+// ExecReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.exec.req.
+//
+// Non-interactive remote command. PTY mode (`run`) lands in P5; this is
+// the simpler `exec` from P4: no terminal allocation, agent runs argv
+// via os/exec and streams stdout/stderr chunks back via the request's
+// reply inbox.
+type ExecReq struct {
+	Argv  []string          `json:"argv"`            // [program, arg1, ...]
+	Env   map[string]string `json:"env,omitempty"`   // extra environment for the child
+	Cwd   string            `json:"cwd,omitempty"`   // working dir; empty = agent's
+	Stdin []byte            `json:"stdin,omitempty"` // small one-shot stdin payload
+}
+
+// ExecChunk is what the agent publishes (one or many) on the reply
+// inbox of an ExecReq:
+//
+//   1. exactly one  Kind="started"  with the assigned PID;
+//   2. zero or more Kind="stdout" / "stderr" with byte chunks;
+//   3. exactly one  Kind="exit"    with the process exit code,
+//      OR exactly one Kind="error" if the agent failed to start the
+//      process (the Error field is set; ExitCode is meaningless).
+//
+// CTL streams these to the local terminal until "exit" / "error" arrives.
+type ExecChunk struct {
+	Kind     string `json:"kind"`               // started | stdout | stderr | exit | error
+	PID      string `json:"pid,omitempty"`      // populated on "started"
+	Data     []byte `json:"data,omitempty"`     // stdout/stderr bytes
+	ExitCode int    `json:"exit_code,omitempty"` // populated on "exit"
+	Error    string `json:"error,omitempty"`    // populated on "error"
+}
+
+// ProcStartedEvent is what agents publish on
+// `s.<sid>.ev.node.<nid>.proc.<pid>.started`. Broker subscribes and
+// transcribes to `audit.proc{kind:start}`. (architecture C.1 §5)
+type ProcStartedEvent struct {
+	PID         string    `json:"pid"`
+	Argv        []string  `json:"argv"`
+	StartedAt   time.Time `json:"started_at"`
+	StartedByFP string    `json:"started_by_fp"` // who via the originating ctl req
+}
+
+// ProcExitEvent is what agents publish on
+// `s.<sid>.ev.node.<nid>.proc.<pid>.exit`. Broker transcribes to
+// `audit.proc{kind:exit}`.
+type ProcExitEvent struct {
+	PID      string    `json:"pid"`
+	ExitCode int       `json:"exit_code"`
+	EndedAt  time.Time `json:"ended_at"`
+}
+
+// PsReq — empty body. Lives in `ctrl.by.<actor>.s.<sid>.ps.req`.
+type PsReq struct{}
+
+// PsEntry describes one running/exited process for `tether ps`.
+type PsEntry struct {
+	PID         string    `json:"pid"`
+	NID         string    `json:"nid"`
+	Argv        []string  `json:"argv"`
+	StartedAt   time.Time `json:"started_at"`
+	EndedAt     time.Time `json:"ended_at,omitempty"`
+	Status      string    `json:"status"` // RUNNING | EXITED | LOST
+	ExitCode    int       `json:"exit_code,omitempty"`
+	StartedByFP string    `json:"started_by_fp,omitempty"`
+}
+
+type PsResp struct {
+	Processes []PsEntry `json:"processes"`
+	Code      string    `json:"code,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+

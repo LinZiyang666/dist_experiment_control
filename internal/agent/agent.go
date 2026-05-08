@@ -94,7 +94,9 @@ func New(cfg Config) (*Agent, error) {
 // Run is the agent's main loop:
 //  1. connect NATS (retried until ctx cancels — see connectNATS),
 //  2. register with the broker (retried per `register`),
-//  3. heartbeat ticker until ctx cancels.
+//  3. subscribe to `cmd.node.<nid>.*.req.forwarded` (P4 exec; P5 will
+//     add run/PTY; P6 expose; etc.),
+//  4. heartbeat ticker until ctx cancels.
 //
 // The NATS connection is drained on exit.
 func (a *Agent) Run(ctx context.Context) error {
@@ -111,6 +113,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		"sid", a.cfg.SID, "nid", a.cfg.NID,
 		"hb_interval", a.cfg.HeartbeatInterval,
 	)
+
+	subFwd, err := nc.Subscribe(
+		fmt.Sprintf("tether.v1.s.%s.cmd.node.%s.*.req.forwarded", a.cfg.SID, a.cfg.NID),
+		func(msg *nats.Msg) { a.dispatchForwarded(nc, msg) },
+	)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe forwarded: %w", err)
+	}
+	defer func() { _ = subFwd.Unsubscribe() }()
 
 	return a.heartbeatLoop(ctx, nc)
 }
