@@ -113,6 +113,23 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	defer func() { _ = subHB.Unsubscribe() }()
 
+	// P3 session management subjects.
+	for _, ss := range []struct {
+		subj    string
+		handler nats.MsgHandler
+	}{
+		{proto.SubjectPrefix + ".ctrl.by.*.session.create.req", b.handleSessionCreate},
+		{proto.SubjectPrefix + ".ctrl.by.*.session.list.req", b.handleSessionList},
+		{proto.SubjectPrefix + ".ctrl.by.*.session.*.rm.req", b.handleSessionRm},
+		{proto.SubjectPrefix + ".ctrl.by.*.session.*.join.req", b.handleSessionJoin},
+	} {
+		sub, err := nc.Subscribe(ss.subj, ss.handler)
+		if err != nil {
+			return fmt.Errorf("broker: subscribe %s: %w", ss.subj, err)
+		}
+		defer func(s *nats.Subscription) { _ = s.Unsubscribe() }(sub)
+	}
+
 	b.cfg.Logger.Info("broker: ready",
 		"nats", b.cfg.NATSURL,
 		"reconcile", b.cfg.ReconcileInterval,

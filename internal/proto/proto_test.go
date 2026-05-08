@@ -95,6 +95,16 @@ func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
 		&NodeRegisterResp{OK: false, Code: "proto_mismatch", Error: "client_proto=2 server_proto=1"},
 		&HeartbeatPayload{Ts: t0},
 		&ErrorReply{Code: "session_not_found_or_deleting", Message: "session lab is being deleted"},
+		&SessionListReq{},
+		&SessionListResp{Sessions: []SessionEntry{
+			{SID: "lab", Name: "lab", OwnerFP: "SHA256:x", State: "ACTIVE", CreatedAt: t0, IsOwner: true},
+		}},
+		&SessionRmReq{},
+		&SessionRmResp{OK: true},
+		&SessionRmResp{Code: "not_owner"},
+		&SessionJoinReq{PIN: "secret"},
+		&SessionJoinResp{OK: true, IsOwner: false},
+		&SessionJoinResp{Code: "invalid_pin"},
 	}
 	for i, v := range cases {
 		first, err := json.Marshal(v)
@@ -112,6 +122,46 @@ func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
 		}
 		if !bytes.Equal(first, second) {
 			t.Errorf("case %d: round-trip mismatch:\n  first:  %s\n  second: %s", i, first, second)
+		}
+	}
+}
+
+func TestSessionSubjects(t *testing.T) {
+	cases := []struct{ got, want string }{
+		{SubjCtrlSessionCreate("UABCD"), "tether.v1.ctrl.by.UABCD.session.create.req"},
+		{SubjCtrlSessionList("UABCD"), "tether.v1.ctrl.by.UABCD.session.list.req"},
+		{SubjCtrlSessionRm("UABCD", "lab"), "tether.v1.ctrl.by.UABCD.session.lab.rm.req"},
+		{SubjCtrlSessionJoin("UABCD", "lab"), "tether.v1.ctrl.by.UABCD.session.lab.join.req"},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("got %q want %q", c.got, c.want)
+		}
+	}
+}
+
+func TestParseCtrlBy(t *testing.T) {
+	cases := []struct {
+		subject              string
+		wantActor, wantLeaf  string
+		wantOK               bool
+	}{
+		{SubjCtrlSessionCreate("UABCD"), "UABCD", "session.create.req", true},
+		{SubjCtrlSessionList("UABCD"), "UABCD", "session.list.req", true},
+		{SubjCtrlSessionRm("UABCD", "lab"), "UABCD", "session.lab.rm.req", true},
+		{SubjCtrlSessionJoin("UABCD", "lab"), "UABCD", "session.lab.join.req", true},
+		// negatives
+		{"", "", "", false},
+		{"tether.v1.ctrl", "", "", false},
+		{"tether.v2.ctrl.by.UABCD.x.y", "", "", false},
+		// wrong tree (cmd.by.* not ctrl.by.*)
+		{"tether.v1.s.lab.cmd.by.UABCD.node.lab-1.run.req", "", "", false},
+	}
+	for _, c := range cases {
+		a, l, ok := ParseCtrlBy(c.subject)
+		if a != c.wantActor || l != c.wantLeaf || ok != c.wantOK {
+			t.Errorf("ParseCtrlBy(%q) = (%q, %q, %v); want (%q, %q, %v)",
+				c.subject, a, l, ok, c.wantActor, c.wantLeaf, c.wantOK)
 		}
 	}
 }
@@ -163,6 +213,18 @@ func newOf(v any) any {
 		return &HeartbeatPayload{}
 	case *ErrorReply:
 		return &ErrorReply{}
+	case *SessionListReq:
+		return &SessionListReq{}
+	case *SessionListResp:
+		return &SessionListResp{}
+	case *SessionRmReq:
+		return &SessionRmReq{}
+	case *SessionRmResp:
+		return &SessionRmResp{}
+	case *SessionJoinReq:
+		return &SessionJoinReq{}
+	case *SessionJoinResp:
+		return &SessionJoinResp{}
 	}
 	panic("newOf: unknown type")
 }

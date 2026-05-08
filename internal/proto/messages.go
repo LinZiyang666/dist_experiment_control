@@ -48,3 +48,46 @@ type ErrorReply struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
+
+// SessionListReq — ctl pub on ctrl.by.<A>.session.list.req. Empty body.
+type SessionListReq struct{}
+
+// SessionEntry is the read-side projection of one session row in list/info
+// responses (no pin_hash, never).
+type SessionEntry struct {
+	SID       string    `json:"sid"`
+	Name      string    `json:"name"`
+	OwnerFP   string    `json:"owner_fp"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	IsOwner   bool      `json:"is_owner"`
+}
+
+type SessionListResp struct {
+	Sessions []SessionEntry `json:"sessions"`
+	Code     string         `json:"code,omitempty"`
+	Error    string         `json:"error,omitempty"`
+}
+
+// SessionRmReq — ctl pub on ctrl.by.<A>.session.<sid>.rm.req. Empty body
+// (sid is in subject; owner check is server-side).
+type SessionRmReq struct{}
+
+type SessionRmResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`  // not_found | already_deleting | not_owner | store_error
+	Error string `json:"error,omitempty"`
+}
+
+// SessionJoinReq — ctl pub on ctrl.by.<A>.session.<sid>.join.req
+// (P3 transitional; replaced by NATS $SYS.REQ.USER.AUTH in P3.5+).
+type SessionJoinReq struct {
+	PIN string `json:"pin"`
+}
+
+type SessionJoinResp struct {
+	OK      bool   `json:"ok"`
+	IsOwner bool   `json:"is_owner,omitempty"`
+	Code    string `json:"code,omitempty"` // not_found | deleting | invalid_pin | store_error
+	Error   string `json:"error,omitempty"`
+}

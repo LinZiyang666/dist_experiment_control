@@ -1,0 +1,120 @@
+package auth
+
+import "github.com/nats-io/jwt/v2"
+
+// subjectPrefix is duplicated from internal/proto.SubjectPrefix to avoid
+// pulling proto into internal/auth (and through it the ed25519 / jwt
+// chain into proto's identifier validation). Kept in sync via the static
+// guard test in this package.
+const subjectPrefix = "tether.v1"
+
+// PermissionsForUnactivated returns the permissions a CLI gets after
+// authenticating but before activating any session. Architecture B.2.
+//
+// `actor` must be the NATS user nkey public key bound to this connection;
+// callers (auth_callout in P3+) write this directly into the JWT so the
+// `by.<actor>` segment of every pub allow is locked to the connection's
+// real identity — that's the unforgeability invariant in B.2 / C.4.
+func PermissionsForUnactivated(actor string) jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.by." + actor + ".session.create.req",
+			subjectPrefix + ".ctrl.by." + actor + ".session.list.req",
+			"_INBOX.>",
+		}},
+		Sub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.version.announce",
+			subjectPrefix + ".sys.events",
+			"_INBOX.>",
+		}},
+	}
+}
+
+// PermissionsForActivatedMember returns permissions for a CLI that has
+// activated session sid as either owner or member. Owner-only operations
+// (session rm / kick / rotate-pin) are pub-allowed at the NATS layer for
+// every member; tetherd performs the owner check on the application side
+// and replies admin_denied for non-owners (see architecture B.2 note).
+func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.by." + actor + ".session.create.req",
+			subjectPrefix + ".ctrl.by." + actor + ".session.list.req",
+			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",
+			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".kick.req",
+			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rotate-pin.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".ps.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.list.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.*.tag.req",
+			subjectPrefix + ".s." + sid + ".cmd.by." + actor + ".node.*.*.req",
+			subjectPrefix + ".s." + sid + ".pty.*.in",
+			subjectPrefix + ".s." + sid + ".pty.*.resize",
+			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			"_INBOX.>",
+		}},
+		Sub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.version.announce",
+			subjectPrefix + ".s." + sid + ".ev.>",
+			subjectPrefix + ".s." + sid + ".audit.>",
+			subjectPrefix + ".s." + sid + ".pty.*.out",
+			subjectPrefix + ".s." + sid + ".pty.*.ready",
+			subjectPrefix + ".sys.events",
+			"_INBOX.>",
+		}},
+	}
+}
+
+// PermissionsForAgent returns permissions for an agent in session sid with
+// node id nid. agents have NO access to `audit.*` (audit is tetherd-single-
+// writer per C.1 §4) and only see their own node's `cmd.*.req.forwarded`.
+func PermissionsForAgent(sid, nid string) jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".register.req",
+			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".unregister.req",
+			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".heartbeat",
+			subjectPrefix + ".s." + sid + ".ev.node." + nid + ".>",
+			subjectPrefix + ".s." + sid + ".pty.*.out",
+			subjectPrefix + ".s." + sid + ".pty.*.ready",
+			subjectPrefix + ".s." + sid + ".pty.*.failed",
+			"_INBOX.>",
+		}},
+		Sub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".s." + sid + ".cmd.node." + nid + ".*.req.forwarded",
+			subjectPrefix + ".s." + sid + ".pty.*.in",
+			subjectPrefix + ".s." + sid + ".pty.*.resize",
+			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			"_INBOX.>",
+		}},
+	}
+}
+
+// PermissionsForBroker returns the permissions tetherd's own NATS connection
+// uses (broad subscribe for routing + pub for forwarded/ev/audit).
+//
+// Note the wildcards here are intentional — only tetherd is allowed `s.*.>`
+// reach (the broker has cross-session authority). The static guard test
+// allow-lists this template for that reason.
+func PermissionsForBroker() jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".s.*.cmd.node.*.*.req.forwarded",
+			subjectPrefix + ".s.*.ev.>",
+			subjectPrefix + ".s.*.audit.>",
+			subjectPrefix + ".ctrl.version.announce",
+			subjectPrefix + ".sys.events",
+			"_INBOX.>",
+		}},
+		Sub: jwt.Permission{Allow: []string{
+			subjectPrefix + ".ctrl.by.*.>",
+			subjectPrefix + ".ctrl.s.*.node.*.register.req",
+			subjectPrefix + ".ctrl.s.*.node.*.unregister.req",
+			subjectPrefix + ".ctrl.s.*.node.*.heartbeat",
+			subjectPrefix + ".s.*.cmd.by.*.node.*.*.req",
+			subjectPrefix + ".s.*.ev.>",
+			subjectPrefix + ".s.*.pty.*.failed",
+			"$SYS.REQ.USER.AUTH",
+			"_INBOX.>",
+		}},
+	}
+}

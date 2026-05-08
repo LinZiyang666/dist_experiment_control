@@ -92,6 +92,46 @@ func SubjPtyFailed(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.failed", SubjectPrefix, sid, pid)
 }
 
+// Session-management subjects (ctl pub, broker handle).
+func SubjCtrlSessionCreate(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.session.create.req", SubjectPrefix, actor)
+}
+func SubjCtrlSessionList(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.session.list.req", SubjectPrefix, actor)
+}
+func SubjCtrlSessionRm(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.rm.req", SubjectPrefix, actor, sid)
+}
+
+// SubjCtrlSessionJoin returns the per-actor, per-session join subject.
+//
+// P3 transitional: this subject is here to give first-time PIN join an RPC
+// path in v1 without auth_callout. P3.5+ will replace it with the standard
+// NATS auth_callout flow over `$SYS.REQ.USER.AUTH`, and this subject will
+// be removed (architecture B.1 / E.2 — login is NOT a business subject).
+func SubjCtrlSessionJoin(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.join.req", SubjectPrefix, actor, sid)
+}
+
+// ParseCtrlBy extracts the actor segment from any "tether.v1.ctrl.by.<actor>.<rest...>"
+// subject. Returns leaf = the dot-joined remainder after the actor segment.
+//
+// Trust note: in P3 (no auth_callout) the actor returned here is not yet
+// proven to be the connection's identity — NATS doesn't verify it. Callers
+// must treat the returned actor as a routing label only, not authoritative
+// identity. P3.5 + auth_callout makes this trustworthy by pinning the
+// actor segment in the connection's JWT.
+func ParseCtrlBy(subject string) (actor, leaf string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:ctrl 3:by 4:<actor> 5+:leaf
+	if len(parts) < 6 ||
+		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[2] != "ctrl" || parts[3] != "by" {
+		return "", "", false
+	}
+	return parts[4], strings.Join(parts[5:], "."), true
+}
+
 // ParseSidNidFromCtrl extracts (sid, nid) from any ctrl-tree subject of the
 // shape "tether.v1.ctrl.s.<sid>.node.<nid>.<rest...>". Returns ok=false when
 // the subject doesn't match this layout.

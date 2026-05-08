@@ -5,11 +5,19 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P2** — broker + agent heartbeat loop). `tether serve`
-runs the broker daemon (NATS subscriber + node state machine), `tether
-agent` runs the agent daemon (register + 5s heartbeat), and `tether admin
-nodes` lists registered nodes by reading SQLite directly. Auth and full
-control plane (`run` / `exec` / `expose`) land in P3+.
+Pre-alpha (phase **P3** — sessions + login). On top of P2's heartbeat loop,
+adds session CRUD (`tether session create / ls / rm`), per-user nkey
+identity (`tether login`), and the broker handlers for
+`ctrl.by.<actor>.session.*.req`. Multi-session isolation is per CLI shell
+via the `TETHER_SESSION` env var.
+
+Note: NATS-level JWT permission enforcement (auth_callout, architecture
+B.2 / E.2) is staged for a P3 follow-up — clients connect anonymously to
+NATS today; the actor token in subjects is a routing label, not yet proof
+of identity. Application-layer owner / member / PIN checks ARE enforced
+by the broker.
+
+Full control plane (`run` / `exec` / `expose`) lands in P4+.
 
 ## Build
 
