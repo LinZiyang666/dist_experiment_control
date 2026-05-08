@@ -101,7 +101,7 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		return h.deny(req, "fingerprint: "+err.Error())
 	}
 
-	role, sid, nid := parseRole(req.ConnectOptions.Name)
+	role, sid, _ := parseRole(req.ConnectOptions.Name)
 	switch role {
 	case roleCtlUnactivated:
 		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey))
@@ -113,11 +113,22 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		h.Logger.Info("authcallout: ctl allow", "actor", clientNkey, "sid", sid)
 		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid))
 	case roleAgent:
-		// P3 transitional: agents bypass membership / PIN. Agent identity
-		// integration with auth_callout lands in P4 alongside the cmd
-		// forwarding subjects.
-		h.Logger.Info("authcallout: agent allow", "actor", clientNkey, "sid", sid, "nid", nid)
-		return h.allow(req, jwtSubject, auth.PermissionsForAgent(sid, nid))
+		// P3-round2 review F1: the agent role MUST NOT mint
+		// PermissionsForAgent based purely on a client-controlled CONNECT
+		// name. Anyone could otherwise present `tether-agent:lab:evil` and
+		// silently register into existing sessions (or `tether-agent:*:*`
+		// and acquire wildcard agent rights across all sessions).
+		//
+		// Real agent provisioning (per-machine nkey + per-session
+		// `(sid,nid)` registration) lands in P4. Until then the agent
+		// path in auth_callout is hard-denied. This keeps the P2-style
+		// anonymous agent path available (test/p2 still works because
+		// broker.Config.AuthCallout is nil there) without granting any
+		// privileges over a NATS server that DOES have auth_callout
+		// enabled.
+		h.Logger.Info("authcallout: agent role denied (provisioning lands in P4)",
+			"actor", clientNkey, "name", req.ConnectOptions.Name)
+		return h.deny(req, "agent role not provisioned (P4 will wire agent install + auth_callout)")
 	default:
 		return h.deny(req, fmt.Sprintf("unknown role from name=%q", req.ConnectOptions.Name))
 	}

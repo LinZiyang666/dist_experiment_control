@@ -162,7 +162,10 @@ func TestHandleDeniesActivatedNonMember(t *testing.T) {
 	}
 }
 
-func TestHandleAgentRoleAllowsWithoutMembership(t *testing.T) {
+// P3-round2 F1: agent role is hard-denied in auth_callout until P4 wires
+// real agent provisioning. Allowing it before then would let any client
+// self-declare as an agent in any session via the CONNECT name.
+func TestHandleAgentRoleIsDeniedUntilP4(t *testing.T) {
 	h, _ := freshHandler(t)
 	ephemeral := freshUserPub(t)
 	client := freshUserPub(t)
@@ -172,20 +175,27 @@ func TestHandleAgentRoleAllowsWithoutMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
-	if resp.Error != "" {
-		t.Fatalf("agent should be allowed in P3, got error %q", resp.Error)
+	if resp.Error == "" {
+		t.Fatalf("agent role must be denied in P3; got allow with JWT %q", resp.Jwt)
 	}
+	if !strings.Contains(resp.Error, "agent role not provisioned") {
+		t.Errorf("expected denial reason to mention provisioning; got %q", resp.Error)
+	}
+}
 
-	uc, _ := jwt.DecodeUserClaims(resp.Jwt)
-	wantSub := "tether.v1.s.lab.cmd.node.lab-1.*.req.forwarded"
-	found := false
-	for _, p := range uc.Permissions.Sub.Allow {
-		if p == wantSub {
-			found = true
-		}
+// Wildcard sid/nid in agent role must also be denied (defense in depth —
+// even if someone re-enables roleAgent, parseRole returning roleUnknown
+// for "*" would route to the unknown-role denial; this test pins that
+// exact pattern.)
+func TestHandleWildcardAgentRoleDenied(t *testing.T) {
+	h, _ := freshHandler(t)
+	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t), "tether-agent:*:*", ""))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !found {
-		t.Errorf("expected agent sub allow %q; got %v", wantSub, uc.Permissions.Sub.Allow)
+	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
+	if resp.Error == "" {
+		t.Fatal("tether-agent:*:* must be denied")
 	}
 }
 
