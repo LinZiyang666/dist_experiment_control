@@ -182,10 +182,12 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Success: tell ctl, broadcast, audit.
+	// Success: tell ctl, broadcast, audit. The raw token does NOT
+	// go to ctl — agent already has it via the forwarded request and
+	// is the only side that needs to present it to the tunnel server.
+	// Architecture F.4 storage boundary; P6 review F2.
 	resp := proto.ExposeResp{
 		Port:       alloc.Port,
-		Token:      alloc.Token,
 		PublicHost: b.publicHostFor(),
 		Name:       req.Name,
 	}
@@ -263,9 +265,25 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyExposeRmErr(msg, "store_error", err.Error())
 		return
 	}
-	// optional: only the creator-fp OR the session owner can rm. v1
-	// keeps it permissive: any session member may rm any expose. Owner
-	// gates can land in P9.
+
+	// P6 review F1 / architecture F.8: only the original creator
+	// (created_by_fp) OR the session owner may rm an expose. Without
+	// this any member could disrupt another member's exposed service
+	// AND immediately squat the freed port number for their own
+	// expose. The fp here is broker-NATS-proven (B.1 by.<actor>) —
+	// no need to re-validate the actor's identity.
+	if alloc.CreatedByFP != fp {
+		isOwner, err := session.IsOwner(b.cfg.DB, sid, fp)
+		if err != nil {
+			b.replyExposeRmErr(msg, "store_error", err.Error())
+			return
+		}
+		if !isOwner {
+			b.replyExposeRmErr(msg, "not_owner_or_creator", req.Name)
+			b.pubAuditCall(sid, fp, actor, "expose-rm", alloc.NID, false, "not_owner_or_creator")
+			return
+		}
+	}
 
 	if err := port.Free(b.cfg.DB, alloc.Port, b.cfg.Now()); err != nil {
 		b.replyExposeRmErr(msg, "free_failed", err.Error())

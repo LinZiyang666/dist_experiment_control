@@ -291,9 +291,15 @@ type ExposeReq struct {
 }
 
 // ExposeResp — broker pub on the expose.req reply inbox.
+//
+// P6 review F2: this struct DOES NOT carry the raw tunnel token.
+// Architecture F.4 storage rule — only the agent ever holds the
+// raw token (state.json), broker keeps SHA256 in port_allocations.
+// Earlier P6 commits leaked the token here, which made any ctl
+// process able to spin up a competing tunnel for the same public
+// port. Fixed by removing the field.
 type ExposeResp struct {
 	Port       int    `json:"port,omitempty"`        // public port assigned (14000-14999)
-	Token      string `json:"token,omitempty"`       // raw token (only ever sent here, not stored on broker)
 	PublicHost string `json:"public_host,omitempty"` // operator-friendly URL host (e.g. broker.example.com)
 	Name       string `json:"name,omitempty"`        // echoed back
 

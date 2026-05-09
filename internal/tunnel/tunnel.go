@@ -40,6 +40,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -73,6 +74,11 @@ type Server struct {
 	tokenLookup TokenLookup
 	logger      *slog.Logger
 
+	// tlsCert, when non-nil, pins a specific server cert. nil means
+	// "generate an ephemeral self-signed cert on Start" (architecture
+	// F.5 fallback). Callers pass this through NewServerWithCert.
+	tlsCert *tls.Certificate
+
 	mu       sync.Mutex
 	sessions map[int]*serverSession // public port -> session
 }
@@ -97,13 +103,24 @@ func NewServer(addr, publicHost string, lookup TokenLookup, logger *slog.Logger)
 }
 
 // Start begins accepting agent control connections. Returns when the
-// listener is bound (so callers know it's ready); the actual accept
-// loop runs in a goroutine until ctx is canceled.
+// TLS listener is bound (so callers know it's ready); the actual
+// accept loop runs in a goroutine until ctx is canceled.
+//
+// P6 review F3 / architecture F.5: control signaling is wrapped in
+// TLS so the bearer token in the REGISTER line cannot be observed by
+// passive eavesdroppers between agent and broker. With s.tlsCert
+// nil we generate a fresh ephemeral self-signed cert on each Start;
+// production deployments can pin one via NewServerWithCert.
 func (s *Server) Start(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.addr)
+	tlsCfg, err := serverTLSConfig(s.tlsCert)
+	if err != nil {
+		return err
+	}
+	rawLn, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("tunnel server: listen %s: %w", s.addr, err)
 	}
+	ln := tls.NewListener(rawLn, tlsCfg)
 	go s.acceptLoop(ctx, ln)
 	go func() {
 		<-ctx.Done()
@@ -334,9 +351,16 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 	if c.ctx == nil {
 		return errors.New("tunnel client: Start not called")
 	}
-	conn, err := net.DialTimeout("tcp", c.brokerAddr, 5*time.Second)
+	// TLS dial wraps the underlying TCP so REGISTER + token cannot be
+	// observed by a passive listener between agent and broker
+	// (architecture F.5). v1 falls back to InsecureSkipVerify because
+	// the broker's self-signed cert has no PKI to validate against;
+	// the threat model F.5 actually targets is passive eavesdrop and
+	// that's still satisfied. See clientTLSConfig().
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", c.brokerAddr, clientTLSConfig())
 	if err != nil {
-		return fmt.Errorf("tunnel client: dial broker: %w", err)
+		return fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
 	}
 	line := fmt.Sprintf("REGISTER %s %s %d %s\n", c.sid, c.nid, publicPort, token)
 	if _, err := conn.Write([]byte(line)); err != nil {

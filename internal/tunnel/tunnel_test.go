@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -119,6 +120,48 @@ func TestTunnelDeniesBadToken(t *testing.T) {
 	if err == nil {
 		t.Fatal("Open with bad token must return DENY error")
 	}
+}
+
+// TestTunnelControlRequiresTLS pins the F3 fix: plain-text TCP can't
+// complete REGISTER. A passive eavesdropper between agent and broker
+// therefore can't observe the bearer token. We verify this by dialing
+// the control listener with raw net.Dial (not tls.Dial), writing a
+// well-formed REGISTER line, and asserting we never get the OK ack
+// the protocol promises on success — the TLS handshake fails first.
+func TestTunnelControlRequiresTLS(t *testing.T) {
+	controlPort := findFreePort(t)
+	srv := NewServer(net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
+		"127.0.0.1",
+		func(_, _ string, _ int, _ string) error { return nil },
+		silentLog())
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	if err := srv.Start(srvCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(controlPort), 1*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Write what would have been a valid REGISTER over a plain TCP
+	// stream. The TLS handshake on the server side will treat this
+	// as garbage and the connection should error out before we ever
+	// see the OK reply.
+	_, _ = conn.Write([]byte("REGISTER lab lab-1 14000 sometoken\n"))
+
+	_ = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	got := string(buf[:n])
+	if err == nil && strings.HasPrefix(got, "OK") {
+		t.Fatalf("plaintext TCP reached OK ack — control channel is not TLS-only; got %q", got)
+	}
+	// Either an error or a non-OK byte stream is acceptable here:
+	// the only failure mode we care about is "the server completed
+	// the protocol over plaintext", and that's the assertion above.
 }
 
 func TestTunnelClosesPublicPortOnSessionDrop(t *testing.T) {

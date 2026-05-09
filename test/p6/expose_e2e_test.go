@@ -253,23 +253,24 @@ func TestExposeAllocatesAndPersistsToken(t *testing.T) {
 	if resp.Port < 14000 || resp.Port > 14002 {
 		t.Errorf("port outside test band: got %d", resp.Port)
 	}
-	if resp.Token == "" {
-		t.Error("token must be returned to ctl exactly once")
-	}
 	if resp.PublicHost != "test.local" {
 		t.Errorf("public host: got %q want test.local", resp.PublicHost)
 	}
 
-	// Adapter should have been called.
+	// P6 review F2: the raw token belongs to (broker→agent) only.
+	// Verify the agent adapter received the token and the SQLite row
+	// has only the SHA256 hash; ctl has no field that could carry it.
 	added, _ := adapter.snapshot()
 	if len(added) != 1 {
 		t.Fatalf("adapter AddProxy calls: got %d want 1", len(added))
 	}
-	if added[0].Token != resp.Token || added[0].Port != resp.Port {
-		t.Errorf("adapter saw different (port,token) than ctl: %+v vs %+v", added[0], resp)
+	if added[0].Token == "" {
+		t.Error("agent adapter must receive the raw token")
+	}
+	if added[0].Port != resp.Port {
+		t.Errorf("adapter / ctl port mismatch: %d vs %d", added[0].Port, resp.Port)
 	}
 
-	// SQLite row.
 	a, err := port.LookupByName(db, "lab", "jupyter")
 	if err != nil {
 		t.Fatalf("lookup by name: %v", err)
@@ -277,8 +278,8 @@ func TestExposeAllocatesAndPersistsToken(t *testing.T) {
 	if a.Port != resp.Port || a.LocalPort != 8888 || a.CreatedByFP != fp {
 		t.Errorf("DB row mismatch: %+v", a)
 	}
-	if a.TokenHash != port.HashToken(resp.Token) {
-		t.Errorf("token hash didn't match raw token")
+	if a.TokenHash != port.HashToken(added[0].Token) {
+		t.Errorf("token hash didn't match the agent-side raw token")
 	}
 }
 
