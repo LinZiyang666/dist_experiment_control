@@ -114,6 +114,14 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	}
 
 	a.registerProc(pid, sess)
+	// Hook into the P4 process state machine. P5 review F1: a `run`
+	// process must be visible to `tether ps` and produce normal
+	// `audit.proc{kind:start,exit}` records, the same as a `tether
+	// exec` process. Failures BEFORE this point (attach_timeout /
+	// pty_alloc_failed / exec_failed) deliberately do NOT publish
+	// proc.started — no child was actually started, so no row should
+	// exist. They surface via PtyFailedEvent → audit.proc{kind:reason}.
+	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
 
 	// Two long-running subscriptions for the lifetime of the child:
@@ -163,6 +171,11 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	a.unregisterProc(pid)
 	_ = sess.Close()
 
+	// Symmetric with pubProcStarted above: emit ev.proc.exit so the
+	// broker's existing handleProcEvent transcribes the SQLite row to
+	// EXITED + writes audit.proc{kind:exit}. Done BEFORE the lifecycle
+	// chunk so the row is updated by the time ctl reacts to exit.
+	a.pubProcExit(nc, pid, exitCode)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
 		Kind: "exit", PID: pid, ExitCode: exitCode,
 	})
