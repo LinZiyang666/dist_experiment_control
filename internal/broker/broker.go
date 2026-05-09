@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
@@ -118,6 +119,13 @@ type Config struct {
 	// monitor calls the package-level diskUsage helper backed by
 	// syscall.Statfs.
 	DiskUsageFn func(path string) (used, total uint64, err error)
+
+	// AdminSocketPath is the absolute Unix socket path for the
+	// `tether admin *` local-only admin channel (architecture
+	// I.2b / P9). Empty disables the admin endpoint entirely;
+	// production sets it to /var/run/tether/admin.sock and the
+	// adminsock package creates it 0600 under a 0700 parent dir.
+	AdminSocketPath string
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -174,6 +182,11 @@ type Broker struct {
 	// changes; a JetStream-enabled deployment activates the P7
 	// upgrade automatically.
 	js jetstream.JetStream
+
+	// admin is the local-only Unix-socket admin server. Non-nil
+	// only when Config.AdminSocketPath is set. Started after JS so
+	// the audit endpoint can read history-<sid>.
+	admin *adminsock.Server
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -370,6 +383,24 @@ func (b *Broker) Run(ctx context.Context) error {
 
 	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
 	b.startDiskMonitor(ctx)
+
+	// P9 / I.2b — local admin socket. No-op when path empty (the
+	// in-process tests that don't exercise admin leave it unset).
+	if b.cfg.AdminSocketPath != "" {
+		backend := adminsock.Backend{
+			DB:              b.cfg.DB,
+			Now:             b.cfg.Now,
+			Logger:          b.cfg.Logger,
+			AuditTail:       b.adminAuditTail,
+			PubAgentEvicted: b.pubAgentEvicted,
+		}
+		b.admin = adminsock.New(b.cfg.AdminSocketPath, backend)
+		if err := b.admin.Start(ctx); err != nil {
+			return fmt.Errorf("broker: admin socket start: %w", err)
+		}
+		defer func() { _ = b.admin.Close() }()
+		b.cfg.Logger.Info("broker: admin socket ready", "path", b.cfg.AdminSocketPath)
+	}
 
 	// G.2 step ① — recompute node states from persisted
 	// last_heartbeat_at once at boot. The ticker below would do this

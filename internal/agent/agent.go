@@ -196,6 +196,37 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer func() { _ = subFwd.Unsubscribe() }()
 
+	// P9 — listen for sys.events{type:agent_evicted, sid, nid}
+	// addressed to us so `tether admin evict` takes effect within
+	// the architecture P9 1s budget instead of waiting for the
+	// next CONNECT to be denied. The handler triggers a graceful
+	// shutdown via runCtx cancel; the surrounding ctx still wins
+	// any race with parent-canceled paths.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) {
+		var ev struct {
+			Type string `json:"type"`
+			SID  string `json:"sid"`
+			NID  string `json:"nid"`
+		}
+		if err := json.Unmarshal(msg.Data, &ev); err != nil {
+			return
+		}
+		if ev.Type != "agent_evicted" {
+			return
+		}
+		if ev.SID != a.cfg.SID || ev.NID != a.cfg.NID {
+			return
+		}
+		a.cfg.Logger.Info("agent: evicted by admin", "sid", ev.SID, "nid", ev.NID)
+		cancelRun()
+	})
+	if err != nil {
+		return fmt.Errorf("agent: subscribe sys.events: %w", err)
+	}
+	defer func() { _ = subEvict.Unsubscribe() }()
+
 	// G.1 reply application MUST run before replay so any RevokePorts
 	// have already pruned state.json by the time replayPortsFromState
 	// reads it. Otherwise we'd re-establish a proxy that the broker
@@ -209,7 +240,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// No-op when state store or adapter is absent.
 	a.replayPortsFromState()
 
-	return a.heartbeatLoop(ctx, nc)
+	return a.heartbeatLoop(runCtx, nc)
 }
 
 func (a *Agent) replayPortsFromState() {
