@@ -114,13 +114,13 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	}
 
 	a.registerProc(pid, sess)
-	// Hook into the P4 process state machine. P5 review F1: a `run`
-	// process must be visible to `tether ps` and produce normal
-	// `audit.proc{kind:start,exit}` records, the same as a `tether
-	// exec` process. Failures BEFORE this point (attach_timeout /
-	// pty_alloc_failed / exec_failed) deliberately do NOT publish
-	// proc.started — no child was actually started, so no row should
-	// exist. They surface via PtyFailedEvent → audit.proc{kind:reason}.
+	// Hook into the shared process state machine: `tether run`
+	// processes must show up in `tether ps` and produce normal
+	// audit.proc{kind:start,exit} records, the same as `tether exec`.
+	// Failures BEFORE this point (attach_timeout / pty_alloc_failed /
+	// exec_failed) deliberately do NOT pub proc.started — no child
+	// was started, so no SQLite row should exist. Those surface via
+	// PtyFailedEvent → audit.proc{kind:reason} instead.
 	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
 

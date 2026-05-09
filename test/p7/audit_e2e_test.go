@@ -8,92 +8,30 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
-	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
-	"github.com/LinZiyang666/tether/internal/storage"
-	natsserver "github.com/nats-io/nats-server/v2/server"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/nats-io/nkeys"
 )
 
 // ----- harness --------------------------------------------------------------
+//
+// Generic primitives live in internal/testharness; helpers below are
+// the phase-specific bits.
 
-// startJSNATS starts an embedded nats-server with JetStream on, store
-// dir under t.TempDir() so the OS reaps it on test exit.
-func startJSNATS(t *testing.T) string {
-	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	opts.JetStream = true
-	opts.StoreDir = t.TempDir()
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded JS nats-server not ready")
-	}
-	waitJSReady(t, ns)
-	return ns.ClientURL()
-}
-
-func waitJSReady(t *testing.T, ns *natsserver.Server) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if ns.JetStreamEnabled() && ns.JetStreamIsCurrent() {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("JS not ready after 2s")
-}
-
-func openDB(t *testing.T) *sql.DB {
-	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
-}
-
-func silentLog() *slog.Logger {
-	if os.Getenv("TETHER_TEST_VERBOSE") != "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-func freshUserPub(t *testing.T) (pub, fp string) {
-	t.Helper()
-	kp, err := nkeys.CreateUser()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub, _ = kp.PublicKey()
-	kp.Wipe()
-	fp, err = auth.FingerprintFromActor(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pub, fp
-}
+func startJSNATS(t *testing.T) string                { return testharness.StartJSNATS(t) }
+func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                        { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
 
 func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()

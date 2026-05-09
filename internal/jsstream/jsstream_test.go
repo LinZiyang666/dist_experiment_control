@@ -3,48 +3,17 @@ package jsstream
 import (
 	"context"
 	"testing"
-	"time"
 
-	natsserver "github.com/nats-io/nats-server/v2/server"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// startJSNATS starts an embedded nats-server with JetStream enabled
-// pointed at a per-test temp dir.
-func startJSNATS(t *testing.T) string {
-	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	opts.JetStream = true
-	opts.StoreDir = t.TempDir()
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded JS nats-server not ready")
-	}
-	// Without this, tests under heavy load occasionally see
-	// "context deadline exceeded" on the first stream call because
-	// JS internal init isn't fully done at ReadyForConnections.
-	waitJSReady(t, ns)
-	return ns.ClientURL()
-}
-
-func waitJSReady(t *testing.T, ns *natsserver.Server) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if ns.JetStreamEnabled() && ns.JetStreamIsCurrent() {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("JS not ready after 2s")
-}
+// startJSNATS is a thin alias over testharness.StartJSNATS so existing
+// call sites in this file (and tests inside this package historically)
+// don't have to change. The shared implementation handles the
+// JetStream-ready wait that prevents flakes under load.
+func startJSNATS(t *testing.T) string { return testharness.StartJSNATS(t) }
 
 func newJS(t *testing.T, url string) jetstream.JetStream {
 	t.Helper()

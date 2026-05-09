@@ -18,7 +18,6 @@ func newExecCmd() *cobra.Command {
 	var (
 		natsURL string
 		home    string
-		nidFlag string
 		cwd     string
 		timeout time.Duration
 	)
@@ -42,7 +41,6 @@ PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
 			}
 			nid := args[0]
 			argv := args[1:]
-			_ = nidFlag // reserved (future: --node override)
 
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
@@ -117,7 +115,6 @@ PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
-	cmd.Flags().StringVar(&nidFlag, "node", "", "(reserved; first positional arg is the node)")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "max time to wait for output / exit")
 	return cmd

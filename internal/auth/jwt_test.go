@@ -148,9 +148,9 @@ func TestLoadAccountSignerRejectsUserSeed(t *testing.T) {
 	}
 }
 
-// IssueUserJWT must reject malformed user public keys with an ordinary error,
-// not a nil-deref panic. jwt.NewUserClaims("") returns nil and would crash
-// at the first field write (round-2 review F1).
+// IssueUserJWT must reject malformed user public keys with an ordinary
+// error, not a nil-deref panic. jwt.NewUserClaims("") returns nil and
+// would crash at the first field write.
 func TestIssueUserJWTRejectsBadUserPub(t *testing.T) {
 	signer, err := LoadAccountSigner(freshAccountSeed(t))
 	if err != nil {

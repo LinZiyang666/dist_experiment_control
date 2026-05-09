@@ -43,9 +43,8 @@ func LoadAccountSigner(seed []byte) (*AccountSigner, error) {
 // the supplied permissions. ttl=0 means "no expiry encoded".
 //
 // `userPub` must be a NATS user public key (`U…`). Empty / wrong-kind /
-// malformed inputs are rejected as ordinary errors; jwt.NewUserClaims("")
-// returns nil and would otherwise panic at the next field access (round-2
-// review F1).
+// malformed inputs are rejected as ordinary errors; otherwise
+// jwt.NewUserClaims("") returns nil and the next field write panics.
 func (a *AccountSigner) IssueUserJWT(userPub string, perms jwt.Permissions, ttl time.Duration) (string, error) {
 	if !nkeys.IsValidPublicUserKey(userPub) {
 		return "", fmt.Errorf("jwt: userPub %q is not a valid NATS user public key (expect U…)", userPub)

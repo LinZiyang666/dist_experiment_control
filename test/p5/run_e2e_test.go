@@ -10,72 +10,28 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
-	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
-	"github.com/LinZiyang666/tether/internal/storage"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nkeys"
 )
 
 // ----- harness --------------------------------------------------------------
+//
+// Generic primitives live in internal/testharness; the helpers below
+// are the phase-specific bits.
 
-func startNATS(t *testing.T) string {
-	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	return ns.ClientURL()
-}
-
-func openDB(t *testing.T) *sql.DB {
-	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
-}
-
-func silentLog() *slog.Logger {
-	if os.Getenv("TETHER_TEST_VERBOSE") != "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-func freshUserPub(t *testing.T) (pub, fp string) {
-	t.Helper()
-	kp, err := nkeys.CreateUser()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub, _ = kp.PublicKey()
-	kp.Wipe()
-	fp, err = auth.FingerprintFromActor(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pub, fp
-}
+func startNATS(t *testing.T) string                  { return testharness.StartNATS(t) }
+func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                        { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
 
 func seed(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()

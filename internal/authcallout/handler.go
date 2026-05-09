@@ -186,13 +186,13 @@ func agentNidFromName(name string) string {
 	return parts[1]
 }
 
-// ensureAgentProvisioned implements the F1 (P4 review) two-phase agent
-// auth flow:
+// ensureAgentProvisioned implements the two-phase agent auth flow:
 //
-//  1. validate sid/nid format strictly (P3-round2 lesson: never mint
-//     PermissionsForAgent off a client-controlled string without
-//     re-validating);
-//  2. consult agent_provisioning(sid, nid):
+//  1. Validate sid/nid format strictly. The connection name is
+//     client-controlled — never mint PermissionsForAgent without
+//     re-validating, otherwise a peer can self-declare into any
+//     session by picking the right name.
+//  2. Consult agent_provisioning(sid, nid):
 //     - row exists with matching fp                     → allow;
 //     - row exists with a different fp                  → deny (this nid
 //       is taken by another agent identity; operator revokes first);

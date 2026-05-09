@@ -185,8 +185,8 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 
 	// Success: tell ctl, broadcast, audit. The raw token does NOT
 	// go to ctl — agent already has it via the forwarded request and
-	// is the only side that needs to present it to the tunnel server.
-	// Architecture F.4 storage boundary; P6 review F2.
+	// is the only side that needs to present it to the tunnel server
+	// (architecture F.4 storage boundary).
 	resp := proto.ExposeResp{
 		Port:       alloc.Port,
 		PublicHost: b.publicHostFor(),
@@ -267,12 +267,12 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// P6 review F1 / architecture F.8: only the original creator
-	// (created_by_fp) OR the session owner may rm an expose. Without
-	// this any member could disrupt another member's exposed service
-	// AND immediately squat the freed port number for their own
-	// expose. The fp here is broker-NATS-proven (B.1 by.<actor>) —
-	// no need to re-validate the actor's identity.
+	// Architecture F.8: only the original creator (created_by_fp) OR
+	// the session owner may rm an expose. Skipping this would let any
+	// member disrupt another member's exposed service AND immediately
+	// squat the freed port number for their own expose. The fp here
+	// is broker-NATS-proven via the by.<actor> subject segment (B.1)
+	// — no extra identity validation needed.
 	if alloc.CreatedByFP != fp {
 		isOwner, err := session.IsOwner(b.cfg.DB, sid, fp)
 		if err != nil {
@@ -358,8 +358,9 @@ func (b *Broker) pubPortEvent(sid string, port int, name, nid string, localPort 
 }
 
 // pubAuditPort writes audit.port using schema.AuditPort (architecture
-// H.5). P7 review F2 — same single-source-of-truth rationale as
-// pubAuditCall / pubAuditProc above.
+// H.5). Same single-source-of-truth rule as pubAuditCall /
+// pubAuditProc — the schema struct is the wire contract; never an
+// inline anonymous one.
 func (b *Broker) pubAuditPort(sid, kind, nid string, port int, name string, localPort int, actorFP string, ts time.Time) {
 	body, err := json.Marshal(schema.AuditPort{
 		V: schema.AuditSchemaVersion, Kind: kind, Ts: ts,

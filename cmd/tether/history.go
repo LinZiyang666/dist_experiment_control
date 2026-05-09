@@ -111,11 +111,10 @@ func newHistoryCmd() *cobra.Command {
 				return runHistorySnapshot(ctx, cons, out, 250*time.Millisecond)
 
 			case lastN > 0:
-				// Filter present — must scan the FILTERED stream
-				// from start and keep a ring buffer of the last N
-				// matches; the unfiltered LastSeq doesn't tell us
-				// where the Nth-from-last filtered match begins.
-				// (P7 review F1.)
+				// Filter present — must scan the FILTERED stream from
+				// start and ring-buffer the last N matches; the
+				// unfiltered LastSeq doesn't tell us where the
+				// Nth-from-last filtered match begins.
 				cfg.DeliverPolicy = jetstream.DeliverAllPolicy
 				cons, err := stream.OrderedConsumer(ctx, cfg)
 				if err != nil {
@@ -207,15 +206,15 @@ func runHistorySnapshot(ctx context.Context, cons jetstream.Consumer, out io.Wri
 // FilterSubjects yields only matching messages, but their seq numbers
 // are sparse (call/proc/port interleave on a single stream). The
 // "OptStartSeq = LastSeq - N + 1" short-cut over-truncates because
-// filtered messages between [LastSeq-N+1, LastSeq] are fewer than N.
-// P7 review F1: that short-cut showed only 33 of 50 matching entries.
+// filtered messages between [LastSeq-N+1, LastSeq] are fewer than N
+// (e.g. with the typical 1 call : 2 proc ratio per exec, asking for
+// N=100 inside the last 100 stream messages yields only ~33 calls).
 //
 // Memory cost is O(n) on the ring + O(1) per message scanned. For
-// the v1 expected volumes (history-<sid> in the thousands of
-// messages range, n typically <= a few hundred), the unfiltered
-// scan is comfortable. Architectures expecting millions of
-// pre-filter messages would want a JetStream subject-specific seq
-// API instead — not in v1.
+// v1 expected volumes (history-<sid> in the thousands of messages,
+// n typically <= a few hundred), the unfiltered scan is comfortable.
+// Architectures expecting millions of pre-filter messages would want
+// a JetStream subject-specific seq API instead — not in v1.
 func runHistoryFilteredTail(ctx context.Context, cons jetstream.Consumer, out io.Writer, n int, idle time.Duration) error {
 	it, err := cons.Messages()
 	if err != nil {

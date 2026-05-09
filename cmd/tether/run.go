@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -324,4 +323,3 @@ func drainPending(outCh <-chan []byte, w io.Writer, maxWait time.Duration) {
 	}
 }
 
-var _ = errors.New // keep errors imported for future error wrapping

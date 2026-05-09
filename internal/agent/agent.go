@@ -7,7 +7,7 @@
 //   1. connectNATS retries the initial CONNECT,
 //   2. register retries the request/reply.
 //
-// Authentication (P4 review F1):
+// Authentication:
 //   - Default path: caller passes Config.Identity (loaded via
 //     cli.EnsureAgentIdentity), agent CONNECTs with nats.Nkey + Name
 //     "tether-agent:<sid>:<nid>". On the very first CONNECT the operator
@@ -16,9 +16,8 @@
 //     CONNECTs need no PIN — the binding is remembered.
 //   - Dev escape hatch: with Config.Identity == nil the agent CONNECTs
 //     anonymously (no nkey, no name discriminator). This only works
-//     against a broker without auth_callout (P2-style or
-//     TETHER_DEV_NO_AUTH-style demo). cmd/tether/agent.go honours
-//     TETHER_DEV_NO_AUTH=1 by leaving Identity nil.
+//     against a broker without auth_callout. cmd/tether/agent.go
+//     honours TETHER_DEV_NO_AUTH=1 by leaving Identity nil.
 package agent
 
 import (

@@ -14,7 +14,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -190,12 +189,3 @@ func listSessionsByState(db *sql.DB, state string) ([]string, error) {
 	}
 	return out, rows.Err()
 }
-
-// errSessionFinalizeRequiresJS is returned when finalizeSessionRm is
-// called on a broker without a JetStream context AND the session
-// has a history stream that needs deleting. Callers can either run
-// without JS (and accept that a stream-less rm is fine) or block
-// the rm; current code path is "no JS → just do phases ③④".
-var errSessionFinalizeRequiresJS = errors.New("broker: cannot delete history stream without JetStream")
-
-var _ = errSessionFinalizeRequiresJS // referenced for future use; keep linter quiet

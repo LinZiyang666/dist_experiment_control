@@ -14,9 +14,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// agent import only kept implicit through harness.go helpers
-// (startAgent), already in audit_e2e_test.go.
-var _ = jsstream.EventsStreamName // explicit reference avoids "imported and not used"
 
 // collectEvents subscribes to sys.events on the given conn and
 // returns a snapshot func plus an unsubscribe. Tests use it to

@@ -63,11 +63,11 @@ func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Pre-forward node check (P4 review F2). Without this a typo in nid or
-	// a long-OFFLINE agent would drop into the NATS request, with no
-	// subscriber on `.req.forwarded`, and the ctl would just hang until its
-	// own timeout. Returning a clean ExecChunk{kind:error} matches the
-	// promise stated in this handler's doc comment.
+	// Pre-forward node check. Without this, a typoed nid or a
+	// long-OFFLINE agent would land on `.req.forwarded` with no
+	// subscriber and ctl would hang until its own timeout. Surface
+	// the failure as an ExecChunk{kind:error} per the contract in
+	// this handler's doc comment.
 	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
 	switch {
 	case errors.Is(err, node.ErrNotFound):
@@ -273,11 +273,10 @@ func splitDot(s string) []string {
 
 // pubAuditCall emits an `audit.call` event using the schema package
 // types so the on-the-wire JSON matches what consumers decode with
-// schema.AuditCall (architecture H.5 — append-only contract). P7
-// review F2: previously this used an inline anonymous struct that
-// drifted from schema.AuditCall (e.g. exit_code vs rc on
-// audit.proc); centralize on the schema types instead so a future
-// drift becomes a build break, not a silent decoder-loses-fields bug.
+// schema.AuditCall (architecture H.5 — append-only contract). Always
+// marshal through the schema struct, never an inline anonymous one;
+// a future field rename then surfaces as a build error here rather
+// than as a silent decoder-loses-fields bug at the consumer.
 func (b *Broker) pubAuditCall(sid, actorFP, actorNkey, verb, nid string, ok bool, errMsg string) {
 	payload, err := json.Marshal(schema.AuditCall{
 		V: schema.AuditSchemaVersion, Kind: "call", Ts: b.cfg.Now(),

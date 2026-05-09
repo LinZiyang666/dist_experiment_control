@@ -11,44 +11,13 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
-	natsserver "github.com/nats-io/nats-server/v2/server"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-func startHistoryJSNATS(t *testing.T) string {
-	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	opts.JetStream = true
-	opts.StoreDir = t.TempDir()
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded JS nats-server not ready")
-	}
-	waitHistoryJSReady(t, ns)
-	return ns.ClientURL()
-}
-
-func waitHistoryJSReady(t *testing.T, ns *natsserver.Server) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if ns.JetStreamEnabled() && ns.JetStreamIsCurrent() {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("JS not ready after 2s")
-}
-
 func TestHistoryKindTailCountsFilteredEntries(t *testing.T) {
-	url := startHistoryJSNATS(t)
+	url := testharness.StartJSNATS(t)
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatal(err)
@@ -79,12 +48,12 @@ func TestHistoryKindTailCountsFilteredEntries(t *testing.T) {
 		})
 	}
 
-	// Pin the contract from P7 review F1: history --kind call -n 100
-	// must return ALL 50 audit.call entries from the 50 exec runs,
-	// not the ~33 the LastSeq-N+1 + FilterSubjects combination
-	// over-truncated to. The fix is the runHistoryFilteredTail helper
-	// in history.go (DeliverAllPolicy + ring buffer over the
-	// filtered stream); this test pins that helper's behavior.
+	// Pin the history --kind ... -n N contract: 50 exec runs must
+	// produce 50 audit.call entries that all show up here. The
+	// runHistoryFilteredTail helper in history.go uses
+	// DeliverAllPolicy + a ring buffer over the filtered stream so
+	// the count is correct regardless of how many non-matching
+	// messages interleave in the underlying stream.
 	stream, err := js.Stream(context.Background(), jsstream.HistoryStreamName("lab"))
 	if err != nil {
 		t.Fatal(err)

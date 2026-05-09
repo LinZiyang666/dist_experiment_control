@@ -106,10 +106,10 @@ func NewServer(addr, publicHost string, lookup TokenLookup, logger *slog.Logger)
 // TLS listener is bound (so callers know it's ready); the actual
 // accept loop runs in a goroutine until ctx is canceled.
 //
-// P6 review F3 / architecture F.5: control signaling is wrapped in
-// TLS so the bearer token in the REGISTER line cannot be observed by
-// passive eavesdroppers between agent and broker. With s.tlsCert
-// nil we generate a fresh ephemeral self-signed cert on each Start;
+// Architecture F.5: control signaling is wrapped in TLS so the bearer
+// token in the REGISTER line cannot be observed by passive
+// eavesdroppers between agent and broker. With s.tlsCert nil we
+// generate a fresh ephemeral self-signed cert on each Start;
 // production deployments can pin one via NewServerWithCert.
 func (s *Server) Start(ctx context.Context) error {
 	tlsCfg, err := serverTLSConfig(s.tlsCert)

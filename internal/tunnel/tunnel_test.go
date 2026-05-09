@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -237,6 +236,3 @@ func httpGet(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// guard against stray goroutines: in CI we sometimes see leaks under
-// load; this gives a clear signal vs a flaky test.
-var _ = sync.WaitGroup{}

@@ -103,12 +103,11 @@ func newExposeRmCmd() *cobra.Command {
 	var (
 		natsURL string
 		home    string
-		nidArg  string
 		name    string
 	)
 	cmd := &cobra.Command{
 		Use:   "rm <node>",
-		Short: "Free a previously-exposed port (P6)",
+		Short: "Free a previously-exposed port",
 		Long: `tether expose rm <node> --name jupyter — reverse a prior expose. The
 public port is immediately returned to the pool and the agent's frpc
 proxy is dropped. Idempotent: removing a non-existent name returns an
@@ -121,7 +120,6 @@ error you can ignore in scripts.
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
 			nid := args[0]
-			_ = nidArg
 			if name == "" {
 				return fmt.Errorf("--name is required")
 			}
