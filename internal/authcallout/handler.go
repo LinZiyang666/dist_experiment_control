@@ -53,6 +53,17 @@ type Handler struct {
 	// user JWT's Audience so the server can route the user into the right
 	// account post-callout (see auth_callout_test.createAuthUser).
 	TargetAccount string
+
+	// EmitEvent, when non-nil, is invoked for sys.events-worthy
+	// auth-callout outcomes (architecture H.1):
+	//   - kind="member_joined" — PIN-bootstrap successfully added a
+	//     new member row (fields: sid, fp, via=pin)
+	//   - kind="pin_failed"    — PIN verify rejected (fields: sid, fp)
+	//
+	// The handler doesn't import broker (broker imports authcallout),
+	// so the broker injects this callback that wraps its pubSysEvent.
+	// Nil callback = no emission, fine for unit tests / pre-P7 builds.
+	EmitEvent func(kind string, fields map[string]any)
 }
 
 const defaultJWTTTL = 24 * time.Hour
@@ -230,12 +241,16 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 	}
 	switch err := agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, h.Now()); {
 	case err == nil:
+		h.emit("member_joined", map[string]any{
+			"sid": sid, "nid": nid, "fp": fp, "via": "pin", "role": "agent",
+		})
 		return nil
 	case errors.Is(err, agentprov.ErrSessionMissing):
 		return fmt.Errorf("session %q does not exist", sid)
 	case errors.Is(err, agentprov.ErrSessionDeleting):
 		return fmt.Errorf("session %q is being deleted", sid)
 	case errors.Is(err, agentprov.ErrInvalidPIN):
+		h.emit("pin_failed", map[string]any{"sid": sid, "nid": nid, "fp": fp, "role": "agent"})
 		return fmt.Errorf("invalid PIN")
 	case errors.Is(err, agentprov.ErrAlreadyProvisioned):
 		// Race: another agent just provisioned this nid with a different
@@ -270,11 +285,21 @@ func (h *Handler) ensureMember(sid, fp, pin string) error {
 	}
 	if err := session.JoinWithPIN(h.DB, sid, fp, pin, auth.VerifyPIN, h.Now()); err != nil {
 		if errors.Is(err, session.ErrInvalidPIN) {
+			h.emit("pin_failed", map[string]any{"sid": sid, "fp": fp, "role": "ctl"})
 			return fmt.Errorf("invalid PIN for session %q", sid)
 		}
 		return fmt.Errorf("join failed: %w", err)
 	}
+	h.emit("member_joined", map[string]any{"sid": sid, "fp": fp, "via": "pin", "role": "ctl"})
 	return nil
+}
+
+// emit safely calls EmitEvent if it's wired. Keeps caller code from
+// having to nil-check at every event point.
+func (h *Handler) emit(kind string, fields map[string]any) {
+	if h.EmitEvent != nil {
+		h.EmitEvent(kind, fields)
+	}
 }
 
 func (h *Handler) allow(req *jwt.AuthorizationRequestClaims, userPub string, perms jwt.Permissions) (string, error) {

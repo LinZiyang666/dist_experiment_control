@@ -23,6 +23,7 @@ func newServeCmd() *cobra.Command {
 		tunnelCtrlAddr   string
 		tunnelPublicHost string
 		publicHost       string
+		storeDir         string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -42,6 +43,7 @@ func newServeCmd() *cobra.Command {
 				PublicHost:        publicHost,
 				TunnelControlAddr: tunnelCtrlAddr,
 				TunnelPublicHost:  tunnelPublicHost,
+				StoreDir:          storeDir,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -90,6 +92,8 @@ func newServeCmd() *cobra.Command {
 		"reverse-TCP tunnel control listener (host:port); empty disables P6 data plane")
 	cmd.Flags().StringVar(&tunnelPublicHost, "tunnel-public-host", "0.0.0.0",
 		"bind address for the public per-port tunnel listeners (default 0.0.0.0)")
+	cmd.Flags().StringVar(&storeDir, "store-dir", "",
+		"JetStream store dir to monitor for disk pressure (P7/H.4); empty = monitor disabled")
 	return cmd
 }
 

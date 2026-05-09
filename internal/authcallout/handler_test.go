@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,6 +234,113 @@ func TestHandleAgentRolePINBootstrapAndRebind(t *testing.T) {
 	if resp2.Error != "" {
 		t.Errorf("re-connect after PIN-bootstrap must succeed; got %q", resp2.Error)
 	}
+}
+
+// TestEmitEventOnPinFailure pins the P7 wiring: when the auth_callout
+// rejects a wrong-PIN attempt for either ctl or agent role, the
+// injected EmitEvent callback fires with kind="pin_failed". Without
+// this hook the P7 events stream would silently miss bad-PIN
+// observations even though the broker logs them.
+func TestEmitEventOnPinFailure(t *testing.T) {
+	h, _ := freshHandler(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
+
+	var (
+		mu      sync.Mutex
+		emitted []emittedEvent
+	)
+	h.EmitEvent = func(kind string, fields map[string]any) {
+		mu.Lock()
+		defer mu.Unlock()
+		emitted = append(emitted, emittedEvent{kind: kind, fields: fields})
+	}
+
+	// ctl path: tether-cli:lab + wrong PIN
+	if _, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t),
+		"tether-cli:lab", "wrong-pin")); err != nil {
+		t.Fatal(err)
+	}
+	// agent path: tether-agent:lab:lab-1 + wrong PIN (no prior provisioning)
+	if _, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t),
+		"tether-agent:lab:lab-1", "wrong-pin")); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	gotCtl, gotAgent := false, false
+	for _, e := range emitted {
+		if e.kind != "pin_failed" {
+			continue
+		}
+		if e.fields["role"] == "ctl" {
+			gotCtl = true
+		}
+		if e.fields["role"] == "agent" {
+			gotAgent = true
+		}
+	}
+	if !gotCtl {
+		t.Errorf("ctl wrong-PIN must emit pin_failed{role:ctl}; got %+v", emitted)
+	}
+	if !gotAgent {
+		t.Errorf("agent wrong-PIN must emit pin_failed{role:agent}; got %+v", emitted)
+	}
+}
+
+// TestEmitEventOnMemberJoined pins the symmetric success path:
+// PIN-bootstrap that successfully writes a members row (or
+// agent_provisioning row) emits kind="member_joined".
+func TestEmitEventOnMemberJoined(t *testing.T) {
+	h, _ := freshHandler(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
+
+	var (
+		mu      sync.Mutex
+		emitted []emittedEvent
+	)
+	h.EmitEvent = func(kind string, fields map[string]any) {
+		mu.Lock()
+		defer mu.Unlock()
+		emitted = append(emitted, emittedEvent{kind: kind, fields: fields})
+	}
+
+	// ctl join via PIN (correct).
+	if _, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t),
+		"tether-cli:lab", "test-pin")); err != nil {
+		t.Fatal(err)
+	}
+	// agent provision via PIN (correct).
+	if _, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t),
+		"tether-agent:lab:lab-1", "test-pin")); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	gotCtl, gotAgent := false, false
+	for _, e := range emitted {
+		if e.kind != "member_joined" {
+			continue
+		}
+		if e.fields["role"] == "ctl" {
+			gotCtl = true
+		}
+		if e.fields["role"] == "agent" {
+			gotAgent = true
+		}
+	}
+	if !gotCtl {
+		t.Errorf("ctl PIN-join success must emit member_joined{role:ctl}; got %+v", emitted)
+	}
+	if !gotAgent {
+		t.Errorf("agent PIN-bootstrap success must emit member_joined{role:agent}; got %+v", emitted)
+	}
+}
+
+type emittedEvent struct {
+	kind   string
+	fields map[string]any
 }
 
 // A different agent identity arriving with a valid PIN to a slot already

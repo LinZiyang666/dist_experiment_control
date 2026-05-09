@@ -78,6 +78,7 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 		AccountKp: accountKp,
 		Now:       b.cfg.Now,
 		Logger:    b.cfg.Logger,
+		EmitEvent: b.pubSysEvent, // P7: member_joined / pin_failed → events stream
 	}
 
 	sub, err := nc.Subscribe("$SYS.REQ.USER.AUTH", func(msg *nats.Msg) {

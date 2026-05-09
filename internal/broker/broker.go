@@ -95,6 +95,28 @@ type Config struct {
 	// listeners the tunnel server opens on demand. Default
 	// "0.0.0.0" (publicly reachable). Tests use "127.0.0.1".
 	TunnelPublicHost string
+
+	// StoreDir is the local filesystem path the disk-pressure
+	// monitor (architecture H.4) statfs's. In production it should
+	// point at the JetStream store dir (where audit history lives).
+	// Empty = monitor disabled — fine for tests / dev setups that
+	// don't run JetStream.
+	StoreDir string
+
+	// DiskCheckInterval is how often the monitor samples disk usage.
+	// Defaults to 5min per H.4. Tests override to 50ms.
+	DiskCheckInterval time.Duration
+
+	// DiskPressureThreshold is the used/total fraction at which the
+	// monitor pubs sys.events{type:disk_pressure}. Defaults to 0.80
+	// (80% per H.4). 0 → use default; values outside (0, 1] disable
+	// the monitor.
+	DiskPressureThreshold float64
+
+	// DiskUsageFn is injected for deterministic tests; when nil the
+	// monitor calls the package-level diskUsage helper backed by
+	// syscall.Statfs.
+	DiskUsageFn func(path string) (used, total uint64, err error)
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -337,6 +359,17 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
+	// P7 / H.1 — emit tetherd_restarted as the broker becomes
+	// fully ready. Done after subscriptions + JS are wired so the
+	// emission itself can land in the events stream.
+	b.pubSysEvent("tetherd_restarted", map[string]any{
+		"nats":      b.cfg.NATSURL,
+		"jetstream": b.js != nil,
+	})
+
+	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
+	b.startDiskMonitor(ctx)
+
 	b.cfg.Logger.Info("broker: ready",
 		"nats", b.cfg.NATSURL,
 		"reconcile", b.cfg.ReconcileInterval,
@@ -413,6 +446,10 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 
 	b.cfg.Logger.Info("broker: node registered",
 		"sid", sid, "nid", nid, "release", req.ReleaseVersion)
+	b.pubSysEvent("agent_registered", map[string]any{
+		"sid": sid, "nid": nid, "release": req.ReleaseVersion,
+		"os": req.OS, "arch": req.Arch,
+	})
 
 	payload, _ := json.Marshal(proto.NodeRegisterResp{OK: true})
 	if msg.Reply != "" {
