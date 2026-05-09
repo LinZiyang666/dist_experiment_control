@@ -101,9 +101,23 @@ PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
 					// Propagate remote exit code as our own. cobra's RunE
 					// returning nil keeps exit 0; for non-zero we use os.Exit
 					// here so we don't print cobra's own error wrapper.
+					//
+					// Audit shard 04 F9: a negative ExitCode from the agent
+					// means the child was signal-killed (Go's exec package
+					// returns -1 for that). os.Exit(-1) wraps to 255 with
+					// no signal information; print a stderr hint and exit
+					// 128 (the closest analog to ssh's 128+sig — we don't
+					// have the actual signal value yet, that's a wire
+					// proto enhancement deferred to v2).
+					if chunk.ExitCode < 0 {
+						_, _ = fmt.Fprintln(errOut,
+							"tether exec: remote process terminated by signal (no exit code)")
+						os.Exit(128)
+					}
 					if chunk.ExitCode != 0 {
 						os.Exit(chunk.ExitCode)
 					}
+					_ = nc.Drain()
 					return nil
 				case "error":
 					return fmt.Errorf("exec: %s", chunk.Error)
@@ -117,5 +131,11 @@ PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "max time to wait for output / exit")
+	// Audit shard 04 F12: without this, `tether exec node1 ls -la`
+	// fails with "unknown shorthand flag 'l'" because cobra parses
+	// the remote command's flags as ours. SetInterspersed(false)
+	// stops flag parsing at the first positional, treating the rest
+	// as the remote argv even when it contains -flag-shaped tokens.
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }

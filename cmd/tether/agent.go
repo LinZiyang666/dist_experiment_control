@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/agent"
@@ -68,7 +69,7 @@ func newAgentCmd() *cobra.Command {
 			// (identity, tunnel adapter, etc.) is skipped — install
 			// callers don't have a broker to talk to yet.
 			if installUserService {
-				return runInstallUserService(cmd, sid, nid)
+				return runInstallUserService(cmd, sid, nid, natsURL, tunnelAddr)
 			}
 			if uninstall {
 				return runUninstallUserService(cmd, sid)
@@ -170,7 +171,7 @@ func newAgentCmd() *cobra.Command {
 // Per K.0 §2 install ≠ start: this writes the file, prints next-step
 // commands, and exits. The caller does `systemctl --user enable
 // --now tether-agent@<sid>` separately.
-func runInstallUserService(cmd *cobra.Command, sid, nid string) error {
+func runInstallUserService(cmd *cobra.Command, sid, nid, natsURL, tunnelAddr string) error {
 	if sid == "" || nid == "" {
 		return fmt.Errorf("--session and --nid are required for --install-user-service")
 	}
@@ -187,7 +188,24 @@ func runInstallUserService(cmd *cobra.Command, sid, nid string) error {
 		return fmt.Errorf("agent install: mkdir %s: %w", unitDir, err)
 	}
 	unitPath := filepath.Join(unitDir, fmt.Sprintf("tether-agent@%s.service", sid))
-	body := agentUserUnitBody(exe, sid, nid)
+	// Audit shard 04 F2: when the operator typed explicit flags
+	// (`--nats-url`, `--tunnel-addr`) on the install line, embed
+	// them in the unit body so the systemd-launched agent uses
+	// them too. Defaults are dropped (agent.yaml fills those in).
+	// $TETHER_HOME passes through via Environment= for the same
+	// reason. PIN is intentionally NOT persisted (architecture K.1).
+	extraArgs := ""
+	if cmd.Flags().Changed("nats-url") {
+		extraArgs += " --nats-url " + shellQuote(natsURL)
+	}
+	if cmd.Flags().Changed("tunnel-addr") {
+		extraArgs += " --tunnel-addr " + shellQuote(tunnelAddr)
+	}
+	envLines := ""
+	if v := os.Getenv("TETHER_HOME"); v != "" {
+		envLines = "Environment=TETHER_HOME=" + v + "\n"
+	}
+	body := agentUserUnitBody(exe, sid, nid, extraArgs, envLines)
 	if err := os.WriteFile(unitPath, []byte(body), 0o644); err != nil {
 		return fmt.Errorf("agent install: write unit: %w", err)
 	}
@@ -221,8 +239,11 @@ func runUninstallUserService(cmd *cobra.Command, sid string) error {
 // Used by runInstallUserService and exposed for the install-time
 // test. exe is the absolute path of the running tether binary so a
 // caller invoking from a non-PATH location still gets a working
-// unit; sid + nid pin the daemon's identity.
-func agentUserUnitBody(exe, sid, nid string) string {
+// unit; sid + nid pin the daemon's identity. extraArgs is appended
+// to ExecStart verbatim (already shell-quoted by the caller);
+// envLines is zero or more `Environment=KEY=val\n` lines injected
+// before [Install].
+func agentUserUnitBody(exe, sid, nid, extraArgs, envLines string) string {
 	return fmt.Sprintf(`[Unit]
 Description=tether agent (session=%s nid=%s)
 After=network-online.target
@@ -230,15 +251,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%s agent --session %s --nid %s
+ExecStart=%s agent --session %s --nid %s%s
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:%%h/.tether/agent/%s/agent.log
 StandardError=append:%%h/.tether/agent/%s/agent.log
-
+%s
 [Install]
 WantedBy=default.target
-`, sid, nid, exe, sid, nid, sid, sid)
+`, sid, nid, exe, sid, nid, extraArgs, sid, sid, envLines)
+}
+
+// shellQuote wraps a value in single quotes, escaping embedded
+// single quotes via the standard '\'' trick. Suitable for systemd
+// ExecStart= values which use shell-style argument splitting.
+func shellQuote(v string) string {
+	if v == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
 }
 
 func displayOrOff(s string) string {

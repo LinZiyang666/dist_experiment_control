@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"text/tabwriter"
 	"time"
@@ -39,7 +38,7 @@ view.`,
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return err
+				return connectError("ps", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -48,14 +47,14 @@ view.`,
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlPs(id.PublicKey, sid), []byte("{}"))
 			if err != nil {
-				return fmt.Errorf("ps: %w", err)
+				return fmt.Errorf("ps: request: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.PsResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
 				return err
 			}
-			if resp.Code != "" || resp.Error != "" {
-				return errors.New("ps rejected: " + resp.Code + " " + resp.Error)
+			if resp.Code != "" {
+				return brokerErrorMessage("ps", resp.Code, resp.Error)
 			}
 
 			now := time.Now()

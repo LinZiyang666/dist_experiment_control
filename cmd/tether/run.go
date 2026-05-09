@@ -227,6 +227,9 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
+	// Audit shard 04 F12: same as exec — stop cobra parsing the
+	// remote command's flags as ours.
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
