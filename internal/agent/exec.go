@@ -173,14 +173,32 @@ func (a *Agent) replyChunk(nc *nats.Conn, replyTo string, c proto.ExecChunk) {
 }
 
 func (a *Agent) pubProcStarted(nc *nats.Conn, pid string, argv []string, actorFP string) {
+	a.pubProcStartedWithTriple(nc, pid, argv, actorFP, "", 0, time.Now().UTC())
+}
+
+// pubProcStartedWithTriple is the full-info variant: PTY children
+// can include the (boot_id, start_time_ticks) pair captured at fork
+// time so the broker persists them in processes.boot_id /
+// .start_time_ticks for the next G.1 reconcile to verify against.
+// Exec children call pubProcStarted (which leaves both empty) — they
+// have a sync lifecycle and no agent-side persistence path that would
+// need the verification.
+func (a *Agent) pubProcStartedWithTriple(
+	nc *nats.Conn,
+	pid string,
+	argv []string,
+	actorFP string,
+	bootID string,
+	startTimeTicks int64,
+	startedAt time.Time,
+) {
 	payload, err := json.Marshal(proto.ProcStartedEvent{
-		PID:       pid,
-		Argv:      argv,
-		StartedAt: time.Now().UTC(),
-		// actorFP was stamped into ExecReq by the broker (see proto.ExecReq
-		// docs). Agent echoes it; the value originated from the broker's
-		// parse of `by.<actor>`, not from any agent-controlled source.
-		StartedByFP: actorFP,
+		PID:            pid,
+		Argv:           argv,
+		StartedAt:      startedAt,
+		StartedByFP:    actorFP,
+		BootID:         bootID,
+		StartTimeTicks: startTimeTicks,
 	})
 	if err != nil {
 		return

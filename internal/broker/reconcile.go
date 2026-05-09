@@ -11,17 +11,25 @@
 //   - directives in the register reply (drop_processes / revoke_ports)
 //     for the agent to act on.
 //
-// v1 simplifications vs. the full G.1 spec:
-//   - PID-reuse detection (boot_id + start_time_ticks triple) is NOT
-//     implemented here. Process rows already carry boot_id but the
-//     agent doesn't currently report start_time_ticks per-pid in
-//     ProcStartedEvent, so we can't disambiguate "same pid, different
-//     process" yet. The chaos cases the architecture tests for (kill
-//     agent → restart → all RUNNING become EXITED-1) are covered by
-//     the simpler rules below; PID-reuse paranoia is a P-future item.
+// PID-reuse defense:
+//   - When the agent supplies (StartedAt, StartTimeTicks) for a
+//     "running" entry, the broker compares against the persisted
+//     processes.boot_id + processes.start_time_ticks: a mismatch
+//     triggers the architecture G.1 PID-reuse handling — original
+//     row → EXITED(rc=-1, reconciled_closed); the new pid is then
+//     treated as an orphan and pushed into drop_processes so the
+//     agent kills it (SIGTERM+5s+SIGKILL).
+//   - When either side is missing the triple data (zero
+//     start_time_ticks; empty boot_id) the broker falls back to the
+//     pre-triple "same ULID = same process" accept path. Exec-style
+//     children fall into this bucket — they have a sync lifecycle
+//     and no agent-side persistence path that would let agent claim
+//     a stale ULID, so the verification has nothing to compare.
+// v1 caveat:
 //   - Per-port LocalPort.TokenHash is matched against the row's
 //     token_hash; sid/nid mismatch is treated as orphan (not a
-//     missed-revoke), since v1 doesn't migrate port rows across nodes.
+//     missed-revoke), since v1 doesn't migrate port rows across
+//     nodes.
 package broker
 
 import (
@@ -67,6 +75,22 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 			delete(agentByPID, p.PID)
 			switch lp.State {
 			case "running":
+				if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
+					// G.1 PID-reuse: the SQLite row and the agent
+					// describe two different OS processes that just
+					// happen to share the tether ULID. Original row
+					// → EXITED(-1, reconciled_closed). The new
+					// process is then treated as an orphan and
+					// scheduled for kill below (we re-add it to
+					// agentByPID so the orphan loop picks it up).
+					_ = proc.MarkExited(b.cfg.DB, p.PID, -1, now)
+					reconciled = append(reconciled, proto.ReconciledProc{
+						PID: p.PID, NewState: "EXITED", RC: -1,
+					})
+					b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, -1, now)
+					agentByPID[p.PID] = lp
+					continue
+				}
 				accepted = append(accepted, p.PID)
 				continue
 			case "exited":
@@ -107,8 +131,9 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	}
 
 	// Anything left in agentByPID is a pid the agent claims to be
-	// running but the broker has no record of → orphan. Architecture
-	// G.1: v1 directs the agent to kill (SIGTERM+5s+SIGKILL).
+	// running but the broker has no record of (or that we just
+	// flagged as PID-reuse above) → orphan. Architecture G.1: v1
+	// directs the agent to kill (SIGTERM+5s+SIGKILL).
 	for pid, lp := range agentByPID {
 		if lp.State != "running" {
 			continue
@@ -160,4 +185,20 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// would force operators to re-expose by hand on every restart.
 
 	return
+}
+
+// pidReused implements the architecture G.1 (boot_id, pid,
+// start_time_ticks) PID-reuse defense. Returns true ONLY when both
+// sides supplied enough information to compare AND the comparison
+// fails. Missing data on either side → returns false (preserve the
+// pre-triple accept path: no false-positive kills when the agent or
+// the SQLite row predates the triple capture, e.g. exec children).
+func pidReused(agentBootID, dbBootID string, agentTicks, dbTicks int64) bool {
+	if agentBootID == "" || dbBootID == "" {
+		return false
+	}
+	if agentTicks == 0 || dbTicks == 0 {
+		return false
+	}
+	return agentBootID != dbBootID || agentTicks != dbTicks
 }

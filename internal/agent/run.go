@@ -113,7 +113,19 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	a.registerProc(pid, sess)
+	// Capture the G.1 PID-reuse triple at fork time. start_time_ticks
+	// is /proc/<os_pid>/stat field 22 — the kernel-stamped boot tick
+	// when this process started. agent echoes it on every register
+	// snapshot; broker compares against the value persisted at
+	// proc.Insert time.
+	startTicks, _ := readStartTimeTicks(sess.OSPID())
+	rec := &procRec{
+		sess:           sess,
+		osPID:          sess.OSPID(),
+		startTimeTicks: startTicks,
+		startedAt:      time.Now().UTC(),
+	}
+	a.registerProc(pid, rec)
 	// Hook into the shared process state machine: `tether run`
 	// processes must show up in `tether ps` and produce normal
 	// audit.proc{kind:start,exit} records, the same as `tether exec`.
@@ -121,7 +133,8 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// exec_failed) deliberately do NOT pub proc.started — no child
 	// was started, so no SQLite row should exist. Those surface via
 	// PtyFailedEvent → audit.proc{kind:reason} instead.
-	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
+	a.pubProcStartedWithTriple(nc, pid, req.Argv, req.ActorFP,
+		readBootID(), startTicks, rec.startedAt)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
 
 	// Two long-running subscriptions for the lifetime of the child:
@@ -295,7 +308,7 @@ func (a *Agent) handleKillForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.replyKill(msg, proto.KillResp{Code: "pid_unknown"})
 		return
 	}
-	if err := sess.Signal(syscall.Signal(req.Signal)); err != nil {
+	if err := sess.sess.Signal(syscall.Signal(req.Signal)); err != nil {
 		a.replyKill(msg, proto.KillResp{Code: "signal_failed", Error: err.Error()})
 		return
 	}
@@ -336,10 +349,10 @@ func (a *Agent) pubPtyFailed(nc *nats.Conn, pid, reason, detail string) {
 	}
 }
 
-func (a *Agent) registerProc(pid string, sess *pty.Session) {
+func (a *Agent) registerProc(pid string, rec *procRec) {
 	a.procsMu.Lock()
 	defer a.procsMu.Unlock()
-	a.procs[pid] = sess
+	a.procs[pid] = rec
 }
 
 func (a *Agent) unregisterProc(pid string) {
@@ -348,11 +361,11 @@ func (a *Agent) unregisterProc(pid string) {
 	delete(a.procs, pid)
 }
 
-func (a *Agent) lookupProc(pid string) (*pty.Session, bool) {
+func (a *Agent) lookupProc(pid string) (*procRec, bool) {
 	a.procsMu.Lock()
 	defer a.procsMu.Unlock()
-	s, ok := a.procs[pid]
-	return s, ok
+	r, ok := a.procs[pid]
+	return r, ok
 }
 
 // normalizedSize returns sane defaults for cols/rows when ctl forgot.

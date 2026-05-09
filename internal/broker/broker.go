@@ -27,6 +27,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -441,6 +442,24 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	if req.ProtoVersion != proto.ProtoVersion {
 		b.replyErr(msg, "proto_mismatch",
 			fmt.Sprintf("server proto=%d, client proto=%d", proto.ProtoVersion, req.ProtoVersion))
+		return
+	}
+
+	// C.1 §6 — every session-scoped ingress must reject DELETING /
+	// missing sessions before mutating any state. register sits on
+	// `ctrl.s.<sid>.node.<nid>.register.req` so the gate applies here
+	// just like it does for exec/run/ps/expose. Without this, a
+	// tombstoned session could get a fresh nodes row, a forced ONLINE
+	// transition, an `agent_registered` sys.event, and reconcile side
+	// effects while H.3 cleanup is supposed to be the only writer.
+	active, err := session.IsActive(b.cfg.DB, sid)
+	if err != nil {
+		b.replyErr(msg, "store_error", err.Error())
+		return
+	}
+	if !active {
+		b.replyErr(msg, "session_not_found_or_deleting",
+			fmt.Sprintf("session %q is missing or being deleted", sid))
 		return
 	}
 

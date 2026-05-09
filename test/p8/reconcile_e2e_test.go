@@ -195,34 +195,6 @@ func startBrokerManual(t *testing.T, url string, db *sql.DB) (stop func()) {
 	}
 }
 
-// runExec drives one synchronous exec via the broker; we wait for the
-// terminal chunk so the proc.exit audit has had time to propagate.
-func runExec(t *testing.T, nc *nats.Conn, sid, actor, nid string, argv []string) {
-	t.Helper()
-	body, _ := json.Marshal(proto.ExecReq{Argv: argv})
-	inbox := nc.NewInbox()
-	sub, err := nc.SubscribeSync(inbox)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = sub.Unsubscribe() }()
-	if err := nc.PublishRequest(proto.SubjCmdBy(sid, actor, nid, "exec"), inbox, body); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		msg, err := sub.NextMsg(200 * time.Millisecond)
-		if err != nil {
-			continue
-		}
-		var c proto.ExecChunk
-		if json.Unmarshal(msg.Data, &c) == nil && (c.Kind == "exit" || c.Kind == "error") {
-			return
-		}
-	}
-	t.Fatal("exec never completed")
-}
-
 // ----- tests ----------------------------------------------------------------
 
 // TestG1MissedExitOnAgentRestart pins the architecture P8 chaos
@@ -1163,6 +1135,280 @@ func TestG1KeepPortsForLiveAlloc(t *testing.T) {
 	}
 	if len(resp.RevokePorts) != 0 {
 		t.Errorf("expected empty revoke_ports; got %v", resp.RevokePorts)
+	}
+}
+
+// TestG1PIDReuseTriggersReconcileAndOrphan covers the architecture
+// G.1 PID-reuse path: SQLite has a RUNNING row with (boot_id_A,
+// start_time_ticks_A); agent reports SAME ULID as running but with
+// a DIFFERENT start_time_ticks. Broker MUST mark the original row
+// EXITED(rc=-1, reconciled_closed) AND list the pid in
+// drop_processes so the agent kills the new (unrelated) OS process
+// that's currently squatting that pid.
+func TestG1PIDReuseTriggersReconcileAndOrphan(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	_, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(
+		`INSERT INTO nodes(nid, sid, last_heartbeat_at, status, registered_at)
+		 VALUES ('lab-1', 'lab', ?, 'OFFLINE', ?)`, now.Add(-2*time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	// Seed RUNNING row with explicit triple data.
+	if _, err := db.Exec(
+		`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp, boot_id, start_time_ticks)
+		 VALUES ('01hz_reuse', 'lab', 'lab-1', '["sleep","9999"]', ?, 'RUNNING', ?, 'boot-A', 1000)`,
+		now, fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	defer startBroker(t, url, db)()
+
+	// Agent reports SAME ULID + SAME boot_id but different start_time_ticks
+	// → triple mismatch → PID reuse.
+	body, _ := json.Marshal(proto.NodeRegisterReq{
+		ProtoVersion:   proto.ProtoVersion,
+		ReleaseVersion: proto.ReleaseVersion,
+		NID:            "lab-1",
+		BootID:         "boot-A",
+		LocalProcesses: []proto.LocalProcess{
+			{PID: "01hz_reuse", State: "running", StartTimeTicks: 9999},
+		},
+	})
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	respMsg, err := nc.Request(proto.SubjNodeRegister("lab", "lab-1"), body, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp proto.NodeRegisterResp
+	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Fatalf("register rejected: %s %s", resp.Code, resp.Error)
+	}
+
+	// Original row must be EXITED rc=-1 (reconciled_closed in audit).
+	if len(resp.ReconciledProcesses) != 1 ||
+		resp.ReconciledProcesses[0].PID != "01hz_reuse" ||
+		resp.ReconciledProcesses[0].RC != -1 {
+		t.Errorf("expected reconciled=[(01hz_reuse, EXITED, -1)] for PID reuse; got %+v",
+			resp.ReconciledProcesses)
+	}
+	// New PID must be in drop_processes (agent kills the squatter).
+	foundDrop := false
+	for _, p := range resp.DropProcesses {
+		if p == "01hz_reuse" {
+			foundDrop = true
+			break
+		}
+	}
+	if !foundDrop {
+		t.Errorf("expected 01hz_reuse in drop_processes after PID reuse; got %v",
+			resp.DropProcesses)
+	}
+	if len(resp.AcceptedProcesses) != 0 {
+		t.Errorf("PID-reuse path must NOT accept; got accepted=%v", resp.AcceptedProcesses)
+	}
+
+	var st string
+	var rcOut *int
+	if err := db.QueryRow(
+		`SELECT status, exit_code FROM processes WHERE pid='01hz_reuse'`,
+	).Scan(&st, &rcOut); err != nil {
+		t.Fatal(err)
+	}
+	if st != "EXITED" || rcOut == nil || *rcOut != -1 {
+		t.Errorf("PID-reuse: expected EXITED rc=-1; got status=%q rc=%v", st, rcOut)
+	}
+}
+
+// TestG1TripleMatchKeepsRowRunning: same setup as the reuse test but
+// with matching triple data → row stays RUNNING (acceptance path).
+func TestG1TripleMatchKeepsRowRunning(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	_, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(
+		`INSERT INTO nodes(nid, sid, last_heartbeat_at, status, registered_at)
+		 VALUES ('lab-1', 'lab', ?, 'OFFLINE', ?)`, now.Add(-2*time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp, boot_id, start_time_ticks)
+		 VALUES ('01hz_match', 'lab', 'lab-1', '["sleep","9999"]', ?, 'RUNNING', ?, 'boot-A', 5555)`,
+		now, fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	defer startBroker(t, url, db)()
+
+	body, _ := json.Marshal(proto.NodeRegisterReq{
+		ProtoVersion:   proto.ProtoVersion,
+		ReleaseVersion: proto.ReleaseVersion,
+		NID:            "lab-1",
+		BootID:         "boot-A",
+		LocalProcesses: []proto.LocalProcess{
+			{PID: "01hz_match", State: "running", StartTimeTicks: 5555},
+		},
+	})
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	respMsg, err := nc.Request(proto.SubjNodeRegister("lab", "lab-1"), body, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp proto.NodeRegisterResp
+	_ = json.Unmarshal(respMsg.Data, &resp)
+	if !resp.OK {
+		t.Fatalf("register rejected: %s %s", resp.Code, resp.Error)
+	}
+	if len(resp.AcceptedProcesses) != 1 || resp.AcceptedProcesses[0] != "01hz_match" {
+		t.Errorf("triple-match: expected accepted=[01hz_match]; got %v", resp.AcceptedProcesses)
+	}
+	if len(resp.ReconciledProcesses) != 0 {
+		t.Errorf("triple-match: expected empty reconciled; got %v", resp.ReconciledProcesses)
+	}
+
+	var st string
+	if err := db.QueryRow(
+		`SELECT status FROM processes WHERE pid='01hz_match'`,
+	).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != "RUNNING" {
+		t.Errorf("triple-match row mutated: got %q", st)
+	}
+}
+
+// TestG1MissingTripleFallsBackToAccept: when EITHER side has no
+// triple data (exec children case; legacy rows; non-Linux agent),
+// reconcile MUST keep the existing accept behavior. No defensive
+// kills purely because /proc isn't available.
+func TestG1MissingTripleFallsBackToAccept(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	_, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(
+		`INSERT INTO nodes(nid, sid, last_heartbeat_at, status, registered_at)
+		 VALUES ('lab-1', 'lab', ?, 'OFFLINE', ?)`, now.Add(-2*time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	// Row with NULL boot_id / start_time_ticks (legacy / exec child).
+	if _, err := db.Exec(
+		`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp)
+		 VALUES ('01hz_legacy', 'lab', 'lab-1', '["sleep","9999"]', ?, 'RUNNING', ?)`,
+		now, fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	defer startBroker(t, url, db)()
+
+	body, _ := json.Marshal(proto.NodeRegisterReq{
+		ProtoVersion:   proto.ProtoVersion,
+		ReleaseVersion: proto.ReleaseVersion,
+		NID:            "lab-1",
+		BootID:         "boot-A",
+		LocalProcesses: []proto.LocalProcess{
+			{PID: "01hz_legacy", State: "running", StartTimeTicks: 1234},
+		},
+	})
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	respMsg, err := nc.Request(proto.SubjNodeRegister("lab", "lab-1"), body, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp proto.NodeRegisterResp
+	_ = json.Unmarshal(respMsg.Data, &resp)
+	if !resp.OK {
+		t.Fatalf("register rejected: %s %s", resp.Code, resp.Error)
+	}
+	if len(resp.AcceptedProcesses) != 1 || resp.AcceptedProcesses[0] != "01hz_legacy" {
+		t.Errorf("missing-triple: expected accepted=[01hz_legacy]; got %v",
+			resp.AcceptedProcesses)
+	}
+	if len(resp.DropProcesses) != 0 {
+		t.Errorf("missing-triple: expected empty drop_processes; got %v",
+			resp.DropProcesses)
+	}
+}
+
+// TestG1StartTimeTicksPersistedFromProcStarted pins the data path:
+// agent's ProcStartedEvent now carries (boot_id, start_time_ticks),
+// broker writes them to processes.boot_id / .start_time_ticks. The
+// next register reconcile reads them back via proc.ListBySession and
+// can compare. Without this wiring, the triple check above is dead
+// code in production.
+func TestG1StartTimeTicksPersistedFromProcStarted(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	_, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+
+	now := time.Now().UTC()
+	if _, err := db.Exec(
+		`INSERT INTO nodes(nid, sid, last_heartbeat_at, status, registered_at)
+		 VALUES ('lab-1', 'lab', ?, 'ONLINE', ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	defer startBroker(t, url, db)()
+
+	// Publish a synthetic proc.started event with the triple set.
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	ev, _ := json.Marshal(proto.ProcStartedEvent{
+		PID:            "01hz_persist_check",
+		Argv:           []string{"sleep", "9999"},
+		StartedAt:      now,
+		StartedByFP:    fp,
+		BootID:         "synthetic-boot",
+		StartTimeTicks: 7777,
+	})
+	if err := nc.Publish(
+		proto.SubjEvProc("lab", "lab-1", "01hz_persist_check", "started"), ev,
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for broker to handle the event.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		_ = db.QueryRow(
+			`SELECT COUNT(*) FROM processes WHERE pid='01hz_persist_check'`,
+		).Scan(&n)
+		if n > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var bootID string
+	var startTimeTicks int64
+	if err := db.QueryRow(
+		`SELECT boot_id, start_time_ticks FROM processes WHERE pid='01hz_persist_check'`,
+	).Scan(&bootID, &startTimeTicks); err != nil {
+		t.Fatal(err)
+	}
+	if bootID != "synthetic-boot" {
+		t.Errorf("processes.boot_id: got %q want synthetic-boot", bootID)
+	}
+	if startTimeTicks != 7777 {
+		t.Errorf("processes.start_time_ticks: got %d want 7777", startTimeTicks)
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -95,14 +96,28 @@ type Config struct {
 	RegisterRetryMax time.Duration
 }
 
+// procRec is one entry in Agent.procs. Tracks the PTY session plus
+// the architecture G.1 PID-reuse triple captured at fork time so the
+// next register snapshot can echo (started_at, start_time_ticks) back
+// to the broker for verification. OSPID is kept around for the future
+// "verify the OS pid is still that triple" path.
+type procRec struct {
+	sess           *pty.Session
+	osPID          int
+	startTimeTicks int64
+	startedAt      time.Time
+}
+
 type Agent struct {
 	cfg Config
 
 	// procs tracks live `tether run` PTY sessions by pid. Used by the
-	// kill verb to look up the right *pty.Session to signal. The map
-	// is populated when fork+exec succeeds (after attach handshake)
-	// and pruned right before the agent publishes RunChunk{Kind:exit}.
-	procs   map[string]*pty.Session
+	// kill verb to look up the right session to signal AND by the
+	// register snapshot to report (PID, started_at, start_time_ticks)
+	// per architecture G.1. Populated when fork+exec succeeds (after
+	// attach handshake) and pruned right before the agent publishes
+	// RunChunk{Kind:exit}.
+	procs   map[string]*procRec
 	procsMu sync.Mutex
 
 	// stateStore persists per-(sid, machine) data — currently the
@@ -138,7 +153,7 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.RegisterRetryMax == 0 {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
-	a := &Agent{cfg: cfg, procs: map[string]*pty.Session{}}
+	a := &Agent{cfg: cfg, procs: map[string]*procRec{}}
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
 	}
@@ -363,13 +378,21 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 // now" for G.1 reconciliation. Procs come from a.procs (the live PTY
 // session map; non-PTY exec children are sync and not registered, so
 // after a restart they are missing — broker correctly treats those as
-// missed-exit). Ports come from state.json (raw token → SHA256 hex
-// matches port.HashToken so the broker can join on token_hash).
+// missed-exit). StartedAt + StartTimeTicks make up two thirds of the
+// G.1 (boot_id, pid, start_time_ticks) triple; broker compares
+// against processes.start_time_ticks for PID-reuse defense. Ports
+// come from state.json (raw token → SHA256 hex matches port.HashToken
+// so the broker can join on token_hash).
 func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 	a.procsMu.Lock()
 	procs := make([]proto.LocalProcess, 0, len(a.procs))
-	for pid := range a.procs {
-		procs = append(procs, proto.LocalProcess{PID: pid, State: "running"})
+	for pid, rec := range a.procs {
+		procs = append(procs, proto.LocalProcess{
+			PID:            pid,
+			State:          "running",
+			StartedAt:      rec.startedAt,
+			StartTimeTicks: rec.startTimeTicks,
+		})
 	}
 	a.procsMu.Unlock()
 
@@ -446,18 +469,18 @@ func (a *Agent) applyReconciliation(resp proto.NodeRegisterResp) {
 // about — which can't happen in a single-broker deployment but is
 // defensible as a "agent connected to the wrong broker by accident".
 func (a *Agent) killOrphanProcess(pid string) {
-	sess, ok := a.lookupProc(pid)
+	rec, ok := a.lookupProc(pid)
 	if !ok {
 		return
 	}
 	a.cfg.Logger.Info("agent: kill orphan", "pid", pid)
-	if err := sess.Signal(syscall.SIGTERM); err != nil {
+	if err := rec.sess.Signal(syscall.SIGTERM); err != nil {
 		a.cfg.Logger.Warn("agent: kill orphan SIGTERM", "err", err, "pid", pid)
 	}
 	go func() {
 		time.Sleep(5 * time.Second)
-		if s, still := a.lookupProc(pid); still {
-			_ = s.Signal(syscall.SIGKILL)
+		if r, still := a.lookupProc(pid); still {
+			_ = r.sess.Signal(syscall.SIGKILL)
 		}
 	}()
 }
@@ -548,4 +571,39 @@ func readBootID() string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// readStartTimeTicks returns /proc/<pid>/stat field 22 (the kernel-
+// stamped boot tick when this process started), the third leg of the
+// architecture G.1 PID-reuse triple. Returns 0 on any failure
+// (non-Linux, /proc not mounted, pid disappeared between fork and
+// read, etc.) — the broker treats 0 as "agent could not capture",
+// which falls back to the no-triple-check accept path. Parsing the
+// stat line correctly requires honoring the comm (bytes 2..end-of-")")
+// because comm can contain spaces or close-parens; we slice from the
+// LAST ')' so a process named "weird ) name" parses cleanly.
+func readStartTimeTicks(osPID int) (int64, error) {
+	if osPID <= 0 {
+		return 0, fmt.Errorf("agent: invalid os pid %d", osPID)
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", osPID))
+	if err != nil {
+		return 0, err
+	}
+	line := string(b)
+	rp := strings.LastIndexByte(line, ')')
+	if rp < 0 || rp+1 >= len(line) {
+		return 0, fmt.Errorf("agent: malformed /proc/%d/stat", osPID)
+	}
+	rest := strings.Fields(line[rp+1:])
+	// rest[0] is field 3 (state); field 22 is rest[19].
+	if len(rest) < 20 {
+		return 0, fmt.Errorf("agent: /proc/%d/stat too short (%d fields after comm)",
+			osPID, len(rest))
+	}
+	ticks, err := strconv.ParseInt(rest[19], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("agent: parse start_time_ticks: %w", err)
+	}
+	return ticks, nil
 }

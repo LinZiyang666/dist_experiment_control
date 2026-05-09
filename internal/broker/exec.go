@@ -144,9 +144,11 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 		}
 		err := proc.Insert(b.cfg.DB, proc.Process{
 			PID: pid, SID: sid, NID: nid,
-			Argv:        ev.Argv,
-			StartedAt:   ev.StartedAt,
-			StartedByFP: ev.StartedByFP,
+			Argv:           ev.Argv,
+			StartedAt:      ev.StartedAt,
+			StartedByFP:    ev.StartedByFP,
+			BootID:         ev.BootID,
+			StartTimeTicks: ev.StartTimeTicks,
 		})
 		if err != nil && !errors.Is(err, proc.ErrNodeMissing) {
 			b.cfg.Logger.Warn("broker: proc.started insert", "err", err, "pid", pid)

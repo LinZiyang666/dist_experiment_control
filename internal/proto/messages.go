@@ -37,13 +37,26 @@ type NodeRegisterReq struct {
 }
 
 // LocalProcess is one entry in NodeRegisterReq.LocalProcesses — the
-// agent's view of a managed process's live state. RC populated only
-// when State=="exited" and the agent observed the rc (otherwise nil
-// → broker treats as missed-exit with rc=-1).
+// agent's view of a managed process's live state.
+//
+// RC is populated only when State=="exited" and the agent observed
+// the rc (otherwise nil → broker treats as missed-exit with rc=-1).
+//
+// StartedAt + StartTimeTicks make up the (boot_id, pid,
+// start_time_ticks) triple per architecture G.1 PID-reuse defense.
+// The agent captures /proc/<os_pid>/stat field 22 at fork time and
+// echoes it back here. Broker compares against
+// processes.start_time_ticks: mismatch → original row treated as
+// missed-exit + new pid handled as orphan. Both fields are omitempty
+// because exec-style children (sync, not held in a.procs) have no
+// way to report them — broker treats those as missed-exit when not
+// reported, which is the same outcome the triple check would yield.
 type LocalProcess struct {
-	PID   string `json:"pid"`
-	State string `json:"state"`        // "running" | "exited"
-	RC    *int   `json:"rc,omitempty"` // populated only when state=="exited"
+	PID            string    `json:"pid"`
+	State          string    `json:"state"` // "running" | "exited"
+	RC             *int      `json:"rc,omitempty"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
+	StartTimeTicks int64     `json:"start_time_ticks,omitempty"`
 }
 
 // LocalPort is one entry in NodeRegisterReq.LocalPorts — the agent's
@@ -173,11 +186,18 @@ type ExecChunk struct {
 // ProcStartedEvent is what agents publish on
 // `s.<sid>.ev.node.<nid>.proc.<pid>.started`. Broker subscribes and
 // transcribes to `audit.proc{kind:start}`. (architecture C.1 §5)
+//
+// BootID + StartTimeTicks land in `processes` so the next G.1 reconcile
+// can verify (boot_id, pid, start_time_ticks) without re-querying the
+// agent. Both omitempty because non-PTY exec children don't capture
+// them in v1 (sync lifecycle, no /proc inspection on the fast path).
 type ProcStartedEvent struct {
-	PID         string    `json:"pid"`
-	Argv        []string  `json:"argv"`
-	StartedAt   time.Time `json:"started_at"`
-	StartedByFP string    `json:"started_by_fp"` // who via the originating ctl req
+	PID            string    `json:"pid"`
+	Argv           []string  `json:"argv"`
+	StartedAt      time.Time `json:"started_at"`
+	StartedByFP    string    `json:"started_by_fp"`
+	BootID         string    `json:"boot_id,omitempty"`
+	StartTimeTicks int64     `json:"start_time_ticks,omitempty"`
 }
 
 // ProcExitEvent is what agents publish on

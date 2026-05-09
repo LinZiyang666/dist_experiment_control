@@ -153,6 +153,17 @@ func (s *Session) Signal(sig syscall.Signal) error {
 	return nil
 }
 
+// OSPID returns the OS pid of the child after Start. Returns 0 when
+// Start has not run yet (or the child is gone). Caller uses this to
+// pair the agent's tether-ULID with /proc/<pid>/stat field 22 for
+// the architecture G.1 PID-reuse triple.
+func (s *Session) OSPID() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
 // Close releases the master + slave fds. Idempotent; safe to call after
 // the child has exited.
 func (s *Session) Close() error {

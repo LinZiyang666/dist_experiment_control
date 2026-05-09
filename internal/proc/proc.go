@@ -31,17 +31,18 @@ const (
 
 // Process is the read-side projection of one row in the `processes` table.
 type Process struct {
-	PID         string
-	SID         string
-	NID         string
-	Argv        []string
-	Cwd         string
-	StartedAt   time.Time
-	EndedAt     *time.Time
-	Status      State
-	ExitCode    *int
-	StartedByFP string
-	BootID      string
+	PID            string
+	SID            string
+	NID            string
+	Argv           []string
+	Cwd            string
+	StartedAt      time.Time
+	EndedAt        *time.Time
+	Status         State
+	ExitCode       *int
+	StartedByFP    string
+	BootID         string
+	StartTimeTicks int64
 }
 
 var (
@@ -114,15 +115,29 @@ func Insert(db *sql.DB, p Process) error {
 	}
 
 	if _, err := tx.Exec(`
-		INSERT INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		INSERT INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 	`,
 		p.PID, p.SID, p.NID, string(argvJSON), p.Cwd,
 		p.StartedAt, string(StateRunning), p.StartedByFP, p.BootID,
+		nullableInt64(p.StartTimeTicks),
 	); err != nil {
 		return fmt.Errorf("proc: insert: %w", err)
 	}
 	return tx.Commit()
+}
+
+// nullableInt64 returns sql.NullInt64{Valid:false} for zero so the
+// processes.start_time_ticks column stays NULL when the agent didn't
+// report it (e.g. exec children). Without this the column gets
+// literal 0, which would compare-equal to a real "boot tick 0"
+// reading on a freshly-booted box and pass the G.1 triple check
+// spuriously.
+func nullableInt64(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // MarkExited transitions pid to EXITED with the given exit code. Returns
@@ -153,7 +168,7 @@ func MarkExited(db *sql.DB, pid string, exitCode int, when time.Time) error {
 func Get(db *sql.DB, pid string) (*Process, error) {
 	row := db.QueryRow(`
 		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-		       started_by_fp, boot_id
+		       started_by_fp, boot_id, start_time_ticks
 		FROM processes
 		WHERE pid = ?
 	`, pid)
@@ -164,7 +179,7 @@ func Get(db *sql.DB, pid string) (*Process, error) {
 func ListBySession(db *sql.DB, sid string) ([]Process, error) {
 	rows, err := db.Query(`
 		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-		       started_by_fp, boot_id
+		       started_by_fp, boot_id, start_time_ticks
 		FROM processes
 		WHERE sid = ?
 		ORDER BY started_at DESC
@@ -199,17 +214,18 @@ func scanProcess(s scanner) (*Process, error) {
 
 func scanProcessRow(s scanner) (*Process, error) {
 	var (
-		p           Process
-		argvJSON    string
-		cwd         sql.NullString
-		endedAt     sql.NullTime
-		exitCode    sql.NullInt64
-		startedBy   sql.NullString
-		bootID      sql.NullString
-		statusStr   string
+		p              Process
+		argvJSON       string
+		cwd            sql.NullString
+		endedAt        sql.NullTime
+		exitCode       sql.NullInt64
+		startedBy      sql.NullString
+		bootID         sql.NullString
+		startTimeTicks sql.NullInt64
+		statusStr      string
 	)
 	if err := s.Scan(&p.PID, &p.SID, &p.NID, &argvJSON, &cwd, &p.StartedAt,
-		&endedAt, &statusStr, &exitCode, &startedBy, &bootID); err != nil {
+		&endedAt, &statusStr, &exitCode, &startedBy, &bootID, &startTimeTicks); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(argvJSON), &p.Argv); err != nil {
@@ -227,5 +243,8 @@ func scanProcessRow(s scanner) (*Process, error) {
 	}
 	p.StartedByFP = startedBy.String
 	p.BootID = bootID.String
+	if startTimeTicks.Valid {
+		p.StartTimeTicks = startTimeTicks.Int64
+	}
 	return &p, nil
 }
