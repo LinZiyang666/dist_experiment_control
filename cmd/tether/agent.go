@@ -13,7 +13,39 @@ import (
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/spf13/cobra"
+	yaml "gopkg.in/yaml.v3"
 )
+
+// agentYAML mirrors the architecture K.1 agent.yaml shape written by
+// `install.sh --role agent`. Field names match install.sh exactly so
+// new operators can hand-edit the file without surprises.
+type agentYAML struct {
+	BrokerURL  string `yaml:"broker_url"`
+	Session    string `yaml:"session"`
+	NID        string `yaml:"nid"`
+	TunnelAddr string `yaml:"tunnel_addr"`
+}
+
+// loadAgentYAML reads ~/.tether/agent/<sid>/agent.yaml when present.
+// Missing file → returns zero-value config without error so callers
+// can treat "no install" the same as "no overrides". A malformed
+// file IS reported so the operator notices a typo instead of
+// silently falling back to flag defaults.
+func loadAgentYAML(home, sid string) (agentYAML, error) {
+	path := filepath.Join(home, "agent", sid, "agent.yaml")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return agentYAML{}, nil
+		}
+		return agentYAML{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var ay agentYAML
+	if err := yaml.Unmarshal(body, &ay); err != nil {
+		return agentYAML{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return ay, nil
+}
 
 func newAgentCmd() *cobra.Command {
 	var (
@@ -41,11 +73,31 @@ func newAgentCmd() *cobra.Command {
 			if uninstall {
 				return runUninstallUserService(cmd, sid)
 			}
-			if sid == "" || nid == "" {
-				return fmt.Errorf("--session and --nid are required to run the agent")
-			}
 
 			home := cli.DefaultHome()
+			// agent.yaml fills in the install-time values so the
+			// systemd unit (and the K.1 manual `setsid nohup`
+			// command) can stay short — `tether agent --session
+			// <sid> --nid <nid>` Just Works after install.sh
+			// dropped the yaml. Precedence: explicit flag > yaml >
+			// cobra default. We need sid resolved first because
+			// the yaml is keyed by it.
+			if sid == "" {
+				return fmt.Errorf("--session is required to run the agent")
+			}
+			ay, err := loadAgentYAML(home, sid)
+			if err != nil {
+				return err
+			}
+			natsURL = pickFlagOrYaml(cmd, "nats-url", natsURL, ay.BrokerURL)
+			tunnelAddr = pickFlagOrYaml(cmd, "tunnel-addr", tunnelAddr, ay.TunnelAddr)
+			if nid == "" {
+				nid = ay.NID
+			}
+			if nid == "" {
+				return fmt.Errorf("--nid is required (set on CLI or in agent.yaml)")
+			}
+
 			cfg := agent.Config{
 				NATSURL: natsURL,
 				SID:     sid,

@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -104,21 +105,40 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	a.cfg.Logger.Info("agent: upgrade installed; exiting for supervisor restart",
+	a.cfg.Logger.Info("agent: upgrade installed; re-execing into new binary",
 		"new_version", newVersion, "exe", exePath)
 	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
 		OK: true, BinaryReplaced: true, NewVersion: newVersion,
 	})
 
-	// Step 5 of J.4: agent disconnects so the supervisor (systemd
-	// Restart=on-failure / setsid nohup wrapper) launches the new
-	// binary, which then runs G.1 reconcile against the broker.
-	// Tests inject UpgradeNoExit=true so the in-process agent
-	// doesn't kill the test runner.
+	// Step 5 of J.4: in-place process replacement via syscall.Exec.
+	// The old NATS connection drops automatically (kernel closes
+	// fds across exec); the new binary runs as the SAME PID, so
+	// systemd / setsid-nohup never see the old agent die — there's
+	// nothing to "restart". G.1 reconcile then runs against the
+	// broker from the new binary's first register.
+	//
+	// We DON'T fall back to os.Exit + supervisor: clean exits don't
+	// trigger Restart=on-failure (agent stays down) and the
+	// non-systemd setsid-nohup path has no supervisor at all.
+	// Tests pin UpgradeNoExit=true so the in-process harness
+	// doesn't replace the go-test binary.
 	if !a.cfg.UpgradeNoExit {
 		go func() {
+			// Tiny delay so the OK reply has a chance to drain
+			// over NATS before we exec out.
 			time.Sleep(100 * time.Millisecond)
-			os.Exit(0)
+			argv := append([]string(nil), os.Args...)
+			argv[0] = exePath
+			if err := syscall.Exec(exePath, argv, os.Environ()); err != nil {
+				// Exec failed — last-ditch fall back to os.Exit
+				// with a non-zero code so Restart=on-failure has
+				// something to grab onto. Logged so the operator
+				// can see why the in-place upgrade didn't take.
+				a.cfg.Logger.Error("agent: re-exec failed; exiting non-zero for supervisor restart",
+					"err", err, "exe", exePath)
+				os.Exit(1)
+			}
 		}()
 	}
 }

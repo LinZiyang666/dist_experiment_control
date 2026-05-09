@@ -91,10 +91,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Architecture K.2 default: bare `curl install.sh | sh` installs ctl.
+# Operators distinguish agent / broker by always passing --role.
 if [ -z "$ROLE" ]; then
-    echo "install.sh: --role is required" >&2
-    usage >&2
-    exit 2
+    ROLE="ctl"
 fi
 
 # -- common helpers --------------------------------------------------------
@@ -228,14 +228,21 @@ install_agent() {
         log "  + (skip) binary install"
     fi
 
-    # agent.yaml: minimal — enough for `tether agent --session <sid>`
-    # to find the broker. PIN deliberately NOT persisted here (it's a
-    # one-time bootstrap secret).
+    # Derive tunnel_addr from broker URL: split-ports model (A.3)
+    # puts frps on host:7000. Host extraction handles wss://, ws://,
+    # and bare host. Port is fixed at 7000 (architecture A.3).
+    BROKER_HOST=$(printf '%s' "$BROKER_URL" | sed -E 's#^[a-z]+://##; s#[:/].*##')
+    TUNNEL_ADDR="${BROKER_HOST}:7000"
+
+    # agent.yaml: enough for `tether agent --session <sid>` to find
+    # the broker without operator-supplied flags. PIN deliberately
+    # NOT persisted (it's a one-time bootstrap secret).
     if [ "$DRY_RUN" -eq 0 ]; then
         cat > "$SESSION_DIR/agent.yaml" <<EOF
 broker_url: $BROKER_URL
 session: $SESSION
 nid: $NID
+tunnel_addr: $TUNNEL_ADDR
 EOF
         chmod 600 "$SESSION_DIR/agent.yaml"
     else
@@ -344,8 +351,19 @@ install_broker() {
         log "  + (skip) useradd tether"
     fi
 
-    run "mkdir -p '$BIN_DIR' '$ETC_DIR' '$LIB_DIR' '$LOG_DIR' '$RUN_DIR' '$SYSTEMD_DIR'"
-    run "chmod 700 '$RUN_DIR'"
+    run "mkdir -p '$BIN_DIR' '$ETC_DIR' '$SYSTEMD_DIR'"
+    # Runtime dirs MUST be writable by the tether service user. The
+    # systemd units run as User=tether; without these chowns the
+    # daemon can't open SQLite, write JetStream files, or bind
+    # admin.sock. install -d sets ownership + mode in one atomic
+    # call (cleaner than mkdir + chmod + chown chain).
+    if [ "$DRY_RUN" -eq 0 ]; then
+        install -d -o tether -g tether -m 0750 "$LIB_DIR" "$LOG_DIR"
+        install -d -o tether -g tether -m 0700 "$RUN_DIR"
+    else
+        log "  + (dry-run) install -d -o tether -g tether -m 0750 $LIB_DIR $LOG_DIR"
+        log "  + (dry-run) install -d -o tether -g tether -m 0700 $RUN_DIR"
+    fi
 
     if [ "$SKIP_DOWNLOAD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         TARBALL=$(mktemp)
@@ -362,6 +380,9 @@ install_broker() {
     else
         log "  + (skip) binary install"
     fi
+
+    install_nats_server "$BIN_DIR"
+    install_caddy "$BIN_DIR"
 
     # broker.yaml — architecture A.3 skeleton.
     if [ "$DRY_RUN" -eq 0 ]; then
@@ -419,6 +440,79 @@ To start the broker stack (install.sh did NOT start anything):
     sudo systemctl daemon-reload
     sudo systemctl enable --now nats-server tether-broker caddy
 EOF
+}
+
+### Sidecar binary installs ##############################################
+#
+# Architecture A.3: broker host needs nats-server (JS-enabled) and
+# caddy (TLS terminator). install.sh ships both as static
+# binaries from upstream releases — pinned versions so the
+# broker.yaml + Caddyfile we generate are always compatible. Each
+# fetch is sha256-verified; failure is fatal.
+#
+# Pin policy: bump these together with broker.yaml / Caddyfile
+# changes. Architecture J.5 keeps tetherd upgrades manual; sidecar
+# upgrades are also manual and bundled with each tether release.
+
+NATS_SERVER_VERSION="${TETHER_NATS_SERVER_VERSION:-v2.10.22}"
+CADDY_VERSION="${TETHER_CADDY_VERSION:-2.7.6}"
+
+install_nats_server() {
+    bin="$1"
+    if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
+        log "  + (skip) nats-server install"
+        return 0
+    fi
+    if [ -x "$bin/nats-server" ]; then
+        log "  + nats-server already present at $bin/nats-server (skip)"
+        return 0
+    fi
+    case "$ARCH" in amd64) na="amd64" ;; arm64) na="arm64" ;; *) die "nats arch $ARCH" ;; esac
+    case "$OS"   in linux) no="linux" ;;  darwin) no="darwin" ;;  *) die "nats os $OS" ;; esac
+    base="https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}"
+    name="nats-server-${NATS_SERVER_VERSION}-${no}-${na}"
+    url="${base}/${name}.tar.gz"
+    sums="${base}/SHA256SUMS"
+    log "  + downloading $url"
+    tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT
+    curl -fsSL --retry 3 "$url"  -o "$tmp/nats.tgz"  || die "fetch nats-server failed: $url"
+    curl -fsSL --retry 3 "$sums" -o "$tmp/sums.txt" || die "fetch nats-server SHA256SUMS failed: $sums"
+    expect=$(grep "${name}.tar.gz$" "$tmp/sums.txt" | awk '{print $1}')
+    [ -n "$expect" ] || die "no sha256 for ${name}.tar.gz in NATS SHA256SUMS"
+    verify_sha "$tmp/nats.tgz" "$expect"
+    tar -xzf "$tmp/nats.tgz" -C "$tmp"
+    install -m 0755 "$tmp/${name}/nats-server" "$bin/nats-server"
+    rm -rf "$tmp"; trap - EXIT
+    log "  ✔ installed $bin/nats-server (${NATS_SERVER_VERSION})"
+}
+
+install_caddy() {
+    bin="$1"
+    if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
+        log "  + (skip) caddy install"
+        return 0
+    fi
+    if [ -x "$bin/caddy" ]; then
+        log "  + caddy already present at $bin/caddy (skip)"
+        return 0
+    fi
+    case "$ARCH" in amd64) ca="amd64" ;; arm64) ca="arm64" ;; *) die "caddy arch $ARCH" ;; esac
+    case "$OS"   in linux) co="linux" ;;  darwin) co="mac"   ;;  *) die "caddy os $OS" ;; esac
+    base="https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}"
+    name="caddy_${CADDY_VERSION}_${co}_${ca}"
+    url="${base}/${name}.tar.gz"
+    sums="${base}/caddy_${CADDY_VERSION}_checksums.txt"
+    log "  + downloading $url"
+    tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT
+    curl -fsSL --retry 3 "$url"  -o "$tmp/caddy.tgz" || die "fetch caddy failed: $url"
+    curl -fsSL --retry 3 "$sums" -o "$tmp/sums.txt"  || die "fetch caddy checksums failed: $sums"
+    expect=$(grep "${name}.tar.gz$" "$tmp/sums.txt" | awk '{print $1}')
+    [ -n "$expect" ] || die "no sha256 for ${name}.tar.gz in Caddy checksums"
+    verify_sha "$tmp/caddy.tgz" "$expect"
+    tar -xzf "$tmp/caddy.tgz" -C "$tmp"
+    install -m 0755 "$tmp/caddy" "$bin/caddy"
+    rm -rf "$tmp"; trap - EXIT
+    log "  ✔ installed $bin/caddy (${CADDY_VERSION})"
 }
 
 write_systemd_units() {

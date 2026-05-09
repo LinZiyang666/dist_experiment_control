@@ -57,11 +57,15 @@ func runInstallExpectFail(t *testing.T, home string, extra ...string) string {
 	return string(out)
 }
 
-// TestInstallShRoleRequired: --role is mandatory.
-func TestInstallShRoleRequired(t *testing.T) {
-	out := runInstallExpectFail(t, t.TempDir())
-	if !strings.Contains(out, "--role is required") {
-		t.Errorf("expected --role required error; got: %s", out)
+// TestInstallShBareInvocationDefaultsToCtl: per architecture K.2,
+// `curl install.sh | sh` (no flags) installs the ctl. Smaller-K
+// roles always pass --role explicitly. The behavior was tightened
+// from the original "--role required" to match the documented
+// invocation.
+func TestInstallShBareInvocationDefaultsToCtl(t *testing.T) {
+	out := runInstall(t, t.TempDir(), "--dry-run", "--skip-download")
+	if !strings.Contains(out, "role=ctl") {
+		t.Errorf("expected ctl default; got:\n%s", out)
 	}
 }
 
