@@ -22,6 +22,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -96,6 +97,74 @@ func SilentLog() *slog.Logger {
 		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// WaitFor polls predicate every interval until it returns true or
+// deadline elapses. Returns false on timeout. Designed to replace
+// the "sleep N then assert" anti-pattern that dominates the
+// pre-quality-audit test suite — quality audit shard 05 found 23
+// bare-sleep barriers; this helper is the standard replacement.
+//
+// Tests use it like:
+//
+//	if !testharness.WaitFor(t, 3*time.Second, 20*time.Millisecond, func() bool {
+//	    return store.Has(key)
+//	}) {
+//	    t.Fatalf("key %q never appeared", key)
+//	}
+//
+// 20ms polling is fine for in-process state; bump for RPC-backed
+// predicates so we don't DOS the system under test.
+func WaitFor(t *testing.T, deadline, interval time.Duration, predicate func() bool) bool {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if predicate() {
+			return true
+		}
+		time.Sleep(interval)
+	}
+	return predicate()
+}
+
+// WaitNodeOnline polls SQLite for the (sid, nid) agent row to
+// reach status='ONLINE'. This is the canonical "both broker AND
+// agent are ready" signal: the broker has installed its register
+// subscription (else the agent's register.req gets ErrNoResponders
+// forever) AND the agent's register actually round-tripped.
+//
+// Replaces the "time.Sleep(150ms) then time.Sleep(300ms)" stack
+// that dominates phase test helpers. On a fast box the row
+// usually appears in <50ms; on a busy CI runner it can take
+// 1-2s — either way this returns as soon as it's there.
+func WaitNodeOnline(t *testing.T, db *sql.DB, sid, nid string, deadline time.Duration) {
+	t.Helper()
+	if !WaitFor(t, deadline, 20*time.Millisecond, func() bool {
+		var status string
+		err := db.QueryRow(
+			`SELECT status FROM nodes WHERE sid=? AND nid=?`, sid, nid,
+		).Scan(&status)
+		return err == nil && status == "ONLINE"
+	}) {
+		t.Fatalf("agent %s/%s never reached ONLINE within %v", sid, nid, deadline)
+	}
+}
+
+// WaitConnect polls nats.Connect against url until it succeeds or
+// deadline elapses. Use as the broker-ready probe when the test
+// doesn't also start an agent (so WaitNodeOnline isn't applicable).
+func WaitConnect(t *testing.T, url string, deadline time.Duration) {
+	t.Helper()
+	if !WaitFor(t, deadline, 20*time.Millisecond, func() bool {
+		nc, err := nats.Connect(url, nats.Timeout(500*time.Millisecond))
+		if err != nil {
+			return false
+		}
+		nc.Close()
+		return true
+	}) {
+		t.Fatalf("NATS at %s never accepted a connection within %v", url, deadline)
+	}
 }
 
 // FreshUserPub generates a brand-new NATS user nkey and returns its
