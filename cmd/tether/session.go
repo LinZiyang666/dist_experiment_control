@@ -51,14 +51,19 @@ func newSessionCmd() *cobra.Command {
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlSessionCreate(id.PublicKey), body)
 			if err != nil {
-				return fmt.Errorf("session create: %w", err)
+				return fmt.Errorf("session create: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.SessionCreateResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
 				return err
 			}
 			if resp.Error != "" {
-				return errors.New(resp.Error)
+				// SessionCreateResp doesn't carry a separate Code; the
+				// architecture-stable identifier is buried in Error
+				// itself. Pass it through brokerErrorMessage anyway —
+				// known prefixes like "session_already_exists" still
+				// match the hint table.
+				return brokerErrorMessage("session create", resp.Error, resp.Error)
 			}
 			if err := cli.WriteCurrentSession(home, resp.SID); err != nil {
 				return fmt.Errorf("write current_session: %w", err)
@@ -93,14 +98,14 @@ func newSessionCmd() *cobra.Command {
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlSessionList(id.PublicKey), []byte("{}"))
 			if err != nil {
-				return fmt.Errorf("session list: %w", err)
+				return fmt.Errorf("session list: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.SessionListResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
 				return err
 			}
-			if resp.Error != "" {
-				return errors.New(resp.Error)
+			if resp.Code != "" || resp.Error != "" {
+				return brokerErrorMessage("session list", resp.Code, resp.Error)
 			}
 
 			active := cli.ReadCurrentSession(home)

@@ -47,7 +47,7 @@ func newAdminSessionsCmd(socketPath *string) *cobra.Command {
 				return err
 			}
 			if resp.Error != "" {
-				return fmt.Errorf("broker: %s", resp.Error)
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "SID\tNAME\tSTATE\tOWNER\tCREATED")
@@ -74,7 +74,7 @@ func newAdminNodesCmd(socketPath *string) *cobra.Command {
 				return err
 			}
 			if resp.Error != "" {
-				return fmt.Errorf("broker: %s", resp.Error)
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "SESSION\tNODE\tSTATE\tHEARTBEAT\tPROTO\tRELEASE")
@@ -111,7 +111,7 @@ func newAdminAuditCmd(socketPath *string) *cobra.Command {
 				return err
 			}
 			if resp.Error != "" {
-				return fmt.Errorf("broker: %s", resp.Error)
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
 			}
 			for _, e := range resp.Audit {
 				body, _ := json.Marshal(e.Body)
@@ -148,7 +148,7 @@ denied at next CONNECT (no longer provisioned).`,
 				return err
 			}
 			if resp.Error != "" {
-				return fmt.Errorf("broker: %s", resp.Error)
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
 			}
 			r := resp.Evict
 			if r == nil {
