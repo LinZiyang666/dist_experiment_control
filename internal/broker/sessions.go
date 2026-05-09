@@ -100,7 +100,16 @@ func (b *Broker) handleSessionList(msg *nats.Msg) {
 	}
 	out := make([]proto.SessionEntry, 0, len(sessions))
 	for _, s := range sessions {
-		isOwner, _ := session.IsOwner(b.cfg.DB, s.SID, fp)
+		// Audit shard 01 F11: previous code swallowed IsOwner err
+		// silently → if any per-row lookup fails, the response shows
+		// is_owner=false everywhere (operator thinks they own
+		// nothing). Surface the error and abort the list response
+		// so the user retries instead of acting on bad data.
+		isOwner, err := session.IsOwner(b.cfg.DB, s.SID, fp)
+		if err != nil {
+			b.replyJSON(msg, proto.SessionListResp{Error: "store_error: " + err.Error()})
+			return
+		}
 		out = append(out, proto.SessionEntry{
 			SID: s.SID, Name: s.Name, OwnerFP: s.OwnerPubkeyFP,
 			State: string(s.State), CreatedAt: s.CreatedAt,
@@ -166,7 +175,18 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	// session is in DELETING, ctl gets OK, and the boot reconciler
 	// will retry on next broker start. We still log loudly because
 	// it usually means the JS server is down.
-	finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//
+	// Audit shard 01 F7: derive from b.runCtx (broker shutdown
+	// context) instead of context.Background so a graceful
+	// shutdown mid-rm cancels the JS+SQLite cascade instead of
+	// running it against a half-torn-down broker. Falls back to
+	// Background when runCtx is nil (broker.New + finalize tests
+	// that bypass Run).
+	parent := b.runCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	finalCtx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	if err := b.finalizeSessionRm(finalCtx, sid); err != nil {
 		b.cfg.Logger.Warn("broker: session rm finalize failed; will resume on next boot",

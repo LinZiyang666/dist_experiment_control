@@ -213,6 +213,12 @@ type Broker struct {
 	// only when Config.AdminSocketPath is set. Started after JS so
 	// the audit endpoint can read history-<sid>.
 	admin *adminsock.Server
+
+	// runCtx is the context passed to Run; available to handlers
+	// that need to derive sub-contexts so a graceful shutdown
+	// propagates (audit shard 01 F7: finalizeSessionRm previously
+	// built a context.Background-derived one). Nil before Run.
+	runCtx context.Context
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -288,6 +294,7 @@ func New(cfg Config) (*Broker, error) {
 // nkey credentials on CONNECT (so it bypasses auth_callout itself) AND
 // subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
 func (b *Broker) Run(ctx context.Context) error {
+	b.runCtx = ctx
 	connOpts, err := b.brokerConnectOptions()
 	if err != nil {
 		return err

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/node"
@@ -209,5 +208,7 @@ func (b *Broker) handlePtyFailed(msg *nats.Msg) {
 	}
 	b.cfg.Logger.Info("broker: pty failed",
 		"sid", sid, "pid", ev.PID, "reason", ev.Reason, "detail", ev.Detail)
-	b.pubAuditProc(sid, ev.Reason, "" /* nid unknown from this subject */, ev.PID, nil, 0, time.Now().UTC())
+	// Audit shard 01 F8: use cfg.Now (test seam) not raw time.Now,
+	// so frozen-clock tests see deterministic audit timestamps.
+	b.pubAuditProc(sid, ev.Reason, "" /* nid unknown from this subject */, ev.PID, nil, 0, b.cfg.Now())
 }

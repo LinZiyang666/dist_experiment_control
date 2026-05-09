@@ -87,6 +87,13 @@ func (b *Broker) startDiskMonitor(ctx context.Context) {
 				emitted = false
 			}
 		}
+		// Audit shard 01 F12: ctx-check before the first probe so
+		// a broker that's already shutting down (Run started but
+		// then immediately canceled) doesn't pub a disk_pressure
+		// onto a draining nats.Conn.
+		if ctx.Err() != nil {
+			return
+		}
 		check()
 		for {
 			select {

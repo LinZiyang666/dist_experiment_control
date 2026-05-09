@@ -154,10 +154,21 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
+	// Audit shard 01 F6: the inner ctx-watcher goroutine used to
+	// leak when shutdown was initiated by an explicit Close()
+	// (which the broker does via defer b.admin.Close()) — accept
+	// returns ErrClosed cleanly, but the watcher sat forever
+	// waiting on <-ctx.Done. Close a `done` channel on loop exit
+	// so the watcher exits via select too.
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		_ = s.Close()
+		select {
+		case <-ctx.Done():
+			_ = s.Close()
+		case <-done:
+		}
 	}()
+	defer close(done)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
