@@ -260,6 +260,12 @@ func installNewBinary(tarball []byte, dst string) (string, error) {
 // upgradeMaxTarballBytes (defense in depth — the network read is
 // already capped, but a maliciously-crafted small tar could
 // declare a huge file size).
+//
+// outPath is opened with O_EXCL | O_NOFOLLOW so a local attacker
+// can't race a symlink swap into the tmp dir between MkdirTemp
+// and our open (audit shard 02 F2). MkdirTemp uses 0700 by
+// default on Linux but a non-root local who already owns the
+// containing directory could pre-plant.
 func extractTetherBinary(tarball []byte, outPath string) error {
 	gz, err := gzip.NewReader(strings.NewReader(string(tarball)))
 	if err != nil {
@@ -288,7 +294,8 @@ func extractTetherBinary(tarball []byte, outPath string) error {
 		if hdr.Size > upgradeMaxTarballBytes {
 			return fmt.Errorf("tether entry too large: %d bytes", hdr.Size)
 		}
-		f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(outPath,
+			os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 		if err != nil {
 			return fmt.Errorf("create binary: %w", err)
 		}

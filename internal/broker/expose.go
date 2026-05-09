@@ -51,12 +51,20 @@ func (b *Broker) publicHostFor() string {
 // Architecture F.4 — broker is the only side that knows token_hash
 // vs raw token; agent presents raw, broker hashes & looks up.
 func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash string) error {
+	// Audit shard 02 F6: collapse "absent" and "port-mismatch" into
+	// the same error code so an attacker probing with stolen
+	// tokens can't tell whether the row exists at all. Internally
+	// log the discrimination for operator triage; over the wire
+	// only "token_unknown_or_revoked" leaks.
 	a, err := port.LookupByTokenHash(b.cfg.DB, tokenHash)
 	if err != nil {
 		return fmt.Errorf("token_unknown_or_revoked")
 	}
 	if a.Port != publicPort || a.SID != sid || a.NID != nid {
-		return fmt.Errorf("token_port_mismatch")
+		b.cfg.Logger.Warn("tunnel: token sid/nid/port mismatch",
+			"want_sid", sid, "want_nid", nid, "want_port", publicPort,
+			"got_sid", a.SID, "got_nid", a.NID, "got_port", a.Port)
+		return fmt.Errorf("token_unknown_or_revoked")
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -77,6 +78,20 @@ func (s *Server) Start(ctx context.Context) error {
 	parent := filepath.Dir(s.path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("adminsock: mkdir parent: %w", err)
+	}
+	// Audit shard 02 F5: verify the parent dir is owned by us
+	// before chmod-ing it. A malicious local user could otherwise
+	// pre-create /var/run/tether owned by THEIR uid, mode 0700;
+	// chmod 0700 of an already-0700 dir succeeds for the owner
+	// (us) — but the dir is still theirs, and they can swap a
+	// symlink for admin.sock. Refuse if uid doesn't match.
+	if fi, err := os.Lstat(parent); err == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if uid := os.Geteuid(); uid != int(st.Uid) {
+				return fmt.Errorf("adminsock: parent %s owned by uid=%d, broker uid=%d",
+					parent, st.Uid, uid)
+			}
+		}
 	}
 	// MkdirAll is a no-op when the parent already exists; defensively
 	// re-chmod every Start so an operator-pre-created /var/run/tether
