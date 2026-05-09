@@ -531,7 +531,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=tether
-ExecStart=/usr/local/bin/nats-server -js -sd $lib/jetstream -addr 127.0.0.1 -p 4222 --ws_listen 127.0.0.1:8222
+ExecStart=$bin/nats-server -js -sd $lib/jetstream -addr 127.0.0.1 -p 4222 --ws_listen 127.0.0.1:8222
 Restart=on-failure
 
 [Install]
@@ -566,7 +566,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/caddy run --config $etc/Caddyfile --adapter caddyfile
+ExecStart=$bin/caddy run --config $etc/Caddyfile --adapter caddyfile
 Restart=on-failure
 
 [Install]

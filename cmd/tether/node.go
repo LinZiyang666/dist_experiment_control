@@ -212,47 +212,33 @@ func isConfigError(err error) bool {
 	return false
 }
 
-// listOnlineNIDs round-trips a ps.req and returns the unique nids
-// whose owning node is currently ONLINE — exactly the set a
-// fleet-wide --all upgrade should target. Skips OFFLINE / STALE
-// (broker would reject those anyway).
+// listOnlineNIDs round-trips a node.list.req (architecture B.1
+// line 129) and returns the nids whose `nodes.status` is ONLINE.
+// Uses the dedicated node-enum RPC instead of process-derived
+// inference: a fresh agent that registered but never exec'd
+// shows up here AND can be upgrade target, which the older
+// ps-based heuristic missed.
 func listOnlineNIDs(ctx context.Context, nc *nats.Conn, sid, actor string) ([]string, error) {
-	body, _ := json.Marshal(proto.PsReq{})
+	body, _ := json.Marshal(proto.NodeListReq{})
 	respCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	respMsg, err := nc.RequestWithContext(respCtx, proto.SubjCtrlPs(actor, sid), body)
+	respMsg, err := nc.RequestWithContext(respCtx,
+		proto.SubjCtrlNodeList(actor, sid), body)
 	if err != nil {
-		return nil, fmt.Errorf("upgrade --all: ps lookup: %w", err)
+		return nil, fmt.Errorf("upgrade --all: node.list lookup: %w", err)
 	}
-	var ps proto.PsResp
-	if err := json.Unmarshal(respMsg.Data, &ps); err != nil {
-		return nil, fmt.Errorf("upgrade --all: ps decode: %w", err)
+	var nl proto.NodeListResp
+	if err := json.Unmarshal(respMsg.Data, &nl); err != nil {
+		return nil, fmt.Errorf("upgrade --all: node.list decode: %w", err)
 	}
-	if ps.Code != "" {
-		return nil, fmt.Errorf("upgrade --all: ps rejected: %s %s", ps.Code, ps.Error)
+	if nl.Code != "" {
+		return nil, fmt.Errorf("upgrade --all: node.list rejected: %s %s", nl.Code, nl.Error)
 	}
-	seen := map[string]bool{}
 	var out []string
-	// PsResp.Processes carries one row per process; we want unique
-	// node ids. The status filter avoids dispatching to OFFLINE /
-	// LOST nodes (broker would reject them at the node_offline
-	// gate, but failing one of those mid-loop would short-circuit
-	// the whole --all run).
-	for _, p := range ps.Processes {
-		if seen[p.NID] {
-			continue
+	for _, n := range nl.Nodes {
+		if n.Status == "ONLINE" {
+			out = append(out, n.NID)
 		}
-		if p.Status != "RUNNING" && p.Status != "EXITED" {
-			// LOST / unknown statuses signal the node is OFFLINE;
-			// skip to avoid abort-on-first-failure mid-fleet.
-			continue
-		}
-		seen[p.NID] = true
-		out = append(out, p.NID)
 	}
-	// Some sessions have nodes with NO processes yet — they show up
-	// in ps.Processes only after their first exec. Future work:
-	// expose a dedicated nodes RPC; for v1 the process-derived list
-	// covers the common upgrade target (a node that's been used).
 	return out, nil
 }

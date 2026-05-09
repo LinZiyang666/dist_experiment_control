@@ -348,6 +348,7 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.exec.req",
 			func(msg *nats.Msg) { b.handleExecReq(nc, msg) }},
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.ps.req", b.handlePsReq},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.node.list.req", b.handleNodeListReq},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.started", b.handleProcEvent},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.exit", b.handleProcEvent},
 		// P5 PTY control plane.

@@ -101,6 +101,15 @@ func SubjCtrlPs(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.ps.req", SubjectPrefix, actor, sid)
 }
 
+// SubjCtrlNodeList returns the per-actor, per-session node-list
+// subject (architecture B.1). Read-only enumeration of the
+// `nodes` table — same pattern as SubjCtrlPs, used by
+// `tether node upgrade --all` to see ONLINE agents that haven't
+// run any process yet (PsReq would miss those).
+func SubjCtrlNodeList(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.node.list.req", SubjectPrefix, actor, sid)
+}
+
 // Session-management subjects (ctl pub, broker handle).
 func SubjCtrlSessionCreate(actor string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.session.create.req", SubjectPrefix, actor)

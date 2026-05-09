@@ -107,3 +107,22 @@ func TestReviewUpgradeRestartsAfterSuccessfulReplacement(t *testing.T) {
 		t.Fatal("successful node upgrade replaces the binary then exits 0, but the generated user service only restarts on failure and the upgrade path does not launch the replacement")
 	}
 }
+
+func TestReviewBrokerSidecarUnitsUseInstallPrefix(t *testing.T) {
+	body, err := os.ReadFile(scriptPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(body)
+
+	if !strings.Contains(script, "install_nats_server \"$BIN_DIR\"") ||
+		!strings.Contains(script, "install_caddy \"$BIN_DIR\"") {
+		t.Fatal("test assumption failed: broker sidecars are not installed through BIN_DIR")
+	}
+	if strings.Contains(script, "ExecStart=/usr/local/bin/nats-server") {
+		t.Error("nats-server unit is hard-coded to /usr/local/bin even though --prefix installs the sidecar into BIN_DIR")
+	}
+	if strings.Contains(script, "ExecStart=/usr/local/bin/caddy") {
+		t.Error("caddy unit is hard-coded to /usr/local/bin even though --prefix installs the sidecar into BIN_DIR")
+	}
+}

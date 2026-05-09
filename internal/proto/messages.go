@@ -209,6 +209,32 @@ type ProcExitEvent struct {
 	EndedAt  time.Time `json:"ended_at"`
 }
 
+// NodeListReq — ctl pub on ctrl.by.<actor>.s.<sid>.node.list.req
+// (architecture B.1 line 129). Empty body; sid in subject.
+//
+// Different from PsReq: NodeList returns the nodes themselves
+// (independent of whether they've ever run a process), so callers
+// like `tether node upgrade --all` can target ALL ONLINE agents
+// even on a fresh install. PsReq's process list misses any agent
+// that hasn't exec'd anything yet.
+type NodeListReq struct{}
+
+// NodeListEntry projects one row of the SQLite `nodes` table.
+type NodeListEntry struct {
+	NID             string    `json:"nid"`
+	Status          string    `json:"status"` // ONLINE | STALE | OFFLINE
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	BootID          string    `json:"boot_id,omitempty"`
+	ReleaseVersion  string    `json:"release_version,omitempty"`
+	ProtoVersion    int       `json:"proto_version,omitempty"`
+}
+
+type NodeListResp struct {
+	Nodes []NodeListEntry `json:"nodes"`
+	Code  string          `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | actor_invalid | store_error
+	Error string          `json:"error,omitempty"`
+}
+
 // PsReq — empty body. Lives in `ctrl.by.<actor>.s.<sid>.ps.req`.
 type PsReq struct{}
 

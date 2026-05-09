@@ -417,3 +417,194 @@ P10 case count grew from 16 → 27:
   + cmd/tether: TestLoadAgentYAML* (4) + TestPickFlagOrYamlOnAgentCmd
     + TestIsTransientError + TestIsConfigError
 ```
+
+---
+
+## Round 2 Review
+
+Date: 2026-05-09
+Reviewer role: test engineer
+
+Reviewed commits:
+
+- `9fb267e Address P10 review: agent.yaml load (F1) + sidecar+chown install (F2) + syscall.Exec upgrade (F3) + ctl default (F4)`
+- `741bedf P10 self-review: plug 5 quality gaps reviewer tests didn't catch`
+
+### Verdict
+
+P10 is still not approved yet.
+
+The four round-1 findings are materially fixed: the original reviewer tests now
+pass, P10 upgrade tests pass, and full regressions pass when reviewer tests are
+skipped. I found two new issues in the round-1.5 changes.
+
+### R2-F1 - High: `node upgrade --all` misses ONLINE agents that have no process rows
+
+`cmd/tether/node.go:219-256` implements `--all` by sending `ps.req` and deriving
+target node IDs from `PsResp.Processes`. But `ps` is a process/port view, not a
+node inventory. A freshly registered ONLINE agent with no prior `exec` has a
+row in `nodes` but no row in `processes`, so `--all` returns no targets and
+silently skips that agent.
+
+The code comment at `cmd/tether/node.go:253-256` acknowledges this as future
+work, but this is the exact P10/J.4 contract for `tether node upgrade --all`:
+current-session agents, not current-session agents that have run a process.
+
+Reviewer test added:
+
+```text
+go test ./cmd/tether -run TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses -count=1
+
+upgrade --all should include ONLINE nodes even before any process has run; got []
+```
+
+Recommendation:
+
+Add a real node inventory path for CLI use. Reasonable options:
+
+- extend `PsResp` with a `Nodes []NodeEntry`/minimal `NID,Status` projection and
+  have broker `handlePsReq` populate it from `nodes`; or
+- add a dedicated authenticated `nodes.req` control subject, reusing the same
+  membership/session checks as `ps.req`.
+
+Then implement `--all` from ONLINE node rows, not process rows. Port rows are
+also insufficient because many healthy agents expose no ports.
+
+### R2-F2 - Medium: broker sidecar units ignore `--prefix`
+
+`scripts/install.sh:340` sets `BIN_DIR="${PREFIX:-/usr/local/bin}"`, and
+`scripts/install.sh:384-385` installs `nats-server` and `caddy` into that
+`BIN_DIR`. But the generated units still hard-code:
+
+- `scripts/install.sh:534`: `ExecStart=/usr/local/bin/nats-server ...`
+- `scripts/install.sh:569`: `ExecStart=/usr/local/bin/caddy ...`
+
+With `--prefix /opt/tether/bin`, `tether-broker.service` points at
+`$bin/tether`, but the sidecar units point somewhere else. This makes the
+documented `--prefix DIR` override inconsistent and breaks staged/non-default
+broker installs.
+
+Reviewer test added:
+
+```text
+go test ./test/p10 -run TestReviewBrokerSidecarUnitsUseInstallPrefix -count=1
+
+nats-server unit is hard-coded to /usr/local/bin even though --prefix installs the sidecar into BIN_DIR
+caddy unit is hard-coded to /usr/local/bin even though --prefix installs the sidecar into BIN_DIR
+```
+
+Recommendation:
+
+Render sidecar unit `ExecStart` from the same `bin` argument used for
+`tether-broker.service`, i.e. `$bin/nats-server` and `$bin/caddy`.
+
+### Round 2 Verification
+
+Round-1 reviewer tests:
+
+```text
+GOCACHE=/tmp/tether-gocache go test ./test/p10 -run TestReview -count=1
+# FAIL only on new R2-F2 test; round-1 reviewer tests pass
+```
+
+New round-2 tests:
+
+```text
+go test ./cmd/tether -run TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses -count=1
+# FAIL: got []
+
+GOCACHE=/tmp/tether-gocache go test ./test/p10 -run TestReviewBrokerSidecarUnitsUseInstallPrefix -count=1
+# FAIL: nats/caddy units hard-code /usr/local/bin
+```
+
+Submitted/current P10 suite:
+
+```text
+go test ./test/p10 -count=1
+# PASS before adding the new R2 reviewer test; after adding it, fails on R2-F2
+
+go test ./cmd/tether -count=1
+# PASS before adding the new R2 reviewer test; after adding it, fails on R2-F1
+```
+
+Regression/static checks with reviewer tests skipped:
+
+```text
+go test ./... -skip '^TestReview' -count=1
+# PASS
+
+GOCACHE=/tmp/tether-gocache go vet ./...
+# PASS
+
+/home/weiland/go/bin/golangci-lint run ./...
+# PASS, 0 issues
+```
+
+Commands requiring embedded NATS/JetStream or default Go/lint cache writes were
+run outside the default sandbox.
+
+### Round 2 Reviewer Tests Added
+
+Added:
+
+- `cmd/tether/p10_round2_review_test.go`
+- appended `TestReviewBrokerSidecarUnitsUseInstallPrefix` to
+  `test/p10/review_risk_test.go`
+
+---
+
+## Maintainer Response (round 2)
+
+Date: 2026-05-09
+
+Both findings accepted; both fixed in this commit series.
+
+### R2-F1 — accepted, fixed
+
+The round-1.5 ps-derivation was a known shortcut documented in the
+code comment, and the reviewer is right that it doesn't satisfy the
+J.4 contract: "current-session agents" includes ones that haven't
+exec'd yet. Implemented the proper node-inventory RPC the
+architecture B.1 line 129 already specified:
+
+- `proto.NodeListReq` / `NodeListResp` / `NodeListEntry` —
+  read-only enumeration of `nodes`.
+- `proto.SubjCtrlNodeList(actor, sid)` builds the
+  `ctrl.by.<actor>.s.<sid>.node.list.req` subject.
+- `broker.handleNodeListReq` mirrors `handlePsReq`'s gates
+  (subject parse → actor fp → C.1 §6 ACTIVE → membership) and
+  filters `node.List` rows by sid.
+- `cmd/tether/node.go.listOnlineNIDs` now goes through the new
+  RPC and filters `Status == "ONLINE"`. The old "process row →
+  node id" inference is gone.
+
+Reviewer's `TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses`
+now passes — a node that registered but never ran a process is
+returned by `--all`.
+
+### R2-F2 — accepted, fixed
+
+Two-line change in `scripts/install.sh`'s `write_systemd_units`:
+`ExecStart=/usr/local/bin/nats-server …` → `ExecStart=$bin/nats-server …`
+and same for caddy. `$bin` is the `BIN_DIR` already passed in (and
+already used by `tether-broker.service`'s ExecStart), so
+`--prefix /opt/tether/bin` now produces a coherent unit set.
+
+Reviewer's `TestReviewBrokerSidecarUnitsUseInstallPrefix` now
+passes.
+
+### Round 2 verification
+
+```text
+go build ./...                                     → ok
+go vet ./...                                       → ok
+golangci-lint run ./...                            → 0 issues
+go test ./...                                      → 29 packages PASS
+go test -run TestReview ./cmd/tether ./test/p10    → all 6 reviewer tests pass
+  - TestReviewCtlInstallDefaultsToCtl                            (round-1)
+  - TestReviewAgentInstallStartPathUsesConfiguredBroker          (round-1)
+  - TestReviewBrokerInstallPreparesSidecarsAndWritableRuntimeDirs (round-1)
+  - TestReviewUpgradeRestartsAfterSuccessfulReplacement          (round-1)
+  - TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses      (round-2)
+  - TestReviewBrokerSidecarUnitsUseInstallPrefix                 (round-2)
+```

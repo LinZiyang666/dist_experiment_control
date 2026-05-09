@@ -168,6 +168,73 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 	}
 }
 
+// handleNodeListReq answers ctrl.by.<actor>.s.<sid>.node.list.req
+// (architecture B.1 line 129) with the SQLite `nodes` rows for sid.
+// Same membership + DELETING gate as handlePsReq; result includes
+// every node ever registered (independent of process activity), so
+// `tether node upgrade --all` can target ONLINE agents that have
+// not exec'd anything.
+func (b *Broker) handleNodeListReq(msg *nats.Msg) {
+	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
+	if !ok {
+		b.replyJSON(msg, proto.NodeListResp{Code: "subject_malformed"})
+		return
+	}
+	// leaf = "s.<sid>.node.list.req"
+	parts := splitDot(leaf)
+	if len(parts) != 5 || parts[0] != "s" || parts[2] != "node" ||
+		parts[3] != "list" || parts[4] != "req" {
+		b.replyJSON(msg, proto.NodeListResp{Code: "subject_malformed", Error: leaf})
+		return
+	}
+	sid := parts[1]
+
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		b.replyJSON(msg, proto.NodeListResp{Code: "actor_invalid", Error: err.Error()})
+		return
+	}
+	active, err := session.IsActive(b.cfg.DB, sid)
+	if err != nil {
+		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	if !active {
+		b.replyJSON(msg, proto.NodeListResp{Code: "session_not_found_or_deleting"})
+		return
+	}
+	member, err := session.IsMember(b.cfg.DB, sid, fp)
+	if err != nil {
+		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	if !member {
+		b.replyJSON(msg, proto.NodeListResp{Code: "not_a_member"})
+		return
+	}
+
+	all, err := node.List(b.cfg.DB)
+	if err != nil {
+		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	out := make([]proto.NodeListEntry, 0, len(all))
+	for _, n := range all {
+		if n.SID != sid {
+			continue
+		}
+		out = append(out, proto.NodeListEntry{
+			NID:             n.NID,
+			Status:          n.Status,
+			LastHeartbeatAt: n.LastHeartbeatAt,
+			BootID:          n.BootID,
+			ReleaseVersion:  n.ReleaseVersion,
+			ProtoVersion:    n.ProtoVersion,
+		})
+	}
+	b.replyJSON(msg, proto.NodeListResp{Nodes: out})
+}
+
 // handlePsReq replies with a PsResp built from internal/proc.ListBySession.
 // Subject layout: `ctrl.by.<actor>.s.<sid>.ps.req`. Architecture F.8 says
 // `tether ps` is read-only and never goes through agent forwarding.
