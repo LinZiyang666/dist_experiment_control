@@ -43,10 +43,16 @@ var allPhases = []string{
 }
 
 func TestAllPhases(t *testing.T) {
+	// Phases run SERIALLY. The first cut had t.Parallel() and
+	// finished in ~24s, but P5's PTY attach handshake (architecture
+	// C.5.1, 3s deadline) is contention-sensitive: with 10 phase
+	// subprocesses each spawning embedded NATS + multiple
+	// goroutines per test, attach_timeout fires under load and
+	// `make e2e` flakes. P11 is a release gate — repeatability
+	// beats wall-clock. Sequential is ~80s on this box, still
+	// well inside any nightly budget.
 	for _, phase := range allPhases {
-		phase := phase
 		t.Run(phase, func(t *testing.T) {
-			t.Parallel()
 			runPhase(t, phase)
 		})
 	}

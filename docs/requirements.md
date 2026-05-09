@@ -1,5 +1,16 @@
 # 分布式节点控制系统 — 需求文档
 
+> **HISTORICAL — 这是 v1 设计开始之前的需求草稿。**
+> **当前 v1 实现以 `docs/architecture.md` 为权威；本文件保留以记录设计起点。**
+>
+> 不在 v1 范围（已挪到 v2 或显式 deferred）：
+> - **`push` / `pull` / 文件传输**（本文 §5、§7、§9 多次出现）—— v1 不实现；
+>   架构定位见 `docs/architecture.md` "v1 不做：file transfer (M5)"。
+> - **`tether tag`、`tether plugin`** 等模块化扩展 —— v1 不实现。
+> - 其它在本文出现但 architecture 未承接的项默认 v2 候选。
+>
+> 当前 v1 的实际命令面以 `tether --help` + architecture I.1/I.2 章为准。
+
 > **文档定位**：系统的**需求规约（what）**，供实现参考。决策过程请看 `logs/log.md`（历史决策日志，冻结）。架构细节请看 `docs/architecture.md`（待产出）。
 
 ---
