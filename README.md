@@ -5,8 +5,40 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P6 complete**). Adds the data plane (`expose` + reverse
-TCP tunnel) on top of P5:
+Pre-alpha (phase **P7 complete**). Adds JetStream-backed audit + history
++ 3-phase session rm on top of P6:
+
+- All `audit.{call,proc,port}` events are now `js.Publish` to a
+  per-session `history-<sid>` JetStream stream (architecture H.1 / H.5).
+  When the underlying nats-server has JetStream enabled the broker
+  auto-detects it and switches; without JS it falls back to core
+  publish (P4-P6 behavior, no test regressions).
+- `tether history [-n N] [--follow] [--kind call|proc|port]` replays
+  audit history via an ephemeral consumer. -n is bounded last-N,
+  --follow tails new entries, --kind filters call/proc/port.
+- `session rm` runs the full architecture H.3 three-phase: ① SQLite
+  tombstone (state=DELETING, C.1 §6 starts rejecting new req
+  immediately) → ② JetStream DELETE history-`<sid>` → ③ SQLite
+  cascade-delete dependent rows → ④ pub `sys.events{session_destroyed}`.
+- Broker boot reconciles: re-runs phases ②③ for sessions stuck in
+  DELETING (crash recovery), creates missing `history-<sid>` for
+  ACTIVE sessions, deletes orphan `history-*` streams whose SQLite
+  session is gone.
+- Global `events` JetStream stream (30d / 1 GiB / discard=old) carries
+  `sys.events`. P7 emits `session_created` / `session_destroyed` so
+  far; member_joined / pin_failed / disk_pressure plug in at the
+  same `pubSysEvent` helper when their feature lands.
+
+P6 features still apply:
+
+- `tether expose <node> --local 8888 --name jupyter` allocates a
+  public port from the broker's [14000-14999] band, generates a
+  one-time token, plumbs it to the agent, and prints the URL
+  (`http://<broker>:14022`). The agent's `internal/tunnel` client opens
+  a yamux session to the broker over the configured tunnel control
+  port (default `:7000`); when external traffic hits 14022, broker
+  multiplexes a new stream over the session and the agent bridges it
+  to its local 8888.
 
 - `tether expose <node> --local 8888 --name jupyter` allocates a
   public port from the broker's [14000-14999] band, generates a
@@ -81,7 +113,8 @@ to both `tether agent` and the ctl commands) to connect anonymously
 to a vanilla `nats-server`. NATS-level identity enforcement is
 bypassed in that mode; never use it in production.
 
-Audit + history (JetStream `history-<sid>`) lands in P7.
+Reconciliation (G.1 / G.2 — agent reconnect snapshot, broker restart
+DELETING resume already in P7, process LOST detection) lands in P8.
 
 ## Build
 

@@ -23,11 +23,13 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // Config wires the broker to its dependencies. Everything has a sane default
@@ -140,11 +142,44 @@ type Broker struct {
 	// Config.TunnelControlAddr is set. Authorizes agent REGISTERs by
 	// looking up port_allocations.token_hash.
 	tunnelSrv *tunnel.Server
+
+	// js is the JetStream context this broker uses for audit publish
+	// + history/events stream management. Non-nil only when the
+	// underlying nats-server has JetStream enabled. When nil the
+	// audit pubs fall back to core publish (P4-P6 behavior) — that
+	// keeps existing tests / dev setups (no -js) working without
+	// changes; a JetStream-enabled deployment activates the P7
+	// upgrade automatically.
+	js jetstream.JetStream
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
-// Used by audit / event broadcast helpers that don't sit on a msg.Reply.
+// Used by event broadcast helpers (ev.port etc) that don't sit on a
+// msg.Reply and don't need persistence.
 func (b *Broker) publishOnConn(subject string, payload []byte) error {
+	if b.nc == nil {
+		return errBrokerNotConnected
+	}
+	return b.nc.Publish(subject, payload)
+}
+
+// publishAudit pubs an audit message. With JetStream available
+// (b.js != nil) the message goes through js.Publish so it lands in
+// the history-<sid> stream with at-least-once delivery + ACK.
+// Without JetStream falls back to core publish, matching P4-P6
+// behavior verbatim — that path is best-effort and lossy on
+// reconnect, but it keeps non-JS dev/test setups working.
+//
+// Architecture H.5 / H.1 — audit subjects are the only thing
+// history-<sid> filters on, so this is the only function that
+// needs to know about JS for normal pub.
+func (b *Broker) publishAudit(subject string, payload []byte) error {
+	if b.js != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := b.js.Publish(ctx, subject, payload)
+		return err
+	}
 	if b.nc == nil {
 		return errBrokerNotConnected
 	}
@@ -271,6 +306,35 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: subscribe %s: %w", ss.subj, err)
 		}
 		defer func(s *nats.Subscription) { _ = s.Unsubscribe() }(sub)
+	}
+
+	// P7 — try JetStream AFTER all subscriptions are installed so the
+	// probe round-trip doesn't head-of-line block test code that's
+	// already firing requests at us. AccountInfo is the cheapest call
+	// that distinguishes "JS enabled" from "JS not present" (just
+	// "jetstream.New(nc)" itself never errors — it's purely client-
+	// side scaffolding). When the probe fails we keep b.js == nil and
+	// audit publishes fall back to core publish (P4-P6 behavior).
+	if js, err := jetstream.New(nc); err == nil {
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 1*time.Second)
+		_, infoErr := js.AccountInfo(probeCtx)
+		cancelProbe()
+		if infoErr == nil {
+			b.js = js
+			b.cfg.Logger.Info("broker: JetStream enabled")
+			ensureCtx, ensureCancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := jsstream.EnsureEventsStream(ensureCtx, js); err != nil {
+				ensureCancel()
+				return fmt.Errorf("broker: ensure events stream: %w", err)
+			}
+			ensureCancel()
+			if err := b.reconcileHistoryStreamsOnBoot(ctx); err != nil {
+				b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", err)
+			}
+		} else {
+			b.cfg.Logger.Debug("broker: JetStream not available; audit falls back to core publish",
+				"err", infoErr)
+		}
 	}
 
 	b.cfg.Logger.Info("broker: ready",

@@ -1,11 +1,14 @@
 package broker
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
@@ -56,8 +59,24 @@ func (b *Broker) handleSessionCreate(msg *nats.Msg) {
 		return
 	}
 
+	// P7 / H.1: a brand-new session needs its own history stream
+	// before any audit pub can land. Best-effort: if EnsureHistory
+	// fails the session itself is still created (SQLite committed)
+	// — the boot reconciler will retry on next broker start.
+	if b.js != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := jsstream.EnsureHistoryStream(ctx, b.js, s.SID); err != nil {
+			b.cfg.Logger.Warn("broker: ensure history stream on create",
+				"sid", s.SID, "err", err)
+		}
+		cancel()
+	}
+
 	b.cfg.Logger.Info("broker: session created",
 		"sid", s.SID, "owner_fp", fp, "actor", actor)
+	b.pubSysEvent("session_created", map[string]any{
+		"sid": s.SID, "owner_fp": fp, "actor": actor,
+	})
 	b.replyJSON(msg, proto.SessionCreateResp{
 		SID: s.SID, OwnerFP: s.OwnerPubkeyFP, CreatedAt: s.CreatedAt,
 	})
@@ -120,6 +139,11 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 		b.replyJSON(msg, proto.SessionRmResp{Code: "not_owner"})
 		return
 	}
+	// Phase ① — tombstone (architecture H.3). After this commits, C.1
+	// §6 starts rejecting new req on this sid (handleExecReq /
+	// handleRunReq / handleExposeReq all consult IsActive). Phases
+	// ②③④ run synchronously below; on failure session stays in
+	// DELETING and the boot reconciler resumes from where we left.
 	if err := session.Tombstone(b.cfg.DB, sid, b.cfg.Now()); err != nil {
 		switch {
 		case errors.Is(err, session.ErrNotFound):
@@ -133,6 +157,17 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	}
 	b.cfg.Logger.Info("broker: session tombstoned",
 		"sid", sid, "by_fp", fp, "actor", actor)
+
+	// Phases ②③④. Failures here are NON-fatal to the rm — the
+	// session is in DELETING, ctl gets OK, and the boot reconciler
+	// will retry on next broker start. We still log loudly because
+	// it usually means the JS server is down.
+	finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.finalizeSessionRm(finalCtx, sid); err != nil {
+		b.cfg.Logger.Warn("broker: session rm finalize failed; will resume on next boot",
+			"sid", sid, "err", err)
+	}
 	b.replyJSON(msg, proto.SessionRmResp{OK: true})
 }
 

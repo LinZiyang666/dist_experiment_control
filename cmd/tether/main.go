@@ -28,6 +28,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPsCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newExposeCmd())
+	root.AddCommand(newHistoryCmd())
 	return root
 }
 

@@ -294,7 +294,7 @@ func (b *Broker) pubAuditCall(sid, actorFP, actorNkey, verb, nid string, ok bool
 	if err != nil {
 		return
 	}
-	if err := b.publishOnConn(proto.SubjAuditCall(sid), payload); err != nil {
+	if err := b.publishAudit(proto.SubjAuditCall(sid), payload); err != nil {
 		b.cfg.Logger.Warn("broker: audit.call pub", "err", err, "sid", sid)
 	}
 }
@@ -331,7 +331,7 @@ func (b *Broker) pubAuditProc(sid, kind, nid, pid string, argv []string, exitCod
 	if err != nil {
 		return
 	}
-	if err := b.publishOnConn(proto.SubjAuditProc(sid), payload); err != nil {
+	if err := b.publishAudit(proto.SubjAuditProc(sid), payload); err != nil {
 		b.cfg.Logger.Warn("broker: audit.proc pub", "err", err, "sid", sid, "pid", pid)
 	}
 }

@@ -378,7 +378,7 @@ func (b *Broker) pubAuditPort(sid, kind, nid string, port int, name string, loca
 	if err != nil {
 		return
 	}
-	if err := b.publishOnConn(proto.SubjAuditPort(sid), body); err != nil {
+	if err := b.publishAudit(proto.SubjAuditPort(sid), body); err != nil {
 		b.cfg.Logger.Warn("broker: audit.port pub", "err", err, "sid", sid)
 	}
 }
