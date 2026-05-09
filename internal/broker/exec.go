@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -60,11 +61,46 @@ func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
+	// Pre-forward node check (P4 review F2). Without this a typo in nid or
+	// a long-OFFLINE agent would drop into the NATS request, with no
+	// subscriber on `.req.forwarded`, and the ctl would just hang until its
+	// own timeout. Returning a clean ExecChunk{kind:error} matches the
+	// promise stated in this handler's doc comment.
+	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
+	switch {
+	case errors.Is(err, node.ErrNotFound):
+		b.replyExecErr(msg, "node_not_found")
+		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_not_found")
+		return
+	case err != nil:
+		b.replyExecErr(msg, "store_error: "+err.Error())
+		return
+	case status != node.StateOnline:
+		b.replyExecErr(msg, "node_offline: status="+string(status))
+		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_offline:"+string(status))
+		return
+	}
+
+	// Re-marshal the body to stamp the broker-parsed actor fp. C.1 §4
+	// requires actor attribution to originate at the broker — the agent
+	// echoes ActorFP into ProcStartedEvent.StartedByFP, never invents one.
+	var req proto.ExecReq
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		b.replyExecErr(msg, "json_parse: "+err.Error())
+		return
+	}
+	req.ActorFP = fp
+	body, err := json.Marshal(&req)
+	if err != nil {
+		b.replyExecErr(msg, "marshal: "+err.Error())
+		return
+	}
+
 	// Forward to agent. We preserve msg.Reply so chunks go straight to ctl.
 	fwd := &nats.Msg{
 		Subject: proto.SubjCmdForwarded(sid, nid, verb),
 		Reply:   msg.Reply,
-		Data:    msg.Data,
+		Data:    body,
 	}
 	if err := nc.PublishMsg(fwd); err != nil {
 		b.replyExecErr(msg, "forward_failed: "+err.Error())
@@ -150,6 +186,19 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		b.replyJSON(msg, proto.PsResp{Code: "actor_invalid", Error: err.Error()})
 		return
 	}
+
+	// C.1 §6: every session-scoped ingress (P4 ps included, not just exec)
+	// must reject DELETING sessions before touching membership / data.
+	active, err := session.IsActive(b.cfg.DB, sid)
+	if err != nil {
+		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	if !active {
+		b.replyJSON(msg, proto.PsResp{Code: "session_not_found_or_deleting"})
+		return
+	}
+
 	member, err := session.IsMember(b.cfg.DB, sid, fp)
 	if err != nil {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})

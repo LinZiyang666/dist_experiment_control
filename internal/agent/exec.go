@@ -66,7 +66,7 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 	pid := proc.NewPID()
 	a.cfg.Logger.Info("agent: exec", "pid", pid, "argv", req.Argv)
 	a.replyChunk(nc, msg.Reply, proto.ExecChunk{Kind: "started", PID: pid})
-	a.pubProcStarted(nc, pid, req.Argv)
+	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
 
 	exitCode, err := a.runChild(nc, msg.Reply, &req)
 	a.pubProcExit(nc, pid, exitCode)
@@ -158,14 +158,15 @@ func (a *Agent) replyChunk(nc *nats.Conn, replyTo string, c proto.ExecChunk) {
 	}
 }
 
-func (a *Agent) pubProcStarted(nc *nats.Conn, pid string, argv []string) {
+func (a *Agent) pubProcStarted(nc *nats.Conn, pid string, argv []string, actorFP string) {
 	payload, err := json.Marshal(proto.ProcStartedEvent{
 		PID:       pid,
 		Argv:      argv,
 		StartedAt: time.Now().UTC(),
-		// StartedByFP is filled by the broker when transcribing audit; agent
-		// sees the original ctl actor only via subject (not available here),
-		// so leave empty and let broker resolve from the audit.call.
+		// actorFP was stamped into ExecReq by the broker (see proto.ExecReq
+		// docs). Agent echoes it; the value originated from the broker's
+		// parse of `by.<actor>`, not from any agent-controlled source.
+		StartedByFP: actorFP,
 	})
 	if err != nil {
 		return

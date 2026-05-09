@@ -26,12 +26,20 @@ P3 features still apply:
   subscribes to `$SYS.REQ.USER.AUTH` and issues per-connection user
   JWTs that pin `by.<actor>`.
 - Multi-session isolation per CLI shell via `TETHER_SESSION`.
-- Agent role in `auth_callout` is hard-denied until P4 ships real
-  agent provisioning (architecture K.1) — not yet on this commit.
 
-Local laptop demo: set `TETHER_DEV_NO_AUTH=1` (CLI-side only) to
-connect anonymously to a vanilla `nats-server`. NATS-level identity
-enforcement is bypassed in that mode; never use it in production.
+P4 review F1 closed: agents own their per-`(machine, sid)` nkey at
+`~/.tether/agent/<sid>/keys/agent.nk` (architecture K.1) and connect
+via `nats.Nkey` + Name `tether-agent:<sid>:<nid>`. The first connect
+supplies `--pin` to bind the agent fp into `agent_provisioning`;
+subsequent connects validate against that binding. The `roleAgent`
+auth_callout branch is no longer hard-denied. `tether serve
+--auth-callout-seeds-dir <dir>` enables the secure path on the daemon
+side (loads `broker.nk` + `account.nk`).
+
+Local laptop demo: set `TETHER_DEV_NO_AUTH=1` (CLI-side env, applies
+to both `tether agent` and the ctl commands) to connect anonymously
+to a vanilla `nats-server`. NATS-level identity enforcement is
+bypassed in that mode; never use it in production.
 
 PTY mode (`tether run` for vim/htop/progress bars) lands in P5.
 

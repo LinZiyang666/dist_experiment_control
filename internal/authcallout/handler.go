@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentprov"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -113,22 +114,15 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		h.Logger.Info("authcallout: ctl allow", "actor", clientNkey, "sid", sid)
 		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid))
 	case roleAgent:
-		// P3-round2 review F1: the agent role MUST NOT mint
-		// PermissionsForAgent based purely on a client-controlled CONNECT
-		// name. Anyone could otherwise present `tether-agent:lab:evil` and
-		// silently register into existing sessions (or `tether-agent:*:*`
-		// and acquire wildcard agent rights across all sessions).
-		//
-		// Real agent provisioning (per-machine nkey + per-session
-		// `(sid,nid)` registration) lands in P4. Until then the agent
-		// path in auth_callout is hard-denied. This keeps the P2-style
-		// anonymous agent path available (test/p2 still works because
-		// broker.Config.AuthCallout is nil there) without granting any
-		// privileges over a NATS server that DOES have auth_callout
-		// enabled.
-		h.Logger.Info("authcallout: agent role denied (provisioning lands in P4)",
-			"actor", clientNkey, "name", req.ConnectOptions.Name)
-		return h.deny(req, "agent role not provisioned (P4 will wire agent install + auth_callout)")
+		nid := agentNidFromName(req.ConnectOptions.Name)
+		if err := h.ensureAgentProvisioned(sid, nid, clientNkey, fp, req.ConnectOptions.Token); err != nil {
+			h.Logger.Info("authcallout: agent deny",
+				"actor", clientNkey, "sid", sid, "nid", nid, "err", err)
+			return h.deny(req, err.Error())
+		}
+		h.Logger.Info("authcallout: agent allow",
+			"actor", clientNkey, "sid", sid, "nid", nid)
+		return h.allow(req, jwtSubject, auth.PermissionsForAgent(sid, nid))
 	default:
 		return h.deny(req, fmt.Sprintf("unknown role from name=%q", req.ConnectOptions.Name))
 	}
@@ -163,6 +157,94 @@ func parseRole(name string) (role, string, string) {
 		return roleAgent, parts[0], parts[1]
 	}
 	return roleUnknown, "", ""
+}
+
+// agentNidFromName extracts the nid out of a `tether-agent:<sid>:<nid>`
+// connection name, returning "" on any malformed input. parseRole has
+// already separated sid out, but it discards nid; this re-parses just the
+// nid for the agent path.
+func agentNidFromName(name string) string {
+	rest := strings.TrimPrefix(name, "tether-agent:")
+	if rest == name {
+		return ""
+	}
+	parts := strings.SplitN(rest, ":", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[1]
+}
+
+// ensureAgentProvisioned implements the F1 (P4 review) two-phase agent
+// auth flow:
+//
+//  1. validate sid/nid format strictly (P3-round2 lesson: never mint
+//     PermissionsForAgent off a client-controlled string without
+//     re-validating);
+//  2. consult agent_provisioning(sid, nid):
+//     - row exists with matching fp                     → allow;
+//     - row exists with a different fp                  → deny (this nid
+//       is taken by another agent identity; operator revokes first);
+//     - row missing AND no PIN supplied                 → deny (agent
+//       must run `tether agent` with --pin on first boot);
+//     - row missing AND a valid PIN supplied            → ProvisionWithPIN
+//       (verifies session ACTIVE + PIN, then INSERT), allow.
+//
+// Architecture K.1 — agent identity is per-machine, per-session, bound
+// once at install/provision time and remembered by the broker thereafter.
+func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) error {
+	if err := proto.ValidateSID(sid); err != nil {
+		return fmt.Errorf("sid: %w", err)
+	}
+	if err := proto.ValidateNID(nid); err != nil {
+		return fmt.Errorf("nid: %w", err)
+	}
+	if !nkeys.IsValidPublicUserKey(clientNkey) {
+		return fmt.Errorf("agent nkey: not a valid public user key")
+	}
+
+	bound, err := agentprov.Lookup(h.DB, sid, nid)
+	switch {
+	case err == nil:
+		if bound != fp {
+			return fmt.Errorf("nid %q is bound to a different agent identity", nid)
+		}
+		// Even on already-provisioned re-connect, refuse if the session
+		// has been tombstoned. C.1 §6 applies at every ingress.
+		active, err := session.IsActive(h.DB, sid)
+		if err != nil {
+			return fmt.Errorf("active check: %w", err)
+		}
+		if !active {
+			return fmt.Errorf("session %q not active", sid)
+		}
+		return nil
+	case errors.Is(err, agentprov.ErrNotProvisioned):
+		// fall through to PIN-bootstrap below
+	default:
+		return fmt.Errorf("provisioning lookup: %w", err)
+	}
+
+	if pin == "" {
+		return fmt.Errorf("agent (sid=%q, nid=%q) not provisioned; first connect must supply --pin", sid, nid)
+	}
+	switch err := agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, h.Now()); {
+	case err == nil:
+		return nil
+	case errors.Is(err, agentprov.ErrSessionMissing):
+		return fmt.Errorf("session %q does not exist", sid)
+	case errors.Is(err, agentprov.ErrSessionDeleting):
+		return fmt.Errorf("session %q is being deleted", sid)
+	case errors.Is(err, agentprov.ErrInvalidPIN):
+		return fmt.Errorf("invalid PIN")
+	case errors.Is(err, agentprov.ErrAlreadyProvisioned):
+		// Race: another agent just provisioned this nid with a different
+		// fp. The caller's nkey can never win this nid; surface as the
+		// same "bound to a different agent" message.
+		return fmt.Errorf("nid %q is bound to a different agent identity", nid)
+	default:
+		return fmt.Errorf("provision: %w", err)
+	}
 }
 
 func (h *Handler) ensureMember(sid, fp, pin string) error {

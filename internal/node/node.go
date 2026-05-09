@@ -185,6 +185,40 @@ type Snapshot struct {
 	ProtoVersion    int
 }
 
+// ErrNotFound is returned by LookupStatus when no `nodes(sid,nid)` row exists.
+// It exists so callers (broker.handleExecReq) can distinguish "node never
+// registered / typoed nid" from a generic store error and return a clean
+// `node_not_found` rejection instead of letting the request hang on a NATS
+// timeout (P4 review F2).
+var ErrNotFound = errors.New("node: row not found")
+
+// LookupStatus returns the current `nodes.status` for (sid,nid) without
+// touching the heartbeat. Used as a precheck before forwarding cmds to a
+// node — if the node row is missing or not ONLINE, the broker rejects
+// immediately and writes audit.call{ok=false} with the appropriate code.
+//
+// Reads the column verbatim; reconciliation runs on a ticker (architecture
+// D.2) so the value is at most one ReconcileInterval out of date. That's
+// acceptable for "is the agent there right now?" precheck — agents that
+// just dropped will surface within ReconcileInterval, and a forwarded msg
+// to a freshly-dropped agent that hasn't been reconciled yet is the same
+// failure mode as today (NATS no responders → ctl timeout). The improvement
+// targets the common "typoed nid" / "long-OFFLINE node" path the review
+// flagged.
+func LookupStatus(db *sql.DB, sid, nid string) (State, error) {
+	var status string
+	switch err := db.QueryRow(
+		`SELECT status FROM nodes WHERE sid = ? AND nid = ?`, sid, nid,
+	).Scan(&status); err {
+	case nil:
+		return State(status), nil
+	case sql.ErrNoRows:
+		return "", ErrNotFound
+	default:
+		return "", fmt.Errorf("node: lookup status: %w", err)
+	}
+}
+
 // List returns every node row, sorted by (sid, nid) for stable display.
 func List(db *sql.DB) ([]Snapshot, error) {
 	rows, err := db.Query(`

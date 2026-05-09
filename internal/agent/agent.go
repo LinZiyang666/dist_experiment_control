@@ -7,12 +7,18 @@
 //   1. connectNATS retries the initial CONNECT,
 //   2. register retries the request/reply.
 //
-// In v1 the agent connects ANONYMOUSLY (no nkey credentials). The P3
-// auth_callout flow exists but its `tether-agent:*:*` role is hard-denied
-// — agent identity provisioning lands in P4. Until then the agent
-// continues to work against a broker started with
-// `broker.Config.AuthCallout=nil`. Managed-process RPCs (run / exec /
-// expose) also land in P4+.
+// Authentication (P4 review F1):
+//   - Default path: caller passes Config.Identity (loaded via
+//     cli.EnsureAgentIdentity), agent CONNECTs with nats.Nkey + Name
+//     "tether-agent:<sid>:<nid>". On the very first CONNECT the operator
+//     also passes Config.PIN; broker auth_callout verifies the PIN and
+//     binds (sid, nid)→agent_fp in `agent_provisioning`. Subsequent
+//     CONNECTs need no PIN — the binding is remembered.
+//   - Dev escape hatch: with Config.Identity == nil the agent CONNECTs
+//     anonymously (no nkey, no name discriminator). This only works
+//     against a broker without auth_callout (P2-style or
+//     TETHER_DEV_NO_AUTH-style demo). cmd/tether/agent.go honours
+//     TETHER_DEV_NO_AUTH=1 by leaving Identity nil.
 package agent
 
 import (
@@ -26,8 +32,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
 // Config wires the agent to its dependencies.
@@ -35,6 +43,20 @@ type Config struct {
 	NATSURL string
 	SID     string
 	NID     string
+
+	// Identity, when non-nil, makes the agent CONNECT with nats.Nkey +
+	// Name "tether-agent:<sid>:<nid>" so the broker auth_callout can
+	// bind the nkey to (sid, nid). When nil the agent CONNECTs
+	// anonymously — only safe against a broker without auth_callout
+	// (TETHER_DEV_NO_AUTH style demo).
+	Identity *cli.Identity
+
+	// PIN is presented as `nats.Token(pin)` on every CONNECT in this
+	// process lifetime. Required exactly once per (sid, nid) — the
+	// first CONNECT binds the agent fp into agent_provisioning. After
+	// that the broker accepts re-connects without PIN, but presenting
+	// it again is harmless (auth_callout sees existing fp first).
+	PIN string
 
 	Logger *slog.Logger
 
@@ -138,9 +160,9 @@ func (a *Agent) Run(ctx context.Context) error {
 // Backoff reuses the same RegisterRetry knobs as register-retry — a single
 // pair of dials governs all transient-NATS-interaction backoff in v1.
 func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
-	connOpts := []nats.Option{
-		nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)),
-		nats.MaxReconnects(-1),
+	connOpts, err := a.buildConnOptions()
+	if err != nil {
+		return nil, err
 	}
 	backoff := a.cfg.RegisterRetryInitial
 	for attempt := 1; ; attempt++ {
@@ -155,6 +177,13 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 					"attempts", attempt)
 			}
 			return nc, nil
+		}
+		// Auth failures are NOT transient: a wrong PIN, an unprovisioned
+		// nid without --pin, or an nkey conflict will all fail every
+		// retry forever. Surface the message to the operator so they
+		// know what to fix instead of silently flapping.
+		if isAuthFailure(err) {
+			return nil, fmt.Errorf("agent: NATS auth rejected (%w); supply --pin on first run or verify session/nid", err)
 		}
 		a.cfg.Logger.Warn("agent: NATS connect failed; retrying",
 			"attempt", attempt, "err", err, "next_backoff", backoff)
@@ -271,6 +300,65 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 			}
 		}
 	}
+}
+
+// buildConnOptions assembles the nats.Options for this agent. With
+// Identity set, signs CONNECT challenges via the loaded nkey and presents
+// the auth_callout-aware Name. Without Identity, falls back to anonymous
+// CONNECT (P2-style / TETHER_DEV_NO_AUTH demos only).
+func (a *Agent) buildConnOptions() ([]nats.Option, error) {
+	opts := []nats.Option{nats.MaxReconnects(-1)}
+
+	if a.cfg.Identity == nil {
+		// Anonymous fallback: name with `/` separators is intentional
+		// — it does NOT match parseRole's `tether-agent:<sid>:<nid>`
+		// format, so a misconfigured prod broker (auth_callout ON,
+		// Identity nil) fails CONNECT immediately rather than landing
+		// on an unintended role.
+		opts = append(opts, nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)))
+		return opts, nil
+	}
+
+	id := a.cfg.Identity
+	seed := append([]byte(nil), id.Seed...)
+	sigCB := func(nonce []byte) ([]byte, error) {
+		kp, err := nkeys.FromSeed(seed)
+		if err != nil {
+			return nil, fmt.Errorf("agent: nkey from seed: %w", err)
+		}
+		defer kp.Wipe()
+		return kp.Sign(nonce)
+	}
+	opts = append(opts,
+		nats.Name(cli.AgentName(a.cfg.SID, a.cfg.NID)),
+		nats.Nkey(id.PublicKey, sigCB),
+	)
+	if a.cfg.PIN != "" {
+		opts = append(opts, nats.Token(a.cfg.PIN))
+	}
+	return opts, nil
+}
+
+// isAuthFailure detects nats-server auth-rejection messages. These come
+// across as plain `error` strings (not typed) — match on the substrings
+// nats-server emits for the relevant cases (auth_callout deny, expired
+// JWT, account mismatch). We deliberately keep the substring set small;
+// anything else is treated as transient and retried.
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, needle := range []string{
+		"Authorization Violation",
+		"authorization violation",
+		"nats: Authorization",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // readBootID returns the Linux per-boot UUID, or "" on non-Linux / error.

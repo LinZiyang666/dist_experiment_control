@@ -46,6 +46,35 @@ func EnsureIdentity(home string) (*Identity, error) {
 	return &Identity{Seed: seed, PublicKey: pub, Fingerprint: fp}, nil
 }
 
+// EnsureAgentIdentity loads (or generates + persists) the per-session agent
+// nkey at `<home>/agent/<sid>/keys/agent.nk`. Path layout per architecture
+// K.1; one nkey per `(machine, sid)` because a single host can run multiple
+// `tether agent --session <sid>` instances side-by-side.
+//
+// Caller (cmd/tether/agent.go) presents this nkey on CONNECT plus a
+// `tether-agent:<sid>:<nid>` Name; the broker auth_callout binds the nkey
+// to (sid, nid) on first PIN-bootstrap and re-validates thereafter.
+func EnsureAgentIdentity(home, sid string) (*Identity, error) {
+	keyPath := filepath.Join(home, "agent", sid, "keys", "agent.nk")
+	seed, err := os.ReadFile(keyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if seed, err = generateAndPersist(keyPath); err != nil {
+			return nil, fmt.Errorf("agent identity: generate: %w", err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("agent identity: read: %w", err)
+	}
+	pub, err := auth.PublicKeyFromSeed(seed)
+	if err != nil {
+		return nil, fmt.Errorf("agent identity: derive pub: %w", err)
+	}
+	fp, err := auth.FingerprintFromActor(pub)
+	if err != nil {
+		return nil, fmt.Errorf("agent identity: derive fp: %w", err)
+	}
+	return &Identity{Seed: seed, PublicKey: pub, Fingerprint: fp}, nil
+}
+
 func generateAndPersist(keyPath string) ([]byte, error) {
 	seed, err := auth.GenerateUserSeed()
 	if err != nil {

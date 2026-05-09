@@ -39,17 +39,26 @@ func TestOpenAppliesMigrations(t *testing.T) {
 func TestMigrationsAreIdempotent(t *testing.T) {
 	db := openTest(t)
 
+	// Snapshot the recorded count after the initial Open.
+	var before int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + migrationsTable).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+
 	// Re-running applyMigrations on the same DB must be a no-op.
 	if err := applyMigrations(db); err != nil {
 		t.Fatalf("second applyMigrations: %v", err)
 	}
 
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + migrationsTable).Scan(&n); err != nil {
+	var after int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + migrationsTable).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("expected exactly 1 migration recorded after re-apply, got %d", n)
+	if before != after {
+		t.Errorf("re-apply changed migration count: before=%d after=%d", before, after)
+	}
+	if before == 0 {
+		t.Error("expected at least one migration to be recorded after Open")
 	}
 }
 

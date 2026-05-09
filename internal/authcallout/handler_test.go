@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
@@ -88,6 +89,24 @@ func freshUserPub(t *testing.T) string {
 	return pub
 }
 
+// seedSessionWithPin inserts an ACTIVE sessions row whose pin_hash matches
+// the supplied raw PIN under auth.HashPIN, so subsequent agent CONNECTs in
+// a test can present that PIN to bootstrap.
+func seedSessionWithPin(t *testing.T, h *Handler, sid, pin string) {
+	t.Helper()
+	hash, err := auth.HashPIN(pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.DB.Exec(
+		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?, ?, ?, ?)`,
+		sid, sid, "SHA256:test-owner", hash,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHandleAllowsUnactivated(t *testing.T) {
 	h, _ := freshHandler(t)
 	ephemeral := freshUserPub(t)
@@ -161,24 +180,88 @@ func TestHandleDeniesActivatedNonMember(t *testing.T) {
 	}
 }
 
-// P3-round2 F1: agent role is hard-denied in auth_callout until P4 wires
-// real agent provisioning. Allowing it before then would let any client
-// self-declare as an agent in any session via the CONNECT name.
-func TestHandleAgentRoleIsDeniedUntilP4(t *testing.T) {
+// P4 F1: agent role is no longer hard-denied. Without provisioning AND
+// without a PIN it must still be rejected — the "anyone can claim any
+// agent slot" attack is blocked by requiring either prior PIN-bootstrap
+// or a fresh PIN.
+func TestHandleAgentRoleDeniedWithoutProvisioningAndPIN(t *testing.T) {
 	h, _ := freshHandler(t)
-	ephemeral := freshUserPub(t)
-	client := freshUserPub(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
 
-	respJWT, err := h.Handle(signedRequest(t, ephemeral, client, "tether-agent:lab:lab-1", ""))
+	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), freshUserPub(t),
+		"tether-agent:lab:lab-1", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
 	if resp.Error == "" {
-		t.Fatalf("agent role must be denied in P3; got allow with JWT %q", resp.Jwt)
+		t.Fatalf("agent without provisioning and without PIN must be denied; got allow")
 	}
-	if !strings.Contains(resp.Error, "agent role not provisioned") {
-		t.Errorf("expected denial reason to mention provisioning; got %q", resp.Error)
+	if !strings.Contains(resp.Error, "not provisioned") {
+		t.Errorf("expected denial to mention provisioning; got %q", resp.Error)
+	}
+}
+
+// PIN-bootstrap path: first connect with a valid PIN registers the agent;
+// a second connect without PIN succeeds because the (sid,nid)→fp binding
+// now exists.
+func TestHandleAgentRolePINBootstrapAndRebind(t *testing.T) {
+	h, _ := freshHandler(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
+
+	clientKp, _ := nkeys.CreateUser()
+	clientPub, _ := clientKp.PublicKey()
+
+	// Bootstrap: with PIN.
+	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), clientPub,
+		"tether-agent:lab:lab-1", "test-pin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
+	if resp.Error != "" {
+		t.Fatalf("bootstrap must succeed with valid PIN; got %q", resp.Error)
+	}
+
+	// Re-connect: no PIN.
+	respJWT2, err := h.Handle(signedRequest(t, freshUserPub(t), clientPub,
+		"tether-agent:lab:lab-1", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2, _ := jwt.DecodeAuthorizationResponseClaims(respJWT2)
+	if resp2.Error != "" {
+		t.Errorf("re-connect after PIN-bootstrap must succeed; got %q", resp2.Error)
+	}
+}
+
+// A different agent identity arriving with a valid PIN to a slot already
+// taken by another fp must be denied. PIN does NOT override the existing
+// (sid,nid)→fp binding — operator must explicitly revoke first.
+func TestHandleAgentRoleRejectsHijack(t *testing.T) {
+	h, _ := freshHandler(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
+
+	firstKp, _ := nkeys.CreateUser()
+	firstPub, _ := firstKp.PublicKey()
+	if _, err := h.Handle(signedRequest(t, freshUserPub(t), firstPub,
+		"tether-agent:lab:lab-1", "test-pin")); err != nil {
+		t.Fatal(err)
+	}
+
+	hijackerKp, _ := nkeys.CreateUser()
+	hijackerPub, _ := hijackerKp.PublicKey()
+	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), hijackerPub,
+		"tether-agent:lab:lab-1", "test-pin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
+	if resp.Error == "" {
+		t.Fatalf("hijack of an already-bound nid must be denied; got allow")
+	}
+	if !strings.Contains(resp.Error, "different agent identity") {
+		t.Errorf("expected denial to mention identity binding; got %q", resp.Error)
 	}
 }
 

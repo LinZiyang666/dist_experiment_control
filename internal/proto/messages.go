@@ -93,6 +93,15 @@ type ExecReq struct {
 	Env   map[string]string `json:"env,omitempty"`   // extra environment for the child
 	Cwd   string            `json:"cwd,omitempty"`   // working dir; empty = agent's
 	Stdin []byte            `json:"stdin,omitempty"` // small one-shot stdin payload
+
+	// ActorFP is broker-stamped at forward time (broker re-marshals the
+	// payload after C.1 §6 / membership checks pass; whatever ctl puts
+	// here is discarded). Agent reads it back into ProcStartedEvent so
+	// the resulting `processes.started_by_fp` row reflects the
+	// broker-parsed `by.<actor>` segment, not agent-supplied data.
+	// Architecture C.1 §4 (broker is the audit single-writer) — actor
+	// attribution must originate at the broker.
+	ActorFP string `json:"actor_fp,omitempty"`
 }
 
 // ExecChunk is what the agent publishes (one or many) on the reply
