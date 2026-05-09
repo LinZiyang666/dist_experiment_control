@@ -1,0 +1,166 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
+	"github.com/spf13/cobra"
+)
+
+// newExposeCmd registers `tether expose` and `tether expose rm`.
+//
+// `tether expose <node> --local 8888 --name jupyter` allocates a public
+// port from the broker's [14000-14999] band, plumbs the token to the
+// agent, and prints the resulting URL ("http://<broker>:<port>").
+// Architecture F.3 / F.4 walks through the wire flow.
+//
+// `tether expose rm --name jupyter` reverses it.
+func newExposeCmd() *cobra.Command {
+	var (
+		natsURL string
+		home    string
+		local   int
+		name    string
+	)
+	cmd := &cobra.Command{
+		Use:   "expose <node>",
+		Short: "Expose a local port on <node> through the broker (P6)",
+		Long: `tether expose — open a TCP tunnel from a public broker port to a
+local port on the named agent node. After the call returns, anyone with
+network access to the broker can reach <local-port> on the agent at
+"http://<broker>:<allocated-port>".
+
+The broker assigns a port from its configured band (default 14000-14999)
+and generates a one-time token. Tokens are persisted on the agent at
+~/.tether/agent/<sid>/state.json so frpc auto-reconnects on agent
+restart without a re-expose.
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sid := cli.ReadCurrentSession(home)
+			if sid == "" {
+				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+			}
+			nid := args[0]
+			if name == "" {
+				return fmt.Errorf("--name is required (logical proxy name; used by `expose rm`)")
+			}
+			if local <= 0 || local > 65535 {
+				return fmt.Errorf("--local must be 1..65535, got %d", local)
+			}
+
+			id, err := cli.EnsureIdentity(home)
+			if err != nil {
+				return err
+			}
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			if err != nil {
+				return fmt.Errorf("expose: connect: %w", err)
+			}
+			defer nc.Close()
+
+			body, err := json.Marshal(proto.ExposeReq{Name: name, LocalPort: local})
+			if err != nil {
+				return err
+			}
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+			defer cancel()
+
+			subj := proto.SubjCmdBy(sid, id.PublicKey, nid, "expose")
+			respMsg, err := nc.RequestWithContext(ctx, subj, body)
+			if err != nil {
+				return fmt.Errorf("expose: request: %w", err)
+			}
+			var resp proto.ExposeResp
+			if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+				return fmt.Errorf("expose: malformed reply: %w", err)
+			}
+			if resp.Code != "" {
+				return fmt.Errorf("expose: %s (%s)", resp.Code, resp.Error)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"exposed: http://%s:%d → %s:%d  (name=%s)\n",
+				resp.PublicHost, resp.Port, nid, local, resp.Name)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().IntVar(&local, "local", 0, "local port on the agent to expose (required)")
+	cmd.Flags().StringVar(&name, "name", "", "logical proxy name (required; used by `expose rm`)")
+
+	cmd.AddCommand(newExposeRmCmd())
+	return cmd
+}
+
+func newExposeRmCmd() *cobra.Command {
+	var (
+		natsURL string
+		home    string
+		nidArg  string
+		name    string
+	)
+	cmd := &cobra.Command{
+		Use:   "rm <node>",
+		Short: "Free a previously-exposed port (P6)",
+		Long: `tether expose rm <node> --name jupyter — reverse a prior expose. The
+public port is immediately returned to the pool and the agent's frpc
+proxy is dropped. Idempotent: removing a non-existent name returns an
+error you can ignore in scripts.
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sid := cli.ReadCurrentSession(home)
+			if sid == "" {
+				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+			}
+			nid := args[0]
+			_ = nidArg
+			if name == "" {
+				return fmt.Errorf("--name is required")
+			}
+
+			id, err := cli.EnsureIdentity(home)
+			if err != nil {
+				return err
+			}
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			if err != nil {
+				return fmt.Errorf("expose rm: connect: %w", err)
+			}
+			defer nc.Close()
+
+			body, err := json.Marshal(proto.ExposeRmReq{Name: name})
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			defer cancel()
+			subj := proto.SubjCmdBy(sid, id.PublicKey, nid, "expose-rm")
+			respMsg, err := nc.RequestWithContext(ctx, subj, body)
+			if err != nil {
+				return fmt.Errorf("expose rm: request: %w", err)
+			}
+			var resp proto.ExposeRmResp
+			if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+				return fmt.Errorf("expose rm: malformed reply: %w", err)
+			}
+			if !resp.OK {
+				return fmt.Errorf("expose rm: %s (%s)", resp.Code, resp.Error)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"freed: %s on %s (port %d back in pool)\n", name, nid, resp.Port)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().StringVar(&name, "name", "", "logical proxy name to free (required)")
+	return cmd
+}

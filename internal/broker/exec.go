@@ -7,6 +7,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -214,7 +215,7 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
 		return
 	}
-	out := make([]proto.PsEntry, 0, len(procs))
+	procOut := make([]proto.PsEntry, 0, len(procs))
 	for _, p := range procs {
 		entry := proto.PsEntry{
 			PID:         p.PID,
@@ -230,9 +231,28 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		if p.ExitCode != nil {
 			entry.ExitCode = *p.ExitCode
 		}
-		out = append(out, entry)
+		procOut = append(procOut, entry)
 	}
-	b.replyJSON(msg, proto.PsResp{Processes: out})
+
+	// P6 / architecture F.8 — same query also returns the ports.
+	ports, err := port.ListBySession(b.cfg.DB, sid)
+	if err != nil {
+		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	portOut := make([]proto.PsPortEntry, 0, len(ports))
+	for _, pa := range ports {
+		portOut = append(portOut, proto.PsPortEntry{
+			Port:        pa.Port,
+			Name:        pa.Name,
+			NID:         pa.NID,
+			LocalPort:   pa.LocalPort,
+			State:       string(pa.State),
+			CreatedByFP: pa.CreatedByFP,
+			CreatedAt:   pa.CreatedAt,
+		})
+	}
+	b.replyJSON(msg, proto.PsResp{Processes: procOut, Ports: portOut})
 }
 
 // splitDot exists so we don't import "strings" just for one Split call

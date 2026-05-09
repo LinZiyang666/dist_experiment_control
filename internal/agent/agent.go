@@ -60,6 +60,19 @@ type Config struct {
 	// it again is harmless (auth_callout sees existing fp first).
 	PIN string
 
+	// Home is the agent's per-machine config root (defaults to
+	// cli.DefaultHome()). state.json lives at
+	// <Home>/agent/<sid>/state.json (architecture K.1). When empty
+	// state persistence is disabled — fine for in-process tests.
+	Home string
+
+	// ExposeAdapter, if non-nil, is invoked from the expose /
+	// expose-rm forwarded handlers to add or drop frp proxies.
+	// Production agents inject the real frp-backed adapter (P6-6);
+	// in-process control-plane tests leave it nil so they exercise
+	// only the SQLite + state.json path without standing up frp.
+	ExposeAdapter ExposeAdapter
+
 	Logger *slog.Logger
 
 	// HeartbeatInterval defaults to 5 seconds (architecture / requirements §6.5).
@@ -90,6 +103,11 @@ type Agent struct {
 	// and pruned right before the agent publishes RunChunk{Kind:exit}.
 	procs   map[string]*pty.Session
 	procsMu sync.Mutex
+
+	// stateStore persists per-(sid, machine) data — currently the
+	// expose port_tokens table — to ~/.tether/agent/<sid>/state.json.
+	// Nil when Config.Home is empty (in-process tests).
+	stateStore *stateStore
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -119,7 +137,11 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.RegisterRetryMax == 0 {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
-	return &Agent{cfg: cfg, procs: map[string]*pty.Session{}}, nil
+	a := &Agent{cfg: cfg, procs: map[string]*pty.Session{}}
+	if cfg.Home != "" {
+		a.stateStore = newStateStore(cfg.Home, cfg.SID)
+	}
+	return a, nil
 }
 
 // Run is the agent's main loop:
@@ -154,7 +176,34 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer func() { _ = subFwd.Unsubscribe() }()
 
+	// Re-establish frp proxies for any port_tokens persisted from a
+	// previous run (architecture F.6: agent restart → frpc rebuilds
+	// proxies from state.json + present token; broker reconciles via
+	// the token_hash already in port_allocations). No-op when state
+	// store or adapter is absent.
+	a.replayPortsFromState()
+
 	return a.heartbeatLoop(ctx, nc)
+}
+
+func (a *Agent) replayPortsFromState() {
+	if a.stateStore == nil || a.cfg.ExposeAdapter == nil {
+		return
+	}
+	sf, err := a.stateStore.load()
+	if err != nil {
+		a.cfg.Logger.Warn("agent: state.json load on boot", "err", err)
+		return
+	}
+	for _, p := range sf.PortTokens {
+		if err := a.cfg.ExposeAdapter.AddProxy(p); err != nil {
+			a.cfg.Logger.Warn("agent: replay proxy",
+				"err", err, "name", p.Name, "port", p.Port)
+			continue
+		}
+		a.cfg.Logger.Info("agent: replayed expose",
+			"name", p.Name, "port", p.Port, "local", p.LocalPort)
+	}
 }
 
 // connectNATS retries nats.Connect on transient failures (server not up

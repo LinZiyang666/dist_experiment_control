@@ -5,7 +5,35 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P5 complete**). Adds interactive PTY mode on top of P4:
+Pre-alpha (phase **P6 complete**). Adds the data plane (`expose` + reverse
+TCP tunnel) on top of P5:
+
+- `tether expose <node> --local 8888 --name jupyter` allocates a
+  public port from the broker's [14000-14999] band, generates a
+  one-time token, plumbs it to the agent, and prints the URL
+  (`http://<broker>:14022`). The agent's `internal/tunnel` client opens
+  a yamux session to the broker over the configured tunnel control
+  port (default `:7000`); when external traffic hits 14022, broker
+  multiplexes a new stream over the session and the agent bridges it
+  to its local 8888.
+- `tether expose rm <node> --name jupyter` immediately tears down the
+  proxy and returns the public port number to the pool.
+- `tether ps` upgrades to the F.8 unified view (PROCESSES + PORTS in
+  one screen).
+- `internal/port` owns the `port_allocations` table; broker-side
+  reconciler tick promotes `ALLOCATED → REVOKED` for ports owned by
+  long-OFFLINE nodes (architecture D.4 / F.6, default 15min).
+- Agent persists `(name, port, local_port, token)` rows to
+  `~/.tether/agent/<sid>/state.json` (architecture I.2 / K.1, mode
+  0600, atomic tmp+rename) so the tunnel auto-reconnects on agent
+  restart without a re-expose.
+- Architecture deviation: spec calls for embedding the `frp` Go
+  library and shipping `frpc` as a subprocess; we use a minimal
+  in-process yamux-over-TCP tunnel (`internal/tunnel`, ~300 LOC) for
+  identical behavior with vastly smaller dep footprint. Swappable if
+  frp's wider feature set (HTTP vhost, kcp, web admin) is ever needed.
+
+P5 features still apply:
 
 - `tether run <node> -- <argv>` runs argv interactively on the named
   agent node with a PTY allocated. Local terminal goes into raw mode
@@ -25,9 +53,9 @@ Pre-alpha (phase **P5 complete**). Adds interactive PTY mode on top of P4:
 - `tether ps [-a]` lists processes in the active session (RUNNING by
   default; `-a` includes EXITED).
 - broker forwards `cmd.by.<actor>.node.<nid>.<verb>.req` →
-  `cmd.node.<nid>.<verb>.req.forwarded` for verb ∈ {exec, run, kill}
-  while preserving the original reply inbox; agent only subscribes to
-  `.forwarded` (architecture C.4).
+  `cmd.node.<nid>.<verb>.req.forwarded` for verb ∈ {exec, run, kill,
+  expose, expose-rm} while preserving the original reply inbox; agent
+  only subscribes to `.forwarded` (architecture C.4).
 - `internal/proc` owns the SQLite process row, written from agent's
   `ev.proc.<pid>.{started,exit}` events. broker also writes
   `audit.call` / `audit.proc` (single-writer rule, C.1 §4).
@@ -53,7 +81,7 @@ to both `tether agent` and the ctl commands) to connect anonymously
 to a vanilla `nats-server`. NATS-level identity enforcement is
 bypassed in that mode; never use it in production.
 
-Port `expose` (frp data plane for jupyter / tensorboard) lands in P6.
+Audit + history (JetStream `history-<sid>`) lands in P7.
 
 ## Build
 

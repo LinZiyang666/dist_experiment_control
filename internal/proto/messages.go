@@ -157,9 +157,23 @@ type PsEntry struct {
 }
 
 type PsResp struct {
-	Processes []PsEntry `json:"processes"`
-	Code      string    `json:"code,omitempty"`
-	Error     string    `json:"error,omitempty"`
+	Processes []PsEntry      `json:"processes"`
+	Ports     []PsPortEntry  `json:"ports,omitempty"`
+	Code      string         `json:"code,omitempty"`
+	Error     string         `json:"error,omitempty"`
+}
+
+// PsPortEntry is the read-side projection of one port_allocations row
+// for `tether ps`. Architecture F.8 — the unified view shows both
+// processes and ports on the same screen.
+type PsPortEntry struct {
+	Port        int       `json:"port"`
+	Name        string    `json:"name"`
+	NID         string    `json:"nid"`
+	LocalPort   int       `json:"local_port"`
+	State       string    `json:"state"` // ALLOCATED | REVOKED | FREED
+	CreatedByFP string    `json:"created_by_fp,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // RunReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.run.req.
@@ -255,5 +269,98 @@ type KillResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"`  // pid_unknown | signal_failed | not_a_member | ...
 	Error string `json:"error,omitempty"`
+}
+
+// ExposeReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.expose.req.
+//
+// `tether expose --local 8888 --name jupyter` packages this and sends.
+// broker allocates a public port from the [14000-14999] band, generates
+// a 32-byte URL-safe token, persists (port, sha256(token), state=
+// ALLOCATED) into port_allocations, and replies with ExposeResp{Port,
+// Token, PublicHost, Name}. The same token is then forwarded to the
+// agent inside ExposeForwardedReq so frpc can present it to frps.
+//
+// Architecture D.4 / F.3 / F.4.
+type ExposeReq struct {
+	Name      string `json:"name"`
+	LocalPort int    `json:"local_port"`
+
+	// ActorFP — broker-stamped at forward time; same convention as
+	// ExecReq.ActorFP. ctl-supplied value is discarded.
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// ExposeResp — broker pub on the expose.req reply inbox.
+type ExposeResp struct {
+	Port       int    `json:"port,omitempty"`        // public port assigned (14000-14999)
+	Token      string `json:"token,omitempty"`       // raw token (only ever sent here, not stored on broker)
+	PublicHost string `json:"public_host,omitempty"` // operator-friendly URL host (e.g. broker.example.com)
+	Name       string `json:"name,omitempty"`        // echoed back
+
+	Code  string `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | ...
+	Error string `json:"error,omitempty"`
+}
+
+// ExposeForwardedReq — broker pub on
+// s.<sid>.cmd.node.<nid>.expose.req.forwarded. Agent uses the supplied
+// (Port, Token, LocalPort, Name) to add a proxy to its frpc instance
+// and persist the entry to ~/.tether/agent/<sid>/state.json so frpc
+// can auto-reconnect on agent restart (architecture F.4 storage rule).
+type ExposeForwardedReq struct {
+	Name      string `json:"name"`
+	Port      int    `json:"port"`
+	LocalPort int    `json:"local_port"`
+	Token     string `json:"token"`
+	ActorFP   string `json:"actor_fp"`
+}
+
+// ExposeForwardedResp — agent pub on the expose.req.forwarded reply
+// inbox. broker waits for this so it can fold "agent agreed to start
+// frpc proxy" into the original expose.req reply latency. OK=false means
+// agent rejected (already-have-proxy / frpc start failed / etc.) and
+// the broker should mark the row FREED (since no traffic will flow).
+type ExposeForwardedResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`  // already_exposed | frpc_failed | local_port_unreachable | ...
+	Error string `json:"error,omitempty"`
+}
+
+// ExposeRmReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.expose-rm.req.
+//
+// `tether expose rm --name jupyter` packages this. broker looks up the
+// ALLOCATED row by (sid, name), marks it FREED, returns the port to
+// the pool, forwards a drop instruction to the agent, and replies OK.
+type ExposeRmReq struct {
+	Name string `json:"name"`
+
+	ActorFP string `json:"actor_fp,omitempty"` // broker-stamped
+}
+
+// ExposeRmResp — broker pub on the expose-rm.req reply inbox.
+type ExposeRmResp struct {
+	OK    bool   `json:"ok"`
+	Port  int    `json:"port,omitempty"` // the port that was just freed (informational)
+	Code  string `json:"code,omitempty"` // not_found | not_a_member | ...
+	Error string `json:"error,omitempty"`
+}
+
+// ExposeRmForwardedReq — broker pub on
+// s.<sid>.cmd.node.<nid>.expose-rm.req.forwarded. Agent removes the
+// proxy from frpc and prunes the corresponding state.json entry.
+type ExposeRmForwardedReq struct {
+	Name string `json:"name"`
+	Port int    `json:"port"`
+}
+
+// PortEvent — broker pub on s.<sid>.ev.port.<port>.<kind>.
+// kind ∈ {allocated, revoked, freed}. Members subscribe to react to
+// port-state changes (e.g. update local CLI ps cache).
+type PortEvent struct {
+	Port      int       `json:"port"`
+	Name      string    `json:"name,omitempty"`
+	NID       string    `json:"nid,omitempty"`
+	LocalPort int       `json:"local_port,omitempty"`
+	Kind      string    `json:"kind"` // allocated | revoked | freed
+	Ts        time.Time `json:"ts"`
 }
 

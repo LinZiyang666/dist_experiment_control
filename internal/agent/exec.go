@@ -47,6 +47,10 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 		go a.handleRunForwarded(nc, msg)
 	case "kill":
 		go a.handleKillForwarded(nc, msg)
+	case "expose":
+		go a.handleExposeForwarded(nc, msg)
+	case "expose-rm":
+		go a.handleExposeRmForwarded(nc, msg)
 	default:
 		a.cfg.Logger.Warn("agent: unknown forwarded verb", "verb", verb)
 	}

@@ -17,9 +17,12 @@ import (
 
 func newServeCmd() *cobra.Command {
 	var (
-		natsURL       string
-		dbPath        string
-		authSeedsDir  string
+		natsURL          string
+		dbPath           string
+		authSeedsDir     string
+		tunnelCtrlAddr   string
+		tunnelPublicHost string
+		publicHost       string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -33,9 +36,12 @@ func newServeCmd() *cobra.Command {
 			defer func() { _ = db.Close() }()
 
 			cfg := broker.Config{
-				NATSURL: natsURL,
-				DB:      db,
-				Logger:  slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				NATSURL:           natsURL,
+				DB:                db,
+				Logger:            slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				PublicHost:        publicHost,
+				TunnelControlAddr: tunnelCtrlAddr,
+				TunnelPublicHost:  tunnelPublicHost,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -78,6 +84,12 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dbPath, "db", "./tether.db", "SQLite database file (use \":memory:\" for ephemeral)")
 	cmd.Flags().StringVar(&authSeedsDir, "auth-callout-seeds-dir", "",
 		"directory containing broker.nk + account.nk for auth_callout (P3+ secure mode); empty = dev/P2 mode")
+	cmd.Flags().StringVar(&publicHost, "public-host", "localhost",
+		"DNS name printed in expose URLs (operator-facing)")
+	cmd.Flags().StringVar(&tunnelCtrlAddr, "tunnel-addr", "0.0.0.0:7000",
+		"reverse-TCP tunnel control listener (host:port); empty disables P6 data plane")
+	cmd.Flags().StringVar(&tunnelPublicHost, "tunnel-public-host", "0.0.0.0",
+		"bind address for the public per-port tunnel listeners (default 0.0.0.0)")
 	return cmd
 }
 

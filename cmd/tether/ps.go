@@ -23,12 +23,10 @@ func newPsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ps",
 		Short: "List managed processes in the active session",
-		Long: `tether ps — list processes in the active session (TETHER_SESSION env
-or current_session file). RUNNING by default; pass -a to also show
-EXITED rows.
-
-P4 scope: processes only. `+"`expose`-allocated ports show up under "+
-			"`tether ps` together with processes once P6 lands.",
+		Long: `tether ps — list processes AND exposed ports in the active session
+(TETHER_SESSION env or current_session file). RUNNING-only by default;
+pass -a to also show EXITED processes. Architecture F.8 — unified
+view.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sid := cli.ReadCurrentSession(home)
@@ -60,23 +58,51 @@ P4 scope: processes only. `+"`expose`-allocated ports show up under "+
 				return errors.New("ps rejected: " + resp.Code + " " + resp.Error)
 			}
 
-			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "PID\tNODE\tSTATE\tEXIT\tSTARTED\tCMD")
 			now := time.Now()
+			out := cmd.OutOrStdout()
+
+			_, _ = fmt.Fprintln(out, "PROCESSES")
+			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw, "  PID\tNODE\tSTATE\tEXIT\tSTARTED\tCMD")
+			anyProc := false
 			for _, p := range resp.Processes {
 				if p.Status != "RUNNING" && !showAll {
 					continue
 				}
+				anyProc = true
 				exit := "-"
 				if p.Status == "EXITED" {
 					exit = fmt.Sprintf("%d", p.ExitCode)
 				}
-				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n",
 					p.PID, p.NID, p.Status, exit,
 					humanizeAgo(now, p.StartedAt),
 					argvToCmd(p.Argv))
 			}
-			return tw.Flush()
+			if !anyProc {
+				_, _ = fmt.Fprintln(tw, "  (none)")
+			}
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+
+			_, _ = fmt.Fprintln(out, "\nPORTS")
+			tw2 := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw2, "  NAME\tNODE\tLOCAL\tPUBLIC\tSTATE\tCREATED")
+			anyPort := false
+			for _, p := range resp.Ports {
+				if p.State != "ALLOCATED" && !showAll {
+					continue
+				}
+				anyPort = true
+				_, _ = fmt.Fprintf(tw2, "  %s\t%s\t:%d\t:%d\t%s\t%s\n",
+					p.Name, p.NID, p.LocalPort, p.Port, p.State,
+					humanizeAgo(now, p.CreatedAt))
+			}
+			if !anyPort {
+				_, _ = fmt.Fprintln(tw2, "  (none)")
+			}
+			return tw2.Flush()
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")

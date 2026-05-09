@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
 )
 
@@ -59,7 +61,71 @@ type Config struct {
 	// permissions invariant. When nil (P2 default), the broker connects
 	// anonymously and no auth_callout is installed.
 	AuthCallout *AuthCalloutConfig
+
+	// PublicHost is the operator-facing DNS name printed in expose
+	// URLs (e.g. "tether.example.com"). Empty defaults to "localhost"
+	// — fine for tests, useless in prod.
+	PublicHost string
+
+	// PortBandLow / PortBandHigh override the public port range
+	// (architecture A.3 / F.3). Defaults 14000-14999.
+	PortBandLow  int
+	PortBandHigh int
+
+	// PortRevokeAfter is how long a port stays ALLOCATED after its
+	// owning node has been OFFLINE before the reconciler revokes it
+	// (architecture D.4 / F.6). Default 15min; tests override down.
+	PortRevokeAfterDur time.Duration
+
+	// ExposeForwardTimeoutDur is the broker-side timeout for the
+	// expose.req → agent ACK request/reply. Default 5s; tests
+	// override down.
+	ExposeForwardTimeoutDur time.Duration
+
+	// TunnelControlAddr is where the broker's reverse-TCP tunnel
+	// server listens for agent control connections. Default
+	// ":7000" (matches architecture A.3 frp control_listen). Empty
+	// disables the tunnel server entirely (control plane still
+	// works; expose just won't actually forward TCP traffic).
+	TunnelControlAddr string
+
+	// TunnelPublicHost is the bind address for the public per-port
+	// listeners the tunnel server opens on demand. Default
+	// "0.0.0.0" (publicly reachable). Tests use "127.0.0.1".
+	TunnelPublicHost string
 }
+
+// PortAllocCfg returns the internal/port.Config derived from this
+// broker.Config.
+func (c *Config) PortAllocCfg() *port.Config {
+	cfg := &port.Config{Now: c.Now}
+	if c.PortBandLow > 0 {
+		cfg.BandLow = c.PortBandLow
+	}
+	if c.PortBandHigh > 0 {
+		cfg.BandHigh = c.PortBandHigh
+	}
+	return cfg
+}
+
+// PortRevokeAfter returns the configured ALLOCATED→REVOKED threshold,
+// defaulting to 15min if unset.
+func (c *Config) PortRevokeAfter() time.Duration {
+	if c.PortRevokeAfterDur > 0 {
+		return c.PortRevokeAfterDur
+	}
+	return 15 * time.Minute
+}
+
+// ExposeForwardTimeout returns the configured broker→agent ACK
+// timeout, defaulting to 5s.
+func (c *Config) ExposeForwardTimeout() time.Duration {
+	if c.ExposeForwardTimeoutDur > 0 {
+		return c.ExposeForwardTimeoutDur
+	}
+	return 5 * time.Second
+}
+
 
 // Broker holds the running state of one `tether serve` instance.
 type Broker struct {
@@ -69,6 +135,11 @@ type Broker struct {
 	// after shutdown. Used by helpers (audit pubs) that need to publish
 	// outside the request handler scope.
 	nc *nats.Conn
+
+	// tunnelSrv is the reverse-TCP tunnel server. Non-nil only when
+	// Config.TunnelControlAddr is set. Authorizes agent REGISTERs by
+	// looking up port_allocations.token_hash.
+	tunnelSrv *tunnel.Server
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -140,6 +211,17 @@ func (b *Broker) Run(ctx context.Context) error {
 		defer func() { _ = subAuth.Unsubscribe() }()
 	}
 
+	if b.cfg.TunnelControlAddr != "" {
+		host := b.cfg.TunnelPublicHost
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		b.tunnelSrv = tunnel.NewServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
+		if err := b.tunnelSrv.Start(ctx); err != nil {
+			return err
+		}
+	}
+
 	subRegister, err := nc.Subscribe(
 		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
 		b.handleRegister,
@@ -178,6 +260,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.kill.req",
 			func(msg *nats.Msg) { b.handleKillReq(nc, msg) }},
 		{proto.SubjectPrefix + ".s.*.pty.*.failed", b.handlePtyFailed},
+		// P6 data-plane control (expose / expose-rm).
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.expose.req",
+			func(msg *nats.Msg) { b.handleExposeReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.expose-rm.req",
+			func(msg *nats.Msg) { b.handleExposeRmReq(nc, msg) }},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {
@@ -202,14 +289,16 @@ func (b *Broker) Run(ctx context.Context) error {
 			b.cfg.Logger.Info("broker: shutting down")
 			return ctx.Err()
 		case <-ticker.C:
-			n, err := node.ReconcileStates(b.cfg.DB, b.cfg.Now(),
+			now := b.cfg.Now()
+			n, err := node.ReconcileStates(b.cfg.DB, now,
 				b.cfg.StaleAfter, b.cfg.OfflineAfter)
 			if err != nil {
 				b.cfg.Logger.Warn("broker: reconcile failed", "err", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				b.cfg.Logger.Info("broker: state transitions", "count", n)
+			}
+			if revoked := b.reconcilePorts(now); revoked > 0 {
+				b.cfg.Logger.Info("broker: port revocations", "count", revoked)
 			}
 		}
 	}
