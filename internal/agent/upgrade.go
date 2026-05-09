@@ -1,0 +1,239 @@
+// Agent side of architecture J.4 (b) — `tether node upgrade`.
+//
+// Pre-conditions enforced by the broker (see broker/upgrade.go):
+// owner-only, URL allowlist, sha256 sanity, proto match. This file
+// re-checks the URL allowlist on the agent side as defense in
+// depth (J.4 § 安全约束: "agent 收到 url 后本地再验一次白名单"),
+// then downloads, verifies, and atomically replaces the running
+// binary. Restart is the supervisor's job (systemd unit Restart=
+// on-failure / setsid wrapper); architecture J.4 step 5 says the
+// agent disconnects NATS so the new process's G.1 reconcile picks
+// up the slack.
+package agent
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
+)
+
+// UpgradeURLAllowlist is the agent-side defense-in-depth allowlist.
+// Defaults to nil (= reject everything) if the operator forgets to
+// configure it; the broker ALWAYS double-gates the same allowlist,
+// so this is belt-and-suspenders for an attacker who somehow
+// reached the forwarded subject directly.
+var defaultAgentURLAllowlist = []string{
+	"https://github.com/LinZiyang666/tether/releases/",
+}
+
+// upgradeFetchTimeout bounds the HTTP GET round-trip. v1 ships
+// ~10MB binaries; 30s covers reasonable broadband + connection setup.
+const upgradeFetchTimeout = 30 * time.Second
+
+func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
+	if msg.Reply == "" {
+		a.cfg.Logger.Warn("agent: upgrade.req.forwarded without Reply")
+		return
+	}
+	var req proto.UpgradeForwardedReq
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code: "json_parse", Error: err.Error(),
+		})
+		return
+	}
+
+	allow := a.cfg.UpgradeURLAllowlist
+	if len(allow) == 0 {
+		allow = defaultAgentURLAllowlist
+	}
+	if !urlAllowed(req.URL, allow) {
+		a.cfg.Logger.Warn("agent: upgrade URL rejected by local allowlist", "url", req.URL)
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code:  "url_not_allowed_local",
+			Error: req.URL,
+		})
+		return
+	}
+
+	body, err := fetchURL(req.URL, upgradeFetchTimeout)
+	if err != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code: "download_failed", Error: err.Error(),
+		})
+		return
+	}
+	got := sha256OfBytes(body)
+	if got != strings.ToLower(req.SHA256) {
+		a.cfg.Logger.Warn("agent: upgrade sha256 mismatch",
+			"want", req.SHA256, "got", got, "url", req.URL)
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code:  "sha256_mismatch",
+			Error: fmt.Sprintf("got %s want %s", got, req.SHA256),
+		})
+		return
+	}
+
+	exePath := a.cfg.UpgradeExecutablePath
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil {
+			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+				Code: "self_path", Error: err.Error(),
+			})
+			return
+		}
+	}
+	newVersion, err := installNewBinary(body, exePath)
+	if err != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code: "install_failed", Error: err.Error(),
+		})
+		return
+	}
+
+	a.cfg.Logger.Info("agent: upgrade installed; exiting for supervisor restart",
+		"new_version", newVersion, "exe", exePath)
+	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+		OK: true, BinaryReplaced: true, NewVersion: newVersion,
+	})
+
+	// Step 5 of J.4: agent disconnects so the supervisor (systemd
+	// Restart=on-failure / setsid nohup wrapper) launches the new
+	// binary, which then runs G.1 reconcile against the broker.
+	// Tests inject UpgradeNoExit=true so the in-process agent
+	// doesn't kill the test runner.
+	if !a.cfg.UpgradeNoExit {
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			os.Exit(0)
+		}()
+	}
+}
+
+func (a *Agent) replyUpgradeForwarded(msg *nats.Msg, resp proto.UpgradeForwardedResp) {
+	if msg.Reply == "" {
+		return
+	}
+	body, _ := json.Marshal(&resp)
+	_ = msg.Respond(body)
+}
+
+// urlAllowed mirrors broker.URLAllowed; duplicated locally so the
+// agent package doesn't import broker (would be a layering
+// violation: agent is a leaf in production deployments). Empty
+// allow → reject.
+func urlAllowed(url string, allow []string) bool {
+	if len(allow) == 0 {
+		return false
+	}
+	for _, p := range allow {
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(url, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchURL downloads body bytes via HTTP GET with a hard timeout.
+// Returns an error for any non-2xx or transport failure.
+func fetchURL(url string, timeout time.Duration) ([]byte, error) {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("http get: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("http status %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func sha256OfBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// installNewBinary atomically replaces dst with the contents of
+// the freshly-downloaded tarball. The release tarball layout
+// (build/goreleaser.yaml § archives) is one file `tether` at the
+// archive root; we extract that into a sibling tmp file, chmod
+// +x, then rename onto dst. Rename is atomic on the same fs;
+// running processes keep their open inode handle (the new binary
+// only loads on the next exec), so this is safe to do while the
+// agent is still serving the upgrade reply.
+//
+// Returns the new tether version string parsed from the binary
+// (best-effort via `tether version`); on parse failure the field
+// stays empty but the install is still considered a success.
+func installNewBinary(tarball []byte, dst string) (string, error) {
+	tmpDir, err := os.MkdirTemp(filepath.Dir(dst), ".tether-upgrade-*")
+	if err != nil {
+		return "", fmt.Errorf("mkdir tmp: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	// Write tarball to disk so we can hand it to `tar` (avoids us
+	// pulling in archive/tar + compress/gzip; the host always has
+	// tar(1)).
+	tarPath := filepath.Join(tmpDir, "release.tar.gz")
+	if err := os.WriteFile(tarPath, tarball, 0o600); err != nil {
+		return "", fmt.Errorf("write tarball: %w", err)
+	}
+	if err := runTar(tarPath, tmpDir); err != nil {
+		return "", err
+	}
+	binPath := filepath.Join(tmpDir, "tether")
+	if _, err := os.Stat(binPath); err != nil {
+		return "", fmt.Errorf("tarball missing tether binary: %w", err)
+	}
+	if err := os.Chmod(binPath, 0o755); err != nil {
+		return "", fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(binPath, dst); err != nil {
+		return "", fmt.Errorf("atomic rename: %w", err)
+	}
+	return readVersionString(dst), nil
+}
+
+func runTar(tarPath, destDir string) error {
+	cmd := exec.Command("tar", "-xzf", tarPath, "-C", destDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tar -xzf: %w: %s", err, string(out))
+	}
+	return nil
+}
+
+// readVersionString runs `<exe> version` and returns the first line
+// trimmed. Failure is non-fatal — install still succeeded; we just
+// won't have the new version number to report.
+func readVersionString(exe string) string {
+	out, err := exec.Command(exe, "version").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}

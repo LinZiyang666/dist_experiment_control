@@ -437,3 +437,53 @@ type PortEvent struct {
 	Ts        time.Time `json:"ts"`
 }
 
+// UpgradeReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.upgrade.req
+// (architecture J.4 (b) "主动触发"). Only the session owner can issue
+// this; the broker rejects non-owner callers before forwarding.
+//
+// URL is the absolute https:// pointer to the new tether binary
+// tarball; SHA256 is the hex digest of the tarball (NOT of the
+// extracted binary — agent verifies before extraction). ProtoVersion
+// MUST match the current tetherd ProtoVersion: J.4 § proto bump
+// requires tetherd-side reinstall (J.3 scenario 2), not this verb.
+type UpgradeReq struct {
+	URL          string `json:"url"`
+	SHA256       string `json:"sha256"`
+	ProtoVersion int    `json:"proto_version"`
+
+	// ActorFP — broker-stamped at forward time (same convention
+	// as ExecReq.ActorFP). ctl-supplied value is discarded.
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// UpgradeResp — broker pub on the upgrade.req reply inbox.
+// OK=true means tetherd accepted the request and forwarded it to
+// the agent; the agent's actual download/verify/restart happens
+// asynchronously and surfaces via audit.proc / sys.events.
+type UpgradeResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// UpgradeForwardedReq — broker pub on
+// s.<sid>.cmd.node.<nid>.upgrade.req.forwarded. Agent uses (URL,
+// SHA256) to fetch + verify + atomically replace its own binary.
+type UpgradeForwardedReq struct {
+	URL     string `json:"url"`
+	SHA256  string `json:"sha256"`
+	ActorFP string `json:"actor_fp"`
+}
+
+// UpgradeForwardedResp — agent pub on the forwarded inbox. OK=true
+// means the binary has been verified and atomically renamed into
+// place; the agent will exit shortly so its supervisor (systemd
+// unit / setsid nohup wrapper) can launch the new binary.
+type UpgradeForwardedResp struct {
+	OK              bool   `json:"ok"`
+	Code            string `json:"code,omitempty"`
+	Error           string `json:"error,omitempty"`
+	NewVersion      string `json:"new_version,omitempty"`      // best-effort, parsed from tarball
+	BinaryReplaced  bool   `json:"binary_replaced,omitempty"`  // true when chmod+rename succeeded
+}
+

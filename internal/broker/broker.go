@@ -126,6 +126,21 @@ type Config struct {
 	// production sets it to /var/run/tether/admin.sock and the
 	// adminsock package creates it 0600 under a 0700 parent dir.
 	AdminSocketPath string
+
+	// UpgradeURLAllowlist is the set of URL prefixes
+	// `tether node upgrade` will accept (architecture J.4 §
+	// "url 白名单"). Default empty = `tether node upgrade` is
+	// REJECTED entirely (the allowlist is mandatory; we don't
+	// silently default to "github.com/<org>/" because the org
+	// name is operator-specific). Operators set it via
+	// broker.yaml or --upgrade-url-allow CLI flag.
+	UpgradeURLAllowlist []string
+
+	// UpgradeForwardTimeoutDur bounds the broker→agent ACK
+	// request/reply for upgrade.req. Default 30s — agent has to
+	// download a tarball before replying, so the budget is
+	// generous. Tests override down.
+	UpgradeForwardTimeoutDur time.Duration
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -157,6 +172,16 @@ func (c *Config) ExposeForwardTimeout() time.Duration {
 		return c.ExposeForwardTimeoutDur
 	}
 	return 5 * time.Second
+}
+
+// UpgradeForwardTimeout returns the upgrade.req broker→agent ACK
+// budget, defaulting to 30s (agent has to download + sha-verify
+// before responding).
+func (c *Config) UpgradeForwardTimeout() time.Duration {
+	if c.UpgradeForwardTimeoutDur > 0 {
+		return c.UpgradeForwardTimeoutDur
+	}
+	return 30 * time.Second
 }
 
 
@@ -336,6 +361,9 @@ func (b *Broker) Run(ctx context.Context) error {
 			func(msg *nats.Msg) { b.handleExposeReq(nc, msg) }},
 		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.expose-rm.req",
 			func(msg *nats.Msg) { b.handleExposeRmReq(nc, msg) }},
+		// P10 J.4 — `tether node upgrade <nid>`.
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.upgrade.req",
+			func(msg *nats.Msg) { b.handleUpgradeReq(nc, msg) }},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {

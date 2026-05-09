@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/agent"
@@ -16,17 +17,34 @@ import (
 
 func newAgentCmd() *cobra.Command {
 	var (
-		natsURL    string
-		sid        string
-		nid        string
-		pin        string
-		tunnelAddr string
+		natsURL            string
+		sid                string
+		nid                string
+		pin                string
+		tunnelAddr         string
+		installUserService bool
+		uninstall          bool
 	)
 	cmd := &cobra.Command{
 		Use:   "agent",
 		Short: "Run agent daemon (register + heartbeat + expose tunnel client)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Architecture K.1: install-user-service writes a
+			// systemd template unit and exits without starting
+			// anything. Runs first so the rest of the agent setup
+			// (identity, tunnel adapter, etc.) is skipped — install
+			// callers don't have a broker to talk to yet.
+			if installUserService {
+				return runInstallUserService(cmd, sid, nid)
+			}
+			if uninstall {
+				return runUninstallUserService(cmd, sid)
+			}
+			if sid == "" || nid == "" {
+				return fmt.Errorf("--session and --nid are required to run the agent")
+			}
+
 			home := cli.DefaultHome()
 			cfg := agent.Config{
 				NATSURL: natsURL,
@@ -83,14 +101,92 @@ func newAgentCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
-	cmd.Flags().StringVar(&sid, "session", "", "session id (required)")
-	cmd.Flags().StringVar(&nid, "nid", "", "node id (required)")
+	cmd.Flags().StringVar(&sid, "session", "", "session id (required for run + install)")
+	cmd.Flags().StringVar(&nid, "nid", "", "node id (required for run + install)")
 	cmd.Flags().StringVar(&pin, "pin", "", "session PIN, required only on first connect (binds (sid,nid) to this agent's nkey)")
 	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "127.0.0.1:7000",
 		"broker reverse-TCP tunnel control address (host:port); empty to disable data plane")
-	_ = cmd.MarkFlagRequired("session")
-	_ = cmd.MarkFlagRequired("nid")
+	cmd.Flags().BoolVar(&installUserService, "install-user-service", false,
+		"write ~/.config/systemd/user/tether-agent@<sid>.service and exit (does NOT start)")
+	cmd.Flags().BoolVar(&uninstall, "uninstall", false,
+		"remove the user systemd unit for this session and exit (does NOT stop running agents)")
 	return cmd
+}
+
+// runInstallUserService writes the architecture K.1 systemd --user
+// template unit at ~/.config/systemd/user/tether-agent@<sid>.service.
+// Per K.0 §2 install ≠ start: this writes the file, prints next-step
+// commands, and exits. The caller does `systemctl --user enable
+// --now tether-agent@<sid>` separately.
+func runInstallUserService(cmd *cobra.Command, sid, nid string) error {
+	if sid == "" || nid == "" {
+		return fmt.Errorf("--session and --nid are required for --install-user-service")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("agent install: cannot resolve own path: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("agent install: $HOME: %w", err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		return fmt.Errorf("agent install: mkdir %s: %w", unitDir, err)
+	}
+	unitPath := filepath.Join(unitDir, fmt.Sprintf("tether-agent@%s.service", sid))
+	body := agentUserUnitBody(exe, sid, nid)
+	if err := os.WriteFile(unitPath, []byte(body), 0o644); err != nil {
+		return fmt.Errorf("agent install: write unit: %w", err)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✔ wrote %s\n", unitPath)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Next:\n")
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "    systemctl --user daemon-reload\n")
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "    systemctl --user enable --now tether-agent@%s.service\n", sid)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "    loginctl enable-linger %s   # keep agent up across logouts\n", os.Getenv("USER"))
+	return nil
+}
+
+func runUninstallUserService(cmd *cobra.Command, sid string) error {
+	if sid == "" {
+		return fmt.Errorf("--session is required for --uninstall")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("agent uninstall: $HOME: %w", err)
+	}
+	unitPath := filepath.Join(home, ".config", "systemd", "user",
+		fmt.Sprintf("tether-agent@%s.service", sid))
+	if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("agent uninstall: remove unit: %w", err)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "✔ removed %s\n", unitPath)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Note: any running tether agent processes are NOT stopped automatically.\n")
+	return nil
+}
+
+// agentUserUnitBody returns the rendered systemd template unit body.
+// Used by runInstallUserService and exposed for the install-time
+// test. exe is the absolute path of the running tether binary so a
+// caller invoking from a non-PATH location still gets a working
+// unit; sid + nid pin the daemon's identity.
+func agentUserUnitBody(exe, sid, nid string) string {
+	return fmt.Sprintf(`[Unit]
+Description=tether agent (session=%s nid=%s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s agent --session %s --nid %s
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%%h/.tether/agent/%s/agent.log
+StandardError=append:%%h/.tether/agent/%s/agent.log
+
+[Install]
+WantedBy=default.target
+`, sid, nid, exe, sid, nid, sid, sid)
 }
 
 func displayOrOff(s string) string {

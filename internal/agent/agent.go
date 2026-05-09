@@ -94,6 +94,30 @@ type Config struct {
 
 	// RegisterRetryMax caps the inter-attempt backoff. Defaults to 2s.
 	RegisterRetryMax time.Duration
+
+	// UpgradeURLAllowlist is the agent-side defense-in-depth set
+	// of URL prefixes accepted by `tether node upgrade`. Empty →
+	// agent uses defaultAgentURLAllowlist (github.com/<org>/
+	// tether/releases/). Architecture J.4 § 安全约束 mandates
+	// the agent re-checks even though the broker already gated;
+	// belt and suspenders against attacker reaching the
+	// forwarded subject directly.
+	UpgradeURLAllowlist []string
+
+	// UpgradeNoExit, when true, suppresses the os.Exit(0) call at
+	// the end of a successful upgrade. Used only by the in-process
+	// test harness so a successful upgrade doesn't kill the test
+	// runner. Production agents always run with this false.
+	UpgradeNoExit bool
+
+	// UpgradeExecutablePath overrides the install target for
+	// installNewBinary. Empty (production default) → use
+	// os.Executable() so the agent overwrites its own running
+	// binary. Tests set this to a sandbox file under t.TempDir()
+	// so the upgrade flow doesn't trample the go-test binary
+	// itself (a successful overwrite mid-test is silent until the
+	// next subprocess fork tries to exec the corrupted binary).
+	UpgradeExecutablePath string
 }
 
 // procRec is one entry in Agent.procs. Tracks the PTY session plus

@@ -27,6 +27,15 @@ type BrokerSection struct {
 	Frp        FrpSection     `yaml:"frp"`
 	Admin      AdminSection   `yaml:"admin"`
 	Storage    StorageSection `yaml:"storage"`
+	Upgrade    UpgradeSection `yaml:"upgrade"`
+}
+
+// UpgradeSection mirrors broker.upgrade — the architecture J.4
+// safety policy. URLAllow is the exact set of URL prefixes
+// `tether node upgrade` may target; mandatory (empty → broker
+// rejects all upgrades).
+type UpgradeSection struct {
+	URLAllow []string `yaml:"url_allow"`
 }
 
 // NATSSection mirrors broker.nats. URL is the address tetherd

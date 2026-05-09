@@ -29,6 +29,7 @@ func newServeCmd() *cobra.Command {
 		publicHost       string
 		storeDir         string
 		adminSocket      string
+		upgradeURLAllow  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -75,17 +76,27 @@ func newServeCmd() *cobra.Command {
 			}
 			defer func() { _ = db.Close() }()
 
+			// Upgrade allowlist: explicit --upgrade-url-allow always
+			// wins; otherwise pull from yaml. Empty stays empty so
+			// broker.handleUpgradeReq REJECTS every upgrade — the
+			// architecture J.4 default-deny posture.
+			allow := upgradeURLAllow
+			if !cmd.Flags().Changed("upgrade-url-allow") && len(fileCfg.Broker.Upgrade.URLAllow) > 0 {
+				allow = fileCfg.Broker.Upgrade.URLAllow
+			}
+
 			cfg := broker.Config{
-				NATSURL:           natsURL,
-				DB:                db,
-				Logger:            slog.New(slog.NewTextHandler(os.Stderr, nil)),
-				PublicHost:        publicHost,
-				TunnelControlAddr: tunnelCtrlAddr,
-				TunnelPublicHost:  tunnelPublicHost,
-				StoreDir:          storeDir,
-				AdminSocketPath:   adminSocket,
-				PortBandLow:       bandLow,
-				PortBandHigh:      bandHigh,
+				NATSURL:             natsURL,
+				DB:                  db,
+				Logger:              slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				PublicHost:          publicHost,
+				TunnelControlAddr:   tunnelCtrlAddr,
+				TunnelPublicHost:    tunnelPublicHost,
+				StoreDir:            storeDir,
+				AdminSocketPath:     adminSocket,
+				PortBandLow:         bandLow,
+				PortBandHigh:        bandHigh,
+				UpgradeURLAllowlist: allow,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -140,6 +151,8 @@ func newServeCmd() *cobra.Command {
 		"JetStream store dir to monitor for disk pressure (P7/H.4); empty = monitor disabled")
 	cmd.Flags().StringVar(&adminSocket, "admin-socket", defaultAdminSocket,
 		"local Unix socket for `tether admin *` (architecture I.2b); set to empty to disable")
+	cmd.Flags().StringSliceVar(&upgradeURLAllow, "upgrade-url-allow", nil,
+		"URL prefixes accepted by `tether node upgrade` (architecture J.4); empty = upgrades disabled")
 	return cmd
 }
 

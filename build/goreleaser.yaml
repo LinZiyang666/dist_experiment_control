@@ -1,0 +1,67 @@
+# goreleaser config for tether v1 (architecture K.4).
+#
+# v1 ships ONE binary per (os, arch) plus a single install.sh and a
+# SHA256SUMS manifest. The install.sh entry covers all three roles
+# (agent / ctl / broker); architecture K.4 makes the case for "one
+# tarball per platform, one script" over six packages plus three
+# scripts.
+#
+# Run locally:   goreleaser release --snapshot --clean
+# CI:            triggered on git tag push; uploads to GitHub Releases.
+version: 2
+
+project_name: tether
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tether
+    main: ./cmd/tether
+    binary: tether
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      # ReleaseVersion is read by `tether version` and stamped into
+      # every audit envelope as actor metadata.
+      - -s -w -X github.com/LinZiyang666/tether/internal/proto.ReleaseVersion={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: tether
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+
+# install.sh ships alongside the per-platform tarballs as an
+# "extra_file". Operators curl install.sh and pass the tarball URL
+# as --source-base; install.sh fetches the right per-platform
+# tarball + verifies SHA256SUMS.
+release:
+  extra_files:
+    - glob: scripts/install.sh
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
