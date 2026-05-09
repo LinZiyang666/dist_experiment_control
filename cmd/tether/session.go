@@ -139,7 +139,7 @@ func newSessionCmd() *cobra.Command {
 			// for session.<sid>.rm.req). Require active session = arg sid.
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(args[0])))
 			if err != nil {
-				return fmt.Errorf("session rm: connect: %w", err)
+				return connectError("session rm", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -149,7 +149,7 @@ func newSessionCmd() *cobra.Command {
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlSessionRm(id.PublicKey, args[0]), body)
 			if err != nil {
-				return fmt.Errorf("session rm: %w", err)
+				return fmt.Errorf("session rm: request: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.SessionRmResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
@@ -157,7 +157,7 @@ func newSessionCmd() *cobra.Command {
 			}
 			if !resp.OK {
 				if resp.Code != "" {
-					return fmt.Errorf("rm rejected (%s): %s", resp.Code, resp.Error)
+					return brokerErrorMessage("session rm", resp.Code, resp.Error)
 				}
 				return errors.New(resp.Error)
 			}

@@ -71,7 +71,7 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return fmt.Errorf("run: connect: %w", err)
+				return connectError("run", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -110,9 +110,9 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			case "ready":
 				// happy path — fall through.
 			case "failed":
-				return fmt.Errorf("run: rejected (%s)", first.Reason)
+				return runFailureMessage(first.Reason)
 			default:
-				return fmt.Errorf("run: unexpected first chunk kind=%q", first.Kind)
+				return fmt.Errorf("run: unexpected first chunk kind=%q (broker version skew?)", first.Kind)
 			}
 
 			pid := first.PID

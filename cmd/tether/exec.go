@@ -48,7 +48,7 @@ PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return fmt.Errorf("exec: connect: %w", err)
+				return connectError("exec", natsURL, err)
 			}
 			defer nc.Close()
 

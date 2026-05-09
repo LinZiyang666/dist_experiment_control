@@ -72,7 +72,7 @@ testing run a single <nid> first.`,
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return fmt.Errorf("upgrade: connect: %w", err)
+				return connectError("upgrade", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -155,15 +155,14 @@ func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	respMsg, err := nc.RequestWithContext(ctx,
 		proto.SubjCmdBy(sid, actor, nid, "upgrade"), body)
 	if err != nil {
-		return fmt.Errorf("upgrade %s/%s: %w", sid, nid, err)
+		return fmt.Errorf("upgrade %s/%s: %w (broker or agent unreachable on NATS)", sid, nid, err)
 	}
 	var resp proto.UpgradeResp
 	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
-		return fmt.Errorf("decode reply for %s: %w", nid, err)
+		return fmt.Errorf("decode reply for %s: %w (broker version skew?)", nid, err)
 	}
 	if !resp.OK {
-		return fmt.Errorf("broker rejected upgrade for %s/%s: %s %s",
-			sid, nid, resp.Code, resp.Error)
+		return brokerErrorMessage(fmt.Sprintf("upgrade %s/%s", sid, nid), resp.Code, resp.Error)
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 		"✔ upgrade dispatched to %s/%s (agent re-exec in progress)\n", sid, nid)

@@ -60,7 +60,7 @@ restart without a re-expose.
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return fmt.Errorf("expose: connect: %w", err)
+				return connectError("expose", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -75,14 +75,14 @@ restart without a re-expose.
 			subj := proto.SubjCmdBy(sid, id.PublicKey, nid, "expose")
 			respMsg, err := nc.RequestWithContext(ctx, subj, body)
 			if err != nil {
-				return fmt.Errorf("expose: request: %w", err)
+				return fmt.Errorf("expose: request: %w (broker or agent unreachable on NATS)", err)
 			}
 			var resp proto.ExposeResp
 			if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
-				return fmt.Errorf("expose: malformed reply: %w", err)
+				return fmt.Errorf("expose: malformed reply: %w (broker version skew?)", err)
 			}
 			if resp.Code != "" {
-				return fmt.Errorf("expose: %s (%s)", resp.Code, resp.Error)
+				return brokerErrorMessage("expose", resp.Code, resp.Error)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"exposed: http://%s:%d → %s:%d  (name=%s)\n",
@@ -130,7 +130,7 @@ error you can ignore in scripts.
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return fmt.Errorf("expose rm: connect: %w", err)
+				return connectError("expose rm", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -143,14 +143,14 @@ error you can ignore in scripts.
 			subj := proto.SubjCmdBy(sid, id.PublicKey, nid, "expose-rm")
 			respMsg, err := nc.RequestWithContext(ctx, subj, body)
 			if err != nil {
-				return fmt.Errorf("expose rm: request: %w", err)
+				return fmt.Errorf("expose rm: request: %w (broker or agent unreachable on NATS)", err)
 			}
 			var resp proto.ExposeRmResp
 			if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
 				return fmt.Errorf("expose rm: malformed reply: %w", err)
 			}
 			if !resp.OK {
-				return fmt.Errorf("expose rm: %s (%s)", resp.Code, resp.Error)
+				return brokerErrorMessage("expose rm", resp.Code, resp.Error)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"freed: %s on %s (port %d back in pool)\n", name, nid, resp.Port)

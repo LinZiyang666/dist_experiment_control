@@ -608,3 +608,67 @@ go test -run TestReview ./cmd/tether ./test/p10    → all 6 reviewer tests pass
   - TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses      (round-2)
   - TestReviewBrokerSidecarUnitsUseInstallPrefix                 (round-2)
 ```
+
+---
+
+## Round 3 Review
+
+Date: 2026-05-09
+Reviewer role: test engineer
+
+Reviewed commit:
+
+- `a885bde Address P10 round-2 review: node.list RPC (R2-F1) + sidecar unit prefix (R2-F2)`
+
+### Verdict
+
+P10 is approved.
+
+Round-2 findings are fixed:
+
+- R2-F1: `tether node upgrade --all` now uses the dedicated
+  `ctrl.by.<actor>.s.<sid>.node.list.req` RPC and filters `nodes.status ==
+  ONLINE`, so ONLINE agents with no process history are included.
+- R2-F2: broker sidecar units now render `ExecStart=$bin/nats-server` and
+  `ExecStart=$bin/caddy`, matching the same `BIN_DIR` used by sidecar
+  installation and `tether-broker.service`.
+
+No new blocking findings found in this round.
+
+### Round 3 Verification
+
+Reviewer tests:
+
+```text
+go test -run TestReview ./cmd/tether ./test/p10 -count=1
+# PASS
+```
+
+Full regression suite:
+
+```text
+go test ./... -count=1
+# PASS on rerun
+```
+
+During the first full-suite run, `test/p4 TestExecHappyPathThroughAuthCallout`
+timed out once with NATS permission-violation logs. The same failing test,
+`go test ./test/p4 -count=1`, and a second `go test ./... -count=1` all passed,
+so I am treating that as an existing auth/NATS e2e flake rather than a P10
+regression.
+
+Static/build checks:
+
+```text
+go build ./...
+# PASS
+
+GOCACHE=/tmp/tether-gocache go vet ./...
+# PASS
+
+/home/weiland/go/bin/golangci-lint run ./...
+# PASS, 0 issues
+```
+
+Commands requiring embedded NATS/JetStream or default Go/lint cache writes were
+run outside the default sandbox.

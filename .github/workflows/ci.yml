@@ -35,6 +35,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: v1.62.2
+      # Run lint via the Makefile so the pinned golangci-lint version
+      # has exactly one source of truth (Makefile.GOLANGCI_VERSION).
+      # The previous setup hard-coded v1.62.2 here while Makefile
+      # required v2.5.0 — local-pass-CI-fail is a worse failure mode
+      # than installing the binary on every CI run.
+      - run: make tools
+      - run: make lint
