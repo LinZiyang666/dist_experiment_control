@@ -545,6 +545,11 @@ func parseRegisterLine(line string) (sid, nid string, port int, token string, ok
 	return parts[1], parts[2], port, parts[4], true
 }
 
+// hashToken is the SHA256 hex digest of raw. Kept locally
+// (duplicated with internal/port.HashToken) to keep tunnel a
+// dep-graph leaf: importing port would pull SQLite into the wire
+// layer with no real benefit. Audit shard 06 F10 — flagged as low,
+// resolved by comment, not extraction.
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])

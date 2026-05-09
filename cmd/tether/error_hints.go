@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 )
@@ -100,6 +99,3 @@ func stripPrefix(s, prefix string) (string, bool) {
 	return "", false
 }
 
-// ensure we don't accidentally drop the errors import; brokerError
-// chains via %w so callers can errors.Is downstream if they want.
-var _ = errors.New

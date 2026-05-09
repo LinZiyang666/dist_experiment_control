@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/spf13/cobra"
 )
 
 // TestLoadAgentYAMLMissingFile: missing agent.yaml is the unhappy
@@ -131,7 +129,3 @@ func TestPickFlagOrYamlOnAgentCmd(t *testing.T) {
 	}
 }
 
-// _ keeps "github.com/spf13/cobra" referenced even if a future
-// edit removes the cobra usage above — pickFlagOrYaml's signature
-// would still need it.
-var _ = cobra.Command{}

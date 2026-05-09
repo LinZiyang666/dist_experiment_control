@@ -1370,7 +1370,7 @@ tether/
 │   ├── proc/                   # process 状态机 + reconcile
 │   ├── port/                   # 端口分配 / 状态机（ALLOCATED→REVOKED，15min OFFLINE 触发；REVOKED/FREED 端口号立即回池）
 │   ├── pty/                    # PTY 封装（creack/pty + SIGWINCH）
-│   ├── frpmgr/                 # 内嵌 frps / frpc 配置热重载
+│   ├── tunnel/                 # 反向 TCP 隧道（in-process yamux；spec 的 frpmgr 已替换，见 README "Architecture deep-dive"）
 │   ├── jsstream/               # JetStream stream / consumer 管理
 │   ├── reconcile/              # G.1 / G.2 / G.3 对账逻辑
 │   ├── adminsock/              # admin Unix socket server（仅 serve 模式启用）
@@ -1403,8 +1403,8 @@ tether/
 | 运行模式 | 启动子命令 | 运行时激活的 `internal/` 包 | 运行时不激活 |
 |---|---|---|---|
 | broker | `tether serve` | 全部（broker 是大脑） | — |
-| agent | `tether agent` | `proto/`, `auth/`（客户端侧）, `pty/`, `proc/`（上报侧）, `frpmgr/`（frpc 嵌入） | `storage/`, `jsstream/`, `session/`, `reconcile/`（broker 侧）, `adminsock/` |
-| ctl | `tether login/ps/run/…` | `cli/`, `auth/`（客户端侧）, `proto/` | `storage/`, `frpmgr/`, `jsstream/`, `adminsock/` |
+| agent | `tether agent` | `proto/`, `auth/`（客户端侧）, `pty/`, `proc/`（上报侧）, `tunnel/`（yamux 隧道客户端） | `storage/`, `jsstream/`, `session/`, `reconcile/`（broker 侧）, `adminsock/` |
+| ctl | `tether login/ps/run/…` | `cli/`, `auth/`（客户端侧）, `proto/` | `storage/`, `tunnel/`, `jsstream/`, `adminsock/` |
 | admin | `tether admin …` | `cli/admin`, 连本地 Unix socket | 其他均走本地 socket 协议 |
 
 - **agent / ctl 无 `storage/`（不用 SQLite）**，但 agent **有最小持久化状态**落到 **per-session 目录** `~/.tether/agent/<sid>/state.json`（0600）——对应 §E.0 "一机多 session 开多 agent" 的语义，路径按 sid 隔离：
@@ -2034,7 +2034,12 @@ P11 release hardening + docs                        ← v0.1.0
 
 **做**
 - `internal/port`：分配表（14000-14999）、token 生成、ALLOCATED→REVOKED（OFFLINE ≥ 15min 自动触发），REVOKED/FREED 立即回池。
-- `internal/frpmgr`：broker 侧 `github.com/fatedier/frp/server.NewService` 内嵌，监听 `:7000`（frpc control）+ `:14000-14999`（remote_port），frp 原生 TLS 自管证书（不经 Caddy）；agent 侧外挂 `frpc` 子进程 + 配置热重载（SIGHUP）。
+- `internal/tunnel`（v1 实现选择 in-process yamux-over-TCP，
+  替换 spec 原本的 `internal/frpmgr` + frpc 子进程方案，详见
+  README "Architecture deep-dive"）：broker 侧 `tunnel.Server`
+  监听 `:7000`（agent control + TLS）+ 按需绑公网端口
+  `:14000-14999`；agent 侧 `tunnel.Client` 维护 yamux 会话，
+  expose 重启自动重连。
 - `tether expose --local 8888 --name jupyter` → 分端口 → 返回 `http://<broker>:<port>`（默认明文，业务自管 HTTPS）。
 - `tether expose rm --name jupyter`。
 - **`tether ps` 升级为统一视图**（进程 + 端口同一张表，F.8）。
