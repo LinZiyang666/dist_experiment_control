@@ -24,14 +24,15 @@ func newExecCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "exec <node> <argv...>",
 		Short: "Run an argv on a node, stream stdout/stderr, propagate exit code",
-		Long: `tether exec — non-interactive remote command (P4).
+		Long: `tether exec — non-interactive remote command.
 
 The command runs on <node> in the active session (TETHER_SESSION env or
 current_session file). stdout/stderr stream back as they arrive; the
 exit code of the remote process becomes the local exit code.
 
-PTY mode (vim, htop, progress bars with cursor moves) lands in P5 as
-'tether run'.
+For interactive commands (vim, htop, progress bars with cursor moves)
+use 'tether run' — it allocates a PTY on the agent and pumps raw bytes
+both ways.
 `,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {

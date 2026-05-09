@@ -10,7 +10,8 @@
 //     CLI role + PIN). Without it, the broker is a pure P2 anonymous
 //     hub — agent registers and heartbeat still work.
 //
-// `cmd.*.req.forwarded` (architecture C.4) command-routing lands in P4.
+// `cmd.*.req.forwarded` (architecture C.4) command-routing is wired in
+// internal/broker/exec.go (handleExecReq → SubjCmdForwarded).
 package broker
 
 import (

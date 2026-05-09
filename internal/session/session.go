@@ -177,7 +177,7 @@ func ListVisible(db *sql.DB, pubkeyFP string) ([]Session, error) {
 // ErrDeleting if already DELETING. Caller must have already verified owner.
 //
 // Stage 2 (DELETE history-<sid> stream) and stage 3 (DELETE related rows)
-// land in P7 (architecture H.3).
+// (architecture H.3 — full three-phase lives in broker/audit.go).
 func Tombstone(db *sql.DB, sid string, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE sessions SET state='DELETING', deleting_at=?

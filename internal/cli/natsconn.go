@@ -66,14 +66,10 @@ const CtlNameUnactivated = "tether-cli"
 // PIN verify if a Token is also presented).
 func CtlNameForSession(sid string) string { return "tether-cli:" + sid }
 
-// AgentName is the connection-Name an agent uses.
-//
-// In P3, auth_callout HARD-DENIES this role: the test
-// `internal/authcallout/handler_test.go::TestHandleAgentRoleIsDeniedUntilP4`
-// pins that. Real agent provisioning (per-machine nkey + per-session
-// `(sid,nid)` registration) lands in P4 and will re-enable the role
-// behind `proto.ValidateSID/NID` + a DB-backed `IsProvisioned` check.
-//
-// The helper is exported anyway because the `test/p3/agent_role_risk_test.go`
-// risk tests use it to construct the very names we want to reject.
+// AgentName is the connection-Name an agent uses on CONNECT. The
+// auth_callout handler parses this format ("tether-agent:<sid>:<nid>")
+// to bind the connecting nkey to the (sid, nid) registered in
+// agent_provisioning (architecture E.2 / K.1). Real agents always
+// connect with this Name + their nkey; the broker's auth_callout
+// branch verifies the binding before issuing a JWT.
 func AgentName(sid, nid string) string { return "tether-agent:" + sid + ":" + nid }

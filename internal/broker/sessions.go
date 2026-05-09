@@ -111,7 +111,11 @@ func (b *Broker) handleSessionList(msg *nats.Msg) {
 }
 
 // handleSessionRm handles ctrl.by.<actor>.session.<sid>.rm.req.
-// Owner-only; tombstones (ACTIVE → DELETING). Stage 2/3 of H.3 land in P7.
+// Owner-only. Drives all three H.3 stages inline:
+// ① tombstone (ACTIVE → DELETING) → ② DELETE history-<sid> stream
+// → ③ cascade-delete dependent SQLite rows + sys.events broadcast.
+// finalizeSessionRm (broker/audit.go) does ②-③ and is idempotent
+// so a crash mid-finalize re-runs cleanly on next broker boot.
 func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
 	if !ok {

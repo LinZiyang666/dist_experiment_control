@@ -145,10 +145,9 @@ type SessionRmResp struct {
 
 // ExecReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.exec.req.
 //
-// Non-interactive remote command. PTY mode (`run`) lands in P5; this is
-// the simpler `exec` from P4: no terminal allocation, agent runs argv
-// via os/exec and streams stdout/stderr chunks back via the request's
-// reply inbox.
+// Non-interactive remote command: no terminal allocation, agent runs
+// argv via os/exec and streams stdout/stderr chunks back via the
+// request's reply inbox. For interactive PTY mode use RunReq.
 type ExecReq struct {
 	Argv  []string          `json:"argv"`            // [program, arg1, ...]
 	Env   map[string]string `json:"env,omitempty"`   // extra environment for the child

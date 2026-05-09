@@ -1,7 +1,10 @@
-// Implementation of the P6 `expose` / `expose-rm` control plane on the
-// broker side. The actual TCP forwarding (frps embed + plugin hook for
-// authorizing frpc's per-port token) lives in internal/frpmgr; this
-// file only owns the SQLite-state + audit + agent-forward layer.
+// `expose` / `expose-rm` control plane on the broker side. The
+// actual TCP forwarding goes through the in-process yamux tunnel
+// (`internal/tunnel`); this file only owns the SQLite-state +
+// audit + agent-forward layer. The architecture spec originally
+// called for embedding the `frp` Go library and shipping `frpc` as
+// a subprocess (architecture F.1); the in-process yamux variant is
+// a documented deviation, see README "Architecture deep-dive".
 //
 // Architecture references:
 //   - D.4   port state machine (ALLOCATED → REVOKED|FREED)
@@ -9,7 +12,7 @@
 //   - F.4   token storage rule (broker keeps only SHA256, raw is
 //           agent-only after delivery)
 //   - F.6   断联与恢复 — agent restart re-uses the same port via
-//           state.json + frpc auto-reconnect
+//           state.json + tunnel auto-reconnect
 package broker
 
 import (

@@ -1,12 +1,13 @@
 // Agent-side expose / expose-rm handlers. Two responsibilities:
 //
 //   - Persist the (Name, Port, LocalPort, Token) row to
-//     ~/.tether/agent/<sid>/state.json so frpc can re-establish the
-//     proxy after agent restart (architecture F.6 / K.1).
+//     ~/.tether/agent/<sid>/state.json so the tunnel adapter can
+//     re-establish the proxy after agent restart (architecture
+//     F.6 / K.1).
 //
-//   - Reconfigure the local frp client. The actual frp wiring is
-//     pluggable through the ExposeAdapter interface — P6-this file
-//     calls the adapter, P6-6 ships the real frp-backed adapter.
+//   - Reconfigure the local tunnel client. The wiring is pluggable
+//     through the ExposeAdapter interface — TunnelExposeAdapter is
+//     the production implementation (in tunnel_adapter.go).
 //     With Adapter == nil the handler still persists state and acks
 //     OK; useful for the in-process control-plane tests where TCP
 //     forwarding is out of scope.
@@ -20,10 +21,9 @@ import (
 )
 
 // ExposeAdapter is the seam between agent.handleExpose* and the
-// in-process frp client. P6-6 will provide a real implementation that
-// adds/removes proxies on a frpc instance and reloads it; P6 control
-// plane tests use a nil adapter and just rely on state.json
-// persistence + audit.
+// in-process tunnel client. TunnelExposeAdapter is the production
+// implementation; control-plane tests pass a nil adapter and rely
+// on state.json persistence + audit.
 type ExposeAdapter interface {
 	// AddProxy is called once per successful expose; the agent has
 	// already persisted state.json by the time this fires. Return

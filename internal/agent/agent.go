@@ -69,10 +69,11 @@ type Config struct {
 	Home string
 
 	// ExposeAdapter, if non-nil, is invoked from the expose /
-	// expose-rm forwarded handlers to add or drop frp proxies.
-	// Production agents inject the real frp-backed adapter (P6-6);
-	// in-process control-plane tests leave it nil so they exercise
-	// only the SQLite + state.json path without standing up frp.
+	// expose-rm forwarded handlers to add or drop tunnel proxies.
+	// Production agents inject TunnelExposeAdapter (yamux-over-TCP
+	// to broker, see tunnel_adapter.go); in-process control-plane
+	// tests leave it nil so they exercise only the SQLite +
+	// state.json path without standing up the tunnel.
 	ExposeAdapter ExposeAdapter
 
 	Logger *slog.Logger
