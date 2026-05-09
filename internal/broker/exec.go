@@ -10,6 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
@@ -270,23 +271,16 @@ func splitDot(s string) []string {
 	return out
 }
 
-// pubAuditCall emits an `audit.call` JetStream candidate (in P4 still
-// core pub; P7 promotes to JS). Architecture H.5 schema.
+// pubAuditCall emits an `audit.call` event using the schema package
+// types so the on-the-wire JSON matches what consumers decode with
+// schema.AuditCall (architecture H.5 — append-only contract). P7
+// review F2: previously this used an inline anonymous struct that
+// drifted from schema.AuditCall (e.g. exit_code vs rc on
+// audit.proc); centralize on the schema types instead so a future
+// drift becomes a build break, not a silent decoder-loses-fields bug.
 func (b *Broker) pubAuditCall(sid, actorFP, actorNkey, verb, nid string, ok bool, errMsg string) {
-	type auditCall struct {
-		V         int       `json:"v"`
-		Kind      string    `json:"kind"`
-		Ts        time.Time `json:"ts"`
-		ActorNkey string    `json:"actor_nkey"`
-		ActorFp   string    `json:"actor_fp"`
-		Session   string    `json:"session"`
-		Node      string    `json:"node,omitempty"`
-		Verb      string    `json:"verb"`
-		OK        bool      `json:"ok"`
-		Error     string    `json:"error,omitempty"`
-	}
-	payload, err := json.Marshal(auditCall{
-		V: 1, Kind: "call", Ts: b.cfg.Now(),
+	payload, err := json.Marshal(schema.AuditCall{
+		V: schema.AuditSchemaVersion, Kind: "call", Ts: b.cfg.Now(),
 		ActorNkey: actorNkey, ActorFp: actorFP,
 		Session: sid, Node: nid, Verb: verb,
 		OK: ok, Error: errMsg,
@@ -299,28 +293,19 @@ func (b *Broker) pubAuditCall(sid, actorFP, actorNkey, verb, nid string, ok bool
 	}
 }
 
-// pubAuditProc emits an `audit.proc` event derived from the agent's
-// runtime ev.proc.* notifications.
+// pubAuditProc emits an `audit.proc` event using schema.AuditProc.
+// `kind` ∈ {"start","exit","reconciled_closed","killed_orphan"}; for
+// exit kinds the rc field is populated (json tag matches schema).
 func (b *Broker) pubAuditProc(sid, kind, nid, pid string, argv []string, exitCode int, ts time.Time) {
-	type auditProc struct {
-		V        int       `json:"v"`
-		Kind     string    `json:"kind"`
-		Ts       time.Time `json:"ts"`
-		Session  string    `json:"session"`
-		Node     string    `json:"node"`
-		PID      string    `json:"pid"`
-		ExitCode *int      `json:"exit_code,omitempty"`
-		Cmd      string    `json:"cmd,omitempty"`
-	}
-	rec := auditProc{
-		V: 1, Kind: kind, Ts: ts,
+	rec := schema.AuditProc{
+		V: schema.AuditSchemaVersion, Kind: kind, Ts: ts,
 		Session: sid, Node: nid, PID: pid,
 	}
-	if kind == "exit" {
-		rec.ExitCode = &exitCode
+	if kind == "exit" || kind == "reconciled_closed" {
+		ec := exitCode
+		rec.RC = &ec
 	}
 	if kind == "start" && len(argv) > 0 {
-		// Stringify argv with simple shell-ish join. Audit is informational.
 		joined := argv[0]
 		for _, a := range argv[1:] {
 			joined += " " + a

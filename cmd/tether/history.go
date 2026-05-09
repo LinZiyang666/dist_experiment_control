@@ -80,15 +80,20 @@ func newHistoryCmd() *cobra.Command {
 					fmt.Sprintf("%s.s.%s.audit.%s", proto.SubjectPrefix, sid, kind),
 				}
 			}
-			if follow {
+
+			out := cmd.OutOrStdout()
+			switch {
+			case follow:
 				cfg.DeliverPolicy = jetstream.DeliverNewPolicy
-			} else if lastN > 0 {
-				cfg.DeliverPolicy = jetstream.DeliverLastPerSubjectPolicy
-				// LastPerSubject buys us "tail-end without re-reading
-				// 100k history msgs", but the only ASCII-clean way to
-				// say "really just the last N" with an ephemeral
-				// ordered consumer is via OptStartSeq computed from
-				// the stream info.
+				cons, err := stream.OrderedConsumer(ctx, cfg)
+				if err != nil {
+					return fmt.Errorf("history: consumer: %w", err)
+				}
+				return runHistoryFollow(ctx, cons, out)
+
+			case lastN > 0 && kind == "":
+				// No filter — the LastSeq - N + 1 short-cut is
+				// safe because every stream message counts.
 				info, err := stream.Info(ctx)
 				if err != nil {
 					return fmt.Errorf("history: stream info: %w", err)
@@ -99,17 +104,33 @@ func newHistoryCmd() *cobra.Command {
 				}
 				cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
 				cfg.OptStartSeq = start
-			}
-			cons, err := stream.OrderedConsumer(ctx, cfg)
-			if err != nil {
-				return fmt.Errorf("history: consumer: %w", err)
-			}
+				cons, err := stream.OrderedConsumer(ctx, cfg)
+				if err != nil {
+					return fmt.Errorf("history: consumer: %w", err)
+				}
+				return runHistorySnapshot(ctx, cons, out, 250*time.Millisecond)
 
-			out := cmd.OutOrStdout()
-			if follow {
-				return runHistoryFollow(ctx, cons, out)
+			case lastN > 0:
+				// Filter present — must scan the FILTERED stream
+				// from start and keep a ring buffer of the last N
+				// matches; the unfiltered LastSeq doesn't tell us
+				// where the Nth-from-last filtered match begins.
+				// (P7 review F1.)
+				cfg.DeliverPolicy = jetstream.DeliverAllPolicy
+				cons, err := stream.OrderedConsumer(ctx, cfg)
+				if err != nil {
+					return fmt.Errorf("history: consumer: %w", err)
+				}
+				return runHistoryFilteredTail(ctx, cons, out, lastN, 250*time.Millisecond)
+
+			default:
+				// No -n, no --follow → replay everything matching.
+				cons, err := stream.OrderedConsumer(ctx, cfg)
+				if err != nil {
+					return fmt.Errorf("history: consumer: %w", err)
+				}
+				return runHistorySnapshot(ctx, cons, out, 250*time.Millisecond)
 			}
-			return runHistorySnapshot(ctx, cons, out, 250*time.Millisecond)
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
@@ -178,6 +199,90 @@ func runHistorySnapshot(ctx context.Context, cons jetstream.Consumer, out io.Wri
 	}
 }
 
+// runHistoryFilteredTail walks every filtered message from the
+// stream's beginning, keeps a ring buffer of the last n, and prints
+// them in arrival order on idle (or end-of-stream).
+//
+// Why a ring buffer: when --kind is present the consumer's
+// FilterSubjects yields only matching messages, but their seq numbers
+// are sparse (call/proc/port interleave on a single stream). The
+// "OptStartSeq = LastSeq - N + 1" short-cut over-truncates because
+// filtered messages between [LastSeq-N+1, LastSeq] are fewer than N.
+// P7 review F1: that short-cut showed only 33 of 50 matching entries.
+//
+// Memory cost is O(n) on the ring + O(1) per message scanned. For
+// the v1 expected volumes (history-<sid> in the thousands of
+// messages range, n typically <= a few hundred), the unfiltered
+// scan is comfortable. Architectures expecting millions of
+// pre-filter messages would want a JetStream subject-specific seq
+// API instead — not in v1.
+func runHistoryFilteredTail(ctx context.Context, cons jetstream.Consumer, out io.Writer, n int, idle time.Duration) error {
+	it, err := cons.Messages()
+	if err != nil {
+		return fmt.Errorf("history: messages: %w", err)
+	}
+	defer it.Stop()
+
+	type item struct{ subject string; data []byte }
+	ring := make([]item, 0, n)
+	add := func(it item) {
+		if len(ring) < n {
+			ring = append(ring, it)
+			return
+		}
+		// Slide-and-overwrite: the oldest goes, the newest takes
+		// the tail. Cheaper than a true ring buffer for n in the
+		// CLI-typical range and easier to read.
+		copy(ring, ring[1:])
+		ring[len(ring)-1] = it
+	}
+
+	ch := make(chan item, 16)
+	doneCh := make(chan struct{})
+	go func() {
+		for {
+			msg, err := it.Next()
+			if err != nil {
+				close(doneCh)
+				return
+			}
+			b := make([]byte, len(msg.Data()))
+			copy(b, msg.Data())
+			ch <- item{subject: msg.Subject(), data: b}
+		}
+	}()
+
+	idleT := time.NewTimer(idle)
+	defer idleT.Stop()
+	flush := func() {
+		for _, it := range ring {
+			printAuditEntry(out, it.subject, it.data)
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return ctx.Err()
+		case it := <-ch:
+			add(it)
+			if !idleT.Stop() {
+				select {
+				case <-idleT.C:
+				default:
+				}
+			}
+			idleT.Reset(idle)
+		case <-idleT.C:
+			flush()
+			return nil
+		case <-doneCh:
+			flush()
+			return nil
+		}
+	}
+}
+
 // runHistoryFollow keeps printing as new audit msgs arrive. Returns
 // when ctx ends (Ctrl-C). Doesn't fall back to the snapshot's idle
 // trick — follow is explicitly indefinite.
@@ -230,7 +335,7 @@ func printAuditEntry(w io.Writer, subject string, data []byte) {
 	case "proc":
 		_, _ = fmt.Fprintf(w, "%s  PROC  %s/%s  pid=%s  kind=%s  rc=%v  %s\n",
 			ts, strFromMap(raw, "session"), strFromMap(raw, "node"),
-			short(strFromMap(raw, "pid")), kind, raw["exit_code"],
+			short(strFromMap(raw, "pid")), kind, raw["rc"],
 			strFromMap(raw, "cmd"))
 	case "port":
 		_, _ = fmt.Fprintf(w, "%s  PORT  %s/%s  port=%v  name=%s  kind=%s\n",

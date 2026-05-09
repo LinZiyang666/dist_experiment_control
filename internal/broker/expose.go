@@ -23,6 +23,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
@@ -356,22 +357,12 @@ func (b *Broker) pubPortEvent(sid string, port int, name, nid string, localPort 
 	}
 }
 
-// pubAuditPort writes audit.port. Architecture H.5 schema; same shape
-// pattern as pubAuditCall / pubAuditProc.
+// pubAuditPort writes audit.port using schema.AuditPort (architecture
+// H.5). P7 review F2 — same single-source-of-truth rationale as
+// pubAuditCall / pubAuditProc above.
 func (b *Broker) pubAuditPort(sid, kind, nid string, port int, name string, localPort int, actorFP string, ts time.Time) {
-	type auditPort struct {
-		V         int       `json:"v"`
-		Kind      string    `json:"kind"`
-		Ts        time.Time `json:"ts"`
-		Session   string    `json:"session"`
-		Node      string    `json:"node"`
-		Port      int       `json:"port"`
-		Name      string    `json:"name,omitempty"`
-		LocalPort int       `json:"local_port,omitempty"`
-		ActorFp   string    `json:"actor_fp,omitempty"`
-	}
-	body, err := json.Marshal(auditPort{
-		V: 1, Kind: kind, Ts: ts,
+	body, err := json.Marshal(schema.AuditPort{
+		V: schema.AuditSchemaVersion, Kind: kind, Ts: ts,
 		Session: sid, Node: nid, Port: port,
 		Name: name, LocalPort: localPort, ActorFp: actorFP,
 	})
