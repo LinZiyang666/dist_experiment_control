@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
@@ -87,11 +88,43 @@ testing run a single <nid> first.`,
 				}
 			}
 
+			// Fleet rollouts must distinguish transient from
+			// configuration errors:
+			//   - node_offline / agent_no_responders / timeout: keep
+			//     going; the operator will retry these later.
+			//   - everything else (not_owner / url_not_allowed /
+			//     proto_bump / sha256_invalid): config bug, abort
+			//     the rest of the fleet so we don't fan-out a known-
+			//     bad request.
+			// Single-nid mode (len(targets) == 1) keeps the original
+			// strict behavior: one explicit target, one yes/no answer.
+			var skipped, failed int
+			strict := !all
 			for _, nid := range targets {
-				if err := dispatchUpgrade(cmd, nc, sid, id.PublicKey, nid,
-					urlFlag, shaFlag, time.Duration(timeoutSec)*time.Second); err != nil {
+				err := dispatchUpgrade(cmd, nc, sid, id.PublicKey, nid,
+					urlFlag, shaFlag, time.Duration(timeoutSec)*time.Second)
+				if err == nil {
+					continue
+				}
+				if strict || isConfigError(err) {
 					return err
 				}
+				if isTransientError(err) {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+						"⚠ %s/%s skipped (transient): %v\n", sid, nid, err)
+					skipped++
+					continue
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"✗ %s/%s failed: %v\n", sid, nid, err)
+				failed++
+			}
+			if failed > 0 {
+				return fmt.Errorf("upgrade --all: %d failed (%d transiently skipped)", failed, skipped)
+			}
+			if all && skipped > 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"(%d node(s) skipped due to transient errors — retry later)\n", skipped)
 			}
 			return nil
 		},
@@ -135,6 +168,48 @@ func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 		"✔ upgrade dispatched to %s/%s (agent re-exec in progress)\n", sid, nid)
 	return nil
+}
+
+// isTransientError returns true for broker reply codes that signal
+// "this specific node is unreachable right now" — `--all` should
+// log + skip these so a single OFFLINE box doesn't abort a
+// fleet-wide rollout. The operator gets a final summary and can
+// retry just the skipped subset.
+func isTransientError(err error) bool {
+	msg := err.Error()
+	for _, needle := range []string{
+		"node_offline",
+		"node_not_found",
+		"agent_no_responders",
+		"agent_malformed_resp",
+		"deadline exceeded",
+		"context canceled",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// isConfigError returns true for broker reply codes that mean the
+// CALL itself is bad (not the target). Aborts `--all` because no
+// other node will accept it either.
+func isConfigError(err error) bool {
+	msg := err.Error()
+	for _, needle := range []string{
+		"not_owner",
+		"url_not_allowed",
+		"sha256_invalid",
+		"proto_bump_requires_reinstall",
+		"actor_invalid",
+		"session_not_found_or_deleting",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // listOnlineNIDs round-trips a ps.req and returns the unique nids

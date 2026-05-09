@@ -128,6 +128,12 @@ func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
 		"broker_url: wss://broker.example.com:443",
 		"session: lab",
 		"nid: lab-1",
+		// tunnel_addr is derived from --broker by install.sh so the
+		// agent.yaml is self-sufficient (architecture A.3 split-ports
+		// puts frps on host:7000). Pin the derivation so a regression
+		// in the sed pipeline doesn't silently leak operator-supplied
+		// flags as an undocumented dependency.
+		"tunnel_addr: broker.example.com:7000",
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("agent.yaml missing %q; got:\n%s", want, string(body))
@@ -144,6 +150,47 @@ func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
 		t.Fatal(err)
 	} else if mode := fi.Mode().Perm(); mode != 0o600 {
 		t.Errorf("agent.yaml mode: got %o want 0600", mode)
+	}
+}
+
+// TestInstallShTunnelAddrDerivation pins the install.sh sed
+// pipeline that turns --broker into agent.yaml's tunnel_addr.
+// Architecture A.3 nails frps to port 7000, so we ALWAYS want
+// "<broker host>:7000" regardless of the input scheme/port/path
+// shape. A regression here would force operators to hand-edit
+// tunnel_addr after install.sh runs.
+func TestInstallShTunnelAddrDerivation(t *testing.T) {
+	cases := []struct {
+		name      string
+		brokerURL string
+		want      string
+	}{
+		{"wss with port", "wss://broker.example.com:443", "broker.example.com:7000"},
+		{"ws no port", "ws://broker.example.com", "broker.example.com:7000"},
+		{"bare host", "broker.example.com", "broker.example.com:7000"},
+		{"with path", "wss://broker.example.com:443/nats", "broker.example.com:7000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			runInstall(t, home,
+				"--role", "agent",
+				"--broker", tc.brokerURL,
+				"--session", "lab",
+				"--pin", "x",
+				"--nid", "lab-1",
+				"--skip-download",
+			)
+			body, err := os.ReadFile(filepath.Join(home, ".tether", "agent", "lab", "agent.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "tunnel_addr: " + tc.want
+			if !strings.Contains(string(body), want) {
+				t.Errorf("input %q: agent.yaml missing %q; got:\n%s",
+					tc.brokerURL, want, string(body))
+			}
+		})
 	}
 }
 

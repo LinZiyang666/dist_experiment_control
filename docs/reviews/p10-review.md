@@ -339,3 +339,81 @@ Reviewer's four risk tests now pass:
 - `TestReviewAgentInstallStartPathUsesConfiguredBroker`
 - `TestReviewBrokerInstallPreparesSidecarsAndWritableRuntimeDirs`
 - `TestReviewUpgradeRestartsAfterSuccessfulReplacement`
+
+---
+
+## Maintainer Self-Review (round 1.5)
+
+After the round-1 fix landed I did one more pass with the
+reviewer hat on. Found 5 quality gaps the reviewer's tests would
+not have caught and fixed them in the same series:
+
+### S1 — `loadAgentYAML` had no behavioral test
+
+Reviewer's `TestReviewAgentInstallStartPathUsesConfiguredBroker`
+greps the source for the strings "agent.yaml" and "broker_url".
+That passes even when an implementation reads the file but
+discards the value. Added `cmd/tether/agent_config_test.go` with
+4 sub-cases: missing file (zero struct + nil err), full file
+(every field round-trips), partial (older install.sh shape with
+no tunnel_addr), malformed (typo surfaces as error so operator
+notices).
+
+### S2 — `tunnel_addr` field not verified in install.sh test
+
+`TestInstallShAgentSkipDownloadWritesYAML` checked the original
+3 fields but not the new `tunnel_addr` line. A regression in the
+sed pipeline that derives `<broker host>:7000` would silently
+ship installs with a missing field. Added the missing assertion.
+
+### S3 — install.sh `tunnel_addr` derivation was untested
+
+The sed pipeline `s#^[a-z]+://##; s#[:/].*##` handles four
+input shapes (wss://host:port, ws://host, bare host, with path).
+Added `TestInstallShTunnelAddrDerivation` with one sub-case per
+shape so a regex change doesn't silently break a subset.
+
+### S4 — `tether node upgrade --all` was fail-fast on transient errors
+
+The first implementation aborted the whole fleet on the first
+`node_offline` reply. Reviewer didn't flag it because they didn't
+have a fleet-rollout risk test. Self-fix: classify replies into
+transient (node_offline / node_not_found / agent_no_responders /
+agent_malformed_resp / context deadline / canceled) vs config
+(not_owner / url_not_allowed / sha256_invalid /
+proto_bump_requires_reinstall / actor_invalid /
+session_not_found_or_deleting). `--all` skips transient with a
+warning + continues; aborts on config; final summary reports
+"X failed (Y transiently skipped)". Single-nid mode keeps the
+strict abort-on-any-error behavior.
+
+Tests: `cmd/tether/node_classify_test.go` pins the helper
+classifications; `test/p10/upgrade_all_test.go` drives the full
+loop against a stub broker that returns mixed responses, asserts
+all 3 nodes were called and only the OFFLINE one was skipped.
+
+### S5 — `pickFlagOrYaml` cross-cmd reuse was not explicitly tested
+
+The helper was originally written for the serve command; the
+agent-yaml wiring depends on it doing the right thing for the
+agent cobra command instance too. Added a sub-test in
+`cmd/tether/agent_config_test.go` that exercises the helper on
+the agent cmd directly with all three precedence paths.
+
+### Round-1.5 verification
+
+```text
+go build ./...                               → ok
+go vet ./...                                 → ok
+golangci-lint run ./...                      → 0 issues
+go test ./...                                → 29 packages PASS
+
+P10 case count grew from 16 → 27:
+  - install.sh: 8 (was 7) — added TestInstallShTunnelAddrDerivation
+  - upgrade safety: 9 (unchanged)
+  - upgrade --all: 2 NEW
+  - install-user-service: 3 (unchanged)
+  - reviewer risk: 4 (unchanged) — all green
+  + cmd/tether: TestLoadAgentYAML* (4) + TestPickFlagOrYamlOnAgentCmd
+    + TestIsTransientError + TestIsConfigError
+```
