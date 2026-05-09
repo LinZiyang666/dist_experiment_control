@@ -55,7 +55,7 @@ func TestNATSDeniesCrossSessionEvSubscribe(t *testing.T) {
 		if asyncErr == nil {
 			t.Fatal("expected permission violation, got nil")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("expected NATS permission violation for cross-session sub, none arrived")
 	}
 }
@@ -97,7 +97,7 @@ func TestNATSDeniesForwardedPub(t *testing.T) {
 		if asyncErr == nil {
 			t.Fatal("expected permission violation, got nil")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("expected NATS permission violation for .forwarded pub, none arrived")
 	}
 }
@@ -142,7 +142,7 @@ func TestNATSDeniesForgedActorPub(t *testing.T) {
 		if asyncErr == nil {
 			t.Fatal("expected permission violation, got nil")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("expected NATS permission violation for forged by.<actor> pub, none arrived")
 	}
 }

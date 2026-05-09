@@ -33,13 +33,19 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	db := openDB(t)
 	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
 
+	// Wide STALE window (200ms → 3s) so the matrix-load CPU
+	// pressure can't make the test fly past STALE and observe
+	// only OFFLINE. Audit shard 05: original 200/600 was 400ms
+	// wide; under `make e2e` parallel loadgen one tick of
+	// scheduling jitter could miss it. The total test deadline
+	// is still bounded by the per-phase 2s waitForState calls.
 	bCfg := broker.Config{
 		NATSURL:           url,
 		DB:                db,
 		Logger:            silent,
 		ReconcileInterval: 30 * time.Millisecond,
 		StaleAfter:        200 * time.Millisecond,
-		OfflineAfter:      600 * time.Millisecond,
+		OfflineAfter:      3 * time.Second,
 	}
 	b, err := broker.New(bCfg)
 	if err != nil {
@@ -78,7 +84,9 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	waitForState(t, db, "lab", "lab-1", "STALE", 2*time.Second)
 
 	// --- Phase 3: still gone → OFFLINE ---------------------------------------
-	waitForState(t, db, "lab", "lab-1", "OFFLINE", 2*time.Second)
+	// Now that OfflineAfter is 3s (was 600ms), Phase 3 needs a
+	// matching deadline.
+	waitForState(t, db, "lab", "lab-1", "OFFLINE", 5*time.Second)
 
 	// --- Phase 4: agent re-registers → ONLINE again --------------------------
 	a2, err := agent.New(agent.Config{
