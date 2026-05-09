@@ -181,6 +181,14 @@ func pickPublicHost(cmd *cobra.Command, flagVal, yamlPublicHost, yamlDomain stri
 // the 14000-14999 default. Inverted ranges, non-numeric tokens, and
 // out-of-range values are rejected with a precise error so the
 // operator's typo doesn't silently bind a valid-but-wrong band.
+//
+// The valid TCP-port range 1..65535 is accepted in full — this
+// helper does not enforce a "must be within 14000-14999" policy.
+// Operators with custom firewall ranges (e.g. an institutional
+// allow-list of 30000-30099) can configure them here; the
+// architecture's 14000-14999 default is just the default, not a
+// hard cap. Documented so future readers don't mistake the absent
+// upper-bound check for a missing validation.
 func parsePortBand(s string) (low, high int, err error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
