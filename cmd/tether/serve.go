@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/broker"
@@ -46,9 +48,26 @@ func newServeCmd() *cobra.Command {
 			dbPath = pickFlagOrYaml(cmd, "db", dbPath, fileCfg.Broker.Storage.DB)
 			tunnelCtrlAddr = pickFlagOrYaml(cmd, "tunnel-addr", tunnelCtrlAddr, fileCfg.Broker.Frp.ControlListen)
 			tunnelPublicHost = pickFlagOrYaml(cmd, "tunnel-public-host", tunnelPublicHost, fileCfg.Broker.Frp.BindAddr)
-			publicHost = pickFlagOrYaml(cmd, "public-host", publicHost, fileCfg.Broker.PublicHost)
+			// public_host precedence: explicit --public-host > yaml
+			// broker.public_host > yaml broker.domain (the architecture
+			// A.3 skeleton key) > cobra default "localhost". Falling
+			// back to broker.domain means a config that only sets
+			// `domain: tether.example.com` Just Works for `tether
+			// expose` URLs without requiring the operator to also
+			// duplicate the value into a non-skeleton public_host key.
+			publicHost = pickPublicHost(cmd, publicHost, fileCfg.Broker.PublicHost, fileCfg.Broker.Domain)
 			storeDir = pickFlagOrYaml(cmd, "store-dir", storeDir, fileCfg.Broker.Storage.JSStore)
 			adminSocket = pickFlagOrYaml(cmd, "admin-socket", adminSocket, fileCfg.Broker.Admin.Socket)
+
+			// frp.port_range "low-high" → PortBandLow/High. Empty stays
+			// 0/0 so broker.PortAllocCfg falls back to the
+			// 14000-14999 default. Bad input is fatal — silently
+			// landing on the default would surprise an operator who
+			// configured a custom firewall range.
+			bandLow, bandHigh, err := parsePortBand(fileCfg.Broker.Frp.PortRange)
+			if err != nil {
+				return fmt.Errorf("broker.yaml frp.port_range: %w", err)
+			}
 
 			db, err := storage.Open(dbPath)
 			if err != nil {
@@ -65,6 +84,8 @@ func newServeCmd() *cobra.Command {
 				TunnelPublicHost:  tunnelPublicHost,
 				StoreDir:          storeDir,
 				AdminSocketPath:   adminSocket,
+				PortBandLow:       bandLow,
+				PortBandHigh:      bandHigh,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -117,8 +138,8 @@ func newServeCmd() *cobra.Command {
 		"bind address for the public per-port tunnel listeners (default 0.0.0.0)")
 	cmd.Flags().StringVar(&storeDir, "store-dir", "",
 		"JetStream store dir to monitor for disk pressure (P7/H.4); empty = monitor disabled")
-	cmd.Flags().StringVar(&adminSocket, "admin-socket", "",
-		"local Unix socket for `tether admin *` (architecture I.2b); empty = admin endpoint disabled")
+	cmd.Flags().StringVar(&adminSocket, "admin-socket", defaultAdminSocket,
+		"local Unix socket for `tether admin *` (architecture I.2b); set to empty to disable")
 	return cmd
 }
 
@@ -134,6 +155,56 @@ func pickFlagOrYaml(cmd *cobra.Command, flag, flagVal, yamlVal string) string {
 		return yamlVal
 	}
 	return flagVal
+}
+
+// pickPublicHost is pickFlagOrYaml with one extra fallback: if both
+// the CLI flag default and yaml broker.public_host are empty, use
+// yaml broker.domain (the architecture A.3 skeleton primary key).
+// Lets a minimal broker.yaml that only sets `domain:` cover the
+// expose-URL use case without requiring a duplicated key.
+func pickPublicHost(cmd *cobra.Command, flagVal, yamlPublicHost, yamlDomain string) string {
+	if cmd.Flags().Changed("public-host") {
+		return flagVal
+	}
+	if yamlPublicHost != "" {
+		return yamlPublicHost
+	}
+	if yamlDomain != "" {
+		return yamlDomain
+	}
+	return flagVal
+}
+
+// parsePortBand parses an architecture A.3 frp.port_range string of
+// the form "low-high" (e.g. "14000-14999") into two ints. Empty
+// input returns (0, 0, nil) so broker.PortAllocCfg falls back to
+// the 14000-14999 default. Inverted ranges, non-numeric tokens, and
+// out-of-range values are rejected with a precise error so the
+// operator's typo doesn't silently bind a valid-but-wrong band.
+func parsePortBand(s string) (low, high int, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected \"low-high\", got %q", s)
+	}
+	low, err = strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("low: %w", err)
+	}
+	high, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("high: %w", err)
+	}
+	if low <= 0 || high <= 0 || low > 65535 || high > 65535 {
+		return 0, 0, fmt.Errorf("ports out of range: %d-%d", low, high)
+	}
+	if low > high {
+		return 0, 0, fmt.Errorf("low %d > high %d", low, high)
+	}
+	return low, high, nil
 }
 
 // loadAuthCalloutSeeds reads broker.nk and account.nk (both 0600 files

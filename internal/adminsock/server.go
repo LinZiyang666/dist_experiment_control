@@ -74,14 +74,31 @@ func New(path string, backend Backend) *Server {
 // runs until ctx is canceled or the server is Closed. Concurrent
 // Start calls are not allowed.
 func (s *Server) Start(ctx context.Context) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	parent := filepath.Dir(s.path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("adminsock: mkdir parent: %w", err)
 	}
+	// MkdirAll is a no-op when the parent already exists; defensively
+	// re-chmod every Start so an operator-pre-created /var/run/tether
+	// at 0755 doesn't silently weaken the architecture P9 invariant
+	// of "parent dir 0700, socket 0600". Failure to harden is fatal:
+	// continuing would leave the socket exposed to any local user.
+	if err := os.Chmod(parent, 0o700); err != nil {
+		return fmt.Errorf("adminsock: chmod parent 0700: %w", err)
+	}
 	// Stale socket from a previous crashed broker would block bind.
-	// `unix` listeners can't reuse the path; remove if present and
-	// it's actually a socket (don't unlink a regular file the
-	// operator may have placed there by mistake).
+	// `unix` listeners can't reuse the path. Two failure modes share
+	// this dirent shape: a TRULY stale path (no listener) and a path
+	// owned by a STILL-RUNNING broker. Unlinking the latter would
+	// silently steal the path from the live process — we'd succeed
+	// here while leaving the original broker bound to a now-orphaned
+	// inode and unreachable via the documented admin path. So probe
+	// with a short Dial first: connectable → return active-socket
+	// error; not connectable → safe to unlink and re-bind.
 	if fi, err := os.Lstat(s.path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		if alive := isAdminSocketAlive(s.path); alive {
+			return fmt.Errorf("adminsock: active socket already exists at %s", s.path)
+		}
 		_ = os.Remove(s.path)
 	}
 	ln, err := net.Listen("unix", s.path)
@@ -96,8 +113,26 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = ln
 	s.mu.Unlock()
 
-	go s.acceptLoop(ctx)
+	// Pass the listener as a parameter so acceptLoop never reads
+	// s.listener concurrently with Close (which sets it to nil). The
+	// loop owns its own reference; Close still triggers exit by
+	// closing the listener (Accept returns ErrClosed).
+	go s.acceptLoop(ctx, ln)
 	return nil
+}
+
+// isAdminSocketAlive returns true iff a Dial against path succeeds
+// within a short window — i.e. another broker is currently bound to
+// it. Connection-refused / ENOENT / timeout are all "not alive,
+// safe to reclaim". The dial doesn't write anything, so the live
+// broker (if any) just sees an immediate disconnect.
+func isAdminSocketAlive(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // Close unbinds the listener and removes the socket file. Safe to
@@ -118,13 +153,13 @@ func (s *Server) Close() error {
 	return err
 }
 
-func (s *Server) acceptLoop(ctx context.Context) {
+func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 	go func() {
 		<-ctx.Done()
 		_ = s.Close()
 	}()
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
