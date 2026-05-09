@@ -99,14 +99,14 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	switch {
 	case errors.Is(err, node.ErrNotFound):
 		b.replyExposeErr(msg, "node_not_found", "")
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_not_found")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_not_found", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyExposeErr(msg, "store_error", err.Error())
 		return
 	case status != node.StateOnline:
 		b.replyExposeErr(msg, "node_offline", string(status))
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_offline:"+string(status))
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_offline:"+string(status), msg.Reply, nil)
 		return
 	}
 
@@ -128,11 +128,11 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	switch {
 	case errors.Is(err, port.ErrNameTaken):
 		b.replyExposeErr(msg, "name_taken", req.Name)
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "name_taken")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "name_taken", msg.Reply, nil)
 		return
 	case errors.Is(err, port.ErrPortExhausted):
 		b.replyExposeErr(msg, "port_exhausted", "")
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "port_exhausted")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "port_exhausted", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyExposeErr(msg, "alloc_failed", err.Error())
@@ -166,7 +166,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
 		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
 		b.replyExposeErr(msg, "agent_no_responders", err.Error())
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_no_responders")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_no_responders", msg.Reply, nil)
 		return
 	}
 	var agentResp proto.ExposeForwardedResp
@@ -179,7 +179,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
 		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
 		b.replyExposeErr(msg, "agent_rejected:"+agentResp.Code, agentResp.Error)
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_rejected:"+agentResp.Code)
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_rejected:"+agentResp.Code, msg.Reply, nil)
 		return
 	}
 
@@ -200,7 +200,8 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		"sid", sid, "nid", nid, "name", req.Name,
 		"port", alloc.Port, "local", req.LocalPort, "fp", fp)
 	b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "allocated")
-	b.pubAuditCall(sid, fp, actor, "expose", nid, true, "")
+	b.pubAuditCall(sid, fp, actor, "expose", nid, true, "", msg.Reply,
+		map[string]any{"port": alloc.Port, "name": req.Name, "local_port": req.LocalPort})
 	b.pubAuditPort(sid, "allocated", nid, alloc.Port, req.Name, req.LocalPort, fp, b.cfg.Now())
 }
 
@@ -281,7 +282,7 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 		}
 		if !isOwner {
 			b.replyExposeRmErr(msg, "not_owner_or_creator", req.Name)
-			b.pubAuditCall(sid, fp, actor, "expose-rm", alloc.NID, false, "not_owner_or_creator")
+			b.pubAuditCall(sid, fp, actor, "expose-rm", alloc.NID, false, "not_owner_or_creator", msg.Reply, nil)
 			return
 		}
 	}
@@ -308,7 +309,8 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 	b.cfg.Logger.Info("broker: expose freed",
 		"sid", sid, "nid", alloc.NID, "name", req.Name, "port", alloc.Port, "fp", fp)
 	b.pubPortEvent(sid, alloc.Port, req.Name, alloc.NID, alloc.LocalPort, "freed")
-	b.pubAuditCall(sid, fp, actor, "expose-rm", alloc.NID, true, "")
+	b.pubAuditCall(sid, fp, actor, "expose-rm", alloc.NID, true, "", msg.Reply,
+		map[string]any{"port": alloc.Port, "name": req.Name})
 	b.pubAuditPort(sid, "freed", alloc.NID, alloc.Port, req.Name, alloc.LocalPort, fp, b.cfg.Now())
 }
 

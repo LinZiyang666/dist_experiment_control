@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
@@ -49,7 +52,17 @@ func newVersionCmd() *cobra.Command {
 }
 
 func main() {
-	if err := newRootCmd().Execute(); err != nil {
+	// ExecuteContext + signal.NotifyContext so Ctrl-C / SIGTERM tear
+	// down running subcommands (`tether ps`, `history --follow`,
+	// `exec`, `session rm`, etc.) instead of waiting for each
+	// command's per-call timeout. Audit shard 04 F1: bare Execute()
+	// gave subcommands `cmd.Context() == Background()`, so signal
+	// handling was a no-op everywhere. The signal-aware ctx is
+	// observed by every cobra command via cmd.Context().
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := newRootCmd().ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

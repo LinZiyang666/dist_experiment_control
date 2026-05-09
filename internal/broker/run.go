@@ -60,14 +60,14 @@ func (b *Broker) handleRunReq(nc *nats.Conn, msg *nats.Msg) {
 	switch {
 	case errors.Is(err, node.ErrNotFound):
 		b.replyRunFailed(msg, "node_not_found")
-		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_not_found")
+		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_not_found", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyRunFailed(msg, "store_error: "+err.Error())
 		return
 	case status != node.StateOnline:
 		b.replyRunFailed(msg, "node_offline: status="+string(status))
-		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_offline:"+string(status))
+		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_offline:"+string(status), msg.Reply, nil)
 		return
 	}
 
@@ -97,7 +97,7 @@ func (b *Broker) handleRunReq(nc *nats.Conn, msg *nats.Msg) {
 
 	b.cfg.Logger.Info("broker: run forwarded",
 		"sid", sid, "nid", nid, "actor", actor, "fp", fp)
-	b.pubAuditCall(sid, fp, actor, "run", nid, true, "")
+	b.pubAuditCall(sid, fp, actor, "run", nid, true, "", msg.Reply, nil)
 }
 
 // replyRunFailed replies on the ctl's inbox with a RunChunk{Kind:failed}.
@@ -178,7 +178,7 @@ func (b *Broker) handleKillReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyKillFailed(msg, "forward_failed: "+err.Error())
 		return
 	}
-	b.pubAuditCall(sid, fp, actor, "kill", nid, true, "")
+	b.pubAuditCall(sid, fp, actor, "kill", nid, true, "", msg.Reply, nil)
 }
 
 func (b *Broker) replyKillFailed(msg *nats.Msg, reason string) {

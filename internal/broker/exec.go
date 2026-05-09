@@ -72,14 +72,14 @@ func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 	switch {
 	case errors.Is(err, node.ErrNotFound):
 		b.replyExecErr(msg, "node_not_found")
-		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_not_found")
+		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_not_found", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyExecErr(msg, "store_error: "+err.Error())
 		return
 	case status != node.StateOnline:
 		b.replyExecErr(msg, "node_offline: status="+string(status))
-		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_offline:"+string(status))
+		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_offline:"+string(status), msg.Reply, nil)
 		return
 	}
 
@@ -113,7 +113,7 @@ func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 		"sid", sid, "nid", nid, "actor", actor, "fp", fp)
 
 	// audit.call (single-writer rule C.1 §4).
-	b.pubAuditCall(sid, fp, actor, "exec", nid, true, "")
+	b.pubAuditCall(sid, fp, actor, "exec", nid, true, "", msg.Reply, nil)
 }
 
 // replyExecErr replies on the ctl's inbox with an ExecChunk{kind:error}.
@@ -365,11 +365,28 @@ func splitDot(s string) []string {
 // marshal through the schema struct, never an inline anonymous one;
 // a future field rename then surfaces as a build error here rather
 // than as a silent decoder-loses-fields bug at the consumer.
-func (b *Broker) pubAuditCall(sid, actorFP, actorNkey, verb, nid string, ok bool, errMsg string) {
+//
+// reqID is the NATS reply inbox the caller is using (uniquely
+// identifies the call across the whole broker process); empty
+// when there's no reply context. target is verb-specific metadata
+// (e.g. {"pid": "01H..."} for exec, {"port": 14022} for expose)
+// so consumers of audit.call can join call→proc/port without
+// guessing. Empty target is OK; the field is omitempty in JSON.
+//
+// Audit shard 03 F2: ReqID + Target were defined in schema but
+// never populated by the broker, so `tether history` lost the
+// ability to correlate call → proc / port. This populates both
+// at every site.
+func (b *Broker) pubAuditCall(
+	sid, actorFP, actorNkey, verb, nid string,
+	ok bool, errMsg string,
+	reqID string, target map[string]any,
+) {
 	payload, err := json.Marshal(schema.AuditCall{
 		V: schema.AuditSchemaVersion, Kind: "call", Ts: b.cfg.Now(),
 		ActorNkey: actorNkey, ActorFp: actorFP,
 		Session: sid, Node: nid, Verb: verb,
+		ReqID: reqID, Target: target,
 		OK: ok, Error: errMsg,
 	})
 	if err != nil {

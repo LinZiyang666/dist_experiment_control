@@ -12,9 +12,12 @@
 package agent
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +31,13 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
 )
+
+// upgradeMaxTarballBytes caps the upgrade download size. v1 tether
+// release tarballs are ~10MiB; 64MiB gives 6× headroom while
+// preventing a malicious or misconfigured URL from OOM-ing the
+// agent (audit Sec F1: io.ReadAll has no size limit, `--all`
+// could OOM the entire fleet at once).
+const upgradeMaxTarballBytes = 64 * 1024 * 1024
 
 // UpgradeURLAllowlist is the agent-side defense-in-depth allowlist.
 // Defaults to nil (= reject everything) if the operator forgets to
@@ -170,8 +180,13 @@ func urlAllowed(url string, allow []string) bool {
 	return false
 }
 
-// fetchURL downloads body bytes via HTTP GET with a hard timeout.
-// Returns an error for any non-2xx or transport failure.
+// fetchURL downloads body bytes via HTTP GET with a hard timeout
+// AND a hard size cap. The cap defends against a malicious URL
+// (broker compromise, MITM on a non-https mirror) that would
+// otherwise stream gigabytes into the agent's memory; with `--all`
+// fan-out, that could OOM every agent in a session at once.
+// Returns an error for any non-2xx, transport failure, or oversize
+// response.
 func fetchURL(url string, timeout time.Duration) ([]byte, error) {
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
@@ -182,7 +197,17 @@ func fetchURL(url string, timeout time.Duration) ([]byte, error) {
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	// LimitReader + 1 trick: read maxN+1 bytes; if the read
+	// returned exactly maxN+1 bytes the actual stream is larger
+	// than maxN. Anything <= maxN is fine.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, upgradeMaxTarballBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(body)) > upgradeMaxTarballBytes {
+		return nil, fmt.Errorf("upgrade tarball too large: > %d bytes", upgradeMaxTarballBytes)
+	}
+	return body, nil
 }
 
 func sha256OfBytes(b []byte) string {
@@ -190,14 +215,21 @@ func sha256OfBytes(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// installNewBinary atomically replaces dst with the contents of
-// the freshly-downloaded tarball. The release tarball layout
-// (build/goreleaser.yaml § archives) is one file `tether` at the
-// archive root; we extract that into a sibling tmp file, chmod
-// +x, then rename onto dst. Rename is atomic on the same fs;
-// running processes keep their open inode handle (the new binary
-// only loads on the next exec), so this is safe to do while the
-// agent is still serving the upgrade reply.
+// installNewBinary atomically replaces dst with the `tether` binary
+// contained in the just-downloaded gzipped tar. The release tarball
+// layout (build/goreleaser.yaml § archives) carries a single file
+// named `tether` at the archive root plus README/LICENSE; we
+// extract just `tether` into a sibling tmp file, chmod +x, then
+// rename onto dst. Rename is atomic on the same fs; running
+// processes keep their open inode handle (the new binary only
+// loads on the next exec), so this is safe to do while the agent
+// is still serving the upgrade reply.
+//
+// Uses archive/tar + compress/gzip directly (audit Sec F1: shelling
+// out to host tar opens path-traversal exposure under non-GNU tar
+// implementations). Each tar header.Name is checked: must be
+// exactly "tether" — anything with a path separator, leading slash,
+// or "..", or any other filename, is refused.
 //
 // Returns the new tether version string parsed from the binary
 // (best-effort via `tether version`); on parse failure the field
@@ -209,19 +241,9 @@ func installNewBinary(tarball []byte, dst string) (string, error) {
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	// Write tarball to disk so we can hand it to `tar` (avoids us
-	// pulling in archive/tar + compress/gzip; the host always has
-	// tar(1)).
-	tarPath := filepath.Join(tmpDir, "release.tar.gz")
-	if err := os.WriteFile(tarPath, tarball, 0o600); err != nil {
-		return "", fmt.Errorf("write tarball: %w", err)
-	}
-	if err := runTar(tarPath, tmpDir); err != nil {
-		return "", err
-	}
 	binPath := filepath.Join(tmpDir, "tether")
-	if _, err := os.Stat(binPath); err != nil {
-		return "", fmt.Errorf("tarball missing tether binary: %w", err)
+	if err := extractTetherBinary(tarball, binPath); err != nil {
+		return "", err
 	}
 	if err := os.Chmod(binPath, 0o755); err != nil {
 		return "", fmt.Errorf("chmod: %w", err)
@@ -232,13 +254,54 @@ func installNewBinary(tarball []byte, dst string) (string, error) {
 	return readVersionString(dst), nil
 }
 
-func runTar(tarPath, destDir string) error {
-	cmd := exec.Command("tar", "-xzf", tarPath, "-C", destDir)
-	out, err := cmd.CombinedOutput()
+// extractTetherBinary scans the gzipped tar for a single file
+// entry literally named "tether" and writes its contents to
+// outPath. Refuses any other path. Refuses files larger than
+// upgradeMaxTarballBytes (defense in depth — the network read is
+// already capped, but a maliciously-crafted small tar could
+// declare a huge file size).
+func extractTetherBinary(tarball []byte, outPath string) error {
+	gz, err := gzip.NewReader(strings.NewReader(string(tarball)))
 	if err != nil {
-		return fmt.Errorf("tar -xzf: %w: %s", err, string(out))
+		return fmt.Errorf("gzip open: %w", err)
 	}
-	return nil
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("tarball missing tether binary entry")
+		}
+		if err != nil {
+			return fmt.Errorf("tar read: %w", err)
+		}
+		// Strict allowlist: the literal name "tether" and nothing
+		// else. base()-ing or filepath.Clean()-ing first would
+		// silently accept "./tether", "subdir/tether", or worse,
+		// "../something".
+		if hdr.Name != "tether" {
+			continue
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return fmt.Errorf("tether entry has wrong type: %v", hdr.Typeflag)
+		}
+		if hdr.Size > upgradeMaxTarballBytes {
+			return fmt.Errorf("tether entry too large: %d bytes", hdr.Size)
+		}
+		f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create binary: %w", err)
+		}
+		_, err = io.CopyN(f, tr, hdr.Size)
+		closeErr := f.Close()
+		if err != nil {
+			return fmt.Errorf("write binary: %w", err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close binary: %w", closeErr)
+		}
+		return nil
+	}
 }
 
 // readVersionString runs `<exe> version` and returns the first line

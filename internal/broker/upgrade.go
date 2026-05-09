@@ -62,7 +62,7 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	if !owner {
 		b.replyUpgradeErr(msg, "not_owner", "")
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "not_owner")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "not_owner", msg.Reply, nil)
 		return
 	}
 
@@ -71,14 +71,14 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	switch {
 	case errors.Is(err, node.ErrNotFound):
 		b.replyUpgradeErr(msg, "node_not_found", "")
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_not_found")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_not_found", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyUpgradeErr(msg, "store_error", err.Error())
 		return
 	case status != node.StateOnline:
 		b.replyUpgradeErr(msg, "node_offline", string(status))
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_offline:"+string(status))
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_offline:"+string(status), msg.Reply, nil)
 		return
 	}
 
@@ -91,17 +91,17 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	if req.ProtoVersion != proto.ProtoVersion {
 		b.replyUpgradeErr(msg, "proto_bump_requires_reinstall",
 			fmt.Sprintf("broker proto=%d, request proto=%d", proto.ProtoVersion, req.ProtoVersion))
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "proto_bump_requires_reinstall")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "proto_bump_requires_reinstall", msg.Reply, nil)
 		return
 	}
 	if !sha256HexRE.MatchString(strings.ToLower(req.SHA256)) {
 		b.replyUpgradeErr(msg, "sha256_invalid", "expected 64 lowercase hex chars")
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "sha256_invalid")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "sha256_invalid", msg.Reply, nil)
 		return
 	}
 	if !urlAllowed(req.URL, b.cfg.UpgradeURLAllowlist) {
 		b.replyUpgradeErr(msg, "url_not_allowed", req.URL)
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "url_not_allowed")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "url_not_allowed", msg.Reply, nil)
 		return
 	}
 
@@ -119,7 +119,7 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	respMsg, err := nc.Request(subj, body, b.cfg.UpgradeForwardTimeout())
 	if err != nil {
 		b.replyUpgradeErr(msg, "agent_no_responders", err.Error())
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "agent_no_responders")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "agent_no_responders", msg.Reply, nil)
 		return
 	}
 	var agentResp proto.UpgradeForwardedResp
@@ -129,7 +129,7 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	if !agentResp.OK {
 		b.replyUpgradeErr(msg, "agent_rejected:"+agentResp.Code, agentResp.Error)
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "agent_rejected:"+agentResp.Code)
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "agent_rejected:"+agentResp.Code, msg.Reply, nil)
 		return
 	}
 
@@ -141,7 +141,8 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	b.cfg.Logger.Info("broker: upgrade dispatched",
 		"sid", sid, "nid", nid, "url", req.URL, "actor_fp", fp,
 		"new_version", agentResp.NewVersion)
-	b.pubAuditCall(sid, fp, actor, "upgrade", nid, true, "")
+	b.pubAuditCall(sid, fp, actor, "upgrade", nid, true, "", msg.Reply,
+		map[string]any{"url": req.URL, "sha256": strings.ToLower(req.SHA256), "new_version": agentResp.NewVersion})
 }
 
 func (b *Broker) replyUpgradeErr(msg *nats.Msg, code, detail string) {
