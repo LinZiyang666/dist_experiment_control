@@ -519,6 +519,16 @@ func TestChaosKillAgentRestartConverges(t *testing.T) {
 
 	// First agent: the node row gets created via real register.
 	stop1, _ := startAgentManual(t, url, "lab", "lab-1")
+	// stop1 is called explicitly mid-test (chaos crash); guard
+	// against an early Fatal between here and that call (audit
+	// shard 05 F20). stoppedExplicitly tracks whether the test
+	// already ran the explicit call so Cleanup doesn't double-stop.
+	stoppedExplicitly := false
+	t.Cleanup(func() {
+		if !stoppedExplicitly {
+			stop1()
+		}
+	})
 
 	// Verify node row is ONLINE.
 	var status string
@@ -566,6 +576,7 @@ func TestChaosKillAgentRestartConverges(t *testing.T) {
 	defer func() { _ = subAudit.Unsubscribe() }()
 
 	// Kill the live agent (= chaos crash).
+	stoppedExplicitly = true
 	stop1()
 
 	// Restart agent (fresh process — empty LocalProcesses snapshot).

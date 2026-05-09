@@ -365,6 +365,18 @@ func TestReconcilerRevokesOfflineNodePorts(t *testing.T) {
 	defer startBroker(t, url, db)()
 
 	stopAgent := startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})
+	// Belt-and-suspenders: stopAgent is called explicitly mid-test
+	// to drive the OFFLINE → REVOKED reconciler, but if the test
+	// fails earlier (Fatal'd setup, etc.) the agent goroutine would
+	// leak. t.Cleanup runs after the explicit call too — harmless
+	// because stopAgent is itself idempotent (the inner cancel is
+	// a no-op the second time). Audit shard 05 F19.
+	stoppedExplicitly := false
+	t.Cleanup(func() {
+		if !stoppedExplicitly {
+			stopAgent()
+		}
+	})
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -390,6 +402,7 @@ func TestReconcilerRevokesOfflineNodePorts(t *testing.T) {
 	// Kill agent → node OFFLINE after ~900ms (broker config) → port
 	// reconciler revokes after PortRevokeAfterDur=300ms → expect event
 	// within ~2s total.
+	stoppedExplicitly = true
 	stopAgent()
 
 	select {
