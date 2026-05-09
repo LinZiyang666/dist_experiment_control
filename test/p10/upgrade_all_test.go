@@ -34,7 +34,15 @@ func stubUpgradeBroker(t *testing.T, url string, routes map[string]proto.Upgrade
 	calls := &atomic.Int32{}
 	sub, err := nc.Subscribe(proto.SubjectPrefix+".s.*.cmd.by.*.node.*.upgrade.req", func(msg *nats.Msg) {
 		calls.Add(1)
-		_, _, nid, _, _ := proto.ParseCmdBy(msg.Subject)
+		// Bypass proto.ParseCmdBy here: the stub takes wildcard
+		// subjects with synthetic actor/sid/nid tokens that don't
+		// pass ValidateActorToken (we don't have a real nkey
+		// machinery here). Split manually to recover the nid.
+		parts := strings.Split(msg.Subject, ".")
+		nid := ""
+		if len(parts) == 11 {
+			nid = parts[8]
+		}
 		resp, ok := routes[nid]
 		if !ok {
 			resp = proto.UpgradeResp{Code: "no_route", Error: nid}

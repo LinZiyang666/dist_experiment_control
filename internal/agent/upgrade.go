@@ -288,7 +288,9 @@ func extractTetherBinary(tarball []byte, outPath string) error {
 		if hdr.Name != "tether" {
 			continue
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		// archive/tar collapses the legacy TypeRegA into TypeReg
+		// since Go 1.11; one check suffices.
+		if hdr.Typeflag != tar.TypeReg {
 			return fmt.Errorf("tether entry has wrong type: %v", hdr.Typeflag)
 		}
 		if hdr.Size > upgradeMaxTarballBytes {
