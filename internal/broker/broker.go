@@ -172,6 +172,12 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.ps.req", b.handlePsReq},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.started", b.handleProcEvent},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.exit", b.handleProcEvent},
+		// P5 PTY control plane.
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.run.req",
+			func(msg *nats.Msg) { b.handleRunReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.kill.req",
+			func(msg *nats.Msg) { b.handleKillReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.pty.*.failed", b.handlePtyFailed},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {

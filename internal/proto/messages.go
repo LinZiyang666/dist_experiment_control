@@ -162,3 +162,98 @@ type PsResp struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+// RunReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.run.req.
+//
+// Interactive PTY mode. Architecture C.5 / P5: agent allocates a PTY,
+// replies RunChunk{Kind:ready,PID,Cols,Rows}, waits for ctl to publish a
+// PtyAttachEvent on s.<sid>.pty.<pid>.attach within 3s, only THEN
+// fork+exec's the child with PTY slave bound to its stdio.
+//
+// Cols/Rows here are ctl's terminal size at run.req time; ctl sends the
+// authoritative initial size again in PtyAttachEvent.
+type RunReq struct {
+	Argv []string          `json:"argv"`
+	Env  map[string]string `json:"env,omitempty"`
+	Cwd  string            `json:"cwd,omitempty"`
+	Cols int               `json:"cols,omitempty"`
+	Rows int               `json:"rows,omitempty"`
+
+	// ActorFP — broker-stamped at forward time; same semantics as
+	// ExecReq.ActorFP. Whatever ctl supplies is discarded.
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// RunChunk is what the agent / broker streams back on the run.req reply
+// inbox over the lifetime of one run:
+//
+//   1. exactly one Kind="ready" with PID + initial Cols/Rows;
+//   2. exactly one Kind="started" once attach was received and exec succeeded;
+//   3. exactly one terminal chunk:
+//        - Kind="exit" with ExitCode (normal end, including non-zero exit),
+//        - Kind="failed" with Reason (attach_timeout / exec_failed / ...).
+//
+// PTY byte streams travel on a SEPARATE subject (`pty.<pid>.out`); this
+// reply inbox carries only lifecycle events. Two channels keep the byte
+// stream untouched by lifecycle bookkeeping (and let broker write
+// `audit.proc{kind:attach_timeout}` without sitting in the byte path).
+type RunChunk struct {
+	Kind     string `json:"kind"`
+	PID      string `json:"pid,omitempty"`
+	Cols     int    `json:"cols,omitempty"`
+	Rows     int    `json:"rows,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// PtyAttachEvent — ctl pub on s.<sid>.pty.<pid>.attach. Architecture
+// C.5.1 step 5: ctl has subscribed to .out / .in / .resize and is now
+// telling the agent "you may exec; here is my authoritative initial
+// terminal size". Agent fork+exec's only after receiving this.
+type PtyAttachEvent struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
+}
+
+// PtyResizeEvent — ctl pub on s.<sid>.pty.<pid>.resize. Architecture
+// C.5.2: ctl SIGWINCH handler emits this whenever the local terminal
+// resizes; agent ioctl(TIOCSWINSZ) on the PTY master.
+type PtyResizeEvent struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
+}
+
+// PtyFailedEvent — agent pub on s.<sid>.pty.<pid>.failed. Architecture
+// C.5.1: when attach doesn't arrive within 3s, OR when fork+exec itself
+// fails after attach. Reason is machine-readable (attach_timeout,
+// exec_failed, pty_alloc_failed). Broker subscribes to write
+// audit.proc{kind:reason} (the audit kind mirrors the failure shape).
+type PtyFailedEvent struct {
+	PID    string `json:"pid"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// KillReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.kill.req.
+//
+// Used for Ctrl-C semantics in `tether run`: ctl captures local Ctrl-C
+// (raw mode swallowed it before the kernel could deliver it to the
+// PTY's foreground process group), and sends one of these instead. The
+// agent forwards the signal to the child's process group so SIGINT
+// propagates to the whole job (e.g. shell + child).
+//
+// Signal is the conventional UNIX signal NUMBER (2 = SIGINT, 15 = SIGTERM,
+// 9 = SIGKILL). v1 only sends SIGINT but the field is open for SIGTERM /
+// SIGKILL escalation (P-future).
+type KillReq struct {
+	PID     string `json:"pid"`
+	Signal  int    `json:"signal"`
+	ActorFP string `json:"actor_fp,omitempty"` // broker-stamped, same convention as ExecReq.ActorFP
+}
+
+// KillResp — agent pub on the kill.req reply inbox.
+type KillResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`  // pid_unknown | signal_failed | not_a_member | ...
+	Error string `json:"error,omitempty"`
+}
+

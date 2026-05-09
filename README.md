@@ -5,17 +5,29 @@ NAT, with a single public broker. Designed in `docs/architecture.md`.
 
 ## Status
 
-Pre-alpha (phase **P4 complete**). Adds the non-interactive control
-plane on top of P3:
+Pre-alpha (phase **P5 complete**). Adds interactive PTY mode on top of P4:
 
-- `tether exec <node> -- <argv>` runs argv on the named agent node,
-  streaming stdout/stderr back via the request's reply inbox, and
-  propagates the remote exit code as the local exit code.
+- `tether run <node> -- <argv>` runs argv interactively on the named
+  agent node with a PTY allocated. Local terminal goes into raw mode
+  so keys / Ctrl sequences / cursor moves flow through; SIGWINCH
+  resizes are forwarded; local Ctrl-C is delivered as SIGINT to the
+  remote process group.
+- Two-phase attach handshake (architecture C.5.1): agent allocates a
+  PTY without exec, replies `RunChunk{Kind:ready}`; ctl subscribes
+  `pty.<pid>.out` and publishes `pty.<pid>.attach`; only then agent
+  forks+execs. First byte of remote output cannot be lost.
+- 3-second attach deadline: agent that doesn't see attach in time
+  publishes `pty.<pid>.failed{reason:attach_timeout}`, releases the
+  PTY, and replies `RunChunk{Kind:failed}` to ctl. broker writes
+  `audit.proc{kind:attach_timeout}`.
+- `tether exec <node> -- <argv>` (P4) for non-interactive commands;
+  streams stdout/stderr and propagates the remote exit code.
 - `tether ps [-a]` lists processes in the active session (RUNNING by
   default; `-a` includes EXITED).
-- broker forwards `cmd.by.<actor>.node.<nid>.exec.req` →
-  `cmd.node.<nid>.exec.req.forwarded` while preserving the original
-  reply inbox; agent only subscribes to `.forwarded` (architecture C.4).
+- broker forwards `cmd.by.<actor>.node.<nid>.<verb>.req` →
+  `cmd.node.<nid>.<verb>.req.forwarded` for verb ∈ {exec, run, kill}
+  while preserving the original reply inbox; agent only subscribes to
+  `.forwarded` (architecture C.4).
 - `internal/proc` owns the SQLite process row, written from agent's
   `ev.proc.<pid>.{started,exit}` events. broker also writes
   `audit.call` / `audit.proc` (single-writer rule, C.1 §4).
@@ -41,7 +53,7 @@ to both `tether agent` and the ctl commands) to connect anonymously
 to a vanilla `nats-server`. NATS-level identity enforcement is
 bypassed in that mode; never use it in production.
 
-PTY mode (`tether run` for vim/htop/progress bars) lands in P5.
+Port `expose` (frp data plane for jupyter / tensorboard) lands in P6.
 
 ## Build
 

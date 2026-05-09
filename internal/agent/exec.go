@@ -34,9 +34,19 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	verb := parts[7]
+	// Each verb handler is dispatched in its own goroutine so a
+	// long-running run (which blocks in pty.Wait) doesn't head-of-line
+	// block subsequent kill.req.forwarded / exec.req.forwarded
+	// messages on the same single NATS subscription. Without this,
+	// `tether run sleep 60` + Ctrl-C would never deliver the kill
+	// signal because the dispatch goroutine is still inside Wait.
 	switch verb {
 	case "exec":
-		a.handleExecForwarded(nc, msg)
+		go a.handleExecForwarded(nc, msg)
+	case "run":
+		go a.handleRunForwarded(nc, msg)
+	case "kill":
+		go a.handleKillForwarded(nc, msg)
 	default:
 		a.cfg.Logger.Warn("agent: unknown forwarded verb", "verb", verb)
 	}

@@ -30,10 +30,12 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
@@ -81,6 +83,13 @@ type Config struct {
 
 type Agent struct {
 	cfg Config
+
+	// procs tracks live `tether run` PTY sessions by pid. Used by the
+	// kill verb to look up the right *pty.Session to signal. The map
+	// is populated when fork+exec succeeds (after attach handshake)
+	// and pruned right before the agent publishes RunChunk{Kind:exit}.
+	procs   map[string]*pty.Session
+	procsMu sync.Mutex
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -110,7 +119,7 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.RegisterRetryMax == 0 {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
-	return &Agent{cfg: cfg}, nil
+	return &Agent{cfg: cfg, procs: map[string]*pty.Session{}}, nil
 }
 
 // Run is the agent's main loop:

@@ -26,6 +26,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newCtxCmd())
 	root.AddCommand(newExecCmd())
 	root.AddCommand(newPsCmd())
+	root.AddCommand(newRunCmd())
 	return root
 }
 
