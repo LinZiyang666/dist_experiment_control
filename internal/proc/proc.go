@@ -154,10 +154,17 @@ func MarkExited(db *sql.DB, pid string, exitCode int, when time.Time) error {
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		// Either unknown pid or already non-RUNNING. Distinguish.
+		// Audit shard 03 F6: previously the SELECT err was discarded
+		// — a transient DB error would silently report success while
+		// SQLite still says RUNNING but audit.proc{exit} got
+		// published. Surface non-ErrNoRows errors so the caller
+		// knows the row is in an unknown state.
 		var any int
-		err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=?`, pid).Scan(&any)
-		if errors.Is(err, sql.ErrNoRows) {
+		switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=?`, pid).Scan(&any); {
+		case errors.Is(err, sql.ErrNoRows):
 			return ErrNotFound
+		case err != nil:
+			return fmt.Errorf("proc: existence check after no-op update: %w", err)
 		}
 		// Already EXITED (or LOST). Idempotent — treat as no-op.
 	}

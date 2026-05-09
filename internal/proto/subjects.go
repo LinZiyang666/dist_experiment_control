@@ -132,12 +132,18 @@ func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
 		parts[4] != "ev" || parts[5] != "node" || parts[7] != "proc" {
 		return "", "", "", "", false
 	}
+	if ValidateSID(parts[3]) != nil || ValidateNID(parts[6]) != nil {
+		return "", "", "", "", false
+	}
 	return parts[3], parts[6], parts[8], parts[9], true
 }
 
 // ParseCmdBy extracts (sid, actor, nid, verb) from any
 // `tether.v1.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req` subject.
-// Returns ok=false when the subject doesn't match this layout.
+// Returns ok=false when the subject doesn't match this layout OR
+// when sid / nid / actor fail their architecture B.5 syntax check
+// (audit shard 03 F5 — defense in depth so a malformed token
+// doesn't reach handlers as opaque strings).
 //
 // Same NATS-proven authority for `actor` as ParseCtrlBy (B.2): the JWT
 // permissions pin the `by.<A>` segment to the connection's real nkey.
@@ -148,6 +154,10 @@ func ParseCmdBy(subject string) (sid, actor, nid, verb string, ok bool) {
 		parts[0] != "tether" || parts[1] != "v1" ||
 		parts[2] != "s" || parts[4] != "cmd" || parts[5] != "by" ||
 		parts[7] != "node" || parts[10] != "req" {
+		return "", "", "", "", false
+	}
+	if ValidateSID(parts[3]) != nil || ValidateNID(parts[8]) != nil ||
+		ValidateActorToken(parts[6]) != nil {
 		return "", "", "", "", false
 	}
 	return parts[3], parts[6], parts[8], parts[9], true
@@ -185,6 +195,9 @@ func ParseSidNidFromCtrl(subject string) (sid, nid string, ok bool) {
 	if len(parts) < 8 ||
 		parts[0] != "tether" || parts[1] != "v1" || parts[2] != "ctrl" ||
 		parts[3] != "s" || parts[5] != "node" {
+		return "", "", false
+	}
+	if ValidateSID(parts[4]) != nil || ValidateNID(parts[6]) != nil {
 		return "", "", false
 	}
 	return parts[4], parts[6], true

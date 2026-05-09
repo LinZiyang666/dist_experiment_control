@@ -80,13 +80,24 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream) error {
 // by handleSessionCreate AND on boot when reconciling existing
 // sessions (architecture H.3 startup rule: SQLite has session row +
 // no history-<sid> stream → rebuild empty stream).
+//
+// MaxBytes is set to a per-session ceiling so an accidental
+// publish loop or an unusually chatty session can't take down the
+// whole broker by exhausting the JetStream store dir. With
+// Discard=DiscardNew the stream refuses new audit at the brink
+// instead of evicting old (preserving audit history). Audit
+// shard 03 F3: previously MaxBytes=-1 made DiscardNew unreachable
+// code; the 80%-disk advisory monitor (H.4) still warns long
+// before this cap matters in practice.
+const historyMaxBytesPerSession = 1 << 30 // 1 GiB
+
 func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string) error {
 	cfg := jetstream.StreamConfig{
 		Name:      HistoryStreamName(sid),
 		Subjects:  []string{historyFilterSubject(sid)},
 		Retention: jetstream.LimitsPolicy,
 		MaxAge:    0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
-		MaxBytes:  -1,
+		MaxBytes:  historyMaxBytesPerSession,
 		Discard:   jetstream.DiscardNew,
 		Storage:   jetstream.FileStorage,
 		Replicas:  1,

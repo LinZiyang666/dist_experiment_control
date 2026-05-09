@@ -24,13 +24,21 @@ import (
 // run it; new connections (e.g. from another goroutine, or after the first is
 // returned to the pool) start with FK off again.
 //
-// Two safeguards together (belt + suspenders):
+// Three safeguards together (belt + suspenders + braces):
 //   1. URI parameter `_pragma=foreign_keys(1)` baked into the DSN — modernc
 //      runs it at every sqlite3_open_v2(), so every conn in the pool starts
 //      with FK on regardless of how the *sql.DB pool is later configured.
-//   2. SetMaxOpenConns(1) — SQLite is a single-writer engine; serializing
+//   2. URI parameter `_pragma=busy_timeout(5000)` so any future writer that
+//      shares the file (sidecar admin tool, accidental SetMaxOpenConns
+//      relaxation) blocks up to 5s instead of immediately failing with
+//      SQLITE_BUSY (audit shard 03 F9).
+//   3. SetMaxOpenConns(1) — SQLite is a single-writer engine; serializing
 //      writes also closes the door on any "second conn missed the pragma"
-//      class of bug.
+//      class of bug. SetMaxOpenConns(1) is LOAD-BEARING: many writers
+//      (port.Allocate, session.Create, agentprov.Provision) execute
+//      compound read-then-write sequences under default-deferred
+//      transactions and rely on the pool serializing them. Don't relax
+//      without re-thinking the affected allocators (audit shard 03 F8).
 //
 // Plain ":memory:" isn't URI-style; promote it to "file::memory:" so the
 // query parameter is honored.
@@ -74,7 +82,10 @@ func withForeignKeysPragma(dsn string) string {
 	if strings.Contains(base, "?") {
 		sep = "&"
 	}
-	return base + sep + "_pragma=foreign_keys(1)"
+	// foreign_keys + busy_timeout chained via & on the same query
+	// string. Both are PRAGMAs that modernc applies at every
+	// sqlite3_open_v2() — pool-safe.
+	return base + sep + "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
 // applyMigrations applies every embedded migration file (sorted by filename)
