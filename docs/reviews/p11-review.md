@@ -298,3 +298,80 @@ architecture line 2148's "7-day nightly stable" — full proof of
 that requires actually waiting 7 days of nightly runs, which is
 out of scope for a single review round; what's in scope is
 removing the obvious flake source the reviewer flagged.
+
+---
+
+## Round 2 Review
+
+Date: 2026-05-09
+Reviewer role: test engineer
+
+Reviewed commit:
+
+- `54283fe Address P11 review: nightly e2e (F1) + serial matrix (F2) + README rewrite (F3) + requirements banner (F4)`
+
+### Verdict
+
+P11 hardening is approved for the current non-public state.
+
+All four round-1 findings are fixed:
+
+- F1: CI now has a daily `schedule` trigger and an `e2e` job that runs
+  `make e2e` on nightly schedule and push-to-main.
+- F2: `test/e2e/all_phases_test.go` now runs phases serially; local
+  `make e2e` passed in review without the P5 attach-timeout flake.
+- F3: README was rewritten around current P0-P11 state, install.sh flows,
+  daily commands, local demo, and troubleshooting.
+- F4: `docs/requirements.md` now has a historical banner making
+  architecture.md the v1 authority and explicitly deferring push/pull/file
+  transfer to v2.
+
+No new blocking issue found in this round.
+
+Public release caveat: this review did not cut or verify a public `v0.1.0`
+tag/GitHub Release, per the current "temporarily not public" instruction. The
+"7 days nightly stable" release gate also cannot be proven inside one review
+turn; the schedule is now wired, and actual nightly history should be checked
+before external publication.
+
+### Round 2 Verification
+
+Reviewer tests:
+
+```text
+GOCACHE=/tmp/tether-gocache go test ./test/p11 -count=1 -v
+# PASS
+```
+
+E2E matrix:
+
+```text
+make e2e
+# PASS, 67.06s
+```
+
+Full regression/static checks:
+
+```text
+go test ./... -count=1
+# PASS
+
+go build ./...
+# PASS
+
+GOCACHE=/tmp/tether-gocache go vet ./...
+# PASS
+
+/home/weiland/go/bin/golangci-lint run ./...
+# PASS, 0 issues
+```
+
+Help surface:
+
+```text
+GOCACHE=/tmp/tether-gocache go run ./cmd/tether --help
+# PASS: no push / pull subcommands listed
+```
+
+Commands requiring embedded NATS/HTTP listeners or default Go/lint cache writes
+were run outside the default sandbox.

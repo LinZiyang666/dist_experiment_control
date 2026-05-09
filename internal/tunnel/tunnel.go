@@ -81,6 +81,13 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[int]*serverSession // public port -> session
+	// closed flips true after Close()/ctx-cancel begin. Guards against
+	// the audit-found shutdown race: in-flight handleAgent that's mid
+	// REGISTER could otherwise insert into s.sessions AFTER Close
+	// drained it, leaking the bound public port across broker restarts.
+	closed bool
+	ln     net.Listener   // control listener; Close() must close it
+	wg     sync.WaitGroup // tracks in-flight handleAgent goroutines
 }
 
 type serverSession struct {
@@ -121,17 +128,14 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("tunnel server: listen %s: %w", s.addr, err)
 	}
 	ln := tls.NewListener(rawLn, tlsCfg)
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
+
 	go s.acceptLoop(ctx, ln)
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
-		s.mu.Lock()
-		for _, sess := range s.sessions {
-			sess.cancel()
-			_ = sess.listener.Close()
-			_ = sess.rawConn.Close()
-		}
-		s.mu.Unlock()
+		s.Close()
 	}()
 	s.logger.Info("tunnel: server listening", "addr", s.addr)
 	return nil
@@ -144,10 +148,23 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			if ctx.Err() != nil {
 				return
 			}
+			// Listener closed by Close() (Close closes ln + sets
+			// s.closed); return cleanly so the goroutine exits
+			// instead of spinning on accept-after-close errors.
+			s.mu.Lock()
+			done := s.closed
+			s.mu.Unlock()
+			if done {
+				return
+			}
 			s.logger.Warn("tunnel server: accept", "err", err)
 			continue
 		}
-		go s.handleAgent(ctx, conn)
+		s.wg.Add(1)
+		go func(c net.Conn) {
+			defer s.wg.Done()
+			s.handleAgent(ctx, c)
+		}(conn)
 	}
 }
 
@@ -216,6 +233,18 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		cancel:     cancel,
 	}
 	s.mu.Lock()
+	if s.closed {
+		// Server is shutting down; don't insert into a map that's
+		// been drained or is about to be. Roll the per-conn state
+		// back so we don't leak the public port across broker
+		// restart (the audit-found EADDRINUSE failure mode).
+		s.mu.Unlock()
+		cancel()
+		_ = publicLn.Close()
+		_ = yamuxSess.Close()
+		_ = conn.Close()
+		return
+	}
 	// Replace any prior session on this port (agent restart / re-expose).
 	if old, ok := s.sessions[port]; ok {
 		old.cancel()
@@ -278,16 +307,40 @@ func (s *Server) bridgePublicToYamux(pubConn net.Conn, sess *serverSession) {
 }
 
 // Close releases the control listener and every active agent session.
-// Idempotent.
+// Idempotent. After Close returns, in-flight handleAgent goroutines
+// have all observed s.closed=true and either exited or rolled back
+// their would-be insert; the bound public ports are released.
 func (s *Server) Close() {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	ln := s.ln
+	// Snapshot sessions under lock; close them OUTSIDE the lock so
+	// a slow TLS close_notify or kernel listener teardown can't
+	// stall every other handleAgent waiting for s.mu (audit F9).
+	snap := make([]*serverSession, 0, len(s.sessions))
 	for _, sess := range s.sessions {
+		snap = append(snap, sess)
+	}
+	s.sessions = map[int]*serverSession{}
+	s.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+	for _, sess := range snap {
 		sess.cancel()
 		_ = sess.listener.Close()
 		_ = sess.rawConn.Close()
 	}
-	s.sessions = map[int]*serverSession{}
-	s.mu.Unlock()
+	// Wait for in-flight handleAgent goroutines to drain so the
+	// caller of Close knows the bound public ports are released
+	// (vs. just "scheduled to close"). Bound by the per-session
+	// cancellation above; can't run forever.
+	s.wg.Wait()
 }
 
 // ----- agent side -----------------------------------------------------------
