@@ -131,12 +131,18 @@ func waitAuthCalloutReady(t *testing.T, url string) {
 		return kp.Sign(nonce)
 	}
 
+	// Per-attempt timeout was 200ms, which on a slow CI runner can
+	// be shorter than the auth_callout round-trip itself; tighten
+	// the outer deadline but loosen the per-attempt timeout to 1s
+	// so we don't burn deadline on connect timeouts faster than
+	// the subscribe-then-handle path can serve them (audit shard 05
+	// F10).
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		nc, err := nats.Connect(url,
 			nats.Nkey(probePub, sigCB),
 			nats.Name(cli.CtlNameUnactivated),
-			nats.Timeout(200*time.Millisecond),
+			nats.Timeout(1*time.Second),
 		)
 		if err == nil {
 			nc.Close()

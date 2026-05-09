@@ -10,6 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -102,19 +103,19 @@ func TestAgentRegisteredEmittedOnHandshake(t *testing.T) {
 	defer startBroker(t, url, db)()
 	defer startAgent(t, url, "lab", "lab-1")()
 
-	// Wait for registration round-trip.
-	time.Sleep(500 * time.Millisecond)
-
-	got := snap()
-	found := false
-	for _, ev := range got {
-		if ev["type"] == "agent_registered" && ev["sid"] == "lab" && ev["nid"] == "lab-1" {
-			found = true
-			break
+	// Poll until the agent_registered event arrives via sys.events.
+	// snap() is monotonic (collectEvents appends; stop never trims),
+	// so checking on each poll iteration is safe (audit shard 05 F2:
+	// 500ms dead-reckon was the largest single-shot deadline in p7).
+	if !testharness.WaitFor(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		for _, ev := range snap() {
+			if ev["type"] == "agent_registered" && ev["sid"] == "lab" && ev["nid"] == "lab-1" {
+				return true
+			}
 		}
-	}
-	if !found {
-		t.Errorf("expected agent_registered{sid=lab,nid=lab-1}; got %+v", got)
+		return false
+	}) {
+		t.Errorf("expected agent_registered{sid=lab,nid=lab-1}; got %+v", snap())
 	}
 }
 
@@ -156,8 +157,9 @@ func TestDiskPressureFiresAboveThreshold(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
-	// Let broker subscribe + JS init + monitor start.
-	time.Sleep(300 * time.Millisecond)
+	// Wait for broker readiness via a NATS connect probe (subscribes
+	// + JS init complete by then). Replaces the 300ms dead-reckon.
+	testharness.WaitConnect(t, url, 3*time.Second)
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -175,8 +177,13 @@ func TestDiskPressureFiresAboveThreshold(t *testing.T) {
 		return n
 	}
 
-	// Phase 1: nothing yet.
-	time.Sleep(150 * time.Millisecond)
+	// Phase 1: nothing yet. Negative assertion — give the monitor a
+	// few ticks (DiskCheckInterval=30ms) to run AND not fire. Using
+	// the explicit 5x ticks instead of a single 150ms guess; if a
+	// future tick faster slowness changes that, this still proves
+	// "monitor ran ≥5 times without firing" rather than "150ms
+	// elapsed without firing" (audit shard 05 F3).
+	time.Sleep(5 * 30 * time.Millisecond)
 	if n := countPressure(); n != 0 {
 		t.Fatalf("disk_pressure fired prematurely: count=%d", n)
 	}
@@ -198,8 +205,9 @@ func TestDiskPressureFiresAboveThreshold(t *testing.T) {
 	}
 
 	// Phase 3: stay above threshold for a few ticks; count must NOT
-	// keep climbing (edge-trigger guarantee).
-	time.Sleep(250 * time.Millisecond)
+	// keep climbing (edge-trigger guarantee). Same explicit-tick
+	// reasoning as Phase 1.
+	time.Sleep(8 * 30 * time.Millisecond)
 	if n := countPressure(); n > 1 {
 		t.Errorf("disk_pressure spammed while still above threshold: count=%d (want 1)", n)
 	}

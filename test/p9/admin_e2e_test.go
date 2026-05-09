@@ -424,7 +424,11 @@ func TestAdminEvictTriggersAgentShutdown(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	time.Sleep(300 * time.Millisecond)
+	// Wait until the agent's register has actually committed a
+	// nodes row; the subsequent evict assertion needs that row to
+	// exist or it just no-ops with no broadcast (audit shard 05
+	// F11: 300ms dead-reckon + 1s evict budget stacks budgets).
+	testharness.WaitNodeOnline(t, db, "lab", "lab-1", 3*time.Second)
 
 	c := &adminsock.Client{Path: socketPath}
 	resp, err := c.Call(adminsock.Request{Op: adminsock.OpEvict, SID: "lab", NID: "lab-1"})

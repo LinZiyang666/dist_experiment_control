@@ -167,24 +167,26 @@ func TestAuditEntriesLandInHistoryStream(t *testing.T) {
 		runExec(t, nc, "lab", pub, "lab-1", []string{"true"})
 	}
 
-	// Wait for audit publishes to land (the broker pubs them after
-	// the agent's exit chunk reaches ctl).
-	time.Sleep(300 * time.Millisecond)
-
+	// Audit publishes land asynchronously after the agent's exit
+	// chunk reaches ctl. Poll the stream's message count until at
+	// least 3*N (= 50 audit.call + 50 audit.proc{start} + 50
+	// audit.proc{exit}) instead of dead-reckoning a 300ms window
+	// (audit shard 05 F1: 300ms is too tight on slow CI).
 	js, _ := jetstream.New(nc)
 	stream, err := js.Stream(context.Background(), jsstream.HistoryStreamName("lab"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := stream.Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// At minimum 50 audit.call + 50 audit.proc{start} + 50 audit.proc{exit}
-	// = 150 messages. We allow any extra (e.g. session_created went to
-	// `events`, not here, so it shouldn't add up).
-	if info.State.Msgs < uint64(3*N) {
-		t.Fatalf("history-lab too few messages: got %d want >= %d", info.State.Msgs, 3*N)
+	var lastMsgs uint64
+	if !testharness.WaitFor(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		info, err := stream.Info(context.Background())
+		if err != nil {
+			return false
+		}
+		lastMsgs = info.State.Msgs
+		return info.State.Msgs >= uint64(3*N)
+	}) {
+		t.Fatalf("history-lab too few messages after 5s: got %d want >= %d", lastMsgs, 3*N)
 	}
 
 	// Sanity: replay all of them and bucket by audit kind.

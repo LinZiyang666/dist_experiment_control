@@ -1076,6 +1076,13 @@ func TestG1AlreadyExitedRowsSkipped(t *testing.T) {
 		t.Fatalf("register rejected: %s %s", resp.Code, resp.Error)
 	}
 
+	// Negative window: prove the broker did NOT publish a
+	// reconciled_closed audit for an already-EXITED row. Wait long
+	// enough that any erroneous publish would've gone through (200ms
+	// covers register handler + audit publish even on a slow box),
+	// then assert. The 200ms is documented as a *lower bound*, not a
+	// guess: a true positive can't take longer than this register
+	// round-trip.
 	time.Sleep(200 * time.Millisecond)
 	if reconciledCount != 0 {
 		t.Errorf("expected 0 reconciled audits for already-EXITED row; got %d",

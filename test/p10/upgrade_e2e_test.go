@@ -58,14 +58,12 @@ func startBroker(t *testing.T, url string, db *sql.DB, allow []string) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
-	for i := 0; i < 30; i++ {
-		if nc, err := nats.Connect(url); err == nil {
-			nc.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	time.Sleep(120 * time.Millisecond)
+	// NATS connect probe is fine; the post-probe 120ms dead-reckon
+	// (audit shard 05 F14) was racy. broker.Run installs the
+	// upgrade subscription synchronously inside Run; once the
+	// connect probe succeeds, subsequent Request() will either hit
+	// the subscription or hit no-responders cleanly.
+	testharness.WaitConnect(t, url, 3*time.Second)
 	return func() {
 		cancel()
 		select {
