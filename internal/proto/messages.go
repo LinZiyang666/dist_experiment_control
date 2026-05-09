@@ -21,7 +21,9 @@ type SessionCreateResp struct {
 
 // NodeRegisterReq — agent pub on ctrl.s.<S>.node.<N>.register.req.
 // First field is proto_version per J.2 strict same-version handshake.
-// More reconciliation fields (boot_id, local_processes[], local_ports[]) land in P8.
+// LocalProcesses / LocalPorts implement architecture G.1: agent's view of
+// "what should be live right now" so the broker can converge SQLite
+// against the agent's reality on (re)connect.
 type NodeRegisterReq struct {
 	ProtoVersion   int    `json:"proto_version"`
 	ReleaseVersion string `json:"release_version"`
@@ -29,14 +31,60 @@ type NodeRegisterReq struct {
 	OS             string `json:"os"`
 	Arch           string `json:"arch"`
 	BootID         string `json:"boot_id,omitempty"`
+
+	LocalProcesses []LocalProcess `json:"local_processes,omitempty"`
+	LocalPorts     []LocalPort    `json:"local_ports,omitempty"`
 }
 
-// NodeRegisterResp — tetherd reply with reconciliation directives (G.1).
+// LocalProcess is one entry in NodeRegisterReq.LocalProcesses — the
+// agent's view of a managed process's live state. RC populated only
+// when State=="exited" and the agent observed the rc (otherwise nil
+// → broker treats as missed-exit with rc=-1).
+type LocalProcess struct {
+	PID   string `json:"pid"`
+	State string `json:"state"`        // "running" | "exited"
+	RC    *int   `json:"rc,omitempty"` // populated only when state=="exited"
+}
+
+// LocalPort is one entry in NodeRegisterReq.LocalPorts — the agent's
+// view of a live tunnel proxy. TokenHash is SHA256 hex (per F.4
+// rule: raw token is agent-only after the initial expose forward;
+// what the agent re-presents on register is the SAME hash the broker
+// already has in port_allocations.token_hash).
+type LocalPort struct {
+	Port      int    `json:"port"`
+	Name      string `json:"name"`
+	LocalPort int    `json:"local_port"`
+	TokenHash string `json:"token_hash"`
+}
+
+// NodeRegisterResp — tetherd reply with G.1 reconciliation directives.
+//
+// Agent applies in this order:
+//  1. RevokePorts — close tunnel sessions + prune state.json.
+//  2. DropProcesses — SIGTERM + 5s + SIGKILL the orphans.
+//
+// AcceptedProcesses / ReconciledProcesses / KeepPorts are
+// informational; the agent may log but isn't required to act.
 type NodeRegisterResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"`  // e.g. "proto_mismatch", "session_not_found_or_deleting"
 	Error string `json:"error,omitempty"` // human-readable; populated when OK=false
-	// Reconciliation arrays land in P8.
+
+	AcceptedProcesses   []string         `json:"accepted_processes,omitempty"`
+	ReconciledProcesses []ReconciledProc `json:"reconciled_processes,omitempty"`
+	KeepPorts           []int            `json:"keep_ports,omitempty"`
+	RevokePorts         []int            `json:"revoke_ports,omitempty"`
+	DropProcesses       []string         `json:"drop_processes,omitempty"`
+}
+
+// ReconciledProc reports one PID the broker just transitioned away
+// from RUNNING/LOST as part of the register reconciliation. NewState
+// is always "EXITED" in v1 (architecture G.1 reply payload).
+type ReconciledProc struct {
+	PID      string `json:"pid"`
+	NewState string `json:"new_state"`
+	RC       int    `json:"rc"`
 }
 
 // HeartbeatPayload — agent core pub on ctrl.s.<S>.node.<N>.heartbeat (no reply).

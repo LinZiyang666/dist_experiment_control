@@ -30,9 +30,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/nats-io/nats.go"
@@ -158,12 +160,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer func() { _ = nc.Drain() }()
 
-	if err := a.register(ctx, nc); err != nil {
+	resp, err := a.register(ctx, nc)
+	if err != nil {
 		return err
 	}
 	a.cfg.Logger.Info("agent: registered",
 		"sid", a.cfg.SID, "nid", a.cfg.NID,
 		"hb_interval", a.cfg.HeartbeatInterval,
+		"reconciled", len(resp.ReconciledProcesses),
+		"drop_procs", len(resp.DropProcesses),
+		"revoke_ports", len(resp.RevokePorts),
 	)
 
 	subFwd, err := nc.Subscribe(
@@ -175,11 +181,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer func() { _ = subFwd.Unsubscribe() }()
 
-	// Re-establish frp proxies for any port_tokens persisted from a
-	// previous run (architecture F.6: agent restart → frpc rebuilds
-	// proxies from state.json + present token; broker reconciles via
-	// the token_hash already in port_allocations). No-op when state
-	// store or adapter is absent.
+	// G.1 reply application MUST run before replay so any RevokePorts
+	// have already pruned state.json by the time replayPortsFromState
+	// reads it. Otherwise we'd re-establish a proxy that the broker
+	// just told us to drop.
+	a.applyReconciliation(resp)
+
+	// Re-establish reverse-TCP proxies for any port_tokens still in
+	// state.json (architecture F.6: agent restart → tunnel client
+	// rebuilds proxies from state.json + presents token; broker
+	// reconciles via the token_hash already in port_allocations).
+	// No-op when state store or adapter is absent.
 	a.replayPortsFromState()
 
 	return a.heartbeatLoop(ctx, nc)
@@ -272,7 +284,11 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 // Permanent rejections (proto_mismatch, nid_mismatch, store_error) come back
 // as a real reply with OK=false — those are configuration / deployment bugs
 // no amount of retry will fix, so they bubble up immediately.
-func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
+//
+// Returns the parsed NodeRegisterResp on success so the caller can apply
+// G.1 reconciliation directives.
+func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegisterResp, error) {
+	procs, ports := a.buildLocalSnapshot()
 	req := proto.NodeRegisterReq{
 		ProtoVersion:   proto.ProtoVersion,
 		ReleaseVersion: proto.ReleaseVersion,
@@ -280,17 +296,19 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 		OS:             runtime.GOOS,
 		Arch:           runtime.GOARCH,
 		BootID:         readBootID(),
+		LocalProcesses: procs,
+		LocalPorts:     ports,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("agent: marshal register: %w", err)
+		return proto.NodeRegisterResp{}, fmt.Errorf("agent: marshal register: %w", err)
 	}
 	subject := proto.SubjNodeRegister(a.cfg.SID, a.cfg.NID)
 
 	backoff := a.cfg.RegisterRetryInitial
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return proto.NodeRegisterResp{}, err
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, a.cfg.RegisterTimeout)
@@ -310,17 +328,17 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 					a.cfg.Logger.Info("agent: register succeeded after retry",
 						"attempts", attempt)
 				}
-				return nil
+				return resp, nil
 			default:
 				// Authoritative reject from broker. Don't retry; the operator
 				// must fix config (proto, nid uniqueness, etc.).
-				return fmt.Errorf("agent: register rejected (code=%s): %s",
+				return proto.NodeRegisterResp{}, fmt.Errorf("agent: register rejected (code=%s): %s",
 					resp.Code, resp.Error)
 			}
 		} else {
 			// Parent ctx canceled mid-request — exit cleanly.
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return proto.NodeRegisterResp{}, ctx.Err()
 			}
 			a.cfg.Logger.Warn("agent: register attempt failed; retrying",
 				"attempt", attempt, "err", err, "next_backoff", backoff)
@@ -329,7 +347,7 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 		// Sleep with backoff, but wake immediately on context cancel.
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return proto.NodeRegisterResp{}, ctx.Err()
 		case <-time.After(backoff):
 		}
 		if backoff < a.cfg.RegisterRetryMax {
@@ -339,6 +357,109 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) error {
 			}
 		}
 	}
+}
+
+// buildLocalSnapshot collects the agent's view of "what is live right
+// now" for G.1 reconciliation. Procs come from a.procs (the live PTY
+// session map; non-PTY exec children are sync and not registered, so
+// after a restart they are missing — broker correctly treats those as
+// missed-exit). Ports come from state.json (raw token → SHA256 hex
+// matches port.HashToken so the broker can join on token_hash).
+func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
+	a.procsMu.Lock()
+	procs := make([]proto.LocalProcess, 0, len(a.procs))
+	for pid := range a.procs {
+		procs = append(procs, proto.LocalProcess{PID: pid, State: "running"})
+	}
+	a.procsMu.Unlock()
+
+	var ports []proto.LocalPort
+	if a.stateStore != nil {
+		sf, err := a.stateStore.load()
+		if err != nil {
+			a.cfg.Logger.Warn("agent: load state.json for register snapshot", "err", err)
+		} else {
+			ports = make([]proto.LocalPort, 0, len(sf.PortTokens))
+			for _, p := range sf.PortTokens {
+				ports = append(ports, proto.LocalPort{
+					Port:      p.Port,
+					Name:      p.Name,
+					LocalPort: p.LocalPort,
+					TokenHash: port.HashToken(p.Token),
+				})
+			}
+		}
+	}
+	return procs, ports
+}
+
+// applyReconciliation acts on the directive arrays in the broker's
+// register reply. Per architecture G.1:
+//   - RevokePorts: tear down the reverse-TCP proxy (if adapter wired)
+//     and prune the corresponding state.json row.
+//   - DropProcesses: SIGTERM + 5s + SIGKILL escalation. Only PTY
+//     sessions are reachable from a.procs; exec children are
+//     sync-managed and have already exited (or are reachable only by
+//     OS pid, which v1 doesn't track).
+func (a *Agent) applyReconciliation(resp proto.NodeRegisterResp) {
+	if len(resp.RevokePorts) > 0 && a.stateStore != nil {
+		sf, err := a.stateStore.load()
+		if err != nil {
+			a.cfg.Logger.Warn("agent: load state.json for revoke", "err", err)
+		} else {
+			byPort := map[int]string{}
+			for _, p := range sf.PortTokens {
+				byPort[p.Port] = p.Name
+			}
+			for _, port := range resp.RevokePorts {
+				name, ok := byPort[port]
+				if !ok {
+					continue
+				}
+				if a.cfg.ExposeAdapter != nil {
+					if err := a.cfg.ExposeAdapter.RemoveProxy(name, port); err != nil {
+						a.cfg.Logger.Warn("agent: revoke remove proxy",
+							"err", err, "port", port, "name", name)
+					}
+				}
+				if err := a.stateStore.RemovePort(name); err != nil {
+					a.cfg.Logger.Warn("agent: revoke prune state.json",
+						"err", err, "name", name)
+				}
+				a.cfg.Logger.Info("agent: revoked", "port", port, "name", name)
+			}
+		}
+	}
+
+	for _, pid := range resp.DropProcesses {
+		a.killOrphanProcess(pid)
+	}
+}
+
+// killOrphanProcess sends SIGTERM, waits 5s, then escalates to SIGKILL
+// if the session is still registered. Only reachable for PTY sessions
+// (those are the only ones tracked in a.procs); v1 has no path to kill
+// non-PTY exec children by their broker-assigned ULID after restart.
+// In practice DropProcesses on a fresh-start agent is empty (a.procs
+// is empty so we never claimed those pids), so this kill path is
+// exercised only when a.procs has entries the broker doesn't know
+// about — which can't happen in a single-broker deployment but is
+// defensible as a "agent connected to the wrong broker by accident".
+func (a *Agent) killOrphanProcess(pid string) {
+	sess, ok := a.lookupProc(pid)
+	if !ok {
+		return
+	}
+	a.cfg.Logger.Info("agent: kill orphan", "pid", pid)
+	if err := sess.Signal(syscall.SIGTERM); err != nil {
+		a.cfg.Logger.Warn("agent: kill orphan SIGTERM", "err", err, "pid", pid)
+	}
+	go func() {
+		time.Sleep(5 * time.Second)
+		if s, still := a.lookupProc(pid); still {
+			_ = s.Signal(syscall.SIGKILL)
+		}
+	}()
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {

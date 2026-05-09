@@ -216,14 +216,33 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
 		return
 	}
+	// LOST is derived at read time per proc.go pkgdoc: a RUNNING row
+	// whose owning node is OFFLINE shows as LOST in `tether ps`. The
+	// underlying SQLite stays RUNNING — when the agent re-registers,
+	// G.1 will resolve it to EXITED(rc=-1) (missed-exit) or back to
+	// RUNNING (still alive). Cache one node-status lookup per (sid,
+	// nid) seen in this list to avoid N round-trips for sessions
+	// with many processes on the same node.
+	nodeStatusCache := map[string]node.State{}
 	procOut := make([]proto.PsEntry, 0, len(procs))
 	for _, p := range procs {
+		status := string(p.Status)
+		if p.Status == proc.StateRunning {
+			ns, cached := nodeStatusCache[p.NID]
+			if !cached {
+				ns, _ = node.LookupStatus(b.cfg.DB, sid, p.NID)
+				nodeStatusCache[p.NID] = ns
+			}
+			if ns == node.StateOffline {
+				status = string(proc.StateLost)
+			}
+		}
 		entry := proto.PsEntry{
 			PID:         p.PID,
 			NID:         p.NID,
 			Argv:        p.Argv,
 			StartedAt:   p.StartedAt,
-			Status:      string(p.Status),
+			Status:      status,
 			StartedByFP: p.StartedByFP,
 		}
 		if p.EndedAt != nil {

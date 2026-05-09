@@ -370,6 +370,24 @@ func (b *Broker) Run(ctx context.Context) error {
 	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
 	b.startDiskMonitor(ctx)
 
+	// G.2 step ① — recompute node states from persisted
+	// last_heartbeat_at once at boot. The ticker below would do this
+	// on its own within ReconcileInterval, but doing it eagerly means
+	// the very first ps / exec request after Run() returns ready
+	// observes the correct ONLINE / STALE / OFFLINE labels (and the
+	// 15-min OFFLINE port revoker fires immediately if applicable
+	// instead of leaking up to one ReconcileInterval).
+	bootNow := b.cfg.Now()
+	if n, err := node.ReconcileStates(b.cfg.DB, bootNow,
+		b.cfg.StaleAfter, b.cfg.OfflineAfter); err != nil {
+		b.cfg.Logger.Warn("broker: boot node reconcile", "err", err)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: boot node reconcile transitions", "count", n)
+	}
+	if revoked := b.reconcilePorts(bootNow); revoked > 0 {
+		b.cfg.Logger.Info("broker: boot port revocations", "count", revoked)
+	}
+
 	b.cfg.Logger.Info("broker: ready",
 		"nats", b.cfg.NATSURL,
 		"reconcile", b.cfg.ReconcileInterval,
@@ -451,7 +469,18 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		"os": req.OS, "arch": req.Arch,
 	})
 
-	payload, _ := json.Marshal(proto.NodeRegisterResp{OK: true})
+	// G.1 — converge SQLite to the agent's reality. Side effects
+	// (proc.MarkExited, audit.proc / audit.port emissions) happen
+	// inside reconcileOnRegister; the directive arrays are returned
+	// to the agent so it can drop orphan processes / proxies.
+	resp := proto.NodeRegisterResp{OK: true}
+	resp.AcceptedProcesses,
+		resp.ReconciledProcesses,
+		resp.KeepPorts,
+		resp.RevokePorts,
+		resp.DropProcesses = b.reconcileOnRegister(sid, nid, req)
+
+	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {
 		_ = msg.Respond(payload)
 	}
