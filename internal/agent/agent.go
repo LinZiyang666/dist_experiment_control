@@ -148,6 +148,14 @@ type Agent struct {
 	// expose port_tokens table — to ~/.tether/agent/<sid>/state.json.
 	// Nil when Config.Home is empty (in-process tests).
 	stateStore *stateStore
+
+	// runCtx is set by Run to the agent's "while running" context
+	// (cancels on parent ctx OR sys.events agent_evicted). Read by
+	// background work that should respect agent shutdown:
+	// dispatchForwarded uses it to drop forwarded msgs that arrive
+	// after shutdown started; handleUpgradeForwarded uses it to
+	// abort an in-flight HTTP download. nil before Run is called.
+	runCtx context.Context
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -228,6 +236,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// any race with parent-canceled paths.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	a.runCtx = runCtx
 	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) {
 		var ev struct {
 			Type string `json:"type"`
@@ -255,7 +264,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// have already pruned state.json by the time replayPortsFromState
 	// reads it. Otherwise we'd re-establish a proxy that the broker
 	// just told us to drop.
-	a.applyReconciliation(resp)
+	a.applyReconciliation(runCtx, resp)
 
 	// Re-establish reverse-TCP proxies for any port_tokens still in
 	// state.json (architecture F.6: agent restart → tunnel client
@@ -479,7 +488,7 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 //     sessions are reachable from a.procs; exec children are
 //     sync-managed and have already exited (or are reachable only by
 //     OS pid, which v1 doesn't track).
-func (a *Agent) applyReconciliation(resp proto.NodeRegisterResp) {
+func (a *Agent) applyReconciliation(ctx context.Context, resp proto.NodeRegisterResp) {
 	if len(resp.RevokePorts) > 0 && a.stateStore != nil {
 		sf, err := a.stateStore.load()
 		if err != nil {
@@ -510,7 +519,7 @@ func (a *Agent) applyReconciliation(resp proto.NodeRegisterResp) {
 	}
 
 	for _, pid := range resp.DropProcesses {
-		a.killOrphanProcess(pid)
+		a.killOrphanProcess(ctx, pid)
 	}
 }
 
@@ -523,7 +532,7 @@ func (a *Agent) applyReconciliation(resp proto.NodeRegisterResp) {
 // exercised only when a.procs has entries the broker doesn't know
 // about — which can't happen in a single-broker deployment but is
 // defensible as a "agent connected to the wrong broker by accident".
-func (a *Agent) killOrphanProcess(pid string) {
+func (a *Agent) killOrphanProcess(ctx context.Context, pid string) {
 	rec, ok := a.lookupProc(pid)
 	if !ok {
 		return
@@ -532,10 +541,19 @@ func (a *Agent) killOrphanProcess(pid string) {
 	if err := rec.sess.Signal(syscall.SIGTERM); err != nil {
 		a.cfg.Logger.Warn("agent: kill orphan SIGTERM", "err", err, "pid", pid)
 	}
+	// Audit shard 01 F4: the SIGKILL escalation goroutine used to
+	// have no ctx, so it survived agent shutdown — meaning it could
+	// SIGKILL a freshly-spawned PID-collision in a follow-up test
+	// run. Use a select so ctx-cancel exits the goroutine cleanly
+	// before the 5s window elapses.
 	go func() {
-		time.Sleep(5 * time.Second)
-		if r, still := a.lookupProc(pid); still {
-			_ = r.sess.Signal(syscall.SIGKILL)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			if r, still := a.lookupProc(pid); still {
+				_ = r.sess.Signal(syscall.SIGKILL)
+			}
 		}
 	}()
 }

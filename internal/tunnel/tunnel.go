@@ -442,6 +442,17 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 	sessCtx, cancel := context.WithCancel(c.ctx)
 
 	c.mu.Lock()
+	// Audit shard 01 F2: between Start's cleanup goroutine running
+	// (c.ctx already canceled) and an in-flight Open inserting into
+	// c.sessions, we'd leak the new session forever. Re-check ctx
+	// under mu — if Start is shutting down, roll back this Open.
+	if err := c.ctx.Err(); err != nil {
+		c.mu.Unlock()
+		cancel()
+		_ = conn.Close()
+		_ = yamuxSess.Close()
+		return fmt.Errorf("tunnel client: Open after Start ctx cancel: %w", err)
+	}
 	if old, ok := c.sessions[publicPort]; ok {
 		old.cancel()
 		_ = old.conn.Close()

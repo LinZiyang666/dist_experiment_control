@@ -28,6 +28,16 @@ const streamChunkSize = 4 * 1024
 //
 // (10 tokens; same as the cmd.by.* tree minus the actor segment).
 func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
+	// Audit shard 01 F5: a forwarded msg that arrives mid-shutdown
+	// would otherwise spawn a goroutine that publishes onto a
+	// draining nats.Conn. Drop early if runCtx is gone — the
+	// caller already told subFwd.Unsubscribe to stop new
+	// dispatches; this catches the in-flight race.
+	if a.runCtx != nil {
+		if err := a.runCtx.Err(); err != nil {
+			return
+		}
+	}
 	parts := strings.Split(msg.Subject, ".")
 	if len(parts) != 10 || parts[8] != "req" || parts[9] != "forwarded" {
 		a.cfg.Logger.Warn("agent: forwarded subject malformed", "subject", msg.Subject)
