@@ -62,6 +62,7 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			nid := args[0]
 			argv := args[1:]
 			// Strip a single leading `--`. See the matching comment

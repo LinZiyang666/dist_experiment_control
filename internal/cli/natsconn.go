@@ -55,6 +55,29 @@ func ConnectNATSWithNkey(url string, id *Identity, opts ...nats.Option) (*nats.C
 	return nats.Connect(url, all...)
 }
 
+// ResolveNATSURLFromHome implements the broker-URL precedence chain
+// the ctl uses on every command. flagVal is whatever cobra parsed
+// (cobra default unless the user passed --nats-url); flagChanged is
+// Cmd.Flags().Changed("nats-url"). Returns the URL the caller should
+// hand to ConnectNATSWithNkey.
+//
+// Precedence (high → low):
+//  1. explicit --nats-url flag (operator override always wins)
+//  2. $TETHER_NATS_URL env var (per-shell override)
+//  3. ~/.tether/broker_url file (persistent default written by `tether login --broker`)
+//  4. flagVal (cobra default — typically nats://127.0.0.1:4222)
+//
+// Call this in every ctl subcommand's RunE before connecting.
+func ResolveNATSURLFromHome(flagVal string, flagChanged bool, home string) string {
+	if flagChanged {
+		return flagVal
+	}
+	if u := ReadDefaultBrokerURL(home); u != "" {
+		return u
+	}
+	return flagVal
+}
+
 // CtlNameUnactivated is the connection-Name a CLI uses before activating
 // a session. The broker auth_callout decodes this and grants the
 // "unactivated" permission template (architecture B.2).

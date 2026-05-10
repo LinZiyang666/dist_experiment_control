@@ -46,6 +46,7 @@ restart without a re-expose.
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			nid := args[0]
 			if name == "" {
 				return fmt.Errorf("--name is required (logical proxy name; used by `expose rm`)")
@@ -119,6 +120,7 @@ error you can ignore in scripts.
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			nid := args[0]
 			if name == "" {
 				return fmt.Errorf("--name is required")

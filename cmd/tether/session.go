@@ -35,6 +35,7 @@ func newSessionCmd() *cobra.Command {
 			if pin == "" {
 				return fmt.Errorf("--pin is required for session create")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
 				return err
@@ -68,9 +69,19 @@ func newSessionCmd() *cobra.Command {
 			if err := cli.WriteCurrentSession(home, resp.SID); err != nil {
 				return fmt.Errorf("write current_session: %w", err)
 			}
+			// Persist the broker URL the operator just used so subsequent
+			// ctl commands inherit it without --nats-url. Only persist
+			// if the operator actually supplied one (don't pin the
+			// stale cobra default of nats://127.0.0.1:4222 on a public
+			// deployment).
+			if cmd.Flags().Changed("nats-url") {
+				if err := cli.WriteDefaultBrokerURL(home, natsURL); err != nil {
+					return fmt.Errorf("write broker_url: %w", err)
+				}
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"session %q created (owner=%s)\nactivated locally — also run:\n    export TETHER_SESSION=%s\n",
-				resp.SID, resp.OwnerFP, resp.SID)
+				"session %q created (owner=%s, broker=%s)\nactivated locally — also run:\n    export TETHER_SESSION=%s\n",
+				resp.SID, resp.OwnerFP, natsURL, resp.SID)
 			return nil
 		},
 	}
@@ -81,6 +92,7 @@ func newSessionCmd() *cobra.Command {
 		Short: "List sessions visible to me",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
 				return err
@@ -136,6 +148,7 @@ func newSessionCmd() *cobra.Command {
 		Short: "Tombstone session (owner-only; ACTIVE → DELETING; full delete in P7)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
 				return err

@@ -33,6 +33,13 @@ performs a real NATS CONNECT and only writes current_session on success.
 `,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Resolve broker URL: explicit flag > $TETHER_NATS_URL >
+			// ~/.tether/broker_url > cobra default. Then if the user
+			// passed --broker / --nats-url explicitly, persist it
+			// so next session of commands inherit without re-typing.
+			natsURL = cli.ResolveNATSURLFromHome(natsURL,
+				cmd.Flags().Changed("nats-url") || cmd.Flags().Changed("broker"), home)
+
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
 				return err
@@ -46,6 +53,11 @@ performs a real NATS CONNECT and only writes current_session on success.
 					return fmt.Errorf("login: %w", err)
 				}
 				nc.Close()
+				if cmd.Flags().Changed("nats-url") || cmd.Flags().Changed("broker") {
+					if err := cli.WriteDefaultBrokerURL(home, natsURL); err != nil {
+						return fmt.Errorf("write broker_url: %w", err)
+					}
+				}
 				_, _ = fmt.Fprintf(out,
 					"authenticated — pubkey=%s\n              fp=%s\n",
 					id.PublicKey, id.Fingerprint)
@@ -72,13 +84,25 @@ performs a real NATS CONNECT and only writes current_session on success.
 			if err := cli.WriteCurrentSession(home, sid); err != nil {
 				return fmt.Errorf("write current_session: %w", err)
 			}
+			// Persist the broker URL so subsequent commands (ps /
+			// exec / run / expose / history / node ...) don't need
+			// --nats-url. Only persist if the operator actually
+			// supplied one this run (don't pin a stale cobra default).
+			if cmd.Flags().Changed("nats-url") || cmd.Flags().Changed("broker") {
+				if err := cli.WriteDefaultBrokerURL(home, natsURL); err != nil {
+					return fmt.Errorf("write broker_url: %w", err)
+				}
+			}
 			_, _ = fmt.Fprintf(out,
-				"activated session %q\n  also run: export TETHER_SESSION=%s\n",
-				sid, sid)
+				"activated session %q  (broker=%s)\n  also run: export TETHER_SESSION=%s\n",
+				sid, natsURL, sid)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	// --broker is the architecture K.1 spelling; alias of --nats-url
+	// for muscle-memory parity with `install.sh --broker`.
+	cmd.Flags().StringVar(&natsURL, "broker", "nats://127.0.0.1:4222", "NATS broker URL (alias of --nats-url)")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVarP(&sid, "session", "s", "", "session to activate")
 	cmd.Flags().StringVar(&pin, "pin", "", "PIN for first-time join (only with -s)")

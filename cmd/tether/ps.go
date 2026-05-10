@@ -32,6 +32,7 @@ view.`,
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
 				return err

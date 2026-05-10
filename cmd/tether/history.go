@@ -46,6 +46,7 @@ func newHistoryCmd() *cobra.Command {
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			if kind != "" && kind != "call" && kind != "proc" && kind != "port" {
 				return fmt.Errorf("--kind must be one of: call | proc | port (got %q)", kind)
 			}

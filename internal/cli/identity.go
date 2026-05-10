@@ -146,3 +146,53 @@ func WriteCurrentSession(home, sid string) error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// DefaultBrokerURLEnv lets the operator set the broker URL once per
+// shell instead of repeating --nats-url on every command.
+const DefaultBrokerURLEnv = "TETHER_NATS_URL"
+
+// BrokerURLFile is where `tether login --broker <URL>` (or any future
+// `tether ctx --broker <URL>` wrapper) persists the broker URL the
+// rest of the CLI should default to. Symmetric with current_session.
+func BrokerURLFile(home string) string {
+	return filepath.Join(home, "broker_url")
+}
+
+// ReadDefaultBrokerURL returns the broker URL the CLI should default to
+// when --nats-url is not explicitly set. Precedence (high → low):
+//  1. $TETHER_NATS_URL
+//  2. ~/.tether/broker_url file
+//  3. "" (caller falls back to the cobra default, typically nats://127.0.0.1:4222)
+func ReadDefaultBrokerURL(home string) string {
+	if v := os.Getenv(DefaultBrokerURLEnv); v != "" {
+		return v
+	}
+	b, err := os.ReadFile(BrokerURLFile(home))
+	if err != nil {
+		return ""
+	}
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		b = b[:len(b)-1]
+	}
+	return string(b)
+}
+
+// WriteDefaultBrokerURL persists the broker URL. Empty url clears.
+func WriteDefaultBrokerURL(home, url string) error {
+	path := BrokerURLFile(home)
+	if url == "" {
+		err := os.Remove(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(url+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
