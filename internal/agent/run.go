@@ -101,13 +101,35 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Step 3 of C.5.1: announce ready and BLOCK until ctl says "I'm
-	// subscribed; here is my real terminal size; you may exec".
+	// Step 3 of C.5.1: subscribe to attach BEFORE replying ready, then
+	// reply ready, then block on the sub. Race condition fixed here:
+	// previously SubscribeSync(attach_subj) lived inside waitForAttach
+	// — called AFTER replying ready. ctl receives ready and immediately
+	// pubs attach; if the agent goroutine hadn't reached SubscribeSync
+	// yet (CI runner under load), the attach pub landed at the NATS
+	// server with no matching subscriber and was discarded. Result:
+	// 15s wait → attach_timeout, even though ctl did its job correctly.
+	attachSubj := proto.SubjPtyAttach(a.cfg.SID, pid)
+	attachSub, err := nc.SubscribeSync(attachSubj)
+	if err != nil {
+		a.cfg.Logger.Warn("agent: SubscribeSync attach", "err", err, "pid", pid)
+		_ = sess.Close()
+		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
+			Kind: "failed", PID: pid, Reason: "pty_alloc_failed",
+		})
+		return
+	}
+	defer func() { _ = attachSub.Unsubscribe() }()
+	// Flush so the SUB protocol frame has reached the NATS server
+	// before ctl can possibly send attach. Same logic as broker
+	// ReadyCh in test/p10.
+	_ = nc.FlushTimeout(200 * time.Millisecond)
+
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
 		Kind: "ready", PID: pid, Cols: cols, Rows: rows,
 	})
 
-	attachCols, attachRows, ok := a.waitForAttach(nc, pid)
+	attachCols, attachRows, ok := a.waitForAttachOnSub(attachSub, pid)
 	if !ok {
 		a.cfg.Logger.Info("agent: attach_timeout", "pid", pid)
 		_ = sess.Close()
@@ -222,23 +244,20 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	a.cfg.Logger.Info("agent: run exit", "pid", pid, "code", exitCode)
 }
 
-// waitForAttach blocks for at most attachDeadline waiting for the ctl's
-// PtyAttachEvent. Returns (cols, rows, true) on success; (0, 0, false)
-// on timeout. Uses SubscribeSync so we can apply a hard deadline; the
-// subscription is unsubscribed before return either way.
-func (a *Agent) waitForAttach(nc *nats.Conn, pid string) (int, int, bool) {
-	subj := proto.SubjPtyAttach(a.cfg.SID, pid)
-	sub, err := nc.SubscribeSync(subj)
-	if err != nil {
-		a.cfg.Logger.Warn("agent: SubscribeSync attach", "err", err, "pid", pid)
-		return 0, 0, false
-	}
-	defer func() { _ = sub.Unsubscribe() }()
-
+// waitForAttachOnSub blocks for at most attachDeadline waiting for
+// the ctl's PtyAttachEvent on a PRE-ESTABLISHED sub. Returns (cols,
+// rows, true) on success; (0, 0, false) on timeout. The caller owns
+// sub.Unsubscribe.
+//
+// The sub MUST be created (and ideally Flushed) BEFORE the agent
+// publishes the ready chunk back to ctl — otherwise ctl can race
+// past us and fire attach into the void. See dispatchRun.
+func (a *Agent) waitForAttachOnSub(sub *nats.Subscription, pid string) (int, int, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), attachDeadline())
 	defer cancel()
 	msg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
+		_ = pid // pid kept in signature for log-context parity
 		return 0, 0, false
 	}
 	var ev proto.PtyAttachEvent

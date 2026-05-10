@@ -112,6 +112,7 @@ func withUpgradeAllow(allow []string) brokerOpt {
 
 func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpt) func() {
 	t.Helper()
+	ready := make(chan struct{})
 	cfg := broker.Config{
 		NATSURL:                  url,
 		DB:                       db,
@@ -120,6 +121,7 @@ func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpt) func()
 		StaleAfter:               300 * time.Millisecond,
 		OfflineAfter:             900 * time.Millisecond,
 		UpgradeForwardTimeoutDur: 3 * time.Second,
+		ReadyCh:                  ready,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -132,6 +134,14 @@ func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpt) func()
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
 	testharness.WaitConnect(t, url, 3*time.Second)
+	// Block until broker has installed all subscriptions — see the
+	// matching note in test/p10/upgrade_e2e_test.go::startBroker for
+	// the no-responders race this prevents on slow CI runners.
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker did not signal ReadyCh in 3s")
+	}
 	return func() {
 		cancel()
 		select {
