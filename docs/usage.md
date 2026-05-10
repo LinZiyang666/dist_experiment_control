@@ -307,6 +307,179 @@ curl -fsSL http://your-dev-machine:8000/install.sh \
 > 到内网或先手动 scp 后用 `--skip-download`（只生成配置 + systemd unit，
 > 不下载二进制）。
 
+#### 升级路径：给 broker 加公网域名 + TLS（Let's Encrypt）
+
+§2.1.5 推荐路径里 broker 是无 TLS 内网模式（`broker_url: nats://broker.lan:4222`）。
+要让公网 ctl/agent 能安全连入，加一层 Caddy 终结 TLS（自动 ACME 拿
+Let's Encrypt 证书），把内部 NATS WebSocket 反代出去。
+
+**前置 1 — DNS A 记录**：把你域名（例 `tether.example.com`）的 A 记录指向
+broker 机的公网 IP。验证：`dig +short tether.example.com` 必须返回正确 IP，
+否则 ACME 拿不到证书。
+
+**前置 2 — 防火墙开放端口**：
+
+| 端口 | 用途 |
+|---|---|
+| 80          | Let's Encrypt ACME http-01 challenge |
+| 443         | ctl/agent 的 NATS WSS（Caddy 终结 TLS） |
+| 7000        | agent 反向隧道控制连接 |
+| 14000-14999 | `tether expose` 公开端口（按需） |
+
+```bash
+# ufw（Ubuntu）
+sudo ufw allow 80,443,7000/tcp && sudo ufw allow 14000:14999/tcp
+# firewalld（CentOS/RHEL）
+sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp --add-port=7000/tcp \
+  --add-port=14000-14999/tcp && sudo firewall-cmd --reload
+```
+
+云服务商**还要在控制台安全组**同样开放。
+
+**步骤 1 — 装 Caddy**（注意 Caddy checksums 是 SHA-512，不是 SHA-256）：
+
+```bash
+ssh root@broker.example.com
+bash <<'SCRIPT'
+set -e
+cd /tmp
+CADDY_VER=2.7.6
+curl -fsSL -o caddy.tgz \
+  https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_linux_amd64.tar.gz
+curl -fsSL -o caddy_sums.txt \
+  https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_checksums.txt
+expect=$(grep "caddy_${CADDY_VER}_linux_amd64.tar.gz$" caddy_sums.txt | awk '{print $1}')
+have=$(sha512sum caddy.tgz | awk '{print $1}')
+[ "$have" = "$expect" ] || { echo "sha mismatch"; exit 1; }
+tar xzf caddy.tgz
+install -m 0755 caddy /usr/local/bin/caddy
+caddy version
+SCRIPT
+```
+
+> 用 `bash <<'SCRIPT' ... SCRIPT` 包起来：里面 `exit 1` 只退子 shell，不会
+> 把 ssh 登录会话踢掉。直接粘到登录 shell 里 `exit 1` 会断 ssh。
+
+**步骤 2 — 让 nats-server 同时监听 plain TCP（内部）+ WebSocket（给 Caddy）**：
+
+⚠️ nats-server **没有 `--ws_listen` 命令行 flag**，WebSocket 配置只能走
+conf 文件。如果你用了 `--ws_listen` 启动，nats-server 会把 help 全打出来
+然后退出。
+
+```bash
+# 写 nats.conf
+sudo tee /etc/tether/nats.conf > /dev/null <<'EOF'
+host: "127.0.0.1"
+port: 4222
+
+jetstream {
+  store_dir: "/var/lib/tether/jetstream"
+}
+
+websocket {
+  host: "127.0.0.1"
+  port: 8222
+  no_tls: true       # Caddy 在前面终结 TLS，本机内部明文 WS
+}
+EOF
+
+# 改 systemd unit 用 -c 指 conf
+sudo tee /etc/systemd/system/nats-server.service > /dev/null <<'EOF'
+[Unit]
+Description=NATS message broker (tether)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=tether
+ExecStart=/usr/local/bin/nats-server -c /etc/tether/nats.conf
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart nats-server
+sudo ss -tlnp | grep -E '4222|8222'    # 应同时见 4222 和 8222
+```
+
+**步骤 3 — 写 Caddyfile + systemd unit**（**邮箱替换成你自己的**）：
+
+```bash
+sudo tee /etc/tether/Caddyfile > /dev/null <<'EOF'
+{
+    email YOUR_EMAIL@example.com
+}
+
+tether.example.com:443 {
+    reverse_proxy 127.0.0.1:8222
+}
+EOF
+
+sudo tee /etc/systemd/system/caddy.service > /dev/null <<'EOF'
+[Unit]
+Description=Caddy (TLS termination for tether NATS WSS)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/caddy run --config /etc/tether/Caddyfile --adapter caddyfile
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now caddy
+sudo journalctl -u caddy --since '1 minute ago' --no-pager | tail -30
+```
+
+成功的话日志含 `obtained certificate ... tether.example.com` + `serving
+initial configuration`。失败常见：DNS 没生效 / 80 端口被占 / 防火墙没开
+80 / Caddy 跑用户没权 bind 443（systemd 默认 root，OK）。
+
+**步骤 4 — 改 broker.yaml 把 public_host 改成域名 + 重启**：
+
+```bash
+sudo tee /etc/tether/broker.yaml > /dev/null <<'EOF'
+broker:
+  domain: tether.example.com
+  public_host: tether.example.com       # `tether expose` URL 用这个域名
+  nats:
+    url: nats://127.0.0.1:4222          # broker → 本机 plain NATS
+  frp:
+    bind_addr: "0.0.0.0"
+    control_listen: ":7000"
+    port_range: "14000-14999"
+  admin:
+    socket: /var/run/tether/admin.sock
+  storage:
+    db: /var/lib/tether/tether.db
+    js_store: /var/lib/tether/jetstream
+EOF
+
+sudo systemctl restart tether-broker
+```
+
+**验证**：
+
+```bash
+# 笔记本上
+curl -vI https://tether.example.com/ 2>&1 | grep -E '(SSL|certificate|HTTP/)'
+# 应看到 HTTP/2 + Let's Encrypt issuer
+
+# ctl 改用 wss://
+tether session create lab --pin 384712 --nats-url wss://tether.example.com:443
+
+# agent 改 ~/.tether/agent/lab/agent.yaml
+broker_url: wss://tether.example.com:443
+session: lab
+nid: gpu-01
+tunnel_addr: tether.example.com:7000
+```
+
+至此公网 + TLS 部署完成。auth_callout 启用见 §3.4。
+
 ---
 
 ### 2.2 install.sh 一键安装（生产路径，需公网 release）
