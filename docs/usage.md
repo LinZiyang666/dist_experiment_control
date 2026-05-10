@@ -96,7 +96,220 @@ make build         # 输出 ./bin/tether
 要求 `Go 1.25+`（`go.mod` 由 nats-io/jwt/v2 ≥ v2.8.1 锁定）。`CGO_ENABLED=0`，
 所有平台都是单文件静态二进制。
 
-### 2.2 install.sh 一键安装（生产路径）
+### 2.1.5 没有公网 release 时怎么部署（pre-alpha 路径）
+
+> ⚠️ 当前 tether **没有公开 GitHub Release**，`install.sh` 默认从
+> `https://github.com/.../releases/download/...` 拉 tarball，**会 404**。
+> 公网 `curl install.sh | sh` 路径暂不可用。
+> 本节给出三种实际可行的内网/本地部署方案。
+
+#### 路径 A：单机本地 demo（最简单）
+
+把 broker、agent、ctl 全部跑在你这台机器上，验证流程：
+
+```bash
+make build                            # 产出 ./bin/tether
+make nats-server-install              # 一次性安装 nats-server
+make nats-dev                         # term A：跑 nats-server -js
+
+# term B
+TETHER_DEV_NO_AUTH=1 ./bin/tether serve \
+  --db ./tether.db \
+  --admin-socket /tmp/tether-admin.sock
+
+# term C
+TETHER_DEV_NO_AUTH=1 ./bin/tether agent --session lab --nid lab-1
+
+# term D
+export TETHER_DEV_NO_AUTH=1
+./bin/tether session create lab --pin 000000   # ★ 注意：DEV_NO_AUTH 跳过鉴权
+./bin/tether ps
+./bin/tether exec lab-1 -- echo hello
+```
+
+`TETHER_DEV_NO_AUTH=1` 跳过 nkey/auth_callout，**仅用于本机 demo**，绝不要
+在多人/公网环境用。
+
+#### 路径 B：两台/几台机器内网部署（推荐 pre-alpha 用法）
+
+不用 install.sh 也不用 release，手动 scp + 写配置。这样每一步都可见可控。
+
+**步骤 1 — 在你的 dev 机 build 二进制：**
+
+```bash
+cd /home/weiland/projects/dist_experiment_control
+make build
+# 产出 ./bin/tether（静态、跨发行版可用）
+
+# 如果目标机架构不同，cross-compile：
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o tether-linux-amd64 ./cmd/tether
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether-linux-arm64 ./cmd/tether
+```
+
+**步骤 2 — 部署 broker 机**（需要内网或公网可达的一台 Linux）：
+
+```bash
+# 把二进制 scp 到 broker 机
+scp ./bin/tether root@broker.lan:/usr/local/bin/tether
+
+# 还需要 nats-server。在 broker 机上：
+ssh root@broker.lan
+apt install -y golang-go      # 或装一份 go
+go install github.com/nats-io/nats-server/v2@v2.10.22
+mv ~/go/bin/nats-server /usr/local/bin/
+
+# 创建 tether 系统用户和目录
+useradd --system --home-dir /var/lib/tether --shell /usr/sbin/nologin tether
+install -d -o tether -g tether -m 0750 /var/lib/tether /var/log/tether
+install -d -o tether -g tether -m 0700 /var/run/tether
+mkdir -p /etc/tether
+
+# 写最小 broker.yaml（无 TLS，监听内网 IP）
+cat > /etc/tether/broker.yaml <<'EOF'
+broker:
+  domain: broker.lan
+  public_host: broker.lan          # `tether expose` URL 用这个
+  nats:
+    url: nats://127.0.0.1:4222
+  frp:
+    bind_addr: "0.0.0.0"
+    control_listen: ":7000"
+    port_range: "14000-14999"
+  admin:
+    socket: /var/run/tether/admin.sock
+  storage:
+    db: /var/lib/tether/tether.db
+    js_store: /var/lib/tether/jetstream
+EOF
+chmod 644 /etc/tether/broker.yaml
+
+# 写 systemd unit
+cat > /etc/systemd/system/nats-server.service <<'EOF'
+[Unit]
+Description=NATS message broker (tether)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=tether
+ExecStart=/usr/local/bin/nats-server -js -sd /var/lib/tether/jetstream -addr 0.0.0.0 -p 4222
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/tether-broker.service <<'EOF'
+[Unit]
+Description=tether broker daemon
+After=nats-server.service
+Wants=nats-server.service
+[Service]
+Type=simple
+User=tether
+ExecStart=/usr/local/bin/tether serve --config /etc/tether/broker.yaml
+Restart=on-failure
+StandardOutput=append:/var/log/tether/broker.log
+StandardError=append:/var/log/tether/broker.err
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now nats-server tether-broker
+systemctl status tether-broker
+```
+
+> 这一版**没启用 TLS / Caddy / auth_callout**（pre-alpha 内网用够了）。
+> 真上公网时再加 Caddy + ACME + auth_callout（见 §3.4）。
+
+**步骤 3 — 部署 agent 机：**
+
+```bash
+# scp 二进制
+scp ./bin/tether user@gpu-01.lan:/home/user/.local/bin/tether
+ssh user@gpu-01.lan
+chmod +x ~/.local/bin/tether
+
+# 准备 agent 目录 + 配置
+mkdir -p ~/.tether/agent/lab
+chmod 700 ~/.tether ~/.tether/agent ~/.tether/agent/lab
+cat > ~/.tether/agent/lab/agent.yaml <<EOF
+broker_url: nats://broker.lan:4222
+session: lab
+nid: gpu-01
+tunnel_addr: broker.lan:7000
+EOF
+chmod 600 ~/.tether/agent/lab/agent.yaml
+
+# 启动（先创建 session 后才能加入，所以这步留到步骤 4 后再做）
+```
+
+**步骤 4 — 部署 ctl 并创建 session：**
+
+```bash
+# 你的笔记本
+sudo install -m 0755 ./bin/tether /usr/local/bin/tether
+# 或 mkdir -p ~/.local/bin && cp ./bin/tether ~/.local/bin/
+
+# 创建 session（PIN 自定义）
+tether session create lab --pin 384712 --nats-url nats://broker.lan:4222
+# 返回 sid（会自动激活）+ 提示 export TETHER_SESSION
+
+# 也可以显式登录
+tether login --broker nats://broker.lan:4222 --session lab --pin 384712
+```
+
+**步骤 5 — 启动 agent**（agent 机上，PIN 同步骤 4）：
+
+```bash
+~/.local/bin/tether agent --session lab --pin 384712 --nid gpu-01 \
+  --nats-url nats://broker.lan:4222
+# 首次连接绑定 nkey，之后省略 --pin
+```
+
+**验证：**
+
+```bash
+# 笔记本上
+tether ps                                  # 应见 gpu-01 ONLINE
+tether exec gpu-01 -- hostname             # 应输出 gpu-01 主机名
+```
+
+#### 路径 C：用 install.sh 但走内网镜像
+
+你愿意用 install.sh 自动化但又没公网时，自己起一个 HTTP server 做"内网
+release"：
+
+```bash
+# dev 机：用 goreleaser 构 tarball（snapshot 模式，无须 tag）
+go install github.com/goreleaser/goreleaser/v2@latest
+goreleaser release --snapshot --clean --config build/goreleaser.yaml
+# 产出 ./dist/tether_*_linux_amd64.tar.gz + SHA256SUMS
+
+# 起内网 HTTP（局域网可见即可）
+cd dist && python3 -m http.server 8000
+
+# 在目标机用 install.sh 指向内网
+curl -fsSL http://your-dev-machine:8000/install.sh \
+  | sh -s -- --role agent \
+    --source-base http://your-dev-machine:8000 \
+    --version v0.0.0-dev \
+    --broker nats://broker.lan:4222 \
+    --session lab --pin 384712 --nid gpu-01
+```
+
+> install.sh 自己也得放到 HTTP server。简单：`cp scripts/install.sh dist/`。
+
+> ⚠️ broker 角色的 install.sh 还会下 nats-server + caddy；这两个也要镜像
+> 到内网或先手动 scp 后用 `--skip-download`（只生成配置 + systemd unit，
+> 不下载二进制）。
+
+---
+
+### 2.2 install.sh 一键安装（生产路径，需公网 release）
+
+> 当前阶段不可用 —— GitHub Release 未发布。下面流程是 v0.1.0 释出后的
+> 目标姿势，pre-alpha 阶段请走 §2.1.5 路径 B。
 
 `scripts/install.sh` 是三种角色的统一入口。**核心不变量**：脚本只落文件、生成
 配置和 systemd unit，**永不启动任何进程**。脚本结束后 `pgrep tether` 必须为空。
