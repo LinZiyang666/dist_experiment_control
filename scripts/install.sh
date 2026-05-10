@@ -150,22 +150,32 @@ fetch() {
     curl -fsSL --retry 3 "$1" -o "$2" || die "download failed: $1"
 }
 
-# verify_sha <file> <sha256-hex>: bail if hash mismatches.
+# verify_sha <file> <hash-hex>: bail if hash mismatches.
+# Auto-detects SHA-256 (64 hex chars) vs SHA-512 (128 hex chars)
+# from the expected length. nats-server SHA256SUMS is sha256;
+# Caddy caddy_<ver>_checksums.txt is sha512; tether's own
+# SHA256SUMS (goreleaser default) is sha256.
 verify_sha() {
     if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
         log "  + (skip) verify_sha $1"
         return 0
     fi
+    expect_len=${#2}
+    case "$expect_len" in
+        64)  algo="sha256"; bits=256 ;;
+        128) algo="sha512"; bits=512 ;;
+        *)   die "verify_sha: unrecognized hash length $expect_len for $1 (need 64 or 128)" ;;
+    esac
     have=""
-    if command -v sha256sum >/dev/null 2>&1; then
-        have=$(sha256sum "$1" | awk '{print $1}')
+    if command -v ${algo}sum >/dev/null 2>&1; then
+        have=$(${algo}sum "$1" | awk '{print $1}')
     elif command -v shasum >/dev/null 2>&1; then
-        have=$(shasum -a 256 "$1" | awk '{print $1}')
+        have=$(shasum -a $bits "$1" | awk '{print $1}')
     else
-        die "neither sha256sum nor shasum found; cannot verify download"
+        die "neither ${algo}sum nor shasum found; cannot verify download"
     fi
     if [ "$have" != "$2" ]; then
-        die "sha256 mismatch: got $have, want $2"
+        die "$algo mismatch: got $have, want $2"
     fi
 }
 
