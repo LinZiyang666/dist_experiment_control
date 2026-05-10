@@ -13,6 +13,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
 	yaml "gopkg.in/yaml.v3"
 )
@@ -32,7 +33,19 @@ type agentYAML struct {
 // can treat "no install" the same as "no overrides". A malformed
 // file IS reported so the operator notices a typo instead of
 // silently falling back to flag defaults.
+//
+// sid is validated via proto.ValidateSID before being concatenated
+// into the path. Without this, a malicious sid like "../../../etc/passwd"
+// would let filepath.Clean escape <home> and read arbitrary files —
+// caught by test/security TestAgentYAMLPathTraversalContract +
+// TestLoadAgentYAMLRejectsTraversalSID below. Defense in depth: the
+// CLI flag parsing and broker-side bootstrap also validate, but a
+// path-handling helper that touches the filesystem must not trust
+// its caller.
 func loadAgentYAML(home, sid string) (agentYAML, error) {
+	if err := proto.ValidateSID(sid); err != nil {
+		return agentYAML{}, fmt.Errorf("loadAgentYAML: %w", err)
+	}
 	path := filepath.Join(home, "agent", sid, "agent.yaml")
 	body, err := os.ReadFile(path)
 	if err != nil {
