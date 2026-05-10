@@ -259,8 +259,26 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 	flushTimer := time.NewTimer(runFlushInterval)
 	defer flushTimer.Stop()
 
+	// resetTimer drains the channel if a tick is already queued and
+	// arms a fresh runFlushInterval. MUST be called every time the
+	// timer fires (even when pending is empty) so the periodic flush
+	// keeps ticking. Otherwise time.NewTimer fires once and stops,
+	// and any future PTY output that doesn't fill 4KB sits in
+	// `pending` until the child closes (operator pain: tmux echo
+	// only appears in batches at session end).
+	resetTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushTimer.Reset(runFlushInterval)
+	}
+
 	flush := func() {
 		if len(pending) == 0 {
+			resetTimer()
 			return
 		}
 		// Make a copy because nats.Publish may queue and reuse our buf.
@@ -277,14 +295,7 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 		// pump on a wedged connection.
 		_ = nc.FlushTimeout(50 * time.Millisecond)
 		pending = pending[:0]
-		// Reset the flush timer for the next batch.
-		if !flushTimer.Stop() {
-			select {
-			case <-flushTimer.C:
-			default:
-			}
-		}
-		flushTimer.Reset(runFlushInterval)
+		resetTimer()
 	}
 
 	readCh := make(chan readResult, 1)
