@@ -261,10 +261,15 @@ func TestRunExitCodePropagates(t *testing.T) {
 	}
 }
 
-// TestAttachTimeout is the architecture-mandated test for C.5.1: agent
-// pubs ready, ctl never sends attach → within 3-4s ctl receives a
+// TestAttachTimeout is the architecture-mandated test for C.5.1:
+// agent pubs ready, ctl never sends attach → ctl receives a
 // failed{reason:attach_timeout} chunk; agent leaks no PTY.
+//
+// Default deadline is 15s (raised from 3s for high-RTT WSS deployments).
+// Override via TETHER_AGENT_ATTACH_DEADLINE so the test stays fast —
+// 500ms is plenty for the in-process loopback scenario here.
 func TestAttachTimeout(t *testing.T) {
+	t.Setenv("TETHER_AGENT_ATTACH_DEADLINE", "500ms")
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -298,9 +303,9 @@ func TestAttachTimeout(t *testing.T) {
 		t.Fatalf("expected ready, got %+v", ready)
 	}
 
-	// Deliberately do NOT publish attach. Wait for failed within 5s
-	// (agent timeout is 3s).
-	msg2, err := sub.NextMsg(5 * time.Second)
+	// Deliberately do NOT publish attach. Wait for failed within 2s
+	// (agent timeout overridden to 500ms above).
+	msg2, err := sub.NextMsg(2 * time.Second)
 	if err != nil {
 		t.Fatalf("waiting for attach_timeout: %v", err)
 	}

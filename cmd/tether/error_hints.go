@@ -78,7 +78,7 @@ func connectError(verb, natsURL string, err error) error {
 // a one-line operator-facing diagnosis. Reasons are agent-emitted
 // (architecture C.5.1), so the set is fixed.
 var runFailureReasons = map[string]string{
-	"attach_timeout":    "agent allocated the PTY but ctl didn't subscribe in time (3s); usually a slow client or NATS hiccup — retry.",
+	"attach_timeout":    "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
 	"pty_alloc_failed":  "agent couldn't open a PTY pair; check the agent host's /dev/ptmx and any container restrictions.",
 	"exec_failed":       "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
 	"argv_required":     "you supplied no command to run.",

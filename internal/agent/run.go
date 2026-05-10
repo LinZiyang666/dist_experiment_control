@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"syscall"
 	"time"
 
@@ -33,10 +34,29 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// attachDeadline is how long the agent waits between publishing
-// RunChunk{Kind:ready} and giving up because no attach arrived. P5 spec
-// pins this at 3s (architecture C.5.1).
-const attachDeadline = 3 * time.Second
+// defaultAttachDeadline is how long the agent waits between publishing
+// RunChunk{Kind:ready} and giving up because no attach arrived. P5
+// spec pinned this at 3s (architecture C.5.1) which proved too tight
+// in production over public NATS WSS — single-trip 200-400ms RTTs
+// from a remote ctl + TLS overhead can routinely eat 1-2s before the
+// ctl's pty.<pid>.attach pub lands.
+//
+// Default raised to 15s. Operators on lower-RTT LAN deployments can
+// tune via TETHER_AGENT_ATTACH_DEADLINE (e.g. "5s", "30s") to trade
+// faster orphan-PTY cleanup for less retry friction.
+const defaultAttachDeadline = 15 * time.Second
+
+// attachDeadline returns the active deadline, honoring the env var
+// override at startup. Read on each PTY alloc so live-reload-style
+// SIGHUP'd unit edits work without a binary restart.
+func attachDeadline() time.Duration {
+	if v := os.Getenv("TETHER_AGENT_ATTACH_DEADLINE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultAttachDeadline
+}
 
 // runChunkSize / runFlushInterval bound the master→.out pump. 4KB or
 // 50ms whichever comes first — see architecture C.5.2.
@@ -208,7 +228,7 @@ func (a *Agent) waitForAttach(nc *nats.Conn, pid string) (int, int, bool) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), attachDeadline)
+	ctx, cancel := context.WithTimeout(context.Background(), attachDeadline())
 	defer cancel()
 	msg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {

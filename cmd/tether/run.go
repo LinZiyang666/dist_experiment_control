@@ -102,7 +102,20 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			}
 
 			// Wait for ready / failed (5s — matches agent attachDeadline + slack).
-			readyCtx, cancelReady := context.WithTimeout(cmd.Context(), 5*time.Second)
+			// ctl waits for the agent's RunChunk{Kind:ready} reply
+			// before publishing pty.<pid>.attach. Has to outlast both
+			// the agent-side attachDeadline (default 15s, override
+			// TETHER_AGENT_ATTACH_DEADLINE) AND the round-trip cost
+			// of the run.req → ready reply over WSS. 20s gives slack
+			// without wedging on a truly dead broker. Override:
+			// TETHER_RUN_READY_TIMEOUT.
+			readyTimeout := 20 * time.Second
+			if v := os.Getenv("TETHER_RUN_READY_TIMEOUT"); v != "" {
+				if d, err := time.ParseDuration(v); err == nil && d > 0 {
+					readyTimeout = d
+				}
+			}
+			readyCtx, cancelReady := context.WithTimeout(cmd.Context(), readyTimeout)
 			defer cancelReady()
 			msg, err := sub.NextMsgWithContext(readyCtx)
 			if err != nil {
