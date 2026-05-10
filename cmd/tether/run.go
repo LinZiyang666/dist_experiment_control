@@ -302,6 +302,11 @@ func pumpStdinToBus(ctx context.Context, nc *nats.Conn, subj string, src io.Read
 			b := make([]byte, n)
 			copy(b, buf[:n])
 			_ = nc.Publish(subj, b)
+			// Force the keystroke to the wire instead of letting
+			// nats.go's internal flusher batch it. On a high-RTT
+			// WSS link the operator otherwise types into a black
+			// hole until the buffer fills naturally.
+			_ = nc.FlushTimeout(50 * time.Millisecond)
 		}
 		if err != nil {
 			return

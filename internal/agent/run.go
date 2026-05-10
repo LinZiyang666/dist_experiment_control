@@ -267,6 +267,15 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 		out := make([]byte, len(pending))
 		copy(out, pending)
 		_ = nc.Publish(outSubj, out)
+		// Force the NATS client to push this chunk to the socket
+		// NOW. Without this, nc.Publish only queues into an in-
+		// process bufio.Writer; on a high-latency WSS link the
+		// internal flusher's batching can stall PTY echo for
+		// seconds (operator pain: typing into `tether run -- cat`
+		// shows nothing until the child closes). A small Flush
+		// timeout means: best-effort push, but never block the
+		// pump on a wedged connection.
+		_ = nc.FlushTimeout(50 * time.Millisecond)
 		pending = pending[:0]
 		// Reset the flush timer for the next batch.
 		if !flushTimer.Stop() {
