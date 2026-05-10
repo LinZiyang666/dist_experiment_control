@@ -144,11 +144,22 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether-linux-arm64 .
 # 把二进制 scp 到 broker 机
 scp ./bin/tether root@broker.lan:/usr/local/bin/tether
 
-# 还需要 nats-server。在 broker 机上：
+# 还需要 nats-server。直接下预编译二进制（不要 `go install` ——
+# nats-server v2.10.22 的 go.mod 用了新格式版本号，broker 机如果
+# Go < 1.21 会报 `invalid go version '1.21.0'`）。在 broker 机上：
 ssh root@broker.lan
-apt install -y golang-go      # 或装一份 go
-go install github.com/nats-io/nats-server/v2@v2.10.22
-mv ~/go/bin/nats-server /usr/local/bin/
+cd /tmp
+NATS_VER=v2.10.22
+curl -fsSL -o nats.tgz \
+  https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/nats-server-${NATS_VER}-linux-amd64.tar.gz
+curl -fsSL -o sums.txt \
+  https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/SHA256SUMS
+expect=$(grep "nats-server-${NATS_VER}-linux-amd64.tar.gz" sums.txt | awk '{print $1}')
+have=$(sha256sum nats.tgz | awk '{print $1}')
+[ "$have" = "$expect" ] || { echo "sha mismatch"; exit 1; }
+tar xzf nats.tgz
+install -m 0755 nats-server-${NATS_VER}-linux-amd64/nats-server /usr/local/bin/nats-server
+nats-server --version    # 应输出 v2.10.22
 
 # 创建 tether 系统用户和目录
 useradd --system --home-dir /var/lib/tether --shell /usr/sbin/nologin tether
