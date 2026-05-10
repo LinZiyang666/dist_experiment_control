@@ -84,6 +84,13 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
 			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			// Agent must receive sys.events to react to admin evict
+			// (architecture P9 / I.2b — agent self-shutdown on
+			// agent_evicted), session_deleting (refuse calls in
+			// the deleting window), and disk_pressure broadcasts.
+			// Without this NATS rejects the subscribe and those
+			// runtime signals never reach the agent.
+			subjectPrefix + ".sys.events",
 			"_INBOX.>",
 		}},
 	}
