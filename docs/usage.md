@@ -101,40 +101,32 @@ make build         # 输出 ./bin/tether
 > ⚠️ 当前 tether **没有公开 GitHub Release**，`install.sh` 默认从
 > `https://github.com/.../releases/download/...` 拉 tarball，**会 404**。
 > 公网 `curl install.sh | sh` 路径暂不可用。
-> 本节给出三种实际可行的内网/本地部署方案。
+> 本节给出实际可行的内网/无公网部署方案。
+>
+> 真正的部署形态由你**已有几台机器**决定。tether 至少需要：
+> - **一台 broker 主机**（任意 Linux，agent 与 ctl 都需要能连到它的 IP/DNS，
+>   可以是公网 VPS、内网服务器、家用 NAS、甚至同一栋楼里的另一台 PC）；
+> - **N 台 agent 主机**（要被远程操作的实验机，NAT 后 OK 但必须能"出向
+>   连"到 broker 的 4222/7000 端口）；
+> - **使用者笔记本**（跑 ctl，能"出向连"到 broker 的 4222 端口）。
+>
+> 三个角色**部署在不同物理机上**是正常用法。把它们都堆在一台机器上只
+> 是 demo（见 §12.1），不能体现"NAT 穿透+反向暴露"的全部行为。
 
-#### 路径 A：单机本地 demo（最简单）
-
-把 broker、agent、ctl 全部跑在你这台机器上，验证流程：
-
-```bash
-make build                            # 产出 ./bin/tether
-make nats-server-install              # 一次性安装 nats-server
-make nats-dev                         # term A：跑 nats-server -js
-
-# term B
-TETHER_DEV_NO_AUTH=1 ./bin/tether serve \
-  --db ./tether.db \
-  --admin-socket /tmp/tether-admin.sock
-
-# term C
-TETHER_DEV_NO_AUTH=1 ./bin/tether agent --session lab --nid lab-1
-
-# term D
-export TETHER_DEV_NO_AUTH=1
-./bin/tether session create lab --pin 000000   # ★ 注意：DEV_NO_AUTH 跳过鉴权
-./bin/tether ps
-./bin/tether exec lab-1 -- echo hello
-```
-
-`TETHER_DEV_NO_AUTH=1` 跳过 nkey/auth_callout，**仅用于本机 demo**，绝不要
-在多人/公网环境用。
-
-#### 路径 B：两台/几台机器内网部署（推荐 pre-alpha 用法）
+#### 推荐路径：手动 scp + 写配置（多机内网部署）
 
 不用 install.sh 也不用 release，手动 scp + 写配置。这样每一步都可见可控。
+适用于"我有 broker 机 + 至少一台 agent 机 + 自己的笔记本"，三方互通但
+没法走公网 release。
 
-**步骤 1 — 在你的 dev 机 build 二进制：**
+**前置网络要求：**
+- agent 机 → broker 机：需要能连 4222（NATS）+ 7000（反向隧道）TCP；
+- ctl 笔记本 → broker 机：需要能连 4222 TCP；
+- broker 端口 14000-14999：是否开放给"会用 expose 出去的客户端"决定 ——
+  你自己用就开给你自己 IP，对外公开就开给 0.0.0.0；
+- broker 主机本身**不需要主动连**到 agent —— agent 永远是反向连入。
+
+**步骤 1 — 在你的 dev 机（任一能跑 Go 1.25+ 的机器）build 二进制：**
 
 ```bash
 cd /home/weiland/projects/dist_experiment_control
@@ -275,7 +267,7 @@ tether ps                                  # 应见 gpu-01 ONLINE
 tether exec gpu-01 -- hostname             # 应输出 gpu-01 主机名
 ```
 
-#### 路径 C：用 install.sh 但走内网镜像
+#### 备用路径：用 install.sh 但走内网镜像
 
 你愿意用 install.sh 自动化但又没公网时，自己起一个 HTTP server 做"内网
 release"：
