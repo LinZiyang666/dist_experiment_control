@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
@@ -19,7 +20,93 @@ func newNodeCmd() *cobra.Command {
 		Short: "Per-node operations (architecture J.4 / G)",
 	}
 	root.AddCommand(newNodeUpgradeCmd())
+	root.AddCommand(newNodeLsCmd())
 	return root
+}
+
+// newNodeLsCmd implements `tether node ls` — list every agent in the
+// active session with its current liveness status, last heartbeat
+// age, proto version, and release version. Companion to `tether ps`
+// (which is process-centric); this command is node-centric so a
+// freshly-registered agent that hasn't exec'd anything still shows
+// up.
+//
+// Underlying RPC is the same node.list.req that `node upgrade --all`
+// uses to enumerate ONLINE targets.
+func newNodeLsCmd() *cobra.Command {
+	var (
+		natsURL string
+		home    string
+		showAll bool
+	)
+	cmd := &cobra.Command{
+		Use:   "ls",
+		Short: "List agents (nodes) in the active session",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sid := cli.ReadCurrentSession(home)
+			if sid == "" {
+				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+			}
+			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
+
+			id, err := cli.EnsureIdentity(home)
+			if err != nil {
+				return err
+			}
+			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			if err != nil {
+				return connectError("node ls", natsURL, err)
+			}
+			defer nc.Close()
+
+			body, _ := json.Marshal(proto.NodeListReq{})
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			defer cancel()
+			respMsg, err := nc.RequestWithContext(ctx,
+				proto.SubjCtrlNodeList(id.PublicKey, sid), body)
+			if err != nil {
+				return fmt.Errorf("node ls: %w (broker unreachable on NATS)", err)
+			}
+			var resp proto.NodeListResp
+			if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+				return fmt.Errorf("node ls: malformed reply: %w", err)
+			}
+			if resp.Code != "" {
+				return brokerErrorMessage("node ls", resp.Code, resp.Error)
+			}
+
+			now := time.Now()
+			out := cmd.OutOrStdout()
+			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+			_, _ = fmt.Fprintln(tw, "NODE\tSTATUS\tHEARTBEAT\tPROTO\tRELEASE")
+			any := false
+			for _, n := range resp.Nodes {
+				if n.Status != "ONLINE" && !showAll {
+					continue
+				}
+				any = true
+				age := "-"
+				if !n.LastHeartbeatAt.IsZero() {
+					age = humanizeAgo(now, n.LastHeartbeatAt)
+				}
+				release := n.ReleaseVersion
+				if release == "" {
+					release = "-"
+				}
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
+					n.NID, n.Status, age, n.ProtoVersion, release)
+			}
+			if !any {
+				_, _ = fmt.Fprintln(tw, "(no nodes)")
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().BoolVarP(&showAll, "all", "a", false, "include OFFLINE / STALE nodes")
+	return cmd
 }
 
 func newNodeUpgradeCmd() *cobra.Command {
