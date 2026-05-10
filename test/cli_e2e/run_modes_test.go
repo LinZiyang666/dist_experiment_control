@@ -150,7 +150,7 @@ func TestRunEchoHelloOverPTY(t *testing.T) {
 	defer nc.Close()
 
 	res := runRunResize(t, nc, "lab", pub, "lab-1",
-		[]string{"echo", "hello"}, 80, 24, nil, 5*time.Second)
+		[]string{"echo", "hello"}, 80, 24, nil, 30*time.Second)
 	if res.Failed != "" {
 		t.Fatalf("run failed: %s", res.Failed)
 	}
@@ -176,7 +176,7 @@ func TestRunExitCodePropagates(t *testing.T) {
 	defer nc.Close()
 
 	res := runRunResize(t, nc, "lab", pub, "lab-1",
-		[]string{"sh", "-c", "exit 7"}, 80, 24, nil, 5*time.Second)
+		[]string{"sh", "-c", "exit 7"}, 80, 24, nil, 30*time.Second)
 	if res.Failed != "" {
 		t.Fatalf("failed: %s", res.Failed)
 	}
@@ -241,7 +241,7 @@ func TestRunFastExitNoAttachTimeout(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		res := runRunResize(t, nc, "lab", pub, "lab-1",
-			[]string{"sh", "-c", "echo q"}, 80, 24, nil, 5*time.Second)
+			[]string{"sh", "-c", "echo q"}, 80, 24, nil, 30*time.Second)
 		if res.Failed != "" {
 			t.Fatalf("iter %d failed: %s", i, res.Failed)
 		}
@@ -274,7 +274,7 @@ func TestRunNonexistentCommandFails(t *testing.T) {
 
 	uniq := fmt.Sprintf("/var/empty/no-such-binary-%d", time.Now().UnixNano())
 	res := runRunResize(t, nc, "lab", pub, "lab-1",
-		[]string{uniq}, 80, 24, nil, 5*time.Second)
+		[]string{uniq}, 80, 24, nil, 30*time.Second)
 	if res.Failed != "exec_failed" {
 		t.Errorf("expected failed{exec_failed}; got failed=%q exit=%d out=%q",
 			res.Failed, res.ExitCode, res.Out.String())

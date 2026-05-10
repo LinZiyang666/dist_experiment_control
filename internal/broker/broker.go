@@ -142,6 +142,15 @@ type Config struct {
 	// download a tarball before replying, so the budget is
 	// generous. Tests override down.
 	UpgradeForwardTimeoutDur time.Duration
+
+	// ReadyCh, if non-nil, is closed by Run AFTER every NATS
+	// subscription has been installed (register / heartbeat / all
+	// session+exec+ps+expose+upgrade handlers). Tests use this to
+	// avoid a race where they fire requests before broker.Run's
+	// goroutine has reached the Subscribe loop on a slow CI runner
+	// (causes spurious "no responders" errors in test/p10).
+	// Production callers leave this nil.
+	ReadyCh chan struct{}
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -379,6 +388,19 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: subscribe %s: %w", ss.subj, err)
 		}
 		defer func(s *nats.Subscription) { _ = s.Unsubscribe() }(sub)
+	}
+
+	// Flush so the SUB protocol frames have actually reached the
+	// NATS server before we signal ready. Without this, a fast test
+	// can race ahead and fire a Request() to a subject the server
+	// "knows about" via our nc but hasn't yet processed the SUB for.
+	// 200ms is plenty for the loopback case + slow CI runners.
+	_ = nc.FlushTimeout(200 * time.Millisecond)
+
+	// Signal ready. Tests use this to gate request firing on a slow
+	// runner; production callers leave Config.ReadyCh nil.
+	if b.cfg.ReadyCh != nil {
+		close(b.cfg.ReadyCh)
 	}
 
 	// P7 — try JetStream AFTER all subscriptions are installed so the

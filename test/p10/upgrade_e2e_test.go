@@ -42,6 +42,7 @@ func seedSession(t *testing.T, db *sql.DB, sid, ownerFP string) {
 
 func startBroker(t *testing.T, url string, db *sql.DB, allow []string) func() {
 	t.Helper()
+	ready := make(chan struct{})
 	b, err := broker.New(broker.Config{
 		NATSURL:                  url,
 		DB:                       db,
@@ -51,6 +52,7 @@ func startBroker(t *testing.T, url string, db *sql.DB, allow []string) func() {
 		OfflineAfter:             900 * time.Millisecond,
 		UpgradeURLAllowlist:      allow,
 		UpgradeForwardTimeoutDur: 5 * time.Second,
+		ReadyCh:                  ready,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,12 +60,17 @@ func startBroker(t *testing.T, url string, db *sql.DB, allow []string) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
-	// NATS connect probe is fine; the post-probe 120ms dead-reckon
-	// (audit shard 05 F14) was racy. broker.Run installs the
-	// upgrade subscription synchronously inside Run; once the
-	// connect probe succeeds, subsequent Request() will either hit
-	// the subscription or hit no-responders cleanly.
+	// Wait for broker.Run to actually install all subscriptions —
+	// the previous "WaitConnect + assume Run is fast enough" was
+	// racy on slow CI runners (TestUpgradeNonOwnerRejected hit
+	// "no responders" intermittently). ReadyCh closes only after
+	// every Subscribe + a Flush round-trip to the NATS server.
 	testharness.WaitConnect(t, url, 3*time.Second)
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker did not signal ReadyCh in 3s")
+	}
 	return func() {
 		cancel()
 		select {
