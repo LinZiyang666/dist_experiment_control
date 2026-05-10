@@ -82,8 +82,19 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			defer nc.Close()
 
 			cols, rows := terminalSize()
+			// Forward TERM (and a couple of related vars) so curses
+			// apps on the agent (tmux, vim, htop, less) know what
+			// terminal capabilities to use. Without this they fall
+			// back to TERM=dumb / unset and refuse to start with
+			// "open terminal failed: terminal does not support clear".
+			env := map[string]string{}
+			for _, k := range []string{"TERM", "COLORTERM", "LANG", "LC_ALL"} {
+				if v := os.Getenv(k); v != "" {
+					env[k] = v
+				}
+			}
 			body, err := json.Marshal(proto.RunReq{
-				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows,
+				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows, Env: env,
 			})
 			if err != nil {
 				return err

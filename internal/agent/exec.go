@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -243,6 +244,39 @@ func envSliceFromMap(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k, v := range m {
 		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+// mergeChildEnv builds a child env array starting from os.Environ()
+// (so PATH / HOME / locale come for free) and overlays the override
+// map on top — last-wins semantics, matching os/exec docs. Always
+// guarantees TERM is set so curses programs (tmux, vim, htop, less)
+// don't fail with "terminal does not support clear" under systemd
+// --user where TERM is unset by default.
+//
+// Used by `tether run` for PTY children. `tether exec` non-PTY
+// children may want a stricter env (no inherited TERM since stdout
+// isn't a tty); they keep using envSliceFromMap directly.
+func mergeChildEnv(override map[string]string) []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(override)+1)
+	out = append(out, base...)
+	hasTerm := false
+	for _, e := range base {
+		if strings.HasPrefix(e, "TERM=") {
+			hasTerm = true
+			break
+		}
+	}
+	for k, v := range override {
+		out = append(out, k+"="+v)
+		if k == "TERM" {
+			hasTerm = true
+		}
+	}
+	if !hasTerm {
+		out = append(out, "TERM=xterm-256color")
 	}
 	return out
 }

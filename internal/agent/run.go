@@ -123,7 +123,14 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 
 	// Now exec. Failures here are exec_failed (not attach_timeout) —
 	// keep them distinguishable so the audit kind is meaningful.
-	if err := sess.Start(req.Argv, envSliceFromMap(req.Env), req.Cwd); err != nil {
+	//
+	// Build the child env on top of os.Environ() so the child
+	// inherits PATH / HOME / locale defaults from the agent unit;
+	// req.Env entries override those; finally TERM is force-defaulted
+	// to xterm-256color if neither layer set it (systemd --user
+	// units run with no TERM, so curses apps like tmux otherwise
+	// fail with "terminal does not support clear").
+	if err := sess.Start(req.Argv, mergeChildEnv(req.Env), req.Cwd); err != nil {
 		a.cfg.Logger.Warn("agent: pty start", "err", err, "pid", pid)
 		_ = sess.Close()
 		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
