@@ -671,25 +671,125 @@ broker:
 非法输入直接 fatal 退出（避免操作员把 `1400-1499` 写成 `14000-14999` 后默默落
 回默认）。
 
-### 3.4 nats-server.conf
+### 3.4 nats-server.conf 启用 auth_callout
 
-由 `install.sh --role broker` 通过 systemd 用命令行参数启动 `nats-server`，无独立
-配置文件。生产部署如需 `auth_callout`：
+`§2.1.5` 给的 nats.conf 是无鉴权（demo / 内网用）。**公网部署必须启用
+auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`。
 
-1. 生成 nkey 种子：
-   ```bash
-   sudo -u tether mkdir -p /etc/tether/seeds
-   sudo -u tether nk -gen user > /etc/tether/seeds/broker.nk
-   sudo -u tether nk -gen account > /etc/tether/seeds/account.nk
-   sudo chmod 600 /etc/tether/seeds/*.nk
-   ```
-2. 修改 `/etc/systemd/system/tether-broker.service`：
-   ```
-   ExecStart=/usr/local/bin/tether serve --config /etc/tether/broker.yaml \
-     --auth-callout-seeds-dir /etc/tether/seeds
-   ```
-3. 配置 nats-server 把 broker pubkey 列入 `nkeys` + `auth_callout.auth_users`，
-   account pubkey 列入 `auth_callout.issuer`。详见 architecture E.2 / K.3。
+#### 第 1 步：生成 broker.nk + account.nk
+
+二选一：
+
+**A. 在能跑 Go 1.20+ 的 dev 机上**（broker 主机 Go 太老就走这条）：
+
+```bash
+mkdir -p /tmp/seeds && cd /tmp/seeds
+cat > go.mod <<'GOMOD'
+module genseeds
+go 1.25
+require github.com/nats-io/nkeys v0.4.7
+GOMOD
+cat > gen.go <<'GO'
+package main
+import ("fmt"; "os"; "github.com/nats-io/nkeys")
+func dump(name string, kp nkeys.KeyPair) {
+    seed, _ := kp.Seed()
+    pub, _ := kp.PublicKey()
+    _ = os.WriteFile(name+".nk", seed, 0o600)
+    fmt.Printf("%s_PUB=%s\n", name, pub)
+}
+func main() {
+    uk, _ := nkeys.CreateUser();    dump("broker", uk)
+    ak, _ := nkeys.CreateAccount(); dump("account", ak)
+}
+GO
+go mod tidy && go run gen.go
+# 输出形如：
+#   broker_PUB=UBVHCNRDN34LOXMAW5PAUYAKAT4DC5CPKRO4GQHF3XD4K2P3PITVY6FV
+#   account_PUB=AC4AQPOXCEMJDK6O3RQV4R2TG44VKH4DSFSPUI42BMH66DL3CRAXCFT3
+# 落地两个 .nk 文件 + 把两个 PUB 记下来
+scp broker.nk account.nk root@your-broker:/tmp/
+```
+
+**B. 在 broker 主机直接装 nats-io 的 `nk` 工具**（要 Go 1.20+）：
+
+```bash
+go install github.com/nats-io/nkeys/nk@latest
+~/go/bin/nk -gen user    > /tmp/broker.nk
+~/go/bin/nk -inkey /tmp/broker.nk -pubout
+~/go/bin/nk -gen account > /tmp/account.nk
+~/go/bin/nk -inkey /tmp/account.nk -pubout
+```
+
+#### 第 2 步：在 broker 上落地 seeds
+
+```bash
+sudo install -d -o tether -g tether -m 0700 /etc/tether/seeds
+sudo install -m 0600 -o tether -g tether /tmp/broker.nk  /etc/tether/seeds/broker.nk
+sudo install -m 0600 -o tether -g tether /tmp/account.nk /etc/tether/seeds/account.nk
+sudo rm /tmp/broker.nk /tmp/account.nk    # 清临时副本
+```
+
+#### 第 3 步：改 nats.conf 加 authorization 块
+
+⚠️ **注意 NATS 字段名是 `users:` 不是 `nkeys:`**（写错会得 `unknown field "nkeys"`）。
+把下面的两个公钥替换成第 1 步打印的 `broker_PUB` / `account_PUB`：
+
+```bash
+sudo tee /etc/tether/nats.conf > /dev/null <<EOF
+host: "127.0.0.1"
+port: 4222
+
+jetstream {
+  store_dir: "/var/lib/tether/jetstream"
+}
+
+websocket {
+  host: "127.0.0.1"
+  port: 8222
+  no_tls: true
+}
+
+authorization {
+  users: [
+    { user: "tether-broker", nkey: "$BROKER_PUB" }
+  ]
+  auth_callout {
+    issuer: "$ACCOUNT_PUB"
+    auth_users: [ "tether-broker" ]
+  }
+}
+EOF
+```
+
+字段含义：
+- `users:` 列出 nats-server **直接认可**的 nkey 身份。这里只放 broker 自己。
+- `auth_callout.issuer:` 信任由这个 account 公钥签发的 JWT。broker 用对应的
+  account.nk 私钥给来访 ctl/agent 签发临时 JWT。
+- `auth_callout.auth_users:` 谁负责回应 callout —— alias `tether-broker` 对
+  应上面 users 里那个 nkey。
+
+#### 第 4 步：改 tether-broker.service 传 seeds dir + 重启
+
+```bash
+sudo sed -i 's|tether serve --config /etc/tether/broker.yaml|& --auth-callout-seeds-dir /etc/tether/seeds|' \
+  /etc/systemd/system/tether-broker.service
+
+sudo systemctl daemon-reload
+sudo systemctl reset-failed nats-server tether-broker
+sudo systemctl restart nats-server tether-broker
+sleep 2
+sudo systemctl status nats-server tether-broker --no-pager | head -20
+sudo tail -10 /var/log/tether/broker.err   # 应见 "auth_callout=on (seeds=...)"
+```
+
+#### 验证
+
+```bash
+# 笔记本：
+tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
+# 不应再报 "nkeys not supported"
+```
 
 未配 `--auth-callout-seeds-dir` 时 broker 以 P2 模式运行（无 NATS 层身份强制，
 仅适合 dev / 内网 demo）。
