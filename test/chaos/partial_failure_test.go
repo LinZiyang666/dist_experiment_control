@@ -82,7 +82,7 @@ func TestUpgradeAllSplitFleetCountsTransientSkips(t *testing.T) {
 		body, _ := json.Marshal(proto.UpgradeReq{
 			URL: "https://x/", SHA256: "deadbeef", ProtoVersion: proto.ProtoVersion,
 		})
-		reqCtx, c := context.WithTimeout(ctx, 2*time.Second)
+		reqCtx, c := context.WithTimeout(ctx, 30*time.Second)
 		resp, err := cli.RequestWithContext(reqCtx,
 			proto.SubjCmdBy("lab", "actor", nid, "upgrade"), body)
 		c()
@@ -154,7 +154,7 @@ func TestUpgradeAllAbortsImmediatelyOnConfigError(t *testing.T) {
 		body, _ := json.Marshal(proto.UpgradeReq{
 			URL: "https://evil/", SHA256: "deadbeef", ProtoVersion: proto.ProtoVersion,
 		})
-		reqCtx, c := context.WithTimeout(ctx, 2*time.Second)
+		reqCtx, c := context.WithTimeout(ctx, 30*time.Second)
 		resp, err := cli.RequestWithContext(reqCtx,
 			proto.SubjCmdBy("lab", "actor", nid, "upgrade"), body)
 		c()

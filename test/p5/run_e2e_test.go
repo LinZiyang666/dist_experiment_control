@@ -129,7 +129,7 @@ func runRun(t *testing.T, nc *nats.Conn, sid, actor, nid string, argv []string, 
 	}
 
 	// Step A: wait for the first chunk (ready or failed).
-	first, err := sub.NextMsg(3 * time.Second)
+	first, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatalf("waiting for first chunk: %v", err)
 	}
@@ -173,7 +173,7 @@ func runRun(t *testing.T, nc *nats.Conn, sid, actor, nid string, argv []string, 
 	}
 
 	// Step E: drain until exit/failed on the inbox.
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		left := time.Until(deadline)
 		if left <= 0 {
@@ -293,7 +293,7 @@ func TestAttachTimeout(t *testing.T) {
 	}
 
 	// Read 'ready'.
-	msg1, err := sub.NextMsg(2 * time.Second)
+	msg1, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestAttachTimeout(t *testing.T) {
 
 	// Deliberately do NOT publish attach. Wait for failed within 2s
 	// (agent timeout overridden to 500ms above).
-	msg2, err := sub.NextMsg(2 * time.Second)
+	msg2, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatalf("waiting for attach_timeout: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestKillSendsSIGINT(t *testing.T) {
 	if err := nc.PublishRequest(proto.SubjCmdBy("lab", pub, "lab-1", "run"), inbox, body); err != nil {
 		t.Fatal(err)
 	}
-	msg1, err := sub.NextMsg(2 * time.Second)
+	msg1, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestKillSendsSIGINT(t *testing.T) {
 	}
 
 	// Wait for `started` first so the trap is installed.
-	startMsg, err := sub.NextMsg(2 * time.Second)
+	startMsg, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

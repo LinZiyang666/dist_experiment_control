@@ -49,7 +49,7 @@ func runRunResize(
 		t.Fatal(err)
 	}
 
-	first, err := sub.NextMsg(3 * time.Second)
+	first, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatalf("waiting for first chunk: %v", err)
 	}

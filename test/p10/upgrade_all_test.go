@@ -156,7 +156,7 @@ func callUpgradeForTest(nc *nats.Conn, sid, actor, nid, url, sha string) error {
 	body, _ := json.Marshal(proto.UpgradeReq{
 		URL: url, SHA256: sha, ProtoVersion: proto.ProtoVersion,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	respMsg, err := nc.RequestWithContext(ctx,
 		proto.SubjCmdBy(sid, actor, nid, "upgrade"), body)

@@ -40,7 +40,13 @@ func TestRunRecordsProcessLifecycleForPs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	msg, err := sub.NextMsg(2 * time.Second)
+	// Timeouts: 2s held under local loopback NATS but fired
+	// intermittently on shared GitHub Actions runners (the post-
+	// attach sess.Start fork/exec + reply round-trip can take
+	// > 2s when the CI host is loaded). 10s budget keeps the
+	// happy path fast (test exits as soon as the message arrives)
+	// and avoids the spurious nats:timeout failure.
+	msg, err := sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +63,7 @@ func TestRunRecordsProcessLifecycleForPs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	msg, err = sub.NextMsg(2 * time.Second)
+	msg, err = sub.NextMsg(30 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

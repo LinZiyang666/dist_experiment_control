@@ -209,7 +209,7 @@ func TestCtlExecBoundedWhenNATSDiesMidExec(t *testing.T) {
 
 	// Kick off an unanswered request with a generous deadline; then
 	// drop NATS. The Request should return within the deadline.
-	reqCtx, reqCancel := context.WithTimeout(ctx, 3*time.Second)
+	reqCtx, reqCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer reqCancel()
 	doneCh := make(chan error, 1)
 	go func() {

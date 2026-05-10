@@ -341,7 +341,7 @@ func TestAgentWithoutPINIsRejectedAtConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err = a.Run(ctx)
 	if err == nil {

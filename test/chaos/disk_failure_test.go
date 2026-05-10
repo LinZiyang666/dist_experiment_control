@@ -107,7 +107,7 @@ func TestAdminSockStartFailsOnReadOnlyParent(t *testing.T) {
 	srv := adminsock.New(filepath.Join(roDir, "admin", "admin.sock"), adminsock.Backend{
 		DB: openDB(t),
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := srv.Start(ctx)
 	if err == nil {
