@@ -64,6 +64,11 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			}
 			nid := args[0]
 			argv := args[1:]
+			// Strip a single leading `--`. See the matching comment
+			// in cmd/tether/exec.go for the rationale.
+			if len(argv) > 0 && argv[0] == "--" {
+				argv = argv[1:]
+			}
 
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {

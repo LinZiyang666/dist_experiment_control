@@ -42,6 +42,16 @@ both ways.
 			}
 			nid := args[0]
 			argv := args[1:]
+			// SetInterspersed(false) eats `--` as a literal positional
+			// (cobra doesn't strip it). `tether exec gpu-01 -- echo`
+			// then reaches the agent as argv ["--", "echo"] and exec
+			// fails with `executable file not found: --`. Operators
+			// reach for `--` because every other CLI uses it to
+			// separate flags from sub-argv; honor that habit by
+			// stripping a single leading `--`.
+			if len(argv) > 0 && argv[0] == "--" {
+				argv = argv[1:]
+			}
 
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
