@@ -10,15 +10,16 @@
 # `pgrep tether` MUST be empty.
 #
 # Usage:
-#   curl -fsSL https://<broker>/install.sh | sh -s -- --role agent  --broker wss://broker --session lab --pin XXX --nid lab-1
-#   curl -fsSL https://<broker>/install.sh | sh -s -- --role ctl
-#   curl -fsSL https://<broker>/install.sh | sudo sh -s -- --role broker --domain tether.example.com --acme-email admin@example.com
+#   BASE=https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download
+#   curl -fsSL "$BASE/install.sh" | sh -s -- --role agent  --broker wss://broker --session lab --pin XXX --nid lab-1
+#   curl -fsSL "$BASE/install.sh" | sh -s -- --role ctl
+#   curl -fsSL "$BASE/install.sh" | sudo sh -s -- --role broker --domain tether.example.com --acme-email admin@example.com
 #
 # Test / dev knobs (not for production callers):
 #   --dry-run           do everything except download + chmod + write
 #                       outside the work-root; useful for CI assertions.
 #   --source-base URL   override the release tarball base URL (default:
-#                       https://github.com/LinZiyang666/tether/releases/download/<ver>).
+#                       https://github.com/LinZiyang666/dist_experiment_control/releases/download/<ver>).
 #   --version VER       pin the release version (default: latest tag).
 #   --prefix DIR        override the install root (defaults: per role).
 #   --skip-download     don't try to fetch the tarball; use the file at
@@ -128,7 +129,7 @@ source_tarball_url() {
     if [ -n "$SOURCE_BASE" ]; then
         printf '%s/tether_%s_%s_%s.tar.gz\n' "$SOURCE_BASE" "$VERSION" "$OS" "$ARCH"
     else
-        printf 'https://github.com/LinZiyang666/tether/releases/download/%s/tether_%s_%s_%s.tar.gz\n' \
+        printf 'https://github.com/LinZiyang666/dist_experiment_control/releases/download/%s/tether_%s_%s_%s.tar.gz\n' \
             "$VERSION" "$VERSION" "$OS" "$ARCH"
     fi
 }
@@ -137,8 +138,38 @@ source_sha_url() {
     if [ -n "$SOURCE_BASE" ]; then
         printf '%s/SHA256SUMS\n' "$SOURCE_BASE"
     else
-        printf 'https://github.com/LinZiyang666/tether/releases/download/%s/SHA256SUMS\n' "$VERSION"
+        printf 'https://github.com/LinZiyang666/dist_experiment_control/releases/download/%s/SHA256SUMS\n' "$VERSION"
     fi
+}
+
+# resolve_latest_version: sniff the redirect from /releases/latest to
+# /releases/tag/<ver>. Plain HTML redirect, no GitHub API ratelimit,
+# works under busybox curl. Returns empty if offline / unresolvable
+# (caller decides whether that's fatal).
+resolve_latest_version() {
+    eff=$(curl -fsSI -o /dev/null -w '%{url_effective}' \
+        "https://github.com/LinZiyang666/dist_experiment_control/releases/latest" 2>/dev/null) || return 1
+    case "$eff" in
+        */releases/tag/*) printf '%s' "${eff##*/tag/}" | tr -d '\r\n ' ;;
+        *) return 1 ;;
+    esac
+}
+
+# maybe_resolve_version: when the caller didn't override --version
+# and didn't override --source-base, replace the build-time default
+# `v0.0.0-dev` with whatever the latest published tag is. This is
+# what makes `curl .../latest/download/install.sh | sh` work without
+# the operator pinning a version.
+maybe_resolve_version() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$SKIP_DOWNLOAD" -eq 1 ] && return 0
+    [ -n "$SOURCE_BASE" ] && return 0
+    case "$VERSION" in
+        latest|v0.0.0-dev|"")
+            v=$(resolve_latest_version) || die "could not resolve latest release tag; pass --version vX.Y.Z explicitly or set TETHER_VERSION"
+            VERSION="$v"
+            ;;
+    esac
 }
 
 # fetch <url> <out>: download with curl, fail on HTTP ≥ 400.
@@ -622,6 +653,10 @@ uninstall_broker() {
 }
 
 # -- dispatch --------------------------------------------------------------
+
+# Resolve VERSION once after argparse so every role's install path
+# sees the same value (no per-role drift if the redirect flaps).
+maybe_resolve_version
 
 case "$ROLE" in
     agent)

@@ -45,7 +45,7 @@ const upgradeMaxTarballBytes = 64 * 1024 * 1024
 // so this is belt-and-suspenders for an attacker who somehow
 // reached the forwarded subject directly.
 var defaultAgentURLAllowlist = []string{
-	"https://github.com/LinZiyang666/tether/releases/",
+	"https://github.com/LinZiyang666/dist_experiment_control/releases/",
 }
 
 // upgradeFetchTimeout bounds the HTTP GET round-trip. v1 ships

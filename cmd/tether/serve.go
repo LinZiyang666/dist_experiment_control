@@ -18,6 +18,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// defaultUpgradeURLPrefix matches the GitHub release URL that
+// install.sh and goreleaser produce; keeping it here (rather than in
+// serveconf) so a self-hosted distribution can override via yaml or
+// flag without recompiling. Architecture J.4: "默认
+// https://github.com/<org>/tether/releases/".
+const defaultUpgradeURLPrefix = "https://github.com/LinZiyang666/dist_experiment_control/releases/"
+
 func newServeCmd() *cobra.Command {
 	var (
 		configPath       string
@@ -76,13 +83,20 @@ func newServeCmd() *cobra.Command {
 			}
 			defer func() { _ = db.Close() }()
 
-			// Upgrade allowlist: explicit --upgrade-url-allow always
-			// wins; otherwise pull from yaml. Empty stays empty so
-			// broker.handleUpgradeReq REJECTS every upgrade — the
-			// architecture J.4 default-deny posture.
+			// Upgrade allowlist precedence: explicit
+			// --upgrade-url-allow > yaml > built-in default. The
+			// built-in default points at this binary's own GitHub
+			// release prefix so `tether node upgrade` works out of
+			// the box; operators who self-host artifacts override
+			// via yaml or flag.
 			allow := upgradeURLAllow
-			if !cmd.Flags().Changed("upgrade-url-allow") && len(fileCfg.Broker.Upgrade.URLAllow) > 0 {
-				allow = fileCfg.Broker.Upgrade.URLAllow
+			if !cmd.Flags().Changed("upgrade-url-allow") {
+				switch {
+				case len(fileCfg.Broker.Upgrade.URLAllow) > 0:
+					allow = fileCfg.Broker.Upgrade.URLAllow
+				case len(allow) == 0:
+					allow = []string{defaultUpgradeURLPrefix}
+				}
 			}
 
 			cfg := broker.Config{
