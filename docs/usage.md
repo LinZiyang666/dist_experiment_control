@@ -3,8 +3,9 @@
 > 面向运维 / 实验机管理员 / 普通使用者的全量操作文档。架构设计请看
 > `docs/architecture.md`，本文只讲"怎么用、怎么部、怎么排错"。
 
-适用版本：P0–P11（pre-alpha，未公开发布）。所有命令以 `tether v0.0.0-dev`
-为准；正式 release 后子命令名与 flag 兼容性遵循 SemVer。
+适用版本：v0.1.0+（公开 GitHub Release 已发布）。子命令名与 flag 兼容性遵循
+SemVer；wire 协议变更走 `tether.v1.*` → `tether.v2.*` 的整次跨版本路径，详见
+§8.3。
 
 ---
 
@@ -84,416 +85,21 @@ ctl  ──── NATS WSS 443 ────►   |           ◄── NATS 4222
 
 ## 2. 安装与部署
 
-### 2.1 源码编译
-
-```bash
-git clone https://github.com/LinZiyang666/tether.git
-cd tether
-make build         # 输出 ./bin/tether
-./bin/tether version
-```
-
-要求 `Go 1.25+`（`go.mod` 由 nats-io/jwt/v2 ≥ v2.8.1 锁定）。`CGO_ENABLED=0`，
-所有平台都是单文件静态二进制。
-
-### 2.1.5 没有公网 release 时怎么部署（pre-alpha 路径）
-
-> ⚠️ 当前 tether **没有公开 GitHub Release**，`install.sh` 默认从
-> `https://github.com/.../releases/download/...` 拉 tarball，**会 404**。
-> 公网 `curl install.sh | sh` 路径暂不可用。
-> 本节给出实际可行的内网/无公网部署方案。
->
-> 真正的部署形态由你**已有几台机器**决定。tether 至少需要：
-> - **一台 broker 主机**（任意 Linux，agent 与 ctl 都需要能连到它的 IP/DNS，
->   可以是公网 VPS、内网服务器、家用 NAS、甚至同一栋楼里的另一台 PC）；
-> - **N 台 agent 主机**（要被远程操作的实验机，NAT 后 OK 但必须能"出向
->   连"到 broker 的 4222/7000 端口）；
-> - **使用者笔记本**（跑 ctl，能"出向连"到 broker 的 4222 端口）。
->
-> 三个角色**部署在不同物理机上**是正常用法。把它们都堆在一台机器上只
-> 是 demo（见 §12.1），不能体现"NAT 穿透+反向暴露"的全部行为。
-
-#### 推荐路径：手动 scp + 写配置（多机内网部署）
-
-不用 install.sh 也不用 release，手动 scp + 写配置。这样每一步都可见可控。
-适用于"我有 broker 机 + 至少一台 agent 机 + 自己的笔记本"，三方互通但
-没法走公网 release。
-
-**前置网络要求：**
-- agent 机 → broker 机：需要能连 4222（NATS）+ 7000（反向隧道）TCP；
-- ctl 笔记本 → broker 机：需要能连 4222 TCP；
-- broker 端口 14000-14999：是否开放给"会用 expose 出去的客户端"决定 ——
-  你自己用就开给你自己 IP，对外公开就开给 0.0.0.0；
-- broker 主机本身**不需要主动连**到 agent —— agent 永远是反向连入。
-
-**步骤 1 — 在你的 dev 机（任一能跑 Go 1.25+ 的机器）build 二进制：**
-
-```bash
-cd /home/weiland/projects/dist_experiment_control
-make build
-# 产出 ./bin/tether（静态、跨发行版可用）
-
-# 如果目标机架构不同，cross-compile：
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o tether-linux-amd64 ./cmd/tether
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether-linux-arm64 ./cmd/tether
-```
-
-**步骤 2 — 部署 broker 机**（需要内网或公网可达的一台 Linux）：
-
-```bash
-# 把二进制 scp 到 broker 机
-scp ./bin/tether root@broker.lan:/usr/local/bin/tether
-
-# 还需要 nats-server。直接下预编译二进制（不要 `go install` ——
-# nats-server v2.10.22 的 go.mod 用了新格式版本号，broker 机如果
-# Go < 1.21 会报 `invalid go version '1.21.0'`）。在 broker 机上：
-ssh root@broker.lan
-cd /tmp
-NATS_VER=v2.10.22
-curl -fsSL -o nats.tgz \
-  https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/nats-server-${NATS_VER}-linux-amd64.tar.gz
-curl -fsSL -o sums.txt \
-  https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/SHA256SUMS
-expect=$(grep "nats-server-${NATS_VER}-linux-amd64.tar.gz" sums.txt | awk '{print $1}')
-have=$(sha256sum nats.tgz | awk '{print $1}')
-[ "$have" = "$expect" ] || { echo "sha mismatch"; exit 1; }
-tar xzf nats.tgz
-install -m 0755 nats-server-${NATS_VER}-linux-amd64/nats-server /usr/local/bin/nats-server
-nats-server --version    # 应输出 v2.10.22
-
-# 创建 tether 系统用户和目录
-useradd --system --home-dir /var/lib/tether --shell /usr/sbin/nologin tether
-install -d -o tether -g tether -m 0750 /var/lib/tether /var/log/tether
-install -d -o tether -g tether -m 0700 /var/run/tether
-mkdir -p /etc/tether
-
-# 写最小 broker.yaml（无 TLS，监听内网 IP）
-cat > /etc/tether/broker.yaml <<'EOF'
-broker:
-  domain: broker.lan
-  public_host: broker.lan          # `tether expose` URL 用这个
-  nats:
-    url: nats://127.0.0.1:4222
-  frp:
-    bind_addr: "0.0.0.0"
-    control_listen: ":7000"
-    port_range: "14000-14999"
-  admin:
-    socket: /var/run/tether/admin.sock
-  storage:
-    db: /var/lib/tether/tether.db
-    js_store: /var/lib/tether/jetstream
-EOF
-chmod 644 /etc/tether/broker.yaml
-
-# 写 systemd unit
-cat > /etc/systemd/system/nats-server.service <<'EOF'
-[Unit]
-Description=NATS message broker (tether)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=tether
-ExecStart=/usr/local/bin/nats-server -js -sd /var/lib/tether/jetstream -addr 0.0.0.0 -p 4222
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/tether-broker.service <<'EOF'
-[Unit]
-Description=tether broker daemon
-After=nats-server.service
-Wants=nats-server.service
-[Service]
-Type=simple
-User=tether
-ExecStart=/usr/local/bin/tether serve --config /etc/tether/broker.yaml
-Restart=on-failure
-StandardOutput=append:/var/log/tether/broker.log
-StandardError=append:/var/log/tether/broker.err
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now nats-server tether-broker
-systemctl status tether-broker
-```
-
-> 这一版**没启用 TLS / Caddy / auth_callout**（pre-alpha 内网用够了）。
-> 真上公网时再加 Caddy + ACME + auth_callout（见 §3.4）。
-
-**步骤 3 — 部署 agent 机：**
-
-```bash
-# scp 二进制
-scp ./bin/tether user@gpu-01.lan:/home/user/.local/bin/tether
-ssh user@gpu-01.lan
-chmod +x ~/.local/bin/tether
-
-# 准备 agent 目录 + 配置
-mkdir -p ~/.tether/agent/lab
-chmod 700 ~/.tether ~/.tether/agent ~/.tether/agent/lab
-cat > ~/.tether/agent/lab/agent.yaml <<EOF
-broker_url: nats://broker.lan:4222
-session: lab
-nid: gpu-01
-tunnel_addr: broker.lan:7000
-EOF
-chmod 600 ~/.tether/agent/lab/agent.yaml
-
-# 启动（先创建 session 后才能加入，所以这步留到步骤 4 后再做）
-```
-
-**步骤 4 — 部署 ctl 并创建 session：**
-
-```bash
-# 你的笔记本
-sudo install -m 0755 ./bin/tether /usr/local/bin/tether
-# 或 mkdir -p ~/.local/bin && cp ./bin/tether ~/.local/bin/
-
-# 创建 session（PIN 自定义）
-tether session create lab --pin 384712 --nats-url nats://broker.lan:4222
-# 返回 sid（会自动激活）+ 提示 export TETHER_SESSION
-
-# 也可以显式登录
-tether login --broker nats://broker.lan:4222 --session lab --pin 384712
-```
-
-**步骤 5 — 启动 agent**（agent 机上，PIN 同步骤 4）：
-
-```bash
-~/.local/bin/tether agent --session lab --pin 384712 --nid gpu-01 \
-  --nats-url nats://broker.lan:4222
-# 首次连接绑定 nkey，之后省略 --pin
-```
-
-**验证：**
-
-```bash
-# 笔记本上
-tether ps                                  # 应见 gpu-01 ONLINE
-tether exec gpu-01 -- hostname             # 应输出 gpu-01 主机名
-```
-
-#### 备用路径：用 install.sh 但走内网镜像
-
-你愿意用 install.sh 自动化但又没公网时，自己起一个 HTTP server 做"内网
-release"：
-
-```bash
-# dev 机：用 goreleaser 构 tarball（snapshot 模式，无须 tag）
-go install github.com/goreleaser/goreleaser/v2@latest
-goreleaser release --snapshot --clean --config build/goreleaser.yaml
-# 产出 ./dist/tether_*_linux_amd64.tar.gz + SHA256SUMS
-
-# 起内网 HTTP（局域网可见即可）
-cd dist && python3 -m http.server 8000
-
-# 在目标机用 install.sh 指向内网
-curl -fsSL http://your-dev-machine:8000/install.sh \
-  | sh -s -- --role agent \
-    --source-base http://your-dev-machine:8000 \
-    --version v0.0.0-dev \
-    --broker nats://broker.lan:4222 \
-    --session lab --pin 384712 --nid gpu-01
-```
-
-> install.sh 自己也得放到 HTTP server。简单：`cp scripts/install.sh dist/`。
-
-> ⚠️ broker 角色的 install.sh 还会下 nats-server + caddy；这两个也要镜像
-> 到内网或先手动 scp 后用 `--skip-download`（只生成配置 + systemd unit，
-> 不下载二进制）。
-
-#### 升级路径：给 broker 加公网域名 + TLS（Let's Encrypt）
-
-§2.1.5 推荐路径里 broker 是无 TLS 内网模式（`broker_url: nats://broker.lan:4222`）。
-要让公网 ctl/agent 能安全连入，加一层 Caddy 终结 TLS（自动 ACME 拿
-Let's Encrypt 证书），把内部 NATS WebSocket 反代出去。
-
-**前置 1 — DNS A 记录**：把你域名（例 `tether.example.com`）的 A 记录指向
-broker 机的公网 IP。验证：`dig +short tether.example.com` 必须返回正确 IP，
-否则 ACME 拿不到证书。
-
-**前置 2 — 防火墙开放端口**：
-
-| 端口 | 用途 |
-|---|---|
-| 80          | Let's Encrypt ACME http-01 challenge |
-| 443         | ctl/agent 的 NATS WSS（Caddy 终结 TLS） |
-| 7000        | agent 反向隧道控制连接 |
-| 14000-14999 | `tether expose` 公开端口（按需） |
-
-```bash
-# ufw（Ubuntu）
-sudo ufw allow 80,443,7000/tcp && sudo ufw allow 14000:14999/tcp
-# firewalld（CentOS/RHEL）
-sudo firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp --add-port=7000/tcp \
-  --add-port=14000-14999/tcp && sudo firewall-cmd --reload
-```
-
-云服务商**还要在控制台安全组**同样开放。
-
-**步骤 1 — 装 Caddy**（注意 Caddy checksums 是 SHA-512，不是 SHA-256）：
-
-```bash
-ssh root@broker.example.com
-bash <<'SCRIPT'
-set -e
-cd /tmp
-CADDY_VER=2.7.6
-curl -fsSL -o caddy.tgz \
-  https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_linux_amd64.tar.gz
-curl -fsSL -o caddy_sums.txt \
-  https://github.com/caddyserver/caddy/releases/download/v${CADDY_VER}/caddy_${CADDY_VER}_checksums.txt
-expect=$(grep "caddy_${CADDY_VER}_linux_amd64.tar.gz$" caddy_sums.txt | awk '{print $1}')
-have=$(sha512sum caddy.tgz | awk '{print $1}')
-[ "$have" = "$expect" ] || { echo "sha mismatch"; exit 1; }
-tar xzf caddy.tgz
-install -m 0755 caddy /usr/local/bin/caddy
-caddy version
-SCRIPT
-```
-
-> 用 `bash <<'SCRIPT' ... SCRIPT` 包起来：里面 `exit 1` 只退子 shell，不会
-> 把 ssh 登录会话踢掉。直接粘到登录 shell 里 `exit 1` 会断 ssh。
-
-**步骤 2 — 让 nats-server 同时监听 plain TCP（内部）+ WebSocket（给 Caddy）**：
-
-⚠️ nats-server **没有 `--ws_listen` 命令行 flag**，WebSocket 配置只能走
-conf 文件。如果你用了 `--ws_listen` 启动，nats-server 会把 help 全打出来
-然后退出。
-
-```bash
-# 写 nats.conf
-sudo tee /etc/tether/nats.conf > /dev/null <<'EOF'
-host: "127.0.0.1"
-port: 4222
-
-jetstream {
-  store_dir: "/var/lib/tether/jetstream"
-}
-
-websocket {
-  host: "127.0.0.1"
-  port: 8222
-  no_tls: true       # Caddy 在前面终结 TLS，本机内部明文 WS
-}
-EOF
-
-# 改 systemd unit 用 -c 指 conf
-sudo tee /etc/systemd/system/nats-server.service > /dev/null <<'EOF'
-[Unit]
-Description=NATS message broker (tether)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=tether
-ExecStart=/usr/local/bin/nats-server -c /etc/tether/nats.conf
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart nats-server
-sudo ss -tlnp | grep -E '4222|8222'    # 应同时见 4222 和 8222
-```
-
-**步骤 3 — 写 Caddyfile + systemd unit**（**邮箱替换成你自己的**）：
-
-```bash
-sudo tee /etc/tether/Caddyfile > /dev/null <<'EOF'
-{
-    email YOUR_EMAIL@example.com
-}
-
-tether.example.com:443 {
-    reverse_proxy 127.0.0.1:8222
-}
-EOF
-
-sudo tee /etc/systemd/system/caddy.service > /dev/null <<'EOF'
-[Unit]
-Description=Caddy (TLS termination for tether NATS WSS)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/caddy run --config /etc/tether/Caddyfile --adapter caddyfile
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now caddy
-sudo journalctl -u caddy --since '1 minute ago' --no-pager | tail -30
-```
-
-成功的话日志含 `obtained certificate ... tether.example.com` + `serving
-initial configuration`。失败常见：DNS 没生效 / 80 端口被占 / 防火墙没开
-80 / Caddy 跑用户没权 bind 443（systemd 默认 root，OK）。
-
-**步骤 4 — 改 broker.yaml 把 public_host 改成域名 + 重启**：
-
-```bash
-sudo tee /etc/tether/broker.yaml > /dev/null <<'EOF'
-broker:
-  domain: tether.example.com
-  public_host: tether.example.com       # `tether expose` URL 用这个域名
-  nats:
-    url: nats://127.0.0.1:4222          # broker → 本机 plain NATS
-  frp:
-    bind_addr: "0.0.0.0"
-    control_listen: ":7000"
-    port_range: "14000-14999"
-  admin:
-    socket: /var/run/tether/admin.sock
-  storage:
-    db: /var/lib/tether/tether.db
-    js_store: /var/lib/tether/jetstream
-EOF
-
-sudo systemctl restart tether-broker
-```
-
-**验证**：
-
-```bash
-# 笔记本上
-curl -vI https://tether.example.com/ 2>&1 | grep -E '(SSL|certificate|HTTP/)'
-# 应看到 HTTP/2 + Let's Encrypt issuer
-
-# ctl 改用 wss://
-tether session create lab --pin 384712 --nats-url wss://tether.example.com:443
-
-# agent 改 ~/.tether/agent/lab/agent.yaml
-broker_url: wss://tether.example.com:443
-session: lab
-nid: gpu-01
-tunnel_addr: tether.example.com:7000
-```
-
-至此公网 + TLS 部署完成。auth_callout 启用见 §3.4。
-
----
-
-### 2.2 install.sh 一键安装（生产路径，需公网 release）
-
-> 当前阶段不可用 —— GitHub Release 未发布。下面流程是 v0.1.0 释出后的
-> 目标姿势，pre-alpha 阶段请走 §2.1.5 路径 B。
-
 `scripts/install.sh` 是三种角色的统一入口。**核心不变量**：脚本只落文件、生成
 配置和 systemd unit，**永不启动任何进程**。脚本结束后 `pgrep tether` 必须为空。
 
-#### 2.2.1 ctl（使用者笔记本）
+默认从最新公开的 GitHub Release 拉二进制 + SHA256SUMS（无需 `--version`）；
+脚本内部嗅探 `releases/latest` 的 301 重定向解析出当前 tag，再从
+`releases/download/<tag>/` 取对应平台的 tarball。
+
+```
+基址：https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download
+```
+
+### 2.1 ctl（使用者笔记本）
 
 ```bash
-curl -fsSL https://<broker>/install.sh | sh
+curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download/install.sh | sh
 # 默认 --role ctl
 # 优先写到 /usr/local/bin/tether（若可写），否则 ~/.local/bin/tether
 ```
@@ -504,10 +110,10 @@ curl -fsSL https://<broker>/install.sh | sh
 tether login --broker wss://<broker>:443 --session lab --pin <pin>
 ```
 
-#### 2.2.2 agent（实验机）
+### 2.2 agent（实验机）
 
 ```bash
-curl -fsSL https://<broker>/install.sh | sh -s -- \
+curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download/install.sh | sh -s -- \
   --role agent \
   --broker wss://<broker>:443 \
   --session lab \
@@ -534,10 +140,10 @@ systemctl --user enable --now tether-agent@lab.service
 loginctl enable-linger $USER     # 用户登出后仍保活
 ```
 
-#### 2.2.3 broker（运维侧，需 sudo + 域名 + ACME 邮箱）
+### 2.3 broker（运维侧，需 sudo + 域名 + ACME 邮箱）
 
 ```bash
-curl -fsSL https://<broker>/install.sh | sudo sh -s -- \
+curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download/install.sh | sudo sh -s -- \
   --role broker \
   --domain tether.example.com \
   --acme-email admin@example.com
@@ -558,11 +164,11 @@ sudo systemctl enable --now nats-server tether-broker caddy
 sudo systemctl status nats-server tether-broker caddy
 ```
 
-后续：编辑 `/etc/tether/broker.yaml` 把 `broker.upgrade.url_allow` 配上至少一个
-URL 前缀（默认空 ⇒ 拒绝所有 upgrade 请求），然后 `sudo systemctl restart
-tether-broker`。
+`broker.upgrade.url_allow` 的内置默认值已经包含本仓库的 GitHub release 前缀，
+开箱即可 `tether node upgrade`；要自托管镜像才需要改 `broker.yaml` 或
+`--upgrade-url-allow` 覆盖。auth_callout 启用见 §3.4。
 
-### 2.3 install.sh flag 全集
+### 2.4 install.sh flag 全集
 
 | flag | 说明 |
 |---|---|
@@ -573,14 +179,16 @@ tether-broker`。
 | `--nid NID`                 | agent 用，必填 |
 | `--domain DOMAIN`           | broker 用，必填 |
 | `--acme-email EMAIL`        | broker 用，必填 |
-| `--version VER`             | 锁定版本（默认 `v0.0.0-dev`） |
-| `--source-base URL`         | 覆盖 release tarball 基址 |
+| `--version VER`             | 默认 `v0.0.0-dev` ⇒ 触发 latest-tag 嗅探；显式如 `v0.1.0` 则锁版本 |
+| `--source-base URL`         | 覆盖 release tarball 基址（自托管镜像走这条；同时跳过 latest 嗅探） |
 | `--prefix DIR`              | 覆盖安装根目录 |
-| `--dry-run`                 | 演练，不下载/不写文件 |
+| `--dry-run`                 | 演练，不下载/不写文件（也跳过 latest 嗅探） |
 | `--skip-download`           | 跳过下载，使用已就位的二进制 |
 | `--uninstall`               | 卸载本角色 |
 
-### 2.4 卸载
+环境变量 `TETHER_VERSION` 等价于 `--version`。
+
+### 2.5 卸载
 
 ```bash
 # ctl
@@ -598,6 +206,22 @@ sudo systemctl disable --now tether-broker nats-server caddy
 sudo install.sh --role broker --uninstall
 sudo userdel tether    # install.sh 不会自动删除系统用户
 ```
+
+### 2.6 从源码构建（开发者用）
+
+仅在你要 hack tether 本身、跑测试矩阵、或需要未发布的特性时才走这条路径；
+日常运行 / 部署用 §2.1–2.3 即可。
+
+```bash
+git clone https://github.com/LinZiyang666/dist_experiment_control.git
+cd dist_experiment_control
+make build                 # 输出 ./bin/tether
+make test                  # 单元 + 包内测试，~30s
+make e2e                   # 端到端矩阵，~80s（嵌入式 nats-server）
+```
+
+要求 `Go 1.25+`（由 `nats-io/jwt/v2 ≥ v2.8.1` 锁定），`CGO_ENABLED=0` 静态
+二进制，跨平台构建见 §12.5。
 
 ---
 
@@ -657,15 +281,17 @@ broker:
     db: /var/lib/tether/tether.db      # SQLite 文件
     js_store: /var/lib/tether/jetstream # JetStream store dir
   upgrade:
-    url_allow:                         # `tether node upgrade` 白名单（必填）
-      - https://releases.example.com/tether/
-      - https://github.com/LinZiyang666/tether/releases/
+    url_allow:                         # `tether node upgrade` 白名单（可选）
+      - https://github.com/LinZiyang666/dist_experiment_control/releases/
+      - https://releases.example.com/tether/   # 追加自托管镜像（可选）
 ```
 
 修改后 `sudo systemctl restart tether-broker` 生效（不支持热重载）。
 
-`broker.upgrade.url_allow` 默认空 ⇒ broker 拒绝所有 upgrade 请求（J.4 默认拒绝
-策略）。
+`broker.upgrade.url_allow` 缺省值是 `https://github.com/LinZiyang666/dist_experiment_control/releases/`
+（与本仓库 release 一致），开箱即可 `tether node upgrade`。yaml 或
+`--upgrade-url-allow` 给出非空切片即整段覆盖默认；要禁用 upgrade 显式给
+单个不存在的前缀即可。
 
 `frp.port_range` 校验严格：`low-high` 形式，二者均 `1..65535` 且 `low ≤ high`，
 非法输入直接 fatal 退出（避免操作员把 `1400-1499` 写成 `14000-14999` 后默默落
@@ -673,8 +299,10 @@ broker:
 
 ### 3.4 nats-server.conf 启用 auth_callout
 
-`§2.1.5` 给的 nats.conf 是无鉴权（demo / 内网用）。**公网部署必须启用
-auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`。
+`install.sh --role broker` 默认写出的 nats.conf 已经预留 auth_callout 占位但
+**没有启用**（开机即可登录、便于第一遍部署排错）。**正式开放公网必须启用
+auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`，
+任何匿名连接都能进集群。
 
 #### 第 1 步：生成 broker.nk + account.nk
 
@@ -920,7 +548,7 @@ debug）。普通使用者不会接触此命令。
 | `--tunnel-public-host`   | `0.0.0.0`                      | `broker.frp.bind_addr` |
 | `--store-dir`            | (空 = 不监控)                   | `broker.storage.js_store` |
 | `--admin-socket`         | `/var/run/tether/admin.sock`   | `broker.admin.socket` |
-| `--upgrade-url-allow` (slice) | (空 = 拒绝所有 upgrade)    | `broker.upgrade.url_allow` |
+| `--upgrade-url-allow` (slice) | (空 ⇒ 退回内置默认 = 本仓库 GitHub release 前缀)  | `broker.upgrade.url_allow` |
 
 启动后处理 `SIGINT/SIGTERM` 优雅退出（tunnel 等所有子组件按 ctx 拆解）。
 
@@ -1217,8 +845,9 @@ SSH 上去 `wget && systemctl restart` 既慢又容易漏。这个命令把"分�
 进制 + 校验 + 替换 + 重启 + 状态恢复"打包成一次远程调用。
 
 **安全模型**：
-1. **broker 端默认拒绝**：`broker.upgrade.url_allow` 为空 ⇒ 所有 upgrade
-   被拒（默认安全）；
+1. **broker 端白名单前缀强校验**：URL 必须前缀匹配
+   `broker.upgrade.url_allow`（默认仅放本仓库的 GitHub release 前缀，自托管
+   镜像需 yaml 覆盖）；任何前缀外的 URL 都拒；
 2. **owner-only**：必须是 session owner，member 没权限；
 3. **白名单 + SHA256**：URL 必须前缀匹配 broker 配置的白名单，tarball
    的 SHA256 必须由调用者提供并校验通过；
@@ -1320,9 +949,10 @@ tether admin evict <sid> <nid>              # 强制踢
 **实验机管理员**：
 ```bash
 # 1. 安装 agent（broker 已经在跑，已经创建了 lab session 并给了 PIN）
-curl -fsSL https://broker.example.com/install.sh | sh -s -- \
-  --role agent --broker wss://broker.example.com:443 \
-  --session lab --pin 384712 --nid gpu-01
+curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download/install.sh \
+  | sh -s -- \
+    --role agent --broker wss://broker.example.com:443 \
+    --session lab --pin 384712 --nid gpu-01
 
 # 2. systemd --user 自动启动
 ~/.local/bin/tether agent --install-user-service --session lab --nid gpu-01
@@ -1337,7 +967,7 @@ journalctl --user -u tether-agent@lab.service --since '1 minute ago' -f
 **使用者**：
 ```bash
 # 1. 安装 ctl
-curl -fsSL https://broker.example.com/install.sh | sh
+curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download/install.sh | sh
 
 # 2. 登录并激活 session（同样的 PIN）
 tether login --broker wss://broker.example.com:443 --session lab --pin 384712
@@ -1496,9 +1126,11 @@ append 的标准写法。
 ### 8.2 owner 远程升级 agent
 
 ```bash
-# 1. 把新 release 上传到一个 broker 已白名单的 URL，记录 sha256
-URL=https://releases.example.com/tether/v0.1.1/tether_v0.1.1_linux_amd64.tar.gz
-SHA=$(sha256sum tether_v0.1.1_linux_amd64.tar.gz | cut -d' ' -f1)
+# 1. 从 GitHub Release 拿 tarball URL + SHA256SUMS
+VER=v0.1.1
+BASE=https://github.com/LinZiyang666/dist_experiment_control/releases/download/$VER
+URL=$BASE/tether_${VER}_linux_amd64.tar.gz
+SHA=$(curl -fsSL $BASE/SHA256SUMS | awk "/tether_${VER}_linux_amd64.tar.gz\$/ {print \$1}")
 
 # 2. 单台试点
 tether node upgrade gpu-01 --url $URL --sha256 $SHA
@@ -1721,8 +1353,9 @@ A: ctl 端 `tether logout` 只清当前活动 session；agent 自己继续跑。
    PIN 在带内传输 ⇒ 永远走带外渠道（口头 / 加密短信）。
 2. **`TETHER_DEV_NO_AUTH=1` 仅本地**：跳过身份验证；启了它的 broker 接受任何
    匿名连接，等于把整个集群裸奔到公网。
-3. **upgrade URL 白名单**：默认空 ⇒ 拒绝。打开后应仅允许你完全控制的镜像
-   服务器（HTTPS + 由你签名的 sha256 校验）。
+3. **upgrade URL 白名单**：默认只放本仓库的 GitHub release 前缀。换成自托管
+   镜像时只允许你完全控制的 HTTPS 源 + 由你签名/审核过的 sha256，避免任何
+   "受 broker 信任的"任意下载源被劫持。
 4. **admin socket 不出本机**：见 §7.3。
 5. **sudo 与隔离**：broker 必须 sudo 装（systemd unit + 系统用户）；
    agent / ctl 一律普通用户（`~/.local/bin`）。`tether agent` 不需要 root。
@@ -1880,11 +1513,16 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether_darwin_arm64
 
 ## 附录 C：版本与发布
 
-- 当前：P11 完结，pre-alpha，无公开 release tag。
-- `goreleaser` 配置在 `build/goreleaser.yaml`，snapshot mode 已可生成 tarball +
-  SHA256SUMS。
-- 正式 v0.1.0 释出前不保证 wire 协议向后兼容；同一 release 内 `tether node
-  upgrade` 是支持的升级路径。
+- 公开 GitHub Release 见
+  `https://github.com/LinZiyang666/dist_experiment_control/releases`。
+- 发布流水线：`git tag vX.Y.Z && git push --tags` 触发
+  `.github/workflows/release.yml`，由 goreleaser 出 4 个平台的 tarball +
+  `install.sh` + `SHA256SUMS` 上传 Release。
+- `install.sh` 在 `--version` 缺省时嗅探 `releases/latest` 的 301 重定向自动
+  锁到最新 tag；`--source-base` 指向私有镜像时跳过嗅探。
+- ProtoVersion bump（wire 协议不兼容）走 §8.3 全量重装，不能用
+  `tether node upgrade`；同一 ProtoVersion 内 patch 升级是 `tether node
+  upgrade` 的支持路径。
 
 排查 / 反馈：把 `tether version` + 完整错误输出 + `journalctl -u tether-broker
 --since '10 min ago'` 一起贴到 issue。
