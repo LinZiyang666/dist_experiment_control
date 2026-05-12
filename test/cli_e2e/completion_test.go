@@ -218,7 +218,7 @@ func TestCompletion_E2E_AdminSocketTimeout(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				<-stopAccept
 			}(conn)
 		}

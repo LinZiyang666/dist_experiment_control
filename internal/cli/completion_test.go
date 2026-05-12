@@ -260,7 +260,7 @@ func TestNATSTransport_DialTimeoutControlledStub(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				<-stopAccept
 			}(conn)
 		}

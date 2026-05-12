@@ -110,10 +110,16 @@ func TestComplete_ExposeRm_FlagAndPositionalHooked(t *testing.T) {
 		t.Errorf("expose rm positional directive: %q", dir)
 	}
 
-	// --name flag value — same behavior.
-	cands, dir, _, _ = runComplete(t, append([]string{"expose", "rm", "a100", "--name", ""}, home...)...)
+	// --name flag value. Use attached form so cobra's __complete sees
+	// the empty string as the --name value, not a positional after it.
+	args := append([]string{"expose", "rm", "a100"}, home...)
+	args = append(args, "--name=")
+	cands, dir, _, _ = runComplete(t, args...)
 	if len(cands) != 0 {
 		t.Errorf("expose rm --name: got %v, want []", cands)
+	}
+	if !strings.Contains(dir, ":4") && !strings.Contains(dir, "NoFileComp") {
+		t.Errorf("expose rm --name directive: %q", dir)
 	}
 }
 
@@ -173,11 +179,17 @@ func TestComplete_AdminEvict_TwoPositionals(t *testing.T) {
 	if len(cands) != 0 {
 		t.Errorf("admin evict pos[1]: got %v, want []", cands)
 	}
+	if !strings.Contains(dir, ":4") && !strings.Contains(dir, "NoFileComp") {
+		t.Errorf("admin evict pos[1] directive: %q", dir)
+	}
 
 	// Third positional → NoFileComp explicit.
 	cands, dir, _, _ = runComplete(t, "admin", "evict", "--socket", bogusSocket, "lab", "n1", "")
 	if len(cands) != 0 {
 		t.Errorf("admin evict pos[2]: got %v, want []", cands)
+	}
+	if !strings.Contains(dir, ":4") && !strings.Contains(dir, "NoFileComp") {
+		t.Errorf("admin evict pos[2] directive: %q", dir)
 	}
 }
 
