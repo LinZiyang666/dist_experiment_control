@@ -360,8 +360,10 @@ sudo rm /tmp/broker.nk /tmp/account.nk    # 清临时副本
 
 #### 第 3 步：改 nats.conf 加 authorization 块
 
-⚠️ **注意 NATS 字段名是 `users:` 不是 `nkeys:`**（写错会得 `unknown field "nkeys"`）。
-把下面的两个公钥替换成第 1 步打印的 `broker_PUB` / `account_PUB`：
+⚠️ **nkey 用户不能带 `user:` 或 `password:` 字段**（写错会得
+`Nkey users do not take usernames or passwords`，nats-server 拒绝启动）。
+`auth_callout.auth_users` 必须用 nkey 公钥本身做身份引用，不是 alias 字符串。
+把下面两处 `$BROKER_PUB` 与一处 `$ACCOUNT_PUB` 替换成第 1 步打印的实际值：
 
 ```bash
 sudo tee /etc/tether/nats.conf > /dev/null <<EOF
@@ -380,22 +382,26 @@ websocket {
 
 authorization {
   users: [
-    { user: "tether-broker", nkey: "$BROKER_PUB" }
+    { nkey: "$BROKER_PUB" }
   ]
   auth_callout {
     issuer: "$ACCOUNT_PUB"
-    auth_users: [ "tether-broker" ]
+    auth_users: [ "$BROKER_PUB" ]
   }
 }
 EOF
 ```
 
 字段含义：
-- `users:` 列出 nats-server **直接认可**的 nkey 身份。这里只放 broker 自己。
+- `users:` 列出 nats-server **直接认可**的 nkey 身份。这里只放 broker 自己，
+  且只能写 `nkey:` —— 加 `user:` 会被 nats-server 拒绝。
 - `auth_callout.issuer:` 信任由这个 account 公钥签发的 JWT。broker 用对应的
   account.nk 私钥给来访 ctl/agent 签发临时 JWT。
-- `auth_callout.auth_users:` 谁负责回应 callout —— alias `tether-broker` 对
-  应上面 users 里那个 nkey。
+- `auth_callout.auth_users:` 哪些身份会触发 callout —— 这里就是 broker 自己
+  的 nkey 公钥；除它之外的所有连接都走 callout 流程，由 broker 决定放不放行。
+
+写完先 `nats-server -c /etc/tether/nats.conf -t` dry-run 一下，输出
+`configuration file ... is valid` 再继续。
 
 #### 第 4 步：改 tether-broker.service 传 seeds dir + 重启
 
