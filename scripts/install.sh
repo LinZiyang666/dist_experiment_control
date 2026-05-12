@@ -126,11 +126,15 @@ detect_os_arch() {
 }
 
 source_tarball_url() {
+    # goreleaser's archive name_template uses {{ .Version }}, which strips
+    # the leading "v" from the git tag (v0.1.1 → 0.1.1). The release URL
+    # path segment still uses the tag verbatim. Keep both in sync here.
+    v="${VERSION#v}"
     if [ -n "$SOURCE_BASE" ]; then
-        printf '%s/tether_%s_%s_%s.tar.gz\n' "$SOURCE_BASE" "$VERSION" "$OS" "$ARCH"
+        printf '%s/tether_%s_%s_%s.tar.gz\n' "$SOURCE_BASE" "$v" "$OS" "$ARCH"
     else
         printf 'https://github.com/LinZiyang666/dist_experiment_control/releases/download/%s/tether_%s_%s_%s.tar.gz\n' \
-            "$VERSION" "$VERSION" "$OS" "$ARCH"
+            "$VERSION" "$v" "$OS" "$ARCH"
     fi
 }
 
