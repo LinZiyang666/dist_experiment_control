@@ -22,10 +22,18 @@ import (
 // `install.sh --role agent`. Field names match install.sh exactly so
 // new operators can hand-edit the file without surprises.
 type agentYAML struct {
-	BrokerURL  string `yaml:"broker_url"`
-	Session    string `yaml:"session"`
-	NID        string `yaml:"nid"`
-	TunnelAddr string `yaml:"tunnel_addr"`
+	BrokerURL    string             `yaml:"broker_url"`
+	Session      string             `yaml:"session"`
+	NID          string             `yaml:"nid"`
+	TunnelAddr   string             `yaml:"tunnel_addr"`
+	FileTransfer fileTransferConfig `yaml:"file_transfer"`
+}
+
+// fileTransferConfig controls `tether push` / `tether pull` containment.
+// AllowRoots EMPTY means file transfer is DISABLED on this agent — see
+// internal/agent/path.go (file-transfer-plan §"Refusing dangerous paths").
+type fileTransferConfig struct {
+	AllowRoots []string `yaml:"allow_roots"`
 }
 
 // loadAgentYAML reads ~/.tether/agent/<sid>/agent.yaml when present.
@@ -113,12 +121,13 @@ func newAgentCmd() *cobra.Command {
 			}
 
 			cfg := agent.Config{
-				NATSURL: natsURL,
-				SID:     sid,
-				NID:     nid,
-				PIN:     pin,
-				Home:    home,
-				Logger:  slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				NATSURL:    natsURL,
+				SID:        sid,
+				NID:        nid,
+				PIN:        pin,
+				Home:       home,
+				Logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				AllowRoots: ay.FileTransfer.AllowRoots,
 			}
 
 			// TETHER_DEV_NO_AUTH (CLI-side env, see internal/cli.DevNoAuthEnv):

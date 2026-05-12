@@ -59,6 +59,32 @@ func TestAuditEnvelopesRoundtrip(t *testing.T) {
 			V: AuditSchemaVersion, Kind: "revoked", Ts: t0,
 			Session: "lab", Node: "lab-1", Port: 14022,
 		},
+		&AuditTransfer{
+			V: AuditSchemaVersion, Kind: "start", Verb: "push", Ts: t0,
+			Session: "lab", Node: "lab-1", ActorNkey: "UABCD", ActorFp: "SHA256:xxx=",
+			TransferID: "01hzxn",
+			Path:       "/srv/local/alice/dataset.bin",
+			Size:       8 * 1024 * 1024,
+			SHA256:     "deadbeef",
+			Tier:       "a",
+		},
+		&AuditTransfer{
+			V: AuditSchemaVersion, Kind: "complete", Verb: "pull", Ts: t0,
+			Session: "lab", Node: "lab-1", ActorNkey: "UABCD", ActorFp: "SHA256:xxx=",
+			TransferID: "01hzxn",
+			Path:       "/srv/local/alice/dataset.bin",
+			Tier:       "b",
+			Bucket:     "xfer-lab-01hzxn",
+			Bytes:      50 * 1024 * 1024,
+			DurationMs: 6740,
+		},
+		&AuditTransfer{
+			V: AuditSchemaVersion, Kind: "failed", Verb: "push", Ts: t0,
+			Session: "lab", Node: "lab-1", TransferID: "01hzxp",
+			Path: "/srv/local/alice/missing.bin", Tier: "b",
+			Bucket: "xfer-lab-01hzxp", Code: "sha_mismatch",
+			Error: "sha256: want=ABC got=DEF",
+		},
 	}
 
 	for i, v := range cases {
@@ -103,6 +129,8 @@ func newOf(v any) any {
 		return &AuditProc{}
 	case *AuditPort:
 		return &AuditPort{}
+	case *AuditTransfer:
+		return &AuditTransfer{}
 	}
 	panic("newOf: unknown type")
 }

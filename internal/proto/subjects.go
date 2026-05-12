@@ -71,6 +71,70 @@ func SubjAuditProc(sid string) string {
 func SubjAuditPort(sid string) string {
 	return fmt.Sprintf("%s.s.%s.audit.port", SubjectPrefix, sid)
 }
+func SubjAuditTransfer(sid string) string {
+	return fmt.Sprintf("%s.s.%s.audit.transfer", SubjectPrefix, sid)
+}
+
+// SubjEvTransfer kind ∈ {complete, failed}. Pubbed by agent (push receiver
+// finalization, both tiers). file-transfer-plan §Audit table row "push".
+func SubjEvTransfer(sid, nid, transferID, kind string) string {
+	return fmt.Sprintf("%s.s.%s.ev.node.%s.transfer.%s.%s",
+		SubjectPrefix, sid, nid, transferID, kind)
+}
+
+// SubjCtrlTransferFinalize — ctl pub on
+// ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req. Pull receiver
+// finalization (both tiers). file-transfer-plan §Audit row "pull".
+// JWT pub allow scopes the wildcard to (sid, actor); broker enforces
+// transfer_id ownership application-side.
+func SubjCtrlTransferFinalize(actor, sid, transferID string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.transfer.%s.finalize.req",
+		SubjectPrefix, actor, sid, transferID)
+}
+
+// SubjCtrlCaps — ctl pub on ctrl.by.<actor>.s.<sid>.caps.req. Pre-flight
+// JetStream-readiness + MaxPayload probe before chooseTier.
+func SubjCtrlCaps(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.caps.req", SubjectPrefix, actor, sid)
+}
+
+// ParseTransferFinalize extracts (actor, sid, transfer_id) from a
+// `tether.v1.ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req` subject.
+// Returns ok=false on layout mismatch.
+func ParseTransferFinalize(subject string) (actor, sid, transferID string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:ctrl 3:by 4:<actor> 5:s 6:<sid> 7:transfer 8:<id> 9:finalize 10:req
+	if len(parts) != 11 ||
+		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[2] != "ctrl" || parts[3] != "by" ||
+		parts[5] != "s" || parts[7] != "transfer" ||
+		parts[9] != "finalize" || parts[10] != "req" {
+		return "", "", "", false
+	}
+	if ValidateSID(parts[6]) != nil ||
+		ValidateActorToken(parts[4]) != nil {
+		return "", "", "", false
+	}
+	return parts[4], parts[6], parts[8], true
+}
+
+// ParseEvTransfer extracts (sid, nid, transfer_id, kind) from a
+// `tether.v1.s.<sid>.ev.node.<nid>.transfer.<id>.<kind>` subject.
+// kind ∈ {complete, failed}.
+func ParseEvTransfer(subject string) (sid, nid, transferID, kind string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// 0:tether 1:v1 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:transfer 8:<id> 9:<kind>
+	if len(parts) != 10 ||
+		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[2] != "s" || parts[4] != "ev" ||
+		parts[5] != "node" || parts[7] != "transfer" {
+		return "", "", "", "", false
+	}
+	if ValidateSID(parts[3]) != nil || ValidateNID(parts[6]) != nil {
+		return "", "", "", "", false
+	}
+	return parts[3], parts[6], parts[8], parts[9], true
+}
 
 // PTY subjects (architecture C.5).
 func SubjPtyOut(sid, pid string) string {

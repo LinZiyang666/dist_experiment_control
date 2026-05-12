@@ -39,6 +39,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
 )
 
@@ -119,6 +120,19 @@ type Config struct {
 	// itself (a successful overwrite mid-test is silent until the
 	// next subprocess fork tries to exec the corrupted binary).
 	UpgradeExecutablePath string
+
+	// AllowRoots is the file-transfer-plan §"Refusing dangerous paths"
+	// allow-list of absolute roots under which `tether push` /
+	// `tether pull` may write or read files. EMPTY → file transfer is
+	// DISABLED on this agent: every push.req / pull.req returns
+	// `transfer_disabled` immediately. Operators populate via
+	// `agent.yaml: file_transfer.allow_roots`.
+	//
+	// Containment is checked after EvalSymlinks-of-parent-dir so a
+	// symlinked dir component still maps to its real path before the
+	// allow-list compare. The leaf is never followed (O_NOFOLLOW on
+	// push, lstat-then-O_NOFOLLOW on pull). See internal/agent/path.go.
+	AllowRoots []string
 }
 
 // procRec is one entry in Agent.procs. Tracks the PTY session plus
@@ -157,6 +171,21 @@ type Agent struct {
 	// after shutdown started; handleUpgradeForwarded uses it to
 	// abort an in-flight HTTP download. nil before Run is called.
 	runCtx context.Context
+
+	// js is the JetStream context the agent uses for file-transfer
+	// Tier-B ObjectStore Put/Get. nil when the underlying nats-server
+	// has no JetStream — in that case push/pull tier-B handlers reply
+	// `jetstream_unavailable` and tier-A continues to work.
+	js jetstream.JetStream
+
+	// pushCommitCache remembers tier-B prep state between
+	// push.req.forwarded (where we validate + reply OK) and
+	// push-commit.req.forwarded (where we actually Get bytes). Keyed
+	// by transfer_id; rebuilt fresh on agent restart so an in-flight
+	// transfer across a restart fails cleanly with transfer_unknown
+	// (the broker's watchdog catches it and writes audit failed).
+	pushCommitCache map[string]pushCommitEntry
+	pushCacheMu     sync.Mutex
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -219,6 +248,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		"drop_procs", len(resp.DropProcesses),
 		"revoke_ports", len(resp.RevokePorts),
 	)
+
+	// JetStream client for file-transfer Tier-B. `jetstream.New` is
+	// pure client-side scaffolding (never errors), so we can stash
+	// the handle eagerly. We DON'T probe with AccountInfo here —
+	// the agent's perm template intentionally excludes
+	// `$JS.API.INFO`, so a probe would log a spurious perm
+	// violation on every agent start. Tier-B handlers surface a
+	// real JS-absent error via the Put/Get path itself.
+	a.js, _ = jetstream.New(nc)
 
 	subFwd, err := nc.Subscribe(
 		fmt.Sprintf("tether.v1.s.%s.cmd.node.%s.*.req.forwarded", a.cfg.SID, a.cfg.NID),

@@ -61,3 +61,37 @@ type AuditPort struct {
 	ActorNkey string    `json:"actor_nkey,omitempty"` // populated when user-triggered
 	ActorFp   string    `json:"actor_fp,omitempty"`
 }
+
+// AuditTransfer is a file-transfer lifecycle envelope.
+// file-transfer-plan §Audit.
+//
+//   kind ∈ {"start","complete","failed"} — receiver-finalization invariant:
+//     start    written when broker accepts the prepare;
+//     complete written on agent ev.transfer (push) or ctl finalize.req (pull);
+//     failed   same parties, on the failure path or broker-side timeout.
+//   verb ∈ {"push","pull"}.
+//   tier ∈ {"a","b"} — "a" inline ≤ 8 MiB, "b" JetStream ObjectStore ≤ 200 MiB.
+//
+// Bytes / DurationMs are populated only on complete/failed; Bucket only
+// on tier B; Code only on failed (machine-readable). The schema name
+// matches the file-transfer-plan §Audit table verbatim — append-only.
+type AuditTransfer struct {
+	V          int       `json:"v"`
+	Kind       string    `json:"kind"`
+	Verb       string    `json:"verb"`
+	Ts         time.Time `json:"ts"`
+	Session    string    `json:"session"`
+	Node       string    `json:"node"`
+	ActorNkey  string    `json:"actor_nkey,omitempty"`
+	ActorFp    string    `json:"actor_fp,omitempty"`
+	TransferID string    `json:"transfer_id"`
+	Path       string    `json:"path,omitempty"`
+	Size       int64     `json:"size,omitempty"`
+	SHA256     string    `json:"sha256,omitempty"`
+	Tier       string    `json:"tier,omitempty"`
+	Bucket     string    `json:"bucket,omitempty"`
+	Bytes      int64     `json:"bytes,omitempty"`
+	DurationMs int64     `json:"duration_ms,omitempty"`
+	Code       string    `json:"code,omitempty"`
+	Error      string    `json:"error,omitempty"`
+}

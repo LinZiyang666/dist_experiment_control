@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -16,7 +17,7 @@ func TestLoadAgentYAMLMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing file should not error: %v", err)
 	}
-	if got != (agentYAML{}) {
+	if !reflect.DeepEqual(got, agentYAML{}) {
 		t.Errorf("missing file should yield zero struct; got %+v", got)
 	}
 }
@@ -51,7 +52,7 @@ func TestLoadAgentYAMLFullFile(t *testing.T) {
 		NID:        "lab-1",
 		TunnelAddr: "broker.example.com:7000",
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("yaml round-trip:\n  got  %+v\n  want %+v", got, want)
 	}
 }

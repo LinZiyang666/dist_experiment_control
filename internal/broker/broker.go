@@ -228,6 +228,12 @@ type Broker struct {
 	// propagates (audit shard 01 F7: finalizeSessionRm previously
 	// built a context.Background-derived one). Nil before Run.
 	runCtx context.Context
+
+	// transfers tracks in-flight file transfers (push/pull) so the
+	// broker can write audit + reap OBJ_xfer-* buckets when the
+	// receiver-finalization signal arrives or the watchdog fires.
+	// file-transfer-plan §Object bucket lifecycle.
+	transfers *transferTracker
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -293,7 +299,7 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.OfflineAfter == 0 {
 		cfg.OfflineAfter = node.DefaultOfflineAfter
 	}
-	return &Broker{cfg: cfg}, nil
+	return &Broker{cfg: cfg, transfers: newTransferTracker()}, nil
 }
 
 // Run connects to NATS, installs subscriptions, runs the reconcile ticker,
@@ -382,6 +388,17 @@ func (b *Broker) Run(ctx context.Context) error {
 		// P10 J.4 — `tether node upgrade <nid>`.
 		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.upgrade.req",
 			func(msg *nats.Msg) { b.handleUpgradeReq(nc, msg) }},
+		// P11 file transfer (file-transfer-plan v0.2.0).
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.push.req",
+			func(msg *nats.Msg) { b.handlePushReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.pull.req",
+			func(msg *nats.Msg) { b.handlePullReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.push-commit.req",
+			func(msg *nats.Msg) { b.handlePushCommitReq(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.ev.node.*.transfer.*.complete", b.handleEvTransfer},
+		{proto.SubjectPrefix + ".s.*.ev.node.*.transfer.*.failed", b.handleEvTransfer},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.transfer.*.finalize.req", b.handleFinalizeReq},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.caps.req", b.handleCapsReq},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {
@@ -425,6 +442,13 @@ func (b *Broker) Run(ctx context.Context) error {
 			ensureCancel()
 			if err := b.reconcileHistoryStreamsOnBoot(ctx); err != nil {
 				b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", err)
+			}
+			// file-transfer-plan §Object bucket lifecycle G.2 —
+			// reap leftover OBJ_xfer-* streams from a previous crash.
+			if n, err := b.reconcileXferStreamsOnBoot(ctx); err != nil {
+				b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", err)
+			} else if n > 0 {
+				b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
 			}
 		} else {
 			b.cfg.Logger.Debug("broker: JetStream not available; audit falls back to core publish",

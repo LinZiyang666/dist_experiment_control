@@ -42,6 +42,14 @@ func PermissionsForUnactivated(actor string) jwt.Permissions {
 // nats-go jetstream client can look up the stream and create an
 // ephemeral OrderedConsumer for `tether history`. Without these the
 // client gets "permissions violation" before any business logic runs.
+//
+// File transfer (P11): adds OBJ_xfer-<sid>-* JS subjects (no
+// STREAM.CREATE/DELETE/PURGE — broker owns bucket lifecycle), the
+// caps.req probe, and the pull-receiver finalize subject. Wildcards
+// on the transfer-id segment are sid-bound by the JWT and
+// transfer-id-bound by broker application logic
+// (`internal/broker/transfer_finalize.go`); see file-transfer-plan
+// §Auth.
 func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 	return jwt.Permissions{
 		Pub: jwt.Permission{Allow: []string{
@@ -53,6 +61,8 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".ps.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.list.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.*.tag.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".caps.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".transfer.*.finalize.req",
 			subjectPrefix + ".s." + sid + ".cmd.by." + actor + ".node.*.*.req",
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
@@ -63,6 +73,16 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			"$JS.API.CONSUMER.INFO.history-" + sid + ".>",
 			"$JS.API.CONSUMER.DELETE.history-" + sid + ".>",
 			"$JS.API.CONSUMER.MSG.NEXT.history-" + sid + ".>",
+			// File transfer Tier-B (Object Store).
+			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid + "-*",
+			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid + "-*",
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*",
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + "-*.>",
+			"$O.xfer-" + sid + "-*.M.>",
+			"$O.xfer-" + sid + "-*.C.>",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
@@ -72,6 +92,9 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.out",
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
 			subjectPrefix + ".sys.events",
+			// Object-store data subjects: ctl Get reads from these.
+			"$O.xfer-" + sid + "-*.M.>",
+			"$O.xfer-" + sid + "-*.C.>",
 			"_INBOX.>",
 		}},
 	}
@@ -80,6 +103,13 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 // PermissionsForAgent returns permissions for an agent in session sid with
 // node id nid. agents have NO access to `audit.*` (audit is tetherd-single-
 // writer per C.1 §4) and only see their own node's `cmd.*.req.forwarded`.
+//
+// File transfer (P11): adds OBJ_xfer-<sid>-* JS subjects so agent can
+// Put (push receiver: Get from bucket; pull sender: Put into bucket).
+// No STREAM.CREATE/DELETE/PURGE — broker owns bucket lifecycle. The
+// existing `ev.node.<nid>.>` wildcard already covers
+// `ev.node.<nid>.transfer.<id>.<kind>` (push receiver-side finalize),
+// no addition needed.
 func PermissionsForAgent(sid, nid string) jwt.Permissions {
 	return jwt.Permissions{
 		Pub: jwt.Permission{Allow: []string{
@@ -90,6 +120,16 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.out",
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
 			subjectPrefix + ".s." + sid + ".pty.*.failed",
+			// File transfer Tier-B Object Store.
+			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid + "-*",
+			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid + "-*",
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*",
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + "-*.>",
+			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + "-*.>",
+			"$O.xfer-" + sid + "-*.M.>",
+			"$O.xfer-" + sid + "-*.C.>",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
@@ -104,6 +144,12 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			// Without this NATS rejects the subscribe and those
 			// runtime signals never reach the agent.
 			subjectPrefix + ".sys.events",
+			// Object-store data subjects: agent Get reads from these
+			// (push receiver: get the file ctl uploaded; pull sender:
+			// not needed for sub but nats.go ObjectStore Watch path
+			// expects sub on metadata).
+			"$O.xfer-" + sid + "-*.M.>",
+			"$O.xfer-" + sid + "-*.C.>",
 			"_INBOX.>",
 		}},
 	}

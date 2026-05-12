@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -46,7 +47,7 @@ func TestLoadAgentYAMLRejectsTraversalSID(t *testing.T) {
 				t.Errorf("malicious sid %q: expected error, got nil + %+v",
 					tc.sid, ay)
 			}
-			if ay != (agentYAML{}) {
+			if !reflect.DeepEqual(ay, agentYAML{}) {
 				t.Errorf("malicious sid %q: returned non-zero config %+v",
 					tc.sid, ay)
 			}
@@ -72,7 +73,7 @@ func TestLoadAgentYAMLAcceptsValidSID(t *testing.T) {
 			if err != nil {
 				t.Fatalf("valid sid %q rejected: %v", sid, err)
 			}
-			if ay != (agentYAML{}) {
+			if !reflect.DeepEqual(ay, agentYAML{}) {
 				t.Errorf("valid sid %q with no file: expected zero, got %+v",
 					sid, ay)
 			}

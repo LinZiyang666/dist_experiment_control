@@ -512,3 +512,178 @@ type UpgradeForwardedResp struct {
 	BinaryReplaced  bool   `json:"binary_replaced,omitempty"`  // true when chmod+rename succeeded
 }
 
+// ─── File transfer (P11 / file-transfer-plan v0.2.0) ───────────────────────
+//
+// Two tiers (file-transfer-plan §Tier selection):
+//   - Tier A (≤ 8 MiB):  InlineData embedded in PushPrepareReq /
+//     PullPrepareResp. No JetStream needed; round-trip ends in one
+//     request/reply.
+//   - Tier B (≤ 200 MiB): ObjectStore bucket created by broker before
+//     forwarding; the receiver Get's the object, the sender Put's it.
+//
+// Finalization invariant (plan §Audit): broker writes audit.transfer
+// {start} from its accepted prepare; broker writes audit.transfer
+// {complete|failed} from a signal sent by whichever party RECEIVED
+// the bytes. Push: agent emits SubjEvTransfer. Pull: ctl emits
+// SubjCtrlTransferFinalize. Both subjects are sid-scoped + ownership-
+// checked broker-side so the audit triplet stays correct under
+// crashes / forgery attempts.
+
+// PushPrepareReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.push.req.
+// One shape covers both tiers; agent reads Tier and dispatches.
+//
+// Tier A: InlineData populated; agent SHA-verifies, writes via tmp+rename
+// into Path, replies OK; agent then publishes ev.transfer.<id>.complete
+// (receiver-finalization). Size MUST equal len(InlineData).
+//
+// Tier B: InlineData empty; broker has already created bucket Bucket and
+// granted the actor Put rights (not in this struct — broker owns
+// lifecycle). Agent validates Path against allow_roots, replies OK +
+// echoes Bucket/ObjectKey/ChunkSize. ctl then ObjectStore.Puts to Bucket
+// keyed by ObjectKey, then sends TransferCommitReq.
+type PushPrepareReq struct {
+	TransferID string `json:"transfer_id"` // ULID, ctl-generated; broker echoes into audit
+	Path       string `json:"path"`        // absolute remote path under one of agent's allow_roots
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`      // hex; expected digest after upload
+	Force      bool   `json:"force,omitempty"` // overwrite existing regular file
+	Tier       string `json:"tier"`        // "a" | "b" — chosen by ctl, validated by agent
+	InlineData []byte `json:"inline_data,omitempty"` // tier A only (base64 over JSON)
+	Bucket     string `json:"bucket,omitempty"`      // tier B only; broker-assigned
+	ObjectKey  string `json:"object_key,omitempty"`  // tier B only; broker-assigned
+	ChunkSize  int    `json:"chunk_size,omitempty"`  // tier B hint
+
+	// ActorFP — broker-stamped at forward time (same convention as ExecReq.ActorFP).
+	// ctl-supplied value is discarded.
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// PushPrepareResp — agent pub on the push.req reply inbox. For tier A
+// this means "file is on disk + SHA verified + renamed into place"; for
+// tier B it means "I validated Path + ready for you to Put".
+type PushPrepareResp struct {
+	OK    bool   `json:"ok"`
+	Tier  string `json:"tier,omitempty"` // echoed for paranoia
+	Code  string `json:"code,omitempty"` // dst_exists | path_outside_roots | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled | jetstream_unavailable | io_error | ...
+	Error string `json:"error,omitempty"`
+}
+
+// PullPrepareReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.pull.req.
+// Single shape; agent decides tier based on size vs MaxInline. Broker
+// pre-creates the tier-B bucket only AFTER seeing the agent's Stat reply,
+// because pull-direction ctl is the receiver and the broker must know
+// the file size to decide tier. To avoid two round-trips per pull, the
+// broker forwards pull.req synchronously and creates the bucket in
+// between when agent.Stat indicates tier B (see broker.transfer.go).
+type PullPrepareReq struct {
+	TransferID string `json:"transfer_id"`
+	Path       string `json:"path"`         // absolute remote path
+	MaxInline  int64  `json:"max_inline"`   // ctl's tier-A budget (server max_payload aware)
+	Force      bool   `json:"force,omitempty"` // overwrite existing local file
+
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// PullPrepareResp — agent pub on the pull.req reply inbox.
+//
+// Tier A: InlineData populated with the entire file contents; ctl
+// SHA-verifies, writes locally via tmp+rename, then sends
+// SubjCtrlTransferFinalize{kind:complete}.
+//
+// Tier B: agent has Put the file into Bucket/ObjectKey (broker created
+// the bucket synchronously between subscribe and forward); ctl Gets it,
+// SHA-verifies, writes locally, then sends finalize.
+type PullPrepareResp struct {
+	OK         bool   `json:"ok"`
+	Tier       string `json:"tier,omitempty"`        // a | b
+	Size       int64  `json:"size,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`      // hex
+	InlineData []byte `json:"inline_data,omitempty"` // tier A only
+	Bucket     string `json:"bucket,omitempty"`      // tier B only
+	ObjectKey  string `json:"object_key,omitempty"`  // tier B only
+	Code       string `json:"code,omitempty"`        // path_not_found | path_outside_roots | not_a_regular_file | too_large | transfer_disabled | jetstream_unavailable | io_error | ...
+	Error      string `json:"error,omitempty"`
+}
+
+// TransferCommitReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.push-commit.req.
+// Tier B push only. ctl signals "ObjectStore.Put completed; please Get,
+// SHA-verify, rename into place, then publish ev.transfer.<id>.<kind>".
+// Reply is TransferCommitResp{OK} — the bytes-on-disk outcome flows via
+// the ev.transfer subject so the broker (subscribed) can write audit
+// and delete the bucket without sitting in the request path.
+type TransferCommitReq struct {
+	TransferID string `json:"transfer_id"`
+	Bucket     string `json:"bucket"`
+	ObjectKey  string `json:"object_key"`
+
+	ActorFP string `json:"actor_fp,omitempty"`
+}
+
+// TransferCommitResp acknowledges that the agent picked up the commit
+// and is starting Get; final outcome flows separately on ev.transfer.
+type TransferCommitResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`  // bucket_unknown | jetstream_unavailable | not_owner | ...
+	Error string `json:"error,omitempty"`
+}
+
+// TransferEvent — agent pub on s.<sid>.ev.node.<nid>.transfer.<id>.<kind>
+// (kind ∈ complete|failed). Push receiver-side finalization for both
+// tiers. Broker subscribes to s.*.ev.node.*.transfer.> and writes the
+// matching audit.transfer{kind} + deletes the tier-B bucket.
+type TransferEvent struct {
+	Kind       string `json:"kind"`        // complete | failed
+	Verb       string `json:"verb"`        // push (v1 only emits for push; pull uses TransferFinalize)
+	TransferID string `json:"transfer_id"`
+	Tier       string `json:"tier,omitempty"`
+	Bucket     string `json:"bucket,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	Code       string `json:"code,omitempty"`  // failed only: sha_mismatch | io_error | object_get_failed | path_outside_roots | ...
+	Error      string `json:"error,omitempty"`
+}
+
+// TransferFinalize — ctl pub on ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req.
+// Pull receiver-side finalization for both tiers. Broker validates
+// (transfer_id ↔ actor) and (sid via NATS-layer ACL), writes
+// audit.transfer{kind}, and (tier B only) deletes the bucket.
+type TransferFinalize struct {
+	Kind       string `json:"kind"`        // complete | failed
+	TransferID string `json:"transfer_id"`
+	Tier       string `json:"tier,omitempty"` // a | b — broker uses to decide bucket cleanup
+	Bucket     string `json:"bucket,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	Code       string `json:"code,omitempty"`  // failed only: sha_mismatch | object_get_failed | io_error | ...
+	Error      string `json:"error,omitempty"`
+}
+
+// TransferFinalizeResp — broker ack on the finalize.req reply inbox.
+// OK=true means audit was written and bucket cleanup (if tier B) is
+// scheduled; OK=false codes ∈ {transfer_unknown, not_owner_or_creator,
+// already_finalized, store_error}.
+type TransferFinalizeResp struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// CapsReq — ctl pub on ctrl.by.<actor>.s.<sid>.caps.req. Pre-flight
+// probe before chooseTier so the CLI can refuse a tier-B request when
+// the broker has no JetStream, or trim a tier-A request to a smaller
+// max_payload than the 8 MiB design ceiling. Empty body.
+type CapsReq struct{}
+
+// CapsResp — broker pub on the caps.req reply inbox.
+type CapsResp struct {
+	OK             bool   `json:"ok"`
+	JetStreamReady bool   `json:"jetstream_ready"`
+	MaxPayload     int64  `json:"max_payload"` // bytes; nc.MaxPayload() at broker side
+	BrokerRelease  string `json:"broker_release,omitempty"`
+	BrokerProto    int    `json:"broker_proto,omitempty"`
+	Code           string `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | actor_invalid | ...
+	Error          string `json:"error,omitempty"`
+}
+
