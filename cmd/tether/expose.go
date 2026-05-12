@@ -95,6 +95,15 @@ restart without a re-expose.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().IntVar(&local, "local", 0, "local port on the agent to expose (required)")
 	cmd.Flags().StringVar(&name, "name", "", "logical proxy name (required; used by `expose rm`)")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteOnlineNodes(t, cctx, toComplete)
+	}
 
 	cmd.AddCommand(newExposeRmCmd())
 	return cmd
@@ -162,5 +171,24 @@ error you can ignore in scripts.
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&name, "name", "", "logical proxy name to free (required)")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteOnlineNodes(t, cctx, toComplete)
+	}
+	_ = cmd.RegisterFlagCompletionFunc("name", func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		var nid string
+		if len(args) > 0 {
+			nid = args[0]
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteAllocatedExposeNames(t, cctx, nid, toComplete)
+	})
 	return cmd
 }

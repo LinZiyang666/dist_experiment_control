@@ -225,6 +225,15 @@ testing run a single <nid> first.`,
 		"seconds to wait for broker reply (must exceed agent download time)")
 	cmd.Flags().BoolVar(&all, "all", false,
 		"upgrade every ONLINE node in the active session (sequential, fail-fast)")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 || all {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteOnlineNodes(t, cctx, toComplete)
+	}
 	return cmd
 }
 

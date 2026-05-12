@@ -183,6 +183,18 @@ func newSessionCmd() *cobra.Command {
 			return nil
 		},
 	}
+	rm.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		// session is a subcommand of a parent with persistent --nats-url / --home.
+		// Closure vars natsURL / home are bound to those persistent flags.
+		changed := c.Flags().Changed("nats-url") || (c.Parent() != nil && c.Parent().PersistentFlags().Changed("nats-url"))
+		cctx := cli.NewCompletionContext(home, natsURL, changed)
+		t := cli.NewCompletionTransport(home, natsURL, changed)
+		defer t.Close()
+		return cli.CompleteOwnedSessions(t, cctx, toComplete)
+	}
 
 	root.AddCommand(create, list, rm)
 	return root

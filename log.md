@@ -306,3 +306,46 @@ tether exec: remote process terminated by signal (no exit code)
 
 **老 agent 全部完好,无任何生产 agent 被删/被踢/重启。**
 
+
+---
+
+## 修复 + 发布 + 验证 (v0.1.3)
+
+### 修复 commits
+- `8a9b613 fix: 5 bugs found in v0.1.2 live-fire testing` — 5 处修复，total +370 -1
+- Tag `v0.1.3` 已 push,CI(goreleaser)自动构建发布
+- Linux/amd64 tarball SHA256: `8fa4469748e6e14474b0e8a986c2c5293968afd9e6ecd7e6f1eae6aa78389031`
+
+### 升级路径(测试更新流程)
+
+| 组件 | 升级方式 | 结果 |
+|---|---|---|
+| **ctl (笔记本)** | `curl install.sh -v0.1.3 \| sh` | ✓ → v0.1.3 |
+| **broker daemon (pc732)** | ssh + 手工 download + verify SHA + replace `/usr/local/bin/tether` + `systemctl restart tether-broker` (跳过 install.sh 以保留 nats.conf + broker.yaml 手工修改) | ✓ tether-broker active, auth_callout=on |
+| **6 agents (all)** | `tether node upgrade --all --url ... --sha256 ...` | ✓ 6/6 升级,re-exec PID 保持,broker 看到 RELEASE=0.1.3 |
+
+**`tether node upgrade --all` 验证通过**:批量升级 6 节点,无一 OFFLINE,完整 G.1 reconcile 走完。
+
+### 修复验证结果
+
+| BUG | 修前现象 | 修后现象 | 验证 |
+|---|---|---|---|
+| **#1 history JS perms** | `tether history` 全 deadline exceeded | `tether history -n 10` 显示 CALL + PROC + PORT 完整 audit 流 | ✓ PASS |
+| **#2 enrollment err generic** | `auth rejected; supply --pin on first run or verify session/nid` | 5 行精确 likely 原因 + 含具体 sid/nid 的 evict 命令 | ✓ PASS |
+| **#3 session rm not-exist** | `cannot reach broker ... Authorization Violation` (误导网络问题) | `broker auth_callout rejected the connection ... this is NOT a network problem` + 4 行可操作 hint | ✓ PASS |
+| **#4 admin evict not-exist** | `evicted ... (false false false)` (误导成功) | `nothing to evict: nid=X not bound to sid=Y` + exit 1 | ✓ PASS |
+| **#5 signal kill no info** | `remote process terminated by signal (no exit code)` | stderr 流出 `[tether agent] child terminated by signal (signal: killed) — usually external pkill / SIGTERM matched the shell's argv` 再正常 exit chunk | ✓ PASS |
+
+### 集群最终状态 (v0.1.3)
+
+```
+NODE              STATUS  HEARTBEAT  PROTO  RELEASE
+a100              ONLINE  3s         1      0.1.3
+jupyter-ziyang10  ONLINE  2s         1      0.1.3
+pc732             ONLINE  2s         1      0.1.3
+timan1            ONLINE  1s         1      0.1.3
+timan107          ONLINE  5s         1      0.1.3
+timan108          ONLINE  4s         1      0.1.3
+```
+
+**6 个生产 agent 全部 v0.1.3 ONLINE,零损失。**

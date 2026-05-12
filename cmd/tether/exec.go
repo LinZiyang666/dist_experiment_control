@@ -149,5 +149,17 @@ both ways.
 	// stops flag parsing at the first positional, treating the rest
 	// as the remote argv even when it contains -flag-shaped tokens.
 	cmd.Flags().SetInterspersed(false)
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		// First positional is the node id; subsequent positionals are
+		// the remote argv (no useful local completion). Cobra calls us
+		// after flag parsing, so home/natsURL closure vars are populated.
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteOnlineNodes(t, cctx, toComplete)
+	}
 	return cmd
 }

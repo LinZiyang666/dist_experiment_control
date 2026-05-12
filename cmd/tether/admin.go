@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/spf13/cobra"
 )
 
@@ -126,11 +127,17 @@ func newAdminAuditCmd(socketPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVarP(&n, "n", "n", 50, "number of entries to tail (most recent)")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		return cli.CompleteAdminSessions(*socketPath, toComplete)
+	}
 	return cmd
 }
 
 func newAdminEvictCmd(socketPath *string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "evict <sid> <nid>",
 		Short: "Remove an agent's provisioning + node row, broadcast eviction",
 		Long: `Architecture P9: deletes agent_provisioning row + nodes row, then
@@ -169,6 +176,17 @@ denied at next CONNECT (no longer provisioned).`,
 			return nil
 		},
 	}
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		switch len(args) {
+		case 0:
+			return cli.CompleteAdminSessions(*socketPath, toComplete)
+		case 1:
+			return cli.CompleteAdminNodes(*socketPath, args[0], toComplete)
+		default:
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+	}
+	return cmd
 }
 
 func callAdmin(socketPath string, req adminsock.Request) (*adminsock.Response, error) {

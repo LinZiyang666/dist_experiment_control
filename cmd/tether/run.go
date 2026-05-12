@@ -260,6 +260,15 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 	// Audit shard 04 F12: same as exec — stop cobra parsing the
 	// remote command's flags as ours.
 	cmd.Flags().SetInterspersed(false)
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+		t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+		defer t.Close()
+		return cli.CompleteOnlineNodes(t, cctx, toComplete)
+	}
 	return cmd
 }
 

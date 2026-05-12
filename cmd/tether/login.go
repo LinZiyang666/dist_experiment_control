@@ -106,6 +106,16 @@ performs a real NATS CONNECT and only writes current_session on success.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVarP(&sid, "session", "s", "", "session to activate")
 	cmd.Flags().StringVar(&pin, "pin", "", "PIN for first-time join (only with -s)")
+	_ = cmd.RegisterFlagCompletionFunc("session", func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		// --nats-url and --broker share `natsURL`; whichever was set
+		// wins, and ResolveNATSURLFromHome inside NewCompletionContext
+		// handles the env / current-session fallbacks.
+		changed := c.Flags().Changed("nats-url") || c.Flags().Changed("broker")
+		cctx := cli.NewCompletionContext(home, natsURL, changed)
+		t := cli.NewCompletionTransport(home, natsURL, changed)
+		defer t.Close()
+		return cli.CompleteVisibleSessions(t, cctx, toComplete)
+	})
 	return cmd
 }
 
