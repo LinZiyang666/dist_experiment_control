@@ -42,9 +42,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Tier-A inline ceiling. Anything above this MUST go through tier B.
-const transferTierAMaxBytes = 8 * 1024 * 1024
-
 // Tier budgets — broker-side timeouts for the receiver-finalization
 // signal to arrive. Past these the broker writes a synthetic
 // failed-audit and reclaims the bucket. file-transfer-plan §Audit
