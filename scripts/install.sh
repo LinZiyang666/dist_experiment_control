@@ -147,7 +147,7 @@ source_sha_url() {
 # works under busybox curl. Returns empty if offline / unresolvable
 # (caller decides whether that's fatal).
 resolve_latest_version() {
-    eff=$(curl -fsSI -o /dev/null -w '%{url_effective}' \
+    eff=$(curl -fsSIL -o /dev/null -w '%{url_effective}' \
         "https://github.com/LinZiyang666/dist_experiment_control/releases/latest" 2>/dev/null) || return 1
     case "$eff" in
         */releases/tag/*) printf '%s' "${eff##*/tag/}" | tr -d '\r\n ' ;;
