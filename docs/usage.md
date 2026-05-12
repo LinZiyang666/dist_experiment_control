@@ -247,6 +247,14 @@ broker_url: wss://broker.example.com:443
 session: lab
 nid: lab-1
 tunnel_addr: broker.example.com:7000
+
+# 可选：v0.2.0 起的 file_transfer / `tether push` / `tether pull` 白名单。
+# 必须配置否则 push/pull 会以 `transfer_disabled` 拒掉。
+file_transfer:
+  allow_roots:
+    - /home/<user>           # 用户家目录
+    - /tmp                   # 临时区
+    - /srv/local/<user>      # UIUC 风格 local-disk 根；其他场景可省
 ```
 
 字段语义：
@@ -257,6 +265,11 @@ tunnel_addr: broker.example.com:7000
 | `session`     | 这个 agent 服务的 session id |
 | `nid`         | 节点 id；session 内必须唯一 |
 | `tunnel_addr` | broker 反向隧道控制端口（默认 `host:7000`） |
+| `file_transfer.allow_roots` | `tether push` 写、`tether pull` 读允许触达的绝对路径前缀列表；**为空 → push/pull 直接回 `transfer_disabled`** |
+
+`allow_roots` 比对方式：先 `EvalSymlinks` 解析目标路径的父目录，再做"前缀 + `/`" 严格匹配，
+所以中间的目录软链允许（解析后落在 root 内即可），叶子层符号链接一律拒绝
+（`O_NOFOLLOW` + `lstat` 双道防线）。
 
 可手动编辑；优先级：**显式 CLI flag > yaml > cobra 默认值**。
 
@@ -444,6 +457,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | 在远端跑一条命令 | `tether exec`（脚本类）/ `tether run`（交互类） |
 | 杀掉远端进程 | `tether run` 里按 Ctrl-C；或下次 v2 加 `tether kill` |
 | 把远端服务暴露到公网 | `tether expose` / `tether expose rm` |
+| 把文件上传/下载到远端 | `tether push` / `tether pull` |
 | 查"过去发生了什么" | `tether history`（含 `--follow` 实时模式） |
 | 给远端 agent 升级 | `tether node upgrade` / `... --all` |
 | 在 broker 主机上做运维 | `tether admin sessions/nodes/audit/evict` |
@@ -468,7 +482,9 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether run <nid> -- argv ...`         | ctl    | 交互式 PTY |
 | `tether expose <nid> --local P --name N` | ctl  | 暴露端口 |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
-| `tether history [-n N] [--kind K] [-f]` | ctl   | 审计历史回放 |
+| `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤200 MiB） |
+| `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤200 MiB） |
+| `tether history [-n N] [--kind K] [-f]` | ctl   | 审计历史回放（含 `--kind transfer`） |
 | `tether node upgrade <nid>`            | ctl    | 升级单台 agent（owner） |
 | `tether node upgrade --all`            | ctl    | 升级 session 内所有 ONLINE agent |
 | `tether admin sessions`                | broker 本机 | 列所有 session |
@@ -800,7 +816,95 @@ tether expose rm <nid> --name <logical-name>
 - `expose rm` 立即把公网端口归还池子，agent 上对应的 tunnel client 也会
   drop。
 
-### 5.10 `tether history`
+### 5.10 `tether push` / `tether pull`（v0.2.0+）
+
+**这是什么**：在 ctl 与远端 agent 之间搬一个文件。无须 `expose` + `scp` /
+`rsync`，复用 NATS 控制平面 + JetStream Object Store 做传输；单次最大 200 MiB
+（再大请走 `tether expose` + rsync）。
+
+**两档机制**（`file-transfer-plan` v0.2.0）：
+
+| 大小 | 档位 | 通道 | 是否需 JetStream |
+|---|---|---|---|
+| ≤ 8 MiB（且 ≤ broker `max_payload`/2） | A | 直接塞进 NATS 消息体 | 否 |
+| 8 MiB – 200 MiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
+| > 200 MiB | — | 拒绝（`too_large`）；改走 `tether expose` + rsync | — |
+
+ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload()`，
+据此选档；agent 也会复算一次（防止操作员把 broker 的 `max_payload` 调
+小了 ctl 不知道）。
+
+**先决条件**：
+
+1. broker 必须已开 JetStream（用 tarball install 写出的 nats.conf 缺省即开）；
+   否则 tier-B 会以 `jetstream_unavailable` 拒掉；
+2. 目标 agent 的 `agent.yaml` 里必须配 `file_transfer.allow_roots`；
+   为空 → push/pull 直接以 `transfer_disabled` 拒。
+
+**命令**：
+
+```
+tether push <local-path> <nid>:<remote-path> [--force] [--timeout 10m]
+tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m]
+```
+
+参数与语义：
+
+| 参数 | 说明 |
+|---|---|
+| `<local-path>` | ctl 所在机器上的本地文件路径，可为相对/绝对 |
+| `<nid>:<remote-path>` | 目标节点 + 该节点上的**绝对**路径；`<remote-path>` 必须落在 `allow_roots` 内 |
+| `--force` | 目标已存在时覆盖；缺省直接拒（`dst_exists`） |
+| `--timeout` | 整次传输上限，缺省 10min（tier A 一般 < 30s，tier B 取决于带宽） |
+
+**安全模型**（plan §"Refusing dangerous paths"）：
+
+- 远端路径**必须绝对**且落在 `allow_roots` 任一前缀下；中间目录的软链
+  允许，落地叶子的软链一律拒（`O_NOFOLLOW`）；
+- 父目录不存在 → `path_parent_missing`（push）或 `path_not_found`（pull）；
+  v0.2.0 不自动 `mkdir -p`，需手动 `tether exec <nid> -- mkdir -p ...`；
+- pull 还会做 dev+inode TOCTOU 校验（`lstat` 与 `open` 之间的换底攻击）；
+- broker 是 ObjectStore bucket 的**唯一所有者**：member/agent JWT 都没有
+  `STREAM.CREATE / DELETE / PURGE` 权限，bucket 由 broker 在 prepare 阶段
+  创建、在 `ev.transfer` / `finalize.req` 收到时删除；超时（tier A 30s /
+  tier B 5min）broker watchdog 也会兜底删除并写 audit failed。
+
+**典型用例**：
+
+```bash
+# 把本地脚本送到远端 GPU
+tether push ./train.py a100:/srv/local/alice/jobs/train.py
+
+# 把训练日志拉回本地
+tether pull a100:/srv/local/alice/jobs/run-2026-05-12.log ./run-2026-05-12.log
+
+# 大文件（tier B）：12 MiB random
+tether push ./checkpoint.bin a100:/srv/local/alice/ckpt.bin --force
+# tether push: ... -> a100:... (tier=b, 12582912 bytes, transfer_id=...)
+# tether push: OK (tier B, 12582912 bytes, 62ms)
+```
+
+**audit**：每次传输都会有 `start` 和 `complete|failed` 两条
+`audit.transfer` 行；用 `tether history --kind transfer` 查看。"接收方-终结
+不变量"（plan §Audit）：push 由 agent 触发终结，pull 由 ctl 触发终结，
+broker 永远是 single audit writer。
+
+**常见错误码**：
+
+| code | 含义 |
+|---|---|
+| `transfer_disabled` | 目标 agent 的 `allow_roots` 为空 |
+| `path_outside_roots` | 远端路径不在 `allow_roots` 任一前缀下 |
+| `path_parent_missing` / `path_not_found` | 父目录不存在 / 源文件不存在 |
+| `not_a_regular_file` | 叶子是软链 / 设备 / 目录 |
+| `dst_exists` | 目标已存在；加 `--force` 覆盖 |
+| `sha_mismatch` | 接收端校验 SHA-256 失败（线上字节翻转 / 攻击） |
+| `too_large` | 文件 > 200 MiB |
+| `jetstream_unavailable` | tier-B 但 broker 没开 JetStream |
+| `node_offline` / `not_a_member` | 目标节点离线 / 调用者不是 session 成员 |
+| `not_owner_or_creator` | finalize 阶段 actor 跟 transfer 创建者不一致（防伪造） |
+
+### 5.11 `tether history`
 
 **这是什么**：当前活动 session 的"审计回放器"。每条**命令调用**（exec /
 run / expose / kill / upgrade...）、每个**进程生命周期**（started /
@@ -822,7 +926,7 @@ exited）、每次**端口分配**（expose / release）都会被 broker 写进 
 ```
 tether history                  # 从最早回放至空闲 250ms 后退出
 tether history -n 50            # 最近 50 条
-tether history --kind call      # 仅 call / proc / port
+tether history --kind call      # 仅 call / proc / port / transfer
 tether history --follow         # 持续 tail（Ctrl-C 退出）
 ```
 
@@ -840,7 +944,7 @@ tether history --follow         # 持续 tail（Ctrl-C 退出）
 
 需要原始 JSON 走 `--kind call | jq .` 之类管线。
 
-### 5.11 `tether node upgrade`
+### 5.12 `tether node upgrade`
 
 **这是什么**：owner-only 的"远程升级 agent 二进制"命令。无需登录目标
 机，无需停服务，PID 不变，systemd 不感知 —— agent 内部用 `syscall.Exec`
@@ -894,7 +998,7 @@ tether node upgrade --all  --url https://... --sha256 <hex64>     # session 内�
 `--timeout` 默认 60s，必须大于 agent 下载 + 解压时间，超大 tarball / 慢链路记得
 显式调大。
 
-### 5.12 `tether admin *`（broker 本机）
+### 5.13 `tether admin *`（broker 本机）
 
 **这一组命令是什么**：运维用的"broker 内部状态"工具，绕过 NATS
 auth_callout，直接通过 broker 进程的本机 Unix socket 读写 SQLite 状态。
@@ -1034,7 +1138,32 @@ tether history -n 100                    # 最近 100 条全类型
 tether history -n 50 --kind call         # 仅命令调用
 tether history --follow                  # 直播
 tether history --kind proc | jq 'select(.rc != 0)'  # 失败进程
+tether history --kind transfer -n 20     # 仅 push/pull
 ```
+
+### 6.7 上传 / 下载文件（push / pull）
+
+```bash
+# 把本地脚本送到 a100，落到 agent allow_roots 内的绝对路径
+tether push ./train.py a100:/srv/local/alice/jobs/train.py
+
+# 拉日志回来
+tether pull a100:/srv/local/alice/jobs/run.log ./run.log
+
+# 大文件用 tier B（broker 自动选档；> 8 MiB 走 ObjectStore）
+tether push ./checkpoint.bin a100:/srv/local/alice/ckpt.bin --force
+
+# 文件 > 200 MiB：先 expose、再 rsync
+tether expose a100 --local 22 --name ssh-tunnel
+rsync -av --progress big-dataset/ rsync@broker:14001/...
+```
+
+排查：
+- `tether push` 报 `transfer_disabled` → agent.yaml `file_transfer.allow_roots` 没配；
+- `path_outside_roots` → 远端绝对路径不在 `allow_roots` 任一前缀下；
+- `dst_exists` → 远端已有同名文件，加 `--force` 覆盖；
+- `jetstream_unavailable` → broker 没开 JetStream，tier B 走不了；
+- 详细 audit：`tether history --kind transfer -n 20`。
 
 ---
 

@@ -47,8 +47,8 @@ func newHistoryCmd() *cobra.Command {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
 			}
 			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
-			if kind != "" && kind != "call" && kind != "proc" && kind != "port" {
-				return fmt.Errorf("--kind must be one of: call | proc | port (got %q)", kind)
+			if kind != "" && kind != "call" && kind != "proc" && kind != "port" && kind != "transfer" {
+				return fmt.Errorf("--kind must be one of: call | proc | port | transfer (got %q)", kind)
 			}
 
 			id, err := cli.EnsureIdentity(home)
@@ -140,7 +140,7 @@ func newHistoryCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false,
 		"after printing the snapshot, keep printing new audit msgs as they land (Ctrl-C to stop)")
 	cmd.Flags().StringVar(&kind, "kind", "",
-		"filter by audit kind: call | proc | port (default: all)")
+		"filter by audit kind: call | proc | port | transfer (default: all)")
 	return cmd
 }
 
@@ -341,6 +341,11 @@ func printAuditEntry(w io.Writer, subject string, data []byte) {
 		_, _ = fmt.Fprintf(w, "%s  PORT  %s/%s  port=%v  name=%s  kind=%s\n",
 			ts, strFromMap(raw, "session"), strFromMap(raw, "node"),
 			raw["port"], strFromMap(raw, "name"), kind)
+	case "transfer":
+		_, _ = fmt.Fprintf(w, "%s  XFER  %s/%s  verb=%s  kind=%s  tier=%s  bytes=%v  path=%s  %s\n",
+			ts, strFromMap(raw, "session"), strFromMap(raw, "node"),
+			strFromMap(raw, "verb"), kind, strFromMap(raw, "tier"),
+			raw["bytes"], strFromMap(raw, "path"), strFromMap(raw, "error"))
 	default:
 		_, _ = fmt.Fprintf(w, "%s  %s  %s\n", ts, auditKind, string(data))
 	}

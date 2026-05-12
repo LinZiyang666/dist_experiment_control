@@ -62,14 +62,19 @@ func (a *Agent) handlePushForwarded(nc *nats.Conn, msg *nats.Msg) {
 	}
 	vp, err := ValidateForWrite(req.Path, a.cfg.AllowRoots)
 	if err != nil {
+		code := "io_error"
+		errMsg := err.Error()
 		var pve *PathValidationError
 		if errors.As(err, &pve) {
-			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-				OK: false, Code: pve.Code, Error: pve.Msg})
-		} else {
-			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-				OK: false, Code: "io_error", Error: err.Error()})
+			code = pve.Code
+			errMsg = pve.Msg
 		}
+		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
+			OK: false, Code: code, Error: errMsg})
+		// Emit ev.transfer.failed so the broker can write audit
+		// failed + reap its in-memory entry immediately, instead of
+		// waiting on the per-tier watchdog timeout.
+		a.pubTransferEvFailed(nc, "push", &req, req.Tier, code, errMsg, 0)
 		return
 	}
 
@@ -409,9 +414,15 @@ func (a *Agent) pubTransferEv(nc *nats.Conn, kind, verb string, req *proto.PushP
 	}
 }
 
-// pubTransferEvFailed mirrors pubTransferEv with kind=failed.
+// pubTransferEvFailed mirrors pubTransferEv with kind=failed. Tolerates
+// being called with an empty TransferID (e.g. agent rejected the
+// request before parsing); silently skip in that case so we don't
+// publish an unnamed ev.transfer.
 func (a *Agent) pubTransferEvFailed(nc *nats.Conn, verb string, req *proto.PushPrepareReq,
 	tier, code, errMsg string, dur time.Duration) {
+	if req.TransferID == "" {
+		return
+	}
 	payload, _ := json.Marshal(proto.TransferEvent{
 		Kind: "failed", Verb: verb, TransferID: req.TransferID,
 		Tier: tier, Bucket: req.Bucket, Path: req.Path,
