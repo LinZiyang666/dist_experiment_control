@@ -332,7 +332,17 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		// retry forever. Surface the message to the operator so they
 		// know what to fix instead of silently flapping.
 		if isAuthFailure(err) {
-			return nil, fmt.Errorf("agent: NATS auth rejected (%w); supply --pin on first run or verify session/nid", err)
+			return nil, fmt.Errorf("agent: NATS auth_callout rejected (%w)\n"+
+				"  the broker accepted the connection but its auth_callout said no. Likely:\n"+
+				"    - first run AND PIN is wrong       -> double-check --pin matches session pin\n"+
+				"    - first run AND no --pin           -> pass --pin <pin> for the first connect\n"+
+				"    - re-run AND nid already bound to a different nkey on broker\n"+
+				"      -> on broker host: `sudo tether admin evict %s %s` to clear binding (a `keys/agent.nk` from a different node also triggers this)\n"+
+				"    - session does not exist or is being deleted (DELETING state)\n"+
+				"      -> on broker host: `sudo tether admin sessions` to check\n"+
+				"    - your agent was evicted (see sys.events; check broker.err)\n"+
+				"  for the exact deny reason, ask the broker operator to grep /var/log/tether/broker.err for this nkey",
+				err, a.cfg.SID, a.cfg.NID)
 		}
 		a.cfg.Logger.Warn("agent: NATS connect failed; retrying",
 			"attempt", attempt, "err", err, "next_backoff", backoff)

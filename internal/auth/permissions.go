@@ -35,6 +35,13 @@ func PermissionsForUnactivated(actor string) jwt.Permissions {
 // (session rm / kick / rotate-pin) are pub-allowed at the NATS layer for
 // every member; tetherd performs the owner check on the application side
 // and replies admin_denied for non-owners (see architecture B.2 note).
+//
+// JetStream API permissions are scoped to this session's `history-<sid>`
+// stream only. Members need to publish to `$JS.API.STREAM.INFO.<stream>`,
+// `$JS.API.CONSUMER.CREATE/INFO/DELETE/MSG.NEXT.<stream>.>` so the
+// nats-go jetstream client can look up the stream and create an
+// ephemeral OrderedConsumer for `tether history`. Without these the
+// client gets "permissions violation" before any business logic runs.
 func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 	return jwt.Permissions{
 		Pub: jwt.Permission{Allow: []string{
@@ -50,6 +57,12 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
 			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			"$JS.API.STREAM.INFO.history-" + sid,
+			"$JS.API.CONSUMER.CREATE.history-" + sid,
+			"$JS.API.CONSUMER.CREATE.history-" + sid + ".>",
+			"$JS.API.CONSUMER.INFO.history-" + sid + ".>",
+			"$JS.API.CONSUMER.DELETE.history-" + sid + ".>",
+			"$JS.API.CONSUMER.MSG.NEXT.history-" + sid + ".>",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{

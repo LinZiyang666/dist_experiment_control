@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -147,6 +148,19 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo string, req *proto.ExecReq) (int
 	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			// ExitCode() returns -1 when the child was terminated by a
+			// signal rather than a clean exit. Stream a stderr note so
+			// the operator can tell e.g. "my own `pkill -f <pattern>`
+			// caught the exec child's shell" apart from "agent crashed",
+			// but keep the legacy wire shape (exit chunk with ExitCode=-1)
+			// so existing ctl tooling that special-cases negative exit
+			// codes keeps working.
+			if exitErr.ExitCode() < 0 {
+				note := []byte(fmt.Sprintf(
+					"\n[tether agent] child terminated by signal (%s) — usually external pkill / SIGTERM matched the shell's argv\n",
+					exitErr.String()))
+				a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: note})
+			}
 			return exitErr.ExitCode(), nil
 		}
 		return -1, err

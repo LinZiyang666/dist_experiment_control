@@ -154,6 +154,15 @@ denied at next CONNECT (no longer provisioned).`,
 			if r == nil {
 				return fmt.Errorf("broker: evict reply missing")
 			}
+			// When neither row was present, evict is a no-op. Surface that
+			// distinctly so operators don't mistake "(false false false)"
+			// for a partial success.
+			if !r.NodeRowDeleted && !r.AgentProvDeleted {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"nothing to evict: nid=%s not bound to sid=%s (no node row, no provisioning row)\n",
+					r.NID, r.SID)
+				return fmt.Errorf("not_found")
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"evicted sid=%s nid=%s (node=%v provisioning=%v broadcast=%v)\n",
 				r.SID, r.NID, r.NodeRowDeleted, r.AgentProvDeleted, r.BroadcastedEvicted)

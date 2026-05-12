@@ -69,7 +69,22 @@ func brokerErrorMessage(verb, code, errMsg string) error {
 // connectError wraps a NATS connect failure with what the operator
 // should check. The wrapped err preserves the underlying %w chain
 // so errors.Is on the original still works.
+//
+// Special case: an "Authorization Violation" at connect time means
+// the auth_callout rejected this nkey for this connection-name
+// template — *not* a network/TLS issue. Surface the four likely
+// causes (session not found, not a member, PIN failed, evicted)
+// so the operator stops debugging the wrong layer.
 func connectError(verb, natsURL string, err error) error {
+	if err != nil && strings.Contains(err.Error(), "Authorization Violation") {
+		return fmt.Errorf("%s: broker auth_callout rejected the connection: %w\n"+
+			"  this is NOT a network problem. Check:\n"+
+			"    - session exists and is ACTIVE     (run `tether session ls`)\n"+
+			"    - you are a member of that session (run `tether login -s <sid> --pin <pin>` if first time)\n"+
+			"    - your PIN matches the session's   (re-check with the session owner)\n"+
+			"    - your nkey hasn't been evicted    (ask broker admin to check `tether admin sessions`)",
+			verb, err)
+	}
 	return fmt.Errorf("%s: cannot reach broker at %s: %w (verify the broker is running and --nats-url is correct)",
 		verb, natsURL, err)
 }
