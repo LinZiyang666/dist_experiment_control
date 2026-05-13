@@ -36,28 +36,31 @@ func TestNoStreamLifecycleOnObjXfer(t *testing.T) {
 }
 
 // Sid scoping invariant: every OBJ_xfer / $O.xfer entry on the
-// activated-member template must contain the bound sid; an unscoped
-// `OBJ_xfer-*` (matching cross-session) would let session-A peek into
-// session-B's bucket.
+// activated-member template must contain the bound sid as a complete
+// token; an unscoped `OBJ_xfer-*` (matching cross-session) would let
+// session-A peek into session-B's bucket. v0.2.2 design: per-session
+// bucket xfer-<sid>, so the bound sid appears as the last segment of
+// the bucket name (e.g. "OBJ_xfer-lab" or "$O.xfer-lab.M.>").
 func TestObjXferEntriesScopedToSession(t *testing.T) {
 	perms := PermissionsForActivatedMember(sampleActor, "lab")
-	for _, allow := range perms.Pub.Allow {
-		if !strings.Contains(allow, "xfer-") && !strings.Contains(allow, "OBJ_xfer-") {
-			continue
-		}
-		// Must contain the literal "lab-" between "xfer-" and the next dot/end.
-		if !strings.Contains(allow, "xfer-lab-") {
-			t.Errorf("activated_member pub %q is not sid-scoped (expected xfer-lab-)", allow)
+	check := func(label string, allows []string) {
+		for _, allow := range allows {
+			if !strings.Contains(allow, "xfer-") && !strings.Contains(allow, "OBJ_xfer-") {
+				continue
+			}
+			// Must reference the bound sid via "xfer-lab" — either at
+			// end-of-string ("OBJ_xfer-lab"), or before a dot
+			// ("OBJ_xfer-lab.>", "$O.xfer-lab.M.>"). Anything else
+			// would be either unscoped or referencing the wrong sid.
+			if !strings.Contains(allow, "xfer-lab.") &&
+				!strings.HasSuffix(allow, "xfer-lab") {
+				t.Errorf("%s %q is not sid-scoped (expected xfer-lab as a token)",
+					label, allow)
+			}
 		}
 	}
-	for _, allow := range perms.Sub.Allow {
-		if !strings.Contains(allow, "xfer-") {
-			continue
-		}
-		if !strings.Contains(allow, "xfer-lab-") {
-			t.Errorf("activated_member sub %q is not sid-scoped", allow)
-		}
-	}
+	check("activated_member pub", perms.Pub.Allow)
+	check("activated_member sub", perms.Sub.Allow)
 }
 
 // Caps probe must be sid+actor scoped (file-transfer-plan §Wire).

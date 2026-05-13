@@ -239,7 +239,7 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 	if err != nil {
 		return fmt.Errorf("push (tier B): jetstream new: %w", err)
 	}
-	bucket := proto.XferBucketName(sid, transferID)
+	bucket := proto.XferBucketName(sid)
 	putCtx, putCancel := context.WithTimeout(cmd.Context(), timeout)
 	defer putCancel()
 	store, err := js.ObjectStore(putCtx, bucket)
@@ -251,13 +251,13 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B): reopen local: %w", err)
 	}
 	defer func() { _ = uploadFile.Close() }()
-	if _, err := store.Put(putCtx, jetstream.ObjectMeta{Name: proto.XferObjectKey}, uploadFile); err != nil {
+	if _, err := store.Put(putCtx, jetstream.ObjectMeta{Name: transferID}, uploadFile); err != nil {
 		return fmt.Errorf("push (tier B): Put: %w", err)
 	}
 
 	// Step 3: push-commit. Agent Gets, verifies, emits ev.transfer.
 	body, _ = json.Marshal(proto.TransferCommitReq{
-		TransferID: transferID, Bucket: bucket, ObjectKey: proto.XferObjectKey,
+		TransferID: transferID, Bucket: bucket, ObjectKey: transferID,
 	})
 	commitCtx, commitCancel := context.WithTimeout(cmd.Context(), timeout)
 	defer commitCancel()

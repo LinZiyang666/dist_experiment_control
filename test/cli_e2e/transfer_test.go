@@ -455,21 +455,24 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket := "xfer-lab-" + tid
+	// v0.2.2: per-session bucket "xfer-lab"; per-transfer object key
+	// is the transfer_id. Broker creates the bucket on prepare; we
+	// just bind to it here and Put with the right object name.
+	bucket := proto.XferBucketName("lab")
 	storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer storeCancel()
 	store, err := js.ObjectStore(storeCtx, bucket)
 	if err != nil {
 		t.Fatalf("bind bucket %s: %v", bucket, err)
 	}
-	if _, err := store.Put(storeCtx, jetstream.ObjectMeta{Name: "object"},
+	if _, err := store.Put(storeCtx, jetstream.ObjectMeta{Name: tid},
 		bytes.NewReader(payload)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
 	// Step 3: push-commit.
 	body, _ = json.Marshal(proto.TransferCommitReq{
-		TransferID: tid, Bucket: bucket, ObjectKey: "object",
+		TransferID: tid, Bucket: bucket, ObjectKey: tid,
 	})
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer commitCancel()
@@ -518,17 +521,22 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 		t.Errorf("dst byte mismatch (len got=%d want=%d)", len(got), len(payload))
 	}
 
-	// Bucket must be gone (broker deleted on receipt of ev.transfer).
-	// We give it a brief window because deletion is async.
+	// v0.2.2: per-session bucket survives across transfers; broker
+	// only deletes the per-transfer OBJECT on ev.transfer.complete.
+	// Verify the object is gone but the bucket is still bound.
+	store2, err := js.ObjectStore(context.Background(), bucket)
+	if err != nil {
+		t.Fatalf("bucket %s should still exist post-transfer: %v", bucket, err)
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := js.ObjectStore(context.Background(), bucket); err != nil {
+		if _, err := store2.GetInfo(context.Background(), tid); err != nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if _, err := js.ObjectStore(context.Background(), bucket); err == nil {
-		t.Errorf("bucket %s still exists after ev.transfer.complete", bucket)
+	if info, err := store2.GetInfo(context.Background(), tid); err == nil && !info.Deleted {
+		t.Errorf("object %s should be gone after ev.transfer.complete (info=%+v)", tid, info)
 	}
 }
 
@@ -621,16 +629,21 @@ func TestTransfer_TierB_PullHappyPath(t *testing.T) {
 		t.Errorf("finalize refused: code=%q err=%q", fr.Code, fr.Error)
 	}
 
-	// Bucket gone.
+	// v0.2.2: per-session bucket survives; verify the per-transfer
+	// object is gone after finalize.
+	store2, err := js.ObjectStore(context.Background(), pr.Bucket)
+	if err != nil {
+		t.Fatalf("bucket %s should still exist post-pull: %v", pr.Bucket, err)
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := js.ObjectStore(context.Background(), pr.Bucket); err != nil {
+		if _, err := store2.GetInfo(context.Background(), tid); err != nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if _, err := js.ObjectStore(context.Background(), pr.Bucket); err == nil {
-		t.Errorf("bucket %s still exists after finalize", pr.Bucket)
+	if info, err := store2.GetInfo(context.Background(), tid); err == nil && !info.Deleted {
+		t.Errorf("object %s should be gone after finalize (info=%+v)", tid, info)
 	}
 }
 

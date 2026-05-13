@@ -98,18 +98,23 @@ func SubjCtrlCaps(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.caps.req", SubjectPrefix, actor, sid)
 }
 
-// XferBucketName returns the per-transfer JetStream Object Store bucket
-// name "xfer-<sid>-<transfer_id>". The backing stream is "OBJ_<bucket>"
-// per nats.go convention. Used by ctl, broker, and agent.
-func XferBucketName(sid, transferID string) string {
-	return "xfer-" + sid + "-" + transferID
+// XferBucketName returns the per-SESSION JetStream Object Store bucket
+// name "xfer-<sid>". One bucket holds every in-flight transfer for the
+// session; per-transfer scoping is done via the object key (= transfer
+// id). The backing stream is "OBJ_<bucket>" = "OBJ_xfer-<sid>" per
+// nats.go convention. Used by ctl, broker, and agent.
+//
+// v0.2.2 design change (audit-fix P11 F4): v0.2.0/v0.2.1 used a
+// per-transfer bucket name `xfer-<sid>-<id>`. That can't be wildcarded
+// in NATS pub/sub permissions because NATS `*` only matches a whole
+// dot-separated token, and bucket names disallow dots — so JWT perms
+// like `$JS.API.STREAM.INFO.OBJ_xfer-<sid>-*` had a literal `*` and
+// matched zero buckets. Per-session buckets fix this: the perm is a
+// single literal `$JS.API.STREAM.INFO.OBJ_xfer-<sid>` (or `.>`-suffix
+// for consumer paths) — no wildcard needed.
+func XferBucketName(sid string) string {
+	return "xfer-" + sid
 }
-
-// XferObjectKey is the single object name inside every xfer bucket. The
-// design is one-object-per-bucket so a bucket name uniquely identifies
-// the transfer; we only need a stable key for nats.go's ObjectStore.Put
-// / .Get calls. file-transfer-plan v0.2.0.
-const XferObjectKey = "object"
 
 // ParseTransferFinalize extracts (actor, sid, transfer_id) from a
 // `tether.v1.ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req` subject.

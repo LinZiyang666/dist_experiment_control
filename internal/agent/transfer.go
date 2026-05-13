@@ -209,7 +209,7 @@ func (a *Agent) handlePushCommitForwarded(nc *nats.Conn, msg *nats.Msg) {
 	go func() {
 		defer cancel()
 		startedAt := time.Now().UTC()
-		bytes, sha, err := a.objectStoreGetAndWrite(commitCtx, store, proto.XferObjectKey, cached.vp, cached.force)
+		bytes, sha, err := a.objectStoreGetAndWrite(commitCtx, store, req.TransferID, cached.vp, cached.force)
 		if err != nil {
 			var pve *PathValidationError
 			code := "object_get_failed"
@@ -307,7 +307,10 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 	bucket := combined.Bucket
 	objectKey := combined.ObjectKey
 	if objectKey == "" {
-		objectKey = proto.XferObjectKey
+		// Older brokers (pre-v0.2.2) used a per-bucket "object" key;
+		// newer brokers send the transfer_id. Default to transfer_id
+		// when broker didn't supply — matches the v0.2.2 design.
+		objectKey = req.TransferID
 	}
 
 	vp, err := ValidateForRead(req.Path, a.canonAllowRoots)

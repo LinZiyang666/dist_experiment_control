@@ -445,7 +445,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 			// file-transfer-plan §Object bucket lifecycle G.2 —
 			// reap leftover OBJ_xfer-* streams from a previous crash.
-			if n, err := b.reconcileXferStreamsOnBoot(ctx); err != nil {
+			if n, err := b.reconcileXferObjectsOnBoot(ctx); err != nil {
 				b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", err)
 			} else if n > 0 {
 				b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)

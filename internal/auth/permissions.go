@@ -73,16 +73,21 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			"$JS.API.CONSUMER.INFO.history-" + sid + ".>",
 			"$JS.API.CONSUMER.DELETE.history-" + sid + ".>",
 			"$JS.API.CONSUMER.MSG.NEXT.history-" + sid + ".>",
-			// File transfer Tier-B (Object Store).
-			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid + "-*",
-			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid + "-*",
-			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*",
-			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + "-*.>",
-			"$O.xfer-" + sid + "-*.M.>",
-			"$O.xfer-" + sid + "-*.C.>",
+			// File transfer Tier-B (Object Store) — single per-session
+			// bucket xfer-<sid>; per-transfer scoping is done via
+			// object key (transfer_id). Subjects below are all
+			// literal stream names + valid `>` tail wildcards;
+			// no partial-token wildcards (which NATS does not
+			// support — see proto.XferBucketName comment).
+			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
+			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + ".>",
+			"$O.xfer-" + sid + ".M.>",
+			"$O.xfer-" + sid + ".C.>",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
@@ -93,8 +98,8 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
 			subjectPrefix + ".sys.events",
 			// Object-store data subjects: ctl Get reads from these.
-			"$O.xfer-" + sid + "-*.M.>",
-			"$O.xfer-" + sid + "-*.C.>",
+			"$O.xfer-" + sid + ".M.>",
+			"$O.xfer-" + sid + ".C.>",
 			"_INBOX.>",
 		}},
 	}
@@ -120,16 +125,17 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.out",
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
 			subjectPrefix + ".s." + sid + ".pty.*.failed",
-			// File transfer Tier-B Object Store.
-			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid + "-*",
-			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid + "-*",
-			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*",
-			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + "-*.>",
-			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + "-*.>",
-			"$O.xfer-" + sid + "-*.M.>",
-			"$O.xfer-" + sid + "-*.C.>",
+			// File transfer Tier-B Object Store — single per-session
+			// bucket; same shape as the activated-member template.
+			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
+			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
+			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.DELETE.OBJ_xfer-" + sid + ".>",
+			"$JS.API.CONSUMER.MSG.NEXT.OBJ_xfer-" + sid + ".>",
+			"$O.xfer-" + sid + ".M.>",
+			"$O.xfer-" + sid + ".C.>",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
@@ -148,8 +154,8 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			// (push receiver: get the file ctl uploaded; pull sender:
 			// not needed for sub but nats.go ObjectStore Watch path
 			// expects sub on metadata).
-			"$O.xfer-" + sid + "-*.M.>",
-			"$O.xfer-" + sid + "-*.C.>",
+			"$O.xfer-" + sid + ".M.>",
+			"$O.xfer-" + sid + ".C.>",
 			"_INBOX.>",
 		}},
 	}

@@ -169,25 +169,32 @@ func (t *transferTracker) activeOBJStreams() map[string]struct{} {
 	return out
 }
 
-// createXferBucket creates the OBJ_xfer-<sid>-<id> stream via the
-// nats.go ObjectStore API. Tier B only. Returns the bucket name.
-// Idempotent w.r.t. existing-name (treated as success — the broker
-// uses ULID transfer_ids so collisions are practically zero, but
-// defending against `nats stream list` shenanigans is cheap).
-func (b *Broker) createXferBucket(ctx context.Context, sid, transferID string) (string, error) {
+// ensureXferBucket lazily creates the per-session bucket xfer-<sid>
+// (backing stream OBJ_xfer-<sid>) on first use. Idempotent: returns OK
+// when the bucket already exists. Tier B only. Bucket sticks around
+// until the session is removed; per-transfer cleanup happens via
+// deleteXferObject (object delete inside the bucket).
+//
+// MaxBytes covers many concurrent transfers + their staging space:
+// ceil at 4 GiB per session. Per-transfer ObjectMeta caps individual
+// objects via the chunked-message TTL on the underlying stream.
+//
+// v0.2.2 change: previously each transfer got its own bucket
+// `xfer-<sid>-<id>`, but NATS perm wildcards can't address that
+// (no partial-token wildcards), so JWTs couldn't allow per-bucket
+// access. Per-session buckets allow a single literal perm entry.
+func (b *Broker) ensureXferBucket(ctx context.Context, sid string) (string, error) {
 	if b.js == nil {
 		return "", fmt.Errorf("jetstream_unavailable")
 	}
-	bucket := proto.XferBucketName(sid, transferID)
+	bucket := proto.XferBucketName(sid)
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
-		TTL:      30 * time.Minute,
-		MaxBytes: 200 * 1024 * 1024, // hard ceiling: 200 MiB (plan §Tier B)
+		MaxBytes: 4 * 1024 * 1024 * 1024, // 4 GiB per-session ceiling
 		Storage:  jetstream.FileStorage,
 		Replicas: 1,
 	}
 	if _, err := b.js.CreateObjectStore(ctx, cfg); err != nil {
-		// "stream name already in use" is acceptable here.
 		if errors.Is(err, jetstream.ErrBucketExists) ||
 			errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
 			return bucket, nil
@@ -197,19 +204,26 @@ func (b *Broker) createXferBucket(ctx context.Context, sid, transferID string) (
 	return bucket, nil
 }
 
-// deleteXferBucket drops the bucket; missing-bucket is treated as
-// success (caller may invoke twice from timeout + finalize paths).
-func (b *Broker) deleteXferBucket(ctx context.Context, bucket string) error {
-	if b.js == nil || bucket == "" {
+// deleteXferObject removes one transfer's object from the per-session
+// bucket. Missing-object is OK (idempotent). The bucket itself
+// survives — it's per-session, not per-transfer.
+func (b *Broker) deleteXferObject(ctx context.Context, sid, transferID string) error {
+	if b.js == nil || transferID == "" {
 		return nil
 	}
-	err := b.js.DeleteObjectStore(ctx, bucket)
-	if err == nil ||
-		errors.Is(err, jetstream.ErrBucketNotFound) ||
-		errors.Is(err, jetstream.ErrStreamNotFound) {
-		return nil
+	store, err := b.js.ObjectStore(ctx, proto.XferBucketName(sid))
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) ||
+			errors.Is(err, jetstream.ErrStreamNotFound) {
+			return nil
+		}
+		return err
 	}
-	return err
+	if err := store.Delete(ctx, transferID); err != nil &&
+		!errors.Is(err, jetstream.ErrObjectNotFound) {
+		return err
+	}
+	return nil
 }
 
 // startTransferWatchdog arms a per-tier timeout. If the receiver-side
@@ -252,7 +266,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			Code:  code,
 			Error: fmt.Sprintf("broker watchdog: no %s finalization within %s", ent.verb, d),
 		})
-		_ = b.deleteXferBucket(context.Background(), ent.bucket)
+		_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
 		b.transfers.remove(ent.transferID)
 		b.cfg.Logger.Warn("broker: transfer watchdog fired",
 			"transfer_id", ent.transferID, "verb", ent.verb, "tier", ent.tier,
@@ -333,21 +347,23 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Tier B: broker creates bucket before forwarding (plan §Tier B push state machine step 2).
+	// Tier B: broker ensures the per-session bucket exists before
+	// forwarding (plan §Tier B push state machine step 2). Per-transfer
+	// scoping happens via ObjectKey = TransferID.
 	if req.Tier == "b" {
 		if b.js == nil {
 			b.replyPushErr(msg, "jetstream_unavailable", "")
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err := b.createXferBucket(ctx, sid, req.TransferID)
+		bucket, err := b.ensureXferBucket(ctx, sid)
 		cancel()
 		if err != nil {
 			b.replyPushErr(msg, "bucket_create_failed", err.Error())
 			return
 		}
 		req.Bucket = bucket
-		req.ObjectKey = proto.XferObjectKey
+		req.ObjectKey = req.TransferID
 	}
 
 	// Stamp actor fp so agent's audit attribution matches broker's.
@@ -365,9 +381,8 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		startedAt: b.cfg.Now(),
 	}
 	if !b.transfers.put(entry) {
-		// In-flight cap reached. Drop the request + reap any bucket
-		// we just optimistically created so we don't leak into JS.
-		_ = b.deleteXferBucket(context.Background(), req.Bucket)
+		// In-flight cap reached. Per-session bucket survives across
+		// transfers, so no bucket cleanup needed here — just reject.
 		b.replyPushErr(msg, "too_many_in_flight",
 			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
 		return
@@ -433,19 +448,17 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Optimistic tier-B bucket creation. Agent uses it iff Size > MaxInline.
-	// Tier-A pulls leave the bucket empty; finalize.req or watchdog
-	// reaps it.
+	// Ensure the per-session bucket exists (no-op if already there).
+	// Cheap because it's per-session, not per-transfer. Agent uses
+	// it iff Size > MaxInline; otherwise nothing is written and the
+	// bucket stays untouched. Per-transfer cleanup deletes only the
+	// object (deleteXferObject), never the bucket.
 	bucket := ""
 	if b.js != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err = b.createXferBucket(ctx, sid, req.TransferID)
+		bucket, err = b.ensureXferBucket(ctx, sid)
 		cancel()
 		if err != nil {
-			// Non-fatal for tier-A pulls; but we can't tell the agent
-			// to fall back without losing the optimization. Reject
-			// the request so the operator notices a misconfigured JS
-			// instead of silently degrading every pull to tier A.
 			b.replyPullErr(msg, "bucket_create_failed", err.Error())
 			return
 		}
@@ -461,7 +474,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	}{
 		PullPrepareReq: req,
 		Bucket:         bucket,
-		ObjectKey:      proto.XferObjectKey,
+		ObjectKey:      req.TransferID,
 	})
 	if err != nil {
 		b.replyPullErr(msg, "marshal", err.Error())
@@ -471,12 +484,13 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	entry := &transferEntry{
 		transferID: req.TransferID, sid: sid, nid: nid,
 		actor: actor, actorFP: fp, verb: "pull",
-		tier:   "b", // optimistic; finalize.req body may say "a" — we delete the empty bucket regardless
+		tier:   "b", // optimistic; finalize.req body may say "a" — we delete the per-transfer object regardless
 		bucket: bucket, path: req.Path,
 		startedAt: b.cfg.Now(),
 	}
 	if !b.transfers.put(entry) {
-		_ = b.deleteXferBucket(context.Background(), bucket)
+		// Per-session bucket survives across transfers; nothing to
+		// reap on this rejection.
 		b.replyPullErr(msg, "too_many_in_flight",
 			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
 		return
@@ -609,7 +623,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 		rec.Error = ev.Error
 	}
 	b.pubAuditTransfer(rec)
-	_ = b.deleteXferBucket(context.Background(), entry.bucket)
+	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()
 	}
@@ -635,7 +649,7 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 		Tier: ent.tier, Bucket: ent.bucket,
 		Code: code, Error: errMsg,
 	})
-	_ = b.deleteXferBucket(context.Background(), ent.bucket)
+	_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
 	if ent.cancel != nil {
 		ent.cancel()
 	}
@@ -869,7 +883,7 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		rec.Error = fin.Error
 	}
 	b.pubAuditTransfer(rec)
-	_ = b.deleteXferBucket(context.Background(), entry.bucket)
+	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()
 	}
