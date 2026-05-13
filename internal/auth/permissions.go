@@ -82,6 +82,7 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
 			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
 			"$JS.API.DIRECT.GET.OBJ_xfer-" + sid + ".>",
+			"$JS.FC.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
@@ -131,6 +132,7 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
 			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
 			"$JS.API.DIRECT.GET.OBJ_xfer-" + sid + ".>",
+			"$JS.FC.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
@@ -181,6 +183,14 @@ func PermissionsForBroker() jwt.Permissions {
 			"_INBOX.>",
 			// auth_callout responses (msg.Respond → $SYS._INBOX.<server>.<rand>).
 			"$SYS._INBOX.>",
+			// JetStream API surface — broker manages history/events
+			// streams + xfer Object Stores. `>` here is a real
+			// wildcard (matches any tail), and broker has
+			// cross-session authority by design (see template
+			// docstring).
+			"$JS.API.>",
+			"$JS.FC.>",
+			"$O.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
 			subjectPrefix + ".ctrl.by.*.>",
