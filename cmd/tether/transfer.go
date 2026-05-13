@@ -43,9 +43,9 @@ func newPushCmd() *cobra.Command {
 File size limits (file-transfer-plan v0.2.0):
 
   - Up to 8 MiB        : tier A (inline over NATS, no JetStream needed).
-  - 8 MiB – 200 MiB    : tier B (JetStream Object Store; broker must
+  - 8 MiB – 2 GiB      : tier B (JetStream Object Store; broker must
                          have JetStream enabled).
-  - > 200 MiB          : refused; use ` + "`tether expose`" + ` + rsync.
+  - > 2 GiB            : refused; use ` + "`tether expose`" + ` + rsync.
 
 The remote path must be absolute and under one of the agent's
 file_transfer.allow_roots (configured in agent.yaml). Symlinks at
@@ -113,7 +113,7 @@ func indexByte(s string, b byte) int {
 
 // runPush implements the push flow:
 //
-//   1. Read+SHA the local file; bail on > 200 MiB.
+//   1. Read+SHA the local file; bail on > 2 GiB.
 //   2. Caps probe; chooseTier.
 //   3. Tier A: PushPrepareReq{inline_data} → wait for resp; done.
 //   4. Tier B: ObjectStore.Put → push-commit.req → wait for resp.
@@ -587,7 +587,11 @@ const cliTierAMaxBytes = 8 * 1024 * 1024
 
 // Hard upper bound. Past this the user is expected to use
 // `tether expose` + rsync (file-transfer-plan §Goals).
-const cliMaxBytes = 200 * 1024 * 1024
+// cliMaxBytes is the hard upper bound for a single transfer. Past this
+// the user is expected to use `tether expose` + rsync. Bumped from
+// 200 MiB → 2 GiB in v0.2.5; per-session JS bucket MaxBytes scales
+// accordingly (see internal/broker/transfer.go ensureXferBucket).
+const cliMaxBytes = 2 * 1024 * 1024 * 1024
 
 // remoteSpec is one parsed `<node>:<remote-path>` argument.
 type remoteSpec struct {
@@ -641,7 +645,7 @@ func probeCaps(nc *nats.Conn, actor, sid string, timeout time.Duration) (proto.C
 // chooseTier decides tier A vs B for a given file size + caps probe
 // result. The plan's rules (file-transfer-plan §Tier selection):
 //
-//   - size > 200 MiB: refused outright before we get here.
+//   - size > 2 GiB: refused outright before we get here.
 //   - size > 8 MiB: tier B.
 //   - size > caps.MaxPayload * 0.5: tier B (give NATS some headroom
 //     for framing + headers).

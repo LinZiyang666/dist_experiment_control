@@ -51,6 +51,12 @@ const (
 	transferTimeoutTierB = 5 * time.Minute
 )
 
+// transferMaxBytes is the hard upper bound for one tier-B transfer.
+// Bumped 200 MiB → 2 GiB in v0.2.5; the per-session bucket MaxBytes
+// (ensureXferBucket) was already set to 4 GiB which leaves 2 GiB
+// headroom for one in-flight + one staging transfer per session.
+const transferMaxBytes = 2 * 1024 * 1024 * 1024
+
 // transferTrackerMaxEntries caps the in-memory tracker map so a fast
 // attacker spamming push.req / pull.req can't OOM the broker before
 // the per-tier watchdog reaps stale entries. At the worst case
@@ -190,7 +196,7 @@ func (b *Broker) ensureXferBucket(ctx context.Context, sid string) (string, erro
 	bucket := proto.XferBucketName(sid)
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
-		MaxBytes: 4 * 1024 * 1024 * 1024, // 4 GiB per-session ceiling
+		MaxBytes: 8 * 1024 * 1024 * 1024, // 8 GiB per-session ceiling (allows ~3 in-flight 2-GiB transfers + headroom)
 		Storage:  jetstream.FileStorage,
 		Replicas: 1,
 	}
@@ -337,8 +343,8 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPushErr(msg, "tier_invalid", req.Tier)
 		return
 	}
-	if req.Size > 200*1024*1024 {
-		b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > 200 MiB", req.Size))
+	if req.Size > transferMaxBytes {
+		b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > %d (2 GiB)", req.Size, transferMaxBytes))
 		return
 	}
 	if req.Tier == "a" && int64(len(req.InlineData)) != req.Size {

@@ -70,7 +70,7 @@ type AuditPort struct {
 //     complete written on agent ev.transfer (push) or ctl finalize.req (pull);
 //     failed   same parties, on the failure path or broker-side timeout.
 //   verb ∈ {"push","pull"}.
-//   tier ∈ {"a","b"} — "a" inline ≤ 8 MiB, "b" JetStream ObjectStore ≤ 200 MiB.
+//   tier ∈ {"a","b"} — "a" inline ≤ 8 MiB, "b" JetStream ObjectStore ≤ 2 GiB (v0.2.5+).
 //
 // Bytes / DurationMs are populated only on complete/failed; Bucket only
 // on tier B; Code only on failed (machine-readable). The schema name

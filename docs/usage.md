@@ -482,8 +482,8 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether run <nid> -- argv ...`         | ctl    | 交互式 PTY |
 | `tether expose <nid> --local P --name N` | ctl  | 暴露端口 |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
-| `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤200 MiB） |
-| `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤200 MiB） |
+| `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤2 GiB） |
+| `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤2 GiB） |
 | `tether history [-n N] [--kind K] [-f]` | ctl   | 审计历史回放（含 `--kind transfer`） |
 | `tether node upgrade <nid>`            | ctl    | 升级单台 agent（owner） |
 | `tether node upgrade --all`            | ctl    | 升级 session 内所有 ONLINE agent |
@@ -819,7 +819,7 @@ tether expose rm <nid> --name <logical-name>
 ### 5.10 `tether push` / `tether pull`（v0.2.0+）
 
 **这是什么**：在 ctl 与远端 agent 之间搬一个文件。无须 `expose` + `scp` /
-`rsync`，复用 NATS 控制平面 + JetStream Object Store 做传输；单次最大 200 MiB
+`rsync`，复用 NATS 控制平面 + JetStream Object Store 做传输；单次最大 2 GiB
 （再大请走 `tether expose` + rsync）。
 
 **两档机制**（`file-transfer-plan` v0.2.0）：
@@ -827,8 +827,8 @@ tether expose rm <nid> --name <logical-name>
 | 大小 | 档位 | 通道 | 是否需 JetStream |
 |---|---|---|---|
 | ≤ 8 MiB（且 ≤ broker `max_payload`/2） | A | 直接塞进 NATS 消息体 | 否 |
-| 8 MiB – 200 MiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
-| > 200 MiB | — | 拒绝（`too_large`）；改走 `tether expose` + rsync | — |
+| 8 MiB – 2 GiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
+| > 2 GiB | — | 拒绝（`too_large`）；改走 `tether expose` + rsync | — |
 
 ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload()`，
 据此选档；agent 也会复算一次（防止操作员把 broker 的 `max_payload` 调
@@ -899,7 +899,7 @@ broker 永远是 single audit writer。
 | `not_a_regular_file` | 叶子是软链 / 设备 / 目录 |
 | `dst_exists` | 目标已存在；加 `--force` 覆盖 |
 | `sha_mismatch` | 接收端校验 SHA-256 失败（线上字节翻转 / 攻击） |
-| `too_large` | 文件 > 200 MiB |
+| `too_large` | 文件 > 2 GiB |
 | `jetstream_unavailable` | tier-B 但 broker 没开 JetStream |
 | `node_offline` / `not_a_member` | 目标节点离线 / 调用者不是 session 成员 |
 | `not_owner_or_creator` | finalize 阶段 actor 跟 transfer 创建者不一致（防伪造） |
@@ -1153,7 +1153,7 @@ tether pull a100:/srv/local/alice/jobs/run.log ./run.log
 # 大文件用 tier B（broker 自动选档；> 8 MiB 走 ObjectStore）
 tether push ./checkpoint.bin a100:/srv/local/alice/ckpt.bin --force
 
-# 文件 > 200 MiB：先 expose、再 rsync
+# 文件 > 2 GiB：先 expose、再 rsync
 tether expose a100 --local 22 --name ssh-tunnel
 rsync -av --progress big-dataset/ rsync@broker:14001/...
 ```

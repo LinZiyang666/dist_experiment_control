@@ -518,7 +518,7 @@ type UpgradeForwardedResp struct {
 //   - Tier A (≤ 8 MiB):  InlineData embedded in PushPrepareReq /
 //     PullPrepareResp. No JetStream needed; round-trip ends in one
 //     request/reply.
-//   - Tier B (≤ 200 MiB): ObjectStore bucket created by broker before
+//   - Tier B (≤ 2 GiB):  ObjectStore bucket created by broker before
 //     forwarding; the receiver Get's the object, the sender Put's it.
 //
 // Finalization invariant (plan §Audit): broker writes audit.transfer

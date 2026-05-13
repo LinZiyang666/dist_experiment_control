@@ -345,10 +345,10 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	size := st.Size()
-	if size > 200*1024*1024 {
+	if size > 2*1024*1024*1024 {
 		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
 			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file size=%d > 200 MiB", size)})
+			Error: fmt.Sprintf("file size=%d > 2 GiB", size)})
 		return
 	}
 	maxInline := req.MaxInline
