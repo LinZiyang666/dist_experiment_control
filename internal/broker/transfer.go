@@ -51,6 +51,15 @@ const (
 	transferTimeoutTierB = 5 * time.Minute
 )
 
+// transferTrackerMaxEntries caps the in-memory tracker map so a fast
+// attacker spamming push.req / pull.req can't OOM the broker before
+// the per-tier watchdog reaps stale entries. At the worst case
+// (5-min Tier-B timeout * 1024 entries * ~200 bytes/entry) the cap
+// holds memory under ~200 KiB. New requests past the cap are
+// rejected with `too_many_in_flight` so callers get a clean error
+// instead of silent slowdown. Audit shard P11 F2.
+const transferTrackerMaxEntries = 1024
+
 // transferEntry is the broker's in-memory tracking record for one
 // in-flight transfer. Keyed by transfer_id in transferTracker.entries.
 type transferEntry struct {
@@ -86,10 +95,21 @@ func (t *transferTracker) get(id string) *transferEntry {
 	return t.entries[id]
 }
 
-func (t *transferTracker) put(e *transferEntry) {
+// put inserts an entry. Returns true on success; false if the tracker
+// is at transferTrackerMaxEntries. Callers must reject the request
+// with `too_many_in_flight` on false.
+func (t *transferTracker) put(e *transferEntry) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if len(t.entries) >= transferTrackerMaxEntries {
+		// Don't overwrite an existing entry with the same id — that
+		// would silently drop the original transfer.
+		if _, exists := t.entries[e.transferID]; !exists {
+			return false
+		}
+	}
 	t.entries[e.transferID] = e
+	return true
 }
 
 func (t *transferTracker) remove(id string) *transferEntry {
@@ -100,10 +120,27 @@ func (t *transferTracker) remove(id string) *transferEntry {
 	return e
 }
 
-// markFinalized claims the right to publish the final audit row. The
-// first caller wins; later callers see ok=false and must not write a
-// second audit (idempotent finalize + timeout race protection).
-func (t *transferTracker) markFinalized(id string) (e *transferEntry, ok bool) {
+// claimFinalize atomically marks the entry as finalized iff:
+//   - the entry exists in the map, AND
+//   - it hasn't already been finalized.
+//
+// First caller wins; later callers receive ok=false and MUST NOT write
+// a second audit row / delete the bucket twice.
+//
+// The returned *transferEntry MAY be non-nil even when ok=false
+// (entry exists but was already claimed) — callers can use the entry
+// for an idempotent OK reply, but must not mutate it. The fields used
+// for caller-side validation (sid, nid, actor, verb, tier, bucket,
+// path) are immutable after put(), so they may be read without
+// holding tracker.mu.
+//
+// Audit shard P11 F1: previous markFinalized + per-handler
+// `entry.finalized = false` "unclaim" pattern was racy because the
+// unclaim happened outside tracker.mu. The new contract is
+// validate-then-claim: callers do all validation against immutable
+// fields BEFORE calling claimFinalize, so there is no path that
+// claims and then needs to back out.
+func (t *transferTracker) claimFinalize(id string) (e *transferEntry, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e = t.entries[id]
@@ -132,12 +169,6 @@ func (t *transferTracker) activeOBJStreams() map[string]struct{} {
 	return out
 }
 
-// xferBucketName returns "xfer-<sid>-<transfer_id>". The backing stream
-// is "OBJ_<bucket>" per nats.go convention.
-func xferBucketName(sid, transferID string) string {
-	return "xfer-" + sid + "-" + transferID
-}
-
 // createXferBucket creates the OBJ_xfer-<sid>-<id> stream via the
 // nats.go ObjectStore API. Tier B only. Returns the bucket name.
 // Idempotent w.r.t. existing-name (treated as success — the broker
@@ -147,7 +178,7 @@ func (b *Broker) createXferBucket(ctx context.Context, sid, transferID string) (
 	if b.js == nil {
 		return "", fmt.Errorf("jetstream_unavailable")
 	}
-	bucket := xferBucketName(sid, transferID)
+	bucket := proto.XferBucketName(sid, transferID)
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
 		TTL:      30 * time.Minute,
@@ -199,7 +230,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			return
 		case <-t.C:
 		}
-		ent, ok := b.transfers.markFinalized(e.transferID)
+		ent, ok := b.transfers.claimFinalize(e.transferID)
 		if !ok || ent == nil {
 			return
 		}
@@ -316,7 +347,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			return
 		}
 		req.Bucket = bucket
-		req.ObjectKey = "object" // single-object-per-bucket convention
+		req.ObjectKey = proto.XferObjectKey
 	}
 
 	// Stamp actor fp so agent's audit attribution matches broker's.
@@ -333,7 +364,14 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: req.Bucket, path: req.Path, size: req.Size,
 		startedAt: b.cfg.Now(),
 	}
-	b.transfers.put(entry)
+	if !b.transfers.put(entry) {
+		// In-flight cap reached. Drop the request + reap any bucket
+		// we just optimistically created so we don't leak into JS.
+		_ = b.deleteXferBucket(context.Background(), req.Bucket)
+		b.replyPushErr(msg, "too_many_in_flight",
+			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
+		return
+	}
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
 	// Audit start (plan §Audit "start written from broker-accepted prepare").
@@ -423,7 +461,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	}{
 		PullPrepareReq: req,
 		Bucket:         bucket,
-		ObjectKey:      "object",
+		ObjectKey:      proto.XferObjectKey,
 	})
 	if err != nil {
 		b.replyPullErr(msg, "marshal", err.Error())
@@ -437,7 +475,12 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: bucket, path: req.Path,
 		startedAt: b.cfg.Now(),
 	}
-	b.transfers.put(entry)
+	if !b.transfers.put(entry) {
+		_ = b.deleteXferBucket(context.Background(), bucket)
+		b.replyPullErr(msg, "too_many_in_flight",
+			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
+		return
+	}
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
 	b.pubAuditTransfer(schema.AuditTransfer{
@@ -531,17 +574,25 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 	if kind != "complete" && kind != "failed" {
 		return
 	}
-	entry, claimed := b.transfers.markFinalized(transferID)
-	if !claimed {
-		// Either unknown transfer (replay / corrupted) or already
-		// finalized by the watchdog. Either way: don't double-write.
+
+	// Validate-then-claim. The fields used here (sid, nid) are
+	// immutable after put(), so reading them via the lookup snapshot
+	// without holding tracker.mu is safe. claimFinalize is the only
+	// state-mutating call.
+	preview := b.transfers.get(transferID)
+	if preview == nil {
+		return // unknown transfer; ignore
+	}
+	if preview.sid != sid || preview.nid != nid {
+		b.cfg.Logger.Warn("broker: ev.transfer sid/nid mismatch",
+			"want_sid", preview.sid, "got_sid", sid,
+			"want_nid", preview.nid, "got_nid", nid)
 		return
 	}
-	if entry.sid != sid || entry.nid != nid {
-		b.cfg.Logger.Warn("broker: ev.transfer sid/nid mismatch",
-			"want_sid", entry.sid, "got_sid", sid,
-			"want_nid", entry.nid, "got_nid", nid)
-		entry.finalized = false // unclaim; let the watchdog or a correct ev handle it
+	entry, claimed := b.transfers.claimFinalize(transferID)
+	if !claimed {
+		// Already finalized by watchdog or another caller. Don't
+		// double-write audit / double-delete bucket.
 		return
 	}
 
@@ -569,9 +620,10 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 
 // cleanupEntry is used on the unhappy paths inside the prepare
 // handlers (forward_failed). Writes a failed audit + drops the
-// bucket + cancels the watchdog.
+// bucket + cancels the watchdog. Idempotent: if a watchdog or
+// finalize handler already claimed the entry, this is a no-op.
 func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
-	ent, claimed := b.transfers.markFinalized(entry.transferID)
+	ent, claimed := b.transfers.claimFinalize(entry.transferID)
 	if !claimed || ent == nil {
 		return
 	}
@@ -591,7 +643,9 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 }
 
 // transferGate runs the standard precondition trio used by every
-// prepare/commit handler. Returns "" on accept, else the response Code.
+// prepare/commit handler. Pass nid="" to skip the node-online check
+// (used for finalize.req / caps.req which don't carry a nid in their
+// subject). Returns "" on accept, else the response Code.
 func (b *Broker) transferGate(sid, fp, nid string) string {
 	active, err := session.IsActive(b.cfg.DB, sid)
 	if err != nil {
@@ -607,6 +661,9 @@ func (b *Broker) transferGate(sid, fp, nid string) string {
 	if !member {
 		return "not_a_member"
 	}
+	if nid == "" {
+		return "" // caller doesn't need the node check (e.g. finalize.req, caps.req)
+	}
 	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
 	if errors.Is(err, node.ErrNotFound) {
 		return "node_not_found"
@@ -620,26 +677,209 @@ func (b *Broker) transferGate(sid, fp, nid string) string {
 	return ""
 }
 
+// replyPushErr / replyPullErr / replyCommitErr are tiny typed wrappers
+// over b.replyJSON: they let call sites stay terse (`b.replyPushErr(msg,
+// "tier_invalid", "")`) while keeping the response type discoverable.
 func (b *Broker) replyPushErr(msg *nats.Msg, code, errMsg string) {
-	if msg.Reply == "" {
-		return
-	}
-	payload, _ := json.Marshal(proto.PushPrepareResp{OK: false, Code: code, Error: errMsg})
-	_ = msg.Respond(payload)
+	b.replyJSON(msg, proto.PushPrepareResp{OK: false, Code: code, Error: errMsg})
 }
-
 func (b *Broker) replyPullErr(msg *nats.Msg, code, errMsg string) {
-	if msg.Reply == "" {
-		return
-	}
-	payload, _ := json.Marshal(proto.PullPrepareResp{OK: false, Code: code, Error: errMsg})
-	_ = msg.Respond(payload)
+	b.replyJSON(msg, proto.PullPrepareResp{OK: false, Code: code, Error: errMsg})
+}
+func (b *Broker) replyCommitErr(msg *nats.Msg, code, errMsg string) {
+	b.replyJSON(msg, proto.TransferCommitResp{OK: false, Code: code, Error: errMsg})
 }
 
-func (b *Broker) replyCommitErr(msg *nats.Msg, code, errMsg string) {
-	if msg.Reply == "" {
+// ─── Caps probe (caps.req) ─────────────────────────────────────────────
+
+
+
+// handleCapsReq replies to `ctrl.by.<actor>.s.<sid>.caps.req` with
+// broker capabilities the CLI needs before chooseTier:
+//
+//   - JetStreamReady: whether tier-B (ObjectStore) is usable.
+//   - MaxPayload: the server-advertised max NATS payload (bytes).
+//     CLI uses this to cap tier-A inline_data to a value the actual
+//     server will accept (operator may have left max_payload at the
+//     1 MiB default even though the design ceiling is 8 MiB).
+//   - BrokerRelease / BrokerProto: lets ctl print a useful version-
+//     skew message instead of hanging on a wrong-proto agent.
+//
+// Membership gate mirrors handlePsReq — sid is parsed from the subject
+// and validated against the session row + the actor's fp.
+//
+// file-transfer-plan §Wire protocol "caps".
+func (b *Broker) handleCapsReq(msg *nats.Msg) {
+	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
+	if !ok {
+		b.replyJSON(msg, proto.CapsResp{Code: "subject_malformed"})
 		return
 	}
-	payload, _ := json.Marshal(proto.TransferCommitResp{OK: false, Code: code, Error: errMsg})
-	_ = msg.Respond(payload)
+	parts := splitDot(leaf)
+	// leaf = "s.<sid>.caps.req"
+	if len(parts) != 4 || parts[0] != "s" || parts[2] != "caps" || parts[3] != "req" {
+		b.replyJSON(msg, proto.CapsResp{Code: "subject_malformed", Error: leaf})
+		return
+	}
+	sid := parts[1]
+
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		b.replyJSON(msg, proto.CapsResp{Code: "actor_invalid", Error: err.Error()})
+		return
+	}
+	active, err := session.IsActive(b.cfg.DB, sid)
+	if err != nil {
+		b.replyJSON(msg, proto.CapsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	if !active {
+		b.replyJSON(msg, proto.CapsResp{Code: "session_not_found_or_deleting"})
+		return
+	}
+	member, err := session.IsMember(b.cfg.DB, sid, fp)
+	if err != nil {
+		b.replyJSON(msg, proto.CapsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	if !member {
+		b.replyJSON(msg, proto.CapsResp{Code: "not_a_member"})
+		return
+	}
+
+	resp := proto.CapsResp{
+		OK:             true,
+		JetStreamReady: b.js != nil,
+		BrokerRelease:  proto.ReleaseVersion,
+		BrokerProto:    proto.ProtoVersion,
+	}
+	if b.nc != nil {
+		resp.MaxPayload = b.nc.MaxPayload()
+	}
+	b.replyJSON(msg, resp)
+}
+
+// ─── Pull receiver finalize (transfer.<id>.finalize.req) ──────────────
+
+
+
+// handleFinalizeReq is invoked on
+// `ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req`.
+//
+// Pull receiver-side: ctl has finished local writing (tier A inline
+// or tier B Get+rename). It tells the broker so audit complete|failed
+// can be written and the bucket cleaned up. Two layers of defence:
+//
+//  1. NATS-layer: the JWT pub allow is scoped to (sid, actor) via
+//     `ctrl.by.<actor>.s.<sid>.transfer.*.finalize.req`. A different
+//     sid never reaches here. A different actor publishing for sid
+//     reaches here only via subject forgery — which is impossible
+//     because the broker parses the actor segment, not the body.
+//  2. Application-layer (this function): the in-memory entry for
+//     transfer_id is looked up; the publishing actor MUST match the
+//     creator. Mismatch → not_owner_or_creator (Round-3 #1).
+//
+// Idempotent on duplicate finalize (Round-3 case #18): the second
+// caller sees finalized=true and gets OK back without re-writing
+// audit / re-deleting bucket.
+//
+// file-transfer-plan §Wire / §Audit / §Risk Round-4 #1.
+func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
+	actor, sid, transferID, ok := proto.ParseTransferFinalize(msg.Subject)
+	if !ok {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "subject_malformed"})
+		return
+	}
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "actor_invalid", Error: err.Error()})
+		return
+	}
+	if code := b.transferGate(sid, fp, ""); code != "" {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: code})
+		return
+	}
+
+	var fin proto.TransferFinalize
+	if err := json.Unmarshal(msg.Data, &fin); err != nil {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "json_parse", Error: err.Error()})
+		return
+	}
+	if fin.TransferID != "" && fin.TransferID != transferID {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+			Code: "request_invalid", Error: "transfer_id mismatch subject vs body"})
+		return
+	}
+	if fin.Kind != "complete" && fin.Kind != "failed" {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+			Code: "request_invalid", Error: "kind must be complete|failed"})
+		return
+	}
+
+	// Validate-then-claim. Read the current entry without claiming;
+	// validate against immutable fields (actor, verb), then atomically
+	// claim. This avoids the previous "claim, then unclaim on
+	// validation failure" race where the unclaim happened outside
+	// tracker.mu.
+	preview := b.transfers.get(transferID)
+	if preview == nil {
+		// Unknown transfer_id (or already reaped by watchdog).
+		// Idempotent reply.
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "transfer_unknown"})
+		return
+	}
+	if preview.actor != actor {
+		// Foreign-actor finalize: leave entry untouched so the real
+		// owner / watchdog handles it.
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "not_owner_or_creator"})
+		return
+	}
+	if preview.verb != "pull" {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+			Code: "verb_mismatch", Error: "finalize.req is pull-only"})
+		return
+	}
+	entry, claimed := b.transfers.claimFinalize(transferID)
+	if !claimed {
+		// Concurrent finalize won the race (duplicate from same actor,
+		// or watchdog raced us after our preview). Reply OK so the
+		// caller sees idempotent success — audit and bucket cleanup
+		// are guaranteed by whoever did claim.
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: true})
+		return
+	}
+
+	// Resolve tier. ctl-supplied body wins over the optimistic "b" we
+	// stamped at pull.req time (tier-A pulls have an empty bucket).
+	tier := entry.tier
+	if fin.Tier == "a" || fin.Tier == "b" {
+		tier = fin.Tier
+	}
+
+	rec := schema.AuditTransfer{
+		V: schema.AuditSchemaVersion, Kind: fin.Kind, Verb: "pull",
+		Ts: b.cfg.Now(), Session: entry.sid, Node: entry.nid,
+		ActorNkey: entry.actor, ActorFp: entry.actorFP,
+		TransferID: entry.transferID, Path: entry.path,
+		Tier: tier, Bucket: entry.bucket,
+		Bytes: fin.Bytes, DurationMs: fin.DurationMs,
+	}
+	if fin.Kind == "failed" {
+		rec.Code = fin.Code
+		rec.Error = fin.Error
+	}
+	b.pubAuditTransfer(rec)
+	_ = b.deleteXferBucket(context.Background(), entry.bucket)
+	if entry.cancel != nil {
+		entry.cancel()
+	}
+	b.transfers.remove(transferID)
+
+	b.replyFinalize(msg, proto.TransferFinalizeResp{OK: true})
+	b.cfg.Logger.Info("broker: pull finalize handled",
+		"transfer_id", transferID, "kind", fin.Kind, "tier", tier)
+}
+
+func (b *Broker) replyFinalize(msg *nats.Msg, resp proto.TransferFinalizeResp) {
+	b.replyJSON(msg, resp)
 }

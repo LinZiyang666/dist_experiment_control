@@ -21,7 +21,7 @@ func TestValidate_TransferDisabledOnEmptyAllowRoots(t *testing.T) {
 }
 
 func TestValidate_RejectsNonAbsolute(t *testing.T) {
-	roots := []string{t.TempDir()}
+	roots := CanonAllowRoots([]string{t.TempDir()})
 	for _, fn := range []func(string, []string) (*ValidatedPath, error){
 		ValidateForRead, ValidateForWrite,
 	} {
@@ -40,7 +40,7 @@ func TestValidateForWrite_RejectsDotDotEscape(t *testing.T) {
 	root := t.TempDir()
 	// /tmp/<root>/sub/../../escape — Clean gives /tmp/escape which is
 	// outside <root>. Containment check rejects.
-	_, err := ValidateForWrite(filepath.Join(root, "sub", "..", "..", "escape"), []string{root})
+	_, err := ValidateForWrite(filepath.Join(root, "sub", "..", "..", "escape"), CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) {
 		t.Fatalf("got %v, want PathValidationError", err)
@@ -65,7 +65,7 @@ func TestValidateForRead_RejectsSymlinkAtLeaf(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ValidateForRead(link, []string{root})
+	_, err := ValidateForRead(link, CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "not_a_regular_file" {
 		t.Errorf("got %v, want not_a_regular_file", err)
@@ -83,7 +83,7 @@ func TestValidateForWrite_RejectsSymlinkAtLeaf(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ValidateForWrite(link, []string{root})
+	_, err := ValidateForWrite(link, CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "not_a_regular_file" {
 		t.Errorf("got %v, want not_a_regular_file", err)
@@ -103,7 +103,7 @@ func TestValidateForWrite_RejectsDirSymlinkEscape(t *testing.T) {
 	}
 	// Try to write /<root>/escape/x — resolves parent to /<outside> →
 	// outside the allow_root.
-	_, err := ValidateForWrite(filepath.Join(link, "x"), []string{root})
+	_, err := ValidateForWrite(filepath.Join(link, "x"), CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "path_outside_roots" {
 		t.Errorf("got %v, want path_outside_roots", err)
@@ -123,7 +123,7 @@ func TestValidateForWrite_AcceptsDirSymlinkInsideRoot(t *testing.T) {
 	if err := os.Symlink(innerReal, innerLink); err != nil {
 		t.Fatal(err)
 	}
-	vp, err := ValidateForWrite(filepath.Join(innerLink, "newfile.bin"), []string{root})
+	vp, err := ValidateForWrite(filepath.Join(innerLink, "newfile.bin"), CanonAllowRoots([]string{root}))
 	if err != nil {
 		t.Fatalf("got %v, want OK", err)
 	}
@@ -135,7 +135,7 @@ func TestValidateForWrite_AcceptsDirSymlinkInsideRoot(t *testing.T) {
 // Push: parent dir missing → path_parent_missing (we don't auto-mkdir).
 func TestValidateForWrite_ParentMissing(t *testing.T) {
 	root := t.TempDir()
-	_, err := ValidateForWrite(filepath.Join(root, "no-such-dir", "file"), []string{root})
+	_, err := ValidateForWrite(filepath.Join(root, "no-such-dir", "file"), CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "path_parent_missing" {
 		t.Errorf("got %v, want path_parent_missing", err)
@@ -145,7 +145,7 @@ func TestValidateForWrite_ParentMissing(t *testing.T) {
 // Pull: source missing → path_not_found.
 func TestValidateForRead_NotFound(t *testing.T) {
 	root := t.TempDir()
-	_, err := ValidateForRead(filepath.Join(root, "no-such-file"), []string{root})
+	_, err := ValidateForRead(filepath.Join(root, "no-such-file"), CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "path_not_found" {
 		t.Errorf("got %v, want path_not_found", err)
@@ -159,14 +159,14 @@ func TestValidateForRead_RejectsDirectoryLeaf(t *testing.T) {
 	if err := os.Mkdir(d, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ValidateForRead(d, []string{root})
+	_, err := ValidateForRead(d, CanonAllowRoots([]string{root}))
 	var pve *PathValidationError
 	if !errors.As(err, &pve) || pve.Code != "not_a_regular_file" {
 		t.Errorf("got %v, want not_a_regular_file", err)
 	}
 }
 
-// canonicalAllowRoots: longest-prefix-wins ordering so /srv/local/alice
+// CanonAllowRoots: longest-prefix-wins ordering so /srv/local/alice
 // shadows /srv when both are listed.
 func TestCanonicalAllowRoots_LongestWins(t *testing.T) {
 	srv := t.TempDir()
@@ -174,7 +174,7 @@ func TestCanonicalAllowRoots_LongestWins(t *testing.T) {
 	if err := os.Mkdir(deeper, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	roots := canonicalAllowRoots([]string{srv, deeper})
+	roots := CanonAllowRoots([]string{srv, deeper})
 	if len(roots) != 2 {
 		t.Fatalf("want 2 roots, got %v", roots)
 	}
@@ -183,14 +183,14 @@ func TestCanonicalAllowRoots_LongestWins(t *testing.T) {
 	}
 }
 
-// canonicalAllowRoots silently drops non-existent + non-directory + relative.
+// CanonAllowRoots silently drops non-existent + non-directory + relative.
 func TestCanonicalAllowRoots_DropsBad(t *testing.T) {
 	root := t.TempDir()
 	regular := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(regular, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	roots := canonicalAllowRoots([]string{
+	roots := CanonAllowRoots([]string{
 		"", "relative", "/no/such/path",
 		regular, // file, not a dir
 		root,    // good
@@ -209,7 +209,7 @@ func TestWriteAtomic_DstExistsHonored(t *testing.T) {
 	if err := os.WriteFile(dst, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	vp, err := ValidateForWrite(dst, []string{root})
+	vp, err := ValidateForWrite(dst, CanonAllowRoots([]string{root}))
 	if err != nil {
 		t.Fatal(err)
 	}

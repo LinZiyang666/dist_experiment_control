@@ -186,6 +186,12 @@ type Agent struct {
 	// (the broker's watchdog catches it and writes audit failed).
 	pushCommitCache map[string]pushCommitEntry
 	pushCacheMu     sync.Mutex
+
+	// canonAllowRoots is the EvalSymlinks-resolved version of
+	// cfg.AllowRoots, computed once at New() and re-used on every
+	// push/pull. Audit shard P11 F3 — previously each handler
+	// re-canonicalized, costing O(allow_roots) syscalls per request.
+	canonAllowRoots []string
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -215,7 +221,11 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.RegisterRetryMax == 0 {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
-	a := &Agent{cfg: cfg, procs: map[string]*procRec{}}
+	a := &Agent{
+		cfg:             cfg,
+		procs:           map[string]*procRec{},
+		canonAllowRoots: CanonAllowRoots(cfg.AllowRoots),
+	}
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
 	}

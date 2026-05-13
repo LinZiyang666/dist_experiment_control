@@ -98,6 +98,19 @@ func SubjCtrlCaps(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.caps.req", SubjectPrefix, actor, sid)
 }
 
+// XferBucketName returns the per-transfer JetStream Object Store bucket
+// name "xfer-<sid>-<transfer_id>". The backing stream is "OBJ_<bucket>"
+// per nats.go convention. Used by ctl, broker, and agent.
+func XferBucketName(sid, transferID string) string {
+	return "xfer-" + sid + "-" + transferID
+}
+
+// XferObjectKey is the single object name inside every xfer bucket. The
+// design is one-object-per-bucket so a bucket name uniquely identifies
+// the transfer; we only need a stable key for nats.go's ObjectStore.Put
+// / .Get calls. file-transfer-plan v0.2.0.
+const XferObjectKey = "object"
+
 // ParseTransferFinalize extracts (actor, sid, transfer_id) from a
 // `tether.v1.ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req` subject.
 // Returns ok=false on layout mismatch.

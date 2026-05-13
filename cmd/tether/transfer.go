@@ -1,0 +1,691 @@
+// File transfer (P11) CLI: `tether push <local> <node>:<remote>` and
+// `tether pull <node>:<remote> <local>`. See file-transfer-plan v0.2.0.
+//
+// One file holds both verbs because they share the parser, the caps
+// probe, the tier chooser, and the SHA / write-atomic helpers — the
+// previous push.go / pull.go / transfer_shared.go split inflated file
+// count without separating concerns.
+
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/spf13/cobra"
+)
+
+func newPushCmd() *cobra.Command {
+	var (
+		natsURL string
+		home    string
+		force   bool
+		timeout time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "push <local-path> <node>:<remote-path>",
+		Short: "Upload a local file to a remote node",
+		Long: `tether push — upload a local file to a remote node.
+
+File size limits (file-transfer-plan v0.2.0):
+
+  - Up to 8 MiB        : tier A (inline over NATS, no JetStream needed).
+  - 8 MiB – 200 MiB    : tier B (JetStream Object Store; broker must
+                         have JetStream enabled).
+  - > 200 MiB          : refused; use ` + "`tether expose`" + ` + rsync.
+
+The remote path must be absolute and under one of the agent's
+file_transfer.allow_roots (configured in agent.yaml). Symlinks at
+the destination are refused; intermediate symlinked dirs are
+followed and must still resolve inside an allow_root.
+`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			localPath := args[0]
+			spec, err := parseRemoteSpec(args[1])
+			if err != nil {
+				return err
+			}
+			return runPush(cmd, home, natsURL, localPath, spec, force, timeout)
+		},
+	}
+	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite remote destination if it exists")
+	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
+		"upper bound on the whole transfer (tier A: ~30s; tier B: ~5min — keep some slack)")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		// First positional is the local path: shell file completion.
+		if len(args) == 0 {
+			return nil, cobra.ShellCompDirectiveDefault
+		}
+		// Second positional is the remote spec; pre-`:` we offer node
+		// completion. Post-`:` we have nothing helpful (the remote
+		// fs is opaque to the local CLI).
+		if len(args) == 1 {
+			return completePushTarget(c, home, natsURL, toComplete)
+		}
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	return cmd
+}
+
+// completePushTarget handles the `<node>:` completion. When `toComplete`
+// has no `:`, we suggest ONLINE nodes followed by `:` (so the user
+// types `gpu-01<TAB>` and gets `gpu-01:`). When it already contains
+// `:`, we return nothing — we don't have a remote-fs picker.
+func completePushTarget(c *cobra.Command, home, natsURL, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if i := indexByte(toComplete, ':'); i >= 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	cctx := cli.NewCompletionContext(home, natsURL, c.Flags().Changed("nats-url"))
+	t := cli.NewCompletionTransport(home, natsURL, c.Flags().Changed("nats-url"))
+	defer t.Close()
+	nodes, dir := cli.CompleteOnlineNodes(t, cctx, toComplete)
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n+":")
+	}
+	return out, dir | cobra.ShellCompDirectiveNoSpace
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// runPush implements the push flow:
+//
+//   1. Read+SHA the local file; bail on > 200 MiB.
+//   2. Caps probe; chooseTier.
+//   3. Tier A: PushPrepareReq{inline_data} → wait for resp; done.
+//   4. Tier B: ObjectStore.Put → push-commit.req → wait for resp.
+//      The agent's ev.transfer flow is what writes audit complete.
+func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpec, force bool, timeout time.Duration) error {
+	sid := cli.ReadCurrentSession(home)
+	if sid == "" {
+		return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+	}
+	natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
+
+	abs, err := filepath.Abs(localPath)
+	if err != nil {
+		return fmt.Errorf("resolve local path: %w", err)
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("local file: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("local file %s: not a regular file", abs)
+	}
+	if st.Size() > cliMaxBytes {
+		return fmt.Errorf("local file %s: size %d > %d (use `tether expose` + rsync)",
+			abs, st.Size(), cliMaxBytes)
+	}
+
+	id, err := cli.EnsureIdentity(home)
+	if err != nil {
+		return err
+	}
+	nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	if err != nil {
+		return connectError("push", natsURL, err)
+	}
+	defer nc.Close()
+
+	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
+	tier, _, err := chooseTier(st.Size(), caps)
+	if err != nil {
+		return err
+	}
+
+	transferID := newTransferID()
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(out, "tether push: %s -> %s:%s (tier=%s, %d bytes, transfer_id=%s)\n",
+		abs, spec.Node, spec.Path, tier, st.Size(), transferID)
+
+	if tier == "a" {
+		return pushTierA(cmd, nc, id.PublicKey, sid, spec, transferID, abs, force, timeout)
+	}
+	return pushTierB(cmd, nc, id.PublicKey, sid, spec, transferID, abs, st.Size(), force, timeout)
+}
+
+func pushTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remoteSpec,
+	transferID, abs string, force bool, timeout time.Duration) error {
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return fmt.Errorf("read local: %w", err)
+	}
+	sha := hexSHA256(data)
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: transferID, Path: spec.Path,
+		Size: int64(len(data)), SHA256: sha,
+		Force: force, Tier: "a", InlineData: data,
+	})
+	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy(sid, actor, spec.Node, "push"), body)
+	if err != nil {
+		return fmt.Errorf("push (tier A): request: %w", err)
+	}
+	var pr proto.PushPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		return fmt.Errorf("push (tier A): parse: %w", err)
+	}
+	if !pr.OK {
+		return fmt.Errorf("push (tier A) refused: code=%s %s", pr.Code, pr.Error)
+	}
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "tether push: OK (tier A)")
+	return nil
+}
+
+func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remoteSpec,
+	transferID, abs string, size int64, force bool, timeout time.Duration) error {
+	// Pre-compute sha over the file.
+	f, err := os.Open(abs)
+	if err != nil {
+		return fmt.Errorf("read local: %w", err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sha local: %w", err)
+	}
+	_ = f.Close()
+	sha := hex.EncodeToString(h.Sum(nil))
+
+	// Step 1: PushPrepareReq with Tier=b. Broker creates bucket and
+	// forwards; agent validates path + replies OK.
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: transferID, Path: spec.Path,
+		Size: size, SHA256: sha, Force: force, Tier: "b",
+	})
+	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy(sid, actor, spec.Node, "push"), body)
+	if err != nil {
+		return fmt.Errorf("push (tier B prepare): %w", err)
+	}
+	var pr proto.PushPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		return fmt.Errorf("push (tier B prepare): parse: %w", err)
+	}
+	if !pr.OK {
+		return fmt.Errorf("push (tier B) refused at prepare: code=%s %s", pr.Code, pr.Error)
+	}
+
+	// Step 2: ObjectStore.Put into bucket xfer-<sid>-<transferID>.
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return fmt.Errorf("push (tier B): jetstream new: %w", err)
+	}
+	bucket := proto.XferBucketName(sid, transferID)
+	putCtx, putCancel := context.WithTimeout(cmd.Context(), timeout)
+	defer putCancel()
+	store, err := js.ObjectStore(putCtx, bucket)
+	if err != nil {
+		return fmt.Errorf("push (tier B): bind bucket %s: %w", bucket, err)
+	}
+	uploadFile, err := os.Open(abs)
+	if err != nil {
+		return fmt.Errorf("push (tier B): reopen local: %w", err)
+	}
+	defer func() { _ = uploadFile.Close() }()
+	if _, err := store.Put(putCtx, jetstream.ObjectMeta{Name: proto.XferObjectKey}, uploadFile); err != nil {
+		return fmt.Errorf("push (tier B): Put: %w", err)
+	}
+
+	// Step 3: push-commit. Agent Gets, verifies, emits ev.transfer.
+	body, _ = json.Marshal(proto.TransferCommitReq{
+		TransferID: transferID, Bucket: bucket, ObjectKey: proto.XferObjectKey,
+	})
+	commitCtx, commitCancel := context.WithTimeout(cmd.Context(), timeout)
+	defer commitCancel()
+	resp, err = nc.RequestWithContext(commitCtx,
+		proto.SubjCmdBy(sid, actor, spec.Node, "push-commit"), body)
+	if err != nil {
+		return fmt.Errorf("push (tier B commit): %w", err)
+	}
+	var cr proto.TransferCommitResp
+	if err := json.Unmarshal(resp.Data, &cr); err != nil {
+		return fmt.Errorf("push (tier B commit): parse: %w", err)
+	}
+	if !cr.OK {
+		return fmt.Errorf("push (tier B) commit refused: code=%s %s", cr.Code, cr.Error)
+	}
+
+	// Wait for ev.transfer.<id>.{complete,failed}. We already have a
+	// member sub allow on ev.>; just subscribe + wait.
+	evSub, err := nc.SubscribeSync(proto.SubjEvTransfer(sid, spec.Node, transferID, "*"))
+	if err != nil {
+		// Subscribe wildcard not allowed by ACL? Fall back to two subs.
+		evSub = nil
+	}
+	if evSub != nil {
+		defer func() { _ = evSub.Unsubscribe() }()
+		waitCtx, waitCancel := context.WithTimeout(cmd.Context(), timeout)
+		defer waitCancel()
+		msg, err := evSub.NextMsgWithContext(waitCtx)
+		if err == nil {
+			var ev proto.TransferEvent
+			if json.Unmarshal(msg.Data, &ev) == nil {
+				if ev.Kind == "failed" {
+					return fmt.Errorf("push (tier B) failed: code=%s %s", ev.Code, ev.Error)
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"tether push: OK (tier B, %d bytes, %dms)\n", ev.Bytes, ev.DurationMs)
+				return nil
+			}
+		}
+	}
+	// Couldn't subscribe or no event arrived in time — report
+	// best-effort success since commit acked.
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "tether push: commit acked (no ev.transfer received within timeout)")
+	return nil
+}
+
+// ─── tether pull ──────────────────────────────────────────────────
+
+
+
+func newPullCmd() *cobra.Command {
+	var (
+		natsURL string
+		home    string
+		force   bool
+		timeout time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "pull <node>:<remote-path> <local-path>",
+		Short: "Download a file from a remote node",
+		Long: `tether pull — download a file from a remote node.
+
+Same tier rules as ` + "`tether push`" + ` (see ` + "`tether push --help`" + `).
+The remote path must be absolute and inside one of the agent's
+allow_roots; the local path may be relative.
+`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			spec, err := parseRemoteSpec(args[0])
+			if err != nil {
+				return err
+			}
+			localPath := args[1]
+			return runPull(cmd, home, natsURL, spec, localPath, force, timeout)
+		},
+	}
+	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite local destination if it exists")
+	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
+		"upper bound on the whole transfer")
+	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) == 0 {
+			return completePushTarget(c, home, natsURL, toComplete)
+		}
+		if len(args) == 1 {
+			return nil, cobra.ShellCompDirectiveDefault
+		}
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	return cmd
+}
+
+func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPath string, force bool, timeout time.Duration) error {
+	sid := cli.ReadCurrentSession(home)
+	if sid == "" {
+		return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+	}
+	natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
+
+	// Local-path safety: refuse non-absolute? No — relative is fine
+	// for pull; user is the one choosing where to write.
+	localAbs, err := filepath.Abs(localPath)
+	if err != nil {
+		return fmt.Errorf("resolve local path: %w", err)
+	}
+	if !force {
+		if _, err := os.Stat(localAbs); err == nil {
+			return fmt.Errorf("local path %s already exists; pass --force to overwrite", localAbs)
+		}
+	}
+
+	id, err := cli.EnsureIdentity(home)
+	if err != nil {
+		return err
+	}
+	nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	if err != nil {
+		return connectError("pull", natsURL, err)
+	}
+	defer nc.Close()
+
+	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
+	maxInline := int64(cliTierAMaxBytes)
+	if caps.MaxPayload > 0 {
+		half := caps.MaxPayload/2 - 1024
+		if half > 0 && half < maxInline {
+			maxInline = half
+		}
+	}
+
+	transferID := newTransferID()
+	startedAt := time.Now().UTC()
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"tether pull: %s:%s -> %s (transfer_id=%s)\n",
+		spec.Node, spec.Path, localAbs, transferID)
+
+	body, _ := json.Marshal(proto.PullPrepareReq{
+		TransferID: transferID, Path: spec.Path,
+		MaxInline: maxInline, Force: force,
+	})
+	prepCtx, prepCancel := context.WithTimeout(cmd.Context(), timeout)
+	defer prepCancel()
+	resp, err := nc.RequestWithContext(prepCtx,
+		proto.SubjCmdBy(sid, id.PublicKey, spec.Node, "pull"), body)
+	if err != nil {
+		return fmt.Errorf("pull prepare: %w", err)
+	}
+	var pr proto.PullPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		return fmt.Errorf("pull prepare: parse: %w", err)
+	}
+	if !pr.OK {
+		// Tell broker we failed so audit + bucket cleanup happens.
+		_ = sendFinalize(nc, id.PublicKey, sid, transferID, proto.TransferFinalize{
+			Kind: "failed", TransferID: transferID,
+			Code: pr.Code, Error: pr.Error,
+		}, 3*time.Second)
+		return fmt.Errorf("pull refused: code=%s %s", pr.Code, pr.Error)
+	}
+
+	if pr.Tier == "a" {
+		return finishPullTierA(cmd, nc, id.PublicKey, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
+	}
+	return finishPullTierB(cmd, nc, id.PublicKey, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
+}
+
+func finishPullTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
+	spec remoteSpec, transferID, localAbs string, startedAt time.Time,
+	pr proto.PullPrepareResp, force bool, timeout time.Duration) error {
+	if int64(len(pr.InlineData)) != pr.Size {
+		failAndFinalize(nc, actor, sid, transferID, "a", "size_mismatch",
+			fmt.Sprintf("inline_data len=%d vs size=%d", len(pr.InlineData), pr.Size), startedAt)
+		return fmt.Errorf("pull (tier A): size mismatch")
+	}
+	got := hexSHA256(pr.InlineData)
+	if got != pr.SHA256 {
+		failAndFinalize(nc, actor, sid, transferID, "a", "sha_mismatch",
+			fmt.Sprintf("want=%s got=%s", pr.SHA256, got), startedAt)
+		return fmt.Errorf("pull (tier A): sha mismatch")
+	}
+	if err := writeLocalAtomic(localAbs, pr.InlineData, force); err != nil {
+		failAndFinalize(nc, actor, sid, transferID, "a", "io_error", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier A) write local: %w", err)
+	}
+	_ = sendFinalize(nc, actor, sid, transferID, proto.TransferFinalize{
+		Kind: "complete", TransferID: transferID, Tier: "a",
+		Path: localAbs, Bytes: pr.Size,
+		DurationMs: time.Since(startedAt).Milliseconds(),
+	}, 5*time.Second)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"tether pull: OK (tier A, %d bytes, %dms)\n", pr.Size, time.Since(startedAt).Milliseconds())
+	return nil
+}
+
+func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
+	spec remoteSpec, transferID, localAbs string, startedAt time.Time,
+	pr proto.PullPrepareResp, force bool, timeout time.Duration) error {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		failAndFinalize(nc, actor, sid, transferID, "b", "jetstream_unavailable", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier B): jetstream new: %w", err)
+	}
+	getCtx, getCancel := context.WithTimeout(cmd.Context(), timeout)
+	defer getCancel()
+	store, err := js.ObjectStore(getCtx, pr.Bucket)
+	if err != nil {
+		failAndFinalize(nc, actor, sid, transferID, "b", "bucket_unknown", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier B): bind bucket: %w", err)
+	}
+	result, err := store.Get(getCtx, pr.ObjectKey)
+	if err != nil {
+		failAndFinalize(nc, actor, sid, transferID, "b", "object_get_failed", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier B): Get: %w", err)
+	}
+	defer func() { _ = result.Close() }()
+
+	// Stream into a tmp sibling of localAbs; sha as we go.
+	if !force {
+		if _, err := os.Stat(localAbs); err == nil {
+			failAndFinalize(nc, actor, sid, transferID, "b", "dst_exists",
+				fmt.Sprintf("local file %s already exists", localAbs), startedAt)
+			return fmt.Errorf("local file %s already exists; pass --force", localAbs)
+		}
+	}
+	tmp := localAbs + ".tmp." + transferID
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		failAndFinalize(nc, actor, sid, transferID, "b", "io_error", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier B): open local tmp: %w", err)
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(f, h), result)
+	if copyErr == nil {
+		copyErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		errMsg := firstErr(copyErr, closeErr).Error()
+		failAndFinalize(nc, actor, sid, transferID, "b", "io_error", errMsg, startedAt)
+		return fmt.Errorf("pull (tier B): write local: %s", errMsg)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != pr.SHA256 {
+		_ = os.Remove(tmp)
+		failAndFinalize(nc, actor, sid, transferID, "b", "sha_mismatch",
+			fmt.Sprintf("want=%s got=%s", pr.SHA256, got), startedAt)
+		return fmt.Errorf("pull (tier B): sha mismatch want=%s got=%s", pr.SHA256, got)
+	}
+	if err := os.Rename(tmp, localAbs); err != nil {
+		_ = os.Remove(tmp)
+		failAndFinalize(nc, actor, sid, transferID, "b", "io_error", err.Error(), startedAt)
+		return fmt.Errorf("pull (tier B): rename local: %w", err)
+	}
+	_ = sendFinalize(nc, actor, sid, transferID, proto.TransferFinalize{
+		Kind: "complete", TransferID: transferID, Tier: "b",
+		Bucket: pr.Bucket, Path: localAbs, Bytes: n,
+		DurationMs: time.Since(startedAt).Milliseconds(),
+	}, 5*time.Second)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"tether pull: OK (tier B, %d bytes, %dms)\n", n, time.Since(startedAt).Milliseconds())
+	return nil
+}
+
+// failAndFinalize emits a tier-aware finalize.req{kind:failed} so the
+// broker writes audit failed + reaps the bucket. Best-effort; we
+// don't return an error from the finalize itself because the original
+// caller already has one.
+func failAndFinalize(nc *nats.Conn, actor, sid, transferID, tier, code, errMsg string, startedAt time.Time) {
+	_ = sendFinalize(nc, actor, sid, transferID, proto.TransferFinalize{
+		Kind: "failed", TransferID: transferID, Tier: tier,
+		Code: code, Error: errMsg,
+		DurationMs: time.Since(startedAt).Milliseconds(),
+	}, 3*time.Second)
+}
+
+func sendFinalize(nc *nats.Conn, actor, sid, transferID string, fin proto.TransferFinalize, timeout time.Duration) error {
+	body, _ := json.Marshal(fin)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	subj := proto.SubjCtrlTransferFinalize(actor, sid, transferID)
+	resp, err := nc.RequestWithContext(ctx, subj, body)
+	if err != nil {
+		return err
+	}
+	var fr proto.TransferFinalizeResp
+	if json.Unmarshal(resp.Data, &fr) == nil && !fr.OK {
+		return fmt.Errorf("finalize refused: code=%s %s", fr.Code, fr.Error)
+	}
+	return nil
+}
+
+func writeLocalAtomic(localAbs string, data []byte, force bool) error {
+	if !force {
+		if _, err := os.Stat(localAbs); err == nil {
+			return fmt.Errorf("local file %s already exists", localAbs)
+		}
+	}
+	tmp := localAbs + ".tmp.pull"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, localAbs); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func firstErr(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// ─── shared helpers (parser, caps probe, tier chooser, hashes) ────
+
+
+
+// Tier-A inline ceiling (mirrors broker + agent ceilings). Files
+// <= this go inline; > this require JetStream tier B.
+const cliTierAMaxBytes = 8 * 1024 * 1024
+
+// Hard upper bound. Past this the user is expected to use
+// `tether expose` + rsync (file-transfer-plan §Goals).
+const cliMaxBytes = 200 * 1024 * 1024
+
+// remoteSpec is one parsed `<node>:<remote-path>` argument.
+type remoteSpec struct {
+	Node string
+	Path string
+}
+
+// parseRemoteSpec splits "<node>:<path>" into its parts. The leading
+// segment up to the FIRST `:` is the node id; everything after is
+// the path. We reject empty node, empty path, and a missing colon —
+// `tether push foo` (no colon) is almost certainly user error and the
+// helpful message is better than guessing.
+func parseRemoteSpec(s string) (remoteSpec, error) {
+	idx := strings.IndexByte(s, ':')
+	if idx <= 0 {
+		return remoteSpec{}, fmt.Errorf("missing 'node:' prefix in %q (expected <node>:<path>)", s)
+	}
+	nid := s[:idx]
+	path := s[idx+1:]
+	if path == "" {
+		return remoteSpec{}, fmt.Errorf("empty remote path in %q", s)
+	}
+	if err := proto.ValidateNID(nid); err != nil {
+		return remoteSpec{}, fmt.Errorf("invalid node id %q: %w", nid, err)
+	}
+	return remoteSpec{Node: nid, Path: path}, nil
+}
+
+// probeCaps issues `ctrl.by.<actor>.s.<sid>.caps.req` and returns the
+// broker's reported capabilities. Used by chooseTier so we don't shoot
+// a tier-B request at a broker without JetStream, or a tier-A request
+// that exceeds the server max_payload. timeout is small (caps is a
+// pre-flight; failing the probe simply means we fall back to
+// conservative defaults).
+func probeCaps(nc *nats.Conn, actor, sid string, timeout time.Duration) (proto.CapsResp, error) {
+	body, _ := json.Marshal(proto.CapsReq{})
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	subj := proto.SubjCtrlCaps(actor, sid)
+	msg, err := nc.RequestWithContext(ctx, subj, body)
+	if err != nil {
+		return proto.CapsResp{}, err
+	}
+	var resp proto.CapsResp
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return proto.CapsResp{}, fmt.Errorf("caps: parse: %w", err)
+	}
+	return resp, nil
+}
+
+// chooseTier decides tier A vs B for a given file size + caps probe
+// result. The plan's rules (file-transfer-plan §Tier selection):
+//
+//   - size > 200 MiB: refused outright before we get here.
+//   - size > 8 MiB: tier B.
+//   - size > caps.MaxPayload * 0.5: tier B (give NATS some headroom
+//     for framing + headers).
+//   - else: tier A.
+//
+// If caps.JetStreamReady=false, tier B isn't an option:
+//   - size > 8 MiB: refuse with `jetstream_unavailable` so the user
+//     gets a clean error instead of a cryptic mid-Put failure.
+//
+// Returns ("a"|"b", maxInline, err). maxInline is what we pass into
+// PullPrepareReq.MaxInline for symmetric agent-side decision.
+func chooseTier(size int64, caps proto.CapsResp) (string, int64, error) {
+	if size > cliMaxBytes {
+		return "", 0, fmt.Errorf("too_large: file size %d > %d (use `tether expose` + rsync)", size, cliMaxBytes)
+	}
+	maxInline := int64(cliTierAMaxBytes)
+	if caps.MaxPayload > 0 {
+		// Leave 1 KiB headroom for proto framing + base64.
+		half := caps.MaxPayload/2 - 1024
+		if half > 0 && half < maxInline {
+			maxInline = half
+		}
+	}
+	if size <= maxInline {
+		return "a", maxInline, nil
+	}
+	if !caps.JetStreamReady {
+		return "", maxInline, fmt.Errorf("jetstream_unavailable: broker has no JetStream so tier-B (>%d bytes) cannot be served; either bump nats max_payload >= %d or use `tether expose` + rsync",
+			maxInline, size*2+2048)
+	}
+	return "b", maxInline, nil
+}
+
+// newTransferID makes a 16-hex random id. Not a ULID (we don't need
+// time ordering for transfers) but identical shape for visual parity
+// with the other audit columns.
+func newTransferID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// hexSHA256 wraps the canonical sha256.Sum256+hex.EncodeToString pair.
+func hexSHA256(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
