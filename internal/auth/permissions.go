@@ -81,6 +81,7 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			// support — see proto.XferBucketName comment).
 			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
 			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
+			"$JS.API.DIRECT.GET.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
@@ -129,6 +130,7 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			// bucket; same shape as the activated-member template.
 			"$JS.API.STREAM.INFO.OBJ_xfer-" + sid,
 			"$JS.API.STREAM.MSG.GET.OBJ_xfer-" + sid,
+			"$JS.API.DIRECT.GET.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid,
 			"$JS.API.CONSUMER.CREATE.OBJ_xfer-" + sid + ".>",
 			"$JS.API.CONSUMER.INFO.OBJ_xfer-" + sid + ".>",
