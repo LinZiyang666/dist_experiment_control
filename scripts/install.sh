@@ -46,7 +46,7 @@ usage() {
 tether install.sh — install (do NOT start) one tether role.
 
 Required:
-  --role {agent,ctl,broker}
+  --role {agent,ctl,broker}    (on macOS: only ctl is supported)
 
 Agent-only:
   --broker URL    (e.g. wss://broker.example.com:443)
@@ -249,6 +249,11 @@ install_agent() {
     SESSION_DIR="$HOME/.tether/agent/$SESSION"
 
     detect_os_arch
+    # macOS support is intentionally limited to --role ctl. agent needs
+    # systemd user units + setsid for the documented start path, and we
+    # don't ship a launchd equivalent. Fail fast instead of laying down
+    # files that have no working start command on this OS.
+    [ "$OS" = "darwin" ] && die "--role agent is not supported on macOS (only --role ctl is)"
     log "tether install (role=agent, version=$VERSION, os=$OS, arch=$ARCH)"
 
     run "mkdir -p '$BIN_DIR'"
@@ -380,6 +385,10 @@ install_broker() {
     [ -n "$ACME_EMAIL" ] || die "--acme-email required for --role broker"
 
     detect_os_arch
+    # broker is Linux-only: useradd, systemd units, and /etc layout below
+    # all assume a Linux host (architecture A.3 / K). docs/usage.md §2.3
+    # also positions broker as the public-internet node.
+    [ "$OS" = "darwin" ] && die "--role broker is not supported on macOS (only --role ctl is); broker requires a Linux host"
     log "tether install (role=broker, version=$VERSION, os=$OS, arch=$ARCH, domain=$DOMAIN)"
 
     BIN_DIR="${PREFIX:-/usr/local/bin}"
