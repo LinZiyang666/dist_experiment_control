@@ -30,6 +30,20 @@ func runtimeCaller() (uintptr, string, int, bool) {
 	return runtime.Caller(1)
 }
 
+// skipIfAgentOrBrokerUnsupported short-circuits tests that exercise
+// `install.sh --role agent` or `--role broker` on hosts where the
+// script intentionally refuses to install them. install.sh only
+// supports --role ctl on darwin (the agent/broker code paths assume
+// systemd / useradd / launchd-less startup). Without this guard the
+// agent + broker test cases would fail with "not supported on macOS"
+// on a developer laptop while still passing in Linux CI.
+func skipIfAgentOrBrokerUnsupported(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("install.sh agent/broker roles are rejected on macOS by design; only --role ctl is supported there")
+	}
+}
+
 // runInstall execs the install.sh under the given fake HOME. extra
 // args go on the command line. Returns combined output for log
 // inspection; non-zero exit returns t.Fatal.
@@ -75,6 +89,7 @@ func TestInstallShBareInvocationDefaultsToCtl(t *testing.T) {
 // install.sh never starts anything; here we verify it can also
 // "do nothing" cleanly.
 func TestInstallShAgentDryRunNoFiles(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	home := t.TempDir()
 	out := runInstall(t, home,
 		"--role", "agent",
@@ -107,6 +122,7 @@ func TestInstallShAgentDryRunNoFiles(t *testing.T) {
 // hardens directory perms. Verifies the per-session layout from
 // architecture K.1.
 func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	home := t.TempDir()
 	out := runInstall(t, home,
 		"--role", "agent",
@@ -160,6 +176,7 @@ func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
 // shape. A regression here would force operators to hand-edit
 // tunnel_addr after install.sh runs.
 func TestInstallShTunnelAddrDerivation(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	cases := []struct {
 		name      string
 		brokerURL string
@@ -235,6 +252,7 @@ func TestInstallShCtlDryRun(t *testing.T) {
 // root for useradd / /etc / /var; in dry-run we still verify the
 // argument validation runs cleanly without trying to su.
 func TestInstallShBrokerDryRun(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	home := t.TempDir()
 	out := runInstall(t, home,
 		"--role", "broker",
@@ -270,6 +288,7 @@ func TestInstallShUnknownRoleRejected(t *testing.T) {
 // without --dry-run, install.sh MUST not invoke `tether` itself
 // (architecture K.0 §2 + K.5 强制语义).
 func TestInstallShDoesNotForkTether(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	home := t.TempDir()
 	// Create a fake tether binary so install.sh's `tether version`
 	// path (if any future regression added one) would actually do

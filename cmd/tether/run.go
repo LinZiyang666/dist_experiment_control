@@ -180,6 +180,26 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 			ctxRun, cancelRun := context.WithCancel(cmd.Context())
 			defer cancelRun()
 
+			// lifecycleCh: agent's RunChunk events (started/exit/failed)
+			// land here from the inbox-drainer below; the watchdog also
+			// posts a synthetic `failed` when the heartbeat goes dark.
+			// Declared up here so the watchdog can be started before the
+			// inbox-drainer (no causal dependency; just ordering).
+			lifecycleCh := make(chan proto.RunChunk, 4)
+
+			// Agent-liveness watchdog: without this, an agent that
+			// goes silent mid-run (machine offline / network partition)
+			// leaves the main select loop below waiting forever for an
+			// `exit` chunk that never comes, with the local terminal
+			// stuck in raw mode. Subscribe to the agent's existing
+			// per-node heartbeat (agent publishes every ~5s; see
+			// internal/agent/agent.go:heartbeatLoop) and arm a timer
+			// AFTER the first HB arrives. The arm-after-first delay
+			// degrades gracefully on a broker whose JWT perms don't yet
+			// grant heartbeat-sub to ctl (older release) — we just stay
+			// unarmed and behave as before, no false positives.
+			startRunWatchdog(ctxRun, nc, sid, nid, lifecycleCh)
+
 			// stdin → pty.<pid>.in
 			if isTTY {
 				go pumpStdinToBus(ctxRun, nc, proto.SubjPtyIn(sid, pid), os.Stdin)
@@ -212,7 +232,6 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 
 			// Foreground: drain .out → stdout AND wait for exit on the inbox.
 			out := cmd.OutOrStdout()
-			lifecycleCh := make(chan proto.RunChunk, 4)
 			go func() {
 				for {
 					m, err := sub.NextMsgWithContext(ctxRun)
@@ -334,6 +353,97 @@ func pumpWinchToBus(ctx context.Context, nc *nats.Conn, subj string, ch <-chan o
 			_ = nc.Publish(subj, body)
 		}
 	}
+}
+
+// runWatchdogTimeout returns the no-heartbeat threshold for the run
+// watchdog. Default 15s = 3 × agent's HeartbeatInterval (5s) so a
+// single missed beat doesn't trip; override via env for flaky links
+// (TETHER_RUN_LIVENESS_TIMEOUT=30s) or kill-switch (=0).
+func runWatchdogTimeout() time.Duration {
+	const defaultTimeout = 15 * time.Second
+	v := os.Getenv("TETHER_RUN_LIVENESS_TIMEOUT")
+	if v == "" {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return defaultTimeout
+	}
+	return d
+}
+
+// startRunWatchdog wires up the heartbeat-based liveness check for an
+// in-progress `tether run`. Behavior:
+//
+//   - Subscribe to ctrl.s.<sid>.node.<nid>.heartbeat. If the subscribe
+//     itself errors (no JWT perm on a stale broker, transport down),
+//     log a one-line warning and return — never wedge the run because
+//     the watchdog couldn't arm.
+//   - The watchdog ARMS only after the first heartbeat is observed.
+//     This is the graceful-degradation hinge: if no HB ever arrives
+//     (old broker, weird auth, dev mode without auth_callout) we
+//     simply behave like before this feature existed.
+//   - Once armed, missing a heartbeat for runWatchdogTimeout pushes a
+//     synthetic `failed` RunChunk into lifecycleCh, which the main
+//     select loop already knows how to handle (drain → restore →
+//     return). No new exit path needed.
+//   - Timeout of 0 disables the watchdog entirely (TETHER_RUN_LIVENESS_TIMEOUT=0).
+func startRunWatchdog(ctx context.Context, nc *nats.Conn, sid, nid string, lifecycleCh chan<- proto.RunChunk) {
+	timeout := runWatchdogTimeout()
+	if timeout == 0 {
+		return
+	}
+	hbCh := make(chan struct{}, 8)
+	sub, err := nc.Subscribe(proto.SubjNodeHeartbeat(sid, nid), func(m *nats.Msg) {
+		select {
+		case hbCh <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: run liveness watchdog disabled: %v\n", err)
+		return
+	}
+	go func() {
+		defer func() { _ = sub.Unsubscribe() }()
+		// Wait for first HB before arming. If ctx cancels (clean
+		// exit / signal) before any HB arrives, just leave silently.
+		select {
+		case <-hbCh:
+		case <-ctx.Done():
+			return
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-hbCh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			case <-timer.C:
+				// Non-blocking send: lifecycleCh has buffer 4 and the
+				// main loop is the only reader. A buffer-full case
+				// here would mean the main loop has already received
+				// another terminal event (exit / failed) and is about
+				// to return — drop the synthetic failed in that case.
+				select {
+				case lifecycleCh <- proto.RunChunk{
+					Kind:   "failed",
+					Reason: fmt.Sprintf("agent unreachable: no heartbeat for %s", timeout),
+				}:
+				default:
+				}
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 func sendKill(nc *nats.Conn, sid, actor, nid, pid string, sig int) error {

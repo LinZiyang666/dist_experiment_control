@@ -98,6 +98,12 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".audit.>",
 			subjectPrefix + ".s." + sid + ".pty.*.out",
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
+			// Node heartbeat — read-only liveness signal used by
+			// `tether run` to detect agent disappearance during an
+			// interactive PTY (otherwise raw mode + no exit chunk
+			// = terminal wedged forever). Wildcard nid because a
+			// ctl session may run against multiple nodes.
+			subjectPrefix + ".ctrl.s." + sid + ".node.*.heartbeat",
 			subjectPrefix + ".sys.events",
 			// Object-store data subjects: ctl Get reads from these.
 			"$O.xfer-" + sid + ".M.>",

@@ -15,6 +15,11 @@ project_name: tether
 before:
   hooks:
     - go mod tidy
+    # Pre-generate zsh completion once and ship it in every tarball
+    # under completions/_tether. install.sh extracts it and drops into
+    # an fpath dir; doing it here keeps install.sh from invoking the
+    # tether binary (K.0 §2 / test/p10/install_sh_test.go forbids that).
+    - sh -c 'mkdir -p dist/completions && go run ./cmd/tether completion zsh > dist/completions/_tether'
 
 builds:
   - id: tether
@@ -43,6 +48,8 @@ archives:
     files:
       - LICENSE
       - README.md
+      - src: dist/completions/_tether
+        dst: completions/_tether
 
 # install.sh ships alongside the per-platform tarballs as an
 # "extra_file". Operators curl install.sh and pass the tarball URL
