@@ -19,7 +19,12 @@ before:
     # under completions/_tether. install.sh extracts it and drops into
     # an fpath dir; doing it here keeps install.sh from invoking the
     # tether binary (K.0 §2 / test/p10/install_sh_test.go forbids that).
-    - sh -c 'mkdir -p dist/completions && go run ./cmd/tether completion zsh > dist/completions/_tether'
+    #
+    # Generated into ./completions/ (not dist/) — goreleaser's
+    # "ensuring distribution directory" step refuses to start if dist
+    # is non-empty, so before-hooks must write somewhere else. The
+    # output dir is .gitignore'd.
+    - sh -c 'mkdir -p completions && go run ./cmd/tether completion zsh > completions/_tether'
 
 builds:
   - id: tether
@@ -48,7 +53,7 @@ archives:
     files:
       - LICENSE
       - README.md
-      - src: dist/completions/_tether
+      - src: completions/_tether
         dst: completions/_tether
 
 # install.sh ships alongside the per-platform tarballs as an
