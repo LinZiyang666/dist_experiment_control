@@ -77,6 +77,22 @@ func newServeCmd() *cobra.Command {
 				return fmt.Errorf("broker.yaml frp.port_range: %w", err)
 			}
 
+			// proc_retention / proc_gc_interval — yaml-only knobs.
+			// Empty values stay 0 so broker.New applies its
+			// built-in defaults (1h / 5m). Parsing happens here,
+			// BEFORE storage.Open, so a misconfigured value
+			// (e.g. `proc_retention: -1h`) fails the launch
+			// instead of leaving behind a half-migrated tether.db
+			// on disk.
+			procRetention, err := fileCfg.ProcRetentionDuration()
+			if err != nil {
+				return err
+			}
+			procGCInterval, err := fileCfg.ProcGCIntervalDuration()
+			if err != nil {
+				return err
+			}
+
 			db, err := storage.Open(dbPath)
 			if err != nil {
 				return err
@@ -111,6 +127,8 @@ func newServeCmd() *cobra.Command {
 				PortBandLow:         bandLow,
 				PortBandHigh:        bandHigh,
 				UpgradeURLAllowlist: allow,
+				ProcRetention:       procRetention,
+				ProcGCInterval:      procGCInterval,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied

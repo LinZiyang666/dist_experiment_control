@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"text/tabwriter"
 	"time"
 
@@ -12,6 +14,25 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
+
+// psRequestTimeout is the wall-clock budget for one `tether ps` RPC.
+// Default 15 s — long enough that a momentarily-busy broker (large
+// SQLite scan after `tether ps -a` on a populous session) gets a
+// chance to reply, short enough that an operator never sits there
+// wondering whether the command hung. Override via TETHER_PS_TIMEOUT
+// (Go time.Duration syntax — "200ms", "5s") for diagnostics or fast
+// behavioral tests; invalid values are ignored and the default
+// stands.
+const defaultPsRequestTimeout = 15 * time.Second
+
+func psRequestTimeout() time.Duration {
+	if s := os.Getenv("TETHER_PS_TIMEOUT"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultPsRequestTimeout
+}
 
 func newPsCmd() *cobra.Command {
 	var (
@@ -23,9 +44,10 @@ func newPsCmd() *cobra.Command {
 		Use:   "ps",
 		Short: "List managed processes in the active session",
 		Long: `tether ps — list processes AND exposed ports in the active session
-(TETHER_SESSION env or current_session file). RUNNING-only by default;
-pass -a to also show EXITED processes. Architecture F.8 — unified
-view.`,
+(TETHER_SESSION env or current_session file). Default view shows active
+processes — both RUNNING (live) and LOST (RUNNING row whose owning
+node is OFFLINE, derived at read time); pass -a to also include
+EXITED processes. Architecture F.8 — unified view.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sid := cli.ReadCurrentSession(home)
@@ -43,12 +65,36 @@ view.`,
 			}
 			defer nc.Close()
 
-			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
+			body, err := json.Marshal(proto.PsReq{IncludeExited: showAll})
+			if err != nil {
+				return fmt.Errorf("ps: marshal req: %w", err)
+			}
+			timeout := psRequestTimeout()
+			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
 			msg, err := nc.RequestWithContext(ctx,
-				proto.SubjCtrlPs(id.PublicKey, sid), []byte("{}"))
+				proto.SubjCtrlPs(id.PublicKey, sid), body)
 			if err != nil {
-				return fmt.Errorf("ps: request: %w (broker unreachable on NATS)", err)
+				// Three distinct diagnostics: no-responder (broker
+				// down / sub missing — NATS replies immediately),
+				// timeout (broker alive but slow — deadline fired),
+				// other (permission, conn closed, …). A blanket
+				// "timed out" wrap misdirects operators on the
+				// no-responder case.
+				if errors.Is(err, nats.ErrNoResponders) {
+					return fmt.Errorf("ps: no responders for %s: %w "+
+						"(broker is not running, or its subscription "+
+						"to ctrl.by.<actor>.s.<sid>.ps.req is gone — "+
+						"check `tether serve` logs)",
+						proto.SubjCtrlPs(id.PublicKey, sid), err)
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("ps: request timed out after %s: %w "+
+						"(broker is reachable for other commands; the "+
+						"processes table may be unusually large — "+
+						"retry, or contact your operator)", timeout, err)
+				}
+				return fmt.Errorf("ps: request failed: %w", err)
 			}
 			var resp proto.PsResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
@@ -66,7 +112,10 @@ view.`,
 			_, _ = fmt.Fprintln(tw, "  PID\tNODE\tSTATE\tEXIT\tSTARTED\tCMD")
 			anyProc := false
 			for _, p := range resp.Processes {
-				if p.Status != "RUNNING" && !showAll {
+				// Default view shows active processes — both
+				// RUNNING (storage rows) and LOST (broker-derived
+				// from RUNNING + OFFLINE node). `-a` adds EXITED.
+				if !showAll && p.Status != "RUNNING" && p.Status != "LOST" {
 					continue
 				}
 				anyProc = true
@@ -107,7 +156,8 @@ view.`,
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
-	cmd.Flags().BoolVarP(&showAll, "all", "a", false, "include EXITED processes (default: only RUNNING)")
+	cmd.Flags().BoolVarP(&showAll, "all", "a", false,
+		"include EXITED processes (default: active only — RUNNING + LOST)")
 	return cmd
 }
 

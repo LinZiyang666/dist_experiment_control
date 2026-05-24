@@ -283,8 +283,11 @@ func TestPsListsExitedProcess(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Now ask via the ps subject and confirm it appears.
-	body, _ := json.Marshal(proto.PsReq{})
+	// Now ask via the ps subject and confirm it appears. The new
+	// default `PsReq{}` filters to active processes only; this test
+	// expects to see an EXITED row, so it sends IncludeExited=true
+	// (the `-a` semantic).
+	body, _ := json.Marshal(proto.PsReq{IncludeExited: true})
 	msg, err := nc.Request(proto.SubjCtrlPs(pub, "lab"), body, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)

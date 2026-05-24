@@ -291,3 +291,163 @@ func waitNATSReady(t *testing.T, url string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// ----------------------------------------------------------------------
+// ps-retention-plan §B — periodic GC ticker.
+// ----------------------------------------------------------------------
+
+// insertExitedRow / insertRunningRow are direct-SQL inserts that bypass
+// the proc.Insert FK-checking path (the broker_test.go fixtures don't
+// always seed a matching node row). They mimic what tests in §A use.
+func insertExitedRow(t *testing.T, db *sql.DB, pid string, endedAt time.Time) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO sessions(sid, name, owner_pubkey_fp, pin_hash)
+		 VALUES ('lab','lab','SHA256:o','ph')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO nodes(sid, nid, status) VALUES ('lab','lab-1','ONLINE')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO processes(pid, sid, nid, argv, started_at, ended_at, status, started_by_fp)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		pid, "lab", "lab-1", `["x"]`,
+		endedAt.Add(-time.Second), endedAt, "EXITED", "SHA256:u",
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertRunningRow(t *testing.T, db *sql.DB, pid string) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO sessions(sid, name, owner_pubkey_fp, pin_hash)
+		 VALUES ('lab','lab','SHA256:o','ph')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO nodes(sid, nid, status) VALUES ('lab','lab-1','ONLINE')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp)
+		 VALUES (?,?,?,?,?,?,?)`,
+		pid, "lab", "lab-1", `["x"]`, time.Now(), "RUNNING", "SHA256:u",
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// B1 — TestProcGCTicker_RemovesAgedExited: the periodic GC sweep
+// deletes EXITED rows past cutoff and leaves RUNNING rows alone.
+func TestProcGCTicker_RemovesAgedExited(t *testing.T) {
+	natsURL := startNATS(t)
+	db := openDB(t)
+
+	// Seed: 1 EXITED with ended_at = 1s ago, 1 RUNNING.
+	insertExitedRow(t, db, "old", time.Now().Add(-time.Second))
+	insertRunningRow(t, db, "alive")
+
+	br, err := New(Config{
+		NATSURL:           natsURL,
+		DB:                db,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ReconcileInterval: time.Hour, // silence reconcile in this test
+		ProcRetention:     50 * time.Millisecond,
+		ProcGCInterval:    30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- br.Run(ctx) }()
+
+	// Wait for at least 3 GC ticks (~90ms); 200ms is generous.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var c int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM processes WHERE status='EXITED'`).Scan(&c)
+		if c == 0 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	var c int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM processes WHERE status='EXITED'`).Scan(&c)
+	if c != 0 {
+		t.Errorf("EXITED count after GC: want 0 got %d", c)
+	}
+	var r int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM processes WHERE status='RUNNING'`).Scan(&r)
+	if r != 1 {
+		t.Errorf("RUNNING count after GC: want 1 got %d", r)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && err != context.Canceled {
+			t.Errorf("Run() returned %v, want context.Canceled or nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after ctx cancel")
+	}
+}
+
+// B2 — defaults from broker.New are applied when Config leaves them zero.
+func TestProcGCTicker_DefaultsApplied(t *testing.T) {
+	db := openDB(t)
+	br, err := New(Config{
+		NATSURL: "nats://127.0.0.1:4222",
+		DB:      db,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if br.cfg.ProcRetention != time.Hour {
+		t.Errorf("ProcRetention default: want 1h got %v", br.cfg.ProcRetention)
+	}
+	if br.cfg.ProcGCInterval != 5*time.Minute {
+		t.Errorf("ProcGCInterval default: want 5m got %v", br.cfg.ProcGCInterval)
+	}
+}
+
+// B3 — broker Run() returns when ctx is canceled; GC ticker stops cleanly.
+func TestProcGCTicker_ShutdownClean(t *testing.T) {
+	natsURL := startNATS(t)
+	db := openDB(t)
+
+	br, err := New(Config{
+		NATSURL:           natsURL,
+		DB:                db,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ReconcileInterval: time.Hour,
+		ProcRetention:     time.Hour,
+		ProcGCInterval:    50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- br.Run(ctx) }()
+
+	time.Sleep(120 * time.Millisecond) // let at least one tick fire
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && err != context.Canceled {
+			t.Errorf("Run() returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s of ctx cancel")
+	}
+}

@@ -235,6 +235,9 @@ ctl 几乎不需要常驻配置；活动会话用 `~/.tether/current_session` �
 环境变量：
 - `TETHER_SESSION` — 临时覆盖活动会话（优先级高于 `current_session` 文件）
 - `TETHER_HOME`    — 覆盖 `~/.tether`（用于多账号隔离 / 测试）
+- `TETHER_NATS_URL` — 覆盖 broker URL（优先级：显式 `--nats-url` / `--broker` flag > 此 env > `~/.tether/broker_url` > cobra 默认）
+- `TETHER_RUN_READY_TIMEOUT` — `tether run` 等待 agent PTY ready 的超时，默认 `20s`（需 ≥ agent attach deadline 15s + 网络 RTT）
+- `TETHER_RUN_LIVENESS_TIMEOUT` — `tether run` 心跳看门狗超时，默认 `15s`（= 3 × 心跳间隔 5s）；设为 `0` 关闭看门狗
 - `TETHER_DEV_NO_AUTH=1` — **仅本地开发**：跳过 nkey 生成与签名，匿名连接
 
 ### 3.2 `~/.tether/agent/<sid>/agent.yaml`（agent）
@@ -485,6 +488,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤2 GiB） |
 | `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤2 GiB） |
 | `tether history [-n N] [--kind K] [-f]` | ctl   | 审计历史回放（含 `--kind transfer`） |
+| `tether node ls [-a]`                  | ctl    | 列 session 内全部 agent（含 OFFLINE / STALE） |
 | `tether node upgrade <nid>`            | ctl    | 升级单台 agent（owner） |
 | `tether node upgrade --all`            | ctl    | 升级 session 内所有 ONLINE agent |
 | `tether admin sessions`                | broker 本机 | 列所有 session |
@@ -650,6 +654,20 @@ PIN 仅在**首次加入**时使用 —— broker 会把 PIN ↔ nkey 公钥的�
 `login -s` 会真实地走一次 NATS CONNECT（auth_callout 验证），只有连接成功才会
 写 `~/.tether/current_session`；失败时不留痕。
 
+flag（`login` 专属）：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--nats-url`    | `nats://127.0.0.1:4222` | NATS broker URL |
+| `--broker`      | `nats://127.0.0.1:4222` | `--nats-url` 的别名（与 `install.sh --broker` 拼写一致；两者共享同一变量，写任一都生效） |
+| `--session, -s` | (空)                  | 要激活的 session id |
+| `--pin`         | (空)                  | 首次加入时的一次性 PIN |
+| `--home`        | `~/.tether`           | tether 家目录 |
+
+`login` 显式给 `--nats-url` 或 `--broker` 之一时，broker URL 会被持久化到
+`~/.tether/broker_url`，之后所有 ctl 子命令默认读它（见 §3.1
+`TETHER_NATS_URL` 的优先级链）。
+
 ### 5.5 `tether session`
 
 **这一组命令是什么**：管理"会话"这个核心隔离单位。一个 session 是
@@ -706,9 +724,15 @@ reconcile 保证 agent 重连后状态自愈。`ps` 是 read-only 的，不会�
 agent 上的任何动作。
 
 ```
-tether ps        # 默认仅 RUNNING 进程 + ALLOCATED 端口
+tether ps        # 默认：活跃进程（RUNNING + LOST）+ ALLOCATED 端口
 tether ps -a     # 含 EXITED 进程 + RELEASED 端口
 ```
+
+LOST 是 read-derived 状态——broker 的 SQLite 行还停在 RUNNING，
+但所属 node 已被 reconcile 转成 OFFLINE。`tether ps` 在响应阶段
+合成 LOST 标签，让运维一眼能看出"这个进程还没确认结束、但承载它
+的 agent 跟丢了"。当 agent 重新 register 时，G.1 reconcile 会把
+对应行收敛到 EXITED(rc=-1, missed-exit) 或重新接受 RUNNING。
 
 输出两节：
 
@@ -749,6 +773,17 @@ PORTS
 tether exec <nid> -- <argv...>  [--cwd DIR] [--timeout 10m]
 ```
 
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--cwd`     | (空 = agent 端默认目录) | 远端进程的工作目录 |
+| `--timeout` | `10m`              | 整次命令最长时间（含流式输出），超时返回 `timed out after ...` |
+
+注：`--` 是可选分隔符（cobra 自动剥离）；`tether exec <nid> ls -la` 与
+`tether exec <nid> -- ls -la` 等价，因为 `SetInterspersed(false)` 已让 `-la`
+不被父命令解析。
+
 ### 5.8 `tether run`
 
 **这是什么**：在指定远端节点上跑**交互式**命令，agent 端分配一个真正的
@@ -778,6 +813,13 @@ tether run <nid> -- <argv...>  [--cwd DIR]
 
 非 tty 调用（如 `tether run nid -- bash <<<EOF ... EOF`）时 SIGINT 转成
 `kill.req{SIGINT}` 发往 agent 的进程组。
+
+调优 env vars（详见 §3.1）：
+- `TETHER_RUN_READY_TIMEOUT` — ctl 等待 agent PTY ready 的总超时，默认 `20s`；
+  慢链路 / 跨大陆链路上 PTY 首字节迟到时调大。
+- `TETHER_RUN_LIVENESS_TIMEOUT` — 心跳看门狗超时，默认 `15s`（agent 心跳间隔
+  5s × 3）；agent 长时间停滞时 ctl 本地会先打印 "agent unreachable" 再退出，
+  避免无限挂起。设为 `0` 关闭看门狗。
 
 ### 5.9 `tether expose` / `expose rm`
 
@@ -811,10 +853,15 @@ tether expose rm <nid> --name <logical-name>
 
 - `<nid>` 节点上的 `--local` 端口被反向打到 broker 的 `[14000-14999]` 公网带，
   分配的端口 + URL 在输出里：`exposed: http://broker.example:14001 → lab-1:8888`。
+- `--local` 必须为 1-65535（ctl 端强制校验，否则 `--local must be 1..65535`）。
 - `--name` 是会话内的逻辑标识，`expose rm` 用它定位条目；同 session 内必须
   唯一。
 - `expose rm` 立即把公网端口归还池子，agent 上对应的 tunnel client 也会
   drop。
+
+子命令：v1 只有 `expose <nid>` / `expose rm <nid>`，**没有** `expose ls` —— 想看
+当前已分配的暴露条目，用 `tether ps` 的 PORTS 节（数据源同为 broker SQLite 的
+`port_allocations`）。
 
 ### 5.10 `tether push` / `tether pull`（v0.2.0+）
 
@@ -833,6 +880,12 @@ tether expose rm <nid> --name <logical-name>
 ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload()`，
 据此选档；agent 也会复算一次（防止操作员把 broker 的 `max_payload` 调
 小了 ctl 不知道）。
+
+**tier A 实际上限**为 `min(8 MiB, broker.max_payload/2 - 1 KiB)`（源码
+`cliTierAMaxBytes = 8*1024*1024`，再与 broker `caps.MaxPayload/2 - 1024` 取小）。
+NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让 tier A 跑满
+8 MiB，broker 的 NATS `max_payload` 必须 ≥ 16 MiB（broker.yaml 之外的 nats.conf
+配置）。超过此阈值的请求由 ctl 自动升 tier B。
 
 **先决条件**：
 
@@ -944,6 +997,41 @@ tether history --follow         # 持续 tail（Ctrl-C 退出）
 
 需要原始 JSON 走 `--kind call | jq .` 之类管线。
 
+### 5.11.5 `tether node ls`
+
+**这是什么**：列出当前活动 session 内**所有注册的 agent**（不仅是有进程在跑的），
+显示在线状态、心跳年龄、proto 版本、release 版本。
+
+**与 `tether ps` 的区别**：
+- `ps` 是**进程视图**，节点只在跑过命令后才出现；
+- `node ls` 是**节点视图**，注册了就出现，从未 exec 过也能看到。
+
+**与 `tether admin nodes` 的区别**：
+- `admin nodes` 跨 session、走 broker 本机 Unix socket、无 NATS 鉴权；
+- `node ls` 仅当前 session、走 NATS auth_callout，任何 member 可用。
+
+**何时用**：
+- 刚装好 agent，想确认它连上 broker（还没跑过任何命令）；
+- 找 OFFLINE / STALE 节点，决定是否 `tether admin evict`；
+- 升级前后核对 `RELEASE` 列。
+
+```
+tether node ls          # 仅 ONLINE 节点
+tether node ls -a       # 含 OFFLINE / STALE（同 --all）
+```
+
+输出列：
+
+| 列 | 含义 |
+|---|---|
+| `NODE`      | nid（节点 id） |
+| `STATUS`    | `ONLINE` / `OFFLINE` / `STALE`（依 broker 端心跳分类） |
+| `HEARTBEAT` | 最后心跳年龄（如 `<1s` / `2s` / `5m`），OFFLINE 时为最后一次见的年龄 |
+| `PROTO`     | wire 协议版本号；与 broker 不一致 ⇒ 必须重装而非 upgrade |
+| `RELEASE`   | release 版本字符串（如 `0.2.7`） |
+
+底层 RPC 是 `node.list.req`，与 `node upgrade --all` 共享同一枚举机制。
+
 ### 5.12 `tether node upgrade`
 
 **这是什么**：owner-only 的"远程升级 agent 二进制"命令。无需登录目标
@@ -977,6 +1065,17 @@ SSH 上去 `wget && systemctl restart` 既慢又容易漏。这个命令把"分�
 tether node upgrade <nid> --url https://... --sha256 <hex64>      # 单台
 tether node upgrade --all  --url https://... --sha256 <hex64>     # session 内全量 ONLINE
 ```
+
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--url`     | (必填) | 绝对 `https://` 的 release tarball URL；必须前缀匹配 `broker.upgrade.url_allow` |
+| `--sha256`  | (必填) | tarball 的 SHA256 hex（64 位小写） |
+| `--all`     | false  | 升级全部 ONLINE 节点（与 positional `<nid>` 互斥） |
+| `--timeout` | `60`（秒） | 单台 upgrade 的总超时；超大 tarball / 慢链路要显式调大 |
+| `--nats-url`| `nats://127.0.0.1:4222` | NATS broker URL |
+| `--home`    | `~/.tether` | tether 家目录 |
 
 - broker 校验：owner、URL 在 `broker.upgrade.url_allow`、proto 一致、SHA256 64 位
   小写 hex；任一不过 ⇒ 拒绝（`url_not_allowed` / `not_owner` / `proto_bump_*` /
@@ -1025,6 +1124,12 @@ sudo -u tether tether admin sessions
 # 或 root：
 sudo tether admin --socket /var/run/tether/admin.sock nodes
 ```
+
+持久 flag（所有 admin 子命令均接受）：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--socket` | `/var/run/tether/admin.sock` | broker admin Unix socket 路径（需读权限；仅限本机） |
 
 子命令：
 

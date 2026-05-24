@@ -182,15 +182,56 @@ func Get(db *sql.DB, pid string) (*Process, error) {
 	return scanProcess(row)
 }
 
-// ListBySession returns all processes for sid in (sid, started_at desc) order.
-func ListBySession(db *sql.DB, sid string) ([]Process, error) {
-	rows, err := db.Query(`
-		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-		       started_by_fp, boot_id, start_time_ticks
-		FROM processes
-		WHERE sid = ?
-		ORDER BY started_at DESC
-	`, sid)
+// ListBySessionOpts narrows the result of the per-session process list.
+//
+//   - IncludeExited=false (default) returns only rows whose storage
+//     `status` column equals 'RUNNING'. LOST is read-derived in the
+//     handler from a RUNNING row + an OFFLINE node — no SQLite row
+//     is ever stored with status='LOST' (Insert writes 'RUNNING',
+//     MarkExited writes 'EXITED'; the schema CHECK constraint
+//     allows 'LOST' for forward compatibility but nothing in the
+//     tree writes it). The storage-level equality filter
+//     `status='RUNNING'` therefore captures every row that could
+//     become RUNNING-or-LOST in the response, without missing an
+//     active process.
+//   - Limit > 0 caps the returned slice. Rows are ordered by
+//     started_at DESC, so the newest are kept; the rest are
+//     silently dropped. Limit=0 returns the whole filtered set.
+//
+// Used by `tether ps` (default RUNNING-only) and by G.1 reconcile.
+// ListBySession remains for out-of-tree callers that need the full
+// RUNNING+EXITED view.
+type ListBySessionOpts struct {
+	IncludeExited bool
+	Limit         int
+}
+
+// ListBySessionFiltered runs a narrowed SELECT against the session.
+//
+// Default (IncludeExited=false) uses the (sid, status, started_at)
+// composite from migration 0005 — equality on the first two
+// columns, trailing started_at DESC matches the ORDER BY, so
+// EXPLAIN QUERY PLAN is "SEARCH ... USING INDEX ..." with no
+// "USE TEMP B-TREE FOR ORDER BY".
+//
+// IncludeExited=true uses the (sid, started_at) composite from
+// migration 0005 with the LIMIT short-circuiting the index walk.
+func ListBySessionFiltered(db *sql.DB, sid string, opts ListBySessionOpts) ([]Process, error) {
+	q := `SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
+	             started_by_fp, boot_id, start_time_ticks
+	      FROM processes WHERE sid = ?`
+	args := []any{sid}
+	if !opts.IncludeExited {
+		// Equality, not inequality — see ListBySessionOpts doc.
+		// The (sid, status, started_at DESC) index covers this fully.
+		q += ` AND status = 'RUNNING'`
+	}
+	q += ` ORDER BY started_at DESC`
+	if opts.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, opts.Limit)
+	}
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("proc: list: %w", err)
 	}
@@ -205,6 +246,37 @@ func ListBySession(db *sql.DB, sid string) ([]Process, error) {
 		out = append(out, *p)
 	}
 	return out, rows.Err()
+}
+
+// ListBySession returns every row for sid in (sid, started_at desc)
+// order. Pre-existing API; kept for out-of-tree callers that need
+// the full RUNNING+EXITED+LOST view. In-tree callers have been
+// migrated to ListBySessionFiltered.
+func ListBySession(db *sql.DB, sid string) ([]Process, error) {
+	return ListBySessionFiltered(db, sid, ListBySessionOpts{IncludeExited: true})
+}
+
+// GCExited deletes EXITED rows whose ended_at is older than cutoff.
+// Returns the number of rows removed (for log lines / metrics).
+//
+// Long-term audit lives in JetStream `history-<sid>`, which is
+// byte-bounded (MaxBytes=1 GiB per session, MaxAge=0, DiscardNew —
+// see internal/jsstream/jsstream.go). The SQLite processes table
+// only needs to keep what the operational surface (`tether ps -a`,
+// G.1 reconcile, agent crash recovery) reads in the near term.
+//
+// Uses migration 0005's idx_processes_status_endedat index: status
+// equality on the leading column, then range scan on ended_at over
+// a tight contiguous prefix.
+func GCExited(db *sql.DB, cutoff time.Time) (int64, error) {
+	res, err := db.Exec(
+		`DELETE FROM processes WHERE status = 'EXITED' AND ended_at < ?`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("proc: gc exited: %w", err)
+	}
+	return res.RowsAffected()
 }
 
 type scanner interface {

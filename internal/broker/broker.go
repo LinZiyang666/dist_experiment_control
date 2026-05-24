@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
+	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/tunnel"
@@ -151,6 +153,22 @@ type Config struct {
 	// (causes spurious "no responders" errors in test/p10).
 	// Production callers leave this nil.
 	ReadyCh chan struct{}
+
+	// ProcRetention is how long an EXITED row is kept in the
+	// `processes` table after ended_at before the periodic GC
+	// sweeps it. Set in broker.yaml as
+	// `broker.storage.proc_retention`. Defaults to 1h. Long-term
+	// audit lives in JetStream `history-<sid>` (byte-bounded at
+	// 1 GiB per session, no time expiry — see jsstream.go).
+	ProcRetention time.Duration
+
+	// ProcGCInterval is how often the broker sweeps EXITED rows
+	// past ProcRetention. Defaults to 5 min. The yaml decoder in
+	// internal/serveconf rejects sub-minute values as a
+	// misconfiguration safety net; raw broker.Config constructed
+	// inside _test.go files bypasses that decoder and can set
+	// short intervals (broker.New imposes no minimum).
+	ProcGCInterval time.Duration
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -200,9 +218,11 @@ type Broker struct {
 	cfg Config
 
 	// nc is the active NATS connection. Set by Run; nil before Run /
-	// after shutdown. Used by helpers (audit pubs) that need to publish
-	// outside the request handler scope.
-	nc *nats.Conn
+	// after shutdown. Stored as atomic.Pointer so the Run shutdown
+	// path (clear on context cancel) can't race with subscription
+	// callbacks still flushing through publishAudit / publishOnConn
+	// on a different goroutine.
+	nc atomic.Pointer[nats.Conn]
 
 	// tunnelSrv is the reverse-TCP tunnel server. Non-nil only when
 	// Config.TunnelControlAddr is set. Authorizes agent REGISTERs by
@@ -240,10 +260,11 @@ type Broker struct {
 // Used by event broadcast helpers (ev.port etc) that don't sit on a
 // msg.Reply and don't need persistence.
 func (b *Broker) publishOnConn(subject string, payload []byte) error {
-	if b.nc == nil {
+	nc := b.nc.Load()
+	if nc == nil {
 		return errBrokerNotConnected
 	}
-	return b.nc.Publish(subject, payload)
+	return nc.Publish(subject, payload)
 }
 
 // publishAudit pubs an audit message. With JetStream available
@@ -263,10 +284,11 @@ func (b *Broker) publishAudit(subject string, payload []byte) error {
 		_, err := b.js.Publish(ctx, subject, payload)
 		return err
 	}
-	if b.nc == nil {
+	nc := b.nc.Load()
+	if nc == nil {
 		return errBrokerNotConnected
 	}
-	return b.nc.Publish(subject, payload)
+	return nc.Publish(subject, payload)
 }
 
 var errBrokerNotConnected = errBrokerSentinel("broker: not connected")
@@ -299,6 +321,12 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.OfflineAfter == 0 {
 		cfg.OfflineAfter = node.DefaultOfflineAfter
 	}
+	if cfg.ProcRetention == 0 {
+		cfg.ProcRetention = time.Hour
+	}
+	if cfg.ProcGCInterval == 0 {
+		cfg.ProcGCInterval = 5 * time.Minute
+	}
 	return &Broker{cfg: cfg, transfers: newTransferTracker()}, nil
 }
 
@@ -318,10 +346,15 @@ func (b *Broker) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("broker: NATS connect: %w", err)
 	}
-	b.nc = nc
+	b.nc.Store(nc)
 	defer func() {
-		b.nc = nil
+		// Drain first so all in-flight subscription callbacks
+		// finish reading b.nc on this connection; only THEN clear
+		// the pointer. The atomic.Pointer + drain-before-clear
+		// ordering closes the publishAudit-vs-Run-shutdown race
+		// that race-tested test/p4 used to expose intermittently.
 		_ = nc.Drain()
+		b.nc.Store(nil)
 	}()
 
 	if subAuth, err := b.installAuthCallout(nc); err != nil {
@@ -513,6 +546,9 @@ func (b *Broker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(b.cfg.ReconcileInterval)
 	defer ticker.Stop()
 
+	gcTicker := time.NewTicker(b.cfg.ProcGCInterval)
+	defer gcTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -529,6 +565,15 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 			if revoked := b.reconcilePorts(now); revoked > 0 {
 				b.cfg.Logger.Info("broker: port revocations", "count", revoked)
+			}
+		case <-gcTicker.C:
+			cutoff := b.cfg.Now().Add(-b.cfg.ProcRetention)
+			n, err := proc.GCExited(b.cfg.DB, cutoff)
+			if err != nil {
+				b.cfg.Logger.Warn("broker: proc gc", "err", err)
+			} else if n > 0 {
+				b.cfg.Logger.Info("broker: proc gc",
+					"deleted", n, "cutoff", cutoff)
 			}
 		}
 	}

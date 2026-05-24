@@ -280,7 +280,32 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		return
 	}
 
-	procs, err := proc.ListBySession(b.cfg.DB, sid)
+	var req proto.PsReq
+	if len(msg.Data) > 0 {
+		// Tolerate unknown fields (encoding/json silently drops
+		// them — keeps the wire forward-compatible) and the empty
+		// `{}` body from legacy v0.2.7 ctl. But surface outright
+		// malformed JSON as bad_request instead of silently
+		// downgrading to defaults — a corrupt client should hear
+		// about it rather than see a partial result.
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			b.replyJSON(msg, proto.PsResp{
+				Code:  "bad_request",
+				Error: "ps: malformed PsReq body: " + err.Error(),
+			})
+			return
+		}
+	}
+	opts := proc.ListBySessionOpts{
+		IncludeExited: req.IncludeExited,
+		Limit:         req.Limit,
+	}
+	const serverMaxLimit = 500
+	if opts.Limit <= 0 || opts.Limit > serverMaxLimit {
+		opts.Limit = serverMaxLimit
+	}
+
+	procs, err := proc.ListBySessionFiltered(b.cfg.DB, sid, opts)
 	if err != nil {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
 		return

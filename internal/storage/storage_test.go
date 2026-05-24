@@ -209,3 +209,123 @@ func TestOpenRejectsBadDSN(t *testing.T) {
 		t.Fatal("expected Open to fail on garbage pragma")
 	}
 }
+
+// ----------------------------------------------------------------------
+// Migration 0005 — processes GC indexes (ps-retention-plan §D).
+// ----------------------------------------------------------------------
+
+// TestMigration0005_AddsIndexes (D1) — the three new indexes from
+// migration 0005 are present after Open, and the pre-existing 0001
+// indexes are NOT dropped.
+func TestMigration0005_AddsIndexes(t *testing.T) {
+	db := openTest(t)
+
+	want := []string{
+		"idx_processes_sid_status_started", // 0005
+		"idx_processes_sid_started",        // 0005
+		"idx_processes_status_endedat",     // 0005
+		"idx_processes_sid_nid",            // pre-existing 0001
+		"idx_processes_status",             // pre-existing 0001
+	}
+	have := map[string]bool{}
+	rows, err := db.Query(
+		`SELECT name FROM sqlite_master
+		 WHERE type='index' AND tbl_name='processes'`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		have[n] = true
+	}
+	_ = rows.Close()
+
+	for _, idx := range want {
+		if !have[idx] {
+			t.Errorf("expected index %q on processes; have=%v", idx, have)
+		}
+	}
+}
+
+// TestMigration0005_Idempotent (D2) — re-running migration 0005
+// against an already-migrated DB is a no-op (IF NOT EXISTS).
+func TestMigration0005_Idempotent(t *testing.T) {
+	db := openTest(t)
+
+	before := indexCount(t, db)
+	// Second Open against the same in-memory file would be a separate
+	// process; instead we re-apply the migration body directly to
+	// simulate "0005 runs twice".
+	body, err := migrationsFS.ReadFile("migrations/0005_processes_gc_indexes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(body)); err != nil {
+		t.Fatalf("re-apply 0005: %v", err)
+	}
+	after := indexCount(t, db)
+	if before != after {
+		t.Errorf("index count changed on re-apply: before=%d after=%d", before, after)
+	}
+}
+
+// TestMigration0005_DoesNotAlterExistingRows (D3) — running migration
+// 0005 against a populated table leaves all rows intact.
+func TestMigration0005_DoesNotAlterExistingRows(t *testing.T) {
+	db := openTest(t)
+	// Seed: 1 session + 1 node + 3 processes
+	if _, err := db.Exec(
+		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash)
+		 VALUES (?,?,?,?)`, "lab", "lab", "SHA256:o", "ph",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO nodes(sid, nid, status) VALUES (?,?,?)`,
+		"lab", "n1", "ONLINE",
+	); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		_, err := db.Exec(
+			`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp)
+			 VALUES (?,?,?,?,?,?,?)`,
+			"p"+string(rune('0'+i)), "lab", "n1",
+			`["x"]`, "2026-01-01 00:00:00", "RUNNING", "SHA256:u",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body, err := migrationsFS.ReadFile("migrations/0005_processes_gc_indexes.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(body)); err != nil {
+		t.Fatalf("re-apply 0005: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM processes`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("row count changed after migration: want=3 got=%d", n)
+	}
+}
+
+func indexCount(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='processes'`,
+	).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}

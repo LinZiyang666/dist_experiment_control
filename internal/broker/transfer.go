@@ -773,8 +773,8 @@ func (b *Broker) handleCapsReq(msg *nats.Msg) {
 		BrokerRelease:  proto.ReleaseVersion,
 		BrokerProto:    proto.ProtoVersion,
 	}
-	if b.nc != nil {
-		resp.MaxPayload = b.nc.MaxPayload()
+	if nc := b.nc.Load(); nc != nil {
+		resp.MaxPayload = nc.MaxPayload()
 	}
 	b.replyJSON(msg, resp)
 }

@@ -8,6 +8,7 @@ package serveconf
 import (
 	"fmt"
 	"os"
+	"time"
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -60,11 +61,29 @@ type AdminSection struct {
 type StorageSection struct {
 	DB      string `yaml:"db"`
 	JSStore string `yaml:"js_store"`
+
+	// ProcRetention is the SQLite `processes` table retention
+	// window for EXITED rows (see docs/reviews/ps-retention-plan.md).
+	// Accepts Go time.Duration syntax ("1h", "30m", "24h").
+	// Empty → broker default (1h).
+	ProcRetention string `yaml:"proc_retention"`
+
+	// ProcGCInterval is how often the broker sweeps EXITED rows
+	// past ProcRetention. Accepts Go time.Duration syntax.
+	// Empty → broker default (5m). Values below 1 minute are
+	// rejected at Load() — see validateProcGC.
+	ProcGCInterval string `yaml:"proc_gc_interval"`
 }
 
 // Load reads, parses, and returns one Config. Empty path returns a
 // zero-valued Config without error so the caller can treat
 // "no --config" the same as "config with everything defaulted".
+//
+// Load runs every duration validator so a misconfigured `proc_retention`
+// or `proc_gc_interval` aborts startup BEFORE any side effect
+// (storage.Open creating tether.db, NATS connect, etc). Tests that
+// need sub-minute GC tickers construct broker.Config directly and
+// bypass this decoder; broker.New imposes no minimum.
 func Load(path string) (*Config, error) {
 	if path == "" {
 		return &Config{}, nil
@@ -77,5 +96,53 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(body, &cfg); err != nil {
 		return nil, fmt.Errorf("serveconf: parse %q: %w", path, err)
 	}
+	if _, err := cfg.ProcRetentionDuration(); err != nil {
+		return nil, err
+	}
+	if _, err := cfg.ProcGCIntervalDuration(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// ProcRetentionDuration parses broker.storage.proc_retention. Returns
+// (0, nil) when unset (caller falls back to broker.New's default).
+//
+// Non-positive values are rejected: GC computes `cutoff = now -
+// retention`; a negative retention puts the cutoff in the FUTURE and
+// the next sweep would delete every EXITED row immediately, not just
+// aged ones. Zero is reserved for "unset → broker default".
+func (c *Config) ProcRetentionDuration() (time.Duration, error) {
+	if c.Broker.Storage.ProcRetention == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Broker.Storage.ProcRetention)
+	if err != nil {
+		return 0, fmt.Errorf("serveconf: broker.storage.proc_retention: %w", err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("serveconf: broker.storage.proc_retention %q "+
+			"must be positive (negative or zero would push the GC cutoff "+
+			"into the future and erase every EXITED row immediately)", d)
+	}
+	return d, nil
+}
+
+// ProcGCIntervalDuration parses broker.storage.proc_gc_interval.
+// Returns (0, nil) when unset (caller falls back to broker.New's
+// default). Values under 1 minute are rejected — a sub-minute sweep
+// burns SQLite write capacity for negligible retention benefit.
+func (c *Config) ProcGCIntervalDuration() (time.Duration, error) {
+	if c.Broker.Storage.ProcGCInterval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Broker.Storage.ProcGCInterval)
+	if err != nil {
+		return 0, fmt.Errorf("serveconf: broker.storage.proc_gc_interval: %w", err)
+	}
+	if d < time.Minute {
+		return 0, fmt.Errorf("serveconf: broker.storage.proc_gc_interval %q "+
+			"< 1m (refusing sub-minute GC)", d)
+	}
+	return d, nil
 }

@@ -53,7 +53,13 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 ) {
 	now := b.cfg.Now()
 
-	procs, err := proc.ListBySession(b.cfg.DB, sid)
+	// Reconcile only consumes RUNNING/LOST rows (see the explicit
+	// filter below at `if p.Status != proc.StateRunning && p.Status
+	// != proc.StateLost`). Reading EXITED rows from disk used to be
+	// dead weight that grew with session history; the bounded helper
+	// keeps reconnect O(active processes) regardless of session age.
+	procs, err := proc.ListBySessionFiltered(b.cfg.DB, sid,
+		proc.ListBySessionOpts{IncludeExited: false})
 	if err != nil {
 		b.cfg.Logger.Warn("broker: reconcileOnRegister list procs", "err", err, "sid", sid)
 	}

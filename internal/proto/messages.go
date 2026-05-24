@@ -234,8 +234,20 @@ type NodeListResp struct {
 	Error string          `json:"error,omitempty"`
 }
 
-// PsReq — empty body. Lives in `ctrl.by.<actor>.s.<sid>.ps.req`.
-type PsReq struct{}
+// PsReq is the JSON body for `ctrl.by.<actor>.s.<sid>.ps.req`.
+//
+// All fields are optional; older clients (v0.2.7-) that send the
+// empty body `{}` decode into the zero value, which on a v0.2.8+
+// broker means "active processes only (storage RUNNING rows; the
+// handler derives LOST per row from node status), server-side row
+// cap". The cap is fixed at the broker (currently 500) — clients
+// cannot raise it via Limit, only lower it.
+//
+// IncludeExited maps to the ctl `-a` flag.
+type PsReq struct {
+	IncludeExited bool `json:"include_exited,omitempty"`
+	Limit         int  `json:"limit,omitempty"`
+}
 
 // PsEntry describes one running/exited process for `tether ps`.
 type PsEntry struct {
