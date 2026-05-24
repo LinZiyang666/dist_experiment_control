@@ -204,7 +204,7 @@ func TestListBySessionFiltered_RunningOnly(t *testing.T) {
 		}
 	}
 	// Newest first (DESC).
-	if !(got[0].StartedAt.After(got[1].StartedAt) && got[1].StartedAt.After(got[2].StartedAt)) {
+	if !got[0].StartedAt.After(got[1].StartedAt) || !got[1].StartedAt.After(got[2].StartedAt) {
 		t.Errorf("order not started_at DESC: %v %v %v",
 			got[0].StartedAt, got[1].StartedAt, got[2].StartedAt)
 	}

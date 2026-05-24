@@ -59,7 +59,7 @@ func bulkSeed(t testing.TB, db *sql.DB, sid, nid, status string, n int, baseTime
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for i := 0; i < n; i++ {
 		pid := fmt.Sprintf("%s-%06d", status, i)
 		started := baseTime.Add(time.Duration(i) * time.Microsecond)
@@ -352,7 +352,7 @@ func bulkSeedExitedWithEndedAt(t testing.TB, db *sql.DB,
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	started := endedAt.Add(-time.Second)
 	for i := 0; i < n; i++ {
 		pid := fmt.Sprintf("e%06d", i)
