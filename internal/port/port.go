@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -85,10 +86,14 @@ type Allocation struct {
 // negative; ErrPortExhausted means every slot in the band is in
 // ALLOCATED state right now (REVOKED/FREED rows count as free).
 // ErrNameTaken is "another ALLOCATED row already has this (sid, name)".
+// ErrPortTaken / ErrPortOutOfBand are the P12 desired-port rejections
+// (Allocate's desiredPort != 0 path only).
 var (
 	ErrNotFound      = errors.New("port: row not found")
 	ErrPortExhausted = errors.New("port: no free port in band")
 	ErrNameTaken     = errors.New("port: another ALLOCATED row already uses this (sid, name)")
+	ErrPortTaken     = errors.New("port: requested port already has an ALLOCATED row")
+	ErrPortOutOfBand = errors.New("port: requested port outside configured band")
 )
 
 // Config customizes the band; pass nil for defaults.
@@ -98,16 +103,32 @@ type Config struct {
 	Now      func() time.Time
 }
 
-// Allocate finds the first free port in the band, generates a fresh
-// random token, and INSERTs the ALLOCATED row in a single SQLite
-// transaction. Returns the assigned port + raw token. The raw token
-// is returned exactly once and never stored — caller MUST forward it
-// to the agent and forget their own copy.
+// Allocate reserves a public port and INSERTs the ALLOCATED row in a
+// single SQLite transaction, generating a fresh random token. Returns
+// the assigned port + raw token. The raw token is returned exactly once
+// and never stored — caller MUST forward it to the agent and forget
+// their own copy.
 //
-// "Free" means: no row exists with state=ALLOCATED for that port. Rows
-// in REVOKED/FREED state DO NOT block reuse (architecture D.4: revoked
-// port number is immediately back in pool).
-func Allocate(db *sql.DB, sid, nid, name string, localPort int, createdByFP string, cfg *Config) (*Allocation, error) {
+// desiredPort selects the port (P12):
+//   - desiredPort == 0 (auto): pick the first free port in the band,
+//     ErrPortExhausted if the band is full. This is the pre-P12 path,
+//     byte-identical.
+//   - desiredPort != 0 (operator `--remote-port`): use exactly that
+//     port. ErrPortOutOfBand if it falls outside [BandLow,BandHigh];
+//     ErrPortTaken if it currently has an ALLOCATED row (hard fail, no
+//     auto fallback).
+//
+// "Free"/"taken" is judged solely by state=ALLOCATED — rows in
+// REVOKED/FREED state DO NOT block reuse (architecture D.4: revoked
+// port number is immediately back in pool). For the desired-port path
+// correctness rests on the partial UNIQUE index idx_port_alloc_unique_active
+// (migration 0003: at most one ALLOCATED row per port). Concurrent
+// callers requesting the same desiredPort are serialized by the single
+// pooled connection (storage SetMaxOpenConns(1)); the index is the
+// independent invariant that still guarantees at-most-one-ALLOCATED even
+// if that serialization were ever relaxed — exactly one INSERT wins, the
+// rest trip the constraint and get ErrPortTaken (never a duplicate row).
+func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP string, cfg *Config) (*Allocation, error) {
 	low, high, now := cfgWithDefaults(cfg)
 
 	tx, err := db.Begin()
@@ -132,9 +153,23 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort int, createdByFP stri
 		return nil, ErrNameTaken
 	}
 
-	port, err := findFreePort(tx, low, high)
-	if err != nil {
-		return nil, err
+	var port int
+	if desiredPort == 0 {
+		// Auto path (unchanged): lowest free port in the band.
+		port, err = findFreePort(tx, low, high)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// P12 desired-port path. The band bounds are the single source
+		// of truth for the allowed set — a value below low or above
+		// high (including <=0 or >65535) is out of band. Pure-Go
+		// comparison, no DB round-trip; checked before any write so an
+		// out-of-band port never reaches the INSERT/constraint.
+		if desiredPort < low || desiredPort > high {
+			return nil, ErrPortOutOfBand
+		}
+		port = desiredPort
 	}
 
 	token, err := genToken()
@@ -149,7 +184,7 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort int, createdByFP stri
 		 VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?)`,
 		port, sid, nid, name, localPort, tokenHash, createdByFP, now.UTC(),
 	); err != nil {
-		return nil, fmt.Errorf("port: insert: %w", err)
+		return nil, translateInsertErr(err, desiredPort)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -358,6 +393,42 @@ func HashToken(rawToken string) string { return hashToken(rawToken) }
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// translateInsertErr maps a failed ALLOCATED-row INSERT to the right
+// caller-facing error, encoding the P12 D-2 gate.
+//
+//   - desiredPort != 0 + UNIQUE violation on idx_port_alloc_unique_active
+//     => ErrPortTaken (the race-free "requested port already taken" signal).
+//   - desiredPort == 0 (auto path): a UNIQUE violation is impossible by
+//     construction — findFreePort just proved the port free inside this
+//     same tx — so it MUST surface loud as a wrapped "port: insert" error,
+//     never be silently relabeled ErrPortTaken.
+//   - any non-UNIQUE error: always wrapped as "port: insert", regardless
+//     of desiredPort.
+//
+// Kept as a pure function (no DB/tx) so the gate is unit-testable
+// deterministically without staging an actual auto-path collision.
+func translateInsertErr(err error, desiredPort int) error {
+	if desiredPort != 0 && isUniqueViolation(err) {
+		return ErrPortTaken
+	}
+	return fmt.Errorf("port: insert: %w", err)
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE-constraint
+// failure. Mirrors internal/session.isUniqueViolation (the established,
+// driver-agnostic string-match idiom for modernc.org/sqlite); kept as a
+// local copy because port and session are separate packages and a 4-line
+// helper isn't worth a shared package. Used only on the P12 desired-port
+// INSERT to map a collision on idx_port_alloc_unique_active to ErrPortTaken.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") ||
+		strings.Contains(msg, "constraint failed: UNIQUE")
 }
 
 func genToken() (string, error) {

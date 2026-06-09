@@ -866,9 +866,15 @@ go srv.Run()
 
 ### F.3 端口按需分配
 
-broker 侧公网端口从 `broker.yaml` §A.3 的 `frp.port_range`（默认 `14000-14999`，1000 个）内按需分配：
+broker 侧公网端口从 `broker.yaml` §A.3 的 `frp.port_range`（默认 `14000-14999`，1000 个）内分配。分配模式由 wire 字段 `ExposeReq.remote_port`（P12，additive，`omitempty`）决定：
 
-- `expose` 到达 → tetherd 从段内找第一个空闲端口 → 写 SQLite 事务（`port_allocations`） → 返回 agent。
+- **自动分配（默认，`remote_port` 省略/0）**：`expose` 到达 → tetherd 从段内找**第一个空闲端口** → 写 SQLite 事务（`port_allocations`） → 返回 agent。
+- **指定分配（P12 `tether expose --remote-port <P>`，`remote_port` 非 0）**：在**同一** SQLite 事务内，按 name 唯一性检查**之后**：
+  - 端口必须落在 `frp.port_range` 带内，否则拒 `port_out_of_band`；
+  - 带内但已有 `state=ALLOCATED` 行 → **硬拒** `port_taken`，**绝不回退**自动分配（要别的端口须显式改值重试）；
+  - 占用判定只看 `state=ALLOCATED`，故 REVOKED/FREED 的旧端口号**可被重新指定**；
+  - 原子性由 `port_allocations(port) WHERE state='ALLOCATED'` 的**部分唯一索引**保证：并发抢同口恰一个 INSERT 成功，其余 `port_taken`（不依赖应用层 check-then-act）。
+  - **不 bump proto**（仅 additive 字段）。同 proto 跨版本下若 ctl 新而 broker 旧，旧 broker 忽略 `remote_port`、**静默退回自动分配**且无报错——无法检测，记为已知限制，**不做能力协商**（部署侧以同版本灰度保证）。
 - 回收：一旦进 REVOKED，端口号立即回池可复用（见 §D.4）；FREED 亦回池。agent 后续若拿着失效 token 回连，frps 插件钩子按 `port_allocations.state≠ALLOCATED` 直接拒绝（见 F.4）。
 
 ### F.4 token：tetherd 单边签发，一对一绑定
@@ -876,12 +882,12 @@ broker 侧公网端口从 `broker.yaml` §A.3 的 `frp.port_range`（默认 `140
 **expose 命令端到端流程**：
 
 ```
-ctl  tether expose --local 8888 --name jupyter
+ctl  tether expose --local 8888 --name jupyter [--remote-port 14022]
   │
-  └──pub s.S.cmd.by.<A>.node.N.expose.req─────>  tetherd
+  └──pub s.S.cmd.by.<A>.node.N.expose.req{…,remote_port}─────>  tetherd
                                              │
                                              │──SQLite 事务：
-                                             │    · 找空闲 port P=14022
+                                             │    · 选 port P：remote_port 非 0 则用该端口（校验带内 + 未被 ALLOCATED 占用，否则 port_out_of_band / port_taken）；否则找第一个空闲 → P=14022
                                              │    · 生成 token T（32 字节 URL-safe base64）
                                              │    · 写 port_allocations{sid,nid,port,token_hash,local_port,name,state=ALLOCATED,created_by_fp}
                                              │    · 写 audit.call
@@ -983,7 +989,7 @@ PORTS
 
 | 动作 | 命令 |
 |---|---|
-| 创建暴露 | `tether expose --local 8888 --name jupyter` |
+| 创建暴露 | `tether expose --local 8888 --name jupyter [--remote-port 14022]`（省略 = 自动取最低空闲；指定 = 该带内端口，占用则 `port_taken` 硬拒，见 F.3） |
 | **撤销暴露** | `tether expose rm --name jupyter` 或 `--port 14022` |
 | 杀进程 | `tether kill --pid 01hzxk...` |
 | 查进程 + 端口 | `tether ps` |
@@ -2040,7 +2046,7 @@ P11 release hardening + docs                        ← v0.1.0
   监听 `:7000`（agent control + TLS）+ 按需绑公网端口
   `:14000-14999`；agent 侧 `tunnel.Client` 维护 yamux 会话，
   expose 重启自动重连。
-- `tether expose --local 8888 --name jupyter` → 分端口 → 返回 `http://<broker>:<port>`（默认明文，业务自管 HTTPS）。
+- `tether expose --local 8888 --name jupyter [--remote-port P]` → 分端口（省略=最低空闲；指定=该带内端口，占用则 `port_taken`，见 F.3）→ 返回 `http://<broker>:<port>`（默认明文，业务自管 HTTPS）。
 - `tether expose rm --name jupyter`。
 - **`tether ps` 升级为统一视图**（进程 + 端口同一张表，F.8）。
 - Port 状态机（D.4）；agent 侧 `state.json` 落 `port_tokens[]` 支持重启恢复。

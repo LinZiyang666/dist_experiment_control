@@ -27,6 +27,8 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 		{"proto_bump_requires_reinstall", "full reinstall"},
 		{"name_taken", "expose rm"},
 		{"port_exhausted", "free public port"},
+		{"port_taken", "already allocated"},
+		{"port_out_of_band", "14000-14999"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.code, func(t *testing.T) {

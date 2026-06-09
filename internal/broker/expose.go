@@ -135,7 +135,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	alloc, err := port.Allocate(b.cfg.DB, sid, nid, req.Name, req.LocalPort, fp, b.cfg.PortAllocCfg())
+	alloc, err := port.Allocate(b.cfg.DB, sid, nid, req.Name, req.LocalPort, req.RemotePort, fp, b.cfg.PortAllocCfg())
 	switch {
 	case errors.Is(err, port.ErrNameTaken):
 		b.replyExposeErr(msg, "name_taken", req.Name)
@@ -144,6 +144,14 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	case errors.Is(err, port.ErrPortExhausted):
 		b.replyExposeErr(msg, "port_exhausted", "")
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "port_exhausted", msg.Reply, nil)
+		return
+	case errors.Is(err, port.ErrPortOutOfBand):
+		b.replyExposeErr(msg, "port_out_of_band", strconv.Itoa(req.RemotePort))
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "port_out_of_band", msg.Reply, nil)
+		return
+	case errors.Is(err, port.ErrPortTaken):
+		b.replyExposeErr(msg, "port_taken", strconv.Itoa(req.RemotePort))
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "port_taken", msg.Reply, nil)
 		return
 	case err != nil:
 		b.replyExposeErr(msg, "alloc_failed", err.Error())
