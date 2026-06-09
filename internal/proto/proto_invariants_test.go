@@ -60,7 +60,7 @@ func allRoundtripCases() []roundtripCase {
 			Cwd: "/tmp", Cols: 80, Rows: 24, ActorFP: "SHA256:fp",
 		}, &RunReq{}},
 		{"ExposeReq", &ExposeReq{
-			Name: "jupyter", LocalPort: 8888, ActorFP: "SHA256:fp",
+			Name: "jupyter", LocalPort: 8888, RemotePort: 14005, ActorFP: "SHA256:fp",
 		}, &ExposeReq{}},
 		{"ExposeResp", &ExposeResp{
 			Port: 14000, PublicHost: "h", Name: "jupyter",
@@ -274,12 +274,18 @@ func TestBinaryPayloadRoundtrip(t *testing.T) {
 	}
 
 	payloads := map[string][]byte{
-		"empty":       {},
-		"only_nul":    {0, 0, 0, 0, 0, 0, 0, 0},
+		"empty":         {},
+		"only_nul":      {0, 0, 0, 0, 0, 0, 0, 0},
 		"text_with_nul": []byte("hi\x00there\x00\x00"),
-		"non_utf8":    {0x80, 0x81, 0xFF, 0xFE, 0xC0, 0xC1},
-		"all_bytes":   func() []byte { b := make([]byte, 256); for i := range b { b[i] = byte(i) }; return b }(),
-		"10_MiB":      big,
+		"non_utf8":      {0x80, 0x81, 0xFF, 0xFE, 0xC0, 0xC1},
+		"all_bytes": func() []byte {
+			b := make([]byte, 256)
+			for i := range b {
+				b[i] = byte(i)
+			}
+			return b
+		}(),
+		"10_MiB": big,
 	}
 
 	for name, payload := range payloads {

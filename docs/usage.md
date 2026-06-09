@@ -483,7 +483,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether ps [-a]`                       | ctl    | 当前 session 的进程 + 端口 |
 | `tether exec <nid> -- argv ...`        | ctl    | 非交互远程命令 |
 | `tether run <nid> -- argv ...`         | ctl    | 交互式 PTY |
-| `tether expose <nid> --local P --name N` | ctl  | 暴露端口 |
+| `tether expose <nid> --local P --name N [--remote-port R]` | ctl  | 暴露端口（可选指定公网端口 R） |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
 | `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤2 GiB） |
 | `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤2 GiB） |
@@ -847,13 +847,19 @@ expose 出去等于把它放公网，敏感服务必须自带认证（Jupyter to
 证书等）。
 
 ```
-tether expose <nid> --local <port> --name <logical-name>
+tether expose <nid> --local <port> --name <logical-name> [--remote-port <port>]
 tether expose rm <nid> --name <logical-name>
 ```
 
 - `<nid>` 节点上的 `--local` 端口被反向打到 broker 的 `[14000-14999]` 公网带，
   分配的端口 + URL 在输出里：`exposed: http://broker.example:14001 → lab-1:8888`。
 - `--local` 必须为 1-65535（ctl 端强制校验，否则 `--local must be 1..65535`）。
+- `--remote-port`（可选）指定要分配的**具体公网端口**，省略=自动取最低空闲端口（默认行为，字节级不变）。语义：
+  - 该端口必须落在 broker 的公网带 `[14000-14999]` 内，否则报 `port_out_of_band`；
+  - 该端口当前已被占用（有 ALLOCATED 记录）则**直接失败** `port_taken`，**不回退**自动分配——你要别的端口请显式改值重试；
+  - 已释放（`expose rm`）或被回收（node 长期 OFFLINE）的端口号不算占用，可被重新指定；
+  - ctl 端只做 `0`(自动) 或 `1..65535` 的粗校验，**带范围由 broker 裁定**（band 是 broker 配置、各 broker 可不同）；
+  - **跨版本注意**：若你的 ctl 比 broker 新而 broker 还没这个特性，旧 broker 会忽略 `--remote-port` 静默改走自动分配（无 proto 区分）；成功输出里打印的就是实际分配到的端口，以它为准。
 - `--name` 是会话内的逻辑标识，`expose rm` 用它定位条目；同 session 内必须
   唯一。
 - `expose rm` 立即把公网端口归还池子，agent 上对应的 tunnel client 也会
@@ -1459,6 +1465,8 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `name_taken`        | session 内已有同 name | 换 name 或 `tether expose rm <nid> --name <X>` 先释放 |
 | `port_exhausted`    | broker 14000-14999 全占满 | `tether admin sessions` 找闲置 expose；`tether expose rm` 释放；或扩 `frp.port_range` |
 | `local_port_invalid`| `--local` 不在 1..65535 | 检查 flag 值 |
+| `port_taken`        | `--remote-port` 指定的公网端口已被占用（有 ALLOCATED 记录） | 换端口、省略 `--remote-port` 自动选、或 `tether expose rm` 先释放 |
+| `port_out_of_band`  | `--remote-port` 不在 broker 公网带 `[14000-14999]` 内 | 选带内端口或省略该 flag 自动选 |
 | `frpc_failed`       | agent 起 tunnel 客户端失败 | 看 `~/.tether/agent/<sid>/agent.log` |
 | `tunnel_token_unknown_or_revoked` | 反向隧道 token 失效 | 重新 `tether expose`（agent 重启后 state.json 损坏可能触发） |
 

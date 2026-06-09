@@ -39,6 +39,8 @@ var brokerCodeHints = map[string]string{
 	"name_taken":         "another expose with that name already exists in this session; pick another --name or `tether expose rm --name <X>` first.",
 	"port_exhausted":     "the broker has no free public port in its 14000-14999 band; ask the operator to free an old expose.",
 	"local_port_invalid": "--local must be 1..65535.",
+	"port_taken":         "that public port is already allocated; pick another port, omit --remote-port to auto-pick a free one, or release the existing one first.",
+	"port_out_of_band":   "--remote-port must be within the broker's public band (default 14000-14999); pick an in-band port or omit it to auto-pick.",
 	"frpc_failed":        "the agent couldn't start the local proxy; check the agent log (`~/.tether/agent/<sid>/agent.log`).",
 	// Storage / generic
 	"store_error": "the broker hit a SQLite error; check the broker log.",

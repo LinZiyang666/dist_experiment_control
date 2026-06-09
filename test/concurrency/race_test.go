@@ -7,6 +7,7 @@ package concurrency_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -74,7 +75,7 @@ func TestConcurrentPortAllocations(t *testing.T) {
 			defer wg.Done()
 			latch.wait()
 			a, err := port.Allocate(db, "lab", "lab-1",
-				fmt.Sprintf("svc-%d", i), 8000+i, "fp-test", cfg)
+				fmt.Sprintf("svc-%d", i), 8000+i, 0, "fp-test", cfg)
 			if err != nil {
 				errs <- fmtErr("alloc %d: %w", i, err)
 				return
@@ -116,6 +117,93 @@ func TestConcurrentPortAllocations(t *testing.T) {
 	}
 	if rows != N {
 		t.Errorf("ALLOCATED row count = %d, want %d", rows, N)
+	}
+}
+
+// TestConcurrentDesiredPortExactlyOneWins — E.20 (P12). N goroutines
+// race the SAME --remote-port. Unlike E.18 (band sized to N so all
+// succeed on distinct auto ports), here the band is tiny and every
+// goroutine asks for the SAME in-band port, so exactly one can win and
+// the rest get ErrPortTaken (never a duplicate ALLOCATED row, never a
+// deadlock). Run under -race.
+//
+// What this proves and what it doesn't: storage.Open caps the pool at
+// one connection (SetMaxOpenConns(1)), so the writers serialize at
+// connection acquisition — this is the SHIPPED production path. The test
+// proves the partial UNIQUE index idx_port_alloc_unique_active is
+// NECESSARY (drop the index and losers' INSERTs would succeed,
+// winners=N), translating a committed-row collision into ErrPortTaken.
+// It does NOT exercise two concurrent in-flight transactions racing the
+// index directly (that would need MaxOpenConns>1 / a second *sql.DB
+// handle) — that scenario is out of scope for the single-handle broker
+// and not a configuration this code ships.
+func TestConcurrentDesiredPortExactlyOneWins(t *testing.T) {
+	db := openMemDB(t)
+	if _, err := session.Create(db, "lab", "lab", "fp-test", "h",
+		time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO nodes(sid, nid, status, registered_at) VALUES (?,?,?,?)`,
+		"lab", "lab-1", "ONLINE", time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		N    = 20
+		want = 14001
+	)
+	cfg := &port.Config{BandLow: 14000, BandHigh: 14002, Now: time.Now}
+
+	var wg sync.WaitGroup
+	var winners, taken atomic.Int32
+	errs := make(chan error, N)
+	latch := newRaceLatch()
+
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		i := i
+		go func() {
+			defer wg.Done()
+			latch.wait()
+			a, err := port.Allocate(db, "lab", "lab-1",
+				fmt.Sprintf("svc-%d", i), 8000+i, want, "fp-test", cfg)
+			switch {
+			case err == nil:
+				winners.Add(1)
+				if a.Port != want {
+					errs <- fmtErr("winner %d got port %d, want %d", i, a.Port, want)
+				}
+			case errors.Is(err, port.ErrPortTaken):
+				taken.Add(1)
+			default:
+				errs <- fmtErr("goroutine %d unexpected err: %w", i, err)
+			}
+		}()
+	}
+	latch.release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("%v", err)
+	}
+
+	if w := winners.Load(); w != 1 {
+		t.Errorf("winners = %d, want exactly 1", w)
+	}
+	if tk := taken.Load(); tk != N-1 {
+		t.Errorf("ErrPortTaken count = %d, want %d", tk, N-1)
+	}
+	var rows int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM port_allocations WHERE port=? AND state='ALLOCATED'`,
+		want,
+	).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Errorf("ALLOCATED rows on port %d = %d, want 1", want, rows)
 	}
 }
 

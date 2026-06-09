@@ -22,10 +22,11 @@ import (
 // `tether expose rm --name jupyter` reverses it.
 func newExposeCmd() *cobra.Command {
 	var (
-		natsURL string
-		home    string
-		local   int
-		name    string
+		natsURL    string
+		home       string
+		local      int
+		name       string
+		remotePort int
 	)
 	cmd := &cobra.Command{
 		Use:   "expose <node>",
@@ -54,6 +55,15 @@ restart without a re-expose.
 			if local <= 0 || local > 65535 {
 				return fmt.Errorf("--local must be 1..65535, got %d", local)
 			}
+			// Soft floor/ceiling only: 0 = auto (omit the flag). The
+			// band (e.g. 14000-14999) is broker config and can differ
+			// per broker, so it is NOT checked here — an in-range but
+			// out-of-band value round-trips to the broker and comes
+			// back as port_out_of_band. This guard only catches values
+			// that can't be a port at all.
+			if remotePort < 0 || remotePort > 65535 {
+				return fmt.Errorf("--remote-port must be 0 (auto) or 1..65535, got %d", remotePort)
+			}
 
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
@@ -65,7 +75,7 @@ restart without a re-expose.
 			}
 			defer nc.Close()
 
-			body, err := json.Marshal(proto.ExposeReq{Name: name, LocalPort: local})
+			body, err := json.Marshal(proto.ExposeReq{Name: name, LocalPort: local, RemotePort: remotePort})
 			if err != nil {
 				return err
 			}
@@ -95,6 +105,7 @@ restart without a re-expose.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().IntVar(&local, "local", 0, "local port on the agent to expose (required)")
 	cmd.Flags().StringVar(&name, "name", "", "logical proxy name (required; used by `expose rm`)")
+	cmd.Flags().IntVar(&remotePort, "remote-port", 0, "request a specific public port from the broker's band (default: auto lowest-free)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
 			return nil, cobra.ShellCompDirectiveNoFileComp

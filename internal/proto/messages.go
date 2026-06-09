@@ -390,6 +390,17 @@ type ExposeReq struct {
 	Name      string `json:"name"`
 	LocalPort int    `json:"local_port"`
 
+	// RemotePort — P12 `--remote-port`: request a SPECIFIC public port
+	// instead of the auto lowest-free. 0/omitted = lowest-free (the
+	// pre-P12 behavior). `omitempty` is load-bearing: an unset value
+	// serializes away entirely, so an old ctl (no field) and a new ctl
+	// that omits the flag send byte-identical bodies, and an old broker
+	// (which ignores the unknown key) keeps auto-allocating. A nonzero
+	// value must fall in the broker's configured band, else the broker
+	// rejects with port_out_of_band; if the port is already ALLOCATED
+	// the broker rejects with port_taken (hard fail, no auto fallback).
+	RemotePort int `json:"remote_port,omitempty"`
+
 	// ActorFP — broker-stamped at forward time; same convention as
 	// ExecReq.ActorFP. ctl-supplied value is discarded.
 	ActorFP string `json:"actor_fp,omitempty"`
@@ -407,7 +418,7 @@ type ExposeResp struct {
 	PublicHost string `json:"public_host,omitempty"` // operator-friendly URL host (e.g. broker.example.com)
 	Name       string `json:"name,omitempty"`        // echoed back
 
-	Code  string `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | ...
+	Code  string `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | port_taken | port_out_of_band | ...
 	Error string `json:"error,omitempty"`
 }
 
