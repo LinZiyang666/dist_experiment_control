@@ -694,6 +694,13 @@ Wants=nats-server.service
 [Service]
 Type=simple
 User=tether
+# admin.sock lives under /run/tether, which is tmpfs and wiped on every reboot.
+# RuntimeDirectory makes systemd recreate it (owner=User, mode below) before each
+# start, so the broker can bind its admin socket after a host reboot. Without it
+# the unit fails on boot with "mkdir /var/run/tether: permission denied" (the
+# tether user can't mkdir under /run) and Restart=on-failure just loops.
+RuntimeDirectory=tether
+RuntimeDirectoryMode=0700
 ExecStart=$bin/tether serve --config $etc/broker.yaml
 Restart=on-failure
 StandardOutput=append:$log_dir/broker.log
