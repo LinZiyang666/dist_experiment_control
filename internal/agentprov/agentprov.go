@@ -7,13 +7,13 @@
 // is the only writer. Two callers:
 //
 //   - auth_callout, on every agent CONNECT:
-//       Lookup(db, sid, nid) → ErrNotProvisioned means "first time, must
-//       supply --pin"; a returned fp that doesn't match the connecting
-//       nkey means "this nid is bound to a different agent, deny".
+//     Lookup(db, sid, nid) → ErrNotProvisioned means "first time, must
+//     supply --pin"; a returned fp that doesn't match the connecting
+//     nkey means "this nid is bound to a different agent, deny".
 //
 //   - auth_callout, on first-time CONNECT (with --pin verified):
-//       Provision(db, sid, nid, fp, now) — idempotent INSERT OR IGNORE
-//       for the (sid, nid) row.
+//     Provision(db, sid, nid, fp, now) — idempotent INSERT OR IGNORE
+//     for the (sid, nid) row.
 //
 // Architecture K.1 — agent identity is per-machine, per-session.
 package agentprov

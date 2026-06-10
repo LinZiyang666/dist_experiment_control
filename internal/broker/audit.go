@@ -56,7 +56,9 @@ func (b *Broker) pubSysEvent(kind string, fields map[string]any) {
 //
 // Phase ② DELETE the history-<sid> stream (no-op if already gone).
 // Phase ③ DELETE all dependent SQLite rows in one tx; sessions row
-//          included so future ① on the same sid can re-create.
+//
+//	included so future ① on the same sid can re-create.
+//
 // Phase ④ pub sys.events session_destroyed.
 //
 // We deliberately keep ② before ③: if ③ runs first and the stream
@@ -74,6 +76,11 @@ func (b *Broker) finalizeSessionRm(ctx context.Context, sid string) error {
 	}
 	if err := dropSessionRows(b.cfg.DB, sid); err != nil {
 		return fmt.Errorf("phase 3: %w", err)
+	}
+	// Prune the tunnel's per-session kill-generation bookkeeping now that the
+	// session is permanently gone (self-review: bounds killGenSession growth).
+	if b.tunnelSrv != nil {
+		b.tunnelSrv.ForgetSession(sid)
 	}
 	b.pubSysEvent("session_destroyed", map[string]any{"sid": sid})
 	b.cfg.Logger.Info("broker: session removed", "sid", sid)
@@ -95,6 +102,7 @@ func dropSessionRows(db *sql.DB, sid string) error {
 	for _, q := range []string{
 		`DELETE FROM port_allocations  WHERE sid = ?`,
 		`DELETE FROM processes         WHERE sid = ?`,
+		`DELETE FROM proxy_subscribers WHERE sid = ?`,
 		`DELETE FROM agent_provisioning WHERE sid = ?`,
 		`DELETE FROM nodes             WHERE sid = ?`,
 		`DELETE FROM members           WHERE sid = ?`,

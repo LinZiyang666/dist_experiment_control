@@ -165,7 +165,6 @@ func connectAnon(t *testing.T, url string) *nats.Conn {
 	return nc
 }
 
-
 // newTestServer returns an httptest.Server that always serves body
 // (with a 200 status) for any path. The caller must Close() it.
 func newTestServer(t *testing.T, body []byte) *httptest.Server {

@@ -170,4 +170,3 @@ func urlAllowed(url string, allow []string) bool {
 	}
 	return false
 }
-

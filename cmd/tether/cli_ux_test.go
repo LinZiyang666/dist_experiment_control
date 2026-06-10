@@ -790,10 +790,10 @@ func TestEnvSessionEmptyFallsBackToFile(t *testing.T) {
 func TestEmptyFlagValueEqualsMissing(t *testing.T) {
 	t.Setenv("TETHER_SESSION", "lab")
 	cases := []struct {
-		name       string
-		argsEmpty  []string // --flag "" form
+		name        string
+		argsEmpty   []string // --flag "" form
 		argsMissing []string // flag omitted form
-		wantSubstr string
+		wantSubstr  string
 	}{
 		{
 			name: "session create: --pin ''",

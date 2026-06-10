@@ -92,10 +92,10 @@ type Transport interface {
 // and `sid` from ~/.tether/current_session (or TETHER_SESSION); a fake
 // transport in tests provides both directly.
 type CompletionContext struct {
-	Home         string // resolved home dir (--home / TETHER_HOME / default)
-	NATSURL      string // resolved NATS URL (flag / TETHER_NATS_URL / ~/.tether/broker_url)
-	ActorPubKey  string // from ReadIdentity(home); empty if no key on disk
-	SID          string // active session id; empty if no active session
+	Home        string // resolved home dir (--home / TETHER_HOME / default)
+	NATSURL     string // resolved NATS URL (flag / TETHER_NATS_URL / ~/.tether/broker_url)
+	ActorPubKey string // from ReadIdentity(home); empty if no key on disk
+	SID         string // active session id; empty if no active session
 }
 
 // cacheKey JSON-encodes the (helper, ctx, helperFilters) tuple so a

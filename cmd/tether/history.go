@@ -21,10 +21,10 @@ import (
 // Replays audit messages from the active session's history-<sid>
 // JetStream stream via an EPHEMERAL consumer. Shapes:
 //
-//   tether history             # all entries from oldest, then exit
-//   tether history -n 50       # last 50 entries
-//   tether history --follow    # tail (stream new audit msgs as they land)
-//   tether history --kind call # filter to call|proc|port
+//	tether history             # all entries from oldest, then exit
+//	tether history -n 50       # last 50 entries
+//	tether history --follow    # tail (stream new audit msgs as they land)
+//	tether history --kind call # filter to call|proc|port
 //
 // All consumers are ephemeral per H.2 — Ctrl-C disposes them. Owners
 // who need durable replay can build their own NATS consumer manually;
@@ -223,7 +223,10 @@ func runHistoryFilteredTail(ctx context.Context, cons jetstream.Consumer, out io
 	}
 	defer it.Stop()
 
-	type item struct{ subject string; data []byte }
+	type item struct {
+		subject string
+		data    []byte
+	}
 	ring := make([]item, 0, n)
 	add := func(it item) {
 		if len(ring) < n {

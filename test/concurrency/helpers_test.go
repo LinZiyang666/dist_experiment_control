@@ -26,8 +26,8 @@ import (
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/tunnel"
-	"github.com/nats-io/nats.go"
 	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 // silentLog returns a discard-only slog handler so test output is

@@ -2,9 +2,10 @@
 // reconciliation, and read-side snapshots. tetherd writes; admin tools read.
 //
 // State machine (architecture D.2):
-//   ONLINE   — heartbeat within StaleAfter (default 5s)
-//   STALE    — StaleAfter ≤ age < OfflineAfter
-//   OFFLINE  — age ≥ OfflineAfter (default 60s)
+//
+//	ONLINE   — heartbeat within StaleAfter (default 5s)
+//	STALE    — StaleAfter ≤ age < OfflineAfter
+//	OFFLINE  — age ≥ OfflineAfter (default 60s)
 //
 // STALE / OFFLINE are visibility states only; per the architecture they
 // don't trigger any cleanup of resources owned by the node.
@@ -55,6 +56,9 @@ type RegisterInput struct {
 	OS             string
 	Arch           string
 	BootID         string
+	// ProxyCapable (P13) records whether the agent advertised the proxy-v1
+	// capability; the broker uses it to gate proxy allocation/push.
+	ProxyCapable bool
 }
 
 // ErrSessionMissing is returned by Register when the agent's target sid
@@ -87,19 +91,29 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 		return fmt.Errorf("node: lookup session: %w", err)
 	}
 
+	capable := 0
+	if in.ProxyCapable {
+		capable = 1
+	}
 	if _, err := tx.Exec(`
 		INSERT INTO nodes(nid, sid, last_heartbeat_at, status, boot_id,
-		                  release_version, proto_version, registered_at)
-		VALUES (?,?,?,?,?,?,?,?)
+		                  release_version, proto_version, registered_at, proxy_capable)
+		VALUES (?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(sid, nid) DO UPDATE SET
 		    last_heartbeat_at = excluded.last_heartbeat_at,
 		    status            = 'ONLINE',
 		    boot_id           = excluded.boot_id,
 		    release_version   = excluded.release_version,
-		    proto_version     = excluded.proto_version
+		    proto_version     = excluded.proto_version,
+		    proxy_capable     = excluded.proxy_capable,
+		    -- round-6 F8: a (re)register means a NEW agent process that has NOT yet
+		    -- re-established its SS server + tunnel. Clear readiness so a restarted
+		    -- or downgraded agent is never rendered into /sub until its post-bind
+		    -- ACK sets proxy_ready=1 again.
+		    proxy_ready       = 0
 	`,
 		in.NID, in.SID, now, string(StateOnline),
-		in.BootID, in.ReleaseVersion, in.ProtoVersion, now,
+		in.BootID, in.ReleaseVersion, in.ProtoVersion, now, capable,
 	); err != nil {
 		return fmt.Errorf("node: upsert: %w", err)
 	}
@@ -164,10 +178,15 @@ func ReconcileStates(db *sql.DB, now time.Time, staleAfter, offlineAfter time.Du
 	}
 
 	for _, u := range pendingUpdates {
-		if _, err := db.Exec(
-			`UPDATE nodes SET status = ? WHERE sid = ? AND nid = ?`,
-			string(u.newState), u.sid, u.nid,
-		); err != nil {
+		// P13 M6: a node going OFFLINE also loses its proxy_ready flag, so a
+		// later ONLINE-via-heartbeat flap can't render a not-yet-rebound node
+		// in /sub (it must re-ACK first), and `proxy status` doesn't show a
+		// dead node as Ready.
+		q := `UPDATE nodes SET status = ? WHERE sid = ? AND nid = ?`
+		if u.newState == StateOffline {
+			q = `UPDATE nodes SET status = ?, proxy_ready = 0 WHERE sid = ? AND nid = ?`
+		}
+		if _, err := db.Exec(q, string(u.newState), u.sid, u.nid); err != nil {
 			return 0, fmt.Errorf("node: update %s/%s: %w", u.sid, u.nid, err)
 		}
 	}
@@ -218,6 +237,21 @@ func LookupStatus(db *sql.DB, sid, nid string) (State, error) {
 	default:
 		return "", fmt.Errorf("node: lookup status: %w", err)
 	}
+}
+
+// SetProxyReady sets the P13 nodes.proxy_ready flag (the agent's SS-bind ACK).
+// A node is rendered into a /sub response only when ready=1. Idempotent.
+func SetProxyReady(db *sql.DB, sid, nid string, ready bool) error {
+	v := 0
+	if ready {
+		v = 1
+	}
+	if _, err := db.Exec(
+		`UPDATE nodes SET proxy_ready=? WHERE sid=? AND nid=?`, v, sid, nid,
+	); err != nil {
+		return fmt.Errorf("node: set proxy_ready: %w", err)
+	}
+	return nil
 }
 
 // List returns every node row, sorted by (sid, nid) for stable display.

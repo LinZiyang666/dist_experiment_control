@@ -138,9 +138,9 @@ func TestSessionSubjects(t *testing.T) {
 
 func TestParseCtrlBy(t *testing.T) {
 	cases := []struct {
-		subject              string
-		wantActor, wantLeaf  string
-		wantOK               bool
+		subject             string
+		wantActor, wantLeaf string
+		wantOK              bool
 	}{
 		{SubjCtrlSessionCreate("UABCD"), "UABCD", "session.create.req", true},
 		{SubjCtrlSessionList("UABCD"), "UABCD", "session.list.req", true},
@@ -163,10 +163,10 @@ func TestParseCtrlBy(t *testing.T) {
 
 func TestParseSidNidFromCtrl(t *testing.T) {
 	cases := []struct {
-		subject       string
-		wantSid       string
-		wantNid       string
-		wantOK        bool
+		subject string
+		wantSid string
+		wantNid string
+		wantOK  bool
 	}{
 		{SubjNodeRegister("lab", "lab-1"), "lab", "lab-1", true},
 		{SubjNodeUnregister("prod", "node-007"), "prod", "node-007", true},

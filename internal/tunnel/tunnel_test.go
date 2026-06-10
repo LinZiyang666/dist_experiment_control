@@ -235,4 +235,3 @@ func httpGet(url string) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
 	return io.ReadAll(resp.Body)
 }
-

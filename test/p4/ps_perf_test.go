@@ -241,8 +241,8 @@ func TestProcGCBoundsTableGrowth(t *testing.T) {
 		logSink = newTestLogSink(t)
 	}
 	br, err := broker.New(broker.Config{
-		NATSURL:           url,
-		DB:                db,
+		NATSURL: url,
+		DB:      db,
 		Logger: slog.New(slog.NewTextHandler(logSink,
 			&slog.HandlerOptions{Level: slog.LevelDebug})),
 		ReconcileInterval: time.Hour, // silence reconcile in this test

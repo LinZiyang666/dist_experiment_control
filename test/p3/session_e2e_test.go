@@ -246,4 +246,3 @@ func readWithEnv(t *testing.T, key, val, home string) string {
 	}()
 	return cli.ReadCurrentSession(home)
 }
-

@@ -15,7 +15,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-
 // collectEvents subscribes to sys.events on the given conn and
 // returns a snapshot func plus an unsubscribe. Tests use it to
 // assert that the right kinds fired without polling.
@@ -235,4 +234,3 @@ func TestDiskPressureFiresAboveThreshold(t *testing.T) {
 	cancel()
 	<-done
 }
-

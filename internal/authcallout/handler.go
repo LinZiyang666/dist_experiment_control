@@ -195,11 +195,11 @@ func agentNidFromName(name string) string {
 //  2. Consult agent_provisioning(sid, nid):
 //     - row exists with matching fp                     → allow;
 //     - row exists with a different fp                  → deny (this nid
-//       is taken by another agent identity; operator revokes first);
+//     is taken by another agent identity; operator revokes first);
 //     - row missing AND no PIN supplied                 → deny (agent
-//       must run `tether agent` with --pin on first boot);
+//     must run `tether agent` with --pin on first boot);
 //     - row missing AND a valid PIN supplied            → ProvisionWithPIN
-//       (verifies session ACTIVE + PIN, then INSERT), allow.
+//     (verifies session ACTIVE + PIN, then INSERT), allow.
 //
 // Architecture K.1 — agent identity is per-machine, per-session, bound
 // once at install/provision time and remembered by the broker thereafter.

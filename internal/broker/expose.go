@@ -10,9 +10,9 @@
 //   - D.4   port state machine (ALLOCATED → REVOKED|FREED)
 //   - F.3   expose end-to-end flow
 //   - F.4   token storage rule (broker keeps only SHA256, raw is
-//           agent-only after delivery)
+//     agent-only after delivery)
 //   - F.6   断联与恢复 — agent restart re-uses the same port via
-//           state.json + tunnel auto-reconnect
+//     state.json + tunnel auto-reconnect
 package broker
 
 import (
@@ -65,6 +65,15 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 			"want_sid", sid, "want_nid", nid, "want_port", publicPort,
 			"got_sid", a.SID, "got_nid", a.NID, "got_port", a.Port)
 		return fmt.Errorf("token_unknown_or_revoked")
+	}
+	// round-3 F1: for the system __proxy__ port, the master switch is part of
+	// the authorization boundary. Even if the ALLOCATED row is briefly visible
+	// between CloseProxy and port.Free, a REGISTER must be denied while proxy is
+	// OFF — otherwise the kill switch leaks an exit through a re-REGISTER race.
+	if a.Name == port.ProxyPortName {
+		if on, err := session.GetProxyEnabled(b.cfg.DB, sid); err != nil || !on {
+			return fmt.Errorf("token_unknown_or_revoked")
+		}
 	}
 	return nil
 }
@@ -128,6 +137,12 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	if req.Name == "" {
 		b.replyExposeErr(msg, "name_required", "")
+		return
+	}
+	// P13: the reserved name __proxy__ belongs to the system-managed proxy
+	// port; a user expose must never collide with it.
+	if req.Name == port.ProxyPortName {
+		b.replyExposeErr(msg, "name_reserved", port.ProxyPortName)
 		return
 	}
 	if req.LocalPort <= 0 || req.LocalPort > 65535 {

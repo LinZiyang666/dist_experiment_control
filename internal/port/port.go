@@ -495,3 +495,82 @@ func scanRow(rows *sql.Rows) (*Allocation, error) {
 	}
 	return &a, nil
 }
+
+// ---------------------------------------------------------------------------
+// P13 — the per-agent proxy port. It is an ordinary port_allocations row with
+// the reserved name ProxyPortName, EXCEPT its uniqueness is per (sid, nid)
+// (one proxy port per agent) rather than per (sid, name) — enforced by the
+// partial index idx_port_alloc_proxy_unique (migration 0006). The 15-min
+// REVOKE reconciler (ListAllocatedForOfflineNodes), Free, Revoke and
+// session-rm cleanup all treat it like any other allocation, so no extra
+// lifecycle wiring is needed.
+// ---------------------------------------------------------------------------
+
+// ProxyPortName is the reserved port_allocations.name for the embedded SS
+// proxy port. User `tether expose --name __proxy__` is rejected at the broker.
+const ProxyPortName = "__proxy__"
+
+// LookupProxyByNode returns the ALLOCATED proxy row for (sid, nid), or
+// ErrNotFound. Used at register time to decide keep-vs-replace.
+func LookupProxyByNode(db *sql.DB, sid, nid string) (*Allocation, error) {
+	return scanOne(db.QueryRow(
+		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
+		 FROM port_allocations
+		 WHERE sid=? AND nid=? AND name=? AND state='ALLOCATED'`,
+		sid, nid, ProxyPortName,
+	))
+}
+
+// AllocateProxy mints a FRESH proxy port + token for (sid, nid), FREEing any
+// existing ALLOCATED proxy row for that node first (reuse-or-replace). The raw
+// token is returned exactly once (delivered to the agent in a ProxyDirective);
+// only its hash is persisted. createdByFP is "" (system-owned, so a member's
+// `expose rm` can never touch it). localPort is 0 at allocation time — the
+// agent binds its loopback SS port and the broker does not need to know it
+// (the tunnel maps publicPort->the agent's local SS port agent-side).
+func AllocateProxy(db *sql.DB, sid, nid string, cfg *Config) (*Allocation, error) {
+	low, high, now := cfgWithDefaults(cfg)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("port: proxy begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(
+		`UPDATE port_allocations SET state='FREED', revoked_at=?
+		 WHERE sid=? AND nid=? AND name=? AND state='ALLOCATED'`,
+		now.UTC(), sid, nid, ProxyPortName,
+	); err != nil {
+		return nil, fmt.Errorf("port: proxy free-existing: %w", err)
+	}
+
+	p, err := findFreePort(tx, low, high)
+	if err != nil {
+		return nil, err
+	}
+	token, err := genToken()
+	if err != nil {
+		return nil, fmt.Errorf("port: proxy token gen: %w", err)
+	}
+	tokenHash := hashToken(token)
+
+	if _, err := tx.Exec(
+		`INSERT INTO port_allocations
+		   (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
+		 VALUES (?, ?, ?, ?, 0, ?, 'ALLOCATED', '', ?)`,
+		p, sid, nid, ProxyPortName, tokenHash, now.UTC(),
+	); err != nil {
+		// A concurrent AllocateProxy for the same (sid,nid) trips
+		// idx_port_alloc_proxy_unique; surface as ErrPortTaken.
+		return nil, translateInsertErr(err, p)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("port: proxy commit: %w", err)
+	}
+	return &Allocation{
+		Port: p, SID: sid, NID: nid, Name: ProxyPortName, LocalPort: 0,
+		TokenHash: tokenHash, State: StateAllocated, CreatedByFP: "",
+		CreatedAt: now.UTC(), Token: token,
+	}, nil
+}

@@ -27,6 +27,13 @@ type agentYAML struct {
 	NID          string             `yaml:"nid"`
 	TunnelAddr   string             `yaml:"tunnel_addr"`
 	FileTransfer fileTransferConfig `yaml:"file_transfer"`
+	Proxy        proxyConfig        `yaml:"proxy"`
+}
+
+// proxyConfig is the agent-side P13 proxy block (round-7 F5). The documented
+// allow_private_destinations opt-in must actually reach agent.Config.
+type proxyConfig struct {
+	AllowPrivateDestinations bool `yaml:"allow_private_destinations"`
 }
 
 // fileTransferConfig controls `tether push` / `tether pull` containment.
@@ -121,13 +128,14 @@ func newAgentCmd() *cobra.Command {
 			}
 
 			cfg := agent.Config{
-				NATSURL:    natsURL,
-				SID:        sid,
-				NID:        nid,
-				PIN:        pin,
-				Home:       home,
-				Logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
-				AllowRoots: ay.FileTransfer.AllowRoots,
+				NATSURL:                       natsURL,
+				SID:                           sid,
+				NID:                           nid,
+				PIN:                           pin,
+				Home:                          home,
+				Logger:                        slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				AllowRoots:                    ay.FileTransfer.AllowRoots,
+				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
 			}
 
 			// TETHER_DEV_NO_AUTH (CLI-side env, see internal/cli.DevNoAuthEnv):
@@ -285,7 +293,7 @@ WantedBy=default.target
 }
 
 // shellQuote wraps a value in single quotes, escaping embedded
-// single quotes via the standard '\'' trick. Suitable for systemd
+// single quotes via the standard '\” trick. Suitable for systemd
 // ExecStart= values which use shell-style argument splitting.
 func shellQuote(v string) string {
 	if v == "" {

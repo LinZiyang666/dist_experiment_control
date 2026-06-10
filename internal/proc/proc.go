@@ -7,8 +7,8 @@
 // agent owns the runtime knowledge ("process is running / has exited
 // with rc=N"); tetherd owns the SQLite row. The path:
 //
-//   agent fork+exec → pub `ev.proc.started` → broker.Insert
-//   agent reads child wait → pub `ev.proc.exit` → broker.MarkExited
+//	agent fork+exec → pub `ev.proc.started` → broker.Insert
+//	agent reads child wait → pub `ev.proc.exit` → broker.MarkExited
 package proc
 
 import (

@@ -31,11 +31,24 @@ type PortToken struct {
 	Token     string `json:"token"`      // raw frp auth token
 }
 
+// ProxyState (P13) persists the embedded SS proxy's tunnel footprint so a
+// restart re-establishes the SAME public port + tunnel. The SS PSKs are NEVER
+// persisted (re-delivered by the broker on every (re)register / push); only
+// the tunnel token + last-applied epoch live here. Pointer/omitempty so a
+// pre-P13 state.json still loads and a proxy-off agent writes no proxy key.
+type ProxyState struct {
+	PublicPort int    `json:"public_port"`
+	LocalPort  int    `json:"local_port"`
+	Token      string `json:"token"`
+	Epoch      int64  `json:"epoch"`
+}
+
 // StateFile is the on-disk shape. Writers serialize through stateMu
 // in the agent so concurrent expose / expose-rm don't trample each
 // other's writes.
 type StateFile struct {
 	PortTokens []PortToken `json:"port_tokens"`
+	Proxy      *ProxyState `json:"proxy,omitempty"`
 }
 
 type stateStore struct {
@@ -116,6 +129,27 @@ func (s *stateStore) RemovePort(name string) error {
 	}
 	sf.PortTokens = out
 	return s.saveLocked(sf)
+}
+
+// SetProxy upserts the proxy footprint (nil clears it). Atomic write.
+func (s *stateStore) SetProxy(p *ProxyState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sf, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	sf.Proxy = p
+	return s.saveLocked(sf)
+}
+
+// GetProxy returns the persisted proxy footprint, or nil if none.
+func (s *stateStore) GetProxy() (*ProxyState, error) {
+	sf, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	return sf.Proxy, nil
 }
 
 // saveLocked writes the StateFile via tmp+rename atomic replace.

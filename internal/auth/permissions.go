@@ -63,6 +63,16 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.*.tag.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".caps.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".transfer.*.finalize.req",
+			// P13 proxy subscription control (owner-only enforced at the
+			// app layer; member-readable status). Fixed-token literals,
+			// pinned to this actor + sid. The keyset push to agents rides
+			// the existing s.<sid>.cmd.node.*.*.req.forwarded wildcards
+			// (broker-pub / agent-sub) — no ctl pub permission for it.
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.set.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.status.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.create.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.list.req",
+			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.revoke.req",
 			subjectPrefix + ".s." + sid + ".cmd.by." + actor + ".node.*.*.req",
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",

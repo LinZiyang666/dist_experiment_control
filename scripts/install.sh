@@ -525,6 +525,8 @@ broker:
     port_range: "14000-14999"
   admin:
     socket: $RUN_DIR/admin.sock
+  sub:
+    listen: "127.0.0.1:8090"   # P13 proxy subscription HTTP (Caddy fronts /sub/*); empty disables
   storage:
     db: $LIB_DIR/tether.db
     js_store: $LIB_DIR/jetstream
@@ -535,6 +537,10 @@ EOF
     fi
 
     # Caddyfile (TLS termination + reverse proxy to NATS WebSocket).
+    # PIN POLICY: the path-scoped `handle /sub/*` (P13 proxy subscription)
+    # MUST come BEFORE the catch-all NATS WebSocket handle, or Clash requests
+    # would be reverse-proxied to nats-server and the WSS upgrade would break.
+    # Verify after any edit that `wss://$DOMAIN/nats` still upgrades.
     if [ "$DRY_RUN" -eq 0 ]; then
         cat > "$ETC_DIR/Caddyfile" <<EOF
 {
@@ -542,7 +548,12 @@ EOF
 }
 
 $DOMAIN:443 {
-    reverse_proxy 127.0.0.1:8222
+    handle /sub/* {
+        reverse_proxy 127.0.0.1:8090
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8222
+    }
 }
 EOF
         chmod 644 "$ETC_DIR/Caddyfile"

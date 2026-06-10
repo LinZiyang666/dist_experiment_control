@@ -28,10 +28,10 @@ import (
 // Generic primitives live in internal/testharness; the helpers below
 // are the phase-specific bits.
 
-func startNATS(t *testing.T) string                  { return testharness.StartNATS(t) }
-func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
-func silentLog() *slog.Logger                        { return testharness.SilentLog() }
-func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
+func startNATS(t *testing.T) string              { return testharness.StartNATS(t) }
+func openDB(t *testing.T) *sql.DB                { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                    { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserPub(t) }
 
 func seed(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()

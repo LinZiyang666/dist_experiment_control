@@ -25,6 +25,7 @@
 //     children fall into this bucket — they have a sync lifecycle
 //     and no agent-side persistence path that would let agent claim
 //     a stale ULID, so the verification has nothing to compare.
+//
 // v1 caveat:
 //   - Per-port LocalPort.TokenHash is matched against the row's
 //     token_hash; sid/nid mismatch is treated as orphan (not a

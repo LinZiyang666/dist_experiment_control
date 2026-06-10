@@ -4,17 +4,17 @@
 //
 // Stream topology (must match H.1 verbatim):
 //
-//   events
-//     subjects   = ["tether.v1.sys.events"]
-//     retention  = limits, max_age=30d, max_bytes=1GiB, discard=old
-//     storage    = file
-//     subscribers: owner ctl + ops tools
+//	events
+//	  subjects   = ["tether.v1.sys.events"]
+//	  retention  = limits, max_age=30d, max_bytes=1GiB, discard=old
+//	  storage    = file
+//	  subscribers: owner ctl + ops tools
 //
-//   history-<sid>                                         per session
-//     subjects   = ["tether.v1.s.<sid>.audit.>"]
-//     retention  = limits, max_age=-1, max_bytes=-1, discard=new
-//     storage    = file
-//     subscribers: session members via ephemeral consumers
+//	history-<sid>                                         per session
+//	  subjects   = ["tether.v1.s.<sid>.audit.>"]
+//	  retention  = limits, max_age=-1, max_bytes=-1, discard=new
+//	  storage    = file
+//	  subscribers: session members via ephemeral consumers
 //
 // Helpers here are idempotent: EnsureXxx is safe to call on every
 // boot and on every session create. Delete is a hard remove and is

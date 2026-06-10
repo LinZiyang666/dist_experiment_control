@@ -1853,6 +1853,74 @@ SHA256SUMS.asc                           # v2 加 GPG 签名
 
 ---
 
+## L. P13 — proxy 订阅（self-hosted airport，post-1.0）
+
+> P13 把一个 session 的在线 agent 机群变成一份 Clash 订阅。owner 拨总开关 → 每个在线 agent
+> 起内嵌 shadowsocks 服务端并自动 expose → broker 托管自动更新的订阅 URL → 任意持链接者(含非
+> 成员)导入 Clash 即经 agent 出网。设计定稿见 `docs/reviews/p13-plan.md`;此处为架构基线增量。
+
+### L.1 子系统与数据流
+
+```
+ctl ──proxy on/sub──> broker(tetherd) ──proxy-keys.req.forwarded──> agent
+                          │                                            │
+                          │ port.AllocateProxy(__proxy__)              ├─ internal/agent/ssproxy: 内嵌 SS server(127.0.0.1)
+                          │ proxysub: 每订阅一把可撤销 PSK              ├─ tunnel.Client.Open(publicPort→localSS)
+                          │ internal/subhttp: GET /sub/<token>         └─ ev.node.<nid>.proxy.ready ACK
+consumer ──Clash──> https://broker/sub/<token> ─(Caddy /sub/*)─> 127.0.0.1:8090(只读)
+consumer 流量 ──> broker:14xxx(明文 TCP,载 SS-AEAD 密文) ──tunnel──> agent SS ──> 外网
+```
+
+- **协议**:经典 `chacha20-ietf-poly1305` shadowsocks(AEAD),**多密钥同端口靠试解密**(Outline pre-2022 机制),纯 `x/crypto`、**CGO_ENABLED=0、无 blake3**、兼容经典 Clash for Windows。自研 vendored(`internal/agent/ssproxy`),同 `internal/tunnel` 替换 frp 的先例。
+- **一 agent 一 `__proxy__` 端口**(`port_allocations` 保留 name,`(sid,nid)` 部分唯一索引);所有订阅的 PSK 同住一个 CipherList,撤销=删一把 key + force-close 在飞连接,互不影响。
+
+### L.2 wire / subject（全 additive,proto 保持 v1）
+
+- owner/member ctrl(broker 直答,非 forwarded):`ctrl.by.<A>.s.<sid>.proxy.{set,status}.req`(5 token)、`...proxy.sub.{create,list,revoke}.req`(6 token);`ParseCtrlProxy` 精确长度。
+- agent-only 密钥推送:`s.<sid>.cmd.node.<nid>.proxy-keys.req.forwarded`(复用既有 forwarded 通配,零 JWT 改动);body=`ProxyDirective{Enabled,PublicPort,Token,Cipher,Keys[],Generation,Epoch}`(`Generation`=broker 化身定序代,见 §L.3)。
+- agent ACK:`s.<sid>.ev.node.<nid>.proxy.{ready,unready}`(复用 agent ev 权限)。
+- `NodeRegisterResp.Proxy *ProxyDirective`(指针;proxy-off 时 nil → 与 pre-P13 字节等价)。
+- `NodeRegisterReq.Capabilities`(agent 显式上报 `proxy-v1`,见 §L.3 capability gate)。
+- `HeartbeatPayload.ProxyGeneration`+`.ProxyEpoch`(agent 上报已应用 `(gen, epoch)` 对,供 broker 每条心跳按完整对判定收敛 —— 同 epoch 不同 generation 也能 fence)。
+- **机密只走** register-reply `_INBOX` 与 `proxy-keys.req.forwarded`;**绝不上** sys.events/audit/history/日志/agent state.json(state.json 只存 tunnel footprint + epoch,PSK 永不落盘)。
+- JWT:`PermissionsForActivatedMember` 仅 +5 条 `proxy.*` literal(各钉死 `by.<A>`+`s.<sid>`);agent/broker 模板不变。
+
+### L.3 状态、收敛与 kill switch
+
+- **`(generation, epoch)` 定序(round-3/4,统一所有来源)**:`ProxyDirective` 带 `Generation`(broker 化身定序代)+ `Epoch`(per-session keyset 版本)。**register-reply / live push / 心跳修复**全部携带同一对;agent 按字典序 `(gen, epoch)>` 应用,且**仅在成功应用后**才推进已应用对(故瞬时启动失败不推进、重试 directive 仍算更新):
+  - 更高 generation ⇒ 即便 epoch 更低也应用(DB 还原 = 新 broker 化身,权威收敛);
+  - 同 generation 内,更低 epoch 为陈旧(杜绝陈旧 register-reply 在 OFF 后复活)。
+  纯标量 epoch 无法区分「陈旧低 epoch」与「还原低 epoch」,generation 才能。register-resp 的 proxy-off 仍用 nil(无对、agent no-op);权威 OFF 由带对的 disable 推送 + 心跳修复送达。
+- **generation 是持久单调 fencing token(round-4 F1 / round-5 F2,F3)**:`proxy_meta.generation`(forward migration `0007`)持久化,每次 broker 启动取 `max(persisted+1, now_unixnano)` 并写回 ⇒ **即便 wall clock 回拨**(NTP/手动/VM 还原)后启的进程也得严格更大值;**取不到持久 generation 则 `broker.New` 直接报错拒启**(不退化到裸 wall clock,否则 fencing 失效)。**DB 还原自动收敛(无需 runbook)**:从更旧备份还原使 `proxy_meta` 回退到某连接中 agent 已应用 generation 之下时,broker 在心跳里见到 `agentGen >= brokerGen`,即 `escalateProxyGen` 原子地把持久 generation 抬到 `agentGen+1` 之上(`advanceProxyGeneration` 的 floor 参数,事务内 max),随后推送即压过 agent。多 agent 经该事务 max 收敛。
+- **收敛按完整 `(gen, epoch)` 对(round-4 F2 / round-6 F1,F2,F3)**:心跳带 `ProxyGeneration`+`ProxyEpoch`(agent 上报已应用对);`repairProxy` **每条心跳**都调,但:① **capability-gated**——先查 `nodes.proxy_capable`,非 capable 节点**不得**影响 generation/repair/render(F2);② **convergence-first**——ON+ready+`(gen,epoch)` 精确相等先返回,**不升代不重推**(否则正常心跳风暴写 `proxy_meta`,F1);③ 升代仅在 `agentGen > brokerGen`(严格)时触发(同代 not-ready 用 epoch 重推,不升代);④ **agent 上报的 generation 不被当作无界全局权威**——`escalateProxyGen` 拒绝 `>= now+10y` 或会触顶(`maxProxyGeneration=1<<62`)的值,故单个 capable agent 无法把 generation 推向耗尽而 brick 全体 session 的下次启动(F3)。OFF 时 agent 仍服务则补推 disable(同样先升代)。
+- **写操作事务化 + 串行化(round-6 F5,F6 / round-7+)**:`proxy on` 的开关翻转 + epoch bump 在**一个事务**(`SetProxyEnabledAndBumpEpoch(…,true)`),bump 失败回滚,绝不留开关 ON 授权陈旧 token。`proxy off` 优先同样原子提交 OFF+epoch;若 epoch 失败,安全语义优先:best-effort 单独提交开关 OFF、无条件 `CloseSession(sid)` 杀已建监听并回 `store_error`,不因版本持久化失败而保持公网出口 ON;修复后重试完成 epoch/agent 收敛。`sub create`/`revoke` 的凭据变更 + epoch bump 同样**一个事务**(`createSubAndBump`/`revokeSubAndBump`)。NATS 推送是 commit 后 best-effort(心跳重放兜底)。**`proxyOpMu`** 进程级串行化 `proxy.set` 与 `proxy.sub.*`(两个独立订阅)的全部 owner 变更,杜绝跨 subject 交错(如 sub 变更观察到 ON、在并发 OFF 完成后才推 `Enabled:true`)。
+- **agent fail-closed 可恢复(round-6 F7)**:本地 fail-closed teardown 保留已应用对(防陈旧复活)但置 `needsReestablish`;重连时 broker 重发**同一**权威 full directive,agent 在该状态下**只**接受 exact-equal 的 token-bearing directive 重建(陈旧低值仍丢弃),不靠把对清零(那会重开复活洞)。
+- **broker 侧即时 kill + 授权边界**:`proxy off` 先提交 `proxy_enabled=0`(此后 `tunnelTokenLookup` 对 `__proxy__` 直接拒授权,杜绝 re-REGISTER 竞争复活);**随即 `tunnel.Server.CloseSession(sid)` 同步关该 session 全部已建公网监听并 bump 各 port killGen + 该 session 的 killGenSession —— 不依赖任何 DB 查询**(round-4 F3)。`BumpProxyEpoch`/`ListBySession` 失败 ⇒ OFF **回 store_error 不谎报成功**;`port.Free` 失败 ⇒ 不发 `freed` 事件,留 stale 行由下次 ON 轮换(节点 `proxy_ready=0` 时 enableProxy 重铸 port+token)。**两级 killGen 都覆盖在飞 REGISTER(round-5 F1)**:`handleAgent` 在授权前同时快照 `killGen[port]` 与 `killGenSession[sid]`,装入会话前两者都校验 —— 故无论 OFF 按 port(`CloseProxy`)还是按 sid(`CloseSession`,**即便此刻尚无已装入监听**)杀,已授权但未装入的 REGISTER 都放弃。
+- **agent fail-closed**:NATS 持续断连 ≥ `ProxyFailClosedGrace`(默认 15min,对齐 OFFLINE→port REVOKE)⇒ 主动停 SS。
+- **render 门(round-6 F8,F9)**:`/sub` 只渲染 `s.state='ACTIVE' AND s.proxy_enabled=1 AND nodes.proxy_capable=1 AND nodes.proxy_ready=1 AND status=ONLINE AND __proxy__ ALLOCATED` —— **独立 honour 权威主开关 + capability**(故 OFF 提交后即便清理失败也不渲染 stale 节点,F9);每次 register **清 `proxy_ready=0`**(重启/降级的新进程未重建数据面前不被渲染,F8);OFFLINE 转移清 `proxy_ready`(`ReconcileStates`);失败重建发 `unready`。
+- **订阅 HTTP 同步绑定(round-6 F10)**:`subhttp.Bind` 同步校验 loopback + 绑定,失败由 `broker.Run` **传播**(非 goroutine 吞错)⇒ 配置错/端口占用使 broker 启动失败,而非留一个看似健康却无订阅端点的 broker。
+- **数据面目的地策略 + 防重放(round-6 F11,F12 / round-7 F1,F2,F5 / round-8 F1)**:SS server 对每个 key 维护**有界 salt 重放过滤**(`maxSaltsPerKey`,revoke 时清),拒绝重放的 client salt(SS-AEAD salt 唯一性);**目的地默认仅公网出口**——agent 默认 `DenyPrivateDestinations`。判定 `blockedIP` 覆盖**类别**(loopback/private/link-local/multicast/unspecified)**加 IANA special-purpose 前缀表**(RFC6598 `100.64/10` 含 `100.100.100.200` 阿里云 metadata、RFC2544 `198.18/15`、TEST-NET、`240/4`、IPv6 NAT64/Teredo/benchmark/6to4/documentation/SRv6/ULA/link-local 等),并归一化 IPv4-mapped IPv6。NAT64 well-known prefix `64:ff9b::/96` 也拒绝,避免把 metadata/private IPv4 编码成表面公网 IPv6 绕过。**防 DNS-rebinding TOCTOU**:不再「校验 hostname 后再拨 hostname」,而是用 `net.Dialer.Control` 在连接时**校验实际拨号的每个候选 IP**(校验的 IP == 连接的 IP);precheck 仅作 fast-fail。private 访问经 `agent.yaml: proxy.allow_private_destinations`(已接线到 `agent.Config`)显式开启(见 R-10 + `proxy on` 警告)。
+- **OFF 时订阅惰性(round-7 F4)**:`sub create/revoke` 仍在事务里提交凭据+epoch bump,但 commit 后**仅 `proxy_enabled=1` 才推 keyset / 发 keyset_changed**(OFF 时不泄露 PSK、不扰动 readiness);下次 ON 发全量权威 keyset。
+- **幂等 re-ACK(round-7 F3)**:agent 收到 exact-equal 的 enabled directive 且**仍在服务**(`p.srv != nil`)时,只**重发 ready**(不重建、不推进 pair),使初次 ready 丢失 / OFFLINE flap 清 `proxy_ready` 后,仍服务的节点能经心跳重新进入 `/sub` 渲染。
+- **mutation 串行化(round-8 F2)**:broker 用 `proxyOpMu` 串行化 `proxy on/off` 与 `sub create/revoke` 的 DB mutation + publish 区间。两个不同 NATS subscription 的 callback 不得交错成「sub 已读 ON,OFF 已完成,sub 再发 Enabled:true」。
+- **ready 必须代表完整数据面(round-8 F3)**:agent 没有 `ExposeAdapter` 时拒绝启动 P13 runtime并发 `unready`;仅 SS 本地 listener 绑定成功不等于 broker 公网 tunnel 就绪,不得 ACK ready/进入订阅渲染。
+- **共享 tunnel adapter 并发安全(round-8 F4)**:`TunnelExposeAdapter` 的 Add/Remove 操作用 `opMu` 串行化,`localFor` 映射用 RWMutex 保护。普通 expose、expose-rm 与 P13 proxy goroutine 可并发到达,不得触发 map race/crash 或同端口 rollback 删除有效映射。
+- **capability gate(显式)**:`NodeRegisterReq.Capabilities` 含 `proto.CapProxyV1="proxy-v1"` 才算 P13-capable(`nodeHasProxyCap`);release semver 仅次级信号(`isP13Capable` 纯 semver、**无 dev 例外**,故 `v0.0.0-dev`/`v0.2.8-dev` 都不被当凭据)。`nodes.proxy_capable` 在 register 写入;dev/CI agent 凭显式 capability 仍可参与。pre-P13 agent 不分配 `__proxy__`、不下推。
+
+### L.4 HTTP 订阅面（tether 首个对外 HTTP）
+
+`internal/subhttp`:独立 `net/http.Server`,**强制 loopback 绑定**(`requireLoopback`,拒 0.0.0.0/非环回),GET-only、只读(无 NATS 句柄、无写)。`SubHTTPAddr==""` 时不启用(pre-P13 部署不变)。`GET /sub/<token>` → `proxysub.LookupByTokenHash`(仅 ACTIVE)→ 渲染 Clash YAML;unknown/revoked/DELETING 一律单一 404(无存在性 oracle)。Caddy `handle /sub/* { reverse_proxy 127.0.0.1:8090 }` **置于 WSS catch-all 之前**(install.sh 已生成 + 静态测试钉序)。requirements §4.3 已为此例外开口。
+
+### L.5 storage / CLI / 出口
+
+- migration `0006_proxy.sql`:`sessions.proxy_enabled`/`.proxy_epoch`、`nodes.proxy_ready`/`.proxy_capable`、`proxy_subscribers`(PK(sid,sub_id),token_hash/name 部分唯一,psk 明文-at-rest 见 R-2)、`idx_port_alloc_proxy_unique`。`dropSessionRows` 级联删 `proxy_subscribers`。
+- migration `0007_proxy_generation.sql`(round-5 F2):`proxy_meta(generation)` 持久单调 fencing 计数器,**独立 forward migration**(不改已应用的 0006,否则按文件名跳过的引擎不会补建),见 §L.3。
+- CLI:`tether proxy on/off/status` + `proxy sub create/ls/revoke`(`on` 强制 `--yes`/交互确认 + 开放出口节点责任警告)。
+- 出口:`make test`/`e2e`(p13 进矩阵)/`lint` 全绿、`-race`、`CGO_ENABLED=0` 且 deps 无 cgo;`TestProxyAuditNoSecrets`/revoke-isolation/loopback/capability-gate/心跳-OFF-修复/fail-closed 等门绿;内审 + 外审通过。
+- **残余威胁**:R-1' 撤销陈旧窗口 ≤15min(心跳修复通常 ~一个心跳收敛);R-2 broker DB 存可恢复 PSK;R-4 开放中继/运营者责任(主导风险);R-5 token-in-URL;**R-9 经典 SS 无响应-salt replay 缓存**(v1 接受为残余风险,记录在案)。
+
+---
+
 # Part II — 实现路线图
 
 > 设计原则："树不能先结果再发芽"——每个 phase 的完成是下一个 phase 的前提。每个 phase 必须有**可执行的交付**与**可验证的测试**，未通过不进入下一阶段。
@@ -2175,6 +2243,9 @@ P11 release hardening + docs                        ← v0.1.0
 | "公网 alpha" | P9 结束 | 可邀请外部人 |
 | "可下载" | P10 结束 | install.sh 发布 |
 | "v0.1.0" | P11 结束 | GitHub release |
+
+**Post-1.0 feature 增量**(不在 P0–P11 线性序内,各自独立设计 + review,见 `docs/reviews/`):
+file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-port`**、**P13 proxy 订阅(§L)**。这些是叶子增量,沿用同一"plan → 实现 → 内审 → 外审"流程,但不阻塞主线里程碑。
 
 ---
 

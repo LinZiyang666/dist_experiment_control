@@ -12,8 +12,8 @@ import (
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
-	"github.com/nats-io/nats.go"
 	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 // startNATS launches an embedded NATS server on an ephemeral port and returns

@@ -94,4 +94,3 @@ func (b *Broker) pubAgentEvicted(sid, nid string) {
 		"sid": sid, "nid": nid,
 	})
 }
-

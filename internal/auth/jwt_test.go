@@ -163,10 +163,10 @@ func TestIssueUserJWTRejectsBadUserPub(t *testing.T) {
 	}()
 
 	bad := []string{
-		"",                                    // empty
-		"hello",                               // garbage
-		strings.Repeat("U", 56),               // looks like a user pub but invalid checksum
-		"A" + strings.Repeat("A", 55),         // account pub, not user
+		"",                            // empty
+		"hello",                       // garbage
+		strings.Repeat("U", 56),       // looks like a user pub but invalid checksum
+		"A" + strings.Repeat("A", 55), // account pub, not user
 	}
 	for _, p := range bad {
 		if _, err := signer.IssueUserJWT(p, jwt.Permissions{}, 0); err == nil {

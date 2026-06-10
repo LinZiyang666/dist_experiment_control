@@ -4,10 +4,10 @@
 //
 // Pattern:
 //
-//	1. Snapshot runtime.NumGoroutine BEFORE component start.
-//	2. Spin component, do something representative.
-//	3. Cancel ctx (or invoke Close).
-//	4. assertNoGoroutineLeak — polls until count returns near baseline.
+//  1. Snapshot runtime.NumGoroutine BEFORE component start.
+//  2. Spin component, do something representative.
+//  3. Cancel ctx (or invoke Close).
+//  4. assertNoGoroutineLeak — polls until count returns near baseline.
 //
 // Why these tests matter: the v1 audit found at least one
 // shutdown-race goroutine leak (tunnel C1 — handleAgent that
@@ -254,4 +254,3 @@ func TestBrokerRepeatedRunNoGoroutineLeak(t *testing.T) {
 
 	assertNoGoroutineLeak(t, "broker repeated run", before)
 }
-

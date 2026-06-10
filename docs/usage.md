@@ -869,6 +869,32 @@ tether expose rm <nid> --name <logical-name>
 当前已分配的暴露条目，用 `tether ps` 的 PORTS 节（数据源同为 broker SQLite 的
 `port_allocations`）。
 
+### 5.9.5 `tether proxy`（v0.2.9+，代理订阅 / 自建机场）
+
+**这是什么**：把当前 session 的**全部在线 agent** 变成一个 Clash 订阅 —— 打开总开关后,
+每个在线 agent(含后加入者)在本机启动内嵌 shadowsocks 服务端并自动 expose, broker 托管
+一个自动更新的订阅 URL; 普通用户(无须 tether 身份)把 URL 导入 Clash for Windows 等,
+即可像用商用机场一样,**经你的 agent 的网络出口**上网。每个 agent = 订阅里一个可选节点。
+
+```
+tether proxy on            # 开总开关(owner-only;需 --yes 或交互确认)
+tether proxy off           # 关:所有 agent 停 SS,订阅 URL 立即无节点
+tether proxy status        # 看开关/在线节点/订阅列表(member 可读;不含任何密钥)
+tether proxy sub create --name alice   # 给某人签发订阅 URL(只打印一次,务必保存)
+tether proxy sub ls                    # 列订阅(NAME/STATE/CREATED;绝不显示 token)
+tether proxy sub revoke alice          # 撤销一个订阅(其他人不受影响,在飞连接被切断)
+```
+
+**底层与安全**：
+- 协议 = 经典 `chacha20-ietf-poly1305` shadowsocks(AEAD 加密+认证;经典 Clash for Windows 即可),
+  每个订阅一把独立 PSK,所有 agent 用单端口**试解密**承载多订阅,撤销互不影响。
+- 数据面是明文公网 TCP 口(§9.5),SS 的 AEAD 是唯一的门 —— **没有订阅密钥连不进来**。
+- **责任警告**:开启后每个在线 agent 是对任意 link 持有者(含非成员)开放的互联网出口,
+  流量从你 agent 的 IP 出去,你负责。一键关闭=`tether proxy off`。`tether proxy on` 因此强制确认。
+- 这是应用层代理,不是整机 VPN;想整机路由,在你自己设备上用 Clash 的 TUN 模式(与 agent 无关)。
+- broker 侧需在 `broker.yaml` 设 `sub.listen`(或 `--sub-http-listen`)启用订阅 HTTP 端点;
+  install.sh 生成的 Caddyfile 已把 `/sub/*` 反代到它。
+
 ### 5.10 `tether push` / `tether pull`（v0.2.0+）
 
 **这是什么**：在 ctl 与远端 agent 之间搬一个文件。无须 `expose` + `scp` /

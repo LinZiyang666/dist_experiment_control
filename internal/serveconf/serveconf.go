@@ -27,6 +27,7 @@ type BrokerSection struct {
 	NATS       NATSSection    `yaml:"nats"`
 	Frp        FrpSection     `yaml:"frp"`
 	Admin      AdminSection   `yaml:"admin"`
+	Sub        SubSection     `yaml:"sub"`
 	Storage    StorageSection `yaml:"storage"`
 	Upgrade    UpgradeSection `yaml:"upgrade"`
 }
@@ -56,6 +57,11 @@ type FrpSection struct {
 
 type AdminSection struct {
 	Socket string `yaml:"socket"`
+}
+
+// SubSection configures the P13 read-only subscription HTTP endpoint.
+type SubSection struct {
+	Listen string `yaml:"listen"` // loopback addr, e.g. "127.0.0.1:8090"; empty disables
 }
 
 type StorageSection struct {

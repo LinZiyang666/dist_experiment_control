@@ -504,8 +504,6 @@ func firstNonNilErr(errs ...error) error {
 
 // ─── Path validation (allow_roots + symlink defence) ──────────────────
 
-
-
 // PathValidationError carries both a human message and a machine-readable
 // code that lands in the proto.Push/PullPrepareResp.Code field.
 //

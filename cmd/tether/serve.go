@@ -37,6 +37,7 @@ func newServeCmd() *cobra.Command {
 		storeDir         string
 		adminSocket      string
 		upgradeURLAllow  []string
+		subHTTPListen    string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -53,6 +54,7 @@ func newServeCmd() *cobra.Command {
 			// default value", which is the standard precedence rule for
 			// "config file + flag override" configs.
 			natsURL = pickFlagOrYaml(cmd, "nats-url", natsURL, fileCfg.Broker.NATS.URL)
+			subHTTPListen = pickFlagOrYaml(cmd, "sub-http-listen", subHTTPListen, fileCfg.Broker.Sub.Listen)
 			dbPath = pickFlagOrYaml(cmd, "db", dbPath, fileCfg.Broker.Storage.DB)
 			tunnelCtrlAddr = pickFlagOrYaml(cmd, "tunnel-addr", tunnelCtrlAddr, fileCfg.Broker.Frp.ControlListen)
 			tunnelPublicHost = pickFlagOrYaml(cmd, "tunnel-public-host", tunnelPublicHost, fileCfg.Broker.Frp.BindAddr)
@@ -129,6 +131,8 @@ func newServeCmd() *cobra.Command {
 				UpgradeURLAllowlist: allow,
 				ProcRetention:       procRetention,
 				ProcGCInterval:      procGCInterval,
+				SubHTTPAddr:         subHTTPListen,
+				SubURLBase:          subURLBase(publicHost),
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -181,6 +185,8 @@ func newServeCmd() *cobra.Command {
 		"bind address for the public per-port tunnel listeners (default 0.0.0.0)")
 	cmd.Flags().StringVar(&storeDir, "store-dir", "",
 		"JetStream store dir to monitor for disk pressure (P7/H.4); empty = monitor disabled")
+	cmd.Flags().StringVar(&subHTTPListen, "sub-http-listen", "",
+		"loopback address for the P13 proxy subscription HTTP endpoint (e.g. 127.0.0.1:8090); empty disables it")
 	cmd.Flags().StringVar(&adminSocket, "admin-socket", defaultAdminSocket,
 		"local Unix socket for `tether admin *` (architecture I.2b); set to empty to disable")
 	cmd.Flags().StringSliceVar(&upgradeURLAllow, "upgrade-url-allow", nil,
@@ -275,4 +281,13 @@ func loadAuthCalloutSeeds(dir string) (*broker.AuthCalloutConfig, error) {
 		BrokerNkeySeed: brokerSeed,
 		AccountSeed:    accountSeed,
 	}, nil
+}
+
+// subURLBase derives the public origin printed in P13 subscription URLs from
+// the broker's public host. https is assumed (Caddy terminates TLS on :443).
+func subURLBase(publicHost string) string {
+	if publicHost == "" || publicHost == "localhost" {
+		return ""
+	}
+	return "https://" + publicHost
 }

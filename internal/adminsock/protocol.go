@@ -81,10 +81,10 @@ type NodeEntry struct {
 // the raw JSON so the operator can inspect verb-specific fields
 // without the admin protocol needing to mirror every audit shape.
 type AuditEntry struct {
-	Subject string          `json:"subject"`
-	Seq     uint64          `json:"seq"`
-	Ts      time.Time       `json:"ts"`
-	Body    map[string]any  `json:"body"`
+	Subject string         `json:"subject"`
+	Seq     uint64         `json:"seq"`
+	Ts      time.Time      `json:"ts"`
+	Body    map[string]any `json:"body"`
 }
 
 // EvictResult reports what the broker actually changed when an

@@ -65,12 +65,12 @@ type AuditPort struct {
 // AuditTransfer is a file-transfer lifecycle envelope.
 // file-transfer-plan §Audit.
 //
-//   kind ∈ {"start","complete","failed"} — receiver-finalization invariant:
-//     start    written when broker accepts the prepare;
-//     complete written on agent ev.transfer (push) or ctl finalize.req (pull);
-//     failed   same parties, on the failure path or broker-side timeout.
-//   verb ∈ {"push","pull"}.
-//   tier ∈ {"a","b"} — "a" inline ≤ 8 MiB, "b" JetStream ObjectStore ≤ 2 GiB (v0.2.5+).
+//	kind ∈ {"start","complete","failed"} — receiver-finalization invariant:
+//	  start    written when broker accepts the prepare;
+//	  complete written on agent ev.transfer (push) or ctl finalize.req (pull);
+//	  failed   same parties, on the failure path or broker-side timeout.
+//	verb ∈ {"push","pull"}.
+//	tier ∈ {"a","b"} — "a" inline ≤ 8 MiB, "b" JetStream ObjectStore ≤ 2 GiB (v0.2.5+).
 //
 // Bytes / DurationMs are populated only on complete/failed; Bucket only
 // on tier B; Code only on failed (machine-readable). The schema name

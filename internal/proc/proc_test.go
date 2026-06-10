@@ -436,10 +436,10 @@ func TestPsQueryPlan_NoTempBTree(t *testing.T) {
 	db := openDB(t)
 
 	cases := []struct {
-		name     string
-		query    string
-		args     []any
-		wantIdx  string
+		name      string
+		query     string
+		args      []any
+		wantIdx   string
 		forbidden string
 	}{
 		{

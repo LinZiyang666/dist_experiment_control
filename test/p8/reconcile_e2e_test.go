@@ -1494,4 +1494,3 @@ func TestPsRecoversFromLOSTOnReconnect(t *testing.T) {
 		t.Errorf("after register: expected RUNNING; got %+v", resp2.Processes)
 	}
 }
-

@@ -284,3 +284,62 @@ func ParseSidNidFromCtrl(subject string) (sid, nid string, ok bool) {
 	}
 	return parts[4], parts[6], true
 }
+
+// ---------------------------------------------------------------------------
+// P13 — session-scoped proxy subscription subjects.
+//
+// Owner/member commands live under the ctrl.by.<actor>.s.<sid> tree (same
+// shape as SubjCtrlCaps / SubjCtrlPs — broker answers directly, NOT forwarded
+// to an agent). The per-(sid,nid) keyset push to agents reuses the existing
+// SubjCmdForwarded builder with verb "proxy-keys" (rides the broker-pub /
+// agent-sub .req.forwarded wildcards — zero JWT edits). The proxy-ready ACK
+// rides the agent's existing s.<sid>.ev.node.<nid>.> pub permission.
+// ---------------------------------------------------------------------------
+
+func SubjCtrlProxySet(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.proxy.set.req", SubjectPrefix, actor, sid)
+}
+func SubjCtrlProxyStatus(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.proxy.status.req", SubjectPrefix, actor, sid)
+}
+func SubjCtrlProxySubCreate(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.proxy.sub.create.req", SubjectPrefix, actor, sid)
+}
+func SubjCtrlProxySubList(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.proxy.sub.list.req", SubjectPrefix, actor, sid)
+}
+func SubjCtrlProxySubRevoke(actor, sid string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.s.%s.proxy.sub.revoke.req", SubjectPrefix, actor, sid)
+}
+
+// SubjEvNodeProxyReady is the agent's SS-bind ACK (kind "ready" or "unready").
+// Broker subscribes to set/clear nodes.proxy_ready.
+func SubjEvNodeProxyReady(sid, nid, kind string) string {
+	return fmt.Sprintf("%s.s.%s.ev.node.%s.proxy.%s", SubjectPrefix, sid, nid, kind)
+}
+
+// ParseCtrlProxy extracts (actor, sid, action) from a proxy ctrl subject.
+// action ∈ {"set","status","sub.create","sub.list","sub.revoke"}. Exact-length
+// + token validation per the handlePsReq/handleNodeListReq precedent; callers
+// reject ok=false as subject_malformed BEFORE any DB/owner work.
+func ParseCtrlProxy(subject string) (actor, sid, action string, ok bool) {
+	parts := strings.Split(subject, ".")
+	// base: 0:tether 1:v1 2:ctrl 3:by 4:<A> 5:s 6:<sid> 7:proxy ...
+	if len(parts) < 10 ||
+		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[2] != "ctrl" || parts[3] != "by" ||
+		parts[5] != "s" || parts[7] != "proxy" {
+		return "", "", "", false
+	}
+	if ValidateActorToken(parts[4]) != nil || ValidateSID(parts[6]) != nil {
+		return "", "", "", false
+	}
+	switch {
+	case len(parts) == 10 && parts[9] == "req" && (parts[8] == "set" || parts[8] == "status"):
+		return parts[4], parts[6], parts[8], true
+	case len(parts) == 11 && parts[8] == "sub" && parts[10] == "req" &&
+		(parts[9] == "create" || parts[9] == "list" || parts[9] == "revoke"):
+		return parts[4], parts[6], "sub." + parts[9], true
+	}
+	return "", "", "", false
+}

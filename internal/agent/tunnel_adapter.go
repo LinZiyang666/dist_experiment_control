@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/LinZiyang666/tether/internal/tunnel"
 )
@@ -22,6 +23,8 @@ type TunnelExposeAdapter struct {
 	client *tunnel.Client
 	logger *slog.Logger
 
+	opMu     sync.Mutex
+	mu       sync.RWMutex
 	localFor map[int]int // publicPort → localPort
 }
 
@@ -46,9 +49,12 @@ func (a *TunnelExposeAdapter) Start(ctx context.Context) {
 // ExposeForwarded) rolls back state.json + replies frpc_failed to the
 // broker so the SQLite row is freed.
 func (a *TunnelExposeAdapter) AddProxy(p PortToken) error {
-	a.localFor[p.Port] = p.LocalPort
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+
+	a.setLocal(p.Port, p.LocalPort)
 	if err := a.client.Open(p.Port, p.LocalPort, p.Token); err != nil {
-		delete(a.localFor, p.Port)
+		a.deleteLocal(p.Port)
 		return fmt.Errorf("tunnel adapter AddProxy: %w", err)
 	}
 	return nil
@@ -57,14 +63,31 @@ func (a *TunnelExposeAdapter) AddProxy(p PortToken) error {
 // RemoveProxy closes the tunnel session for publicPort. Name is
 // unused (the broker keys by name, the tunnel keys by port).
 func (a *TunnelExposeAdapter) RemoveProxy(_ string, publicPort int) error {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+
 	a.client.Close(publicPort)
-	delete(a.localFor, publicPort)
+	a.deleteLocal(publicPort)
 	return nil
 }
 
 func (a *TunnelExposeAdapter) lookupLocal(publicPort int) (int, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if local, ok := a.localFor[publicPort]; ok {
 		return local, nil
 	}
 	return 0, fmt.Errorf("tunnel adapter: no local mapping for public port %d", publicPort)
+}
+
+func (a *TunnelExposeAdapter) setLocal(publicPort, localPort int) {
+	a.mu.Lock()
+	a.localFor[publicPort] = localPort
+	a.mu.Unlock()
+}
+
+func (a *TunnelExposeAdapter) deleteLocal(publicPort int) {
+	a.mu.Lock()
+	delete(a.localFor, publicPort)
+	a.mu.Unlock()
 }

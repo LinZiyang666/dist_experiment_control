@@ -32,17 +32,17 @@ func TestValidateSIDBoundaries(t *testing.T) {
 	}{
 		{"empty", "", false},
 		{"single_letter", "a", true},
-		{"single_digit_first", "1", false},          // must start with [a-z]
-		{"single_dash", "-", false},                 // must start with [a-z]
-		{"contains_dot", "lab.1", false},            // NATS subject separator
-		{"contains_star", "lab*", false},            // NATS partial wildcard
-		{"contains_gt", "lab>", false},              // NATS terminal wildcard
+		{"single_digit_first", "1", false}, // must start with [a-z]
+		{"single_dash", "-", false},        // must start with [a-z]
+		{"contains_dot", "lab.1", false},   // NATS subject separator
+		{"contains_star", "lab*", false},   // NATS partial wildcard
+		{"contains_gt", "lab>", false},     // NATS terminal wildcard
 		{"contains_space", "lab 1", false},
 		{"contains_tab", "lab\t1", false},
 		{"contains_nul", "lab\x001", false},
 		{"contains_uppercase", "Lab", false},
 		{"contains_underscore", "lab_1", false},
-		{"unicode_lab01", "实验室01", false},          // outside [a-z0-9-]
+		{"unicode_lab01", "实验室01", false}, // outside [a-z0-9-]
 		{"len_1_letter", "a", true},
 		{"len_26", "a" + strings.Repeat("b", 25), true},
 		{"len_32", "a" + strings.Repeat("b", 31), true},
@@ -79,8 +79,8 @@ func TestValidateNIDBoundaries(t *testing.T) {
 	}{
 		{"empty", "", false},
 		{"single_letter", "a", true},
-		{"single_digit", "1", true},                // nid allows leading digit
-		{"single_dash", "-", true},                 // nid allows leading dash
+		{"single_digit", "1", true}, // nid allows leading digit
+		{"single_dash", "-", true},  // nid allows leading dash
 		{"contains_dot", "node.with.dots", false},
 		{"contains_star", "node*", false},
 		{"contains_gt", "node>", false},
@@ -152,8 +152,8 @@ func TestValidateActorTokenBoundaries(t *testing.T) {
 // for these representative shapes, it holds for the whole accepted
 // charset (idCharset is a regexp without any non-ASCII branches).
 var (
-	roundtripSIDs = []string{"a", "lab", "lab-1", "abcd1234", "a" + strings.Repeat("b", 31)}
-	roundtripNIDs = []string{"a", "1gpu", "lab-1", "node-007", "default", strings.Repeat("a", 32)}
+	roundtripSIDs  = []string{"a", "lab", "lab-1", "abcd1234", "a" + strings.Repeat("b", 31)}
+	roundtripNIDs  = []string{"a", "1gpu", "lab-1", "node-007", "default", strings.Repeat("a", 32)}
 	roundtripVerbs = []string{"run", "exec", "kill", "expose", "expose-rm", "upgrade"}
 )
 
@@ -248,8 +248,8 @@ func TestParseEvProcRejectsMalformed(t *testing.T) {
 		strings.Replace(good, ".ev.", ".cmd.", 1),
 		strings.Replace(good, ".node.", ".xnode.", 1),
 		strings.Replace(good, ".proc.", ".xproc.", 1),
-		"tether.v1.s.LAB.ev.node.lab-1.proc.01h.exit",          // sid invalid
-		"tether.v1.s.lab.ev.node.LAB.proc.01h.exit",            // nid invalid
+		"tether.v1.s.LAB.ev.node.lab-1.proc.01h.exit", // sid invalid
+		"tether.v1.s.lab.ev.node.LAB.proc.01h.exit",   // nid invalid
 		strings.Repeat(".", 9),
 	}
 	for i, s := range cases {
@@ -306,8 +306,8 @@ func TestParseSidNidFromCtrlRejectsMalformed(t *testing.T) {
 //
 // We pin both directions:
 //
-//   1. SubjCmdBy embeds the wildcard verbatim (current behaviour),
-//   2. ParseCmdBy refuses to round-trip the resulting subject.
+//  1. SubjCmdBy embeds the wildcard verbatim (current behaviour),
+//  2. ParseCmdBy refuses to round-trip the resulting subject.
 //
 // If a future refactor adds validation to SubjCmdBy, point (2) still
 // holds and point (1) becomes a panic / error — which is fine; this

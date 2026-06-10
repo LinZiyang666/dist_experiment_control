@@ -477,4 +477,3 @@ func TestUpgradeAgentRejectsNonAllowlistedURL(t *testing.T) {
 		t.Errorf("expected url_not_allowed_local; got %+v", resp)
 	}
 }
-

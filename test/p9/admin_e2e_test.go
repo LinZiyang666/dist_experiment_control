@@ -498,4 +498,3 @@ func TestAdminRejectsMalformedRequest(t *testing.T) {
 		t.Errorf("expected json_parse error; got %+v", resp)
 	}
 }
-

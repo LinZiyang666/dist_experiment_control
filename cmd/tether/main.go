@@ -31,6 +31,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newPsCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newExposeCmd())
+	root.AddCommand(newProxyCmd())
 	root.AddCommand(newHistoryCmd())
 	root.AddCommand(newNodeCmd())
 	root.AddCommand(newPushCmd())

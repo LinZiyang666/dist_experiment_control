@@ -218,6 +218,110 @@ func IsOwner(db *sql.DB, sid, pubkeyFP string) (bool, error) {
 	return role == string(RoleOwner), nil
 }
 
+// GetProxyEnabled returns the session's P13 proxy master-switch state.
+// ErrNotFound if the session row is gone.
+func GetProxyEnabled(db *sql.DB, sid string) (bool, error) {
+	var v int
+	err := db.QueryRow(`SELECT proxy_enabled FROM sessions WHERE sid=?`, sid).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return v == 1, nil
+}
+
+// SetProxyEnabled flips the P13 proxy master switch. It only touches ACTIVE
+// sessions (defense-in-depth on the C.1 §6 precheck) and reports whether the
+// value actually changed. Returns ErrNotFound if no ACTIVE row matched.
+func SetProxyEnabled(db *sql.DB, sid string, enabled bool) (changed bool, err error) {
+	v := 0
+	if enabled {
+		v = 1
+	}
+	res, err := db.Exec(
+		`UPDATE sessions SET proxy_enabled=? WHERE sid=? AND state='ACTIVE' AND proxy_enabled<>?`,
+		v, sid, v,
+	)
+	if err != nil {
+		return false, fmt.Errorf("session: set proxy_enabled: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// No change: distinguish "already at value" from "no ACTIVE row".
+	var cur int
+	err = db.QueryRow(`SELECT proxy_enabled FROM sessions WHERE sid=? AND state='ACTIVE'`, sid).Scan(&cur)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// GetProxyEpoch returns the session's current keyset epoch.
+func GetProxyEpoch(db *sql.DB, sid string) (int64, error) {
+	var e int64
+	err := db.QueryRow(`SELECT proxy_epoch FROM sessions WHERE sid=?`, sid).Scan(&e)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	return e, err
+}
+
+// BumpProxyEpoch increments and returns the session's keyset epoch (used after
+// enable / sub create / sub revoke so agents detect a changed key set).
+func BumpProxyEpoch(db *sql.DB, sid string) (int64, error) {
+	if _, err := db.Exec(`UPDATE sessions SET proxy_epoch=proxy_epoch+1 WHERE sid=?`, sid); err != nil {
+		return 0, fmt.Errorf("session: bump proxy_epoch: %w", err)
+	}
+	return GetProxyEpoch(db, sid)
+}
+
+// SetProxyEnabledAndBumpEpoch flips the master switch AND bumps the keyset epoch
+// in ONE transaction (round-6 F6). If the epoch bump fails the switch change
+// rolls back, so a failed enable never leaves the authorization switch ON (which
+// tunnelTokenLookup treats as the auth boundary). Returns the post-bump epoch.
+func SetProxyEnabledAndBumpEpoch(db *sql.DB, sid string, enabled bool) (epoch int64, err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var cur int
+	if err := tx.QueryRow(`SELECT proxy_enabled FROM sessions WHERE sid=? AND state='ACTIVE'`, sid).Scan(&cur); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	v := 0
+	if enabled {
+		v = 1
+	}
+	if _, err := tx.Exec(`UPDATE sessions SET proxy_enabled=? WHERE sid=? AND state='ACTIVE'`, v, sid); err != nil {
+		return 0, fmt.Errorf("session: set proxy_enabled: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE sessions SET proxy_epoch=proxy_epoch+1 WHERE sid=?`, sid); err != nil {
+		return 0, fmt.Errorf("session: bump proxy_epoch: %w", err)
+	}
+	if err := tx.QueryRow(`SELECT proxy_epoch FROM sessions WHERE sid=?`, sid).Scan(&epoch); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return epoch, nil
+}
+
 // IsMember returns true iff pubkeyFP appears in members for sid.
 func IsMember(db *sql.DB, sid, pubkeyFP string) (bool, error) {
 	var n int

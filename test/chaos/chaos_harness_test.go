@@ -35,9 +35,9 @@ import (
 
 // short type aliases over testharness so the per-file tests stay terse.
 
-func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
-func silentLog() *slog.Logger                        { return testharness.SilentLog() }
-func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
+func openDB(t *testing.T) *sql.DB                { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                    { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserPub(t) }
 
 // startJSNATS / startNATS proxy through to the shared harness; they're
 // here too so the chaos suite reads consistently with test/p* naming.

@@ -3,21 +3,21 @@
 //
 // One handler call drives one full run lifecycle:
 //
-//   handleRunForwarded
-//     ├── allocate PTY (Cols/Rows from RunReq)
-//     ├── reply RunChunk{Kind:ready, PID, Cols, Rows}
-//     ├── subscribe pty.<pid>.attach (sync, with 3s deadline)
-//     │     attach not received → reply RunChunk{Kind:failed, Reason:attach_timeout}
-//     │                          + pub PtyFailedEvent on pty.<pid>.failed
-//     │                          + close PTY → return
-//     ├── pty.Start with the (potentially updated) cols/rows from attach
-//     ├── put session into a.procs (kill verb looks here)
-//     ├── reply RunChunk{Kind:started}
-//     ├── subscribe pty.<pid>.in     → write bytes to PTY master
-//     ├── subscribe pty.<pid>.resize → ioctl(TIOCSWINSZ) on master
-//     ├── pump master → publish chunks on pty.<pid>.out (4KB or 50ms)
-//     ├── Wait → reply RunChunk{Kind:exit, ExitCode}
-//     └── prune from a.procs, close PTY, unsubscribe
+//	handleRunForwarded
+//	  ├── allocate PTY (Cols/Rows from RunReq)
+//	  ├── reply RunChunk{Kind:ready, PID, Cols, Rows}
+//	  ├── subscribe pty.<pid>.attach (sync, with 3s deadline)
+//	  │     attach not received → reply RunChunk{Kind:failed, Reason:attach_timeout}
+//	  │                          + pub PtyFailedEvent on pty.<pid>.failed
+//	  │                          + close PTY → return
+//	  ├── pty.Start with the (potentially updated) cols/rows from attach
+//	  ├── put session into a.procs (kill verb looks here)
+//	  ├── reply RunChunk{Kind:started}
+//	  ├── subscribe pty.<pid>.in     → write bytes to PTY master
+//	  ├── subscribe pty.<pid>.resize → ioctl(TIOCSWINSZ) on master
+//	  ├── pump master → publish chunks on pty.<pid>.out (4KB or 50ms)
+//	  ├── Wait → reply RunChunk{Kind:exit, ExitCode}
+//	  └── prune from a.procs, close PTY, unsubscribe
 package agent
 
 import (
@@ -445,4 +445,3 @@ func normalizedSize(cols, rows int) (int, int) {
 	}
 	return cols, rows
 }
-

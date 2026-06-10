@@ -13,22 +13,22 @@
 //
 // Wire shape (line-based control + binary stream multiplex):
 //
-//   1. agent dials broker:7000.
-//   2. agent writes:  REGISTER <sid> <nid> <port> <token>\n
-//      one line, ASCII; broker reads + parses.
-//   3. broker computes SHA256(token), looks up port_allocations:
-//      - state must be ALLOCATED;
-//      - port must equal the row's port;
-//      - sid/nid must equal the row's sid/nid.
-//      On match, broker writes:  OK\n  and starts a yamux SERVER
-//      session over the same TCP connection. On mismatch, broker
-//      writes  DENY <reason>\n  and closes.
-//   4. broker starts listening on the public port (e.g. :14022). For
-//      each accepted public connection, broker opens a new yamux
-//      stream to the agent.
-//   5. agent receives the yamux stream, dials its local_port, and
-//      pipes bytes both ways with io.Copy. The public TCP client
-//      sees the bytes the local server sent and vice-versa.
+//  1. agent dials broker:7000.
+//  2. agent writes:  REGISTER <sid> <nid> <port> <token>\n
+//     one line, ASCII; broker reads + parses.
+//  3. broker computes SHA256(token), looks up port_allocations:
+//     - state must be ALLOCATED;
+//     - port must equal the row's port;
+//     - sid/nid must equal the row's sid/nid.
+//     On match, broker writes:  OK\n  and starts a yamux SERVER
+//     session over the same TCP connection. On mismatch, broker
+//     writes  DENY <reason>\n  and closes.
+//  4. broker starts listening on the public port (e.g. :14022). For
+//     each accepted public connection, broker opens a new yamux
+//     stream to the agent.
+//  5. agent receives the yamux stream, dials its local_port, and
+//     pipes bytes both ways with io.Copy. The public TCP client
+//     sees the bytes the local server sent and vice-versa.
 //
 // One yamux session per (agent, public_port). Session breakage
 // (network blip, agent restart, etc.) is detected by both sides as a
@@ -81,6 +81,19 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[int]*serverSession // public port -> session
+	// killGen[port] is bumped by CloseProxy. A handleAgent that snapshotted an
+	// older value before binding refuses to install (F1 in-flight-REGISTER race).
+	killGen map[int]int64
+	// killGenSession[sid] is bumped by CloseSession — even when NO listener is
+	// installed yet — so a session-level OFF also fences an in-flight REGISTER
+	// that passed token auth but hasn't inserted its serverSession (round-5 F1).
+	killGenSession map[string]int64
+	// inflightBySID[sid] counts REGISTER handlers currently between snapshot and
+	// install for sid; forgotten[sid] marks a deleted session awaiting prune.
+	// ForgetSession BUMPS the fence and only prunes once in-flight drains, so a
+	// paused authorized REGISTER can't install after deletion (round-6 F4).
+	inflightBySID map[string]int
+	forgotten     map[string]bool
 	// closed flips true after Close()/ctx-cancel begin. Guards against
 	// the audit-found shutdown race: in-flight handleAgent that's mid
 	// REGISTER could otherwise insert into s.sessions AFTER Close
@@ -91,21 +104,26 @@ type Server struct {
 }
 
 type serverSession struct {
-	publicPort  int
-	listener    net.Listener
-	yamuxSess   *yamux.Session
-	rawConn     net.Conn // the raw TCP control connection from agent
-	cancel      context.CancelFunc
+	sid        string // owning session — lets CloseSession kill by sid without a DB query
+	publicPort int
+	listener   net.Listener
+	yamuxSess  *yamux.Session
+	rawConn    net.Conn // the raw TCP control connection from agent
+	cancel     context.CancelFunc
 }
 
 // NewServer returns a broker-side tunnel server. Call Start to bind.
 func NewServer(addr, publicHost string, lookup TokenLookup, logger *slog.Logger) *Server {
 	return &Server{
-		addr:        addr,
-		publicHost:  publicHost,
-		tokenLookup: lookup,
-		logger:      logger,
-		sessions:    map[int]*serverSession{},
+		addr:           addr,
+		publicHost:     publicHost,
+		tokenLookup:    lookup,
+		logger:         logger,
+		sessions:       map[int]*serverSession{},
+		killGen:        map[int]int64{},
+		killGenSession: map[string]int64{},
+		inflightBySID:  map[string]int{},
+		forgotten:      map[string]bool{},
 	}
 }
 
@@ -189,6 +207,27 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Snapshot BOTH the port and session kill generations BEFORE authorizing.
+	// If a CloseProxy(port) [round-2 F1] or a CloseSession(sid) [round-5 F1]
+	// lands during our handshake (the proxy-off kill switch firing between the
+	// token lookup and session install), the matching generation advances and we
+	// abort the install — so an already-authorized REGISTER can't resurrect the
+	// public listener after OFF returned, whether OFF closed by port or by sid.
+	s.mu.Lock()
+	gen := s.killGen[port]
+	sessGen := s.killGenSession[sid]
+	// round-6 F4: mark this REGISTER in-flight for sid so ForgetSession can't
+	// prune the session tombstone (and lose the fence) while we're paused
+	// between snapshot and install. Decremented when the handler returns.
+	s.inflightBySID[sid]++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.inflightBySID[sid]--
+		s.maybePruneSessionLocked(sid)
+		s.mu.Unlock()
+	}()
+
 	if err := s.tokenLookup(sid, nid, port, hashToken(token)); err != nil {
 		s.logger.Info("tunnel server: REGISTER denied",
 			"sid", sid, "nid", nid, "port", port, "err", err)
@@ -226,6 +265,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	sess := &serverSession{
+		sid:        sid,
 		publicPort: port,
 		listener:   publicLn,
 		yamuxSess:  yamuxSess,
@@ -233,11 +273,11 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		cancel:     cancel,
 	}
 	s.mu.Lock()
-	if s.closed {
-		// Server is shutting down; don't insert into a map that's
-		// been drained or is about to be. Roll the per-conn state
-		// back so we don't leak the public port across broker
-		// restart (the audit-found EADDRINUSE failure mode).
+	if s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen {
+		// Server shutting down, OR a CloseProxy(port)/CloseSession(sid) fired
+		// during our handshake (round-2/round-5 F1). Either way don't install —
+		// roll back the per-conn state so we don't leak the public port or
+		// resurrect a killed exit.
 		s.mu.Unlock()
 		cancel()
 		_ = publicLn.Close()
@@ -310,6 +350,107 @@ func (s *Server) bridgePublicToYamux(pubConn net.Conn, sess *serverSession) {
 // Idempotent. After Close returns, in-flight handleAgent goroutines
 // have all observed s.closed=true and either exited or rolled back
 // their would-be insert; the bound public ports are released.
+// CloseProxy tears down the single public-port session for `port` (listener +
+// yamux + control conn) immediately, independent of the agent or NATS. Used by
+// the P13 `proxy off` authoritative kill switch so the public exit dies the
+// moment the owner disables, not whenever the agent next processes the OFF.
+// No-op (returns false) if no session owns that port.
+func (s *Server) CloseProxy(port int) bool {
+	s.mu.Lock()
+	// Advance the kill generation FIRST, so any in-flight handleAgent that
+	// already passed the token lookup for this port aborts its install (F1).
+	s.killGen[port]++
+	sess, ok := s.sessions[port]
+	if ok {
+		delete(s.sessions, port)
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		return false
+	}
+	sess.cancel()
+	_ = sess.listener.Close()
+	_ = sess.rawConn.Close()
+	return true
+}
+
+// ForgetSession closes any remaining listeners for sid and PRUNES its kill-gen
+// bookkeeping (self-review: killGenSession would otherwise grow unbounded across
+// session lifecycles). Safe to call ONLY when the session is permanently gone
+// (finalizeSessionRm, after dropSessionRows) — once its allocation rows are
+// deleted, tunnelTokenLookup denies every REGISTER for sid regardless of the
+// pruned generation, so a late in-flight REGISTER can never install.
+func (s *Server) ForgetSession(sid string) {
+	s.mu.Lock()
+	// round-6 F4: BUMP the session fence (not merely delete it) so an authorized
+	// REGISTER paused between snapshot and install observes a changed generation
+	// and aborts — even after its allocation rows are gone. Mark the session
+	// forgotten; the entry is only pruned once no handler is in-flight, so the
+	// fence can't be lost from under a paused handler.
+	s.killGenSession[sid]++
+	s.forgotten[sid] = true
+	var victims []*serverSession
+	for port, sess := range s.sessions {
+		if sess.sid == sid {
+			s.killGen[port]++
+			victims = append(victims, sess)
+			delete(s.sessions, port)
+		}
+	}
+	s.maybePruneSessionLocked(sid)
+	s.mu.Unlock()
+
+	for _, sess := range victims {
+		sess.cancel()
+		_ = sess.listener.Close()
+		_ = sess.rawConn.Close()
+	}
+}
+
+// maybePruneSessionLocked deletes a forgotten session's kill-gen bookkeeping
+// once no REGISTER handler is in-flight for it (so the fence is never removed
+// from under a paused handler). Caller holds s.mu.
+func (s *Server) maybePruneSessionLocked(sid string) {
+	if s.forgotten[sid] && s.inflightBySID[sid] <= 0 {
+		delete(s.killGenSession, sid)
+		delete(s.inflightBySID, sid)
+		delete(s.forgotten, sid)
+	}
+}
+
+// CloseSession closes EVERY installed public listener owned by sid and bumps
+// each port's kill generation, WITHOUT consulting any database (round-4 F3).
+// `proxy off` calls it so the data plane dies even if the broker's subsequent
+// allocation-store query fails — the broker-side immediate kill must not depend
+// on a post-switch DB read. Returns the ports it closed.
+func (s *Server) CloseSession(sid string) []int {
+	s.mu.Lock()
+	// Bump the SESSION kill generation FIRST and unconditionally, so an in-flight
+	// REGISTER that already passed auth but hasn't inserted its session yet
+	// aborts at the install check (round-5 F1) — not just the listeners already
+	// in s.sessions.
+	s.killGenSession[sid]++
+	var victims []*serverSession
+	var ports []int
+	for port, sess := range s.sessions {
+		if sess.sid == sid {
+			s.killGen[port]++
+			victims = append(victims, sess)
+			ports = append(ports, port)
+			delete(s.sessions, port)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, sess := range victims {
+		sess.cancel()
+		_ = sess.listener.Close()
+		_ = sess.rawConn.Close()
+	}
+	return ports
+}
+
 func (s *Server) Close() {
 	s.mu.Lock()
 	if s.closed {

@@ -64,4 +64,3 @@ func TestForgedActorCannotTombstoneVictimSession(t *testing.T) {
 		t.Fatalf("owner can no longer activate lab; the attack succeeded silently: %v", err)
 	}
 }
-

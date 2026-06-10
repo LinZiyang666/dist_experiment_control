@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/subhttp"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -78,6 +80,16 @@ type Config struct {
 	// (architecture A.3 / F.3). Defaults 14000-14999.
 	PortBandLow  int
 	PortBandHigh int
+
+	// SubHTTPAddr is the loopback listen address for the P13 read-only
+	// subscription HTTP endpoint (e.g. "127.0.0.1:8090"). Empty disables
+	// the HTTP listener entirely — every pre-P13 deployment is unchanged.
+	SubHTTPAddr string
+
+	// SubURLBase is the public origin printed in subscription URLs
+	// (e.g. "https://tether.example.com"). The full URL is
+	// SubURLBase + "/sub/<token>". Empty falls back to PublicHost.
+	SubURLBase string
 
 	// PortRevokeAfter is how long a port stays ALLOCATED after its
 	// owning node has been OFFLINE before the reconciler revokes it
@@ -212,7 +224,6 @@ func (c *Config) UpgradeForwardTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-
 // Broker holds the running state of one `tether serve` instance.
 type Broker struct {
 	cfg Config
@@ -254,6 +265,20 @@ type Broker struct {
 	// receiver-finalization signal arrives or the watchdog fires.
 	// file-transfer-plan §Object bucket lifecycle.
 	transfers *transferTracker
+
+	// proxyGen is this broker incarnation's P13 ordering generation, stamped onto
+	// every ProxyDirective. It is persisted (proxy_meta) and can be ESCALATED at
+	// runtime when a connected agent reports a higher applied generation after a
+	// DB restore (round-5 F3). proxyGenMu guards the runtime read/escalate; the
+	// one-time set in New happens before Run so it needs no lock.
+	proxyGenMu sync.Mutex
+	proxyGen   int64
+
+	// proxyOpMu serializes all owner-visible P13 mutations across the switch and
+	// subscriber subjects. Those subjects are separate NATS subscriptions, so
+	// their callbacks may otherwise interleave: a sub mutation can observe ON,
+	// then publish Enabled:true after a concurrent OFF has completed.
+	proxyOpMu sync.Mutex
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -327,7 +352,21 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.ProcGCInterval == 0 {
 		cfg.ProcGCInterval = 5 * time.Minute
 	}
-	return &Broker{cfg: cfg, transfers: newTransferTracker()}, nil
+	// proxyGen (round-3/4/5) is this broker incarnation's ordering generation: a
+	// PERSISTED monotonic counter (max(stored+1, now_nanos)) so it advances
+	// across restarts even if the wall clock rolls back (F1). round-5 F2: an
+	// unreadable counter is FATAL — we must NOT fall open to a bare wall clock,
+	// which is the exact fencing hole the persisted counter closes. The whole of
+	// P13 needs the P13 schema anyway, so there is no safe pre-migration fallback.
+	gen, err := advanceProxyGeneration(cfg.DB, cfg.Now().UnixNano(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("broker: durable proxy generation unavailable (fencing would be unsafe): %w", err)
+	}
+	return &Broker{
+		cfg:       cfg,
+		transfers: newTransferTracker(),
+		proxyGen:  gen,
+	}, nil
 }
 
 // Run connects to NATS, installs subscriptions, runs the reconcile ticker,
@@ -372,6 +411,29 @@ func (b *Broker) Run(ctx context.Context) error {
 		if err := b.tunnelSrv.Start(ctx); err != nil {
 			return err
 		}
+	}
+
+	// P13: read-only subscription HTTP surface (loopback; Caddy fronts it).
+	// Disabled (no listener) when SubHTTPAddr is empty — pre-P13 deployments
+	// are unchanged.
+	if b.cfg.SubHTTPAddr != "" {
+		// round-6 F10: bind SYNCHRONOUSLY and propagate failure from Run — a bad
+		// config / occupied port must fail broker startup, not leave a
+		// healthy-looking broker with no subscription endpoint.
+		subLn, err := subhttp.Bind(b.cfg.SubHTTPAddr)
+		if err != nil {
+			return fmt.Errorf("broker: subscription http: %w", err)
+		}
+		b.cfg.Logger.Info("broker: subscription http listening", "addr", subLn.Addr().String())
+		go func() {
+			if err := subhttp.ServeListener(ctx, subLn, subhttp.Config{
+				DB:         b.cfg.DB,
+				PublicHost: b.publicHostFor(),
+				Logger:     b.cfg.Logger,
+			}); err != nil {
+				b.cfg.Logger.Error("broker: subscription http server", "err", err)
+			}
+		}()
 	}
 
 	subRegister, err := nc.Subscribe(
@@ -432,6 +494,13 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".s.*.ev.node.*.transfer.*.failed", b.handleEvTransfer},
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.transfer.*.finalize.req", b.handleFinalizeReq},
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.caps.req", b.handleCapsReq},
+		// P13 proxy subscription control plane.
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.set.req",
+			func(msg *nats.Msg) { b.handleProxySet(nc, msg) }},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.status.req", b.handleProxyStatus},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.*.req",
+			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
+		{proto.SubjectPrefix + ".s.*.ev.node.*.proxy.*", b.handleProxyReadyEvent},
 	} {
 		sub, err := nc.Subscribe(ss.subj, ss.handler)
 		if err != nil {
@@ -629,6 +698,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		OS:             req.OS,
 		Arch:           req.Arch,
 		BootID:         req.BootID,
+		ProxyCapable:   nodeHasProxyCap(req.Capabilities, req.ReleaseVersion),
 	}
 	if err := node.Register(b.cfg.DB, in, b.cfg.Now()); err != nil {
 		if errors.Is(err, node.ErrSessionMissing) {
@@ -658,6 +728,11 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		resp.RevokePorts,
 		resp.DropProcesses = b.reconcileOnRegister(sid, nid, req)
 
+	// P13: if the session's proxy switch is ON, attach the authoritative
+	// per-node proxy directive (join/reconnect path). Nil otherwise, so a
+	// proxy-off reply stays byte-identical to pre-P13.
+	resp.Proxy = b.proxyDirectiveForRegister(sid, nid, req)
+
 	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {
 		_ = msg.Respond(payload)
@@ -674,7 +749,18 @@ func (b *Broker) handleHeartbeat(msg *nats.Msg) {
 		// will see this on broker restart before re-register has happened.
 		b.cfg.Logger.Debug("broker: heartbeat for unknown node",
 			"sid", sid, "nid", nid, "err", err)
+		return
 	}
+	// P13 (round-3 F3 / round-4 F2): drive proxy convergence off EVERY heartbeat,
+	// comparing the FULL (generation, epoch) pair the agent reports — let
+	// repairProxy decide from switch/readiness/generation/epoch state. Calling it
+	// only when ProxyEpoch>0 would skip a transiently-failed agent (epoch 0), and
+	// comparing epoch alone would miss a same-epoch generation mismatch.
+	var hp proto.HeartbeatPayload
+	if len(msg.Data) > 0 {
+		_ = json.Unmarshal(msg.Data, &hp)
+	}
+	b.repairProxy(sid, nid, hp.ProxyGeneration, hp.ProxyEpoch)
 }
 
 func (b *Broker) replyErr(msg *nats.Msg, code, message string) {

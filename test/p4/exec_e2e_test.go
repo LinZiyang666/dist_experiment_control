@@ -35,10 +35,10 @@ import (
 // seed shape) and a thin adapter layer over the package-locals the
 // rest of this file already used.
 
-func startNATS(t *testing.T) string                  { return testharness.StartNATS(t) }
-func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
-func silentLog() *slog.Logger                        { return testharness.SilentLog() }
-func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
+func startNATS(t *testing.T) string              { return testharness.StartNATS(t) }
+func openDB(t *testing.T) *sql.DB                { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                    { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserPub(t) }
 
 // seed creates the "lab" session and adds the given fingerprint as a
 // member, so broker.handleExecReq's member check passes.

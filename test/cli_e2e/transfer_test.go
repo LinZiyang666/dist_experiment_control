@@ -407,6 +407,7 @@ func hexSHA256ForTest(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
+
 // Tier-B push: ctl Put, agent Get, sha verify, rename, ev.transfer.
 // On completion the broker must delete the OBJ_xfer-* stream.
 func TestTransfer_TierB_PushHappyPath(t *testing.T) {
@@ -655,4 +656,3 @@ func readAllResult(r jetstream.ObjectResult) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
-

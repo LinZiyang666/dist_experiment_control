@@ -31,11 +31,11 @@ import (
 //     sequences, etc. don't get cooked by the kernel before reaching the
 //     remote PTY) — restored on exit;
 //  5. run three pumps for the lifetime of the child:
-//        local stdin  → pty.<PID>.in
-//        SIGWINCH     → pty.<PID>.resize  (with current cols/rows)
-//        local Ctrl-C → cmd.by.<A>.node.<N>.kill.req {SIGINT}
+//     local stdin  → pty.<PID>.in
+//     SIGWINCH     → pty.<PID>.resize  (with current cols/rows)
+//     local Ctrl-C → cmd.by.<A>.node.<N>.kill.req {SIGINT}
 //     and one passive listener:
-//        pty.<PID>.out → local stdout
+//     pty.<PID>.out → local stdout
 //  6. on RunChunk{Kind:exit} restore terminal and exit with the same code.
 func newRunCmd() *cobra.Command {
 	var (
@@ -479,4 +479,3 @@ func drainPending(outCh <-chan []byte, w io.Writer, maxWait time.Duration) {
 		}
 	}
 }
-

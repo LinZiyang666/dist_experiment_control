@@ -113,11 +113,11 @@ func indexByte(s string, b byte) int {
 
 // runPush implements the push flow:
 //
-//   1. Read+SHA the local file; bail on > 2 GiB.
-//   2. Caps probe; chooseTier.
-//   3. Tier A: PushPrepareReq{inline_data} → wait for resp; done.
-//   4. Tier B: ObjectStore.Put → push-commit.req → wait for resp.
-//      The agent's ev.transfer flow is what writes audit complete.
+//  1. Read+SHA the local file; bail on > 2 GiB.
+//  2. Caps probe; chooseTier.
+//  3. Tier A: PushPrepareReq{inline_data} → wait for resp; done.
+//  4. Tier B: ObjectStore.Put → push-commit.req → wait for resp.
+//     The agent's ev.transfer flow is what writes audit complete.
 func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpec, force bool, timeout time.Duration) error {
 	sid := cli.ReadCurrentSession(home)
 	if sid == "" {
@@ -305,8 +305,6 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 }
 
 // ─── tether pull ──────────────────────────────────────────────────
-
-
 
 func newPullCmd() *cobra.Command {
 	var (
@@ -578,8 +576,6 @@ func firstErr(errs ...error) error {
 }
 
 // ─── shared helpers (parser, caps probe, tier chooser, hashes) ────
-
-
 
 // Tier-A inline ceiling (mirrors broker + agent ceilings). Files
 // <= this go inline; > this require JetStream tier B.

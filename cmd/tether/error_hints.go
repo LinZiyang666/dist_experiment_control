@@ -25,9 +25,9 @@ var brokerCodeHints = map[string]string{
 	"session_not_found":             "the session doesn't exist; check `tether session list`.",
 	"actor_invalid":                 "your identity is malformed; if this persists, regenerate keys with `rm -rf ~/.tether/keys/` (loses session memberships).",
 	// Node lifecycle
-	"node_not_found":  "no agent registered under that nid in this session; check `tether ps`.",
-	"node_offline":    "the agent is OFFLINE (no recent heartbeat); start it with `tether agent --session <sid> --nid <nid>`.",
-	"agent_no_responders": "the agent isn't reachable on NATS; check it's running and connected.",
+	"node_not_found":       "no agent registered under that nid in this session; check `tether ps`.",
+	"node_offline":         "the agent is OFFLINE (no recent heartbeat); start it with `tether agent --session <sid> --nid <nid>`.",
+	"agent_no_responders":  "the agent isn't reachable on NATS; check it's running and connected.",
 	"agent_malformed_resp": "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
 	// Upgrade
 	"url_not_allowed":               "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
@@ -42,6 +42,14 @@ var brokerCodeHints = map[string]string{
 	"port_taken":         "that public port is already allocated; pick another port, omit --remote-port to auto-pick a free one, or release the existing one first.",
 	"port_out_of_band":   "--remote-port must be within the broker's public band (default 14000-14999); pick an in-band port or omit it to auto-pick.",
 	"frpc_failed":        "the agent couldn't start the local proxy; check the agent log (`~/.tether/agent/<sid>/agent.log`).",
+	"name_reserved":      "that name is reserved for the system proxy; pick a different --name.",
+	// P13 proxy subscription
+	"subject_malformed": "the request subject was malformed; this is a tether bug or version skew — please report.",
+	"proxy_disabled":    "the proxy switch is off for this session; an owner must run `tether proxy on` first.",
+	"sub_name_invalid":  "subscriber --name must be 1..64 printable ASCII with no '/'.",
+	"sub_name_taken":    "an active subscriber already uses that name; pick another or revoke the existing one.",
+	"sub_not_found":     "no subscriber by that name in this session; check `tether proxy sub ls`.",
+	"already_revoked":   "that subscriber is already revoked.",
 	// Storage / generic
 	"store_error": "the broker hit a SQLite error; check the broker log.",
 	"json_parse":  "the broker couldn't parse our request; this is a tether bug — please report.",
@@ -95,11 +103,11 @@ func connectError(verb, natsURL string, err error) error {
 // a one-line operator-facing diagnosis. Reasons are agent-emitted
 // (architecture C.5.1), so the set is fixed.
 var runFailureReasons = map[string]string{
-	"attach_timeout":    "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
-	"pty_alloc_failed":  "agent couldn't open a PTY pair; check the agent host's /dev/ptmx and any container restrictions.",
-	"exec_failed":       "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
-	"argv_required":     "you supplied no command to run.",
-	"json_parse":        "the agent couldn't parse our run request — tether bug, please report.",
+	"attach_timeout":   "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
+	"pty_alloc_failed": "agent couldn't open a PTY pair; check the agent host's /dev/ptmx and any container restrictions.",
+	"exec_failed":      "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
+	"argv_required":    "you supplied no command to run.",
+	"json_parse":       "the agent couldn't parse our run request — tether bug, please report.",
 }
 
 func runFailureMessage(reason string) error {
@@ -115,4 +123,3 @@ func stripPrefix(s, prefix string) (string, bool) {
 	}
 	return "", false
 }
-

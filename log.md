@@ -349,3 +349,61 @@ timan108          ONLINE  4s         1      0.1.3
 ```
 
 **6 个生产 agent 全部 v0.1.3 ONLINE,零损失。**
+
+---
+
+## P13 proxy 订阅 — 验证记录
+
+**日期**: 2026-06-10 · **阶段**: 内审 + 外审整改后
+
+### 已在本机/CI 验证（in-process,真 NATS + 真 broker + 真 agent goroutine）
+
+| 项 | 测试 | 结果 |
+|---|---|---|
+| SS 数据面字节往返(多密钥/大载荷>16KiB 跨 chunk/并发换 key/撤销 force-close/空 keyset 拒连/TCP 半关闭) | `internal/agent/ssproxy` `-race` | ✓ |
+| 控制面全链路 e2e:proxy on → agent 绑 SS + 隧道 + ready ACK → sub create → `GET /sub/<token>` 渲染活节点 → revoke→404 → **join-after-ON** → **proxy off 后 agent 真 RemoveProxy + 有效订阅渲染清空** | `test/p13` `-count=10` | ✓ |
+| owner-only + 生命周期 + 撤销隔离 + no-secrets keystone + session-rm 级联 + 心跳-OFF-修复 + capability gate + malformed→json_parse | `internal/broker` | ✓ |
+| fail-closed 15min 看门狗 / 陈旧 directive 丢弃 / 失败重建发 unready / 并发 runtime 无 race / nil-register no-op | `internal/agent` `-race` | ✓ |
+| `/sub` loopback 强制 + 无存在性 oracle 404 + 渲染门 | `internal/subhttp` | ✓ |
+| 闸门:`CGO_ENABLED=0 go build`、`golangci-lint v2.5.0` 0 issues、`-race` | ✓ |
+
+### 外审 round-7 后新增/更新的 in-process 覆盖
+
+- 5 个 round-7 reviewer 测试全过：DNS-rebinding pin（Control 校验实际 IP）、non-public 前缀表（100.64/10、198.18/15、metadata）、幂等 re-ACK、OFF 时不推 enable、agent.yaml proxy.allow_private_destinations 接线。
+
+### 外审 round-8 reviewer 直接修复后的覆盖
+
+- IPv6 special-purpose/NAT64/6to4 literal 绕过已加入目的地策略与回归。
+- proxy switch 与 subscriber mutation 共用串行化锁，跨 NATS subscription 不再交错。
+- 无 tunnel adapter 的 agent 不启动 P13 runtime、不虚假 ACK ready。
+- `TunnelExposeAdapter.localFor` 与 Add/Remove 已并发安全，新增 `-race` 压测。
+
+### 外审 round-6 后新增/更新的 in-process 覆盖
+
+- 12 个 round-6 reviewer 测试全过（convergence-first、capability-gate、generation 有界、ForgetSession 在飞 fence、revoke/enable 事务、fail-closed 重建、register 清 ready、render 认开关、subhttp 同步绑定、SS 防重放）。
+- 自加 `TestDestinationPolicyBlocksPrivateTargets`（deny-private 拦 loopback）。
+
+### 外审 round-5 后新增的 in-process 覆盖
+
+- **持久 generation 取不到拒启**（`internal/broker` `TestExternalReviewBrokerRefusesUnpersistedGeneration`）：DROP proxy_meta 后 broker.New 报错不退化到 wall clock。
+- **DB 还原后越过 agent generation 自举**（`TestExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration`）：restored broker(gen 100) 见 agent gen 200 心跳即把 generation 抬到 >200 再推。
+- **session 级 kill 覆盖在飞 REGISTER**（`internal/tunnel` `TestExternalReviewCloseSessionInvalidatesInFlightRegister`）：CloseSession 使已授权未装入的 REGISTER 放弃。
+- **forward 0007 在已有 0006 的 DB 上补建 proxy_meta**（`internal/storage` `TestProxyGenerationForwardMigrationAppliesOnExisting0006DB`）。
+
+### 外审 round-4 后新增的 in-process 覆盖
+
+- **持久单调 generation**（`internal/broker` `TestExternalReviewBrokerGenerationSurvivesClockRollback`）：时钟回拨后启的 broker 仍得严格更大 generation。
+- **同 epoch 不同 generation 收敛**（`TestExternalReviewHeartbeatRepairsGenerationMismatchAtSameEpoch`）：旧化身 agent 同 epoch 心跳仍被补推当前 keyset。
+- **OFF 不依赖 DB 杀监听**（`internal/tunnel` `TestExternalReviewCloseSessionKillsListenersWithoutDB`）+ **OFF 失败回报错**（`TestProxyOffReportsErrorWhenAllocStoreFails`）+ **stale 轮换重铸 token**（`TestProxyOnRotatesStaleNotReadyAllocation`）。
+
+### 外审 round-2 后新增的 in-process 覆盖（F6)
+
+- **真 CLI→NATS wire 测试**（`cmd/tether/proxy_wire_test.go`）:实跑 `tether proxy on/off/sub create/sub revoke` cobra 命令,内嵌 responder 捕获真实发布的 NATS 请求体,断言 subject + body 正确(不再只是本地校验)。
+- **合并数据面往返**（`internal/agent/ssproxy/dataplane_test.go`）:SS 客户端 → broker 公网口 → 真 `internal/tunnel` 隧道 → agent SS server → echo target → 原路返回,字节一致;错误 PSK 经同一公网路径被拒。证明 consumer→broker:port→tunnel→agent SS 端到端链路(合并,非两个半证明)。
+
+### 仍待真实硬件验证（外审要求,**尚未在 lab broker 上跑**)
+
+- [ ] 真 Caddy + ACME 上 `handle /sub/*` 与 WSS catch-all 共存:`wss://broker/nats` 仍 upgrade + `curl https://broker/sub/<token>` 返回 Clash YAML(install.sh 已生成 Caddyfile;静态序测 `test/p10` 已钉,**真 ACME+Caddy 联调待 lab**)。
+- [ ] 真 **Clash for Windows / Clash-Meta** 导入订阅 URL → 选节点 → 经某 agent 出网,`ifconfig.me` 显示该 agent 出口 IP(需真客户端,本机无法复现)。
+
+> 说明:上述硬件项需 `pc732.emulab.net` broker + 真域名 + 真 Clash 客户端,本机 macOS 无法复现(`--role broker` install.sh 不支持 macOS、无公网域名)。控制面与数据面逻辑已由 in-process 测试覆盖;此三项为部署联调,排期到下次 lab 窗口。

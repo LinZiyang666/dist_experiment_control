@@ -34,7 +34,19 @@ type NodeRegisterReq struct {
 
 	LocalProcesses []LocalProcess `json:"local_processes,omitempty"`
 	LocalPorts     []LocalPort    `json:"local_ports,omitempty"`
+
+	// Capabilities (P13) is the explicit feature set this agent build
+	// implements (e.g. "proxy-v1"). The broker gates proxy allocation on the
+	// presence of CapProxyV1 here rather than guessing from ReleaseVersion —
+	// every source build shares "v0.0.0-dev", so a version string can't prove
+	// P13 support (external review round-2 F5). Additive/omitempty.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// CapProxyV1 is the capability token an agent advertises when it implements the
+// P13 proxy subscription. Absence (any pre-P13 agent, any version) means the
+// broker won't allocate a proxy port or push a directive to it.
+const CapProxyV1 = "proxy-v1"
 
 // LocalProcess is one entry in NodeRegisterReq.LocalProcesses — the
 // agent's view of a managed process's live state.
@@ -89,6 +101,12 @@ type NodeRegisterResp struct {
 	KeepPorts           []int            `json:"keep_ports,omitempty"`
 	RevokePorts         []int            `json:"revoke_ports,omitempty"`
 	DropProcesses       []string         `json:"drop_processes,omitempty"`
+
+	// Proxy (P13), when non-nil, is the authoritative per-node proxy
+	// directive delivered at register/reconnect time. A POINTER so a
+	// proxy-disabled response marshals with NO "proxy" key and stays
+	// byte-identical to a pre-P13 NodeRegisterResp (proto stays v1).
+	Proxy *ProxyDirective `json:"proxy,omitempty"`
 }
 
 // ReconciledProc reports one PID the broker just transitioned away
@@ -103,6 +121,14 @@ type ReconciledProc struct {
 // HeartbeatPayload — agent core pub on ctrl.s.<S>.node.<N>.heartbeat (no reply).
 type HeartbeatPayload struct {
 	Ts time.Time `json:"ts"`
+	// ProxyGeneration + ProxyEpoch (P13 round-4) report the agent's last
+	// SUCCESSFULLY-applied ordering pair. The broker considers a node converged
+	// only when BOTH match the current (broker generation, session epoch); on
+	// any mismatch — including the SAME epoch under a different generation (two
+	// DB snapshots can share an epoch with different keysets) — it re-pushes the
+	// current directive. Epoch alone is insufficient to fence that case.
+	ProxyGeneration int64 `json:"proxy_generation,omitempty"`
+	ProxyEpoch      int64 `json:"proxy_epoch,omitempty"`
 }
 
 // ErrorReply is the canonical shape for any req that responds with an error
@@ -139,7 +165,7 @@ type SessionRmReq struct{}
 
 type SessionRmResp struct {
 	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`  // not_found | already_deleting | not_owner | store_error
+	Code  string `json:"code,omitempty"` // not_found | already_deleting | not_owner | store_error
 	Error string `json:"error,omitempty"`
 }
 
@@ -167,19 +193,19 @@ type ExecReq struct {
 // ExecChunk is what the agent publishes (one or many) on the reply
 // inbox of an ExecReq:
 //
-//   1. exactly one  Kind="started"  with the assigned PID;
-//   2. zero or more Kind="stdout" / "stderr" with byte chunks;
-//   3. exactly one  Kind="exit"    with the process exit code,
-//      OR exactly one Kind="error" if the agent failed to start the
-//      process (the Error field is set; ExitCode is meaningless).
+//  1. exactly one  Kind="started"  with the assigned PID;
+//  2. zero or more Kind="stdout" / "stderr" with byte chunks;
+//  3. exactly one  Kind="exit"    with the process exit code,
+//     OR exactly one Kind="error" if the agent failed to start the
+//     process (the Error field is set; ExitCode is meaningless).
 //
 // CTL streams these to the local terminal until "exit" / "error" arrives.
 type ExecChunk struct {
-	Kind     string `json:"kind"`               // started | stdout | stderr | exit | error
-	PID      string `json:"pid,omitempty"`      // populated on "started"
-	Data     []byte `json:"data,omitempty"`     // stdout/stderr bytes
+	Kind     string `json:"kind"`                // started | stdout | stderr | exit | error
+	PID      string `json:"pid,omitempty"`       // populated on "started"
+	Data     []byte `json:"data,omitempty"`      // stdout/stderr bytes
 	ExitCode int    `json:"exit_code,omitempty"` // populated on "exit"
-	Error    string `json:"error,omitempty"`    // populated on "error"
+	Error    string `json:"error,omitempty"`     // populated on "error"
 }
 
 // ProcStartedEvent is what agents publish on
@@ -230,7 +256,7 @@ type NodeListEntry struct {
 
 type NodeListResp struct {
 	Nodes []NodeListEntry `json:"nodes"`
-	Code  string          `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | actor_invalid | store_error
+	Code  string          `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | actor_invalid | store_error
 	Error string          `json:"error,omitempty"`
 }
 
@@ -262,10 +288,10 @@ type PsEntry struct {
 }
 
 type PsResp struct {
-	Processes []PsEntry      `json:"processes"`
-	Ports     []PsPortEntry  `json:"ports,omitempty"`
-	Code      string         `json:"code,omitempty"`
-	Error     string         `json:"error,omitempty"`
+	Processes []PsEntry     `json:"processes"`
+	Ports     []PsPortEntry `json:"ports,omitempty"`
+	Code      string        `json:"code,omitempty"`
+	Error     string        `json:"error,omitempty"`
 }
 
 // PsPortEntry is the read-side projection of one port_allocations row
@@ -305,11 +331,11 @@ type RunReq struct {
 // RunChunk is what the agent / broker streams back on the run.req reply
 // inbox over the lifetime of one run:
 //
-//   1. exactly one Kind="ready" with PID + initial Cols/Rows;
-//   2. exactly one Kind="started" once attach was received and exec succeeded;
-//   3. exactly one terminal chunk:
-//        - Kind="exit" with ExitCode (normal end, including non-zero exit),
-//        - Kind="failed" with Reason (attach_timeout / exec_failed / ...).
+//  1. exactly one Kind="ready" with PID + initial Cols/Rows;
+//  2. exactly one Kind="started" once attach was received and exec succeeded;
+//  3. exactly one terminal chunk:
+//     - Kind="exit" with ExitCode (normal end, including non-zero exit),
+//     - Kind="failed" with Reason (attach_timeout / exec_failed / ...).
 //
 // PTY byte streams travel on a SEPARATE subject (`pty.<pid>.out`); this
 // reply inbox carries only lifecycle events. Two channels keep the byte
@@ -372,7 +398,7 @@ type KillReq struct {
 // KillResp — agent pub on the kill.req reply inbox.
 type KillResp struct {
 	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`  // pid_unknown | signal_failed | not_a_member | ...
+	Code  string `json:"code,omitempty"` // pid_unknown | signal_failed | not_a_member | ...
 	Error string `json:"error,omitempty"`
 }
 
@@ -418,7 +444,7 @@ type ExposeResp struct {
 	PublicHost string `json:"public_host,omitempty"` // operator-friendly URL host (e.g. broker.example.com)
 	Name       string `json:"name,omitempty"`        // echoed back
 
-	Code  string `json:"code,omitempty"`  // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | port_taken | port_out_of_band | ...
+	Code  string `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | port_taken | port_out_of_band | ...
 	Error string `json:"error,omitempty"`
 }
 
@@ -442,7 +468,7 @@ type ExposeForwardedReq struct {
 // the broker should mark the row FREED (since no traffic will flow).
 type ExposeForwardedResp struct {
 	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`  // already_exposed | frpc_failed | local_port_unreachable | ...
+	Code  string `json:"code,omitempty"` // already_exposed | frpc_failed | local_port_unreachable | ...
 	Error string `json:"error,omitempty"`
 }
 
@@ -528,11 +554,11 @@ type UpgradeForwardedReq struct {
 // place; the agent will exit shortly so its supervisor (systemd
 // unit / setsid nohup wrapper) can launch the new binary.
 type UpgradeForwardedResp struct {
-	OK              bool   `json:"ok"`
-	Code            string `json:"code,omitempty"`
-	Error           string `json:"error,omitempty"`
-	NewVersion      string `json:"new_version,omitempty"`      // best-effort, parsed from tarball
-	BinaryReplaced  bool   `json:"binary_replaced,omitempty"`  // true when chmod+rename succeeded
+	OK             bool   `json:"ok"`
+	Code           string `json:"code,omitempty"`
+	Error          string `json:"error,omitempty"`
+	NewVersion     string `json:"new_version,omitempty"`     // best-effort, parsed from tarball
+	BinaryReplaced bool   `json:"binary_replaced,omitempty"` // true when chmod+rename succeeded
 }
 
 // ─── File transfer (P11 / file-transfer-plan v0.2.0) ───────────────────────
@@ -568,9 +594,9 @@ type PushPrepareReq struct {
 	TransferID string `json:"transfer_id"` // ULID, ctl-generated; broker echoes into audit
 	Path       string `json:"path"`        // absolute remote path under one of agent's allow_roots
 	Size       int64  `json:"size"`
-	SHA256     string `json:"sha256"`      // hex; expected digest after upload
-	Force      bool   `json:"force,omitempty"` // overwrite existing regular file
-	Tier       string `json:"tier"`        // "a" | "b" — chosen by ctl, validated by agent
+	SHA256     string `json:"sha256"`                // hex; expected digest after upload
+	Force      bool   `json:"force,omitempty"`       // overwrite existing regular file
+	Tier       string `json:"tier"`                  // "a" | "b" — chosen by ctl, validated by agent
 	InlineData []byte `json:"inline_data,omitempty"` // tier A only (base64 over JSON)
 	Bucket     string `json:"bucket,omitempty"`      // tier B only; broker-assigned
 	ObjectKey  string `json:"object_key,omitempty"`  // tier B only; broker-assigned
@@ -600,8 +626,8 @@ type PushPrepareResp struct {
 // between when agent.Stat indicates tier B (see broker.transfer.go).
 type PullPrepareReq struct {
 	TransferID string `json:"transfer_id"`
-	Path       string `json:"path"`         // absolute remote path
-	MaxInline  int64  `json:"max_inline"`   // ctl's tier-A budget (server max_payload aware)
+	Path       string `json:"path"`            // absolute remote path
+	MaxInline  int64  `json:"max_inline"`      // ctl's tier-A budget (server max_payload aware)
 	Force      bool   `json:"force,omitempty"` // overwrite existing local file
 
 	ActorFP string `json:"actor_fp,omitempty"`
@@ -618,7 +644,7 @@ type PullPrepareReq struct {
 // SHA-verifies, writes locally, then sends finalize.
 type PullPrepareResp struct {
 	OK         bool   `json:"ok"`
-	Tier       string `json:"tier,omitempty"`        // a | b
+	Tier       string `json:"tier,omitempty"` // a | b
 	Size       int64  `json:"size,omitempty"`
 	SHA256     string `json:"sha256,omitempty"`      // hex
 	InlineData []byte `json:"inline_data,omitempty"` // tier A only
@@ -646,7 +672,7 @@ type TransferCommitReq struct {
 // and is starting Get; final outcome flows separately on ev.transfer.
 type TransferCommitResp struct {
 	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`  // bucket_unknown | jetstream_unavailable | not_owner | ...
+	Code  string `json:"code,omitempty"` // bucket_unknown | jetstream_unavailable | not_owner | ...
 	Error string `json:"error,omitempty"`
 }
 
@@ -655,15 +681,15 @@ type TransferCommitResp struct {
 // tiers. Broker subscribes to s.*.ev.node.*.transfer.> and writes the
 // matching audit.transfer{kind} + deletes the tier-B bucket.
 type TransferEvent struct {
-	Kind       string `json:"kind"`        // complete | failed
-	Verb       string `json:"verb"`        // push (v1 only emits for push; pull uses TransferFinalize)
+	Kind       string `json:"kind"` // complete | failed
+	Verb       string `json:"verb"` // push (v1 only emits for push; pull uses TransferFinalize)
 	TransferID string `json:"transfer_id"`
 	Tier       string `json:"tier,omitempty"`
 	Bucket     string `json:"bucket,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Bytes      int64  `json:"bytes,omitempty"`
 	DurationMs int64  `json:"duration_ms,omitempty"`
-	Code       string `json:"code,omitempty"`  // failed only: sha_mismatch | io_error | object_get_failed | path_outside_roots | ...
+	Code       string `json:"code,omitempty"` // failed only: sha_mismatch | io_error | object_get_failed | path_outside_roots | ...
 	Error      string `json:"error,omitempty"`
 }
 
@@ -672,14 +698,14 @@ type TransferEvent struct {
 // (transfer_id ↔ actor) and (sid via NATS-layer ACL), writes
 // audit.transfer{kind}, and (tier B only) deletes the bucket.
 type TransferFinalize struct {
-	Kind       string `json:"kind"`        // complete | failed
+	Kind       string `json:"kind"` // complete | failed
 	TransferID string `json:"transfer_id"`
 	Tier       string `json:"tier,omitempty"` // a | b — broker uses to decide bucket cleanup
 	Bucket     string `json:"bucket,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Bytes      int64  `json:"bytes,omitempty"`
 	DurationMs int64  `json:"duration_ms,omitempty"`
-	Code       string `json:"code,omitempty"`  // failed only: sha_mismatch | object_get_failed | io_error | ...
+	Code       string `json:"code,omitempty"` // failed only: sha_mismatch | object_get_failed | io_error | ...
 	Error      string `json:"error,omitempty"`
 }
 
@@ -710,3 +736,127 @@ type CapsResp struct {
 	Error          string `json:"error,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// P13 — session-scoped proxy subscription. All additive; ProtoVersion stays 1.
+// ---------------------------------------------------------------------------
+
+// ProxyKey is one ACTIVE subscriber's Shadowsocks credential pushed to an
+// agent. SubID is the subscriber's stable internal id (== ssproxy KeyID, used
+// for targeted revocation); Secret is the SS password string.
+type ProxyKey struct {
+	SubID  string `json:"sub_id"`
+	Secret string `json:"secret"`
+}
+
+// ProxyDirective is the authoritative per-node proxy state delivered to an
+// agent via the register response (join/reconnect) or the per-(sid,nid)
+// proxy-keys.req.forwarded push (live delta). Epoch is the broker-DB-monotonic
+// keyset version; the agent applies on Epoch != last-applied (not >) so a
+// broker DB restore that rewinds Epoch still converges.
+//
+// SECURITY: this message carries the raw tunnel Token (once) and the SS PSKs.
+// It travels ONLY over the register-reply _INBOX and the Agent-only
+// .req.forwarded channel — NEVER over sys.events (which members can read).
+type ProxyDirective struct {
+	Enabled    bool       `json:"enabled"`
+	PublicPort int        `json:"public_port,omitempty"`
+	Token      string     `json:"token,omitempty"`  // tunnel token (raw, agent-only)
+	Cipher     string     `json:"cipher,omitempty"` // locked "chacha20-ietf-poly1305"
+	Keys       []ProxyKey `json:"keys,omitempty"`
+
+	// Generation + Epoch form the ORDERING PAIR (round-3). Generation is the
+	// broker incarnation id (its process boot time); it increases across broker
+	// restarts INCLUDING a DB restore (which requires a restart). Epoch is the
+	// per-session keyset version. Every directive source — register reply, live
+	// keyset push, and heartbeat repair — carries the SAME pair, and the agent
+	// applies on lexicographic (Generation, Epoch) >:
+	//   - a higher Generation applies even with a LOWER epoch (DB-restore
+	//     convergence);
+	//   - within one Generation, a lower epoch is stale (no resurrect-after-OFF).
+	// A scalar epoch alone can't distinguish a stale lower reply from an
+	// authoritative restore; the generation does.
+	Generation int64 `json:"generation,omitempty"`
+	Epoch      int64 `json:"epoch,omitempty"`
+}
+
+// ProxySetReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.set.req. Owner-only.
+// One message carries both on (Enabled:true) and off (Enabled:false).
+type ProxySetReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+// ProxySetResp — broker reply. AffectedNodes counts the ONLINE P13-capable
+// nodes the directive was pushed to (actual readiness shows in proxy status).
+type ProxySetResp struct {
+	OK            bool   `json:"ok"`
+	Enabled       bool   `json:"enabled"`
+	AffectedNodes int    `json:"affected_nodes"`
+	Code          string `json:"code,omitempty"` // not_owner | not_a_member | session_not_found_or_deleting | subject_malformed | store_error
+	Error         string `json:"error,omitempty"`
+}
+
+// ProxyStatusReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.status.req.
+// Member-readable (status reveals NO secrets).
+type ProxyStatusReq struct{}
+
+// ProxyNodeEntry is one node row in proxy status (NEVER carries a token/psk).
+type ProxyNodeEntry struct {
+	NID        string `json:"nid"`
+	Status     string `json:"status"` // ONLINE | STALE | OFFLINE
+	Ready      bool   `json:"ready"`  // agent ACKed SS bind (rendered in /sub)
+	PublicHost string `json:"public_host,omitempty"`
+	PublicPort int    `json:"public_port,omitempty"`
+}
+
+// ProxySubEntry is one subscriber row in status/list (NEVER carries token/psk).
+type ProxySubEntry struct {
+	Name      string     `json:"name"`
+	State     string     `json:"state"` // ACTIVE | REVOKED
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+}
+
+type ProxyStatusResp struct {
+	Enabled      bool             `json:"enabled"`
+	Nodes        []ProxyNodeEntry `json:"nodes,omitempty"`
+	Subscribers  []ProxySubEntry  `json:"subscribers,omitempty"`
+	SubURLPrefix string           `json:"sub_url_prefix,omitempty"` // e.g. "https://broker/sub/"
+	Code         string           `json:"code,omitempty"`
+	Error        string           `json:"error,omitempty"`
+}
+
+// ProxySubCreateReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.sub.create.req. Owner-only.
+type ProxySubCreateReq struct {
+	Name string `json:"name"`
+}
+
+// ProxySubCreateResp — broker reply. SubURL is printed exactly once (the raw
+// token only ever leaves the broker here).
+type ProxySubCreateResp struct {
+	OK     bool   `json:"ok"`
+	Name   string `json:"name,omitempty"`
+	SubURL string `json:"sub_url,omitempty"`
+	Code   string `json:"code,omitempty"` // sub_name_invalid | sub_name_taken | not_owner | ...
+	Error  string `json:"error,omitempty"`
+}
+
+// ProxySubListReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.sub.list.req. Owner-only.
+type ProxySubListReq struct{}
+
+type ProxySubListResp struct {
+	Subs  []ProxySubEntry `json:"subs,omitempty"`
+	Code  string          `json:"code,omitempty"`
+	Error string          `json:"error,omitempty"`
+}
+
+// ProxySubRevokeReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.sub.revoke.req. Owner-only.
+type ProxySubRevokeReq struct {
+	Name string `json:"name"`
+}
+
+type ProxySubRevokeResp struct {
+	OK    bool   `json:"ok"`
+	Name  string `json:"name,omitempty"`
+	Code  string `json:"code,omitempty"` // sub_not_found | already_revoked | not_owner | ...
+	Error string `json:"error,omitempty"`
+}

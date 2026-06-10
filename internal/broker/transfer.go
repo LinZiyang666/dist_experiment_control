@@ -712,8 +712,6 @@ func (b *Broker) replyCommitErr(msg *nats.Msg, code, errMsg string) {
 
 // ─── Caps probe (caps.req) ─────────────────────────────────────────────
 
-
-
 // handleCapsReq replies to `ctrl.by.<actor>.s.<sid>.caps.req` with
 // broker capabilities the CLI needs before chooseTier:
 //
@@ -780,8 +778,6 @@ func (b *Broker) handleCapsReq(msg *nats.Msg) {
 }
 
 // ─── Pull receiver finalize (transfer.<id>.finalize.req) ──────────────
-
-
 
 // handleFinalizeReq is invoked on
 // `ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req`.

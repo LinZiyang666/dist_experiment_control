@@ -36,10 +36,10 @@ func TestTransferSubjectGolden(t *testing.T) {
 // reject ill-formed subjects (esp. wrong sid/actor token).
 func TestParseTransferFinalize(t *testing.T) {
 	cases := []struct {
-		subject               string
-		wantActor, wantSID    string
-		wantTID               string
-		wantOK                bool
+		subject            string
+		wantActor, wantSID string
+		wantTID            string
+		wantOK             bool
 	}{
 		{SubjCtrlTransferFinalize(fakeActor, "lab", "01hzxn"), fakeActor, "lab", "01hzxn", true},
 		// Different actor key shape — token validator must reject.
@@ -63,10 +63,10 @@ func TestParseTransferFinalize(t *testing.T) {
 // ParseEvTransfer must round-trip with SubjEvTransfer and reject mismatched layouts.
 func TestParseEvTransfer(t *testing.T) {
 	cases := []struct {
-		subject                       string
-		wantSid, wantNid, wantTID     string
-		wantKind                      string
-		wantOK                        bool
+		subject                   string
+		wantSid, wantNid, wantTID string
+		wantKind                  string
+		wantOK                    bool
 	}{
 		{SubjEvTransfer("lab", "lab-1", "01hzxn", "complete"),
 			"lab", "lab-1", "01hzxn", "complete", true},

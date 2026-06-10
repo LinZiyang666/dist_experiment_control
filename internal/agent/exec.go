@@ -26,7 +26,7 @@ const streamChunkSize = 4 * 1024
 // dispatchForwarded routes a `cmd.node.<N>.<verb>.req.forwarded` message
 // to the right verb handler. Subject layout:
 //
-//   tether.v1.s.<sid>.cmd.node.<nid>.<verb>.req.forwarded
+//	tether.v1.s.<sid>.cmd.node.<nid>.<verb>.req.forwarded
 //
 // (10 tokens; same as the cmd.by.* tree minus the actor segment).
 func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
@@ -63,6 +63,23 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 		go a.handleExposeForwarded(nc, msg)
 	case "expose-rm":
 		go a.handleExposeRmForwarded(nc, msg)
+	case "proxy-keys":
+		// round-2 F4: assign the arrival sequence and register with the drain
+		// barrier UNDER proxyDrainMu, so once Run sets proxyDraining no further
+		// Add can happen and proxyHandlerWG.Wait is a sound shutdown barrier.
+		a.proxyDrainMu.Lock()
+		if a.proxyDraining {
+			a.proxyDrainMu.Unlock()
+			return
+		}
+		a.proxyDispatchN++
+		seq := a.proxyDispatchN
+		a.proxyHandlerWG.Add(1)
+		a.proxyDrainMu.Unlock()
+		go func() {
+			defer a.proxyHandlerWG.Done()
+			a.handleProxyKeysForwarded(nc, msg, seq)
+		}()
 	case "upgrade":
 		go a.handleUpgradeForwarded(nc, msg)
 	case "push":

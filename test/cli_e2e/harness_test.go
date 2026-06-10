@@ -29,10 +29,10 @@ import (
 // startNATS / startJSNATS / openDB / silentLog / freshUserPub are
 // thin re-exports so each *_test.go file in this package keeps the
 // same naming the per-phase suites use.
-func startNATS(t *testing.T) string                  { return testharness.StartNATS(t) }
-func openDB(t *testing.T) *sql.DB                    { return testharness.OpenDB(t) }
-func silentLog() *slog.Logger                        { return testharness.SilentLog() }
-func freshUserPub(t *testing.T) (pub, fp string)     { return testharness.FreshUserPub(t) }
+func startNATS(t *testing.T) string              { return testharness.StartNATS(t) }
+func openDB(t *testing.T) *sql.DB                { return testharness.OpenDB(t) }
+func silentLog() *slog.Logger                    { return testharness.SilentLog() }
+func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserPub(t) }
 
 // seedSession inserts an ACTIVE session row owned by fp. Mirrors the
 // helper used by every per-phase suite — copy-pasted here rather than
@@ -53,17 +53,17 @@ type brokerOpts func(*broker.Config)
 func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpts) func() {
 	t.Helper()
 	cfg := broker.Config{
-		NATSURL:                 url,
-		DB:                      db,
-		Logger:                  silentLog(),
-		ReconcileInterval:       50 * time.Millisecond,
-		StaleAfter:              300 * time.Millisecond,
-		OfflineAfter:            900 * time.Millisecond,
-		PublicHost:              "test.local",
-		PortBandLow:             14000,
-		PortBandHigh:            14002,
-		PortRevokeAfterDur:      300 * time.Millisecond,
-		ExposeForwardTimeoutDur: 1 * time.Second,
+		NATSURL:                  url,
+		DB:                       db,
+		Logger:                   silentLog(),
+		ReconcileInterval:        50 * time.Millisecond,
+		StaleAfter:               300 * time.Millisecond,
+		OfflineAfter:             900 * time.Millisecond,
+		PublicHost:               "test.local",
+		PortBandLow:              14000,
+		PortBandHigh:             14002,
+		PortRevokeAfterDur:       300 * time.Millisecond,
+		ExposeForwardTimeoutDur:  1 * time.Second,
 		UpgradeForwardTimeoutDur: 5 * time.Second,
 	}
 	for _, o := range opts {

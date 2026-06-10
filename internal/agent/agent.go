@@ -4,8 +4,8 @@
 //
 // Connection-level resilience (architecture C.3) is implemented at two
 // layers, both ctx-aware with exponential backoff:
-//   1. connectNATS retries the initial CONNECT,
-//   2. register retries the request/reply.
+//  1. connectNATS retries the initial CONNECT,
+//  2. register retries the request/reply.
 //
 // Authentication:
 //   - Default path: caller passes Config.Identity (loaded via
@@ -121,6 +121,12 @@ type Config struct {
 	// next subprocess fork tries to exec the corrupted binary).
 	UpgradeExecutablePath string
 
+	// ProxyFailClosedGrace (P13) is how long the agent may stay partitioned
+	// from NATS while still serving the embedded proxy before it proactively
+	// tears the SS server down (fail-closed). Defaults to 15min, aligned with
+	// the broker's OFFLINE→port-REVOKE threshold. Tests override down.
+	ProxyFailClosedGrace time.Duration
+
 	// AllowRoots is the file-transfer-plan §"Refusing dangerous paths"
 	// allow-list of absolute roots under which `tether push` /
 	// `tether pull` may write or read files. EMPTY → file transfer is
@@ -133,6 +139,13 @@ type Config struct {
 	// allow-list compare. The leaf is never followed (O_NOFOLLOW on
 	// push, lstat-then-O_NOFOLLOW on pull). See internal/agent/path.go.
 	AllowRoots []string
+
+	// ProxyAllowPrivateDestinations (P13 round-6 F12) opts the embedded SS proxy
+	// OUT of the default internet-egress-only destination policy, permitting a
+	// subscription to reach loopback / private / link-local / metadata addresses
+	// on this agent. Default false (deny). Set only for deployments that
+	// intentionally expose private-network access.
+	ProxyAllowPrivateDestinations bool
 }
 
 // procRec is one entry in Agent.procs. Tracks the PTY session plus
@@ -192,6 +205,30 @@ type Agent struct {
 	// push/pull. Audit shard P11 F3 — previously each handler
 	// re-canonicalized, costing O(allow_roots) syscalls per request.
 	canonAllowRoots []string
+
+	// proxy is the P13 embedded SS proxy runtime (lazily created on the
+	// first directive). nil-safe; methods serialize through its own mutex.
+	proxy *proxyRuntime
+
+	// flcTimer is the P13 fail-closed watchdog (armed on NATS disconnect,
+	// cancelled on reconnect); flcMu guards it.
+	flcMu    sync.Mutex
+	flcTimer *time.Timer
+
+	// proxyHandlerWG tracks in-flight proxy-keys forwarded handlers so Run can
+	// drain them on shutdown (they write state.json; a late write must not race
+	// the agent Home cleanup). F9 / round-2 F4.
+	proxyHandlerWG sync.WaitGroup
+	// proxyDrainMu guards proxyDraining: once set (Run shutdown), dispatch will
+	// not Add a new proxy handler, so proxyHandlerWG.Wait is a sound barrier.
+	proxyDrainMu   sync.Mutex
+	proxyDraining  bool
+	proxyDispatchN int64 // monotonic proxy-keys arrival sequence (assigned in dispatch)
+
+	// proxyApplyMu serializes live keyset-push application and orders it by the
+	// arrival sequence; lastAppliedPushSeq is the highest applied (round-2 F2).
+	proxyApplyMu       sync.Mutex
+	lastAppliedPushSeq int64
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -225,6 +262,7 @@ func New(cfg Config) (*Agent, error) {
 		cfg:             cfg,
 		procs:           map[string]*procRec{},
 		canonAllowRoots: CanonAllowRoots(cfg.AllowRoots),
+		proxy:           &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
 	}
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
@@ -246,6 +284,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = nc.Drain() }()
+	// F9 / round-2 F4: drain in-flight proxy-keys handlers before the connection
+	// drains. Set proxyDraining FIRST (under the lock) so dispatch cannot Add a
+	// new handler after this point, THEN Wait — a sound barrier (no Add races
+	// the Wait). Runs just before nc.Drain (registered right after it).
+	defer func() {
+		a.proxyDrainMu.Lock()
+		a.proxyDraining = true
+		a.proxyDrainMu.Unlock()
+		a.proxyHandlerWG.Wait()
+	}()
 
 	resp, err := a.register(ctx, nc)
 	if err != nil {
@@ -270,7 +318,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	subFwd, err := nc.Subscribe(
 		fmt.Sprintf("tether.v1.s.%s.cmd.node.%s.*.req.forwarded", a.cfg.SID, a.cfg.NID),
-		func(msg *nats.Msg) { a.dispatchForwarded(nc, msg) },
+		func(msg *nats.Msg) {
+			// round-2 F4: count the callback from the moment it STARTS, before
+			// dispatchForwarded — so a callback preempted before it spawns a
+			// proxy handler is still covered by the shutdown drain barrier
+			// (proxyHandlerWG.Wait). The proxy handler takes its own Add inside
+			// dispatch; this wrapper bridges the gap. Cheap for non-proxy verbs
+			// (dispatchForwarded returns immediately after spawning).
+			a.proxyHandlerWG.Add(1)
+			defer a.proxyHandlerWG.Done()
+			a.dispatchForwarded(nc, msg)
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("agent: subscribe forwarded: %w", err)
@@ -285,6 +343,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// any race with parent-canceled paths.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	defer a.cancelFailClosed() // stop any armed fail-closed timer on shutdown
 	a.runCtx = runCtx
 	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) {
 		var ev struct {
@@ -321,6 +380,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	// reconciles via the token_hash already in port_allocations).
 	// No-op when state store or adapter is absent.
 	a.replayPortsFromState()
+
+	// P13: converge the embedded SS proxy to the broker's directive (nil
+	// when the session's proxy switch is off → ensures it's torn down).
+	a.applyProxyDirective(runCtx, nc, resp.Proxy)
 
 	return a.heartbeatLoop(runCtx, nc)
 }
@@ -436,6 +499,7 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 		BootID:         readBootID(),
 		LocalProcesses: procs,
 		LocalPorts:     ports,
+		Capabilities:   []string{proto.CapProxyV1}, // P13: this build implements proxy-v1
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -525,13 +589,24 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 		if err != nil {
 			a.cfg.Logger.Warn("agent: load state.json for register snapshot", "err", err)
 		} else {
-			ports = make([]proto.LocalPort, 0, len(sf.PortTokens))
+			ports = make([]proto.LocalPort, 0, len(sf.PortTokens)+1)
 			for _, p := range sf.PortTokens {
 				ports = append(ports, proto.LocalPort{
 					Port:      p.Port,
 					Name:      p.Name,
 					LocalPort: p.LocalPort,
 					TokenHash: port.HashToken(p.Token),
+				})
+			}
+			// P13: report the embedded-proxy port too, so the broker's
+			// register reconcile keeps it (token_hash match) instead of
+			// re-minting a token + tunnel on every reconnect.
+			if sf.Proxy != nil && sf.Proxy.PublicPort != 0 {
+				ports = append(ports, proto.LocalPort{
+					Port:      sf.Proxy.PublicPort,
+					Name:      proxyTokenName,
+					LocalPort: sf.Proxy.LocalPort,
+					TokenHash: port.HashToken(sf.Proxy.Token),
 				})
 			}
 		}
@@ -627,7 +702,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 			a.cfg.Logger.Info("agent: shutting down")
 			return ctx.Err()
 		case t := <-ticker.C:
-			payload, _ := json.Marshal(proto.HeartbeatPayload{Ts: t.UTC()})
+			pgen, pepoch := a.proxyGenEpoch()
+			payload, _ := json.Marshal(proto.HeartbeatPayload{Ts: t.UTC(), ProxyGeneration: pgen, ProxyEpoch: pepoch})
 			if err := nc.Publish(subject, payload); err != nil {
 				a.cfg.Logger.Warn("agent: heartbeat publish", "err", err)
 			}
@@ -640,7 +716,21 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 // the auth_callout-aware Name. Without Identity, falls back to anonymous
 // CONNECT (P2-style / TETHER_DEV_NO_AUTH demos only).
 func (a *Agent) buildConnOptions() ([]nats.Option, error) {
-	opts := []nats.Option{nats.MaxReconnects(-1)}
+	opts := []nats.Option{
+		nats.MaxReconnects(-1),
+		// P13 convergence (architecture p13-plan §5 / Critique 4): the agent
+		// registers ONCE and heartbeat is fire-and-forget. On a NATS reconnect
+		// (the agent process stayed up while its connection bounced) trigger a
+		// single re-register so the broker's register reply re-delivers the
+		// authoritative proxy directive (and re-runs G.1 reconcile).
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			go a.onNATSReconnect(nc)
+		}),
+		// B1 fail-closed: arm the SS-teardown countdown on disconnect.
+		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+			a.armFailClosed()
+		}),
+	}
 
 	if a.cfg.Identity == nil {
 		// Anonymous fallback: name with `/` separators is intentional

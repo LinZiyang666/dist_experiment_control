@@ -19,10 +19,10 @@ import (
 // end-to-end by test/p3.
 func TestParseRole(t *testing.T) {
 	cases := []struct {
-		name        string
-		want        role
-		wantSid     string
-		wantNid     string
+		name    string
+		want    role
+		wantSid string
+		wantNid string
 	}{
 		{"tether-cli", roleCtlUnactivated, "", ""},
 		{"tether-cli:lab", roleCtlActivated, "lab", ""},
@@ -388,4 +388,3 @@ func TestHandleWildcardAgentRoleDenied(t *testing.T) {
 		t.Fatal("tether-agent:*:* must be denied")
 	}
 }
-

@@ -82,6 +82,31 @@ func TestLoadAgentYAMLPartial(t *testing.T) {
 	}
 }
 
+func TestExternalReviewAgentYAMLExposesPrivateDestinationOptIn(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "agent", "lab")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("session: lab\nnid: lab-1\nproxy:\n  allow_private_destinations: true\n")
+	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadAgentYAML(home, "lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := reflect.ValueOf(got).FieldByName("Proxy")
+	if !proxy.IsValid() {
+		t.Fatal("documented proxy.allow_private_destinations setting is not represented in agentYAML")
+	}
+	allow := proxy.FieldByName("AllowPrivateDestinations")
+	if !allow.IsValid() || allow.Kind() != reflect.Bool || !allow.Bool() {
+		t.Fatal("documented proxy.allow_private_destinations setting was not loaded as true")
+	}
+}
+
 // TestLoadAgentYAMLMalformed: a typo in the operator's
 // hand-edited yaml should surface as an error rather than silent
 // fall-through to flag defaults — otherwise the operator wonders
@@ -129,4 +154,3 @@ func TestPickFlagOrYamlOnAgentCmd(t *testing.T) {
 		t.Errorf("tunnel-addr default+yaml: got %q want yaml", got)
 	}
 }
-

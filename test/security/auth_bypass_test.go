@@ -110,9 +110,9 @@ func TestUpgradeWithMalformedActorTokenRejected(t *testing.T) {
 	// the subject string directly.
 	for _, badActor := range []string{
 		"NOTANACTOR",
-		strings.Repeat("U", 56),                          // right shape, wrong charset (U+U... has no valid base32 CRC)
-		"U" + strings.Repeat("Z", 55),                    // wrong charset alphabet
-		"u" + strings.Repeat("A", 55),                    // lowercase 'u'
+		strings.Repeat("U", 56),       // right shape, wrong charset (U+U... has no valid base32 CRC)
+		"U" + strings.Repeat("Z", 55), // wrong charset alphabet
+		"u" + strings.Repeat("A", 55), // lowercase 'u'
 		"",
 	} {
 		subj := "tether.v1.s.lab.cmd.by." + badActor + ".node.lab-1.upgrade.req"

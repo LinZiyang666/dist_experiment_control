@@ -144,7 +144,8 @@
   - History 记录（SQLite 条目 + JetStream 流联动）。
   - 挑战-响应鉴权。
 - **不做**：实验级编排 / 调度、任务状态机、托管进程 stdout/stderr 历史聚合。
-- 本身是 NATS 客户端；不暴露任何 REST / HTTP 管理接口。
+- 本身是 NATS 客户端；不暴露任何 REST / HTTP **管理**接口。
+  - **P13 例外**：proxy 订阅功能引入一个**只读、loopback 绑定、GET-only** 的订阅端点（`GET /sub/<token>`，经 Caddy 反代），仅吐出 Clash 配置，不接受写、不持有 NATS 句柄、不是管理面。这是当前唯一的对外 HTTP 表面（`broker.sub.listen` 为空时整体禁用）。
 
 ### 4.4 Agent（每个受控节点）
 
