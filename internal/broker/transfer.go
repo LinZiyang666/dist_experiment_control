@@ -10,12 +10,11 @@
 //   IN  ctrl.by.<actor>.s.<sid>.caps.req                   → handleCapsReq (caps.go)
 //   OUT s.<sid>.audit.transfer                             → pubAuditTransfer
 //
-// Bucket lifecycle invariant (plan §Object bucket lifecycle): the
-// broker is the SOLE owner of OBJ_xfer-<sid>-<transfer_id> stream
-// CREATE / DELETE. ctl + agent only Put/Get/Watch via the data
-// subjects ($O.xfer-<sid>-<id>.{M,C}.>). Member/agent permission
-// templates explicitly omit STREAM.CREATE/DELETE/PURGE; see
-// internal/auth/permissions.go.
+// Bucket lifecycle invariant: the broker is the SOLE owner of the
+// per-session OBJ_xfer-<sid> stream. ctl + agent only Put/Get/Watch
+// per-transfer objects keyed by transfer_id via the data subjects
+// ($O.xfer-<sid>.{M,C}.>). Member/agent permission templates
+// explicitly omit STREAM.CREATE/DELETE/PURGE; see internal/auth/permissions.go.
 //
 // Receiver-finalization invariant (plan §Audit): start row is written
 // here on accepted prepare; complete|failed flows from the RECEIVER
@@ -101,21 +100,22 @@ func (t *transferTracker) get(id string) *transferEntry {
 	return t.entries[id]
 }
 
-// put inserts an entry. Returns true on success; false if the tracker
-// is at transferTrackerMaxEntries. Callers must reject the request
-// with `too_many_in_flight` on false.
-func (t *transferTracker) put(e *transferEntry) bool {
+// put inserts an entry. Returns "" on success, else the response Code
+// the caller must reject the request with. A transfer_id already in
+// flight is never overwritten: the original entry's watchdog stays
+// armed on that id, so replacing the entry would let the stale
+// watchdog claim and reap the replacement mid-transfer.
+func (t *transferTracker) put(e *transferEntry) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if _, exists := t.entries[e.transferID]; exists {
+		return "transfer_id_in_flight"
+	}
 	if len(t.entries) >= transferTrackerMaxEntries {
-		// Don't overwrite an existing entry with the same id — that
-		// would silently drop the original transfer.
-		if _, exists := t.entries[e.transferID]; !exists {
-			return false
-		}
+		return "too_many_in_flight"
 	}
 	t.entries[e.transferID] = e
-	return true
+	return ""
 }
 
 func (t *transferTracker) remove(id string) *transferEntry {
@@ -131,7 +131,7 @@ func (t *transferTracker) remove(id string) *transferEntry {
 //   - it hasn't already been finalized.
 //
 // First caller wins; later callers receive ok=false and MUST NOT write
-// a second audit row / delete the bucket twice.
+// a second audit row / delete the transfer object twice.
 //
 // The returned *transferEntry MAY be non-nil even when ok=false
 // (entry exists but was already claimed) — callers can use the entry
@@ -310,7 +310,7 @@ func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
 
 // handlePushReq is the broker entry for `tether push`. It runs the
 // standard ctl preconditions (sid alive, actor is a member, node is
-// ONLINE), pre-creates the tier-B bucket if needed, registers the
+// ONLINE), ensures the per-session tier-B bucket exists if needed, registers the
 // in-memory entry, forwards a tightly-shaped payload to the agent,
 // and writes audit start. The agent's reply (PushPrepareResp) goes
 // directly back to ctl on msg.Reply — broker isn't in the data path.
@@ -386,11 +386,11 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: req.Bucket, path: req.Path, size: req.Size,
 		startedAt: b.cfg.Now(),
 	}
-	if !b.transfers.put(entry) {
-		// In-flight cap reached. Per-session bucket survives across
-		// transfers, so no bucket cleanup needed here — just reject.
-		b.replyPushErr(msg, "too_many_in_flight",
-			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
+	if code := b.transfers.put(entry); code != "" {
+		// Duplicate id or in-flight cap reached. Per-session bucket
+		// survives across transfers, so no bucket cleanup needed here.
+		b.replyPushErr(msg, code,
+			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
 		return
 	}
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
@@ -494,11 +494,11 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: bucket, path: req.Path,
 		startedAt: b.cfg.Now(),
 	}
-	if !b.transfers.put(entry) {
+	if code := b.transfers.put(entry); code != "" {
 		// Per-session bucket survives across transfers; nothing to
 		// reap on this rejection.
-		b.replyPullErr(msg, "too_many_in_flight",
-			fmt.Sprintf("broker has %d transfers in flight; retry shortly", transferTrackerMaxEntries))
+		b.replyPullErr(msg, code,
+			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
 		return
 	}
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
@@ -612,7 +612,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 	entry, claimed := b.transfers.claimFinalize(transferID)
 	if !claimed {
 		// Already finalized by watchdog or another caller. Don't
-		// double-write audit / double-delete bucket.
+		// double-write audit / double-delete the transfer object.
 		return
 	}
 

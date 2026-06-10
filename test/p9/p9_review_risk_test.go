@@ -34,7 +34,14 @@ func TestReviewAdminSocketDoesNotUnlinkActiveSocket(t *testing.T) {
 }
 
 func TestReviewAdminSocketChmodsExistingParent(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "tether-run")
+	// Pre-create the parent at 0o755 so Start's defensive re-chmod is
+	// exercised. Short temp dir (not t.TempDir) — see adminSocketPath.
+	base, err := os.MkdirTemp("", "tsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	dir := filepath.Join(base, "tether-run")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

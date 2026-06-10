@@ -184,13 +184,11 @@ func (a *Agent) handlePushCommitForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Look up the expected SHA + path saved during push.req prepare.
-	// We piggyback on the broker's bucket-object Metadata, set by the
-	// agent itself on push.req? No — we never wrote metadata. The
-	// SHA + path were embedded in the original PushPrepareReq, which
-	// we replay through a small in-memory cache (a.pushCommitCache).
-	// Same with allow_roots validation result. If not in cache (a
-	// crashed-mid-prep agent could have lost it) → bucket_unknown.
+	// Look up the expected SHA + path + allow_roots validation saved
+	// during push.req prepare (a.pushCommitCache — no object metadata
+	// is written, the original PushPrepareReq is the only carrier).
+	// Cache miss (agent restarted between prep and commit) →
+	// transfer_unknown; the broker's watchdog writes the failed audit.
 	a.pushCacheMu.Lock()
 	cached, hit := a.pushCommitCache[req.TransferID]
 	a.pushCacheMu.Unlock()

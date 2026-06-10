@@ -346,10 +346,6 @@ func (s *Server) bridgePublicToYamux(pubConn net.Conn, sess *serverSession) {
 	bridge(pubConn, stream)
 }
 
-// Close releases the control listener and every active agent session.
-// Idempotent. After Close returns, in-flight handleAgent goroutines
-// have all observed s.closed=true and either exited or rolled back
-// their would-be insert; the bound public ports are released.
 // CloseProxy tears down the single public-port session for `port` (listener +
 // yamux + control conn) immediately, independent of the agent or NATS. Used by
 // the P13 `proxy off` authoritative kill switch so the public exit dies the
@@ -451,6 +447,10 @@ func (s *Server) CloseSession(sid string) []int {
 	return ports
 }
 
+// Close releases the control listener and every active agent session.
+// Idempotent. After Close returns, in-flight handleAgent goroutines
+// have all observed s.closed=true and either exited or rolled back
+// their would-be insert; the bound public ports are released.
 func (s *Server) Close() {
 	s.mu.Lock()
 	if s.closed {

@@ -50,14 +50,20 @@ func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 }
 
 // adminSocketPath returns a path inside a fresh, broker-created
-// subdir of t.TempDir() so adminsock.Server.Start's mkdir(0o700)
-// applies (the test's TempDir itself comes back 0o755, which would
-// hide a regression where the broker fails to set 0o700 on its own
-// freshly-created parent). Path stays short enough for the kernel's
-// sun_path limit (~108 bytes).
+// subdir of a SHORT temp dir so adminsock.Server.Start's mkdir(0o700)
+// applies (the temp dir itself comes back 0o755, which would hide a
+// regression where the broker fails to set 0o700 on its own freshly-
+// created parent). os.MkdirTemp("", ...) rather than t.TempDir():
+// the latter embeds the full test name, which on macOS pushes the
+// path past the kernel's sun_path limit (104 bytes on Darwin, 108
+// on Linux) and bind fails with EINVAL.
 func adminSocketPath(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "tsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "tether-run", "admin.sock")
 }
 

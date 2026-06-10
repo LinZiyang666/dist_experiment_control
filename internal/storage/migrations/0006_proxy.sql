@@ -15,8 +15,8 @@ ALTER TABLE sessions ADD COLUMN proxy_enabled INTEGER NOT NULL DEFAULT 0
     CHECK (proxy_enabled IN (0, 1));
 
 -- Monotonic keyset version, bumped on every enable / sub create / sub revoke.
--- The agent applies a directive when its Epoch differs from the last applied
--- (not >), so a broker DB restore that rewinds the counter still converges.
+-- Ordering on the agent is by the (generation, epoch) pair (see 0007 and
+-- architecture L.3), which keeps a broker DB restore convergent.
 ALTER TABLE sessions ADD COLUMN proxy_epoch INTEGER NOT NULL DEFAULT 0;
 
 -- Render gate: set to 1 when the agent ACKs that its embedded SS server is

@@ -17,6 +17,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -34,6 +36,23 @@ import (
 // not polluted by broker / agent / tunnel info lines.
 func silentLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// shortSocketPath returns a Unix socket path under a SHORT temp dir.
+// t.TempDir() embeds the full test name, which on macOS pushes the
+// path past the kernel's sun_path limit (104 bytes on Darwin, 108 on
+// Linux) and bind fails with EINVAL. os.MkdirTemp("", ...) stays under
+// the limit on both platforms. The tether-run subdir is left for
+// adminsock.Server.Start to create so its mkdir(0o700) path is
+// exercised.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "tsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "tether-run", "admin.sock")
 }
 
 // startNATS launches an embedded NATS server on an ephemeral port.

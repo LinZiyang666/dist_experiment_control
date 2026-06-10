@@ -7,7 +7,6 @@ package concurrency_test
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -118,8 +117,7 @@ func TestAgentCancelReturnsQuickly(t *testing.T) {
 // in adminsock.Start enforces this.
 func TestAdminsockDoubleBindRejected(t *testing.T) {
 	db := openMemDB(t)
-	dir := t.TempDir()
-	socketPath := filepath.Join(dir, "tether-run", "admin.sock")
+	socketPath := shortSocketPath(t)
 
 	srv1 := adminsock.New(socketPath, adminsock.Backend{
 		DB: db, Logger: silentLog(),
@@ -154,8 +152,7 @@ func TestAdminsockDoubleBindRejected(t *testing.T) {
 // removes the socket file inode.)
 func TestAdminsockReBindAfterClose(t *testing.T) {
 	db := openMemDB(t)
-	dir := t.TempDir()
-	socketPath := filepath.Join(dir, "tether-run", "admin.sock")
+	socketPath := shortSocketPath(t)
 
 	srv1 := adminsock.New(socketPath, adminsock.Backend{
 		DB: db, Logger: silentLog(),

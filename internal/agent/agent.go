@@ -137,7 +137,8 @@ type Config struct {
 	// Containment is checked after EvalSymlinks-of-parent-dir so a
 	// symlinked dir component still maps to its real path before the
 	// allow-list compare. The leaf is never followed (O_NOFOLLOW on
-	// push, lstat-then-O_NOFOLLOW on pull). See internal/agent/path.go.
+	// push, lstat-then-O_NOFOLLOW on pull). See the path-validation
+	// half of internal/agent/transfer.go.
 	AllowRoots []string
 
 	// ProxyAllowPrivateDestinations (P13 round-6 F12) opts the embedded SS proxy

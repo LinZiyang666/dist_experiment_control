@@ -213,8 +213,8 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 	_ = f.Close()
 	sha := hex.EncodeToString(h.Sum(nil))
 
-	// Step 1: PushPrepareReq with Tier=b. Broker creates bucket and
-	// forwards; agent validates path + replies OK.
+	// Step 1: PushPrepareReq with Tier=b. Broker ensures the per-session
+	// bucket exists and forwards; agent validates path + replies OK.
 	body, _ := json.Marshal(proto.PushPrepareReq{
 		TransferID: transferID, Path: spec.Path,
 		Size: size, SHA256: sha, Force: force, Tier: "b",
@@ -234,7 +234,8 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B) refused at prepare: code=%s %s", pr.Code, pr.Error)
 	}
 
-	// Step 2: ObjectStore.Put into bucket xfer-<sid>-<transferID>.
+	// Step 2: ObjectStore.Put into the per-session bucket xfer-<sid>,
+	// keyed by transferID.
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return fmt.Errorf("push (tier B): jetstream new: %w", err)
@@ -409,11 +410,16 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 		return fmt.Errorf("pull prepare: parse: %w", err)
 	}
 	if !pr.OK {
-		// Tell broker we failed so audit + bucket cleanup happens.
-		_ = sendFinalize(nc, id.PublicKey, sid, transferID, proto.TransferFinalize{
-			Kind: "failed", TransferID: transferID,
-			Code: pr.Code, Error: pr.Error,
-		}, 3*time.Second)
+		// Agent-side prepare failures happen after the broker accepted and
+		// tracked this transfer, so finalize them for audit + object cleanup.
+		// A duplicate transfer ID is rejected before insertion; finalizing that
+		// ID would instead claim and terminate the original in-flight pull.
+		if pullPrepareFailureNeedsFinalize(pr.Code) {
+			_ = sendFinalize(nc, id.PublicKey, sid, transferID, proto.TransferFinalize{
+				Kind: "failed", TransferID: transferID,
+				Code: pr.Code, Error: pr.Error,
+			}, 3*time.Second)
+		}
 		return fmt.Errorf("pull refused: code=%s %s", pr.Code, pr.Error)
 	}
 
@@ -533,6 +539,10 @@ func failAndFinalize(nc *nats.Conn, actor, sid, transferID, tier, code, errMsg s
 	}, 3*time.Second)
 }
 
+func pullPrepareFailureNeedsFinalize(code string) bool {
+	return code != "transfer_id_in_flight"
+}
+
 func sendFinalize(nc *nats.Conn, actor, sid, transferID string, fin proto.TransferFinalize, timeout time.Duration) error {
 	body, _ := json.Marshal(fin)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -581,12 +591,11 @@ func firstErr(errs ...error) error {
 // <= this go inline; > this require JetStream tier B.
 const cliTierAMaxBytes = 8 * 1024 * 1024
 
-// Hard upper bound. Past this the user is expected to use
-// `tether expose` + rsync (file-transfer-plan §Goals).
 // cliMaxBytes is the hard upper bound for a single transfer. Past this
-// the user is expected to use `tether expose` + rsync. Bumped from
-// 200 MiB → 2 GiB in v0.2.5; per-session JS bucket MaxBytes scales
-// accordingly (see internal/broker/transfer.go ensureXferBucket).
+// the user is expected to use `tether expose` + rsync (file-transfer-
+// plan §Goals). Bumped from 200 MiB → 2 GiB in v0.2.5; per-session JS
+// bucket MaxBytes scales accordingly (see internal/broker/transfer.go
+// ensureXferBucket).
 const cliMaxBytes = 2 * 1024 * 1024 * 1024
 
 // remoteSpec is one parsed `<node>:<remote-path>` argument.

@@ -53,8 +53,9 @@ terminal goes into raw mode so keys, arrow sequences, Ctrl-C, etc. flow
 through to the remote process group untouched. Resize is propagated.
 
 The two-phase attach handshake (architecture C.5.1) ensures the very
-first byte of remote output is not dropped; on the agent side a 3s
-attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
+first byte of remote output is not dropped; on the agent side an attach
+deadline (default 15s) guarantees no orphan PTYs if ctl drops
+mid-handshake.
 `,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -112,7 +113,7 @@ attach deadline guarantees no orphan PTYs if ctl drops mid-handshake.
 				return fmt.Errorf("run: publish: %w", err)
 			}
 
-			// Wait for ready / failed (5s — matches agent attachDeadline + slack).
+			// Wait for ready / failed.
 			// ctl waits for the agent's RunChunk{Kind:ready} reply
 			// before publishing pty.<pid>.attach. Has to outlast both
 			// the agent-side attachDeadline (default 15s, override

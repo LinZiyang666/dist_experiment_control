@@ -8,6 +8,19 @@ import (
 	"testing"
 )
 
+// canonDir resolves symlinks in a test dir path. t.TempDir() is not
+// guaranteed canonical (macOS: /var → /private/var), while
+// CanonAllowRoots / ValidateFor* return EvalSymlinks-resolved paths —
+// expectations must compare against the resolved form.
+func canonDir(t *testing.T, dir string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
+	}
+	return resolved
+}
+
 func TestValidate_TransferDisabledOnEmptyAllowRoots(t *testing.T) {
 	for _, fn := range []func(string, []string) (*ValidatedPath, error){
 		ValidateForRead, ValidateForWrite,
@@ -127,8 +140,8 @@ func TestValidateForWrite_AcceptsDirSymlinkInsideRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("got %v, want OK", err)
 	}
-	if !strings.HasPrefix(vp.Abs, innerReal+"/") {
-		t.Errorf("vp.Abs=%q does not start with resolved %q/", vp.Abs, innerReal)
+	if want := canonDir(t, innerReal); !strings.HasPrefix(vp.Abs, want+"/") {
+		t.Errorf("vp.Abs=%q does not start with resolved %q/", vp.Abs, want)
 	}
 }
 
@@ -178,8 +191,8 @@ func TestCanonicalAllowRoots_LongestWins(t *testing.T) {
 	if len(roots) != 2 {
 		t.Fatalf("want 2 roots, got %v", roots)
 	}
-	if roots[0] != deeper {
-		t.Errorf("longest first violation: roots[0]=%q want %q", roots[0], deeper)
+	if want := canonDir(t, deeper); roots[0] != want {
+		t.Errorf("longest first violation: roots[0]=%q want %q", roots[0], want)
 	}
 }
 
@@ -195,8 +208,8 @@ func TestCanonicalAllowRoots_DropsBad(t *testing.T) {
 		regular, // file, not a dir
 		root,    // good
 	})
-	if len(roots) != 1 || roots[0] != root {
-		t.Errorf("got %v, want exactly [%q]", roots, root)
+	if want := canonDir(t, root); len(roots) != 1 || roots[0] != want {
+		t.Errorf("got %v, want exactly [%q]", roots, want)
 	}
 }
 

@@ -19,7 +19,6 @@ package concurrency_test
 import (
 	"context"
 	"net"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"testing"
@@ -208,8 +207,7 @@ func TestAdminsockServerCloseNoGoroutineLeak(t *testing.T) {
 
 	before := runtime.NumGoroutine()
 
-	dir := t.TempDir()
-	socketPath := filepath.Join(dir, "tether-run", "admin.sock")
+	socketPath := shortSocketPath(t)
 	srv := adminsock.New(socketPath, adminsock.Backend{
 		DB: db, Logger: silentLog(),
 	})

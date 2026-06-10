@@ -432,7 +432,8 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 	dst := filepath.Join(root, "big.bin")
 	tid := "tid-tierb-push"
 
-	// Step 1: PushPrepareReq{Tier=b} — broker creates bucket and forwards.
+	// Step 1: PushPrepareReq{Tier=b} — broker ensures the per-session bucket
+	// exists and forwards.
 	body, _ := json.Marshal(proto.PushPrepareReq{
 		TransferID: tid, Path: dst, Size: int64(size), SHA256: sha, Tier: "b",
 	})
@@ -542,7 +543,7 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 }
 
 // Tier-B pull: agent Put, ctl Get, finalize.req → broker writes
-// audit + deletes bucket.
+// audit + deletes the transfer object.
 func TestTransfer_TierB_PullHappyPath(t *testing.T) {
 	url := startJSNATS_xfer(t)
 	db := openDB(t)
@@ -610,7 +611,7 @@ func TestTransfer_TierB_PullHappyPath(t *testing.T) {
 		t.Errorf("sha mismatch: want=%s got=%s", pr.SHA256, hexSHA256ForTest(got))
 	}
 
-	// Send finalize.req — broker writes audit complete + deletes bucket.
+	// Send finalize.req — broker writes audit complete + deletes the object.
 	finBody, _ := json.Marshal(proto.TransferFinalize{
 		Kind: "complete", TransferID: tid, Tier: "b", Bucket: pr.Bucket,
 		Bytes: int64(size),

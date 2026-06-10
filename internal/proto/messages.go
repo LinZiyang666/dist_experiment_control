@@ -567,8 +567,9 @@ type UpgradeForwardedResp struct {
 //   - Tier A (≤ 8 MiB):  InlineData embedded in PushPrepareReq /
 //     PullPrepareResp. No JetStream needed; round-trip ends in one
 //     request/reply.
-//   - Tier B (≤ 2 GiB):  ObjectStore bucket created by broker before
-//     forwarding; the receiver Get's the object, the sender Put's it.
+//   - Tier B (≤ 2 GiB):  broker ensures the per-session ObjectStore bucket
+//     exists before forwarding; the receiver Gets the transfer-keyed object
+//     and the sender Puts it.
 //
 // Finalization invariant (plan §Audit): broker writes audit.transfer
 // {start} from its accepted prepare; broker writes audit.transfer
@@ -585,13 +586,13 @@ type UpgradeForwardedResp struct {
 // into Path, replies OK; agent then publishes ev.transfer.<id>.complete
 // (receiver-finalization). Size MUST equal len(InlineData).
 //
-// Tier B: InlineData empty; broker has already created bucket Bucket and
-// granted the actor Put rights (not in this struct — broker owns
-// lifecycle). Agent validates Path against allow_roots, replies OK +
+// Tier B: InlineData empty; broker has already ensured bucket Bucket exists
+// and the actor's session-scoped permissions allow Put (not in this struct).
+// Agent validates Path against allow_roots, replies OK +
 // echoes Bucket/ObjectKey/ChunkSize. ctl then ObjectStore.Puts to Bucket
 // keyed by ObjectKey, then sends TransferCommitReq.
 type PushPrepareReq struct {
-	TransferID string `json:"transfer_id"` // ULID, ctl-generated; broker echoes into audit
+	TransferID string `json:"transfer_id"` // random ctl-generated id; broker echoes into audit
 	Path       string `json:"path"`        // absolute remote path under one of agent's allow_roots
 	Size       int64  `json:"size"`
 	SHA256     string `json:"sha256"`                // hex; expected digest after upload
@@ -613,17 +614,14 @@ type PushPrepareReq struct {
 type PushPrepareResp struct {
 	OK    bool   `json:"ok"`
 	Tier  string `json:"tier,omitempty"` // echoed for paranoia
-	Code  string `json:"code,omitempty"` // dst_exists | path_outside_roots | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled | jetstream_unavailable | io_error | ...
+	Code  string `json:"code,omitempty"` // transfer_id_in_flight | dst_exists | path_outside_roots | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled | jetstream_unavailable | io_error | ...
 	Error string `json:"error,omitempty"`
 }
 
 // PullPrepareReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.pull.req.
-// Single shape; agent decides tier based on size vs MaxInline. Broker
-// pre-creates the tier-B bucket only AFTER seeing the agent's Stat reply,
-// because pull-direction ctl is the receiver and the broker must know
-// the file size to decide tier. To avoid two round-trips per pull, the
-// broker forwards pull.req synchronously and creates the bucket in
-// between when agent.Stat indicates tier B (see broker.transfer.go).
+// Single shape; agent decides tier based on size vs MaxInline. Broker ensures
+// the per-session tier-B bucket exists before forwarding; a tier-A response
+// simply leaves that shared bucket untouched.
 type PullPrepareReq struct {
 	TransferID string `json:"transfer_id"`
 	Path       string `json:"path"`            // absolute remote path
@@ -650,7 +648,7 @@ type PullPrepareResp struct {
 	InlineData []byte `json:"inline_data,omitempty"` // tier A only
 	Bucket     string `json:"bucket,omitempty"`      // tier B only
 	ObjectKey  string `json:"object_key,omitempty"`  // tier B only
-	Code       string `json:"code,omitempty"`        // path_not_found | path_outside_roots | not_a_regular_file | too_large | transfer_disabled | jetstream_unavailable | io_error | ...
+	Code       string `json:"code,omitempty"`        // transfer_id_in_flight | path_not_found | path_outside_roots | not_a_regular_file | too_large | transfer_disabled | jetstream_unavailable | io_error | ...
 	Error      string `json:"error,omitempty"`
 }
 
@@ -659,7 +657,7 @@ type PullPrepareResp struct {
 // SHA-verify, rename into place, then publish ev.transfer.<id>.<kind>".
 // Reply is TransferCommitResp{OK} — the bytes-on-disk outcome flows via
 // the ev.transfer subject so the broker (subscribed) can write audit
-// and delete the bucket without sitting in the request path.
+// and delete the transfer object without sitting in the request path.
 type TransferCommitReq struct {
 	TransferID string `json:"transfer_id"`
 	Bucket     string `json:"bucket"`
@@ -679,7 +677,7 @@ type TransferCommitResp struct {
 // TransferEvent — agent pub on s.<sid>.ev.node.<nid>.transfer.<id>.<kind>
 // (kind ∈ complete|failed). Push receiver-side finalization for both
 // tiers. Broker subscribes to s.*.ev.node.*.transfer.> and writes the
-// matching audit.transfer{kind} + deletes the tier-B bucket.
+// matching audit.transfer{kind} + deletes the tier-B transfer object.
 type TransferEvent struct {
 	Kind       string `json:"kind"` // complete | failed
 	Verb       string `json:"verb"` // push (v1 only emits for push; pull uses TransferFinalize)
@@ -696,7 +694,7 @@ type TransferEvent struct {
 // TransferFinalize — ctl pub on ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req.
 // Pull receiver-side finalization for both tiers. Broker validates
 // (transfer_id ↔ actor) and (sid via NATS-layer ACL), writes
-// audit.transfer{kind}, and (tier B only) deletes the bucket.
+// audit.transfer{kind}, and (tier B only) deletes the transfer object.
 type TransferFinalize struct {
 	Kind       string `json:"kind"` // complete | failed
 	TransferID string `json:"transfer_id"`
@@ -750,9 +748,9 @@ type ProxyKey struct {
 
 // ProxyDirective is the authoritative per-node proxy state delivered to an
 // agent via the register response (join/reconnect) or the per-(sid,nid)
-// proxy-keys.req.forwarded push (live delta). Epoch is the broker-DB-monotonic
-// keyset version; the agent applies on Epoch != last-applied (not >) so a
-// broker DB restore that rewinds Epoch still converges.
+// proxy-keys.req.forwarded push (live delta). Ordering is by the
+// (Generation, Epoch) pair — see the field comment below for the exact
+// rule that keeps a broker DB restore convergent.
 //
 // SECURITY: this message carries the raw tunnel Token (once) and the SS PSKs.
 // It travels ONLY over the register-reply _INBOX and the Agent-only

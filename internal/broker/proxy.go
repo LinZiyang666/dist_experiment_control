@@ -93,7 +93,7 @@ func (b *Broker) enableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Msg
 		// while the agent cleared its footprint), a token-less directive can't
 		// recover it — so ROTATE: free the stale row and mint a fresh port+token
 		// below so the agent gets a full token-bearing directive.
-		if _, err := port.LookupProxyByNode(b.cfg.DB, sid, nid); err == nil {
+		if existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid); err == nil {
 			if b.nodeProxyReady(sid, nid) {
 				b.pushProxyDirective(nc, sid, nid, &proto.ProxyDirective{
 					Enabled: true, Cipher: ssproxy.Cipher, Keys: keys, Epoch: epoch,
@@ -101,13 +101,11 @@ func (b *Broker) enableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Msg
 				affected++
 				continue
 			}
-			if existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid); err == nil {
-				if b.tunnelSrv != nil {
-					b.tunnelSrv.CloseProxy(existing.Port)
-				}
-				if err := port.Free(b.cfg.DB, existing.Port, b.cfg.Now()); err != nil {
-					b.cfg.Logger.Warn("broker: proxy on rotate stale port", "sid", sid, "nid", nid, "err", err)
-				}
+			if b.tunnelSrv != nil {
+				b.tunnelSrv.CloseProxy(existing.Port)
+			}
+			if err := port.Free(b.cfg.DB, existing.Port, b.cfg.Now()); err != nil {
+				b.cfg.Logger.Warn("broker: proxy on rotate stale port", "sid", sid, "nid", nid, "err", err)
 			}
 		}
 		alloc, err := port.AllocateProxy(b.cfg.DB, sid, nid, b.cfg.PortAllocCfg())
@@ -465,9 +463,6 @@ func (b *Broker) activeProxyKeys(sid string) ([]proto.ProxyKey, error) {
 	return keys, nil
 }
 
-// bumpAndPushKeyset bumps the epoch and pushes the new ACTIVE keyset to every
-// online node — but only while the switch is on (a sub created/revoked while
-// off just sits in the DB until the next enable).
 // createSubAndBump creates a subscriber AND bumps the epoch in ONE transaction
 // (round-6 F5): the credential and the version commit together, so a failed bump
 // rolls the credential back instead of leaving agents on a stale keyset version.

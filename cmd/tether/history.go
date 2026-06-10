@@ -160,12 +160,10 @@ func runHistorySnapshot(ctx context.Context, cons jetstream.Consumer, out io.Wri
 		data    []byte
 	}
 	ch := make(chan item, 16)
-	doneCh := make(chan error, 1)
 	go func() {
 		for {
 			msg, err := it.Next()
 			if err != nil {
-				doneCh <- err
 				close(ch)
 				return
 			}

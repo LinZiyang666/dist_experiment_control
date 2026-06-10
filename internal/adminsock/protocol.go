@@ -62,9 +62,8 @@ type SessionEntry struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// NodeEntry mirrors the SQLite nodes row, plus a derived heartbeat
-// age the broker computes at reply time so the client doesn't have
-// to know the broker's clock skew.
+// NodeEntry mirrors the SQLite nodes row. The client derives the
+// heartbeat age for display from LastHeartbeatAt.
 type NodeEntry struct {
 	SID             string    `json:"sid"`
 	NID             string    `json:"nid"`

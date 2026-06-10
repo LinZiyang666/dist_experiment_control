@@ -83,16 +83,54 @@ func generateAndPersist(keyPath string) ([]byte, error) {
 	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
 		return nil, err
 	}
-	// Atomic-ish write: tmp + fsync + rename.
-	tmp := keyPath + ".tmp"
-	if err := os.WriteFile(tmp, seed, 0o600); err != nil {
+	// Atomic write: tmp + fsync + rename. The fsync matters — this is
+	// the private key; a post-rename crash surfacing an empty file would
+	// silently mint a NEW identity on next run, orphaning every session
+	// membership bound to the old fingerprint.
+	f, err := os.CreateTemp(filepath.Dir(keyPath), "."+filepath.Base(keyPath)+".tmp-*")
+	if err != nil {
+		return nil, err
+	}
+	tmp := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, err
+	}
+	if _, err := f.Write(seed); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return nil, err
 	}
 	if err := os.Rename(tmp, keyPath); err != nil {
 		_ = os.Remove(tmp)
 		return nil, err
 	}
+	if err := syncParentDir(keyPath); err != nil {
+		return nil, err
+	}
 	return seed, nil
+}
+
+func syncParentDir(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open parent directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("fsync parent directory: %w", err)
+	}
+	return nil
 }
 
 // DefaultHome returns ~/.tether unless $TETHER_HOME overrides.

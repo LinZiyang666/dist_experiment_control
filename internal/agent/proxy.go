@@ -307,7 +307,6 @@ func (a *Agent) pubProxyReady(nc *nats.Conn, ready bool) {
 	_ = nc.Publish(proto.SubjEvNodeProxyReady(a.cfg.SID, a.cfg.NID, kind), nil)
 }
 
-// handleProxyKeysForwarded handles the per-(sid,nid) keyset push.
 // handleProxyKeysForwarded applies one live keyset push. seq is the arrival
 // order assigned in dispatchForwarded (the NATS subscription delivers a single
 // publisher's pushes in order; seq + proxyApplyMu serialize application so the

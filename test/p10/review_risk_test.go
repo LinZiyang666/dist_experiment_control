@@ -23,6 +23,7 @@ func TestReviewCtlInstallDefaultsToCtl(t *testing.T) {
 }
 
 func TestReviewAgentInstallStartPathUsesConfiguredBroker(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
 	home := t.TempDir()
 	brokerURL := "wss://broker.example.com:443"
 	out := runInstall(t, home,

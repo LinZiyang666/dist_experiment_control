@@ -53,9 +53,6 @@ type Subscriber struct {
 	Token string
 }
 
-// Create inserts an ACTIVE subscriber with a fresh token + SS psk and returns
-// it (with the raw Token populated once). ErrNameTaken if an ACTIVE row
-// already uses (sid, name).
 // execQuerier is satisfied by both *sql.DB and *sql.Tx, so Create/Revoke can run
 // either standalone or inside a broker transaction that also bumps the epoch
 // (round-6 F5: the credential mutation and version bump must commit together).
@@ -64,6 +61,9 @@ type execQuerier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
+// Create inserts an ACTIVE subscriber with a fresh token + SS psk and returns
+// it (with the raw Token populated once). ErrNameTaken if an ACTIVE row
+// already uses (sid, name).
 func Create(db execQuerier, sid, name, createdByFP string, now time.Time) (*Subscriber, error) {
 	token, err := genSecret(32)
 	if err != nil {

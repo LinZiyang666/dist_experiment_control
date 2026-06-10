@@ -113,7 +113,7 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		return h.deny(req, "fingerprint: "+err.Error())
 	}
 
-	role, sid, _ := parseRole(req.ConnectOptions.Name)
+	role, sid, nid := parseRole(req.ConnectOptions.Name)
 	switch role {
 	case roleCtlUnactivated:
 		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey))
@@ -125,7 +125,6 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		h.Logger.Info("authcallout: ctl allow", "actor", clientNkey, "sid", sid)
 		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid))
 	case roleAgent:
-		nid := agentNidFromName(req.ConnectOptions.Name)
 		if err := h.ensureAgentProvisioned(sid, nid, clientNkey, fp, req.ConnectOptions.Token); err != nil {
 			h.Logger.Info("authcallout: agent deny",
 				"actor", clientNkey, "sid", sid, "nid", nid, "err", err)
@@ -149,6 +148,8 @@ const (
 	roleAgent
 )
 
+// parseRole classifies a connection name into (role, sid, nid). sid is
+// empty for unactivated CLIs; nid is non-empty only for agents.
 func parseRole(name string) (role, string, string) {
 	switch {
 	case name == "tether-cli":
@@ -168,22 +169,6 @@ func parseRole(name string) (role, string, string) {
 		return roleAgent, parts[0], parts[1]
 	}
 	return roleUnknown, "", ""
-}
-
-// agentNidFromName extracts the nid out of a `tether-agent:<sid>:<nid>`
-// connection name, returning "" on any malformed input. parseRole has
-// already separated sid out, but it discards nid; this re-parses just the
-// nid for the agent path.
-func agentNidFromName(name string) string {
-	rest := strings.TrimPrefix(name, "tether-agent:")
-	if rest == name {
-		return ""
-	}
-	parts := strings.SplitN(rest, ":", 2)
-	if len(parts) != 2 {
-		return ""
-	}
-	return parts[1]
 }
 
 // ensureAgentProvisioned implements the two-phase agent auth flow:

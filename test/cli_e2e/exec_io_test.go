@@ -138,12 +138,14 @@ func TestExecLargeStdoutDelivered(t *testing.T) {
 	defer nc.Close()
 
 	const wantBytes = 10 * 1024 * 1024
-	// `head -c N /dev/zero | base64 -w0` emits ceil(N*4/3) base64 bytes.
+	// `head -c N /dev/zero | base64 | tr -d '\n'` emits ceil(N*4/3)
+	// base64 bytes. tr (not GNU `base64 -w0`) keeps the pipeline
+	// portable: BSD/macOS base64 rejects -w with EX_USAGE (exit 64).
 	// We want close to wantBytes of *output*; ask base64 for 7.5MiB
 	// raw to approximate 10MiB encoded.
 	rawBytes := wantBytes * 3 / 4
 	res := runExec(t, nc, "lab", pub, "lab-1",
-		[]string{"sh", "-c", fmt.Sprintf("head -c %d /dev/zero | base64 -w0", rawBytes)},
+		[]string{"sh", "-c", fmt.Sprintf(`head -c %d /dev/zero | base64 | tr -d '\n'`, rawBytes)},
 		30*time.Second)
 
 	if res.Err != "" {
@@ -181,7 +183,7 @@ func TestExecBothStreamsDeliveredFully(t *testing.T) {
 	rawBytes := wantOut * 3 / 4
 	// One sh process emits 1MiB to stdout, then 1MiB to stderr. We use
 	// >&2 to retarget the second base64.
-	cmd := fmt.Sprintf("head -c %d /dev/zero | base64 -w0 ; head -c %d /dev/zero | base64 -w0 1>&2",
+	cmd := fmt.Sprintf(`head -c %d /dev/zero | base64 | tr -d '\n' ; head -c %d /dev/zero | base64 | tr -d '\n' 1>&2`,
 		rawBytes, rawBytes)
 	res := runExec(t, nc, "lab", pub, "lab-1",
 		[]string{"sh", "-c", cmd}, 20*time.Second)

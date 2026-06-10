@@ -1,10 +1,10 @@
-// Per-session agent state persisted to disk so frpc can re-establish
+// Per-session agent state persisted to disk so the tunnel client can re-establish
 // proxies on agent restart without re-running `tether expose`.
 //
-// Architecture I.2 / K.1 / F.6: agent owns the raw frp tokens (broker
+// Architecture I.2 / K.1 / F.6: agent owns the raw tunnel tokens (broker
 // only keeps SHA256), so agent must persist them or restart loses
 // every proxy. Path: ~/.tether/agent/<sid>/state.json, mode 0600 in
-// a 0700 dir, atomic tmp+rename writes.
+// a 0700 dir, atomic tmp+fsync+rename writes.
 //
 // Schema is intentionally tiny — for v1 we only need the port_tokens
 // table the architecture mentions. Future fields (last_known_node_id,
@@ -28,7 +28,7 @@ type PortToken struct {
 	Name      string `json:"name"`
 	Port      int    `json:"port"`       // public port (14000-14999)
 	LocalPort int    `json:"local_port"` // agent-side port being exposed
-	Token     string `json:"token"`      // raw frp auth token
+	Token     string `json:"token"`      // raw tunnel auth token
 }
 
 // ProxyState (P13) persists the embedded SS proxy's tunnel footprint so a
@@ -152,8 +152,10 @@ func (s *stateStore) GetProxy() (*ProxyState, error) {
 	return sf.Proxy, nil
 }
 
-// saveLocked writes the StateFile via tmp+rename atomic replace.
-// 0700 dir, 0600 file per architecture K.1 permission rules.
+// saveLocked writes the StateFile via tmp+fsync+rename atomic replace
+// (architecture I.2 — the fsync matters: state.json holds the only copy
+// of the raw tunnel tokens, so a post-rename crash must not surface an
+// empty or partial file). 0700 dir, 0600 file per K.1 permission rules.
 func (s *stateStore) saveLocked(sf *StateFile) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("agent state: mkdir: %w", err)
@@ -162,13 +164,48 @@ func (s *stateStore) saveLocked(sf *StateFile) error {
 	if err != nil {
 		return fmt.Errorf("agent state: marshal: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("agent state: open tmp: %w", err)
+	}
+	tmp := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("agent state: chmod tmp: %w", err)
+	}
+	if _, err := f.Write(body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("agent state: write tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("agent state: fsync tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("agent state: close tmp: %w", err)
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("agent state: rename: %w", err)
+	}
+	if err := syncStateParentDir(s.path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncStateParentDir(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("agent state: open parent directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("agent state: fsync parent directory: %w", err)
 	}
 	return nil
 }

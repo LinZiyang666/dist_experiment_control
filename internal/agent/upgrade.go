@@ -13,6 +13,7 @@ package agent
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,11 +40,11 @@ import (
 // could OOM the entire fleet at once).
 const upgradeMaxTarballBytes = 64 * 1024 * 1024
 
-// UpgradeURLAllowlist is the agent-side defense-in-depth allowlist.
-// Defaults to nil (= reject everything) if the operator forgets to
-// configure it; the broker ALWAYS double-gates the same allowlist,
-// so this is belt-and-suspenders for an attacker who somehow
-// reached the forwarded subject directly.
+// defaultAgentURLAllowlist is the agent-side defense-in-depth
+// allowlist used when Config.UpgradeURLAllowlist is empty; the broker
+// ALWAYS double-gates the same allowlist, so this is belt-and-
+// suspenders for an attacker who somehow reached the forwarded
+// subject directly.
 var defaultAgentURLAllowlist = []string{
 	"https://github.com/LinZiyang666/dist_experiment_control/releases/",
 }
@@ -267,7 +268,7 @@ func installNewBinary(tarball []byte, dst string) (string, error) {
 // default on Linux but a non-root local who already owns the
 // containing directory could pre-plant.
 func extractTetherBinary(tarball []byte, outPath string) error {
-	gz, err := gzip.NewReader(strings.NewReader(string(tarball)))
+	gz, err := gzip.NewReader(bytes.NewReader(tarball))
 	if err != nil {
 		return fmt.Errorf("gzip open: %w", err)
 	}

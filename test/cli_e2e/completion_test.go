@@ -16,6 +16,7 @@ package cli_e2e_test
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -205,7 +206,14 @@ func TestCompletion_E2E_AdminSocketTimeout(t *testing.T) {
 	cli.ClearCompletionCacheForTest()
 	t.Cleanup(cli.ClearCompletionCacheForTest)
 
-	sockPath := filepath.Join(t.TempDir(), "hang.sock")
+	// Short temp dir, not t.TempDir(): the test name would push the
+	// socket path past macOS's 104-byte sun_path limit (bind EINVAL).
+	sockDir, err := os.MkdirTemp("", "tsock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sockPath := filepath.Join(sockDir, "hang.sock")
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)

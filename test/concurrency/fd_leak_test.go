@@ -168,8 +168,7 @@ func TestStorageOpenCloseFDStable(t *testing.T) {
 // adding leak coverage.
 func TestAdminsockClientCallFDStable(t *testing.T) {
 	db := openMemDB(t)
-	dir := t.TempDir()
-	socketPath := filepath.Join(dir, "tether-run", "admin.sock")
+	socketPath := shortSocketPath(t)
 	srv := adminsock.New(socketPath, adminsock.Backend{
 		DB: db, Logger: silentLog(),
 	})

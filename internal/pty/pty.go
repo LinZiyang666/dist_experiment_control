@@ -102,9 +102,10 @@ func (s *Session) Start(argv []string, env []string, cwd string) error {
 }
 
 // Wait blocks until the child exits and returns its exit code. A non-nil
-// error is returned only for setup failures (Wait was called without a
-// successful Start, child was killed by a signal, etc.). Normal non-zero
-// exits return the exit code with a nil error.
+// error is returned only for setup failures (Wait without a successful
+// Start, wait syscall failure). Normal non-zero exits — including
+// signal-kills, which surface as ExitCode()==-1 — return the code with
+// a nil error.
 func (s *Session) Wait() (int, error) {
 	if s.cmd == nil {
 		return -1, fmt.Errorf("pty: Wait without Start")

@@ -43,7 +43,7 @@ func PermissionsForUnactivated(actor string) jwt.Permissions {
 // ephemeral OrderedConsumer for `tether history`. Without these the
 // client gets "permissions violation" before any business logic runs.
 //
-// File transfer (P11): adds OBJ_xfer-<sid>-* JS subjects (no
+// File transfer (P11): adds the literal OBJ_xfer-<sid> JS subjects (no
 // STREAM.CREATE/DELETE/PURGE — broker owns bucket lifecycle), the
 // caps.req probe, and the pull-receiver finalize subject. Wildcards
 // on the transfer-id segment are sid-bound by the JWT and
@@ -127,7 +127,7 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 // node id nid. agents have NO access to `audit.*` (audit is tetherd-single-
 // writer per C.1 §4) and only see their own node's `cmd.*.req.forwarded`.
 //
-// File transfer (P11): adds OBJ_xfer-<sid>-* JS subjects so agent can
+// File transfer (P11): adds the literal OBJ_xfer-<sid> JS subjects so agent can
 // Put (push receiver: Get from bucket; pull sender: Put into bucket).
 // No STREAM.CREATE/DELETE/PURGE — broker owns bucket lifecycle. The
 // existing `ev.node.<nid>.>` wildcard already covers

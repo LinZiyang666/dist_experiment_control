@@ -208,8 +208,6 @@ func renderClash(sid, publicHost, cipher, psk string, nodes []ProxyNode) ([]byte
 	return yaml.Marshal(cfg)
 }
 
-// Serve runs an http.Server bound to addr until ctx is canceled. Returns
-// immediately (nil) when addr is empty (feature disabled).
 // Bind validates the address (loopback-only, F6) and binds the listener
 // SYNCHRONOUSLY, returning any configuration/bind error to the caller (round-6
 // F10). The broker calls this before declaring startup successful, then hands
@@ -245,8 +243,9 @@ func ServeListener(ctx context.Context, ln net.Listener, cfg Config) error {
 }
 
 // Serve binds and serves in one call (validation is synchronous; an invalid
-// address returns before any goroutine). Retained for callers/tests that want
-// the combined form.
+// address returns before any goroutine). Returns immediately (nil) when addr
+// is empty (feature disabled). Retained for callers/tests that want the
+// combined form.
 func Serve(ctx context.Context, addr string, cfg Config) error {
 	if addr == "" {
 		return nil

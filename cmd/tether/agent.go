@@ -37,8 +37,9 @@ type proxyConfig struct {
 }
 
 // fileTransferConfig controls `tether push` / `tether pull` containment.
-// AllowRoots EMPTY means file transfer is DISABLED on this agent — see
-// internal/agent/path.go (file-transfer-plan §"Refusing dangerous paths").
+// AllowRoots EMPTY means file transfer is DISABLED on this agent — see the
+// path-validation half of internal/agent/transfer.go (file-transfer-plan
+// §"Refusing dangerous paths").
 type fileTransferConfig struct {
 	AllowRoots []string `yaml:"allow_roots"`
 }

@@ -282,7 +282,7 @@ type CapsResp struct {
 ```
 
 **Failure codes** (the set valid in `Code` fields):
-`dst_exists | not_a_regular_file | sha_mismatch | too_large | tier_mismatch | path_outside_roots | path_not_absolute | transfer_disabled | payload_too_small | jetstream_unavailable | too_many_in_flight | version_skew | io_error | ctl_disconnect | agent_no_responders`.
+`dst_exists | not_a_regular_file | sha_mismatch | too_large | tier_mismatch | path_outside_roots | path_not_absolute | transfer_disabled | payload_too_small | jetstream_unavailable | too_many_in_flight | transfer_id_in_flight | version_skew | io_error | ctl_disconnect | agent_no_responders`.
 
 ### Tier A — inline transfer
 

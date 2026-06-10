@@ -29,6 +29,11 @@ func TestEnsureIdentityCreatesAndReuses(t *testing.T) {
 	if mode := stat.Mode().Perm(); mode != 0o600 {
 		t.Errorf("key file mode = %o, want 0600", mode)
 	}
+	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(keyPath), ".default.nk.tmp-*")); err != nil {
+		t.Fatal(err)
+	} else if len(matches) != 0 {
+		t.Fatalf("identity temp files remain after atomic replace: %v", matches)
+	}
 
 	// Second call must reuse the same key.
 	id2, err := EnsureIdentity(home)
@@ -37,6 +42,32 @@ func TestEnsureIdentityCreatesAndReuses(t *testing.T) {
 	}
 	if id2.PublicKey != id1.PublicKey || id2.Fingerprint != id1.Fingerprint {
 		t.Fatal("second EnsureIdentity returned a different key")
+	}
+}
+
+func TestEnsureIdentityDoesNotFollowPredictableTempSymlink(t *testing.T) {
+	home := t.TempDir()
+	keyPath := filepath.Join(home, "keys", "default.nk")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(home, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, keyPath+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureIdentity(home); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "keep" {
+		t.Fatalf("predictable temp symlink target was overwritten: %q", body)
 	}
 }
 
