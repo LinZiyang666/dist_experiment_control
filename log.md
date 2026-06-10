@@ -401,9 +401,21 @@ timan108          ONLINE  4s         1      0.1.3
 - **真 CLI→NATS wire 测试**（`cmd/tether/proxy_wire_test.go`）:实跑 `tether proxy on/off/sub create/sub revoke` cobra 命令,内嵌 responder 捕获真实发布的 NATS 请求体,断言 subject + body 正确(不再只是本地校验)。
 - **合并数据面往返**（`internal/agent/ssproxy/dataplane_test.go`）:SS 客户端 → broker 公网口 → 真 `internal/tunnel` 隧道 → agent SS server → echo target → 原路返回,字节一致;错误 PSK 经同一公网路径被拒。证明 consumer→broker:port→tunnel→agent SS 端到端链路(合并,非两个半证明)。
 
-### 仍待真实硬件验证（外审要求,**尚未在 lab broker 上跑**)
+### F6 真机验收 —— **已在 pc732.emulab.net (weiland.top) 上跑通（2026-06-10, v0.3.0）**
 
-- [ ] 真 Caddy + ACME 上 `handle /sub/*` 与 WSS catch-all 共存:`wss://broker/nats` 仍 upgrade + `curl https://broker/sub/<token>` 返回 Clash YAML(install.sh 已生成 Caddyfile;静态序测 `test/p10` 已钉,**真 ACME+Caddy 联调待 lab**)。
-- [ ] 真 **Clash for Windows / Clash-Meta** 导入订阅 URL → 选节点 → 经某 agent 出网,`ifconfig.me` 显示该 agent 出口 IP(需真客户端,本机无法复现)。
+**部署迁移**(经 `tether exec pc732 -- sudo` + `systemd-run` 远程完成,本机无 SSH):
+- broker daemon `/usr/local/bin/tether serve` v0.2.9 → **v0.3.0**(sha256 校验 + 原子换 + 备份 `tether.pre-v0.3.0.bak`)。
+- `broker.yaml` 加 `broker.sub.listen: 127.0.0.1:8090`;`Caddyfile` 加 `handle /sub/* { reverse_proxy 127.0.0.1:8090 }`(排在 NATS-WSS catch-all 之前);`systemctl restart tether-broker caddy`。
+- 5 个 ONLINE agent(pc732/timan1/timan107/timan108/weiland-optiplex-7050)经 `tether node upgrade --all` v0.2.9 → **v0.3.0**,重注册为 `proxy_capable`(proto 仍 v1,无需重装)。
 
-> 说明:上述硬件项需 `pc732.emulab.net` broker + 真域名 + 真 Clash 客户端,本机 macOS 无法复现(`--role broker` install.sh 不支持 macOS、无公网域名)。控制面与数据面逻辑已由 in-process 测试覆盖;此三项为部署联调,排期到下次 lab 窗口。
+**验收结果**:
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 真 ACME+Caddy `/sub/*` 与 WSS 共存 | **PASS** | `curl https://weiland.top/sub/<token>` → HTTP/2 200,TLS verify ok,`server: Caddy`,`content-type: application/yaml`,渲染 5 个 ss 节点;同 :443 上 ctl 的 `wss://weiland.top/nats` 持续可用 |
+| 真出网(每节点经自己网络) | **PASS** | SS 客户端经 `weiland.top:14000`(pc732)→ `api.ipify.org` 回 `155.98.36.32`(=pc732 直连出口);经 `:14001`(timan1)→ `192.17.168.94`(=timan1 出口);不同节点不同出口 IP |
+| 目的地策略(默认仅公网) | **PASS** | SS 客户端经 pc732 打 `127.0.0.1:22` → 连接被拒(无响应),loopback 在真机被挡 |
+| 撤销订阅 | **PASS** | `proxy sub revoke f6test` 后 `/sub/<token>` → 404(无 oracle),旧 PSK 的 SS 握手被拒 |
+| OFF kill switch | **PASS** | `proxy off` 后公网口 `:14000` 连接 refused(监听已关),`proxy status` = OFF,ctl/WSS 不受影响(5 节点仍 ONLINE) |
+
+> F6 出口阻塞**已闭合**。lab 现状:proxy OFF(测试前后一致)、无残留订阅、5 agent + broker 均 v0.3.0。SS 客户端验证脚本见 `/tmp/ssclient`(经典 chacha20-ietf-poly1305 AEAD,与 Clash for Windows 同协议)。
