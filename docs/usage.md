@@ -460,6 +460,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | 在远端跑一条命令 | `tether exec`（脚本类）/ `tether run`（交互类） |
 | 杀掉远端进程 | `tether run` 里按 Ctrl-C；或下次 v2 加 `tether kill` |
 | 把远端服务暴露到公网 | `tether expose` / `tether expose rm` |
+| 把整组 agent 变成 Clash 订阅出口 | `tether proxy on/off` + `tether proxy sub create/ls/revoke` |
 | 把文件上传/下载到远端 | `tether push` / `tether pull` |
 | 查"过去发生了什么" | `tether history`（含 `--follow` 实时模式） |
 | 给远端 agent 升级 | `tether node upgrade` / `... --all` |
@@ -485,6 +486,10 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether run <nid> -- argv ...`         | ctl    | 交互式 PTY |
 | `tether expose <nid> --local P --name N [--remote-port R]` | ctl  | 暴露端口（可选指定公网端口 R） |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
+| `tether proxy on / off`                | ctl(owner) | 代理订阅总开关（自建机场，§5.9.5） |
+| `tether proxy status`                  | ctl    | 看开关/在线节点/订阅（member 可读，无密钥） |
+| `tether proxy sub create --name N`     | ctl(owner) | 签发订阅 URL（只打印一次） |
+| `tether proxy sub ls / revoke <name>`  | ctl(owner) | 列 / 撤销订阅 |
 | `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤2 GiB） |
 | `tether pull <nid>:<remote> <local>`   | ctl    | 下载远端文件到本地（≤2 GiB） |
 | `tether history [-n N] [--kind K] [-f]` | ctl   | 审计历史回放（含 `--kind transfer`） |
@@ -869,7 +874,7 @@ tether expose rm <nid> --name <logical-name>
 当前已分配的暴露条目，用 `tether ps` 的 PORTS 节（数据源同为 broker SQLite 的
 `port_allocations`）。
 
-### 5.9.5 `tether proxy`（v0.2.9+，代理订阅 / 自建机场）
+### 5.9.5 `tether proxy`（v0.3.0+，代理订阅 / 自建机场）
 
 **这是什么**：把当前 session 的**全部在线 agent** 变成一个 Clash 订阅 —— 打开总开关后,
 每个在线 agent(含后加入者)在本机启动内嵌 shadowsocks 服务端并自动 expose, broker 托管
@@ -887,13 +892,14 @@ tether proxy sub revoke alice          # 撤销一个订阅(其他人不受影�
 
 **底层与安全**：
 - 协议 = 经典 `chacha20-ietf-poly1305` shadowsocks(AEAD 加密+认证;经典 Clash for Windows 即可),
-  每个订阅一把独立 PSK,所有 agent 用单端口**试解密**承载多订阅,撤销互不影响。
-- 数据面是明文公网 TCP 口(§9.5),SS 的 AEAD 是唯一的门 —— **没有订阅密钥连不进来**。
+  每个订阅一把独立 PSK,所有 agent 用单端口**试解密**承载多订阅,撤销互不影响(撤销后该 PSK 的重放 salt 也立即失效)。
+- 数据面是明文公网 TCP 口(与 `expose` 的公网带同性质,见 §11 安全注意第 6 条),SS 的 AEAD 是唯一的门 —— **没有订阅密钥连不进来**。
 - **责任警告**:开启后每个在线 agent 是对任意 link 持有者(含非成员)开放的互联网出口,
   流量从你 agent 的 IP 出去,你负责。一键关闭=`tether proxy off`。`tether proxy on` 因此强制确认。
+- **出口范围默认仅公网**:agent 默认拒绝订阅流量去 loopback / 内网(RFC1918+RFC6598 共享段)/ link-local / multicast / 云 metadata(`169.254.169.254`、`100.100.100.200` 等)等**非公网地址**,按**解析后 IP** 判定(挡 DNS-rebinding,连 NAT64/6to4 编码的内网 IPv4 也挡)。即订阅持有者**只能经 agent 出公网,碰不到 agent 本机/内网**。确需私网访问,在该 agent 的 `agent.yaml` 设 `proxy.allow_private_destinations: true` 显式开启(**高危**:等于把该 agent 所在内网借给订阅持有者)。
 - 这是应用层代理,不是整机 VPN;想整机路由,在你自己设备上用 Clash 的 TUN 模式(与 agent 无关)。
-- broker 侧需在 `broker.yaml` 设 `sub.listen`(或 `--sub-http-listen`)启用订阅 HTTP 端点;
-  install.sh 生成的 Caddyfile 已把 `/sub/*` 反代到它。
+- broker 侧需在 `broker.yaml` 设 `broker.sub.listen`(或 `--sub-http-listen`,缺省 `127.0.0.1:8090`)启用订阅 HTTP 端点;
+  install.sh 生成的 Caddyfile 已把 `/sub/*` 反代到它(排在 NATS-WSS catch-all 之前)。**P13 之前装的 broker 升级到 v0.3.0 后,这两处配置不会自动出现**——见 §8.5 手动迁移。
 
 ### 5.10 `tether push` / `tether pull`（v0.2.0+）
 
@@ -1445,6 +1451,38 @@ sudo journalctl -u tether-broker --since '1 minute ago' -f
 - 按 `nodes` 表里 `last_heartbeat_at` 计算每个 agent 应处于的状态；
 - 等待 agent 重新 register（agent 端在 NATS 重连后会自动 re-register）；
 - 期间 ctl 调用排队等待 broker 响应。
+
+### 8.5 升级到 v0.3.0 启用代理订阅（P13）的 broker 配置迁移
+
+`tether node upgrade` 只换 **agent** 二进制；§8.4 的 broker 升级只换 broker 二进制。
+两者都**不会**改 broker 的 `broker.yaml` / `Caddyfile`。所以一台 **P13 之前装的
+broker** 升级到 v0.3.0 后，`tether proxy` 的控制面能用，但 `/sub/<token>` 端点
+不会自动出现——必须手动补两处配置（proto 仍是 v1，agent 用 `node upgrade` 即可，
+无需重装）：
+
+```bash
+# 1) broker.yaml 增加 sub 块（缺省监听 127.0.0.1:8090）
+sudo sed -i '/^  admin:/i\  sub:\n    listen: "127.0.0.1:8090"' /etc/tether/broker.yaml
+# 或手动在 broker: 下加：
+#   sub:
+#     listen: "127.0.0.1:8090"
+
+# 2) Caddyfile 在 $DOMAIN:443 { ... } 块里、catch-all `handle {` 之前插入 /sub 反代：
+#    handle /sub/* {
+#        reverse_proxy 127.0.0.1:8090
+#    }
+#    （顺序很重要：必须排在 NATS-WSS 的 catch-all 之前，否则 Clash 请求会被打到
+#     nats-server，且 wss://$DOMAIN/nats 的 WSS upgrade 会坏。）
+
+# 3) 重启并自检
+sudo systemctl restart tether-broker caddy
+curl -fsS "https://$DOMAIN/sub/<任一已签发 token>"   # 应回 Clash YAML
+# 同时确认 wss://$DOMAIN/nats 仍能 upgrade（ctl 还能正常连）
+```
+
+省事也可以直接重跑 `install.sh --role broker --domain ... --acme-email ...`
+重写 `broker.yaml` + `Caddyfile`（它幂等、不动 SQLite/JetStream 数据），但会覆盖
+你对这两个文件做过的任何手改，谨慎。
 
 ---
 
