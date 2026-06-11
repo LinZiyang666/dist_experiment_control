@@ -82,6 +82,42 @@ func TestTransferDefaultsMatrix(t *testing.T) {
 	}
 }
 
+// TestRemoteFSMatrix folds the remote-fs-resilience leaf increment
+// (docs/reviews/remote-fs-resilience-plan.md) into the -tags e2e_matrix
+// regression net. Like TestTransferDefaultsMatrix, rather than mint a fake
+// phase it re-runs the feature's hermetic suites as a subprocess (under -race,
+// since the spawn watchdog + sticky/self-healing probe are concurrency
+// surfaces): a regression in PATH sanitization, the abandon/ceiling watchdog,
+// the broker Safe round-trip, or Component I thus fails `make e2e` too, not just
+// `make test`.
+func TestRemoteFSMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+
+	run := func(label string, args ...string) {
+		base := []string{"test", "-race", "-count=1", "-timeout", phaseTimeout.String()}
+		cmd := exec.Command("go", append(base, args...)...)
+		cmd.Dir = repoRoot
+		var buf bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &buf, &buf
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("remote-fs %s failed: %v\n--- output ---\n%s", label, err, buf.String())
+		}
+	}
+
+	// Whole feature-core packages (review F13: pty abandon-recover, the
+	// test/concurrency spawnsafe gate, and the cmd/tether config tests must run
+	// under -race here, not only spawnsafe).
+	run("spawnsafe", "./internal/spawnsafe/...")
+	run("pty", "./internal/pty/...")
+	run("concurrency", "-run", "Spawnsafe", "./test/concurrency/...")
+	run("cmd-config", "-run", "RemoteFS|AgentYAML_remoteFS|ParseOptDuration|SafeFlagOrdering", "./cmd/tether/...")
+	// Targeted wiring cases across agent + proto + p4.
+	run("wiring",
+		"-run", "RemoteFS|BuildExecCmd|BoundedHomeRead|StateStore_loadNoLock|StartBounded|ReplayPortsFromState|AgentNew_rejectsBadRemoteFSMode|SafeField|SafeReqRoundTrips",
+		"./internal/agent/...", "./internal/proto/...", "./test/p4/...")
+}
+
 func runPhase(t *testing.T, phase string) {
 	t.Helper()
 	// go test sets cwd to the package dir (test/e2e/), so the

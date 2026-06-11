@@ -14,6 +14,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/nats-io/nats.go"
 )
 
@@ -138,12 +139,10 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 // failures (pipe / Start), not for child exit codes — those are the
 // returned exitCode value and the caller pubs an "exit" chunk.
 func (a *Agent) runChild(nc *nats.Conn, replyTo string, req *proto.ExecReq) (int, error) {
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
-	if req.Cwd != "" {
-		cmd.Dir = req.Cwd
-	}
-	if len(req.Env) > 0 {
-		cmd.Env = envSliceFromMap(req.Env)
+	cmd, decision, err := a.buildExecCmd(req)
+	if err != nil {
+		// Hung-fs fail-fast (remote_fs_unhealthy / _unsafe_cwd / _not_found).
+		return -1, err
 	}
 	if len(req.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(req.Stdin)
@@ -158,7 +157,29 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo string, req *proto.ExecReq) (int
 		return -1, err
 	}
 
-	if err := cmd.Start(); err != nil {
+	// Start. In safe mode the execve is bounded by a spawn-window deadline so a
+	// D-state hang (e.g. a TOCTOU mount death after resolution) is abandoned and
+	// surfaced as remote_fs_spawn_timeout instead of wedging the handler forever.
+	// On abandon we close the stdout/stderr pipe read ends and reap the cmd once
+	// its execve eventually returns, so the pipe fds are reclaimed rather than
+	// leaked unbounded over a long outage (review M4).
+	if decision.Active {
+		err := a.startBounded(
+			cmd.Start,
+			func() { _ = stdoutPipe.Close(); _ = stderrPipe.Close() }, // reclaim read fds on abandon
+			func(startErr error) {
+				if startErr == nil {
+					_ = cmd.Wait() // reap child + close write fds when execve recovers
+				}
+			},
+		)
+		if err != nil {
+			return -1, err
+		}
+		if decision.Warn != "" {
+			a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: []byte(decision.Warn + "\n")})
+		}
+	} else if err := cmd.Start(); err != nil {
 		return -1, err
 	}
 
@@ -283,6 +304,111 @@ func envSliceFromMap(m map[string]string) []string {
 		out = append(out, k+"="+v)
 	}
 	return out
+}
+
+// buildExecCmd constructs the child *exec.Cmd. When the hung-fs-safe spawn
+// policy is active it pre-resolves argv[0] against a sanitized PATH and builds
+// &exec.Cmd{Path: <abs>, Args: argv} DIRECTLY — bypassing exec.Command's
+// LookPath, which would D-hang stat'ing a wedged PATH dir. Otherwise it falls
+// back to the legacy exec.Command path, byte-identical to before the feature.
+// The returned Decision tells the caller whether to bound cmd.Start and emit the
+// sanitize warning.
+func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision, error) {
+	// lookupPATH is the AGENT process PATH — the one exec.Command's LookPath would
+	// walk and D-hang on (review F2) — NOT the child env's PATH.
+	d, err := a.spawnPolicy.Prepare(req.Argv, req.Cwd, os.Getenv("PATH"), a.execBaseEnv(req), req.Safe)
+	if err != nil {
+		return nil, spawnsafe.Decision{}, err
+	}
+	if !d.Active {
+		// Legacy path (booted with no hangable mount) — byte-identical to today.
+		cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+		if req.Cwd != "" {
+			cmd.Dir = req.Cwd
+		}
+		if len(req.Env) > 0 {
+			cmd.Env = envSliceFromMap(req.Env)
+		}
+		return cmd, d, nil
+	}
+	// Active: ALWAYS &exec.Cmd{Path,Args} (bypass the hanging LookPath). Args[0]
+	// keeps the ORIGINAL argv[0] so multi-call binaries that inspect os.Args[0]
+	// still work.
+	cmd := &exec.Cmd{Path: d.Path, Args: req.Argv}
+	if d.Outage {
+		cmd.Env = d.Env
+		cmd.Dir = d.Cwd
+	} else {
+		// Healthy-hangable: keep the LEGACY env/cwd so the child is byte-identical
+		// to before the feature; only resolution + execve are now bounded.
+		if req.Cwd != "" {
+			cmd.Dir = req.Cwd
+		}
+		if len(req.Env) > 0 {
+			cmd.Env = envSliceFromMap(req.Env)
+		}
+	}
+	return cmd, d, nil
+}
+
+// execBaseEnv is the env an exec child would otherwise run with: the override
+// map when set (which REPLACES the agent env, matching today's semantics), else
+// the inherited agent environment. The spawn policy sanitizes this base's PATH
+// when active.
+func (a *Agent) execBaseEnv(req *proto.ExecReq) []string {
+	if len(req.Env) > 0 {
+		return envSliceFromMap(req.Env)
+	}
+	return os.Environ()
+}
+
+// startBounded runs start (a cmd.Start) under the safe-mode spawn-window
+// deadline. On a D-state execve hang past the deadline it abandons the start
+// goroutine, invokes onAbandon (close the pipe read ends, reclaiming those fds
+// immediately), and once the execve eventually returns invokes reapOnReturn with
+// its error (cmd.Wait on success, closing the write ends + reaping the orphaned
+// child) — so no fds leak unbounded over a long outage (review M4). The wedge
+// slot is held until the abandoned start finally returns. Returns
+// spawnsafe.ErrSpawnTimeout on abandon, ErrTooManyWedged at the ceiling. The
+// callbacks are injectable so the abandon/reap accounting is hermetically
+// testable without a real D-state execve.
+func (a *Agent) startBounded(start func() error, onAbandon func(), reapOnReturn func(error)) error {
+	if !a.spawnPolicy.TryAcquireSpawnSlot() {
+		return spawnsafe.ErrTooManyWedged
+	}
+	done := make(chan error, 1)
+	go func() { done <- start() }()
+	select {
+	case err := <-done:
+		a.spawnPolicy.ReleaseSpawnSlot()
+		return err
+	case <-time.After(a.spawnTimeout()):
+		onAbandon()
+		go func() {
+			err := <-done
+			reapOnReturn(err)
+			a.spawnPolicy.ReleaseSpawnSlot()
+		}()
+		return spawnsafe.ErrSpawnTimeout
+	}
+}
+
+// remoteFSFailReason maps a spawnsafe fail-fast / watchdog error to its wire
+// reason string (RunChunk.Reason / the run-side error_hints key). Falls back to
+// "exec_failed" for any non-remote-fs error.
+func remoteFSFailReason(err error) string {
+	var fe *spawnsafe.FSError
+	if errors.As(err, &fe) {
+		return fe.Code
+	}
+	switch {
+	case errors.Is(err, spawnsafe.ErrSpawnTimeout):
+		return spawnsafe.ReasonSpawnTimeout
+	case errors.Is(err, spawnsafe.ErrTooManyWedged):
+		return spawnsafe.ReasonTooManyWedged
+	default:
+		return "exec_failed"
+	}
 }
 
 // mergeChildEnv builds a child env array starting from os.Environ()

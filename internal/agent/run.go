@@ -23,6 +23,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"syscall"
@@ -31,6 +32,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/pty"
+	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/nats-io/nats.go"
 )
 
@@ -152,13 +154,63 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// to xterm-256color if neither layer set it (systemd --user
 	// units run with no TERM, so curses apps like tmux otherwise
 	// fail with "terminal does not support clear").
-	if err := sess.Start(req.Argv, mergeChildEnv(req.Env), req.Cwd); err != nil {
-		a.cfg.Logger.Warn("agent: pty start", "err", err, "pid", pid)
+	childEnv := mergeChildEnv(req.Env)
+	childCwd := req.Cwd
+	resolvedPath := ""
+	// Hung-fs-safe resolution: pre-resolve argv[0] against a PATH sanitized of
+	// wedged network mounts so fork+exec cannot D-hang on a dead $PATH dir. A
+	// fail-fast (argv[0]/cwd on a dead mount, or not found) surfaces as
+	// RunChunk{failed, Reason:remote_fs_*} rather than an indefinite black screen.
+	// lookupPATH = agent process PATH (what LookPath would walk — review F2).
+	d, ferr := a.spawnPolicy.Prepare(req.Argv, req.Cwd, os.Getenv("PATH"), childEnv, req.Safe)
+	if ferr != nil {
+		reason := remoteFSFailReason(ferr)
+		_ = sess.Close()
+		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "failed", PID: pid, Reason: reason})
+		a.pubPtyFailed(nc, pid, reason, ferr.Error())
+		return
+	}
+	if d.Active {
+		resolvedPath = d.Path // always self-resolve on a hangable machine (bypass LookPath)
+		if d.Outage {
+			childEnv, childCwd = d.Env, d.Cwd
+			// run warnings go to agent.log only — injecting a banner into the
+			// raw PTY stream would corrupt vim/tmux (§3.H).
+			a.cfg.Logger.Warn("agent: run in remote-fs-safe mode", "pid", pid, "detail", d.Warn)
+		}
+		// else healthy-hangable: keep legacy childEnv/childCwd (byte-identical).
+	}
+	startFn := func() error { return sess.Start(req.Argv, childEnv, childCwd, resolvedPath) }
+	var startErr error
+	if d.Active {
+		// Bound only the execve start window (not the interactive session
+		// lifetime) so a D-state hang is abandoned, not a healthy long shell.
+		startErr = a.spawnPolicy.RunStartWithCleanup(
+			startFn,
+			a.spawnTimeout(),
+			func() { _ = sess.Close() },
+			func(err error) {
+				// If the timer won just after Start returned nil, Start did not
+				// observe the later Close and therefore did not self-reap.
+				if err == nil {
+					sess.KillAndWaitAfterAbandonedStart()
+				}
+			},
+		)
+	} else {
+		startErr = startFn()
+	}
+	if startErr != nil {
+		reason := "exec_failed"
+		if errors.Is(startErr, spawnsafe.ErrSpawnTimeout) || errors.Is(startErr, spawnsafe.ErrTooManyWedged) {
+			reason = remoteFSFailReason(startErr)
+		}
+		a.cfg.Logger.Warn("agent: pty start", "err", startErr, "pid", pid)
 		_ = sess.Close()
 		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
-			Kind: "failed", PID: pid, Reason: "exec_failed",
+			Kind: "failed", PID: pid, Reason: reason,
 		})
-		a.pubPtyFailed(nc, pid, "exec_failed", err.Error())
+		a.pubPtyFailed(nc, pid, reason, startErr.Error())
 		return
 	}
 

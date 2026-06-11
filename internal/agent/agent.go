@@ -38,6 +38,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/pty"
+	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
@@ -161,6 +162,23 @@ type Config struct {
 	// on this agent. Default false (deny). Set only for deployments that
 	// intentionally expose private-network access.
 	ProxyAllowPrivateDestinations bool
+
+	// RemoteFS* configure hung-network-filesystem-safe spawn for exec/run
+	// (docs/reviews/remote-fs-resilience-plan.md). When a network mount backing
+	// $PATH/argv[0]/cwd is wedged in D-state, exec/run would otherwise hang at
+	// LookPath/execve; the policy pre-resolves argv[0] against a sanitized PATH
+	// and fails fast instead.
+	RemoteFSMode         string        // "auto" (default) | "off"; empty ⇒ "auto". Validated in New.
+	RemoteFSSafeDir      string        // optional local safe-dir override; empty ⇒ os.TempDir().
+	RemoteFSProbeTimeout time.Duration // 0 ⇒ spawnsafe.DefaultProbeTimeout.
+	RemoteFSSpawnTimeout time.Duration // execve start-window deadline; 0 ⇒ defaultRemoteFSSpawnTimeout.
+	RemoteFSWedgeCeiling int           // max concurrent abandoned spawns; 0 ⇒ spawnsafe.DefaultWedgeCeiling.
+
+	// Seams for hermetic tests (nil ⇒ real /proc/self/mountinfo + statfs).
+	// Mirror ExposeAdapter: in-process tests inject deterministic mount
+	// tables + probes so the remote-fs path runs with no real NFS.
+	RemoteFSMountSource spawnsafe.MountSource
+	RemoteFSProbe       spawnsafe.ProbeFn
 }
 
 // procRec is one entry in Agent.procs. Tracks the PTY session plus
@@ -232,6 +250,24 @@ type Agent struct {
 	// first directive). nil-safe; methods serialize through its own mutex.
 	proxy *proxyRuntime
 
+	// spawnPolicy is the hung-network-filesystem-safe spawn engine for
+	// exec/run (docs/reviews/remote-fs-resilience-plan.md). Always non-nil
+	// after New; inert when the machine has no hangable mounts or mode=off.
+	spawnPolicy *spawnsafe.Policy
+
+	// homeHangable records, at New time, whether cfg.Home is backed by a
+	// hangable network mount. When true the agent guards its own state.json
+	// reads (buildLocalSnapshot / applyReconciliation) behind the bounded
+	// probe so a wedged Home cannot D-hang the re-register path (Component I).
+	homeHangable bool
+
+	// homeReadInFlight (guarded by homeReadMu) is set while a bounded, lock-free
+	// Home state.json read is outstanding (possibly D-hung on a wedged mount). It
+	// single-flights the bounded read so abandoned readers are bounded to ONE
+	// regardless of reconnect count (review B1).
+	homeReadMu       sync.Mutex
+	homeReadInFlight bool
+
 	// flcTimer is the P13 fail-closed watchdog (armed on NATS disconnect,
 	// cancelled on reconnect); flcMu guards it.
 	flcMu    sync.Mutex
@@ -256,6 +292,9 @@ type Agent struct {
 // New validates the config and returns an Agent not yet connected. Run
 // performs the actual NATS connect and blocks until ctx is canceled.
 func New(cfg Config) (*Agent, error) {
+	if cfg.RemoteFSSpawnTimeout < 0 {
+		return nil, fmt.Errorf("agent: remote_fs.spawn_timeout: must not be negative")
+	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("agent: NATSURL required")
 	}
@@ -298,7 +337,50 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
 	}
+
+	// Build the hung-network-filesystem-safe spawn policy. Validate the mode
+	// up front so a typo'd remote_fs.mode fails loud (matching agent.yaml's
+	// KnownFields strictness) instead of silently defaulting.
+	mode, err := spawnsafe.ParseMode(cfg.RemoteFSMode)
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+	sp, err := spawnsafe.New(spawnsafe.Config{
+		Mode:         mode,
+		SafeDir:      cfg.RemoteFSSafeDir,
+		ProbeTimeout: cfg.RemoteFSProbeTimeout,
+		WedgeCeiling: cfg.RemoteFSWedgeCeiling,
+		MountSource:  cfg.RemoteFSMountSource,
+		Probe:        cfg.RemoteFSProbe,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+	a.spawnPolicy = sp
+	// Component I: if the agent's own Home is on a hangable mount, its
+	// state.json reads can D-hang the re-register path on every reconnect.
+	// Record it (so buildLocalSnapshot can guard those reads) and warn loud.
+	if cfg.Home != "" && a.spawnPolicy.IsHangablePath(cfg.Home) {
+		a.homeHangable = true
+		cfg.Logger.Warn("agent: Home is on a network filesystem; a server outage can stall "+
+			"re-register and reconcile. Prefer a local-disk Home (e.g. /srv/local/<user>).",
+			"home", cfg.Home)
+	}
 	return a, nil
+}
+
+// defaultRemoteFSSpawnTimeout bounds the execve start window for a safe-mode
+// spawn (NOT the child's runtime). A child that wedges in D-state during
+// execve is abandoned after this; a clean-started long-running command is
+// never affected. Tunable via agent.yaml remote_fs.spawn_timeout.
+const defaultRemoteFSSpawnTimeout = 30 * time.Second
+
+// spawnTimeout returns the configured execve start-window deadline.
+func (a *Agent) spawnTimeout() time.Duration {
+	if a.cfg.RemoteFSSpawnTimeout > 0 {
+		return a.cfg.RemoteFSSpawnTimeout
+	}
+	return defaultRemoteFSSpawnTimeout
 }
 
 // Run is the agent's main loop:
@@ -423,9 +505,13 @@ func (a *Agent) replayPortsFromState() {
 	if a.stateStore == nil || a.cfg.ExposeAdapter == nil {
 		return
 	}
-	sf, err := a.stateStore.load()
-	if err != nil {
-		a.cfg.Logger.Warn("agent: state.json load on boot", "err", err)
+	// Bounded read (review B2): this was the lone unguarded state.json read on
+	// the boot path; on a wedged hangable Home it would D-hang the whole Run()
+	// goroutine before heartbeatLoop starts, sending the node OFFLINE. Degrade
+	// (skip replay) instead — proxies re-establish on the next healthy reconnect
+	// via the same persisted token path.
+	sf, ok := a.loadStateBounded("boot replay")
+	if !ok {
 		return
 	}
 	for _, p := range sf.PortTokens {
@@ -592,6 +678,80 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 	}
 }
 
+// loadStateBounded reads state.json. When the agent Home is on a hangable
+// network mount (Component I) the read is bounded behind a deadline so a wedged
+// fs cannot D-hang the re-register / reconcile path on every NATS reconnect; on
+// timeout it returns a degraded (nil, false) result and the next healthy read
+// repopulates. When Home is local it reads directly with no added overhead.
+// Returns (sf, ok) — ok=false means "no usable state this cycle".
+func (a *Agent) loadStateBounded(why string) (*StateFile, bool) {
+	if a.stateStore == nil {
+		return nil, false
+	}
+	if !a.homeHangable {
+		sf, err := a.stateStore.load()
+		if err != nil {
+			a.cfg.Logger.Warn("agent: load state.json", "for", why, "err", err)
+			return nil, false
+		}
+		return sf, true
+	}
+	// Hangable Home: the read goes through loadNoLock (lock-free os.ReadFile,
+	// torn-free because writes are atomic-rename), so an abandoned (D-hung) read
+	// holds NO stateStore mutex (review B1). It is also SINGLE-FLIGHT: while one
+	// read is wedged, later reconnects degrade immediately rather than each
+	// spawning another D-goroutine, so abandoned readers are bounded to ONE
+	// regardless of reconnect count (review B1: no O(reconnects) pile-up).
+	return a.boundedHomeRead(a.stateStore.loadNoLock, why)
+}
+
+// boundedHomeRead is the single-flight, deadline-bounded, lock-free read used
+// when Home is hangable. Split out (and parameterized on loadFn) so a hermetic
+// test can drive it with a blockable fake — review B1 noted the original test
+// stubbed the read with a closure that never exercised the mutex/abandon path.
+func (a *Agent) boundedHomeRead(loadFn func() (*StateFile, error), why string) (*StateFile, bool) {
+	a.homeReadMu.Lock()
+	if a.homeReadInFlight {
+		a.homeReadMu.Unlock()
+		a.cfg.Logger.Warn("agent: state.json read already stalled on a network Home; "+
+			"degraded (a prior read is still wedged)", "for", why)
+		return nil, false
+	}
+	a.homeReadInFlight = true
+	a.homeReadMu.Unlock()
+
+	type result struct {
+		sf  *StateFile
+		err error
+	}
+	ch := make(chan result, 1) // buffered: the abandoned reader exits on fs recovery
+	go func() {
+		sf, err := loadFn()
+		// Clear the in-flight flag BEFORE publishing the result, so a caller that
+		// receives the result and immediately issues the next read sees the flag
+		// already cleared (and single-flights correctly) rather than spuriously
+		// degrading (external review F6, reproduced under -count=1000).
+		a.homeReadMu.Lock()
+		a.homeReadInFlight = false
+		a.homeReadMu.Unlock()
+		ch <- result{sf, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			a.cfg.Logger.Warn("agent: load state.json", "for", why, "err", r.err)
+			return nil, false
+		}
+		return r.sf, true
+	case <-time.After(a.spawnPolicy.ProbeTimeout()):
+		// Abandon. homeReadInFlight stays set until the read returns (recovery),
+		// so concurrent/subsequent reconnects degrade instead of piling up.
+		a.cfg.Logger.Warn("agent: state.json read stalled on a network Home; "+
+			"proceeding with a degraded snapshot (ports reconcile on the next healthy read)", "for", why)
+		return nil, false
+	}
+}
+
 // buildLocalSnapshot collects the agent's view of "what is live right
 // now" for G.1 reconciliation. Procs come from a.procs (the live PTY
 // session map; non-PTY exec children are sync and not registered, so
@@ -615,31 +775,26 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 	a.procsMu.Unlock()
 
 	var ports []proto.LocalPort
-	if a.stateStore != nil {
-		sf, err := a.stateStore.load()
-		if err != nil {
-			a.cfg.Logger.Warn("agent: load state.json for register snapshot", "err", err)
-		} else {
-			ports = make([]proto.LocalPort, 0, len(sf.PortTokens)+1)
-			for _, p := range sf.PortTokens {
-				ports = append(ports, proto.LocalPort{
-					Port:      p.Port,
-					Name:      p.Name,
-					LocalPort: p.LocalPort,
-					TokenHash: port.HashToken(p.Token),
-				})
-			}
-			// P13: report the embedded-proxy port too, so the broker's
-			// register reconcile keeps it (token_hash match) instead of
-			// re-minting a token + tunnel on every reconnect.
-			if sf.Proxy != nil && sf.Proxy.PublicPort != 0 {
-				ports = append(ports, proto.LocalPort{
-					Port:      sf.Proxy.PublicPort,
-					Name:      proxyTokenName,
-					LocalPort: sf.Proxy.LocalPort,
-					TokenHash: port.HashToken(sf.Proxy.Token),
-				})
-			}
+	if sf, ok := a.loadStateBounded("register snapshot"); ok {
+		ports = make([]proto.LocalPort, 0, len(sf.PortTokens)+1)
+		for _, p := range sf.PortTokens {
+			ports = append(ports, proto.LocalPort{
+				Port:      p.Port,
+				Name:      p.Name,
+				LocalPort: p.LocalPort,
+				TokenHash: port.HashToken(p.Token),
+			})
+		}
+		// P13: report the embedded-proxy port too, so the broker's
+		// register reconcile keeps it (token_hash match) instead of
+		// re-minting a token + tunnel on every reconnect.
+		if sf.Proxy != nil && sf.Proxy.PublicPort != 0 {
+			ports = append(ports, proto.LocalPort{
+				Port:      sf.Proxy.PublicPort,
+				Name:      proxyTokenName,
+				LocalPort: sf.Proxy.LocalPort,
+				TokenHash: port.HashToken(sf.Proxy.Token),
+			})
 		}
 	}
 	return procs, ports
@@ -654,11 +809,8 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 //     sync-managed and have already exited (or are reachable only by
 //     OS pid, which v1 doesn't track).
 func (a *Agent) applyReconciliation(ctx context.Context, resp proto.NodeRegisterResp) {
-	if len(resp.RevokePorts) > 0 && a.stateStore != nil {
-		sf, err := a.stateStore.load()
-		if err != nil {
-			a.cfg.Logger.Warn("agent: load state.json for revoke", "err", err)
-		} else {
+	if len(resp.RevokePorts) > 0 {
+		if sf, ok := a.loadStateBounded("revoke"); ok {
 			byPort := map[int]string{}
 			for _, p := range sf.PortTokens {
 				byPort[p.Port] = p.Name

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/cli"
@@ -30,6 +31,35 @@ type agentYAML struct {
 	TunnelAddr   string             `yaml:"tunnel_addr"`
 	FileTransfer fileTransferConfig `yaml:"file_transfer"`
 	Proxy        proxyConfig        `yaml:"proxy"`
+	RemoteFS     remoteFSConfig     `yaml:"remote_fs"`
+}
+
+// remoteFSConfig controls hung-network-filesystem-safe spawn for exec/run
+// (docs/reviews/remote-fs-resilience-plan.md). Absent block ⇒ mode "auto",
+// which is inert on machines with no network mounts.
+type remoteFSConfig struct {
+	Mode         string `yaml:"mode"`          // "auto" (default) | "off"
+	SafeDir      string `yaml:"safe_dir"`      // optional local substitute cwd during an outage
+	ProbeTimeout string `yaml:"probe_timeout"` // bounded mount-liveness probe deadline, e.g. "2s" (empty ⇒ default)
+	SpawnTimeout string `yaml:"spawn_timeout"` // execve start-window deadline, e.g. "30s" (empty ⇒ default)
+	WedgeCeiling int    `yaml:"wedge_ceiling"` // max concurrent abandoned spawns (0 ⇒ default)
+}
+
+// parseOptDuration parses an optional Go duration string (e.g. "2s"). Empty ⇒ 0
+// (the agent then applies its built-in default). A malformed value fails loud so
+// a typo doesn't silently fall back to the default.
+func parseOptDuration(s, field string) (time.Duration, error) {
+	if strings.TrimSpace(s) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid duration %q: %w", field, s, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: must not be negative: %q", field, s)
+	}
+	return d, nil
 }
 
 // proxyConfig is the agent-side P13 proxy block (round-7 F5). The documented
@@ -165,6 +195,15 @@ func newAgentCmd() *cobra.Command {
 				return fmt.Errorf("--nid is required (set on CLI or in agent.yaml)")
 			}
 
+			probeTO, err := parseOptDuration(ay.RemoteFS.ProbeTimeout, "remote_fs.probe_timeout")
+			if err != nil {
+				return err
+			}
+			spawnTO, err := parseOptDuration(ay.RemoteFS.SpawnTimeout, "remote_fs.spawn_timeout")
+			if err != nil {
+				return err
+			}
+
 			cfg := agent.Config{
 				NATSURL:                       natsURL,
 				SID:                           sid,
@@ -175,6 +214,11 @@ func newAgentCmd() *cobra.Command {
 				AllowRoots:                    ay.FileTransfer.AllowRoots,
 				RootsConfigured:               ay.FileTransfer.AllowRoots != nil,
 				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
+				RemoteFSMode:                  ay.RemoteFS.Mode,
+				RemoteFSSafeDir:               ay.RemoteFS.SafeDir,
+				RemoteFSProbeTimeout:          probeTO,
+				RemoteFSSpawnTimeout:          spawnTO,
+				RemoteFSWedgeCeiling:          ay.RemoteFS.WedgeCeiling,
 			}
 
 			// TETHER_DEV_NO_AUTH (CLI-side env, see internal/cli.DevNoAuthEnv):

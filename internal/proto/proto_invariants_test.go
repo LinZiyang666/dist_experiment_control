@@ -53,11 +53,11 @@ func allRoundtripCases() []roundtripCase {
 		}, &ExecChunk{}},
 		{"ExecReq", &ExecReq{
 			Argv: []string{"echo", "hi"}, Env: map[string]string{"K": "V"},
-			Cwd: "/tmp", Stdin: []byte("in"), ActorFP: "SHA256:fp",
+			Cwd: "/tmp", Stdin: []byte("in"), Safe: true, ActorFP: "SHA256:fp",
 		}, &ExecReq{}},
 		{"RunReq", &RunReq{
 			Argv: []string{"bash"}, Env: map[string]string{"K": "V"},
-			Cwd: "/tmp", Cols: 80, Rows: 24, ActorFP: "SHA256:fp",
+			Cwd: "/tmp", Cols: 80, Rows: 24, Safe: true, ActorFP: "SHA256:fp",
 		}, &RunReq{}},
 		{"ExposeReq", &ExposeReq{
 			Name: "jupyter", LocalPort: 8888, RemotePort: 14005, ActorFP: "SHA256:fp",

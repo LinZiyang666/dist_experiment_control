@@ -180,6 +180,15 @@ type ExecReq struct {
 	Cwd   string            `json:"cwd,omitempty"`   // working dir; empty = agent's
 	Stdin []byte            `json:"stdin,omitempty"` // small one-shot stdin payload
 
+	// Safe, when true, forces hung-mount-safe spawn for THIS call regardless of
+	// the agent's remote_fs default: the agent pre-resolves argv[0] against a
+	// PATH sanitized of unhealthy network mounts and fails fast (never hangs) if
+	// argv[0]/cwd is backed by a wedged mount. omitempty ⇒ absent when false ⇒
+	// byte-identical default wire (ProtoVersion stays 1). Broker-transparent
+	// (survives the forward re-marshal, same as ActorFP). See
+	// docs/reviews/remote-fs-resilience-plan.md.
+	Safe bool `json:"safe,omitempty"`
+
 	// ActorFP is broker-stamped at forward time (broker re-marshals the
 	// payload after C.1 §6 / membership checks pass; whatever ctl puts
 	// here is discarded). Agent reads it back into ProcStartedEvent so
@@ -322,6 +331,10 @@ type RunReq struct {
 	Cwd  string            `json:"cwd,omitempty"`
 	Cols int               `json:"cols,omitempty"`
 	Rows int               `json:"rows,omitempty"`
+
+	// Safe — per-call hung-mount-safe spawn escalation; same semantics as
+	// ExecReq.Safe. omitempty ⇒ byte-identical default wire, ProtoVersion 1.
+	Safe bool `json:"safe,omitempty"`
 
 	// ActorFP — broker-stamped at forward time; same semantics as
 	// ExecReq.ActorFP. Whatever ctl supplies is discarded.

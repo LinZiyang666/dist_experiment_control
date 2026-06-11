@@ -270,6 +270,9 @@ tunnel_addr: broker.example.com:7000
 | `nid`         | 节点 id；session 内必须唯一 |
 | `tunnel_addr` | broker 反向隧道控制端口（默认 `host:7000`） |
 | `file_transfer.allow_roots` | `tether push`/`pull` 路径策略：**键缺省 → 全盘开放**（= run/exec 触达）；**非空列表 → 收紧**到这些绝对前缀；**显式 `[]` → 禁用**（`transfer_disabled`） |
+| `remote_fs.mode` | 网络盘挂死时 `exec`/`run` 的自救策略：`auto`（默认；无网络挂载时完全惰性）/ `off`（关闭，回今天的行为）。见 §7.7。 |
+| `remote_fs.safe_dir` | 检测到挂载死掉且用户未指定 `--cwd` 时，子进程的本地替代 cwd；缺省优先选择经验证的 `os.TempDir()`，再尝试 `/tmp`、`/var/tmp`。 |
+| `remote_fs.probe_timeout` / `.spawn_timeout` / `.wedge_ceiling` | 挂载存活探测超时（默认 `2s`）/ execve 启动窗口超时（默认 `30s`）/ 并发放弃 spawn 上限（默认 `64`）。 |
 
 `allow_roots` **是可选收紧而非安全边界**：member 本就有不受限的 `run`/`exec`
 （requirements §9.3），随时能绕过白名单。配了 `allow_roots` 时的比对方式：先
@@ -1416,6 +1419,53 @@ append 的标准写法。
 - NATS 连接数：`/usr/local/bin/nats server check connections`；
 - JetStream 磁盘：`df` 阈值 80%；
 - `journalctl -u tether-broker | grep -E '(disk_pressure|store_error|panic)'`。
+
+### 7.7 网络文件系统（NFS/CIFS/…）挂死时 run/exec 卡住（v0.3.3+）
+
+**症状**：某台 agent 的 home / `$PATH` / 数据盘在 NFS（或 CIFS/sshfs）上，NFS 服务端
+挂掉后，`tether exec <node> ...` / `tether run <node>` **永久卡死出不来**，但 `node ls`
+/ `ps` / `expose` 等其余命令照常——`ssh <node>` 通常也一起卡。
+
+**为什么**：`hard` 挂载的 NFS 一旦服务端无响应，任何访问该路径的系统调用会进入
+**不可中断 D 状态**（连 `kill -9` 都打不动）。agent 启动子进程时，`os/exec` 会先按
+`$PATH` 逐个 `stat` 找可执行文件；只要 `$PATH` 里排在前面的目录在死掉的 NFS 上（常见：
+conda 在 `/shared`、`~/.local/bin` 在 NFS home），**在 fork 之前就 D 住**，连 `whoami`
+都跑不出来。agent 守护进程本身不受影响（它热路径不碰盘），所以只有 run/exec 卡。
+
+**v0.3.3 起的自救（默认 `remote_fs.mode: auto`，无网络挂载的机器完全惰性、行为同旧）**：
+agent 检测到某网络挂载无响应时，会**把该挂载的目录从 `$PATH` 剔除**、自己把 argv[0]
+解析成绝对路径再启动（绕过会卡的 `LookPath`），并对 fork/exec 设启动窗口超时。于是：
+
+- **不依赖那块盘的命令照常可用**——停机排障时你仍能 `nvidia-smi`、`kill`、看本地盘、
+  跑本地 conda（若 conda 在本地盘）。
+- **依赖死盘的命令快速失败带提示**而非永久卡：
+  - `remote_fs_unhealthy` —— argv[0] 在死挂载上（换本地盘的二进制，或 `--cwd` 本地目录）;
+  - `remote_fs_unsafe_cwd` —— `--cwd` 指向死挂载;
+  - `remote_fs_spawn_timeout` —— fork/exec 卡死被放弃（二进制/数据可能真在死 NFS 上）。
+
+**手动强制**（即便 agent 设了 `mode: off`）：`tether exec --safe <node> -- ...`、
+`tether run --safe <node> -- ...`。注意 `--safe` 必须放在 node 前面（`exec`/`run`
+把 node 之后的 flag 当远程命令的参数）。
+
+**做不到的事（诚实说明）**：如果命令的**二进制或数据本身就在挂死的 NFS 上**，没有任何
+办法能跑它（内核 D 状态、不可杀）——safe 模式只能保住"不碰那块盘"的命令，并让其余
+快速失败。根治仍是：**把 agent 装在本地盘**（`HOME=/srv/local/<user>/...`，见 §2 安装），
+这样网络盘挂了 agent 与本地命令都不受影响。
+
+**降级注意**：`agent.yaml` 里写了 `remote_fs:` 块后，若要把 agent **降级回 v0.3.3 之前**的
+二进制，必须先删掉该块——老二进制用 `KnownFields` 严格解析，遇到未知顶层键会拒绝启动
+（与 `file_transfer`/`proxy` 等历史 additive 块同理）。
+
+**已知边界（明确契约，非 bug）**：
+- **启动后新挂载**：`auto` 模式只在**启动时**判定本机有无网络挂载;启动时全本地的 agent,
+  生命周期内**不会**检测启动后新挂的网络盘(为保证本地机零开销)。需要让这种 agent 也防护,
+  用显式 `tether exec/run --safe`(每次都重新探测挂载),或重启 agent。
+- **autofs**:未触发的 autofs 挂载**不**当作死挂载、也不主动探测(否则会破坏健康机的首次
+  自动挂载),但会启用有界 argv0 解析和启动窗口看门狗。若 automount 目标真死了,返回
+  `remote_fs_spawn_timeout`,不是永久卡。
+- **网络盘上的 `~/.tether`(state.json)**:Component I 只把**重连时的读**做了有界降级,保住
+  agent 在线 + run/exec 防护;但 `expose`/`proxy` 的**写**(改 state.json)在网络 Home 挂死时
+  仍会阻塞该次操作。**网络 Home 是 best-effort**,强烈建议把 agent 装在本地盘(`HOME=/srv/local/...`)。
 
 ---
 

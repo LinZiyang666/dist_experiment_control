@@ -42,6 +42,7 @@ func newRunCmd() *cobra.Command {
 		natsURL string
 		home    string
 		cwd     string
+		safe    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run <node> -- <argv...>",
@@ -56,6 +57,11 @@ The two-phase attach handshake (architecture C.5.1) ensures the very
 first byte of remote output is not dropped; on the agent side an attach
 deadline (default 15s) guarantees no orphan PTYs if ctl drops
 mid-handshake.
+
+Flags must come BEFORE the node argument (flag parsing stops at the first
+positional). Use --safe to survive a hung network filesystem on the node:
+    tether run --safe gpu-01 -- bash
+A trailing '--safe' is sent to the remote command, not parsed here.
 `,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -95,7 +101,7 @@ mid-handshake.
 				}
 			}
 			body, err := json.Marshal(proto.RunReq{
-				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows, Env: env,
+				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows, Env: env, Safe: safe,
 			})
 			if err != nil {
 				return err
@@ -277,6 +283,11 @@ mid-handshake.
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
+	// NOTE: SetInterspersed(false) means --safe must PRECEDE the node arg:
+	// `tether run --safe gpu-01 -- bash`. A trailing `--safe` is sent to the
+	// remote argv, not parsed here.
+	cmd.Flags().BoolVar(&safe, "safe", false,
+		"hung-mount-safe spawn: resolve argv[0] against a PATH sanitized of unresponsive network mounts; fail fast instead of hanging")
 	// Audit shard 04 F12: same as exec — stop cobra parsing the
 	// remote command's flags as ours.
 	cmd.Flags().SetInterspersed(false)

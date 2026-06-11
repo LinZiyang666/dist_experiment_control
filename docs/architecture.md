@@ -2245,9 +2245,11 @@ P11 release hardening + docs                        ← v0.1.0
 | "v0.1.0" | P11 结束 | GitHub release |
 
 **Post-1.0 feature 增量**(不在 P0–P11 线性序内,各自独立设计 + review,见 `docs/reviews/`):
-file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-port`**、**P13 proxy 订阅(§L)**、**transfer-unrestrict(v0.4.0)**。这些是叶子增量,沿用同一"plan → 实现 → 内审 → 外审"流程,但不阻塞主线里程碑。
+file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-port`**、**P13 proxy 订阅(§L)**、**transfer-unrestrict(v0.4.0)**、**remote-fs-resilience(v0.3.3)**。这些是叶子增量,沿用同一"plan → 实现 → 内审 → 外审"流程,但不阻塞主线里程碑。
 
 > **transfer-unrestrict(v0.4.0,见 `docs/reviews/transfer-unrestrict-plan.md`)**:push/pull 的 `file_transfer.allow_roots` 从"必配、空=禁用"改为**可选收紧**——缺省 = 全盘开放(与 `run`/`exec` 同等触达)、非空 = 收紧、显式 `[]` = 禁用。`allow_roots` **不是安全边界**(member 本就有不受限 run/exec,requirements §9.3),仅作便利性收紧;叶子软链/`O_NOFOLLOW`/TOCTOU/普通文件等机制级加固在所有模式下不变。无 wire 变更(`ProtoVersion` 仍为 1)。
+
+> **remote-fs-resilience(v0.3.3,见 `docs/reviews/remote-fs-resilience-plan.md`)**:当 agent `$PATH`/argv[0]/cwd 背后的网络文件系统(NFS/CIFS/sshfs/…)挂死(`hard` 挂载 → 不可中断 D 状态)时,`exec`/`run` 不再永久卡死。`os/exec.Command` 在**构造期**就 `LookPath` 逐个 `stat` `$PATH`,死挂载首目录即 D 住——故 agent 改为:从 `/proc/self/mountinfo` 按 fstype 分类挂载、对可挂死挂载做**有界、单飞、粘滞且自愈**的 `statfs` 探测、消毒 `$PATH`(剔除不健康网络目录)、**自行解析 argv[0]** 为绝对路径并以 `&exec.Cmd{Path,Args}` 直建(绕过会挂的 LookPath)、对 execve 设启动窗口看门狗(超时**放弃**不可杀的 D 子进程)。argv[0]/cwd 落在死挂载 → **快速失败带警告**(`remote_fs_*` reason),而非卡死。新增 `ExecReq.Safe`/`RunReq.Safe`(additive `omitempty`,**`ProtoVersion` 仍为 1**)+ ctl `--safe` + `agent.yaml: remote_fs.{mode,safe_dir,probe_timeout,spawn_timeout,wedge_ceiling}`(默认 `mode=auto`,**无网络挂载即完全惰性、字节级同旧**)。Component I:agent 自身 `~/.tether` 若在网络盘,重连时读 `state.json` 也会 D 住,故对该读同样设有界降级。**不可逾越边界**:命令的二进制/数据真在死挂载上则谁都跑不了(内核 D 状态),safe 模式只保住不依赖该盘的命令 + 让其余快速失败。
 
 ---
 

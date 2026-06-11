@@ -73,7 +73,21 @@ func (s *stateStore) load() (*StateFile, error) {
 }
 
 func (s *stateStore) loadLocked() (*StateFile, error) {
-	b, err := os.ReadFile(s.path)
+	return parseStateBytes(os.ReadFile(s.path))
+}
+
+// loadNoLock reads state.json WITHOUT taking s.mu. Writes are atomic
+// (tmp+fsync+rename, saveLocked), so a lock-free reader always sees a complete
+// file — never a torn one. Used by the agent's hung-fs-bounded read path
+// (Component I, agent.loadStateBounded): if os.ReadFile D-hangs on a wedged
+// network Home, the abandoned reader holds NO mutex, so AddPort/RemovePort/
+// SetProxy/load are not poisoned (review B1). It is read-only and eventually
+// consistent — exactly what a register snapshot needs.
+func (s *stateStore) loadNoLock() (*StateFile, error) {
+	return parseStateBytes(os.ReadFile(s.path))
+}
+
+func parseStateBytes(b []byte, err error) (*StateFile, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return &StateFile{}, nil
 	}

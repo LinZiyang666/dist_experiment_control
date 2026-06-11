@@ -108,6 +108,13 @@ var runFailureReasons = map[string]string{
 	"exec_failed":      "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
 	"argv_required":    "you supplied no command to run.",
 	"json_parse":       "the agent couldn't parse our run request — tether bug, please report.",
+	// remote-fs-resilience (docs/reviews/remote-fs-resilience-plan.md): the
+	// agent refused/abandoned the spawn because a network filesystem is wedged.
+	"remote_fs_unhealthy":     "argv[0] is on an unresponsive network mount (NFS/CIFS/...); use a binary on local disk, or --cwd a local dir.",
+	"remote_fs_unsafe_cwd":    "the requested --cwd is on an unresponsive network mount; pick a local working directory.",
+	"remote_fs_not_found":     "argv[0] was not found in the network-safe PATH (its dir may be on a wedged mount); use an absolute local path.",
+	"remote_fs_spawn_timeout": "fork/exec stalled (likely a hung network mount under argv[0] or cwd) and was abandoned; the binary/data may live on dead NFS.",
+	"too_many_wedged_spawns":  "too many spawns are already wedged on a hung filesystem; wait for the mount to recover (or restart the agent).",
 }
 
 func runFailureMessage(reason string) error {
@@ -115,6 +122,21 @@ func runFailureMessage(reason string) error {
 		return fmt.Errorf("run failed: %s (%s)", hint, reason)
 	}
 	return fmt.Errorf("run rejected by agent (%s)", reason)
+}
+
+// execFailureMessage wraps an exec error-chunk string, appending the operator
+// hint when the chunk carries a remote_fs_* / too_many_wedged_spawns reason code
+// (the chunk is "<code>" or "<code>: <detail>"). Review m3 — exec gets the same
+// guidance run already surfaces via runFailureMessage, instead of a raw code.
+func execFailureMessage(chunkErr string) error {
+	code := chunkErr
+	if i := strings.IndexByte(chunkErr, ':'); i >= 0 {
+		code = chunkErr[:i]
+	}
+	if hint := runFailureReasons[strings.TrimSpace(code)]; hint != "" {
+		return fmt.Errorf("exec: %s (%s)", hint, chunkErr)
+	}
+	return fmt.Errorf("exec: %s", chunkErr)
 }
 
 func stripPrefix(s, prefix string) (string, bool) {

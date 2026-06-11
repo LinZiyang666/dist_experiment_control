@@ -20,6 +20,7 @@ func newExecCmd() *cobra.Command {
 		home    string
 		cwd     string
 		timeout time.Duration
+		safe    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "exec <node> <argv...>",
@@ -33,6 +34,12 @@ exit code of the remote process becomes the local exit code.
 For interactive commands (vim, htop, progress bars with cursor moves)
 use 'tether run' — it allocates a PTY on the agent and pumps raw bytes
 both ways.
+
+Flags must come BEFORE the node argument (flag parsing stops at the first
+positional). Use --safe to survive a hung network filesystem on the node:
+    tether exec --safe gpu-01 -- whoami
+A trailing '--safe' (e.g. 'tether exec gpu-01 --safe whoami') is sent to the
+remote command, not parsed here, and the safe-spawn lifeline silently no-ops.
 `,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -64,7 +71,7 @@ both ways.
 			}
 			defer nc.Close()
 
-			body, err := json.Marshal(proto.ExecReq{Argv: argv, Cwd: cwd})
+			body, err := json.Marshal(proto.ExecReq{Argv: argv, Cwd: cwd, Safe: safe})
 			if err != nil {
 				return err
 			}
@@ -132,7 +139,7 @@ both ways.
 					_ = nc.Drain()
 					return nil
 				case "error":
-					return fmt.Errorf("exec: %s", chunk.Error)
+					return execFailureMessage(chunk.Error)
 				default:
 					// Forward-compat: ignore unknown chunk kinds.
 				}
@@ -143,6 +150,11 @@ both ways.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "max time to wait for output / exit")
+	// NOTE: SetInterspersed(false) below means flags must PRECEDE the node arg:
+	// `tether exec --safe gpu-01 -- whoami`. A trailing `--safe` is sent to the
+	// remote argv, not parsed here.
+	cmd.Flags().BoolVar(&safe, "safe", false,
+		"hung-mount-safe spawn: resolve argv[0] against a PATH sanitized of unresponsive network mounts; fail fast instead of hanging")
 	// Audit shard 04 F12: without this, `tether exec node1 ls -la`
 	// fails with "unknown shorthand flag 'l'" because cobra parses
 	// the remote command's flags as ours. SetInterspersed(false)
