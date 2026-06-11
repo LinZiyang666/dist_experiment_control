@@ -348,6 +348,14 @@ broker_url: $BROKER_URL
 session: $SESSION
 nid: $NID
 tunnel_addr: $TUNNEL_ADDR
+# file transfer (tether push / pull) — optional, OPEN by default:
+# with no allow_roots key, push/pull can reach any path the agent user
+# can (the same reach as run/exec). Uncomment to narrow, or disable:
+# file_transfer:
+#   allow_roots:           # narrow push/pull to these absolute prefixes
+#     - /srv/data
+#     - /tmp
+#   # allow_roots: []      # explicit empty list disables push/pull entirely
 EOF
         chmod 600 "$SESSION_DIR/agent.yaml"
     else

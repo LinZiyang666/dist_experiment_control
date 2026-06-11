@@ -127,19 +127,33 @@ type Config struct {
 	// the broker's OFFLINE→port-REVOKE threshold. Tests override down.
 	ProxyFailClosedGrace time.Duration
 
-	// AllowRoots is the file-transfer-plan §"Refusing dangerous paths"
-	// allow-list of absolute roots under which `tether push` /
-	// `tether pull` may write or read files. EMPTY → file transfer is
-	// DISABLED on this agent: every push.req / pull.req returns
-	// `transfer_disabled` immediately. Operators populate via
-	// `agent.yaml: file_transfer.allow_roots`.
+	// AllowRoots narrows `tether push` / `tether pull` to an allow-list of
+	// absolute roots. Together with RootsConfigured it selects the agent's
+	// transferMode (see resolveTransferMode in transfer.go):
 	//
-	// Containment is checked after EvalSymlinks-of-parent-dir so a
-	// symlinked dir component still maps to its real path before the
-	// allow-list compare. The leaf is never followed (O_NOFOLLOW on
-	// push, lstat-then-O_NOFOLLOW on pull). See the path-validation
-	// half of internal/agent/transfer.go.
+	//   - RootsConfigured==false (yaml key absent/null) → OPEN: whole-FS
+	//     reach, equal to run/exec. The default, including fresh installs.
+	//   - non-empty AllowRoots → NARROW: push/pull confined to these roots
+	//     (path_outside_roots on miss).
+	//   - RootsConfigured==true with empty AllowRoots (explicit
+	//     `allow_roots: []`) → DISABLED: every push/pull → transfer_disabled.
+	//
+	// allow_roots is an optional convenience narrowing, NOT a security
+	// boundary: a session member already has unrestricted run/exec on every
+	// node (requirements.md §9.3), so it can reach any path regardless.
+	// Mechanism hardening (EvalSymlinks-of-parent, leaf-symlink reject,
+	// O_NOFOLLOW, dev+inode TOCTOU) runs in ALL modes — it defends a
+	// hostile NON-member process on the host, not the member. See the
+	// path-validation half of internal/agent/transfer.go.
 	AllowRoots []string
+
+	// RootsConfigured is true iff the operator wrote a
+	// file_transfer.allow_roots key in agent.yaml (yaml.v3 leaves AllowRoots
+	// nil when the key is absent/null). It is the discriminator between OPEN
+	// (key absent) and DISABLED (explicit empty list); see
+	// resolveTransferMode. cmd/tether sets it from
+	// `ay.FileTransfer.AllowRoots != nil`.
+	RootsConfigured bool
 
 	// ProxyAllowPrivateDestinations (P13 round-6 F12) opts the embedded SS proxy
 	// OUT of the default internet-egress-only destination policy, permitting a
@@ -207,6 +221,13 @@ type Agent struct {
 	// re-canonicalized, costing O(allow_roots) syscalls per request.
 	canonAllowRoots []string
 
+	// transferMode is the resolved push/pull path policy (open / narrow /
+	// disabled), computed once at New() from cfg.RootsConfigured + the RAW
+	// cfg.AllowRoots length. See resolveTransferMode — it is deliberately
+	// NOT derived from len(canonAllowRoots), so an all-dropped narrow
+	// config fails closed instead of falling open.
+	transferMode transferMode
+
 	// proxy is the P13 embedded SS proxy runtime (lazily created on the
 	// first directive). nil-safe; methods serialize through its own mutex.
 	proxy *proxyRuntime
@@ -263,7 +284,16 @@ func New(cfg Config) (*Agent, error) {
 		cfg:             cfg,
 		procs:           map[string]*procRec{},
 		canonAllowRoots: CanonAllowRoots(cfg.AllowRoots),
+		transferMode:    resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
 		proxy:           &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
+	}
+	if a.transferMode == modeOpen {
+		// Posture-change signal: with no allow_roots configured, push/pull
+		// now reaches the whole filesystem (matching run/exec). Logged once
+		// at startup so an operator upgrading from the old empty==disabled
+		// default sees the change at the moment it takes effect.
+		cfg.Logger.Warn("file transfer: whole-filesystem reach (no file_transfer.allow_roots configured); " +
+			"set file_transfer.allow_roots to narrow, or allow_roots: [] to disable push/pull")
 	}
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)

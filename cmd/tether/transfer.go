@@ -47,10 +47,12 @@ File size limits (file-transfer-plan v0.2.0):
                          have JetStream enabled).
   - > 2 GiB            : refused; use ` + "`tether expose`" + ` + rsync.
 
-The remote path must be absolute and under one of the agent's
-file_transfer.allow_roots (configured in agent.yaml). Symlinks at
-the destination are refused; intermediate symlinked dirs are
-followed and must still resolve inside an allow_root.
+The remote path must be absolute. By default it may be any path the
+agent's user can reach (the same reach as run/exec); an operator may
+optionally narrow push/pull to file_transfer.allow_roots in agent.yaml.
+Symlinks at the destination are refused; intermediate symlinked dirs are
+followed and (when narrowing is configured) must still resolve inside an
+allow_root.
 `,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -170,9 +172,17 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 
 func pushTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remoteSpec,
 	transferID, abs string, force bool, timeout time.Duration) error {
-	data, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
 	if err != nil {
 		return fmt.Errorf("read local: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, cliTierAMaxBytes+1))
+	if err != nil {
+		return fmt.Errorf("read local: %w", err)
+	}
+	if len(data) > cliTierAMaxBytes {
+		return fmt.Errorf("local file grew beyond tier-A limit while reading; retry")
 	}
 	sha := hexSHA256(data)
 	body, _ := json.Marshal(proto.PushPrepareReq{
@@ -206,11 +216,15 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("read local: %w", err)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	hashed, err := io.Copy(h, io.LimitReader(f, cliMaxBytes+1))
+	if err != nil {
 		_ = f.Close()
 		return fmt.Errorf("sha local: %w", err)
 	}
 	_ = f.Close()
+	if hashed != size {
+		return fmt.Errorf("local file changed while hashing: initial size=%d hashed=%d; retry", size, hashed)
+	}
 	sha := hex.EncodeToString(h.Sum(nil))
 
 	// Step 1: PushPrepareReq with Tier=b. Broker ensures the per-session
@@ -252,8 +266,28 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B): reopen local: %w", err)
 	}
 	defer func() { _ = uploadFile.Close() }()
-	if _, err := store.Put(putCtx, jetstream.ObjectMeta{Name: transferID}, uploadFile); err != nil {
+	info, err := store.Put(putCtx, jetstream.ObjectMeta{Name: transferID},
+		io.LimitReader(uploadFile, size+1))
+	if err != nil {
 		return fmt.Errorf("push (tier B): Put: %w", err)
+	}
+	if int64(info.Size) != size {
+		_ = store.Delete(putCtx, transferID)
+		return fmt.Errorf("local file changed while uploading: prepared size=%d uploaded=%d; retry",
+			size, info.Size)
+	}
+
+	// Subscribe before commit. The agent acks commit before its async Get,
+	// but a fast local Object Store can still publish ev.transfer before a
+	// post-commit subscription reaches the server.
+	evSub, subErr := nc.SubscribeSync(proto.SubjEvTransfer(sid, spec.Node, transferID, "*"))
+	if subErr == nil {
+		if err := nc.FlushTimeout(2 * time.Second); err != nil {
+			_ = evSub.Unsubscribe()
+			evSub = nil
+		} else {
+			defer func() { _ = evSub.Unsubscribe() }()
+		}
 	}
 
 	// Step 3: push-commit. Agent Gets, verifies, emits ev.transfer.
@@ -275,15 +309,9 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B) commit refused: code=%s %s", cr.Code, cr.Error)
 	}
 
-	// Wait for ev.transfer.<id>.{complete,failed}. We already have a
-	// member sub allow on ev.>; just subscribe + wait.
-	evSub, err := nc.SubscribeSync(proto.SubjEvTransfer(sid, spec.Node, transferID, "*"))
-	if err != nil {
-		// Subscribe wildcard not allowed by ACL? Fall back to two subs.
-		evSub = nil
-	}
+	// Wait for ev.transfer.<id>.{complete,failed}. If subscription was
+	// unavailable, retain the historical best-effort commit-acked result.
 	if evSub != nil {
-		defer func() { _ = evSub.Unsubscribe() }()
 		waitCtx, waitCancel := context.WithTimeout(cmd.Context(), timeout)
 		defer waitCancel()
 		msg, err := evSub.NextMsgWithContext(waitCtx)
@@ -320,8 +348,9 @@ func newPullCmd() *cobra.Command {
 		Long: `tether pull — download a file from a remote node.
 
 Same tier rules as ` + "`tether push`" + ` (see ` + "`tether push --help`" + `).
-The remote path must be absolute and inside one of the agent's
-allow_roots; the local path may be relative.
+The remote path must be absolute; by default any path the agent's user can
+read, optionally narrowed by file_transfer.allow_roots. The local path may
+be relative.
 `,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -432,6 +461,11 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 func finishPullTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 	spec remoteSpec, transferID, localAbs string, startedAt time.Time,
 	pr proto.PullPrepareResp, force bool, timeout time.Duration) error {
+	if pr.Size < 0 || pr.Size > cliTierAMaxBytes {
+		failAndFinalize(nc, actor, sid, transferID, "a", "too_large",
+			fmt.Sprintf("inline size=%d exceeds tier-A limit", pr.Size), startedAt)
+		return fmt.Errorf("pull (tier A): invalid size %d", pr.Size)
+	}
 	if int64(len(pr.InlineData)) != pr.Size {
 		failAndFinalize(nc, actor, sid, transferID, "a", "size_mismatch",
 			fmt.Sprintf("inline_data len=%d vs size=%d", len(pr.InlineData), pr.Size), startedAt)
@@ -460,6 +494,11 @@ func finishPullTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 	spec remoteSpec, transferID, localAbs string, startedAt time.Time,
 	pr proto.PullPrepareResp, force bool, timeout time.Duration) error {
+	if pr.Size < 0 || pr.Size > cliMaxBytes {
+		failAndFinalize(nc, actor, sid, transferID, "b", "too_large",
+			fmt.Sprintf("object size=%d exceeds 2 GiB limit", pr.Size), startedAt)
+		return fmt.Errorf("pull (tier B): invalid size %d", pr.Size)
+	}
 	js, err := jetstream.New(nc)
 	if err != nil {
 		failAndFinalize(nc, actor, sid, transferID, "b", "jetstream_unavailable", err.Error(), startedAt)
@@ -494,7 +533,7 @@ func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 		return fmt.Errorf("pull (tier B): open local tmp: %w", err)
 	}
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(f, h), result)
+	n, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(result, pr.Size+1))
 	if copyErr == nil {
 		copyErr = f.Sync()
 	}
@@ -505,6 +544,12 @@ func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 		failAndFinalize(nc, actor, sid, transferID, "b", "io_error", errMsg, startedAt)
 		return fmt.Errorf("pull (tier B): write local: %s", errMsg)
 	}
+	if n != pr.Size {
+		_ = os.Remove(tmp)
+		failAndFinalize(nc, actor, sid, transferID, "b", "size_mismatch",
+			fmt.Sprintf("want=%d got=%d", pr.Size, n), startedAt)
+		return fmt.Errorf("pull (tier B): size mismatch want=%d got=%d", pr.Size, n)
+	}
 	got := hex.EncodeToString(h.Sum(nil))
 	if got != pr.SHA256 {
 		_ = os.Remove(tmp)
@@ -512,10 +557,10 @@ func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 			fmt.Sprintf("want=%s got=%s", pr.SHA256, got), startedAt)
 		return fmt.Errorf("pull (tier B): sha mismatch want=%s got=%s", pr.SHA256, got)
 	}
-	if err := os.Rename(tmp, localAbs); err != nil {
+	if err := commitLocalTemp(tmp, localAbs, force); err != nil {
 		_ = os.Remove(tmp)
 		failAndFinalize(nc, actor, sid, transferID, "b", "io_error", err.Error(), startedAt)
-		return fmt.Errorf("pull (tier B): rename local: %w", err)
+		return fmt.Errorf("pull (tier B): commit local: %w", err)
 	}
 	_ = sendFinalize(nc, actor, sid, transferID, proto.TransferFinalize{
 		Kind: "complete", TransferID: transferID, Tier: "b",
@@ -560,19 +605,42 @@ func sendFinalize(nc *nats.Conn, actor, sid, transferID string, fin proto.Transf
 }
 
 func writeLocalAtomic(localAbs string, data []byte, force bool) error {
-	if !force {
-		if _, err := os.Stat(localAbs); err == nil {
-			return fmt.Errorf("local file %s already exists", localAbs)
-		}
-	}
-	tmp := localAbs + ".tmp.pull"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp := localAbs + ".tmp." + newTransferID()
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, localAbs); err != nil {
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
+	if err := commitLocalTemp(tmp, localAbs, force); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// commitLocalTemp atomically installs tmp. Without --force, hard-linking
+// is a portable create-if-absent primitive; it closes the Stat+Rename race
+// that could overwrite a destination created concurrently.
+func commitLocalTemp(tmp, dst string, force bool) error {
+	if force {
+		return os.Rename(tmp, dst)
+	}
+	if err := os.Link(tmp, dst); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("local file %s already exists", dst)
+		}
+		return err
+	}
+	_ = os.Remove(tmp)
 	return nil
 }
 

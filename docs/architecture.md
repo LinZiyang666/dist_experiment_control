@@ -2245,7 +2245,9 @@ P11 release hardening + docs                        ← v0.1.0
 | "v0.1.0" | P11 结束 | GitHub release |
 
 **Post-1.0 feature 增量**(不在 P0–P11 线性序内,各自独立设计 + review,见 `docs/reviews/`):
-file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-port`**、**P13 proxy 订阅(§L)**。这些是叶子增量,沿用同一"plan → 实现 → 内审 → 外审"流程,但不阻塞主线里程碑。
+file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-port`**、**P13 proxy 订阅(§L)**、**transfer-unrestrict(v0.4.0)**。这些是叶子增量,沿用同一"plan → 实现 → 内审 → 外审"流程,但不阻塞主线里程碑。
+
+> **transfer-unrestrict(v0.4.0,见 `docs/reviews/transfer-unrestrict-plan.md`)**:push/pull 的 `file_transfer.allow_roots` 从"必配、空=禁用"改为**可选收紧**——缺省 = 全盘开放(与 `run`/`exec` 同等触达)、非空 = 收紧、显式 `[]` = 禁用。`allow_roots` **不是安全边界**(member 本就有不受限 run/exec,requirements §9.3),仅作便利性收紧;叶子软链/`O_NOFOLLOW`/TOCTOU/普通文件等机制级加固在所有模式下不变。无 wire 变更(`ProtoVersion` 仍为 1)。
 
 ---
 

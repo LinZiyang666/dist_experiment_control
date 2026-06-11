@@ -46,8 +46,9 @@ import (
 // failed-audit and reclaims the bucket. file-transfer-plan §Audit
 // (timeout fallback) and §Object bucket lifecycle.
 const (
-	transferTimeoutTierA = 30 * time.Second
-	transferTimeoutTierB = 5 * time.Minute
+	transferTimeoutTierA  = 30 * time.Second
+	transferTimeoutTierB  = 5 * time.Minute
+	transferTierAMaxBytes = 8 * 1024 * 1024
 )
 
 // transferMaxBytes is the hard upper bound for one tier-B transfer.
@@ -343,8 +344,17 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPushErr(msg, "tier_invalid", req.Tier)
 		return
 	}
+	if req.Size < 0 {
+		b.replyPushErr(msg, "request_invalid", fmt.Sprintf("size=%d must be non-negative", req.Size))
+		return
+	}
 	if req.Size > transferMaxBytes {
 		b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > %d (2 GiB)", req.Size, transferMaxBytes))
+		return
+	}
+	if req.Tier == "a" && req.Size > transferTierAMaxBytes {
+		b.replyPushErr(msg, "too_large",
+			fmt.Sprintf("tier-a size=%d > %d (8 MiB)", req.Size, transferTierAMaxBytes))
 		return
 	}
 	if req.Tier == "a" && int64(len(req.InlineData)) != req.Size {

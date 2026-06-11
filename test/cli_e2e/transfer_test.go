@@ -29,10 +29,20 @@ import (
 func startJSNATS_xfer(t *testing.T) string { return testharness.StartJSNATS(t) }
 
 // withAllowRoots returns an opt-style mutator for startAgent that
-// populates the agent's file_transfer.allow_roots.
+// populates the agent's file_transfer.allow_roots (narrow mode).
 func withAllowRoots(roots ...string) func(*agent.Config) {
 	return func(c *agent.Config) {
 		c.AllowRoots = append([]string(nil), roots...)
+		c.RootsConfigured = true
+	}
+}
+
+// withTransferDisabled disables push/pull the way an explicit
+// `allow_roots: []` in agent.yaml does (configured key, empty list).
+func withTransferDisabled() func(*agent.Config) {
+	return func(c *agent.Config) {
+		c.AllowRoots = []string{}
+		c.RootsConfigured = true
 	}
 }
 
@@ -124,21 +134,62 @@ func TestTransfer_TierA_PushRejectsOutsideAllowRoots(t *testing.T) {
 	// clarity that the agent didn't even try.
 }
 
-// transfer_disabled when allow_roots is empty.
-func TestTransfer_TierA_TransferDisabledWhenAllowRootsEmpty(t *testing.T) {
+// Open-by-default: with no allow_roots configured, push reaches an
+// arbitrary absolute path (a per-test temp dir) and succeeds. This is the
+// post-unrestrict default — the old empty==transfer_disabled behavior is
+// gone (now spelled `allow_roots: []`, see ...OffSwitchDisables).
+func TestTransfer_TierA_OpenByDefaultPushSucceeds(t *testing.T) {
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
 	seedSession(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "a100")() // no AllowRoots
+	defer startAgent(t, url, "lab", "a100")() // no AllowRoots → open
 	testharness.WaitNodeOnline(t, db, "lab", "a100", 3*time.Second)
 
 	nc := connect(t, url)
 	defer nc.Close()
 
+	dst := filepath.Join(t.TempDir(), "open.bin")
+	payload := []byte("open-by-default")
 	body, _ := json.Marshal(proto.PushPrepareReq{
-		TransferID: "tid-x", Path: "/tmp/x", Size: 1,
+		TransferID: "tid-open", Path: dst, Size: int64(len(payload)),
+		SHA256: hexSHA256ForTest(payload), Tier: "a", InlineData: payload,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy("lab", pub, "a100", "push"), body)
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	var pr proto.PushPrepareResp
+	_ = json.Unmarshal(resp.Data, &pr)
+	if !pr.OK {
+		t.Fatalf("open-mode push refused: code=%s err=%s", pr.Code, pr.Error)
+	}
+	if got, _ := os.ReadFile(dst); !bytes.Equal(got, payload) {
+		t.Errorf("dst bytes != src: got %q", got)
+	}
+}
+
+// Off-switch: an explicit `allow_roots: []` disables push/pull entirely,
+// short-circuiting before any disk write.
+func TestTransfer_TierA_OffSwitchDisables(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	pub, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	defer startBroker(t, url, db)()
+	defer startAgent(t, url, "lab", "a100", withTransferDisabled())()
+	testharness.WaitNodeOnline(t, db, "lab", "a100", 3*time.Second)
+
+	nc := connect(t, url)
+	defer nc.Close()
+
+	dst := filepath.Join(t.TempDir(), "blocked.bin")
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: "tid-off", Path: dst, Size: 1,
 		SHA256: hexSHA256ForTest([]byte("x")), Tier: "a",
 		InlineData: []byte("x"),
 	})
@@ -153,6 +204,9 @@ func TestTransfer_TierA_TransferDisabledWhenAllowRootsEmpty(t *testing.T) {
 	_ = json.Unmarshal(resp.Data, &pr)
 	if pr.OK || pr.Code != "transfer_disabled" {
 		t.Errorf("got OK=%v code=%q, want transfer_disabled", pr.OK, pr.Code)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Errorf("dst created despite disabled transfer (stat=%v)", statErr)
 	}
 }
 
@@ -257,6 +311,53 @@ func TestTransfer_TierA_PullHappyPath(t *testing.T) {
 	}
 	if !fr.OK {
 		t.Errorf("finalize not OK: code=%q err=%q", fr.Code, fr.Error)
+	}
+}
+
+// Open-by-default PULL: with no allow_roots configured, an absolute path
+// outside any root is readable (open mode). Mirrors the push open-mode test
+// on the read side so the ValidateForRead open branch is exercised through
+// the broker→agent pull pipeline, not just in unit tests.
+func TestTransfer_TierA_OpenByDefaultPullSucceeds(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	pub, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	defer startBroker(t, url, db)()
+
+	src := filepath.Join(t.TempDir(), "open-src.bin")
+	payload := []byte("open-mode pull payload")
+	if err := os.WriteFile(src, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer startAgent(t, url, "lab", "a100")() // no AllowRoots → open
+	testharness.WaitNodeOnline(t, db, "lab", "a100", 3*time.Second)
+
+	nc := connect(t, url)
+	defer nc.Close()
+
+	body, _ := json.Marshal(proto.PullPrepareReq{
+		TransferID: "tid-open-pull", Path: src, MaxInline: 8 << 20,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy("lab", pub, "a100", "pull"), body)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	var pr proto.PullPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if !pr.OK {
+		t.Fatalf("open-mode pull refused: code=%s err=%s", pr.Code, pr.Error)
+	}
+	if pr.Tier != "a" {
+		t.Errorf("tier=%q want a", pr.Tier)
+	}
+	if !bytes.Equal(pr.InlineData, payload) {
+		t.Errorf("inline_data != src")
 	}
 }
 
@@ -539,6 +640,243 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 	}
 	if info, err := store2.GetInfo(context.Background(), tid); err == nil && !info.Deleted {
 		t.Errorf("object %s should be gone after ev.transfer.complete (info=%+v)", tid, info)
+	}
+}
+
+// Tier-B must verify both the prepare-time size and SHA before the tmp is
+// committed. The old order renamed first and compared SHA in the caller,
+// leaving rejected bytes at dst. Use force=true + an existing destination
+// so either regression is visible as clobbered "OLD" content.
+func TestTransfer_TierB_VerifiesBeforeDestinationCommit(t *testing.T) {
+	url := startJSNATS_xfer(t)
+	db := openDB(t)
+	pub, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	defer startBroker(t, url, db)()
+
+	root := t.TempDir()
+	defer startAgent(t, url, "lab", "a100", withAllowRoots(root))()
+	testharness.WaitNodeOnline(t, db, "lab", "a100", 3*time.Second)
+
+	nc := connect(t, url)
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := proto.XferBucketName("lab")
+
+	tests := []struct {
+		name     string
+		tid      string
+		declared []byte
+		object   []byte
+		wantCode string
+	}{
+		{
+			name:     "sha mismatch",
+			tid:      "tid-tierb-sha-before-commit",
+			declared: []byte("GOOD"),
+			object:   []byte("EVIL"),
+			wantCode: "sha_mismatch",
+		},
+		{
+			name:     "size mismatch",
+			tid:      "tid-tierb-size-before-commit",
+			declared: []byte("GOOD"),
+			object:   []byte("LONGER"),
+			wantCode: "size_mismatch",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := filepath.Join(root, tc.tid+".bin")
+			if err := os.WriteFile(dst, []byte("OLD"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(proto.PushPrepareReq{
+				TransferID: tc.tid,
+				Path:       dst,
+				Size:       int64(len(tc.declared)),
+				SHA256:     hexSHA256ForTest(tc.declared),
+				Force:      true,
+				Tier:       "b",
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			resp, err := nc.RequestWithContext(ctx,
+				proto.SubjCmdBy("lab", pub, "a100", "push"), body)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			var pr proto.PushPrepareResp
+			if err := json.Unmarshal(resp.Data, &pr); err != nil {
+				t.Fatal(err)
+			}
+			if !pr.OK {
+				t.Fatalf("prepare refused: %+v", pr)
+			}
+
+			storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer storeCancel()
+			store, err := js.ObjectStore(storeCtx, bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Put(storeCtx, jetstream.ObjectMeta{Name: tc.tid},
+				bytes.NewReader(tc.object)); err != nil {
+				t.Fatal(err)
+			}
+
+			evSub, err := nc.SubscribeSync(proto.SubjEvTransfer("lab", "a100", tc.tid, "*"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = evSub.Unsubscribe() }()
+			if err := nc.FlushTimeout(2 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+
+			commitBody, _ := json.Marshal(proto.TransferCommitReq{
+				TransferID: tc.tid, Bucket: bucket, ObjectKey: tc.tid,
+			})
+			resp, err = nc.RequestWithContext(ctx,
+				proto.SubjCmdBy("lab", pub, "a100", "push-commit"), commitBody)
+			if err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			var cr proto.TransferCommitResp
+			if err := json.Unmarshal(resp.Data, &cr); err != nil {
+				t.Fatal(err)
+			}
+			if !cr.OK {
+				t.Fatalf("commit refused: %+v", cr)
+			}
+
+			evCtx, evCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer evCancel()
+			msg, err := evSub.NextMsgWithContext(evCtx)
+			if err != nil {
+				t.Fatalf("event: %v", err)
+			}
+			var ev proto.TransferEvent
+			if err := json.Unmarshal(msg.Data, &ev); err != nil {
+				t.Fatal(err)
+			}
+			if ev.Kind != "failed" || ev.Code != tc.wantCode {
+				t.Fatalf("event=%+v, want failed/%s", ev, tc.wantCode)
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "OLD" {
+				t.Fatalf("destination clobbered before verification: %q", got)
+			}
+		})
+	}
+}
+
+// Open-by-default over tier B: the realistic "fresh install (no
+// file_transfer block), large file" scenario must work out of the box,
+// not just tier A. Same flow as TierB_PushHappyPath but the agent has no
+// allow_roots (open mode) and the dst is an arbitrary temp path.
+func TestTransfer_TierB_OpenByDefaultPushSucceeds(t *testing.T) {
+	url := startJSNATS_xfer(t)
+	db := openDB(t)
+	pub, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	defer startBroker(t, url, db)()
+
+	defer startAgent(t, url, "lab", "a100")() // no AllowRoots → open
+	testharness.WaitNodeOnline(t, db, "lab", "a100", 3*time.Second)
+
+	nc := connect(t, url)
+	defer nc.Close()
+
+	const size = 12 * 1024 * 1024
+	payload := make([]byte, size)
+	_, _ = rand.Read(payload)
+	sha := hexSHA256ForTest(payload)
+	dst := filepath.Join(t.TempDir(), "open-big.bin")
+	tid := "tid-tierb-open"
+
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: tid, Path: dst, Size: int64(size), SHA256: sha, Tier: "b",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy("lab", pub, "a100", "push"), body)
+	if err != nil {
+		t.Fatalf("push prepare: %v", err)
+	}
+	var pr proto.PushPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if !pr.OK {
+		t.Fatalf("open-mode tier-B prepare refused: code=%s err=%s", pr.Code, pr.Error)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := proto.XferBucketName("lab")
+	storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer storeCancel()
+	store, err := js.ObjectStore(storeCtx, bucket)
+	if err != nil {
+		t.Fatalf("bind bucket %s: %v", bucket, err)
+	}
+	if _, err := store.Put(storeCtx, jetstream.ObjectMeta{Name: tid},
+		bytes.NewReader(payload)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	body, _ = json.Marshal(proto.TransferCommitReq{
+		TransferID: tid, Bucket: bucket, ObjectKey: tid,
+	})
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer commitCancel()
+	resp, err = nc.RequestWithContext(commitCtx,
+		proto.SubjCmdBy("lab", pub, "a100", "push-commit"), body)
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var cr proto.TransferCommitResp
+	if err := json.Unmarshal(resp.Data, &cr); err != nil {
+		t.Fatal(err)
+	}
+	if !cr.OK {
+		t.Fatalf("commit refused: code=%s err=%s", cr.Code, cr.Error)
+	}
+
+	evSub, err := nc.SubscribeSync(proto.SubjEvTransfer("lab", "a100", tid, "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = evSub.Unsubscribe() }()
+	evCtx, evCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer evCancel()
+	msg, err := evSub.NextMsgWithContext(evCtx)
+	if err != nil {
+		t.Fatalf("ev.transfer: %v", err)
+	}
+	var ev proto.TransferEvent
+	if err := json.Unmarshal(msg.Data, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Kind != "complete" {
+		t.Fatalf("ev.kind=%q (code=%s err=%s)", ev.Kind, ev.Code, ev.Error)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("dst byte mismatch (len got=%d want=%d)", len(got), len(payload))
 	}
 }
 

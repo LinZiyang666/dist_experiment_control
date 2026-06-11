@@ -593,7 +593,7 @@ type UpgradeForwardedResp struct {
 // keyed by ObjectKey, then sends TransferCommitReq.
 type PushPrepareReq struct {
 	TransferID string `json:"transfer_id"` // random ctl-generated id; broker echoes into audit
-	Path       string `json:"path"`        // absolute remote path under one of agent's allow_roots
+	Path       string `json:"path"`        // absolute remote path; under agent's allow_roots only when narrowing is configured
 	Size       int64  `json:"size"`
 	SHA256     string `json:"sha256"`                // hex; expected digest after upload
 	Force      bool   `json:"force,omitempty"`       // overwrite existing regular file
@@ -614,7 +614,7 @@ type PushPrepareReq struct {
 type PushPrepareResp struct {
 	OK    bool   `json:"ok"`
 	Tier  string `json:"tier,omitempty"` // echoed for paranoia
-	Code  string `json:"code,omitempty"` // transfer_id_in_flight | dst_exists | path_outside_roots | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled | jetstream_unavailable | io_error | ...
+	Code  string `json:"code,omitempty"` // transfer_id_in_flight | dst_exists | path_outside_roots (narrow mode) | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled (explicit allow_roots: []) | jetstream_unavailable | io_error | ...
 	Error string `json:"error,omitempty"`
 }
 
@@ -624,7 +624,7 @@ type PushPrepareResp struct {
 // simply leaves that shared bucket untouched.
 type PullPrepareReq struct {
 	TransferID string `json:"transfer_id"`
-	Path       string `json:"path"`            // absolute remote path
+	Path       string `json:"path"`            // absolute remote path; under agent's allow_roots only when narrowing is configured
 	MaxInline  int64  `json:"max_inline"`      // ctl's tier-A budget (server max_payload aware)
 	Force      bool   `json:"force,omitempty"` // overwrite existing local file
 
@@ -648,7 +648,7 @@ type PullPrepareResp struct {
 	InlineData []byte `json:"inline_data,omitempty"` // tier A only
 	Bucket     string `json:"bucket,omitempty"`      // tier B only
 	ObjectKey  string `json:"object_key,omitempty"`  // tier B only
-	Code       string `json:"code,omitempty"`        // transfer_id_in_flight | path_not_found | path_outside_roots | not_a_regular_file | too_large | transfer_disabled | jetstream_unavailable | io_error | ...
+	Code       string `json:"code,omitempty"`        // transfer_id_in_flight | path_not_found | path_outside_roots (narrow mode) | not_a_regular_file | too_large | transfer_disabled (explicit allow_roots: []) | jetstream_unavailable | io_error | ...
 	Error      string `json:"error,omitempty"`
 }
 

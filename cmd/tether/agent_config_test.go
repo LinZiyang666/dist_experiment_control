@@ -127,6 +127,84 @@ func TestLoadAgentYAMLMalformed(t *testing.T) {
 	}
 }
 
+func TestLoadAgentYAMLRejectsUnknownFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "misspelled allow_roots cannot fall open",
+			body: "session: lab\nnid: lab-1\nfile_transfer:\n  allow_root:\n    - /srv/data\n",
+		},
+		{
+			name: "misspelled top-level file_transfer cannot fall open",
+			body: "session: lab\nnid: lab-1\nfile_transfers:\n  allow_roots: []\n",
+		},
+		{
+			name: "unknown proxy option rejected",
+			body: "session: lab\nnid: lab-1\nproxy:\n  allow_private_destination: true\n",
+		},
+		{
+			name: "second document cannot hide narrowing",
+			body: "session: lab\nnid: lab-1\n---\nfile_transfer:\n  allow_roots: []\n",
+		},
+		{
+			// F11: an empty MIDDLE document must not let a later non-empty
+			// document slip through the multi-doc check (was a fail-open).
+			name: "empty middle document cannot hide a later narrowing",
+			body: "session: lab\nnid: lab-1\n---\n# empty\n---\nfile_transfer:\n  allow_roots: []\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			dir := filepath.Join(home, "agent", "lab")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAgentYAML(home, "lab"); err == nil {
+				t.Fatal("unknown field was silently ignored")
+			}
+		})
+	}
+}
+
+// Regression: strict decoding (KnownFields + multi-doc reject) must still
+// TOLERATE a benign empty / comment-only / whitespace-only agent.yaml (zero
+// struct → caller falls through to CLI flags) and a lone trailing `---`.
+// An empty placeholder config failing agent startup was a strict-parsing
+// over-rejection; the real-second-document rejection
+// (TestLoadAgentYAMLRejectsUnknownFields) stays intact.
+func TestLoadAgentYAML_ToleratesEmptyAndTrailingSeparator(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"empty file", ""},
+		{"comment only", "# nothing configured here\n"},
+		{"whitespace only", "\n\n"},
+		{"trailing separator", "session: lab\nnid: a100\n---\n"},
+		{"multiple empty trailing docs", "session: lab\nnid: a100\n---\n---\n# trailing\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			dir := filepath.Join(home, "agent", "lab")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAgentYAML(home, "lab"); err != nil {
+				t.Errorf("benign config rejected by strict decoder: %v", err)
+			}
+		})
+	}
+}
+
 // TestPickFlagOrYamlOnAgentCmd pins the cross-cmd reuse of the
 // helper: pickFlagOrYaml was originally written for the serve
 // command but the agent-yaml wiring depends on it doing the right
@@ -152,5 +230,56 @@ func TestPickFlagOrYamlOnAgentCmd(t *testing.T) {
 	cmd2 := newAgentCmd()
 	if got := pickFlagOrYaml(cmd2, "tunnel-addr", "127.0.0.1:7000", "broker.example:7000"); got != "broker.example:7000" {
 		t.Errorf("tunnel-addr default+yaml: got %q want yaml", got)
+	}
+}
+
+// The transfer-unrestrict tri-state (open / narrow / disabled) hinges on
+// yaml.v3 distinguishing "allow_roots key absent" (slice stays nil → OPEN)
+// from "allow_roots: []" (non-nil len-0 slice → DISABLED). cmd/tether
+// derives Config.RootsConfigured from exactly `AllowRoots != nil`, so this
+// table pins the decoder quirk the whole design depends on — a yaml lib
+// bump that collapsed nil→[] would silently disable transfer on every
+// fresh install (the inverse failure), and this test catches it.
+func TestLoadAgentYAML_AllowRootsNilVsEmpty(t *testing.T) {
+	const base = "broker_url: wss://b:443\nsession: lab\nnid: a100\n"
+	tests := []struct {
+		name           string
+		ftBlock        string
+		wantNil        bool // AllowRoots == nil → OPEN discriminator
+		wantLen        int
+		wantConfigured bool // == (AllowRoots != nil) → what cmd/tether stamps
+	}{
+		{"no file_transfer block", "", true, 0, false},
+		{"empty file_transfer block", "file_transfer: {}\n", true, 0, false},
+		{"allow_roots null", "file_transfer:\n  allow_roots:\n", true, 0, false},
+		{"allow_roots tilde", "file_transfer:\n  allow_roots: ~\n", true, 0, false},
+		{"allow_roots explicit empty", "file_transfer:\n  allow_roots: []\n", false, 0, true},
+		{"allow_roots one entry", "file_transfer:\n  allow_roots:\n    - /tmp\n", false, 1, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			dir := filepath.Join(home, "agent", "lab")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(base+tc.ftBlock), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ay, err := loadAgentYAML(home, "lab")
+			if err != nil {
+				t.Fatalf("loadAgentYAML: %v", err)
+			}
+			if gotNil := ay.FileTransfer.AllowRoots == nil; gotNil != tc.wantNil {
+				t.Errorf("AllowRoots==nil = %v, want %v", gotNil, tc.wantNil)
+			}
+			if got := len(ay.FileTransfer.AllowRoots); got != tc.wantLen {
+				t.Errorf("len = %d, want %d", got, tc.wantLen)
+			}
+			// The exact expression cmd/tether feeds into Config.RootsConfigured.
+			if gotConfigured := ay.FileTransfer.AllowRoots != nil; gotConfigured != tc.wantConfigured {
+				t.Errorf("RootsConfigured = %v, want %v", gotConfigured, tc.wantConfigured)
+			}
+		})
 	}
 }

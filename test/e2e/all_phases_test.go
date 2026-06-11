@@ -59,6 +59,29 @@ func TestAllPhases(t *testing.T) {
 	}
 }
 
+// TestTransferDefaultsMatrix wires the transfer-unrestrict default-inversion
+// (open-by-default push/pull + explicit-`[]`-disabled off-switch) into the
+// -tags e2e_matrix cross-phase regression net. The transfer e2e itself lives
+// in test/cli_e2e (a `make test` hard gate); the phase matrix is otherwise a
+// `./test/pN` runner and transfer is a post-1.0 feature increment, so rather
+// than mint a fake phase this subprocess re-runs just the open/off-switch
+// cases here. A silent re-disable of the open default thus fails `make e2e`
+// too, not only `make test`.
+func TestTransferDefaultsMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-count=1", "-timeout", phaseTimeout.String(),
+		"-run", "TestTransfer_TierA_OpenByDefault|TestTransfer_TierB_OpenByDefault|TestTransfer_TierA_OffSwitchDisables",
+		"./test/cli_e2e/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("transfer defaults failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func runPhase(t *testing.T, phase string) {
 	t.Helper()
 	// go test sets cwd to the package dir (test/e2e/), so the

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -37,9 +39,16 @@ type proxyConfig struct {
 }
 
 // fileTransferConfig controls `tether push` / `tether pull` containment.
-// AllowRoots EMPTY means file transfer is DISABLED on this agent — see the
-// path-validation half of internal/agent/transfer.go (file-transfer-plan
-// §"Refusing dangerous paths").
+// AllowRoots is an OPTIONAL narrowing, resolved into a transferMode by the
+// agent (internal/agent/transfer.go resolveTransferMode):
+//
+//   - key absent/null → OPEN: whole-FS reach, equal to run/exec (default).
+//   - non-empty list  → NARROW: confined to those absolute roots.
+//   - explicit `[]`   → DISABLED: every push/pull → transfer_disabled.
+//
+// yaml.v3 leaves AllowRoots nil when the key is absent and a non-nil len-0
+// slice for `allow_roots: []`, which is exactly the open-vs-disabled
+// discriminator (carried to the agent as Config.RootsConfigured).
 type fileTransferConfig struct {
 	AllowRoots []string `yaml:"allow_roots"`
 }
@@ -71,8 +80,36 @@ func loadAgentYAML(home, sid string) (agentYAML, error) {
 		return agentYAML{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	var ay agentYAML
-	if err := yaml.Unmarshal(body, &ay); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(body))
+	dec.KnownFields(true)
+	if err := dec.Decode(&ay); err != nil {
+		// An empty / comment-only / whitespace-only file has no document;
+		// tolerate it (zero struct → caller falls through to CLI flags),
+		// matching the historical yaml.Unmarshal behavior. KnownFields
+		// strictness still applies to any real document.
+		if errors.Is(err, io.EOF) {
+			return agentYAML{}, nil
+		}
 		return agentYAML{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	// Reject any SECOND-or-later NON-EMPTY document: it could hide a
+	// narrowing/disable the first does not show. Benign empty trailing
+	// documents (e.g. a lone `---`) decode to nil and are tolerated. The
+	// scan MUST loop to io.EOF: an empty *middle* document must not let a
+	// later non-empty document slip through unchecked (F11 fail-open).
+	for {
+		var extra any
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return agentYAML{}, fmt.Errorf("parse %s: %w", path, err)
+		}
+		if extra != nil {
+			return agentYAML{}, fmt.Errorf("parse %s: multiple YAML documents are not supported", path)
+		}
+		// extra == nil: an empty document — keep scanning for a hidden one.
 	}
 	return ay, nil
 }
@@ -136,6 +173,7 @@ func newAgentCmd() *cobra.Command {
 				Home:                          home,
 				Logger:                        slog.New(slog.NewTextHandler(os.Stderr, nil)),
 				AllowRoots:                    ay.FileTransfer.AllowRoots,
+				RootsConfigured:               ay.FileTransfer.AllowRoots != nil,
 				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
 			}
 

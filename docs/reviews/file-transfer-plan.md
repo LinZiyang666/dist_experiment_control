@@ -4,6 +4,14 @@ Date: 2026-05-12
 Status: draft
 Target release: v0.2.0
 
+> **PARTIALLY SUPERSEDED (2026-06-11, v0.4.0):** the §"Refusing dangerous
+> paths" decision that `allow_roots` is **mandatory** (empty/missing →
+> `transfer_disabled`) is reversed by `transfer-unrestrict-plan.md`.
+> `allow_roots` is now an OPTIONAL narrowing: absent key → whole-FS reach
+> (= run/exec), non-empty → narrowed, explicit `[]` → disabled. The
+> mechanism hardening described below (symlink / `O_NOFOLLOW` / TOCTOU /
+> regular-file / parent-exists) is KEPT verbatim and runs in all modes.
+
 ## Background
 
 `docs/architecture.md` §941 explicitly defers file transfer to a v2
@@ -666,7 +674,9 @@ disappears. So a "no `..` after Clean" check catches nothing useful.
 **v2.0 mandatory containment**: agent.yaml must declare
 `file_transfer.allow_roots` (a non-empty list of absolute paths).
 **Empty / missing → file transfer is disabled** on that agent;
-push/pull requests return `transfer_disabled` immediately. The
+push/pull requests return `transfer_disabled` immediately.
+*(SUPERSEDED v0.4.0 — see top-of-file banner: missing key now → OPEN, only
+explicit `allow_roots: []` → disabled.)* The
 install.sh-generated default agent.yaml ships with:
 
 ```yaml
@@ -785,6 +795,8 @@ need richer harnesses. Three test files:
 6. `allow_roots` violation (push to `/etc/passwd` when allow_roots = `["/tmp"]`) → `path_outside_roots`.
 7. Symlink at leaf → `not_a_regular_file`.
 8. `file_transfer` disabled (empty allow_roots) → `transfer_disabled`.
+   *(SUPERSEDED v0.4.0: "empty" now means explicit `allow_roots: []`; a
+   missing key is OPEN, not disabled.)*
 9. `version_skew`: agent reports RELEASE 0.1.4 → ctl refuses with hint.
 
 **`test/cli_e2e/transfer_js_test.go` — JS-enabled (`testharness.StartJSNATS`), tier B, anonymous NATS**:

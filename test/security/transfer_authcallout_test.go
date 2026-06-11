@@ -383,6 +383,125 @@ func TestTierB_PushPull_AuthCallout(t *testing.T) {
 	}
 }
 
+// TestTierB_OpenDefault_AuthCallout is the open-mode (no allow_roots) twin
+// of TestTierB_PushPull_AuthCallout. The transfer-unrestrict default flip
+// means a fresh agent reaches the whole filesystem; this is the ONLY harness
+// exercising that open-mode write path under real auth_callout + JWT/ACL +
+// JetStream. The two existing auth tests pass a non-empty root (modeNarrow),
+// so without this an open-mode JWT/ObjectStore-perm regression would ship
+// undetected. dst is OUTSIDE any allow_root (there are none) — only open
+// mode permits it.
+func TestTierB_OpenDefault_AuthCallout(t *testing.T) {
+	url, bSeed, aSeed := startJSAuthCalloutNATS(t)
+	db := openTransferDB(t)
+
+	ownerID := freshTransferIdentity(t)
+	pin := "123456"
+	pinHash, err := auth.HashPIN(pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Create(db, "lab", "lab", ownerID.Fingerprint, pinHash, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	defer startBrokerWithAuthJS(t, url, db, bSeed, aSeed)()
+
+	// nil allowRoots → RootsConfigured stays false → modeOpen (whole-FS).
+	defer startAgentAuthJS(t, url, db, "lab", "a-test", pin, nil)()
+	waitNodeOnline(t, db, "lab", "a-test", 5*time.Second)
+
+	nc, err := cli.ConnectNATSWithNkey(url, ownerID, nats.Name(cli.CtlNameForSession("lab")))
+	if err != nil {
+		t.Fatalf("ctl activated connect: %v", err)
+	}
+	defer nc.Close()
+
+	const size = 12 * 1024 * 1024
+	payload := make([]byte, size)
+	_, _ = rand.Read(payload)
+	sha := hexSHA256ForTransferTest(payload)
+	dst := filepath.Join(t.TempDir(), "open-authcallout.bin") // outside any root
+	tid := "tid-open-authcallout"
+
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: tid, Path: dst, Size: int64(size), SHA256: sha, Tier: "b",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := nc.RequestWithContext(ctx,
+		proto.SubjCmdBy("lab", ownerID.PublicKey, "a-test", "push"), body)
+	if err != nil {
+		t.Fatalf("push prepare: %v", err)
+	}
+	var pr proto.PushPrepareResp
+	if err := json.Unmarshal(resp.Data, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if !pr.OK {
+		t.Fatalf("open-mode prepare refused: code=%s err=%s", pr.Code, pr.Error)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := proto.XferBucketName("lab")
+	storeCtx, storeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer storeCancel()
+	store, err := js.ObjectStore(storeCtx, bucket)
+	if err != nil {
+		t.Fatalf("ctl bind bucket %s: %v", bucket, err)
+	}
+	if _, err := store.Put(storeCtx, jetstream.ObjectMeta{Name: tid},
+		bytes.NewReader(payload)); err != nil {
+		t.Fatalf("ctl Put (PERM CHECK!): %v", err)
+	}
+
+	body, _ = json.Marshal(proto.TransferCommitReq{
+		TransferID: tid, Bucket: bucket, ObjectKey: tid,
+	})
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer commitCancel()
+	resp, err = nc.RequestWithContext(commitCtx,
+		proto.SubjCmdBy("lab", ownerID.PublicKey, "a-test", "push-commit"), body)
+	if err != nil {
+		t.Fatalf("push-commit: %v", err)
+	}
+	var cr proto.TransferCommitResp
+	if err := json.Unmarshal(resp.Data, &cr); err != nil {
+		t.Fatal(err)
+	}
+	if !cr.OK {
+		t.Fatalf("commit refused: code=%s err=%s", cr.Code, cr.Error)
+	}
+
+	evSub, err := nc.SubscribeSync(proto.SubjEvTransfer("lab", "a-test", tid, "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = evSub.Unsubscribe() }()
+	evCtx, evCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer evCancel()
+	msg, err := evSub.NextMsgWithContext(evCtx)
+	if err != nil {
+		t.Fatalf("ev.transfer (agent didn't finalize in open mode): %v", err)
+	}
+	var ev proto.TransferEvent
+	if err := json.Unmarshal(msg.Data, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Kind != "complete" {
+		t.Fatalf("ev.kind=%q (code=%s err=%s)", ev.Kind, ev.Code, ev.Error)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst on agent: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("byte mismatch (got=%d want=%d)", len(got), len(payload))
+	}
+}
+
 // TestTierB_PullThenPush_AuthCallout exercises the pull path (ctl
 // Gets). Same JWT perm coverage but flips the Put/Get role.
 func TestTierB_PullThenPush_AuthCallout(t *testing.T) {

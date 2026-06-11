@@ -156,6 +156,23 @@ func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
 		}
 	}
 
+	// Fresh-install contract (transfer-unrestrict v0.4.0): the generated
+	// agent.yaml must contain NO ACTIVE (non-commented) file_transfer /
+	// allow_roots key, so a fresh install resolves to OPEN (whole-FS) mode.
+	// The template ships a COMMENTED example block; a future edit that
+	// uncomments `allow_roots: []` would silently DISABLE transfer on every
+	// new install (the inverse footgun the change exists to prevent), so
+	// pin that only comment lines may mention these keys.
+	for _, ln := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(ln)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "allow_roots") || trimmed == "file_transfer:" {
+			t.Errorf("fresh install must ship OPEN (no active file_transfer/allow_roots); got active line %q", ln)
+		}
+	}
+
 	// Per-session dir must be 0700, agent.yaml 0600.
 	if fi, err := os.Stat(filepath.Dir(yaml)); err != nil {
 		t.Fatal(err)

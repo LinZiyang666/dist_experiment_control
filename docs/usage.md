@@ -251,13 +251,14 @@ session: lab
 nid: lab-1
 tunnel_addr: broker.example.com:7000
 
-# 可选：v0.2.0 起的 file_transfer / `tether push` / `tether pull` 白名单。
-# 必须配置否则 push/pull 会以 `transfer_disabled` 拒掉。
-file_transfer:
-  allow_roots:
-    - /home/<user>           # 用户家目录
-    - /tmp                   # 临时区
-    - /srv/local/<user>      # UIUC 风格 local-disk 根；其他场景可省
+# 可选：file_transfer 是 `tether push` / `tether pull` 的路径策略。
+# 不配（如上）= 开放：push/pull 可达 agent 用户能访问的任意绝对路径
+# （与 run/exec 同等）。要收紧或关闭再写下面这块：
+# file_transfer:
+#   allow_roots:             # 仅允许这些绝对前缀（不配则全盘开放）
+#     - /srv/local/<user>
+#     - /tmp
+#   # allow_roots: []        # 显式空列表 = 彻底禁用 push/pull
 ```
 
 字段语义：
@@ -268,11 +269,14 @@ file_transfer:
 | `session`     | 这个 agent 服务的 session id |
 | `nid`         | 节点 id；session 内必须唯一 |
 | `tunnel_addr` | broker 反向隧道控制端口（默认 `host:7000`） |
-| `file_transfer.allow_roots` | `tether push` 写、`tether pull` 读允许触达的绝对路径前缀列表；**为空 → push/pull 直接回 `transfer_disabled`** |
+| `file_transfer.allow_roots` | `tether push`/`pull` 路径策略：**键缺省 → 全盘开放**（= run/exec 触达）；**非空列表 → 收紧**到这些绝对前缀；**显式 `[]` → 禁用**（`transfer_disabled`） |
 
-`allow_roots` 比对方式：先 `EvalSymlinks` 解析目标路径的父目录，再做"前缀 + `/`" 严格匹配，
-所以中间的目录软链允许（解析后落在 root 内即可），叶子层符号链接一律拒绝
-（`O_NOFOLLOW` + `lstat` 双道防线）。
+`allow_roots` **是可选收紧而非安全边界**：member 本就有不受限的 `run`/`exec`
+（requirements §9.3），随时能绕过白名单。配了 `allow_roots` 时的比对方式：先
+`EvalSymlinks` 解析目标路径的父目录，再做"前缀 + `/`" 严格匹配（中间目录软链允许、
+解析后落在 root 内即可）。叶子层符号链接、TOCTOU、必须普通文件等**机制级加固在
+所有模式下都生效**（`O_NOFOLLOW` + `lstat` 双道防线），防的是 agent 机器上的敌对
+非 member 进程，与白名单是否配置无关。
 
 可手动编辑；优先级：**显式 CLI flag > yaml > cobra 默认值**。
 
@@ -929,8 +933,12 @@ NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让
 
 1. broker 必须已开 JetStream（用 tarball install 写出的 nats.conf 缺省即开）；
    否则 tier-B 会以 `jetstream_unavailable` 拒掉；
-2. 目标 agent 的 `agent.yaml` 里必须配 `file_transfer.allow_roots`；
-   为空 → push/pull 直接以 `transfer_disabled` 拒。
+2. push/pull **默认开放**（无需配置）：不配 `file_transfer.allow_roots` 时，
+   远端路径可达 agent 用户能访问的**任意绝对路径**（与 `run`/`exec` 同等触达）。
+   `allow_roots` 是**可选收紧**；显式 `allow_roots: []`（空列表）则**禁用**
+   push/pull（`transfer_disabled`）。`agent.yaml` 使用严格字段校验，拼错
+   `file_transfer` / `allow_roots` 会直接拒绝启动，不会静默回落到开放模式。
+   详见下方「安全模型」与「升级说明」。
 
 **命令**：
 
@@ -944,14 +952,18 @@ tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m]
 | 参数 | 说明 |
 |---|---|
 | `<local-path>` | ctl 所在机器上的本地文件路径，可为相对/绝对 |
-| `<nid>:<remote-path>` | 目标节点 + 该节点上的**绝对**路径；`<remote-path>` 必须落在 `allow_roots` 内 |
+| `<nid>:<remote-path>` | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
 | `--force` | 目标已存在时覆盖；缺省直接拒（`dst_exists`） |
 | `--timeout` | 整次传输上限，缺省 10min（tier A 一般 < 30s，tier B 取决于带宽） |
 
 **安全模型**（plan §"Refusing dangerous paths"）：
 
-- 远端路径**必须绝对**且落在 `allow_roots` 任一前缀下；中间目录的软链
-  允许，落地叶子的软链一律拒（`O_NOFOLLOW`）；
+- 远端路径**必须绝对**。缺省（未配 `allow_roots`）可达任意路径；配置后须落在
+  某前缀下（否则 `path_outside_roots`）。`allow_roots` 是**便利性收紧而非安全
+  边界**——member 本就有不受限的 `run`/`exec`（requirements §9.3），随时能绕过；
+  但叶子软链 / TOCTOU / 普通文件等**机制级加固在所有模式下都生效**（中间目录
+  软链先解析到真实目录；随后父目录逐级 `openat(O_NOFOLLOW)` 固定，落地叶子软链
+  一律拒绝），防的是 agent 机器上的敌对**非 member** 进程；
 - 父目录不存在 → `path_parent_missing`（push）或 `path_not_found`（pull）；
   v0.2.0 不自动 `mkdir -p`，需手动 `tether exec <nid> -- mkdir -p ...`；
 - pull 还会做 dev+inode TOCTOU 校验（`lstat` 与 `open` 之间的换底攻击）；
@@ -984,16 +996,32 @@ broker 永远是 single audit writer。
 
 | code | 含义 |
 |---|---|
-| `transfer_disabled` | 目标 agent 的 `allow_roots` 为空 |
-| `path_outside_roots` | 远端路径不在 `allow_roots` 任一前缀下 |
+| `transfer_disabled` | 目标 agent 配了显式 `allow_roots: []`（关闭 push/pull） |
+| `path_outside_roots` | 配了 `allow_roots` 收紧，且远端路径不在任一前缀下 |
 | `path_parent_missing` / `path_not_found` | 父目录不存在 / 源文件不存在 |
 | `not_a_regular_file` | 叶子是软链 / 设备 / 目录 |
 | `dst_exists` | 目标已存在；加 `--force` 覆盖 |
-| `sha_mismatch` | 接收端校验 SHA-256 失败（线上字节翻转 / 攻击） |
+| `sha_mismatch` / `size_mismatch` | 接收端在提交目标文件前发现 SHA-256 / 字节数不符 |
+| `path_race` | 校验后父目录或文件 inode 被并发替换，操作已拒绝 |
 | `too_large` | 文件 > 2 GiB |
 | `jetstream_unavailable` | tier-B 但 broker 没开 JetStream |
 | `node_offline` / `not_a_member` | 目标节点离线 / 调用者不是 session 成员 |
 | `not_owner_or_creator` | finalize 阶段 actor 跟 transfer 创建者不一致（防伪造） |
+
+> **升级说明（v0.4.0 行为变更）**：v0.3.x 及更早版本里"未配 `allow_roots`"
+> 等价于 push/pull **禁用**（含 `install.sh` 写出的默认 `agent.yaml`——它根本
+> 不含 `file_transfer` 块）。自本版起，**未配 = 全盘开放**（与 `run`/`exec` 同等
+> 触达）。
+>
+> | `agent.yaml` 配置 | 旧行为 | 新行为 |
+> |---|---|---|
+> | 无 `file_transfer` / `allow_roots` 键 | 禁用 | **开放（全盘）** |
+> | `allow_roots: [/a, /b]`（非空） | 收紧到这些前缀 | 不变 |
+> | `allow_roots: []`（显式空列表） | 禁用 | 不变（仍禁用） |
+>
+> 想在升级后保持关闭：在 `agent.yaml` 的 `file_transfer:` 下加一行 `allow_roots: []`
+> 并重启 agent。无 wire/proto 变更（`ProtoVersion` 仍为 1），换二进制重启即可，
+> 无需重装。开放模式下 agent 启动会打一条 WARN 提示当前为全盘触达。
 
 ### 5.11 `tether history`
 
@@ -1287,7 +1315,7 @@ tether history --kind transfer -n 20     # 仅 push/pull
 ### 6.7 上传 / 下载文件（push / pull）
 
 ```bash
-# 把本地脚本送到 a100，落到 agent allow_roots 内的绝对路径
+# 把本地脚本送到 a100 的某绝对路径（缺省可达任意路径，配了 allow_roots 才收紧）
 tether push ./train.py a100:/srv/local/alice/jobs/train.py
 
 # 拉日志回来
@@ -1302,8 +1330,8 @@ rsync -av --progress big-dataset/ rsync@broker:14001/...
 ```
 
 排查：
-- `tether push` 报 `transfer_disabled` → agent.yaml `file_transfer.allow_roots` 没配；
-- `path_outside_roots` → 远端绝对路径不在 `allow_roots` 任一前缀下；
+- `tether push` 报 `transfer_disabled` → agent.yaml 里 `file_transfer.allow_roots: []`（显式关闭）；删掉该键即恢复开放；
+- `path_outside_roots` → 配了 `allow_roots` 收紧，远端绝对路径不在任一前缀下；
 - `dst_exists` → 远端已有同名文件，加 `--force` 覆盖；
 - `jetstream_unavailable` → broker 没开 JetStream，tier B 走不了；
 - 详细 audit：`tether history --kind transfer -n 20`。
