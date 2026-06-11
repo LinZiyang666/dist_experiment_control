@@ -419,3 +419,34 @@ timan108          ONLINE  4s         1      0.1.3
 | OFF kill switch | **PASS** | `proxy off` 后公网口 `:14000` 连接 refused(监听已关),`proxy status` = OFF,ctl/WSS 不受影响(5 节点仍 ONLINE) |
 
 > F6 出口阻塞**已闭合**。lab 现状:proxy OFF(测试前后一致)、无残留订阅、5 agent + broker 均 v0.3.0。SS 客户端验证脚本见 `/tmp/ssclient`(经典 chacha20-ietf-poly1305 AEAD,与 Clash for Windows 同协议)。
+
+---
+
+## transfer-unrestrict 真机验收 —— **已在 pc732.emulab.net (weiland.top) 上跑通（2026-06-11, v0.3.2）**
+
+push/pull 的 `allow_roots` 从"必配、空=禁用"改为可选收紧(缺省=全盘开放,= run/exec 触达);
+路径/传输加固(openat 父目录钉定、linkat 原子无覆盖、tier-B 验后提交、流式 size 上限、严格
+config 解析)。详见 `docs/reviews/transfer-unrestrict-{plan,review,external-review}.md`。
+
+**全线升级**(经 `tether exec pc732 -- sudo` + `systemd-run`,本机无 SSH;proto 仍 v1,无需重装):
+- ctl(笔记本)v0.3.1 → **v0.3.2**(本地 `make build VERSION=v0.3.2` + 装到 `~/.local/bin/tether`)。
+- 5 个 ONLINE agent(pc732/timan1/timan107/timan108/weiland-optiplex-7050)经 `tether node upgrade --all`
+  v0.3.1 → **v0.3.2**(GitHub release linux_amd64 tarball + SHA256,syscall.Exec 原地换,PID 不变,reconcile)。
+- broker daemon `/usr/local/bin/tether serve` v0.3.1 → **v0.3.2**(下载校验 + `mv` 原子换 +
+  `systemd-run --on-active=3 systemctl restart tether-broker`,避免掐断 exec 自身连接)。
+- 3 个 OFFLINE agent(a100/jupyter-xuanlel2/jupyter-ziyang10,v0.2.8)未升(离线,上线后重装/upgrade)。
+
+**验收结果**(15/15 PASS;脚本经 ctl→broker→agent 真链路,SHA256 双向校验):
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| **默认开放(headline)** | **PASS** | 这些 agent `agent.yaml` 无 `file_transfer` 块——0.3.1 时 push/pull 是 `transfer_disabled`(废);升 0.3.2 后 tier-A push 到 `timan1:/tmp/…` 成功、SHA 与本地一致 |
+| **全盘触达(非 /tmp)** | **PASS** | open 模式 push 到 `$HOME`:`timan1:/srv/local/zixuans8/tether-home/…`、`optiplex:/home/weiland/.tether-agent/…`,SHA 一致——证明可达任意绝对路径(旧默认会拒) |
+| **tier-A 往返** | **PASS** | push→`exec sha256sum`→pull-back,本地==远端==回拉,2 台 agent 各一组 |
+| **tier-B(12 MiB, JetStream)** | **PASS** | timan1:>8MiB 自动走 tier=b(object store + 验后提交),push/pull SHA 双向一致 |
+| **`dst_exists` / `--force`** | **PASS** | 已存在目标不加 `--force` → `dst_exists`;加 `--force` → 覆盖成功 |
+| **`path_parent_missing`** | **PASS** | push 到 `/no-such-<r>/x` → `path_parent_missing`(open 模式不自动 mkdir) |
+
+> transfer-unrestrict **已闭合**。lab 现状:ctl + broker + 5 ONLINE agent 全 **v0.3.2**(proto v1);
+> 测试文件已清理。off-switch(`allow_roots: []`)与 narrow 模式未在生产 agent 上重配验证(需改 yaml +
+> 重启 agent,侵入),由单测 + e2e + 外审黑盒复现覆盖(含 F11 空中间文档 fail-open 回归)。
