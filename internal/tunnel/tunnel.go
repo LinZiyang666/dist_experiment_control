@@ -249,6 +249,25 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Pre-fence BEFORE writing OK: a CloseProxy(port) / CloseSession(sid) /
+	// ForgetSession(sid) that landed while we were paused in tokenLookup must
+	// abort HERE — before the agent's Open() sees OK — so a forgotten session
+	// never receives an authorized reply and the just-bound listener is torn
+	// down before it can be dialed. Without this gate, OK below returns the
+	// agent's Open() while the listener is still bound, and the post-yamux
+	// re-check only closes it later — a window the round-6 ForgetSession test
+	// loses under load. The post-yamux re-check stays as the authoritative
+	// install-time fence for the residual snapshot→install window.
+	s.mu.Lock()
+	fenced := s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen
+	s.mu.Unlock()
+	if fenced {
+		_ = publicLn.Close()
+		_, _ = conn.Write([]byte("DENY session_closed\n"))
+		_ = conn.Close()
+		return
+	}
+
 	if _, err := conn.Write([]byte("OK\n")); err != nil {
 		_ = publicLn.Close()
 		_ = conn.Close()
