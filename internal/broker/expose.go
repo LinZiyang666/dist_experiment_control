@@ -58,6 +58,19 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 	// only "token_unknown_or_revoked" leaks.
 	a, err := port.LookupByTokenHash(b.cfg.DB, tokenHash)
 	if err != nil {
+		if !errors.Is(err, port.ErrNotFound) {
+			// A TRANSIENT store fault must NOT masquerade as a revocation: a
+			// reconnecting agent treats token_unknown_or_revoked as terminal
+			// (proxy off) and stops forever — the false-online incident, this
+			// time DB-triggerable. Emit a distinct transient reason the agent
+			// retries. This leaks nothing: try_again fires only on the broker's
+			// own DB fault, never as a function of token validity — the F6
+			// anti-enumeration collapse below (absent/mismatch/off → one code)
+			// is preserved.
+			b.cfg.Logger.Warn("tunnel: token lookup transient store error",
+				"sid", sid, "nid", nid, "port", publicPort, "err", err)
+			return fmt.Errorf("try_again")
+		}
 		return fmt.Errorf("token_unknown_or_revoked")
 	}
 	if a.Port != publicPort || a.SID != sid || a.NID != nid {
@@ -71,7 +84,21 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 	// between CloseProxy and port.Free, a REGISTER must be denied while proxy is
 	// OFF — otherwise the kill switch leaks an exit through a re-REGISTER race.
 	if a.Name == port.ProxyPortName {
-		if on, err := session.GetProxyEnabled(b.cfg.DB, sid); err != nil || !on {
+		on, err := session.GetProxyEnabled(b.cfg.DB, sid)
+		if err != nil {
+			// Same transient-vs-authoritative split as the lookup above (Fix C):
+			// a store fault on the dominant __proxy__ reconnect path must NOT be
+			// folded into the terminal token_unknown_or_revoked, or the exact
+			// DB-hiccup false-terminal hole Fix C closes reopens one query later.
+			// try_again leaks nothing — it fires only on the broker's own DB
+			// fault, never as a function of switch state or token validity.
+			b.cfg.Logger.Warn("tunnel: proxy-enabled check transient store error",
+				"sid", sid, "port", publicPort, "err", err)
+			return fmt.Errorf("try_again")
+		}
+		if !on {
+			// Authoritative: the master switch is OFF — terminal kill switch (a
+			// re-REGISTER must NOT resurrect a disabled exit).
 			return fmt.Errorf("token_unknown_or_revoked")
 		}
 	}

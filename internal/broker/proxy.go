@@ -617,8 +617,26 @@ func (b *Broker) repairProxy(sid, nid string, agentGen, agentEpoch int64) {
 		return
 	}
 
-	// ON, not converged → push the current keyset (covers not-ready retry,
-	// generation/epoch mismatch).
+	// Fix D (proxy-tunnel-reconnect): suppress a keyset nudge whose ONLY trigger
+	// is !ready at the current (gen, epoch). Such a node is either self-healing
+	// its data-plane tunnel (the agent's reconnect re-publishes ready itself) or
+	// authoritatively terminal (revoked/disabled exit — must stay down). A
+	// keyset re-push here would hit the agent `default:` (srv!=nil) branch and
+	// re-ACK ready=true every heartbeat, flapping the node in/out of /sub for
+	// the whole outage. A genuine gen/epoch divergence still falls through.
+	//
+	// NOTE: brokerGen here is the PRE-escalation snapshot (:588). That is
+	// intentional: if the escalation branch above raised b.proxyGen past agentGen,
+	// then agentGen != brokerGen(snapshot), so this guard does NOT suppress and the
+	// push below fires — an escalated node always converges. The guard only fires
+	// for a node already at the broker's pre-escalation pair, which is the
+	// self-healing / authoritative-terminal case.
+	if !ready && agentGen == brokerGen && agentEpoch == epoch {
+		return
+	}
+
+	// ON, not converged → push the current keyset (covers generation/epoch
+	// mismatch; the not-ready-only case is handled above).
 	keys, err := b.activeProxyKeys(sid)
 	if err != nil {
 		return

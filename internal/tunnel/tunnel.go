@@ -30,10 +30,14 @@
 //     pipes bytes both ways with io.Copy. The public TCP client
 //     sees the bytes the local server sent and vice-versa.
 //
-// One yamux session per (agent, public_port). Session breakage
-// (network blip, agent restart, etc.) is detected by both sides as a
-// closed yamux session; agent re-registers from state.json on its
-// next ConnectAll() call.
+// One yamux session per (agent, public_port). Session breakage (network
+// blip, etc.) is detected by both sides as a closed yamux session. The
+// agent side runs a per-port supervisor goroutine that re-dials +
+// re-REGISTERs with capped backoff (the broker's still-ALLOCATED row +
+// token_hash re-authorize it), surfaces up/down to the owner via the
+// session-state hook, and stops permanently on an authoritative DENY
+// (proxy off / revoke). On a full agent restart the tunnel is instead
+// rebuilt from state.json (see agent.replayPortsFromState).
 package tunnel
 
 import (
@@ -46,6 +50,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -54,6 +59,35 @@ import (
 
 	"github.com/hashicorp/yamux"
 )
+
+// ErrRegisterDenied wraps every broker DENY reply. errors.Is(err,
+// ErrRegisterDenied) is true for a *DenyError; the reconnect loop then
+// classifies the Reason as terminal (stop) or transient (retry).
+var ErrRegisterDenied = errors.New("tunnel: broker denied REGISTER")
+
+// DenyError carries the broker's DENY reason string for terminal-vs-
+// transient classification (see denyIsTransient).
+type DenyError struct{ Reason string }
+
+func (e *DenyError) Error() string { return "tunnel: broker denied REGISTER: " + e.Reason }
+
+func (e *DenyError) Is(target error) bool { return target == ErrRegisterDenied }
+
+// denyIsTransient reports whether a DENY reason is worth retrying. Only
+// the broker's two non-authoritative reasons are transient: a public-port
+// bind race (the old listener is mid-teardown) and a broker-side store
+// fault (try_again, see broker.tunnelTokenLookup). Every other reason —
+// including any UNKNOWN one from a newer broker — is treated terminal:
+// the safe default is to stop rather than hammer a broker that
+// authoritatively refused us.
+func denyIsTransient(reason string) bool {
+	switch reason {
+	case "public_port_bind_failed", "try_again":
+		return true
+	default:
+		return false
+	}
+}
 
 // TokenLookup is what the broker calls on each REGISTER to decide
 // allow/deny. Returns nil if (sid, nid, port, token) maps to an
@@ -506,7 +540,8 @@ func (s *Server) Close() {
 // ----- agent side -----------------------------------------------------------
 
 // Client is the agent side. Owns one yamux session per public port the
-// broker has authorized us to expose. Reconnects on session loss.
+// broker has authorized us to expose, plus one supervisor goroutine per
+// port that re-dials with capped backoff on session loss (see supervise).
 type Client struct {
 	brokerAddr      string
 	sid             string
@@ -514,17 +549,25 @@ type Client struct {
 	localPortLookup LocalPortLookup
 	logger          *slog.Logger
 
-	mu       sync.Mutex
-	sessions map[int]*clientSession // public port -> session
-	ctx      context.Context
-	cancel   context.CancelFunc
+	backoffBase time.Duration // first redial wait (default 500ms)
+	backoffMax  time.Duration // redial wait ceiling (default 30s)
+
+	mu        sync.Mutex
+	sessions  map[int]*clientSession        // public port -> session
+	nextGen   uint64                        // monotonic generation stamp (mu-guarded)
+	stateHook func(publicPort int, up bool) // set once before Start; nil = no-op
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type clientSession struct {
 	publicPort int
-	conn       net.Conn
-	yamuxSess  *yamux.Session
-	cancel     context.CancelFunc
+	localPort  int                // redial target; reused across redials
+	token      string             // in-memory only; NEVER logged, NEVER persisted here
+	conn       net.Conn           // swapped in place on a successful redial (under c.mu)
+	yamuxSess  *yamux.Session     // swapped in place on a successful redial (under c.mu)
+	cancel     context.CancelFunc // ONE per generation, for life (the sole stop signal)
+	gen        uint64             // fences a stale supervisor against a concurrent Open/Close
 }
 
 // NewClient returns an agent-side tunnel client.
@@ -535,7 +578,32 @@ func NewClient(brokerAddr, sid, nid string, lookup LocalPortLookup, logger *slog
 		nid:             nid,
 		localPortLookup: lookup,
 		logger:          logger,
+		backoffBase:     500 * time.Millisecond,
+		backoffMax:      30 * time.Second,
 		sessions:        map[int]*clientSession{},
+	}
+}
+
+// SetSessionStateHook installs a callback fired (off any lock) whenever a
+// supervised port's data plane transitions up/down: on the first drop
+// (up→down), on every successful redial (down→up), and a final down
+// before a terminal-DENY exit. Set it once before Start. The agent wires
+// this to publish proxy ready/unready so /sub tracks real liveness.
+func (c *Client) SetSessionStateHook(fn func(publicPort int, up bool)) {
+	c.mu.Lock()
+	c.stateHook = fn
+	c.mu.Unlock()
+}
+
+// notifyState invokes the session-state hook (nil-guarded) OUTSIDE c.mu.
+// The supervisor that calls this owns transition de-duplication, so this
+// fires only on a genuine up/down edge.
+func (c *Client) notifyState(publicPort int, up bool) {
+	c.mu.Lock()
+	hook := c.stateHook
+	c.mu.Unlock()
+	if hook != nil {
+		hook(publicPort, up)
 	}
 }
 
@@ -557,47 +625,19 @@ func (c *Client) Start(ctx context.Context) {
 }
 
 // Open establishes (or replaces) a yamux session for one (publicPort,
-// token) pair. localPort is the agent-side port to dial when the
-// broker pushes a new stream. Blocks until REGISTER is acknowledged
-// (or fails fast on DENY).
+// token) pair and starts its supervisor. localPort is the agent-side port
+// to dial when the broker pushes a new stream. Blocks on the FIRST dial +
+// REGISTER (so AddProxy's rollback contract sees a first-attempt failure)
+// and returns that error verbatim. AFTER a successful Open, transient
+// session drops are recovered by the supervisor's reconnect loop; the
+// caller is not involved again unless it calls Close.
 func (c *Client) Open(publicPort, localPort int, token string) error {
 	if c.ctx == nil {
 		return errors.New("tunnel client: Start not called")
 	}
-	// TLS dial wraps the underlying TCP so REGISTER + token cannot be
-	// observed by a passive listener between agent and broker
-	// (architecture F.5). v1 falls back to InsecureSkipVerify because
-	// the broker's self-signed cert has no PKI to validate against;
-	// the threat model F.5 actually targets is passive eavesdrop and
-	// that's still satisfied. See clientTLSConfig().
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", c.brokerAddr, clientTLSConfig())
+	conn, yamuxSess, err := c.dialAndRegister(c.ctx, publicPort, token)
 	if err != nil {
-		return fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
-	}
-	line := fmt.Sprintf("REGISTER %s %s %d %s\n", c.sid, c.nid, publicPort, token)
-	if _, err := conn.Write([]byte(line)); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("tunnel client: write REGISTER: %w", err)
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	br := bufio.NewReader(conn)
-	resp, err := br.ReadString('\n')
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("tunnel client: read REGISTER reply: %w", err)
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-	resp = strings.TrimRight(resp, "\r\n")
-	if resp != "OK" {
-		_ = conn.Close()
-		return fmt.Errorf("tunnel client: broker denied REGISTER: %s", resp)
-	}
-
-	yamuxSess, err := yamux.Client(conn, nil)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("tunnel client: yamux client: %w", err)
+		return fmt.Errorf("tunnel client: Open: %w", err)
 	}
 	sessCtx, cancel := context.WithCancel(c.ctx)
 
@@ -614,22 +654,214 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 		return fmt.Errorf("tunnel client: Open after Start ctx cancel: %w", err)
 	}
 	if old, ok := c.sessions[publicPort]; ok {
+		// Replace a prior session (re-expose / full proxy rebuild). Canceling
+		// its ctx retires the old supervisor; bumping nextGen fences it out of
+		// swapTransport/dropSession on this port.
 		old.cancel()
 		_ = old.conn.Close()
 		_ = old.yamuxSess.Close()
 	}
+	c.nextGen++
+	gen := c.nextGen
 	c.sessions[publicPort] = &clientSession{
 		publicPort: publicPort,
+		localPort:  localPort,
+		token:      token,
 		conn:       conn,
 		yamuxSess:  yamuxSess,
 		cancel:     cancel,
+		gen:        gen,
 	}
 	c.mu.Unlock()
 
-	go c.streamAcceptLoop(sessCtx, publicPort, localPort, yamuxSess)
+	go c.supervise(sessCtx, publicPort, localPort, token, gen, yamuxSess)
 	c.logger.Info("tunnel: opened",
 		"public_port", publicPort, "local_port", localPort)
 	return nil
+}
+
+// dialAndRegister performs ONE TLS dial + REGISTER handshake + yamux client
+// setup. ctx cancels both the dial (DialContext) AND an in-flight handshake
+// read/write (a watcher closes the conn on ctx.Done) so Close/Start-cancel
+// reap a blocked redial promptly instead of waiting out the 5s read deadline.
+// A broker DENY returns *DenyError (wraps ErrRegisterDenied); all transport
+// failures return plain (transient) errors.
+//
+// TLS wraps the underlying TCP so REGISTER + token cannot be observed by a
+// passive listener (architecture F.5); v1 InsecureSkipVerify is sufficient
+// for the passive-eavesdrop threat model (see clientTLSConfig).
+func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token string) (net.Conn, *yamux.Session, error) {
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: clientTLSConfig()}
+	conn, err := dialer.DialContext(ctx, "tcp", c.brokerAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
+	}
+	// Close the conn on ctx.Done until the handshake completes so a blocked
+	// Write/ReadString is interrupted by Close/Start-cancel. On the success
+	// path stopHS fires before any later ctx.Done can reach the conn; if ctx
+	// is ALREADY canceled we're shutting down, so closing the fresh conn is
+	// correct (the supervisor discards it on ctx.Err()).
+	hsDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-hsDone:
+		}
+	}()
+	defer close(hsDone)
+
+	line := fmt.Sprintf("REGISTER %s %s %d %s\n", c.sid, c.nid, publicPort, token)
+	if _, err := conn.Write([]byte(line)); err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("tunnel client: write REGISTER: %w", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := br.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("tunnel client: read REGISTER reply: %w", err)
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	resp = strings.TrimRight(resp, "\r\n")
+	if resp != "OK" {
+		_ = conn.Close()
+		reason := strings.TrimSpace(strings.TrimPrefix(resp, "DENY"))
+		return nil, nil, &DenyError{Reason: reason}
+	}
+
+	yamuxSess, err := yamux.Client(conn, nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("tunnel client: yamux client: %w", err)
+	}
+	return conn, yamuxSess, nil
+}
+
+// supervise owns one (publicPort, generation) for life: it runs the accept
+// loop on the current yamux session, and on a session drop re-dials with
+// backoff, swapping the live transport in place. It exits ONLY on ctx
+// cancel (Close / Start-cancel / a newer Open replacing this port) or a
+// terminal DENY (proxy off / revoke). The loop structure makes the state
+// hook fire exactly once per edge: one notifyState(false) per drop, one
+// notifyState(true) per successful reconnect — they strictly alternate.
+func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token string, gen uint64, initial *yamux.Session) {
+	sess := initial
+	for {
+		c.runAcceptLoop(ctx, publicPort, localPort, sess)
+		if ctx.Err() != nil {
+			return // intentional teardown — owner already knows; no callback
+		}
+		c.notifyState(publicPort, false) // down edge (one per drop)
+		conn, ys, err := c.redialWithBackoff(ctx, publicPort, token)
+		if err != nil {
+			// ctx-cancel or terminal DENY: the down edge above is the final
+			// state; drop the slot so status reflects a dead exit, then stop.
+			c.dropSession(publicPort, gen)
+			return
+		}
+		if !c.swapTransport(publicPort, gen, conn, ys) {
+			// A concurrent Open/Close superseded us. Close the freshly-dialed
+			// transport (FD-leak guard) and let the new owner take over.
+			_ = conn.Close()
+			_ = ys.Close()
+			return
+		}
+		sess = ys
+		c.notifyState(publicPort, true) // up edge (one per reconnect)
+	}
+}
+
+// redialWithBackoff retries dialAndRegister with full-jitter exponential
+// backoff until it succeeds, hits a terminal error (terminal DENY or ctx
+// cancel), or ctx is done. Returns the new transport on success, or a
+// non-nil error on terminal stop.
+func (c *Client) redialWithBackoff(ctx context.Context, publicPort int, token string) (net.Conn, *yamux.Session, error) {
+	sleep := c.backoffBase
+	for {
+		timer := time.NewTimer(jitter(sleep))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, nil, ctx.Err()
+		case <-timer.C:
+		}
+		conn, ys, err := c.dialAndRegister(ctx, publicPort, token)
+		if err == nil {
+			return conn, ys, nil
+		}
+		var de *DenyError
+		if errors.As(err, &de) && !denyIsTransient(de.Reason) {
+			// Authoritative refusal (proxy off / revoke / unknown reason):
+			// stop. A revoked exit can never be resurrected by reconnect.
+			c.logger.Warn("tunnel: reconnect denied, stopping",
+				"public_port", publicPort, "reason", de.Reason)
+			return nil, nil, err
+		}
+		// Transient (network error OR a transient DENY): back off and retry.
+		if de != nil {
+			c.logger.Info("tunnel: reconnect transient DENY, retrying",
+				"public_port", publicPort, "reason", de.Reason)
+		}
+		sleep *= 2
+		if sleep > c.backoffMax {
+			sleep = c.backoffMax
+		}
+	}
+}
+
+// swapTransport replaces a supervised port's live conn+yamux in place IFF
+// the slot still belongs to this generation (not superseded by a concurrent
+// Open/Close). Returns false to tell the caller to discard its freshly-dialed
+// transport. KEEPS the same cancel — the one-cancel-for-life invariant.
+func (c *Client) swapTransport(publicPort int, gen uint64, conn net.Conn, ys *yamux.Session) bool {
+	c.mu.Lock()
+	cur, ok := c.sessions[publicPort]
+	if !ok || cur.gen != gen {
+		c.mu.Unlock()
+		return false
+	}
+	oldConn, oldYS := cur.conn, cur.yamuxSess
+	cur.conn = conn
+	cur.yamuxSess = ys
+	c.mu.Unlock()
+	// Close the predecessor transport AFTER releasing c.mu. On a HALF-OPEN drop
+	// (the residential-link case) the old conn's fd + yamux goroutines are not
+	// yet reaped — the local side only saw a keepalive timeout, not a peer FIN —
+	// so without this every reconnect would leak one fd + yamux internals,
+	// unbounded over a long flaky-link outage. Closing an already-closed
+	// conn/session (the clean-drop path) is a harmless no-op.
+	_ = oldYS.Close()
+	_ = oldConn.Close()
+	return true
+}
+
+// dropSession removes a supervised port's slot IFF it still belongs to this
+// generation, scrubbing the cached token. A no-op if a newer Open already
+// replaced the slot.
+func (c *Client) dropSession(publicPort int, gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur, ok := c.sessions[publicPort]; ok && cur.gen == gen {
+		// Release the per-session ctx (and its children) — matching Close and the
+		// Open-replace path. On the terminal-DENY exit the sessCtx was NEVER
+		// canceled, so without this its cancelCtx lingers in c.ctx's children list
+		// until the whole agent run-ctx ends; repeated revoke/off cycles would
+		// accumulate them. Idempotent on the ctx-cancel path (already canceled).
+		cur.cancel()
+		cur.token = ""
+		delete(c.sessions, publicPort)
+	}
+}
+
+// jitter returns a full-jitter sleep in (0, d]. Per-attempt randomness
+// de-synchronizes a fleet reconnecting after a shared broker blip.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d)) + 1)
 }
 
 // Close drops the session for one public port (e.g. after expose-rm).
@@ -647,7 +879,11 @@ func (c *Client) Close(publicPort int) {
 	_ = sess.yamuxSess.Close()
 }
 
-func (c *Client) streamAcceptLoop(ctx context.Context, publicPort, localPort int, sess *yamux.Session) {
+// runAcceptLoop pumps streams off ONE yamux session value (passed in, not
+// re-read from c.sessions — keeps the hot path lock-free) until that session
+// errors. It returns on any Accept error; the caller (supervise) checks
+// ctx.Err() to tell an intentional close from a drop that warrants a redial.
+func (c *Client) runAcceptLoop(ctx context.Context, publicPort, localPort int, sess *yamux.Session) {
 	for {
 		stream, err := sess.Accept()
 		if err != nil {

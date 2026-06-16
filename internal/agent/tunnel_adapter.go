@@ -45,6 +45,14 @@ func (a *TunnelExposeAdapter) Start(ctx context.Context) {
 	a.client.Start(ctx)
 }
 
+// SetSessionStateHook forwards a data-plane up/down callback to the tunnel
+// client. The agent wires this (in agent.New) to publish proxy ready/unready
+// so /sub tracks real liveness. Pass-through: policy (the proxy-port filter)
+// lives in the agent, not here.
+func (a *TunnelExposeAdapter) SetSessionStateHook(fn func(publicPort int, up bool)) {
+	a.client.SetSessionStateHook(fn)
+}
+
 // AddProxy opens a tunnel session. Failure → caller (agent.handle
 // ExposeForwarded) rolls back state.json + replies frpc_failed to the
 // broker so the SQLite row is freed.

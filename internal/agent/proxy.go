@@ -210,6 +210,11 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 			a.cfg.Logger.Warn("agent: persist proxy state", "err", err)
 		}
 	}
+	// Publish the proxy public port for the tunnel session-state hook BEFORE
+	// opening the tunnel, so a drop/reconnect callback (fired on the supervisor
+	// goroutine the instant AddProxy spawns it) is correctly attributed to the
+	// proxy port rather than filtered out. Cleared on teardown / fail-cleanup.
+	a.proxyPublicPort.Store(int64(publicPort))
 	if err := a.cfg.ExposeAdapter.AddProxy(PortToken{
 		Name: proxyTokenName, Port: publicPort, LocalPort: lp, Token: token,
 	}); err != nil {
@@ -246,6 +251,7 @@ func (a *Agent) proxyFailCleanupLocked(p *proxyRuntime, nc *nats.Conn) {
 	p.publicPort = 0
 	p.localPort = 0
 	p.token = ""
+	a.proxyPublicPort.Store(0) // stop attributing tunnel transitions to the proxy
 	a.pubProxyReady(nc, false)
 }
 
@@ -253,6 +259,11 @@ func (a *Agent) proxyFailCleanupLocked(p *proxyRuntime, nc *nats.Conn) {
 // it also wipes the persisted footprint and ACKs unready (the proxy-off path);
 // when false it is a silent teardown ahead of an immediate rebuild.
 func (a *Agent) proxyTeardownLocked(p *proxyRuntime, nc *nats.Conn, clearPersist bool) {
+	// Close the readiness-hook filter FIRST (before RemoveProxy → Client.Close
+	// cancels the supervisor), so any final supervisor edge fired during
+	// teardown is filtered out and cannot publish a stale ready/unready for a
+	// port we're tearing down.
+	a.proxyPublicPort.Store(0)
 	if p.srv != nil {
 		if a.cfg.ExposeAdapter != nil {
 			_ = a.cfg.ExposeAdapter.RemoveProxy(proxyTokenName, p.publicPort)
@@ -340,7 +351,8 @@ const proxyTokenName = "__proxy__"
 // broker's reconciliation + proxy directive. Runs on its own goroutine
 // (off the NATS callback goroutine) because register may retry.
 func (a *Agent) onNATSReconnect(nc *nats.Conn) {
-	a.cancelFailClosed() // B1: a reconnect cancels the fail-closed countdown
+	a.cancelFailClosed()  // B1: a reconnect cancels the fail-closed countdown
+	a.ncBox.Store(nc)     // keep the session-state hook publishing on the live conn
 	ctx := a.runCtx
 	if ctx == nil {
 		ctx = context.Background()

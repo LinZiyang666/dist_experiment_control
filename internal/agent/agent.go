@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -287,6 +288,42 @@ type Agent struct {
 	// arrival sequence; lastAppliedPushSeq is the highest applied (round-2 F2).
 	proxyApplyMu       sync.Mutex
 	lastAppliedPushSeq int64
+
+	// ncBox holds the current *nats.Conn so the lock-free tunnel session-state
+	// hook (fired on a supervisor goroutine, off p.mu/c.mu) can publish proxy
+	// ready/unready without threading nc through the tunnel layer. Stored in Run
+	// after connectNATS and re-stored in onNATSReconnect (the pointer is stable
+	// across nats.go auto-reconnect, but we re-store defensively).
+	ncBox atomic.Pointer[nats.Conn]
+
+	// proxyPublicPort is the lock-free mirror of the embedded proxy's public
+	// port (0 when not serving). The tunnel hook reads it to FILTER: only the
+	// __proxy__ port's up/down transitions may move proxy_ready — a flap on a
+	// regular `expose` port must not. Stored before AddProxy in proxyStartLocked,
+	// cleared on teardown / fail-cleanup.
+	proxyPublicPort atomic.Int64
+}
+
+// sessionStateHookSetter is the OPTIONAL capability a production ExposeAdapter
+// (TunnelExposeAdapter) implements to receive data-plane up/down transitions.
+// The in-process test adapter does not implement it, so the type assertion in
+// New simply skips wiring there.
+type sessionStateHookSetter interface {
+	SetSessionStateHook(fn func(publicPort int, up bool))
+}
+
+// onTunnelSessionState is the tunnel session-state hook. It publishes proxy
+// ready/unready ONLY for the embedded proxy's public port, so /sub and
+// `proxy status` track real data-plane liveness (Defect B fix). Lock-free: it
+// takes neither p.mu nor c.mu (AddProxy → tunnel.Open runs under p.mu, so a
+// hook needing p.mu would deadlock; lock order is p.mu → c.mu).
+func (a *Agent) onTunnelSessionState(publicPort int, up bool) {
+	if int64(publicPort) != a.proxyPublicPort.Load() {
+		return // not the proxy port — a regular expose flap, ignore
+	}
+	if nc := a.ncBox.Load(); nc != nil {
+		a.pubProxyReady(nc, up)
+	}
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -366,6 +403,12 @@ func New(cfg Config) (*Agent, error) {
 			"re-register and reconcile. Prefer a local-disk Home (e.g. /srv/local/<user>).",
 			"home", cfg.Home)
 	}
+	// Wire the tunnel data-plane liveness hook (Defect B). The production
+	// TunnelExposeAdapter implements sessionStateHookSetter; the in-process
+	// test adapter does not, so this is a no-op there.
+	if setter, ok := cfg.ExposeAdapter.(sessionStateHookSetter); ok {
+		setter.SetSessionStateHook(a.onTunnelSessionState)
+	}
 	return a, nil
 }
 
@@ -396,6 +439,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.ncBox.Store(nc) // publish nc for the lock-free tunnel session-state hook
 	defer func() { _ = nc.Drain() }()
 	// F9 / round-2 F4: drain in-flight proxy-keys handlers before the connection
 	// drains. Set proxyDraining FIRST (under the lock) so dispatch cannot Add a

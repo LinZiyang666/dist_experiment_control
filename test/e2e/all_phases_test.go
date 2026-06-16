@@ -118,6 +118,42 @@ func TestRemoteFSMatrix(t *testing.T) {
 		"./internal/agent/...", "./internal/proto/...", "./test/p4/...")
 }
 
+// TestProxyTunnelReconnectMatrix folds the proxy-tunnel-reconnect leaf
+// increment (docs/reviews/proxy-tunnel-reconnect-plan.md) into the
+// -tags e2e_matrix regression net. The data-plane reconnect supervisor +
+// readiness-liveness seam are concurrency surfaces, so the subset runs under
+// -race: a regression in the reconnect loop (DENY-terminal taxonomy, transient
+// retry, ctx-cancel, no-leak / no-double-owner), the broker token-lookup
+// transient split (Fix C), the repairProxy not-ready suppression (Fix D), or
+// the agent readiness hook (Fix B) thus fails `make e2e` too, not only `make test`.
+func TestProxyTunnelReconnectMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+
+	run := func(label string, args ...string) {
+		base := []string{"test", "-race", "-count=1", "-timeout", phaseTimeout.String()}
+		cmd := exec.Command("go", append(base, args...)...)
+		cmd.Dir = repoRoot
+		var buf bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &buf, &buf
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("proxy-tunnel-reconnect %s failed: %v\n--- output ---\n%s", label, err, buf.String())
+		}
+	}
+
+	// Fix A: tunnel reconnect mechanics (drop→rebind, DENY taxonomy, ctx-cancel,
+	// churn no-leak, reconnect-vs-Open race) — the whole reconnect surface.
+	run("tunnel", "-run", "Reconnect|Deny", "./internal/tunnel/...")
+	// Fix C + Fix D: broker token-lookup transient split + repairProxy gate.
+	run("broker", "-run", "TunnelTokenLookup|RepairProxy", "./internal/broker/...")
+	// Fix B: agent readiness hook (port filter + lock-order deadlock guard).
+	run("agent", "-run", "ProxyReadinessHook", "./internal/agent/...")
+	// Full-stack: real TunnelExposeAdapter + broker tunnel server + a severable
+	// relay — false-online recovery after a data-plane drop, and the disable-
+	// during-drop no-resurrection security invariant.
+	run("p13-fullstack", "-run", "FalseOnlineRecoversAfterTunnelDrop|DisableDuringTunnelDropStaysDown", "./test/p13/...")
+}
+
 func runPhase(t *testing.T, phase string) {
 	t.Helper()
 	// go test sets cwd to the package dir (test/e2e/), so the
