@@ -653,7 +653,7 @@ func TestHistoryKindEnum(t *testing.T) {
 	t.Setenv("TETHER_SESSION", "lab")
 	// Valid values: must NOT trigger the "must be one of" message.
 	// We expect a downstream NATS error (refused port) instead.
-	for _, k := range []string{"call", "proc", "port"} {
+	for _, k := range []string{"call", "proc", "port", "transfer"} {
 		t.Run("valid="+k, func(t *testing.T) {
 			home := t.TempDir()
 			_, _, err := runRoot(t, "history",
@@ -667,7 +667,9 @@ func TestHistoryKindEnum(t *testing.T) {
 			}
 		})
 	}
-	// Invalid values: must trip the explicit guard.
+	// Invalid values: must trip the explicit guard. Assert the FULL
+	// enum message (including transfer) — the old prefix-only substring
+	// `... call | proc | port` passed even when transfer was missing.
 	for _, k := range []string{"invalid", "calls", "proc!", "PORT"} {
 		t.Run("invalid="+k, func(t *testing.T) {
 			home := t.TempDir()
@@ -677,8 +679,8 @@ func TestHistoryKindEnum(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected --kind rejection for %q; got nil", k)
 			}
-			if !strings.Contains(err.Error(), "must be one of: call | proc | port") {
-				t.Errorf("expected enum-validation message; got %q", err.Error())
+			if !strings.Contains(err.Error(), "must be one of: call | proc | port | transfer") {
+				t.Errorf("expected full enum-validation message; got %q", err.Error())
 			}
 		})
 	}

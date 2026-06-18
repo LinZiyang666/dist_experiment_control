@@ -66,7 +66,9 @@ func TestHistoryKindTailCountsFilteredEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runHistoryFilteredTail(context.Background(), cons, &out, 100, 200*time.Millisecond); err != nil {
+	// Mirrors the real --kind path: matching count is unknown up front
+	// (known=false), so the drain relies on per-message NumPending.
+	if err := runHistoryFilteredTail(context.Background(), cons, &out, 100, false /*known*/, 0); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Count(out.String(), "CALL"); got != 50 {
