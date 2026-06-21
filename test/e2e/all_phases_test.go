@@ -90,6 +90,25 @@ func TestTransferDefaultsMatrix(t *testing.T) {
 // surfaces): a regression in PATH sanitization, the abandon/ceiling watchdog,
 // the broker Safe round-trip, or Component I thus fails `make e2e` too, not just
 // `make test`.
+// TestProxyDialMatrix runs the post-1.0 proxy-aware-dial leaf under -race, like
+// the other leaf matrices (the dialer is invoked concurrently on reconnect, so
+// the plan mandates -race — which the no-race runPhase default would not give).
+// The integration test (real TLS nats-server reached through a fake CONNECT
+// proxy) also guards the load-bearing "CustomDialer carries TCP before the
+// TLS/WebSocket handshake" fact against a nats.go createConn-order regression.
+func TestProxyDialMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", phaseTimeout.String(),
+		"./internal/proxydial/...", "./test/proxydial/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("proxydial matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
