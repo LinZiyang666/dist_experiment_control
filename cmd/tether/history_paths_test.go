@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -65,7 +66,7 @@ func TestHistorySnapshotDefaultReplaysEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runHistorySnapshot(context.Background(), cons, &out, 200*time.Millisecond); err != nil {
+	if err := runHistorySnapshot(context.Background(), cons, &out, true /*known*/, 15 /*pending*/); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	got := out.String()
@@ -80,10 +81,85 @@ func TestHistorySnapshotDefaultReplaysEverything(t *testing.T) {
 	}
 }
 
+// TestHistoryStartSeqTailReplaysExactlyLastN drives the real -n
+// unfiltered path end-to-end on embedded NATS: it derives the bounds
+// via historyReplayBounds (the production helper), builds the actual
+// DeliverByStartSequencePolicy ordered consumer at OptStartSeq, and
+// asserts runHistorySnapshot returns EXACTLY the last N entries — and
+// well under historyFirstMsgGrace, proving NumPending/count (not a
+// timer) drove completion. This is the shape the original bug hit
+// hardest and previously had zero coverage.
+func TestHistoryStartSeqTailReplaysExactlyLastN(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		t.Fatal(err)
+	}
+	const total = 30
+	for i := 1; i <= total; i++ {
+		publishAuditForHistoryTest(t, js, proto.SubjAuditCall("lab"), map[string]any{
+			"v": 1, "kind": "call", "ts": time.Now().UTC().Format(time.RFC3339Nano),
+			"session": "lab", "node": "n", "actor_fp": "SHA256:x",
+			"verb": fmt.Sprintf("exec-%d", i), "ok": true,
+		})
+	}
+	stream, err := js.Stream(context.Background(), jsstream.HistoryStreamName("lab"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := stream.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(t *testing.T, lastN, wantCount int, wantFirstVerb, wantLastVerb, absentVerb string) {
+		t.Helper()
+		b := historyReplayBounds("", lastN, info.State.Msgs, info.State.LastSeq)
+		cons, err := stream.OrderedConsumer(context.Background(), jetstream.OrderedConsumerConfig{
+			DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+			OptStartSeq:   b.startSeq,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		start := time.Now()
+		if err := runHistorySnapshot(context.Background(), cons, &out, b.known, b.pending); err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Fatalf("-n %d took %v — NumPending/count did not drive completion", lastN, elapsed)
+		}
+		got := out.String()
+		if c := strings.Count(got, "CALL"); c != wantCount {
+			t.Fatalf("-n %d: want %d CALL lines, got %d\n%s", lastN, wantCount, c, got)
+		}
+		if !strings.Contains(got, "verb="+wantFirstVerb) || !strings.Contains(got, "verb="+wantLastVerb) {
+			t.Errorf("-n %d: expected window [%s..%s]\n%s", lastN, wantFirstVerb, wantLastVerb, got)
+		}
+		if absentVerb != "" && strings.Contains(got, "verb="+absentVerb+" ") {
+			t.Errorf("-n %d: entry %s should be outside the window\n%s", lastN, absentVerb, got)
+		}
+	}
+
+	// N < Msgs: exactly the last 5 (exec-26..exec-30), exec-1 excluded.
+	t.Run("N<Msgs", func(t *testing.T) { run(t, 5, 5, "exec-26", "exec-30", "exec-1") })
+	// N >= Msgs: start=1, all 30 (exec-1..exec-30).
+	t.Run("N>=Msgs", func(t *testing.T) { run(t, 80, total, "exec-1", "exec-30", "") })
+}
+
 // TestHistorySnapshotEmptyStreamExitsCleanly: a brand-new stream
-// with zero entries must NOT hang — the idle window fires and
-// runHistorySnapshot returns nil. Catches the regression where
-// "wait for idle" relied on at least one delivered message.
+// with zero entries must NOT hang — the up-front consumer-pending
+// check (NumPending == 0) makes runHistorySnapshot return nil
+// immediately, without blocking on a Next() that would never fire.
 func TestHistorySnapshotEmptyStreamExitsCleanly(t *testing.T) {
 	url := testharness.StartJSNATS(t)
 	nc, err := nats.Connect(url)
@@ -112,7 +188,7 @@ func TestHistorySnapshotEmptyStreamExitsCleanly(t *testing.T) {
 	var out bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- runHistorySnapshot(context.Background(), cons, &out, 200*time.Millisecond)
+		done <- runHistorySnapshot(context.Background(), cons, &out, true /*known*/, 0 /*empty*/)
 	}()
 	select {
 	case err := <-done:
