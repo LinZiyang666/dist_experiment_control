@@ -10,7 +10,7 @@ import (
 )
 
 // TestNATSDeniesCrossSessionEvSubscribe — architecture P3 spec scenario:
-// "session A 的 token 订阅 tether.v1.s.<sidB>.ev.> → NATS permission denied".
+// "session A 的 token 订阅 tether.v2.s.<sidB>.ev.> → NATS permission denied".
 //
 // alice activates 'lab' (member). She tries to subscribe to 'prod.ev.>'.
 // NATS denies; nc.Subscribe returns no error (subscriptions are
@@ -28,7 +28,7 @@ func TestNATSDeniesCrossSessionEvSubscribe(t *testing.T) {
 	mustCreate(t, url, bob, "prod", "q")
 
 	// alice connects activated for "lab" — JWT permissions sub allow only
-	// `tether.v1.s.lab.ev.>`. Trying to sub `tether.v1.s.prod.ev.>` must be
+	// `tether.v2.s.lab.ev.>`. Trying to sub `tether.v2.s.prod.ev.>` must be
 	// denied at NATS.
 	errs := make(chan error, 4)
 	nc, err := cli.ConnectNATSWithNkey(url, alice,

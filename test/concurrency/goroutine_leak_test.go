@@ -97,7 +97,7 @@ func TestAgentRunCancelNoGoroutineLeak(t *testing.T) {
 	}
 	defer stub.Close()
 	if _, err := stub.Subscribe(
-		"tether.v1.ctrl.s.*.node.*.register.req",
+		"tether.v2.ctrl.s.*.node.*.register.req",
 		func(msg *nats.Msg) {
 			_ = msg.Respond([]byte(`{"OK":true}`))
 		},

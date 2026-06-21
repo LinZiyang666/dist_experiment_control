@@ -249,15 +249,15 @@ func FuzzSubjectParsers(f *testing.F) {
 		"",
 		".",
 		"tether",
-		"tether.v1",
-		"tether.v1.s..cmd.by..node...req",
-		"tether.v1.s.lab.cmd.by.U.node.lab-1.run.req",
-		"tether.v1.ctrl.by.UABCD.session.create.req",
-		"tether.v1.s.lab.ev.node.lab-1.proc.01hzxk.exit",
-		"tether.v1.ctrl.s.lab.node.lab-1.register.req",
+		"tether.v2",
+		"tether.v2.s..cmd.by..node...req",
+		"tether.v2.s.lab.cmd.by.U.node.lab-1.run.req",
+		"tether.v2.ctrl.by.UABCD.session.create.req",
+		"tether.v2.s.lab.ev.node.lab-1.proc.01hzxk.exit",
+		"tether.v2.ctrl.s.lab.node.lab-1.register.req",
 		strings.Repeat("a.", 200) + "b",
-		"tether.v1.s.lab.cmd.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.node.lab-1.run.req",
-		"tether.v1.s.*.cmd.by.>.node.*.>.req",
+		"tether.v2.s.lab.cmd.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.node.lab-1.run.req",
+		"tether.v2.s.*.cmd.by.>.node.*.>.req",
 	}
 	for _, s := range seeds {
 		f.Add(s)

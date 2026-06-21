@@ -22,9 +22,9 @@ func TestReleaseVersionDefault(t *testing.T) {
 
 func TestSubjectPrefixStable(t *testing.T) {
 	// Bumping SubjectPrefix without a ProtoVersion bump would silently break
-	// every subscriber. Pin them together.
-	if SubjectPrefix != "tether.v1" {
-		t.Fatalf("SubjectPrefix must equal 'tether.v1' for ProtoVersion=1, got %q", SubjectPrefix)
+	// every subscriber. Pin them together. v2 = distributed-broker D0 flip.
+	if SubjectPrefix != "tether.v2" {
+		t.Fatalf("SubjectPrefix must equal 'tether.v2' for ProtoVersion=2, got %q", SubjectPrefix)
 	}
 }
 
@@ -34,26 +34,26 @@ func TestSubjectGolden(t *testing.T) {
 	cases := []struct {
 		got, want string
 	}{
-		{SubjVersionAnnounce, "tether.v1.ctrl.version.announce"},
-		{SubjSysEvents, "tether.v1.sys.events"},
-		{SubjCtrlBy("UABCD", "session.create.req"), "tether.v1.ctrl.by.UABCD.session.create.req"},
-		{SubjCmdBy("lab", "UABCD", "lab-1", "run"), "tether.v1.s.lab.cmd.by.UABCD.node.lab-1.run.req"},
-		{SubjCmdForwarded("lab", "lab-1", "run"), "tether.v1.s.lab.cmd.node.lab-1.run.req.forwarded"},
-		{SubjNodeRegister("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.register.req"},
-		{SubjNodeUnregister("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.unregister.req"},
-		{SubjNodeHeartbeat("lab", "lab-1"), "tether.v1.ctrl.s.lab.node.lab-1.heartbeat"},
-		{SubjEvNodeState("lab", "lab-1"), "tether.v1.s.lab.ev.node.lab-1.state"},
-		{SubjEvProc("lab", "lab-1", "01hzxk", "exit"), "tether.v1.s.lab.ev.node.lab-1.proc.01hzxk.exit"},
-		{SubjEvPort("lab", 14022, "allocated"), "tether.v1.s.lab.ev.port.14022.allocated"},
-		{SubjAuditCall("lab"), "tether.v1.s.lab.audit.call"},
-		{SubjAuditProc("lab"), "tether.v1.s.lab.audit.proc"},
-		{SubjAuditPort("lab"), "tether.v1.s.lab.audit.port"},
-		{SubjPtyOut("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.out"},
-		{SubjPtyIn("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.in"},
-		{SubjPtyResize("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.resize"},
-		{SubjPtyAttach("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.attach"},
-		{SubjPtyReady("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.ready"},
-		{SubjPtyFailed("lab", "01hzxk"), "tether.v1.s.lab.pty.01hzxk.failed"},
+		{SubjVersionAnnounce, "tether.v2.ctrl.version.announce"},
+		{SubjSysEvents, "tether.v2.sys.events"},
+		{SubjCtrlBy("UABCD", "session.create.req"), "tether.v2.ctrl.by.UABCD.session.create.req"},
+		{SubjCmdBy("lab", "UABCD", "lab-1", "run"), "tether.v2.s.lab.cmd.by.UABCD.node.lab-1.run.req"},
+		{SubjCmdForwarded("lab", "lab-1", "run"), "tether.v2.s.lab.cmd.node.lab-1.run.req.forwarded"},
+		{SubjNodeRegister("lab", "lab-1"), "tether.v2.ctrl.s.lab.node.lab-1.register.req"},
+		{SubjNodeUnregister("lab", "lab-1"), "tether.v2.ctrl.s.lab.node.lab-1.unregister.req"},
+		{SubjNodeHeartbeat("lab", "lab-1"), "tether.v2.ctrl.s.lab.node.lab-1.heartbeat"},
+		{SubjEvNodeState("lab", "lab-1"), "tether.v2.s.lab.ev.node.lab-1.state"},
+		{SubjEvProc("lab", "lab-1", "01hzxk", "exit"), "tether.v2.s.lab.ev.node.lab-1.proc.01hzxk.exit"},
+		{SubjEvPort("lab", 14022, "allocated"), "tether.v2.s.lab.ev.port.14022.allocated"},
+		{SubjAuditCall("lab"), "tether.v2.s.lab.audit.call"},
+		{SubjAuditProc("lab"), "tether.v2.s.lab.audit.proc"},
+		{SubjAuditPort("lab"), "tether.v2.s.lab.audit.port"},
+		{SubjPtyOut("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.out"},
+		{SubjPtyIn("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.in"},
+		{SubjPtyResize("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.resize"},
+		{SubjPtyAttach("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.attach"},
+		{SubjPtyReady("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.ready"},
+		{SubjPtyFailed("lab", "01hzxk"), "tether.v2.s.lab.pty.01hzxk.failed"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -73,6 +73,50 @@ func TestForwardedTokenCountDiffers(t *testing.T) {
 	if na == nb {
 		t.Fatalf("cmd.by.* and cmd.*.req.forwarded must differ in token count, both = %d", na)
 	}
+}
+
+// TestForwardedWildcardMatchesConcrete pins the agent.go:477 subscription-builder
+// swap (D0): the agent subscribes via proto.SubjCmdForwarded(sid, nid, "*") and
+// the broker publishes via proto.SubjCmdForwarded(sid, nid, <verb>). The "*" must
+// sit exactly at the verb token so a NATS single-token wildcard matches every
+// concrete forwarded subject and nothing else. Guards against silent
+// wildcard-shape drift that make test alone wouldn't catch.
+func TestForwardedWildcardMatchesConcrete(t *testing.T) {
+	const sid, nid = "lab", "lab-1"
+	wild := SubjCmdForwarded(sid, nid, "*")
+	if wild != "tether.v2.s.lab.cmd.node.lab-1.*.req.forwarded" {
+		t.Fatalf("forwarded wildcard shape drift: %q", wild)
+	}
+	for _, verb := range []string{"run", "exec", "expose", "kill", "proxy-keys"} {
+		if concrete := SubjCmdForwarded(sid, nid, verb); !natsTokenMatch(wild, concrete) {
+			t.Errorf("wildcard %q must match concrete forwarded subject %q (verb=%s)", wild, concrete, verb)
+		}
+	}
+	// Negatives: the wildcard must NOT match a different tree, token count, or version.
+	for _, bad := range []string{
+		"tether.v2.s.lab.cmd.node.lab-1.run.req",                // not .forwarded
+		"tether.v2.s.lab.cmd.by.U.node.lab-1.run.req.forwarded", // cmd.by.* tree (more tokens)
+		"tether.v1.s.lab.cmd.node.lab-1.run.req.forwarded",      // wrong version
+	} {
+		if natsTokenMatch(wild, bad) {
+			t.Errorf("wildcard %q must NOT match %q", wild, bad)
+		}
+	}
+}
+
+// natsTokenMatch implements NATS `*` (single-token) subject matching.
+func natsTokenMatch(pattern, subject string) bool {
+	p := strings.Split(pattern, ".")
+	s := strings.Split(subject, ".")
+	if len(p) != len(s) {
+		return false
+	}
+	for i := range p {
+		if p[i] != "*" && p[i] != s[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // JSON round-trip equivalence: Marshal → Unmarshal → Marshal yields the same
@@ -125,9 +169,9 @@ func TestMessagesJSONGoldenRoundtrip(t *testing.T) {
 
 func TestSessionSubjects(t *testing.T) {
 	cases := []struct{ got, want string }{
-		{SubjCtrlSessionCreate("UABCD"), "tether.v1.ctrl.by.UABCD.session.create.req"},
-		{SubjCtrlSessionList("UABCD"), "tether.v1.ctrl.by.UABCD.session.list.req"},
-		{SubjCtrlSessionRm("UABCD", "lab"), "tether.v1.ctrl.by.UABCD.session.lab.rm.req"},
+		{SubjCtrlSessionCreate("UABCD"), "tether.v2.ctrl.by.UABCD.session.create.req"},
+		{SubjCtrlSessionList("UABCD"), "tether.v2.ctrl.by.UABCD.session.list.req"},
+		{SubjCtrlSessionRm("UABCD", "lab"), "tether.v2.ctrl.by.UABCD.session.lab.rm.req"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -147,10 +191,12 @@ func TestParseCtrlBy(t *testing.T) {
 		{SubjCtrlSessionRm("UABCD", "lab"), "UABCD", "session.lab.rm.req", true},
 		// negatives
 		{"", "", "", false},
-		{"tether.v1.ctrl", "", "", false},
-		{"tether.v2.ctrl.by.UABCD.x.y", "", "", false},
+		{"tether.v2.ctrl", "", "", false},
+		// wrong version: the v2 parser must reject the old v1 prefix even though
+		// the rest is structurally valid (was a `tether.v2` case pre-flip).
+		{"tether.v1.ctrl.by.UABCD.x.y", "", "", false},
 		// wrong tree (cmd.by.* not ctrl.by.*)
-		{"tether.v1.s.lab.cmd.by.UABCD.node.lab-1.run.req", "", "", false},
+		{"tether.v2.s.lab.cmd.by.UABCD.node.lab-1.run.req", "", "", false},
 	}
 	for _, c := range cases {
 		a, l, ok := ParseCtrlBy(c.subject)
@@ -176,10 +222,10 @@ func TestParseSidNidFromCtrl(t *testing.T) {
 		// Wrong prefix.
 		{"foo.bar.ctrl.s.lab.node.lab-1.register.req", "", "", false},
 		// Too short.
-		{"tether.v1.ctrl.s.lab.node.lab-1", "", "", false},
+		{"tether.v2.ctrl.s.lab.node.lab-1", "", "", false},
 		// Wrong segment names.
-		{"tether.v1.ctrl.x.lab.node.lab-1.register.req", "", "", false},
-		{"tether.v1.ctrl.s.lab.x.lab-1.register.req", "", "", false},
+		{"tether.v2.ctrl.x.lab.node.lab-1.register.req", "", "", false},
+		{"tether.v2.ctrl.s.lab.x.lab-1.register.req", "", "", false},
 		// Empty.
 		{"", "", "", false},
 	}

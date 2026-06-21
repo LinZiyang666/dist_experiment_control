@@ -6,10 +6,14 @@ import (
 	"testing"
 )
 
-// P13: proto stays v1 — the whole feature is additive.
-func TestProtoVersionUnchangedP13(t *testing.T) {
-	if ProtoVersion != 1 {
-		t.Fatalf("P13 must NOT bump proto: ProtoVersion=%d, want 1", ProtoVersion)
+// P13 was additive (proto stayed v1 through the entire v0.3.x line). The
+// distributed-broker HA epic is the first DELIBERATE proto bump: v1→v2 hard
+// upgrade (D0, §16.2). This pins the current wire version so an accidental
+// bump still trips; intentional bumps update this one line + the version-
+// agnostic TestProtoVersionStillPositive.
+func TestProtoVersionIsV2(t *testing.T) {
+	if ProtoVersion != 2 {
+		t.Fatalf("expected proto v2 (distributed-broker D0 hard upgrade), got ProtoVersion=%d", ProtoVersion)
 	}
 }
 
@@ -36,13 +40,13 @@ func TestNodeRegisterRespProxyOffByteIdentical(t *testing.T) {
 func TestProxySubjectBuilders(t *testing.T) {
 	const a, s = "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "lab"
 	cases := []struct{ got, want string }{
-		{SubjCtrlProxySet(a, s), "tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req"},
-		{SubjCtrlProxyStatus(a, s), "tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.status.req"},
-		{SubjCtrlProxySubCreate(a, s), "tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.create.req"},
-		{SubjCtrlProxySubList(a, s), "tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.list.req"},
-		{SubjCtrlProxySubRevoke(a, s), "tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.revoke.req"},
-		{SubjEvNodeProxyReady(s, "node1", "ready"), "tether.v1.s.lab.ev.node.node1.proxy.ready"},
-		{SubjCmdForwarded(s, "node1", "proxy-keys"), "tether.v1.s.lab.cmd.node.node1.proxy-keys.req.forwarded"},
+		{SubjCtrlProxySet(a, s), "tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req"},
+		{SubjCtrlProxyStatus(a, s), "tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.status.req"},
+		{SubjCtrlProxySubCreate(a, s), "tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.create.req"},
+		{SubjCtrlProxySubList(a, s), "tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.list.req"},
+		{SubjCtrlProxySubRevoke(a, s), "tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.revoke.req"},
+		{SubjEvNodeProxyReady(s, "node1", "ready"), "tether.v2.s.lab.ev.node.node1.proxy.ready"},
+		{SubjCmdForwarded(s, "node1", "proxy-keys"), "tether.v2.s.lab.cmd.node.node1.proxy-keys.req.forwarded"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -55,11 +59,11 @@ func TestParseCtrlProxy(t *testing.T) {
 	good := []struct {
 		subj, action string
 	}{
-		{"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req", "set"},
-		{"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.status.req", "status"},
-		{"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.create.req", "sub.create"},
-		{"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.list.req", "sub.list"},
-		{"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.revoke.req", "sub.revoke"},
+		{"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req", "set"},
+		{"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.status.req", "status"},
+		{"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.create.req", "sub.create"},
+		{"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.list.req", "sub.list"},
+		{"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.revoke.req", "sub.revoke"},
 	}
 	for _, g := range good {
 		actor, sid, action, ok := ParseCtrlProxy(g.subj)
@@ -70,13 +74,17 @@ func TestParseCtrlProxy(t *testing.T) {
 	}
 
 	bad := []string{
-		"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set",           // missing req (too few)
-		"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req.extra", // extra token
-		"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.bogus.req",     // unknown action
-		"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.bogus.req", // unknown sub action
-		"tether.v1.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.BAD!SID.proxy.set.req",   // bad sid
-		"tether.v1.ctrl.by..s.lab.proxy.set.req",                                                               // empty actor
-		"tether.v1.s.lab.cmd.node.n.proxy-keys.req.forwarded",                                                  // wrong tree
+		"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set",           // missing req (too few)
+		"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.set.req.extra", // extra token
+		"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.bogus.req",     // unknown action
+		"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.lab.proxy.sub.bogus.req", // unknown sub action
+		"tether.v2.ctrl.by.UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.s.BAD!SID.proxy.set.req",   // bad sid
+		"tether.v2.ctrl.by..s.lab.proxy.set.req",                                                               // empty actor
+		"tether.v2.s.lab.cmd.node.n.proxy-keys.req.forwarded",                                                  // wrong tree
+		// Wrong VERSION: structurally valid but the old v1 prefix — the v2 parser
+		// must reject at parts[1] (D0 hard-upgrade, §16.2). Without this the
+		// proxy parser's parts[1]!=SubjectVersionToken branch is never tested.
+		"tether.v1.ctrl.by." + "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + ".s.lab.proxy.set.req",
 	}
 	for _, b := range bad {
 		if _, _, _, ok := ParseCtrlProxy(b); ok {

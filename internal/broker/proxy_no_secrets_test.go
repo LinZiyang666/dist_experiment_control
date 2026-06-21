@@ -21,7 +21,7 @@ func TestProxyNoSecretsInMemberChannels(t *testing.T) {
 	var captured []string
 	collect := func(m *nats.Msg) { mu.Lock(); captured = append(captured, string(m.Data)); mu.Unlock() }
 	s1, _ := nc.Subscribe(proto.SubjSysEvents, collect)
-	s2, _ := nc.Subscribe("tether.v1.s."+sid+".audit.>", collect)
+	s2, _ := nc.Subscribe("tether.v2.s."+sid+".audit.>", collect)
 	defer func() { _ = s1.Unsubscribe(); _ = s2.Unsubscribe() }()
 
 	var setR proto.ProxySetResp

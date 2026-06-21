@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "code": "proto_mismatch",
+  "error": "client_proto=2 server_proto=1"
+}

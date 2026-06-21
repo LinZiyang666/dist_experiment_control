@@ -159,7 +159,7 @@ func TestProxySubjectMalformedRejected(t *testing.T) {
 	nc, owner, sid, b := proxyTestBroker(t)
 	// `BAD!SID` is a single NATS token (matches `s.*`) but fails ValidateSID,
 	// so handleProxySet's ParseCtrlProxy returns subject_malformed up front.
-	bad := "tether.v1.ctrl.by." + owner + ".s.BAD!SID.proxy.set.req"
+	bad := "tether.v2.ctrl.by." + owner + ".s.BAD!SID.proxy.set.req"
 	reply, err := nc.Request(bad, []byte(`{"enabled":true}`), 2*time.Second)
 	if err != nil {
 		t.Fatalf("expected a subject_malformed reply, got transport error: %v", err)

@@ -91,7 +91,7 @@ func TestHandleSessionCreateRejectsBadPayloads(t *testing.T) {
 	}{
 		{
 			name:    "subject_malformed",
-			subject: "tether.v1.ctrl.by." + actor + ".session.create.req",
+			subject: "tether.v2.ctrl.by." + actor + ".session.create.req",
 			body:    nil,
 			wantErr: "json_parse", // empty body fails JSON parse before subject is malformed
 		},
@@ -112,7 +112,7 @@ func TestHandleSessionCreateRejectsBadPayloads(t *testing.T) {
 		},
 		{
 			name:    "actor_invalid",
-			subject: "tether.v1.ctrl.by.NOT_A_VALID_ACTOR.session.create.req",
+			subject: "tether.v2.ctrl.by.NOT_A_VALID_ACTOR.session.create.req",
 			body:    mustJSONBytes(proto.SessionCreateReq{Name: "lab", PIN: "x"}),
 			wantErr: "actor_invalid",
 		},

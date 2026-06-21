@@ -334,7 +334,7 @@ func (b *Broker) handleProxyStatus(msg *nats.Msg) {
 // s.<sid>.ev.node.<nid>.proxy.<ready|unready>.
 func (b *Broker) handleProxyReadyEvent(msg *nats.Msg) {
 	p := splitDot(msg.Subject)
-	// 0:tether 1:v1 2:s 3:sid 4:ev 5:node 6:nid 7:proxy 8:kind
+	// 0:tether 1:v2 2:s 3:sid 4:ev 5:node 6:nid 7:proxy 8:kind
 	if len(p) != 9 || p[2] != "s" || p[4] != "ev" || p[5] != "node" || p[7] != "proxy" {
 		return
 	}

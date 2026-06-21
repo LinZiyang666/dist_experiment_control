@@ -73,6 +73,11 @@ var ErrSessionMissing = errors.New("node: target session does not exist")
 // creates it via `tether session create`). Foreign-key cascade in
 // 0001_init.sql guarantees the row will be cleaned up with the session.
 func Register(db *sql.DB, in RegisterInput, now time.Time) error {
+	// Store UTC for last_heartbeat_at + registered_at (see Heartbeat for why:
+	// last_heartbeat_at is compared via raw SQL against a UTC cutoff in
+	// port.ListAllocatedForOfflineNodes; a local-TZ value breaks it on non-UTC
+	// hosts). .UTC() also strips the monotonic-clock reading.
+	now = now.UTC()
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("node: begin: %w", err)
@@ -125,6 +130,14 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 // (covers STALE → ONLINE recovery on the very next beat without waiting for
 // the reconcile ticker). Returns an error when the node is unknown.
 func Heartbeat(db *sql.DB, sid, nid string, now time.Time) error {
+	// Store UTC: last_heartbeat_at is compared via a RAW SQL string comparison
+	// in port.ListAllocatedForOfflineNodes against a UTC cutoff (now.UTC()).
+	// A local-TZ value stored here (e.g. ...+08:00) sorts lexicographically
+	// wrong against a UTC cutoff (...+00:00), so on any non-UTC host the offline
+	// port reconciler would silently never revoke. .UTC() also strips the
+	// monotonic-clock reading. (Go-side comparisons like ReconcileStates are
+	// instant-based and unaffected either way.)
+	now = now.UTC()
 	res, err := db.Exec(
 		`UPDATE nodes SET last_heartbeat_at = ?, status = 'ONLINE' WHERE sid = ? AND nid = ?`,
 		now, sid, nid,

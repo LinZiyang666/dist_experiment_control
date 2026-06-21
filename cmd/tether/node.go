@@ -121,7 +121,7 @@ func newNodeUpgradeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "upgrade <nid>|--all",
 		Short: "Trigger an owner-only agent binary upgrade (architecture J.4)",
-		Long: `Sends a tether.v1.s.<sid>.cmd.by.<actor>.node.<nid>.upgrade.req
+		Long: fmt.Sprintf(`Sends a %s.s.<sid>.cmd.by.<actor>.node.<nid>.upgrade.req
 to the broker. The broker enforces owner-only + URL allowlist +
 proto match before forwarding to the agent. The agent downloads
 the tarball, verifies SHA256 + URL allowlist locally, atomically
@@ -135,7 +135,7 @@ NOT of the extracted binary.
 
 --all upgrades every ONLINE node in the active session (sequential,
 fail-fast). Use it for fleet-wide patch rollouts; for canary
-testing run a single <nid> first.`,
+testing run a single <nid> first.`, proto.SubjectPrefix),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if urlFlag == "" || shaFlag == "" {

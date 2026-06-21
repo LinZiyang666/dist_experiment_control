@@ -11,13 +11,13 @@ const (
 	SubjSysEvents       = SubjectPrefix + ".sys.events"
 )
 
-// SubjCtrlBy returns "tether.v1.ctrl.by.<actor>.<leaf>".
+// SubjCtrlBy returns "tether.v2.ctrl.by.<actor>.<leaf>".
 // Used for actor-scoped global control messages (session.create/list/...).
 func SubjCtrlBy(actor, leaf string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.%s", SubjectPrefix, actor, leaf)
 }
 
-// SubjCmdBy returns "tether.v1.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req".
+// SubjCmdBy returns "tether.v2.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req".
 // Used for ctl-originated per-session commands targeting a node.
 // `actor` is the NATS user nkey public key; tetherd extracts it from the
 // subject (B.1) rather than trusting message headers.
@@ -117,13 +117,13 @@ func XferBucketName(sid string) string {
 }
 
 // ParseTransferFinalize extracts (actor, sid, transfer_id) from a
-// `tether.v1.ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req` subject.
+// `tether.v2.ctrl.by.<actor>.s.<sid>.transfer.<id>.finalize.req` subject.
 // Returns ok=false on layout mismatch.
 func ParseTransferFinalize(subject string) (actor, sid, transferID string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:ctrl 3:by 4:<actor> 5:s 6:<sid> 7:transfer 8:<id> 9:finalize 10:req
+	// 0:tether 1:v2 2:ctrl 3:by 4:<actor> 5:s 6:<sid> 7:transfer 8:<id> 9:finalize 10:req
 	if len(parts) != 11 ||
-		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken ||
 		parts[2] != "ctrl" || parts[3] != "by" ||
 		parts[5] != "s" || parts[7] != "transfer" ||
 		parts[9] != "finalize" || parts[10] != "req" {
@@ -137,13 +137,13 @@ func ParseTransferFinalize(subject string) (actor, sid, transferID string, ok bo
 }
 
 // ParseEvTransfer extracts (sid, nid, transfer_id, kind) from a
-// `tether.v1.s.<sid>.ev.node.<nid>.transfer.<id>.<kind>` subject.
+// `tether.v2.s.<sid>.ev.node.<nid>.transfer.<id>.<kind>` subject.
 // kind ∈ {complete, failed}.
 func ParseEvTransfer(subject string) (sid, nid, transferID, kind string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:transfer 8:<id> 9:<kind>
+	// 0:tether 1:v2 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:transfer 8:<id> 9:<kind>
 	if len(parts) != 10 ||
-		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken ||
 		parts[2] != "s" || parts[4] != "ev" ||
 		parts[5] != "node" || parts[7] != "transfer" {
 		return "", "", "", "", false
@@ -204,13 +204,13 @@ func SubjCtrlSessionRm(actor, sid string) string {
 }
 
 // ParseEvProc extracts (sid, nid, pid, kind) from a process-lifecycle
-// event subject `tether.v1.s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`.
+// event subject `tether.v2.s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`.
 // kind ∈ {"started", "exit"}.
 func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:proc 8:<pid> 9:<kind>
+	// 0:tether 1:v2 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:proc 8:<pid> 9:<kind>
 	if len(parts) != 10 ||
-		parts[0] != "tether" || parts[1] != "v1" || parts[2] != "s" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken || parts[2] != "s" ||
 		parts[4] != "ev" || parts[5] != "node" || parts[7] != "proc" {
 		return "", "", "", "", false
 	}
@@ -221,7 +221,7 @@ func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
 }
 
 // ParseCmdBy extracts (sid, actor, nid, verb) from any
-// `tether.v1.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req` subject.
+// `tether.v2.s.<sid>.cmd.by.<actor>.node.<nid>.<verb>.req` subject.
 // Returns ok=false when the subject doesn't match this layout OR
 // when sid / nid / actor fail their architecture B.5 syntax check
 // (audit shard 03 F5 — defense in depth so a malformed token
@@ -231,9 +231,9 @@ func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
 // permissions pin the `by.<A>` segment to the connection's real nkey.
 func ParseCmdBy(subject string) (sid, actor, nid, verb string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:s 3:<sid> 4:cmd 5:by 6:<actor> 7:node 8:<nid> 9:<verb> 10:req
+	// 0:tether 1:v2 2:s 3:<sid> 4:cmd 5:by 6:<actor> 7:node 8:<nid> 9:<verb> 10:req
 	if len(parts) != 11 ||
-		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken ||
 		parts[2] != "s" || parts[4] != "cmd" || parts[5] != "by" ||
 		parts[7] != "node" || parts[10] != "req" {
 		return "", "", "", "", false
@@ -245,7 +245,7 @@ func ParseCmdBy(subject string) (sid, actor, nid, verb string, ok bool) {
 	return parts[3], parts[6], parts[8], parts[9], true
 }
 
-// ParseCtrlBy extracts the actor segment from any "tether.v1.ctrl.by.<actor>.<rest...>"
+// ParseCtrlBy extracts the actor segment from any "tether.v2.ctrl.by.<actor>.<rest...>"
 // subject. Returns leaf = the dot-joined remainder after the actor segment.
 //
 // Authority: with the P3 auth_callout in place, the JWT permissions
@@ -255,9 +255,9 @@ func ParseCmdBy(subject string) (sid, actor, nid, verb string, ok bool) {
 // at the broker layer.
 func ParseCtrlBy(subject string) (actor, leaf string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:ctrl 3:by 4:<actor> 5+:leaf
+	// 0:tether 1:v2 2:ctrl 3:by 4:<actor> 5+:leaf
 	if len(parts) < 6 ||
-		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken ||
 		parts[2] != "ctrl" || parts[3] != "by" {
 		return "", "", false
 	}
@@ -265,7 +265,7 @@ func ParseCtrlBy(subject string) (actor, leaf string, ok bool) {
 }
 
 // ParseSidNidFromCtrl extracts (sid, nid) from any ctrl-tree subject of the
-// shape "tether.v1.ctrl.s.<sid>.node.<nid>.<rest...>". Returns ok=false when
+// shape "tether.v2.ctrl.s.<sid>.node.<nid>.<rest...>". Returns ok=false when
 // the subject doesn't match this layout.
 //
 // Used by the broker's wildcard subscription handlers
@@ -273,9 +273,9 @@ func ParseCtrlBy(subject string) (actor, leaf string, ok bool) {
 // and node identifiers without trusting the message body.
 func ParseSidNidFromCtrl(subject string) (sid, nid string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// 0:tether 1:v1 2:ctrl 3:s 4:<sid> 5:node 6:<nid> 7:<verb> [8:req]
+	// 0:tether 1:v2 2:ctrl 3:s 4:<sid> 5:node 6:<nid> 7:<verb> [8:req]
 	if len(parts) < 8 ||
-		parts[0] != "tether" || parts[1] != "v1" || parts[2] != "ctrl" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken || parts[2] != "ctrl" ||
 		parts[3] != "s" || parts[5] != "node" {
 		return "", "", false
 	}
@@ -324,9 +324,9 @@ func SubjEvNodeProxyReady(sid, nid, kind string) string {
 // reject ok=false as subject_malformed BEFORE any DB/owner work.
 func ParseCtrlProxy(subject string) (actor, sid, action string, ok bool) {
 	parts := strings.Split(subject, ".")
-	// base: 0:tether 1:v1 2:ctrl 3:by 4:<A> 5:s 6:<sid> 7:proxy ...
+	// base: 0:tether 1:v2 2:ctrl 3:by 4:<A> 5:s 6:<sid> 7:proxy ...
 	if len(parts) < 10 ||
-		parts[0] != "tether" || parts[1] != "v1" ||
+		parts[0] != "tether" || parts[1] != SubjectVersionToken ||
 		parts[2] != "ctrl" || parts[3] != "by" ||
 		parts[5] != "s" || parts[7] != "proxy" {
 		return "", "", "", false

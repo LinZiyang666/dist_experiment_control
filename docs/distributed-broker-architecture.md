@@ -61,7 +61,7 @@ cmd/tether/
 ## 3. 状态层（Raft + 本地 SQLite）
 
 ### 3.1 选库（Stage-B/合并前置门）
-`hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。**raft 是全新依赖（go.mod 现只有 yamux）**：pin 版本、`CGO_ENABLED=0`+Go1.25 编译、**确认 `Config.PreVote`**（§8.4/§9.4 正确性前提）——升为合并前置门。
+`hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。**raft 是全新依赖（go.mod 现只有 yamux）**：pin 版本、`CGO_ENABLED=0`+Go1.25 编译、**确认 `Config.PreVoteDisabled` 字段在**（hashicorp/raft v1.7.x **无 `Config.PreVote`**；真实字段是 `PreVoteDisabled bool`，`DefaultConfig()` 不设它 → 零值 false → pre-vote **缺省启用**。另：raft 在 transport 未实现 `WithPreVote` 接口时**静默关闭** pre-vote，故"字段在"不足证"行为生效"，见 §18.2.14）（§8.4/§9.4 正确性前提）——升为合并前置门。
 
 ### 3.2 写入模型 + 读一致性
 **写**：leader 在 `Plan` 把命令渲染成**键/fence 值无不确定性**的 SQL，`cn.Apply→raft.Apply`，各副本 Apply 同 txn 写 `applied_index`。**任何复制写路径 ZERO 直连 `db.Exec`**；废黜 leader 的 `raft.Apply` 返回 `ErrLeadershipLost`。
@@ -116,7 +116,7 @@ cmd/tether/
 ### 4.2 migrations（精简：保留 AUTOINCREMENT、不物理拆 nodes）
 0007 之后：**0008** `cluster_nodes` 名册（含 `nats_server_id`）；**0009** `cluster_meta`(KV) + `alerts` + `alert_acks`（**删 `cluster_revoked_identities`——§18.3：无 writer/reader**）；**0010** `port_allocations` 加 `home_broker`/`rebuild_on_failure`/`epoch` + 索引。cluster/alert 系表无 `CURRENT_TIMESTAMP` 默认。**不删历史 migration 默认值、不重建表**（migration 引擎按名只跑一次、从不回改已应用库；活性列用 §3.5 列级 lint，不物理拆）。术语：roster 用 `node`/`cluster_nodes`，"member" 留给 session 成员；op 命名 `ClusterNode*`。
 
-`cluster_nodes` 关键列：`node_id`(PK,==Raft ServerID) | `name`(UNIQUE) | `node_ident_pub`(≠bus nkey) | `nats_server_id`(natscluster 模板化时确定性赋、agent 自报用它桥接) | `raft_addr/nats_route/tunnel_addr/public_host` | **`cert_fp`/`cert_fp_prev`/`cert_fp_valid_until`**(稳定 tunnel 证书轮换双 pin，§15 RF3/R3F2) | `phase`(承载 §8.1 `JOIN_VERIFIED_PENDING_VOTER`/`CATCHING_UP`/`VOTER`/`VOTER_ADD_FAILED`/draining/retiring) | `added_at`。**Raft 投票集权威，`phase` 为派生展示态。**
+`cluster_nodes` 关键列：`node_id`(PK,==Raft ServerID) | `name`(UNIQUE) | `node_ident_pub`(≠bus nkey) | `nats_server_id`(natscluster 模板化时确定性赋、agent 自报用它桥接) | `raft_addr/nats_route/tunnel_addr/public_host` | **`cert_fp`/`cert_fp_prev`/`cert_fp_valid_until`**(稳定 tunnel 证书轮换双 pin，§15 RF3/R3F2) | `phase`(承载 §8.1 `JOIN_VERIFIED_PENDING_VOTER`/`CATCHING_UP`/`VOTER`/`VOTER_ADD_FAILED`/`DRAINING`/`RETIRING`——**全大写为 canonical 枚举值**，单条 CHECK 用此 6 值) | `added_at`。**Raft 投票集权威，`phase` 为派生展示态。**
 
 `alerts`/`alert_acks` DDL（无默认时间戳）：`alerts(id,kind,severity,dedup_key,state,message,raised_at,cleared_at)` + `idx_alerts_dedup_active`；`alert_acks(dedup_key,acked_by,acked_at, PRIMARY KEY(dedup_key))`——**单一集群级 ack（§18.3：一条 alert 一个 ack，`acked_by` 仅记录"谁 ack 的"供展示，非 per-identity 簿记），删 snooze_until/session_nonce/identity_fp**。需求 §8 原要求 per-identity 生效，本架构降为集群级——见 §16 偏离登记。
 
@@ -201,7 +201,7 @@ NATS 种子 + `connect_urls` 发现 + 无限退避；`ClientAdvertise`=公网:44
 > - **阶段 2 — Raft config 变更（非 FSM proof 点）**：**仅当阶段 1 的 `ClusterNodeUpsert` committed 后**，leader 才调 `raft.AddVoter(node_id, raft_addr)`。**明示此步不是 FSM 校验点**——它是底层 Raft config entry，靠"阶段 1 已把该 node_id 的 PoP 验证并复制进 roster"间接受信。
 > - **半成功状态机（`phase` 列承载）**：`JOIN_VERIFIED_PENDING_VOTER`（阶段 1 过、阶段 2 未发/失败）→ `CATCHING_UP`（AddVoter 成功、未过 §8.2 catch-up）→ `VOTER`（健康）；失败分支 `VOTER_ADD_FAILED`。`status/doctor` 显式渲染，绝不出现"DB 认为 voter、Raft config 不是 voter"的静默分叉。
 > - **重试幂等**：阶段 2 失败重试**复用同一 committed `ClusterNodeUpsert`（PoP 已验、nonce 已消费、不重签）**；`raft.AddVoter` 按 node_id 幂等（已是 voter 即 no-op）。永不追平节点用 §8.3 的"加个永不追平节点再干净移除"清理路径。
-> - **Remove/retire 顺序**：**先写 roster `ClusterNodePhase`(draining/retiring) 再 `raft.RemoveServer`，最后 `ClusterNodeRemove`**；任一步失败 `status/doctor` 显示停在哪个 phase + 下一步命令。
+> - **Remove/retire 顺序**：**先写 roster `ClusterNodePhase`(`DRAINING`/`RETIRING`，§4.2 canonical 大写枚举) 再 `raft.RemoveServer`，最后 `ClusterNodeRemove`**；任一步失败 `status/doctor` 显示停在哪个 phase + 下一步命令。
 > - **诚实威胁边界**：沦陷 *leader* 仍可提任意成员变更（§18.2.4 已接受）；沦陷 *follower* 自合成 `ClusterNodeUpsert` 在 §6.2 RF1 ACL 层（pub 不到 `cluster.*`）+ join PoP 验签层被双重拒。admin socket 仅 leader-local admission（决定 leader 是否**提议**阶段 1），**FSM 不声称校验任何不可复制的 origin proof**。
 > - **测试门（§13.11）**：阶段 1 committed 后 AddVoter 失败 / AddVoter 成功后 catch-up stalled / 重复 add 同 node_id——断言状态机幂等、无静默分叉。
 
@@ -396,7 +396,7 @@ ctl 侧绝不因"笔记本 ping 不到 :7400"误报 `quorum_lost` 而诱导误 f
 11. **§7.7/§1.3 cert_fp 移动靶（major）**：tunnel server 改用**稳定持久证书**（`/etc/tether/secrets`、绑 node-identity、**非每次 Start 重生成**），否则重启即换 fp→`cluster_nodes.cert_fp` 变陈→所有 agent 拒连合法重启的 home（自伤）。定义谁在 provision/rotation 时经 Raft entry 写 cert_fp；门：重启 home→老 agent 仍 re-pin 成功、拒真不同证书。
 12. **§3.2/§6.2/§17 撤销（major）**：(1) 每次 callout 决策对**栅栏到 ≥撤销 index 的读**或复制的撤销墓碑 + §3.2 fail-closed 谓词裁决（堵"踢掉后立刻在落后 follower 重新 24h JWT"）；量化"在落后 peer 重认证窗口 = 副本应用滞后"，cluster 场景默认 JWTTTL 调短；(2) **per-port 主动撤销**：`PortRevoke/PortFree` Apply 时 **home broker（即便作为 follower 重放）关该口的公网监听 + yamux**；leader 如何通知远端 home 须定义。
 13. **§6.2 auth fail-closed 谓词（major）→ 已回写 §3.2/§6.2（统一为 §8.4 的 `T_fence`）**：节点自身观测到与 leader 失联 > `T_fence`（已 pin=10s，`> 最坏 PreVote 选举`~2–3s，§8.4）才 fail-closed（非"正在选举但仍见 quorum"就黑洞全集群新连接）；provisioned-read 授权是**有界陈旧**（被撤成员在落后应答者上可放行至其应用撤销，界 = 应用滞后），加测试断言最坏接受窗口 = 应用滞后而非 0；谓词是 O(本地读)/连接。
-14. **§3.1 PreVote（major）**：§3.1 **pin 确切 raft 版本**并把"该版本 PreVote 实测生效"列为合并门项（配置字段存在 ≠ 行为生效）；测试：分区再连一个 follower，断言健康 leader 的 term 没涨、没下台。
+14. **§3.1 PreVote（major）**：§3.1 **pin 确切 raft 版本**并把"该版本 PreVote 实测生效"列为合并门项（配置字段存在 ≠ 行为生效）。**字段名修正（D0 实测对齐 v1.7.x 源码）**：真实字段是 `Config.PreVoteDisabled`（缺省 false=启用），**无 `Config.PreVote`**；且 raft 在 transport 不实现 `WithPreVote` 时**静默关闭** pre-vote（`api.go`：`preVoteDisabled = conf.PreVoteDisabled || !transportSupportPreVote`）——故实测门须三件齐验：① 编译期断言 transport 实现 `WithPreVote`（`var _ raft.WithPreVote = tr`，InmemTransport 已实现）；② 分区一个 follower（保留 leader 侧 quorum），断言**被隔离 follower 自身的 `CurrentTerm()` 不抬高**（pre-vote 拦住 term 自增——这是 pre-vote 的直接效果），且健康 leader 不下台、term 不涨、重连后干净归队；③ 反向对照子测试（`PreVoteDisabled=true`）断言**同一被隔离 follower 的 term 反而抬高**，证明门有判别力、非恒真。**判别信号取被隔离节点自身的 term**（D0 inmem 实测：启用恒为 termBefore、禁用抬到 20+），**非 leader 的 term**——inmem harness 下 leader 侧 term 在两种配置下都不被扰动（rejoin 扰动不在此 harness 内确定性复现），故 leader-term 不变是真不变式但**无判别力**。
 15. **§8.3 retire 不撤信任（major，诚实）**：roster/Raft 移除即时，但 `account.nk` + cluster CA **不轮换** → retired 节点留有它们即在 TTL/轮换前仍可签 JWT、出示 route 证书。**把 account.nk + CA 轮换 runbook 内联为本 epic 硬依赖**（含全机群重装、status 显示"retired 节点凭据在轮换前仍密码学有效"）；明示"retire 不轮换 = 仅拓扑变更非安全边界"；**runbook 没写不算 retire done**。
 16. **§16.8/§10.2 双信任面（major）**：明列——`cluster-ca.key` 泄露 ⇒ NATS route+callout 参与（总线级沦陷，**即便 Raft 拒它当 voter**）；`account.nk` 泄露 ⇒ JWT 签发。**route mTLS 叶子也须 nkey-钉到 node-identity**（同 Raft 传输），令"只有 CA 签名"不足以 route-join；`cluster-ca.key` 按 `account.nk` 同等重视、定轮换。
 17. **§10.4 destructive 命令表 + drain（major）**：§10.4 加**destructive 命令明表**（≥ expose/run/session rm，及 push/pull/kill/expose-rm），逐条标在 quorum_lost/force_single 下是否 gate，与 §4.1 转发动词集对账（别混）；drain 给**默认提前通知时长 + 截止前持续服务 + 到点（或 `--now`）迁移 + `--abort` + status 进度（"draining: 3/5 已迁，1 rebuild-OFF 待"）+ 销毁 rebuild-OFF 须键入确认**。
@@ -482,9 +482,9 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 
 ### D0 — 前置门 + proto v2 + migrations
 **目标**：依赖与 wire/schema 地基就位，无运行期行为变化。
-**做**：§3.1 pin `hashicorp/raft`+`raft-boltdb/v2`+`FileSnapshotStore` 确切版本、`CGO_ENABLED=0`+Go1.25 编译、`Config.PreVote` 字段在；§proto 建 `tether.v2` subject grammar SSOT + `ProtoVersion=2` 常量（§16.2 硬升级）；§4.2 migrations 0008（`cluster_nodes` 含 `nats_server_id`+`cert_fp/_prev/_valid_until`+`phase`）、0009（`cluster_meta`+`alerts`+`alert_acks` 集群级 PK、**无 `cluster_revoked_identities`**）、0010（`port_allocations` 加 `home_broker/rebuild_on_failure/epoch`+索引）。
+**做**：§3.1 pin `hashicorp/raft`+`raft-boltdb/v2`+`FileSnapshotStore` 确切版本、`CGO_ENABLED=0`+Go1.25 编译、`Config.PreVoteDisabled` 字段在（v1.7.x **无 `Config.PreVote`**；`DefaultConfig` 缺省启用 pre-vote）；§proto 建 `tether.v2` subject grammar SSOT + `ProtoVersion=2` 常量（§16.2 硬升级）；§4.2 migrations 0008（`cluster_nodes` 含 `nats_server_id`+`cert_fp/_prev/_valid_until`+`phase`）、0009（`cluster_meta`+`alerts`+`alert_acks` 集群级 PK、**无 `cluster_revoked_identities`**）、0010（`port_allocations` 加 `home_broker/rebuild_on_failure/epoch`+索引）。
 **测试**：§13.1 确定性 lint 骨架可跑；migrations 前向应用幂等（按名只跑一次）；proto v2 golden JSON 回环；`go build ./...` 绿。
-**出口**：raft 依赖编译通过且 **PreVote 实测生效**（§3.1/§18.2.14 合并门：分区再连 follower，健康 leader term 不涨/不下台）；0008–0010 在内存库前向跑通。
+**出口**：raft 依赖编译通过且 **PreVote 实测生效**（§3.1/§18.2.14 合并门：分区一个 follower，断言**被隔离节点 term 不抬高** + 健康 leader 不下台；反向对照 `PreVoteDisabled=true` 时该 term 抬高，证明判别力）；0008–0010 在内存库前向跑通。
 
 ### D1 — 状态层：Raft FSM + SQLite Apply + 快照/恢复（N=1）
 **目标**：单节点 Raft FSM 把写经 Apply 落 SQLite，崩溃一致。

@@ -97,7 +97,7 @@ func TestExternalReviewFailedProxyRebuildPublishesUnready(t *testing.T) {
 	defer nc.Close()
 
 	events := make(chan *nats.Msg, 4)
-	sub, err := nc.ChanSubscribe("tether.v1.s.lab.ev.node.lab-1.proxy.*", events)
+	sub, err := nc.ChanSubscribe("tether.v2.s.lab.ev.node.lab-1.proxy.*", events)
 	if err != nil {
 		t.Fatal(err)
 	}

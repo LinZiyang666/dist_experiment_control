@@ -193,9 +193,9 @@ func (b *Broker) replyKillFailed(msg *nats.Msg, reason string) {
 // is the audit single-writer for attach_timeout / pty_alloc_failed /
 // exec_failed (as for any other proc lifecycle event).
 func (b *Broker) handlePtyFailed(msg *nats.Msg) {
-	// Subject layout: tether.v1.s.<sid>.pty.<pid>.failed (7 tokens).
+	// Subject layout: tether.v2.s.<sid>.pty.<pid>.failed (7 tokens).
 	parts := strings.Split(msg.Subject, ".")
-	if len(parts) != 7 || parts[0] != "tether" || parts[1] != "v1" ||
+	if len(parts) != 7 || parts[0] != "tether" || parts[1] != proto.SubjectVersionToken ||
 		parts[2] != "s" || parts[4] != "pty" || parts[6] != "failed" {
 		return
 	}

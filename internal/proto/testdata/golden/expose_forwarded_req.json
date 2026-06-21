@@ -1,0 +1,7 @@
+{
+  "name": "jupyter",
+  "port": 14000,
+  "local_port": 8888,
+  "token": "tok",
+  "actor_fp": "fp"
+}

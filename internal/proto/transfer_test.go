@@ -15,15 +15,15 @@ const fakeActor = "UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 // without ProtoVersion is a wire break.
 func TestTransferSubjectGolden(t *testing.T) {
 	cases := []struct{ got, want string }{
-		{SubjAuditTransfer("lab"), "tether.v1.s.lab.audit.transfer"},
+		{SubjAuditTransfer("lab"), "tether.v2.s.lab.audit.transfer"},
 		{SubjEvTransfer("lab", "lab-1", "01hzxn", "complete"),
-			"tether.v1.s.lab.ev.node.lab-1.transfer.01hzxn.complete"},
+			"tether.v2.s.lab.ev.node.lab-1.transfer.01hzxn.complete"},
 		{SubjEvTransfer("lab", "lab-1", "01hzxn", "failed"),
-			"tether.v1.s.lab.ev.node.lab-1.transfer.01hzxn.failed"},
+			"tether.v2.s.lab.ev.node.lab-1.transfer.01hzxn.failed"},
 		{SubjCtrlTransferFinalize(fakeActor, "lab", "01hzxn"),
-			"tether.v1.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.finalize.req"},
+			"tether.v2.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.finalize.req"},
 		{SubjCtrlCaps(fakeActor, "lab"),
-			"tether.v1.ctrl.by." + fakeActor + ".s.lab.caps.req"},
+			"tether.v2.ctrl.by." + fakeActor + ".s.lab.caps.req"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -43,13 +43,17 @@ func TestParseTransferFinalize(t *testing.T) {
 	}{
 		{SubjCtrlTransferFinalize(fakeActor, "lab", "01hzxn"), fakeActor, "lab", "01hzxn", true},
 		// Different actor key shape — token validator must reject.
-		{"tether.v1.ctrl.by.short.s.lab.transfer.01hzxn.finalize.req", "", "", "", false},
+		{"tether.v2.ctrl.by.short.s.lab.transfer.01hzxn.finalize.req", "", "", "", false},
 		// Wrong shape.
-		{"tether.v1.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.commit.req", "", "", "", false},
-		// Wrong prefix.
+		{"tether.v2.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.commit.req", "", "", "", false},
+		// Wrong root.
 		{"foo.v1.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.finalize.req", "", "", "", false},
+		// Wrong VERSION: structurally valid but the old v1 prefix — the v2 parser
+		// must reject it at parts[1] (D0 hard-upgrade, §16.2; exercises the
+		// parts[1]!=SubjectVersionToken branch).
+		{"tether.v1.ctrl.by." + fakeActor + ".s.lab.transfer.01hzxn.finalize.req", "", "", "", false},
 		// Sid validation rejects.
-		{"tether.v1.ctrl.by." + fakeActor + ".s.\xff\xff.transfer.01hzxn.finalize.req", "", "", "", false},
+		{"tether.v2.ctrl.by." + fakeActor + ".s.\xff\xff.transfer.01hzxn.finalize.req", "", "", "", false},
 	}
 	for _, c := range cases {
 		a, s, id, ok := ParseTransferFinalize(c.subject)
@@ -75,7 +79,10 @@ func TestParseEvTransfer(t *testing.T) {
 		// Wrong tree.
 		{SubjEvProc("lab", "lab-1", "p1", "exit"), "", "", "", "", false},
 		// Truncated.
-		{"tether.v1.s.lab.ev.node.lab-1.transfer.01hzxn", "", "", "", "", false},
+		{"tether.v2.s.lab.ev.node.lab-1.transfer.01hzxn", "", "", "", "", false},
+		// Wrong VERSION: structurally valid but the old v1 prefix — v2 parser
+		// must reject at parts[1] (D0 hard-upgrade, §16.2).
+		{"tether.v1.s.lab.ev.node.lab-1.transfer.01hzxn.complete", "", "", "", "", false},
 	}
 	for _, c := range cases {
 		sid, nid, tid, kind, ok := ParseEvTransfer(c.subject)

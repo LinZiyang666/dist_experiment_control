@@ -187,9 +187,9 @@ func TestParseCmdByRejectsMalformed(t *testing.T) {
 	}{
 		{"empty", ""},
 		{"just_prefix", SubjectPrefix},
-		{"too_few_tokens", "tether.v1.s.lab.cmd.by." + validActor + ".node.lab-1"},
+		{"too_few_tokens", "tether.v2.s.lab.cmd.by." + validActor + ".node.lab-1"},
 		{"too_many_tokens", good + ".extra"},
-		{"wrong_version", strings.Replace(good, ".v1.", ".v2.", 1)},
+		{"wrong_version", strings.Replace(good, ".v2.", ".v1.", 1)},
 		{"wrong_root", strings.Replace(good, "tether.", "tetherx.", 1)},
 		{"missing_cmd_segment", strings.Replace(good, ".cmd.", ".xmd.", 1)},
 		{"missing_by_segment", strings.Replace(good, ".by.", ".xy.", 1)},
@@ -198,11 +198,11 @@ func TestParseCmdByRejectsMalformed(t *testing.T) {
 		{"all_dots", strings.Repeat(".", 10)},
 		{"all_blank", "          "},
 		{"sid_invalid_uppercase",
-			"tether.v1.s.LAB.cmd.by." + validActor + ".node.lab-1.run.req"},
+			"tether.v2.s.LAB.cmd.by." + validActor + ".node.lab-1.run.req"},
 		{"actor_invalid_short",
-			"tether.v1.s.lab.cmd.by.UAAA.node.lab-1.run.req"},
+			"tether.v2.s.lab.cmd.by.UAAA.node.lab-1.run.req"},
 		{"nid_with_dot_breaks_token_count",
-			"tether.v1.s.lab.cmd.by." + validActor + ".node.lab.1.run.req"},
+			"tether.v2.s.lab.cmd.by." + validActor + ".node.lab.1.run.req"},
 	}
 	for _, c := range cases {
 		c := c
@@ -244,12 +244,12 @@ func TestParseEvProcRejectsMalformed(t *testing.T) {
 		SubjectPrefix,
 		good + ".extra",
 		strings.TrimSuffix(good, ".exit"),
-		strings.Replace(good, ".v1.", ".v2.", 1),
+		strings.Replace(good, ".v2.", ".v1.", 1),
 		strings.Replace(good, ".ev.", ".cmd.", 1),
 		strings.Replace(good, ".node.", ".xnode.", 1),
 		strings.Replace(good, ".proc.", ".xproc.", 1),
-		"tether.v1.s.LAB.ev.node.lab-1.proc.01h.exit", // sid invalid
-		"tether.v1.s.lab.ev.node.LAB.proc.01h.exit",   // nid invalid
+		"tether.v2.s.LAB.ev.node.lab-1.proc.01h.exit", // sid invalid
+		"tether.v2.s.lab.ev.node.LAB.proc.01h.exit",   // nid invalid
 		strings.Repeat(".", 9),
 	}
 	for i, s := range cases {
@@ -279,13 +279,13 @@ func TestParseSidNidFromCtrlRejectsMalformed(t *testing.T) {
 	cases := []string{
 		"",
 		SubjectPrefix,
-		strings.Replace(good, ".v1.", ".v2.", 1),
+		strings.Replace(good, ".v2.", ".v1.", 1),
 		strings.Replace(good, ".ctrl.", ".cmd.", 1),
 		strings.Replace(good, ".s.lab.", ".x.lab.", 1),
 		strings.Replace(good, ".node.", ".xnode.", 1),
-		"tether.v1.ctrl.s.LAB.node.lab-1.register.req", // sid invalid
-		"tether.v1.ctrl.s.lab.node.LAB.register.req",   // nid invalid
-		"tether.v1.ctrl.s.lab.node.lab-1",              // too short
+		"tether.v2.ctrl.s.LAB.node.lab-1.register.req", // sid invalid
+		"tether.v2.ctrl.s.lab.node.LAB.register.req",   // nid invalid
+		"tether.v2.ctrl.s.lab.node.lab-1",              // too short
 	}
 	for i, s := range cases {
 		if _, _, ok := ParseSidNidFromCtrl(s); ok {

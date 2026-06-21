@@ -51,7 +51,7 @@ func TestIssueAndDecodeUserJWT(t *testing.T) {
 	}
 	userPub := freshUserPub(t)
 
-	pubAllow := "tether.v1.ctrl.by." + userPub + ".session.create.req"
+	pubAllow := "tether.v2.ctrl.by." + userPub + ".session.create.req"
 	perms := jwt.Permissions{
 		Pub: jwt.Permission{Allow: []string{pubAllow}},
 		Sub: jwt.Permission{Allow: []string{"_INBOX.>"}},

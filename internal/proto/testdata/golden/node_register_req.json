@@ -1,0 +1,25 @@
+{
+  "proto_version": 2,
+  "release_version": "v0.0.0-dev",
+  "nid": "lab-1",
+  "os": "linux",
+  "arch": "amd64",
+  "boot_id": "deadbeef",
+  "local_processes": [
+    {
+      "pid": "01h",
+      "state": "exited",
+      "rc": 0,
+      "started_at": "2026-05-08T10:00:00Z",
+      "start_time_ticks": 12345
+    }
+  ],
+  "local_ports": [
+    {
+      "port": 14000,
+      "name": "jupyter",
+      "local_port": 8888,
+      "token_hash": "abc"
+    }
+  ]
+}

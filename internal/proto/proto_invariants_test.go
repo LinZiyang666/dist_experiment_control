@@ -19,7 +19,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"reflect"
-	"strings"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -42,7 +42,7 @@ func allRoundtripCases() []roundtripCase {
 	rc := 42
 	return []roundtripCase{
 		{"UpgradeReq", &UpgradeReq{
-			URL: "https://x/y.tgz", SHA256: "deadbeef", ProtoVersion: 1, ActorFP: "SHA256:fp",
+			URL: "https://x/y.tgz", SHA256: "deadbeef", ProtoVersion: 2, ActorFP: "SHA256:fp",
 		}, &UpgradeReq{}},
 		{"UpgradeResp", &UpgradeResp{OK: true, Code: "x", Error: "y"}, &UpgradeResp{}},
 		{"RunChunk", &RunChunk{
@@ -86,14 +86,14 @@ func allRoundtripCases() []roundtripCase {
 		{"NodeListReq", &NodeListReq{}, &NodeListReq{}},
 		{"NodeListResp", &NodeListResp{Nodes: []NodeListEntry{{
 			NID: "lab-1", Status: "ONLINE", LastHeartbeatAt: t0,
-			BootID: "x", ReleaseVersion: "v0.0.0-dev", ProtoVersion: 1,
+			BootID: "x", ReleaseVersion: "v0.0.0-dev", ProtoVersion: 2,
 		}}}, &NodeListResp{}},
 		{"PtyAttachEvent", &PtyAttachEvent{Cols: 80, Rows: 24}, &PtyAttachEvent{}},
 		{"PtyResizeEvent", &PtyResizeEvent{Cols: 80, Rows: 24}, &PtyResizeEvent{}},
 		// Bonus structs that participate on the wire but weren't in the
 		// minimum list — covering them keeps the catalogue closed.
 		{"NodeRegisterReq", &NodeRegisterReq{
-			ProtoVersion: 1, ReleaseVersion: "v0.0.0-dev", NID: "lab-1",
+			ProtoVersion: 2, ReleaseVersion: "v0.0.0-dev", NID: "lab-1",
 			OS: "linux", Arch: "amd64", BootID: "deadbeef",
 			LocalProcesses: []LocalProcess{{
 				PID: "01h", State: "exited", RC: &rc,
@@ -377,15 +377,26 @@ func TestOKCodeErrorCombinations(t *testing.T) {
 }
 
 // TestProtoVersionStillPositive guards against accidental regression of
-// the existing TestProtoVersionPositive — and pins the relationship
-// between ProtoVersion and SubjectPrefix's "v1" tag.
+// TestProtoVersionPositive — and pins the relationship between ProtoVersion,
+// SubjectVersionToken and SubjectPrefix as a VERSION-AGNOSTIC invariant.
+//
+// The old form (`!HasSuffix(.v1) && ProtoVersion==1`) silently passed vacuously
+// the moment ProtoVersion left 1, so it provided no safety net for the D0 v2
+// flip. This form fires on ANY mismatch and never needs editing on a future
+// bump: SubjectVersionToken must be exactly "v<ProtoVersion>", and SubjectPrefix
+// must be "tether." + SubjectVersionToken (the single source of truth, §SSOT).
 func TestProtoVersionStillPositive(t *testing.T) {
 	if ProtoVersion < 1 {
 		t.Fatalf("ProtoVersion must be ≥ 1, got %d", ProtoVersion)
 	}
-	if !strings.HasSuffix(SubjectPrefix, ".v1") && ProtoVersion == 1 {
-		t.Fatalf("SubjectPrefix=%q must end with .v1 while ProtoVersion=%d",
-			SubjectPrefix, ProtoVersion)
+	wantToken := "v" + strconv.Itoa(ProtoVersion)
+	if SubjectVersionToken != wantToken {
+		t.Fatalf("SubjectVersionToken=%q must be %q for ProtoVersion=%d",
+			SubjectVersionToken, wantToken, ProtoVersion)
+	}
+	if wantPrefix := "tether." + SubjectVersionToken; SubjectPrefix != wantPrefix {
+		t.Fatalf("SubjectPrefix=%q must be %q (derived from SubjectVersionToken)",
+			SubjectPrefix, wantPrefix)
 	}
 }
 

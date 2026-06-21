@@ -5,13 +5,13 @@
 // Stream topology (must match H.1 verbatim):
 //
 //	events
-//	  subjects   = ["tether.v1.sys.events"]
+//	  subjects   = ["tether.v2.sys.events"]
 //	  retention  = limits, max_age=30d, max_bytes=1GiB, discard=old
 //	  storage    = file
 //	  subscribers: owner ctl + ops tools
 //
 //	history-<sid>                                         per session
-//	  subjects   = ["tether.v1.s.<sid>.audit.>"]
+//	  subjects   = ["tether.v2.s.<sid>.audit.>"]
 //	  retention  = limits, max_age=-1, max_bytes=-1, discard=new
 //	  storage    = file
 //	  subscribers: session members via ephemeral consumers
@@ -139,7 +139,7 @@ func ListHistorySIDs(ctx context.Context, js jetstream.JetStream) ([]string, err
 }
 
 // historyFilterSubject is the subject pattern history-<sid> filters
-// on. Architecture H.1: "tether.v1.s.<sid>.audit.>" — captures
+// on. Architecture H.1: "tether.v2.s.<sid>.audit.>" — captures
 // audit.call / audit.proc / audit.port. The wildcard at the end is
 // what lets us add new audit subkinds (e.g. audit.kick) later
 // without re-creating the stream.

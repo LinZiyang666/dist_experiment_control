@@ -11,10 +11,24 @@ package proto
 
 const (
 	// ProtoVersion is the wire/contract version. Bump only on breaking changes.
-	ProtoVersion = 1
+	//
+	// v2 = the distributed-broker HA epic (proto v1→v2 HARD upgrade, architecture
+	// distributed-broker §16.2): incompatible with v1 agents, rolled out as a
+	// coordinated fleet-wide reinstall. The wire struct SHAPES are unchanged at
+	// the v2 baseline (D0) — the breaking field additions (REGISTER epoch,
+	// HomeDirective.cert_pins) land in D6.
+	ProtoVersion = 2
 
-	// SubjectPrefix is the global root for all v1 NATS subjects.
-	SubjectPrefix = "tether.v1"
+	// SubjectVersionToken is the single source of truth for the version segment
+	// ("v<ProtoVersion>") of every NATS subject. Every subject builder AND parser
+	// derives from it — never hardcode "v1"/"v2" elsewhere. Enforced by the
+	// determinism-lint TestNoStrayVersionLiteral tripwire and asserted in sync
+	// with ProtoVersion by TestProtoVersionStillPositive.
+	SubjectVersionToken = "v2"
+
+	// SubjectPrefix is the global root for all NATS subjects, derived from
+	// SubjectVersionToken so the version lives in exactly one place.
+	SubjectPrefix = "tether." + SubjectVersionToken
 )
 
 // ReleaseVersion is the human-facing release tag. Defaults to dev value;

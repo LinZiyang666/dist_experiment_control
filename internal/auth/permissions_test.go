@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/jwt/v2"
 )
 
@@ -27,7 +28,7 @@ func allTemplates() []templateCase {
 	}
 }
 
-// Top-level wildcard `tether.v1.>` is forbidden in EVERY template, including
+// Top-level wildcard `tether.v2.>` is forbidden in EVERY template, including
 // the broker template. We never want any single subscription/publish entry
 // to cover the entire protocol surface.
 func TestNoTopLevelWildcard(t *testing.T) {
@@ -40,7 +41,7 @@ func TestNoTopLevelWildcard(t *testing.T) {
 	}
 }
 
-// "Cross-subtree" wildcard = `tether.v1.s.<sid>.>` — covers cmd, ev, audit,
+// "Cross-subtree" wildcard = `tether.v2.s.<sid>.>` — covers cmd, ev, audit,
 // pty, and ctrl.* in one entry. Allowed only on broker template (as
 // `s.*.ev.>` / `s.*.audit.>` etc., which still pin a leaf subtree).
 func TestNoCrossSubtreeWildcard(t *testing.T) {
@@ -122,13 +123,24 @@ func TestAgentSubScopedToOwnNode(t *testing.T) {
 	}
 }
 
-// SubjectPrefix duplicated in this package vs proto must match.
+// TestSubjectPrefixInSyncWithProto is the REAL cross-check that auth's
+// import-cycle copy of the subject prefix stays synced with the proto SSOT.
+//
+// The non-test permissions.go deliberately duplicates `subjectPrefix` to avoid
+// importing proto (cycle through proto's ed25519/jwt identifier validation),
+// but this _test.go is free to import proto (proto does NOT depend on
+// internal/auth — verified). Asserting against the literal "tether.v2" would be
+// a tautology that a future bump (e.g. proto→"tether.v3" while forgetting to
+// update permissions.go) would still pass — silently pointing every JWT ACL at
+// the wrong subject tree. Assert against the live SSOT instead.
 func TestSubjectPrefixInSyncWithProto(t *testing.T) {
-	// Encoded into subjectPrefix const. proto.SubjectPrefix is "tether.v1".
-	// If they ever diverge, every other test here breaks first; this is just
-	// an explicit pin for grep-ability.
-	if subjectPrefix != "tether.v1" {
-		t.Fatalf("subjectPrefix in internal/auth diverged: %q", subjectPrefix)
+	if subjectPrefix != proto.SubjectPrefix {
+		t.Fatalf("auth subjectPrefix diverged from proto SSOT: auth=%q proto=%q "+
+			"(update internal/auth/permissions.go to match)", subjectPrefix, proto.SubjectPrefix)
+	}
+	// Literal anchor so the current wire prefix is also greppable.
+	if proto.SubjectPrefix != "tether.v2" {
+		t.Fatalf("expected proto.SubjectPrefix=tether.v2 at D0, got %q", proto.SubjectPrefix)
 	}
 }
 

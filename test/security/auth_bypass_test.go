@@ -115,7 +115,7 @@ func TestUpgradeWithMalformedActorTokenRejected(t *testing.T) {
 		"u" + strings.Repeat("A", 55), // lowercase 'u'
 		"",
 	} {
-		subj := "tether.v1.s.lab.cmd.by." + badActor + ".node.lab-1.upgrade.req"
+		subj := "tether.v2.s.lab.cmd.by." + badActor + ".node.lab-1.upgrade.req"
 		respMsg, err := nc.Request(subj, body, 500*time.Millisecond)
 		if err != nil {
 			// Timeout is fine — broker's wildcard subscription matches

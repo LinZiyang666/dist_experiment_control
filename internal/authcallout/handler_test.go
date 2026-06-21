@@ -133,7 +133,7 @@ func TestHandleAllowsUnactivated(t *testing.T) {
 		t.Errorf("subject: got %q want ephemeral %q", uc.Subject, ephemeral)
 	}
 	// Pub allow must be locked to the CLIENT's nkey, not the ephemeral.
-	want := "tether.v1.ctrl.by." + client + ".session.create.req"
+	want := "tether.v2.ctrl.by." + client + ".session.create.req"
 	found := false
 	for _, p := range uc.Pub.Allow {
 		if p == want {

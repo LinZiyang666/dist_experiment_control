@@ -474,7 +474,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.js, _ = jetstream.New(nc)
 
 	subFwd, err := nc.Subscribe(
-		fmt.Sprintf("tether.v1.s.%s.cmd.node.%s.*.req.forwarded", a.cfg.SID, a.cfg.NID),
+		// Wildcard over verbs; derive the subject from the SSOT builder so the
+		// version prefix is never hardcoded (tether.v2.* after the D0 flip).
+		proto.SubjCmdForwarded(a.cfg.SID, a.cfg.NID, "*"),
 		func(msg *nats.Msg) {
 			// round-2 F4: count the callback from the moment it STARTS, before
 			// dispatchForwarded — so a callback preempted before it spawns a

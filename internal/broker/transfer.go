@@ -294,7 +294,7 @@ func msSince(t0, t1 time.Time) int64 {
 }
 
 // pubAuditTransfer marshals + publishes one AuditTransfer row to
-// `tether.v1.s.<sid>.audit.transfer`. Best-effort: failures log a
+// `tether.v2.s.<sid>.audit.transfer`. Best-effort: failures log a
 // warning but don't abort the surrounding handler — losing one audit
 // row is preferable to flapping a successful transfer because
 // JetStream momentarily glitched.

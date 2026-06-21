@@ -31,14 +31,18 @@ e2e:
 	go test -count=1 -tags e2e_matrix -v ./test/e2e/...
 
 lint:
-	@command -v golangci-lint >/dev/null || { \
-	  echo "error: golangci-lint not found. Run: make tools"; exit 1; }
-	golangci-lint run
+	@GOPATH_BIN="$$(go env GOPATH)/bin/golangci-lint"; \
+	  if [ -x "$$GOPATH_BIN" ]; then LINT="$$GOPATH_BIN"; \
+	  else LINT="$$(command -v golangci-lint 2>/dev/null)"; fi; \
+	  test -n "$$LINT" && test -x "$$LINT" || { echo "error: golangci-lint not found. Run: make tools"; exit 1; }; \
+	  "$$LINT" run
 
+# Build golangci-lint from source with the LOCAL Go toolchain (Go 1.25) via the
+# module proxy. This avoids both (a) the prebuilt v1.x binary that refuses Go
+# 1.25 modules and (b) a network dependency on raw.githubusercontent.com (the
+# install.sh host), which may be firewalled.
 tools:
-	@command -v curl >/dev/null || { echo "error: curl is required for tools install"; exit 1; }
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-	  | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_VERSION)
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 
 # nats-server is a development-time dependency (only needed to manually exercise
 # `tether serve` against a real broker; the Go test suite uses an embedded

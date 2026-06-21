@@ -21,7 +21,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// pubSysEvent emits one tether.v1.sys.events message. Always best-
+// pubSysEvent emits one tether.v2.sys.events message. Always best-
 // effort: failure to publish doesn't fail the underlying operation
 // (ops events are observability, not authoritative state). Routes
 // through publishAudit so it lands in the `events` JetStream stream

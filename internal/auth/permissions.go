@@ -5,8 +5,10 @@ import "github.com/nats-io/jwt/v2"
 // subjectPrefix is duplicated from internal/proto.SubjectPrefix to avoid
 // pulling proto into internal/auth (and through it the ed25519 / jwt
 // chain into proto's identifier validation). Kept in sync via the static
-// guard test in this package.
-const subjectPrefix = "tether.v1"
+// guard test in this package (TestSubjectPrefixInSyncWithProto). This is the
+// one legitimate off-SSOT copy of the version prefix (the D0 tripwire
+// whitelists it).
+const subjectPrefix = "tether.v2"
 
 // PermissionsForUnactivated returns the permissions a CLI gets after
 // authenticating but before activating any session. Architecture B.2.

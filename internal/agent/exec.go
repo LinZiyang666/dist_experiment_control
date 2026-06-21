@@ -27,7 +27,7 @@ const streamChunkSize = 4 * 1024
 // dispatchForwarded routes a `cmd.node.<N>.<verb>.req.forwarded` message
 // to the right verb handler. Subject layout:
 //
-//	tether.v1.s.<sid>.cmd.node.<nid>.<verb>.req.forwarded
+//	tether.v2.s.<sid>.cmd.node.<nid>.<verb>.req.forwarded
 //
 // (10 tokens; same as the cmd.by.* tree minus the actor segment).
 func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {

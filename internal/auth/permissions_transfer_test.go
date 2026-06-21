@@ -66,7 +66,7 @@ func TestObjXferEntriesScopedToSession(t *testing.T) {
 // Caps probe must be sid+actor scoped (file-transfer-plan §Wire).
 func TestCapsProbePermissionShape(t *testing.T) {
 	perms := PermissionsForActivatedMember(sampleActor, "lab")
-	want := "tether.v1.ctrl.by." + sampleActor + ".s.lab.caps.req"
+	want := "tether.v2.ctrl.by." + sampleActor + ".s.lab.caps.req"
 	for _, allow := range perms.Pub.Allow {
 		if allow == want {
 			return
@@ -80,7 +80,7 @@ func TestCapsProbePermissionShape(t *testing.T) {
 // Reviewer Round-4 #1 fix.
 func TestFinalizePermissionShape(t *testing.T) {
 	perms := PermissionsForActivatedMember(sampleActor, "lab")
-	want := "tether.v1.ctrl.by." + sampleActor + ".s.lab.transfer.*.finalize.req"
+	want := "tether.v2.ctrl.by." + sampleActor + ".s.lab.transfer.*.finalize.req"
 	for _, allow := range perms.Pub.Allow {
 		if allow == want {
 			return
@@ -104,7 +104,7 @@ func TestActivatedMemberSidIsLockedAtMint(t *testing.T) {
 			if strings.HasPrefix(allow, "_INBOX") {
 				continue
 			}
-			if strings.HasPrefix(allow, "tether.v1.ctrl.by."+sampleActor+".session.") {
+			if strings.HasPrefix(allow, "tether.v2.ctrl.by."+sampleActor+".session.") {
 				continue
 			}
 			t.Errorf("activated_member allow %q references a different sid (template was minted for sid=lab)", allow)

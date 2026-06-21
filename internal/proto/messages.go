@@ -184,7 +184,8 @@ type ExecReq struct {
 	// the agent's remote_fs default: the agent pre-resolves argv[0] against a
 	// PATH sanitized of unhealthy network mounts and fails fast (never hangs) if
 	// argv[0]/cwd is backed by a wedged mount. omitempty ⇒ absent when false ⇒
-	// byte-identical default wire (ProtoVersion stays 1). Broker-transparent
+	// byte-identical default wire (additive; this field did not itself bump the
+	// proto version — v2 is the distributed-broker D0 epic bump). Broker-transparent
 	// (survives the forward re-marshal, same as ActorFP). See
 	// docs/reviews/remote-fs-resilience-plan.md.
 	Safe bool `json:"safe,omitempty"`
@@ -333,7 +334,8 @@ type RunReq struct {
 	Rows int               `json:"rows,omitempty"`
 
 	// Safe — per-call hung-mount-safe spawn escalation; same semantics as
-	// ExecReq.Safe. omitempty ⇒ byte-identical default wire, ProtoVersion 1.
+	// ExecReq.Safe. omitempty ⇒ byte-identical default wire (additive; did not
+	// itself bump the proto version — v2 is the distributed-broker D0 epic bump).
 	Safe bool `json:"safe,omitempty"`
 
 	// ActorFP — broker-stamped at forward time; same semantics as
@@ -748,7 +750,8 @@ type CapsResp struct {
 }
 
 // ---------------------------------------------------------------------------
-// P13 — session-scoped proxy subscription. All additive; ProtoVersion stays 1.
+// P13 — session-scoped proxy subscription. All additive; P13 did not itself bump
+// ProtoVersion (the v1→v2 bump is the distributed-broker D0 epic, §16.2).
 // ---------------------------------------------------------------------------
 
 // ProxyKey is one ACTIVE subscriber's Shadowsocks credential pushed to an

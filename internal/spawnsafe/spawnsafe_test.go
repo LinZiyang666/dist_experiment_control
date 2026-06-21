@@ -432,7 +432,13 @@ func TestPrepare_inertAndEscalation(t *testing.T) {
 	// + bound on a hangable machine, review F1/F2) but NOT an outage: byte-identical
 	// output (resolved Path, no Env/Cwd/Warn rewrite).
 	pHealthy := mustNew(t, Config{Mode: ModeAuto, MountSource: mountSrc([2]string{"/nfs", "nfs"}, [2]string{"/", "ext4"}), Probe: fp.fn})
-	d0, err0 := pHealthy.Prepare([]string{"echo"}, "", "/usr/bin:"+tmp, []string{"PATH=" + tmp}, false)
+	// tmp MUST come first in the resolve PATH: a later "/usr/bin" entry would
+	// otherwise win on any host where /usr/bin/echo exists (it does on Linux),
+	// resolving Path to /usr/bin/echo instead of our fake tmp/echo and failing
+	// the byte-identical-Path assertion. (Pre-existing env-fragility; the
+	// contract under test is "self-resolve picks the on-PATH binary", not which
+	// dir wins.)
+	d0, err0 := pHealthy.Prepare([]string{"echo"}, "", tmp+":/usr/bin", []string{"PATH=" + tmp}, false)
 	if err0 != nil {
 		t.Fatalf("healthy-hangable Prepare: %v", err0)
 	}

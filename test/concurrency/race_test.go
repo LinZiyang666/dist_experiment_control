@@ -314,7 +314,7 @@ func TestAgentDispatchAfterRunCancel(t *testing.T) {
 	}
 	defer stub.Close()
 	if _, err := stub.Subscribe(
-		"tether.v1.ctrl.s.*.node.*.register.req",
+		"tether.v2.ctrl.s.*.node.*.register.req",
 		func(msg *nats.Msg) { _ = msg.Respond([]byte(`{"OK":true}`)) },
 	); err != nil {
 		t.Fatal(err)
@@ -357,7 +357,7 @@ func TestAgentDispatchAfterRunCancel(t *testing.T) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	if err := stub.PublishRequest(
-		"tether.v1.s.lab.cmd.node.lab-1.exec.req.forwarded",
+		"tether.v2.s.lab.cmd.node.lab-1.exec.req.forwarded",
 		inbox, []byte(`{"argv":["true"]}`),
 	); err != nil {
 		t.Fatal(err)
@@ -417,7 +417,7 @@ func TestSessionRmAfterBrokerCancel(t *testing.T) {
 		sid := sid
 		go func() {
 			defer wg.Done()
-			subj := fmt.Sprintf("tether.v1.ctrl.by.fp.session.%s.rm.req", sid)
+			subj := fmt.Sprintf("tether.v2.ctrl.by.fp.session.%s.rm.req", sid)
 			// Use a short timeout — we don't care about the
 			// reply; we only care that the broker survives.
 			_, _ = nc.Request(subj, []byte(`{}`), 500*time.Millisecond)

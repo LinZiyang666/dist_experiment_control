@@ -30,9 +30,44 @@ func openDB(t *testing.T) *sql.DB {
 func sampleInput() RegisterInput {
 	return RegisterInput{
 		SID: "lab", NID: "lab-1",
-		ProtoVersion: 1, ReleaseVersion: "v0.0.0-dev",
+		ProtoVersion: 2, ReleaseVersion: "v0.0.0-dev",
 		OS: "linux", Arch: "amd64",
 		BootID: "deadbeef",
+	}
+}
+
+// TestLastHeartbeatStoredUTC is the regression guard for the non-UTC offline
+// port-revoke bug: last_heartbeat_at must be stored in UTC so the RAW SQL
+// comparison in port.ListAllocatedForOfflineNodes (`n.last_heartbeat_at < <UTC
+// cutoff>`) is correct on ANY host timezone. A +08:00 input is forced so the
+// test is deterministic regardless of where it runs — a UTC-host CI would NOT
+// otherwise catch the bug (the original failure only reproduced on non-UTC
+// hosts: a local-TZ value like "17:00..+08:00" sorts lexicographically AFTER a
+// UTC cutoff like "10:00..+00:00", so the reconciler silently never revoked).
+func TestLastHeartbeatStoredUTC(t *testing.T) {
+	db := openDB(t)
+	if err := Register(db, sampleInput(), time.Now()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Heartbeat with an OLD time expressed in +08:00 (= 09:00:00 UTC).
+	plus8 := time.FixedZone("plus8", 8*3600)
+	oldHb := time.Date(2026, 6, 21, 17, 0, 0, 0, plus8) // 09:00:00 UTC
+	if err := Heartbeat(db, "lab", "lab-1", oldHb); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	// Reproduce the reconciler's comparison: a UTC cutoff strictly AFTER the
+	// heartbeat instant must select the row.
+	cutoff := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC) // 10:00 UTC > 09:00 UTC
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM nodes WHERE sid='lab' AND nid='lab-1' AND last_heartbeat_at < ?`,
+		cutoff,
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("last_heartbeat_at must be stored UTC and compare < a later UTC cutoff "+
+			"(the offline-port reconciler relies on this); got %d rows, want 1", n)
 	}
 }
 

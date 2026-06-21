@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "keep_ports": [
+    14000
+  ],
+  "revoke_ports": [
+    14001
+  ],
+  "drop_processes": [
+    "03h"
+  ]
+}
