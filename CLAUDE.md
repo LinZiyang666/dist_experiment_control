@@ -7,7 +7,7 @@
 
 - 一句话：**"SSH + 端口暴露" 的 NAT 穿透控制面**——NAT 后的 agent 经 NATS 反连公网 broker，使用者（ctl）经同一 NATS 把命令路由到 agent。三角色同一二进制 `tether`，子命令切换。
 - `docs/requirements.md` — 需求基线（唯一需求真相）。
-- `docs/architecture.md` — 架构基线（实现尺）。关键：**「里程碑映射」（P0→P11 出口）**、**「关键依赖警告」（先父后子硬约束）**、**「每进入新 phase 的 checklist」**。
+- `docs/architecture.md` — 架构基线（实现尺）。关键：**「里程碑映射」（P0→P11 出口 + post-1.0 叶子增量登记）**、**「关键依赖警告」（先父后子硬约束）**、**「每进入新 phase 的 checklist」**。
 - `docs/usage.md` — 全量用户/运维手册（怎么用、怎么部、怎么排错）。
 - `docs/devices.md` — 实机/设备清单。
 - `docs/reviews/` — 每个 phase / feature 的 plan 与各轮 review 报告（`p<N>-plan.md`、`p<N>-review.md`(+`-round2`/`-round3`)、`p<N>-external-review.md`；历史 feature 增量用 `<feature>-plan.md`）。
@@ -16,7 +16,8 @@
 
 ## 2. 工作单元：一次一个 phase
 
-- 按 `architecture.md`「里程碑映射」的 **P<N> 序列**推进，**一次只做一个 phase**。P0–P11 已带到 **v0.1.0**；post-1.0 的 feature 增量（file-transfer→v0.2.0、ps-retention→v0.2.8 等）已发布；**新工作从 P12 续编**。
+- 按 `architecture.md`「里程碑映射」的 **P<N> 序列**推进，**一次只做一个 phase**。主线 P0–P11 已带到 **v0.1.0**；其后改为 **post-1.0 叶子增量**模式（各自独立 plan→实现→内审→外审，不在线性 P 序内、不阻塞主线），P12（expose `--remote-port`）/P13（proxy 订阅）等均按此走，当前已发布到 **v0.3.4**。
+- **新工作**：除非用户明确要延续线性里程碑（则取下一个未做的 P 号），否则一律当作**新的叶子 feature 增量**——范围先与用户敲定，再按 §3 的 3 阶段 7 步开工。
 - 依赖"**先父后子**"：任何 phase 只用已完成的前序产物，绝不超前——严格遵守 `architecture.md`「关键依赖警告」里的不可跳序约束。
 - 每进入新 phase 先过 `architecture.md`「每进入新 phase 的 checklist」（前一 phase 出口断言全过、翻状态、开分支、**实现中发现设计问题先改文档再改代码**、单测+e2e 同 PR 落盘）。
 
@@ -64,8 +65,28 @@
 - commit message：conventional commits `<type>(scope): <imperative summary>`（如 `feat(ps): retention-bounded ps RPC`、`fix(auth): grant $JS.API.DIRECT.GET`）。
 - **绝不添加 `Co-Authored-By: Claude` 或任何 AI 署名**（全局规则；已推送的若混入，用户会 rebase 移除）。作者/协作者只保留用户本人。
 
-## 7. 当前状态
+## 7. 当前状态（截至 2026-06，最新 tag v0.3.4，proto 始终 v1）
 
-- **已发布 v0.2.8**（proto v1）。P0–P11 带到 v0.1.0（GitHub release）；post-1.0 feature 增量已发：file-transfer（push/pull，tier-A inline + tier-B JetStream Object Store，v0.2.0）、run heartbeat watchdog、retention-bounded `ps` RPC + processes GC（v0.2.8）等。
-- 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net`，lab session 多 agent）。
-- **下一个 phase：P12**（范围待与用户确认后，按 §3 的 3 阶段 7 步开工；先父后子，不超前）。
+- **主线**：P0–P11 → **v0.1.0**（GitHub release，里程碑全达成）。
+- **已发布的 post-1.0 叶子增量**（按 tag 序）：
+  - file-transfer（`push`/`pull`，tier-A inline + tier-B JetStream Object Store）— **v0.2.0**（后 tier-B 上限提到 2 GiB）
+  - run heartbeat watchdog、retention-bounded `ps` RPC + processes GC — **v0.2.8**
+  - **P12** expose `--remote-port`（指定公网端口，带内唯一索引仲裁） — **v0.2.9**
+  - **P13** session-scoped proxy 订阅（"自建机场"：内嵌纯 Go shadowsocks `chacha20-ietf-poly1305` + 试解密多密钥，broker 托管 HTTPS 订阅 URL，Clash 可导入） — **v0.3.0**
+  - compliance-cleanup 审计加固 — **v0.3.1**
+  - transfer-unrestrict（`file_transfer.allow_roots` 改为可选收紧，缺省全盘触达） — **v0.3.2**
+  - remote-fs-resilience（agent 网络盘挂死时 `exec`/`run` 不再永久卡死，`--safe`） — v0.3.3（随 v0.3.4 线发布）
+  - proxy-tunnel-reconnect（反向隧道自愈重连 + 就绪 liveness） — **v0.3.4**
+- 规模：~58k 行 Go（非测试）、22 个 internal 包、161 个测试文件 / ~777 个 Test+Fuzz；`CGO_ENABLED=0 go build ./...` 通过。
+- 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net`，lab session 多 agent；P12/P13/transfer-unrestrict/remote-fs 均有 pc732 真硬件验证记录）。
+
+### 已知未收口 / 缺口（接手时优先处理）
+
+- **P13 阶段出口仍是 CONDITIONAL PASS**（见 `docs/reviews/p13-external-review-round8.md`）：代码已放行，但锁定的 **真 Caddy/WSS + 真 Clash 客户端**端到端验证尚未跑过；按"外审不过不算 done"，P13 严格说还差这一步收口。
+- **e2e 矩阵覆盖洞**：`test/e2e/all_phases_test.go` 仅覆盖 p1–p10 + p13；**p11 及 post-1.0 的 file-transfer / ps-retention / P12 未进矩阵**（plan 已承认为既有缺口）。新增量进矩阵时一并回填。
+- **`README.md` 为空**（0 字节）——对外门面缺失。
+- `log.md` BUG#1（v0.1.2 时 `history` 因 JWT 缺 JetStream 权限全 FAIL）已由后续 auth 修复（`$JS.API.DIRECT.GET` / `$JS.FC`）处理，但 `log.md` 未补对应的实机重测 PASS 记录。
+
+### 下一步
+
+- **无进行中的 phase**；新工作按 §2 当作新叶子增量（范围先与用户敲定）。可选的收口/打磨项见上方缺口清单。
