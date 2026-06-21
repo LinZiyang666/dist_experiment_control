@@ -28,9 +28,10 @@ jobs:
           out=$(./bin/tether version)
           echo "$out"
           # P0 exit assertion: default build prints "tether v0.0.0-dev" on line 1.
+          # proto is v2 since the distributed-broker D0 wire bump (proto v1->v2).
           # When VERSION is overridden (release builds), this step is updated
           # alongside the release workflow.
-          [ "$(echo "$out" | head -n1)" = "tether v0.0.0-dev (proto v1)" ]
+          [ "$(echo "$out" | head -n1)" = "tether v0.0.0-dev (proto v2)" ]
       - run: make test
 
   lint:
