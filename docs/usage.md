@@ -549,6 +549,44 @@ linux/amd64
 go1.25.0
 ```
 
+### 5.1.6 控制面代理（proxy-aware dial）
+
+**这是什么**：让 tether 的**控制面 NATS 连接**经一个本地代理（如 Clash `127.0.0.1:7897`）出网。**默认不开**——只有设了代理 env（`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`）时才生效；没设时行为与以前逐字节一致。
+
+**何时用**：NAT 后的笔记本（尤其 **WSL 镜像网络**）连墙外 broker 时 `tether ps`/`exec` 永久 hang。根因：broker 域名被本地代理（Clash 等）解析成 **fake-ip**（`198.18.x.x`），而 WSL 的透明 TUN 承载不动 fake-ip 流量 → TLS 握手卡死。设了代理 env 后，tether 把**域名**交给代理做**远程 DNS**，绕开本地 fake-ip。Mac 原生 TUN 能承载 fake-ip 故无此问题。
+
+**支持的 env**（每个 key 大写优先于小写；控制面恒为 TLS 目标）：
+
+| env | 用途 |
+|---|---|
+| `HTTPS_PROXY` | 控制面（TLS）首选 |
+| `ALL_PROXY`   | 次选（catch-all） |
+| `HTTP_PROXY`  | 末选 |
+| `NO_PROXY`    | 直连旁路列表（见下） |
+
+优先级是 **per-key**：`HTTPS_PROXY` > `ALL_PROXY` > `HTTP_PROXY`，每个 key 自身**大写优先于小写**、首个非空胜（故小写 `https_proxy` 仍胜过大写 `ALL_PROXY`）。
+
+**支持的 scheme**：`http://`/`https://`（HTTP CONNECT）、`socks5://`/`socks5h://`。**`socks5://` 与 `socks5h://` 在 tether 里等价——都让代理做远程 DNS**（这正是绕开 WSL fake-ip 的关键）。设了代理 env 但 URL 不可解析/不支持 → **直接报错**（fail-closed，不会静默裸连再 hang）。
+
+**NO_PROXY 规则**（只对**目标 broker host** 判定，不影响到代理本身的连接）：
+- 内建旁路：`localhost` / `127.0.0.0/8` / `::1` **即使 NO_PROXY 没写也直连**——故本地 dev broker `nats://127.0.0.1:4222` 永不走代理。
+- `*` = 全部直连；精确 host（大小写不敏感）；`example.com` 匹配该域**及其子域**；`.example.com` 只匹配子域；CIDR（如 `10.0.0.0/8`）**仅对 IP 字面量 broker URL 生效**（域名 broker 走远程解析、CIDR 不命中）。
+
+**典型 WSL + Clash 7897 例子**：
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7897      # 或 socks5h://127.0.0.1:7897
+tether ps                                      # 经代理连 weiland.top:443，不再 hang
+```
+带认证：`export HTTPS_PROXY=socks5://user:pass@127.0.0.1:7897`（HTTP 代理用 `http://user:pass@...`，发 `Proxy-Authorization`）。
+
+**TLS 不破**：代理只承载**裸 TCP**，TLS 握手 / SNI / 证书校验仍由 tether **端到端**做（SNI 取自 broker URL 的主机名）——代理看不到明文、无法 MITM。
+
+**角色覆盖**：**ctl 与 agent 都认**这些 env；**broker 不认**（它是 server，不外拨）。
+
+**范围边界（本版）**：**只代理控制面**（命令/注册/心跳/审计/历史/文件传输——都走同一条 NATS 连接）。**数据面反向隧道**（`tether expose` 的 agent→broker:7000、端口暴露字节、proxy 订阅流量）**本版不经代理**，登记为可选 follow-up。
+
+**排查**：先验代理本身通：`curl -x $HTTPS_PROXY https://<broker>:443 -k`（能连上代理即说明 7897 可用）。代理不可达/认证失败/`NO_PROXY` 误把 broker 列进去导致仍直连，错误信息会点名（凭据不回显）。
+
 ### 5.2 `tether serve`（broker）
 
 ```

@@ -38,6 +38,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/proxydial"
 	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/nats-io/nats.go"
@@ -571,6 +572,10 @@ func (a *Agent) replayPortsFromState() {
 	}
 }
 
+// agentProxyDialTimeout bounds a single proxy dial (proxy hop + CONNECT/SOCKS
+// handshake) when the agent is configured to reach the broker through a proxy.
+const agentProxyDialTimeout = 10 * time.Second
+
 // connectNATS retries nats.Connect on transient failures (server not up
 // yet, DNS not yet resolvable, port closed) until ctx is canceled.
 //
@@ -587,6 +592,14 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Proxy-aware dial. Injected here (the single connect call site) rather than
+	// in buildConnOptions, which has two returns and no merge point — so both
+	// the anonymous and nkey branches are covered. No-op when no proxy env set.
+	popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
+	if perr != nil {
+		return nil, perr
+	}
+	connOpts = append(connOpts, popts...)
 	backoff := a.cfg.RegisterRetryInitial
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {

@@ -3,10 +3,17 @@ package cli
 import (
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/LinZiyang666/tether/internal/proxydial"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
+
+// proxyDialTimeout bounds a single proxy dial (proxy hop + CONNECT/SOCKS
+// handshake) for the ctl's normal connect path. Generous because the broker is
+// typically remote and reached through a local proxy.
+const proxyDialTimeout = 10 * time.Second
 
 // DevNoAuthEnv switches the CLI off nkey CONNECT.
 //
@@ -52,6 +59,14 @@ func ConnectNATSWithNkey(url string, id *Identity, opts ...nats.Option) (*nats.C
 		all = append(all, nats.Nkey(id.PublicKey, sigCB))
 	}
 	all = append(all, opts...)
+	// Proxy-aware dial: when a proxy env var is set, route the NATS TCP dial
+	// through it (HTTP CONNECT / SOCKS5) and skip nats.go's local DNS so the
+	// hostname reaches the proxy for remote resolution. No-op (nil) otherwise.
+	popts, err := proxydial.Options(proxydial.OSEnv, proxyDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	all = append(all, popts...)
 	return nats.Connect(url, all...)
 }
 

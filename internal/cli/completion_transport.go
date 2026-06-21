@@ -12,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/proxydial"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
@@ -131,14 +132,22 @@ func (t *natsTransport) dial(ctx context.Context, name string) (*nats.Conn, erro
 				defer kp.Wipe()
 				return kp.Sign(nonce)
 			}
-			return nats.Connect(t.cctx.NATSURL,
+			opts := []nats.Option{
 				nats.Name(n),
 				nats.Timeout(completionDialTimeout),
 				nats.RetryOnFailedConnect(false),
 				nats.MaxReconnects(0),
 				nats.NoEcho(),
 				nats.Nkey(pubKey, sigCB),
-			)
+			}
+			// Proxy-aware dial; pass the completion budget so a ctx-cancel can't
+			// leave a dial goroutine lingering past the tab-completion deadline.
+			popts, err := proxydial.Options(proxydial.OSEnv, completionDialTimeout)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, popts...)
+			return nats.Connect(t.cctx.NATSURL, opts...)
 		}
 	}
 
