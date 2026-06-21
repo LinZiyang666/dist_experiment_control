@@ -1,0 +1,579 @@
+# 分布式 broker 架构文档（proto v2）
+
+> 本文是"把单点 broker 改造成分布式 HA 系统"这一 epic 的**架构基线（实现尺）**，承接 `docs/distributed-broker-requirements.md`（需求基线）。
+>
+> **流程状态**：Stage B 定稿 → **已过 Stage C 全部三轮对抗性审查并三次改稿**（报告见 `docs/reviews/dist-broker-arch-review.md`、`-round2.md`、`-round3.md`）→ **外审 round-1（FAIL）已处置**：6 条 finding（F1–F3 High：apply.* 鉴权双契约 / force-single runbook / cluster status 直连 Raft 矛盾；F4–F6 Medium：per-expose 地址粒度 / alert ack 集群级 / §18.4 架构契约升正文）已逐条回写正文、§18 降为审计轨迹、§16 补偏离登记（报告与回复见 `docs/reviews/dist-broker-arch-external-review.md`）。**外审 round-2（FAIL）已处置**：3 条契约欠定义（RF1 apply.* 发布者身份=broker nkey AuthUsers/`PermissionsForBroker`，§6.2；RF2 membership 门控=入群密码学 join PoP + remove/upsert 的 leader-local admission，FSM 不假称校验不可复制的 origin proof，§8.1；RF3 稳定 tunnel 证书的存储/Raft 写/轮换契约，§15/§7.7）+ 2 非阻塞已修。**外审 round-3（FAIL）已处置**：R3F1（membership 拆**两阶段**——roster `ClusterNodeUpsert`+join PoP 由 follower 在 `Apply` 复算，`raft.AddVoter` 仅在其 committed 后发起、非 FSM 校验点；半成功 phase + 顺序 + 幂等 + §13.11 门，§8.1/§5）、R3F2（tunnel cert 轮换定 **wire-list `cert_pins{current,previous,valid_until}`** 无状态 agent 契约，§15/§7.7/§2/§13.7）、R3F3（§8.3 create/add 分发 `broker.nk`+稳定 tunnel cert、§6.2 generated nats config 同含 auth_users 与 static nkey permissions）。架构级结论收敛自洽；**纯实现精度长尾见 §18.4(B)，留 plan 阶段必解**。→ **外审 round-4 PASS / 放行（2026-06）**：4 轮外审（F1–F6 / RF1–RF3 / R3F1–R3F3 全部回写正文）后，本文档**作为下一大版本实现基线进入 plan/implementation**（报告见 `docs/reviews/dist-broker-arch-external-review.md`）。**开发 phase 分解（依赖分明的 D0–D9，体例同主项目 P0–P11）见 §19。**
+>
+> 语言：中文叙述；代码 / 标识符 / subject / 表名 / 配置键英文。所有结论**已逐条对齐真实代码树**（migrations 到 0007；`SetMaxOpenConns(1)`+rollback-journal；auth_callout 用普通 `Subscribe`、CONNECT 时一次、`JWTTTL=24h`；`go.mod` **只有 `hashicorp/yamux`，无 raft**；8 处 `CURRENT_TIMESTAMP`；`tunnel.denyIsTransient` 默认 **terminal**、agent 端 `InsecureSkipVerify`；**≥71** 处内联 `pubAudit*/pubSysEvent`（实现期 lint 点清，非"约 15/63"）；存储助手均 `*sql.DB` 自开事务；`disk_pressure` 仅 `disk.go` 的 fire-and-forget `pubSysEvent`（无存储/ack/banner）；`tunnel` server 每次 Start 自签**临时**证书、agent `InsecureSkipVerify`；`port_allocations` row_id 是 AUTOINCREMENT；`PermissionsForBroker` 给每台 broker `s.*.audit.>`/`$JS.API.>` 通配 pub；`adminsock` 仅 0600 文件权限、无签名密钥；P13 仅 **CONDITIONAL PASS**）。
+
+---
+
+## 0. 范围、北极星与显式不做
+
+控制面状态用**内嵌 Raft + 本地 SQLite**（rqlite 模式，单 shard）HA；消息+审计用**外置 NATS 集群 + JetStream**（方案 C：tetherd 编排）HA。
+
+- **N=1 与今天功能等价**（功能等价，非字节级，见 §3.6）；现网平滑变 N=1 集群。
+- **N=2 = 过渡态**（非一等档，无完整性/无 witness，掉一个即只读），`cluster status` 主动警告。
+- **N≥3 奇数 = quorum HA（唯一推荐生产形态，0 丢失承诺的唯一范围）**。
+- 失多数派 → 默认只读 + 运维 `force-single` 逃生（放弃完整性）。
+
+**HA 北极星只覆盖需求点名的数据**：session / member / node / process / port + 审计。**显式不在 v1 HA 范围**：
+- **P13 proxy（"自建机场"）**：P13 本身仍 CONDITIONAL PASS、是 post-1.0 叶子、不在北极星。**proxy 在 v1 维持 single-home / best-effort**——`proxy_meta.generation`、`escalateProxyGen`、`proxy_epoch`、`proxy_ready` 等 P13 fencing **不进 Raft**，故障切换后 proxy 正确性**不是 v1 HA 保证**（§17 明列）。等 P13 转无条件 PASS 再单独做"proxy HA"叶子增量。**这一刀砍掉本 epic 最大一块新增共识面。**
+- 文件传输的 multipath / 最快链路（需求 §1.3 已推后）。
+
+**两个 "REGISTER" 必须分清**（第 1 轮核心纠错）：① **控制面 `register.req`**（NATS）写权威态 → 转发 leader Apply（§4.1）；② **数据面 tunnel REGISTER**（agent 拨 home:7000）→ home broker 本地副本读（§7）。
+
+---
+
+## 1. 信任域与进程模型
+
+### 1.1 NATS 拓扑 = C（外置 + tetherd 编排）
+每台 broker 同机一个独立 `nats-server`（保 A.1/A.2 隔离），N 个 routes 组集群、一个 JS domain。`tether cluster *` 生成每台 `nats-server.conf`（routes + 路由 mTLS + JetStream + **auth_callout：共享 account 为 Issuer、所有 broker nkey 为每台 AuthUsers**——跨节点 queue-group 应答的硬前提，见 §6.1）、托管启停。N=1 退化外置单 NATS（今天不变）。
+
+### 1.2 两层复制
+状态层 = Raft + 本地 SQLite（已提交 0 丢失，仅 N≥3）；消息层 = NATS 集群 + JetStream（`ev.*`/PTY/transfer 字节 best-effort；`audit.*`/`events` JetStream R≤3）。**铁律**：任何权威消息只由 leader 在其 Raft entry 提交后发布（§4.4 的可重导发布契约）；follower 跑同样 Apply 但跳副作用。**HA 不统一——见 §17 保证矩阵。**
+
+### 1.3 监听面（agent 面隧道认证升为硬要求）
+client WSS（Caddy:443/127.0.0.1）；NATS client(127.0.0.1:4222)；**NATS routes(:6222, mTLS cluster CA)**；**Raft transport(:7400, mTLS nkey 钉式)**；**tunnel(:7000)——agent 端 v2 必须按 `HomeDirective.cert_pins`（`current`/未过期 `previous`）钉 home broker 证书、都不匹配拒拨**（§7.7/§15 RF3，不再 `InsecureSkipVerify`；只在 N=1 退路保留旧行为）；admin Unix socket(0600)。Raft/route 口私网+防火墙，`cluster doctor` 断言不可从公网到达。
+
+---
+
+## 2. 包布局
+```
+internal/
+  cluster/      NEW. raft node + FSM apply + 成员变更 + 生命周期 + force-single(offline 子命令) + catch-up + status/doctor(+--json/exit code)
+  alert/        NEW. 复制 alerts + **单一集群级 ack（§18.3，非 per-identity；记 acked_by 仅供展示）** + 客户端合成 gating + banner；严重告警每新会话必重现
+  natscluster/  NEW. 外置 nats-server 配置模板化(含 server_id 确定性命名) + 进程托管 + 路由 mTLS + per-session 流副本重配
+  authcallout/  EXTEND. queue-group + 读路径(本地副本+node fail-closed)/写路径(PIN 经 broker-only mTLS 路由转 leader)
+  jsstream/     EXTEND. replicasFor(nVoters) + 对 history-<sid> 与 OBJ_xfer-<sid> 的 UpdateStream(Replicas) 重配
+  port/         EXTEND. home_broker/rebuild_on_failure/epoch 列；*sql.Tx 变体；ReassignHome；tunnelTokenLookup 加 home==self+epoch 比较
+  tunnel/       EXTEND. **per-expose (per-publicPort) brokerAddr**（§18.2.2，非 per-session）：addr 放每个 clientSession（已按 publicPort 键）、Open/AddProxy 收 addr、dialAndRegister/redialWithBackoff/swapTransport 读 `sess.brokerAddr`；一个 tunnel.Client 并发扇出 N 个 home；v2 常量 home_catching_up(transient)+有界重试；cert_fp 按 expose 线程化钉证
+  adminsock/    EXTEND. cluster.* + alert raise/clear；危险操作 TTY+typed node_id；**仅本地、非 leader 上 fail-fast 指名 leader host**
+  auth/         EXTEND. account 签名私钥 + 专用 node-identity 密钥(≠bus nkey)——**仅用于入群 PoP 挑战-应答 + Raft/route mTLS 叶子钉证（§18.1），不再做 apply.* 转发签名**；短 TTL JWT；**`PermissionsForBroker()` 加 `cluster.apply.>`+`cluster.>` pub/sub，仅授给 broker nkey AuthUsers（apply.* 发布者身份，§6.2 RF1）**
+  proto/        EXTEND. v2 subject grammar SSOT(tether.v2)；HomeDirective{node_id,tunnel_addr,**cert_pins{current,previous,valid_until}**(§15 RF3 轮换双 pin),epoch}/RehomeDirective(带 ReassignHome 的 raft_index)；register 自报 nats server_id + 第 6 字段 epoch(§7.2)
+cmd/tether/
+  cluster.go alert.go   NEW（force-single/recover 为 daemon 停机下的 offline 子命令）
+```
+所有 Raft-owned 表写助手须提供 `*sql.Tx` 变体（Apply 组单 txn）；无变体者禁入 Apply 路径（lint）。
+
+---
+
+## 3. 状态层（Raft + 本地 SQLite）
+
+### 3.1 选库（Stage-B/合并前置门）
+`hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。**raft 是全新依赖（go.mod 现只有 yamux）**：pin 版本、`CGO_ENABLED=0`+Go1.25 编译、**确认 `Config.PreVote`**（§8.4/§9.4 正确性前提）——升为合并前置门。
+
+### 3.2 写入模型 + 读一致性
+**写**：leader 在 `Plan` 把命令渲染成**键/fence 值无不确定性**的 SQL，`cn.Apply→raft.Apply`，各副本 Apply 同 txn 写 `applied_index`。**任何复制写路径 ZERO 直连 `db.Exec`**；废黜 leader 的 `raft.Apply` 返回 `ErrLeadershipLost`。
+> **裁定（R2-blocker：stale-leader 读窗）**：写 fencing 只管写。**读一致性契约**：
+> - 正确性敏感读（force-single 前的 peer 健康、撤销判定）走 **`raft.VerifyLeader()`/ReadIndex barrier**；
+> - `ps`/`history`/`status` 显式降为**有界陈旧**（可能反映尚未下台的旧 leader），§17 列窗口；
+> - auth_callout 本地副本读（已 provision）加 **node 级 fail-closed**：本节点**自上次成功 leader 接触 > `T_fence`（§8.4 pin=10s，统一单调时钟谓词）** 即停止 authorize；若**能**听到更高 term 则立即 fence（更快路径），但不依赖之——无接触分区的旧 leader 靠 `T_fence` 超时而非听到更高 term 也会停（§8.4(a)），故被分区的旧 leader 不再放行连接。
+
+### 3.3 Plan/Apply 确定性（"键/fence 无不确定性"，非"处处无"）
+- **`Plan*`（仅 leader）**：读 leader DB、生成并烤入一切喂 PK/唯一索引/fence 的值（port、token_hash、sub_id、ULID pid、时间戳），渲染 SQL，可返回业务错误。
+- **`Apply*`（每副本）**：exec leader 给的 SQL + 同 txn 写 `applied_index`/`applied_term`。
+- **规则缩为"键/fence 无不确定性"**（非"Apply 处处无计算"）；装饰列（时间戳、`applied_at`）只需功能收敛。
+- **每个自生成 mutator 显式 Plan/Apply 拆分清单**：`proxysub.Create`、`port.Allocate/AllocateProxy`、`ProvisionWithPIN`（verify=Plan、INSERT=Apply）等——**编译期断言 Apply-可达函数不 import `crypto/rand`/`math/rand`/`oklog/ulid`**。
+- **删 `port.go cfgWithDefaults` 的 `time.Now()` fallback**。lint 扫 `internal/{port,proc,node,session,agentprov}`（proxysub 随 P13 移出 v1，§0）+ 禁 FSM 外对 Apply-owned 表 INSERT + 禁 Apply 调 `*sql.DB`-bound mutator。
+
+### 3.4 确定性雷区（收敛后）
+| 雷区 | 处置 |
+|---|---|
+| `time.Now()`/`CURRENT_TIMESTAMP`（8 处，含 `storage.go schema_migrations`） | leader 烤时间字面量；`schema_migrations` 是操作元数据、**排除出等价断言**（各副本自盖）|
+| `genToken`/`rand.Read`/`ulid.Make` pid / entry `ReqID`+`IssuedTS` | leader Plan 一次铸成、字节不可变；去重 key 用 `raft_index` |
+| `port_allocations` PK | **保留 AUTOINCREMENT，不做 0008 重建表**（见 §3.6）|
+| `reconcile.go` G.1 批 map 迭代 | leader 算好、**按 (pid/port ASC) 排序**成一条 `ReconcileBatch`，DB 变更与审计顺序 replay-stable |
+| ~~proxy_meta.generation / proxy_epoch~~ | **随 P13 移出 v1 HA（§0），不进 Raft** |
+
+### 3.5 不进 Raft（leader-local 活性 + 列级 lint 替代物理拆表）
+活性态（`status/last_heartbeat_at/proxy_ready`）leader-local、永不进快照、G.2 一拍重建；身份态（`boot_id/release/proto/proxy_capable/registered_at`）仅 Apply 写。
+> **裁定（R2-nit 简化 + R3 §18.4 修正快照形状）**：**不做 0009 物理拆 `nodes_identity/nodes_liveness`**——改**列级 lint**：`Apply 永不写 status/last_heartbeat_at/proxy_ready`、本地永不写身份列。**不变式改述（架构契约，非快照排除）**：快照采 online-backup 整文件 page-copy，**做不到"投影掉活性列"**；故正确不变式是 **「Apply 永不写活性列 + 恢复/换 leader 无条件 G.2 一拍重建活性列」**——活性列即便随快照带过去也会被重建覆盖，不依赖快照排除。心跳/`ReconcileStates`/`SetProxyReady` 只走活性列。
+
+### 3.6 代理键
+> **裁定（R2-minor）**：**保留 AUTOINCREMENT**——单写 leader 串行 Apply 下 SQLite 自赋 rowid 已确定性；leader **省略 row_id 让 SQLite 赋**（match 今天 `port.go` INSERT）。撤"字节级一致"。等价测试（§13.2）比**逻辑内容**（`.dump` 去 `schema_migrations` 或 per-table 排序 SELECT 哈希），**不比文件字节**（避 free-page/vacuum 假发散）。
+
+### 3.7 双存储崩溃一致性（applied_index 权威源 = SQLite）
+> **裁定（R3-blocker：纠 R2 的不存在 API）**：hashicorp/raft **没有**"FSM 覆盖 raft 内存 lastApplied"的钩子——raft 只从自己的 snapshot meta + log 推 lastApplied，启动时**无条件**把 `log[lastSnapshot.Index+1 .. commit]` 重投给 FSM。故正确机制是两条不变式：
+> 1. **快照 index ≤ SQLite 的 `applied_index`，永不超前**——快照与 SQLite 提交原子地/其后取；这样 raft 截断 log 时不会丢掉 SQLite 尚未落的 entry。
+> 2. **Apply 对 `index ≤ applied_index` 的 entry 必须是已验证的 no-op（幂等重放）**——因为 raft **会**重投已应用 entry，FSM 靠"读本地 applied_index 跳过"自我幂等，**不靠 raft 跳过**。
+>
+> `applied_index` 与 Apply 同 txn。kill-9 矩阵断言"**FSM 容忍 raft 重投已应用 entry**"（真实窗口），而非虚构的覆盖调用。相对增量随 P13 移出后已无。
+
+### 3.8 快照 / 恢复
+采 **WAL** + SQLite online-backup，**专用独立只读 sqlite handle**（**非放松写池**——`SetMaxOpenConns(1)` 仍管写、保 `port.Allocate`/`session.Create` 复合读改写串行化）。WAL 下重验 FK/单写者；并发测试：持续 Apply + 流式 backup，无超 `busy_timeout`、无 `SQLITE_BUSY`、backup 反映一致提交点（含最后已提交 WAL frame）。恢复 = 临时文件 + `integrity_check`（撕裂拒绝）+ migrations 前向 + 原子换入。
+
+---
+
+## 4. 写转发模型 + Schema
+
+### 4.1 session-scoped 写落在非 leader 的控制流
+任意 broker 收到 session-scoped 控制请求（`register.req`/`exec`/`run`/`expose`/`kill`/`push`/`pull`）：入口校验后**经 broker-only subject `tether.v2.cluster.apply.<verb>` 转 leader**。该 subject **走 mTLS cluster routes（broker 间已加密）+ broker-only pub ACL 鉴权**（发布者身份 = broker nkey AuthUsers，可执行定义见 §6.2 RF1）——发起转发的非 leader 本身已是受信 broker。**转发不带 origin-proof 签名 / term / 专用 role：在"所有 broker 同等可信"下 per-broker 转发签名对沦陷 broker 无遏制力（它已在信任边界内），故转发是一致性/路由机制、不是安全边界**（§18.1 / §18.2.3 裁定；遏制由入群 PoP + Raft/route mTLS 叶子钉证提供，见 §6.1/§8.3/§18.2.4）。leader `Plan`→`cn.Apply`→各副本 Apply→**leader post-commit 发唯一审计**（§4.4）。reply 经原 inbox 回 ctl。
+> **fail-closed + 跨重试幂等（R3 §18.4 升为正文契约）**：转发落到刚下台 leader（propose 返回 `ErrLeadershipLost`）→ 应答 broker 转 **typed `not_leader` → fail-closed deny + 客户端重连**，不重试旧 leader、不歧义超时。**幂等键由发起 broker（或客户端）在转发前铸、且跨重试稳定**——**不能由 leader 铸**：`ErrLeadershipLost` 含"entry 已提交但 ack 丢失"的歧义，重试会打到新 leader，若键随 leader 重铸则新 leader 无法去重那条已提交 entry → 重复执行。故 FSM 按此稳定键在 Apply 去重已提交 entry（`r:ReqID` 取该键，§5）。
+> **G.1 reconcile 全程 leader 权威**（需求 §4.1）：home follower 转 agent 清单 → leader 把**整个 reconcileOnRegister 结果算成一条 `ReconcileBatch` entry**。
+> **裁定（R3-blocker：审计可重导）**：`reconcile.go` 现把 DB 变更（`proc.MarkExited`）与内联 `pubAuditProc/pubAuditPort` 交织、迭代 Go map（`agentByPID`，序不定）、且消费 **agent 上报但不在任何持久行里的字段**（`name/local_port/rc` 来自实时 `NodeRegisterReq`）。故 `ReconcileBatch` entry **必须把完整解析后的元组集（pid/port, kind, nid, name, local_port, rc）按 leader 定的全序（port ASC / pid ULID ASC，覆盖两个 map 循环 + killed_orphan 列表）烤进 entry**——使任何新 leader **只读 entry** 就能字节一致地重导审计，绝不再读实时请求或 leader-local map。**§2.2 RTO 含此 leader 往返**（往返预算见 §4.4 末与 §18）。
+
+### 4.2 migrations（精简：保留 AUTOINCREMENT、不物理拆 nodes）
+0007 之后：**0008** `cluster_nodes` 名册（含 `nats_server_id`）；**0009** `cluster_meta`(KV) + `alerts` + `alert_acks`（**删 `cluster_revoked_identities`——§18.3：无 writer/reader**）；**0010** `port_allocations` 加 `home_broker`/`rebuild_on_failure`/`epoch` + 索引。cluster/alert 系表无 `CURRENT_TIMESTAMP` 默认。**不删历史 migration 默认值、不重建表**（migration 引擎按名只跑一次、从不回改已应用库；活性列用 §3.5 列级 lint，不物理拆）。术语：roster 用 `node`/`cluster_nodes`，"member" 留给 session 成员；op 命名 `ClusterNode*`。
+
+`cluster_nodes` 关键列：`node_id`(PK,==Raft ServerID) | `name`(UNIQUE) | `node_ident_pub`(≠bus nkey) | `nats_server_id`(natscluster 模板化时确定性赋、agent 自报用它桥接) | `raft_addr/nats_route/tunnel_addr/public_host` | **`cert_fp`/`cert_fp_prev`/`cert_fp_valid_until`**(稳定 tunnel 证书轮换双 pin，§15 RF3/R3F2) | `phase`(承载 §8.1 `JOIN_VERIFIED_PENDING_VOTER`/`CATCHING_UP`/`VOTER`/`VOTER_ADD_FAILED`/draining/retiring) | `added_at`。**Raft 投票集权威，`phase` 为派生展示态。**
+
+`alerts`/`alert_acks` DDL（无默认时间戳）：`alerts(id,kind,severity,dedup_key,state,message,raised_at,cleared_at)` + `idx_alerts_dedup_active`；`alert_acks(dedup_key,acked_by,acked_at, PRIMARY KEY(dedup_key))`——**单一集群级 ack（§18.3：一条 alert 一个 ack，`acked_by` 仅记录"谁 ack 的"供展示，非 per-identity 簿记），删 snooze_until/session_nonce/identity_fp**。需求 §8 原要求 per-identity 生效，本架构降为集群级——见 §16 偏离登记。
+
+---
+
+## 5. Raft op 集（自描述、不要 catch-all）
+`{t:OpType, v, r:ReqID, b:渲染 SQL+元}`。op：`SessionCreate/Tombstone/HardDelete`、`MemberJoin/Kick`、`NodeRegister/Remove`、`ProcCreate/MarkExited/ReconcileBatch`、`PortAllocate/Free/Revoke/ReassignHome`、`RotatePin`、`AlertRaise/AlertAck/AlertClear`、`ClusterNodeUpsert/Phase/Remove`、`ClusterMetaSet`。
+> **裁定（R2-major）**：**删 `GenericRowMutate` catch-all**（绕过 per-mutator lint、毁 raft-log 可读性）——低频 op 本无运行期成本，保持窄类型化。`ProcGC` = **leader-local**（选后 G.2 重跑，不进 Raft，从 §3.4 baked-time 表与 lint 移除）。proxy/`AllocateProxy/ProxyGenAdvance` 随 P13 移出 v1（§0）。`ReconcileBatch` 承载 §4.1 整个 reconcile 结果。
+> **层次澄清（R3F1）**：上列均为**业务 FSM op**（走 `FSM.Apply`，followers 可校验）；**`ClusterNodeUpsert` 携 `{node_ident_pub, join_nonce, join_sig, cert_fp}`，followers 在 Apply 复算 join PoP**（入群密码学门）。**`raft.AddVoter`/`raft.RemoveServer` 不在本 op 集**——它们是 hashicorp/raft 的**配置变更路径、非 `FSM.Apply` 拦截点**；membership 两阶段顺序（先 `ClusterNodeUpsert` committed 再 `raft.AddVoter`）见 §8.1。
+
+---
+
+## 6. NATS 集群层
+
+### 6.1 拓扑与跨节点签名（升为硬要求）
+扁平全网格 routes、一个 JS domain、cluster CA 签路由 mTLS。**生成的 conf 必须：共享 account = auth_callout Issuer，所有 broker nkey = 每台 AuthUsers**（broker B 应答 server A 上发起的请求，A 的 nats-server 才接受 B 的本地签名）——**§13.8 跨真 ≥2 节点 nats 集群测**（非内嵌单 server harness）：client 连 A、B 应答、连接被授权。
+
+### 6.2 auth_callout：读本地、PIN 写转 leader（去 XKey）
+queue-group `tether-authcallout`。已 provision（无 PIN）= **应答 broker 本地副本读 + §3.2 node fail-closed**，失 quorum 不锁死、不经 leader。
+> **裁定（R2-major：XKey 不存在）**：**不引入 NATS XKey**（树里无任何 curve/XKey 设施）。**PIN-join 把请求经 broker-only subject 转 leader，该 subject 走 mTLS cluster routes（broker 间已加密）+ broker-only ACL**——PIN 只在受信 broker 间、加密链路上流动，符合"所有 broker 同等可信"。leader 验 PIN + 提议 provision entry，**allow 门控在 entry 提交后**；失 quorum PIN-join 正确失败。运维恢复永不经 callout（§10.6）。
+
+> **"broker-only ACL" 可执行定义（RF1：发布者身份写实）**：route mTLS 只证明 nats-server 之间的 route，**不**证明本机某个 NATS client 是 broker——故 `cluster.apply.>`/`cluster.>` 的发布权限必须绑到一个**具体 NATS client 身份**：
+> - **tetherd 用其 per-broker bus nkey（代码里 `AuthCallout.BrokerNkeySeed`，已是该 server `Options.AuthCallout.AuthUsers` 成员）连本地 NATS**；该 nkey 的权限由 `auth.PermissionsForBroker()` 定义。
+> - **只有 broker nkey AuthUsers 获 `cluster.apply.>` + `cluster.>` 的 pub/sub**——即把 `cluster.apply.>`/`cluster.>` 加进 `PermissionsForBroker()`，且**仅** AuthUsers 列里的 broker nkey 持有；其余一律无。
+> - **生成的 `nats-server.conf` 必须同时写两处（R3F3）**：`authorization.auth_callout.auth_users = [<每台 brokerPub>]`（回显应答用，§6.1）**且** 给该 broker nkey 配 **static `Nkeys`/`users` 条目，permissions = `PermissionsForBroker()`**（含 `cluster.apply.>`/`cluster.>`）——只配 auth_users 漏 static permissions 则 broker 自身连接拿不到该 subject 权限（现有代码注释即要求二者并存）。
+> - **auth_callout 签发给 member/agent/ctl 的 user JWT（用 account 签名私钥铸）绝不含 `cluster.*` pub**；node-identity 不是 NATS client 身份（仅 Raft/route mTLS PoP）；route peer 是 nats-server 非 client。
+> - 故威胁边界精确为：**能以 broker nkey 连本地 NATS 者方可 pub `cluster.apply.*`**——这与"所有 broker 同等可信"一致（broker nkey 本就是受信 broker 凭据），而普通 bus 连接（哪怕能连进本地 NATS）拿不到该 subject。
+> - 验收（§13.8）：**普通 bus credential pub `cluster.apply.*` 被 NATS ACL 拒；broker nkey credential pub 被允许**；member/agent JWT pub/sub `cluster.*` 被拒。
+
+### 6.3 单写者权威消息 + 审计可重导
+只有 leader post-commit 发 `ev.*`/`audit.*`/`sys.events`。
+> **裁定（R2-major：跨 leader 死的审计恢复）**：**审计派生 = committed Raft entry + `raft_index` 的纯确定性函数**（任何新 leader 可从复制 entry 重导，**不依赖 leader-local 态**）；同 `raft_index:kind:seq` 去重 key 重发，JetStream 丢重复；**dedup 窗口配置值 > (选举+扫尾) 最大时延**并断言；选后 sweep 幂等可重跑（sweep 中再死可重跑）。源是 leader-local-only 的审计归 best-effort（§17）。**需求 §2.3 偏差登记：审计 0 丢失为"近似"（leader 提交后、JS 发布前崩有窗口，由可重导 sweep 兜底但非严格 exactly-once）。**
+
+### 6.4 JetStream：退回 per-session 流（隔离白送）
+> **裁定（R2-major：撤共享流）**：**退回今天的 per-session `history-<sid>` 流模型**——subject+stream 双隔离白送，成员 JWT 现成的 `CONSUMER.CREATE.history-<sid>` 作用域即读隔离，**无需 broker 中介 consumer、无需 per-subject 限额、无需改 FilterSubject 防偷读**。代价是每 session 一条流，在几十~上百量级可接受。`session rm` 仍 DeleteStream。
+> **副本重配**：`history-<sid>` 与 `OBJ_xfer-<sid>` 均 `Replicas=replicasFor(nVoters)`；今天 `ensureStream` 拒 UpdateStream，故扩容/retire 时 leader 显式 `UpdateStream(Replicas)`（post-commit、重试、对每条流）。重配窗口内审计写**排队于 leader 不丢**（与 §2.3 对齐）；`cluster status` 显示**每流 actual/target 副本**、任一 actual<target 升 `replication_degraded`、**重配未完不放行 retire 原节点**。kill-during-expand 测试断言无审计丢失 + 有界写停顿。
+
+### 6.5 agent/ctl 发现与归属（server_id 桥接）
+NATS 种子 + `connect_urls` 发现 + 无限退避；`ClientAdvertise`=公网:443。
+> **裁定（R2-blocker：server_id≠node_id）**：agent 在 `register.req`/heartbeat **自报其当前连接的 nats server_id（N… nuid）**；natscluster 模板化时给每台 nats-server **确定性命名**并写进 `cluster_nodes.nats_server_id`；leader 据 `server_id→cluster_nodes 行→node_id/tunnel_addr/cert_fp` 做**权威 home 指派**（agent 永不自选），经 `NodeRegisterResp.Home HomeDirective` 下发。初版规则：home=agent 当前所连 broker；首猜错由 §7.4 收敛。
+
+---
+
+## 7. 数据面（方案 B）
+
+### 7.1–7.2 唯一映射 + 本地读 + epoch 防双绑
+`port_allocations` 唯一权威映射（加 `home_broker/rebuild_on_failure/epoch`），partial-unique-index 保单写。`tunnelTokenLookup` = home broker 本地副本读 + `home_broker==self`。
+> **裁定（R2）**：(a) **新瞬态 DENY `home_catching_up`**——leader 在拨号指令前已提交 `port.allocate`，落后副本对未应用行返回它（**不塌成 terminal**）；它是 **v2 wire 常量、broker 发 + agent `denyIsTransient` 同改**（agent 默认 terminal，不改则永久 brick），并加**有界重试**（永远应用不上则升告警，不无限重试）。(b) **防 ex-home 双绑**：`tunnelTokenLookup` 比对**本地副本的 allocation epoch vs agent 出示的 epoch**，本地 epoch 更高即 DENY——ReassignHome 在途时旧 home 未应用也不会双绑同一公网口。**wire 契约（R3 §18.4 升正文）**：REGISTER 加**第 6 个字段 `<epoch>`**（v2 wire break，parser **收正好 6 字段**否则拒）；`HomeDirective` 带 `epoch`；`tunnelTokenLookup` 新变体过滤 `home_broker==self` + port + 返回 epoch 比对；`home_catching_up` 双端同版本上线。(c) **catch-up 谓词 = 服务节点 follower-local `applied_index >= barrier index`**（R3 §18.4 升正文，非"ReadIndex barrier"含糊措辞）：leader 的 `VerifyLeader`/ReadIndex **只用来取一个新鲜 barrier 值**（AddVoter 提交后），新 home 自己比对本地 `applied_index >= 该 barrier` 才算就绪；未过前对 token 查找一律 `home_catching_up`。
+
+### 7.3 选址与 happy path
+`--on-broker <host>`（校验 ONLINE）/默认=§6.5 所连 broker/`--remote-port <P>`（P12）；`tether expose --rebuild/--no-rebuild`（默认 ON，Plan 写列）。happy path：Plan 选 port+token+home → Raft 提交 → leader 发 `ExposeForwardedReq{tunnel_addr,home_broker,cert_pins,epoch}` → agent 按 `cert_pins`(current/未过期 previous，§15 RF3) 钉证拨 home:7000 → home 绑口并 **ACK 绑定** → leader 才回 `ExposeResp`（无死 URL）。raw token：leader Plan 铸、只复制 hash、经 NATS authed 通道一次性给 agent、agent 在 home 出示、home 按本地行 hash 比对。
+
+### 7.4 home 死的检测与重建（agent 自驱为主）
+> **裁定（R2-blocker：rehome 触发解耦）**：home broker 死时其**同机 nats-server 一并死**，故 **agent 的 NATS 连接弹到别节点、`onNATSReconnect` 触发**——**让 agent 自己的 NATS 重连（及任何带更高 epoch HomeDirective 的 register 回包）直接驱动隧道 rehome**：比对 directive epoch vs clientSession 当前 home epoch，调 `Open(newAddr)` 原子替换（旧 supervisor 经 Open-replace cancel 退出——不在 `redialWithBackoff` 里死盯旧 addr）。**leader 侧 broker-死检测（Raft peer + route 健康）+ 推 RehomeDirective 作 BACKUP**（home 死但 agent 的 nats server 还活的少见情形）。
+> **限流与就绪对齐**：RehomeDirective **携带其 `ReassignHome` entry 的 `raft_index`**，新 home `applied_index>=该 index` 前回 `home_catching_up`（确定性就绪，非猜）；§7.4 的 K/秒与 agent 退避**绑定**，慢 drip 不被反超。无活 home 时保持 ALLOCATED+info 告警+重试。rebuild OFF=`port.free`+expose-rm+info。`ps`/`status` 显示每 expose 的 home + 末次 rehome；`broker_down` 告警带 ok/failed 计数。
+
+### 7.5–7.7 撤销 / per-expose addr / cert 钉证
+撤销权威 fence=`home_broker` 列 + agent 关 yamux；evict 推送 best-effort。**撤销对已连接生效要主动断连**（§10.1）。**per-expose (per-publicPort) brokerAddr** 重构（§18.2.2，非 per-session——同一 agent 的多个 expose 可落在不同 home broker）须改 `Open/AddProxy`(收 addr)、`clientSession`(按 publicPort 键存 addr)、**`dialAndRegister`/`redialWithBackoff`/`swapTransport`(从 session 读 `sess.brokerAddr`、非 `Client.brokerAddr`)**、adapter 支持一个 Client 并发扇出 N 个 home；不变式：每个 expose 的 home addr 一个 generation 内不可变、只经新 Open 换。并发测试（一 agent N session M home failover + mass-rehome 风暴，`-race`+`goleak`，断言有界 re-REGISTER、rehome 后瞬断重拨**新** addr、提交于一个选举窗口内的行不出 terminal DENY）。**cert 钉证为 v2 硬要求**：agent 验 home TLS cert ∈ `HomeDirective.cert_pins`（接受 `current` 或未过 `valid_until` 的 `previous`；源自 Raft 复制的 `cluster_nodes.cert_fp[_prev]`，经 authed NATS 下发），都不匹配则拒拨、raw token 不出示；§16 删"仍 InsecureSkipVerify"矛盾措辞、只限 N=1 退路。**pin 必须来自 §15 的稳定持久 `tunnel-cert.pem`（非每次 Start 自签），写入/轮换经 Raft entry + wire-list 双 pin 窗口（agent 无状态）——完整生命周期契约见 §15 RF3、§18.2.11**；否则重启换 fp → 老 agent 拒连合法重启 home（自伤）。
+
+---
+
+## 8. 生命周期与 `tether cluster`
+
+### 8.1 命令面 + 传输（admin 严格本地）
+> **裁定（R2-major：解矛盾）**：**两条路分清**——
+> - **session 控制写**（follower→leader）：走 §4.1 `apply.*` 总线，鉴权 = **route mTLS 客户端身份 + broker-only pub ACL**（无转发签名 / role / term——§18.1：转发是一致性而非安全边界）。
+> - **admin 变更**（cluster add/remove/drain/retire/force-single）：**严格本地 admin socket，无任何网络旁路**（adminsock 本就只 unix）。在非 leader 上发起的变更 **fail-fast 指名应去哪台 leader host 重跑**（运维本就有 shell，§10.6）。
+
+| 命令 | 何处 | 危险/确认 |
+|---|---|---|
+| `cluster init [--from-existing]` / `add <host> <node-pub>` / `remove <node_id>` | 本地 | add/remove 走 quorum 投影；remove TTY+typed node_id |
+| `cluster status`/`doctor`（**+`--json`+退出码契约**） | 本地或 NATS | — |
+| `cluster transfer-leader <node_id>`（**并入 promote/step-down**，§16） | 本地 | — |
+| `cluster drain <node_id> [--retire]` | 本地 | quorum 投影；retire 跌破 HA typed 确认 |
+| `cluster node-pub`/`keygen` | 本地 | 打印本机 node-identity 公钥（带 nkey 前缀，防 fat-finger）|
+| `force-single` / `recover [--dump-divergent]` | **本地 offline 子命令**（见 §8.4） | TTY+typed node_id，永不认 -y |
+| `alert ls/ack` | **NATS（所有人）** | 集群级 ack（§18.3）；`ls` 显示 acked_by |
+| `alert raise/clear` | 本地 | — |
+
+**membership flow = 两层、两阶段（R3F1：roster admission FSM op 与 Raft config 变更分离）**：`hashicorp/raft` 的 `AddVoter`/`RemoveServer` 是 **Raft 配置变更路径，不是业务 `FSM.Apply` 能拦截/否决的 `LogCommand`**——故"follower 在 FSM Apply 对 AddVoter 本身密码学 veto"不可实现。join PoP 只能挂在**业务 roster op** 上。定两阶段：
+> - **阶段 1 — roster admission（业务 FSM op，可复制校验）**：`ClusterNodeUpsert{node_id, node_ident_pub, join_nonce, join_sig, cert_fp, raft_addr, nats_route, ...}`。leader 发 nonce、入群 daemon 用 node-identity 私钥签、leader 对运维**带外键入**的 pubkey 验签后才提议；**followers 在 `Apply(ClusterNodeUpsert)` 复算 join PoP**，验不过则 roster 不落库（这是真·跨节点可验证 proof）。
+> - **阶段 2 — Raft config 变更（非 FSM proof 点）**：**仅当阶段 1 的 `ClusterNodeUpsert` committed 后**，leader 才调 `raft.AddVoter(node_id, raft_addr)`。**明示此步不是 FSM 校验点**——它是底层 Raft config entry，靠"阶段 1 已把该 node_id 的 PoP 验证并复制进 roster"间接受信。
+> - **半成功状态机（`phase` 列承载）**：`JOIN_VERIFIED_PENDING_VOTER`（阶段 1 过、阶段 2 未发/失败）→ `CATCHING_UP`（AddVoter 成功、未过 §8.2 catch-up）→ `VOTER`（健康）；失败分支 `VOTER_ADD_FAILED`。`status/doctor` 显式渲染，绝不出现"DB 认为 voter、Raft config 不是 voter"的静默分叉。
+> - **重试幂等**：阶段 2 失败重试**复用同一 committed `ClusterNodeUpsert`（PoP 已验、nonce 已消费、不重签）**；`raft.AddVoter` 按 node_id 幂等（已是 voter 即 no-op）。永不追平节点用 §8.3 的"加个永不追平节点再干净移除"清理路径。
+> - **Remove/retire 顺序**：**先写 roster `ClusterNodePhase`(draining/retiring) 再 `raft.RemoveServer`，最后 `ClusterNodeRemove`**；任一步失败 `status/doctor` 显示停在哪个 phase + 下一步命令。
+> - **诚实威胁边界**：沦陷 *leader* 仍可提任意成员变更（§18.2.4 已接受）；沦陷 *follower* 自合成 `ClusterNodeUpsert` 在 §6.2 RF1 ACL 层（pub 不到 `cluster.*`）+ join PoP 验签层被双重拒。admin socket 仅 leader-local admission（决定 leader 是否**提议**阶段 1），**FSM 不声称校验任何不可复制的 origin proof**。
+> - **测试门（§13.11）**：阶段 1 committed 后 AddVoter 失败 / AddVoter 成功后 catch-up stalled / 重复 add 同 node_id——断言状态机幂等、无静默分叉。
+
+### 8.2 catch-up 闸
+pin `TrailingLogs`/snapshot 阈值；谓词 = **follower-local `applied_index >= barrier index`**（§7.2c；leader ReadIndex 仅取新鲜 barrier 值，服务节点本地比对）+ 作为非滞后 voter 持续固定墙钟时长，带 max-wait fallback 升 `catch_up_stalled`（不饿死）。只护数据面 token 查找(§7.2)与 ClientAdvertise（auth 读已本地，§6.2）。
+
+### 8.3 create/online/drain/retire（drain 对齐需求 §6.1）
+create=装二进制 + **生成/分发本机全套 secrets：`account.nk`(共享，可信信道拷) + `broker.nk`(本机 NATS bus 身份，§6.2 RF1) + `node-ident.nk`(本机) + `tunnel-cert.pem`/`tunnel-key.pem`(本机稳定，§15 RF3) + cluster CA**（R3F3：与 §15 文件布局/preflight 对齐，缺任一 preflight 红）。`cluster add`（运维键入新节点 node-identity 公钥，`cluster node-pub` 打印之）= **§8.1 两阶段**：阶段 1 `ClusterNodeUpsert`(带 join PoP) committed → 阶段 2 `raft.AddVoter`。online=`phase` 经 `JOIN_VERIFIED_PENDING_VOTER`→`CATCHING_UP`→`VOTER` 且 JS 副本达 target 才 HEALTHY-HA。**drain（重写）**：① 升 `broker_draining` 带 `drain_deadline`；② **停服前主动迁 expose**（rebuild-ON 走 §7.4、OFF teardown+notify）；③ leader 先 `transfer-leader`；④ `--retire` 则 §8.1 顺序（先 roster `ClusterNodePhase` 再 `raft.RemoveServer` 再 `ClusterNodeRemove`）。**drain/retire 共用 quorum 投影守卫**：显示"操作后 N voters quorum=K 容 F 故障"；**F 为 0（含已处于 N=2 时再 drain）即 TTY+typed 确认 + 升持久 severe**。`cluster add` 半失败（阶段 1 committed 但阶段 2 `VOTER_ADD_FAILED`/`catch_up_stalled`）有文档化清理命令 + "加个永不追平的节点再干净移除"测试。
+> **retire 身份吊销如实**（R2-major）：roster/Raft 移除即时；**account-key 信任不撤销**（共享、不轮换）——retired 但留有 `account.nk` 的节点在 TTL 窗内仍可签 JWT。retire-after-疑似沦陷**须配 account.nk 轮换 runbook**；§16/§17 登记此 gap 待外审签字。
+
+### 8.4 force-single（offline 子命令 + 自我 fence + runbook）
+> **裁定（R2-blocker×2 + R3 §18.2.5/.6/.7 已回写）**：(a) **"自我观测"fence**——节点 `自上次成功 leader 接触 > T_fence`（一处、一个单调时钟，§3.2/§6.2 复用同一谓词）即**凭自身观测停止接受写**（不依赖听到更高 term），堵无接触分区（native term fencing 只在能互通节点间生效）。**不是反脑裂结构性保证**：若 B 仅被分区但活着，force-single **可能**双写。(b) **force-single/recover = daemon 停机下的 offline 子命令**，直接操作磁盘 `raft/`+`tether.db`，**不经 admin socket**（停机后 socket 已没），**与 daemon 共享同一把磁盘 advisory lock** 防两实例并发动磁盘。
+
+**`T_fence` 数值（pin）**：`electionTimeout = 1000ms`（hashicorp/raft 默认，随 §3.1 pin 的版本核对）；`T_fence = k_fence × electionTimeout`，**`k_fence = 10` → `T_fence = 10s`**。两条约束（§18.2.6/.13）：① `T_fence > 最坏 PreVote 选举`（~2–3s，故 10s 不误触发）；② **`T_fence ≪ runbook step1 的最小墙钟时长`**（人类发现告警→SSH→status→mask→确认 peer 死，分钟级 ≫ 10s），保证被分区旧侧在任何运维能 force-single 另一侧**之前**早已只读。auth_callout fail-closed（§6.2）与正确性敏感读（§3.2）用同一 `T_fence`。
+
+**RUNBOOK（可复制，offline 模型；§18.2.5/.7）**：
+```
+0. systemctl mask tether            # 防 systemd 在你动磁盘期间自动重启 daemon、与 offline 工具争 advisory lock
+1. tether cluster status            # 纯本地：离线读磁盘 raft 配置 + 对每 peer 直接 Raft-transport ping（broker 在私网内）
+   #  打印每 peer "我测得已 UNREACHABLE 47s（展示阈值=120s，仅供参考）" + 将抛弃的 node_id
+   #  *安全闸不是这个计时* —— 见 step2 的 hard-refuse
+   #  死 vs 分区核对清单：确认其余节点已断电 / 对 agent 不可达，不只是"对本机不可达"
+2. tether cluster force-single --confirm-peers-dead <abandoned_node_id...>
+   #  daemon 仍停机；TTY 键入本机 node_id 确认（无 -y）。执行前硬前置：
+   #   (b) raft/ 或 tether.db 缺失/空 → 拒绝（"无既有 raft 态，会建空集群丢全部数据"）
+   #   (c) 改写 Raft 配置为 {self} 前先调和两存储：把 BoltDB 已提交到 commitIndex 的 entry
+   #       应用进 SQLite；超出 SQLite.applied_index 者经 step4 --dump-divergent 取证后丢弃
+   #   (d) 任一被抛弃 peer 经 Raft-transport(:7400) 仍可达 → HARD-REFUSE（peer 活着会脑裂）
+3. systemctl unmask tether && systemctl start tether   # 以单投票成员起；升 force_single_active 持久告警
+4. 恢复多节点：每个回归 peer 先 wipe：
+   tether cluster recover --dump-divergent <file>   # 0600；键入被 wipe 的 node_id 确认；
+   #  打印发散摘要（"N 行 sessions/ports/audit 仅存于此节点、将永久丢弃、已存 <file> 仅供取证不可自动合并"）；
+   #  dump 写失败则拒 wipe。再 wipe-and-rejoin（cluster add）
+```
+`status` 实测的 peer-unreachable 秒数仅供展示（默认展示阈值 120s，**非** force-single 依据）；真正的安全闸是 step2 的 (b)(c)(d) 硬前置 + `--confirm-peers-dead`。`status`/`force-single`/`recover` 属 **no-leader-safe 子集**（纯本地磁盘、不重定向 leader），每条 severe banner 的下一步只引用该子集（模拟 quorum 丢失下测试）。runbook 须在 3 节点实跑演练过外审。
+
+---
+
+## 9. 文件传输（分布式，补全为真 §9）
+
+> **裁定（R2-blocker：transfer 不是 stub）**：
+> - **终结于 agent 的 home broker**（与方案 B 一致）；`push.req/pull.req` 经 §4.1 转发，但**transfer audit start/complete/failed 行经 leader Apply + post-commit 发布**（与 §4.4 一致）。
+> - **tier-B ObjectStore：`ensureXferBucket` 的 `Replicas` 从字面 1 改 `replicasFor(nVoters)`**；`OBJ_xfer-<sid>` 与 audit 流同样在扩容/retire 时重配、计入 `cluster status` actual/target、受 `replication_degraded` 与"未重配完不 retire"约束。完成对象 N≥3 下 home 死可存活。
+> - **in-flight tracker + watchdog 在 home broker、best-effort**：home 死则在途丢失、客户端重启；**rehome 不保在途传输**（重启）。
+> - 无 multipath / 最快链路（需求 §1.3 推后）。
+> - 门：tier-B 对象在 N≥3 杀 home 后存活；home 死时在途重启。
+
+---
+
+## 10. 告警系统
+
+### 10.1 存储 / ack（简化）
+leader 权威 Raft 复制 `alerts`/`alert_acks`，**单一集群级 ack（§18.3，非 per-identity；删 snooze_until/session_nonce/identity_fp）**：一条 alert 一个 ack，对全集群生效，`acked_by` 记录"谁 ack"仅供展示。**ack 只压抑内联 ack 提示、不压 banner**；**严重告警每新会话必重现**（ack 时打印"将于新会话重现"让运维不困惑）。`alert ls` 显示**每条 acked_by + 何时**（集群级，不是 per-identity 各自 ack）。
+> 三条**严重 gating 告警由客户端合成**（§10.4，quorum 丢时无法 Raft 写）；复制存储承载 `manual/below_quorum/broker_draining/broker_down/replication_degraded`。**§16 登记需求 §8 偏差**：并非所有告警都 Raft 存储。
+
+### 10.2 目录 + 文案→动作（保留 disk_pressure/raft_lag）
+| kind | severity | banner（面向所有人）| 下一步 |
+|---|---|---|---|
+| quorum_lost | severe | 集群失多数派已只读；确认其余已死后在某 broker 上 status→force-single | force-single |
+| force_single_active | severe | 运行在 force-single（单机、无完整性）；尽快 recover | recover |
+| replication_degraded | severe | 审计/对象流副本 actual<target，HA 未达 | status |
+| below_quorum | info | 当前仅容 F 故障，再掉一个即只读 | cluster add |
+| broker_draining/broker_down | info | brokerX 下线/失联，expose 迁移中 ok/failed | status |
+| **disk_pressure** | info | 盘占用超阈（**桥接现有 `disk.go`**）| — |
+| raft_lag | info | 某 follower 复制延迟高（**lag 已在 status 算**）| — |
+| manual | info | 运维自定义 | — |
+> **裁定（R2-major）**：`disk_pressure`/`raft_lag` 是需求 §8 点名源、且 `disk_pressure` 已实现——**留在 v1 目录**（trivial 桥接），不静默推后。文案风格对齐 `error_hints.go`（每条 severe 点名下一步命令）。
+
+### 10.3 投递（所有人）
+每条 ctl 回包带活跃告警渲染 banner，含普通用户 `ps`/`ls`；§10.4 leader-不可达合成 banner 也对读/列命令触发。
+> **裁定（R3 §18.3 覆盖原 R2-nit 披露分层）**：**取消 member/operator 脱敏分层**——单团队全员可信，降级 banner（含拓扑细节：node_id、peer UNREACHABLE 列表、applied-lag）**对所有 NATS 可达者一视同仁**。原"成员看脱敏版"的双层 banner 不做（§16.9 登记）。
+
+### 10.4 destructive 闸 + 选举 vs quorum-loss（server 佐证）
+destructive 硬闸**只 `quorum_lost`+`force_single_active`**；`below_quorum` 降信息 + retire 确认触发（N=2 正常不要 `--ack-alerts`）。
+> **裁定（R2-major：severe 一致性）**：`replication_degraded` 虽 severe **不**硬闸 destructive——§16 显式枚举"哪些 severe 闸/不闸 + 理由"，调和需求 §8"severe 即闸"。客户端区分"连不上 NATS"vs"NATS 在但无 leader"：(re)connect 时向任一可达 broker 查最近健康（follower 可如实报"已 T 秒无 leader"而无需 Raft 写），据 **server 佐证** 合成阻断；纯客户端网络抖动不阻断；合成 banner 陈述证据与不确定性。**判定用 §8.4 pin 的同一 `T_fence=10s`（`k_fence=10 × electionTimeout 1000ms`）**——"已 T 秒无 leader"的 T 即此值。force-single 永不由客户端合成单独驱动。
+
+---
+
+## 11. 一次性迁移 + 在位 nats.conf 接管
+`cluster init --from-existing`：前向 0008–0010、`cluster_meta(applied_index=0,bootstrapped)`、`cluster_nodes` 回填本机 + `home_broker=self`、`BootstrapCluster({self})`、迁移后 DB 作 index-0 快照。**删 `broker.New` 启动期本地写**（proxy-gen 随 P13 移出；启动只读）。DB 永不重写（`.bak`）。
+> **裁定（R2-major：接管手调 nats.conf）**：**tether 接管 `nats-server.conf`**（旧的备份 `.bak`），给 **before/after 文件归属表**、与现有 systemd 单元关系、此后不得手改的部分；**同 PR 改写 `usage.md` §2.3/§3.4**（不只标 stale），免肌肉记忆冲突。
+
+---
+
+## 12. 失效与恢复矩阵
+follower 死(N≥3)：leader 保 quorum；info。leader 死：选举~1-2s(PreVote)、已提交存活、**新 leader 从复制 entry 可重导审计补发（幂等 sweep）**、重派活性态、跑 leader-local GC。失 quorum：只读 + server-佐证合成 banner + force-single（节点级自我 fence 已停写）。N=2 死一：只读。home 死：agent 自身 NATS 重连**自驱** rehome（leader 推为 backup）。盘满 follower：逐出 queue group。扩容中崩：流副本未达 target 不报 HEALTHY-HA、不放行 retire。
+
+---
+
+## 13. 测试与合并门（硬）
+1. 确定性 lint：`internal/{port,proc,node,session,agentprov}` Apply-可达 mutator + 编译期断言不 import rand/ulid；禁 FSM 外对 Apply-owned 表 INSERT；禁 Apply 调 `*sql.DB` mutator；列级断言 Apply 不写活性列。
+2. 多 FSM **逻辑内容**等价（`.dump` 去 schema_migrations / per-table 排序哈希）；含 port.Allocate/proc(nil clock)、分配→硬删 session→再分配。
+3. 快照-恢复-重放确定性（撕裂 integrity_check 拒）。
+4. **kill-9 崩溃一致性矩阵**（§3.7 两窗口，含 BoltDB 超前 SQLite 重导 lastApplied）——承重、合并前必存在。
+5. WAL 并发：持续 Apply + 流式 backup，无超 busy_timeout/无 SQLITE_BUSY、一致提交点；WAL 下重验 FK/单写者。
+6. **per-expose (per-publicPort) brokerAddr**（§18.2.2）+ 一 agent N expose 分散到不同 home + mass-rehome 风暴有界 re-REGISTER + rehome 后瞬断重拨新 addr，`-race`+`goleak`；home_catching_up 不塌 terminal。
+7. **RF3 cert 重启不变性 + 轮换（R3F2）**：broker 重启后同一 publicPort 的 advertised fp 不变（稳定持久 `tunnel-cert.pem`，§15）；轮换 wire-list `{current,previous,valid_until}` 下老 agent 在窗口内接受新旧任一、**窗口内 agent 进程重启后仍按 directive 重连成功**、`valid_until` 后旧 cert 被拒；拒真正不在 pin 集的证书。
+8. **跨真 ≥2 节点 nats 集群**：client 连 A、B 应答 callout 授权；PIN-join 撞选举/转到刚下台 leader 返回可重试 deny 不假放行；无 PIN/JWT 字节出现在非 broker 可订 subject。**RF1 发布者 ACL**：普通 bus credential pub `cluster.apply.*` 被 NATS ACL 拒、broker nkey credential pub 被允许；member/agent JWT pub/sub `cluster.*` 被拒。
+9. 扩容/审计：1→3 后每条 history-<sid> 与 OBJ_xfer 副本到 target 才 online；kill-during-expand 无审计丢失；leader 提交后审计发布前崩 → 新 leader 精确补发不重复。
+10. transfer：tier-B 对象 N≥3 杀 home 存活；ex-home ReassignHome 在途不双绑。
+11. **membership 两阶段（R3F1）**：`ClusterNodeUpsert` committed 后 `raft.AddVoter` 失败 / AddVoter 成功后 catch-up stalled / 重复 add 同 node_id——断言 `phase` 状态机幂等、`status/doctor` 如实显示停在哪个 phase、绝无"DB voter 但 Raft config 非 voter"静默分叉；follower `Apply(ClusterNodeUpsert)` 复算 join PoP，伪签被拒。
+12. force-single→recover 3 节点实跑演练；offline 子命令磁盘锁防并发。
+13. `cluster status --json` + 退出码契约；FDE preflight；新 phase 进 e2e。
+
+---
+
+## 14. open issues 裁定（承前 13 + 本轮新增）
+NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQLite；kill-9=门；force-single=**自我观测 fence + offline 子命令 + runbook**（撤"结构性"）；PreVote=前置门；危险操作=TTY+typed 无旁路；JWT=短 TTL + **撤销靠主动断连**（非 TTL）；psk=删 DEK + **FDE 可验证 preflight 门**；expose=先确认后回包 + cert_fp 钉证硬要求；JS=**退 per-session 流** + 显式副本重配；home=agent 自报 server_id 桥接 + 自身 NATS 重连自驱 rehome；audit=可重导 + dedup 窗口 > 选举+扫尾（0 丢失"近似"登记）；**P13/proxy 移出 v1 HA**；**leader-only 发布实为 ~63 处**（机械契约 + lint 门）；op 集删 GenericRowMutate、ProcGC 转 leader-local。
+
+---
+
+## 15. provisioning 与文件布局
+```
+/etc/tether/secrets/{account.nk(共享,0600), node-ident.nk(每台,0600),
+                     broker.nk(每台,0600;tetherd→本地 NATS 的 bus 身份=AuthUsers,§6.2 RF1),
+                     tunnel-cert.pem + tunnel-key.pem(每台,0600;稳定持久,§7.7 RF3),
+                     cluster-ca.pem/.key}                                              # dir 0700
+/var/lib/tether/{tether.db(WAL), raft/{logs,snapshots}}                               # 0600
+/var/run/tether/admin.sock                                                            # 0600
+```
+**稳定 tunnel 证书契约（RF3）**：tunnel server **不再每次 Start 自签临时证书**，改用上列 `tunnel-cert.pem/.key`（绑 node-identity、provision 期生成、跨重启不变）。`cluster_nodes.cert_fp` = 该证书指纹；REGISTER/`HomeDirective` 上报的 `cert_fp` **必须来自该稳定证书**。**写入/轮换经 Raft entry，wire 契约（R3F2：选 wire-list 方案、agent 无状态）**：
+- **wire**：`HomeDirective` 不再单 `cert_fp`，改 **`cert_pins{current, previous, valid_until}`**（`previous` 可空、`valid_until` 仅轮换期非零）；`cluster_nodes` 加 `cert_fp_prev`/`cert_fp_valid_until` 两列承载之。agent **按 directive 当前列出的 pin 集验证**（接受 `current` 或未过期的 `previous`），**不在本地持久化任何 pin**——故 agent 在窗口内重启后，重连/register 拿到的 directive 仍带 `{current,previous,valid_until}`，照常验证，无陈旧本地态。
+- **初始**：create/add 由 `ClusterNodeUpsert` 写 `current=fp`、`previous=空`。
+- **轮换 = `cluster rotate-tunnel-cert <node_id>`**：① `ClusterNodeUpsert` 写 `current=新fp, previous=旧fp, valid_until=now+window`；② broker 即起用**新证书**对外服务（agent 已接受 `current`）；③ `valid_until` 到点后 `ClusterNodeUpsert` 写 `current=新fp, previous=空`——**旧证书此后被拒**。窗口时长 pin（默认值随 plan 定，须 > 最坏 agent 重连周期）。
+- 门（§13.7）：**broker 重启后同一 publicPort advertised fp 不变**（重启不变性）；**轮换窗口内 agent 进程重启后仍能按 `{current,previous}` 重连成功，窗口后旧 cert 被拒**；轮换中老 agent 不被合法重启的 home 拒（§18.2.11）。
+- 备份/恢复：`tunnel-key.pem` 与其它 secrets 同 0600 + 同 FDE 卷、随 §8.3 secret 分发 runbook 走可信信道。
+
+**`cluster doctor`/`add` 入群前 preflight（绿/红）**：秘密文件（含 `broker.nk`/`tunnel-cert.pem/.key`）存在+0600、`account.nk` 指纹==集群、时钟偏移在界、Raft(:7400)/route(:6222) 可达且不对公网开放、**FDE（LUKS/dm-crypt/FileVault）已开**——缺 FDE **拒绝入群或升持久 `psk_at_rest_unprotected` 告警**（psk 明文复制到 N 盘、靠 FDE 保护，非建议而是可验证门）。`recover --dump-divergent` 文件 0600 + 同 FDE 警示。
+
+---
+
+## 16. 与基线偏离登记（需外审确认）
+1. 反转 A.1/A.2：NATS 独立进程但 tether 编排（C）；在位接管 nats.conf、同 PR 改写 `usage.md` §2.3/§3.4。
+2. proto v1→v2 硬升级、不兼容老 agent、协调全机群重装；`home_catching_up`/cert_fp 钉证须 broker+agent 同改。
+3. 存储：WAL；快照独立只读 handle；保留 AUTOINCREMENT、撤"字节级一致"、等价比逻辑内容。
+4. **P13/proxy 移出 v1 HA**：proxy 故障切换正确性非 v1 保证（§0/§17），待 P13 无条件 PASS 再做 proxy-HA 叶子。
+5. NTP 降为推荐（leader 单调时间戳地板保排序正确性；NTP 只为审计时间戳可读）。
+6. 删 cluster DEK；psk 静态靠**可验证的 FDE preflight**。
+7. agent 面隧道 v2 **必须钉 cert_pins**（current/未过期 previous，§7.7/§15 RF3；删"仍 InsecureSkipVerify"矛盾，只限 N=1 退路）。
+8. 审计 0 丢失为"近似"（§6.3 窗口）；retire 不撤 account-key 信任（§8.3，需轮换 runbook）；命令面 promote/step-down 并入 transfer-leader；severe 告警非全部硬闸 destructive（§10.4 枚举）；`cluster-ca.key` 单独泄露即可 route-join（§10.2 注，route-cert 接受须再过 roster）。
+9. **告警 ack 从需求 §8 的 per-identity 生效降为集群级单 ack**（§18.3/§10.1/§4.2：全员可信单团队，去 per-identity 簿记；`acked_by` 仅展示）。补偿：严重告警每新会话必重现、ack 不压 banner，故"降级"不致永久隐藏严重态。**`alert/` 去 member/operator banner 脱敏分层**（同 §18.3：单团队，原 §10.3 的成员脱敏取消，拓扑细节对所有 NATS 可达者可见）。
+10. **node-identity 不再做 apply.* 转发签名**（§18.1）：apply.* 鉴权 = route mTLS + broker-only ACL；node-identity 仅入群 PoP + mTLS 叶子钉证。转发是一致性而非安全边界（全员可信下 per-broker 转发签名无遏制力）。
+
+---
+
+## 17. HA 保证矩阵（面向运维，一屏）
+| 数据类 | N=1 | N=2 | N≥3 健康 | N≥3 扩容未重配完 |
+|---|---|---|---|---|
+| 控制状态(session/port/proc/member) | 无冗余 | 双副本掉一即只读 | **已提交 0 丢失**容 1 故障 | 同 |
+| 审计 history-<sid> / OBJ_xfer | R1 | R2 | R3 | **仍 R1/部分——未达 HA**（status actual<target + `replication_degraded`，禁 retire 原节点）|
+| 审计 0 丢失 | — | — | **近似**（leader 提交后/JS 发布前崩有窗口，可重导 sweep 兜底） | 同 |
+| ev/PTY/transfer 在途 | best-effort | best-effort | best-effort（重连/重试） | 同 |
+| **proxy(/sub) 故障切换** | — | — | **非 v1 HA 保证**（P13 移出，§0）| 同 |
+| 撤销延迟 | 即时 | — | **max(副本应用滞后, 残留 JWT TTL, 强制断连耗时)**——靠主动断连非 TTL | 同 |
+
+**结论行**：HA 仅 N≥3 且 JS 副本达 target 后成立；N=1/N=2 无完整性；扩容后审计要等 leader 驱动副本重配完才真 R3；proxy 切换非保证。
+
+**健康判定分两个明确模式（§18.2.8 裁定，互不混用）**：
+| 模式 | 何处跑 | 数据源 | peer 活性 | 退出码 | banner 措辞 |
+|---|---|---|---|---|---|
+| **ctl / NATS 视图**（默认，笔记本） | 任意 NATS 可达处 | **仅 NATS 可达 broker 的自报视图**（follower 如实报"已 T 秒无 leader"+自身 applied-lag） | **不直连 Raft :7400**（私网+防火墙，笔记本够不到） | 0/1/2/3 按自报推断 | 显示 peer UNREACHABLE 时**明说"本机 NATS 视图、非直测，不构成 force-single 依据"** |
+| **broker 本机 offline 视图** | 故障 broker 本机（§8.4 runbook） | 磁盘 raft 配置 + admin socket，零 NATS 依赖（§18.2.8） | **对每 peer 直连 Raft-transport ping**（broker 在私网内，够得到） | 同 4 档 | 实测 peer 状态；但 force-single 安全闸是 §8.4 step2 硬前置、非此计时 |
+
+ctl 侧绝不因"笔记本 ping 不到 :7400"误报 `quorum_lost` 而诱导误 force-single；只有 broker 本机 offline 视图能直测 peer，且即便直测，force-single 仍受 §8.4 的 hard-refuse（任一 peer 可达即拒）+ `--confirm-peers-dead` 约束。
+
+### `cluster status` 规格
+列：`node_id|name|phase|role(leader/voter/learner)|applied-lag|last-contact|account.nk-fp(Y/N)|stream-replicas(actual/target)`；一行粗体健康判定 + 下一步命令指针（每降级态都有）；**`--json` 稳定 schema + 退出码契约（0=HEALTHY-HA、1=DEGRADED-可写、2=只读/quorum-lost、3=force-single）**供 cron/监控；每状态给一份具体渲染样例（Stage-C 验收 fixture）。
+> **裁定（R3-blocker §17 矛盾）**：**ctl/笔记本侧的健康判定不得依赖直连 Raft :7400**（私网+防火墙，笔记本够不到→会把每个 peer 读成 UNREACHABLE→误报 quorum_lost→吓得运维误 force-single）。**笔记本侧健康只从 NATS 可达 broker 的自报视图推**（follower 如实报"已 T 秒无 leader"）；**对 peer 直连 Raft-transport ping 仅限 broker 本机上的 offline `cluster status`**（它在私网内）。公网侧 status 显示 peer UNREACHABLE **不构成 force-single 依据**，banner 须明说。
+
+---
+
+## 18. 第 3 轮裁定与 Stage-C 残留（审计轨迹）
+
+> 第 3 轮（52 条：8B/20M/21m/3n）已进入实现精度层。
+>
+> **外审 round-1（FAIL）后处置**：本节的约束性裁定原写作"覆盖正文"，导致正文与 §18 出现**互斥双源**。现已**逐条回写正文对应章节、删除被否定的旧契约**（见各 §18.1/.2/.3 项末的"→ 已回写 §X"与 §16 偏离登记 9/10）。**本节自此降为审计轨迹（记录第 3 轮改了什么、为什么），正文是唯一实现尺**；如正文与本节再有出入，以正文为准。§18.4 进一步把其中**会改 wire/状态机/安全边界的架构契约**升级进正文（F6），仅留纯实现精度在 plan 阶段。
+
+### 18.1 设计岔路裁定：node-identity 密钥
+> **裁定**：**node-identity 密钥保留，但只用于两处：(a) 入群挑战-应答 PoP（运维同意的唯一可密码学强制的属性）；(b) 绑进 Raft/route mTLS 叶子证书，使"只有 cluster-CA 签名"不足以入群/入路由**。**删掉**它作为 `apply.*` 转发的"签名 origin proof + tether-broker role + term 校验"——在"所有 broker 同等可信"下，per-broker 属性对转发**无遏制力**（沦陷 broker 已在信任边界内）；`apply.*` 这一跳改由**route mTLS 客户端身份 + broker-only pub ACL** 鉴权（与 §6.2 PIN 走 routes 不用 XKey 同理）。net：少一套"转发签名"机制，保住"入群 PoP + mTLS 叶子绑定"两个真有用的性质。
+
+### 18.2 第 3 轮 blocker/major 约束性修正（已回写正文，落点见各项；正文为准）
+1. **§6.4/§9 流副本重配（blocker）**：三处 `Replicas:1` 字面量**建流时即改 `replicasFor(nVoters)`**；`ensureStream` 的 already-in-use 分支**比对 actual vs target、不足则 `UpdateStream`**；重配须等**新 nats-server 已加入 JS meta-group**（非仅 Raft）；`OBJ_xfer-<sid>` 与 `history-<sid>` 同等处理；**所有流达 target 前禁 retire 原节点**；sweep 限并发/封顶 + 单条卡死的逃生（force-delete 死 session 的流 vs 阻塞）+ status 用"全部 at target"canonical flag（非抽样）。
+2. **§7.5/§7.6 粒度（blocker）**：是 **per-expose（per-publicPort）brokerAddr**，不是 per-session——addr 放每个 `clientSession`（已按 publicPort 键），`dialAndRegister/redialWithBackoff/swapTransport` 读 `sess.brokerAddr`；一个 `tune.Client` 并发扇出 N 个 home；cert_fp 按 expose 线程化。
+3. **§6.1/§6.2 queue-group 签名（blocker，诚实定性）**：每台 server `AuthCallout.Issuer=共享 account pub、AuthUsers=每台 broker nkey、resp.Audience=发起请求的 `req.Server.ID``（应答 broker 回显，非自身 ID）。**leader-forward 降级为"一致性/PIN 校验"机制、非安全边界**——全员可信下任一 broker 已能签 allow，转发不提供遏制；如实写。
+4. **§8.3/§10.3 入群 PoP（blocker）→ 已回写 §8.1 两阶段（R3F1 纠层混淆）**：`cluster add` 增**挑战-应答**——leader 发 nonce、入群 daemon 用 node-identity 私钥签、leader 对运维键入的 pubkey 验签。**join PoP 由 follower 在 `Apply(ClusterNodeUpsert)`（业务 op）复算**，**不是**在 `raft.AddVoter`（Raft config 路径、非 FSM 拦截点）——`raft.AddVoter` 仅在 `ClusterNodeUpsert` committed 后由 leader 发起（§8.1）。明示**不防**：全沦陷 leader 仍可提任意成员变更（已接受）。
+5. **§8.4 force-single 离线脚枪（blocker）**：(a) offline 工具与 daemon **共享同一把磁盘 advisory lock**，runbook step1 = `systemctl mask`（防 systemd 自动重启与工具并发动 `raft/`+`tether.db`）；(b) `raft/`+`tether.db` 缺失/空则**拒绝**（"无既有 raft 态，会建空集群丢全部数据"）；(c) 改写 Raft 配置为 {self} 前先**调和两存储**（把 BoltDB 已提交到 commitIndex 的 entry 应用进 SQLite，或文档化恢复点 = SQLite.applied_index、超出者经 `--dump-divergent` 取证后丢弃）；(d) **任一 peer 经 Raft-transport 可达即 HARD-REFUSE force-single**（peer 活着→会脑裂），要求键入被抛弃 peer 的 node_id + `--confirm-peers-dead`。
+6. **§8.4 self-fence 谓词（major）→ 已回写 §8.4/§3.2/§6.2**：一处、一个单调时钟——`自上次成功 leader 接触 > T_fence` 即拒绝 (1) leader Apply-forward、(2) auth_callout allow、(3) 正确性敏感读。**已 pin：`T_fence = k_fence(10) × electionTimeout(1000ms) = 10s`，且 `T_fence ≪ runbook step1 最小墙钟`**（§8.4）。
+7. **§8.4(b)/recover（major）**：键入被 wipe 的 node_id 确认；打印发散摘要（"N 行 sessions/ports/audit 仅存于此节点、将永久丢弃、已存 `<file>` **仅供取证不可自动合并**"）；dump 写失败则拒 wipe。
+8. **§8.4/§11/§17 nats 坏掉的本地诊断（blocker）**：`cluster doctor`/`status` **纯本地可跑**（admin socket + 磁盘，零 NATS 依赖），报"本机 nats-server 未起/conf 非法"+ 精确 systemd 单元名 + `.bak` 回滚一行命令；takeover **preflight 遇 tether 不认识的指令则拒绝接管**（不静默覆盖手调 conf）。§11 须承认**今天根本没有 nats.conf 模板化**（`install.sh` 写的），natscluster 是首次生成、需与 install.sh 产物对账、列出哪些指令转归 tether。
+9. **§5/§11/§3.2 proxy 启动 db.Exec（major）**：cluster 模式下 **P13 proxy subscribe 路径编译关/禁用**，`broker.New` 在 cluster 模式**零 DB 写**（`advanceProxyGeneration` 不跑）；门：cluster 模式 `broker.New` 无 DB 写。
+10. **§6.3/§16 审计发布无 ACL 强制（major，诚实）**：`PermissionsForBroker` 通配 pub `s.*.audit.>` → 任一 follower（含沦陷/选举中错算）可注入伪造/重复审计且 JetStream 无法辨源。如实写"leader-唯一发布是代码契约+全员可信、非 quorum/源认证强制"；审计盖 `node_id`+`raft_index`+leader-epoch header（消费端可查 raft_index 已提交、丢 stale-leader 发布）；禁非 leader 发布的 lint 设硬门。
+11. **§7.7/§1.3 cert_fp 移动靶（major）**：tunnel server 改用**稳定持久证书**（`/etc/tether/secrets`、绑 node-identity、**非每次 Start 重生成**），否则重启即换 fp→`cluster_nodes.cert_fp` 变陈→所有 agent 拒连合法重启的 home（自伤）。定义谁在 provision/rotation 时经 Raft entry 写 cert_fp；门：重启 home→老 agent 仍 re-pin 成功、拒真不同证书。
+12. **§3.2/§6.2/§17 撤销（major）**：(1) 每次 callout 决策对**栅栏到 ≥撤销 index 的读**或复制的撤销墓碑 + §3.2 fail-closed 谓词裁决（堵"踢掉后立刻在落后 follower 重新 24h JWT"）；量化"在落后 peer 重认证窗口 = 副本应用滞后"，cluster 场景默认 JWTTTL 调短；(2) **per-port 主动撤销**：`PortRevoke/PortFree` Apply 时 **home broker（即便作为 follower 重放）关该口的公网监听 + yamux**；leader 如何通知远端 home 须定义。
+13. **§6.2 auth fail-closed 谓词（major）→ 已回写 §3.2/§6.2（统一为 §8.4 的 `T_fence`）**：节点自身观测到与 leader 失联 > `T_fence`（已 pin=10s，`> 最坏 PreVote 选举`~2–3s，§8.4）才 fail-closed（非"正在选举但仍见 quorum"就黑洞全集群新连接）；provisioned-read 授权是**有界陈旧**（被撤成员在落后应答者上可放行至其应用撤销，界 = 应用滞后），加测试断言最坏接受窗口 = 应用滞后而非 0；谓词是 O(本地读)/连接。
+14. **§3.1 PreVote（major）**：§3.1 **pin 确切 raft 版本**并把"该版本 PreVote 实测生效"列为合并门项（配置字段存在 ≠ 行为生效）；测试：分区再连一个 follower，断言健康 leader 的 term 没涨、没下台。
+15. **§8.3 retire 不撤信任（major，诚实）**：roster/Raft 移除即时，但 `account.nk` + cluster CA **不轮换** → retired 节点留有它们即在 TTL/轮换前仍可签 JWT、出示 route 证书。**把 account.nk + CA 轮换 runbook 内联为本 epic 硬依赖**（含全机群重装、status 显示"retired 节点凭据在轮换前仍密码学有效"）；明示"retire 不轮换 = 仅拓扑变更非安全边界"；**runbook 没写不算 retire done**。
+16. **§16.8/§10.2 双信任面（major）**：明列——`cluster-ca.key` 泄露 ⇒ NATS route+callout 参与（总线级沦陷，**即便 Raft 拒它当 voter**）；`account.nk` 泄露 ⇒ JWT 签发。**route mTLS 叶子也须 nkey-钉到 node-identity**（同 Raft 传输），令"只有 CA 签名"不足以 route-join；`cluster-ca.key` 按 `account.nk` 同等重视、定轮换。
+17. **§10.4 destructive 命令表 + drain（major）**：§10.4 加**destructive 命令明表**（≥ expose/run/session rm，及 push/pull/kill/expose-rm），逐条标在 quorum_lost/force_single 下是否 gate，与 §4.1 转发动词集对账（别混）；drain 给**默认提前通知时长 + 截止前持续服务 + 到点（或 `--now`）迁移 + `--abort` + status 进度（"draining: 3/5 已迁，1 rebuild-OFF 待"）+ 销毁 rebuild-OFF 须键入确认**。
+18. **§4.1/§7.4/§2.2 RTO 预算（major）**：register 现无 home/epoch 字段、tunnel client 固定单 addr 构造一次——**"directive epoch → `Open(newAddr)` 重指"是全新接线**，须具体化（tunnel adapter 加 `Open(newAddr)` 入口）；§7.4/§2.2 列**失效切换最坏串行时延和**（NATS 重连退避 + rehome epoch swap + home `applied_index>=raft_index` 栅栏 + leader reconcile 往返 + JS 副本等待）证明落在数秒~数十秒；§7.4 的 K/秒限流**也作用于 leader-forwarded register→ReconcileBatch 路径**（防上百 agent 同时弹连的惊群撞上选举中 leader）；加 mass-reconnect e2e 门。
+19. **§10.2 disk_pressure/raft_lag 诚实定大小（major）**：今天**无 alert store/banner**，disk_pressure 仅 sys.event——晋升进存储/ack/banner 是净新增（小但非零）；raft_lag 全新（raft 都还没有）。保留在 v1 但如实标，别悄悄砍。
+
+### 18.3 采纳的减法（第 3 轮 YAGNI）
+删 `cluster_revoked_identities` 表（0009，无 writer/reader）；确定性回到**一条结构性不变式 + 一个 Apply-可达 lint**（非四套 AST 扫描器，因 leader 复制字面量 SQL 后发散已结构性不可能，lint 只是 tripwire）；告警**去 per-identity ack 簿记 + 去 member/operator 脱敏分层**（全员可信单团队）——改**单一集群级 ack + 严重告警每新会话必重现**（ack 只压抑内联 ack 提示、不压 banner）；审计"纯函数"规则**只施于恢复尾**（leader 变更时重发那段），非全 71 站点的全局属性；home 指派加**资格约束**（只选 ONLINE/HEALTHY、非 draining/retiring/未过 catch-up 的 broker）。
+
+### 18.4 残留分类（外审 F6 后）
+
+> 外审 F6 指出原"实现精度残留"里混入了**会改 wire / 状态机 / 安全边界的架构契约**，不能由 plan 自由发挥。现拆两类：
+>
+> **(A) 已升级为正文契约（F6，正文为准；下列标 `[→正文]`）**——`[→正文]` 的 4 项已写进对应章节，本节仅留指针。
+> **(B) 留 plan 阶段的纯实现精度**——其余项，确为长尾，外审就"此边界"签字。
+- `sqlite_sequence` 排除出逻辑等价比对 + 规范快照路径为 page-level online-backup（非 `.dump+reload`）+ 禁 Apply 可达 `LastInsertId()`/SELECT row_id（§3.6/§13.2）。
+- `ReconcileBatch` **输入**集也须按全序重排再烤（输入是 `started_at DESC`、非唯一时间戳靠 rowid 破并，脆弱）；时间戳走"Raft op 内显式值、各副本 Apply 绑该值"而非字符串字面量（§3.4）。
+- **[→正文 §3.5]** 快照形状：online-backup 是整文件 page-copy、投影不掉活性列——§3.5 不变式已改述为"**Apply 永不写活性列 + 恢复/换 leader 无条件重建活性列**"（非"快照排除活性列"，后者 online-backup 做不到）。
+- 每个带 `CURRENT_TIMESTAMP` 默认的 Apply-owned 表的运行期测试：断言 Apply-path INSERT 总显式赋值、无副本持 `CURRENT_TIMESTAMP`（§13）。
+- **[→正文 §7.2]** REGISTER 加第 6 个 `<epoch>` 字段（v2 wire break，parser 收正好 6）；`tunnelTokenLookup` 新变体过滤 `home_broker==self` + port + 返回 epoch 比对；`home_catching_up` 双端同版本上线。已写进 §7.2(b) 的 wire 契约。
+- **[→正文 §7.2c/§8.2]** catch-up 谓词是**服务节点本地 `applied_index >= barrier index`**（follower-local），leader ReadIndex 只用来取一个新鲜 barrier 值。已写进 §7.2(c)/§8.2。
+- **epoch vs barrier 张力**（已 flag）：保留 epoch——它堵 ReassignHome 应用间隙里 agent 在未应用的旧 home 重 REGISTER（旧 epoch 过 token-hash）→ 同口双绑；要求 agent 拨新 home **前**先 cancel 旧 supervisor（Open-replace），不复现旧 epoch；加"ReassignHome 在途 + agent 抢在未应用旧 home 重 REGISTER，断言同口不双绑"测试（§7.2b/§7.3）。
+- **[→正文 §4.1]** forwarded-write 幂等的"提交后 `ErrLeadershipLost`"歧义：发起 broker/客户端须带**跨重试稳定的幂等键**（非 leader 铸）让新 leader 去重已提交 entry。已写进 §4.1 fail-closed 段。
+- per-stream 重配规模：上百 session ×2(OBJ_xfer) 顺序触碰数百流——封顶/并行 + status 如何枚举每流副本态（缓存+重配时失效，或一次 JS meta 查 under-replicated）+ 卡死单流的运维行为（§6.4/§9）。
+- 对抗性安全测试构造（非仅断言结果）：member/agent JWT 在 NATS ACL 层被拒 pub/sub `apply.*/cluster.*`；**普通 bus credential 被拒 pub `cluster.apply.*`、broker nkey credential 被允许**（RF1 broker-only ACL，非"若保留签名"——已无 apply 签名）；并发 ex-home+new-home 同口 REGISTER 恰一绑 + loser 得 `home_catching_up`(非 terminal)；撤销后立刻在落后 peer 重认证在界内被拒（§13.8）。
+- `cluster init --from-existing` 半跑/失败的幂等/回滚契约（哪些 `.bak` 恢复、半写 `raft/` 怎么办）+ 已半初始化的 preflight 拒绝（§11）。
+- `node_ident_pub` 的带外确认（运维比对入群机 console 打印的指纹）+ status 暴露各节点指纹防替换（§4.2/§8.1）。
+- "grow to 3" 的具体可复制 secret 分发 runbook（文件→路径+权限、"经可信信道 scp / 勿提交"、新机 `cluster doctor` 全绿且 account.nk 指纹匹配后才 `cluster add`，否则 fail-fast）（§8.3/§15）。
+- psk-FDE 连贯性：proxy 既移出 v1 不复制，则"明文复制到 N 盘"的 FDE 理由在 v1 不成立——要么按单 home 威胁模型重述 `psk_at_rest_unprotected` 硬门、要么降为 advisory；并明示 online-backup 输出与 `.bak` 是否含明文 psk/pin_hash、要求同 FDE 卷（§16.6/§0/§11）。
+- 中途 home 死的客户端可见契约：客户端收可重试错误 / 观察到 abort 须重发（非静默 resume）（§9）。
+- promote/step-down 作为 `transfer-leader` 的文档化别名（CLI 提示"did you mean"）；标注需求 §12 的 alert/cluster 命令分组**已由 §8.1 表解决**（§8.1）。
+
+> **收敛说明**：三轮内审共提 ~140 条（去重后 50/38/52），跨轮修复了包括我两处过度简化在内的全部架构级问题；第 3 轮余下多为实现精度，已归本节路由 plan 阶段。架构层视为 settled，**待外审对"此边界"签字**。
+
+---
+
+## 19. 开发 phase 分解（D0–D9，依赖分明）
+
+> 体例同主项目 `docs/architecture.md` 的 P0–P11：**"树不能先结果再发芽"——每个 phase 的"出口"是下一个 phase 的前提，未过不进下一阶段**。前缀用 **`D`（distributed）**，避开主线 `P0–P13`。每个 D-phase 至少一个 PR、分支 `phase/d<N>-<slug>`。所有"做/测试"以 §0–§18 正文为唯一实现尺，本节只给**切分与顺序**，不重述契约。
+>
+> 起点 = 现网单点 broker（v0.3.5，proto v1，`go.mod` 仅 yamux 无 raft）。终点 = N≥3 quorum HA（§0 北极星）。**两个里程碑硬节点**：D2 出口 = **N=1 与今天功能等价**（§0）；D9 出口 = **N≥3 HA GA**。
+
+### 依赖图（根→叶）
+
+```
+D0  前置门 + proto v2 SSOT + migrations 0008–0010        ← 地基（无运行期行为）
+ │
+ ▼
+D1  状态层：Raft FSM + SQLite Apply + 快照/恢复 + kill-9   ← 共识心脏（单节点 N=1 raft）
+ │
+ ▼
+D2  op 集 + 全 mutator Plan/Apply 移植                     ← 里程碑：N=1 功能等价
+ │
+ ▼
+D3  NATS 集群层：≥2 节点 routes + auth_callout 本地读 +     ← 多节点信任面
+    fail-closed(T_fence) + broker-only ACL(apply 发布者)
+ │
+ ▼
+D4  写转发 apply.*（follower→leader）+ 跨重试幂等 +         ← 控制写分布式
+    ReconcileBatch leader 权威
+ │
+ ▼
+D5  审计可重导（leader 单写 + dedup + sweep）+              ← 观测/审计 HA
+    JS per-session 流副本重配（replicasFor + UpdateStream）
+ │
+ ▼
+D6  数据面分布式：per-expose home + server_id 桥接指派 +     ← 公网面 HA
+    REGISTER 6-field epoch + cert_pins 钉证/轮换 +
+    home_catching_up + catch-up barrier + 自驱 rehome
+ │
+ ▼
+D7  集群生命周期：init/add(membership 两阶段+join PoP)/     ← 运维面 + 逃生
+    online/drain/retire + status/doctor(双视图,--json) +
+    force-single(offline+self-fence+runbook)
+ │
+ ▼
+D8  文件传输分布式（终结于 home + tier-B 副本）            ← 叶子（D8a/D8b 可并行）
+    ‖ 告警系统（Raft 复制 alerts + 客户端合成 gating + banner）
+ │
+ ▼
+D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA GA / 现网切换
+```
+
+### D0 — 前置门 + proto v2 + migrations
+**目标**：依赖与 wire/schema 地基就位，无运行期行为变化。
+**做**：§3.1 pin `hashicorp/raft`+`raft-boltdb/v2`+`FileSnapshotStore` 确切版本、`CGO_ENABLED=0`+Go1.25 编译、`Config.PreVote` 字段在；§proto 建 `tether.v2` subject grammar SSOT + `ProtoVersion=2` 常量（§16.2 硬升级）；§4.2 migrations 0008（`cluster_nodes` 含 `nats_server_id`+`cert_fp/_prev/_valid_until`+`phase`）、0009（`cluster_meta`+`alerts`+`alert_acks` 集群级 PK、**无 `cluster_revoked_identities`**）、0010（`port_allocations` 加 `home_broker/rebuild_on_failure/epoch`+索引）。
+**测试**：§13.1 确定性 lint 骨架可跑；migrations 前向应用幂等（按名只跑一次）；proto v2 golden JSON 回环；`go build ./...` 绿。
+**出口**：raft 依赖编译通过且 **PreVote 实测生效**（§3.1/§18.2.14 合并门：分区再连 follower，健康 leader term 不涨/不下台）；0008–0010 在内存库前向跑通。
+
+### D1 — 状态层：Raft FSM + SQLite Apply + 快照/恢复（N=1）
+**目标**：单节点 Raft FSM 把写经 Apply 落 SQLite，崩溃一致。
+**做**：§3.2 写入模型（leader Plan→`raft.Apply`→各副本 Apply 同 txn 写 `applied_index`，零直连 `db.Exec`）+ 读一致性契约；§3.3 Plan/Apply 确定性框架；§3.7 双存储崩溃一致性两不变式（快照 index≤`applied_index`、Apply 对已应用 entry 幂等 no-op）；§3.8 快照=WAL+online-backup（独立只读 handle）+ 恢复（integrity_check+前向 migrations+原子换入）；§3.5 活性列不变式（Apply 永不写 + 恢复/换 leader 无条件重建）。
+**测试**：§13.3 快照-恢复-重放确定性；**§13.4 kill-9 崩溃一致性矩阵**（含 BoltDB 超前 SQLite 重导 lastApplied）；§13.5 WAL 并发（持续 Apply + 流式 backup 无 SQLITE_BUSY/一致提交点）。
+**出口**：单节点 FSM 容忍 raft 重投已应用 entry；kill-9 矩阵存在且绿（承重门）。
+
+### D2 — op 集 + 全 mutator Plan/Apply 移植（里程碑：N=1 功能等价）
+**目标**：现有所有权威写改走 FSM；N=1 与今天功能等价。
+**做**：§5 窄类型化 op 集（无 `GenericRowMutate`）；§3.3 每个自生成 mutator 显式 Plan/Apply 拆分（port/proc/node/session/agentprov）；§3.4 确定性雷区处置（leader 烤时间/token/ULID/seq；`ReconcileBatch` 全序；保留 AUTOINCREMENT）；`ProcGC` 转 leader-local。
+**测试**：§13.1 确定性 lint 全开（编译期断言 Apply 不 import rand/ulid、禁 FSM 外 INSERT、禁 Apply 调 `*sql.DB` mutator、列级断言）；**§13.2 多 FSM 逻辑内容等价**（`.dump` 去 schema_migrations / per-table 排序哈希）。
+**出口**：**N=1 集群与今天单点 broker 功能等价**（§0）——现网可平滑变 N=1 集群、行为不变。
+
+### D3 — NATS 集群层（≥2 节点）
+**目标**：多节点 NATS 集群 + 本地读授权 + apply.* 发布者边界。
+**做**：§1.1/§6.1 natscluster 配置模板化（routes mTLS + 共享 account Issuer + 每台 broker nkey AuthUsers + 确定性 `nats_server_id`）；§6.2 auth_callout 读本地副本 + node fail-closed（统一 `T_fence=10s`，§3.2/§8.4）+ PIN 写转 leader（去 XKey）；**§6.2 RF1 broker-only ACL**（`cluster.apply.>`/`cluster.>` 仅授 broker nkey AuthUsers，generated conf 同含 auth_users 与 static nkey permissions=`PermissionsForBroker()`）。
+**测试**：**§13.8 跨真 ≥2 节点 nats 集群**（client 连 A、B 应答 callout 授权；RF1 ACL 正/负向：普通 bus 拒 pub `cluster.apply.*`、broker nkey 允许、member/agent JWT 拒 `cluster.*`）；fail-closed 谓词测试（失联 >`T_fence` 才 fail-closed、界=应用滞后）。
+**出口**：双节点跨服务器 callout 授权通；失 quorum 已 provision 读不锁死；apply.* 发布者身份强制。
+
+### D4 — 写转发 apply.*（follower→leader）
+**目标**：任意 broker 收 session 控制写 → 转 leader Apply。
+**做**：§4.1 入口校验 → broker-only `cluster.apply.<verb>` 转 leader（mTLS routes + broker-only ACL，无转发签名）；not_leader typed fail-closed deny + 客户端重连；**发起 broker 铸跨重试稳定幂等键**（非 leader 铸，§4.1）；G.1 reconcile 全程 leader 权威（整个 `reconcileOnRegister` 算成一条 `ReconcileBatch` entry、全序烤入、审计可重导）。
+**测试**：§13.7 PIN-join 撞选举/转到刚下台 leader 返回可重试 deny 不假放行；转发幂等（提交后 `ErrLeadershipLost` 重试不重复执行）；`ReconcileBatch` 任新 leader 只读 entry 字节一致重导。
+**出口**：follower 收写经 leader 落库；旧 leader 拒写（`ErrLeadershipLost`→fail-closed）。
+
+### D5 — 审计可重导 + JS 流副本重配
+**目标**：审计/对象流跨 leader 死可重导、跨节点冗余。
+**做**：§6.3 leader post-commit 单写 `ev.*`/`audit.*`/`sys.events` + 审计=committed entry+`raft_index` 纯函数 + dedup 窗口 > 选举+扫尾 + 选后幂等 sweep；§6.4/§9 `history-<sid>`/`OBJ_xfer-<sid>` `Replicas=replicasFor(nVoters)` + already-in-use 分支 actual<target 即 `UpdateStream`（等新 nats 入 JS meta-group）+ 全流达 target 前禁 retire + `replication_degraded`。
+**测试**：**§13.9（原 8）扩容/审计**：1→3 后每流副本到 target 才 online；kill-during-expand 无审计丢失；leader 提交后审计发布前崩 → 新 leader 精确补发不重复。
+**出口**：N≥3 杀 leader 审计可重导补发；扩容副本达 target 才报 HEALTHY-HA。
+
+### D6 — 数据面分布式
+**目标**：expose/tunnel 跨 home broker 故障切换。
+**做**：§6.5 server_id 桥接权威 home 指派（agent 自报 server_id、leader 据 `cluster_nodes` 指派、`NodeRegisterResp.Home`）；§7.1–7.2 per-expose `home_broker/epoch` 唯一映射 + `tunnelTokenLookup` 本地读 + epoch 防双绑 + `home_catching_up` 瞬态 DENY（v2 wire + agent `denyIsTransient` 同改）；**§7.2(b) REGISTER 第 6 字段 `<epoch>`（parser 收正好 6）**；§7.2(c) catch-up = follower-local `applied_index>=barrier`；§7.4 agent 自身 NATS 重连自驱 rehome（leader 推 backup）；§7.5 **per-expose brokerAddr**（一 Client 扇出 N home）；§7.7/§15 **稳定 tunnel cert + `cert_pins{current,previous,valid_until}` 钉证 + wire-list 双 pin 轮换**。
+**测试**：**§13.6 per-expose brokerAddr + 一 agent N expose 分散 + mass-rehome 风暴**（`-race`+`goleak`，有界 re-REGISTER、瞬断重拨新 addr、home_catching_up 不塌 terminal）；**§13.7 cert 重启不变性 + 轮换窗口内 agent 重启**；并发 ex-home+new-home 同口 REGISTER 恰一绑。
+**出口**：杀 home → agent 自驱 rehome 到新 home、瞬断重连、不双绑；broker 重启 cert_fp 不变。
+
+### D7 — 集群生命周期 + 逃生
+**目标**：`tether cluster *` 全命令面 + 安全的成员变更与 force-single。
+**做**：§8.1 命令面（admin 严格本地、非 leader fail-fast 指名 leader）+ **membership 两阶段**（阶段 1 `ClusterNodeUpsert{join PoP}` follower Apply 复算 → 阶段 2 `raft.AddVoter`、半成功 phase 状态机、Remove/retire 顺序、幂等）；§8.2 catch-up 闸；§8.3 create/online/drain/retire（drain 迁 expose + quorum 投影守卫 + secret 全套分发）；§8.4 **force-single offline 子命令 + self-fence(`T_fence`) + runbook（`systemctl mask`/空缺拒/调和两存储/peer 可达 hard-refuse）**；§17 `status/doctor` 双视图（ctl/NATS vs broker offline）+ `--json` + 退出码。
+**测试**：**§13.11 membership 两阶段**（roster committed 后 AddVoter 失败 / catch-up stalled / 重复 add → 状态机幂等无"DB voter/Raft 非 voter"分叉、伪签拒）；**§13.12 force-single→recover 3 节点实跑演练** + offline 磁盘锁防并发；§13.13 `cluster status --json`+退出码契约；`cluster add` 半失败清理。
+**出口**：3 节点 add/drain/retire/leader 切换走通；quorum 丢失下 force-single→recover 演练过；status 双视图不误导。
+
+### D8 — 文件传输分布式 ‖ 告警系统（两叶子可并行）
+**目标**：transfer 与 alerts 补成分布式/HA。
+**做（D8a transfer）**：§9 终结于 home + `push/pull` 经 §4.1 转发 + audit start/complete/failed 经 leader Apply；tier-B `ensureXferBucket` `Replicas=replicasFor(nVoters)` + 重配；in-flight tracker/watchdog 在 home best-effort（rehome 不保在途、客户端重启）。
+**做（D8b alerts）**：§10 leader 复制 `alerts`/`alert_acks`（集群级单 ack + 严重每新会话重现）+ 三条 severe 客户端合成 gating（server 佐证）+ §10.2 目录（含桥接 `disk_pressure`/新 `raft_lag`）+ §10.3 banner（所有人、不脱敏分层）+ §10.4 destructive 闸枚举。
+**测试**：**§13.10（原 9）transfer**：tier-B 对象 N≥3 杀 home 存活、ex-home 在途不双绑、home 死在途重启；alerts：失 quorum 客户端合成阻断 destructive、纯抖动不阻断、集群级 ack 行为。
+**出口**：tier-B 对象杀 home 存活；severe 告警正确 gate destructive 且不误伤。
+
+### D9 — 一次性迁移 + nats.conf 接管 + 发布硬化（HA GA）
+**目标**：现网单点平滑切 N=1 集群、可长成 N≥3、文档对齐、发布。
+**做**：§11 `cluster init --from-existing`（前向 0008–0010 + `BootstrapCluster({self})` + 迁移后 DB 作 index-0 快照 + 删 `broker.New` 启动期写）；**§11 tether 接管 `nats-server.conf`**（`.bak` + before/after 归属表 + preflight 遇不认识指令拒接管 + 与 install.sh 产物对账）；**同 PR 改写 `usage.md` §2.3/§3.4**；§15 provisioning 全套 secret 分发 runbook + FDE preflight；§8.3 account.nk/CA 轮换 runbook（retire 安全闭环）。
+**测试**：**§13.12** 3 节点实跑全演练 + **mass-reconnect e2e 门**（§18.2.18：上百 agent 弹连撞选举中 leader）；§13.13 FDE preflight；`cluster init --from-existing` 半跑/回滚幂等；**新 phase 全进 e2e 矩阵**（回填主项目 e2e 洞）。
+**出口**：现网单点一次性迁成 N=1 → `cluster add` 长到 N≥3 → **N≥3 quorum HA 全部 §17 保证矩阵达成**；usage.md 对齐；GitHub release。
+
+### 里程碑映射
+
+| 里程碑 | 完成时机 | 外部可见度 |
+|---|---|---|
+| **N=1 功能等价**（共识心脏就位、行为不变） | D2 结束 | 内部（现网可无感切 N=1） |
+| 多节点信任面 + 控制写分布式 | D4 结束 | 内部 dogfood（≥2 节点） |
+| 观测/审计 + 公网数据面 HA | D6 结束 | 可故障切换演示 |
+| 运维面 + 逃生闭环 | D7 结束 | 运维可操作集群 |
+| **N≥3 quorum HA GA** | D9 结束 | 现网切换 + release |
+
+### 关键依赖警告（违反即返工）
+
+**不能跳序的**（"先发芽"硬约束）：
+- ❌ D1 之前碰任何 `apply.*`/转发 —— FSM/Apply 还不存在，写无处落。
+- ❌ D3 之前做写转发（D4）—— 转发需 ≥2 节点 routes + broker-only ACL；单节点无"转发"。
+- ❌ D3 之前依赖"auth_callout 读本地副本" —— 本地副本由 D1/D2 的 FSM 填，且 fail-closed 谓词（`T_fence`）此处才定。
+- ❌ D6 之前做 rehome/per-expose home —— `home_broker/epoch` 在 D1 复制表里、server_id 桥接在 D3、catch-up barrier 在 D6 自身/§8.2。
+- ❌ D5/D6 未完做 D7 `drain`（迁 expose 依赖 D6 rehome、JS 重配依赖 D5）。
+- ❌ D2（N=1 等价）未过就上多节点 —— 等价性是一切分布式行为的回归基线。
+- ❌ 任何 phase 跳过其 §13 测试门进下一阶段（kill-9/等价/跨真 nats/membership 两阶段是承重门）。
+
+**可并行的**（树分叉）：
+- D8a（transfer）与 D8b（alerts）互不依赖，可并行。
+- D9 的 `usage.md` 改写在各 phase 完成时增量写，不留到最后。
+- 确定性 lint（§13.1）随 D1/D2 建立后，对后续每 phase 持续生效（非一次性）。
+
+### 每进入新 D-phase 的 checklist
+
+- [ ] 前一 D-phase 的"出口"断言全部通过（尤其 D2 的 N=1 等价、D1 的 kill-9）。
+- [ ] 本节当前 phase 状态翻 ✔。
+- [ ] 新开分支 `phase/d<N>-<slug>`；每个 phase 至少一个 PR。
+- [ ] 实现中发现设计问题 **先改 §0–§18 正文再改代码**（§18 为审计轨迹、正文为唯一实现尺）。
+- [ ] 单测 + e2e 同 PR 落盘；触碰并发面（隧道/Raft/Apply/重配）带 `-race`+`goleak`。
+- [ ] 提交前硬闸 `make test`+`make e2e`+`make lint` 全绿；新 phase 进 e2e 矩阵。
+
+> **范围边界**：本分解只覆盖 §0 北极星点名的数据（session/member/node/process/port+审计）的 HA。**P13 proxy / 文件传输 multipath 不在 D0–D9**（§0 显式不做）；待 P13 转无条件 PASS 再单做 "proxy-HA" 叶子。
