@@ -55,9 +55,9 @@
 - **测试纪律**：
   - 表驱动；快测 `make test`（`go test ./...`，用嵌入式 `nats-server/v2/test`，**不需要本机 nats-server**）。
   - 端到端矩阵 `make e2e`（`-tags e2e_matrix`，`test/e2e/all_phases_test.go` 每 phase 一个子进程子测试；单 phase 用 `go test ./test/pX/...`）。**新 phase 的 e2e 进矩阵，作为跨 phase 回归网。**
-  - 并发安全：`-race` + `goleak`（见 `test/concurrency/`）；触碰隧道/PTY/reconcile/传输等并发面必须带 race + leak 门。
+  - 并发安全：`-race` + **仓库内建泄漏门**（`runtime.NumGoroutine` poll-with-tolerance + fd 基线，见 `test/concurrency/helpers_test.go`；**刻意不用 `go.uber.org/goleak`**）；触碰隧道/PTY/reconcile/传输/Raft 等并发面必须带 race + leak 门。
   - lint：`make lint`（golangci-lint **v2**；v1 在 Go 1.25 模块上会拒跑）。
-- **提交前硬闸**：`make test` + `make e2e` + `make lint` 全绿，并发改动另过 `-race`/`goleak`；**任一不过不算 done**。
+- **提交前硬闸**：`make test` + `make e2e` + `make lint` 全绿，并发改动另过 `-race` + 内建 NumGoroutine/fd 泄漏门（非 goleak）；**任一不过不算 done**。
 
 ## 6. Git
 
@@ -65,28 +65,33 @@
 - commit message：conventional commits `<type>(scope): <imperative summary>`（如 `feat(ps): retention-bounded ps RPC`、`fix(auth): grant $JS.API.DIRECT.GET`）。
 - **绝不添加 `Co-Authored-By: Claude` 或任何 AI 署名**（全局规则；已推送的若混入，用户会 rebase 移除）。作者/协作者只保留用户本人。
 
-## 7. 当前状态（截至 2026-06，最新 tag v0.3.4，proto 始终 v1）
+## 7. 当前状态（截至 2026-06）
+
+> **⚠ 双线地雷**：`main` 顶端已是 **proto v2**（distributed-broker **D0** 已 commit），**连不上现网 proto-v1 车队**。面向用户的 patch 走 **v1 线**（从 `v0.3.5` 切 release 分支 + cherry-pick），**绝不从 main 发**给现网；详见 memory `project-release-lines-v1-v2`。
 
 - **主线**：P0–P11 → **v0.1.0**（GitHub release，里程碑全达成）。
-- **已发布的 post-1.0 叶子增量**（按 tag 序）：
+- **已发布的 post-1.0 叶子增量**（v1 线，按 tag 序，proto 始终 v1）：
   - file-transfer（`push`/`pull`，tier-A inline + tier-B JetStream Object Store）— **v0.2.0**（后 tier-B 上限提到 2 GiB）
   - run heartbeat watchdog、retention-bounded `ps` RPC + processes GC — **v0.2.8**
-  - **P12** expose `--remote-port`（指定公网端口，带内唯一索引仲裁） — **v0.2.9**
-  - **P13** session-scoped proxy 订阅（"自建机场"：内嵌纯 Go shadowsocks `chacha20-ietf-poly1305` + 试解密多密钥，broker 托管 HTTPS 订阅 URL，Clash 可导入） — **v0.3.0**
+  - **P12** expose `--remote-port`（带内唯一索引仲裁） — **v0.2.9**
+  - **P13** session-scoped proxy 订阅（内嵌纯 Go shadowsocks + 试解密多密钥，broker 托管 HTTPS 订阅 URL） — **v0.3.0**
   - compliance-cleanup 审计加固 — **v0.3.1**
-  - transfer-unrestrict（`file_transfer.allow_roots` 改为可选收紧，缺省全盘触达） — **v0.3.2**
-  - remote-fs-resilience（agent 网络盘挂死时 `exec`/`run` 不再永久卡死，`--safe`） — v0.3.3（随 v0.3.4 线发布）
+  - transfer-unrestrict（`file_transfer.allow_roots` 可选收紧、缺省全盘） — **v0.3.2**
+  - remote-fs-resilience（网络盘挂死时 `exec`/`run` 不卡死，`--safe`） — v0.3.3（随 v0.3.4 发布）
   - proxy-tunnel-reconnect（反向隧道自愈重连 + 就绪 liveness） — **v0.3.4**
-- 规模：~58k 行 Go（非测试）、22 个 internal 包、161 个测试文件 / ~777 个 Test+Fuzz；`CGO_ENABLED=0 go build ./...` 通过。
-- 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net`，lab session 多 agent；P12/P13/transfer-unrestrict/remote-fs 均有 pc732 真硬件验证记录）。
+  - history-snapshot-race（NumPending 驱动快照完成，修远程 broker 空输出） — **v0.3.5**
+  - proxy-aware-dial（ctl/agent NATS 经本地代理：HTTP CONNECT + SOCKS5h，解 WSL fake-ip hang；默认关、零回归） — **v0.3.6**（WSL 实机验证过）
+- **distributed-broker HA epic（D0–D9，proto v2，在 main）**：架构基线 `docs/distributed-broker-architecture.md` 过 4 轮外审 PASS；分解见 §19。
+  - **D0**（前置门 + proto v2 SSOT + migrations 0008–0010 + PreVote 合并门）— **已 commit 进 main**。
+  - **D1**（状态层：单节点 Raft FSM + SQLite Apply 同 txn `applied_index` + 幂等重投 + online-backup 快照/恢复 + kill-9 矩阵；`internal/cluster`、`internal/storage` OpenWAL/OpenReadOnly）— **实现完成 + 内审过（CONDITIONAL PASS→must-fix 已修），待外审**。报告 `docs/reviews/d1-{plan,review}.md`。
+- 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net` / `weiland.top`，多 agent）。
 
 ### 已知未收口 / 缺口（接手时优先处理）
 
-- **P13 阶段出口仍是 CONDITIONAL PASS**（见 `docs/reviews/p13-external-review-round8.md`）：代码已放行，但锁定的 **真 Caddy/WSS + 真 Clash 客户端**端到端验证尚未跑过；按"外审不过不算 done"，P13 严格说还差这一步收口。
-- **e2e 矩阵覆盖洞**：`test/e2e/all_phases_test.go` 仅覆盖 p1–p10 + p13；**p11 及 post-1.0 的 file-transfer / ps-retention / P12 未进矩阵**（plan 已承认为既有缺口）。新增量进矩阵时一并回填。
+- **P13 阶段出口仍是 CONDITIONAL PASS**：真 Caddy/WSS + 真 Clash 端到端验证未跑（外审不过不算 done）。
+- **e2e 矩阵覆盖洞**：`test/e2e/all_phases_test.go` 覆盖 p1–p10 + p13 + 叶子矩阵（TransferDefaults / RemoteFS / ProxyTunnelReconnect / **ProxyDial** / **D1**）；**p11 及 post-1.0 的 file-transfer / ps-retention / P12 仍未进矩阵**。新增量进矩阵时一并回填。
 - **`README.md` 为空**（0 字节）——对外门面缺失。
-- `log.md` BUG#1（v0.1.2 时 `history` 因 JWT 缺 JetStream 权限全 FAIL）已由后续 auth 修复（`$JS.API.DIRECT.GET` / `$JS.FC`）处理，但 `log.md` 未补对应的实机重测 PASS 记录。
 
 ### 下一步
 
-- **无进行中的 phase**；新工作按 §2 当作新叶子增量（范围先与用户敲定）。可选的收口/打磨项见上方缺口清单。
+- **D1 外审中**（于外审时停下）；外审过后 commit/push（注意：proto v2 不发现网），再进 **D2**（op 集 + 全 mutator Plan/Apply 移植 → N=1 功能等价里程碑）。

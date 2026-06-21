@@ -119,28 +119,115 @@ var raftImportPaths = map[string]bool{
 
 func TestRaftConfinedToClusterPackage(t *testing.T) {
 	root := repoRoot(t)
-	clusterPkg := filepath.Join("internal", "cluster")
 	var offenders []string
+	visited := 0
 	for _, base := range []string{"internal", "cmd"} {
 		walkGoFiles(t, filepath.Join(root, base), func(rel string) {
-			// Whitelist is D1-FORWARD: it has no effect in D0 because the only
-			// raft importers are internal/cluster's *_test.go files, which
-			// walkGoFiles already excludes — so this branch is never hit today.
-			// It exists so D1's PRODUCT raft node under internal/cluster won't
-			// trip the guard. Do not remove it as "dead code".
-			if strings.HasPrefix(rel, clusterPkg+string(os.PathSeparator)) || rel == clusterPkg {
-				return // whitelist (forward-compat for D1 product code)
-			}
+			visited++
+			// Use the SAME predicate the self-check exercises, so an edit to the
+			// whitelist logic is caught by TestRaftConfinementSelfCheck.
 			for _, imp := range fileImports(t, filepath.Join(root, rel)) {
-				if raftImportPaths[imp] {
+				if raftConfinementOffender(rel, imp) {
 					offenders = append(offenders, rel+" imports "+imp)
 				}
 			}
 		})
 	}
+	// File-count floor: a broken traversal must not make the guard vacuously green.
+	if visited < 50 {
+		t.Fatalf("raft-confinement scan visited only %d non-test files — traversal likely broken", visited)
+	}
 	if len(offenders) > 0 {
 		sort.Strings(offenders)
-		t.Errorf("raft must stay confined to internal/cluster in D0 (§19): \n%s", strings.Join(offenders, "\n"))
+		t.Errorf("raft must stay confined to internal/cluster (§19/§13.1 L-2):\n%s", strings.Join(offenders, "\n"))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// L-2 is LIVE in D1 — internal/cluster now holds product raft code (the FSM /
+// node / snapshot). These tests make the previously-vacuous whitelist branch
+// load-bearing: the whitelist is genuinely exercised, the offender-detection
+// logic is non-vacuous, and Apply-reachable cluster code imports no
+// non-deterministic source (§13.1 / §3.4).
+// ---------------------------------------------------------------------------
+
+// TestRaftConfinementWhitelistIsLive asserts the L-2 whitelist is no longer
+// vacuous: at least one NON-test file under internal/cluster imports raft. If the
+// FSM/node failed to land (or walkGoFiles is broken), this catches it.
+func TestRaftConfinementWhitelistIsLive(t *testing.T) {
+	root := repoRoot(t)
+	clusterPkg := filepath.Join("internal", "cluster")
+	importers := 0
+	walkGoFiles(t, filepath.Join(root, clusterPkg), func(rel string) {
+		for _, imp := range fileImports(t, filepath.Join(root, rel)) {
+			if raftImportPaths[imp] {
+				importers++
+				return
+			}
+		}
+	})
+	if importers == 0 {
+		t.Fatal("L-2 whitelist is vacuous: no PRODUCT raft import found under internal/cluster " +
+			"(D1 must have landed the FSM/node) — a green TestRaftConfinedToClusterPackage would be meaningless")
+	}
+}
+
+// raftConfinementOffender is the EXACT predicate TestRaftConfinedToClusterPackage
+// applies, factored out so the self-check exercises the same logic.
+func raftConfinementOffender(rel, imp string) bool {
+	clusterPkg := filepath.Join("internal", "cluster")
+	if strings.HasPrefix(rel, clusterPkg+string(os.PathSeparator)) || rel == clusterPkg {
+		return false // whitelisted
+	}
+	return raftImportPaths[imp]
+}
+
+// TestRaftConfinementSelfCheck proves the predicate has discriminating power: a
+// raft import OUTSIDE internal/cluster is flagged, one INSIDE is allowed.
+func TestRaftConfinementSelfCheck(t *testing.T) {
+	if !raftConfinementOffender(filepath.Join("internal", "port", "x.go"), `"github.com/hashicorp/raft"`) {
+		t.Fatal("self-check: a raft import under internal/port MUST be flagged")
+	}
+	if raftConfinementOffender(filepath.Join("internal", "cluster", "node.go"), `"github.com/hashicorp/raft"`) {
+		t.Fatal("self-check: a raft import under internal/cluster MUST be allowed")
+	}
+}
+
+// TestClusterApplyNoNondeterministicImports forbids crypto/rand, math/rand and
+// oklog/ulid in internal/cluster product code (§3.4): D1's representative op bakes
+// a literal value, so the package imports none — green with a real subject.
+func TestClusterApplyNoNondeterministicImports(t *testing.T) {
+	root := repoRoot(t)
+	var offenders []string
+	walkGoFiles(t, filepath.Join(root, "internal", "cluster"), func(rel string) {
+		for _, imp := range fileImports(t, filepath.Join(root, rel)) {
+			if bannedImports[imp] {
+				offenders = append(offenders, rel+" imports "+imp)
+			}
+		}
+	})
+	if len(offenders) > 0 {
+		sort.Strings(offenders)
+		t.Errorf("internal/cluster (Apply-reachable) must not import a non-deterministic source (§3.4):\n%s",
+			strings.Join(offenders, "\n"))
+	}
+}
+
+// livenessColumnRe flags an UPDATE that writes a leader-local liveness column.
+// D1 ships only a STATIC self-check of this detector; the real Apply-reachability
+// column guard (which excludes legitimate restore-time RebuildLiveness) is D2.
+var livenessColumnRe = regexp.MustCompile(`(?is)UPDATE\s+nodes\s+SET\b.*\b(status|last_heartbeat_at|proxy_ready)\b`)
+
+// TestLivenessColumnLintSelfCheck proves the liveness-column detector is
+// non-vacuous: it flags an Apply writing a liveness column and ignores a
+// non-liveness UPDATE. (Scanning real cluster code is deferred to D2 because
+// restore-time RebuildLiveness legitimately writes these columns.)
+func TestLivenessColumnLintSelfCheck(t *testing.T) {
+	if !livenessColumnRe.MatchString(`UPDATE nodes SET status = 'ONLINE' WHERE nid = ?`) {
+		t.Fatal("self-check: detector must flag an Apply writing nodes.status")
+	}
+	if livenessColumnRe.MatchString(`UPDATE nodes SET release_version = ? WHERE nid = ?`) {
+		t.Fatal("self-check: detector must NOT flag a non-liveness-column UPDATE")
 	}
 }
 
@@ -236,7 +323,7 @@ func TestNoStrayVersionLiteralSelfCheck(t *testing.T) {
 func walkGoFiles(t *testing.T, dir string, fn func(rel string)) {
 	t.Helper()
 	root := repoRoot(t)
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	if werr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -249,7 +336,9 @@ func walkGoFiles(t *testing.T, dir string, fn func(rel string)) {
 		}
 		fn(rel)
 		return nil
-	})
+	}); werr != nil {
+		t.Fatalf("walk %s: %v", dir, werr)
+	}
 }
 
 // fileImports returns the quoted import paths of a single .go file.

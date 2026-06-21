@@ -45,9 +45,9 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Re-running applyMigrations on the same DB must be a no-op.
-	if err := applyMigrations(db); err != nil {
-		t.Fatalf("second applyMigrations: %v", err)
+	// Re-running ApplyMigrations on the same DB must be a no-op.
+	if err := ApplyMigrations(db); err != nil {
+		t.Fatalf("second ApplyMigrations: %v", err)
 	}
 
 	var after int

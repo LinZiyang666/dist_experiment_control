@@ -25,7 +25,7 @@ func TestProxyGenerationForwardMigrationAppliesOnExisting0006DB(t *testing.T) {
 	}
 
 	// Re-running migrations (what every broker start does) must re-apply 0007.
-	if err := applyMigrations(db); err != nil {
+	if err := ApplyMigrations(db); err != nil {
 		t.Fatalf("re-running migrations on a 0006-only DB failed: %v", err)
 	}
 

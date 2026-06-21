@@ -109,6 +109,28 @@ func TestProxyDialMatrix(t *testing.T) {
 	}
 }
 
+// TestD1Matrix folds the distributed-broker D1 state layer (docs/reviews/
+// d1-plan.md) into the -tags e2e_matrix regression net under -race. D1 is the
+// consensus heart (Raft FSM + SQLite Apply + snapshot/restore), and its load-
+// bearing gate is the §13.4 real-SIGKILL kill-9 crash-consistency matrix — a
+// subprocess test that self-forks the (race-instrumented) test binary, so it
+// needs its OWN budget well beyond the 90s phase cap and must NOT go through the
+// no-race allPhases runPhase. A regression in the same-txn applied_index
+// invariant, the idempotent re-apply, the online-backup snapshot/restore, or the
+// WAL-concurrency path thus fails `make e2e` too, not only `make test`.
+func TestD1Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "240s",
+		"./internal/cluster/...", "./test/cluster/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d1 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

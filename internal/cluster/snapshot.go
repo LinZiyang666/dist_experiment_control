@@ -1,0 +1,227 @@
+package cluster
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/hashicorp/raft"
+	sqlite "modernc.org/sqlite"
+)
+
+// backupStepPages is how many DB pages each online-backup Step copies. Paged
+// (not -1 "all at once") so a concurrent Apply can interleave between steps
+// (§13.5 WAL concurrency), and so the WAL test can observe interleaving.
+const backupStepPages = 64
+
+// modernc's online-backup methods live on the unexported *conn, reached via
+// (*sql.Conn).Raw + this interface assertion. *sqlite.Backup is exported, so the
+// interface is expressible. A future modernc rename turns the backup_pin_test red
+// instead of panicking here.
+type backupConn interface {
+	NewBackup(dstURI string) (*sqlite.Backup, error)
+}
+type restoreConn interface {
+	NewRestore(srcURI string) (*sqlite.Backup, error)
+}
+
+// fsmSnapshot is the FSMSnapshot raft persists. It holds only the read-only
+// handle + a scratch dir; all IO is in Persist.
+type fsmSnapshot struct {
+	ro     *sql.DB
+	tmpDir string
+}
+
+// Persist writes a consistent online-backup of the live DB into the raft sink.
+// Two-stage (modernc NewBackup copies into a FILE, not an io.Writer): backup to a
+// temp file, then io.Copy that file into the sink (architecture §3.8 D1
+// amendment).
+func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
+	if err := s.persist(sink); err != nil {
+		_ = sink.Cancel()
+		return err
+	}
+	return sink.Close()
+}
+
+func (s *fsmSnapshot) persist(sink raft.SnapshotSink) error {
+	tmp, err := os.CreateTemp(s.tmpDir, "snap-*.db")
+	if err != nil {
+		return fmt.Errorf("cluster: snapshot temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close() // NewBackup opens its own dst conn on this path
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := backupTo(context.Background(), s.ro, tmpPath); err != nil {
+		return err
+	}
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("cluster: open snapshot temp: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := io.Copy(sink, f); err != nil {
+		return fmt.Errorf("cluster: stream snapshot: %w", err)
+	}
+	return nil
+}
+
+func (s *fsmSnapshot) Release() {}
+
+// backupTo runs modernc's online-backup from ro into a fresh dst file. Step
+// returns true=MORE pages / false=DONE; Finish closes the unmanaged dst conn (a
+// missing Finish leaks an fd, which the §13.5 fd-baseline gate catches).
+func backupTo(ctx context.Context, ro *sql.DB, dstPath string) error {
+	conn, err := ro.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("cluster: backup conn: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	return conn.Raw(func(driverConn any) error {
+		bc, ok := driverConn.(backupConn)
+		if !ok {
+			return fmt.Errorf("cluster: driver conn does not implement NewBackup (modernc API drift)")
+		}
+		b, err := bc.NewBackup(dstPath)
+		if err != nil {
+			return fmt.Errorf("cluster: NewBackup: %w", err)
+		}
+		// backupStepGate (fp3, test-only) fires after the first Step so a SIGKILL
+		// lands mid-backup (temp exists, snapshot not finalized).
+		stepErr := stepAll(b, backupStepGate)
+		finErr := b.Finish() // ALWAYS run (closes dst conn); both errors checked
+		if stepErr != nil {
+			return stepErr
+		}
+		if finErr != nil {
+			return fmt.Errorf("cluster: backup finish: %w", finErr)
+		}
+		return nil
+	})
+}
+
+// restoreInPlace copies srcPath INTO the live write-pool conn (modernc
+// NewRestore) — no rename over the open inode (§3.8 D1 amendment).
+func restoreInPlace(ctx context.Context, db *sql.DB, srcPath string) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("cluster: restore conn: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	return conn.Raw(func(driverConn any) error {
+		rc, ok := driverConn.(restoreConn)
+		if !ok {
+			return fmt.Errorf("cluster: driver conn does not implement NewRestore (modernc API drift)")
+		}
+		b, err := rc.NewRestore(srcPath)
+		if err != nil {
+			return fmt.Errorf("cluster: NewRestore: %w", err)
+		}
+		stepErr := stepAll(b, nil) // no fp3 gate on the restore path
+		finErr := b.Finish()
+		if stepErr != nil {
+			return stepErr
+		}
+		if finErr != nil {
+			return fmt.Errorf("cluster: restore finish: %w", finErr)
+		}
+		return nil
+	})
+}
+
+// stepAll drives a Backup to completion (true=more pages, false=done). If
+// afterFirstStep is non-nil it fires once, right after the first Step has copied
+// pages (so the destination temp file exists but the backup is not yet finalized).
+func stepAll(b *sqlite.Backup, afterFirstStep func()) error {
+	first := true
+	for {
+		more, err := b.Step(backupStepPages)
+		if err != nil {
+			return fmt.Errorf("cluster: backup step: %w", err)
+		}
+		if first {
+			first = false
+			if afterFirstStep != nil {
+				afterFirstStep()
+			}
+		}
+		if !more {
+			return nil
+		}
+	}
+}
+
+// restoreFrom implements FSM.Restore (architecture §3.8 D1 amendment).
+func (f *fsm) restoreFrom(rc io.ReadCloser) error {
+	defer func() { _ = rc.Close() }()
+
+	// 1. Stream the snapshot into a temp SOURCE file on the SAME filesystem.
+	tmp, err := os.CreateTemp(f.tmpDir, "restore-*.db")
+	if err != nil {
+		return fmt.Errorf("cluster: restore temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := io.Copy(tmp, rc); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("cluster: stream restore: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("cluster: close restore temp: %w", err)
+	}
+
+	// 2. integrity_check + foreign_key_check (torn snapshot rejected — §13.3).
+	if err := verifyIntegrity(tmpPath); err != nil {
+		return err
+	}
+
+	// 3. Forward-migrate the temp file through the SAME storage runner.
+	mdb, err := storage.Open("file:" + tmpPath)
+	if err != nil {
+		return fmt.Errorf("cluster: forward-migrate restore temp: %w", err)
+	}
+	_ = mdb.Close()
+
+	// 4. In-place restore into the live write pool (no rename over open inode).
+	if err := restoreInPlace(context.Background(), f.db, tmpPath); err != nil {
+		return err
+	}
+
+	// 5. Liveness baseline reset (§3.5 D1 amendment).
+	if err := RebuildLiveness(f.db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifyIntegrity opens a throwaway handle on path and runs integrity_check +
+// foreign_key_check. A torn/corrupt DB makes the pragma error or return non-"ok"
+// (or surfaces FK violations); any of these REJECTS the restore (§13.3).
+func verifyIntegrity(path string) error {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		return fmt.Errorf("cluster: open snapshot for integrity_check: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var res string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&res); err != nil {
+		return fmt.Errorf("cluster: integrity_check could not run (torn snapshot): %w", err)
+	}
+	if res != "ok" {
+		return fmt.Errorf("cluster: snapshot integrity_check = %q, refusing restore (torn/corrupt)", res)
+	}
+	rows, err := db.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("cluster: foreign_key_check could not run: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		return fmt.Errorf("cluster: snapshot has foreign-key violations, refusing restore")
+	}
+	return rows.Err()
+}

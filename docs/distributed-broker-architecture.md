@@ -62,6 +62,7 @@ cmd/tether/
 
 ### 3.1 选库（Stage-B/合并前置门）
 `hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。**raft 是全新依赖（go.mod 现只有 yamux）**：pin 版本、`CGO_ENABLED=0`+Go1.25 编译、**确认 `Config.PreVoteDisabled` 字段在**（hashicorp/raft v1.7.x **无 `Config.PreVote`**；真实字段是 `PreVoteDisabled bool`，`DefaultConfig()` 不设它 → 零值 false → pre-vote **缺省启用**。另：raft 在 transport 未实现 `WithPreVote` 接口时**静默关闭** pre-vote，故"字段在"不足证"行为生效"，见 §18.2.14）（§8.4/§9.4 正确性前提）——升为合并前置门。
+> **D1 注（快照/恢复 API 按 driver 实际）**：SQLite 侧用 **modernc.org/sqlite v1.50.0**（非 mattn/go-sqlite3）——online-backup/restore 走 modernc 的 `NewBackup`/`NewRestore`（非 mattn `Backup()` 或 `VACUUM INTO`），机制与 raft v1.7.3 的快照 meta.Index 真相见 **§3.8 D1 实现修正**。
 
 ### 3.2 写入模型 + 读一致性
 **写**：leader 在 `Plan` 把命令渲染成**键/fence 值无不确定性**的 SQL，`cn.Apply→raft.Apply`，各副本 Apply 同 txn 写 `applied_index`。**任何复制写路径 ZERO 直连 `db.Exec`**；废黜 leader 的 `raft.Apply` 返回 `ErrLeadershipLost`。
@@ -89,6 +90,7 @@ cmd/tether/
 ### 3.5 不进 Raft（leader-local 活性 + 列级 lint 替代物理拆表）
 活性态（`status/last_heartbeat_at/proxy_ready`）leader-local、永不进快照、G.2 一拍重建；身份态（`boot_id/release/proto/proxy_capable/registered_at`）仅 Apply 写。
 > **裁定（R2-nit 简化 + R3 §18.4 修正快照形状）**：**不做 0009 物理拆 `nodes_identity/nodes_liveness`**——改**列级 lint**：`Apply 永不写 status/last_heartbeat_at/proxy_ready`、本地永不写身份列。**不变式改述（架构契约，非快照排除）**：快照采 online-backup 整文件 page-copy，**做不到"投影掉活性列"**；故正确不变式是 **「Apply 永不写活性列 + 恢复/换 leader 无条件 G.2 一拍重建活性列」**——活性列即便随快照带过去也会被重建覆盖，不依赖快照排除。心跳/`ReconcileStates`/`SetProxyReady` 只走活性列。
+> **D1 实现修正（恢复后活性基线）**：§3.5 说恢复无条件重建活性列，但未命名"刚恢复、尚无心跳"时的基线。定 **`status=OFFLINE`、`proxy_ready=0`、`last_heartbeat_at=NULL`**（match `node.go`：ONLINE 仅由活的 Register/Heartbeat 置）。`RebuildLiveness(db)` 在 Restore 末**无条件**跑此重置；完整 G.2 reconcile（按真心跳重算）在后续 phase。
 
 ### 3.6 代理键
 > **裁定（R2-minor）**：**保留 AUTOINCREMENT**——单写 leader 串行 Apply 下 SQLite 自赋 rowid 已确定性；leader **省略 row_id 让 SQLite 赋**（match 今天 `port.go` INSERT）。撤"字节级一致"。等价测试（§13.2）比**逻辑内容**（`.dump` 去 `schema_migrations` 或 per-table 排序 SELECT 哈希），**不比文件字节**（避 free-page/vacuum 假发散）。
@@ -99,9 +101,12 @@ cmd/tether/
 > 2. **Apply 对 `index ≤ applied_index` 的 entry 必须是已验证的 no-op（幂等重放）**——因为 raft **会**重投已应用 entry，FSM 靠"读本地 applied_index 跳过"自我幂等，**不靠 raft 跳过**。
 >
 > `applied_index` 与 Apply 同 txn。kill-9 矩阵断言"**FSM 容忍 raft 重投已应用 entry**"（真实窗口），而非虚构的覆盖调用。相对增量随 P13 移出后已无。
+> **D1 审查纠正（不变式 #1 字面表述有误）**：上面 #1"快照 index ≤ applied_index 永不超前"**字面错**——见 §3.8 的「不变式纠正」：raft 的 `snapshot.Index` 可被**无变更的 barrier/config entry** 合法地超过 `applied_index`（良性）；真正保证是"**重启不丢任何已提交 LogCommand 变更**"。承重纪律 = `FSM.Apply` 对未落库命令**fail-stop（重试→panic）而非返回错误**（否则 raft 前进 lastIndex + 一次快照 = 真丢数据）。
 
 ### 3.8 快照 / 恢复
 采 **WAL** + SQLite online-backup，**专用独立只读 sqlite handle**（**非放松写池**——`SetMaxOpenConns(1)` 仍管写、保 `port.Allocate`/`session.Create` 复合读改写串行化）。WAL 下重验 FK/单写者；并发测试：持续 Apply + 流式 backup，无超 `busy_timeout`、无 `SQLITE_BUSY`、backup 反映一致提交点（含最后已提交 WAL frame）。恢复 = 临时文件 + `integrity_check`（撕裂拒绝）+ migrations 前向 + 原子换入。
+> **D1 实现修正（先改正文 · 2026-06 · driver = modernc.org/sqlite v1.50.0，非 mattn）**：online-backup 走 modernc `NewBackup(dstUri)`（`conn.go:1051`，经只读 handle 的 `Raw` conn + 接口断言取）——它**自开目标 conn、把页拷进一个目标文件**（不 stream 到 `io.Writer`/`SnapshotSink`），故 `FSMSnapshot.Persist` **两段**：① `NewBackup(临时文件)` + `for { more,err:=b.Step(64); if err…; if !more break }`（`Step`：**`true`=还有页 / `false`=完**——反了会发**截断快照**）+ `defer b.Finish()`（Finish 关那个无人管的目标 conn，漏 Finish 即 **fd 泄漏**，被 fd 门抓）；② `io.Copy(sink, 临时文件)`。快照文件是**非 WAL 独立库**（`integrity_check` 对它跑）。**raft v1.7.3 真相 + 不变式纠正（D1 审查 must-fix）**：`FSMSnapshot.Persist` 只写内容、**无 API 设/盖快照 meta.Index**；raft 在 `runFSM` **无条件**取 `snapshot.Index = 其内部 lastIndex`（= 最后一个**已返回**的 `FSM.Apply` 的 log index，**不管返回值**），快照不嵌独立 index。故原"快照 index ≤ applied_index 永不超前"**作为字面不变式是错的**——两种合法情形令 `snapshot.Index > applied_index`：(a) **LogBarrier/config 尾**（Barrier 进 runFSM 但非 LogCommand，FSM 不动 applied_index，raft.lastIndex 却前进——**良性**，这些 entry 不携带变更）；(b) **Apply 把未提交命令返回给 raft**（若 `applyCommand` 将瞬时 Begin/Commit 错误**返回**，raft 仍前进 lastIndex，此后一次快照把 meta.Index 钉到 K 而 SQLite 停 K-1，重启后该 entry 永不再投 FSM.Apply → **真丢数据**）。**正确不变式**：「**重启不丢任何已提交 LogCommand 的变更**——raft 重投 `[lastSnapshot+1..commit]`、FSM 按本地 durable `applied_index` 自跳；`snapshot.Index` 只可能被**无变更的** entry（barrier/config）超过 applied_index」。**实现纪律（fail-stop）**：`FSM.Apply` **绝不把未持久落库的命令返回给 raft**——瞬时错误**重试，仍失败则 panic 停机**（`applyMaxAttempts`），消除 (b) 的丢数据窗口；§13.3 用 `TestSnapshotThenRestart`（快照后再写→重启→断 N+M 全在且 reapply==M）+ `TestSnapshotAfterBarrier`（(a) 的良性 gap 仍收敛）+ `TestFSM_FailStopOnPersistentApplyError`（断 panic）替代原 vacuous 断言。**恢复用 `NewRestore(srcUri)`（`conn.go:1065`）就地拷入活 conn**——不 `os.Rename` 盖开着的 inode（`FSM.Restore` 在 `NewRaft` 内重入、写池已开，rename 会留 stale `-wal/-shm`）：恢复 = 流 `rc` → 同盘临时源文件 → `integrity_check`+`foreign_key_check`（撕裂拒、不动活库）→ `storage.ApplyMigrations` 前向 → `NewRestore` 就地拷 → §3.5 活性列重置。
+> **WAL 作用域（D1 限定）**：WAL（+ `synchronous=FULL`，保 `applied_index` 在 §3.7 下持久；WAL 缺省 `NORMAL` 掉电可丢最后已提交 frame）**只开在 cluster FSM 的独立库文件**（D1 可测构造、对 P0–P13 冻结的 broker 库**零爆炸半径**，经新 `storage.OpenWAL`/`WithWAL`，**不翻**共享 `storage.Open` 的 DSN）；真实 mutator + FSM 合到单 WAL 库是 **D9 一次性迁移**（`journal_mode=WAL` 落库头，故非 D1 副作用）。**崩溃模型边界**：kill-9 SIGKILL 是**进程死、非掉电**——矩阵证的是 OS 可见已提交前缀的崩溃一致性，**非** fsync/掉电持久性（勿让文档/测试过度声称 FULL-vs-NORMAL 的区分被 SIGKILL 证到）。
 
 ---
 
@@ -126,6 +131,7 @@ cmd/tether/
 `{t:OpType, v, r:ReqID, b:渲染 SQL+元}`。op：`SessionCreate/Tombstone/HardDelete`、`MemberJoin/Kick`、`NodeRegister/Remove`、`ProcCreate/MarkExited/ReconcileBatch`、`PortAllocate/Free/Revoke/ReassignHome`、`RotatePin`、`AlertRaise/AlertAck/AlertClear`、`ClusterNodeUpsert/Phase/Remove`、`ClusterMetaSet`。
 > **裁定（R2-major）**：**删 `GenericRowMutate` catch-all**（绕过 per-mutator lint、毁 raft-log 可读性）——低频 op 本无运行期成本，保持窄类型化。`ProcGC` = **leader-local**（选后 G.2 重跑，不进 Raft，从 §3.4 baked-time 表与 lint 移除）。proxy/`AllocateProxy/ProxyGenAdvance` 随 P13 移出 v1（§0）。`ReconcileBatch` 承载 §4.1 整个 reconcile 结果。
 > **层次澄清（R3F1）**：上列均为**业务 FSM op**（走 `FSM.Apply`，followers 可校验）；**`ClusterNodeUpsert` 携 `{node_ident_pub, join_nonce, join_sig, cert_fp}`，followers 在 Apply 复算 join PoP**（入群密码学门）。**`raft.AddVoter`/`raft.RemoveServer` 不在本 op 集**——它们是 hashicorp/raft 的**配置变更路径、非 `FSM.Apply` 拦截点**；membership 两阶段顺序（先 `ClusterNodeUpsert` committed 再 `raft.AddVoter`）见 §8.1。
+> **D1 实现注（raft-log 编码 ≠ proto v2 SSOT）**：raft-log `Data` 字段编码（D1 用 `encoding/json`，D1 量级无性能顾虑、可读）**不属 proto v2 subject SSOT**——proto v2 只管 NATS subject grammar，不管 raft log wire。**`Args []any` over `encoding/json` 非 round-trip 类型稳定**（int→float64、`[]byte`→base64）：故 D1 `ClusterMetaSet` 把值烤成 **SQL 字面量**（不走 typed Args 回环），**D2 携参 op 必须用 leader 烤的 SQL 字面量或 typed/positional 编码**，不得把 JSON `[]any` 信封冻结为 D2 传参机制。
 
 ---
 
@@ -292,6 +298,7 @@ follower 死(N≥3)：leader 保 quorum；info。leader 死：选举~1-2s(PreVot
 ---
 
 ## 13. 测试与合并门（硬）
+> **泄漏门约定（D1 实现修正）**：本仓库**刻意不用 `go.uber.org/goleak`**（`test/concurrency/helpers_test.go:5`、`internal/spawnsafe/spawnsafe_test.go:127`、`cmd/tether/history_race_test.go:237` 明确拒之；go.mod/go.sum 无此依赖）。下文及 §19 checklist 凡写"goleak"处，**一律指仓库内建的 `runtime.NumGoroutine` poll-with-tolerance 计数门 + fd 基线门**（fd 门抓 `NewBackup` 漏 `Finish` 留下的目标 conn 泄漏——NumGoroutine 抓不到）。`-race` 仍为硬要求。
 1. 确定性 lint：`internal/{port,proc,node,session,agentprov}` Apply-可达 mutator + 编译期断言不 import rand/ulid；禁 FSM 外对 Apply-owned 表 INSERT；禁 Apply 调 `*sql.DB` mutator；列级断言 Apply 不写活性列。
 2. 多 FSM **逻辑内容**等价（`.dump` 去 schema_migrations / per-table 排序哈希）；含 port.Allocate/proc(nil clock)、分配→硬删 session→再分配。
 3. 快照-恢复-重放确定性（撕裂 integrity_check 拒）。
@@ -491,6 +498,7 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 **做**：§3.2 写入模型（leader Plan→`raft.Apply`→各副本 Apply 同 txn 写 `applied_index`，零直连 `db.Exec`）+ 读一致性契约；§3.3 Plan/Apply 确定性框架；§3.7 双存储崩溃一致性两不变式（快照 index≤`applied_index`、Apply 对已应用 entry 幂等 no-op）；§3.8 快照=WAL+online-backup（独立只读 handle）+ 恢复（integrity_check+前向 migrations+原子换入）；§3.5 活性列不变式（Apply 永不写 + 恢复/换 leader 无条件重建）。
 **测试**：§13.3 快照-恢复-重放确定性；**§13.4 kill-9 崩溃一致性矩阵**（含 BoltDB 超前 SQLite 重导 lastApplied）；§13.5 WAL 并发（持续 Apply + 流式 backup 无 SQLITE_BUSY/一致提交点）。
 **出口**：单节点 FSM 容忍 raft 重投已应用 entry；kill-9 矩阵存在且绿（承重门）。
+> **状态（2026-06）**：**实现完成 + 内审过**（多专家对抗审查 CONDITIONAL PASS → must-fix「§3.7 #1 不变式有误 + fail-stop」已修，报告 `docs/reviews/d1-review.md`），**待外审**。⚠ 上「做」里的"快照 index≤`applied_index`"按 §3.7/§3.8 的「D1 实现修正」**改述**为"重启不丢任何已提交 LogCommand 变更"+ `FSM.Apply` 对未落库命令 **fail-stop**（原字面不变式被 LogBarrier 尾 / 瞬时 Apply 错破坏）。kill-9 矩阵 fp1/fp2/fp3 + `TestSnapshotThenRestart`/`AfterBarrier`/`FailStop` 落盘。
 
 ### D2 — op 集 + 全 mutator Plan/Apply 移植（里程碑：N=1 功能等价）
 **目标**：现有所有权威写改走 FSM；N=1 与今天功能等价。
@@ -573,7 +581,7 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 - [ ] 本节当前 phase 状态翻 ✔。
 - [ ] 新开分支 `phase/d<N>-<slug>`；每个 phase 至少一个 PR。
 - [ ] 实现中发现设计问题 **先改 §0–§18 正文再改代码**（§18 为审计轨迹、正文为唯一实现尺）。
-- [ ] 单测 + e2e 同 PR 落盘；触碰并发面（隧道/Raft/Apply/重配）带 `-race`+`goleak`。
+- [ ] 单测 + e2e 同 PR 落盘；触碰并发面（隧道/Raft/Apply/重配）带 `-race` + 仓库内建 `NumGoroutine`/fd 泄漏门（**非 goleak**，见 §13「泄漏门约定」）。
 - [ ] 提交前硬闸 `make test`+`make e2e`+`make lint` 全绿；新 phase 进 e2e 矩阵。
 
 > **范围边界**：本分解只覆盖 §0 北极星点名的数据（session/member/node/process/port+审计）的 HA。**P13 proxy / 文件传输 multipath 不在 D0–D9**（§0 显式不做）；待 P13 转无条件 PASS 再单做 "proxy-HA" 叶子。

@@ -47,7 +47,7 @@ import (
 var migrationsFS embed.FS
 
 // migrationsTable is the per-database tracker of which migration files have
-// been applied. Created lazily by applyMigrations.
+// been applied. Created lazily by ApplyMigrations.
 const migrationsTable = "schema_migrations"
 
 // Open opens (and creates if absent) a SQLite database at dsn, enforces
@@ -66,9 +66,46 @@ func Open(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("storage: open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if err := applyMigrations(db); err != nil {
+	if err := ApplyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	return db, nil
+}
+
+// OpenWAL is like Open but additionally enables WAL journaling + synchronous=FULL.
+// It backs the distributed-broker cluster FSM database ONLY (architecture §3.8 D1
+// amendment): WAL is required so the online-backup snapshot can capture a
+// consistent commit point including the last committed WAL frame, and
+// synchronous=FULL keeps applied_index durable under the §3.7 crash-consistency
+// invariant. The shared Open() DSN (the frozen P0-P13 broker DB) is deliberately
+// NOT switched to WAL here — unifying both onto one WAL DB is a D9 migration.
+//
+// The SetMaxOpenConns(1) single-writer pool is preserved EXACTLY (load-bearing,
+// see the long comment above). The snapshot's read-only backup source is a
+// SEPARATE handle (OpenReadOnly), never a relaxation of this write pool.
+func OpenWAL(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", withWALPragmas(dsn))
+	if err != nil {
+		return nil, fmt.Errorf("storage: open (wal): %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := ApplyMigrations(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// OpenReadOnly opens a dedicated READ-ONLY handle on an already-migrated DB file
+// — the online-backup snapshot source (architecture §3.8). It opens the file
+// mode=ro so a write through this handle fails at the OS level (a second writer
+// can never slip in), and runs NO migrations (the file is already current). It is
+// a SEPARATE *sql.DB; it must never be conflated with the write pool.
+func OpenReadOnly(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", withReadOnlyPragmas(dsn))
+	if err != nil {
+		return nil, fmt.Errorf("storage: open (ro): %w", err)
 	}
 	return db, nil
 }
@@ -88,11 +125,37 @@ func withForeignKeysPragma(dsn string) string {
 	return base + sep + "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 }
 
-// applyMigrations applies every embedded migration file (sorted by filename)
+// withWALPragmas adds journal_mode(WAL) + synchronous(FULL) on top of the
+// foreign_keys/busy_timeout DSN (cluster FSM DB only, §3.8 D1 amendment).
+func withWALPragmas(dsn string) string {
+	return withForeignKeysPragma(dsn) + "&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+}
+
+// withReadOnlyPragmas opens the file mode=ro (OS-level read-only) while keeping
+// foreign_keys/busy_timeout. The DSN is promoted to file: form so the mode=ro
+// URI parameter is honored by the driver.
+func withReadOnlyPragmas(dsn string) string {
+	base := dsn
+	if dsn == ":memory:" {
+		base = "file::memory:"
+	} else if !strings.HasPrefix(base, "file:") {
+		base = "file:" + base
+	}
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return base + sep + "mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+}
+
+// ApplyMigrations applies every embedded migration file (sorted by filename)
 // that has not yet been recorded in schema_migrations. Each migration runs in
 // its own transaction; the tracker insert is part of that same transaction so
 // "applied" and "recorded" are atomic.
-func applyMigrations(db *sql.DB) error {
+//
+// Exported so the cluster FSM restore path (architecture §3.8) forward-migrates
+// a restored snapshot file through the SAME runner instead of duplicating it.
+func ApplyMigrations(db *sql.DB) error {
 	if _, err := db.Exec(fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			version    TEXT PRIMARY KEY,

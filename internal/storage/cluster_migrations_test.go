@@ -12,7 +12,7 @@ import (
 // D0 — cluster migrations 0008 / 0009 / 0010.
 //
 // White-box (package storage): these tests call the unexported migration engine
-// (applyMigrations / applyOne / migrationsFS / migrationsTable) and the DSN
+// (ApplyMigrations / applyOne / migrationsFS / migrationsTable) and the DSN
 // helper (withForeignKeysPragma), following the internal/storage/*_test.go
 // precedent (p13_generation_migration_test.go). They assert the §4.2/§18.3
 // schema contract, NOT any Apply/runtime behavior (which lands in D1+).
@@ -369,8 +369,8 @@ func TestPortColumns_BackfillExistingRows(t *testing.T) {
 	}
 
 	// Apply the remaining migrations (0008–0010) via the real engine.
-	if err := applyMigrations(db); err != nil {
-		t.Fatalf("applyMigrations (0008-0010): %v", err)
+	if err := ApplyMigrations(db); err != nil {
+		t.Fatalf("ApplyMigrations (0008-0010): %v", err)
 	}
 
 	var rof, epoch int
@@ -433,8 +433,8 @@ func TestClusterMigrations_EngineIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + migrationsTable).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyMigrations(db); err != nil {
-		t.Fatalf("second applyMigrations: %v", err)
+	if err := ApplyMigrations(db); err != nil {
+		t.Fatalf("second ApplyMigrations: %v", err)
 	}
 	var after int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + migrationsTable).Scan(&after); err != nil {
