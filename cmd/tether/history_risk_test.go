@@ -27,7 +27,7 @@ func TestHistoryKindTailCountsFilteredEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 

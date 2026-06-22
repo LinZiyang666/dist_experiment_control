@@ -540,7 +540,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			b.js = js
 			b.cfg.Logger.Info("broker: JetStream enabled")
 			ensureCtx, ensureCancel := context.WithTimeout(ctx, 5*time.Second)
-			if err := jsstream.EnsureEventsStream(ensureCtx, js); err != nil {
+			if err := jsstream.EnsureEventsStream(ensureCtx, js, jsstream.ReplicasSingle); err != nil {
 				ensureCancel()
 				return fmt.Errorf("broker: ensure events stream: %w", err)
 			}

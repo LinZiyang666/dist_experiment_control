@@ -85,19 +85,20 @@ func (genericExecApplier) ApplyTx(tx *sql.Tx, cmd *Command) error {
 func defaultAppliers() map[OpType]Applier {
 	exec := genericExecApplier{}
 	return map[OpType]Applier{
-		OpClusterMetaSet:    exec,
-		OpSessionCreate:     exec,
-		OpSessionTombstone:  exec,
-		OpSessionHardDelete: exec,
-		OpMemberJoin:        exec,
-		OpNodeRegister:      exec,
-		OpNodeEvict:         exec,
-		OpProcCreate:        exec,
-		OpProcMarkExited:    exec,
-		OpReconcileBatch:    exec,
-		OpPortAllocate:      exec,
-		OpPortFree:          exec,
-		OpPortRevoke:        exec,
-		OpAgentProvision:    exec,
+		OpClusterMetaSet:     exec,
+		OpSessionCreate:      exec,
+		OpSessionTombstone:   exec,
+		OpSessionHardDelete:  exec,
+		OpMemberJoin:         exec,
+		OpNodeRegister:       exec,
+		OpNodeEvict:          exec,
+		OpProcCreate:         exec,
+		OpProcMarkExited:     exec,
+		OpReconcileBatch:     exec,
+		OpPortAllocate:       exec,
+		OpPortFree:           exec,
+		OpPortRevoke:         exec,
+		OpAgentProvision:     exec,
+		OpAuditCheckpointSet: exec, // D5 §6.3: monotonic cursor UPSERT, baked WHERE guard
 	}
 }

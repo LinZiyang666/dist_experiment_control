@@ -33,7 +33,7 @@ func TestHistorySnapshotDefaultReplaysEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +100,7 @@ func TestHistoryStartSeqTailReplaysExactlyLastN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 	const total = 30
@@ -171,7 +171,7 @@ func TestHistorySnapshotEmptyStreamExitsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jsstream.EnsureHistoryStream(context.Background(), js, "empty"); err != nil {
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "empty", jsstream.ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 	stream, err := js.Stream(context.Background(), jsstream.HistoryStreamName("empty"))
@@ -219,7 +219,7 @@ func TestHistoryFollowStreamsLiveEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jsstream.EnsureHistoryStream(context.Background(), js, "tail"); err != nil {
+	if err := jsstream.EnsureHistoryStream(context.Background(), js, "tail", jsstream.ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 	stream, err := js.Stream(context.Background(), jsstream.HistoryStreamName("tail"))

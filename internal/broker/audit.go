@@ -148,7 +148,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 	for _, sid := range active {
 		activeSet[sid] = true
 		ensureCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := jsstream.EnsureHistoryStream(ensureCtx, b.js, sid); err != nil {
+		if err := jsstream.EnsureHistoryStream(ensureCtx, b.js, sid, jsstream.ReplicasSingle); err != nil {
 			b.cfg.Logger.Warn("broker: ensure history stream on boot",
 				"sid", sid, "err", err)
 		}

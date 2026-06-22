@@ -65,7 +65,7 @@ func (b *Broker) handleSessionCreate(msg *nats.Msg) {
 	// — the boot reconciler will retry on next broker start.
 	if b.js != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := jsstream.EnsureHistoryStream(ctx, b.js, s.SID); err != nil {
+		if err := jsstream.EnsureHistoryStream(ctx, b.js, s.SID, jsstream.ReplicasSingle); err != nil {
 			b.cfg.Logger.Warn("broker: ensure history stream on create",
 				"sid", s.SID, "err", err)
 		}

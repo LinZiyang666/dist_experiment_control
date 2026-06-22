@@ -282,7 +282,7 @@ func (f *fakeMsgCtx) Next(_ ...jetstream.NextOpt) (jetstream.Msg, error) {
 	}
 }
 
-func (f *fakeMsgCtx) Stop()                 { f.stopOnce.Do(func() { close(f.stopped) }) }
+func (f *fakeMsgCtx) Stop()                   { f.stopOnce.Do(func() { close(f.stopped) }) }
 func (f *fakeMsgCtx) deliver(m jetstream.Msg) { f.msgs <- m }
 
 // TestFeedHistoryExitsOnIteratorStop: when the iterator errors (Stop),

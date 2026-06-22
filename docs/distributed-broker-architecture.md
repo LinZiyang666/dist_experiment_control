@@ -152,6 +152,8 @@ cmd/tether/
 
 > **D4 实现注（`commandVersion` 1→2 + `ReqID` 启用）**：D4 给 `OpReconcileBatch` 加 apply-inert 有序审计元组字段（§4.1 自足重导），故 `commandVersion` 升 2（与 proto v2 解耦、只管 raft-log 信封）；`Command.ReqID`（信封 `r`）从 D1 的 RESERVED+INERT 转为**活跃跨重试幂等键**，`decodeCommand` 加 charset 守（空或 hex/有界、拒 NUL/非 UTF-8）。空 ReqID = 今天行为（D1/D2 op 字节不变、不碰 ledger）。详 §4.1 D4 实现定稿。
 
+> **D5 实现注（新 op `OpAuditCheckpointSet`）**：D5 注册 `OpAuditCheckpointSet`（推进复制游标 `cluster_meta.audit_published_index`，FSM 烤单调守卫 UPSERT、reuse `sqlbake.LitInt`、禁 `Args`），经 `genericExecApplier`。**不是放松 `t:` 前缀守卫**（该守卫为 §2.10 防碰撞，`ApplyMetaSet` 仍只准 `t:` 键）——这是独立 op。**不需 migration**（沿用 0009 `cluster_meta`，KV 缺省读 0 同 `applied_index`）。该 op **派生零审计**、在 publisher skip-set。详 §6.3 D5 实现裁定 + `docs/reviews/d5-plan.md`。
+
 ---
 
 ## 6. NATS 集群层
@@ -177,9 +179,24 @@ queue-group `tether-authcallout`。已 provision（无 PIN）= **应答 broker �
 只有 leader post-commit 发 `ev.*`/`audit.*`/`sys.events`。
 > **裁定（R2-major：跨 leader 死的审计恢复）**：**审计派生 = committed Raft entry + `raft_index` 的纯确定性函数**（任何新 leader 可从复制 entry 重导，**不依赖 leader-local 态**）；同 `raft_index:kind:seq` 去重 key 重发，JetStream 丢重复；**dedup 窗口配置值 > (选举+扫尾) 最大时延**并断言；选后 sweep 幂等可重跑（sweep 中再死可重跑）。源是 leader-local-only 的审计归 best-effort（§17）。**需求 §2.3 偏差登记：审计 0 丢失为"近似"（leader 提交后、JS 发布前崩有窗口，由可重导 sweep 兜底但非严格 exactly-once）。**
 
+> **D5 实现裁定（先改正文 · 2026-06 · 详 `docs/reviews/d5-plan.md`）**：D5 = **build + prove，不切线上**（同 D2/D3/D4，cutover=D9；`serve.go` 字节不动、生产 `Broker` 不构造 `cluster.Node`、publisher loop 永不启动；live `publishAudit`/`reconcileOnRegister` 字节不变，guard `TestD5ProductionWiresNoClusterNode` 锁死）。
+> - **可重导面 = 仅 `OpReconcileBatch`**（D4 已烤自足 entry + 纯 `proc.ReplayReconcileAudit`）；`audit.call`(exec)、inline `audit.proc{start,exit}`、live `audit.port`、`sys.events` 仍 best-effort leader-local、**不重导**（§2.3/§17 诚实边界机械化）。
+> - **发布游标 = 复制态、非 leader-local**：`cluster_meta` 键 `audit_published_index`，经**新 op `OpAuditCheckpointSet`**（`ApplyMetaSet` 的 `t:` 前缀守卫挡掉它）推进，**FSM 烤入单调守卫 SQL** `ON CONFLICT … WHERE CAST(value AS INTEGER) < CAST(excluded.value AS INTEGER)`（陈旧 ex-leader 的低值在每副本成 no-op），**批量推进**（一批一次 raft 写、上限 256）、**空闲零 raft 写**。游标 op 自身**不派生审计**（防 checkpoint 自激）。
+> - **发布天花板 = `raft.CommitIndex()`**（v1.7.3 **确导出** `api.go:1234`——纠正任何"CommitIndex 不可用"措辞；不用 `AppliedIndex`：新选 leader 追平期 AppliedIndex 滞后 CommitIndex，徒增 sweep 延迟），**地板 = `max(checkpoint, LogFirstIndex())` 每轮重夹**；快照截断未发布审计 = **有界 loud accepted-loss**（typed `ErrLogTruncated`、计数+结构化日志、推进游标过 gap 不 wedge），把 §16/§17 的近似 0 丢失收紧为"以快照节律为界"，并断言 `CommitIndex - checkpoint < TrailingLogs`(10240)。
+> - **去重 id = `r<raftIndex>:<kind>:<seq>`**（`kind∈{proc,port}`、D5 内封闭；`seq`=`ReplayReconcileAudit` 全序内 0 基位次，两 leader 解同字节得同 id）；**reqID-bearing reconcile 改 `q<reqID>:<kind>:<seq>`**——D4 ack-lost 重试经 `appliedDedup` 落新 raft index 却仍携 Aux，raft-index-keyed 会双发，改用跨重试稳定的 `ReconcileReqID` 键使原提交与去重重试发同 id、JS 收拢（**5 份草稿均漏、综合稿 R-10 抓出**）。
+> - **单写者 = 跨选举同 id 收拢、非"只一个进程发"**；follower 不发（publisher loop 结构性只在 `internal/broker`、FSM 够不到=L-2）。**发布门 = `IsLeader() && !LeaderContactStale(now)`**（CommitIndex 天花板是承重安全、fence 是加固）；**不在审计体加 leader-epoch header**（破 build-and-prove 字节锁；消费端拒陈旧 leader 是 D7/D8）。
+> - **loop 形态**：**一根长生命 broker-owned goroutine**（每 tick poll `IsLeader()`、非 leader no-op；**无 `OnLeaderChange`/无 per-flap spawn**，同 read.go 拒 `LeaderCh` goroutine 的家风）；per-publish ctx 是 loop ctx 的**子**（leadership 丢→cancel→即放 reply-inbox fd）。机制 A 与 B 合一根 goroutine（tick：门→`publishOnce` drain→`reconcileOnce` pass）。
+> - **live `publishAudit` 字节不变**：D5 **不加** `publishAuditWithID` sibling 方法（MP-6 实现修正——独立 `AuditPublisher`（仅 test/d5 构造）**直接经自己的 JS client** 加 `jetstream.WithMsgID` 发布，"live 字节不变"反而成立更彻底）；流建时 `Duplicates=AuditDedupWindow`(2m) 无条件设但**生产惰性**（live 无 msg-id→去重不触发；预置 D9）。**`OpAuditCheckpointSet` 是 publisher 游标推进的硬跳过**（外审 F1）：游标绝不推过自己的 checkpoint entry（一次 advance 本身提交一条 checkpoint entry，若推过它会再生下一条→空闲 leader 每 tick 写 raft log；改由后续真源 entry 隐式带过，至多留 1 条尾随 checkpoint）。**D5↔D7/D8 边界**：D5 出 publisher+sweep+预测语原语，不出 `cluster status`/retire CLI（D7）、不写 `replication_degraded` alert 行（D8b）、不发数据面 rehome（D6）。
+
 ### 6.4 JetStream：退回 per-session 流（隔离白送）
 > **裁定（R2-major：撤共享流）**：**退回今天的 per-session `history-<sid>` 流模型**——subject+stream 双隔离白送，成员 JWT 现成的 `CONSUMER.CREATE.history-<sid>` 作用域即读隔离，**无需 broker 中介 consumer、无需 per-subject 限额、无需改 FilterSubject 防偷读**。代价是每 session 一条流，在几十~上百量级可接受。`session rm` 仍 DeleteStream。
 > **副本重配**：`history-<sid>` 与 `OBJ_xfer-<sid>` 均 `Replicas=replicasFor(nVoters)`；今天 `ensureStream` 拒 UpdateStream，故扩容/retire 时 leader 显式 `UpdateStream(Replicas)`（post-commit、重试、对每条流）。重配窗口内审计写**排队于 leader 不丢**（与 §2.3 对齐）；`cluster status` 显示**每流 actual/target 副本**、任一 actual<target 升 `replication_degraded`、**重配未完不放行 retire 原节点**。kill-during-expand 测试断言无审计丢失 + 有界写停顿。
+
+> **D5 实现裁定（先改正文 · 2026-06 · 详 `docs/reviews/d5-plan.md`）**：
+> - **`replicasFor(nVoters)` = `1→1, 2→2, 3→3, 封顶 3`**（架构 R≤3；N=2→R2 是唯一单调 1→2→3 且满足"副本数 ≤ 服务器数"、且使 kill-during-expand 在 2-voter 中途点 no-loss 可达——数据已在第 2 节点）。住 `internal/jsstream`（L-2：纯 `int→int`，**不 import `internal/cluster`**）。§17 登记诚实："RF2 = 读可存活、写零容错"。
+> - **三族全重配**：`events`、`history-<sid>`、`OBJ_xfer-<sid>`（三处字面 `Replicas:1`：jsstream.go:74/103、transfer.go:202）；对象库经 `UpdateObjectStore`。`ensureStream` already-in-use 分支 = **只升不降**（`current<target→UpdateStream`；缩容是 D7 retire、带门）。
+> - **target = `replicasFor(NumVoters())`（raft 投票集=权威意图）**，**非** `replicasFor(nJSPeers)`（混淆意图与就绪→JS-meta 落后投票入群时 target 算低、永不收敛）。**升配门 = 把 `UpdateStream`/`UpdateObjectStore` 拒绝分类为 `ErrMetaGroupNotReady`（`IsMetaGroupNotReady`）后重试——重试即门（MP-5 实现修正）**，**不是** `metaGroupCanHost` 前置门：R1 流的 `StreamInfo.Cluster` 恒列 0 peer（只反映本流 1 副本放置、不反映 meta 大小），前置门会永久挡住 R1→R3 升配。`StreamInfo.Cluster`/`ActualReplicas` **仅用于 `AllAtTarget` 的 actual 计数**（broker 是 JS client 无 `*server.Server`、不能 `JetStreamClusterPeers()`）。bootstrap：先扩 `events`。`actual = 1(leader) + Σ(Cluster.Replicas 中 Current && !Offline)`，滞后 peer 计为 not-actual（对 retire 门保守）。
+> - **D5 只出 `AllAtTarget`/`Degraded` 预测语**（全集 `{events}∪{history-<sid>}∪{OBJ_xfer-<sid>}` 的**唯一权威 canonical 扫描**、list/info 出错 fail-closed、空集→false——§6.4 禁抽样）；**不写 `replication_degraded` alert 行（写者=D8b、store-backed 非 client-synthesized）**、**不出 `cluster status` CLI（D7 消费 `AllAtTarget` 作 retire 门）**。重配并发有界（`maxParallel=8`、pass 返回前 join）。**"排队不丢" = 发布游标不越过未 ACK 的发布**（§6.3 的游标不前进**即**本节的排队、不另设第二队列）。
 
 ### 6.5 agent/ctl 发现与归属（server_id 桥接）
 NATS 种子 + `connect_urls` 发现 + 无限退避；`ClientAdvertise`=公网:443。
@@ -273,6 +290,7 @@ create=装二进制 + **生成/分发本机全套 secrets：`account.nk`(共享�
 > **裁定（R2-blocker：transfer 不是 stub）**：
 > - **终结于 agent 的 home broker**（与方案 B 一致）；`push.req/pull.req` 经 §4.1 转发，但**transfer audit start/complete/failed 行经 leader Apply + post-commit 发布**（与 §4.4 一致）。
 > - **tier-B ObjectStore：`ensureXferBucket` 的 `Replicas` 从字面 1 改 `replicasFor(nVoters)`**；`OBJ_xfer-<sid>` 与 audit 流同样在扩容/retire 时重配、计入 `cluster status` actual/target、受 `replication_degraded` 与"未重配完不 retire"约束。完成对象 N≥3 下 home 死可存活。
+> - **D5 实现裁定**：`ensureXferBucket(…, targetReplicas)` 经 `UpdateObjectStore` 只升不降、计入 §6.4 的 `AllAtTarget` 全集（否则 retire 门对未冗余 tier-B false-green）。**no-audit-loss-under-kill 证明锁定 `history-<sid>`**（审计承载流）；OBJ_xfer 在 D5 只证"扩到 target"（E-B8）+ 预测语纳入（E-B4），tier-B no-loss-under-kill 出 D5（OQ-6）。
 > - **in-flight tracker + watchdog 在 home broker、best-effort**：home 死则在途丢失、客户端重启；**rehome 不保在途传输**（重启）。
 > - 无 multipath / 最快链路（需求 §1.3 推后）。
 > - 门：tier-B 对象在 N≥3 杀 home 后存活；home 死时在途重启。
@@ -375,6 +393,8 @@ NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQ
 9. **告警 ack 从需求 §8 的 per-identity 生效降为集群级单 ack**（§18.3/§10.1/§4.2：全员可信单团队，去 per-identity 簿记；`acked_by` 仅展示）。补偿：严重告警每新会话必重现、ack 不压 banner，故"降级"不致永久隐藏严重态。**`alert/` 去 member/operator banner 脱敏分层**（同 §18.3：单团队，原 §10.3 的成员脱敏取消，拓扑细节对所有 NATS 可达者可见）。
 10. **node-identity 不再做 apply.* 转发签名**（§18.1）：apply.* 鉴权 = route mTLS + broker-only ACL；node-identity 仅入群 PoP + mTLS 叶子钉证。转发是一致性而非安全边界（全员可信下 per-broker 转发签名无遏制力）。
 
+> **D5 登记（2026-06，详 §6.3/§6.4 D5 实现裁定）**：(a) **`replication_degraded` 是 store-backed（0009 CHECK）、写者 = D8b、非 client-synthesized**（client-synthesized 仅 `quorum_lost`/`force_single_active`）——D5 只出预测语、不写 alert 行；纠正任何"degraded 由客户端合成"的措辞。(b) **审计近似 0 丢失收紧为"以快照节律 + dedup 窗口为界"**（仅 `OpReconcileBatch` 可重导；leader-local-only 审计如 `audit.call` 仍 best-effort）；快照截断未发布的 reconcile 审计 = 有界 loud accepted-loss。(c) **RF2（N=2）= 读可存活、写零容错**（2 副本 raft 组写 quorum=2，掉一即写停；与"N=2 不承诺完整性"一致；外审可一行翻成 R1）。
+
 ---
 
 ## 17. HA 保证矩阵（面向运维，一屏）
@@ -382,7 +402,7 @@ NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQ
 |---|---|---|---|---|
 | 控制状态(session/port/proc/member) | 无冗余 | 双副本掉一即只读 | **已提交 0 丢失**容 1 故障 | 同 |
 | 审计 history-<sid> / OBJ_xfer | R1 | R2 | R3 | **仍 R1/部分——未达 HA**（status actual<target + `replication_degraded`，禁 retire 原节点）|
-| 审计 0 丢失 | — | — | **近似**（leader 提交后/JS 发布前崩有窗口，可重导 sweep 兜底） | 同 |
+| 审计 0 丢失 | — | — | **近似**（leader 提交后/JS 发布前崩有窗口，可重导 sweep 兜底；D5：仅 `OpReconcileBatch` 可重导、以快照节律+dedup 窗口为界；leader-local-only 审计 best-effort） | 同 |
 | ev/PTY/transfer 在途 | best-effort | best-effort | best-effort（重连/重试） | 同 |
 | **proxy(/sub) 故障切换** | — | — | **非 v1 HA 保证**（P13 移出，§0）| 同 |
 | 撤销延迟 | 即时 | — | **max(副本应用滞后, 残留 JWT TTL, 强制断连耗时)**——靠主动断连非 TTL | 同 |
@@ -553,6 +573,8 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 **做**：§6.3 leader post-commit 单写 `ev.*`/`audit.*`/`sys.events` + 审计=committed entry+`raft_index` 纯函数 + dedup 窗口 > 选举+扫尾 + 选后幂等 sweep；§6.4/§9 `history-<sid>`/`OBJ_xfer-<sid>` `Replicas=replicasFor(nVoters)` + already-in-use 分支 actual<target 即 `UpdateStream`（等新 nats 入 JS meta-group）+ 全流达 target 前禁 retire + `replication_degraded`。
 **测试**：**§13.9（原 8）扩容/审计**：1→3 后每流副本到 target 才 online；kill-during-expand 无审计丢失；leader 提交后审计发布前崩 → 新 leader 精确补发不重复。
 **出口**：N≥3 杀 leader 审计可重导补发；扩容副本达 target 才报 HEALTHY-HA。
+
+> **D5 范围定稿（先改正文 · 2026-06 · 详 `docs/reviews/d5-plan.md`）**：D5 = **build + prove，不切线上**（同 D2/D3/D4 R1，cutover=D9；`serve.go` 字节不动、生产 `Broker` 不构造 `cluster.Node`/不持 node 字段、publisher loop 永不启动、live `publishAudit`/`reconcileOnRegister` 字节不变；guard `TestD5ProductionWiresNoClusterNode` 锁死）。两正交机制：(A) **leader-only post-commit 可重导审计发布** = 复制游标 `audit_published_index`（新 op `OpAuditCheckpointSet`、FSM 烤单调守卫、批量推进/空闲零写）+ 天花板 `CommitIndex()`/地板 `max(checkpoint,LogFirstIndex())` 每轮重夹 + 去重 id `r<idx>:<kind>:<seq>`（reqID-bearing reconcile 改 `q<reqID>:…` 收 `appliedDedup` 重试双发，R-10）+ 纯 `ReplayReconcileAudit`（仅 `OpReconcileBatch` 可重导）+ 选后 sweep 即同 loop 大 gap；(B) **JS 流副本重配** = `replicasFor(nVoters)`(1→1,2→2,3→3,封顶 3，住 jsstream、L-2) + 三族 `UpdateStream`/`UpdateObjectStore` 只升不降 + target=`NumVoters`、升配门=`UpdateStream` 拒分类 `ErrMetaGroupNotReady` 重试（`StreamInfo.Cluster` 仅算 actual，非前置门）+ `AllAtTarget`/`Degraded` canonical 预测语（D7 消费、D8b 写 alert）。新增 `cluster.Node` raft-free 原语（`CommitIndex`/`LogFirstIndex`/`CommittedCommandAt`/`AuditPublishedIndex`/`AdvanceAuditPublished`/`NumVoters`）+ 新 `internal/broker/audit_publisher.go` 合一 leader-only goroutine。新建首个**路由 NATS + mTLS raft + clustered JetStream** 三合一 `test/d5` harness。三道 guard：build-and-prove token-scan、`internal/cluster` no-NATS import 门、`internal/jsstream` no-`cluster` import 门。**硬非目标**：`cluster status`/create/online/drain/retire CLI（D7）、数据面 rehome（D6）、serve.go `cluster.Node`（D9）、审计体 epoch header（D8）、`replication_degraded` alert 行写（D8b）。N=2→R2 与 §17 矩阵既有取值一致。
 
 ### D6 — 数据面分布式
 **目标**：expose/tunnel 跨 home broker 故障切换。

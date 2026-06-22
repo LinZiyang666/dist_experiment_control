@@ -147,7 +147,7 @@ func TestAuditEntriesLandInHistoryStream(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()
@@ -331,7 +331,7 @@ func TestDeletingSessionResumesOnBrokerRestart(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()
@@ -379,7 +379,7 @@ func TestOrphanHistoryStreamCleanedOnBoot(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "ghost"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "ghost", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()

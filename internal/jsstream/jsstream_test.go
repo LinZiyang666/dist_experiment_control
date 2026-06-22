@@ -33,11 +33,11 @@ func TestEnsureEventsStreamIsIdempotent(t *testing.T) {
 	js := newJS(t, startJSNATS(t))
 	ctx := context.Background()
 
-	if err := EnsureEventsStream(ctx, js); err != nil {
+	if err := EnsureEventsStream(ctx, js, ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 	// Second call must succeed (already-exists path).
-	if err := EnsureEventsStream(ctx, js); err != nil {
+	if err := EnsureEventsStream(ctx, js, ReplicasSingle); err != nil {
 		t.Fatalf("re-create: %v", err)
 	}
 }
@@ -46,13 +46,13 @@ func TestEnsureHistoryStreamCreatesPerSession(t *testing.T) {
 	js := newJS(t, startJSNATS(t))
 	ctx := context.Background()
 
-	if err := EnsureHistoryStream(ctx, js, "lab"); err != nil {
+	if err := EnsureHistoryStream(ctx, js, "lab", ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureHistoryStream(ctx, js, "lab"); err != nil {
+	if err := EnsureHistoryStream(ctx, js, "lab", ReplicasSingle); err != nil {
 		t.Fatalf("re-create same sid: %v", err)
 	}
-	if err := EnsureHistoryStream(ctx, js, "prod"); err != nil {
+	if err := EnsureHistoryStream(ctx, js, "prod", ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,7 +73,7 @@ func TestDeleteHistoryStreamIdempotent(t *testing.T) {
 	js := newJS(t, startJSNATS(t))
 	ctx := context.Background()
 
-	if err := EnsureHistoryStream(ctx, js, "lab"); err != nil {
+	if err := EnsureHistoryStream(ctx, js, "lab", ReplicasSingle); err != nil {
 		t.Fatal(err)
 	}
 	if err := DeleteHistoryStream(ctx, js, "lab"); err != nil {

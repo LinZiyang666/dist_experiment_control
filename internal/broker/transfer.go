@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
@@ -190,7 +191,7 @@ func (t *transferTracker) activeOBJStreams() map[string]struct{} {
 // `xfer-<sid>-<id>`, but NATS perm wildcards can't address that
 // (no partial-token wildcards), so JWTs couldn't allow per-bucket
 // access. Per-session buckets allow a single literal perm entry.
-func (b *Broker) ensureXferBucket(ctx context.Context, sid string) (string, error) {
+func (b *Broker) ensureXferBucket(ctx context.Context, sid string, targetReplicas int) (string, error) {
 	if b.js == nil {
 		return "", fmt.Errorf("jetstream_unavailable")
 	}
@@ -199,16 +200,79 @@ func (b *Broker) ensureXferBucket(ctx context.Context, sid string) (string, erro
 		Bucket:   bucket,
 		MaxBytes: 8 * 1024 * 1024 * 1024, // 8 GiB per-session ceiling (allows ~3 in-flight 2-GiB transfers + headroom)
 		Storage:  jetstream.FileStorage,
-		Replicas: 1,
+		Replicas: targetReplicas, // D5 §6.4/§9: replicasFor(nVoters); live callers pass jsstream.ReplicasSingle
 	}
 	if _, err := b.js.CreateObjectStore(ctx, cfg); err != nil {
 		if errors.Is(err, jetstream.ErrBucketExists) ||
 			errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
+			// Exists: RAISE-ONLY reconcile toward target (D5 §9, R-18). Idempotent +
+			// retriable on a not-yet-ready meta-group (ErrMetaGroupNotReady).
+			if err := raiseXferReplicas(ctx, b.js, bucket, targetReplicas); err != nil {
+				return "", err
+			}
 			return bucket, nil
 		}
 		return "", fmt.Errorf("create_bucket: %w", err)
 	}
 	return bucket, nil
+}
+
+// xferBackingStream is the JetStream stream that backs the per-session object-store
+// bucket (nats.go names it "OBJ_<bucket>"). Reading its StreamInfo gives the per-peer
+// Cluster placement (object-store Status() exposes only the configured Replicas count,
+// not the caught-up peers), so the §6.4 AllAtTarget "actual" is read from it.
+func xferBackingStream(sid string) string { return "OBJ_" + proto.XferBucketName(sid) }
+
+// raiseXferReplicas raises an existing object-store bucket's replica factor toward
+// target via UpdateObjectStore (D5 §9, R-18). Raise-only (the configured Replicas <
+// target check); the meta-group readiness gate is the UpdateObjectStore rejection
+// classified to jsstream.ErrMetaGroupNotReady (retriable), mirroring the stream path.
+func raiseXferReplicas(ctx context.Context, js jetstream.JetStream, bucket string, target int) error {
+	os, err := js.ObjectStore(ctx, bucket)
+	if err != nil {
+		return fmt.Errorf("xfer reconcile lookup %s: %w", bucket, err)
+	}
+	st, err := os.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("xfer reconcile status %s: %w", bucket, err)
+	}
+	cur := st.Replicas()
+	if cur < 1 {
+		cur = 1
+	}
+	if cur >= target {
+		return nil // raise-only
+	}
+	cfg := jetstream.ObjectStoreConfig{
+		Bucket:   bucket,
+		MaxBytes: 8 * 1024 * 1024 * 1024,
+		Storage:  jetstream.FileStorage,
+		Replicas: target,
+	}
+	if _, err := js.UpdateObjectStore(ctx, cfg); err != nil {
+		if jsstream.IsMetaGroupNotReady(err) {
+			return jsstream.ErrMetaGroupNotReady
+		}
+		return fmt.Errorf("xfer reconcile update %s replicas->%d: %w", bucket, target, err)
+	}
+	return nil
+}
+
+// XferReplicaState ensures+raises the per-session object-store bucket toward target and
+// returns its replica health for the §6.4 AllAtTarget predicate (read from the backing
+// stream's live Cluster placement). It is the OBJ_xfer half of the publisher's reconcile
+// pass (wired as auditPublisher.xferState in test/d5). A not-yet-ready meta-group
+// surfaces as jsstream.ErrMetaGroupNotReady (the caller marks the tick degraded + retries).
+func XferReplicaState(ctx context.Context, js jetstream.JetStream, sid string, target int) (jsstream.StreamReplicaState, error) {
+	// A not-yet-ready meta-group is expected mid-expand: swallow it and still report the
+	// CURRENT (degraded) state so AllAtTarget sees actual<target. A missing bucket
+	// (session never transferred) propagates jetstream.ErrBucketNotFound so the reconcile
+	// pass SKIPS it (nothing to replicate). Any other error is a real failure.
+	if err := raiseXferReplicas(ctx, js, proto.XferBucketName(sid), target); err != nil &&
+		!errors.Is(err, jsstream.ErrMetaGroupNotReady) {
+		return jsstream.StreamReplicaState{}, err
+	}
+	return jsstream.CollectStreamState(ctx, js, xferBackingStream(sid), target)
 }
 
 // deleteXferObject removes one transfer's object from the per-session
@@ -372,7 +436,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err := b.ensureXferBucket(ctx, sid)
+		bucket, err := b.ensureXferBucket(ctx, sid, jsstream.ReplicasSingle)
 		cancel()
 		if err != nil {
 			b.replyPushErr(msg, "bucket_create_failed", err.Error())
@@ -472,7 +536,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	bucket := ""
 	if b.js != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err = b.ensureXferBucket(ctx, sid)
+		bucket, err = b.ensureXferBucket(ctx, sid, jsstream.ReplicasSingle)
 		cancel()
 		if err != nil {
 			b.replyPullErr(msg, "bucket_create_failed", err.Error())

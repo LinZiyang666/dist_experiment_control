@@ -62,7 +62,7 @@ func SIDFromHistoryStream(stream string) (string, bool) {
 // is treated as success. Architecture H.1 spec values are inlined
 // rather than imported from anywhere else; if H.1 changes, this is
 // the one place to update.
-func EnsureEventsStream(ctx context.Context, js jetstream.JetStream) error {
+func EnsureEventsStream(ctx context.Context, js jetstream.JetStream, targetReplicas int) error {
 	cfg := jetstream.StreamConfig{
 		Name:      EventsStreamName,
 		Subjects:  []string{proto.SubjSysEvents},
@@ -71,8 +71,11 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream) error {
 		MaxBytes:  1 << 30, // 1 GiB
 		Discard:   jetstream.DiscardOld,
 		Storage:   jetstream.FileStorage,
-		Replicas:  1,
+		Replicas:  targetReplicas, // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle
 	}
+	// NOTE: sys.events is best-effort leader-local (NOT re-derivable; R-11), so the
+	// events stream carries NO Duplicates window — only the audit-bearing
+	// history-<sid> streams need it (the publisher only stamps msg-ids there).
 	return ensureStream(ctx, js, cfg)
 }
 
@@ -91,16 +94,17 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream) error {
 // before this cap matters in practice.
 const historyMaxBytesPerSession = 1 << 30 // 1 GiB
 
-func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string) error {
+func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string, targetReplicas int) error {
 	cfg := jetstream.StreamConfig{
-		Name:      HistoryStreamName(sid),
-		Subjects:  []string{historyFilterSubject(sid)},
-		Retention: jetstream.LimitsPolicy,
-		MaxAge:    0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
-		MaxBytes:  historyMaxBytesPerSession,
-		Discard:   jetstream.DiscardNew,
-		Storage:   jetstream.FileStorage,
-		Replicas:  1,
+		Name:       HistoryStreamName(sid),
+		Subjects:   []string{historyFilterSubject(sid)},
+		Retention:  jetstream.LimitsPolicy,
+		MaxAge:     0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
+		MaxBytes:   historyMaxBytesPerSession,
+		Discard:    jetstream.DiscardNew,
+		Storage:    jetstream.FileStorage,
+		Replicas:   targetReplicas,   // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle
+		Duplicates: AuditDedupWindow, // D5 §6.3: dedup window for the re-derivable audit publisher's msg-ids (inert in build-and-prove production — live publishAudit sets no msg-id; MP-2)
 	}
 	return ensureStream(ctx, js, cfg)
 }
@@ -147,19 +151,69 @@ func historyFilterSubject(sid string) string {
 	return fmt.Sprintf("%s.s.%s.audit.>", proto.SubjectPrefix, sid)
 }
 
-// ensureStream is the create-or-update helper. We intentionally do
-// NOT call UpdateStream when the stream already exists — operators
-// who need to widen retention should use `nats stream edit`; an
-// auto-mutate could surprise an operator who's pinned a different
-// limit. CreateStream returning "name already in use" is the
-// signal we use to know it exists.
+// ensureStream is the create-OR-RAISE helper (D5 §6.4 / R-18). On first call it
+// creates the stream at cfg.Replicas. When the stream already exists it RECONCILES the
+// replica factor toward cfg.Replicas — RAISE-ONLY: it never shrinks (shrink is the D7
+// retire path, gated on AllAtTarget). Retention/limits are NOT auto-mutated (operators
+// pin those via `nats stream edit`); only Replicas is reconciled, because the HA
+// replica factor is owned by the cluster (replicasFor(nVoters)), not the operator.
 func ensureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig) error {
 	_, err := js.CreateStream(ctx, cfg)
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
-		return nil
+	if !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
+		return fmt.Errorf("jsstream: create %s: %w", cfg.Name, err)
 	}
-	return fmt.Errorf("jsstream: create %s: %w", cfg.Name, err)
+	return reconcileReplicas(ctx, js, cfg)
+}
+
+// reconcileReplicas raises an existing stream's replica factor toward cfg.Replicas
+// (D5 §6.4 / R-17/R-18). It compares the stream's CONFIGURED replicas (the current
+// target) to cfg.Replicas: at-or-above => no-op (raise-only, never shrink). Below =>
+// UpdateStream toward the target, with the meta-group readiness GATE being the
+// UpdateStream rejection itself (classified to ErrMetaGroupNotReady) — an R1 stream's
+// StreamInfo.Cluster cannot reveal the meta-group size, so a Cluster-based pre-check
+// would falsely block the expansion (R-17).
+func reconcileReplicas(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig) error {
+	s, err := js.Stream(ctx, cfg.Name)
+	if err != nil {
+		return fmt.Errorf("jsstream: lookup %s: %w", cfg.Name, err)
+	}
+	info, err := s.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("jsstream: info %s: %w", cfg.Name, err)
+	}
+	current := info.Config.Replicas
+	if current < 1 {
+		current = 1 // JS normalizes 0 -> 1 at create; defensive
+	}
+	if current >= cfg.Replicas {
+		return nil // raise-only (R-18): already at/above target
+	}
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		if IsMetaGroupNotReady(err) {
+			return ErrMetaGroupNotReady // R-17: retriable; meta-group not ready
+		}
+		return fmt.Errorf("jsstream: update %s replicas->%d: %w", cfg.Name, cfg.Replicas, err)
+	}
+	return nil
+}
+
+// CollectStreamState reads a stream's live replica health for the §6.4 AllAtTarget
+// predicate (R-19/R-20). It does NOT mutate (the raise is ensureStream's job); it
+// reports Target=target, Actual=caught-up replicas (ActualReplicas), Ready=Actual>=Target.
+// A missing stream is an error (fail-closed: the canonical pass must not silently skip
+// a stream that should exist — R-20).
+func CollectStreamState(ctx context.Context, js jetstream.JetStream, name string, target int) (StreamReplicaState, error) {
+	s, err := js.Stream(ctx, name)
+	if err != nil {
+		return StreamReplicaState{}, fmt.Errorf("jsstream: lookup %s: %w", name, err)
+	}
+	info, err := s.Info(ctx)
+	if err != nil {
+		return StreamReplicaState{}, fmt.Errorf("jsstream: info %s: %w", name, err)
+	}
+	actual := ActualReplicas(info)
+	return StreamReplicaState{Name: name, Target: target, Actual: actual, Ready: actual >= target}, nil
 }

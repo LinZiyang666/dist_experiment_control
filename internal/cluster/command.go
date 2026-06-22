@@ -3,6 +3,7 @@ package cluster
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -38,6 +39,25 @@ const (
 	OpPortFree          OpType = "PortFree"
 	OpPortRevoke        OpType = "PortRevoke"
 	OpAgentProvision    OpType = "AgentProvision"
+
+	// OpAuditCheckpointSet (D5, §6.3) advances the REPLICATED audit-publish cursor
+	// cluster_meta.audit_published_index. It is NOT a relaxation of OpClusterMetaSet's
+	// "t:" prefix guard (that exists for §2.10 collision prevention) — it is a distinct
+	// op whose Plan (auditcursor.go) bakes a monotonic-guard UPSERT so a stale ex-leader
+	// proposing a LOWER value is a deterministic no-op on every replica. It rides
+	// genericExecApplier and DERIVES ZERO AUDIT (it is in the publisher's skip-set, so it
+	// never begets another checkpoint). No migration: cluster_meta exists since 0009.
+	OpAuditCheckpointSet OpType = "AuditCheckpointSet"
+)
+
+// Log-read sentinels returned by Node.CommittedCommandAt (D5 audit publisher, §6.3).
+// The publisher treats each distinctly: truncated = a bounded loud accepted-loss
+// (advance the cursor past the gap, never wedge); non-command / poison = skip (carries
+// no replayable audit; the FSM already advanced applied_index past a poison entry).
+var (
+	ErrLogTruncated  = errors.New("cluster: log entry truncated by snapshot")
+	ErrLogNonCommand = errors.New("cluster: log entry is not a command")
+	ErrLogPoison     = errors.New("cluster: log entry failed to decode")
 )
 
 // metaTestKeyPrefix namespaces the keys D1's representative op may write, so it
@@ -169,18 +189,19 @@ func validReqID(s string) bool {
 }
 
 var knownOps = map[OpType]bool{
-	OpClusterMetaSet:    true,
-	OpSessionCreate:     true,
-	OpSessionTombstone:  true,
-	OpSessionHardDelete: true,
-	OpMemberJoin:        true,
-	OpNodeRegister:      true,
-	OpNodeEvict:         true,
-	OpProcCreate:        true,
-	OpProcMarkExited:    true,
-	OpReconcileBatch:    true,
-	OpPortAllocate:      true,
-	OpPortFree:          true,
-	OpPortRevoke:        true,
-	OpAgentProvision:    true,
+	OpClusterMetaSet:     true,
+	OpSessionCreate:      true,
+	OpSessionTombstone:   true,
+	OpSessionHardDelete:  true,
+	OpMemberJoin:         true,
+	OpNodeRegister:       true,
+	OpNodeEvict:          true,
+	OpProcCreate:         true,
+	OpProcMarkExited:     true,
+	OpReconcileBatch:     true,
+	OpPortAllocate:       true,
+	OpPortFree:           true,
+	OpPortRevoke:         true,
+	OpAgentProvision:     true,
+	OpAuditCheckpointSet: true,
 }

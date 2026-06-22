@@ -213,7 +213,7 @@ func TestG1MissedExitOnAgentRestart(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()
@@ -509,7 +509,7 @@ func TestChaosKillAgentRestartConverges(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()
@@ -1037,7 +1037,7 @@ func TestG1AlreadyExitedRowsSkipped(t *testing.T) {
 	{
 		nc, _ := nats.Connect(url)
 		js, _ := jetstream.New(nc)
-		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab"); err != nil {
+		if err := jsstream.EnsureHistoryStream(context.Background(), js, "lab", jsstream.ReplicasSingle); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()

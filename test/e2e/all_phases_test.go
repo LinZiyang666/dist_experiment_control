@@ -190,6 +190,31 @@ func TestD4Matrix(t *testing.T) {
 	}
 }
 
+// TestD5Matrix runs the D5 re-derivable-audit-publish + JS replica-reconfig surface under
+// -race: the replicated audit-publish cursor + read primitives (internal/cluster), the
+// replica-factor helper + reconfig (internal/jsstream), the leader-only publisher loop +
+// dedup-id keying + AllAtTarget predicate (internal/broker), and the combined routed-NATS +
+// clustered-JetStream + mTLS-raft behavioral suite (test/d5). Dedicated -race subprocess
+// like TestD1/D2/D3/D4Matrix; the 300s timeout covers the JS-meta-group + election waits.
+func TestD5Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags d5_integration builds the HEAVY clustered-JetStream behavioral suite (test/d5):
+	// it is gated out of the parallel `make test` (where ~30 concurrent package binaries
+	// starve the embedded JS clusters into timeouts) and runs only here, in its own
+	// dedicated -race subprocess (uncontended). The cheap d5 guard/window tests are NOT
+	// gated and run in `make test` too.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "d5_integration", "-timeout", "300s",
+		"./internal/cluster/...", "./internal/proc/...", "./internal/jsstream/...",
+		"./internal/broker/...", "./test/d5/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d5 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
