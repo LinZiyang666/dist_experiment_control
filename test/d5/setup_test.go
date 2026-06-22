@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/hashicorp/raft"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -271,8 +272,64 @@ func startCluster5(t *testing.T, n int) *cluster5 {
 	}
 
 	c := &cluster5{n: n, servers: servers, nodes: nodes, conns: conns, js: jss, dbPaths: dbPaths}
-	c.leaderIdx(t) // wait for a raft leader
+	c.leaderIdx(t)             // wait for a raft leader
+	waitJSPlacementReady(t, c) // wait until an R=n stream actually PLACES (see below)
 	return c
+}
+
+// waitJSPlacementReady probes that the JS meta-group can actually PLACE an R=n stream
+// before any test proceeds. A freshly-formed meta-group can transiently reject placement
+// with "no suitable peers for placement, peer offline" (code 10005) even after the meta
+// leader reports all peers — especially under the full-matrix tail load. The JS-meta
+// readiness gate in startRoutedJS is necessary but not sufficient for PLACEMENT, so we
+// retry a create-an-R=n-probe-then-delete until it succeeds, guaranteeing every test's
+// real R=n stream creation places cleanly.
+func waitJSPlacementReady(t *testing.T, c *cluster5) {
+	t.Helper()
+	const probe = "d5-placement-probe"
+	ok := waitForCond(25*time.Second, func() bool {
+		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer pcancel()
+		_, err := c.js[0].CreateStream(pctx, jetstream.StreamConfig{
+			Name: probe, Subjects: []string{"d5.placement.probe"}, Replicas: c.n,
+			Storage: jetstream.FileStorage, MaxBytes: 16 << 20,
+		})
+		return err == nil
+	})
+	dctx, dcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_ = c.js[0].DeleteStream(dctx, probe)
+	dcancel()
+	if !ok {
+		t.Fatal("JS cluster never became ready to place an R=n stream")
+	}
+}
+
+// ensureHistory / ensureEvents create-or-raise a stream, RETRYING on a transient placement
+// rejection. Under sustained -race load the embedded JS peers intermittently flap "offline"
+// (code 10005 "no suitable peers for placement, peer offline"), so a single create can fail
+// even after the meta-group formed; EnsureHistoryStream is idempotent + raise-only, so a
+// retry is safe and converges. The E-B3 capacity-gate test calls EnsureHistoryStream
+// DIRECTLY (it asserts the ErrMetaGroupNotReady these helpers would otherwise spin on).
+func ensureHistory(t *testing.T, c *cluster5, idx int, sid string, replicas int) {
+	t.Helper()
+	if !waitForCond(25*time.Second, func() bool {
+		cx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		return jsstream.EnsureHistoryStream(cx, c.js[idx], sid, replicas) == nil
+	}) {
+		t.Fatalf("ensure history-%s R%d never placed (JS cluster overloaded)", sid, replicas)
+	}
+}
+
+func ensureEvents(t *testing.T, c *cluster5, idx, replicas int) {
+	t.Helper()
+	if !waitForCond(25*time.Second, func() bool {
+		cx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		return jsstream.EnsureEventsStream(cx, c.js[idx], replicas) == nil
+	}) {
+		t.Fatalf("ensure events R%d never placed", replicas)
+	}
 }
 
 func (c *cluster5) leaderIdx(t *testing.T) int {

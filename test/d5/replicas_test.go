@@ -4,6 +4,7 @@ package d5_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -23,9 +24,7 @@ func TestD5StreamExpandsR1toR3(t *testing.T) {
 	defer cancel()
 	name := jsstream.HistoryStreamName("lab")
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 1); err != nil {
-		t.Fatalf("create R1: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 1)
 	if !waitForStreamReplicas(t, c.js[li], name, 1) {
 		t.Fatal("stream not at R1")
 	}
@@ -34,9 +33,7 @@ func TestD5StreamExpandsR1toR3(t *testing.T) {
 		t.Fatalf("pre-expand publish: %v", err)
 	}
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("expand to R3: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], name, 3) {
 		t.Fatalf("stream never reached R3 (have %d)", streamReplicas(t, c.js[li], name))
 	}
@@ -44,9 +41,7 @@ func TestD5StreamExpandsR1toR3(t *testing.T) {
 		t.Fatalf("pre-expand message lost: msgs = %d, want 1", got)
 	}
 	// Idempotent: a second ensure at R3 does not error.
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("re-ensure R3: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 }
 
 // TestD5ReconfigGatedOnMetaCapacity (E-B3): raising a stream toward a target the meta-group
@@ -58,9 +53,7 @@ func TestD5ReconfigGatedOnMetaCapacity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "gated", 1); err != nil {
-		t.Fatalf("create R1: %v", err)
-	}
+	ensureHistory(t, c, li, "gated", 1)
 	if !waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("gated"), 1) {
 		t.Fatal("stream not at R1")
 	}
@@ -85,20 +78,14 @@ func isMetaNotReady(err error) bool {
 func TestD5ShrinkIsNoop(t *testing.T) {
 	c := startCluster5(t, 3)
 	li := c.leaderIdx(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
 	name := jsstream.HistoryStreamName("lab")
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("create R3: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], name, 3) {
 		t.Fatal("stream not at R3")
 	}
 	// Target 1 < current 3: raise-only => no shrink.
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 1); err != nil {
-		t.Fatalf("ensure R1 (should be a no-op): %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 1)
 	time.Sleep(300 * time.Millisecond)
 	if got := streamReplicas(t, c.js[li], name); got != 3 {
 		t.Fatalf("stream was shrunk to R%d; shrink must be a no-op (D7 owns retire)", got)
@@ -114,18 +101,19 @@ func TestD5AllThreeFamiliesReconcile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	// Seed all three families at R1.
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 1); err != nil {
-		t.Fatalf("history R1: %v", err)
-	}
-	if err := jsstream.EnsureEventsStream(ctx, c.js[li], 1); err != nil {
-		t.Fatalf("events R1: %v", err)
-	}
-	if _, err := c.js[li].CreateObjectStore(ctx, jetstream.ObjectStoreConfig{
-		Bucket: proto.XferBucketName("lab"), Storage: jetstream.FileStorage, Replicas: 1,
-		MaxBytes: 8 * 1024 * 1024 * 1024,
-	}); err != nil {
-		t.Fatalf("xfer bucket R1: %v", err)
+	// Seed all three families at R1 (retry on the transient "peer offline" placement flap).
+	ensureHistory(t, c, li, "lab", 1)
+	ensureEvents(t, c, li, 1)
+	if !waitForCond(25*time.Second, func() bool {
+		bctx, bcancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer bcancel()
+		_, err := c.js[li].CreateObjectStore(bctx, jetstream.ObjectStoreConfig{
+			Bucket: proto.XferBucketName("lab"), Storage: jetstream.FileStorage, Replicas: 1,
+			MaxBytes: 8 * 1024 * 1024 * 1024,
+		})
+		return err == nil || errors.Is(err, jetstream.ErrBucketExists) || errors.Is(err, jetstream.ErrStreamNameAlreadyInUse)
+	}) {
+		t.Fatal("xfer bucket R1 never placed")
 	}
 
 	p := broker.NewAuditPublisher(broker.AuditPublisherConfig{

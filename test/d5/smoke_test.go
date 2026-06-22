@@ -58,9 +58,7 @@ func TestD5Smoke(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3) {
 		t.Fatalf("history-lab never reached R3 (have %d)", streamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab")))
 	}

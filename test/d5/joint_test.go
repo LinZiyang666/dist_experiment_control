@@ -24,9 +24,7 @@ func TestD5KillDuringExpandNoAuditLoss(t *testing.T) {
 	defer cancel()
 	name := jsstream.HistoryStreamName("lab")
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history R3: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], name, 3) {
 		t.Fatal("history-lab never reached R3")
 	}

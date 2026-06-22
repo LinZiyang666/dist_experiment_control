@@ -35,9 +35,7 @@ func TestD5ReviewBoundedFanout(t *testing.T) {
 	// Pre-create every history stream at R1 so EnsureHistoryStream/CollectStreamState in the
 	// worker hit an existing stream (fast path) rather than a slow create+replicate.
 	for _, sid := range sids {
-		if err := jsstream.EnsureHistoryStream(ctx, c.js[li], sid, 1); err != nil {
-			t.Fatalf("seed history %s: %v", sid, err)
-		}
+		ensureHistory(t, c, li, sid, 1)
 	}
 
 	var inFlight, highWater atomic.Int64

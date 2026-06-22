@@ -49,9 +49,7 @@ func TestD5PostElectionSweep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3) {
 		t.Fatal("history-lab never reached R3")
 	}
@@ -91,9 +89,7 @@ func TestD5ForwardedReconcileNoDoublePublish(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3) {
 		t.Fatal("history-lab never reached R3")
 	}
@@ -138,9 +134,7 @@ func TestD5DedupCollapsesIdenticalID(t *testing.T) {
 	defer cancel()
 	name := jsstream.HistoryStreamName("lab")
 
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	waitForStreamReplicas(t, c.js[li], name, 3)
 
 	// The publisher publishes the reqID-keyed reconcile's proc[0] -> id "q<testReqID>:proc:0".
@@ -187,9 +181,7 @@ func TestD5IdleLeaderNoCheckpointGrowth(t *testing.T) {
 	li := c.leaderIdx(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3)
 
 	p := newPublisher(c, li, "lab")
@@ -222,9 +214,7 @@ func TestD5ProcPortSameSeqBothSurvive(t *testing.T) {
 	li := c.leaderIdx(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3)
 
 	commitReconcile(t, c.nodes[li], "", "lab",
@@ -247,9 +237,7 @@ func TestD5FollowerNeverPublishes(t *testing.T) {
 	li := c.leaderIdx(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3)
 	// Committed audit exists + replicates to followers (so a follower's PublishOnce WOULD
 	// publish if it were not gated).
@@ -309,9 +297,7 @@ func TestD5QueueNotDropCheckpointStaysOnFailure(t *testing.T) {
 	}
 
 	// Recover: create the stream, retry → publishes exactly once, checkpoint advances.
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "orphan", 3); err != nil {
-		t.Fatalf("ensure orphan: %v", err)
-	}
+	ensureHistory(t, c, li, "orphan", 3)
 	waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("orphan"), 3)
 	if _, err := p.PublishOnce(ctx); err != nil {
 		t.Fatalf("post-recovery publish: %v", err)
@@ -336,9 +322,7 @@ func TestD5RunPublishesAndNoLeak(t *testing.T) {
 	li := c.leaderIdx(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := jsstream.EnsureHistoryStream(ctx, c.js[li], "lab", 3); err != nil {
-		t.Fatalf("ensure history: %v", err)
-	}
+	ensureHistory(t, c, li, "lab", 3)
 	if !waitForStreamReplicas(t, c.js[li], jsstream.HistoryStreamName("lab"), 3) {
 		t.Fatal("history-lab never reached R3")
 	}
