@@ -85,15 +85,17 @@
   - proxy-aware-dial（ctl/agent NATS 经本地代理：HTTP CONNECT + SOCKS5h，解 WSL fake-ip hang；默认关、零回归） — **v0.3.6**（WSL 实机验证过）
 - **distributed-broker HA epic（D0–D9，proto v2，在 main）**：架构基线 `docs/distributed-broker-architecture.md` 过 4 轮外审 PASS；分解见 §19。
   - **D0**（前置门 + proto v2 SSOT + migrations 0008–0010 + PreVote 合并门）— **已 commit 进 main**。
-  - **D1**（状态层：单节点 Raft FSM + SQLite Apply 同 txn `applied_index` + 幂等重投 + online-backup 快照/恢复 + kill-9 矩阵；`internal/cluster`、`internal/storage` OpenWAL/OpenReadOnly）— **实现完成 + 内审过（CONDITIONAL PASS→must-fix 已修），待外审**。报告 `docs/reviews/d1-{plan,review}.md`。
+  - **D1**（状态层：单节点 Raft FSM + SQLite Apply 同 txn `applied_index` + 幂等重投 + online-backup 快照/恢复 + kill-9 矩阵）— **DONE**（内审 + 外审 PASS，commit `bc181c1`）。报告 `docs/reviews/d1-{plan,review,external-review}.md`。
+  - **D2**（op 集 + 全 mutator Plan/Apply 移植 → **N=1 功能等价**）— **DONE**（内审 + 外审 PASS，commit `38e2576` + pushed main）。**ops-only 不切线上 broker**（cutover=D9）；全 13 op + sqlbake(`LitTime=t.String()` 不强制 UTC、禁 `Args`、拒 NUL/非 UTF-8) + `Node.Propose` applyMu 接缝 + CHA §13.1 lint + DIFF-1 差分(UTC+非UTC) + TestD2Matrix。报告 `docs/reviews/d2-{plan,review,external-review}.md`。
 - 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net` / `weiland.top`，多 agent）。
 
 ### 已知未收口 / 缺口（接手时优先处理）
 
 - **P13 阶段出口仍是 CONDITIONAL PASS**：真 Caddy/WSS + 真 Clash 端到端验证未跑（外审不过不算 done）。
-- **e2e 矩阵覆盖洞**：`test/e2e/all_phases_test.go` 覆盖 p1–p10 + p13 + 叶子矩阵（TransferDefaults / RemoteFS / ProxyTunnelReconnect / **ProxyDial** / **D1**）；**p11 及 post-1.0 的 file-transfer / ps-retention / P12 仍未进矩阵**。新增量进矩阵时一并回填。
+- **e2e 矩阵覆盖洞**：`test/e2e/all_phases_test.go` 覆盖 p1–p10 + p13 + 叶子矩阵（TransferDefaults / RemoteFS / ProxyTunnelReconnect / **ProxyDial** / **D1** / **D2**）；**p11 及 post-1.0 的 file-transfer / ps-retention / P12 仍未进矩阵**。新增量进矩阵时一并回填。
+- **D2 D9-staged 项（非欠账，已在 d2-review 确认边界）**：禁 FSM 外 INSERT lint（live 直连 mutator grandfathered）、leader-local 不碰身份列反向断言、`reconcileOnRegister`↔`resolveReconcileMarks` 真正共用重构、broker 切 FSM——全是 D9 cutover。
 - **`README.md` 为空**（0 字节）——对外门面缺失。
 
 ### 下一步
 
-- **D1 外审中**（于外审时停下）；外审过后 commit/push（注意：proto v2 不发现网），再进 **D2**（op 集 + 全 mutator Plan/Apply 移植 → N=1 功能等价里程碑）。
+- **D2 DONE（外审 PASS，已 push main）**；下一步 **D3**（NATS 集群层 ≥2 节点 routes + auth_callout 本地读 + fail-closed `T_fence` + broker-only ACL）。依赖 D2 出口（N=1 等价）已过。注意 proto v2 不发现网 v1 车队。
