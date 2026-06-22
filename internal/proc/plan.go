@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/schema"
 )
 
 // Plan* are the D2 leader-side renderers for the process mutators (architecture
@@ -94,27 +95,146 @@ type ExitMark struct {
 	When     time.Time
 }
 
+// ReconProcAudit / ReconPortAudit are the apply-inert audit-replay tuples baked into
+// OpReconcileBatch's Command.Aux (§4.1 D4). They capture the fields that live in NO
+// persistent row — proc rc (from the agent's LocalProcesses) and port name/local_port
+// (from LocalPorts) — so any new leader replays byte-identical audit reading ONLY the
+// committed entry, never the live register request or a leader-local map. killed_orphan
+// carries NO rc (RC=nil), matching pubAuditProc's kind-gating (rc only on
+// exit/reconciled_closed). Ts is monotonic-stripped at bake time.
+type ReconProcAudit struct {
+	NID  string    `json:"nid"`
+	PID  string    `json:"pid"`
+	Kind string    `json:"kind"` // "reconciled_closed" | "killed_orphan"
+	RC   *int      `json:"rc,omitempty"`
+	Ts   time.Time `json:"ts"`
+}
+
+// ReconPortAudit is the port half of the reconcile audit (kind="reconciled").
+type ReconPortAudit struct {
+	NID       string    `json:"nid"`
+	Port      int       `json:"port"`
+	Name      string    `json:"name,omitempty"`
+	LocalPort int       `json:"local_port,omitempty"`
+	Kind      string    `json:"kind"` // "reconciled"
+	Ts        time.Time `json:"ts"`
+}
+
+// ReconcileBatchInput is the FULL leader-resolved G.1 result for one (sid, nid)
+// register: the proc MarkExited decisions (Body) + the audit-replay tuples (Aux).
+// The broker-side resolver produces it; PlanReconcileBatch bakes it into ONE op.
+type ReconcileBatchInput struct {
+	SID       string
+	Marks     []ExitMark
+	ProcAudit []ReconProcAudit
+	PortAudit []ReconPortAudit
+}
+
+// reconAuxV1 is the apply-inert Command.Aux payload for OpReconcileBatch: the
+// total-ordered audit-replay tuples. genericExecApplier ignores Aux; only
+// ReplayReconcileAudit (D5 publisher / D4 replay test) reads it.
+type reconAuxV1 struct {
+	SID       string           `json:"sid"`
+	ProcAudit []ReconProcAudit `json:"proc,omitempty"`
+	PortAudit []ReconPortAudit `json:"port,omitempty"`
+}
+
 // PlanReconcileBatch renders OpReconcileBatch — the whole G.1 reconcile result as
-// ONE op. It sorts the marks by PID (ULID) ASC so the entry is byte-stable
-// regardless of the Go-map iteration order the caller resolved them in
-// (architecture §3.4/§4.1: "leader sorts by pid ASC into one ReconcileBatch"), and
-// bakes each through the shared markExitedSQL renderer. Returns a nil command for
-// an empty mark set (no-op: nothing to propose). The caller (resolver) owns
-// de-duplication and the not-found decisions; the UPDATEs are idempotent
-// (WHERE status='RUNNING').
-func PlanReconcileBatch(marks []ExitMark) (*cluster.Command, error) {
-	if len(marks) == 0 {
+// ONE self-sufficient op (§4.1 D4). Body = the MarkExited UPDATEs, total-ordered by
+// PID (ULID) ASC so the entry is byte-stable regardless of the Go-map iteration
+// order the resolver produced them in, each baked through the shared markExitedSQL
+// renderer (idempotent: WHERE status='RUNNING'). Aux = the ordered audit-replay
+// tuples (proc by (PID,Kind) ASC — a PID-reuse PID carries BOTH reconciled_closed
+// and killed_orphan, so Kind breaks the tie deterministically; port by Port ASC),
+// monotonic-stripped. Returns a nil command only when there is NOTHING to do
+// (no marks AND no audit) — an audit-only reconcile (orphans / port revokes, which
+// have no DB mutation) still commits an entry so D5 can replay+publish its audit.
+func PlanReconcileBatch(in ReconcileBatchInput) (*cluster.Command, error) {
+	if len(in.Marks) == 0 && len(in.ProcAudit) == 0 && len(in.PortAudit) == 0 {
 		return nil, nil
 	}
-	sorted := append([]ExitMark(nil), marks...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].PID < sorted[j].PID })
-	stmts := make([]cluster.Statement, len(sorted))
-	for i, m := range sorted {
+	marks := append([]ExitMark(nil), in.Marks...)
+	sort.Slice(marks, func(i, j int) bool { return marks[i].PID < marks[j].PID })
+	stmts := make([]cluster.Statement, len(marks))
+	for i, m := range marks {
 		sql, err := markExitedSQL(m.PID, m.ExitCode, m.When)
 		if err != nil {
 			return nil, err
 		}
 		stmts[i] = cluster.Stmt(sql)
 	}
-	return cluster.NewCommand(cluster.OpReconcileBatch, stmts...), nil
+
+	aux := reconAuxV1{SID: in.SID}
+	aux.ProcAudit = append(aux.ProcAudit, in.ProcAudit...)
+	sort.Slice(aux.ProcAudit, func(i, j int) bool {
+		if aux.ProcAudit[i].PID != aux.ProcAudit[j].PID {
+			return aux.ProcAudit[i].PID < aux.ProcAudit[j].PID
+		}
+		return aux.ProcAudit[i].Kind < aux.ProcAudit[j].Kind
+	})
+	aux.PortAudit = append(aux.PortAudit, in.PortAudit...)
+	sort.Slice(aux.PortAudit, func(i, j int) bool {
+		if aux.PortAudit[i].Port != aux.PortAudit[j].Port {
+			return aux.PortAudit[i].Port < aux.PortAudit[j].Port
+		}
+		if aux.PortAudit[i].LocalPort != aux.PortAudit[j].LocalPort {
+			return aux.PortAudit[i].LocalPort < aux.PortAudit[j].LocalPort
+		}
+		return aux.PortAudit[i].Name < aux.PortAudit[j].Name
+	})
+	// Strip the monotonic reading (review m6): time.Time.MarshalJSON already emits
+	// only the wall RFC3339Nano (never the monotonic part), so this is NOT required
+	// for the replayed-JSON byte-identity — it is defensive so any non-JSON time.Time
+	// EQUALITY check (tests, future callers) sees the same value the wire carries.
+	for i := range aux.ProcAudit {
+		aux.ProcAudit[i].Ts = aux.ProcAudit[i].Ts.Round(0)
+	}
+	for i := range aux.PortAudit {
+		aux.PortAudit[i].Ts = aux.PortAudit[i].Ts.Round(0)
+	}
+
+	cmd := cluster.NewCommand(cluster.OpReconcileBatch, stmts...)
+	auxBytes, err := json.Marshal(aux)
+	if err != nil {
+		return nil, fmt.Errorf("proc: marshal reconcile aux: %w", err)
+	}
+	cmd.Aux = auxBytes
+	return cmd, nil
+}
+
+// ReplayReconcileAudit deterministically reconstructs the audit records a
+// ReconcileBatch entry stands for, reading ONLY the committed Command (its Aux) —
+// no live request, no leader-local map, no DB (§4.1 D4). It reproduces
+// pubAuditProc/pubAuditPort's record shapes exactly (incl killed_orphan's nil rc),
+// in the baked total order, so two leaders replaying the SAME committed entry
+// produce byte-identical audit. D4 only PROVES this (the byte-identical-replay
+// test); the post-commit publish is D5. Threads no raftIndex and computes no dedup
+// key (that is D5's raft_index:kind:seq). A v1-shaped entry never reaches here
+// (decodeCommand rejects it as poison); an empty Aux yields empty records.
+func ReplayReconcileAudit(cmd *cluster.Command) ([]schema.AuditProc, []schema.AuditPort, error) {
+	if cmd == nil || cmd.Op != cluster.OpReconcileBatch {
+		return nil, nil, fmt.Errorf("proc: ReplayReconcileAudit: not a ReconcileBatch command")
+	}
+	if len(cmd.Aux) == 0 {
+		return nil, nil, nil
+	}
+	var aux reconAuxV1
+	if err := json.Unmarshal(cmd.Aux, &aux); err != nil {
+		return nil, nil, fmt.Errorf("proc: ReplayReconcileAudit decode aux: %w", err)
+	}
+	procs := make([]schema.AuditProc, 0, len(aux.ProcAudit))
+	for _, t := range aux.ProcAudit {
+		procs = append(procs, schema.AuditProc{
+			V: schema.AuditSchemaVersion, Kind: t.Kind, Ts: t.Ts,
+			Session: aux.SID, Node: t.NID, PID: t.PID, RC: t.RC,
+		})
+	}
+	ports := make([]schema.AuditPort, 0, len(aux.PortAudit))
+	for _, t := range aux.PortAudit {
+		ports = append(ports, schema.AuditPort{
+			V: schema.AuditSchemaVersion, Kind: t.Kind, Ts: t.Ts,
+			Session: aux.SID, Node: t.NID, Port: t.Port, Name: t.Name, LocalPort: t.LocalPort,
+		})
+	}
+	return procs, ports, nil
 }

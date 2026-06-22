@@ -170,6 +170,26 @@ func TestD3Matrix(t *testing.T) {
 	}
 }
 
+// TestD4Matrix runs the D4 write-forwarding surface under -race: the ReqID dedup
+// ledger + appliedDedup + GC (internal/cluster), the self-sufficient ReconcileBatch +
+// byte-identical replay (internal/proc), the live-vs-op audit equivalence + forward
+// adapter (internal/broker), and the combined routed-NATS + mTLS-raft forwarding suite
+// (test/d4). Dedicated -race subprocess like TestD1/D2/D3Matrix; the 300s timeout
+// covers the multi-node election + leadership-transfer waits.
+func TestD4Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./internal/cluster/...", "./internal/proc/...", "./internal/broker/...",
+		"./internal/storage/...", "./test/d4/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d4 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

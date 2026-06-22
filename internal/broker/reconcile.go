@@ -41,23 +41,37 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// resolveReconcileMarks is the PURE G.1 classifier (architecture §4.1 +
-// docs/reviews/d2-plan.md §4 / 裁定 R2): given the broker's RUNNING/LOST procs and
-// the agent's reported LocalProcesses, it returns the ordered set of proc.ExitMark
-// decisions — the EXACT MarkExited transitions reconcileOnRegister applies inline
-// today (PID-reuse -> -1, agent-reported exit -> rc, unknown -> -1, missed-exit ->
-// -1; an accepted running proc yields no mark). It has ZERO side effects (no DB
-// write, no audit). The D2 ReconcileBatch op path feeds these marks into
-// proc.PlanReconcileBatch; under ops-only the live reconcileOnRegister keeps its
-// inline application unchanged (zero risk to the e2e-covered G.1 path), and adopts
-// this shared classifier at the D9 cutover. Equivalence is proven in
+// intp returns a pointer to i (for the audit-tuple RC, which is *int so
+// killed_orphan can carry no rc).
+func intp(i int) *int { return &i }
+
+// resolveReconcile is the PURE, full G.1 classifier (architecture §4.1 D4 +
+// docs/reviews/d4-plan.md §0bis-A): given the broker's RUNNING/LOST procs, the
+// agent's reported LocalProcesses/LocalPorts, and the session's port rows, it
+// returns the COMPLETE leader-resolved reconcile result — the proc.ExitMark
+// decisions (Body) AND the audit-replay tuples (Aux) — with ZERO side effects (no
+// DB write, no audit emission). It is a faithful, side-effect-free copy of the
+// EXACT transitions + audit reconcileOnRegister produces inline today:
+//   - proc: PID-reuse -> MarkExited(-1) + reconciled_closed(rc=-1) AND the reused
+//     pid is re-treated as an orphan (killed_orphan); agent exit -> MarkExited(rc) +
+//     reconciled_closed(rc); unknown/missed -> MarkExited(-1) + reconciled_closed(-1);
+//     accepted running -> NO mark, NO audit; orphan (agent-only running pid) ->
+//     killed_orphan (NO rc, no mark).
+//   - port: token unknown / port-mismatch / state!=ALLOCATED -> reconciled audit
+//     (name/local_port from the AGENT report); ALLOCATED -> keep, NO audit.
+//
+// The D4 op path feeds this into proc.PlanReconcileBatch (Body+Aux). The live
+// reconcileOnRegister keeps its inline application unchanged (zero risk to the
+// e2e-covered G.1 path) and adopts this shared classifier at the D9 cutover.
+// Equivalence (marks AND audit, compared as a set) is proven in
 // reconcile_marks_test.go.
-func resolveReconcileMarks(nid string, req proto.NodeRegisterReq, procs []proc.Process, now time.Time) []proc.ExitMark {
+func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.Process, portRows []port.Allocation, now time.Time) proc.ReconcileBatchInput {
+	out := proc.ReconcileBatchInput{SID: sid}
+
 	agentByPID := map[string]proto.LocalProcess{}
 	for _, lp := range req.LocalProcesses {
 		agentByPID[lp.PID] = lp
 	}
-	var marks []proc.ExitMark
 	for _, p := range procs {
 		if p.NID != nid {
 			continue
@@ -66,30 +80,63 @@ func resolveReconcileMarks(nid string, req proto.NodeRegisterReq, procs []proc.P
 			continue
 		}
 		lp, hasIt := agentByPID[p.PID]
-		if !hasIt {
-			// Broker thinks RUNNING/LOST but agent didn't list it -> missed-exit.
-			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
-			continue
-		}
-		switch lp.State {
-		case "running":
-			// PID-reuse: same ULID, different OS process -> close the old row.
-			// (A genuinely-accepted running proc yields NO mark.)
-			if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
-				marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+		if hasIt {
+			delete(agentByPID, p.PID)
+			switch lp.State {
+			case "running":
+				if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
+					out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+					out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
+					// Re-treat the reused pid as an orphan (mirrors the live re-add).
+					agentByPID[p.PID] = lp
+					continue
+				}
+				// accepted: no mark, no audit
+			case "exited":
+				rc := -1
+				if lp.RC != nil {
+					rc = *lp.RC
+				}
+				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: now})
+				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(rc), Ts: now})
+			default:
+				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
 			}
-		case "exited":
-			rc := -1
-			if lp.RC != nil {
-				rc = *lp.RC
-			}
-			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: now})
-		default:
-			// Unknown agent state -> treat as missed-exit.
-			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+		} else {
+			out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+			out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
 		}
 	}
-	return marks
+	// Orphans: agent claims a running pid the broker has no record of (or a PID-reuse
+	// pid re-added above) -> killed_orphan (NO rc, no mark).
+	for pid, lp := range agentByPID {
+		if lp.State != "running" {
+			continue
+		}
+		out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: pid, Kind: "killed_orphan", RC: nil, Ts: now})
+	}
+
+	// Ports: classify the agent's re-presented tunnels against the port rows.
+	portByHash := map[string]*port.Allocation{}
+	for i := range portRows {
+		if portRows[i].NID != nid {
+			continue
+		}
+		portByHash[portRows[i].TokenHash] = &portRows[i]
+	}
+	for _, lp := range req.LocalPorts {
+		alloc, ok := portByHash[lp.TokenHash]
+		switch {
+		case !ok, ok && alloc.Port != lp.Port, ok && alloc.State != port.StateAllocated:
+			// Orphan / mismatch / dropped-while-offline -> reconciled audit + revoke
+			// directive (the directive itself is live-path-only; the op bakes the audit).
+			out.PortAudit = append(out.PortAudit, proc.ReconPortAudit{NID: nid, Port: lp.Port, Name: lp.Name, LocalPort: lp.LocalPort, Kind: "reconciled", Ts: now})
+		default:
+			// ALLOCATED + matching: keep, NO audit.
+		}
+	}
+	return out
 }
 
 // reconcileOnRegister runs G.1 over (sid, nid) using req.LocalProcesses /

@@ -575,7 +575,7 @@ func TestReconcileBatch_TotalOrderDeterminism(t *testing.T) {
 
 	var firstSQL []string
 	for i, ord := range orders {
-		cmd, err := proc.PlanReconcileBatch(ord)
+		cmd, err := proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: ord})
 		if err != nil {
 			t.Fatalf("order %d: %v", i, err)
 		}
@@ -605,7 +605,7 @@ func TestReconcileBatch_TotalOrderDeterminism(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd, _ := proc.PlanReconcileBatch([]proc.ExitMark{c, a, b}) // shuffled input
+	cmd, _ := proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: []proc.ExitMark{c, a, b}}) // shuffled input
 	if err := cluster.ExecCommand(db, cmd); err != nil {
 		t.Fatal(err)
 	}

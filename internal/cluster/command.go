@@ -48,7 +48,13 @@ const metaTestKeyPrefix = "t:"
 // commandVersion is the raft-log envelope version. It is DECOUPLED from
 // proto.ProtoVersion: proto v2 governs NATS subject grammar, NOT the raft log
 // wire (architecture §5 D1 amendment).
-const commandVersion = 1
+//
+// D4 bumped this 1->2 when OpReconcileBatch gained the apply-inert Aux audit-tuple
+// field (§4.1 self-sufficient replay). Safe: no production cluster.Node exists yet
+// (build-and-prove, cutover=D9) so no persisted v1 log can be rejected, and harness
+// DBs are fresh per test. A v1-shaped entry now decodes as POISON (loud, advances
+// applied_index, never wedges) rather than silently replaying an empty audit set.
+const commandVersion = 2
 
 // Statement is one baked, leader-rendered SQL statement plus its already-frozen
 // SQL parameters.
@@ -63,12 +69,25 @@ type Statement struct {
 	Args []any  `json:"a,omitempty"`
 }
 
-// Command is the raft-log envelope (architecture §5: {t,v,r,b}).
+// Command is the raft-log envelope (architecture §5: {t,v,r,b,x}).
 type Command struct {
-	Op      OpType      `json:"t"`
-	Version int         `json:"v"`
-	ReqID   string      `json:"r,omitempty"` // RESERVED + INERT in D1 (no dedup; that is D4)
-	Body    []Statement `json:"b"`
+	Op      OpType `json:"t"`
+	Version int    `json:"v"`
+	// ReqID is the cross-retry-STABLE, originating-broker-minted idempotency key
+	// (§4.1 D4). The FSM dedups an already-committed ReqID arriving at a NEW raft
+	// index (a forwarder retry after the "committed but ack lost" ErrLeadershipLost
+	// ambiguity) via the cluster_reqid_ledger, skipping the op while still advancing
+	// applied_index. Empty = no dedup (D1/D2 ops are byte-unchanged). decodeCommand
+	// fail-closes a malformed ReqID (charset/length) so it cannot round-trip raft-log
+	// JSON differently per node (split-brain ledger).
+	ReqID string      `json:"r,omitempty"`
+	Body  []Statement `json:"b"`
+	// Aux is an opaque, APPLY-INERT auxiliary payload: genericExecApplier ignores it
+	// entirely (only Body statements mutate the DB). Currently only OpReconcileBatch
+	// uses it, to carry the §4.1 self-sufficient ordered audit-replay tuples so any
+	// new leader can byte-identically replay the audit from the committed entry alone
+	// (decoded by proc.ReplayReconcileAudit). D4 publishes nothing; D5 owns publish.
+	Aux json.RawMessage `json:"x,omitempty"`
 }
 
 // NewCommand builds a versioned Command for op with the given baked statements.
@@ -123,7 +142,30 @@ func decodeCommand(data []byte) (*Command, error) {
 	if !knownOps[c.Op] {
 		return nil, fmt.Errorf("cluster: unknown op %q", c.Op)
 	}
+	// §4.1 D4: fail-close a malformed ReqID. The minted key is lowercase hex (a
+	// SHA-256 prefix); anything else (NUL, non-UTF-8, oversized) could round-trip
+	// raft-log JSON differently per node and split-brain the dedup ledger. A bad
+	// ReqID makes the whole entry POISON (advanced past, never honored).
+	if !validReqID(c.ReqID) {
+		return nil, fmt.Errorf("cluster: invalid req_id (must be empty or <=64 lowercase hex)")
+	}
 	return &c, nil
+}
+
+// validReqID reports whether s is an acceptable Command.ReqID: empty (no dedup) or
+// 1..64 lowercase-hex chars (a SHA-256-derived idempotency key, §4.1 D4). The hex
+// constraint intrinsically rejects NUL / non-UTF-8 / whitespace.
+func validReqID(s string) bool {
+	if len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 var knownOps = map[OpType]bool{

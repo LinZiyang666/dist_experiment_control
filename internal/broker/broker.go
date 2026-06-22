@@ -303,6 +303,9 @@ func (b *Broker) publishOnConn(subject string, payload []byte) error {
 // history-<sid> filters on, so this is the only function that
 // needs to know about JS for normal pub.
 func (b *Broker) publishAudit(subject string, payload []byte) error {
+	if auditTapForTest != nil {
+		auditTapForTest(subject, payload)
+	}
 	if b.js != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

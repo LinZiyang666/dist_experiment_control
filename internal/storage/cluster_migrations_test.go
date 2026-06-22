@@ -545,6 +545,7 @@ func TestClusterMigrations_MigrationOrderContiguous(t *testing.T) {
 		"0004_token_hash_index.sql", "0005_processes_gc_indexes.sql", "0006_proxy.sql",
 		"0007_proxy_generation.sql", "0008_cluster_nodes.sql",
 		"0009_cluster_meta_alerts.sql", "0010_port_cluster_columns.sql",
+		"0011_cluster_reqid_ledger.sql",
 	}
 	got := migrationNames(t)
 	if len(got) != len(want) {

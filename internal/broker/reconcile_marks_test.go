@@ -2,12 +2,14 @@ package broker
 
 import (
 	"database/sql"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -60,7 +62,8 @@ func TestResolveReconcileMarks_G1Cases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	marks := resolveReconcileMarks("lab-1", req, procs, now)
+	res := resolveReconcile("lab", "lab-1", req, procs, nil, now)
+	marks := res.Marks
 	got := map[string]int{}
 	for _, m := range marks {
 		got[m.PID] = m.ExitCode
@@ -79,7 +82,7 @@ func TestResolveReconcileMarks_G1Cases(t *testing.T) {
 	}
 
 	// apply via the ReconcileBatch op and verify the processes table
-	cmd, err := proc.PlanReconcileBatch(marks)
+	cmd, err := proc.PlanReconcileBatch(res)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +168,7 @@ func TestResolveReconcileMarks_VsLiveDifferential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd, err := proc.PlanReconcileBatch(resolveReconcileMarks("lab-1", req, procs, now))
+	cmd, err := proc.PlanReconcileBatch(resolveReconcile("lab", "lab-1", req, procs, nil, now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,3 +200,138 @@ func procSnapshot(t *testing.T, db *sql.DB) string {
 }
 
 func slogDiscard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// TestD4ReconcileEquivalence_AuditSet (D4 §13.7 #3 live-vs-op) proves the op-path
+// audit (resolveReconcile -> PlanReconcileBatch -> ReplayReconcileAudit) reproduces
+// EXACTLY the audit the LIVE reconcileOnRegister emits — captured byte-for-byte via
+// the auditTapForTest seam (NATS-free) and compared as a MULTISET (R-7: the live
+// path emits killed_orphan in Go-map order, so sequence is not comparable without
+// reordering the live path, which a zero-regression phase must not do). It covers
+// reconciled_closed (rc set), killed_orphan (NO rc), PID-reuse (BOTH), and port
+// reconciled (name/local_port from the agent report) — the exact drift surface.
+func TestD4ReconcileEquivalence_AuditSet(t *testing.T) {
+	now := time.Date(2026, 6, 21, 13, 14, 15, 0, time.UTC)
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('lab','lab','o','p','ACTIVE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at) VALUES('lab-1','lab','ONLINE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []proc.Process{
+		{PID: "01a", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot2", StartTimeTicks: 100},
+		{PID: "01b", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot1", StartTimeTicks: 200},
+		{PID: "01c", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot2", StartTimeTicks: 300},
+		{PID: "01d", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot2", StartTimeTicks: 400},
+		{PID: "01e", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot2", StartTimeTicks: 500},
+	} {
+		if err := proc.Insert(db, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One ALLOCATED port the agent re-presents (keep, NO audit) + the agent will also
+	// claim an unknown-token tunnel (orphan -> reconciled audit).
+	if _, err := db.Exec(`INSERT INTO port_allocations(port,sid,nid,name,local_port,token_hash,state,created_by_fp)
+		VALUES (14022,'lab','lab-1','keepme',8888,'hashA','ALLOCATED','o')`); err != nil {
+		t.Fatal(err)
+	}
+
+	rc5 := 5
+	req := proto.NodeRegisterReq{
+		BootID: "boot2",
+		LocalProcesses: []proto.LocalProcess{
+			{PID: "01a", State: "running", StartTimeTicks: 100}, // accepted -> no audit
+			{PID: "01b", State: "running", StartTimeTicks: 200}, // PID-reuse -> reconciled_closed(-1) + killed_orphan
+			{PID: "01c", State: "exited", RC: &rc5},             // reconciled_closed(5)
+			{PID: "01e", State: "weird"},                        // unknown -> reconciled_closed(-1)
+			{PID: "01forphan", State: "running"},                // orphan -> killed_orphan (no rc)
+			// 01d absent -> missed-exit -> reconciled_closed(-1)
+		},
+		LocalPorts: []proto.LocalPort{
+			{Port: 14022, Name: "keepme", LocalPort: 8888, TokenHash: "hashA"},      // keep -> no audit
+			{Port: 15000, Name: "orphanport", LocalPort: 9999, TokenHash: "hashZZZ"}, // reconciled
+		},
+	}
+
+	// OP arm (read state BEFORE the live arm mutates it): resolve -> bake -> replay.
+	procs, err := proc.ListBySessionFiltered(db, "lab", proc.ListBySessionOpts{IncludeExited: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ports, err := port.ListBySession(db, "lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := proc.PlanReconcileBatch(resolveReconcile("lab", "lab-1", req, procs, ports, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aps, pps, err := proc.ReplayReconcileAudit(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opProc, opPort []string
+	for _, r := range aps {
+		b, _ := json.Marshal(r)
+		opProc = append(opProc, string(b))
+	}
+	for _, r := range pps {
+		b, _ := json.Marshal(r)
+		opPort = append(opPort, string(b))
+	}
+
+	// LIVE arm: capture every audit publish byte-for-byte via the seam.
+	var liveProc, livePort []string
+	auditTapForTest = func(subject string, payload []byte) {
+		switch subject {
+		case proto.SubjAuditProc("lab"):
+			liveProc = append(liveProc, string(payload))
+		case proto.SubjAuditPort("lab"):
+			livePort = append(livePort, string(payload))
+		}
+	}
+	defer func() { auditTapForTest = nil }()
+	bLive := &Broker{cfg: Config{DB: db, Logger: slogDiscard(), Now: func() time.Time { return now }}}
+	bLive.reconcileOnRegister("lab", "lab-1", req)
+
+	if !sameMultiset(liveProc, opProc) {
+		t.Fatalf("proc-audit drift (op replay must reproduce live emission as a set):\n live=%v\n op  =%v", liveProc, opProc)
+	}
+	if !sameMultiset(livePort, opPort) {
+		t.Fatalf("port-audit drift:\n live=%v\n op  =%v", livePort, opPort)
+	}
+	if len(opProc) != 6 {
+		t.Fatalf("expected 6 proc audits (4 reconciled_closed + 2 killed_orphan), got %d: %v", len(opProc), opProc)
+	}
+	if len(opPort) != 1 {
+		t.Fatalf("expected 1 port audit (reconciled), got %d: %v", len(opPort), opPort)
+	}
+}
+
+// sameMultiset reports whether a and b contain the same strings with the same
+// multiplicities (order-independent — R-7 set comparison).
+func sameMultiset(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]int{}
+	for _, s := range a {
+		m[s]++
+	}
+	for _, s := range b {
+		m[s]--
+		if m[s] < 0 {
+			return false
+		}
+	}
+	for _, v := range m {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}

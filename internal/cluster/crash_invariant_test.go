@@ -72,27 +72,59 @@ func TestFSM_IdempotentReapply(t *testing.T) {
 	}
 }
 
-// TestFSM_ReqIDInert pins that ReqID does NOT dedup in D1 (that is D4): two
-// DISTINCT indices with the SAME ReqID BOTH apply; only the same INDEX is skipped.
-func TestFSM_ReqIDInert(t *testing.T) {
+// TestD4FSMReqIDDedupSemantics pins the §4.1 D4 cross-retry dedup (this replaces the
+// D1 "ReqID is inert" pin — D4 activates it). It uses a NON-idempotent metaCmd
+// (distinct keys t:a/t:b) so a missed dedup is OBSERVABLE (the §0bis-B non-vacuous
+// framing): (a) a NEW ReqID execs + records the ledger; (b) the SAME ReqID at a NEW
+// index is appliedDedup — the op SQL is SKIPPED (t:b never written) but applied_index
+// ADVANCES and dedupCount increments; (c) re-delivery of the SAME index is the cheap
+// index-skip (appliedNoOp, dedupCount unchanged); (d) an empty ReqID never dedups.
+func TestD4FSMReqIDDedupSemantics(t *testing.T) {
 	f, _ := freshFSM(t, t.TempDir())
 
 	c1 := metaCmd(t, "t:a", "1")
-	c1.ReqID = "same-req"
+	c1.ReqID = "abc123"
 	c2 := metaCmd(t, "t:b", "2")
-	c2.ReqID = "same-req" // identical ReqID, different index
+	c2.ReqID = "abc123" // identical ReqID, different index — a committed-but-ack-lost retry
 
+	// (a) new ReqID at @2 executes.
 	if _, ok := f.Apply(logCmd(t, 2, 1, c1)).(appliedOK); !ok {
-		t.Fatal("apply @2 should be appliedOK")
+		t.Fatal("apply @2 (new ReqID) should be appliedOK")
 	}
-	if _, ok := f.Apply(logCmd(t, 3, 1, c2)).(appliedOK); !ok {
-		t.Fatal("apply @3 with the SAME ReqID must STILL apply (ReqID is inert in D1)")
+	// (b) same ReqID at @3 is deduped: op SKIPPED, cursor advanced, dedupCount=1.
+	if _, ok := f.Apply(logCmd(t, 3, 1, c2)).(appliedDedup); !ok {
+		t.Fatal("apply @3 with the SAME ReqID must be appliedDedup (op skipped, cursor advanced)")
+	}
+	if got := f.dedupCount.Load(); got != 1 {
+		t.Fatalf("dedupCount = %d, want 1 (the dedup branch must have fired — non-vacuity)", got)
 	}
 	if v, ok := mustMetaOK(t, f, "t:a"); !ok || v != "1" {
 		t.Fatalf("t:a = (%q,%v) want (\"1\",true)", v, ok)
 	}
-	if v, ok := mustMetaOK(t, f, "t:b"); !ok || v != "2" {
-		t.Fatalf("t:b = (%q,%v) want (\"2\",true) — ReqID must not have deduped it away", v, ok)
+	if _, ok := mustMetaOK(t, f, "t:b"); ok {
+		t.Fatal("t:b MUST NOT exist — the dedup must have SKIPPED the op (non-idempotent observable)")
+	}
+	if got := mustApplied(t, f); got != 3 {
+		t.Fatalf("applied_index must advance to 3 through the dedup, got %d (a rollback here would wedge re-delivery)", got)
+	}
+
+	// (c) raft re-delivers the SAME index @3 -> cheap index-skip, NOT a dedup.
+	if _, ok := f.Apply(logCmd(t, 3, 1, c2)).(appliedNoOp); !ok {
+		t.Fatal("re-delivery of the SAME index must be appliedNoOp (index-skip runs first)")
+	}
+	if got := f.dedupCount.Load(); got != 1 {
+		t.Fatalf("dedupCount = %d after a same-index re-delivery, want 1 (index-skip must run BEFORE the dedup branch)", got)
+	}
+
+	// (d) empty ReqID never dedups: two distinct ops both apply.
+	if _, ok := f.Apply(logCmd(t, 4, 1, metaCmd(t, "t:c", "3"))).(appliedOK); !ok {
+		t.Fatal("apply @4 (empty ReqID) should be appliedOK")
+	}
+	if _, ok := f.Apply(logCmd(t, 5, 1, metaCmd(t, "t:d", "4"))).(appliedOK); !ok {
+		t.Fatal("apply @5 (empty ReqID) should be appliedOK (empty ReqID never dedups)")
+	}
+	if v, ok := mustMetaOK(t, f, "t:d"); !ok || v != "4" {
+		t.Fatalf("t:d = (%q,%v) want (\"4\",true) — empty ReqID must not dedup", v, ok)
 	}
 }
 

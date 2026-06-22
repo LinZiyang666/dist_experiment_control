@@ -71,8 +71,8 @@ type Node struct {
 	raft         *raft.Raft
 	fsm          *fsm
 	store        *raftboltdb.BoltStore
-	db           *sql.DB // write pool (owned)
-	ro           *sql.DB // read-only backup handle (owned)
+	db           *sql.DB        // write pool (owned)
+	ro           *sql.DB        // read-only backup handle (owned)
 	transport    raft.Transport // injected; closed by Shutdown (raft does not reap it)
 	applyTimeout time.Duration
 	logger       *slog.Logger
@@ -250,6 +250,15 @@ func IsNotLeader(err error) bool {
 	return errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost)
 }
 
+// ErrForwardNotLeader is the raft-free sentinel a broker-side forwarder (§4.1 D4,
+// internal/broker/cluster_forward.go) returns when a forwarded write could not be
+// committed by a leader — the answering broker replied not_leader, or the NATS
+// request timed out (NOT proof of non-commit; the retry's stable ReqID dedups). It
+// is RETRIABLE (re-request the broadcast bus, never the deposed broker). The broker
+// maps it to authcallout.ErrNotLeader for the PIN path; cluster stays nats-free so
+// the sentinel (not the wire) is what the broker adapter translates.
+var ErrForwardNotLeader = errors.New("cluster: forwarded write not committed by a leader (retriable)")
+
 // Apply proposes a command through raft. On a deposed leader the returned error
 // is raft.ErrLeadershipLost / raft.ErrNotLeader, UNWRAPPED so D4 can type-match.
 // A typed FSM error (e.g. an op business error) surfaces via the future Response.
@@ -305,6 +314,26 @@ func (n *Node) ApplyMetaSet(key, value string) error {
 // Apply — also transient (cluster.IsNotLeader). Held under applyMu so the check is
 // part of the same serialized {gate -> Plan -> Apply} window.
 func (n *Node) Propose(plan func(db *sql.DB) (*Command, error)) error {
+	return n.ProposeWithReqID("", plan)
+}
+
+// ProposeWithReqID is Propose with a cross-retry-stable idempotency key (§4.1 D4).
+// It stamps reqID into the planned Command before Apply so the FSM dedups a
+// committed-but-ack-lost forwarder retry (same reqID at a new raft index). The
+// leader gate, applyMu window, and nil-command no-op are identical to Propose
+// (which delegates here with an empty reqID; D1/D2 callers are byte-unchanged). The
+// reqID is the broker-side forwarding key (the originating broker mints it; NEVER
+// the leader — a per-leader re-mint cannot dedup an already-committed entry).
+func (n *Node) ProposeWithReqID(reqID string, plan func(db *sql.DB) (*Command, error)) error {
+	// Validate the key BEFORE proposing (external-review F2): an invalid reqID would
+	// otherwise be stamped into a Command that decodeCommand POISONS on apply — the
+	// FSM skips the op SQL but still advances applied_index, and Node.Apply maps the
+	// non-error appliedPoison to nil, so the caller would see a false "ok" for a write
+	// that never executed. A malformed key cannot become valid on retry, so this is a
+	// permanent error (the responder maps it to a non-ok typed reply, never retriable).
+	if reqID != "" && !validReqID(reqID) {
+		return fmt.Errorf("cluster: invalid req_id %q (must be <=64 lowercase hex)", reqID)
+	}
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
 	if n.raft.State() != raft.Leader {
@@ -317,8 +346,16 @@ func (n *Node) Propose(plan func(db *sql.DB) (*Command, error)) error {
 	if cmd == nil {
 		return nil
 	}
+	if reqID != "" {
+		cmd.ReqID = reqID
+	}
 	return n.Apply(cmd)
 }
+
+// DedupCount returns how many committed entries the FSM has short-circuited via the
+// §4.1 D4 cross-retry ReqID ledger. Tests read it to assert the dedup branch fired
+// (the in-scope writes are SQL-idempotent, so a row-count assertion is vacuous).
+func (n *Node) DedupCount() uint64 { return n.fsm.dedupCount.Load() }
 
 // Snapshot forces raft to take a snapshot now (tests; raft's automatic cadence is
 // time/threshold based).
@@ -344,6 +381,13 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 // IsLeader reports whether this node currently believes it is leader (bounded
 // stale; for correctness-sensitive checks use VerifyLeaderRead).
 func (n *Node) IsLeader() bool { return n.raft.State() == raft.Leader }
+
+// TransferLeadership asks raft to hand leadership to a caught-up follower and blocks
+// until the transfer completes or fails. Leader-only (returns raft.ErrNotLeader
+// otherwise). Used by the D4 forwarding tests to deterministically land a retry under
+// a NEW leader (decoupling the commit fact from the leadership change, §0bis-C) and
+// by D7 drain. Not part of the §5 op set (it is a raft config/leadership action).
+func (n *Node) TransferLeadership() error { return n.raft.LeadershipTransfer().Error() }
 
 // Shutdown stops raft and closes the stores + DB handles in deterministic order.
 func (n *Node) Shutdown() error {

@@ -29,6 +29,18 @@ const (
 	applyRetryBackoff = 50 * time.Millisecond
 )
 
+// reqIDRetentionWindow bounds the cluster_reqid_ledger (§4.1 D4). It is in
+// RAFT-INDEX units and must exceed the maximum forwarder-retry horizon — bounded by
+// agent NATS reconnect backoff + the not_leader bounce loop (seconds-scale)
+// expressed in indices at the control-plane write rate (LOW: session-control
+// writes, not data-plane). 1<<20 ≈ 1M indices = months of operation before a key is
+// evicted, so a live retry is never aged out prematurely while growth stays bounded.
+// Decoupled from D5's raft_index:kind:seq audit-dedup window (which sizes itself).
+// A var (not const) only so the in-package GC vacuity test can shrink it; production
+// never reassigns it. Mutating it from a test is safe ONLY because no internal/cluster
+// test calls t.Parallel() (a parallel test would observe the shrunk window + race it).
+var reqIDRetentionWindow uint64 = 1 << 20
+
 // fsm implements raft.FSM over the cluster SQLite write pool.
 type fsm struct {
 	db     *sql.DB // the SetMaxOpenConns(1) write pool
@@ -43,12 +55,20 @@ type fsm struct {
 	// invariant #2), so the kill-9 matrix can assert the idempotent-skip path
 	// actually fired (non-vacuity). Atomic; read by tests.
 	reapplyCount atomic.Uint64
+
+	// dedupCount counts entries short-circuited by the §4.1 D4 cross-retry ReqID
+	// ledger (a committed-but-ack-lost forwarder retry arriving at a NEW index), so
+	// the forwarding-idempotency tests can assert the dedup branch actually fired
+	// (non-vacuity — the in-scope writes are SQL-idempotent so a row-count assertion
+	// alone is vacuous). Atomic; read by tests + Node.DedupCount.
+	dedupCount atomic.Uint64
 }
 
 // Apply result sentinels (returned via raft ApplyFuture.Response()).
 type appliedOK struct{ index uint64 }     // op executed + applied_index advanced
 type appliedNoOp struct{ index uint64 }   // idempotent re-apply skip (§3.7 #2); nothing written
 type appliedPoison struct{ index uint64 } // poison entry skipped, applied_index advanced past it (§2.8)
+type appliedDedup struct{ index uint64 }  // §4.1 D4: ReqID already committed; op SKIPPED but applied_index ADVANCED + committed (NOT a rollback — distinct from appliedNoOp)
 
 // Apply runs one committed log entry (architecture §3.2/§3.7). raft re-applies
 // log[lastSnapshot+1 .. commit] UNCONDITIONALLY on restart, so the FSM must be
@@ -118,6 +138,39 @@ func (f *fsm) applyCommand(l *raft.Log, cmd *Command) (any, error) {
 		return appliedNoOp{l.Index}, nil
 	}
 
+	// §4.1 D4 cross-retry dedup — runs AFTER the index-skip (so raft re-delivery of
+	// the SAME index stays on the cheap reapply path) and ONLY for a NEW index
+	// (l.Index > applied). A committed-but-ack-lost forwarder retry re-proposes the
+	// SAME ReqID at a NEW index; if the ledger already holds it the op ran on a prior
+	// committed entry, so SKIP the op SQL but STILL advance applied_index and COMMIT
+	// (raft advances lastApplied regardless of return value; a rollback here would
+	// wedge re-delivery forever). Distinct from appliedNoOp, which rolls back.
+	if cmd != nil && cmd.ReqID != "" {
+		seen, err := reqIDSeenTx(tx, cmd.ReqID)
+		if err != nil {
+			return nil, err
+		}
+		if seen {
+			f.dedupCount.Add(1)
+			if err := writeAppliedIndexTx(tx, l.Index, l.Term); err != nil {
+				return nil, err
+			}
+			if applyFailHook != nil {
+				if err := applyFailHook(l.Index); err != nil {
+					return nil, fmt.Errorf("cluster: injected apply failure @%d: %w", l.Index, err)
+				}
+			}
+			if applyCommitGate != nil {
+				applyCommitGate(l.Index)
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("cluster: commit dedup txn @%d: %w", l.Index, err)
+			}
+			committed = true
+			return appliedDedup{l.Index}, nil
+		}
+	}
+
 	if cmd != nil {
 		applier := f.appliers[cmd.Op]
 		if applier == nil {
@@ -126,6 +179,17 @@ func (f *fsm) applyCommand(l *raft.Log, cmd *Command) (any, error) {
 		}
 		if err := applier.ApplyTx(tx, cmd); err != nil {
 			return nil, fmt.Errorf("cluster: apply %s @%d: %w", cmd.Op, l.Index, err)
+		}
+		// NEW-ReqID path: record it + deterministic same-txn GC so a later retry
+		// dedups (above) and the ledger stays bounded. Every replica runs the
+		// identical INSERT + range-DELETE at the identical index (no wall-clock).
+		if cmd.ReqID != "" {
+			if err := insertReqIDTx(tx, cmd.ReqID, l.Index); err != nil {
+				return nil, err
+			}
+			if err := gcReqIDLedgerTx(tx, l.Index); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -186,6 +250,49 @@ func writeAppliedIndexTx(tx *sql.Tx, index, term uint64) error {
 	}
 	if _, err := tx.Exec(q, metaKeyAppliedTerm, formatUint(term)); err != nil {
 		return fmt.Errorf("cluster: write applied_term: %w", err)
+	}
+	return nil
+}
+
+// reqIDSeenTx reports whether req_id already stands in the ledger (a prior committed
+// entry minted it). §4.1 D4 cross-retry dedup.
+func reqIDSeenTx(tx *sql.Tx, reqID string) (bool, error) {
+	var one int
+	err := tx.QueryRow(`SELECT 1 FROM cluster_reqid_ledger WHERE req_id = ?`, reqID).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("cluster: reqid ledger lookup: %w", err)
+	}
+	return true, nil
+}
+
+// insertReqIDTx records a NEW req_id at raft index. The PRIMARY KEY is the
+// dedup-uniqueness backstop: a duplicate INSERT here is a programming bug (the
+// dedup branch should have caught it) and surfaces as an error → fail-stop.
+func insertReqIDTx(tx *sql.Tx, reqID string, index uint64) error {
+	if _, err := tx.Exec(
+		`INSERT INTO cluster_reqid_ledger(req_id, raft_index) VALUES(?, ?)`,
+		reqID, formatUint(index),
+	); err != nil {
+		return fmt.Errorf("cluster: reqid ledger insert: %w", err)
+	}
+	return nil
+}
+
+// gcReqIDLedgerTx range-deletes ledger rows older than reqIDRetentionWindow indices
+// behind the current index, in the SAME apply txn. Deterministic across replicas
+// (keyed on raft index, no wall-clock). Underflow (index <= window) deletes nothing.
+func gcReqIDLedgerTx(tx *sql.Tx, index uint64) error {
+	if index <= reqIDRetentionWindow {
+		return nil
+	}
+	cutoff := index - reqIDRetentionWindow
+	if _, err := tx.Exec(
+		`DELETE FROM cluster_reqid_ledger WHERE raft_index < ?`, formatUint(cutoff),
+	); err != nil {
+		return fmt.Errorf("cluster: reqid ledger gc: %w", err)
 	}
 	return nil
 }

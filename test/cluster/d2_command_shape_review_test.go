@@ -73,7 +73,7 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd, err = proc.PlanReconcileBatch([]proc.ExitMark{{PID: p.PID, ExitCode: -1, When: now}})
+	cmd, err = proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: []proc.ExitMark{{PID: p.PID, ExitCode: -1, When: now}}})
 	if err != nil {
 		t.Fatal(err)
 	}
