@@ -150,6 +150,26 @@ func TestD2Matrix(t *testing.T) {
 	}
 }
 
+// TestD3Matrix runs the D3 NATS-cluster-layer surface under -race: the mTLS raft
+// transport + fail-closed predicate (internal/cluster), the conf renderer
+// (internal/natscluster), the RF1 ACL templates + proto SSOT (internal/auth,
+// internal/proto), the handler seams (internal/authcallout), and the real ≥2-node
+// behavioral suite (test/d3). Dedicated -race subprocess like TestD1/D2Matrix; the
+// explicit 300s timeout overrides the suite default for the cluster election waits.
+func TestD3Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./internal/cluster/...", "./internal/natscluster/...", "./internal/authcallout/...",
+		"./internal/auth/...", "./internal/proto/...", "./test/d3/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d3 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

@@ -81,7 +81,12 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 		EmitEvent: b.pubSysEvent, // P7: member_joined / pin_failed → events stream
 	}
 
-	sub, err := nc.Subscribe("$SYS.REQ.USER.AUTH", func(msg *nats.Msg) {
+	// QueueSubscribe (not Subscribe) so that in a ≥2-node cluster exactly ONE
+	// broker answers each callout — every broker shares the "tether-authcallout"
+	// queue group (§6.2), and a request raised on server A can be answered by
+	// broker B over the routes. At N=1 a one-member queue group behaves identically
+	// to a plain subscription (zero regression).
+	sub, err := nc.QueueSubscribe("$SYS.REQ.USER.AUTH", "tether-authcallout", func(msg *nats.Msg) {
 		respJWT, err := h.Handle(string(msg.Data))
 		if err != nil {
 			b.cfg.Logger.Warn("authcallout: handle failed", "err", err)
@@ -92,7 +97,7 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 		}
 	})
 	if err != nil {
-		return nil, fmt.Errorf("broker: subscribe $SYS.REQ.USER.AUTH: %w", err)
+		return nil, fmt.Errorf("broker: queue-subscribe $SYS.REQ.USER.AUTH: %w", err)
 	}
 	b.cfg.Logger.Info("broker: auth_callout active")
 	return sub, nil

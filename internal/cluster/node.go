@@ -37,7 +37,34 @@ type Config struct {
 	Logger *slog.Logger
 	// ApplyTimeout overrides defaultApplyTimeout when non-zero.
 	ApplyTimeout time.Duration
+
+	// HeartbeatTimeout / ElectionTimeout / LeaderLeaseTimeout / CommitTimeout
+	// override raft's per-Node timeouts. Zero => the D1/D2 fast N=1 defaults
+	// (200ms / 20ms) so existing single-node tests are byte-unchanged. D3
+	// multinode harnesses (and the D9 production cutover) pass the safe
+	// Multinode* values below (1000/1000/500ms). raft validates
+	// LeaderLeaseTimeout <= HeartbeatTimeout <= ElectionTimeout (config.go:369/372).
+	HeartbeatTimeout   time.Duration
+	ElectionTimeout    time.Duration
+	LeaderLeaseTimeout time.Duration
+	CommitTimeout      time.Duration
+
+	// BootstrapPeers, when non-empty, is the initial raft Configuration used on
+	// FIRST boot (no existing state) — the D3 static multi-node bootstrap. Empty
+	// => bootstrap a {self}-only single-node cluster (production / D1 / D2).
+	// Dynamic membership (raft.AddVoter + join-PoP) is D7, NOT this.
+	BootstrapPeers []raft.Server
 }
+
+// Multinode raft timeouts (§8.4 / d3-plan R6): the safe values D3 harnesses and
+// the D9 production cutover pass into Config. LeaderLeaseTimeout=500ms (the raft
+// default), deliberately NOT 1000ms — a longer lease widens the §3.2 stale-leader
+// fail-open window. raft requires Lease <= Heartbeat <= Election.
+const (
+	MultinodeHeartbeatTimeout   = 1000 * time.Millisecond
+	MultinodeElectionTimeout    = 1000 * time.Millisecond
+	MultinodeLeaderLeaseTimeout = 500 * time.Millisecond
+)
 
 // Node is a single-node raft state layer.
 type Node struct {
@@ -46,6 +73,7 @@ type Node struct {
 	store        *raftboltdb.BoltStore
 	db           *sql.DB // write pool (owned)
 	ro           *sql.DB // read-only backup handle (owned)
+	transport    raft.Transport // injected; closed by Shutdown (raft does not reap it)
 	applyTimeout time.Duration
 	logger       *slog.Logger
 
@@ -65,6 +93,18 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Transport == nil {
 		return nil, errors.New("cluster: New requires a Transport")
 	}
+	// On ANY error exit, close the injected transport ourselves: New returns
+	// (nil, err) so the caller has no *Node to Shutdown, and the transport's
+	// listener fd + accept goroutine would otherwise leak (d3-review B3). On
+	// success the Node owns it and Shutdown closes it.
+	success := false
+	defer func() {
+		if !success {
+			if c, ok := cfg.Transport.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
+	}()
 	if cfg.DBPath == "" || cfg.DataDir == "" {
 		return nil, errors.New("cluster: New requires DBPath and DataDir")
 	}
@@ -119,7 +159,7 @@ func New(cfg Config) (*Node, error) {
 		appliers: defaultAppliers(),
 		logger:   logger,
 	}
-	rc := raftConfig(cfg.LocalID)
+	rc := raftConfig(cfg)
 
 	existing, err := raft.HasExistingState(store, store, snaps)
 	if err != nil {
@@ -129,9 +169,16 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("cluster: probe existing raft state: %w", err)
 	}
 	if !existing {
-		cfgr := raft.Configuration{Servers: []raft.Server{{
-			Suffrage: raft.Voter, ID: cfg.LocalID, Address: cfg.Transport.LocalAddr(),
-		}}}
+		// D3 static multi-node bootstrap: if BootstrapPeers is set, bring up the
+		// whole initial voter set at once; else a {self}-only single node. Dynamic
+		// AddVoter/join-PoP is D7 (not here).
+		servers := cfg.BootstrapPeers
+		if len(servers) == 0 {
+			servers = []raft.Server{{
+				Suffrage: raft.Voter, ID: cfg.LocalID, Address: cfg.Transport.LocalAddr(),
+			}}
+		}
+		cfgr := raft.Configuration{Servers: servers}
 		if err := raft.BootstrapCluster(rc, store, store, snaps, cfg.Transport, cfgr); err != nil {
 			_ = store.Close()
 			_ = ro.Close()
@@ -148,28 +195,31 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("cluster: NewRaft: %w", err)
 	}
 
+	success = true // Node now owns the transport; Shutdown will close it.
 	return &Node{
 		raft:         r,
 		fsm:          f,
 		store:        store,
 		db:           db,
 		ro:           ro,
+		transport:    cfg.Transport,
 		applyTimeout: applyTimeout,
 		logger:       logger,
 	}, nil
 }
 
-// raftConfig builds the raft.Config. PreVoteDisabled stays false (pre-vote
-// enabled — a forward invariant for D3 multinode; vacuous at N=1). Sub-second
-// timeouts give fast N=1 leadership with no contention; D3 tunes them for
-// multinode.
-func raftConfig(id raft.ServerID) *raft.Config {
+// raftConfig builds the raft.Config. Timeouts come from cfg when set, else the
+// D1/D2 fast N=1 defaults (200ms / 20ms) so existing single-node tests are
+// byte-unchanged; D3 multinode harnesses pass cluster.Multinode* values via
+// Config. PreVoteDisabled stays false (pre-vote enabled — re-proven over the real
+// mTLS transport in D3; vacuous at N=1).
+func raftConfig(cfg Config) *raft.Config {
 	c := raft.DefaultConfig()
-	c.LocalID = id
-	c.HeartbeatTimeout = 200 * time.Millisecond
-	c.ElectionTimeout = 200 * time.Millisecond
-	c.LeaderLeaseTimeout = 200 * time.Millisecond
-	c.CommitTimeout = 20 * time.Millisecond
+	c.LocalID = cfg.LocalID
+	c.HeartbeatTimeout = orDur(cfg.HeartbeatTimeout, 200*time.Millisecond)
+	c.ElectionTimeout = orDur(cfg.ElectionTimeout, 200*time.Millisecond)
+	c.LeaderLeaseTimeout = orDur(cfg.LeaderLeaseTimeout, 200*time.Millisecond)
+	c.CommitTimeout = orDur(cfg.CommitTimeout, 20*time.Millisecond)
 	c.LogOutput = io.Discard // D1: discard raft's internal chatter; D3 wires logging
 	// SQLite is the durable apply authority (§3.7): on restart it already holds
 	// the committed state, and raft re-applies the log idempotently (the FSM
@@ -180,6 +230,24 @@ func raftConfig(id raft.ServerID) *raft.Config {
 	// direct restore test; the N=1 crash-recovery path is pure idempotent replay.
 	c.NoSnapshotRestoreOnStart = true
 	return c
+}
+
+// orDur returns v when positive, else def.
+func orDur(v, def time.Duration) time.Duration {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
+// IsNotLeader reports whether err is the raft "not the leader" family
+// (raft.ErrNotLeader / raft.ErrLeadershipLost) that Apply/Propose surface
+// unwrapped on a follower or a just-deposed leader. It is the seam-building
+// primitive the broker/D9 uses to translate a Propose failure into the
+// raft-free authcallout.ErrNotLeader sentinel (architecture L-2 keeps raft out of
+// authcallout): `if cluster.IsNotLeader(err) { return authcallout.ErrNotLeader }`.
+func IsNotLeader(err error) bool {
+	return errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost)
 }
 
 // Apply proposes a command through raft. On a deposed leader the returned error
@@ -225,9 +293,23 @@ func (n *Node) ApplyMetaSet(key, value string) error {
 // SetMaxOpenConns(1)): the plan closure MUST fully materialize and close every
 // *sql.Rows and hold NO open *sql.Tx before returning the Command. Otherwise the
 // FSM's Begin() inside raft.Apply blocks forever on the one pooled connection.
+//
+// LEADER GATE (external-review F1): Plan is LEADER-ONLY (§3.3) — it reads n.db as
+// the authoritative leader DB and bakes keys/fences. On a FOLLOWER the local
+// replica may be bounded-stale, so running Plan there can leak a spurious PERMANENT
+// business error (e.g. agentprov.ErrSessionMissing when the session row has not
+// replicated yet) instead of the transient not-leader signal the caller needs
+// (D3-R3). So fail fast with raft.ErrNotLeader BEFORE planning when not leader; the
+// seam maps it to authcallout.ErrNotLeader via cluster.IsNotLeader. A leadership
+// loss racing between this check and Apply surfaces as raft.ErrLeadershipLost from
+// Apply — also transient (cluster.IsNotLeader). Held under applyMu so the check is
+// part of the same serialized {gate -> Plan -> Apply} window.
 func (n *Node) Propose(plan func(db *sql.DB) (*Command, error)) error {
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
+	if n.raft.State() != raft.Leader {
+		return raft.ErrNotLeader
+	}
 	cmd, err := plan(n.db)
 	if err != nil {
 		return err
@@ -268,6 +350,12 @@ func (n *Node) Shutdown() error {
 	var errs []error
 	if n.raft != nil {
 		errs = append(errs, n.raft.Shutdown().Error())
+	}
+	// Close the injected transport ourselves — raft.Shutdown() does not reap an
+	// externally-supplied transport (d3-plan R5). NetworkTransport holds a listener
+	// + goroutines; InmemTransport.Close is a harmless DisconnectAll.
+	if c, ok := n.transport.(io.Closer); ok {
+		errs = append(errs, c.Close())
 	}
 	if n.store != nil {
 		errs = append(errs, n.store.Close())

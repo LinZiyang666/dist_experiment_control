@@ -64,9 +64,53 @@ type Handler struct {
 	// so the broker injects this callback that wraps its pubSysEvent.
 	// Nil callback = no emission, fine for unit tests / pre-P7 builds.
 	EmitEvent func(kind string, fields map[string]any)
+
+	// LeaderContactStale, when non-nil, fences already-provisioned (no-PIN)
+	// authorize decisions: if it returns true (this node lost timely leader
+	// contact beyond T_fence) the handler DENIES even a valid member/agent
+	// reconnect (distributed-broker §3.2/§6.2 fail-closed). nil => never fenced —
+	// today's single-node behavior, the production default in D3 (no cluster.Node
+	// is wired into the live broker until D9).
+	LeaderContactStale func(now time.Time) bool
+
+	// JoinMemberWrite / ProvisionAgentWrite, when non-nil, route the PIN-bootstrap
+	// WRITE through the cluster FSM (leader-only Node.Propose) instead of a direct
+	// local mutator. They MUST return the same typed errors as session.JoinWithPIN /
+	// agentprov.ProvisionWithPIN, plus authcallout.ErrNotLeader when this broker is
+	// not the leader (D3-R3: a transient deny, never a false-allow or an
+	// un-replicated local write). nil => direct local mutator (production default
+	// in D3). Transparent follower→leader forwarding is D4.
+	JoinMemberWrite     func(sid, fp, pin string, now time.Time) error
+	ProvisionAgentWrite func(sid, nid, fp, pin string, now time.Time) error
 }
 
+// ErrNotLeader is the transient deny a clustered write seam returns when this
+// broker is not the raft leader (D3-R3). The PIN bootstrap cannot complete here;
+// the request is retriable (e.g. the client reconnects onto the leader). It is
+// NEVER a false-allow and NEVER an un-replicated local write.
+var ErrNotLeader = errors.New("not_leader: cluster write must go to the leader (retriable)")
+
+// ErrFenced is the transient deny returned when this node has lost timely leader
+// contact (> T_fence) and must fail closed (§3.2/§6.2). Retriable once contact
+// is restored.
+var ErrFenced = errors.New("fenced: node lost leader contact (retriable)")
+
 const defaultJWTTTL = 24 * time.Hour
+
+// fenced reports whether this node must fail closed right now (LeaderContactStale
+// wired and tripped). nil predicate => never fenced (production default in D3).
+func (h *Handler) fenced() bool {
+	return h.LeaderContactStale != nil && h.LeaderContactStale(h.Now())
+}
+
+// isNotLeader classifies a write-seam error as the transient not-leader case. The
+// handler stays raft-free (architecture L-2: raft is confined to internal/cluster):
+// the clustered seam (built by the broker/D9, which may import raft — see
+// cluster.IsNotLeader) is responsible for translating raw raft.ErrNotLeader /
+// raft.ErrLeadershipLost into this sentinel before returning. §6.2 / D3-R3.
+func isNotLeader(err error) bool {
+	return errors.Is(err, ErrNotLeader)
+}
 
 // Handle decodes the request, decides permissions, returns the response JWT.
 // On any decision failure (not a member, bad PIN, malformed), returns an
@@ -214,6 +258,11 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 		if !active {
 			return fmt.Errorf("session %q not active", sid)
 		}
+		// Already-provisioned (no-PIN) local-replica read: fail closed if this
+		// node lost timely leader contact (§3.2/§6.2).
+		if h.fenced() {
+			return ErrFenced
+		}
 		return nil
 	case errors.Is(err, agentprov.ErrNotProvisioned):
 		// fall through to PIN-bootstrap below
@@ -224,12 +273,22 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 	if pin == "" {
 		return fmt.Errorf("agent (sid=%q, nid=%q) not provisioned; first connect must supply --pin", sid, nid)
 	}
-	switch err := agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, h.Now()); {
+	// PIN-bootstrap WRITE: route through the cluster FSM (leader-only) when wired,
+	// else the direct local mutator (production default in D3).
+	provision := h.ProvisionAgentWrite
+	if provision == nil {
+		provision = func(sid, nid, fp, pin string, now time.Time) error {
+			return agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, now)
+		}
+	}
+	switch err := provision(sid, nid, fp, pin, h.Now()); {
 	case err == nil:
 		h.emit("member_joined", map[string]any{
 			"sid": sid, "nid": nid, "fp": fp, "via": "pin", "role": "agent",
 		})
 		return nil
+	case isNotLeader(err):
+		return ErrNotLeader // transient — never false-allow (D3-R3)
 	case errors.Is(err, agentprov.ErrSessionMissing):
 		return fmt.Errorf("session %q does not exist", sid)
 	case errors.Is(err, agentprov.ErrSessionDeleting):
@@ -263,12 +322,28 @@ func (h *Handler) ensureMember(sid, fp, pin string) error {
 		return fmt.Errorf("member check: %w", err)
 	}
 	if member {
+		// Already-provisioned (no-PIN) local-replica read: fail closed if this
+		// node lost timely leader contact (§3.2/§6.2).
+		if h.fenced() {
+			return ErrFenced
+		}
 		return nil
 	}
 	if pin == "" {
 		return fmt.Errorf("not a member of session %q", sid)
 	}
-	if err := session.JoinWithPIN(h.DB, sid, fp, pin, auth.VerifyPIN, h.Now()); err != nil {
+	// PIN-bootstrap WRITE: route through the cluster FSM (leader-only) when wired,
+	// else the direct local mutator (production default in D3).
+	join := h.JoinMemberWrite
+	if join == nil {
+		join = func(sid, fp, pin string, now time.Time) error {
+			return session.JoinWithPIN(h.DB, sid, fp, pin, auth.VerifyPIN, now)
+		}
+	}
+	if err := join(sid, fp, pin, h.Now()); err != nil {
+		if isNotLeader(err) {
+			return ErrNotLeader // transient — never false-allow (D3-R3)
+		}
 		if errors.Is(err, session.ErrInvalidPIN) {
 			h.emit("pin_failed", map[string]any{"sid": sid, "fp": fp, "role": "ctl"})
 			return fmt.Errorf("invalid PIN for session %q", sid)

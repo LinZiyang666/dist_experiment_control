@@ -144,6 +144,56 @@ func TestSubjectPrefixInSyncWithProto(t *testing.T) {
 	}
 }
 
+// TestD3RF1ClusterACLOnlyBroker (distributed-broker §6.2 RF1): the broker-only
+// cluster.* ACL must be present in the broker template (pub AND sub) and ABSENT
+// from every user template. The guard matches the version-prefixed literal
+// (tether.v2.cluster…), NOT a bare "cluster." substring, so it cannot false-match
+// an unrelated subject.
+func TestD3RF1ClusterACLOnlyBroker(t *testing.T) {
+	clusterPrefix := subjectPrefix + ".cluster"
+	wantBroker := []string{subjectPrefix + ".cluster.apply.>", subjectPrefix + ".cluster.>"}
+
+	for _, tc := range allTemplates() {
+		has := func(set []string, want string) bool {
+			for _, s := range set {
+				if s == want {
+					return true
+				}
+			}
+			return false
+		}
+		if tc.brokerWide {
+			for _, w := range wantBroker {
+				if !has(tc.perms.Pub.Allow, w) {
+					t.Errorf("broker template missing PUB %q (RF1 forwarder publishes here)", w)
+				}
+				if !has(tc.perms.Sub.Allow, w) {
+					t.Errorf("broker template missing SUB %q (RF1 leader subscribes here)", w)
+				}
+			}
+			continue
+		}
+		for _, entry := range allEntries(tc.perms) {
+			if strings.HasPrefix(entry, clusterPrefix) {
+				t.Errorf("%s: user template must NOT carry any cluster.* grant, found %q", tc.name, entry)
+			}
+			// User templates must also never reach the system account ($SYS.*) —
+			// that is where the PIN-bearing auth requests flow (broker-only).
+			if strings.HasPrefix(entry, "$SYS.") {
+				t.Errorf("%s: user template must NOT carry any $SYS.* grant, found %q", tc.name, entry)
+			}
+		}
+	}
+
+	// SSOT cross-check: the literals in PermissionsForBroker match proto's SSOT.
+	if proto.SubjClusterApplyWildcard != subjectPrefix+".cluster.apply.>" {
+		t.Errorf("proto.SubjClusterApplyWildcard=%q out of sync with auth ACL literal", proto.SubjClusterApplyWildcard)
+	}
+	if proto.SubjClusterWildcard != subjectPrefix+".cluster.>" {
+		t.Errorf("proto.SubjClusterWildcard=%q out of sync with auth ACL literal", proto.SubjClusterWildcard)
+	}
+}
+
 func allEntries(p jwt.Permissions) []string {
 	out := make([]string, 0, len(p.Pub.Allow)+len(p.Sub.Allow))
 	out = append(out, p.Pub.Allow...)

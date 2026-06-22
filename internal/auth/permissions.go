@@ -198,6 +198,12 @@ func PermissionsForBroker() jwt.Permissions {
 			subjectPrefix + ".s.*.audit.>",
 			subjectPrefix + ".ctrl.version.announce",
 			subjectPrefix + ".sys.events",
+			// RF1 broker-only cluster ACL (distributed-broker §6.2). Granted ONLY
+			// to broker nkey AuthUsers; the D4 follower publishes a forwarded write
+			// here, so the broker needs PUB. Version-prefixed, SSOT in
+			// proto.SubjClusterApplyWildcard / proto.SubjClusterWildcard.
+			subjectPrefix + ".cluster.apply.>",
+			subjectPrefix + ".cluster.>",
 			"_INBOX.>",
 			// auth_callout responses (msg.Respond → $SYS._INBOX.<server>.<rand>).
 			"$SYS._INBOX.>",
@@ -218,6 +224,11 @@ func PermissionsForBroker() jwt.Permissions {
 			subjectPrefix + ".s.*.cmd.by.*.node.*.*.req",
 			subjectPrefix + ".s.*.ev.>",
 			subjectPrefix + ".s.*.pty.*.failed",
+			// RF1 broker-only cluster ACL (distributed-broker §6.2). The D4 leader
+			// SUBSCRIBES here to receive forwarded writes. Granted ONLY to broker
+			// nkey AuthUsers.
+			subjectPrefix + ".cluster.apply.>",
+			subjectPrefix + ".cluster.>",
 			"$SYS.REQ.USER.AUTH",
 			"_INBOX.>",
 		}},

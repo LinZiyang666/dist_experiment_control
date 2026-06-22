@@ -11,6 +11,28 @@ const (
 	SubjSysEvents       = SubjectPrefix + ".sys.events"
 )
 
+// Cluster control plane (distributed-broker, D3+). These are the SSOT for the
+// broker-only inter-broker subjects: the D4 follower→leader write-forwarding verb
+// space (cluster.apply.<verb>) and the broader cluster.> namespace. Per §6.2 RF1
+// the pub/sub permission for these is granted ONLY to broker nkey AuthUsers
+// (auth.PermissionsForBroker); member/agent/unactivated user JWTs never carry them.
+// D3 wires the ACL; the actual forwarding publish/subscribe is D4.
+const (
+	// SubjClusterPrefix is the root of the broker-only cluster namespace.
+	SubjClusterPrefix = SubjectPrefix + ".cluster"
+	// SubjClusterApplyPrefix is the root of the D4 write-forwarding verb space.
+	SubjClusterApplyPrefix = SubjClusterPrefix + ".apply"
+	// SubjClusterApplyWildcard / SubjClusterWildcard are the NATS ACL grants.
+	SubjClusterApplyWildcard = SubjClusterApplyPrefix + ".>"
+	SubjClusterWildcard      = SubjClusterPrefix + ".>"
+)
+
+// SubjClusterApply returns "tether.v2.cluster.apply.<verb>" — the broker-only
+// subject a follower publishes a forwarded session-control write to (D4). §4.1.
+func SubjClusterApply(verb string) string {
+	return fmt.Sprintf("%s.%s", SubjClusterApplyPrefix, verb)
+}
+
 // SubjCtrlBy returns "tether.v2.ctrl.by.<actor>.<leaf>".
 // Used for actor-scoped global control messages (session.create/list/...).
 func SubjCtrlBy(actor, leaf string) string {
