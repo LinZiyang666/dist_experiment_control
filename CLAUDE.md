@@ -87,6 +87,7 @@
   - **D0**（前置门 + proto v2 SSOT + migrations 0008–0010 + PreVote 合并门）— **已 commit 进 main**。
   - **D1**（状态层：单节点 Raft FSM + SQLite Apply 同 txn `applied_index` + 幂等重投 + online-backup 快照/恢复 + kill-9 矩阵）— **DONE**（内审 + 外审 PASS，commit `bc181c1`）。报告 `docs/reviews/d1-{plan,review,external-review}.md`。
   - **D2**（op 集 + 全 mutator Plan/Apply 移植 → **N=1 功能等价**）— **DONE**（内审 + 外审 PASS，commit `38e2576` + pushed main）。**ops-only 不切线上 broker**（cutover=D9）；全 13 op + sqlbake(`LitTime=t.String()` 不强制 UTC、禁 `Args`、拒 NUL/非 UTF-8) + `Node.Propose` applyMu 接缝 + CHA §13.1 lint + DIFF-1 差分(UTC+非UTC) + TestD2Matrix。报告 `docs/reviews/d2-{plan,review,external-review}.md`。
+  - **D3**（NATS 集群层 ≥2 节点：routes mTLS + auth_callout 本地读 + fail-closed `T_fence` + broker-only ACL）— **DONE**（内审 + 外审 round-2 PASS，commit `d15472d` + pushed main）。**build-and-prove 不切线上 broker**（cutover=D9，同 D2）：真 mTLS raft `NetworkTransport`(无 `NewTLSTransport`)+静态 `BootstrapPeers`(动态 AddVoter=D7) + 单一 `LeaderContactStale` 谓词(leader 无状态/follower `LastContact`，读路不调 VerifyLeader) + RF1 `tether.v2.cluster.*` ACL(SSOT proto，仅 `PermissionsForBroker`) + `internal/natscluster` conf 渲染器 + auth_callout 本地读 fail-closed + PIN 写经 raft-free `Node.Propose` seam(`cluster.IsNotLeader` 映射)。生产 `serve.go` 不构造 `cluster.Node`、seam 缺省 no-op(guard 测试锁)。**外审 F1 修**：`Propose` 跑 leader-only Plan 前先门 leadership(非 leader 返 `raft.ErrNotLeader`，不在 follower 陈旧副本跑 Plan)。报告 `docs/reviews/d3-{plan,review,external-review}.md`。
 - 实机环境与历史验证见 `log.md`（broker `pc732.emulab.net` / `weiland.top`，多 agent）。
 
 ### 已知未收口 / 缺口（接手时优先处理）
@@ -98,4 +99,4 @@
 
 ### 下一步
 
-- **D2 DONE（外审 PASS，已 push main）**；下一步 **D3**（NATS 集群层 ≥2 节点 routes + auth_callout 本地读 + fail-closed `T_fence` + broker-only ACL）。依赖 D2 出口（N=1 等价）已过。注意 proto v2 不发现网 v1 车队。
+- **D3 DONE（外审 round-2 PASS，已 push main，`d15472d`）**；下一步 **D4**（写转发 `apply.*`：follower→leader 经 broker-only `tether.v2.cluster.apply.<verb>` 转 leader + not_leader typed fail-closed + 发起 broker 铸跨重试稳定幂等键 + G.1 `reconcileOnRegister` 整算一条 `ReconcileBatch` entry/审计可重导）。依赖 D3 出口（≥2 节点 routes + broker-only ACL + 跨服务器 callout）已过；`SubjClusterApply(verb)` SSOT + `cluster.IsNotLeader` seam 原语已就位（D3 留给 D4）。注意 proto v2 不发现网 v1 车队。
