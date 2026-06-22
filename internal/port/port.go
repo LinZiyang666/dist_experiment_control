@@ -209,7 +209,15 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, cre
 // ALLOCATED row. O(N) in the band size; fine for v1's 1000-port range.
 // A future P-future could keep an in-memory free-list seeded from DB on
 // boot, but the SQL is plenty fast for v1's expected volumes.
-func findFreePort(tx *sql.Tx, low, high int) (int, error) {
+// rowsQueryer is satisfied by both *sql.Tx (today's Allocate, inside its txn) and
+// *sql.DB (D2 PlanAllocate, a leader read under Node.applyMu). findFreePort is
+// deterministic regardless of which it gets: it builds a `taken` set then scans
+// low->high in order, so the returned port does not depend on row iteration order.
+type rowsQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func findFreePort(tx rowsQueryer, low, high int) (int, error) {
 	rows, err := tx.Query(
 		`SELECT port FROM port_allocations WHERE state='ALLOCATED' AND port BETWEEN ? AND ? ORDER BY port`,
 		low, high,

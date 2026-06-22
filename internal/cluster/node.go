@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -47,6 +48,14 @@ type Node struct {
 	ro           *sql.DB // read-only backup handle (owned)
 	applyTimeout time.Duration
 	logger       *slog.Logger
+
+	// applyMu serializes the leader-side {Plan reads leader DB} + {raft.Apply} +
+	// {await} window so two concurrent compound mutators (e.g. PlanAllocate's
+	// findFreePort scan) cannot bake conflicting keys that both commit
+	// (d2-plan §3 PA-5/PA-8). Held only by Propose; liveness/GC writes do NOT take
+	// it (they touch disjoint tables/columns — the table-ownership disjointness
+	// argument in d2-plan §3).
+	applyMu sync.Mutex
 }
 
 // New opens the cluster DB (WAL + a dedicated read-only handle), the raft
@@ -200,6 +209,31 @@ func (n *Node) ApplyMetaSet(key, value string) error {
 	cmd, err := clusterMetaPlanner{}.Plan(context.Background(), n.db, metaSetReq{Key: key, Value: value})
 	if err != nil {
 		return err
+	}
+	return n.Apply(cmd)
+}
+
+// Propose renders an op on the leader DB and applies it through raft, holding the
+// leader-side applyMu across the whole {Plan read -> raft.Apply -> await} window.
+// This is the D2 ops-only seam (the per-op typed Plan* funcs live in the mutator
+// packages and return a *Command). Any secret the plan mints (e.g. a raw port
+// token) is captured by the closure and returned to the caller OUT OF BAND — it
+// is NEVER part of the replicated Command (only its hash is). A plan returning a
+// nil command + nil error is a no-op (nothing proposed).
+//
+// CONTRACT (load-bearing — fsm.db and n.db are the SAME single-writer pool,
+// SetMaxOpenConns(1)): the plan closure MUST fully materialize and close every
+// *sql.Rows and hold NO open *sql.Tx before returning the Command. Otherwise the
+// FSM's Begin() inside raft.Apply blocks forever on the one pooled connection.
+func (n *Node) Propose(plan func(db *sql.DB) (*Command, error)) error {
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+	cmd, err := plan(n.db)
+	if err != nil {
+		return err
+	}
+	if cmd == nil {
+		return nil
 	}
 	return n.Apply(cmd)
 }

@@ -54,8 +54,9 @@ func notTest(fi fs.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.
 var determinismTargetPkgs = []string{"port", "proc", "node", "session", "agentprov"}
 
 var bannedImports = map[string]bool{
-	`"crypto/rand"`:               true,
-	`"math/rand"`:                 true,
+	`"crypto/rand"`:              true,
+	`"math/rand"`:                true,
+	`"math/rand/v2"`:             true,
 	`"github.com/oklog/ulid/v2"`: true,
 }
 
@@ -87,17 +88,20 @@ func TestDeterminismBannedImportBaseline(t *testing.T) {
 			}
 		}
 	}
-	// Compare got against the baseline.
-	for pkg, imp := range bannedBaseline {
-		if len(got[pkg]) != 1 || got[pkg][0] != imp {
-			t.Errorf("baseline drift in %q: want exactly [%s], got %v "+
-				"(TODO(D2): banned-import gate tightens to t.Fatal once Plan/Apply split exists)", pkg, imp, got[pkg])
-		}
-	}
+	// D2-R5: the gate is now ASYMMETRIC. The real Apply-reachability guarantee is
+	// TestApplyReachability_NoNondeterministicImports (CHA-based). This baseline is
+	// only a tripwire for a NEW banned import in a target package — it must NOT fire
+	// when a baselined hit is REMOVED, because a legitimate Plan-side relocation
+	// (e.g. moving a token mint behind a leader-only Plan) can drop one. So: red only
+	// on a banned import that is NOT the package's baselined one.
 	for pkg, imps := range got {
-		if _, ok := bannedBaseline[pkg]; !ok {
-			t.Errorf("NEW banned import(s) in %q: %v — a target package gained a non-deterministic "+
-				"import; if this is intentional, update bannedBaseline and re-check the Plan/Apply contract", pkg, imps)
+		allowed := bannedBaseline[pkg] // "" if pkg has no baselined banned import
+		for _, imp := range imps {
+			if imp != allowed {
+				t.Errorf("NEW banned import %s in %q (not the baselined %q) — a target package gained a "+
+					"non-deterministic import; ensure it is NOT reachable from Apply (the CHA lint checks "+
+					"that) and update bannedBaseline if intentional", imp, pkg, allowed)
+			}
 		}
 	}
 }
@@ -113,8 +117,8 @@ func TestDeterminismBannedImportBaseline(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 var raftImportPaths = map[string]bool{
-	`"github.com/hashicorp/raft"`:             true,
-	`"github.com/hashicorp/raft-boltdb/v2"`:   true,
+	`"github.com/hashicorp/raft"`:           true,
+	`"github.com/hashicorp/raft-boltdb/v2"`: true,
 }
 
 func TestRaftConfinedToClusterPackage(t *testing.T) {
@@ -232,15 +236,15 @@ func TestLivenessColumnLintSelfCheck(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Apply-reachability — D2 stub. Registered so D2 has a named接续点.
+// Apply-reachability — IMPLEMENTED in D2 (apply_reachability_test.go).
 // ---------------------------------------------------------------------------
-
-func TestApplyReachabilityDeterminismLint(t *testing.T) {
-	t.Skip("D2: Apply-reachability lint (forbid FSM-external INSERT to Apply-owned tables, " +
-		"forbid Apply→*sql.DB mutators, column-level activity assertions) — no FSM/Apply root " +
-		"exists in D0, so the reachability graph cannot be built yet (§13.1, d0-plan §6). The " +
-		"runnable D0 skeleton is the banned-import baseline + raft-confinement guard above.")
-}
+//
+// The D0 stub here is superseded by TestApplyReachability_NoNondeterministicImports
+// (apply_reachability_test.go), which builds a CHA call graph from the real FSM
+// Apply root and asserts no in-module function reachable from Apply calls a
+// nondeterministic source (crypto/rand / math/rand / oklog/ulid), with a positive
+// control proving the walk is non-vacuous. The column-level liveness assertion +
+// "no FSM-external INSERT to Apply-owned tables" land alongside it as D2 matures.
 
 // ---------------------------------------------------------------------------
 // TestNoStrayVersionLiteral — version-prefix SSOT tripwire.

@@ -51,15 +51,24 @@ func newClusterMetaSet(key, value string) (*Command, error) {
 	}, nil
 }
 
-type clusterMetaApplier struct{}
+// genericExecApplier execs an op's baked statements inside the FSM's
+// transaction, in Body order. It is the shared Applier for every D2 op: because
+// the leader bakes ALL values into Statement.SQL as literals (sqlbake.go), the
+// Apply side is a pure "exec the leader-rendered SQL" with no per-op branching
+// and no out-of-band Args. (OpClusterMetaSet rides the same applier carrying its
+// one string value via Args, which is JSON-round-trip-stable.)
+//
+// Consequence the determinism lint must own (d2-plan §6): this generic applier
+// SEVERS the static call graph from a per-op Plan, so an import-reachability lint
+// rooted at the Applier is tautologically clean and CANNOT prove Plan-side
+// determinism. The real determinism guarantor is §13.2 multi-FSM equivalence;
+// the lint is a tripwire, not a proof.
+type genericExecApplier struct{}
 
-// compile-time proof that the only D1 Applier is *sql.Tx-bound (§3.2/§3.7).
-var _ Applier = clusterMetaApplier{}
+// compile-time proof the shared Applier is *sql.Tx-bound (§3.2/§3.7).
+var _ Applier = genericExecApplier{}
 
-// ApplyTx execs the op's baked statements inside the FSM's transaction. D1's
-// applier is the generic "exec the leader-rendered SQL" path; D2's typed ops
-// attach richer per-op logic behind this same seam.
-func (clusterMetaApplier) ApplyTx(tx *sql.Tx, cmd *Command) error {
+func (genericExecApplier) ApplyTx(tx *sql.Tx, cmd *Command) error {
 	for i, st := range cmd.Body {
 		if _, err := tx.Exec(st.SQL, st.Args...); err != nil {
 			return fmt.Errorf("cluster: exec stmt %d: %w", i, err)
@@ -68,10 +77,27 @@ func (clusterMetaApplier) ApplyTx(tx *sql.Tx, cmd *Command) error {
 	return nil
 }
 
-// defaultAppliers is the op→Applier dispatch table the FSM uses. D1 registers one
-// op; D2 grows this to the typed §5 set.
+// defaultAppliers is the op→Applier dispatch table the FSM uses. Every D2 op
+// shares genericExecApplier (all logic is on the leader Plan side); the per-op
+// registration keeps the raft log self-describing and leaves room for a future
+// op that needs bespoke Apply logic (none in D2 — Apply-side reads would break
+// §3.3 determinism).
 func defaultAppliers() map[OpType]Applier {
+	exec := genericExecApplier{}
 	return map[OpType]Applier{
-		OpClusterMetaSet: clusterMetaApplier{},
+		OpClusterMetaSet:    exec,
+		OpSessionCreate:     exec,
+		OpSessionTombstone:  exec,
+		OpSessionHardDelete: exec,
+		OpMemberJoin:        exec,
+		OpNodeRegister:      exec,
+		OpNodeEvict:         exec,
+		OpProcCreate:        exec,
+		OpProcMarkExited:    exec,
+		OpReconcileBatch:    exec,
+		OpPortAllocate:      exec,
+		OpPortFree:          exec,
+		OpPortRevoke:        exec,
+		OpAgentProvision:    exec,
 	}
 }

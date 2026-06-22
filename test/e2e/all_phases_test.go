@@ -131,6 +131,25 @@ func TestD1Matrix(t *testing.T) {
 	}
 }
 
+// TestD2Matrix runs the D2 op-set / Plan-Apply migration surface under -race: the
+// mutator packages (per-op Plan* + the equivalence/differential harnesses), the
+// cluster FSM, and the determinism CHA Apply-reachability lint. Kept as a dedicated
+// -race subprocess (not in allPhases) like TestD1Matrix.
+func TestD2Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./internal/cluster/...", "./internal/port/...", "./internal/proc/...",
+		"./internal/node/...", "./internal/session/...", "./internal/agentprov/...",
+		"./test/cluster/...", "./test/determinism/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d2 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

@@ -34,10 +34,63 @@
 package broker
 
 import (
+	"time"
+
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
+
+// resolveReconcileMarks is the PURE G.1 classifier (architecture §4.1 +
+// docs/reviews/d2-plan.md §4 / 裁定 R2): given the broker's RUNNING/LOST procs and
+// the agent's reported LocalProcesses, it returns the ordered set of proc.ExitMark
+// decisions — the EXACT MarkExited transitions reconcileOnRegister applies inline
+// today (PID-reuse -> -1, agent-reported exit -> rc, unknown -> -1, missed-exit ->
+// -1; an accepted running proc yields no mark). It has ZERO side effects (no DB
+// write, no audit). The D2 ReconcileBatch op path feeds these marks into
+// proc.PlanReconcileBatch; under ops-only the live reconcileOnRegister keeps its
+// inline application unchanged (zero risk to the e2e-covered G.1 path), and adopts
+// this shared classifier at the D9 cutover. Equivalence is proven in
+// reconcile_marks_test.go.
+func resolveReconcileMarks(nid string, req proto.NodeRegisterReq, procs []proc.Process, now time.Time) []proc.ExitMark {
+	agentByPID := map[string]proto.LocalProcess{}
+	for _, lp := range req.LocalProcesses {
+		agentByPID[lp.PID] = lp
+	}
+	var marks []proc.ExitMark
+	for _, p := range procs {
+		if p.NID != nid {
+			continue
+		}
+		if p.Status != proc.StateRunning && p.Status != proc.StateLost {
+			continue
+		}
+		lp, hasIt := agentByPID[p.PID]
+		if !hasIt {
+			// Broker thinks RUNNING/LOST but agent didn't list it -> missed-exit.
+			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+			continue
+		}
+		switch lp.State {
+		case "running":
+			// PID-reuse: same ULID, different OS process -> close the old row.
+			// (A genuinely-accepted running proc yields NO mark.)
+			if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
+				marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+			}
+		case "exited":
+			rc := -1
+			if lp.RC != nil {
+				rc = *lp.RC
+			}
+			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: now})
+		default:
+			// Unknown agent state -> treat as missed-exit.
+			marks = append(marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
+		}
+	}
+	return marks
+}
 
 // reconcileOnRegister runs G.1 over (sid, nid) using req.LocalProcesses /
 // req.LocalPorts as the agent's truth. Side effects:

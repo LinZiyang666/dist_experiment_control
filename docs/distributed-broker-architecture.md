@@ -87,10 +87,13 @@ cmd/tether/
 | `reconcile.go` G.1 批 map 迭代 | leader 算好、**按 (pid/port ASC) 排序**成一条 `ReconcileBatch`，DB 变更与审计顺序 replay-stable |
 | ~~proxy_meta.generation / proxy_epoch~~ | **随 P13 移出 v1 HA（§0），不进 Raft** |
 
+> **D2 实现修正（先改正文 · 2026-06）**：① 表中「`ulid.Make` pid → leader Plan 铸」**字面有误**——proc 的 pid ULID 由 **agent 侧铸**（`agent/exec.go`/`run.go` 的 `proc.NewPID`，broker 收到成形 pid），**leader 对 proc pid 不烤任何东西**；故 §13.1 banned-import lint 是 **Apply-reachability-scoped**，`oklog/ulid` 合法留在 `internal/proc`（`NewPID` 非 Apply 可达）。port token（`genToken`/crypto/rand）确由 leader 在 `PlanAllocate` 铸。② 「leader 烤时间字面量」的**格式 driver-coupled**：modernc.org/sqlite v1.50.0 把绑定 `time.Time` 存为**精确的 Go `time.Time.String()`**——**忠实于时区甚至 monotonic 读数**（实测：UTC→`… +0000 UTC`、`+0800`→`… +0800 CST`（不转 UTC）、`time.Now()`→带 `m=+…` 后缀），**非 RFC3339**。故 `LitTime(t)` = `t.String()`（**不强制 `.UTC()`**），且**调用方必须传入与对应 live mutator 完全相同的 `time.Time`**——port/proc/node/agentprov 绑 `now.UTC()`、**session.\* 绑 raw `now`（含 monotonic，是 live 既有怪癖，D2 严格等价须忠实复现）**。传错时区会静默破坏 §13.2/DIFF-1 等价 + 线上 `port.ListAllocatedForOfflineNodes` 的字典序 `last_heartbeat_at < cutoff` 比较。已实测字节相等（`TestLitTimeMatchesBoundParam` blocking 门）；driver 升级必重验。详见 `docs/reviews/d2-plan.md` 裁定 R1。
+
 ### 3.5 不进 Raft（leader-local 活性 + 列级 lint 替代物理拆表）
 活性态（`status/last_heartbeat_at/proxy_ready`）leader-local、永不进快照、G.2 一拍重建；身份态（`boot_id/release/proto/proxy_capable/registered_at`）仅 Apply 写。
 > **裁定（R2-nit 简化 + R3 §18.4 修正快照形状）**：**不做 0009 物理拆 `nodes_identity/nodes_liveness`**——改**列级 lint**：`Apply 永不写 status/last_heartbeat_at/proxy_ready`、本地永不写身份列。**不变式改述（架构契约，非快照排除）**：快照采 online-backup 整文件 page-copy，**做不到"投影掉活性列"**；故正确不变式是 **「Apply 永不写活性列 + 恢复/换 leader 无条件 G.2 一拍重建活性列」**——活性列即便随快照带过去也会被重建覆盖，不依赖快照排除。心跳/`ReconcileStates`/`SetProxyReady` 只走活性列。
 > **D1 实现修正（恢复后活性基线）**：§3.5 说恢复无条件重建活性列，但未命名"刚恢复、尚无心跳"时的基线。定 **`status=OFFLINE`、`proxy_ready=0`、`last_heartbeat_at=NULL`**（match `node.go`：ONLINE 仅由活的 Register/Heartbeat 置）。`RebuildLiveness(db)` 在 Restore 末**无条件**跑此重置；完整 G.2 reconcile（按真心跳重算）在后续 phase。
+> **D2 实现修正（先改正文 · 2026-06）**：`node.Register` 的活性半（`status='ONLINE'`、`last_heartbeat_at`、**`proxy_ready=0`**）拆出为 leader-local 后，**`proxy_ready=0` 复位必须在每次 re-register 无条件触发**（含身份是 content no-op 的重连）——这是 round-6 F8 安全复位（重启/降级 agent 必须重新 ACK 才进 `/sub`）。`OpNodeRegister` 的 Apply 只写身份列、`ON CONFLICT` 不碰活性列；活性复位由 leader-local 写承担。**D2 ops-only 下线上 `node.Register` 仍是单条原子 UPSERT 不变**（拆分是 op 定义属性，供 lint+DIFF-1 exercise，非线上写）。
 
 ### 3.6 代理键
 > **裁定（R2-minor）**：**保留 AUTOINCREMENT**——单写 leader 串行 Apply 下 SQLite 自赋 rowid 已确定性；leader **省略 row_id 让 SQLite 赋**（match 今天 `port.go` INSERT）。撤"字节级一致"。等价测试（§13.2）比**逻辑内容**（`.dump` 去 `schema_migrations` 或 per-table 排序 SELECT 哈希），**不比文件字节**（避 free-page/vacuum 假发散）。
@@ -132,6 +135,11 @@ cmd/tether/
 > **裁定（R2-major）**：**删 `GenericRowMutate` catch-all**（绕过 per-mutator lint、毁 raft-log 可读性）——低频 op 本无运行期成本，保持窄类型化。`ProcGC` = **leader-local**（选后 G.2 重跑，不进 Raft，从 §3.4 baked-time 表与 lint 移除）。proxy/`AllocateProxy/ProxyGenAdvance` 随 P13 移出 v1（§0）。`ReconcileBatch` 承载 §4.1 整个 reconcile 结果。
 > **层次澄清（R3F1）**：上列均为**业务 FSM op**（走 `FSM.Apply`，followers 可校验）；**`ClusterNodeUpsert` 携 `{node_ident_pub, join_nonce, join_sig, cert_fp}`，followers 在 Apply 复算 join PoP**（入群密码学门）。**`raft.AddVoter`/`raft.RemoveServer` 不在本 op 集**——它们是 hashicorp/raft 的**配置变更路径、非 `FSM.Apply` 拦截点**；membership 两阶段顺序（先 `ClusterNodeUpsert` committed 再 `raft.AddVoter`）见 §8.1。
 > **D1 实现注（raft-log 编码 ≠ proto v2 SSOT）**：raft-log `Data` 字段编码（D1 用 `encoding/json`，D1 量级无性能顾虑、可读）**不属 proto v2 subject SSOT**——proto v2 只管 NATS subject grammar，不管 raft log wire。**`Args []any` over `encoding/json` 非 round-trip 类型稳定**（int→float64、`[]byte`→base64）：故 D1 `ClusterMetaSet` 把值烤成 **SQL 字面量**（不走 typed Args 回环），**D2 携参 op 必须用 leader 烤的 SQL 字面量或 typed/positional 编码**，不得把 JSON `[]any` 信封冻结为 D2 传参机制。
+
+> **D2 实现定稿（先改正文 · 2026-06 · 详 `docs/reviews/d2-plan.md`）**：
+> - **D2 in-scope op 集**（由 `internal/` 全量权威写 grep 推出，非照搬上列目录）：`SessionCreate/Tombstone/HardDelete`、**`MemberJoin`**（authcallout 的 `JoinWithPIN→AddMember` INSERT 是 live 写，原目录把它与 `Kick` 混淆而漏）、`NodeRegister`(identity-only)、**`NodeEvict`**（`adminsock handleEvict` 的 `DELETE nodes`+`DELETE agent_provisioning`，原 §5「NodeRegister/Remove」的 Remove 写者，survey 漏）、`ProcCreate/MarkExited/ReconcileBatch`、`PortAllocate/Free/Revoke`、`AgentProvision`、`ClusterMetaSet`(D1 接缝)。
+> - **推迟（今天无 live writer，加了即死代码）**：`MemberKick`（members 唯一 DELETE 折进 HardDelete）、`PortReassignHome`(D6)、`RotatePin`（只有 NATS 权限串、无 `pin_hash` UPDATE 写者）、`Alert*`(D8)、`ClusterNode*`(D3)。
+> - **arg 编码定为「全 leader 烤 SQL 字面量、D2 op 一律禁 `Statement.Args []any`」**（不选 typed Args，因 `int64` 过 JSON→float64 丢精度，`processes.start_time_ticks` 按精确相等比、损坏即破坏 PID-reuse 防御）。单一审计路 `internal/cluster/sqlbake.go`：`LitText`（`''`-doubling + 拒 NUL + **拒非 UTF-8**，唯一 text→SQL 路；非 UTF-8 会被 raft-log JSON 换 U+FFFD 静默腐蚀，故 fail-closed）/`LitInt`/**`LitTime`(=`t.String()`，不强制 UTC——调用方传与对应 live mutator 一致的 `time.Time`：port/proc/node/agentprov 传 `now.UTC()`、session.\* 传 raw `now`，见 §3.4)**/`LitNull`；`Args` 只留给惰性的 D1 `ClusterMetaSet`。`Command`/`Statement`/`commandVersion` 不变。
 
 ---
 
@@ -300,6 +308,7 @@ follower 死(N≥3)：leader 保 quorum；info。leader 死：选举~1-2s(PreVot
 ## 13. 测试与合并门（硬）
 > **泄漏门约定（D1 实现修正）**：本仓库**刻意不用 `go.uber.org/goleak`**（`test/concurrency/helpers_test.go:5`、`internal/spawnsafe/spawnsafe_test.go:127`、`cmd/tether/history_race_test.go:237` 明确拒之；go.mod/go.sum 无此依赖）。下文及 §19 checklist 凡写"goleak"处，**一律指仓库内建的 `runtime.NumGoroutine` poll-with-tolerance 计数门 + fd 基线门**（fd 门抓 `NewBackup` 漏 `Finish` 留下的目标 conn 泄漏——NumGoroutine 抓不到）。`-race` 仍为硬要求。
 1. 确定性 lint：`internal/{port,proc,node,session,agentprov}` Apply-可达 mutator + 编译期断言不 import rand/ulid；禁 FSM 外对 Apply-owned 表 INSERT；禁 Apply 调 `*sql.DB` mutator；列级断言 Apply 不写活性列。
+   > **D2 实现修正**：Apply-reachability 调用图用 `golang.org/x/tools/go/callgraph/cha`（或 `rta`）seed 于 `fsm.Apply`，**非手卷 `TypesInfo.Uses` BFS**——Applier 是 `defaultAppliers() map[OpType]Applier` 里的**接口值**，静态 BFS 遍历不了 map/接口 dispatch → 整个 Apply 子树不可达 → lint **vacuously 绿**。CHA/RTA sound 地过近似动态 dispatch。引入 `golang.org/x/tools` 作 **test 依赖**（go.mod 增量，升级前验 go directive）。共享 `genericExecApplier` 切断调用图，故 reachability lint 是**绊线、非 Apply 确定性证明**；真正的确定性保证是下条 §13.2 多 FSM 等价。每条 lint 规则配**经同一 map dispatch 的负向对照**（poison Applier 必被抓、Plan-only helper 不被抓）。
 2. 多 FSM **逻辑内容**等价（`.dump` 去 schema_migrations / per-table 排序哈希）；含 port.Allocate/proc(nil clock)、分配→硬删 session→再分配。
 3. 快照-恢复-重放确定性（撕裂 integrity_check 拒）。
 4. **kill-9 崩溃一致性矩阵**（§3.7 两窗口，含 BoltDB 超前 SQLite 重导 lastApplied）——承重、合并前必存在。
@@ -505,6 +514,8 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 **做**：§5 窄类型化 op 集（无 `GenericRowMutate`）；§3.3 每个自生成 mutator 显式 Plan/Apply 拆分（port/proc/node/session/agentprov）；§3.4 确定性雷区处置（leader 烤时间/token/ULID/seq；`ReconcileBatch` 全序；保留 AUTOINCREMENT）；`ProcGC` 转 leader-local。
 **测试**：§13.1 确定性 lint 全开（编译期断言 Apply 不 import rand/ulid、禁 FSM 外 INSERT、禁 Apply 调 `*sql.DB` mutator、列级断言）；**§13.2 多 FSM 逻辑内容等价**（`.dump` 去 schema_migrations / per-table 排序哈希）。
 **出口**：**N=1 集群与今天单点 broker 功能等价**（§0）——现网可平滑变 N=1 集群、行为不变。
+> **D2 范围定稿（先改正文 · 2026-06 · 详 `docs/reviews/d2-plan.md`）**：D2 = **build + prove FSM 写路径（cutover-ready），不切线上 broker**。上「目标」的"现有所有权威写改走 FSM"指**建成 FSM-routed 写能力并证其与今天逻辑等价**，**不**指把生产 broker 切到 FSM——后者（`broker.New` 内嵌 `cluster.Node`、删启动期写、真实 mutator + FSM 合到单 WAL 库）是 **D9 `cluster init --from-existing` 一次性迁移**（§3.8 line 109 明划 D9，切线上会拉 D9 前移、违反先父后子）。故：① 出口门「N=1 等价」由 **DIFF-1 差分测试**证明（今天直连 mutator vs `Plan*→Node.Apply` 同输入 → 逻辑内容哈希相等，配负向对照），**等价靠测试直驱 `cluster.Node`**、非切生产；② 线上 broker 保留直连 mutator（同时作 DIFF-1 的 golden 臂，保差分非 vacuous）；③ §13.1「禁 FSM 外 INSERT」lint 是 **Apply-reachability-scoped**（证 Apply 面干净）+ **分级**（线上直连 mutator grandfathered 到 D9 cutover）；④ ReconcileBatch 抽**共享纯分类器**（线上路行为不变、op 路烤 batch）。
+> **状态（2026-06）**：**实现完成 + 内审过**（Stage A plan `docs/reviews/d2-plan.md`；Stage B 全 13 op + Plan/Apply；Stage C 5 Opus 4.8 对抗内审 `docs/reviews/d2-review.md` → 抓 2 真 bug（PlanAllocate desired-port fail-stop panic、LitText 非 UTF-8 静默腐蚀）+ 等价 vacuity，全采纳修），**待外审/外审中**。承重事实亲手验：**`LitTime=t.String()`（不强制 UTC，调用方传一致时间）**、int64-精度-禁-`Args`、modernc 存绑定 time.Time 为精确 `time.Time.String()`（时区+monotonic 忠实）。门：build/`go test ./...`/`make lint` 0/`TestD2Matrix` -race/p8 e2e 全绿。
 
 ### D3 — NATS 集群层（≥2 节点）
 **目标**：多节点 NATS 集群 + 本地读授权 + apply.* 发布者边界。
