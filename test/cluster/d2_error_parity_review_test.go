@@ -162,7 +162,7 @@ func TestD2PlanErrorParity_Review(t *testing.T) {
 		if _, err := port.Allocate(live, "lab", "lab-1", "first", 1, 0, "fp", cfg); err != nil {
 			t.Fatal(err)
 		}
-		_, cmd, err := port.PlanAllocate(planned, "lab", "lab-1", "first", 1, 0, "fp", cfg)
+		_, cmd, err := port.PlanAllocate(planned, "lab", "lab-1", "first", 1, 0, "fp", "", cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func TestD2PlanErrorParity_Review(t *testing.T) {
 		if _, err := port.Allocate(live, "lab", "lab-1", "second", 2, 0, "fp", cfg); !errors.Is(err, port.ErrPortExhausted) {
 			t.Fatalf("live: got %v, want ErrPortExhausted", err)
 		}
-		if _, _, err := port.PlanAllocate(planned, "lab", "lab-1", "second", 2, 0, "fp", cfg); !errors.Is(err, port.ErrPortExhausted) {
+		if _, _, err := port.PlanAllocate(planned, "lab", "lab-1", "second", 2, 0, "fp", "", cfg); !errors.Is(err, port.ErrPortExhausted) {
 			t.Fatalf("plan: got %v, want ErrPortExhausted", err)
 		}
 	})

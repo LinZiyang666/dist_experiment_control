@@ -14,7 +14,7 @@ func TestExternalReviewCloseSessionInvalidatesInFlightRegister(t *testing.T) {
 
 	authorized := make(chan struct{})
 	releaseLookup := make(chan struct{})
-	lookup := func(_, _ string, _ int, _ string) error {
+	lookup := func(_, _ string, _ int, _ string, _ int64) error {
 		close(authorized)
 		<-releaseLookup
 		return nil
@@ -79,7 +79,7 @@ func TestExternalReviewCloseSessionInvalidatesInFlightRegister(t *testing.T) {
 // Self-review: ForgetSession prunes the per-session kill-generation entry so
 // killGenSession does not grow unbounded across session lifecycles.
 func TestForgetSessionPrunesKillGen(t *testing.T) {
-	srv := NewServer("127.0.0.1:0", "127.0.0.1", func(_, _ string, _ int, _ string) error { return nil }, silentLog())
+	srv := NewServer("127.0.0.1:0", "127.0.0.1", func(_, _ string, _ int, _ string, _ int64) error { return nil }, silentLog())
 
 	srv.CloseSession("lab")   // bumps killGenSession["lab"]
 	srv.CloseSession("other") // bumps killGenSession["other"]

@@ -23,9 +23,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	mrand "math/rand/v2"
 	"os"
 	"runtime"
 	"strconv"
@@ -41,6 +43,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proxydial"
 	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
+	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
@@ -303,6 +306,25 @@ type Agent struct {
 	// regular `expose` port must not. Stored before AddProxy in proxyStartLocked,
 	// cleared on teardown / fail-cleanup.
 	proxyPublicPort atomic.Int64
+
+	// rehome (D6 §7.4) dedup: exactly ONE applyOneHome retry loop runs per public
+	// port regardless of how many reconnects fire (review A4 B1 — a flapping NATS
+	// link must not spawn an unbounded fan of concurrent same-port dials). rehomeWant
+	// holds the FRESHEST directive per port (a newer epoch supersedes a retrying
+	// loop in place); rehomeRunning marks ports with a live loop. Guarded by rehomeMu.
+	rehomeMu      sync.Mutex
+	rehomeWant    map[int]proto.HomeDirective
+	rehomeRunning map[int]bool
+	// rehomeSeq is bumped every time rehomeWant[port] is (re)recorded — including a
+	// SAME-epoch pure-pin update (external review RF2). The per-port loop tracks the
+	// seq it applied and re-applies whenever it changed, so a same-epoch cert
+	// rotation queued behind a running attempt is not dropped by an epoch>-only check.
+	rehomeSeq map[int]uint64
+	// deferredReplay holds ports whose boot replay deferred on missing cert pins
+	// (a clustered PortToken with HomeBrokerAddr but no persisted pins, external
+	// review F2). A directive for such a port must OPEN it from state.json (not
+	// ApplyHome a non-existent session); cleared once opened. Guarded by rehomeMu.
+	deferredReplay map[int]bool
 }
 
 // sessionStateHookSetter is the OPTIONAL capability a production ExposeAdapter
@@ -311,6 +333,15 @@ type Agent struct {
 // New simply skips wiring there.
 type sessionStateHookSetter interface {
 	SetSessionStateHook(fn func(publicPort int, up bool))
+}
+
+// homeApplier is the OPTIONAL capability (D6 §7.4) a production ExposeAdapter
+// (TunnelExposeAdapter) implements to epoch-ordered-rehome an open expose to a
+// new home broker. The in-process test adapter does not implement it, so
+// applyHomeDirectives simply skips rehome there (the home directives are a no-op
+// without a real tunnel).
+type homeApplier interface {
+	ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error
 }
 
 // onTunnelSessionState is the tunnel session-state hook. It publishes proxy
@@ -363,6 +394,10 @@ func New(cfg Config) (*Agent, error) {
 		canonAllowRoots: CanonAllowRoots(cfg.AllowRoots),
 		transferMode:    resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
 		proxy:           &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
+		rehomeWant:      map[int]proto.HomeDirective{},
+		rehomeRunning:   map[int]bool{},
+		rehomeSeq:       map[int]uint64{},
+		deferredReplay:  map[int]bool{},
 	}
 	if a.transferMode == modeOpen {
 		// Posture-change signal: with no allow_roots configured, push/pull
@@ -563,6 +598,21 @@ func (a *Agent) replayPortsFromState() {
 	}
 	for _, p := range sf.PortTokens {
 		if err := a.cfg.ExposeAdapter.AddProxy(p); err != nil {
+			// D6 §7.7/R-22: a clustered expose (HomeBrokerAddr set) has NO cert
+			// pins on boot (pins are never persisted) → ErrHomePinsRequired. That
+			// is EXPECTED: defer — the first register reply re-delivers the home
+			// directive WITH pins and rehomes it. Not a real replay failure.
+			if errors.Is(err, tunnel.ErrHomePinsRequired) {
+				// F2: remember this port so a later register/expose directive (which
+				// carries the pins) OPENS it from state.json rather than no-op'ing an
+				// ApplyHome on a session that was never created.
+				a.rehomeMu.Lock()
+				a.deferredReplay[p.Port] = true
+				a.rehomeMu.Unlock()
+				a.cfg.Logger.Info("agent: deferring clustered expose replay until pins arrive",
+					"name", p.Name, "port", p.Port)
+				continue
+			}
 			a.cfg.Logger.Warn("agent: replay proxy",
 				"err", err, "name", p.Name, "port", p.Port)
 			continue
@@ -676,6 +726,11 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 		LocalProcesses: procs,
 		LocalPorts:     ports,
 		Capabilities:   []string{proto.CapProxyV1}, // P13: this build implements proxy-v1
+		// D6 §6.5: self-report the DETERMINISTIC nats server_name we are connected
+		// to (NOT the volatile NUID) so the leader can bridge it to a home broker.
+		// "" on a single-node bus → inert. ConnectedServerName reflects the actual
+		// connected server, updated across reconnects (drives §7.4 rehome).
+		ServerID: nc.ConnectedServerName(),
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -897,6 +952,212 @@ func (a *Agent) applyReconciliation(ctx context.Context, resp proto.NodeRegister
 	for _, pid := range resp.DropProcesses {
 		a.killOrphanProcess(ctx, pid)
 	}
+
+	// D6 §7.4: apply per-expose home directives (epoch-ordered rehome). nil in
+	// N=1 (no clustered broker emits Home), so this is inert there.
+	a.applyHomeDirectives(ctx, resp.Home)
+}
+
+// applyHomeDirectives drives the §7.4 agent-self-driven rehome from a register
+// reply's HomeAssignment. Directives for DIFFERENT ports are applied
+// CONCURRENTLY (R-14); but per port there is EXACTLY ONE retry loop at a time
+// (review A4 B1): a reconnect storm records the freshest directive per port
+// (rehomeWant) and spawns a new applyOneHome ONLY when no loop is running for
+// that port, so the live-goroutine count is bounded by the number of distinct
+// ports, not by the reconnect rate. A newer epoch supersedes a retrying loop in
+// place (the loop re-reads rehomeWant each iteration).
+func (a *Agent) applyHomeDirectives(ctx context.Context, ha *proto.HomeAssignment) {
+	if ha == nil || len(ha.Directives) == 0 {
+		return
+	}
+	applier, ok := a.cfg.ExposeAdapter.(homeApplier)
+	if !ok {
+		return // adapter has no tunnel (in-process test) — nothing to rehome
+	}
+	for _, d := range ha.Directives {
+		a.rehomeMu.Lock()
+		// Record the freshest directive for this port (a stale lower-epoch
+		// directive never overwrites a newer want). A >= compare keeps a SAME-epoch
+		// pure-pin rotation as the latest want, and bumping rehomeSeq makes the
+		// running loop re-apply it (RF2).
+		if cur, ok := a.rehomeWant[d.PublicPort]; !ok || d.Epoch >= cur.Epoch {
+			a.rehomeWant[d.PublicPort] = d
+			a.rehomeSeq[d.PublicPort]++
+		}
+		if a.rehomeRunning[d.PublicPort] {
+			a.rehomeMu.Unlock()
+			continue // an existing loop will pick up the freshest want
+		}
+		a.rehomeRunning[d.PublicPort] = true
+		a.rehomeMu.Unlock()
+		go a.applyOneHome(ctx, applier, d.PublicPort)
+	}
+}
+
+// applyOneHome runs the SINGLE retry loop for one public port (R-15). Each
+// iteration applies the FRESHEST directive recorded in rehomeWant (so a newer
+// epoch arriving mid-retry supersedes in place). A rehome's first dial returns
+// home_catching_up BEFORE any supervisor exists (the supervisor's own retry
+// never sees it), so this loop retries with full-jitter backoff until the home
+// catches up, ctx is canceled, a terminal error fires, or a max wall-time
+// elapses (catch_up_stalled — give up until the next reconnect; never collapse
+// to terminal). On success it persists the home addr+epoch (monotone). On exit
+// it clears the running flag under lock, re-checking that no newer want arrived.
+func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int) {
+	const (
+		base    = 500 * time.Millisecond
+		maxWait = 30 * time.Second
+		deadln  = 2 * time.Minute // bound: don't retry forever (§7.2 有界重试 + 告警)
+	)
+	defer func() {
+		a.rehomeMu.Lock()
+		delete(a.rehomeRunning, port)
+		delete(a.rehomeWant, port)
+		a.rehomeMu.Unlock()
+	}()
+	sleep := base
+	start := time.Now()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		a.rehomeMu.Lock()
+		d := a.rehomeWant[port]
+		seq := a.rehomeSeq[port]
+		deferred := a.deferredReplay[port]
+		a.rehomeMu.Unlock()
+
+		var err error
+		if deferred {
+			// F2: the boot replay deferred this port on missing pins; now that a
+			// directive carries pins, OPEN it from state.json (LocalPort + raw token).
+			// AddProxy → OpenHome installs the session; a silent ApplyHome no-op
+			// would leave a restarted clustered expose down forever.
+			outcome, oerr := a.openHomeFromState(d)
+			switch outcome {
+			case openStateUnavailable:
+				// RF1: state.json is temporarily unreadable/unparseable; NOTHING was
+				// opened. KEEP the deferred marker and give up until the next reconnect
+				// re-spawns this loop with a (hopefully) healthy read — never treat a
+				// failed open-from-state as a successful rehome.
+				return
+			case openPortAbsent:
+				// The persisted entry is gone (expose-rm) — nothing to open.
+				a.clearDeferred(port)
+				return
+			}
+			err = oerr // openedOK: AddProxy's result
+		} else {
+			// An OPEN expose: ApplyHome rehomes (epoch>) or pure-pin-updates (epoch==)
+			// without tearing a live transport on a same-epoch reconnect.
+			err = applier.ApplyHome(d.PublicPort, d.BrokerAddr, d.Epoch, d.CertPins)
+		}
+		if err == nil {
+			if deferred {
+				a.clearDeferred(port) // opened from state — no longer deferred
+			}
+			if a.stateStore != nil {
+				// Monotone persist (review L-4): UpdatePortHome never downgrades the
+				// stored epoch, so a no-op/stale directive can't rewrite state.json back.
+				if perr := a.stateStore.UpdatePortHome(d.Name, d.BrokerAddr, d.Epoch); perr != nil {
+					a.cfg.Logger.Warn("agent: persist rehome", "err", perr, "name", d.Name, "port", port)
+				}
+			}
+			a.cfg.Logger.Info("agent: rehomed expose", "name", d.Name, "port", port, "epoch", d.Epoch)
+			if a.wantChanged(port, seq) {
+				sleep = base
+				continue // a newer directive (higher epoch OR same-epoch pin update, RF2) arrived
+			}
+			return
+		}
+		// Transient home_catching_up (the home has not yet applied the reassign):
+		// back off and retry. Any other error is terminal for THIS directive — but a
+		// NEWER directive that arrived while we were applying must still be tried
+		// (external review F3: the unconditional drop wedged the expose).
+		var de *tunnel.DenyError
+		terminal := !errors.As(err, &de) || de.Reason != proto.ReasonHomeCatchingUp
+		stalled := time.Since(start) > deadln
+		if terminal || stalled {
+			if terminal {
+				a.cfg.Logger.Warn("agent: rehome failed (terminal)", "err", err, "name", d.Name, "port", port)
+			} else {
+				a.cfg.Logger.Warn("agent: rehome catch_up_stalled — giving up until next reconnect",
+					"name", d.Name, "port", port, "epoch", d.Epoch)
+			}
+			if a.wantChanged(port, seq) {
+				sleep, start = base, time.Now() // a newer directive supersedes; apply it
+				continue
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(jitterDur(sleep)):
+		}
+		if sleep *= 2; sleep > maxWait {
+			sleep = maxWait
+		}
+	}
+}
+
+// wantChanged reports whether rehomeWant[port] was (re)recorded since the loop
+// read sequence `seq` — a higher epoch OR a same-epoch pure-pin rotation (RF2).
+// Used so the per-port loop re-applies the freshest directive instead of dropping
+// it on exit (external review F3/RF2).
+func (a *Agent) wantChanged(port int, seq uint64) bool {
+	a.rehomeMu.Lock()
+	defer a.rehomeMu.Unlock()
+	return a.rehomeSeq[port] != seq
+}
+
+func (a *Agent) clearDeferred(port int) {
+	a.rehomeMu.Lock()
+	delete(a.deferredReplay, port)
+	a.rehomeMu.Unlock()
+}
+
+// openOutcome distinguishes the three results of opening an expose from state so
+// the caller never treats a failed/empty open-from-state as a successful rehome
+// (external review RF1).
+type openOutcome int
+
+const (
+	openedOK            openOutcome = iota // AddProxy was attempted; the returned error carries its result
+	openStateUnavailable                   // state.json unreadable/unparseable — keep deferred, give up until next reconnect
+	openPortAbsent                         // the persisted entry is gone — nothing to open, clear deferred
+)
+
+// openHomeFromState opens (or replaces) an expose's tunnel from its persisted
+// PortToken (LocalPort + raw token) against the directive's home addr/epoch/pins
+// (external review F2). Used for the deferred-boot-replay path where no session
+// exists yet.
+func (a *Agent) openHomeFromState(d proto.HomeDirective) (openOutcome, error) {
+	if a.stateStore == nil || a.cfg.ExposeAdapter == nil {
+		return openPortAbsent, nil // no state/adapter — nothing to open
+	}
+	sf, ok := a.loadStateBounded("rehome-open")
+	if !ok {
+		return openStateUnavailable, nil // RF1: degraded read — DO NOT AddProxy, keep deferred
+	}
+	for _, p := range sf.PortTokens {
+		if p.Port == d.PublicPort {
+			p.HomeBrokerAddr = d.BrokerAddr
+			p.Epoch = d.Epoch
+			p.CertPins = d.CertPins
+			return openedOK, a.cfg.ExposeAdapter.AddProxy(p)
+		}
+	}
+	return openPortAbsent, nil // removed from state.json — nothing to open
+}
+
+// jitterDur returns a full-jitter sleep in (0, d] to de-synchronize a fleet
+// retrying after a shared home failover.
+func jitterDur(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(mrand.Int64N(int64(d)) + 1)
 }
 
 // killOrphanProcess sends SIGTERM, waits 5s, then escalates to SIGKILL

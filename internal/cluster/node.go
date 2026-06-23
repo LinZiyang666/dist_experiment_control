@@ -75,6 +75,7 @@ type Node struct {
 	ro           *sql.DB        // read-only backup handle (owned)
 	transport    raft.Transport // injected; closed by Shutdown (raft does not reap it)
 	applyTimeout time.Duration
+	localID      raft.ServerID // this node's raft ServerID (== cluster_nodes.node_id); see SelfID
 	logger       *slog.Logger
 
 	// applyMu serializes the leader-side {Plan reads leader DB} + {raft.Apply} +
@@ -204,9 +205,15 @@ func New(cfg Config) (*Node, error) {
 		ro:           ro,
 		transport:    cfg.Transport,
 		applyTimeout: applyTimeout,
+		localID:      cfg.LocalID,
 		logger:       logger,
 	}, nil
 }
+
+// SelfID returns this node's raft ServerID as a string (== cluster_nodes.node_id).
+// The broker uses it as the "self" home identity in tunnelTokenLookup's
+// home_broker==self filter (D6 §7.2/R-10). It is stable for the node's lifetime.
+func (n *Node) SelfID() string { return string(n.localID) }
 
 // raftConfig builds the raft.Config. Timeouts come from cfg when set, else the
 // D1/D2 fast N=1 defaults (200ms / 20ms) so existing single-node tests are

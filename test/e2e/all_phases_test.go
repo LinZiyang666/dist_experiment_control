@@ -215,6 +215,25 @@ func TestD5Matrix(t *testing.T) {
 	}
 }
 
+func TestD6Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags d6_integration builds the D6 data-plane end-to-end suite (test/d6):
+	// real tunnel servers (stable pinned certs) + a real agent tunnel.Client +
+	// real broker tunnelTokenLookups over a shared replicated-state DB, proving
+	// ladder enforcement / rehome failover / cert pinning / catch-up. It is gated
+	// out of the parallel `make test` and runs only here in its own -race
+	// subprocess; the cheap d6 guard/ladder/cert-verify tests run in `make test`.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "d6_integration", "-timeout", "300s",
+		"./test/d6/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d6 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

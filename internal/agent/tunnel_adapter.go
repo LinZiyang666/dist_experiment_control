@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 )
 
@@ -61,11 +62,26 @@ func (a *TunnelExposeAdapter) AddProxy(p PortToken) error {
 	defer a.opMu.Unlock()
 
 	a.setLocal(p.Port, p.LocalPort)
-	if err := a.client.Open(p.Port, p.LocalPort, p.Token); err != nil {
+	// D6 §7.5: dial THIS expose's home (p.HomeBrokerAddr, "" ⇒ the Client's single
+	// --tunnel-addr fallback) at its home epoch, pinned by the directive's certs.
+	// A clustered home (non-empty addr) with no pins returns ErrHomePinsRequired;
+	// the caller (replay) defers until a register/expose reply re-delivers them.
+	if err := a.client.OpenHome(p.Port, p.LocalPort, p.Token, p.HomeBrokerAddr, p.Epoch, p.CertPins); err != nil {
 		a.deleteLocal(p.Port)
 		return fmt.Errorf("tunnel adapter AddProxy: %w", err)
 	}
 	return nil
+}
+
+// ApplyHome performs an epoch-ordered rehome of an already-open expose (D6
+// §7.4): the tunnel client Open-replaces the session against the new home iff
+// the directive epoch is newer. It implements the optional homeApplier interface
+// the agent type-asserts. A transient home_catching_up surfaces here for the
+// caller (applyReconciliation) to retry.
+func (a *TunnelExposeAdapter) ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error {
+	a.opMu.Lock()
+	defer a.opMu.Unlock()
+	return a.client.ApplyHome(publicPort, brokerAddr, epoch, certPins)
 }
 
 // RemoveProxy closes the tunnel session for publicPort. Name is

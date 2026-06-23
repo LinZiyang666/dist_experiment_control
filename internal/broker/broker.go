@@ -16,6 +16,7 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -279,6 +280,25 @@ type Broker struct {
 	// their callbacks may otherwise interleave: a sub mutation can observe ON,
 	// then publish Enabled:true after a concurrent OFF has completed.
 	proxyOpMu sync.Mutex
+
+	// selfID + tunnelCert are the D6 BUILD-AND-PROVE seam (cutover=D9). Both are
+	// the zero value in production: serve.go never attaches a cluster identity nor
+	// loads a stable cert, so every D6 home-assignment path (homeForRegister /
+	// homeForExpose / selfNodeID / the tunnelTokenLookup home ladder / the stable
+	// cert) is inert and the responses stay byte-identical. The test harness sets
+	// them via AttachClusterSeam (internal/broker/home.go). The guard test
+	// TestD6ProductionWiresNoClusterNode bans AttachClusterSeam + the stable-cert
+	// constructors from production files so these can never become non-zero there.
+	//
+	// selfID is this broker's cluster_nodes.node_id (== cluster.Node.SelfID() at
+	// D9 cutover). It is the "self" the tunnelTokenLookup home_broker==self filter
+	// compares against; "" ⇒ the whole home ladder is inert (single-node). The D6
+	// CORE (home assignment from the replicated cluster_nodes/port_allocations view
+	// + the ladder + agent rehome + cert pinning) needs only this string + the
+	// local DB; the FSM PRODUCER op OpPortReassignHome is proven by its own unit
+	// test (build-and-prove, like every D2 op), not wired into the live DB here.
+	selfID     string
+	tunnelCert *tls.Certificate
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -410,7 +430,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		if host == "" {
 			host = "0.0.0.0"
 		}
-		b.tunnelSrv = tunnel.NewServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
+		// D6 seam: newTunnelServer (home.go) returns the ephemeral-cert NewServer
+		// in production (b.tunnelCert == nil) and the stable-cert NewServerWithCert
+		// only when the harness attached a cert. Production is byte-equivalent to
+		// the prior tunnel.NewServer call.
+		b.tunnelSrv = b.newTunnelServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
 		if err := b.tunnelSrv.Start(ctx); err != nil {
 			return err
 		}
@@ -702,6 +726,10 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		Arch:           req.Arch,
 		BootID:         req.BootID,
 		ProxyCapable:   nodeHasProxyCap(req.Capabilities, req.ReleaseVersion),
+		// D6 §6.5 (external review F1): persist the agent's reported nats
+		// server_name into nodes.nats_server so the home bridge can resolve it at
+		// expose time. "" in production (single-node agent) → inert.
+		NatsServer: req.ServerID,
 	}
 	if err := node.Register(b.cfg.DB, in, b.cfg.Now()); err != nil {
 		if errors.Is(err, node.ErrSessionMissing) {
@@ -735,6 +763,11 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// per-node proxy directive (join/reconnect path). Nil otherwise, so a
 	// proxy-off reply stays byte-identical to pre-P13.
 	resp.Proxy = b.proxyDirectiveForRegister(sid, nid, req)
+
+	// D6 §7.4: attach per-expose home directives so a reconnecting agent rehomes
+	// any expose whose home was re-pointed by the leader. Self-gating — nil in
+	// production (selfID=="") so the reply stays byte-identical (the Proxy precedent).
+	resp.Home = b.homeForRegister(sid, nid, req)
 
 	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {

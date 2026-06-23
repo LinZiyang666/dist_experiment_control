@@ -50,7 +50,7 @@ func (b *Broker) publicHostFor() string {
 //
 // Architecture F.4 — broker is the only side that knows token_hash
 // vs raw token; agent presents raw, broker hashes & looks up.
-func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash string) error {
+func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash string, epoch int64) error {
 	// Audit shard 02 F6: collapse "absent" and "port-mismatch" into
 	// the same error code so an attacker probing with stolen
 	// tokens can't tell whether the row exists at all. Internally
@@ -101,6 +101,39 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 			// re-REGISTER must NOT resurrect a disabled exit).
 			return fmt.Errorf("token_unknown_or_revoked")
 		}
+	}
+	// D6 §7.2 home/epoch ladder. INERT when the row carries no cluster home
+	// (home_broker=='', the migration-0010 default / single-node path) — this
+	// branch is skipped entirely, leaving tunnelTokenLookup byte-equivalent to
+	// pre-D6. When the row IS homed, the bind decision is a function of BOTH
+	// (home vs self) AND (agent-presented epoch vs the LOCAL row epoch a.Epoch):
+	if a.HomeBroker != "" {
+		self := b.selfNodeID()
+		switch {
+		case a.Epoch < 0:
+			// Defense-in-depth (review A5 M6): a corrupted negative stored epoch must
+			// not make every honest agent (epoch >= 0) loop on home_catching_up
+			// forever. Treat it as a terminal, anti-enumeration-collapsed deny.
+			return fmt.Errorf("token_unknown_or_revoked")
+		case epoch < a.Epoch:
+			// The agent holds a SUPERSEDED directive (an OpPortReassignHome bumped
+			// the row past it); its higher-epoch directive will rehome it. Terminal
+			// (collapsed to the anti-enumeration code, like absent/mismatch/off).
+			return fmt.Errorf("token_unknown_or_revoked")
+		case epoch > a.Epoch:
+			// This replica has NOT yet applied the latest OpPortReassignHome
+			// (REGARDLESS of home-vs-self — a higher presented epoch can only come
+			// from a leader-committed directive this replica will eventually apply).
+			// TRANSIENT: the agent retries until this home catches up. This IS the
+			// catch-up barrier (§7.2c, epoch-as-local-row-epoch — NOT a raft index).
+			return fmt.Errorf("%s", proto.ReasonHomeCatchingUp)
+		case a.HomeBroker != self:
+			// Same epoch, but this node is genuinely NOT the assigned home (an
+			// ex-home or never-home replica at the same epoch). Terminal.
+			return fmt.Errorf("token_unknown_or_revoked")
+		}
+		// epoch == a.Epoch && a.HomeBroker == self → this IS the home at the right
+		// epoch: allow (fall through to return nil).
 	}
 	return nil
 }
@@ -211,6 +244,11 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		Token:     alloc.Token,
 		ActorFP:   fp,
 	}
+	// D6 §7.2/§6.5 (C1 fix): the initial-expose path never touches
+	// NodeRegisterResp, so the home directive must ride the forward. Self-gating —
+	// nil in production (selfID==""), so the forward stays byte-identical; in a
+	// cluster it stamps home_broker on the row + tells the agent which home to dial.
+	fwdReq.Home = b.homeForExpose(sid, nid, req.Name, alloc.Port)
 	fwdBody, err := json.Marshal(&fwdReq)
 	if err != nil {
 		// roll back the allocation — no point keeping a row no agent saw

@@ -59,7 +59,7 @@ func TestTunnelRoundTripsHTTP(t *testing.T) {
 	rawToken := "test-token-deadbeef"
 
 	// Token lookup: only the configured (sid,nid,port,token) is OK.
-	lookup := func(gotSid, gotNid string, gotPort int, gotHash string) error {
+	lookup := func(gotSid, gotNid string, gotPort int, gotHash string, _ int64) error {
 		if gotSid != sid || gotNid != nid || gotPort != publicPort || gotHash != hashToken(rawToken) {
 			return errors.New("token_mismatch")
 		}
@@ -101,7 +101,7 @@ func TestTunnelDeniesBadToken(t *testing.T) {
 	controlPort := findFreePort(t)
 	publicPort := findFreePort(t)
 
-	rejected := func(_, _ string, _ int, _ string) error {
+	rejected := func(_, _ string, _ int, _ string, _ int64) error {
 		return errors.New("token_mismatch")
 	}
 	srv := NewServer(net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
@@ -131,7 +131,7 @@ func TestTunnelControlRequiresTLS(t *testing.T) {
 	controlPort := findFreePort(t)
 	srv := NewServer(net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
 		"127.0.0.1",
-		func(_, _ string, _ int, _ string) error { return nil },
+		func(_, _ string, _ int, _ string, _ int64) error { return nil },
 		silentLog())
 	srvCtx, srvCancel := context.WithCancel(context.Background())
 	defer srvCancel()
@@ -170,7 +170,7 @@ func TestTunnelClosesPublicPortOnSessionDrop(t *testing.T) {
 
 	const sid, nid = "lab", "lab-1"
 	rawToken := "ok"
-	lookup := func(_, _ string, _ int, _ string) error { return nil }
+	lookup := func(_, _ string, _ int, _ string, _ int64) error { return nil }
 
 	srv := NewServer(net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
 		"127.0.0.1", lookup, silentLog())

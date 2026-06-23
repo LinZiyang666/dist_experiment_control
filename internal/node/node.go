@@ -59,6 +59,11 @@ type RegisterInput struct {
 	// ProxyCapable (P13) records whether the agent advertised the proxy-v1
 	// capability; the broker uses it to gate proxy allocation/push.
 	ProxyCapable bool
+	// NatsServer (D6 §6.5) is the deterministic nats server_name the agent
+	// reported (NodeRegisterReq.ServerID). Stored in nodes.nats_server as an
+	// IDENTITY column so any broker can resolve the agent's home at expose time.
+	// "" when not reported. Inert in production (only read when clustered).
+	NatsServer string
 }
 
 // ErrSessionMissing is returned by Register when the agent's target sid
@@ -102,8 +107,8 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO nodes(nid, sid, last_heartbeat_at, status, boot_id,
-		                  release_version, proto_version, registered_at, proxy_capable)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		                  release_version, proto_version, registered_at, proxy_capable, nats_server)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(sid, nid) DO UPDATE SET
 		    last_heartbeat_at = excluded.last_heartbeat_at,
 		    status            = 'ONLINE',
@@ -111,6 +116,10 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 		    release_version   = excluded.release_version,
 		    proto_version     = excluded.proto_version,
 		    proxy_capable     = excluded.proxy_capable,
+		    -- D6 §6.5: refresh the server-id bridge binding on every (re)register so
+		    -- a reconnect to a different nats-server re-homes the agent. Identity
+		    -- column; written by both this live mutator and PlanRegister (DIFF-1).
+		    nats_server       = excluded.nats_server,
 		    -- round-6 F8: a (re)register means a NEW agent process that has NOT yet
 		    -- re-established its SS server + tunnel. Clear readiness so a restarted
 		    -- or downgraded agent is never rendered into /sub until its post-bind
@@ -118,7 +127,7 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 		    proxy_ready       = 0
 	`,
 		in.NID, in.SID, now, string(StateOnline),
-		in.BootID, in.ReleaseVersion, in.ProtoVersion, now, capable,
+		in.BootID, in.ReleaseVersion, in.ProtoVersion, now, capable, in.NatsServer,
 	); err != nil {
 		return fmt.Errorf("node: upsert: %w", err)
 	}

@@ -19,7 +19,7 @@ import (
 func TestTunnelTokenLookupAbsentIsRevoked(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}}
-	err := b.tunnelTokenLookup("lab", "lab-1", 14000, "no-such-token-hash")
+	err := b.tunnelTokenLookup("lab", "lab-1", 14000, "no-such-token-hash", 0)
 	if err == nil || err.Error() != "token_unknown_or_revoked" {
 		t.Fatalf("absent token: want token_unknown_or_revoked, got %v", err)
 	}
@@ -33,7 +33,7 @@ func TestTunnelTokenLookupTransientStoreErrorIsTryAgain(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}}
 	_ = db.Close() // induce a non-ErrNotFound store error on the next query
-	err := b.tunnelTokenLookup("lab", "lab-1", 14000, "any-hash")
+	err := b.tunnelTokenLookup("lab", "lab-1", 14000, "any-hash", 0)
 	if err == nil || err.Error() != "try_again" {
 		t.Fatalf("transient store error: want try_again, got %v", err)
 	}
@@ -55,7 +55,7 @@ func TestTunnelTokenLookupMismatchIsRevoked(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Correct token hash but WRONG port → authoritative mismatch (terminal).
-	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port+1, alloc.TokenHash); err == nil || err.Error() != "token_unknown_or_revoked" {
+	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port+1, alloc.TokenHash, 0); err == nil || err.Error() != "token_unknown_or_revoked" {
 		t.Fatalf("port mismatch: want token_unknown_or_revoked, got %v", err)
 	}
 }
@@ -78,7 +78,7 @@ func TestTunnelTokenLookupProxyOffIsTerminalNotTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Switch never enabled → GetProxyEnabled returns (false, nil) → terminal.
-	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port, alloc.TokenHash); err == nil || err.Error() != "token_unknown_or_revoked" {
+	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port, alloc.TokenHash, 0); err == nil || err.Error() != "token_unknown_or_revoked" {
 		t.Fatalf("proxy-off __proxy__ REGISTER: want terminal token_unknown_or_revoked, got %v", err)
 	}
 }

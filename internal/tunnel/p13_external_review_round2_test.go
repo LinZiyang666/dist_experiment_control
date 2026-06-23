@@ -18,7 +18,7 @@ func TestExternalReviewCloseProxyInvalidatesInFlightRegister(t *testing.T) {
 
 	authorized := make(chan struct{})
 	releaseLookup := make(chan struct{})
-	lookup := func(_, _ string, _ int, _ string) error {
+	lookup := func(_, _ string, _ int, _ string, _ int64) error {
 		close(authorized)
 		<-releaseLookup
 		return nil

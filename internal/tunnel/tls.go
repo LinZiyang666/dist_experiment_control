@@ -4,12 +4,16 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // generateSelfSignedCert produces a fresh ephemeral P-256 ECDSA cert
@@ -73,11 +77,79 @@ func serverTLSConfig(cert *tls.Certificate) (*tls.Config, error) {
 // against — confidentiality (passive eavesdropper can't read REGISTER
 // or token bytes) is the threat model F.5 actually targets here, and
 // that's still satisfied. Active MITM is acknowledged-not-blocked in
-// v1; a future revision can add cert pinning derived from the
-// broker's nkey identity.
+// v1; D6 adds cert pinning (clientTLSConfigPinned) for clustered homes.
 func clientTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, //nolint:gosec // documented v1 fallback per architecture F.5
+		InsecureSkipVerify: true, //nolint:gosec // documented v1 fallback per architecture F.5/§16.7 (N=1)
+	}
+}
+
+// LoadServerCert parses a stable tunnel server certificate + key from PEM bytes
+// (D6 §15 RF3). Used by the broker tunnel server (via NewServerWithCert) to pin
+// a persistent cert whose fingerprint the agent verifies, instead of the
+// ephemeral self-signed fallback. In D6 build-and-prove this is harness-only;
+// production stays on the ephemeral path (cutover = D9). The leaf's DER is
+// validated so CertFingerprint and the agent's pin agree.
+func LoadServerCert(certPEM, keyPEM string) (*tls.Certificate, error) {
+	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		return nil, fmt.Errorf("tunnel tls: load server cert: %w", err)
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("tunnel tls: loaded cert has no leaf DER")
+	}
+	return &cert, nil
+}
+
+// CertFingerprint is the SINGLE SOURCE OF TRUTH for a tunnel cert pin (D6
+// §7.7/§15/R-20): "sha256:" + hex(SHA-256(leaf DER)). The same function is used
+// by the harness/operator that seeds cluster_nodes.cert_fp AND by the agent that
+// verifies the home's presented cert — a divergent formula would silently bypass
+// pinning. It hashes cert.Raw (the leaf certificate DER), NOT the SPKI.
+func CertFingerprint(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// certFingerprintDER is the raw-DER variant used inside VerifyConnection (where
+// only the parsed leaf's .Raw is in hand). Identical output to CertFingerprint.
+func certFingerprintDER(der []byte) string {
+	sum := sha256.Sum256(der)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// clientTLSConfigPinned returns the agent dial TLS config for one expose (D6
+// §7.7/R-21). With EMPTY pins (pins.Current == "") it is the legacy N=1 fallback
+// — InsecureSkipVerify, no callback, byte-equivalent to clientTLSConfig (the
+// ONLY remaining InsecureSkipVerify path, §16.7). With NON-EMPTY pins it keeps
+// InsecureSkipVerify (the home cert is self-signed, no CA chain) but installs a
+// VerifyConnection callback — which runs on EVERY handshake INCLUDING TLS 1.3
+// session resumption (VerifyPeerCertificate does NOT) — that fingerprints the
+// presented leaf and accepts it iff it matches Current, or Previous within an
+// unexpired rotation window. The handshake fails BEFORE the REGISTER token is
+// written, so a MITM presenting a non-pinned cert never receives the bearer
+// token. Fail-closed: empty peer certs, or a Previous with no/zero ValidUntil,
+// are rejected.
+func clientTLSConfigPinned(pins proto.CertPins) *tls.Config {
+	if pins.Current == "" {
+		return clientTLSConfig()
+	}
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, //nolint:gosec // pin check is done in VerifyConnection below
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("tunnel tls: home presented no certificate")
+			}
+			fp := certFingerprintDER(cs.PeerCertificates[0].Raw)
+			if fp == pins.Current {
+				return nil
+			}
+			if pins.Previous != "" && pins.ValidUntil != nil && time.Now().Before(*pins.ValidUntil) && fp == pins.Previous {
+				return nil
+			}
+			return fmt.Errorf("tunnel tls: home cert %s not in pin set", fp)
+		},
 	}
 }

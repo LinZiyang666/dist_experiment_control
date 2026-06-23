@@ -38,17 +38,21 @@ func PlanRegister(db *sql.DB, in RegisterInput, now time.Time) (*cluster.Command
 	if in.ProxyCapable {
 		capable = 1
 	}
-	lits, err := cluster.LitTextAll(in.NID, in.SID, in.BootID, in.ReleaseVersion)
+	lits, err := cluster.LitTextAll(in.NID, in.SID, in.BootID, in.ReleaseVersion, in.NatsServer)
 	if err != nil {
 		return nil, fmt.Errorf("node: plan register literal: %w", err)
 	}
-	nidL, sidL, bootL, relL := lits[0], lits[1], lits[2], lits[3]
-	sql := `INSERT INTO nodes(nid, sid, boot_id, release_version, proto_version, registered_at, proxy_capable) ` +
+	nidL, sidL, bootL, relL, natsL := lits[0], lits[1], lits[2], lits[3], lits[4]
+	// nats_server (D6 §6.5) is an IDENTITY column written by BOTH register paths
+	// so the DIFF-1 equivalence stays consistent. Set on INSERT and refreshed on
+	// conflict (matching the live mutator's `nats_server = excluded.nats_server`).
+	sql := `INSERT INTO nodes(nid, sid, boot_id, release_version, proto_version, registered_at, proxy_capable, nats_server) ` +
 		`VALUES (` + nidL + `, ` + sidL + `, ` + bootL + `, ` + relL + `, ` +
-		cluster.LitInt(int64(in.ProtoVersion)) + `, ` + cluster.LitTime(now.UTC()) + `, ` + cluster.LitInt(capable) + `) ` +
+		cluster.LitInt(int64(in.ProtoVersion)) + `, ` + cluster.LitTime(now.UTC()) + `, ` + cluster.LitInt(capable) + `, ` + natsL + `) ` +
 		`ON CONFLICT(sid, nid) DO UPDATE SET ` +
 		`boot_id = excluded.boot_id, release_version = excluded.release_version, ` +
-		`proto_version = excluded.proto_version, proxy_capable = excluded.proxy_capable`
+		`proto_version = excluded.proto_version, proxy_capable = excluded.proxy_capable, ` +
+		`nats_server = excluded.nats_server`
 	return cluster.NewCommand(cluster.OpNodeRegister, cluster.Stmt(sql)), nil
 }
 

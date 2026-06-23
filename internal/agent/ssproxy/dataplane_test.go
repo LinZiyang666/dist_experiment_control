@@ -48,7 +48,7 @@ func TestDataPlaneSSOverTunnelRoundTrip(t *testing.T) {
 	// Broker tunnel server (auth allows any token here; the broker's real
 	// TokenLookup is tested elsewhere).
 	tsrv := tunnel.NewServer(net.JoinHostPort("127.0.0.1", itoa(controlPort)), "127.0.0.1",
-		func(_, _ string, _ int, _ string) error { return nil }, log)
+		func(_, _ string, _ int, _ string, _ int64) error { return nil }, log)
 	if err := tsrv.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

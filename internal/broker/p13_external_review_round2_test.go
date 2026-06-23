@@ -36,7 +36,7 @@ func TestExternalReviewProxyTokenDeniedWhileSwitchOff(t *testing.T) {
 	// The allocation row can remain visible briefly between CloseProxy and
 	// port.Free. Once the master switch is OFF, that row must not authorize a
 	// fresh REGISTER in the gap.
-	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port, alloc.TokenHash); err == nil {
+	if err := b.tunnelTokenLookup(sid, "lab-1", alloc.Port, alloc.TokenHash, 0); err == nil {
 		t.Fatal("proxy token was authorized while the session proxy switch was OFF")
 	}
 }

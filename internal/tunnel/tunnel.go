@@ -57,6 +57,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/hashicorp/yamux"
 )
 
@@ -82,18 +83,31 @@ func (e *DenyError) Is(target error) bool { return target == ErrRegisterDenied }
 // authoritatively refused us.
 func denyIsTransient(reason string) bool {
 	switch reason {
-	case "public_port_bind_failed", "try_again":
+	case "public_port_bind_failed", "try_again", proto.ReasonHomeCatchingUp:
+		// home_catching_up (D6 §7.2): the home replica has not yet applied the
+		// latest OpPortReassignHome (presented epoch > its local row epoch). It is
+		// TRANSIENT — the agent must keep retrying until the home catches up, never
+		// treat it as terminal (which would brick the rehome). The reason string is
+		// the proto SSOT shared with the broker emit-side (no duplicated literal).
 		return true
 	default:
 		return false
 	}
 }
 
+// ErrHomePinsRequired is returned by Open when a CLUSTERED home (non-empty
+// brokerAddr) is targeted without cert pins (D6 §7.7/R-22). The agent must NOT
+// dial a named home insecurely; it defers the dial until a register/expose reply
+// re-delivers the pins. The N=1 path (empty brokerAddr) never hits this.
+var ErrHomePinsRequired = errors.New("tunnel client: clustered home addr without cert pins")
+
 // TokenLookup is what the broker calls on each REGISTER to decide
 // allow/deny. Returns nil if (sid, nid, port, token) maps to an
 // ALLOCATED row whose token_hash matches; non-nil error otherwise.
-// Backed in production by internal/port.LookupByTokenHash.
-type TokenLookup func(sid, nid string, port int, tokenHash string) error
+// Backed in production by internal/port.LookupByTokenHash. The epoch is the
+// agent-presented per-port expose epoch (D6 §7.2, REGISTER 6th field); the
+// production lookup ignores it when the row carries no cluster home.
+type TokenLookup func(sid, nid string, port int, tokenHash string, epoch int64) error
 
 // LocalPortLookup is the agent-side counterpart: given the public port
 // the broker registered us for, return which local port to dial. The
@@ -148,10 +162,25 @@ type serverSession struct {
 
 // NewServer returns a broker-side tunnel server. Call Start to bind.
 func NewServer(addr, publicHost string, lookup TokenLookup, logger *slog.Logger) *Server {
+	return newServer(addr, publicHost, lookup, nil, logger)
+}
+
+// NewServerWithCert is like NewServer but pins a STABLE persistent tunnel cert
+// (D6 §15 RF3) instead of generating an ephemeral self-signed one on Start, so
+// the advertised fingerprint survives restarts and the agent can pin it. It is
+// HARNESS/TEST ONLY in D6 build-and-prove — production keeps calling NewServer
+// (cert nil → ephemeral, the N=1 fallback); the stable-cert cutover is D9. The
+// build-and-prove guard bans NewServerWithCert( from production files.
+func NewServerWithCert(addr, publicHost string, lookup TokenLookup, cert *tls.Certificate, logger *slog.Logger) *Server {
+	return newServer(addr, publicHost, lookup, cert, logger)
+}
+
+func newServer(addr, publicHost string, lookup TokenLookup, cert *tls.Certificate, logger *slog.Logger) *Server {
 	return &Server{
 		addr:           addr,
 		publicHost:     publicHost,
 		tokenLookup:    lookup,
+		tlsCert:        cert,
 		logger:         logger,
 		sessions:       map[int]*serverSession{},
 		killGen:        map[int]int64{},
@@ -234,7 +263,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	sid, nid, port, token, ok := parseRegisterLine(line)
+	sid, nid, port, token, epoch, ok := parseRegisterLine(line)
 	if !ok {
 		_, _ = conn.Write([]byte("DENY malformed_register\n"))
 		_ = conn.Close()
@@ -262,9 +291,9 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	if err := s.tokenLookup(sid, nid, port, hashToken(token)); err != nil {
+	if err := s.tokenLookup(sid, nid, port, hashToken(token), epoch); err != nil {
 		s.logger.Info("tunnel server: REGISTER denied",
-			"sid", sid, "nid", nid, "port", port, "err", err)
+			"sid", sid, "nid", nid, "port", port, "epoch", epoch, "err", err)
 		_, _ = conn.Write([]byte("DENY " + err.Error() + "\n"))
 		_ = conn.Close()
 		return
@@ -568,6 +597,15 @@ type clientSession struct {
 	yamuxSess  *yamux.Session     // swapped in place on a successful redial (under c.mu)
 	cancel     context.CancelFunc // ONE per generation, for life (the sole stop signal)
 	gen        uint64             // fences a stale supervisor against a concurrent Open/Close
+
+	// D6 §7.5 per-expose home: the broker addr this expose dials, its home epoch,
+	// and the cert pins to verify the home with. These are stored on the session
+	// (NOT a single shared Client field) so one Client fans out to N homes; the
+	// SUPERVISOR reads them ONLY as spawn-time value params (R-13), never back from
+	// this struct in its loop. brokerAddr "" ⇒ fall back to Client.brokerAddr (N=1).
+	brokerAddr string
+	epoch      int64
+	certPins   proto.CertPins
 }
 
 // NewClient returns an agent-side tunnel client.
@@ -631,11 +669,32 @@ func (c *Client) Start(ctx context.Context) {
 // and returns that error verbatim. AFTER a successful Open, transient
 // session drops are recovered by the supervisor's reconnect loop; the
 // caller is not involved again unless it calls Close.
+// Open is the N=1 / single-home convenience entry: it dials the Client's
+// configured brokerAddr with epoch 0 and no cert pins (InsecureSkipVerify
+// fallback). Equivalent to OpenHome(publicPort, localPort, token, "", 0,
+// proto.CertPins{}). Kept so non-clustered callers (and existing tests) stay
+// unchanged.
 func (c *Client) Open(publicPort, localPort int, token string) error {
+	return c.OpenHome(publicPort, localPort, token, "", 0, proto.CertPins{})
+}
+
+// OpenHome establishes (or epoch-monotone replaces) a yamux session for one
+// (publicPort, token) pair against a SPECIFIC home broker (D6 §7.5), pinned by
+// certPins, at home epoch. brokerAddr "" falls back to the Client's single
+// configured addr (N=1). See the package doc / Open for the supervisor contract.
+func (c *Client) OpenHome(publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) error {
 	if c.ctx == nil {
 		return errors.New("tunnel client: Start not called")
 	}
-	conn, yamuxSess, err := c.dialAndRegister(c.ctx, publicPort, token)
+	// D6 §7.7/R-22: never dial a NAMED home (non-empty brokerAddr) insecurely.
+	// A clustered expose with no pins yet (e.g. a state.json replay before the
+	// register reply re-delivers them) defers — the caller retries when pins
+	// arrive. The N=1 path (empty brokerAddr → Client.brokerAddr fallback) is
+	// unaffected and keeps its InsecureSkipVerify.
+	if brokerAddr != "" && certPins.Current == "" {
+		return ErrHomePinsRequired
+	}
+	conn, yamuxSess, err := c.dialAndRegister(c.ctx, publicPort, token, brokerAddr, epoch, certPins)
 	if err != nil {
 		return fmt.Errorf("tunnel client: Open: %w", err)
 	}
@@ -654,7 +713,19 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 		return fmt.Errorf("tunnel client: Open after Start ctx cancel: %w", err)
 	}
 	if old, ok := c.sessions[publicPort]; ok {
-		// Replace a prior session (re-expose / full proxy rebuild). Canceling
+		// D6 §7.4/R-13: epoch-monotone rehome replace. If a NEWER home epoch is
+		// already installed for this port (two directives raced; the higher won),
+		// THIS Open is stale — discard the freshly-dialed transport and report
+		// success (the port IS served, by the newer epoch). Equal/greater epoch
+		// (incl. the N=1 epoch-0 re-expose path) proceeds as a normal replace.
+		if old.epoch > epoch {
+			c.mu.Unlock()
+			cancel()
+			_ = conn.Close()
+			_ = yamuxSess.Close()
+			return nil
+		}
+		// Replace a prior session (re-expose / proxy rebuild / rehome). Canceling
 		// its ctx retires the old supervisor; bumping nextGen fences it out of
 		// swapTransport/dropSession on this port.
 		old.cancel()
@@ -671,13 +742,57 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 		yamuxSess:  yamuxSess,
 		cancel:     cancel,
 		gen:        gen,
+		brokerAddr: brokerAddr,
+		epoch:      epoch,
+		certPins:   certPins,
 	}
 	c.mu.Unlock()
 
-	go c.supervise(sessCtx, publicPort, localPort, token, gen, yamuxSess)
+	// R-13: the supervisor receives brokerAddr/epoch/certPins as VALUE PARAMS
+	// snapshotted here — it MUST NOT read them back from c.sessions[port] in its
+	// loop (that would be an unsynchronized read racing Open-replace's map write).
+	go c.supervise(sessCtx, publicPort, localPort, token, brokerAddr, epoch, certPins, gen, yamuxSess)
 	c.logger.Info("tunnel: opened",
-		"public_port", publicPort, "local_port", localPort)
+		"public_port", publicPort, "local_port", localPort, "epoch", epoch)
 	return nil
+}
+
+// ApplyHome applies a home directive to an OPEN expose (D6 §7.4):
+//   - epoch > session epoch → an actual REHOME: Open-replace against the new home
+//     (reusing the existing localPort + token), the atomic cutover.
+//   - epoch == session epoch → a PURE-PIN (cert-rotation) update (R-24 / external
+//     review F4): refresh the session's cert pins IN PLACE, WITHOUT tearing the
+//     live transport (brokerAddr is unchanged at the same epoch; the running
+//     supervisor picks the new pins up on its next redial, which reads them under
+//     c.mu, gen-fenced).
+//   - epoch < session epoch → a stale duplicate: no-op.
+//
+// A directive for a port with no open session is a no-op (the agent's
+// open-from-state path handles a deferred/closed expose). The rehome dial BLOCKS;
+// the caller retries a returned transient home_catching_up (R-15).
+func (c *Client) ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error {
+	c.mu.Lock()
+	sess, ok := c.sessions[publicPort]
+	if !ok {
+		c.mu.Unlock()
+		return nil // not open — nothing to rehome (directive for a closed/unknown expose)
+	}
+	if epoch < sess.epoch {
+		c.mu.Unlock()
+		return nil // stale lower-epoch directive
+	}
+	if epoch == sess.epoch {
+		// Same home epoch, possibly rotated pins: update in place, no transport tear.
+		sess.certPins = certPins
+		c.mu.Unlock()
+		return nil
+	}
+	localPort, token := sess.localPort, sess.token
+	c.mu.Unlock()
+	// OpenHome is the atomic replace (re-checks the epoch under mu, cancels the
+	// old supervisor, installs the new session + supervisor). A transient/terminal
+	// DENY surfaces to the caller for retry/handling.
+	return c.OpenHome(publicPort, localPort, token, brokerAddr, epoch, certPins)
 }
 
 // dialAndRegister performs ONE TLS dial + REGISTER handshake + yamux client
@@ -690,9 +805,16 @@ func (c *Client) Open(publicPort, localPort int, token string) error {
 // TLS wraps the underlying TCP so REGISTER + token cannot be observed by a
 // passive listener (architecture F.5); v1 InsecureSkipVerify is sufficient
 // for the passive-eavesdrop threat model (see clientTLSConfig).
-func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token string) (net.Conn, *yamux.Session, error) {
-	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: clientTLSConfig()}
-	conn, err := dialer.DialContext(ctx, "tcp", c.brokerAddr)
+func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) (net.Conn, *yamux.Session, error) {
+	// D6 §7.5: dial THIS expose's home addr; "" falls back to the single
+	// configured Client.brokerAddr (the N=1 / --tunnel-addr path). The TLS config
+	// pins the home cert when pins are present, else InsecureSkipVerify (N=1).
+	addr := brokerAddr
+	if addr == "" {
+		addr = c.brokerAddr
+	}
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: clientTLSConfigPinned(certPins)}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
 	}
@@ -711,7 +833,8 @@ func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token stri
 	}()
 	defer close(hsDone)
 
-	line := fmt.Sprintf("REGISTER %s %s %d %s\n", c.sid, c.nid, publicPort, token)
+	// D6 §7.2(b): 6-field REGISTER carrying this expose's home epoch (0 in N=1).
+	line := fmt.Sprintf("REGISTER %s %s %d %s %d\n", c.sid, c.nid, publicPort, token, epoch)
 	if _, err := conn.Write([]byte(line)); err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("tunnel client: write REGISTER: %w", err)
@@ -746,7 +869,15 @@ func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token stri
 // terminal DENY (proxy off / revoke). The loop structure makes the state
 // hook fire exactly once per edge: one notifyState(false) per drop, one
 // notifyState(true) per successful reconnect — they strictly alternate.
-func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token string, gen uint64, initial *yamux.Session) {
+// R-13: brokerAddr/epoch are VALUE PARAMS snapshotted at the `go c.supervise(...)`
+// spawn in Open — this goroutine NEVER reads THEM back from c.sessions[port]
+// (which Open-replace mutates under c.mu); a rehome is a fresh Open (new
+// supervisor with new params), not a mutation of this one's. certPins is the
+// ONE exception: a same-epoch cert rotation (ApplyHome / R-24) updates
+// sess.certPins in place, so redialWithBackoff reads the CURRENT pins under c.mu
+// (gen-fenced) instead of the spawn-time value — off the hot accept path, so
+// race-free. certPins here is only the initial/fallback value.
+func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins, gen uint64, initial *yamux.Session) {
 	sess := initial
 	for {
 		c.runAcceptLoop(ctx, publicPort, localPort, sess)
@@ -754,7 +885,7 @@ func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token
 			return // intentional teardown — owner already knows; no callback
 		}
 		c.notifyState(publicPort, false) // down edge (one per drop)
-		conn, ys, err := c.redialWithBackoff(ctx, publicPort, token)
+		conn, ys, err := c.redialWithBackoff(ctx, publicPort, token, brokerAddr, epoch, certPins, gen)
 		if err != nil {
 			// ctx-cancel or terminal DENY: the down edge above is the final
 			// state; drop the slot so status reflects a dead exit, then stop.
@@ -777,7 +908,7 @@ func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token
 // backoff until it succeeds, hits a terminal error (terminal DENY or ctx
 // cancel), or ctx is done. Returns the new transport on success, or a
 // non-nil error on terminal stop.
-func (c *Client) redialWithBackoff(ctx context.Context, publicPort int, token string) (net.Conn, *yamux.Session, error) {
+func (c *Client) redialWithBackoff(ctx context.Context, publicPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins, gen uint64) (net.Conn, *yamux.Session, error) {
 	sleep := c.backoffBase
 	for {
 		timer := time.NewTimer(jitter(sleep))
@@ -787,7 +918,16 @@ func (c *Client) redialWithBackoff(ctx context.Context, publicPort int, token st
 			return nil, nil, ctx.Err()
 		case <-timer.C:
 		}
-		conn, ys, err := c.dialAndRegister(ctx, publicPort, token)
+		// Pick up a same-epoch cert rotation (ApplyHome / R-24): read THIS session's
+		// current pins under c.mu (gen-fenced so we never read a successor's pins).
+		// Off the hot accept path → race-free with ApplyHome's write.
+		pins := certPins
+		c.mu.Lock()
+		if cur, ok := c.sessions[publicPort]; ok && cur.gen == gen {
+			pins = cur.certPins
+		}
+		c.mu.Unlock()
+		conn, ys, err := c.dialAndRegister(ctx, publicPort, token, brokerAddr, epoch, pins)
 		if err == nil {
 			return conn, ys, nil
 		}
@@ -928,17 +1068,27 @@ func bridge(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-func parseRegisterLine(line string) (sid, nid string, port int, token string, ok bool) {
+func parseRegisterLine(line string) (sid, nid string, port int, token string, epoch int64, ok bool) {
 	line = strings.TrimRight(line, "\r\n")
 	parts := strings.Split(line, " ")
-	if len(parts) != 5 || parts[0] != "REGISTER" {
-		return "", "", 0, "", false
+	// D6 §7.2(b): the v2 REGISTER grammar is EXACTLY 6 fields
+	// (REGISTER <sid> <nid> <port> <token> <epoch>). A 5-field (pre-D6) or
+	// 7-field line is rejected — never mis-bound.
+	if len(parts) != 6 || parts[0] != "REGISTER" {
+		return "", "", 0, "", 0, false
 	}
 	port, err := strconv.Atoi(parts[3])
 	if err != nil {
-		return "", "", 0, "", false
+		return "", "", 0, "", 0, false
 	}
-	return parts[1], parts[2], port, parts[4], true
+	// ParseInt(_, 10, 64) matches port_allocations.epoch (int64) and rejects
+	// overflow that strconv.Atoi would silently truncate; negatives are rejected
+	// (epoch is a non-negative monotone counter).
+	epoch, err = strconv.ParseInt(parts[5], 10, 64)
+	if err != nil || epoch < 0 {
+		return "", "", 0, "", 0, false
+	}
+	return parts[1], parts[2], port, parts[4], epoch, true
 }
 
 // hashToken is the SHA256 hex digest of raw. Kept locally

@@ -20,7 +20,7 @@ func TestExternalReviewCloseSessionKillsListenersWithoutDB(t *testing.T) {
 	srv := NewServer(
 		net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
 		"127.0.0.1",
-		func(_, _ string, _ int, _ string) error { return nil },
+		func(_, _ string, _ int, _ string, _ int64) error { return nil },
 		silentLog(),
 	)
 	ctx, cancel := context.WithCancel(context.Background())

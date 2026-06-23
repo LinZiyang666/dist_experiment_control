@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // PortToken is one persisted expose row. Mirrors what the broker
@@ -29,6 +31,17 @@ type PortToken struct {
 	Port      int    `json:"port"`       // public port (14000-14999)
 	LocalPort int    `json:"local_port"` // agent-side port being exposed
 	Token     string `json:"token"`      // raw tunnel auth token
+
+	// HomeBrokerAddr + Epoch (D6 §7.5) persist this expose's home broker tunnel
+	// addr + home epoch so a restart re-targets the right home (replay). Both
+	// omitempty so a pre-D6 / single-node state.json stays byte-stable (empty addr
+	// ⇒ the agent's single --tunnel-addr fallback). CertPins is NOT persisted
+	// (json:"-"): like the ProxyState PSKs, pins are re-delivered on every
+	// register/expose reply, so a clustered expose replayed on boot defers its
+	// dial (tunnel.ErrHomePinsRequired) until the register reply re-delivers them.
+	HomeBrokerAddr string         `json:"home_broker_addr,omitempty"`
+	Epoch          int64          `json:"epoch,omitempty"`
+	CertPins       proto.CertPins `json:"-"`
 }
 
 // ProxyState (P13) persists the embedded SS proxy's tunnel footprint so a
@@ -123,6 +136,32 @@ func (s *stateStore) AddPort(p PortToken) error {
 		sf.PortTokens = append(sf.PortTokens, p)
 	}
 	return s.saveLocked(sf)
+}
+
+// UpdatePortHome rewrites the persisted home addr + epoch for the expose named
+// name (D6 §7.4, called after a successful rehome) so a restart re-targets the
+// new home. MONOTONE (review L-4): it never downgrades the stored epoch — a
+// stale/no-op rehome at a lower epoch leaves the persisted home untouched, so a
+// restart can't replay an older home than the live session. No-op if absent.
+// Pins are NEVER persisted (re-delivered on register).
+func (s *stateStore) UpdatePortHome(name, homeBrokerAddr string, epoch int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sf, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	for i := range sf.PortTokens {
+		if sf.PortTokens[i].Name == name {
+			if epoch < sf.PortTokens[i].Epoch {
+				return nil // monotone: never persist an older home epoch
+			}
+			sf.PortTokens[i].HomeBrokerAddr = homeBrokerAddr
+			sf.PortTokens[i].Epoch = epoch
+			return s.saveLocked(sf)
+		}
+	}
+	return nil
 }
 
 // RemovePort drops the entry matching name (no-op if absent). Used by

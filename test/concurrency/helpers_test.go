@@ -199,7 +199,7 @@ func newTunnelServer(t *testing.T, controlPort int) *tunnel.Server {
 	return tunnel.NewServer(
 		net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
 		"127.0.0.1",
-		func(_, _ string, _ int, _ string) error { return nil },
+		func(_, _ string, _ int, _ string, _ int64) error { return nil },
 		silentLog(),
 	)
 }

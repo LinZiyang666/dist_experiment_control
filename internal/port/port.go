@@ -80,6 +80,15 @@ type Allocation struct {
 	// agent and discard their own copy; subsequent lookups will not
 	// re-derive it (only the hash is persisted).
 	Token string
+
+	// HomeBroker + Epoch (D6 §7.1-7.2) are populated ONLY by LookupByTokenHash
+	// (the tunnelTokenLookup read path). HomeBroker is the cluster_nodes.node_id
+	// of the broker that serves this expose ('' = no cluster home, the
+	// migration-0010 default / single-node); Epoch is the per-port monotone
+	// reassign counter (0 baseline). All other lookups leave these at the zero
+	// value — they do not read the columns.
+	HomeBroker string
+	Epoch      int64
 }
 
 // Errors callers may need to distinguish. ErrNotFound is the lookup
@@ -265,12 +274,40 @@ func LookupByName(db *sql.DB, sid, name string) (*Allocation, error) {
 // looks up here, and authorizes only if the row is ALLOCATED AND the
 // claimed remote_port matches the row's port.
 func LookupByTokenHash(db *sql.DB, tokenHash string) (*Allocation, error) {
-	return scanOne(db.QueryRow(
-		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
+	// D6 §7.1-7.2: this is the ONE read path that needs home_broker + epoch (for
+	// tunnelTokenLookup's home==self / catch-up ladder), so it scans a WIDER
+	// column set than the shared scanOne. Legacy / single-node rows return
+	// home_broker='' (migration-0010 default) + epoch=0, which keeps
+	// tunnelTokenLookup byte-equivalent to pre-D6 (the home/epoch branch is inert
+	// when home_broker==''). A differential test pins that equivalence.
+	var (
+		a         Allocation
+		revokedAt sql.NullTime
+		stateStr  string
+	)
+	err := db.QueryRow(
+		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
+		        home_broker, epoch
 		 FROM port_allocations
 		 WHERE token_hash=? AND state='ALLOCATED'`,
 		tokenHash,
-	))
+	).Scan(
+		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
+		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
+		&a.HomeBroker, &a.Epoch,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.State = State(stateStr)
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		a.RevokedAt = &t
+	}
+	return &a, nil
 }
 
 // ListBySession returns every row (any state) for sid, sorted by port

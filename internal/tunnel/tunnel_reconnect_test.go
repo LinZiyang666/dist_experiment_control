@@ -46,7 +46,7 @@ func newReconnectHarness(t *testing.T, logger *slog.Logger) *reconnectHarness {
 
 	var registers atomic.Int64
 	var denyReason atomic.Pointer[string]
-	lookup := func(gotSid, gotNid string, gotPort int, gotHash string) error {
+	lookup := func(gotSid, gotNid string, gotPort int, gotHash string, _ int64) error {
 		n := registers.Add(1)
 		if gotSid != sid || gotNid != nid || gotPort != publicPort || gotHash != hashToken(rawToken) {
 			return errors.New("token_unknown_or_revoked")
@@ -255,7 +255,7 @@ func TestTunnelReconnectCtxCancelInterruptsBackoff(t *testing.T) {
 	const sid, nid = "lab", "lab-1"
 	rawToken := "tok"
 	var denyAfter atomic.Bool
-	lookup := func(_, _ string, _ int, _ string) error {
+	lookup := func(_, _ string, _ int, _ string, _ int64) error {
 		if denyAfter.Load() {
 			return errors.New("try_again") // transient → keeps the loop in backoff
 		}

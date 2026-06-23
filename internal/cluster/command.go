@@ -24,8 +24,9 @@ const (
 	// Plan* functions live in the mutator packages (internal/{port,proc,node,
 	// session,agentprov}) and render all-literal Commands (no Statement.Args); the
 	// shared genericExecApplier execs the baked SQL. Ops with no live writer today
-	// (MemberKick, PortReassignHome, RotatePin, Alert*, ClusterNode*) are DEFERRED
+	// (MemberKick, RotatePin, Alert*, ClusterNode*) are DEFERRED
 	// — adding them would be dead code the equivalence test cannot exercise.
+	// (PortReassignHome was promoted to a live op in D6 — see OpPortReassignHome.)
 	OpSessionCreate     OpType = "SessionCreate"
 	OpSessionTombstone  OpType = "SessionTombstone"
 	OpSessionHardDelete OpType = "SessionHardDelete"
@@ -48,6 +49,17 @@ const (
 	// genericExecApplier and DERIVES ZERO AUDIT (it is in the publisher's skip-set, so it
 	// never begets another checkpoint). No migration: cluster_meta exists since 0009.
 	OpAuditCheckpointSet OpType = "AuditCheckpointSet"
+
+	// OpPortReassignHome (D6 §7.1-7.2) re-points one expose's home broker and
+	// bumps its per-port epoch. Its Plan (port.PlanReassignHome) reads the current
+	// epoch under applyMu and bakes an all-literal UPDATE with a monotonic CAS
+	// guard (... WHERE port=<lit> AND state='ALLOCATED' AND epoch < <LitInt(cur+1)>)
+	// so a stale ex-leader's lower-epoch reassign is a deterministic RowsAffected==0
+	// no-op on every replica — the FSM-layer ex-home double-bind fence. It rides
+	// genericExecApplier. The leader-driven backup path carries NO reqID (the D4
+	// ledger requires an originating-broker-minted key, which a leader-push has
+	// none of; the CAS guard is the sole idempotency anchor, like D4 provision/join).
+	OpPortReassignHome OpType = "PortReassignHome"
 )
 
 // Log-read sentinels returned by Node.CommittedCommandAt (D5 audit publisher, §6.3).
@@ -204,4 +216,5 @@ var knownOps = map[OpType]bool{
 	OpPortRevoke:         true,
 	OpAgentProvision:     true,
 	OpAuditCheckpointSet: true,
+	OpPortReassignHome:   true,
 }

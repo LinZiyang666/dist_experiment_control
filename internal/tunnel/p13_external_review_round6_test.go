@@ -14,7 +14,7 @@ func TestExternalReviewForgetSessionInvalidatesInFlightRegister(t *testing.T) {
 
 	authorized := make(chan struct{})
 	releaseLookup := make(chan struct{})
-	lookup := func(_, _ string, _ int, _ string) error {
+	lookup := func(_, _ string, _ int, _ string, _ int64) error {
 		// Models a lookup that read the still-existing allocation immediately
 		// before session deletion, then returns its already-authorized result.
 		close(authorized)

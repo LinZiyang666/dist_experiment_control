@@ -62,6 +62,15 @@ func (a *Agent) handleExposeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		LocalPort: req.LocalPort,
 		Token:     req.Token,
 	}
+	// D6 §7.2/§6.5 (C1 fix): if the broker assigned a home, persist its addr +
+	// epoch (so a restart re-targets it) and carry the cert pins TRANSIENTLY into
+	// AddProxy (pins are never persisted; re-delivered on register). nil Home ⇒
+	// the N=1 single --tunnel-addr path (empty fields, byte-identical state.json).
+	if req.Home != nil {
+		tok.HomeBrokerAddr = req.Home.BrokerAddr
+		tok.Epoch = req.Home.Epoch
+		tok.CertPins = req.Home.CertPins
+	}
 	if a.stateStore != nil {
 		if err := a.stateStore.AddPort(tok); err != nil {
 			a.cfg.Logger.Warn("agent: state.json AddPort", "err", err)

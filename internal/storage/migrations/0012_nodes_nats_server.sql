@@ -1,0 +1,19 @@
+-- Migration 0012 — nodes.nats_server (D6 §6.5, server-id bridge binding).
+--
+-- ALTER ADD COLUMN, NOT a table rebuild: preserves the (sid, nid) PRIMARY KEY,
+-- the sessions FK ON DELETE CASCADE, and every index from 0001.
+--
+-- nats_server records the DETERMINISTIC nats server_name the agent last reported
+-- on register (NodeRegisterReq.ServerID == nc.ConnectedServerName(), e.g.
+-- "tether-1"), NOT the volatile per-boot NUID (D6 plan DA-1). It is an IDENTITY
+-- column (an attribute of the node, not liveness), so BOTH register paths write
+-- it: the live node.Register direct mutator AND the FSM node.PlanRegister
+-- (OpNodeRegister) — keeping the D2 DIFF-1 equivalence consistent.
+--
+-- Default is the deterministic constant '' (§3.4) — NOT NULL like 0010's
+-- home_broker, so a row that never reported a server_name reads back as '' and
+-- the home-resolution treats '' as "no binding". No writer fills it with a
+-- non-empty value until an agent self-reports a server_name; in single-node
+-- production that is whatever the local nats-server's name is, but it is INERT —
+-- only read when the broker runs clustered (b.node != nil) for home assignment.
+ALTER TABLE nodes ADD COLUMN nats_server TEXT NOT NULL DEFAULT '';

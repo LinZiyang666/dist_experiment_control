@@ -154,7 +154,7 @@ func TestPortAllocate_RenderingEquivalence(t *testing.T) {
 		t.Fatalf("direct Allocate: %v", err)
 	}
 	// fsm-rendered arm
-	alloc, cmd, err := port.PlanAllocate(fa, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", cfg)
+	alloc, cmd, err := port.PlanAllocate(fa, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", cfg)
 	if err != nil {
 		t.Fatalf("PlanAllocate: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestPortAllocate_RenderingEquivalence(t *testing.T) {
 	// the comparator actually bites.
 	fb := freshDB(t)
 	seedSessionNode(t, fb, "lab", "lab-1", now)
-	badAlloc, badCmd, err := port.PlanAllocate(fb, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", cfg)
+	badAlloc, badCmd, err := port.PlanAllocate(fb, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func buildMultiOp(t *testing.T, useFSM bool, now time.Time, cfg *port.Config) *s
 		t.Fatalf("session.JoinWithPIN: %v", err)
 	}
 	if useFSM {
-		_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", cfg)
+		_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", cfg)
 		apply(cmd, err)
 	} else if _, err := port.Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", cfg); err != nil {
 		t.Fatalf("port.Allocate: %v", err)
@@ -505,7 +505,7 @@ func TestPlanAllocate_DesiredPortCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	// request the SAME public port with a different name -> must be ErrPortTaken.
-	_, _, err = port.PlanAllocate(db, "lab", "lab-1", "second", 1001, a.Port, "fp", cfg)
+	_, _, err = port.PlanAllocate(db, "lab", "lab-1", "second", 1001, a.Port, "fp", "", cfg)
 	if err != port.ErrPortTaken {
 		t.Fatalf("desired-port collision: got %v, want ErrPortTaken (a bare INSERT would panic the FSM at Apply)", err)
 	}
@@ -555,7 +555,7 @@ func TestPlanError_Parity(t *testing.T) {
 	t.Run("port_out_of_band_and_exhausted", func(t *testing.T) {
 		db := freshDB(t)
 		seedSessionNode(t, db, "lab", "lab-1", now)
-		if _, _, err := port.PlanAllocate(db, "lab", "lab-1", "n", 1, 70000, "fp", cfg); err != port.ErrPortOutOfBand {
+		if _, _, err := port.PlanAllocate(db, "lab", "lab-1", "n", 1, 70000, "fp", "", cfg); err != port.ErrPortOutOfBand {
 			t.Fatalf("Plan out-of-band: got %v, want ErrPortOutOfBand", err)
 		}
 	})
@@ -693,7 +693,7 @@ func TestPortAllocateFreeReallocate_AutoincrementEquivalence(t *testing.T) {
 				}
 			} else {
 				apply(func(d *sql.DB) (*cluster.Command, error) {
-					_, cmd, err := port.PlanAllocate(d, "lab", "lab-1", s.name, 1000, 0, "SHA256:c", cfg)
+					_, cmd, err := port.PlanAllocate(d, "lab", "lab-1", s.name, 1000, 0, "SHA256:c", "", cfg)
 					return cmd, err
 				})
 			}
@@ -713,7 +713,7 @@ func TestPortAllocateFreeReallocate_AutoincrementEquivalence(t *testing.T) {
 		} else {
 			apply(func(d *sql.DB) (*cluster.Command, error) { return port.PlanFree(d, aPort, now) })
 			apply(func(d *sql.DB) (*cluster.Command, error) {
-				_, cmd, err := port.PlanAllocate(d, "lab", "lab-1", "c", 1000, 0, "SHA256:c", cfg)
+				_, cmd, err := port.PlanAllocate(d, "lab", "lab-1", "c", 1000, 0, "SHA256:c", "", cfg)
 				return cmd, err
 			})
 		}

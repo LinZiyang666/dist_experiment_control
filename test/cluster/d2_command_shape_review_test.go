@@ -79,7 +79,7 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 	}
 	assertNoArgs(t, "ReconcileBatch", cmd)
 
-	_, cmd, err = port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:actor", cfg)
+	_, cmd, err = port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:actor", "", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, cmd, err = port.PlanAllocate(db, "lab", "lab-1", "jupyter2", 9999, 0, "SHA256:actor", cfg)
+	_, cmd, err = port.PlanAllocate(db, "lab", "lab-1", "jupyter2", 9999, 0, "SHA256:actor", "", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,6 +32,16 @@ type NodeRegisterReq struct {
 	Arch           string `json:"arch"`
 	BootID         string `json:"boot_id,omitempty"`
 
+	// ServerID (D6 §6.5) is the DETERMINISTIC nats server_name the agent is
+	// currently connected to (== nc.ConnectedServerName() == INFO.Name, e.g.
+	// "tether-1"), NOT the volatile per-boot NUID (nc.ConnectedServerId()). The
+	// leader bridges it via cluster_nodes.nats_server_id → home node for
+	// authoritative home assignment. omitempty ⇒ a non-clustered agent (server
+	// name empty/unknown) and any pre-D6 wire stay byte-identical. The broker
+	// persists the last-reported value (nodes.nats_server) so it is resolvable at
+	// expose time. Inert in production (only read when the broker runs clustered).
+	ServerID string `json:"server_id,omitempty"`
+
 	LocalProcesses []LocalProcess `json:"local_processes,omitempty"`
 	LocalPorts     []LocalPort    `json:"local_ports,omitempty"`
 
@@ -107,7 +117,82 @@ type NodeRegisterResp struct {
 	// proxy-disabled response marshals with NO "proxy" key and stays
 	// byte-identical to a pre-P13 NodeRegisterResp (proto stays v1).
 	Proxy *ProxyDirective `json:"proxy,omitempty"`
+
+	// Home (D6 §6.5/§7.4), when non-nil, carries the authoritative per-expose
+	// home-broker directives for this agent (one per exposed public port). A
+	// POINTER + omitempty so a single-node (non-clustered) broker — which never
+	// emits it — produces a NodeRegisterResp byte-identical to today (the
+	// Proxy *ProxyDirective precedent). The agent applies each directive
+	// epoch-ordered (apply iff Epoch > the clientSession's current home epoch).
+	Home *HomeAssignment `json:"home,omitempty"`
 }
+
+// HomeAssignment is the register-reply container for per-expose home
+// directives (D6 §6.5/§7.5). The slice is keyed conceptually by (Name,
+// PublicPort). A wrapper struct (not a bare []HomeDirective on the resp) keeps
+// the nil-omits-the-key guarantee unambiguous and leaves room for a future
+// cluster-wide field.
+type HomeAssignment struct {
+	Directives []HomeDirective `json:"directives,omitempty"`
+}
+
+// HomeDirective is the authoritative home broker for ONE expose (per public
+// port, D6 §7.5). It is delivered three ways — the register reply
+// (NodeRegisterResp.Home), the initial expose forward (ExposeForwardedReq.Home,
+// the C1 fix), and the leader-pushed RehomeDirective backup — all epoch-ordered
+// so the agent applies a directive iff its Epoch strictly exceeds the
+// clientSession's current home epoch (idempotent re-delivery).
+//
+// It carries NO raw tunnel token (the token is unchanged across a rehome; the
+// agent already holds it). Like ProxyDirective it travels ONLY over the
+// register-reply _INBOX / expose.req.forwarded / agent-only forwarded channel —
+// NEVER over sys.events (which members can read).
+type HomeDirective struct {
+	Name       string   `json:"name"`
+	PublicPort int      `json:"public_port"`
+	NodeID     string   `json:"node_id"`     // home raft ServerID (display/audit)
+	BrokerAddr string   `json:"broker_addr"` // home tunnel_addr the agent dials
+	Epoch      int64    `json:"epoch"`       // per-port monotone counter (DA-3); 0 at allocate, +1 per reassign
+	CertPins   CertPins `json:"cert_pins,omitempty"`
+}
+
+// CertPins is the agent's pin set for verifying the home tunnel server's TLS
+// certificate (D6 §7.7/§15). Current is the live fingerprint; Previous is
+// non-empty only during a rotation window and is accepted until ValidUntil.
+// Fingerprint format is the tunnel.CertFingerprint SSOT: "sha256:"+hex(SHA-256
+// of the leaf certificate DER). ValidUntil is a *time.Time so a NULL (no
+// rotation in flight) is distinguishable from a zero time.
+type CertPins struct {
+	Current    string     `json:"current,omitempty"`
+	Previous   string     `json:"previous,omitempty"`
+	ValidUntil *time.Time `json:"valid_until,omitempty"`
+}
+
+// RehomeDirective is the leader-pushed BACKUP rehome trigger (D6 §7.4), the same
+// shape as a HomeDirective, applied by the same epoch-ordered path.
+//
+// NOT YET WIRED (D7): there is no publisher, subscriber, or K/sec rate-limiter
+// for this type in D6 — the leader broker-death DETECTION it depends on needs
+// raft peer/route health, which is the D7 cluster lifecycle (§8). The PRIMARY,
+// load-bearing rehome trigger in D6 is the agent-self-driven path
+// (onNATSReconnect → re-register → homeForRegister directives → applyHomeDirectives);
+// the home broker dying takes its co-located nats-server with it, so the agent's
+// NATS connection bounces and that path fires. This type is defined here so the
+// v2 wire is stable when D7 wires the backup; a guard test asserts it has no live
+// publisher so a half-wiring is caught (review A5 M5).
+type RehomeDirective struct {
+	HomeDirective
+}
+
+// ReasonHomeCatchingUp is the TRANSIENT tunnel DENY reason (D6 §7.2(a)) a home
+// broker returns when the agent presents an expose epoch HIGHER than the home's
+// own locally-applied port_allocations row — i.e. this replica has not yet
+// applied the latest OpPortReassignHome. It is the SINGLE SOURCE OF TRUTH shared
+// by the broker emit-side (tunnelTokenLookup) and the agent classifier
+// (tunnel.denyIsTransient): a duplicated literal would let one side drift and
+// permanently brick a fleet. The agent MUST retry it (bounded), never treat it
+// as terminal.
+const ReasonHomeCatchingUp = "home_catching_up"
 
 // ReconciledProc reports one PID the broker just transitioned away
 // from RUNNING/LOST as part of the register reconciliation. NewState
@@ -474,6 +559,15 @@ type ExposeForwardedReq struct {
 	LocalPort int    `json:"local_port"`
 	Token     string `json:"token"`
 	ActorFP   string `json:"actor_fp"`
+
+	// Home (D6 §7.2/§6.5, the C1 fix), when non-nil, is the authoritative home
+	// directive for THIS expose, resolved by the broker at allocate time from the
+	// agent's persisted server_name binding. The initial-expose path never
+	// touches NodeRegisterResp, so the home must ride the forward here. A POINTER
+	// + omitempty so a non-clustered broker (which leaves it nil) sends a
+	// byte-identical ExposeForwardedReq. The agent persists it into the PortToken
+	// and dials the home accordingly; nil ⇒ the legacy single --tunnel-addr.
+	Home *HomeDirective `json:"home,omitempty"`
 }
 
 // ExposeForwardedResp — agent pub on the expose.req.forwarded reply
