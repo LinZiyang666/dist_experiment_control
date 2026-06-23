@@ -99,6 +99,38 @@ func TestCtlPubLocksActorSegment(t *testing.T) {
 	}
 }
 
+// TestD8bMemberAlertACLCarveOut: the D8b carve-out — a member CAN pub the actor-scoped
+// cluster-health + alert RPCs (banner + client-synth gating are member-reachable), but the
+// §13.8 negative invariant holds: a member's pub allow never reaches the broker-only
+// tether.v2.cluster.* namespace (note ".cluster-health" is a DISTINCT token from ".cluster.").
+func TestD8bMemberAlertACLCarveOut(t *testing.T) {
+	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	want := []string{
+		subjectPrefix + ".ctrl.by." + sampleActor + ".cluster-health.req",
+		subjectPrefix + ".ctrl.by." + sampleActor + ".alert.ls.req",
+		subjectPrefix + ".ctrl.by." + sampleActor + ".alert.ack.req",
+	}
+	for _, w := range want {
+		if !contains(perms.Pub.Allow, w) {
+			t.Errorf("member must be allowed to pub %q (D8b carve-out)", w)
+		}
+	}
+	for _, allow := range perms.Pub.Allow {
+		if strings.Contains(allow, ".cluster.") { // broker-only (cluster.apply.* / cluster.>)
+			t.Errorf("member pub allow %q reaches the broker-only cluster.* namespace", allow)
+		}
+	}
+	// Scope is ACTIVATED-member (review M2): an UNACTIVATED CLI does NOT get the carve-out —
+	// every destructive op the gate guards itself needs a session, so this scope is sufficient
+	// and tighter. Pin it so the "session-independent subject" naming never silently widens.
+	un := PermissionsForUnactivated(sampleActor)
+	for _, w := range want {
+		if contains(un.Pub.Allow, w) {
+			t.Errorf("unactivated CLI must NOT be granted %q (D8b carve-out is activated-member scope)", w)
+		}
+	}
+}
+
 // agents are NEVER allowed to publish `audit.*` — audit is tetherd-single-
 // writer (architecture C.1 §4 / B.2 note).
 func TestAgentCannotPublishAudit(t *testing.T) {

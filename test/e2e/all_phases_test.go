@@ -29,6 +29,15 @@ import (
 	"time"
 )
 
+// NOTE on speed (2026-06): parallelizing the matrices was tried + measured and REVERTED. The
+// heavy clustered-JetStream matrices (D5/D8) starve their embedded-JS meta-group formation
+// ("routed JS server not ready") whenever a concurrent heavy -race matrix shares the machine —
+// even at -parallel 2 with GOMAXPROCS capped (D8 flaked at 2-way, D5 at 4-way). The matrix
+// runtime is dominated by these timing-sensitive suites, so meaningful parallelism reintroduces
+// exactly the contention flakes this phase hardened. Serial is the right release-gate posture.
+// For fast LOCAL iteration run the ONE suite you touched, e.g. `go test ./test/p8/...` or
+// `go test -tags d8_integration -race ./test/d8/`, not the whole e2e.
+
 // phaseTimeout caps each subprocess. test/p3 is the slow one
 // (~22s for the full auth_callout matrix); 90s gives 4× headroom.
 const phaseTimeout = 90 * time.Second
@@ -253,6 +262,30 @@ func TestD7Matrix(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = &buf, &buf
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("d7 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
+func TestD8Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags d8_integration builds the D8 distributed-transfer ‖ replicated-alerts suite
+	// (test/d8): a real routed-NATS + clustered-JetStream + mTLS-raft cluster proving the
+	// leader-gated alert reconcile loop (replication_degraded raise/clear REPLICATES; a
+	// transient unobserved pass never false-clears), the cluster-level ack replicating with
+	// the authenticated actor, re-derivable transfer audit (OpTransferAudit replays exactly
+	// once across an election via the q<reqID>:xfer dedup), the VerifyLeader-confirmed
+	// cluster-health gate (no false-positive on a healthy cluster), and EXIT-A (a completed
+	// tier-B object at R=n survives killing its home broker). Gated out of the parallel
+	// `make test` (clustered JS + raft elections starve under contention) and run only here
+	// in its own -race subprocess; the cheap d8 guard + the alert/audit/gate unit tests run
+	// in `make test`.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "d8_integration", "-timeout", "300s",
+		"./test/d8/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d8 matrix failed: %v\n--- output ---\n%s", err, buf.String())
 	}
 }
 

@@ -58,6 +58,13 @@ func productionBrokerFiles(t *testing.T, root string) []string {
 		if n == "clusteradmin.go" || n == "clusterdrain.go" || n == "clusterstatus.go" {
 			continue
 		}
+		// D8 build-and-prove mechanism files: they consume the D5 read primitives
+		// (NumVoters / ReplicaReport / ObserveReplicas) to drive the alert reconcile loop
+		// + tier-B replica seam + cluster-health responder. Production (serve.go) is scanned.
+		if n == "transfer_home.go" || n == "transfer_audit_forward.go" ||
+			n == "alert_reconcile.go" || n == "alert_forward.go" || n == "cluster_health.go" {
+			continue
+		}
 		out = append(out, filepath.Join("internal/broker", n))
 	}
 	return out

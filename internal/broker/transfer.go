@@ -328,7 +328,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 		default:
 			code = "timeout"
 		}
-		b.pubAuditTransfer(schema.AuditTransfer{
+		b.emitTransferAudit(schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 			Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 			ActorNkey: ent.actor, ActorFp: ent.actorFP,
@@ -373,6 +373,20 @@ func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
 	}
 }
 
+// emitTransferAudit routes one transfer-audit record. In production
+// (transferAuditSink==nil, D8a build-and-prove) it is the byte-identical best-effort
+// pubAuditTransfer — the nil-seam read is the only change. When the harness has attached
+// the cluster sink (AttachTransferAuditSink) the record is routed through leader Apply
+// (OpTransferAudit, re-derivable §9/§6.3) so any new leader re-derives committed-but-
+// unpublished transfer audit after a leader death (cutover=D9).
+func (b *Broker) emitTransferAudit(rec schema.AuditTransfer) {
+	if b.transferAuditSink != nil {
+		b.transferAuditSink(rec)
+		return
+	}
+	b.pubAuditTransfer(rec)
+}
+
 // handlePushReq is the broker entry for `tether push`. It runs the
 // standard ctl preconditions (sid alive, actor is a member, node is
 // ONLINE), ensures the per-session tier-B bucket exists if needed, registers the
@@ -393,6 +407,9 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyPushErr(msg, err, "")
 		return
+	}
+	if !b.transferHomeGate(sid, nid) {
+		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
 	}
 	var req proto.PushPrepareReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
@@ -436,7 +453,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err := b.ensureXferBucket(ctx, sid, jsstream.ReplicasSingle)
+		bucket, err := b.ensureXferBucket(ctx, sid, b.xferTargetReplicas())
 		cancel()
 		if err != nil {
 			b.replyPushErr(msg, "bucket_create_failed", err.Error())
@@ -470,7 +487,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
 	// Audit start (plan §Audit "start written from broker-accepted prepare").
-	b.pubAuditTransfer(schema.AuditTransfer{
+	b.emitTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "start", Verb: "push",
 		Ts: entry.startedAt, Session: sid, Node: nid,
 		ActorNkey: actor, ActorFp: fp,
@@ -517,6 +534,9 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPullErr(msg, err, "")
 		return
 	}
+	if !b.transferHomeGate(sid, nid) {
+		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
+	}
 	var req proto.PullPrepareReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		b.replyPullErr(msg, "json_parse", err.Error())
@@ -536,7 +556,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	bucket := ""
 	if b.js != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err = b.ensureXferBucket(ctx, sid, jsstream.ReplicasSingle)
+		bucket, err = b.ensureXferBucket(ctx, sid, b.xferTargetReplicas())
 		cancel()
 		if err != nil {
 			b.replyPullErr(msg, "bucket_create_failed", err.Error())
@@ -577,7 +597,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
-	b.pubAuditTransfer(schema.AuditTransfer{
+	b.emitTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "start", Verb: "pull",
 		Ts: entry.startedAt, Session: sid, Node: nid,
 		ActorNkey: actor, ActorFp: fp,
@@ -627,7 +647,14 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	entry := b.transfers.get(req.TransferID)
 	if entry == nil {
-		b.replyCommitErr(msg, "transfer_unknown", req.TransferID)
+		// Tracker miss. In clustered mode (selfID!="") this broker is NOT the transfer's
+		// origin — every broker receives this broadcast subject, so a non-owner MUST stay
+		// SILENT (else it would race-answer transfer_unknown before the real home's OK,
+		// §9 D8 continuation routing). In production (no cluster identity) the single broker
+		// IS the owner, so a miss is a genuine unknown transfer → reply (byte-identical).
+		if b.selfNodeID() == "" {
+			b.replyCommitErr(msg, "transfer_unknown", req.TransferID)
+		}
 		return
 	}
 	if entry.actor != actor || entry.verb != "push" {
@@ -702,7 +729,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 		rec.Code = ev.Code
 		rec.Error = ev.Error
 	}
-	b.pubAuditTransfer(rec)
+	b.emitTransferAudit(rec)
 	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()
@@ -721,7 +748,7 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 	if !claimed || ent == nil {
 		return
 	}
-	b.pubAuditTransfer(schema.AuditTransfer{
+	b.emitTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 		Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 		ActorNkey: ent.actor, ActorFp: ent.actorFP,
@@ -913,9 +940,12 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	// tracker.mu.
 	preview := b.transfers.get(transferID)
 	if preview == nil {
-		// Unknown transfer_id (or already reaped by watchdog).
-		// Idempotent reply.
-		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "transfer_unknown"})
+		// Tracker miss: SILENT in clustered mode (not this broker's transfer — a non-owner
+		// must not race-answer transfer_unknown before the real home, §9 D8); reply in
+		// production (no cluster identity, the single owner — genuine unknown / already reaped).
+		if b.selfNodeID() == "" {
+			b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "transfer_unknown"})
+		}
 		return
 	}
 	if preview.actor != actor {
@@ -958,7 +988,7 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		rec.Code = fin.Code
 		rec.Error = fin.Error
 	}
-	b.pubAuditTransfer(rec)
+	b.emitTransferAudit(rec)
 	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()

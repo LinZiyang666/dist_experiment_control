@@ -47,6 +47,31 @@ func HistoryStreamName(sid string) string {
 	return HistoryStreamPref + sid
 }
 
+// XferBackingStreamPref is the prefix of the JetStream stream backing a per-session
+// transfer object-store bucket: nats.go names an object store "OBJ_<bucket>" and the
+// broker's bucket is "xfer-<sid>", so the backing stream is "OBJ_xfer-<sid>". Kept here
+// so the read-only replica observer can enumerate xfer buckets from the LIVE stream list
+// rather than a DB session list — a bucket can outlive its purged session row (§9 D8).
+const XferBackingStreamPref = "OBJ_xfer-"
+
+// ListXferStreams returns the names of all OBJ_xfer-* streams currently in JetStream
+// (the object stores backing transfers). The retire-gate observer counts these directly
+// off JetStream so an orphan bucket (session row gone, bucket not yet reaped) at a
+// single replica is still seen — never false-greening a retire onto un-redundant data.
+func ListXferStreams(ctx context.Context, js jetstream.JetStream) ([]string, error) {
+	var out []string
+	infos := js.ListStreams(ctx)
+	for info := range infos.Info() {
+		if strings.HasPrefix(info.Config.Name, XferBackingStreamPref) {
+			out = append(out, info.Config.Name)
+		}
+	}
+	if err := infos.Err(); err != nil {
+		return nil, fmt.Errorf("jsstream: list streams: %w", err)
+	}
+	return out, nil
+}
+
 // SIDFromHistoryStream reverses HistoryStreamName. Returns ("", false)
 // if the stream isn't a history-* stream. Used by orphan-cleanup to
 // derive the sid from the stream name and check it against SQLite.

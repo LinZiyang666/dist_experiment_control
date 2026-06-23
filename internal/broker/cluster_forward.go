@@ -38,7 +38,9 @@ import (
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/xferaudit"
 	"github.com/nats-io/nats.go"
 )
 
@@ -48,6 +50,21 @@ const (
 	VerbProvision = "provision"
 	VerbJoin      = "join"
 	VerbReconcile = "reconcile"
+	// VerbTransferAudit (D8a §9) forwards one transfer-audit record to the leader, which
+	// commits it as a re-derivable OpTransferAudit entry. Unlike provision/join it does
+	// NOT reject a non-empty env.ReqID at the boundary — the idempotency key is CONTENT-
+	// derived inside xferaudit.PlanTransferAudit (hex(sha256(transfer_id:kind))), so any
+	// leader re-derives the SAME key and the 0011 ledger collapses a forwarder retry; the
+	// originating broker passes reqID="" (the key is not minted there).
+	VerbTransferAudit = "xferaudit"
+	// VerbAlertSignal (D8b §10.2) forwards a per-node alert raise/clear decision (currently
+	// disk_pressure) to the leader's replicated alert store. The leader reads the CURRENT
+	// ACTIVE state and commits a raise/clear ONLY on a transition, so the level-triggered
+	// re-assert from each broker's disk monitor self-heals a dropped clear without writing a
+	// raft entry per tick (idle-zero-writes).
+	VerbAlertSignal = "alertsignal"
+	// VerbAlertAck (D8b §10.1) forwards a cluster-level ack to the leader (idempotent UPSERT).
+	VerbAlertAck = "alertack"
 )
 
 // Reply status codes on the typed forward reply envelope.
@@ -354,6 +371,39 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 				return nil, err
 			}
 			return proc.PlanReconcileBatch(resolveReconcile(p.SID, p.NID, p.Req, procs, ports, now()))
+		})
+	case VerbTransferAudit:
+		// D8a §9: re-derivable transfer audit. PlanTransferAudit sets the content-derived
+		// ReqID itself; node.Propose (empty arg) PRESERVES it (ProposeWithReqID only
+		// overwrites a NON-empty arg), so the 0011 ledger dedups a forwarder retry. No
+		// env.ReqID gate — the key is a pure function of the payload, not minted here.
+		var rec schema.AuditTransfer
+		if err := json.Unmarshal(env.Payload, &rec); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return xferaudit.PlanTransferAudit(rec)
+		})
+	case VerbAlertSignal:
+		// D8b §10.2: read the CURRENT ACTIVE state and commit a raise/clear ONLY on a
+		// transition — a nil command (no transition) issues no raft write, so a broker's
+		// every-tick re-assert is free and a dropped clear self-heals next tick.
+		var p AlertSignalPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return planAlertSignal(db, p, now())
+		})
+	case VerbAlertAck:
+		// D8b §10.1: cluster-level ack (idempotent UPSERT). User-initiated + rare, so no
+		// transition gate is needed (unlike the periodic signal).
+		var p AlertAckPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return cluster.PlanAlertAck(p.DedupKey, p.AckedBy, now())
 		})
 	default:
 		return fmt.Errorf("cluster_forward: unknown verb %q", env.Verb)

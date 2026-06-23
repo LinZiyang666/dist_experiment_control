@@ -143,6 +143,7 @@ func newSessionCmd() *cobra.Command {
 		},
 	}
 
+	var rmAckAlerts bool
 	rm := &cobra.Command{
 		Use:   "rm <sid>",
 		Short: "Tombstone session (owner-only; ACTIVE → DELETING; full delete in P7)",
@@ -160,6 +161,12 @@ func newSessionCmd() *cobra.Command {
 				return connectError("session rm", natsURL, err)
 			}
 			defer nc.Close()
+
+			// D8b §10.4: client-synth severe gate. Inert at N=1 (no responder → no gate);
+			// a real cluster with quorum_lost / force_single_active blocks unless --ack-alerts.
+			if gerr := gateDestructive(nc, id.PublicKey, rmAckAlerts); gerr != nil {
+				return gerr
+			}
 
 			body, _ := json.Marshal(proto.SessionRmReq{})
 			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
@@ -196,6 +203,7 @@ func newSessionCmd() *cobra.Command {
 		return cli.CompleteOwnedSessions(t, cctx, toComplete)
 	}
 
+	rm.Flags().BoolVar(&rmAckAlerts, "ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	root.AddCommand(create, list, rm)
 	return root
 }

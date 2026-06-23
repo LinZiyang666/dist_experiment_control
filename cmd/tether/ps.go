@@ -151,7 +151,11 @@ EXITED processes. Architecture F.8 — unified view.`,
 			if !anyPort {
 				_, _ = fmt.Fprintln(tw2, "  (none)")
 			}
-			return tw2.Flush()
+			if err := tw2.Flush(); err != nil {
+				return err
+			}
+			withBanner(nc, id.PublicKey, false) // D8b §10.3: severe-alert banner to stderr (stdout stays parseable)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")

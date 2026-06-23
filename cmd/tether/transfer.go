@@ -66,6 +66,7 @@ allow_root.
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite remote destination if it exists")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
 		"upper bound on the whole transfer (tier A: ~30s; tier B: ~5min — keep some slack)")
@@ -152,6 +153,11 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 		return connectError("push", natsURL, err)
 	}
 	defer nc.Close()
+
+	ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
+	if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+		return gerr
+	}
 
 	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
 	tier, _, err := chooseTier(st.Size(), caps)
@@ -364,6 +370,7 @@ be relative.
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite local destination if it exists")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
 		"upper bound on the whole transfer")
@@ -407,6 +414,11 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 		return connectError("pull", natsURL, err)
 	}
 	defer nc.Close()
+
+	ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
+	if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+		return gerr
+	}
 
 	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
 	maxInline := int64(cliTierAMaxBytes)

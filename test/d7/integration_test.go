@@ -138,7 +138,7 @@ func testD7DrainRefusesRebuildOff(t *testing.T) {
 		cu := func(idx int) func(uint64) (bool, error) {
 			return func(b uint64) (bool, error) { cur, e := c.nodes[idx].AppliedIndex(); return cur >= b, e }
 		}(i)
-		if err := c.admin.AddNode(in, c.ids[i], cu, 5*time.Second); err != nil {
+		if err := c.addNodeRetry(in, c.ids[i], cu, 5*time.Second); err != nil {
 			t.Fatalf("seed AddNode %d: %v", i, err)
 		}
 	}
@@ -192,7 +192,7 @@ func testD7AddNodeReplicates(t *testing.T) {
 		cur, err := c.nodes[1].AppliedIndex()
 		return cur >= barrier, err
 	}
-	if err := c.admin.AddNode(in, c.ids[1], caughtUp, 5*time.Second); err != nil {
+	if err := c.addNodeRetry(in, c.ids[1], caughtUp, 5*time.Second); err != nil {
 		t.Fatalf("AddNode: %v", err)
 	}
 	// The follower (node 1) must have the roster row at VOTER (replicated via raft).
@@ -220,7 +220,7 @@ func testD7ForgedSigOnFollower(t *testing.T) {
 	// First add node-1 so it is a live follower applying the log.
 	in1 := c.joinInput(t, 1)
 	caughtUp := func(barrier uint64) (bool, error) { cur, e := c.nodes[1].AppliedIndex(); return cur >= barrier, e }
-	if err := c.admin.AddNode(in1, c.ids[1], caughtUp, 5*time.Second); err != nil {
+	if err := c.addNodeRetry(in1, c.ids[1], caughtUp, 5*time.Second); err != nil {
 		t.Fatalf("seed AddNode: %v", err)
 	}
 
@@ -288,6 +288,36 @@ func testD7AddNeverCatchesUp(t *testing.T) {
 	}
 }
 
+// d7TransientAddErr reports whether an AddNode error is a TRANSIENT raft leadership change
+// (the orchestrator's phase Propose raced an election) — safe to retry, since the two-phase
+// membership change is idempotent. Only fires under full make e2e -race contention.
+func d7TransientAddErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if cluster.IsNotLeader(err) || errors.Is(err, raft.ErrLeadershipLost) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "leadership lost") || strings.Contains(s, "not leader") || strings.Contains(s, "not the leader")
+}
+
+// addNodeRetry seeds a cluster member, retrying a TRANSIENT raft leadership change (the
+// orchestrator phase Propose racing an election under full make e2e -race contention). The
+// two-phase membership change is idempotent, so a re-run converges. Used by every SEED site;
+// the ghost/half-state drills that ASSERT an error call AddNode directly.
+func (c *d7Cluster) addNodeRetry(in cluster.ClusterNodeUpsertInput, raftAddr string, caughtUp func(uint64) (bool, error), maxWait time.Duration) error {
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		err = c.admin.AddNode(in, raftAddr, caughtUp, maxWait)
+		if err == nil || !d7TransientAddErr(err) {
+			return err
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return err
+}
+
 // testD7ForceSingleRecover: kill a 3-node cluster, force-single a survivor (peers
 // dead), restart it as a writable N=1, and prove the restart does not double-apply.
 func testD7ForceSingleRecover(t *testing.T) {
@@ -298,7 +328,7 @@ func testD7ForceSingleRecover(t *testing.T) {
 		cu := func(idx int) func(uint64) (bool, error) {
 			return func(barrier uint64) (bool, error) { cur, e := c.nodes[idx].AppliedIndex(); return cur >= barrier, e }
 		}(i)
-		if err := c.admin.AddNode(in, c.ids[i], cu, 5*time.Second); err != nil {
+		if err := c.addNodeRetry(in, c.ids[i], cu, 5*time.Second); err != nil {
 			t.Fatalf("seed AddNode %d: %v", i, err)
 		}
 	}
@@ -436,7 +466,7 @@ func testD7DrainRetireFollower(t *testing.T) {
 		cu := func(idx int) func(uint64) (bool, error) {
 			return func(b uint64) (bool, error) { cur, e := c.nodes[idx].AppliedIndex(); return cur >= b, e }
 		}(i)
-		if err := c.admin.AddNode(in, c.ids[i], cu, 5*time.Second); err != nil {
+		if err := c.addNodeRetry(in, c.ids[i], cu, 5*time.Second); err != nil {
 			t.Fatalf("seed AddNode %d: %v", i, err)
 		}
 	}
@@ -472,7 +502,7 @@ func testD7DrainLeaderTransfers(t *testing.T) {
 		cu := func(idx int) func(uint64) (bool, error) {
 			return func(b uint64) (bool, error) { cur, e := c.nodes[idx].AppliedIndex(); return cur >= b, e }
 		}(i)
-		if err := c.admin.AddNode(in, c.ids[i], cu, 5*time.Second); err != nil {
+		if err := c.addNodeRetry(in, c.ids[i], cu, 5*time.Second); err != nil {
 			t.Fatalf("seed AddNode %d: %v", i, err)
 		}
 	}

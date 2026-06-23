@@ -20,13 +20,15 @@ build:
 test:
 	go test ./...
 
-# P11 / architecture line 2141: P2-P10 e2e suites are the
-# regression net for cross-phase behavior. `make e2e` runs the
-# whole matrix via test/e2e/all_phases_test.go (subtest per
-# phase, parallel, each in its own subprocess with a per-phase
-# timeout). Faster iteration: `go test ./test/pX/...` for a
-# single phase. The test is gated by the e2e_matrix build tag
-# so a bare `go test ./...` doesn't recursively fork itself.
+# P11 / architecture line 2141: P2-P10 e2e suites are the regression net for cross-phase
+# behavior. `make e2e` runs the whole matrix via test/e2e/all_phases_test.go (TestAllPhases =
+# subtest per phase, SERIAL; each DN/leaf matrix = its own -race subprocess, SERIAL). Serial is
+# the documented release-gate posture: the heavy -race clustered-JS / raft / PTY subprocesses
+# are timing-sensitive and starve under contention — parallelizing them was tried, measured, and
+# reverted (the clustered-JS matrices flake "routed JS server not ready" under any concurrent
+# heavy matrix; see the note in all_phases_test.go). For fast LOCAL iteration run the ONE suite
+# you touched: `go test ./test/pX/...`, or `go test -tags dN_integration -race ./test/dN/`. The
+# test is gated by the e2e_matrix build tag so a bare `go test ./...` doesn't recursively fork.
 e2e:
 	go test -count=1 -tags e2e_matrix -v ./test/e2e/...
 

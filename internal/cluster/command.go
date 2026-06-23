@@ -109,6 +109,30 @@ const (
 	// VerifyConnection accepts the previous pin until valid_until (resumption-safe
 	// rotation). Rides genericExecApplier.
 	OpClusterCertRotate OpType = "ClusterCertRotate"
+
+	// OpTransferAudit (D8a §9/§6.3) makes transfer audit (start/complete/failed)
+	// re-derivable. It carries the full schema.AuditTransfer record apply-inert in
+	// cmd.Aux and an EMPTY Body — transfer audit lives only in the JS history-<sid>
+	// stream, never a SQL row, so Apply is a deterministic no-op (rides
+	// genericExecApplier). The D5 publisher replays it via xferaudit.ReplayTransferAudit
+	// with a q<reqID>:xfer dedup id; cross-retry idempotency is the derived
+	// reqID=hex(sha256("xferaudit:"||transfer_id||":"||kind)) through the 0011
+	// cluster_reqid_ledger (the finite JS Duplicates window is a second line only). The
+	// Aux schema lives in internal/xferaudit (NOT here) so the FSM core stays free of the
+	// audit schema (L-2). No migration: nothing is written to SQLite.
+	OpTransferAudit OpType = "TransferAudit"
+
+	// D8b alert store (§10). Three leader-driven ops, all riding genericExecApplier with
+	// all-literal baked SQL (alert_ops.go). No migration: alerts/alert_acks exist since
+	// 0009. Determinism rests on strictly-ordered Apply + a committed-state predicate
+	// (every replica evaluates the same WHERE against the same committed rows → identical
+	// RowsAffected), NOT on "no replica errors". They carry NO reqID — the leader-gated
+	// reconcile loop proposes raise/clear ONLY on a genuine desired-vs-current transition
+	// (no per-tick re-propose), and the WHERE NOT EXISTS / ON CONFLICT guards make a racing
+	// double-raise / double-ack a deterministic no-op, so a forwarding key is unneeded.
+	OpAlertRaise OpType = "AlertRaise" // INSERT one ACTIVE alert iff no ACTIVE row holds its dedup_key
+	OpAlertClear OpType = "AlertClear" // UPDATE the ACTIVE row for a dedup_key to CLEARED
+	OpAlertAck   OpType = "AlertAck"   // UPSERT the single cluster-level ack for a dedup_key
 )
 
 // Log-read sentinels returned by Node.CommittedCommandAt (D5 audit publisher, §6.3).
@@ -272,4 +296,8 @@ var knownOps = map[OpType]bool{
 	OpClusterDrainSet:    true,
 	OpClusterMetaClear:   true,
 	OpClusterCertRotate:  true,
+	OpTransferAudit:      true,
+	OpAlertRaise:         true,
+	OpAlertClear:         true,
+	OpAlertAck:           true,
 }

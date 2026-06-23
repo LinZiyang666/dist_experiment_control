@@ -57,6 +57,17 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 		Pub: jwt.Permission{Allow: []string{
 			subjectPrefix + ".ctrl.by." + actor + ".session.create.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session.list.req",
+			// D8b (§10) member-reachable cluster health + alert RPCs. The SUBJECTS are
+			// cluster-wide (actor-scoped, no sid — a member queries any reachable broker), but
+			// the GRANT lives in the ACTIVATED-member template: a member operates within a
+			// session, and every destructive op the gate guards (session rm / expose rm / …)
+			// itself requires a session, so an activated-member scope is sufficient (and
+			// tighter than granting an unactivated CLI). Deliberately UNDER ctrl.by.<actor>.* —
+			// NOT broker-only tether.v2.cluster.* (the §13.8 negative test that a member cannot
+			// pub cluster.apply.* stays green; a positive test asserts member reach to these).
+			subjectPrefix + ".ctrl.by." + actor + ".cluster-health.req",
+			subjectPrefix + ".ctrl.by." + actor + ".alert.ls.req",
+			subjectPrefix + ".ctrl.by." + actor + ".alert.ack.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".kick.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rotate-pin.req",

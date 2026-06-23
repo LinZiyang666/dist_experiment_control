@@ -75,6 +75,11 @@ restart without a re-expose.
 			}
 			defer nc.Close()
 
+			ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
+			if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+				return gerr
+			}
+
 			body, err := json.Marshal(proto.ExposeReq{Name: name, LocalPort: local, RemotePort: remotePort})
 			if err != nil {
 				return err
@@ -106,6 +111,7 @@ restart without a re-expose.
 	cmd.Flags().IntVar(&local, "local", 0, "local port on the agent to expose (required)")
 	cmd.Flags().StringVar(&name, "name", "", "logical proxy name (required; used by `expose rm`)")
 	cmd.Flags().IntVar(&remotePort, "remote-port", 0, "request a specific public port from the broker's band (default: auto lowest-free)")
+	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
 			return nil, cobra.ShellCompDirectiveNoFileComp
@@ -156,6 +162,11 @@ error you can ignore in scripts.
 			}
 			defer nc.Close()
 
+			ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
+			if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+				return gerr
+			}
+
 			body, err := json.Marshal(proto.ExposeRmReq{Name: name})
 			if err != nil {
 				return err
@@ -182,6 +193,7 @@ error you can ignore in scripts.
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().StringVar(&name, "name", "", "logical proxy name to free (required)")
+	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
 			return nil, cobra.ShellCompDirectiveNoFileComp

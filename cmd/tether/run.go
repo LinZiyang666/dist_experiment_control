@@ -88,6 +88,11 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			}
 			defer nc.Close()
 
+			ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
+			if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+				return gerr
+			}
+
 			cols, rows := terminalSize()
 			// Forward TERM (and a couple of related vars) so curses
 			// apps on the agent (tmux, vim, htop, less) know what
@@ -282,6 +287,7 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "working directory on the agent (default: agent's)")
 	// NOTE: SetInterspersed(false) means --safe must PRECEDE the node arg:
 	// `tether run --safe gpu-01 -- bash`. A trailing `--safe` is sent to the

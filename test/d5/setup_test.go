@@ -116,13 +116,17 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 		}
 	})
 	for _, s := range servers {
-		if !s.ReadyForConnections(10 * time.Second) {
+		// 30s (was 10s): under the full make e2e matrix this harness starts AFTER every other
+		// phase + DN matrix, so the machine is loaded and embedded-server startup is slow — a
+		// 10s ready-check was a load-induced flake ("routed JS server not ready"). No logic
+		// change; just headroom.
+		if !s.ReadyForConnections(30 * time.Second) {
 			t.Fatal("routed JS server not ready")
 		}
 	}
 	// Wait for the routes to mesh.
 	for _, s := range servers {
-		if !waitForCond(10*time.Second, func() bool { return s.NumRoutes() >= n-1 }) {
+		if !waitForCond(20*time.Second, func() bool { return s.NumRoutes() >= n-1 }) {
 			t.Fatalf("server %s never meshed %d routes (have %d)", s.Name(), n-1, s.NumRoutes())
 		}
 	}
@@ -130,7 +134,7 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 	// peer set is complete. (JetStreamClusterPeers() returns the full set only on the meta
 	// leader; followers report 0 — so the completeness check is leader-scoped.) Deterministic
 	// readiness gate, no time.Sleep.
-	if !waitForCond(20*time.Second, func() bool {
+	if !waitForCond(30*time.Second, func() bool { // 30s (was 20s): full-matrix load headroom
 		leaders, metaComplete := 0, false
 		for _, s := range servers {
 			if !s.JetStreamIsClustered() {

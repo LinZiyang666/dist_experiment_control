@@ -36,6 +36,14 @@ func (b *Broker) reconcileXferObjectsOnBoot(ctx context.Context) (int, error) {
 		if !strings.HasPrefix(name, "OBJ_xfer-") {
 			continue
 		}
+		// D8 §9: in clustered mode the bucket is REPLICATED across brokers — only the
+		// broker that is the home of every node bound to the session may reap it, else this
+		// broker's empty-tracker boot reap would delete another broker's LIVE in-flight
+		// object. Inert in production (selfID==""): homeOwnsXferBucket is always true.
+		sid := strings.TrimPrefix(name, "OBJ_xfer-")
+		if !b.homeOwnsXferBucket(sid) {
+			continue
+		}
 		bucket := strings.TrimPrefix(name, "OBJ_")
 		store, err := b.js.ObjectStore(ctx, bucket)
 		if err != nil {

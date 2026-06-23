@@ -241,7 +241,11 @@ func TestProxyFalseOnlineRecoversAfterTunnelDrop(t *testing.T) {
 	// (1) the dead exit is dropped from /sub, not advertised: proxy_ready clears.
 	// (This is the reliable Defect-B signal; the public-port unbind is corroborating
 	// but transient — the agent self-heals within one backoff, so we don't race it.)
-	if !testharness.WaitFor(t, 5*time.Second, 20*time.Millisecond, func() bool {
+	// 15s (was 5s): under the full make e2e matrix this -race subprocess runs after every
+	// other heavy matrix, so tunnel-drop detection + /sub re-advertise is slower; the assertion
+	// is "eventually clears" (it clears in ~0.5s in isolation), so the extra headroom only
+	// prevents a load-induced false Defect-B regression.
+	if !testharness.WaitFor(t, 15*time.Second, 20*time.Millisecond, func() bool {
 		return !proxyReady(f.db, "lab", "lab-1")
 	}) {
 		t.Fatal("proxy_ready did not clear on tunnel drop (Defect B: false-online persists)")

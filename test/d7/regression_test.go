@@ -46,6 +46,13 @@ var d7ExcludedFiles = map[string]bool{
 	"clusteradmin.go":  true, // two-phase orchestrator + reconciliation + nonce store
 	"clusterdrain.go":  true, // drain/retire (RemoveServer, PlanClusterNodeRemove)
 	"clusterstatus.go": true, // status report + adminsock adapter (RemoveServer, TransferLeadership)
+	// D8 mechanism files (no D7 banned tokens today, but excluded for forward-consistency
+	// so a future D8 edge that touches a D7 token is not double-counted here).
+	"transfer_home.go":          true,
+	"transfer_audit_forward.go": true,
+	"alert_reconcile.go":        true,
+	"alert_forward.go":          true,
+	"cluster_health.go":         true,
 }
 
 func stripComment(line string) string {

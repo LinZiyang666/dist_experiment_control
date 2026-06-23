@@ -86,6 +86,11 @@ func (b *Broker) startDiskMonitor(ctx context.Context) {
 				// Recovered below threshold — re-arm for next spike.
 				emitted = false
 			}
+			// D8b §10.2: level-triggered re-assert of the CURRENT disk state to the leader's
+			// replicated alert store (inert when alertSink==nil, i.e. production). Asserting
+			// every tick self-heals a dropped clear — the leader-side VerbAlertSignal handler
+			// commits a raise/clear only on a transition, so an unchanged state is free.
+			b.signalDiskAlert(frac >= threshold)
 		}
 		// Audit shard 01 F12: ctx-check before the first probe so
 		// a broker that's already shutting down (Run started but
@@ -104,6 +109,15 @@ func (b *Broker) startDiskMonitor(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// signalDiskAlert forwards the current local disk-pressure state to the leader's replicated
+// alert store via the D8b seam (alert_forward.go). Inert when alertSink==nil (production,
+// build-and-prove): disk pressure surfaces only via the existing edge-triggered pubSysEvent.
+func (b *Broker) signalDiskAlert(active bool) {
+	if b.alertSink != nil {
+		b.alertSink(active)
+	}
 }
 
 // diskUsage returns (used, total) bytes on the filesystem containing

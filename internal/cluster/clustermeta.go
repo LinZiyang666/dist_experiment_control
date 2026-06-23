@@ -113,5 +113,15 @@ func defaultAppliers() map[OpType]Applier {
 		OpClusterDrainSet:   exec,
 		OpClusterMetaClear:  exec,
 		OpClusterCertRotate: exec,
+
+		// D8a §9: empty-Body, pure-Aux re-derivable transfer audit. Apply is a
+		// deterministic no-op (0 statements); the publisher replays cmd.Aux.
+		OpTransferAudit: exec,
+
+		// D8b §10: replicated alert store. All-literal baked SQL with committed-state
+		// guards (WHERE NOT EXISTS / ON CONFLICT); deterministic under ordered Apply.
+		OpAlertRaise: exec,
+		OpAlertClear: exec,
+		OpAlertAck:   exec,
 	}
 }

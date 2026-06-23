@@ -225,6 +225,30 @@ func SubjCtrlSessionRm(actor, sid string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.session.%s.rm.req", SubjectPrefix, actor, sid)
 }
 
+// D8b (§10) member-reachable, actor-scoped cluster health + alert RPCs. They live UNDER
+// ctrl.by.<actor>.* — NOT broker-only tether.v2.cluster.* — so a member JWT can reach them
+// (the banner is for everyone; client-synth gating queries any reachable broker). The §13.8
+// negative test (member denied cluster.apply.*) stays green; a positive test asserts member
+// reach to these. The broker subscribes the wildcards below.
+func SubjCtrlClusterHealth(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.cluster-health.req", SubjectPrefix, actor)
+}
+func SubjCtrlAlertLs(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.alert.ls.req", SubjectPrefix, actor)
+}
+func SubjCtrlAlertAck(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.alert.ack.req", SubjectPrefix, actor)
+}
+
+// Broker-side wildcard subscriptions for the D8b ctl RPCs (any actor segment). cluster-health
+// is broadcast (every broker answers, ctl corroborates); alert.ls uses a queue group (any one
+// broker serves the bounded-stale replicated read); alert.ack any broker forwards to leader.
+const (
+	SubjCtrlClusterHealthWildcard = SubjectPrefix + ".ctrl.by.*.cluster-health.req"
+	SubjCtrlAlertLsWildcard       = SubjectPrefix + ".ctrl.by.*.alert.ls.req"
+	SubjCtrlAlertAckWildcard      = SubjectPrefix + ".ctrl.by.*.alert.ack.req"
+)
+
 // ParseEvProc extracts (sid, nid, pid, kind) from a process-lifecycle
 // event subject `tether.v2.s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`.
 // kind ∈ {"started", "exit"}.

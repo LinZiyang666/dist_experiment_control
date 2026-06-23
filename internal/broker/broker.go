@@ -33,6 +33,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/subhttp"
 	"github.com/LinZiyang666/tether/internal/tunnel"
@@ -299,6 +300,34 @@ type Broker struct {
 	// test (build-and-prove, like every D2 op), not wired into the live DB here.
 	selfID     string
 	tunnelCert *tls.Certificate
+
+	// transferAuditSink + transferAuditWG are the D8a (§9) BUILD-AND-PROVE seam
+	// (cutover=D9). transferAuditSink is nil in production: serve.go never attaches it,
+	// so emitTransferAudit falls through to the byte-identical best-effort
+	// pubAuditTransfer (the read of the nil seam is the only production-visible change).
+	// The harness wires it via AttachTransferAuditSink (transfer_audit_forward.go, a
+	// guard-excluded mechanism file) to route start/complete/failed through leader Apply
+	// (OpTransferAudit, re-derivable). transferAuditWG tracks the async forward goroutines
+	// so the leak gate can drain them (WaitTransferAudit). The guard bans the write tokens
+	// (transferAuditSink: / b.transferAuditSink =) from scanned production files.
+	transferAuditSink func(schema.AuditTransfer)
+	transferAuditWG   sync.WaitGroup
+
+	// xferReplicasFn is the D8a (§9) tier-B replica seam (cutover=D9). nil in production:
+	// xferTargetReplicas() returns jsstream.ReplicasSingle so a freshly-created OBJ_xfer
+	// bucket is byte-identically R=1. The harness sets it (AttachXferReplicas) to
+	// ReplicasFor(NumVoters) so a completed tier-B object survives a home-broker kill at
+	// N>=3. The guard bans the write token (b.xferReplicasFn = / xferReplicasFn:) from
+	// scanned production files.
+	xferReplicasFn func() int
+
+	// alertSink is the D8b (§10.2) disk-pressure forward seam (cutover=D9). nil in
+	// production: the disk monitor surfaces pressure only via the existing pubSysEvent
+	// (byte-identical). The harness sets it (AttachAlertSink) to forward the local disk
+	// state to the leader's replicated alert store (VerbAlertSignal). The guard bans the
+	// write token (b.alertSink = / alertSink:) from scanned production files; the disk
+	// monitor's `if b.alertSink != nil` READ is allowed.
+	alertSink func(active bool)
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.

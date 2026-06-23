@@ -24,6 +24,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xferaudit"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -236,6 +237,12 @@ func (p *AuditPublisher) PublishOnce(ctx context.Context) (uint64, error) {
 				return advanced, perr
 			}
 		}
+		if cmd.Op == cluster.OpTransferAudit { // D8a §9: re-derivable transfer audit
+			if perr := p.publishTransferAudit(ctx, idx, cmd); perr != nil {
+				_ = flush(advanced) // R-22: queue + retry next tick, do not advance past
+				return advanced, perr
+			}
+		}
 		advanced = idx
 		if advanced-lastCkpt >= uint64(p.cfg.Batch) { // R-5: batched checkpoint
 			if err := flush(advanced); err != nil {
@@ -315,6 +322,35 @@ func (p *AuditPublisher) publishReconcile(ctx context.Context, idx uint64, cmd *
 		}
 	}
 	return nil
+}
+
+// publishTransferAudit replays the committed OpTransferAudit's single record (PURE, from
+// cmd.Aux only — no live request, no DB) and publishes it to history-<sid>. dedup id
+// q<reqID>:xfer:0 — the derived reqID (hex(sha256(transfer_id:kind))) is cross-retry
+// stable, so a post-election sweep or follower→leader forwarder retry re-derives the SAME
+// id and JetStream collapses the duplicate (the 0011 ledger collapses it at the FSM layer
+// too — two independent anchors, neither window-bound). An empty Aux publishes nothing
+// (advance past). A publish error aborts the entry (caller does not advance, R-22).
+func (p *AuditPublisher) publishTransferAudit(ctx context.Context, idx uint64, cmd *cluster.Command) error {
+	rec, ok, err := xferaudit.ReplayTransferAudit(cmd)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // empty Aux: nothing to publish
+	}
+	// Subject-injection guard (cf. publishReconcile m5): rec.Session is baked into the JS
+	// subject; loud-skip a malformed sid rather than publish to a poisoned subject.
+	if verr := proto.ValidateSID(rec.Session); verr != nil {
+		p.cfg.Logger.Warn("d8: skipping transfer audit with invalid sid (subject-injection guard)",
+			"sid", rec.Session, "raft_index", idx, "err", verr)
+		return nil
+	}
+	payload, merr := json.Marshal(rec)
+	if merr != nil {
+		return merr
+	}
+	return p.publish(ctx, proto.SubjAuditTransfer(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "xfer", 0))
 }
 
 func (p *AuditPublisher) publish(ctx context.Context, subject string, payload []byte, msgID string) error {
@@ -406,6 +442,56 @@ func (p *AuditPublisher) ReconcileOnce(ctx context.Context) (ReplicaReport, erro
 		return ReplicaReport{}, ferr // R-20: a hard error => Observed stays false
 	}
 	states = append(states, collected...)
+	return ReplicaReport{Streams: states, Observed: true}, nil
+}
+
+// ObserveReplicas is the READ-ONLY replica-health pass for the D7 retire gate (§8.3 / §9
+// D8). Unlike ReconcileOnce it RAISES NOTHING — a drain-readiness check must never mutate
+// JetStream topology (a raising probe could mask a stuck reconfig) — and it enumerates
+// OBJ_xfer-* buckets from the LIVE JetStream stream list, NOT the DB ListSIDs, so a bucket
+// that outlived its purged session row is still counted (else retire false-greens on a
+// 1-replica orphan object → data loss, §9 D8). Collects events + every active history-<sid>
+// + every OBJ_xfer-* and reports AllAtTarget/Degraded fail-closed (a hard JS error =>
+// Observed stays false). XferState==nil disables the OBJ_xfer enumeration (events+history
+// only), matching ReconcileOnce.
+func (p *AuditPublisher) ObserveReplicas(ctx context.Context) (ReplicaReport, error) {
+	nv, err := p.cfg.Node.NumVoters()
+	if err != nil {
+		return ReplicaReport{}, err
+	}
+	target := jsstream.ReplicasFor(nv)
+
+	ev, eerr := jsstream.CollectStreamState(ctx, p.cfg.JS, jsstream.EventsStreamName, target)
+	if eerr != nil {
+		return ReplicaReport{}, eerr
+	}
+	states := []jsstream.StreamReplicaState{ev}
+
+	sids, lerr := p.cfg.ListSIDs(ctx)
+	if lerr != nil {
+		return ReplicaReport{}, lerr
+	}
+	for _, sid := range sids {
+		hs, herr := jsstream.CollectStreamState(ctx, p.cfg.JS, jsstream.HistoryStreamName(sid), target)
+		if herr != nil {
+			return ReplicaReport{}, herr
+		}
+		states = append(states, hs)
+	}
+
+	if p.cfg.XferState != nil { // same gate ReconcileOnce uses to enable OBJ_xfer
+		xstreams, xerr := jsstream.ListXferStreams(ctx, p.cfg.JS)
+		if xerr != nil {
+			return ReplicaReport{}, xerr
+		}
+		for _, name := range xstreams {
+			xs, cerr := jsstream.CollectStreamState(ctx, p.cfg.JS, name, target)
+			if cerr != nil {
+				return ReplicaReport{}, cerr
+			}
+			states = append(states, xs)
+		}
+	}
 	return ReplicaReport{Streams: states, Observed: true}, nil
 }
 
