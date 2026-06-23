@@ -41,6 +41,13 @@ type Backend struct {
 	// time.Now.
 	Now func() time.Time
 
+	// Cluster handles the D7 cluster admin verbs (add/remove/drain/
+	// transfer/status/rotate-cert). nil (production until the D9
+	// cutover; the build-and-prove harness sets it) → those verbs
+	// reply "cluster mode not enabled". adminsock stays a leaf: the
+	// broker provides an adapter that translates to the wire types.
+	Cluster ClusterAdminBackend
+
 	// Logger receives info/warn lines about accepts and dispatch
 	// failures; nil → discard.
 	Logger *slog.Logger
@@ -243,6 +250,12 @@ func (s *Server) dispatch(req Request) Response {
 	case OpEvict:
 		return s.handleEvict(req)
 	default:
+		if clusterOps[req.Op] {
+			if s.backend.Cluster == nil {
+				return Response{Op: req.Op, Error: "cluster mode not enabled"}
+			}
+			return s.backend.Cluster.HandleCluster(req)
+		}
 		return Response{Op: req.Op, Error: "unknown op: " + req.Op}
 	}
 }

@@ -78,6 +78,12 @@ func productionScanFiles(t *testing.T, root string) []string {
 			if n == "home.go" || n == "audit_publisher.go" {
 				continue // build-and-prove mechanism files (intentionally hold the seam tokens)
 			}
+			// D7 build-and-prove mechanism files: drain reuses D6 rehome
+			// (PlanReassignHome) to migrate exposes off a draining node. Production
+			// wiring (serve.go) is still scanned.
+			if n == "clusteradmin.go" || n == "clusterdrain.go" || n == "clusterstatus.go" {
+				continue
+			}
 			out = append(out, filepath.Join(dir, n))
 		}
 	}

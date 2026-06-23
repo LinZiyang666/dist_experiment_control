@@ -60,6 +60,55 @@ const (
 	// ledger requires an originating-broker-minted key, which a leader-push has
 	// none of; the CAS guard is the sole idempotency anchor, like D4 provision/join).
 	OpPortReassignHome OpType = "PortReassignHome"
+
+	// D7 cluster-membership op set (§8.1). All leader-driven, carry NO reqID (no
+	// originating-broker key; their CAS/phase-predecessor guards are the idempotency
+	// anchors, like OpPortReassignHome). Their Plan helpers live in THIS package
+	// (membership_ops.go) — they are cluster's OWN ops (cf. D1's clusterMetaPlanner),
+	// NOT mutator-package ops, and internal/clusternodes must NOT import internal/
+	// cluster (L-2), so the writers cannot live there.
+
+	// OpClusterNodeUpsert (§8.1 phase-1 roster admission) is the ONE op that does
+	// NOT ride genericExecApplier: clusterNodeUpsertApplier re-verifies the join PoP
+	// ed25519 signature (carried apply-inert in cmd.Aux) on EVERY replica before
+	// execing the baked roster UPSERT. A verify failure is a deterministic POISON
+	// SKIP (errAppliedRejected → advance applied_index, run no op, never panic), so a
+	// compromised/buggy leader proposing a forged entry cannot brick the cluster on
+	// log replay (§2.8 never-wedge). Verify is a pure function of committed bytes
+	// (auth.VerifySignature + the canonical message), so all replicas reach the
+	// identical verdict — no fork.
+	OpClusterNodeUpsert OpType = "ClusterNodeUpsert"
+
+	// OpClusterNodePhase (§8.1 half-success state machine) transitions a node's
+	// phase with a baked `WHERE node_id=<lit> AND phase IN (<allowed predecessors>)`
+	// guard so a stale ex-leader's disallowed transition is a RowsAffected==0 no-op.
+	// Rides genericExecApplier.
+	OpClusterNodePhase OpType = "ClusterNodePhase"
+
+	// OpClusterNodeRemove (§8.1 removal order) deletes a roster row only when it has
+	// walked through removal (phase IN ('RETIRING','VOTER_ADD_FAILED')) — a live
+	// VOTER is structurally undeletable. Idempotent. Rides genericExecApplier.
+	OpClusterNodeRemove OpType = "ClusterNodeRemove"
+
+	// OpClusterDrainSet (§8.3) raises/clears a broker_draining flag as a cluster_meta
+	// KV ('draining:'+node_id -> deadline literal) with a monotonic guard (later
+	// deadline wins), reusing the audit-checkpoint UPSERT pattern. Rides
+	// genericExecApplier. No migration: cluster_meta exists since 0009.
+	OpClusterDrainSet OpType = "ClusterDrainSet"
+
+	// OpClusterMetaClear (review M3) DELETEs the replicated force_single_active marker
+	// once HA is restored (a node added back to F>=1). Without it the marker — written
+	// by the offline force-single tool into cluster_meta — rides the snapshot into
+	// every regrown peer and the whole cluster reports exit 3 (FORCE_SINGLE) forever.
+	// Rides genericExecApplier; bakes a fixed-key DELETE (no external input).
+	OpClusterMetaClear OpType = "ClusterMetaClear"
+
+	// OpClusterCertRotate (§15 RF3 / external review F2) rotates a node's stable tunnel
+	// cert fingerprint: SET cert_fp_prev=cert_fp (the row's current value, deterministic
+	// self-reference), cert_fp=<new>, cert_fp_valid_until=<now+window>. The D6 cert-pin
+	// VerifyConnection accepts the previous pin until valid_until (resumption-safe
+	// rotation). Rides genericExecApplier.
+	OpClusterCertRotate OpType = "ClusterCertRotate"
 )
 
 // Log-read sentinels returned by Node.CommittedCommandAt (D5 audit publisher, §6.3).
@@ -217,4 +266,10 @@ var knownOps = map[OpType]bool{
 	OpAgentProvision:     true,
 	OpAuditCheckpointSet: true,
 	OpPortReassignHome:   true,
+	OpClusterNodeUpsert:  true,
+	OpClusterNodePhase:   true,
+	OpClusterNodeRemove:  true,
+	OpClusterDrainSet:    true,
+	OpClusterMetaClear:   true,
+	OpClusterCertRotate:  true,
 }

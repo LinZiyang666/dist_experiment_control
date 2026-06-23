@@ -51,6 +51,13 @@ func productionBrokerFiles(t *testing.T, root string) []string {
 		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") || n == "audit_publisher.go" {
 			continue
 		}
+		// D7 build-and-prove mechanism files: they legitimately consume the D5
+		// raft-free read primitives (NumVoters/CommitIndex/AppliedIndex) to build the
+		// cluster status report + drain projection — like audit_publisher.go consumes
+		// the publisher primitives. Production wiring (serve.go) is still scanned.
+		if n == "clusteradmin.go" || n == "clusterdrain.go" || n == "clusterstatus.go" {
+			continue
+		}
 		out = append(out, filepath.Join("internal/broker", n))
 	}
 	return out

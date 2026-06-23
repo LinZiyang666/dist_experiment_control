@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,13 +49,13 @@ func silent() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil
 // stable cert attached via the build-and-prove seam) running a real tunnel
 // server over the shared DB.
 type homeBrokerInst struct {
-	nodeID  string
-	addr    string
-	certFP  string
-	cert    *tls.Certificate
-	srv     *tunnel.Server
-	cancel  context.CancelFunc
-	b       *broker.Broker
+	nodeID string
+	addr   string
+	certFP string
+	cert   *tls.Certificate
+	srv    *tunnel.Server
+	cancel context.CancelFunc
+	b      *broker.Broker
 }
 
 // newHomeBroker builds a home broker over the shared DB with selfID=nodeID and a
@@ -72,12 +73,25 @@ func newHomeBroker(t *testing.T, db *sql.DB, nodeID string) *homeBrokerInst {
 	}
 	b.AttachClusterSeam(nodeID, cert)
 
-	addr := "127.0.0.1:" + strconv.Itoa(freePort(t))
-	srv := tunnel.NewServerWithCert(addr, "127.0.0.1", b.TunnelTokenLookupForTest(), cert, silent())
+	// Retry the listen-port bind: freePort is a TOCTOU allocator (listen :0 -> close ->
+	// reuse), so under the heavy concurrent `make e2e` -race load the chosen port can be
+	// grabbed by another listener before Start binds it. Retry with a fresh port a few
+	// times rather than flaking the whole suite.
+	var addr string
+	var srv *tunnel.Server
 	ctx, cancel := context.WithCancel(context.Background())
-	if err := srv.Start(ctx); err != nil {
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		addr = "127.0.0.1:" + strconv.Itoa(freePort(t))
+		srv = tunnel.NewServerWithCert(addr, "127.0.0.1", b.TunnelTokenLookupForTest(), cert, silent())
+		if lastErr = srv.Start(ctx); lastErr == nil {
+			break
+		}
+		srv.Close()
+	}
+	if lastErr != nil {
 		cancel()
-		t.Fatalf("tunnel start: %v", err)
+		t.Fatalf("tunnel start (after port-bind retries): %v", lastErr)
 	}
 	return &homeBrokerInst{nodeID: nodeID, addr: addr, certFP: fp, cert: cert, srv: srv, cancel: cancel, b: b}
 }
@@ -197,6 +211,31 @@ func waitEcho(t *testing.T, publicPort int, msg string, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("data plane never flowed on public port %d: last err %v", publicPort, lastErr)
+}
+
+// seedAndOpenHome seeds a homed expose on a fresh public port and opens it via the
+// agent, RETRYING with a new port if the broker's public-port bind loses the freePort
+// TOCTOU race ("public_port_bind_failed") under the concurrent `make e2e` -race load.
+// Returns the public port that succeeded. Use it for the HAPPY-path opens (the
+// expect-failure tests assert specific errors and must not retry).
+func seedAndOpenHome(t *testing.T, db *sql.DB, cli *tunnel.Client, sid, nid, name string, localPort int, token, homeNodeID, homeAddr string, epoch int64, pins proto.CertPins) int {
+	t.Helper()
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		port := freePort(t)
+		seedHomedExpose(t, db, sid, nid, name, port, localPort, token, homeNodeID, epoch)
+		err := cli.OpenHome(port, localPort, token, homeAddr, epoch, pins)
+		if err == nil {
+			return port
+		}
+		lastErr = err
+		if strings.Contains(err.Error(), "bind_failed") {
+			continue // racy public port; try a fresh one
+		}
+		t.Fatalf("OpenHome %s: %v", name, err)
+	}
+	t.Fatalf("OpenHome %s: public-port bind retries exhausted: %v", name, lastErr)
+	return 0
 }
 
 func freePort(t *testing.T) int {

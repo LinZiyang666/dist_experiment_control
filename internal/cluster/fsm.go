@@ -62,13 +62,34 @@ type fsm struct {
 	// (non-vacuity — the in-scope writes are SQL-idempotent so a row-count assertion
 	// alone is vacuous). Atomic; read by tests + Node.DedupCount.
 	dedupCount atomic.Uint64
+
+	// rejectCount counts entries a custom applier DETERMINISTICALLY rejected
+	// (errAppliedRejected — D7 §8.1 join-PoP verify fail), so the forged-sig test can
+	// assert the poison-skip branch actually fired (non-vacuity: a "no row written"
+	// assertion alone cannot tell rejection from a never-proposed entry). Atomic.
+	rejectCount atomic.Uint64
 }
 
 // Apply result sentinels (returned via raft ApplyFuture.Response()).
-type appliedOK struct{ index uint64 }     // op executed + applied_index advanced
-type appliedNoOp struct{ index uint64 }   // idempotent re-apply skip (§3.7 #2); nothing written
-type appliedPoison struct{ index uint64 } // poison entry skipped, applied_index advanced past it (§2.8)
-type appliedDedup struct{ index uint64 }  // §4.1 D4: ReqID already committed; op SKIPPED but applied_index ADVANCED + committed (NOT a rollback — distinct from appliedNoOp)
+type appliedOK struct{ index uint64 }       // op executed + applied_index advanced
+type appliedNoOp struct{ index uint64 }     // idempotent re-apply skip (§3.7 #2); nothing written
+type appliedPoison struct{ index uint64 }   // poison entry skipped, applied_index advanced past it (§2.8)
+type appliedDedup struct{ index uint64 }    // §4.1 D4: ReqID already committed; op SKIPPED but applied_index ADVANCED + committed (NOT a rollback — distinct from appliedNoOp)
+type appliedRejected struct{ index uint64 } // D7 §8.1: a custom applier DETERMINISTICALLY rejected the op (e.g. join-PoP verify fail); op SQL ran NONE, applied_index ADVANCED + committed, never panicked
+
+// errAppliedRejected is the sentinel a custom Applier returns to signal a
+// DETERMINISTIC, op-level rejection (D7 §8.1: the join-PoP signature did not
+// verify). It is NOT a transient infra failure: applyCommand catches it BEFORE the
+// fail-stop retry loop and treats it like a poison entry (advance applied_index,
+// run no op SQL, commit, never panic). This is mandatory — returning a plain error
+// would feed the §3.7 retry→panic path, so a single forged committed entry from a
+// compromised/buggy leader would brick EVERY replica on every boot's log replay
+// (a one-shot remote wedge §2.8 forbids; §18.2.4 accepts a compromised leader can
+// propose garbage, but it must NOT be able to halt honest replicas). Because the
+// verdict is a pure function of committed bytes, every replica rejects identically
+// — no DB fork. An Applier wraps it (errors.Is-detectable) only when it has
+// executed NO statement; it must never be returned after a partial write.
+var errAppliedRejected = errors.New("cluster: applier rejected op deterministically")
 
 // Apply runs one committed log entry (architecture §3.2/§3.7). raft re-applies
 // log[lastSnapshot+1 .. commit] UNCONDITIONALLY on restart, so the FSM must be
@@ -178,6 +199,33 @@ func (f *fsm) applyCommand(l *raft.Log, cmd *Command) (any, error) {
 			return nil, fmt.Errorf("cluster: no applier registered for op %q", cmd.Op)
 		}
 		if err := applier.ApplyTx(tx, cmd); err != nil {
+			// D7 §8.1: a DETERMINISTIC op-level rejection (the applier ran NO op SQL,
+			// e.g. join-PoP signature did not verify). Treat exactly like a poison
+			// entry — advance applied_index + commit + return appliedRejected — NEVER
+			// return the error (that retries→panics, letting a forged committed entry
+			// brick every replica on log replay). Every replica reaches the identical
+			// deterministic verdict, so the roster row is written nowhere; no fork.
+			if errors.Is(err, errAppliedRejected) {
+				f.rejectCount.Add(1)
+				f.logger.Error("cluster: op rejected by applier (deterministic), advancing applied_index past it as a no-op",
+					"op", cmd.Op, "index", l.Index, "term", l.Term, "err", err)
+				if werr := writeAppliedIndexTx(tx, l.Index, l.Term); werr != nil {
+					return nil, werr
+				}
+				if applyFailHook != nil {
+					if ferr := applyFailHook(l.Index); ferr != nil {
+						return nil, fmt.Errorf("cluster: injected apply failure @%d: %w", l.Index, ferr)
+					}
+				}
+				if applyCommitGate != nil {
+					applyCommitGate(l.Index)
+				}
+				if cerr := tx.Commit(); cerr != nil {
+					return nil, fmt.Errorf("cluster: commit rejected txn @%d: %w", l.Index, cerr)
+				}
+				committed = true
+				return appliedRejected{l.Index}, nil
+			}
 			return nil, fmt.Errorf("cluster: apply %s @%d: %w", cmd.Op, l.Index, err)
 		}
 		// NEW-ReqID path: record it + deterministic same-txn GC so a later retry

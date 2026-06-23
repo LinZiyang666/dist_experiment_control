@@ -1,0 +1,329 @@
+package broker
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/port"
+)
+
+// clusterdrain.go — D7 §8.3 drain / retire orchestration (build-and-prove; part of
+// the guard-excluded ClusterAdmin mechanism). Reuses D6 rehome (port.PlanReassignHome)
+// to migrate exposes off the draining node and D5 AllAtTarget (via the injected
+// streamsReady probe) to gate retire.
+
+// QuorumProjection is the §8.3 "after this op" fault-tolerance summary shown before
+// a drain/retire. FaultTolerance==0 means the cluster goes read-only on the next
+// single failure — the TTY+typed-confirm gate (and `--yes` is refused there).
+type QuorumProjection struct {
+	Voters         int // raft voters remaining after the op
+	Quorum         int // majority needed to commit
+	FaultTolerance int // how many further node failures keep quorum (Voters - Quorum)
+}
+
+// ProjectQuorum computes the post-op projection. A plain drain keeps the node a raft
+// voter (OQ-6: it sheds serving load only), so currentVoters is unchanged; a retire
+// removes it. Either way FaultTolerance is the raft headroom on the resulting voter
+// set — so a plain drain at N=2 still projects F==0 (matches §8.3 "含已处于 N=2 时再
+// drain").
+func ProjectQuorum(currentVoters int, retire bool) QuorumProjection {
+	remaining := currentVoters
+	if retire && remaining > 0 {
+		remaining--
+	}
+	quorum := remaining/2 + 1
+	f := remaining - quorum
+	if f < 0 {
+		f = 0
+	}
+	return QuorumProjection{Voters: remaining, Quorum: quorum, FaultTolerance: f}
+}
+
+// ErrQuorumConfirmRequired is returned by DrainNode when the projection is F==0 and
+// the operator has not passed the typed confirmation. The CLI renders Proj, requires
+// a typed node_id (never --yes), then re-calls with confirmed=true.
+type ErrQuorumConfirmRequired struct{ Proj QuorumProjection }
+
+func (e *ErrQuorumConfirmRequired) Error() string {
+	return fmt.Sprintf("quorum projection F==0 (after op: %d voters, quorum=%d, tolerate 0 failures) — typed confirmation required",
+		e.Proj.Voters, e.Proj.Quorum)
+}
+
+// ErrStreamsNotAtTarget refuses a retire while the node still holds stream replicas
+// below target (data not yet redundant elsewhere; §8.3 AllAtTarget guard).
+var ErrStreamsNotAtTarget = errors.New("cluster retire: this node's streams are not yet at target replicas (data not redundant) — refusing retire")
+
+// ErrNoMigrationTarget is returned when exposes are homed on the draining node but no
+// other eligible VOTER exists to receive them.
+var ErrNoMigrationTarget = errors.New("cluster drain: exposes are homed here but no other eligible VOTER exists to migrate them to")
+
+// ErrLeadershipTransferred is returned when DrainNode was asked to drain the CURRENT
+// leader: it transfers leadership off it FIRST (so this broker, now a follower,
+// never half-drains via failed Proposes — review B5) and bails. The operator
+// re-runs the drain on the new leader, which drains the old leader as a follower.
+type ErrLeadershipTransferred struct{ NodeID string }
+
+func (e *ErrLeadershipTransferred) Error() string {
+	return fmt.Sprintf("cluster drain %s: it was the leader — leadership transferred off it; re-run `cluster drain %s` on the new leader", e.NodeID, e.NodeID)
+}
+
+// DrainNode drains (and optionally retires) nodeID (§8.3). streamsReady is the D5
+// AllAtTarget probe (retire only; nil => treated as ready, for the no-JS unit path).
+// confirmed is the operator's typed F==0 confirmation.
+//
+// Order: quorum-projection guard -> AllAtTarget (retire) -> raise broker_draining ->
+// migrate exposes (D6 rehome) -> transfer-leader if self is leader -> phase
+// VOTER->DRAINING -> (retire) RETIRING -> RemoveServer -> ClusterNodeRemove -> clear
+// the drain marker. Each step's failure leaves a status-visible stuck phase.
+func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline time.Time, streamsReady func() (bool, error)) error {
+	voters, err := a.node.NumVoters()
+	if err != nil {
+		return fmt.Errorf("cluster drain %s: count voters: %w", nodeID, err)
+	}
+	proj := ProjectQuorum(voters, retire)
+	if retire && proj.Voters < 1 {
+		// Retiring the last/only voter destroys the cluster (unrecoverable except via
+		// force-single). HARD-refuse — no typed confirm bypasses this (review m4).
+		return fmt.Errorf("cluster retire %s: cannot retire the last voter (the cluster would have 0 voters); this is the force-single/recover territory, not retire", nodeID)
+	}
+	if proj.FaultTolerance == 0 && !confirmed {
+		return &ErrQuorumConfirmRequired{Proj: proj}
+	}
+	if retire && streamsReady != nil {
+		ready, err := streamsReady()
+		if err != nil {
+			return fmt.Errorf("cluster retire %s: stream readiness: %w", nodeID, err)
+		}
+		if !ready {
+			return ErrStreamsNotAtTarget
+		}
+	}
+
+	// If draining the CURRENT leader, transfer leadership off it FIRST and bail
+	// (review B5): this broker is the leader running the orchestration; once it sheds
+	// leadership it can no longer Propose, so it must NOT proceed to raise the marker
+	// / migrate / phase-bump (that half-drains). The operator re-runs on the new
+	// leader, which drains the old leader as a follower.
+	if _, leaderID := a.node.LeaderWithID(); leaderID == nodeID {
+		if err := a.transferLeadershipOff(nodeID); err != nil {
+			return fmt.Errorf("cluster drain %s: transfer leadership off the leader: %w", nodeID, err)
+		}
+		return &ErrLeadershipTransferred{NodeID: nodeID}
+	}
+
+	// 1. raise broker_draining with the deadline (nodeID is a follower; we are leader).
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterDrainSet(nodeID, &deadline)
+	}); err != nil {
+		return fmt.Errorf("cluster drain %s: raise broker_draining: %w", nodeID, err)
+	}
+
+	// 2. migrate exposes homed here to another eligible VOTER (D6 rehome).
+	if err := a.migrateExposes(nodeID); err != nil {
+		return fmt.Errorf("cluster drain %s: migrate exposes: %w", nodeID, err)
+	}
+
+	// 3. phase VOTER -> DRAINING (the node still votes; it sheds serving load).
+	if err := a.setPhase(nodeID, phaseDraining, []string{phaseVoter}, ""); err != nil {
+		return fmt.Errorf("cluster drain %s: phase->DRAINING: %w", nodeID, err)
+	}
+	if !retire {
+		return nil
+	}
+
+	// 5. retire: §8.1 removal ORDER — roster RETIRING -> raft RemoveServer -> roster delete.
+	if err := a.setPhase(nodeID, phaseRetiring, []string{phaseDraining}, ""); err != nil {
+		return fmt.Errorf("cluster retire %s: phase->RETIRING: %w", nodeID, err)
+	}
+	if err := a.node.RemoveServer(nodeID); err != nil {
+		return fmt.Errorf("cluster retire %s: raft RemoveServer (roster stuck at RETIRING, status shows next step): %w", nodeID, err)
+	}
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeRemove(nodeID)
+	}); err != nil {
+		return fmt.Errorf("cluster retire %s: roster delete: %w", nodeID, err)
+	}
+	// Clear the drain marker (the node is gone).
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterDrainSet(nodeID, nil)
+	}); err != nil {
+		a.logger.Warn("cluster retire: clear broker_draining marker failed", "node_id", nodeID, "err", err)
+	}
+	return nil
+}
+
+// RemoveNode finishes the removal of a node that has ALREADY walked through a
+// removal phase (RETIRING or VOTER_ADD_FAILED). It REFUSES a live VOTER/CATCHING_UP/
+// PENDING node (review B1): a bare RemoveServer on a healthy voter, paired with the
+// phase-guarded roster DELETE, leaves the roster row stuck at VOTER while raft drops
+// the voter — a permanent silent fork the reconciliation pass cannot heal. Use
+// `drain --retire` to remove a live node.
+func (a *ClusterAdmin) RemoveNode(nodeID string) error {
+	phase, ok := a.nodePhase(nodeID)
+	if !ok {
+		return fmt.Errorf("cluster remove %s: no such roster node", nodeID)
+	}
+	if phase != phaseRetiring && phase != phaseAddFailed {
+		return fmt.Errorf("cluster remove %s: node is %s; bare remove only finishes a RETIRING or VOTER_ADD_FAILED node — use `cluster drain %s --retire` to remove a live node (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+	}
+	if err := a.node.RemoveServer(nodeID); err != nil {
+		return fmt.Errorf("cluster remove %s: raft RemoveServer: %w", nodeID, err)
+	}
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeRemove(nodeID)
+	})
+}
+
+// nodePhase reads a roster row's phase (materialized read; no nested Propose).
+func (a *ClusterAdmin) nodePhase(nodeID string) (string, bool) {
+	var phase string
+	var found bool
+	_ = a.node.BoundedStaleRead(func(db *sql.DB) error {
+		err := db.QueryRow(`SELECT phase FROM cluster_nodes WHERE node_id=?`, nodeID).Scan(&phase)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	return phase, found
+}
+
+// AbortDrain clears broker_draining and returns the node to VOTER (the --abort path).
+func (a *ClusterAdmin) AbortDrain(nodeID string) error {
+	if err := a.setPhase(nodeID, phaseVoter, []string{phaseDraining}, ""); err != nil {
+		return fmt.Errorf("cluster drain --abort %s: phase->VOTER: %w", nodeID, err)
+	}
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterDrainSet(nodeID, nil)
+	})
+}
+
+// RotateTunnelCert rotates a node's stable tunnel cert pin (external review F2 /
+// §15 RF3): the new fp becomes cert_fp, the old becomes cert_fp_prev, and
+// cert_fp_valid_until = now + window so the D6 cert-pin VerifyConnection accepts the
+// previous pin during the cutover. The post-window clear is enforced by that
+// VerifyConnection check (it rejects the previous pin after valid_until) regardless
+// of the column value, so no separate clear op is needed.
+func (a *ClusterAdmin) RotateTunnelCert(nodeID, newFP string, window time.Duration) error {
+	if newFP == "" {
+		return fmt.Errorf("rotate-tunnel-cert %s: --cert-fp is required", nodeID)
+	}
+	if phase, ok := a.nodePhase(nodeID); !ok {
+		return fmt.Errorf("rotate-tunnel-cert %s: no such roster node", nodeID)
+	} else if phase != phaseVoter && phase != phaseCatchingUp && phase != phasePending {
+		return fmt.Errorf("rotate-tunnel-cert %s: node is %s (rotate a live node)", nodeID, phase)
+	}
+	validUntil := a.now().Add(window)
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterCertRotate(nodeID, newFP, validUntil)
+	})
+}
+
+// transferLeadershipOff hands raft leadership to a specific voter that is NOT
+// excludeID, using the TARGETED LeadershipTransferToServer (review m1: the targeted
+// wrapper was dead code; drain used the untargeted variant). It picks any raft voter
+// != excludeID from the live configuration.
+func (a *ClusterAdmin) transferLeadershipOff(excludeID string) error {
+	cfg, err := a.node.RaftConfiguration()
+	if err != nil {
+		return err
+	}
+	for _, s := range cfg {
+		if s.Voter && s.NodeID != excludeID {
+			return a.node.LeadershipTransferToServer(s.NodeID, s.Addr)
+		}
+	}
+	return fmt.Errorf("no other voter to transfer leadership to (cannot drain the only voter)")
+}
+
+// ErrRebuildOffExposes is returned when a drained node homes rebuild-OFF exposes:
+// the operator's explicit "do not rebuild this on failure" choice must NOT be turned
+// into a silent auto-rehome (external review F3). The error enumerates the exact
+// ports so the operator handles them deliberately (free them, or re-decide) before
+// re-running drain.
+type ErrRebuildOffExposes struct {
+	NodeID string
+	Ports  []int
+}
+
+func (e *ErrRebuildOffExposes) Error() string {
+	return fmt.Sprintf("cluster drain %s: %d rebuild-OFF expose(s) are homed here (ports %v) — they will NOT be auto-migrated (the operator chose no-rebuild). Free/re-decide them, then re-run drain.",
+		e.NodeID, len(e.Ports), e.Ports)
+}
+
+// migrateExposes re-homes ALLOCATED rebuild-ON exposes homed on nodeID to another
+// eligible VOTER via D6 rehome, and REFUSES (enumerating them) on any rebuild-OFF
+// expose — silently rehoming a rebuild-OFF expose would override the operator's
+// explicit choice (external review F3). It materializes the port lists + the target
+// FIRST (close the rows) THEN Proposes — the FSM and the reader share the one
+// SetMaxOpenConns(1) pool, so a Propose nested inside an open *sql.Rows deadlocks
+// (the D6 lesson).
+func (a *ClusterAdmin) migrateExposes(nodeID string) error {
+	var rebuildOn, rebuildOff []int
+	var target string
+	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
+		rows, err := db.Query(
+			`SELECT port, rebuild_on_failure FROM port_allocations WHERE home_broker=? AND state=?`,
+			nodeID, string(port.StateAllocated))
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var p, rebuild int
+			if err := rows.Scan(&p, &rebuild); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if rebuild == 1 {
+				rebuildOn = append(rebuildOn, p)
+			} else {
+				rebuildOff = append(rebuildOff, p)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Pick an eligible VOTER that is not the draining node AND has a resolved
+		// nats_server_id (review m5: a home the D6 server-id bridge cannot resolve is
+		// not a valid rehome target — match D6's eligibility, not just phase=VOTER).
+		return db.QueryRow(
+			`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND node_id != ? AND nats_server_id != '' ORDER BY node_id LIMIT 1`,
+			nodeID).Scan(&target)
+	}); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// Rebuild-OFF exposes are NEVER silently rehomed (F3): refuse + enumerate.
+	if len(rebuildOff) > 0 {
+		return &ErrRebuildOffExposes{NodeID: nodeID, Ports: rebuildOff}
+	}
+	if len(rebuildOn) == 0 {
+		return nil // nothing to migrate
+	}
+	if target == "" {
+		return ErrNoMigrationTarget
+	}
+	for _, p := range rebuildOn {
+		p := p
+		if err := a.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			_, cmd, err := port.PlanReassignHome(db, p, target)
+			if errors.Is(err, port.ErrNotFound) {
+				return nil, nil // raced free/revoke — skip
+			}
+			return cmd, err
+		}); err != nil {
+			return fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
+		}
+	}
+	a.logger.Info("cluster drain: migrated rebuild-ON exposes", "node_id", nodeID, "count", len(rebuildOn), "target", target)
+	return nil
+}

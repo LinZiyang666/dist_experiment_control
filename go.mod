@@ -14,6 +14,7 @@ require (
 	github.com/nats-io/nkeys v0.4.15
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/spf13/cobra v1.10.2
+	go.etcd.io/bbolt v1.3.5
 	golang.org/x/crypto v0.50.0
 	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.43.0
@@ -43,7 +44,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	go.etcd.io/bbolt v1.3.5 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/time v0.15.0 // indirect

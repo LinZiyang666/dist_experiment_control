@@ -34,7 +34,6 @@ func newAgentClient(t *testing.T, fallbackAddr string, echoPort int) *tunnel.Cli
 func TestD6LadderEnforcedEndToEnd(t *testing.T) {
 	db := openSharedDB(t)
 	echo := startEcho(t)
-	publicPort := freePort(t)
 	const token = "tok-ladder-deadbeef"
 
 	homeA := newHomeBroker(t, db, "node-A")
@@ -42,12 +41,9 @@ func TestD6LadderEnforcedEndToEnd(t *testing.T) {
 	homeB := newHomeBroker(t, db, "node-B")
 	t.Cleanup(homeB.stop)
 	seedClusterNode(t, db, "node-A", "tether-1", homeA.addr, homeA.certFP)
-	seedHomedExpose(t, db, hSID, hNID, "svc", publicPort, echo, token, "node-A", 0)
 
 	cli := newAgentClient(t, homeA.addr, echo)
-	if err := cli.OpenHome(publicPort, echo, token, homeA.addr, 0, pinsFor(homeA)); err != nil {
-		t.Fatalf("OpenHome to A: %v", err)
-	}
+	publicPort := seedAndOpenHome(t, db, cli, hSID, hNID, "svc", echo, token, "node-A", homeA.addr, 0, pinsFor(homeA))
 	waitEcho(t, publicPort, "hello-A", 5*time.Second)
 
 	// Broker B is NOT the home for this row → terminal deny (anti-enum code).
@@ -63,7 +59,6 @@ func TestD6LadderEnforcedEndToEnd(t *testing.T) {
 func TestD6RehomeAtoB(t *testing.T) {
 	db := openSharedDB(t)
 	echo := startEcho(t)
-	publicPort := freePort(t)
 	const token = "tok-rehome-cafebabe"
 
 	homeA := newHomeBroker(t, db, "node-A")
@@ -71,12 +66,9 @@ func TestD6RehomeAtoB(t *testing.T) {
 	t.Cleanup(homeB.stop)
 	seedClusterNode(t, db, "node-A", "tether-1", homeA.addr, homeA.certFP)
 	seedClusterNode(t, db, "node-B", "tether-2", homeB.addr, homeB.certFP)
-	seedHomedExpose(t, db, hSID, hNID, "svc", publicPort, echo, token, "node-A", 0)
 
 	cli := newAgentClient(t, homeA.addr, echo)
-	if err := cli.OpenHome(publicPort, echo, token, homeA.addr, 0, pinsFor(homeA)); err != nil {
-		t.Fatalf("OpenHome to A: %v", err)
-	}
+	publicPort := seedAndOpenHome(t, db, cli, hSID, hNID, "svc", echo, token, "node-A", homeA.addr, 0, pinsFor(homeA))
 	waitEcho(t, publicPort, "via-A", 5*time.Second)
 
 	// Home A dies (releases the public port); the leader re-points to B @ epoch 1.
@@ -102,24 +94,16 @@ func TestD6RehomeAtoB(t *testing.T) {
 func TestD6PerExposeScatter(t *testing.T) {
 	db := openSharedDB(t)
 	echo := startEcho(t)
-	portA := freePort(t)
-	portB := freePort(t)
 	const tokA, tokB = "tok-scatter-aaaa", "tok-scatter-bbbb"
 
 	homeA := newHomeBroker(t, db, "node-A")
 	t.Cleanup(homeA.stop)
 	homeB := newHomeBroker(t, db, "node-B")
 	t.Cleanup(homeB.stop)
-	seedHomedExpose(t, db, hSID, hNID, "svcA", portA, echo, tokA, "node-A", 0)
-	seedHomedExpose(t, db, hSID, hNID, "svcB", portB, echo, tokB, "node-B", 0)
 
 	cli := newAgentClient(t, homeA.addr, echo)
-	if err := cli.OpenHome(portA, echo, tokA, homeA.addr, 0, pinsFor(homeA)); err != nil {
-		t.Fatalf("OpenHome A: %v", err)
-	}
-	if err := cli.OpenHome(portB, echo, tokB, homeB.addr, 0, pinsFor(homeB)); err != nil {
-		t.Fatalf("OpenHome B: %v", err)
-	}
+	portA := seedAndOpenHome(t, db, cli, hSID, hNID, "svcA", echo, tokA, "node-A", homeA.addr, 0, pinsFor(homeA))
+	portB := seedAndOpenHome(t, db, cli, hSID, hNID, "svcB", echo, tokB, "node-B", homeB.addr, 0, pinsFor(homeB))
 	waitEcho(t, portA, "scatter-A", 5*time.Second)
 	waitEcho(t, portB, "scatter-B", 5*time.Second)
 }
@@ -181,7 +165,6 @@ func TestD6CatchUpTransientEndToEnd(t *testing.T) {
 func TestD6ConcurrentRehomeRace(t *testing.T) {
 	db := openSharedDB(t)
 	echo := startEcho(t)
-	publicPort := freePort(t)
 	const token = "tok-race-12345678"
 
 	homeA := newHomeBroker(t, db, "node-A")
@@ -189,12 +172,9 @@ func TestD6ConcurrentRehomeRace(t *testing.T) {
 	t.Cleanup(homeB.stop)
 	seedClusterNode(t, db, "node-A", "tether-1", homeA.addr, homeA.certFP)
 	seedClusterNode(t, db, "node-B", "tether-2", homeB.addr, homeB.certFP)
-	seedHomedExpose(t, db, hSID, hNID, "svc", publicPort, echo, token, "node-A", 0)
 
 	cli := newAgentClient(t, homeA.addr, echo)
-	if err := cli.OpenHome(publicPort, echo, token, homeA.addr, 0, pinsFor(homeA)); err != nil {
-		t.Fatalf("OpenHome to A: %v", err)
-	}
+	publicPort := seedAndOpenHome(t, db, cli, hSID, hNID, "svc", echo, token, "node-A", homeA.addr, 0, pinsFor(homeA))
 	waitEcho(t, publicPort, "pre-race", 5*time.Second)
 
 	// A dies (frees the port); the row moves to B at the top epoch.

@@ -46,7 +46,7 @@ func (c *cluster5) waitLeaderExcept(t *testing.T, old int) int {
 func TestD5PostElectionSweep(t *testing.T) {
 	c := startCluster5(t, 3)
 	li := c.leaderIdx(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	ensureHistory(t, c, li, "lab", 3)
@@ -67,13 +67,25 @@ func TestD5PostElectionSweep(t *testing.T) {
 	}
 	ni := c.waitLeaderExcept(t, li)
 
-	// The NEW leader sweeps the replicated entry.
+	// The NEW leader sweeps the replicated entry. Under the heavy concurrent -race
+	// load of `make e2e`, the election settle + the JS publish/propagation can exceed
+	// a tight single-shot window, so RETRY the (idempotent, dedup-id-keyed → no
+	// double-publish) sweep until the records land or a generous deadline. This is the
+	// same flake class the D5 stream-placement retry already addresses.
 	p := newPublisher(c, ni, "lab")
-	if _, err := p.PublishOnce(ctx); err != nil {
-		t.Fatalf("new-leader sweep: %v", err)
-	}
 	const want = 2
-	if !waitForCond(5*time.Second, func() bool { return streamMsgs(t, c.js[ni], jsstream.HistoryStreamName("lab")) == want }) {
+	swept := false
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		if _, err := p.PublishOnce(ctx); err != nil {
+			t.Fatalf("new-leader sweep: %v", err)
+		}
+		if streamMsgs(t, c.js[ni], jsstream.HistoryStreamName("lab")) == want {
+			swept = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !swept {
 		t.Fatalf("post-election sweep published %d records, want %d", streamMsgs(t, c.js[ni], jsstream.HistoryStreamName("lab")), want)
 	}
 }

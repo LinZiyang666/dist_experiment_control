@@ -234,6 +234,28 @@ func TestD6Matrix(t *testing.T) {
 	}
 }
 
+func TestD7Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags d7_integration builds the D7 cluster-lifecycle suite (test/d7): a real
+	// multi-node raft cluster proving the two-phase membership change (dynamic
+	// AddVoter + roster replication to the follower), the forged-sig POISON-SKIP read
+	// on a FOLLOWER's DB (never panics, stays live), the no-silent-fork half-state,
+	// and force-single->recover (kill the cluster, recover a survivor, restart
+	// writable with no applied_index regression). Gated out of the parallel
+	// `make test` (real raft elections starve under contention) and run only here in
+	// its own -race subprocess; the cheap d7 op/applier/offline/guard/status tests run
+	// in `make test`.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "d7_integration", "-timeout", "300s",
+		"./test/d7/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d7 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

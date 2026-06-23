@@ -101,5 +101,17 @@ func defaultAppliers() map[OpType]Applier {
 		OpAgentProvision:     exec,
 		OpAuditCheckpointSet: exec, // D5 §6.3: monotonic cursor UPSERT, baked WHERE guard
 		OpPortReassignHome:   exec, // D6 §7.1-7.2: home re-point + epoch bump, baked CAS guard
+
+		// D7 §8.1. OpClusterNodeUpsert is the ONE custom applier: it re-verifies the
+		// join PoP signature (apply-inert cmd.Aux) on every replica before execing the
+		// baked roster UPSERT — a verify failure is a deterministic poison-skip
+		// (errAppliedRejected), never a panic. The other three ride the shared applier
+		// (their CAS/phase-predecessor guards are baked into the leader-rendered SQL).
+		OpClusterNodeUpsert: clusterNodeUpsertApplier{},
+		OpClusterNodePhase:  exec,
+		OpClusterNodeRemove: exec,
+		OpClusterDrainSet:   exec,
+		OpClusterMetaClear:  exec,
+		OpClusterCertRotate: exec,
 	}
 }
