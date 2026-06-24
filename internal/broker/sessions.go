@@ -49,7 +49,9 @@ func (b *Broker) handleSessionCreate(msg *nats.Msg) {
 		return
 	}
 
-	s, err := session.Create(b.cfg.DB, req.Name, req.Name, fp, pinHash, b.cfg.Now())
+	// D9 §3 (audit #9): in cluster mode this routes through raft (Propose on the leader /
+	// forward on a follower) + a read-back; single mode is the byte-identical direct mutator.
+	s, err := b.createSession(req.Name, fp, pinHash)
 	switch {
 	case errors.Is(err, session.ErrAlreadyExists):
 		b.replyJSON(msg, proto.SessionCreateResp{Error: "already_exists"})
@@ -157,7 +159,10 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	// handleRunReq / handleExposeReq all consult IsActive). Phases
 	// ②③④ run synchronously below; on failure session stays in
 	// DELETING and the boot reconciler resumes from where we left.
-	if err := session.Tombstone(b.cfg.DB, sid, b.cfg.Now()); err != nil {
+	// D9: route the tombstone through raft in cluster mode (the leader bakes deleting_at;
+	// a follower forwards). errors.Is still classifies ErrNotFound/ErrDeleting across the
+	// wire (ForwardBusinessError.Is maps the typed kinds); single mode is byte-identical.
+	if err := b.tombstoneSession(sid); err != nil {
 		switch {
 		case errors.Is(err, session.ErrNotFound):
 			b.replyJSON(msg, proto.SessionRmResp{Code: "not_found"})

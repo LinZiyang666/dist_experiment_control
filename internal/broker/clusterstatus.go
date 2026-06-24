@@ -9,6 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // clusterstatus.go — D7 §17 status/doctor self-report + the adminsock adapter
@@ -126,8 +127,42 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		selfLag = commit - selfApplied
 	}
 	streamTarget := jsstream.ReplicasFor(voters)
+	// External-review F1: report the REAL stream actual, not a synthesized actual==target. An
+	// unwired probe (N=1) keeps the optimistic default; a wired-but-incomplete observation
+	// reports 0 (unknown → a visible deficit in `actual/target`, never a false green).
+	streamActual := streamTarget
+	if a.streamObserve != nil {
+		if rep, err := a.streamObserve(); err == nil && rep.Observed {
+			streamActual = minStreamActual(rep, streamTarget)
+		} else {
+			streamActual = 0
+		}
+	}
 
 	rep := &adminsock.ClusterStatusReport{SchemaVersion: statusSchemaVersion, View: view, LeaderID: leaderID}
+	// §17 row 3: scatter-gather the broker-only cursor probe ONCE (if wired) so each peer's
+	// reachability + applied-lag is REAL, not a blanket self-report. self is always reachable
+	// (it is answering this request). nil poll ⇒ honest "unverified" for peers.
+	var health map[string]proto.ClusterHealthResp
+	if a.healthPoll != nil {
+		health = a.healthPoll()
+	}
+	reachOf := func(nodeID string) (reachable bool, source string, lag uint64) {
+		if nodeID == a.node.SelfID() {
+			return true, "self", selfLag
+		}
+		if a.healthPoll == nil {
+			return false, "unverified", 0 // single-broker view: we genuinely don't know
+		}
+		if r, ok := health[nodeID]; ok {
+			l := uint64(0)
+			if commit > r.AppliedIndex {
+				l = commit - r.AppliedIndex
+			}
+			return true, "nats-health", l
+		}
+		return false, "nats-health", 0 // polled but no answer ⇒ unreachable
+	}
 	rosterIDs := map[string]bool{}
 	for _, r := range roster {
 		rosterIDs[r.nodeID] = true
@@ -136,24 +171,22 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		// the row is absent from the config), or vice-versa.
 		inconsistent := (r.phase == phaseVoter && (!inCfg || ro == "learner")) ||
 			(!inCfg && r.phase != phaseRetiring && r.phase != phaseAddFailed)
-		lag := uint64(0)
-		if r.nodeID == a.node.SelfID() {
-			lag = selfLag
-		}
+		reachable, source, lag := reachOf(r.nodeID)
 		rep.Nodes = append(rep.Nodes, adminsock.ClusterNodeStatus{
 			NodeID: r.nodeID, Name: r.name, Phase: r.phase, Role: ro,
 			AppliedLag: lag, AccountNkMatch: true,
-			StreamActual: streamTarget, StreamTarget: streamTarget,
-			Reachable: true, ReachSource: "self-report",
+			StreamActual: streamActual, StreamTarget: streamTarget,
+			Reachable: reachable, ReachSource: source,
 			Inconsistent: inconsistent,
 		})
 	}
 	// A raft voter with NO roster row is the loud INCONSISTENT case (§8.1).
 	for _, s := range cfg {
 		if s.Voter && !rosterIDs[s.NodeID] {
+			reachable, source, _ := reachOf(s.NodeID)
 			rep.Nodes = append(rep.Nodes, adminsock.ClusterNodeStatus{
-				NodeID: s.NodeID, Role: role[s.NodeID], Reachable: true,
-				ReachSource: "self-report", Inconsistent: true,
+				NodeID: s.NodeID, Role: role[s.NodeID], Reachable: reachable,
+				ReachSource: source, Inconsistent: true,
 			})
 		}
 	}
@@ -161,6 +194,22 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	rep.Health, rep.Banner, rep.NextStep = computeHealth(forceSingle, leaderID, voters, rep.Nodes)
 	rep.ExitCode = healthExitCode(rep.Health)
 	return rep, nil
+}
+
+// minStreamActual is the conservative cluster-wide stream actual: the smallest observed
+// replica count across all streams (so a single under-replicated stream shows the deficit).
+// No streams ⇒ the optimistic target (nothing to be under-replicated).
+func minStreamActual(rep ReplicaReport, target int) int {
+	if len(rep.Streams) == 0 {
+		return target
+	}
+	m := rep.Streams[0].Actual
+	for _, s := range rep.Streams[1:] {
+		if s.Actual < m {
+			m = s.Actual
+		}
+	}
+	return m
 }
 
 // computeHealth derives the health verdict from the self-report. QUORUM_LOST is
@@ -187,6 +236,24 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 	degraded := false
 	for _, n := range nodes {
 		if n.Inconsistent || n.Phase == phaseCatchingUp || n.Phase == phaseAddFailed || n.Phase == phaseDraining || n.Phase == phaseRetiring {
+			degraded = true
+		}
+		// External-review F5: a VOTER that a REAL health poll found UNREACHABLE, or that
+		// trails the leader's commit beyond the §17 lag threshold, is DEGRADED — never call a
+		// cluster HEALTHY_HA when a voter is observably down or behind (the §17 exit-code
+		// contract). "nats-health" means it was actually polled (vs "unverified"/"self").
+		if n.Phase == phaseVoter {
+			if n.ReachSource == "nats-health" && !n.Reachable {
+				degraded = true
+			}
+			if n.AppliedLag > observeLagThreshold {
+				degraded = true
+			}
+		}
+		// External-review F1: a JS stream below its target replica count (observed actual <
+		// target) is DEGRADED — never report HEALTHY_HA while replication is short of target
+		// (a node loss could then lose data). StreamTarget==0 means "not observed" → skip.
+		if n.StreamTarget > 0 && n.StreamActual < n.StreamTarget {
 			degraded = true
 		}
 	}
@@ -340,9 +407,18 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 	if !b.admin.nonceKnown(nonce) {
 		return adminsock.Response{Op: req.Op, Error: "unknown or already-used nonce; re-run `cluster add` (no token) for a fresh one"}
 	}
+	// D9 round-1 BLOCKER: thread the joiner's full expose-home identity (else an added voter
+	// has empty nats_server_id/tunnel_addr/cert_fp → resolveHomeForAgent can never home an
+	// agent there → D6 failover onto grown nodes is impossible). nats_server_id == node_id
+	// (the §6.5 SSOT). public_host defaults to the raft host if the operator omitted it.
+	publicHost := req.PublicHost
+	if publicHost == "" {
+		publicHost = req.Host
+	}
 	in := cluster.ClusterNodeUpsertInput{
 		NodeID: req.NodeID, Name: req.NodeID, NodeIdentPub: req.NodePub,
-		NatsServerID: "", RaftAddr: req.Host, NatsRoute: "", TunnelAddr: "", PublicHost: req.Host,
+		NatsServerID: req.NodeID, RaftAddr: req.Host, NatsRoute: req.NatsRoute,
+		TunnelAddr: req.TunnelAddr, PublicHost: publicHost,
 		CertFP: req.CertFP, JoinNonce: nonce, JoinSigHex: sigHex, Now: b.admin.now(),
 	}
 	caughtUp := func(barrier uint64) (bool, error) {

@@ -183,6 +183,29 @@ type Config struct {
 	// inside _test.go files bypasses that decoder and can set
 	// short intervals (broker.New imposes no minimum).
 	ProcGCInterval time.Duration
+
+	// --- D9 cluster cutover surface (all zero ⇒ single mode, byte-equivalent) ---
+
+	// ClusterDataDir is the raft sub-tree parent (raft/raft.db + raft/snapshots),
+	// from serveconf broker.cluster.data_dir. Empty ⇒ no cluster intent. The
+	// AUTHORITATIVE cluster-mode trigger is the on-disk raft/ probe
+	// (clusterModeEnabled in cutover.go), cross-checked against this intent; a
+	// non-empty value is only an intent, never the sole trigger (a flag that
+	// drifts from disk reality would let node bootstrap overwrite a live DB).
+	ClusterDataDir string
+
+	// ClusterRaftAddr is the raft transport bind (host:port), private-net only.
+	ClusterRaftAddr string
+
+	// ClusterSecretsDir is the §15 secrets directory (cluster-ca, route leaf,
+	// tunnel-cert, broker.nk, node-ident, account.nk). Required in cluster mode.
+	ClusterSecretsDir string
+
+	// DBPath is the SQLite file path (storage.DB / --db). In cluster mode
+	// cluster.Node owns the sole WAL handle on it (storage.OpenWAL) and serve.go
+	// does NOT pre-open DB via storage.Open; in single mode DB carries the
+	// already-open handle and DBPath is informational.
+	DBPath string
 }
 
 // PortAllocCfg returns the internal/port.Config derived from this
@@ -312,6 +335,11 @@ type Broker struct {
 	// (transferAuditSink: / b.transferAuditSink =) from scanned production files.
 	transferAuditSink func(schema.AuditTransfer)
 	transferAuditWG   sync.WaitGroup
+	// transferAuditDraining (D9 round-1 MAJOR): once the ordered shutdown sets it, new audit
+	// emits forward SYNCHRONOUSLY in the NATS handler instead of spawning a tracked goroutine
+	// — so a transfer event arriving in the shutdown window is drained within nc.Drain's
+	// callback wait, not lost by a goroutine spawned AFTER WaitTransferAudit already returned.
+	transferAuditDraining atomic.Bool
 
 	// xferReplicasFn is the D8a (§9) tier-B replica seam (cutover=D9). nil in production:
 	// xferTargetReplicas() returns jsstream.ReplicasSingle so a freshly-created OBJ_xfer
@@ -328,6 +356,21 @@ type Broker struct {
 	// write token (b.alertSink = / alertSink:) from scanned production files; the disk
 	// monitor's `if b.alertSink != nil` READ is allowed.
 	alertSink func(active bool)
+
+	// clusterMode is the D9 cutover switch, decided once in New by clusterModeEnabled
+	// (cutover.go): false ⇒ the byte-equivalent single-broker path (every pre-D9
+	// deployment; advanceProxyGeneration runs, seams stay nil, no cluster.Node); true
+	// ⇒ Run constructs cluster.Node and attaches every seam (the proxy path is off and
+	// New does ZERO DB write, §16.4/§483). The build-and-prove guards are replaced by
+	// TestD9ClusterMode{Off,On}* keyed on this switch.
+	clusterMode bool
+
+	// cl is the cluster-mode runtime (cluster.Node + forwarder + lifecycle), nil in
+	// single mode. It is a broker-package type (cutover.go) so broker.go itself does
+	// not import internal/cluster; Run builds it when clusterMode is true. All
+	// authoritative writes route through cl in cluster mode (proposeOrForward); reads
+	// use b.cfg.DB which Run re-points to cl.node.RODB().
+	cl *clusterRuntime
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -380,7 +423,27 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("broker: NATSURL required")
 	}
-	if cfg.DB == nil {
+	// D9 (steps 1-3): decide single vs cluster mode FIRST (raft-probe based, no DB
+	// needed), so the DB requirement can differ. Single mode needs an already-open DB
+	// (cfg.DB, storage.Open by serve.go — byte-identical to pre-D9). Cluster mode lets
+	// cluster.Node own the sole WAL DB: cfg.DB is nil here and Run sets b.cfg.DB =
+	// node.RODB() after constructing the node. FATAL on any inconsistent combination.
+	clusterMode, err := clusterModeEnabled(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if clusterMode {
+		if cfg.DBPath == "" {
+			return nil, fmt.Errorf("broker: cluster mode requires DBPath (cluster.Node owns the DB)")
+		}
+		// D9 C-1 belt-and-suspenders: the cluster.Node is the SOLE writable WAL pool. A
+		// non-nil cfg.DB means a caller (e.g. a regressed serve.go) opened a SECOND pool on
+		// the same file — refuse, so the dual-handle corruption hazard can never reappear.
+		if cfg.DB != nil {
+			return nil, fmt.Errorf("broker: cluster mode must be constructed with a nil cfg.DB " +
+				"(the FSM owns the single WAL pool; serve.go must skip storage.Open in cluster mode)")
+		}
+	} else if cfg.DB == nil {
 		return nil, fmt.Errorf("broker: DB required")
 	}
 	if cfg.Now == nil {
@@ -404,21 +467,34 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.ProcGCInterval == 0 {
 		cfg.ProcGCInterval = 5 * time.Minute
 	}
-	// proxyGen (round-3/4/5) is this broker incarnation's ordering generation: a
-	// PERSISTED monotonic counter (max(stored+1, now_nanos)) so it advances
-	// across restarts even if the wall clock rolls back (F1). round-5 F2: an
-	// unreadable counter is FATAL — we must NOT fall open to a bare wall clock,
-	// which is the exact fencing hole the persisted counter closes. The whole of
-	// P13 needs the P13 schema anyway, so there is no safe pre-migration fallback.
-	gen, err := advanceProxyGeneration(cfg.DB, cfg.Now().UnixNano(), 0)
-	if err != nil {
-		return nil, fmt.Errorf("broker: durable proxy generation unavailable (fencing would be unsafe): %w", err)
+	b := &Broker{
+		cfg:         cfg,
+		transfers:   newTransferTracker(),
+		clusterMode: clusterMode,
 	}
-	return &Broker{
-		cfg:       cfg,
-		transfers: newTransferTracker(),
-		proxyGen:  gen,
-	}, nil
+
+	// proxyGen (round-3/4/5) is this broker incarnation's ordering generation: a
+	// PERSISTED monotonic counter (max(stored+1, now_nanos)) so it advances across
+	// restarts even if the wall clock rolls back (F1). round-5 F2: an unreadable
+	// counter is FATAL — we must NOT fall open to a bare wall clock.
+	//
+	// D9: this is the ONLY startup-time DB write, and it runs ONLY in single mode. The
+	// P13 proxy path is OUT of v1 HA (§16.4/§483), so a cluster-mode broker neither
+	// serves proxy subscribe nor advances proxy generation — New is side-effect-free
+	// in cluster mode (cluster.Node owns the sole writer). The single-mode DB-marker
+	// consistency check + proxy-gen are here; the cluster-mode consistency check runs
+	// in Run AFTER cluster.Node opens the DB (cfg.DB is nil until then).
+	if !clusterMode {
+		if err := assertClusterDBConsistent(cfg.DB, false); err != nil {
+			return nil, err
+		}
+		gen, err := advanceProxyGeneration(cfg.DB, cfg.Now().UnixNano(), 0)
+		if err != nil {
+			return nil, fmt.Errorf("broker: durable proxy generation unavailable (fencing would be unsafe): %w", err)
+		}
+		b.proxyGen = gen
+	}
+	return b, nil
 }
 
 // Run connects to NATS, installs subscriptions, runs the reconcile ticker,
@@ -429,6 +505,32 @@ func New(cfg Config) (*Broker, error) {
 // subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
 func (b *Broker) Run(ctx context.Context) error {
 	b.runCtx = ctx
+
+	// D9 cutover: in cluster mode cluster.Node owns the sole WAL DB. Construct it FIRST
+	// (it opens the merged WAL + raft), re-point reads at its read-only handle, and
+	// cross-check the DB-side migration marker now that the DB is open. All
+	// authoritative writes route through b.cl (proposeOrForward); liveness writes go to
+	// node.DB(). The full seam attach + leader-gated loops are wired below after the
+	// NATS connect + JS probe. (Step 5 replaces this defer with an ordered shutdown.)
+	if b.clusterMode {
+		cl, err := b.buildClusterRuntime()
+		if err != nil {
+			return fmt.Errorf("broker: build cluster runtime: %w", err)
+		}
+		b.cl = cl
+		b.cfg.DB = cl.node.RODB()
+		if err := assertClusterDBConsistent(b.cfg.DB, true); err != nil {
+			_ = cl.node.Shutdown()
+			return err
+		}
+		defer func() { _ = b.cl.node.Shutdown() }()
+		// Early seam: stable tunnel cert + selfID, BEFORE the tunnel server is created
+		// (so it advertises the stable cert_fp that agents pin against).
+		if err := b.wireClusterEarly(); err != nil {
+			return err
+		}
+	}
+
 	connOpts, err := b.brokerConnectOptions()
 	if err != nil {
 		return err
@@ -447,6 +549,13 @@ func (b *Broker) Run(ctx context.Context) error {
 		_ = nc.Drain()
 		b.nc.Store(nil)
 	}()
+
+	// D9 round-1 BLOCKER: build the follower→leader forwarder BEFORE installAuthCallout so
+	// the authcallout PIN provision/join writes can route through raft (the handler is built
+	// next + needs the seam). wireClusterLate reuses this same forwarder (does not rebuild).
+	if b.clusterMode {
+		b.cl.forwarder = NewForwarder(nc, b.cfg.ExposeForwardTimeout())
+	}
 
 	if subAuth, err := b.installAuthCallout(nc); err != nil {
 		return err
@@ -558,7 +667,25 @@ func (b *Broker) Run(ctx context.Context) error {
 			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proxy.*", b.handleProxyReadyEvent},
 	} {
-		sub, err := nc.Subscribe(ss.subj, ss.handler)
+		// D9 round-2 BLOCKER: in a ≥2-node cluster the leader-forwarded ctl-command + event
+		// subjects must be handled by EXACTLY ONE broker per message (a QUEUE group), not
+		// broadcast — otherwise every broker handles each command, the followers'
+		// proposeOrForward all forward to the leader, and a follower's reply can race the
+		// leader's (e.g. session.create returns a spurious "already exists"). One broker
+		// handles + forwards/proposes; reads reply once. EXCEPTION (round-3 BLOCKER): the
+		// FILE-TRANSFER subjects stay BROADCAST — their D8 routing needs the HOME broker (the
+		// in-memory tracker holder) to see every message; the home gate + tracker-presence
+		// already collapse the fan-out to one answering broker. Single mode is always plain
+		// Subscribe (a 1-member queue group is behaviorally identical, but stay byte-exact).
+		var (
+			sub *nats.Subscription
+			err error
+		)
+		if b.clusterMode && !isBroadcastClusterSubject(ss.subj) {
+			sub, err = nc.QueueSubscribe(ss.subj, ctlQueueGroup, ss.handler)
+		} else {
+			sub, err = nc.Subscribe(ss.subj, ss.handler)
+		}
 		if err != nil {
 			return fmt.Errorf("broker: subscribe %s: %w", ss.subj, err)
 		}
@@ -614,6 +741,20 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
+	// D9 cutover late wiring: attach the D8 sinks, subscribe the cluster responders,
+	// and start the leader-gated audit-publisher + alert-reconciler loops. After the JS
+	// probe (the loops need b.js) and the NATS connect (nc).
+	if b.clusterMode {
+		if err := b.wireClusterLate(ctx, nc); err != nil {
+			return err
+		}
+		// D9 step 5: explicit ordered shutdown. Registered AFTER the nc.Drain defer (line
+		// ~531) so it runs BEFORE it (LIFO) on EVERY return path: WaitTransferAudit while
+		// nc is live → cancel+join the leader loops → unsubscribe responders. The Run-top
+		// node.Shutdown defer (registered first) then runs LAST, after nc.Drain.
+		defer b.clusterShutdownOrdered()
+	}
+
 	// P7 / H.1 — emit tetherd_restarted as the broker becomes
 	// fully ready. Done after subscriptions + JS are wired so the
 	// emission itself can land in the events stream.
@@ -635,6 +776,21 @@ func (b *Broker) Run(ctx context.Context) error {
 			AuditTail:       b.adminAuditTail,
 			PubAgentEvicted: b.pubAgentEvicted,
 		}
+		// D9: in cluster mode the `tether cluster *` admin verbs are served by the
+		// ClusterAdmin orchestrator (D7); nil in single mode ⇒ "cluster mode not enabled".
+		if b.clusterMode {
+			// caughtUp/streamsReady nil for now: status/drain/remove/transfer work and
+			// add's catch-up gate uses the leader-applied proxy. The real per-follower
+			// cursor + stream-ready probes are wired by Step 10b (§17 observability).
+			// b.cl.admin was constructed in wireClusterLate (independent of the socket).
+			// External-review F1: wire the REAL catch-up + stream-readiness transports so
+			// the operator's `tether cluster add` (catch-up gate) + `cluster drain --retire`
+			// (AllAtTarget gate) work through the production adminsock — not just the harness.
+			backend.Cluster = NewClusterAdminBackend(b.cl.admin, b.clusterCaughtUp, b.clusterStreamsReady)
+			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
+			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).
+			backend.EvictWrite = b.evictNode
+		}
 		b.admin = adminsock.New(b.cfg.AdminSocketPath, backend)
 		if err := b.admin.Start(ctx); err != nil {
 			return fmt.Errorf("broker: admin socket start: %w", err)
@@ -651,7 +807,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// 15-min OFFLINE port revoker fires immediately if applicable
 	// instead of leaking up to one ReconcileInterval).
 	bootNow := b.cfg.Now()
-	if n, err := node.ReconcileStates(b.cfg.DB, bootNow,
+	if n, err := node.ReconcileStates(b.livenessDB(), bootNow,
 		b.cfg.StaleAfter, b.cfg.OfflineAfter); err != nil {
 		b.cfg.Logger.Warn("broker: boot node reconcile", "err", err)
 	} else if n > 0 {
@@ -681,19 +837,32 @@ func (b *Broker) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			now := b.cfg.Now()
-			n, err := node.ReconcileStates(b.cfg.DB, now,
+			n, err := node.ReconcileStates(b.livenessDB(), now,
 				b.cfg.StaleAfter, b.cfg.OfflineAfter)
 			if err != nil {
 				b.cfg.Logger.Warn("broker: reconcile failed", "err", err)
 			} else if n > 0 {
 				b.cfg.Logger.Info("broker: state transitions", "count", n)
 			}
-			if revoked := b.reconcilePorts(now); revoked > 0 {
-				b.cfg.Logger.Info("broker: port revocations", "count", revoked)
+			// D9 round-1 MAJOR: the OFFLINE-node port-revocation scan is a leader-local
+			// DECISION (like proc GC) — in cluster mode run it only on the leader, so N
+			// followers don't each re-scan + forward the same (idempotent but wasteful)
+			// PlanRevoke every tick. ReconcileStates above is per-broker-local liveness
+			// (livenessDB), so it stays on every broker. Single mode unchanged.
+			if !b.clusterMode || b.cl.node.IsLeader() {
+				if revoked := b.reconcilePorts(now); revoked > 0 {
+					b.cfg.Logger.Info("broker: port revocations", "count", revoked)
+				}
 			}
 		case <-gcTicker.C:
+			// D9 §3 (audit #5): proc GC is leader-local retention (local maintenance, not
+			// replicated state) — in cluster mode it runs only on the leader and writes the
+			// local handle (a follower GCs when it leads); single mode unchanged.
+			if b.clusterMode && !b.cl.node.IsLeader() {
+				continue
+			}
 			cutoff := b.cfg.Now().Add(-b.cfg.ProcRetention)
-			n, err := proc.GCExited(b.cfg.DB, cutoff)
+			n, err := proc.GCExited(b.livenessDB(), cutoff)
 			if err != nil {
 				b.cfg.Logger.Warn("broker: proc gc", "err", err)
 			} else if n > 0 {
@@ -747,6 +916,17 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		return
 	}
 
+	// D9 round-2 MAJOR: register sits on a BROADCAST subject (nc.Subscribe), so in a ≥2-node
+	// cluster EVERY broker would otherwise run the full identity-forward + G.1 reconcile +
+	// reply + audit — N× the reconcile audit (reconciled_closed/killed_orphan emitted N
+	// times) and N stale-RODB directive computations. Make register LEADER-ONLY: a follower
+	// returns silently (no reply, no reconcile, no audit). Liveness stays fresh on every
+	// broker because handleHeartbeat is ALSO broadcast (each broker updates its own local
+	// last_heartbeat_at), so the leader-only OFFLINE/revoke scan sees current heartbeats.
+	if b.clusterMode && !b.cl.node.IsLeader() {
+		return
+	}
+
 	in := node.RegisterInput{
 		SID: sid, NID: nid,
 		ProtoVersion:   req.ProtoVersion,
@@ -760,7 +940,9 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		// expose time. "" in production (single-node agent) → inert.
 		NatsServer: req.ServerID,
 	}
-	if err := node.Register(b.cfg.DB, in, b.cfg.Now()); err != nil {
+	// D9 §3 (audit #1): cluster mode routes the identity write through raft (Propose /
+	// forward) + a local liveness write; single mode is the byte-identical direct mutator.
+	if err := b.registerNode(in); err != nil {
 		if errors.Is(err, node.ErrSessionMissing) {
 			b.replyErr(msg, "session_not_found",
 				fmt.Sprintf("session %q does not exist; have an owner run `tether session create %s` first", sid, sid))
@@ -809,7 +991,10 @@ func (b *Broker) handleHeartbeat(msg *nats.Msg) {
 	if !ok {
 		return
 	}
-	if err := node.Heartbeat(b.cfg.DB, sid, nid, b.cfg.Now()); err != nil {
+	// D9: last_heartbeat_at/status is a LIVENESS column (§3.5) — written to the local
+	// liveness handle, NOT through raft (high-frequency, per-broker-local, rebuilt on
+	// failover). In single mode livenessDB() == b.cfg.DB (byte-identical).
+	if err := node.Heartbeat(b.livenessDB(), sid, nid, b.cfg.Now()); err != nil {
 		// Heartbeat from an unregistered node — drop quietly. A real network
 		// will see this on broker restart before re-register has happened.
 		b.cfg.Logger.Debug("broker: heartbeat for unknown node",

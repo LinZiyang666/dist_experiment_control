@@ -21,6 +21,7 @@ package broker
 // the first reply and the content-addressed ReqID dedups any double-commit.
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -35,6 +36,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/authcallout"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	nodepkg "github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -42,6 +44,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
 	"github.com/nats-io/nats.go"
+	"golang.org/x/time/rate"
 )
 
 // Forwarded verbs (§13.7-named writes). Building the GENERIC forwarder but wiring +
@@ -65,7 +68,85 @@ const (
 	VerbAlertSignal = "alertsignal"
 	// VerbAlertAck (D8b §10.1) forwards a cluster-level ack to the leader (idempotent UPSERT).
 	VerbAlertAck = "alertack"
+	// VerbSessionCreate (D9 §3 step 3) forwards a session create to the leader, which bakes
+	// the created_at literal and commits OpSessionCreate. The SID == the user-given name
+	// (sessions are name-keyed), so no leader-baked id read-back is needed for the key; the
+	// caller reads the committed row back by SID for the authoritative created_at. PlanCreate
+	// re-checks existence on the leader (ErrAlreadyExists), so no boundary ReqID is minted.
+	VerbSessionCreate = "sessioncreate"
+	// VerbPortFree / VerbPortRevoke (D9 §3) forward a port free/revoke to the leader. Both
+	// are data-less (error-only), so the caller routes the Plan and needs no read-back; the
+	// leader bakes the freed_at/revoked_at literal. PlanFree/PlanRevoke are no-ops on a row
+	// that is already gone, so a forwarder retry is harmless.
+	VerbPortFree   = "portfree"
+	VerbPortRevoke = "portrevoke"
+	// VerbNodeRegister (D9 §3, audit #1) forwards an agent register's IDENTITY columns to
+	// the leader (PlanRegister writes identity only; the liveness columns last_heartbeat_at/
+	// status are written locally by the originating broker, §3.5). The payload is the
+	// node.RegisterInput; PlanRegister re-checks the session exists on the leader.
+	VerbNodeRegister = "noderegister"
+	// VerbProcInsert (D9 §3, audit #4) forwards a process-started record to the leader.
+	// Data-less (error-only); a forwarder retry is idempotent (PlanInsert keys on pid).
+	VerbProcInsert = "procinsert"
+	// VerbProcMarkExited (D9 round-1 review BLOCKER) forwards a process EXIT to the leader
+	// (the proc.exit event + reconcileOnRegister's missed-exit path). Carries the agent-
+	// reported exit code + end time (a FACT, not leader-baked). PlanMarkExited's
+	// WHERE status='RUNNING' guard makes it idempotent on an already-exited row, so a
+	// forwarder retry / a double-exit is harmless.
+	VerbProcMarkExited = "procmarkexited"
+	// VerbSessionTombstone (D9 round-1 review BLOCKER, audit #11) forwards a session rm's
+	// state transition to DELETING (PlanTombstone). The H.3 finalize cascade (drop rows) is
+	// a SEPARATE leader-local Apply (VerbSessionDrop) once the agent-side teardown completes.
+	VerbSessionTombstone = "sessiontombstone"
+	// VerbSessionDrop forwards the H.3 cascade delete (the DELETE of a DELETING session's
+	// rows after teardown). Data-less; PlanDropSession is a no-op on an absent row, so a
+	// forwarder retry is harmless.
+	VerbSessionDrop = "sessiondrop"
+	// VerbNodeEvict (D9 round-2 BLOCKER) forwards `tether admin evict` (the operator's agent
+	// kick) to the leader: PlanEvict deletes the agent_provisioning + nodes rows in one Apply.
+	// Data-less; the DELETEs are no-ops on absent rows, so a forwarder retry is harmless.
+	VerbNodeEvict = "nodeevict"
+	// NOTE (D9 §3, audit #6): port allocate is NOT a forward verb. The expose token is
+	// leaked exactly once in the Allocate RETURN (only its hash is persisted), so a
+	// follower could not read it back. In v1 expose is therefore LEADER-LOCAL (allocatePort
+	// bounces a follower with a retryable not_leader, like the §8.1 admin verbs); transparent
+	// follower-forward of the leak-once token is a future leaf (needs a forward-result reply).
 )
+
+// PortMutatePayload (D9) carries a single public port for the data-less port verbs
+// (free/revoke). The leader bakes the timestamp literal.
+type PortMutatePayload struct {
+	Port int `json:"port"`
+}
+
+// SessionCreatePayload (D9) is the forwarded session-create request. The leader bakes the
+// created_at; SID == Name (name-keyed sessions), so the follower needs no id round-trip.
+type SessionCreatePayload struct {
+	Name    string `json:"name"`
+	FP      string `json:"fp"`
+	PinHash string `json:"pin_hash"`
+}
+
+// SessionMutatePayload carries a single SID for the data-less session verbs (tombstone +
+// hard-delete). The leader bakes the deleting_at literal for tombstone.
+type SessionMutatePayload struct {
+	SID string `json:"sid"`
+}
+
+// ProcMarkExitedPayload (D9 round-1 BLOCKER) carries an agent-reported process exit. The
+// exit code + end time are FACTS from the agent (not leader-baked); PlanMarkExited's
+// WHERE status='RUNNING' guard makes the Apply idempotent on an already-exited row.
+type ProcMarkExitedPayload struct {
+	Pid      string    `json:"pid"`
+	ExitCode int       `json:"exit_code"`
+	EndedAt  time.Time `json:"ended_at"`
+}
+
+// EvictPayload (D9 round-2 BLOCKER) carries the (sid,nid) of an `admin evict` kick.
+type EvictPayload struct {
+	SID string `json:"sid"`
+	NID string `json:"nid"`
+}
 
 // Reply status codes on the typed forward reply envelope.
 const (
@@ -257,11 +338,35 @@ func writeSeg(h interface{ Write([]byte) (int, error) }, s string) {
 type Forwarder struct {
 	nc      *nats.Conn
 	timeout time.Duration
+	// limiter is the D9 §18.2.18 mass-reconnect bound: a token bucket caps the rate at
+	// which THIS broker forwards writes to the leader, so ~100 agents re-REGISTERing into
+	// an in-progress election drain at ≤ K/sec instead of herding the new leader with a
+	// burst of ReconcileBatch Proposes. A forward that can't get a token within the request
+	// timeout returns the retriable not_leader sentinel → the agent's reconnect backoff
+	// smooths the herd over time. nil ⇒ unlimited (tests that don't exercise the herd).
+	limiter *rate.Limiter
 }
 
-// NewForwarder builds a Forwarder over an already-connected broker-nkey NATS conn.
+// defaultForwardRatePerSec bounds the leader-forward rate (§18.2.18). Generous enough not
+// to impede steady-state writes, low enough that a 100-agent herd drains over ~2s (past a
+// PreVote election) instead of in one burst. Burst == rate so a brief idle period lets a
+// small batch through immediately.
+const defaultForwardRatePerSec = 50
+
+// NewForwarder builds a Forwarder over an already-connected broker-nkey NATS conn, with
+// the default mass-reconnect rate limit.
 func NewForwarder(nc *nats.Conn, timeout time.Duration) *Forwarder {
-	return &Forwarder{nc: nc, timeout: timeout}
+	return NewForwarderWithLimit(nc, timeout, defaultForwardRatePerSec)
+}
+
+// NewForwarderWithLimit is NewForwarder with an explicit per-second forward cap (tests use
+// a low cap to assert the bound; perSec<=0 disables the limiter).
+func NewForwarderWithLimit(nc *nats.Conn, timeout time.Duration, perSec int) *Forwarder {
+	f := &Forwarder{nc: nc, timeout: timeout}
+	if perSec > 0 {
+		f.limiter = rate.NewLimiter(rate.Limit(perSec), perSec)
+	}
+	return f
 }
 
 // Forward sends one verb+payload and classifies the reply. Returns nil on ok,
@@ -270,6 +375,17 @@ func NewForwarder(nc *nats.Conn, timeout time.Duration) *Forwarder {
 // *ForwardBusinessError on a permanent business error. The caller re-calls with the
 // SAME reqID on a retriable error; it MUST NOT mint a fresh key.
 func (f *Forwarder) Forward(verb, reqID string, payload []byte) error {
+	// §18.2.18 mass-reconnect bound: acquire a forward token (bounded by the request
+	// timeout). Exceeding the deadline is treated as retriable (not a commit) — the agent
+	// backs off, smoothing the herd; the SAME reqID dedups any eventual double-commit.
+	if f.limiter != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), f.timeout)
+		err := f.limiter.Wait(ctx)
+		cancel()
+		if err != nil {
+			return cluster.ErrForwardNotLeader
+		}
+	}
 	data, err := json.Marshal(forwardEnvelope{ReqID: reqID, Verb: verb, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("cluster_forward: marshal envelope: %w", err)
@@ -404,6 +520,81 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 		}
 		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return cluster.PlanAlertAck(p.DedupKey, p.AckedBy, now())
+		})
+	case VerbSessionCreate:
+		// D9 §3: the leader bakes created_at via now() and commits OpSessionCreate;
+		// PlanCreate re-checks existence on the LEADER's committed view (ErrAlreadyExists
+		// surfaces as a typed forward error). SID == Name (name-keyed sessions).
+		var p SessionCreatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return session.PlanCreate(db, p.Name, p.Name, p.FP, p.PinHash, now())
+		})
+	case VerbPortFree:
+		var p PortMutatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return port.PlanFree(db, p.Port, now())
+		})
+	case VerbPortRevoke:
+		var p PortMutatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return port.PlanRevoke(db, p.Port, now())
+		})
+	case VerbNodeRegister:
+		var in nodepkg.RegisterInput
+		if err := json.Unmarshal(env.Payload, &in); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return nodepkg.PlanRegister(db, in, now())
+		})
+	case VerbProcInsert:
+		var p proc.Process
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return proc.PlanInsert(db, p)
+		})
+	case VerbProcMarkExited:
+		var p ProcMarkExitedPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return proc.PlanMarkExited(db, p.Pid, p.ExitCode, p.EndedAt)
+		})
+	case VerbSessionTombstone:
+		var p SessionMutatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return session.PlanTombstone(db, p.SID, now())
+		})
+	case VerbSessionDrop:
+		var p SessionMutatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return session.PlanHardDelete(p.SID)
+		})
+	case VerbNodeEvict:
+		var p EvictPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return nodepkg.PlanEvict(p.SID, p.NID)
 		})
 	default:
 		return fmt.Errorf("cluster_forward: unknown verb %q", env.Verb)

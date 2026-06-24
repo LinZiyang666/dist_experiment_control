@@ -146,6 +146,13 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 // ctl. On any pre-forward failure we reply ExposeResp{Code,Error} —
 // ctl gets a clean lifecycle message instead of a NATS timeout.
 func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
+	// External-review F3: expose is LEADER-LOCAL (the leak-once token can't be read back),
+	// so the expose subject is BROADCAST (not queue-grouped) and handled ONLY by the leader —
+	// a follower returns silently, so the leader (also a broadcast subscriber) always answers
+	// and the ctl never sees a spurious not_leader from a random queue member.
+	if b.clusterMode && !b.cl.node.IsLeader() {
+		return
+	}
 	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
 	if !ok || verb != "expose" {
 		b.replyExposeErr(msg, "subject_malformed", "")
@@ -210,7 +217,11 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	alloc, err := port.Allocate(b.cfg.DB, sid, nid, req.Name, req.LocalPort, req.RemotePort, fp, b.cfg.PortAllocCfg())
+	// D9 §3 (audit #6): cluster mode routes the allocation through the leader (Propose);
+	// single mode is the byte-identical direct mutator. The handler is leader-only in cluster
+	// mode (F3), so allocatePort runs on the leader; a leadership race falls through to the
+	// generic store_error below (raft.ErrNotLeader) and the ctl retries.
+	alloc, err := b.allocatePort(sid, nid, req.Name, req.LocalPort, req.RemotePort, fp)
 	switch {
 	case errors.Is(err, port.ErrNameTaken):
 		b.replyExposeErr(msg, "name_taken", req.Name)
@@ -252,7 +263,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	fwdBody, err := json.Marshal(&fwdReq)
 	if err != nil {
 		// roll back the allocation — no point keeping a row no agent saw
-		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
+		_ = b.freePort(alloc.Port)
 		b.replyExposeErr(msg, "marshal", err.Error())
 		return
 	}
@@ -262,7 +273,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		// Agent didn't ACK in time. Free the port so we don't leak it.
 		// Common cause: agent process crashed between OK status read
 		// and message receive.
-		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
+		_ = b.freePort(alloc.Port)
 		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
 		b.replyExposeErr(msg, "agent_no_responders", err.Error())
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_no_responders", msg.Reply, nil)
@@ -270,12 +281,12 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	var agentResp proto.ExposeForwardedResp
 	if err := json.Unmarshal(fwdResp.Data, &agentResp); err != nil {
-		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
+		_ = b.freePort(alloc.Port)
 		b.replyExposeErr(msg, "agent_malformed_resp", err.Error())
 		return
 	}
 	if !agentResp.OK {
-		_ = port.Free(b.cfg.DB, alloc.Port, b.cfg.Now())
+		_ = b.freePort(alloc.Port)
 		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
 		b.replyExposeErr(msg, "agent_rejected:"+agentResp.Code, agentResp.Error)
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_rejected:"+agentResp.Code, msg.Reply, nil)
@@ -386,7 +397,7 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 		}
 	}
 
-	if err := port.Free(b.cfg.DB, alloc.Port, b.cfg.Now()); err != nil {
+	if err := b.freePort(alloc.Port); err != nil {
 		b.replyExposeRmErr(msg, "free_failed", err.Error())
 		return
 	}
@@ -433,7 +444,7 @@ func (b *Broker) reconcilePorts(now time.Time) int {
 	}
 	revoked := 0
 	for _, a := range allocs {
-		if err := port.Revoke(b.cfg.DB, a.Port, now); err != nil {
+		if err := b.revokePort(a.Port, now); err != nil {
 			b.cfg.Logger.Warn("broker: reconcilePorts revoke", "err", err, "port", a.Port)
 			continue
 		}

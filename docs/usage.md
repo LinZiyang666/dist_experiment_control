@@ -156,6 +156,13 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 - `/etc/systemd/system/{nats-server, tether-broker, caddy}.service`
 - `/var/{lib,log,run}/tether`（属主 `tether` 系统用户，`install.sh` 自动 useradd）
 
+> **分布式 HA（proto v2）补充**：升级成集群时，tether 接管 `nats.conf`（`tether cluster
+> takeover-natsconf`，见 §3.4）并留 `nats.conf.bak.<ts>`；§15 secrets（`/etc/tether/secrets/`：
+> `cluster-ca.pem`、`route-cert.pem`/`route-key.pem`、稳定 `tunnel-cert.pem`/`tunnel-key.pem`、
+> `broker.nk`、`node-ident.nk`、`account.nk`，私钥 0600）须先 provision（`tether cluster doctor`
+> 预检：缺/不可读/私钥权限松 = 拒；FDE 缺 = advisory）。现网单点→N≥3 的一次性迁移全流程 +
+> 回滚见 **`docs/cluster-runbook.md` 第 4 节**。proto v2 不与现网 v1 车队 wire 兼容（需协调全车队重装）。
+
 启动：
 
 ```bash
@@ -326,6 +333,13 @@ broker:
 **没有启用**（开机即可登录、便于第一遍部署排错）。**正式开放公网必须启用
 auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`，
 任何匿名连接都能进集群。
+
+> **单 broker（非集群）保持本节的手动流程不变**——`install.sh` 写 nats.conf + 你按下面手动加
+> `authorization{}`，是单 broker 的受支持路径。**分布式 HA（proto v2）下不要手改 nats.conf**：改用
+> `tether cluster takeover-natsconf`（D9）让 tether 接管——它在保留 install.sh 的 websocket/jetstream +
+> 已记录的调优指令（如 `max_payload`）的前提下重写出集群指令（routes mTLS + auth_callout + per-broker
+> ACL），遇到不认识的指令会 fail-closed 拒绝（不静默覆盖手调 conf），并留一份 pristine `.bak`。整套
+> 现网单点→集群的一次性迁移见 §2.3 指向的 `docs/cluster-runbook.md` 第 4 节。
 
 #### 第 1 步：生成 broker.nk + account.nk
 

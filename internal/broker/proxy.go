@@ -37,6 +37,10 @@ func (b *Broker) proxyErr(msg *nats.Msg, code, errMsg string) {
 }
 
 func (b *Broker) handleProxySet(nc *nats.Conn, msg *nats.Msg) {
+	if b.clusterMode {
+		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
+		return
+	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok || action != "set" {
 		b.proxyErr(msg, "subject_malformed", "")
@@ -193,6 +197,10 @@ func (b *Broker) disableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Ms
 }
 
 func (b *Broker) handleProxySub(nc *nats.Conn, msg *nats.Msg) {
+	if b.clusterMode {
+		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
+		return
+	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok {
 		b.proxyErr(msg, "subject_malformed", "")
@@ -333,6 +341,9 @@ func (b *Broker) handleProxyStatus(msg *nats.Msg) {
 // handleProxyReadyEvent records the agent's SS-bind ACK on
 // s.<sid>.ev.node.<nid>.proxy.<ready|unready>.
 func (b *Broker) handleProxyReadyEvent(msg *nats.Msg) {
+	if b.clusterMode {
+		return // D9 round-1 MAJOR: P13 proxy is off in cluster mode; never touch the RODB handle
+	}
 	p := splitDot(msg.Subject)
 	// 0:tether 1:v2 2:s 3:sid 4:ev 5:node 6:nid 7:proxy 8:kind
 	if len(p) != 9 || p[2] != "s" || p[4] != "ev" || p[5] != "node" || p[7] != "proxy" {
@@ -381,6 +392,9 @@ func (b *Broker) sessionNIDs(sid string) []string {
 // hash, keep it (Token empty → agent reuses its persisted token); otherwise
 // mint a fresh port+token.
 func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegisterReq) *proto.ProxyDirective {
+	if b.clusterMode {
+		return nil // D9 round-1 MAJOR: proxy off in cluster mode (no AllocateProxy on the RODB handle)
+	}
 	enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
 	if err != nil || !enabled {
 		return nil
@@ -562,6 +576,11 @@ func (b *Broker) repairProxyEpoch(sid, nid string, agentEpoch int64) {
 // under a different generation (round-4 F2: two DB snapshots can share an epoch
 // with different keysets) — it re-pushes the current directive.
 func (b *Broker) repairProxy(sid, nid string, agentGen, agentEpoch int64) {
+	// D9 §16.4: P13/proxy is OUT of v1 HA — cluster mode does not serve the proxy path at
+	// all (it would write port_allocations via the RODB handle anyway). No-op in cluster mode.
+	if b.clusterMode {
+		return
+	}
 	// round-6 F2: a non-P13-capable node must NOT influence proxy generation,
 	// repair, or readiness — gate on the persisted capability before trusting
 	// any P13 heartbeat field.

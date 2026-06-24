@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -75,6 +76,66 @@ func RaftStateExists(dataDir string) (bool, error) {
 		return false, fmt.Errorf("cluster: probe existing state: %w", err)
 	}
 	return existing, nil
+}
+
+// ErrAlreadyBootstrapped is BootstrapSingleNode's idempotent signal: raft/ already holds
+// state (a prior `cluster init` created it), so there is nothing to bootstrap. The caller
+// treats it as success (the init is idempotent).
+var ErrAlreadyBootstrapped = errors.New("cluster: raft state already exists (already bootstrapped)")
+
+// BootstrapSingleNode creates a fresh single-voter raft/ for a never-clustered DB — the
+// D9 `cluster init [--from-existing]` FINAL step (after the DB is migrated + seeded).
+// Unlike RecoverSingleNode it REQUIRES empty stores and replays NO log (a never-clustered
+// DB has none): it writes only the {self} configuration as the initial raft state, so the
+// already-migrated DB stands as the index-0 snapshot. It opens NO SQLite handle — the DB
+// seeding (self_node_id / applied_index / cluster_nodes self row) is a separate seed step,
+// committed BEFORE this call so the detection probe (raft/ present) flips true only once the
+// DB is fully prepared. Returns ErrAlreadyBootstrapped (idempotent) if raft/ already exists.
+func BootstrapSingleNode(dataDir, selfID, selfRaftAddr string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if selfID == "" || selfRaftAddr == "" {
+		return errors.New("cluster: BootstrapSingleNode requires selfID and selfRaftAddr")
+	}
+	logger.Info("cluster: bootstrapping single-voter raft", "self", selfID, "data_dir", dataDir)
+	raftDir, boltPath := raftPaths(dataDir)
+	if err := os.MkdirAll(raftDir, 0o700); err != nil {
+		return fmt.Errorf("cluster: mkdir raft dir: %w", err)
+	}
+	store, err := raftboltdb.New(raftboltdb.Options{
+		Path:        boltPath,
+		BoltOptions: &bolt.Options{Timeout: boltLockProbeTimeout},
+	})
+	if err != nil {
+		return fmt.Errorf("cluster: open boltstore for bootstrap: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	snaps, err := raft.NewFileSnapshotStore(raftDir, 2, io.Discard)
+	if err != nil {
+		return fmt.Errorf("cluster: open snapshot store for bootstrap: %w", err)
+	}
+	existing, err := raft.HasExistingState(store, store, snaps)
+	if err != nil {
+		return fmt.Errorf("cluster: probe existing state: %w", err)
+	}
+	if existing {
+		return ErrAlreadyBootstrapped
+	}
+	// An in-memory transport: BootstrapCluster needs LocalAddr to match the single-server
+	// config but performs no network IO. Closed after.
+	_, trans := raft.NewInmemTransport(raft.ServerAddress(selfRaftAddr))
+	defer func() { _ = trans.Close() }()
+	cfg := raft.Configuration{Servers: []raft.Server{{
+		Suffrage: raft.Voter,
+		ID:       raft.ServerID(selfID),
+		Address:  raft.ServerAddress(selfRaftAddr),
+	}}}
+	if err := raft.BootstrapCluster(raftConfig(Config{LocalID: raft.ServerID(selfID)}),
+		store, store, snaps, trans, cfg); err != nil {
+		return fmt.Errorf("cluster: BootstrapCluster({%s}): %w", selfID, err)
+	}
+	return nil
 }
 
 // RecoverSingleNode rewrites the on-disk raft configuration to a single voter

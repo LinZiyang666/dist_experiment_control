@@ -48,28 +48,39 @@ func (b *Broker) AttachTransferAuditSink(fwd *Forwarder) {
 // ErrForwardNotLeader is retried (the derived reqID dedups a double-commit), a permanent error
 // returns at once, and the loop ALWAYS terminates (bounded attempts×backoff) — not a leak.
 func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error) {
+	runForward := func(payload []byte, rec schema.AuditTransfer) {
+		for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
+			ferr := forward(payload)
+			if ferr == nil {
+				return
+			}
+			if !errors.Is(ferr, cluster.ErrForwardNotLeader) {
+				b.cfg.Logger.Warn("d8: transfer audit forward failed (best-effort)",
+					"err", ferr, "tid", rec.TransferID, "kind", rec.Kind)
+				return
+			}
+			time.Sleep(transferAuditForwardBackoff) // transient: retry (reqID dedups a double-commit)
+		}
+		b.cfg.Logger.Warn("d8: transfer audit forward gave up after retries (best-effort)",
+			"tid", rec.TransferID, "kind", rec.Kind)
+	}
 	b.transferAuditSink = func(rec schema.AuditTransfer) {
 		payload, err := json.Marshal(rec)
 		if err != nil {
 			return
 		}
+		// D9 round-1 MAJOR: during the ordered shutdown forward SYNCHRONOUSLY in the NATS
+		// handler so nc.Drain (which waits for handler callbacks) drains this audit too — the
+		// async goroutine could otherwise be spawned AFTER WaitTransferAudit returned and lost
+		// on Drain. Steady state stays async (OQ9-A: never block the agent-forward handler).
+		if b.transferAuditDraining.Load() {
+			runForward(payload, rec)
+			return
+		}
 		b.transferAuditWG.Add(1)
 		go func() {
 			defer b.transferAuditWG.Done()
-			for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
-				ferr := forward(payload)
-				if ferr == nil {
-					return
-				}
-				if !errors.Is(ferr, cluster.ErrForwardNotLeader) {
-					b.cfg.Logger.Warn("d8: transfer audit forward failed (best-effort)",
-						"err", ferr, "tid", rec.TransferID, "kind", rec.Kind)
-					return
-				}
-				time.Sleep(transferAuditForwardBackoff) // transient: retry (reqID dedups a double-commit)
-			}
-			b.cfg.Logger.Warn("d8: transfer audit forward gave up after retries (best-effort)",
-				"tid", rec.TransferID, "kind", rec.Kind)
+			runForward(payload, rec)
 		}()
 	}
 }

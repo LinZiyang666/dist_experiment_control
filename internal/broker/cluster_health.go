@@ -22,7 +22,21 @@ import (
 // — a partitioned ex-leader still reporting State()==Leader within its lease FAILS VerifyLeader
 // and answers false, so the gate fires precisely in the data-loss window.
 func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, func(msg *nats.Msg) {
+	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now))
+}
+
+// SubscribeClusterCursor (D9 §17 round-1 BLOCKER fix) wires the same broadcast health
+// responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
+// observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).
+// Every broker answers (no queue group) so the leader collects each voter's AppliedIndex.
+func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now))
+}
+
+// clusterHealthResponder builds the shared health-reply handler used by both the member-
+// facing cluster-health RPC and the broker-only §17 cursor probe.
+func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time) func(*nats.Msg) {
+	return func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
 		}
@@ -30,6 +44,12 @@ func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 			SchemaVersion:      proto.ClusterHealthSchemaVersion,
 			LeaderContactStale: node.LeaderContactStale(now()),
 			ForceSingleActive:  forceSingleActive(db),
+			NodeID:             node.SelfID(),
+		}
+		// D9 §17 (step 10b): self-report the command-domain AppliedIndex so the leader's
+		// observability poll can compute this broker's raft_lag.
+		if ai, err := node.AppliedIndex(); err == nil {
+			resp.AppliedIndex = ai
 		}
 		if verr := node.VerifyLeaderRead(func(*sql.DB) error { return nil }); verr == nil {
 			resp.WritableLeaderConfirmed = true
@@ -42,7 +62,7 @@ func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 			return
 		}
 		_ = msg.Respond(b)
-	})
+	}
 }
 
 // SubscribeAlertLs wires the QUEUE-GROUP alert-ls responder (§10.1/§10.3): any ONE broker

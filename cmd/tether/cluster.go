@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -36,6 +39,8 @@ operate directly on disk (see the runbook in docs/).`,
 	root.AddCommand(newClusterTransferCmd(&socketPath))
 	root.AddCommand(newClusterRotateCertCmd(&socketPath))
 	root.AddCommand(newClusterInitCmd())
+	root.AddCommand(newClusterTakeoverNatsconfCmd())
+	root.AddCommand(newClusterDoctorCmd())
 	// Offline + local (cluster_offline.go).
 	root.AddCommand(newClusterForceSingleCmd())
 	root.AddCommand(newClusterRecoverCmd())
@@ -91,16 +96,16 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 		return fmt.Errorf("offline status: open %s: %w", dbPath, err)
 	}
 	defer func() { _ = db.Close() }()
-	rows, err := db.Query(`SELECT node_id, name, phase, cert_fp FROM cluster_nodes ORDER BY node_id`)
+	rows, err := db.Query(`SELECT node_id, name, phase, cert_fp, raft_addr FROM cluster_nodes ORDER BY node_id`)
 	if err != nil {
 		return fmt.Errorf("offline status: read roster: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	type row struct{ NodeID, Name, Phase, CertFP string }
+	type row struct{ NodeID, Name, Phase, CertFP, RaftAddr string }
 	var roster []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.NodeID, &r.Name, &r.Phase, &r.CertFP); err != nil {
+		if err := rows.Scan(&r.NodeID, &r.Name, &r.Phase, &r.CertFP, &r.RaftAddr); err != nil {
 			return err
 		}
 		roster = append(roster, r)
@@ -111,15 +116,14 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	var forceSingle string
 	_ = db.QueryRow(`SELECT value FROM cluster_meta WHERE key='force_single_active'`).Scan(&forceSingle)
 
-	// Emit the SAME versioned ClusterStatusReport schema as the online view (review
-	// F4). The offline view is a DISK-ONLY roster snapshot: it does NOT probe peer
-	// liveness over :7400 in this build (the force-single --confirm-peers-dead
-	// TCP-liveness gate is the authoritative live-peer check; the offline raft-ping
-	// view is deferred to D9). It therefore carries NO health/exit semantics —
-	// Health is empty and ExitCode is 0, with a banner saying so.
+	// Emit the SAME versioned ClusterStatusReport schema as the online view (review F4).
+	// §17 row 4: the offline view is a disk roster snapshot that ALSO TCP-pings each peer's
+	// raft port (raft_addr) so the operator sees real per-peer liveness without a running
+	// daemon. This is an advisory liveness hint; the authoritative live-peer gate is still
+	// `cluster force-single --confirm-peers-dead` (which HARD-REFUSES any live peer).
 	rep := &adminsock.ClusterStatusReport{
 		SchemaVersion: 1, View: "offline", ExitCode: 0,
-		Banner:   "disk-only roster snapshot — peer liveness NOT probed; for quorum loss use `cluster force-single --confirm-peers-dead ...` (it TCP-probes + HARD-REFUSES any live peer)",
+		Banner:   "disk roster snapshot with a raft-port TCP liveness probe (advisory); for quorum loss use `cluster force-single --confirm-peers-dead ...` (it re-probes + HARD-REFUSES any live peer)",
 		NextStep: "cluster force-single --confirm-peers-dead <ids...>",
 	}
 	if forceSingle != "" {
@@ -128,9 +132,18 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 		rep.Banner = "force_single_active set at " + forceSingle + " — " + rep.Banner
 	}
 	for _, r := range roster {
+		reachable := false
+		source := "disk-snapshot"
+		if r.RaftAddr != "" {
+			if c, derr := net.DialTimeout("tcp", r.RaftAddr, 2*time.Second); derr == nil {
+				_ = c.Close()
+				reachable = true
+			}
+			source = "raft-ping"
+		}
 		rep.Nodes = append(rep.Nodes, adminsock.ClusterNodeStatus{
 			NodeID: r.NodeID, Name: r.Name, Phase: r.Phase,
-			Reachable: false, ReachSource: "disk-snapshot",
+			Reachable: reachable, ReachSource: source,
 		})
 	}
 	if asJSON {
@@ -139,12 +152,19 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 		return nil
 	}
 	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "NODE_ID\tNAME\tPHASE")
-	for _, r := range roster {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", r.NodeID, r.Name, r.Phase)
+	_, _ = fmt.Fprintln(tw, "NODE_ID\tNAME\tPHASE\tRAFT_PING")
+	for _, n := range rep.Nodes {
+		ping := "DOWN"
+		if n.Reachable {
+			ping = "UP"
+		}
+		if n.ReachSource != "raft-ping" {
+			ping = "?"
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", n.NodeID, n.Name, n.Phase, ping)
 	}
 	_ = tw.Flush()
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\n** offline roster view (disk-only; peer liveness NOT probed) **\n%s\n", rep.Banner)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\n** offline roster view (disk snapshot + advisory raft-port ping) **\n%s\n", rep.Banner)
 	return nil
 }
 
@@ -179,14 +199,23 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 }
 
 func newClusterAddCmd(socketPath *string) *cobra.Command {
-	var joinToken string
+	var joinToken, tunnelAddr, publicHost, natsRoute, certFP string
 	cmd := &cobra.Command{
 		Use:   "add <node-id> <host> <node-pub>",
 		Short: "Admit a new voter (two-phase: run without --join-token to get a nonce, sign it on the joiner, then re-run)",
 		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// D9 round-1 BLOCKER + external-review Q2: the second (token) call MUST carry the
+			// joiner's full expose-home + NATS identity (tunnel-addr + cert-fp + nats-route),
+			// else the added voter can hold raft votes but never serve as an expose home nor be
+			// rendered into a correct NATS topology.
+			if joinToken != "" && (tunnelAddr == "" || certFP == "" || natsRoute == "") {
+				return fmt.Errorf("cluster add: --tunnel-addr, --cert-fp and --nats-route are required on the " +
+					"token call (an added voter without them can never serve as an expose home or NATS peer)")
+			}
 			resp, err := callAdmin(*socketPath, adminsock.Request{
 				Op: adminsock.OpClusterAdd, NodeID: args[0], Host: args[1], NodePub: args[2], JoinToken: joinToken,
+				TunnelAddr: tunnelAddr, PublicHost: publicHost, NatsRoute: natsRoute, CertFP: certFP,
 			})
 			if err != nil {
 				return err
@@ -208,6 +237,10 @@ func newClusterAddCmd(socketPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&joinToken, "join-token", "", "<nonce>:<sigHex> from `cluster sign-join` on the joiner")
+	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "joiner's public tunnel addr host:port (required on the token call)")
+	cmd.Flags().StringVar(&certFP, "cert-fp", "", "joiner's stable tunnel cert fingerprint sha256:… (required on the token call)")
+	cmd.Flags().StringVar(&publicHost, "public-host", "", "joiner's public host (defaults to <host>)")
+	cmd.Flags().StringVar(&natsRoute, "nats-route", "", "joiner's NATS route URL, e.g. nats://10.0.0.2:6222")
 	return cmd
 }
 
@@ -328,19 +361,76 @@ func newClusterRotateCertCmd(socketPath *string) *cobra.Command {
 }
 
 func newClusterInitCmd() *cobra.Command {
-	var fromExisting bool
+	var (
+		fromExisting bool
+		dataDir      string
+		dbPath       string
+		secretsDir   string
+		selfID       string
+		name         string
+		nodeIdentPub string
+		raftAddr     string
+		natsRoute    string
+		tunnelAddr   string
+		publicHost   string
+	)
 	cmd := &cobra.Command{
-		Use:   "init",
-		Short: "Initialize a cluster (the live single-broker --from-existing migration is D9)",
+		Use:   "init --from-existing",
+		Short: "Migrate THIS live single broker into a single-voter cluster (the D9 one-time migration)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if fromExisting {
-				return fmt.Errorf("cluster init --from-existing is the D9 one-time migration path; not available in this build")
+			if !fromExisting {
+				return fmt.Errorf("cluster init: pass --from-existing to migrate this broker's DB into a cluster " +
+					"(there is no fresh-bootstrap path; a node always migrates an existing DB)")
 			}
-			return fmt.Errorf("cluster init: a node bootstraps as a single-voter cluster automatically; use `cluster add` to grow it")
+			if selfID == "" || raftAddr == "" {
+				return fmt.Errorf("cluster init --from-existing requires --self-id and --raft-addr")
+			}
+			// Loud v1→v2 wire-break warning: a one-way, flag-day migration. The daemon
+			// MUST be stopped, and ALL agents reinstalled on v2 afterward (a v1 agent
+			// cannot connect to a v2 broker). Rollback = restore tether.db.bak (to the v2
+			// single broker, NOT the v1 fleet).
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+				"WARNING: cluster init --from-existing is a one-time, one-way migration.\n"+
+					"  - Stop the broker first (systemctl stop tether-broker).\n"+
+					"  - proto v2 breaks the wire: EVERY agent must be reinstalled on v2 afterward.\n"+
+					"  - Rollback = restore tether.db.bak (to the v2 SINGLE broker; no path back to a v1 fleet).")
+			if !confirmTypedNodeID(cmd, selfID) {
+				return fmt.Errorf("cluster init: aborted (node_id not confirmed)")
+			}
+			if err := clusteroffline.InitFromExisting(clusteroffline.InitFromExistingOptions{
+				DataDir: dataDir, DBPath: dbPath, SecretsDir: secretsDir,
+				SelfID: selfID, Name: name, NodeIdentPub: nodeIdentPub,
+				RaftAddr: raftAddr, NatsRoute: natsRoute, TunnelAddr: tunnelAddr, PublicHost: publicHost,
+			}); err != nil {
+				return err
+			}
+			// Halt-and-print the restart sequence (tether does NOT orchestrate systemctl;
+			// d9-plan OQ-3). cluster mode needs the new nats.conf authorization{} ACL live
+			// before the broker connects.
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"cluster init --from-existing complete — %s is now a single-voter cluster (data_dir %s).\n"+
+					"NEXT (run in order):\n"+
+					"  1. tether cluster takeover-natsconf --secrets-dir %s   # rewrite /etc/tether/nats.conf (cluster + auth_callout)\n"+
+					"  2. systemctl restart nats-server                       # bring up the new conf\n"+
+					"  3. set broker.cluster.{data_dir,raft_addr,secrets_dir} in broker.yaml\n"+
+					"  4. systemctl start tether-broker                       # starts in cluster mode (N=1)\n"+
+					"  5. reinstall ALL agents on v2, then `tether cluster add` to grow to N>=3\n",
+				selfID, dataDir, secretsDir)
+			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&fromExisting, "from-existing", false, "migrate a live single-broker into a cluster (D9)")
+	cmd.Flags().BoolVar(&fromExisting, "from-existing", false, "migrate this live single broker into a cluster")
+	cmd.Flags().StringVar(&dataDir, "data-dir", defaultDataDir, "broker data dir (raft/ is created here)")
+	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "tether.db path")
+	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (cluster-ca, route leaf, tunnel cert)")
+	cmd.Flags().StringVar(&selfID, "self-id", "", "this node's cluster node_id (== deterministic nats server_name)")
+	cmd.Flags().StringVar(&name, "name", "", "human-facing broker name (UNIQUE in the cluster)")
+	cmd.Flags().StringVar(&nodeIdentPub, "node-ident-pub", "", "this node's node-identity public key")
+	cmd.Flags().StringVar(&raftAddr, "raft-addr", "", "this node's raft transport address (host:7400, private net)")
+	cmd.Flags().StringVar(&natsRoute, "nats-route", "", "this node's NATS route address (host:6222)")
+	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "this node's public tunnel control address")
+	cmd.Flags().StringVar(&publicHost, "public-host", "", "this node's public DNS host")
 	return cmd
 }
 

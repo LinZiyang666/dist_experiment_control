@@ -18,6 +18,12 @@ type ClusterHealthResp struct {
 	LeaderID                string `json:"leader_id,omitempty"`  // best-effort, banner text only
 	ForceSingleActive       bool   `json:"force_single_active"`  // this node's persisted D7 marker
 	SchemaVersion           int    `json:"schema_version"`
+	// NodeID + AppliedIndex (D9 §17, step 10b) let the leader's observability poll detect
+	// raft_lag (a voter's command-domain AppliedIndex trailing the leader's CommitIndex) and
+	// broker_down (a known voter that does not answer the broadcast within the window). raft
+	// does not cleanly expose per-peer cursors/liveness, so each broker self-reports here.
+	NodeID       string `json:"node_id,omitempty"`
+	AppliedIndex uint64 `json:"applied_index"`
 }
 
 // AlertView is one ACTIVE alert as rendered for the banner / `alert ls` (§10.1/§10.3).

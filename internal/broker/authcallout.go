@@ -81,6 +81,15 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 		EmitEvent: b.pubSysEvent, // P7: member_joined / pin_failed → events stream
 	}
 
+	// D9 round-1 BLOCKER: in cluster mode the handler's DB is the READ-ONLY FSM handle, so
+	// the default ProvisionWithPIN(h.DB)/JoinWithPIN(h.DB) direct writes would fail (and
+	// bypass raft). Route the PIN provision/join writes through the leader (Propose-local /
+	// follower-forward) via the D4 seams. The forwarder was built in Run before this call.
+	if b.clusterMode {
+		h.ProvisionAgentWrite = NewProvisionSeam(b.cl.node, b.cl.forwarder)
+		h.JoinMemberWrite = NewJoinSeam(b.cl.node, b.cl.forwarder)
+	}
+
 	// QueueSubscribe (not Subscribe) so that in a ≥2-node cluster exactly ONE
 	// broker answers each callout — every broker shares the "tether-authcallout"
 	// queue group (§6.2), and a request raised on server A can be answered by

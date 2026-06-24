@@ -25,6 +25,13 @@ const (
 	// SubjClusterApplyWildcard / SubjClusterWildcard are the NATS ACL grants.
 	SubjClusterApplyWildcard = SubjClusterApplyPrefix + ".>"
 	SubjClusterWildcard      = SubjClusterPrefix + ".>"
+	// SubjClusterCursor is the BROKER-ONLY (§17) cursor/health probe the leader scatters to
+	// all brokers for the broker_down/raft_lag observability. It lives under cluster.> (NOT
+	// the member-facing ctrl.by.<actor>.cluster-health.req) because PermissionsForBroker
+	// grants the broker nkey pub+sub on cluster.> but NOT on ctrl.by.* — using the member
+	// subject would get the leader's publish DENIED (round-1 BLOCKER: empty replies ⇒ a
+	// false broker_down for every voter every tick).
+	SubjClusterCursor = SubjClusterPrefix + ".cursor.req"
 )
 
 // SubjClusterApply returns "tether.v2.cluster.apply.<verb>" — the broker-only

@@ -215,6 +215,19 @@ func New(cfg Config) (*Node, error) {
 // home_broker==self filter (D6 §7.2/R-10). It is stable for the node's lifetime.
 func (n *Node) SelfID() string { return string(n.localID) }
 
+// RODB returns the node's READ-ONLY SQLite handle (the dedicated read pool, separate
+// from the FSM write pool). At the D9 cutover the broker's reads route through this so
+// the FSM stays the single writer on the merged WAL DB (§3.8/§590): broker code does
+// `b.cfg.DB = node.RODB()` and routes every authoritative write through Propose. WAL
+// permits concurrent readers + one writer, so reads here never block the FSM.
+func (n *Node) RODB() *sql.DB { return n.ro }
+
+// DB returns the node's WAL WRITE pool. It is the FSM's single-writer handle; callers
+// MUST NOT issue authoritative writes through it directly (that bypasses raft and
+// breaks replication) — it is exposed only for the offline `cluster init --from-existing`
+// seed path, which writes BEFORE raft is serving. Live writes go through Propose.
+func (n *Node) DB() *sql.DB { return n.db }
+
 // raftConfig builds the raft.Config. Timeouts come from cfg when set, else the
 // D1/D2 fast N=1 defaults (200ms / 20ms) so existing single-node tests are
 // byte-unchanged; D3 multinode harnesses pass cluster.Multinode* values via

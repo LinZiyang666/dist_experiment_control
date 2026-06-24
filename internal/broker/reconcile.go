@@ -190,7 +190,17 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 					// process is then treated as an orphan and
 					// scheduled for kill below (we re-add it to
 					// agentByPID so the orphan loop picks it up).
-					_ = proc.MarkExited(b.cfg.DB, p.PID, -1, now)
+					// D9 round-1 BLOCKER: route through raft in cluster mode (was a direct
+					// b.cfg.DB==RODB write that silently failed). Audit only on a committed
+					// transition (don't emit reconciled_closed for a write that didn't land).
+					// round-2 MINOR: on a close error STILL re-add the reused PID as an orphan
+					// (the kill is independent of the old row's close) — preserving the pre-D9
+					// swallow-and-schedule behavior; only the audit is gated on success.
+					if err := b.markProcExited(p.PID, -1, now); err != nil {
+						b.cfg.Logger.Warn("broker: reconcile pid-reuse close", "err", err, "pid", p.PID)
+						agentByPID[p.PID] = lp
+						continue
+					}
 					reconciled = append(reconciled, proto.ReconciledProc{
 						PID: p.PID, NewState: "EXITED", RC: -1,
 					})
@@ -205,7 +215,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 				if lp.RC != nil {
 					rc = *lp.RC
 				}
-				if err := proc.MarkExited(b.cfg.DB, p.PID, rc, now); err != nil {
+				if err := b.markProcExited(p.PID, rc, now); err != nil {
 					b.cfg.Logger.Warn("broker: reconcile mark exited", "err", err, "pid", p.PID)
 					continue
 				}
@@ -216,7 +226,10 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 			default:
 				// Unknown state from agent — treat as missed-exit so we
 				// don't leave the row stuck RUNNING forever.
-				_ = proc.MarkExited(b.cfg.DB, p.PID, -1, now)
+				if err := b.markProcExited(p.PID, -1, now); err != nil {
+					b.cfg.Logger.Warn("broker: reconcile unknown-state close", "err", err, "pid", p.PID)
+					continue
+				}
 				reconciled = append(reconciled, proto.ReconciledProc{
 					PID: p.PID, NewState: "EXITED", RC: -1,
 				})
@@ -226,7 +239,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 			// Broker thinks RUNNING/LOST but agent didn't list it →
 			// missed-exit. Architecture G.1: rc=-1, audit.proc{kind:
 			// reconciled_closed}.
-			if err := proc.MarkExited(b.cfg.DB, p.PID, -1, now); err != nil {
+			if err := b.markProcExited(p.PID, -1, now); err != nil {
 				b.cfg.Logger.Warn("broker: reconcile missed-exit", "err", err, "pid", p.PID)
 				continue
 			}

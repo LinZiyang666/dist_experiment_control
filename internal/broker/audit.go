@@ -74,7 +74,7 @@ func (b *Broker) finalizeSessionRm(ctx context.Context, sid string) error {
 			return fmt.Errorf("phase 2: %w", err)
 		}
 	}
-	if err := dropSessionRows(b.cfg.DB, sid); err != nil {
+	if err := b.dropSession(sid); err != nil {
 		return fmt.Errorf("phase 3: %w", err)
 	}
 	// Prune the tunnel's per-session kill-generation bookkeeping now that the

@@ -58,7 +58,37 @@ func freeClusterPort(t *testing.T) int {
 // startRoutedJS brings up n routed NATS servers with clustered JetStream (plain, no auth —
 // the broker-nkey JS ACL is a D3 concern already proven; D8 proves the alert/audit/replica
 // MECHANISM over a real clustered JetStream).
+// startRoutedJS brings up an n-server clustered-JetStream mesh, RETRYING the whole bring-up
+// on fresh ports if the embedded servers fail to become ready / mesh / form the meta-group
+// within their windows under full-make-e2e host load (a documented clustered-JS flake;
+// CLAUDE.md §e2e). A clean retry clears a transient startup starvation; isolation is <10s.
 func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
+	t.Helper()
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		servers, ok := attemptRoutedJS(t, n)
+		if ok {
+			t.Cleanup(func() {
+				for _, s := range servers {
+					s.Shutdown()
+					s.WaitForShutdown()
+				}
+			})
+			return servers
+		}
+		for _, s := range servers {
+			if s != nil {
+				s.Shutdown()
+				s.WaitForShutdown()
+			}
+		}
+		t.Logf("startRoutedJS attempt %d/%d not ready under load; retrying on fresh ports", attempt, attempts)
+	}
+	t.Fatalf("routed JS cluster did not come up after %d attempts", attempts)
+	return nil
+}
+
+func attemptRoutedJS(t *testing.T, n int) ([]*natsserver.Server, bool) {
 	t.Helper()
 	ports := make([]int, n)
 	routeStrs := make([]string, n)
@@ -82,31 +112,22 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 		}
 		s, err := natsserver.NewServer(o)
 		if err != nil {
-			t.Fatalf("NewServer %d: %v", i, err)
+			return servers, false // freePort TOCTOU race etc. — a fresh-port retry clears it
 		}
 		go s.Start()
 		servers[i] = s
 	}
-	t.Cleanup(func() {
-		for _, s := range servers {
-			s.Shutdown()
-			s.WaitForShutdown()
-		}
-	})
 	for _, s := range servers {
-		// 30s (was 10s): under the full make e2e matrix this harness starts after every other
-		// matrix, so the machine is loaded and embedded-server startup is slow (the D5 harness
-		// flaked "routed JS server not ready" here). No logic change; just load headroom.
 		if !s.ReadyForConnections(30 * time.Second) {
-			t.Fatal("routed JS server not ready")
+			return servers, false
 		}
 	}
 	for _, s := range servers {
 		if !waitFor(20*time.Second, func() bool { return s.NumRoutes() >= n-1 }) {
-			t.Fatalf("server %s never meshed", s.Name())
+			return servers, false
 		}
 	}
-	if !waitFor(30*time.Second, func() bool {
+	ok := waitFor(30*time.Second, func() bool {
 		leaders, complete := 0, false
 		for _, s := range servers {
 			if !s.JetStreamIsClustered() {
@@ -120,10 +141,8 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 			}
 		}
 		return leaders == 1 && complete
-	}) {
-		t.Fatal("JS meta-group did not form")
-	}
-	return servers
+	})
+	return servers, ok
 }
 
 // ---- mTLS raft CA ----

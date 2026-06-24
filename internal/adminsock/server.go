@@ -37,6 +37,12 @@ type Backend struct {
 	// agent only notices on next reconnect.
 	PubAgentEvicted func(sid, nid string)
 
+	// EvictWrite, when non-nil (the D9 cutover wires it in cluster mode), routes the evict's
+	// row deletes through raft (Propose PlanEvict on the leader / forward on a follower)
+	// instead of the direct tx on DB (which is the READ-ONLY FSM handle in cluster mode).
+	// nil ⇒ single mode: handleEvict does the direct tx (byte-identical to pre-D9).
+	EvictWrite func(sid, nid string) error
+
 	// Now is the time source used for reply timestamps; nil →
 	// time.Now.
 	Now func() time.Time
@@ -336,9 +342,36 @@ func (s *Server) handleAudit(req Request) Response {
 	return Response{Op: OpAudit, Audit: entries, OK: true}
 }
 
+// rowExists reports whether the 1-column existence query returns a row (used by the
+// cluster-mode evict to report whether a row was actually removed). Read on the RODB handle.
+func (s *Server) rowExists(query string, args ...any) bool {
+	var one int
+	return s.backend.DB.QueryRow(query, args...).Scan(&one) == nil
+}
+
 func (s *Server) handleEvict(req Request) Response {
 	if req.SID == "" || req.NID == "" {
 		return Response{Op: OpEvict, Error: "sid and nid required"}
+	}
+	// D9 round-2 BLOCKER: in cluster mode the direct tx below writes the READ-ONLY FSM
+	// handle and fails ("readonly database"). Route through raft via the EvictWrite seam
+	// (Propose PlanEvict / forward). Pre-query existence on the read handle so the result
+	// still reports whether a row was actually removed.
+	if s.backend.EvictWrite != nil {
+		provExisted := s.rowExists(`SELECT 1 FROM agent_provisioning WHERE sid=? AND nid=?`, req.SID, req.NID)
+		nodeExisted := s.rowExists(`SELECT 1 FROM nodes WHERE sid=? AND nid=?`, req.SID, req.NID)
+		if err := s.backend.EvictWrite(req.SID, req.NID); err != nil {
+			return Response{Op: OpEvict, Error: err.Error()}
+		}
+		broadcasted := false
+		if (provExisted || nodeExisted) && s.backend.PubAgentEvicted != nil {
+			s.backend.PubAgentEvicted(req.SID, req.NID)
+			broadcasted = true
+		}
+		return Response{Op: OpEvict, OK: true, Evict: &EvictResult{
+			SID: req.SID, NID: req.NID,
+			NodeRowDeleted: nodeExisted, AgentProvDeleted: provExisted, BroadcastedEvicted: broadcasted,
+		}}
 	}
 	tx, err := s.backend.DB.Begin()
 	if err != nil {

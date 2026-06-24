@@ -105,13 +105,16 @@ func (b *Broker) homeForExpose(sid, nid, name string, publicPort int) *proto.Hom
 	if home == nil {
 		return nil
 	}
+	// D9 §3 (audit #10): home_broker is stamped AT allocate (PlanAllocate's homeBroker arg,
+	// baked by the leader via Propose), so here we only READ the epoch — b.cfg.DB is the FSM
+	// read-only handle in cluster mode and must not be written directly. (Pre-D9 the seam ran
+	// only under the harness, which DID write here; the live cutover moves the stamp to Apply.)
 	var epoch int64
 	if err := b.cfg.DB.QueryRow(
-		`UPDATE port_allocations SET home_broker=? WHERE sid=? AND nid=? AND port=? AND state='ALLOCATED'
-		 RETURNING epoch`,
-		home.NodeID, sid, nid, publicPort,
+		`SELECT epoch FROM port_allocations WHERE sid=? AND nid=? AND port=? AND state='ALLOCATED'`,
+		sid, nid, publicPort,
 	).Scan(&epoch); err != nil {
-		b.cfg.Logger.Warn("broker: home stamp on expose failed", "err", err, "sid", sid, "nid", nid, "port", publicPort)
+		b.cfg.Logger.Warn("broker: home epoch read on expose failed", "err", err, "sid", sid, "nid", nid, "port", publicPort)
 		return nil
 	}
 	return &proto.HomeDirective{

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // clusteradmin.go — D7 §8.1 two-phase membership orchestrator + the leader-startup
@@ -46,6 +47,18 @@ type ClusterAdmin struct {
 	logger    *slog.Logger
 	catchPoll time.Duration
 	now       func() time.Time
+
+	// healthPoll, when set (wireClusterLate injects the broker-only cursor scatter-gather),
+	// returns each reachable broker's self-reported AppliedIndex keyed by node_id. StatusReport
+	// uses it to fill REAL reachability + applied-lag (§17 row 3) instead of stamping every peer
+	// Reachable:true. nil ⇒ the honest "unverified" fallback (single-broker view).
+	healthPoll func() map[string]proto.ClusterHealthResp
+
+	// streamObserve, when set (wireClusterLate injects the audit publisher's read-only replica
+	// observation), reports the live JS stream replica state. StatusReport uses it to render
+	// the REAL stream actual instead of synthesizing actual==target (external-review F1). nil
+	// or an incomplete observation ⇒ actual is reported 0 (unknown / fail-closed, not green).
+	streamObserve func() (ReplicaReport, error)
 
 	// issuedNonces is the leader-local single-use join-nonce store (OQ-5). `cluster
 	// add` step 1 issues a fresh nonce; step 2 (with the signed token) consumes it.

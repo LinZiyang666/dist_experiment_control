@@ -289,6 +289,30 @@ func TestD8Matrix(t *testing.T) {
 	}
 }
 
+func TestD9Matrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags d9_integration builds the D9 production-cutover suite (test/d9): it seeds +
+	// bootstraps a single-voter cluster DB via clusteroffline.InitFromExisting, then starts a
+	// broker in CLUSTER MODE (the real serve.go path: detect → cluster.NewProduction over mTLS
+	// raft + §15 secrets → attach every seam → leader-gated loops) against an embedded
+	// JetStream NATS, and proves the cutover stands up (the single voter leads) AND an
+	// authoritative control write (session.create) routes through node.Propose, commits to the
+	// FSM-owned WAL, and a duplicate is rejected (it truly committed). Replaces the deleted
+	// build-and-prove guards' "production wires NO cluster" obligation with the positive proof.
+	// Gated out of the parallel `make test` (clustered raft elections starve under contention)
+	// and run only here in its own -race subprocess; the cheap two-mode + detection + audit
+	// unit tests run in `make test`.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "d9_integration", "-timeout", "300s",
+		"./test/d9/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("d9 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestRemoteFSMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

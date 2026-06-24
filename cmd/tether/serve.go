@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -38,6 +39,9 @@ func newServeCmd() *cobra.Command {
 		adminSocket      string
 		upgradeURLAllow  []string
 		subHTTPListen    string
+		clusterDataDir   string
+		clusterRaftAddr  string
+		clusterSecrets   string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -68,6 +72,12 @@ func newServeCmd() *cobra.Command {
 			publicHost = pickPublicHost(cmd, publicHost, fileCfg.Broker.PublicHost, fileCfg.Broker.Domain)
 			storeDir = pickFlagOrYaml(cmd, "store-dir", storeDir, fileCfg.Broker.Storage.JSStore)
 			adminSocket = pickFlagOrYaml(cmd, "admin-socket", adminSocket, fileCfg.Broker.Admin.Socket)
+			// D9 cluster cutover surface — paths only; all empty ⇒ single mode (no
+			// behavior change). The authoritative cluster trigger is the on-disk raft/
+			// probe (broker.clusterModeEnabled), cross-checked against ClusterDataDir.
+			clusterDataDir = pickFlagOrYaml(cmd, "cluster-data-dir", clusterDataDir, fileCfg.Broker.Cluster.DataDir)
+			clusterRaftAddr = pickFlagOrYaml(cmd, "cluster-raft-addr", clusterRaftAddr, fileCfg.Broker.Cluster.RaftAddr)
+			clusterSecrets = pickFlagOrYaml(cmd, "cluster-secrets-dir", clusterSecrets, fileCfg.Broker.Cluster.SecretsDir)
 
 			// frp.port_range "low-high" → PortBandLow/High. Empty stays
 			// 0/0 so broker.PortAllocCfg falls back to the
@@ -95,11 +105,23 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 
-			db, err := storage.Open(dbPath)
+			// D9 C-1 (single WAL owner): in CLUSTER mode the cluster.Node opens the merged
+			// WAL DB and is the sole writable pool — serve.go must NOT call storage.Open (a
+			// second pool that also runs migrations is a locking/corruption hazard). Decide
+			// the mode from the on-disk raft state BEFORE touching the DB; only single mode
+			// opens it here (broker.Run re-points b.cfg.DB to node.RODB() in cluster mode).
+			clusterMode, err := broker.DetectClusterMode(clusterDataDir)
 			if err != nil {
 				return err
 			}
-			defer func() { _ = db.Close() }()
+			var db *sql.DB
+			if !clusterMode {
+				db, err = storage.Open(dbPath)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = db.Close() }()
+			}
 
 			// Upgrade allowlist precedence: explicit
 			// --upgrade-url-allow > yaml > built-in default. The
@@ -133,6 +155,10 @@ func newServeCmd() *cobra.Command {
 				ProcGCInterval:      procGCInterval,
 				SubHTTPAddr:         subHTTPListen,
 				SubURLBase:          subURLBase(publicHost),
+				ClusterDataDir:      clusterDataDir,
+				ClusterRaftAddr:     clusterRaftAddr,
+				ClusterSecretsDir:   clusterSecrets,
+				DBPath:              dbPath,
 			}
 
 			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
@@ -191,6 +217,12 @@ func newServeCmd() *cobra.Command {
 		"local Unix socket for `tether admin *` (architecture I.2b); set to empty to disable")
 	cmd.Flags().StringSliceVar(&upgradeURLAllow, "upgrade-url-allow", nil,
 		"URL prefixes accepted by `tether node upgrade` (architecture J.4); empty = upgrades disabled")
+	cmd.Flags().StringVar(&clusterDataDir, "cluster-data-dir", "",
+		"D9 cluster: raft sub-tree parent (raft/ lives here); empty = single mode. Cluster mode requires `tether cluster init` to have created raft/ first")
+	cmd.Flags().StringVar(&clusterRaftAddr, "cluster-raft-addr", "",
+		"D9 cluster: raft transport bind host:port (private net only, e.g. 0.0.0.0:7400)")
+	cmd.Flags().StringVar(&clusterSecrets, "cluster-secrets-dir", "",
+		"D9 cluster: secrets dir (cluster-ca, route leaf, tunnel-cert, broker.nk, node-ident, account.nk); required in cluster mode")
 	return cmd
 }
 

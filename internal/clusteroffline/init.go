@@ -1,0 +1,285 @@
+package clusteroffline
+
+import (
+	"crypto/x509"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/tunnel"
+)
+
+// init.go — the D9 `cluster init --from-existing` one-time migration (§11). OFFLINE
+// surgery with the daemon STOPPED, directly on the on-disk tether.db + raft/. It mirrors
+// the ForceSingle discipline (flock + live-daemon interlock + idempotent steps) and runs
+// the steps in an ORDER where a kill-9 at any point re-runs cleanly: migrations are
+// filename-idempotent, the seeds are ON CONFLICT DO NOTHING / empty-only, and the raft/
+// bootstrap is the FINAL step (so the daemon's detection probe — raft/ present — flips
+// true only once the DB is fully seeded). The DB is never rewritten except by forward
+// migrations; the pristine pre-migration copy is preserved in tether.db.bak (skip-if-exists).
+
+// InitFromExistingOptions carries the node identity + paths. Identity (SelfID == the raft
+// ServerID == cluster_nodes.node_id == the deterministic nats server_name, §6.5 SSOT) and
+// the route/tunnel addresses are operator-provided (the provisioning runbook prints them);
+// cert_fp is DERIVED from the tunnel cert the daemon will actually present, so seed-time and
+// runtime fingerprints are provably the same file (§15 RF3, d9-plan §6 cert_fp loop).
+type InitFromExistingOptions struct {
+	DataDir      string
+	DBPath       string
+	SecretsDir   string
+	SelfID       string
+	Name         string
+	NodeIdentPub string
+	RaftAddr     string
+	NatsRoute    string
+	TunnelAddr   string
+	PublicHost   string
+	Now          func() time.Time
+	Logger       *slog.Logger
+}
+
+// ErrInitDaemonRunning is returned when a live (pre-cutover or cluster) daemon still holds
+// the DB/raft store. The runbook's `systemctl stop tether-broker` must precede init.
+var ErrInitDaemonRunning = errors.New("clusteroffline: a tether daemon is still running on this DataDir; `systemctl stop tether-broker` first")
+
+// InitFromExisting migrates a live single-broker DB into a single-voter cluster.
+func InitFromExisting(opts InitFromExistingOptions) error {
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.SelfID == "" || opts.RaftAddr == "" || opts.DBPath == "" || opts.DataDir == "" {
+		return errors.New("clusteroffline: InitFromExisting requires SelfID, RaftAddr, DBPath, DataDir")
+	}
+	// External-review F4: the self VOTER row must carry a COMPLETE identity, else the
+	// migrated cluster has a self row that cannot serve as an expose home, cannot be rendered
+	// into a correct NATS topology, and only fails later at startup / data-plane time. Reject
+	// an empty (or structurally invalid) identity field BEFORE the lock/backup/migration.
+	for _, f := range []struct{ name, val string }{
+		{"Name", opts.Name}, {"NodeIdentPub", opts.NodeIdentPub}, {"NatsRoute", opts.NatsRoute},
+		{"TunnelAddr", opts.TunnelAddr}, {"PublicHost", opts.PublicHost},
+	} {
+		if strings.TrimSpace(f.val) == "" {
+			return fmt.Errorf("clusteroffline: InitFromExisting requires a non-empty %s "+
+				"(the self VOTER row must be a usable expose home + renderable NATS peer)", f.name)
+		}
+	}
+	// Structural checks on the fields that are unambiguously host:port (raft + tunnel addrs).
+	// NatsRoute is left to non-empty only — it is carried as host:port in cluster_nodes and
+	// rendered into the nats:// route URL by the takeover step, so both forms reach it.
+	if _, _, err := net.SplitHostPort(opts.RaftAddr); err != nil {
+		return fmt.Errorf("clusteroffline: RaftAddr %q must be host:port: %w", opts.RaftAddr, err)
+	}
+	if _, _, err := net.SplitHostPort(opts.TunnelAddr); err != nil {
+		return fmt.Errorf("clusteroffline: TunnelAddr %q must be host:port: %w", opts.TunnelAddr, err)
+	}
+
+	// (1) flock — bar two concurrent inits.
+	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// (2) live-daemon interlock — TWO probes (d9-plan OQ-2 "BOTH"):
+	//  (2a) bolt probe: catches a CLUSTER daemon (it holds raft.db). Only meaningful once
+	//       raft/raft.db exists (a prior init / a running cluster daemon); on a never-
+	//       clustered box raft.db is absent so no daemon can hold it — skip.
+	if _, statErr := os.Stat(filepath.Join(opts.DataDir, "raft", "raft.db")); statErr == nil {
+		if locked, err := cluster.RaftStoreLockedByDaemon(opts.DataDir); err != nil {
+			return err
+		} else if locked {
+			return ErrInitDaemonRunning
+		}
+	}
+	//  (2b) SQLite write-lock probe (round-1 BLOCKER: the plan-mandated defense the impl had
+	//       dropped to runbook-only): a pre-cutover (v1) daemon NEVER opens raft.db, so the
+	//       bolt probe cannot see it, yet it IS writing tether.db. A no-migration BEGIN
+	//       IMMEDIATE with busy_timeout=0 detects that writer (reliable for a DELETE-mode v1
+	//       DB) and refuses BEFORE OpenWAL runs the irreversible migration against a file a
+	//       live daemon has open. Runs only if the DB exists (a fresh box has nothing to
+	//       lock). The runbook's `systemctl stop` stays the primary guard (a WAL idle daemon
+	//       can slip past), this is defense-in-depth.
+	if _, statErr := os.Stat(opts.DBPath); statErr == nil {
+		if busy, err := storage.ProbeWriterLock(opts.DBPath); err != nil {
+			return fmt.Errorf("clusteroffline: write-lock probe: %w", err)
+		} else if busy {
+			return ErrInitDaemonRunning
+		}
+	}
+
+	// (3) secrets precondition (FATAL): the stable tunnel cert MUST exist before we seed
+	// cert_fp from it, else the daemon would present a cert whose fp mismatches the seeded
+	// row and EVERY agent dial is rejected (ErrHomePinsRequired). Also require the cluster
+	// CA + this node's route leaf (cluster.NewProduction loads them at daemon start).
+	certFP, err := tunnelCertFingerprint(opts.SecretsDir)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: secrets precondition: %w", err)
+	}
+	// External-review Q1: run the SAME SecretsPreflight the broker runs at startup, BEFORE the
+	// .bak/migration — so a secrets dir that would make cluster startup FATAL (missing
+	// node-ident.nk, a world-readable private key, …) is rejected up front instead of after
+	// the irreversible migration. FDE-absent stays a non-fatal advisory.
+	if adv, fatal := SecretsPreflight(opts.SecretsDir); fatal != nil {
+		return fmt.Errorf("clusteroffline: secrets preflight: %w", fatal)
+	} else {
+		for _, a := range adv {
+			opts.Logger.Warn("clusteroffline: secrets advisory", "detail", a)
+		}
+	}
+
+	// (4) .bak the pristine pre-migration DB (skip-if-exists: a prior half-run's .bak is the
+	// real pristine copy — never overwrite it).
+	if err := backupOnce(opts.DBPath); err != nil {
+		return err
+	}
+
+	// (5) forward migrations 0008-0013 + (6) seed, in the opened WAL DB.
+	db, err := storage.OpenWAL("file:" + opts.DBPath) // OpenWAL runs ApplyMigrations
+	if err != nil {
+		return fmt.Errorf("clusteroffline: open+migrate DB: %w", err)
+	}
+	if err := seedClusterState(db, opts, certFP); err != nil {
+		_ = db.Close()
+		return err
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("clusteroffline: close after seed: %w", err)
+	}
+
+	// (7) bootstrap raft/ — the FINAL step (idempotent: ErrAlreadyBootstrapped on re-run).
+	if err := cluster.BootstrapSingleNode(opts.DataDir, opts.SelfID, opts.RaftAddr, opts.Logger); err != nil &&
+		!errors.Is(err, cluster.ErrAlreadyBootstrapped) {
+		return err
+	}
+	opts.Logger.Warn("clusteroffline: cluster init --from-existing complete; this node is now a single-voter cluster",
+		"self", opts.SelfID, "data_dir", opts.DataDir)
+	return nil
+}
+
+// seedClusterState writes the migration marker + the self VOTER row + the home backfill in
+// ONE txn (idempotent). applied_index=0 is the index-0-snapshot marker (the daemon-start
+// half-state cross-check); self_node_id lets the daemon set its raft LocalID before opening
+// the DB. A re-run with a CONFLICTING self row (same node_id, different name/addr) is a loud
+// refusal, not a silent INSERT OR IGNORE that masks an operator typo. nats_server_id is the
+// SelfID itself (the §6.5 SSOT: server_name == node_id == nats_server_id).
+func seedClusterState(db *sql.DB, opts InitFromExistingOptions, certFP string) error {
+	now := opts.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("clusteroffline: begin seed: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, kv := range []struct{ k, v string }{{"applied_index", "0"}, {"applied_term", "0"}} {
+		if _, err := tx.Exec(`INSERT INTO cluster_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING`, kv.k, kv.v); err != nil {
+			return fmt.Errorf("clusteroffline: seed %s: %w", kv.k, err)
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO cluster_meta(key,value) VALUES('self_node_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, opts.SelfID); err != nil {
+		return fmt.Errorf("clusteroffline: seed self_node_id: %w", err)
+	}
+
+	// Re-run guard (round-1 MAJOR: widen beyond name+raft_addr): a re-run with a
+	// CONFLICTING self row on ANY identity column is a loud refusal, not a silent overwrite
+	// that would mask an operator typo (e.g. a changed cert_fp would silently un-pin agents).
+	var exName, exRaft, exIdent, exServer, exTunnel, exHost, exFP string
+	switch err := tx.QueryRow(`SELECT name, raft_addr, node_ident_pub, nats_server_id, tunnel_addr, public_host, cert_fp
+		FROM cluster_nodes WHERE node_id=?`, opts.SelfID).Scan(
+		&exName, &exRaft, &exIdent, &exServer, &exTunnel, &exHost, &exFP); err {
+	case nil:
+		mismatch := exName != opts.Name || exRaft != opts.RaftAddr || exIdent != opts.NodeIdentPub ||
+			exServer != opts.SelfID || exTunnel != opts.TunnelAddr || exHost != opts.PublicHost || exFP != certFP
+		if mismatch {
+			return fmt.Errorf("clusteroffline: self row already seeded with a DIFFERENT identity "+
+				"(name/raft/ident/server/tunnel/host/cert_fp = %q/%q/%q/%q/%q/%q/%q vs %q/%q/%q/%q/%q/%q/%q) "+
+				"— refusing to overwrite (re-run with the SAME identity or wipe + re-init)",
+				exName, exRaft, exIdent, exServer, exTunnel, exHost, exFP,
+				opts.Name, opts.RaftAddr, opts.NodeIdentPub, opts.SelfID, opts.TunnelAddr, opts.PublicHost, certFP)
+		}
+	case sql.ErrNoRows:
+		if _, err := tx.Exec(`INSERT INTO cluster_nodes
+			(node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at)
+			VALUES(?,?,?,?,?,?,?,?,?,'VOTER',?)`,
+			opts.SelfID, opts.Name, opts.NodeIdentPub, opts.SelfID, opts.RaftAddr,
+			opts.NatsRoute, opts.TunnelAddr, opts.PublicHost, certFP, now); err != nil {
+			return fmt.Errorf("clusteroffline: seed self cluster_nodes row: %w", err)
+		}
+	default:
+		return fmt.Errorf("clusteroffline: probe self row: %w", err)
+	}
+
+	// home_broker backfill: stamp self on every ALLOCATED, un-homed port (empty-only, idempotent).
+	if _, err := tx.Exec(`UPDATE port_allocations SET home_broker=? WHERE state='ALLOCATED' AND home_broker=''`, opts.SelfID); err != nil {
+		return fmt.Errorf("clusteroffline: backfill home_broker: %w", err)
+	}
+	return tx.Commit()
+}
+
+// tunnelCertFingerprint loads the stable tunnel cert from the secrets dir and returns its
+// canonical fingerprint (== cluster_nodes.cert_fp, §15 RF3).
+func tunnelCertFingerprint(secretsDir string) (string, error) {
+	certPEM, err := os.ReadFile(filepath.Join(secretsDir, "tunnel-cert.pem"))
+	if err != nil {
+		return "", fmt.Errorf("read tunnel cert: %w", err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(secretsDir, "tunnel-key.pem"))
+	if err != nil {
+		return "", fmt.Errorf("read tunnel key: %w", err)
+	}
+	cert, err := tunnel.LoadServerCert(string(certPEM), string(keyPEM))
+	if err != nil {
+		return "", fmt.Errorf("load stable tunnel cert: %w", err)
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if len(cert.Certificate) == 0 {
+			return "", errors.New("tunnel cert has no certificate")
+		}
+		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return "", fmt.Errorf("parse tunnel leaf: %w", err)
+		}
+	}
+	return tunnel.CertFingerprint(leaf), nil
+}
+
+// backupOnce copies dbPath to dbPath+".bak" iff the .bak does not already exist (a prior
+// half-run's .bak is the pristine pre-migration copy). fsync'd.
+func backupOnce(dbPath string) error {
+	bak := dbPath + ".bak"
+	if _, err := os.Stat(bak); err == nil {
+		return nil // pristine pre-migration copy already preserved
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clusteroffline: stat .bak: %w", err)
+	}
+	src, err := os.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: open DB for backup: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	dst, err := os.OpenFile(bak, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: create .bak: %w", err)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		return fmt.Errorf("clusteroffline: copy .bak: %w", err)
+	}
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		return fmt.Errorf("clusteroffline: fsync .bak: %w", err)
+	}
+	return dst.Close()
+}

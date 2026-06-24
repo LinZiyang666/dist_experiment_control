@@ -110,6 +110,41 @@ func OpenReadOnly(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+// ProbeWriterLock reports whether ANOTHER process currently holds a write lock on the DB
+// at dbPath, WITHOUT running migrations or mutating the file (a raw open + `BEGIN IMMEDIATE`
+// with busy_timeout=0 + immediate ROLLBACK). Used by `cluster init --from-existing` as a
+// defense-in-depth interlock against a still-running pre-cutover (v1) daemon that holds the
+// file but never opened raft.db (so the bolt probe can't see it). Reliable for a DELETE/
+// rollback-journal v1 DB (where a writer holds an exclusive lock); a WAL-mode idle daemon
+// can yield a false-negative, so the runbook's `systemctl stop` stays the primary guard.
+// busy==false,err==nil means "no writer detected" (or the file is absent / read-only).
+func ProbeWriterLock(dbPath string) (busy bool, err error) {
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		return false, fmt.Errorf("storage: probe open: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	if _, execErr := db.Exec("BEGIN IMMEDIATE"); execErr != nil {
+		if isSQLiteBusy(execErr) {
+			return true, nil
+		}
+		return false, fmt.Errorf("storage: probe begin: %w", execErr)
+	}
+	_, _ = db.Exec("ROLLBACK")
+	return false, nil
+}
+
+// isSQLiteBusy classifies a modernc.org/sqlite lock error (SQLITE_BUSY / SQLITE_LOCKED).
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "SQLITE_BUSY") || strings.Contains(s, "database is locked") ||
+		strings.Contains(s, "SQLITE_LOCKED")
+}
+
 func withForeignKeysPragma(dsn string) string {
 	base := dsn
 	if dsn == ":memory:" {

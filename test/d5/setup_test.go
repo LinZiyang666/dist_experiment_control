@@ -73,7 +73,42 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+// startRoutedJS brings up an n-server clustered-JetStream NATS mesh. Under the full
+// `make e2e` suite (now including D9's clustered matrix) the embedded servers occasionally
+// fail to become ready / mesh / form the JS meta-group within their windows due to host
+// load — a documented flake (CLAUDE.md §e2e). Rather than chase ever-longer timeouts, it
+// RETRIES the whole bring-up on a fresh port set (a transient startup starvation clears on
+// a clean retry); each failed attempt is torn down before the next. Isolation passes on the
+// first attempt in <10s.
 func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
+	t.Helper()
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		servers, ok := attemptRoutedJS(t, n)
+		if ok {
+			t.Cleanup(func() {
+				for _, s := range servers {
+					s.Shutdown()
+					s.WaitForShutdown()
+				}
+			})
+			return servers
+		}
+		for _, s := range servers { // tear down the failed attempt before retrying
+			if s != nil {
+				s.Shutdown()
+				s.WaitForShutdown()
+			}
+		}
+		t.Logf("startRoutedJS attempt %d/%d not ready under load; retrying on fresh ports", attempt, attempts)
+	}
+	t.Fatalf("routed JS cluster did not come up after %d attempts", attempts)
+	return nil
+}
+
+// attemptRoutedJS is one bring-up attempt: it returns the servers (for teardown on failure)
+// and whether they all became ready + meshed + formed the JS meta-group within the windows.
+func attemptRoutedJS(t *testing.T, n int) ([]*natsserver.Server, bool) {
 	t.Helper()
 	clusterPorts := make([]int, n)
 	routeStrs := make([]string, n)
@@ -104,37 +139,28 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 		}
 		s, err := natsserver.NewServer(o)
 		if err != nil {
-			t.Fatalf("NewServer %d: %v", i, err)
+			return servers, false // e.g. a freePort TOCTOU port race — a fresh-port retry clears it
 		}
 		go s.Start()
 		servers[i] = s
 	}
-	t.Cleanup(func() {
-		for _, s := range servers {
-			s.Shutdown()
-			s.WaitForShutdown()
-		}
-	})
+	// Ready within the window? (30s; the retry, not an ever-longer timeout, handles a
+	// load-induced startup starvation — isolation is <10s.)
 	for _, s := range servers {
-		// 30s (was 10s): under the full make e2e matrix this harness starts AFTER every other
-		// phase + DN matrix, so the machine is loaded and embedded-server startup is slow — a
-		// 10s ready-check was a load-induced flake ("routed JS server not ready"). No logic
-		// change; just headroom.
 		if !s.ReadyForConnections(30 * time.Second) {
-			t.Fatal("routed JS server not ready")
+			return servers, false
 		}
 	}
-	// Wait for the routes to mesh.
+	// Routes meshed?
 	for _, s := range servers {
 		if !waitForCond(20*time.Second, func() bool { return s.NumRoutes() >= n-1 }) {
-			t.Fatalf("server %s never meshed %d routes (have %d)", s.Name(), n-1, s.NumRoutes())
+			return servers, false
 		}
 	}
-	// Wait for the JS meta-group: every server clustered + exactly ONE meta leader whose
-	// peer set is complete. (JetStreamClusterPeers() returns the full set only on the meta
-	// leader; followers report 0 — so the completeness check is leader-scoped.) Deterministic
-	// readiness gate, no time.Sleep.
-	if !waitForCond(30*time.Second, func() bool { // 30s (was 20s): full-matrix load headroom
+	// JS meta-group formed: every server clustered + exactly ONE meta leader whose peer set
+	// is complete. (JetStreamClusterPeers() returns the full set only on the meta leader;
+	// followers report 0 — so the completeness check is leader-scoped.)
+	ok := waitForCond(30*time.Second, func() bool {
 		leaders, metaComplete := 0, false
 		for _, s := range servers {
 			if !s.JetStreamIsClustered() {
@@ -148,10 +174,8 @@ func startRoutedJS(t *testing.T, n int) []*natsserver.Server {
 			}
 		}
 		return leaders == 1 && metaComplete
-	}) {
-		t.Fatal("JS meta-group did not form")
-	}
-	return servers
+	})
+	return servers, ok
 }
 
 // ---- mTLS raft CA (mirror test/d4) ----

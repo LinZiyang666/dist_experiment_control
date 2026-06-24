@@ -154,15 +154,19 @@ func TestD6HomeForRegisterDirectives(t *testing.T) {
 	}
 }
 
-// TestD6HomeForExposeStampsHome (DA-12 / C1): homeForExpose resolves the agent's
-// home from nodes.nats_server → an eligible cluster node, STAMPS home_broker onto
-// the row, and returns the directive (epoch 0). A non-VOTER home yields nil.
+// TestD6HomeForExposeStampsHome (DA-12 / C1; D9-updated): homeForExpose resolves the
+// agent's home from nodes.nats_server → an eligible cluster node and returns the
+// directive, READING the row's epoch. As of the D9 cutover the home_broker STAMP moved
+// to allocate (PlanAllocate's homeBroker, baked by the leader via Propose) — homeForExpose
+// no longer writes (b.cfg.DB is the FSM read-only handle in cluster mode); it reads the
+// epoch off the already-stamped row. A non-VOTER home yields nil.
 func TestD6HomeForExposeStampsHome(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}, selfID: "node-self"}
 	// The agent reported server_name "tether-2"; that node is an eligible VOTER.
 	seedClusterNode(t, b, "node-home", "tether-2", "10.0.0.2:7000", "sha256:xyz", "VOTER")
-	seedHomedExpose(t, b, "lab", "lab-1", "svc", 14000, "th", "", 0) // starts un-homed
+	// The row is already home-stamped (as allocate would, at epoch 0).
+	seedHomedExpose(t, b, "lab", "lab-1", "svc", 14000, "th", "node-home", 0)
 	if _, err := db.Exec(`UPDATE nodes SET nats_server='tether-2' WHERE sid='lab' AND nid='lab-1'`); err != nil {
 		t.Fatal(err)
 	}
@@ -171,14 +175,8 @@ func TestD6HomeForExposeStampsHome(t *testing.T) {
 	if hd == nil || hd.NodeID != "node-home" || hd.BrokerAddr != "10.0.0.2:7000" || hd.Epoch != 0 {
 		t.Fatalf("directive mismatch: %+v", hd)
 	}
-	// home_broker was stamped onto the row.
-	var home string
-	_ = db.QueryRow(`SELECT home_broker FROM port_allocations WHERE port=14000`).Scan(&home)
-	if home != "node-home" {
-		t.Fatalf("home_broker not stamped, got %q", home)
-	}
 
-	// A draining (non-VOTER) home is not eligible → nil, no stamp.
+	// A draining (non-VOTER) home is not eligible → nil.
 	seedClusterNode(t, b, "node-drain", "tether-3", "10.0.0.3:7000", "sha256:d", "DRAINING")
 	seedHomedExpose(t, b, "lab", "lab-1", "svc2", 14001, "th2", "", 0)
 	_, _ = db.Exec(`UPDATE nodes SET nats_server='tether-3' WHERE sid='lab' AND nid='lab-1'`)

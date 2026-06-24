@@ -57,7 +57,13 @@ type Request struct {
 	NodePub   string `json:"node_pub,omitempty"`   // node-identity pubkey the operator typed
 	Host      string `json:"host,omitempty"`       // new node's host/raft addr
 	JoinToken string `json:"join_token,omitempty"` // nonce|sig from `cluster sign-join`
-	CertFP    string `json:"cert_fp,omitempty"`    // rotate-tunnel-cert
+	CertFP    string `json:"cert_fp,omitempty"`    // rotate-tunnel-cert / cluster add (the joiner's tunnel cert fp)
+	// D9 round-1 BLOCKER: the joiner's expose-home identity (else an added voter can never
+	// serve as an expose home — D6 rehome is structurally impossible). nats_server_id is
+	// derived from node_id (the §6.5 SSOT), not carried here.
+	TunnelAddr string `json:"tunnel_addr,omitempty"` // cluster add: the joiner's public tunnel addr
+	PublicHost string `json:"public_host,omitempty"` // cluster add: the joiner's public host
+	NatsRoute  string `json:"nats_route,omitempty"`  // cluster add: the joiner's NATS route URL
 	Retire    bool   `json:"retire,omitempty"`
 	Now       bool   `json:"now,omitempty"`
 	Abort     bool   `json:"abort,omitempty"`

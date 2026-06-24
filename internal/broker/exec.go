@@ -142,7 +142,9 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			b.cfg.Logger.Warn("broker: proc.started parse", "err", err)
 			return
 		}
-		err := proc.Insert(b.cfg.DB, proc.Process{
+		// D9 §3 (audit #4): cluster mode routes the proc record through raft; single
+		// mode is the byte-identical direct mutator.
+		err := b.recordProc(proc.Process{
 			PID: pid, SID: sid, NID: nid,
 			Argv:           ev.Argv,
 			StartedAt:      ev.StartedAt,
@@ -161,7 +163,7 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			b.cfg.Logger.Warn("broker: proc.exit parse", "err", err)
 			return
 		}
-		if err := proc.MarkExited(b.cfg.DB, pid, ev.ExitCode, ev.EndedAt); err != nil {
+		if err := b.markProcExited(pid, ev.ExitCode, ev.EndedAt); err != nil {
 			b.cfg.Logger.Warn("broker: proc.exit mark", "err", err, "pid", pid)
 		}
 		b.pubAuditProc(sid, "exit", nid, pid, nil, ev.ExitCode, ev.EndedAt)

@@ -30,6 +30,28 @@ type BrokerSection struct {
 	Sub        SubSection     `yaml:"sub"`
 	Storage    StorageSection `yaml:"storage"`
 	Upgrade    UpgradeSection `yaml:"upgrade"`
+	Cluster    ClusterSection `yaml:"cluster"`
+}
+
+// ClusterSection mirrors broker.cluster — the D9 cutover surface. It carries
+// only PATHS; the cluster IDENTITY (account issuer, broker nkey, server_name /
+// node_id, cert_fp) is DERIVED from SecretsDir + the existing nats.conf so it
+// cannot drift (d9-plan §3). All-empty ⇒ single mode: serve.go constructs no
+// cluster.Node and the broker stays byte-equivalent to a pre-D9 single broker
+// (the D2 N=1 functional-equivalence floor). A non-empty DataDir is only an
+// INTENT; the authoritative cluster-mode trigger is the on-disk raft/ probe
+// (cluster.RaftStateExists), cross-checked against this intent in serve.go.
+type ClusterSection struct {
+	// DataDir holds the raft sub-tree (raft/raft.db + raft/snapshots). Empty ⇒
+	// single mode. `cluster init --from-existing` creates raft/ under it.
+	DataDir string `yaml:"data_dir"`
+	// RaftAddr is the raft transport bind (host:port, e.g. "0.0.0.0:7400"),
+	// private-net only (never public; preflight checks this).
+	RaftAddr string `yaml:"raft_addr"`
+	// SecretsDir is the §15 secrets directory (cluster-ca.pem/.key, this node's
+	// route leaf cert/key, tunnel-cert.pem/.key, broker.nk, node-ident.nk,
+	// account.nk). Required in cluster mode; preflight refuses if unreadable.
+	SecretsDir string `yaml:"secrets_dir"`
 }
 
 // UpgradeSection mirrors broker.upgrade — the architecture J.4

@@ -24,12 +24,28 @@ leader$ tether cluster add <node-id> <host:7400> <Uxxxx...>
 joiner$ tether cluster sign-join <node-id> <nonce>
         <nonce>:<sigHex>
 
-# 3. On the LEADER: re-run with the token. The node is admitted + AddVoter'd + caught up.
-leader$ tether cluster add <node-id> <host:7400> <Uxxxx...> --join-token <nonce>:<sigHex>
+# 3. On the LEADER: re-run with the token. The token call MUST carry the joiner's full
+#    expose-home + NATS identity (else the new voter can hold raft votes but can never serve
+#    as an expose home nor be rendered into the NATS topology — external-review F4/Q2).
+leader$ tether cluster add <node-id> <host:7400> <Uxxxx...> --join-token <nonce>:<sigHex> \
+          --tunnel-addr <host:7000> --cert-fp <sha256:...> --public-host <host> \
+          --nats-route nats://<host>:6222
         added <node-id>
 
-# 4. Verify.
+# 4. RE-RENDER nats.conf on EVERY node with the COMPLETE peer set, then restart NATS.
+#    `cluster add` grows RAFT membership; it does NOT form the NATS route/auth mesh. Each
+#    broker's nats.conf must list every peer's {server_name, route_url, bus_nkey}; growth
+#    therefore re-runs takeover-natsconf on ALL nodes (external-review F2). Restart NATS one
+#    node at a time (rolling), leader LAST, verifying `cluster status` reachability after each.
+each-broker$ sudo tether cluster takeover-natsconf --secrets-dir /etc/tether/secrets \
+               --server-name <self-id> --route-url nats://<self-host>:6222 \
+               --peer <other1-id>,nats://<other1-host>:6222,<other1-bus-nkey> \
+               --peer <other2-id>,nats://<other2-host>:6222,<other2-bus-nkey>
+each-broker$ sudo systemctl restart nats-server   # rolling; leader last
+
+# 5. Verify.
 leader$ tether cluster status            # the new node walks JOIN_VERIFIED_PENDING_VOTER -> CATCHING_UP -> VOTER
+                                         # + every voter shows reachable (nats-health), no applied-lag
 ```
 
 Half-success is visible, never silently forked: if AddVoter fails the node shows
@@ -135,3 +151,63 @@ leader$    tether cluster add <returning-node-id> <host:7400> <Uxxxx...>
 > **Drill it.** Practice force-single -> recover on a 3-node staging cluster before
 > you need it in production (§13.12). The safety gates are the (b)/(c)/(d) hard
 > preconditions + the typed confirmation, NOT the displayed peer-unreachable timer.
+
+---
+
+## 4. Migrate a LIVE single broker into a cluster (the D9 one-time cutover)
+
+> **This is a one-way, flag-day migration.** proto v2 breaks the wire: a v1 agent CANNOT
+> connect to a v2 broker, so EVERY agent must be reinstalled on v2 afterward. Rollback =
+> restore `tether.db.bak` (returns to the v2 SINGLE broker, NOT the v1 fleet — there is no
+> path back to a v1 fleet once reinstalled). Practice on staging first.
+
+```
+# 0. PROVISION the §15 secrets on the broker host BEFORE migrating (0600; FDE volume):
+#    /etc/tether/secrets/{cluster-ca.pem, route-cert.pem, route-key.pem(0600),
+#                         tunnel-cert.pem, tunnel-key.pem(0600), broker.nk(0600),
+#                         node-ident.nk(0600), account.nk(0600)}
+#    tether does NOT generate keys — you own the CA. Verify with the doctor preflight:
+broker$ tether cluster doctor --secrets-dir /etc/tether/secrets
+#    Missing / unreadable / world-readable private key => FATAL. FDE-absent => advisory
+#    (psk_at_rest_unprotected): ensure the secrets volume is full-disk-encrypted.
+
+# 1. STOP the broker (the migration is OFFLINE disk surgery; the daemon must not be writing).
+broker$ sudo systemctl stop tether-broker
+
+# 2. Migrate the DB + bootstrap a single-voter raft. Idempotent (re-runnable after a kill-9):
+#    forward migrations 0008-0013, seed cluster_meta(applied_index=0, self_node_id) + the
+#    self VOTER row (cert_fp DERIVED from the tunnel cert) + home_broker backfill, then
+#    raft.BootstrapCluster({self}) LAST. The pristine pre-migration DB is kept in
+#    tether.db.bak (skip-if-exists). You TYPE the node_id to confirm (no --yes).
+broker$ sudo tether cluster init --from-existing \
+          --self-id <node-id> --name <broker-name> --node-ident-pub <Uxxxx...> \
+          --raft-addr <host:7400> --nats-route <host:6222> \
+          --tunnel-addr <host:7000> --public-host <dns> \
+          --secrets-dir /etc/tether/secrets
+
+# 3. TAKE OVER nats.conf (rewrite it with the cluster directives + auth_callout, preserving
+#    the install.sh websocket/jetstream + any documented tuning). Refuses fail-closed if the
+#    conf has a directive tether does not recognize. Prints the before/after ownership table.
+broker$ sudo tether cluster takeover-natsconf --secrets-dir /etc/tether/secrets
+
+# 4. Restart nats-server so the new authorization{} (cluster.apply.* ACL) is live BEFORE the
+#    broker connects in cluster mode (else it fails closed: no ACL).
+broker$ sudo systemctl restart nats-server
+broker$ tether cluster status   # (offline ok) confirm the seeded single-voter roster
+
+# 5. Point the broker at the cluster + start it (now a single-voter cluster, N=1).
+#    In /etc/tether/broker.yaml under broker.cluster: data_dir / raft_addr / secrets_dir.
+broker$ sudo systemctl start tether-broker
+
+# 6. Reinstall ALL agents on v2 (the wire break forces this), then grow to N>=3 (section 1).
+leader$ tether cluster add <node-2> <host:7400> <Uxxxx...>   # x2 for N=3
+```
+
+> **Rollback** (before agents are reinstalled): `systemctl stop tether-broker`, restore
+> `tether.db.bak` over `tether.db` (and `rm tether.db-wal tether.db-shm`), restore
+> `nats.conf.bak.<ts>`, remove `broker.cluster.*` from broker.yaml, `systemctl start`. This
+> returns to the **v2 single broker** (cluster-mode OFF) — NOT to a v1 fleet.
+>
+> **HA guarantee** (§17): N=1 has no redundancy; N=2 is read-survives / write-zero-fault;
+> only N>=3 with JS replicas at target gives committed-0-loss HA. `cluster status` shows
+> `stream-replicas actual/target` + raises `replication_degraded` until they converge.
