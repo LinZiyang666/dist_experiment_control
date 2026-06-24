@@ -32,7 +32,7 @@ const (
 
 // ErrDaemonRunning is returned when a live daemon still holds raft.db (the (b)
 // bolt-lock probe). The runbook's `systemctl mask` + stop must precede force-single.
-var ErrDaemonRunning = errors.New("clusteroffline: daemon still running (raft.db locked); `systemctl mask tether` and stop it first")
+var ErrDaemonRunning = errors.New("clusteroffline: daemon still running (raft.db locked); `systemctl mask tether-broker` and stop it first")
 
 // Peer is one non-self roster member the operator must confirm dead.
 type Peer struct {
@@ -147,6 +147,13 @@ func readRoster(dbPath, selfID string) ([]Peer, error) {
 		return nil, err
 	}
 	defer func() { _ = db.Close() }()
+	var selfRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM cluster_nodes WHERE node_id = ?`, selfID).Scan(&selfRows); err != nil {
+		return nil, err
+	}
+	if selfRows != 1 {
+		return nil, fmt.Errorf("clusteroffline: self-id %q is not present in cluster_nodes; refusing to rewrite raft config for an unknown node", selfID)
+	}
 	rows, err := db.Query(`SELECT node_id, raft_addr FROM cluster_nodes WHERE node_id != ?`, selfID)
 	if err != nil {
 		return nil, err
@@ -188,9 +195,10 @@ type RecoverOptions struct {
 }
 
 // Recover takes a forensic divergence dump (DURABLY — fsync file + dir, refuse the
-// wipe if it fails), then wipes raft/ + tether.db so `cluster add` re-provisions the
-// node clean. The dump is forensic-only / not auto-mergeable (§8.4(b)/R-7). Returns
-// the number of rows dumped.
+// wipe if it fails), then wipes raft/ + tether.db. The node must be reinitialized
+// before the daemon can start, then `cluster add` admits it as a clean voter. The
+// dump is forensic-only / not auto-mergeable (§8.4(b)/R-7). Returns the number of
+// rows dumped.
 func Recover(opts RecoverOptions) (int, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -215,7 +223,7 @@ func Recover(opts RecoverOptions) (int, error) {
 	if err := wipe(opts.DataDir, opts.DBPath); err != nil {
 		return n, fmt.Errorf("clusteroffline: dumped %d rows but wipe failed: %w", n, err)
 	}
-	opts.Logger.Warn("clusteroffline: recover complete; node wiped, run `cluster add` to rejoin",
+	opts.Logger.Warn("clusteroffline: recover complete; node wiped, re-run cluster init before daemon start, then cluster add to rejoin",
 		"dump", opts.DumpPath, "rows", n)
 	return n, nil
 }
@@ -349,8 +357,9 @@ func normalize(v any) any {
 	return v
 }
 
-// wipe removes the raft/ directory and the tether.db (+ -wal/-shm) so a subsequent
-// `cluster add` re-provisions the node from clean state.
+// wipe removes the raft/ directory and the tether.db (+ -wal/-shm). A subsequent
+// `cluster init --from-existing` recreates local raft/ state before `cluster add`
+// admits the node from clean state.
 func wipe(dataDir, dbPath string) error {
 	// Remove tether.db (+ WAL sidecars) FIRST, then raft/ (review m8): a partial
 	// failure must never leave stale business state (tether.db) under a wiped raft

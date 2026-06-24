@@ -88,6 +88,7 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 	if b.clusterMode {
 		h.ProvisionAgentWrite = NewProvisionSeam(b.cl.node, b.cl.forwarder)
 		h.JoinMemberWrite = NewJoinSeam(b.cl.node, b.cl.forwarder)
+		h.LeaderContactStale = b.cl.node.LeaderContactStale
 	}
 
 	// QueueSubscribe (not Subscribe) so that in a ≥2-node cluster exactly ONE

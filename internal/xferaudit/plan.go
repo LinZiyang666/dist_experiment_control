@@ -26,18 +26,23 @@ type xferAuxV1 struct {
 	Rec schema.AuditTransfer `json:"rec"`
 }
 
-// TransferReqID derives the cross-retry-STABLE idempotency key for one transfer-audit
-// event: hex(sha256("xferaudit:"||transfer_id||":"||kind)) — 64 lowercase-hex chars, a
-// valid Command.ReqID (cluster.validReqID). Keyed on (transfer_id, kind) so the SAME
-// lifecycle event re-proposed (a follower→leader forwarder retry after ErrLeadershipLost,
-// or a post-election publish sweep) collapses on the 0011 cluster_reqid_ledger; distinct
-// kinds (start/complete/failed) get distinct keys because they are distinct audit rows.
-// The ledger — NOT the finite JetStream Duplicates window — is the primary cross-election
-// anchor (§9 D8 implementation note): a duplicate re-published OUTSIDE the JS window would
-// otherwise produce two rows.
+// TransferReqID is the legacy coarse key for a transfer lifecycle slot.
 func TransferReqID(transferID, kind string) string {
 	sum := sha256.Sum256([]byte("xferaudit:" + transferID + ":" + kind))
 	return hex.EncodeToString(sum[:])
+}
+
+// TransferRecordReqID derives the cross-retry-STABLE idempotency key for one exact
+// transfer-audit record. The full normalized record is included so a later legitimate
+// transfer that reuses the same transfer_id/kind does not get dedup-skipped.
+func TransferRecordReqID(rec schema.AuditTransfer) (string, error) {
+	rec.Ts = rec.Ts.Round(0)
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(append([]byte("xferaudit-record:"), body...))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // PlanTransferAudit renders OpTransferAudit for one audit record: EMPTY Body (no DB
@@ -57,13 +62,17 @@ func PlanTransferAudit(rec schema.AuditTransfer) (*cluster.Command, error) {
 		return nil, fmt.Errorf("xferaudit: invalid kind %q (want start|complete|failed)", rec.Kind)
 	}
 	rec.Ts = rec.Ts.Round(0)
+	reqID, err := TransferRecordReqID(rec)
+	if err != nil {
+		return nil, fmt.Errorf("xferaudit: reqid: %w", err)
+	}
 	aux, err := json.Marshal(xferAuxV1{Rec: rec})
 	if err != nil {
 		return nil, fmt.Errorf("xferaudit: marshal aux: %w", err)
 	}
 	cmd := cluster.NewCommand(cluster.OpTransferAudit) // empty Body — apply is a deterministic no-op
 	cmd.Aux = aux
-	cmd.ReqID = TransferReqID(rec.TransferID, rec.Kind)
+	cmd.ReqID = reqID
 	return cmd, nil
 }
 

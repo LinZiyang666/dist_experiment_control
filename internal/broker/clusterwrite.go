@@ -14,6 +14,7 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
@@ -41,6 +42,8 @@ import (
 // dual-handling that races replies). Single mode uses a plain Subscribe (byte-equivalent).
 const ctlQueueGroup = "tether-broker-ctl"
 
+type clusterTunnelClosePayload = tunnel.SessionInfo
+
 // isBroadcastClusterSubject reports whether a subject must stay a plain (broadcast)
 // Subscribe even in cluster mode (round-3 BLOCKER). The FILE-TRANSFER subjects are
 // broadcast + per-broker in-memory tracker presence + a home-keyed START gate (D8 /
@@ -56,12 +59,19 @@ func isBroadcastClusterSubject(subj string) bool {
 		// External-review F3: expose is leader-local (leak-once token) → broadcast +
 		// leader-only handler, so it always reaches the leader (never a random follower).
 		".expose.req",
+		// Correctness-sensitive ingress that reads authoritative session/node/port state
+		// before publishing to an agent or freeing a port must run on the leader's view.
+		".run.req", ".exec.req", ".kill.req", ".expose-rm.req",
 	} {
 		if strings.HasSuffix(subj, leaf) {
 			return true
 		}
 	}
 	return false
+}
+
+func (b *Broker) isClusterFollower() bool {
+	return b.clusterMode && b.cl != nil && b.cl.node != nil && !b.cl.node.IsLeader()
 }
 
 // clusterRuntime holds the cluster-mode state. It is built by Run when clusterMode is
@@ -135,42 +145,72 @@ func (b *Broker) clusterShutdownOrdered() {
 // server (so newTunnelServer picks NewServerWithCert with the stable cert and the
 // advertised cert_fp matches cluster_nodes.cert_fp).
 func (b *Broker) wireClusterEarly() error {
-	certPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelCert))
+	cert, gotFP, err := b.loadStableTunnelCert()
 	if err != nil {
-		return fmt.Errorf("broker: read stable tunnel cert: %w", err)
+		return err
 	}
-	keyPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelKey))
-	if err != nil {
-		return fmt.Errorf("broker: read stable tunnel key: %w", err)
-	}
-	cert, err := tunnel.LoadServerCert(string(certPEM), string(keyPEM))
-	if err != nil {
-		return fmt.Errorf("broker: load stable tunnel cert: %w", err)
-	}
-	// D9 round-1 BLOCKER: cross-check the loaded cert against the seeded
-	// cluster_nodes.cert_fp. home.go advertises CertPins{Current: cert_fp, Previous:
-	// cert_fp_prev} to every agent; the live tunnel presents THIS on-disk cert. If they
-	// drifted (operator replaced the cert, or a rotate updated the DB but not the file),
-	// every pinned agent dial is rejected — a SILENT, total data-plane outage. Accept a
-	// match on EITHER current or previous (the rotation window agents also accept); FATAL
-	// otherwise so the drift surfaces at startup instead of as a mass agent outage.
-	leaf, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return fmt.Errorf("broker: parse stable tunnel cert leaf: %w", err)
-	}
-	gotFP := tunnel.CertFingerprint(leaf)
 	self, err := clusternodes.LookupByNodeID(b.cl.node.RODB(), b.cl.node.SelfID())
 	if err != nil {
 		return fmt.Errorf("broker: read seeded cert_fp for self %q: %w", b.cl.node.SelfID(), err)
 	}
-	if gotFP != self.CertFP && gotFP != self.CertFPPrev {
+	if !tunnelCertMatchesPinned(gotFP, self, b.cfg.Now()) {
 		return fmt.Errorf("broker: on-disk tunnel cert fingerprint %q matches neither the pinned "+
-			"cluster_nodes.cert_fp %q nor cert_fp_prev %q for node %q — agents pin against those and "+
+			"cluster_nodes.cert_fp %q nor an unexpired cert_fp_prev %q for node %q — agents pin against those and "+
 			"would reject EVERY dial (silent data-plane outage). Restore the pinned cert or re-run "+
 			"`tether cluster rotate-tunnel-cert`", gotFP, self.CertFP, self.CertFPPrev, b.cl.node.SelfID())
 	}
 	b.AttachClusterSeam(b.cl.node.SelfID(), cert)
 	return nil
+}
+
+func (b *Broker) loadStableTunnelCert() (*tls.Certificate, string, error) {
+	certPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelCert))
+	if err != nil {
+		return nil, "", fmt.Errorf("broker: read stable tunnel cert: %w", err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelKey))
+	if err != nil {
+		return nil, "", fmt.Errorf("broker: read stable tunnel key: %w", err)
+	}
+	cert, err := tunnel.LoadServerCert(string(certPEM), string(keyPEM))
+	if err != nil {
+		return nil, "", fmt.Errorf("broker: load stable tunnel cert: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, "", fmt.Errorf("broker: parse stable tunnel cert leaf: %w", err)
+	}
+	return cert, tunnel.CertFingerprint(leaf), nil
+}
+
+func (b *Broker) prepareTunnelCertRotate(newFP string) (func(), error) {
+	if b.tunnelSrv == nil {
+		return nil, fmt.Errorf("live tunnel server is not running on this broker")
+	}
+	cert, gotFP, err := b.loadStableTunnelCert()
+	if err != nil {
+		return nil, err
+	}
+	if gotFP != newFP {
+		return nil, fmt.Errorf("on-disk tunnel cert fingerprint %q does not match requested --cert-fp %q", gotFP, newFP)
+	}
+	return func() {
+		b.tunnelCert = cert
+		b.tunnelSrv.SetCertificate(cert)
+	}, nil
+}
+
+func tunnelCertMatchesPinned(gotFP string, self *clusternodes.HomeNode, now time.Time) bool {
+	if self == nil || gotFP == "" {
+		return false
+	}
+	if gotFP == self.CertFP {
+		return true
+	}
+	return self.CertFPPrev != "" &&
+		gotFP == self.CertFPPrev &&
+		self.CertValid != nil &&
+		now.Before(*self.CertValid)
 }
 
 // wireClusterLate attaches the D8 write/forward sinks, subscribes the cluster
@@ -204,6 +244,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// follower (the leader answers); collected for ordered unsubscribe.
 	subscribers := []func() (*nats.Subscription, error){
 		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now) },
+		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) { return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now) },
 		func() (*nats.Subscription, error) { return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now) },
 		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB) },
@@ -225,10 +266,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 			return listSessionsByState(b.cfg.DB, "ACTIVE")
 		},
 		XferState: func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error) {
-			if _, err := b.ensureXferBucket(ctx, sid, target); err != nil {
-				return jsstream.StreamReplicaState{}, err
-			}
-			return jsstream.CollectStreamState(ctx, b.js, jsstream.XferBackingStreamPref+sid, target)
+			return XferReplicaState(ctx, b.js, sid, target)
 		},
 	})
 	rec := NewAlertReconciler(AlertReconcilerConfig{
@@ -240,6 +278,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D7 membership orchestrator — constructed in cluster mode regardless of the admin
 	// socket (the adminsock backend, wired later in Run, uses it iff the socket is set).
 	b.cl.admin = NewClusterAdmin(node, b.cfg.Logger)
+	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
 	// §17 row 3: give the admin the broker-only cursor scatter-gather so `cluster status`
 	// reports REAL per-peer reachability + applied-lag (not a blanket self-report).
 	b.cl.admin.healthPoll = func() map[string]proto.ClusterHealthResp {
@@ -430,21 +469,90 @@ func (b *Broker) freePort(publicPort int) error {
 	})
 }
 
-// revokePort routes a port revoke (D9 audit #8). The revoke DECISION (the OFFLINE-node
-// scan) is leader-local; this routes the row WRITE through raft. now is the caller's
-// loop timestamp (preserved in single mode for byte-equivalence; the leader-direct
-// Propose bakes the same value, a forwarded revoke bakes the leader's own now()).
-func (b *Broker) revokePort(publicPort int, now time.Time) error {
+func (b *Broker) freePortAllocation(a port.Allocation) error {
 	if !b.clusterMode {
-		return port.Revoke(b.cfg.DB, publicPort, now)
+		return port.FreeAllocation(b.cfg.DB, a, b.cfg.Now())
 	}
-	payload, err := json.Marshal(PortMutatePayload{Port: publicPort})
+	payload, err := json.Marshal(PortFreeAllocationPayload{
+		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
+	})
+	if err != nil {
+		return err
+	}
+	return b.proposeOrForward(VerbPortFreeAllocation, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+		return port.PlanFreeAllocation(db, a, b.cfg.Now())
+	})
+}
+
+func allocationSessionInfo(a port.Allocation) tunnel.SessionInfo {
+	return tunnel.SessionInfo{
+		PublicPort: a.Port,
+		SID:        a.SID,
+		NID:        a.NID,
+		TokenHash:  a.TokenHash,
+		Epoch:      a.Epoch,
+	}
+}
+
+func (b *Broker) closeTunnelProxyLocal(info tunnel.SessionInfo) {
+	if b.tunnelSrv == nil || info.PublicPort <= 0 {
+		return
+	}
+	if ok := b.tunnelSrv.CloseProxyIf(info); ok {
+		b.cfg.Logger.Info("broker: tunnel proxy closed", "port", info.PublicPort, "sid", info.SID, "nid", info.NID)
+	}
+}
+
+func (b *Broker) closeTunnelProxyEverywhere(a port.Allocation) {
+	info := allocationSessionInfo(a)
+	b.closeTunnelProxyLocal(info)
+	if !b.clusterMode {
+		return
+	}
+	body, err := json.Marshal(clusterTunnelClosePayload(info))
+	if err != nil {
+		b.cfg.Logger.Warn("broker: marshal tunnel close", "err", err, "port", info.PublicPort)
+		return
+	}
+	if err := b.publishOnConn(proto.SubjClusterTunnelClose, body); err != nil {
+		b.cfg.Logger.Warn("broker: broadcast tunnel close", "err", err, "port", info.PublicPort)
+	}
+}
+
+func (b *Broker) subscribeTunnelClose(nc *nats.Conn) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterTunnelClose, func(msg *nats.Msg) {
+		var p clusterTunnelClosePayload
+		if err := json.Unmarshal(msg.Data, &p); err != nil {
+			b.cfg.Logger.Warn("broker: tunnel close malformed", "err", err)
+			return
+		}
+		b.closeTunnelProxyLocal(tunnel.SessionInfo(p))
+	})
+}
+
+func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
+	if !b.clusterMode {
+		return port.RevokeAllocation(b.cfg.DB, a, now)
+	}
+	payload, err := json.Marshal(PortFreeAllocationPayload{
+		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
+	})
 	if err != nil {
 		return err
 	}
 	return b.proposeOrForward(VerbPortRevoke, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanRevoke(db, publicPort, now)
+		return port.PlanRevokeAllocation(db, a, now)
 	})
+}
+
+// revokePort is retained for single-mode/proxy-style callers that only know a public port.
+// Cluster-mode offline revocation must use revokePortAllocation so a stale scan cannot
+// revoke a row that reused the same port.
+func (b *Broker) revokePort(publicPort int, now time.Time) error {
+	if !b.clusterMode {
+		return port.Revoke(b.cfg.DB, publicPort, now)
+	}
+	return fmt.Errorf("broker: cluster port revoke requires allocation identity for port %d", publicPort)
 }
 
 // markProcExited routes a process EXIT (D9 round-1 BLOCKER: exec.go's proc.exit + the
@@ -493,7 +601,7 @@ func (b *Broker) dropSession(sid string) error {
 		return err
 	}
 	return b.proposeOrForward(VerbSessionDrop, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return session.PlanHardDelete(sid)
+		return session.PlanHardDelete(db, sid)
 	})
 }
 

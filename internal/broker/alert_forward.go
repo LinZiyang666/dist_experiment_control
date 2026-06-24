@@ -14,7 +14,6 @@ package broker
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -54,7 +53,7 @@ func planAlertSignal(db *sql.DB, p AlertSignalPayload, now time.Time) (*cluster.
 	}
 	switch {
 	case p.Active && !active:
-		id := fmt.Sprintf("%s@%d", key, now.UnixNano())
+		id := newAlertID(key, now)
 		return cluster.PlanAlertRaise(id, p.Kind, p.Severity, key, p.Message, now)
 	case !p.Active && active:
 		return cluster.PlanAlertClear(key, now)

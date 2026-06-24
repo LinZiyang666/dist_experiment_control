@@ -1,6 +1,7 @@
 package clusteroffline
 
 import (
+	"database/sql"
 	"errors"
 	"net"
 	"os"
@@ -128,6 +129,57 @@ func TestD7PeerReachableHardRefuse(t *testing.T) {
 	// deterministic, unlike a just-closed ephemeral port the OS may reuse.
 	if err := checkPeersDead([]Peer{{NodeID: "peer-dead", RaftAddr: "127.0.0.1:1"}}, []string{"peer-dead"}); err != nil {
 		t.Fatalf("a dead+listed peer should pass, got %v", err)
+	}
+}
+
+func TestD7ReadRosterRejectsUnknownSelfID(t *testing.T) {
+	_, dbPath := mustDataDir(t)
+	seedDB(t, dbPath)
+	if _, err := readRoster(dbPath, "typo-self"); err == nil || !strings.Contains(err.Error(), "self-id") {
+		t.Fatalf("unknown self-id must be rejected before raft rewrite, got %v", err)
+	}
+	peers, err := readRoster(dbPath, "peer-2")
+	if err != nil {
+		t.Fatalf("known self-id should read roster: %v", err)
+	}
+	if len(peers) != 0 {
+		t.Fatalf("self-only fixture should have no peers, got %+v", peers)
+	}
+}
+
+func TestD9BackupOnceCheckpointsWAL(t *testing.T) {
+	_, dbPath := mustDataDir(t)
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw wal db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`PRAGMA wal_autocheckpoint=0`); err != nil {
+		t.Fatalf("disable autocheckpoint: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE demo(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO demo(value) VALUES('from-wal')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := os.Stat(dbPath + "-wal"); err != nil {
+		t.Fatalf("expected WAL sidecar before backup: %v", err)
+	}
+	if err := backupOnce(dbPath); err != nil {
+		t.Fatalf("backupOnce: %v", err)
+	}
+	bak, err := sql.Open("sqlite", "file:"+dbPath+".bak?mode=ro")
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	defer func() { _ = bak.Close() }()
+	var value string
+	if err := bak.QueryRow(`SELECT value FROM demo WHERE id=1`).Scan(&value); err != nil {
+		t.Fatalf("backup is missing WAL-only row: %v", err)
+	}
+	if value != "from-wal" {
+		t.Fatalf("backup value = %q, want from-wal", value)
 	}
 }
 

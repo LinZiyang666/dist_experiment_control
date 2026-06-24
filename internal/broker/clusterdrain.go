@@ -92,6 +92,9 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	if proj.FaultTolerance == 0 && !confirmed {
 		return &ErrQuorumConfirmRequired{Proj: proj}
 	}
+	if err := a.requireClusterNode(nodeID); err != nil {
+		return fmt.Errorf("cluster drain %s: %w", nodeID, err)
+	}
 	if retire && streamsReady != nil {
 		ready, err := streamsReady()
 		if err != nil {
@@ -155,6 +158,19 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	return nil
 }
 
+func (a *ClusterAdmin) requireClusterNode(nodeID string) error {
+	return a.node.VerifyLeaderRead(func(db *sql.DB) error {
+		var exists int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM cluster_nodes WHERE node_id=?`, nodeID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists != 1 {
+			return fmt.Errorf("node_id %q is not in cluster_nodes", nodeID)
+		}
+		return nil
+	})
+}
+
 // RemoveNode finishes the removal of a node that has ALREADY walked through a
 // removal phase (RETIRING or VOTER_ADD_FAILED). It REFUSES a live VOTER/CATCHING_UP/
 // PENDING node (review B1): a bare RemoveServer on a healthy voter, paired with the
@@ -215,15 +231,32 @@ func (a *ClusterAdmin) RotateTunnelCert(nodeID, newFP string, window time.Durati
 	if newFP == "" {
 		return fmt.Errorf("rotate-tunnel-cert %s: --cert-fp is required", nodeID)
 	}
+	if nodeID != a.node.SelfID() {
+		return fmt.Errorf("rotate-tunnel-cert %s: rotate must run on the target broker while it is leader; transfer leadership to %s first so it can hot-swap its live tunnel certificate", nodeID, nodeID)
+	}
 	if phase, ok := a.nodePhase(nodeID); !ok {
 		return fmt.Errorf("rotate-tunnel-cert %s: no such roster node", nodeID)
 	} else if phase != phaseVoter && phase != phaseCatchingUp && phase != phasePending {
 		return fmt.Errorf("rotate-tunnel-cert %s: node is %s (rotate a live node)", nodeID, phase)
 	}
+	var commitCert func()
+	if a.prepareTunnelCertRotate != nil {
+		var err error
+		commitCert, err = a.prepareTunnelCertRotate(newFP)
+		if err != nil {
+			return fmt.Errorf("rotate-tunnel-cert %s: %w", nodeID, err)
+		}
+	}
 	validUntil := a.now().Add(window)
-	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterCertRotate(nodeID, newFP, validUntil)
-	})
+	}); err != nil {
+		return err
+	}
+	if commitCert != nil {
+		commitCert()
+	}
+	return nil
 }
 
 // transferLeadershipOff hands raft leadership to a specific voter that is NOT

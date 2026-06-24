@@ -95,7 +95,7 @@ func denyIsTransient(reason string) bool {
 	}
 }
 
-// ErrHomePinsRequired is returned by Open when a CLUSTERED home (non-empty
+// ErrHomePinsRequired is returned when targeting a CLUSTERED home (non-empty
 // brokerAddr) is targeted without cert pins (D6 §7.7/R-22). The agent must NOT
 // dial a named home insecurely; it defers the dial until a register/expose reply
 // re-delivers the pins. The N=1 path (empty brokerAddr) never hits this.
@@ -132,6 +132,11 @@ type Server struct {
 	// killGen[port] is bumped by CloseProxy. A handleAgent that snapshotted an
 	// older value before binding refuses to install (F1 in-flight-REGISTER race).
 	killGen map[int]int64
+	// killGenAllocation is bumped by CloseProxyIf for one allocation identity.
+	// Unlike killGen, it does not fence a newly reallocated port with a different
+	// token_hash; this keeps stale cluster-close broadcasts from denying the new
+	// listener while still killing an old in-flight REGISTER for the freed row.
+	killGenAllocation map[sessionFenceKey]int64
 	// killGenSession[sid] is bumped by CloseSession — even when NO listener is
 	// installed yet — so a session-level OFF also fences an in-flight REGISTER
 	// that passed token auth but hasn't inserted its serverSession (round-5 F1).
@@ -140,8 +145,10 @@ type Server struct {
 	// install for sid; forgotten[sid] marks a deleted session awaiting prune.
 	// ForgetSession BUMPS the fence and only prunes once in-flight drains, so a
 	// paused authorized REGISTER can't install after deletion (round-6 F4).
-	inflightBySID map[string]int
-	forgotten     map[string]bool
+	inflightBySID        map[string]int
+	forgotten            map[string]bool
+	inflightByAllocation map[sessionFenceKey]int
+	closedAllocation     map[sessionFenceKey]bool
 	// closed flips true after Close()/ctx-cancel begin. Guards against
 	// the audit-found shutdown race: in-flight handleAgent that's mid
 	// REGISTER could otherwise insert into s.sessions AFTER Close
@@ -151,9 +158,43 @@ type Server struct {
 	wg     sync.WaitGroup // tracks in-flight handleAgent goroutines
 }
 
+// SessionInfo is the stable identity of an installed public proxy listener.
+// TokenHash fences port reuse: a stale close for an old allocation must not close
+// a new allocation that reused the same public port.
+type SessionInfo struct {
+	PublicPort int    `json:"port"`
+	SID        string `json:"sid"`
+	NID        string `json:"nid"`
+	TokenHash  string `json:"token_hash"`
+	Epoch      int64  `json:"epoch"`
+}
+
+type sessionFenceKey struct {
+	publicPort int
+	sid        string
+	nid        string
+	tokenHash  string
+}
+
+func sessionFenceKeyFor(publicPort int, sid, nid, tokenHash string) sessionFenceKey {
+	return sessionFenceKey{
+		publicPort: publicPort,
+		sid:        sid,
+		nid:        nid,
+		tokenHash:  tokenHash,
+	}
+}
+
+func sessionFenceKeyFromInfo(info SessionInfo) sessionFenceKey {
+	return sessionFenceKeyFor(info.PublicPort, info.SID, info.NID, info.TokenHash)
+}
+
 type serverSession struct {
 	sid        string // owning session — lets CloseSession kill by sid without a DB query
+	nid        string
 	publicPort int
+	tokenHash  string
+	epoch      int64
 	listener   net.Listener
 	yamuxSess  *yamux.Session
 	rawConn    net.Conn // the raw TCP control connection from agent
@@ -177,16 +218,19 @@ func NewServerWithCert(addr, publicHost string, lookup TokenLookup, cert *tls.Ce
 
 func newServer(addr, publicHost string, lookup TokenLookup, cert *tls.Certificate, logger *slog.Logger) *Server {
 	return &Server{
-		addr:           addr,
-		publicHost:     publicHost,
-		tokenLookup:    lookup,
-		tlsCert:        cert,
-		logger:         logger,
-		sessions:       map[int]*serverSession{},
-		killGen:        map[int]int64{},
-		killGenSession: map[string]int64{},
-		inflightBySID:  map[string]int{},
-		forgotten:      map[string]bool{},
+		addr:                 addr,
+		publicHost:           publicHost,
+		tokenLookup:          lookup,
+		tlsCert:              cert,
+		logger:               logger,
+		sessions:             map[int]*serverSession{},
+		killGen:              map[int]int64{},
+		killGenAllocation:    map[sessionFenceKey]int64{},
+		killGenSession:       map[string]int64{},
+		inflightBySID:        map[string]int{},
+		forgotten:            map[string]bool{},
+		inflightByAllocation: map[sessionFenceKey]int{},
+		closedAllocation:     map[sessionFenceKey]bool{},
 	}
 }
 
@@ -200,7 +244,7 @@ func newServer(addr, publicHost string, lookup TokenLookup, cert *tls.Certificat
 // generate a fresh ephemeral self-signed cert on each Start;
 // production deployments can pin one via NewServerWithCert.
 func (s *Server) Start(ctx context.Context) error {
-	tlsCfg, err := serverTLSConfig(s.tlsCert)
+	tlsCfg, err := s.serverTLSConfig()
 	if err != nil {
 		return err
 	}
@@ -220,6 +264,36 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	s.logger.Info("tunnel: server listening", "addr", s.addr)
 	return nil
+}
+
+func (s *Server) SetCertificate(cert *tls.Certificate) {
+	s.mu.Lock()
+	s.tlsCert = cert
+	s.mu.Unlock()
+}
+
+func (s *Server) serverTLSConfig() (*tls.Config, error) {
+	s.mu.Lock()
+	if s.tlsCert == nil {
+		c, err := generateSelfSignedCert()
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		s.tlsCert = &c
+	}
+	s.mu.Unlock()
+	return &tls.Config{
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.tlsCert == nil {
+				return nil, fmt.Errorf("tunnel server: no TLS certificate loaded")
+			}
+			return s.tlsCert, nil
+		},
+		MinVersion: tls.VersionTLS12,
+	}, nil
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
@@ -269,6 +343,8 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	tokenHash := hashToken(token)
+	fenceKey := sessionFenceKeyFor(port, sid, nid, tokenHash)
 
 	// Snapshot BOTH the port and session kill generations BEFORE authorizing.
 	// If a CloseProxy(port) [round-2 F1] or a CloseSession(sid) [round-5 F1]
@@ -279,19 +355,23 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	s.mu.Lock()
 	gen := s.killGen[port]
 	sessGen := s.killGenSession[sid]
+	allocGen := s.killGenAllocation[fenceKey]
 	// round-6 F4: mark this REGISTER in-flight for sid so ForgetSession can't
 	// prune the session tombstone (and lose the fence) while we're paused
 	// between snapshot and install. Decremented when the handler returns.
 	s.inflightBySID[sid]++
+	s.inflightByAllocation[fenceKey]++
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.inflightBySID[sid]--
+		s.inflightByAllocation[fenceKey]--
 		s.maybePruneSessionLocked(sid)
+		s.maybePruneAllocationLocked(fenceKey)
 		s.mu.Unlock()
 	}()
 
-	if err := s.tokenLookup(sid, nid, port, hashToken(token), epoch); err != nil {
+	if err := s.tokenLookup(sid, nid, port, tokenHash, epoch); err != nil {
 		s.logger.Info("tunnel server: REGISTER denied",
 			"sid", sid, "nid", nid, "port", port, "epoch", epoch, "err", err)
 		_, _ = conn.Write([]byte("DENY " + err.Error() + "\n"))
@@ -322,7 +402,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// loses under load. The post-yamux re-check stays as the authoritative
 	// install-time fence for the residual snapshot→install window.
 	s.mu.Lock()
-	fenced := s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen
+	fenced := s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen || s.killGenAllocation[fenceKey] != allocGen
 	s.mu.Unlock()
 	if fenced {
 		_ = publicLn.Close()
@@ -348,14 +428,17 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	sessCtx, cancel := context.WithCancel(ctx)
 	sess := &serverSession{
 		sid:        sid,
+		nid:        nid,
 		publicPort: port,
+		tokenHash:  tokenHash,
+		epoch:      epoch,
 		listener:   publicLn,
 		yamuxSess:  yamuxSess,
 		rawConn:    conn,
 		cancel:     cancel,
 	}
 	s.mu.Lock()
-	if s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen {
+	if s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen || s.killGenAllocation[fenceKey] != allocGen {
 		// Server shutting down, OR a CloseProxy(port)/CloseSession(sid) fired
 		// during our handshake (round-2/round-5 F1). Either way don't install —
 		// roll back the per-conn state so we don't leak the public port or
@@ -368,13 +451,15 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 	// Replace any prior session on this port (agent restart / re-expose).
-	if old, ok := s.sessions[port]; ok {
-		old.cancel()
-		_ = old.listener.Close()
-		_ = old.rawConn.Close()
+	var old *serverSession
+	if prior, ok := s.sessions[port]; ok {
+		old = prior
 	}
 	s.sessions[port] = sess
 	s.mu.Unlock()
+	if old != nil {
+		closeServerSession(old)
+	}
 
 	s.logger.Info("tunnel: registered",
 		"sid", sid, "nid", nid, "public_port", port)
@@ -447,10 +532,75 @@ func (s *Server) CloseProxy(port int) bool {
 	if !ok {
 		return false
 	}
-	sess.cancel()
-	_ = sess.listener.Close()
-	_ = sess.rawConn.Close()
+	closeServerSession(sess)
 	return true
+}
+
+// CloseProxyIf tears down the public listener only if the currently installed
+// session still matches the supplied allocation identity. Even when no listener
+// is installed, it bumps an allocation-scoped generation so an old in-flight
+// REGISTER for that exact token cannot install after the caller freed/revoked
+// the allocation. The fence is not bare-port scoped: a stale close for token A
+// must not deny or close a new allocation on the same public port with token B.
+func (s *Server) CloseProxyIf(info SessionInfo) bool {
+	if info.PublicPort <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	s.ensureAllocationFenceMapsLocked()
+	key := sessionFenceKeyFromInfo(info)
+	s.killGenAllocation[key]++
+	s.closedAllocation[key] = true
+	sess, ok := s.sessions[info.PublicPort]
+	if !ok {
+		s.maybePruneAllocationLocked(key)
+		s.mu.Unlock()
+		return false
+	}
+	if sess.sid != info.SID || sess.nid != info.NID || sess.tokenHash != info.TokenHash {
+		s.maybePruneAllocationLocked(key)
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.sessions, info.PublicPort)
+	s.maybePruneAllocationLocked(key)
+	s.mu.Unlock()
+
+	closeServerSession(sess)
+	return true
+}
+
+// SessionInfos snapshots every installed public listener identity.
+func (s *Server) SessionInfos() []SessionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]SessionInfo, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		out = append(out, SessionInfo{
+			PublicPort: sess.publicPort,
+			SID:        sess.sid,
+			NID:        sess.nid,
+			TokenHash:  sess.tokenHash,
+			Epoch:      sess.epoch,
+		})
+	}
+	return out
+}
+
+func closeServerSession(sess *serverSession) {
+	if sess == nil {
+		return
+	}
+	sess.cancel()
+	if sess.listener != nil {
+		_ = sess.listener.Close()
+	}
+	if sess.yamuxSess != nil {
+		_ = sess.yamuxSess.Close()
+	}
+	if sess.rawConn != nil {
+		_ = sess.rawConn.Close()
+	}
 }
 
 // ForgetSession closes any remaining listeners for sid and PRUNES its kill-gen
@@ -480,9 +630,7 @@ func (s *Server) ForgetSession(sid string) {
 	s.mu.Unlock()
 
 	for _, sess := range victims {
-		sess.cancel()
-		_ = sess.listener.Close()
-		_ = sess.rawConn.Close()
+		closeServerSession(sess)
 	}
 }
 
@@ -494,6 +642,26 @@ func (s *Server) maybePruneSessionLocked(sid string) {
 		delete(s.killGenSession, sid)
 		delete(s.inflightBySID, sid)
 		delete(s.forgotten, sid)
+	}
+}
+
+func (s *Server) ensureAllocationFenceMapsLocked() {
+	if s.killGenAllocation == nil {
+		s.killGenAllocation = map[sessionFenceKey]int64{}
+	}
+	if s.inflightByAllocation == nil {
+		s.inflightByAllocation = map[sessionFenceKey]int{}
+	}
+	if s.closedAllocation == nil {
+		s.closedAllocation = map[sessionFenceKey]bool{}
+	}
+}
+
+func (s *Server) maybePruneAllocationLocked(key sessionFenceKey) {
+	if s.closedAllocation[key] && s.inflightByAllocation[key] <= 0 {
+		delete(s.killGenAllocation, key)
+		delete(s.inflightByAllocation, key)
+		delete(s.closedAllocation, key)
 	}
 }
 
@@ -522,9 +690,7 @@ func (s *Server) CloseSession(sid string) []int {
 	s.mu.Unlock()
 
 	for _, sess := range victims {
-		sess.cancel()
-		_ = sess.listener.Close()
-		_ = sess.rawConn.Close()
+		closeServerSession(sess)
 	}
 	return ports
 }
@@ -555,9 +721,7 @@ func (s *Server) Close() {
 		_ = ln.Close()
 	}
 	for _, sess := range snap {
-		sess.cancel()
-		_ = sess.listener.Close()
-		_ = sess.rawConn.Close()
+		closeServerSession(sess)
 	}
 	// Wait for in-flight handleAgent goroutines to drain so the
 	// caller of Close knows the bound public ports are released
@@ -783,6 +947,10 @@ func (c *Client) ApplyHome(publicPort int, brokerAddr string, epoch int64, certP
 	}
 	if epoch == sess.epoch {
 		// Same home epoch, possibly rotated pins: update in place, no transport tear.
+		if (brokerAddr != "" || sess.brokerAddr != "") && certPins.Current == "" {
+			c.mu.Unlock()
+			return ErrHomePinsRequired
+		}
 		sess.certPins = certPins
 		c.mu.Unlock()
 		return nil
@@ -793,6 +961,13 @@ func (c *Client) ApplyHome(publicPort int, brokerAddr string, epoch int64, certP
 	// old supervisor, installs the new session + supervisor). A transient/terminal
 	// DENY surfaces to the caller for retry/handling.
 	return c.OpenHome(publicPort, localPort, token, brokerAddr, epoch, certPins)
+}
+
+func (c *Client) HasSession(publicPort int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.sessions[publicPort]
+	return ok
 }
 
 // dialAndRegister performs ONE TLS dial + REGISTER handshake + yamux client

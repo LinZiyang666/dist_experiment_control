@@ -264,6 +264,9 @@ func backupOnce(dbPath string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("clusteroffline: stat .bak: %w", err)
 	}
+	if err := checkpointWALForBackup(dbPath); err != nil {
+		return err
+	}
 	src, err := os.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("clusteroffline: open DB for backup: %w", err)
@@ -282,4 +285,17 @@ func backupOnce(dbPath string) error {
 		return fmt.Errorf("clusteroffline: fsync .bak: %w", err)
 	}
 	return dst.Close()
+}
+
+func checkpointWALForBackup(dbPath string) error {
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("clusteroffline: open DB for checkpoint: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("clusteroffline: checkpoint WAL before backup: %w", err)
+	}
+	return nil
 }

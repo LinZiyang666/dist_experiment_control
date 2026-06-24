@@ -263,7 +263,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	fwdBody, err := json.Marshal(&fwdReq)
 	if err != nil {
 		// roll back the allocation — no point keeping a row no agent saw
-		_ = b.freePort(alloc.Port)
+		_ = b.rollbackExposeAllocation(*alloc)
 		b.replyExposeErr(msg, "marshal", err.Error())
 		return
 	}
@@ -273,21 +273,23 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		// Agent didn't ACK in time. Free the port so we don't leak it.
 		// Common cause: agent process crashed between OK status read
 		// and message receive.
-		_ = b.freePort(alloc.Port)
-		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
+		if b.rollbackExposeAllocation(*alloc) {
+			b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
+		}
 		b.replyExposeErr(msg, "agent_no_responders", err.Error())
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_no_responders", msg.Reply, nil)
 		return
 	}
 	var agentResp proto.ExposeForwardedResp
 	if err := json.Unmarshal(fwdResp.Data, &agentResp); err != nil {
-		_ = b.freePort(alloc.Port)
+		_ = b.rollbackExposeAllocation(*alloc)
 		b.replyExposeErr(msg, "agent_malformed_resp", err.Error())
 		return
 	}
 	if !agentResp.OK {
-		_ = b.freePort(alloc.Port)
-		b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
+		if b.rollbackExposeAllocation(*alloc) {
+			b.pubPortEvent(sid, alloc.Port, req.Name, nid, req.LocalPort, "freed")
+		}
 		b.replyExposeErr(msg, "agent_rejected:"+agentResp.Code, agentResp.Error)
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "agent_rejected:"+agentResp.Code, msg.Reply, nil)
 		return
@@ -315,6 +317,18 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	b.pubAuditPort(sid, "allocated", nid, alloc.Port, req.Name, req.LocalPort, fp, b.cfg.Now())
 }
 
+func (b *Broker) rollbackExposeAllocation(a port.Allocation) bool {
+	if err := b.freePortAllocation(a); err != nil {
+		if errors.Is(err, port.ErrNotFound) {
+			return false
+		}
+		b.cfg.Logger.Warn("broker: expose rollback free failed",
+			"sid", a.SID, "nid", a.NID, "name", a.Name, "port", a.Port, "err", err)
+		return false
+	}
+	return true
+}
+
 func (b *Broker) replyExposeErr(msg *nats.Msg, code, detail string) {
 	if msg.Reply == "" {
 		return
@@ -331,6 +345,9 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 	sid, actor, _, verb, ok := proto.ParseCmdBy(msg.Subject)
 	if !ok || verb != "expose-rm" {
 		b.replyExposeRmErr(msg, "subject_malformed", "")
+		return
+	}
+	if b.isClusterFollower() {
 		return
 	}
 
@@ -397,10 +414,11 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 		}
 	}
 
-	if err := b.freePort(alloc.Port); err != nil {
+	if err := b.freePortAllocation(*alloc); err != nil {
 		b.replyExposeRmErr(msg, "free_failed", err.Error())
 		return
 	}
+	b.closeTunnelProxyEverywhere(*alloc)
 
 	// Tell agent best-effort. We don't gate the user-visible OK on the
 	// agent's response — the SQLite row is the source of truth and
@@ -444,10 +462,11 @@ func (b *Broker) reconcilePorts(now time.Time) int {
 	}
 	revoked := 0
 	for _, a := range allocs {
-		if err := b.revokePort(a.Port, now); err != nil {
+		if err := b.revokePortAllocation(a, now); err != nil {
 			b.cfg.Logger.Warn("broker: reconcilePorts revoke", "err", err, "port", a.Port)
 			continue
 		}
+		b.closeTunnelProxyEverywhere(a)
 		b.pubPortEvent(a.SID, a.Port, a.Name, a.NID, a.LocalPort, "revoked")
 		b.pubAuditPort(a.SID, "revoked", a.NID, a.Port, a.Name, a.LocalPort, "" /* system, no actor */, now)
 		revoked++

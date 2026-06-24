@@ -100,7 +100,11 @@ func newNodeLsCmd() *cobra.Command {
 			if !any {
 				_, _ = fmt.Fprintln(tw, "(no nodes)")
 			}
-			return tw.Flush()
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			withBanner(nc, id.PublicKey, false)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")

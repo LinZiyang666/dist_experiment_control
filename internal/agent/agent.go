@@ -344,6 +344,12 @@ type homeApplier interface {
 	ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error
 }
 
+type homeSessionChecker interface {
+	HasSession(publicPort int) bool
+}
+
+var afterRehomeWantSettledHook func(*Agent, int)
+
 // onTunnelSessionState is the tunnel session-state hook. It publishes proxy
 // ready/unready ONLY for the embedded proxy's public port, so /sub and
 // `proxy status` track real data-plane liveness (Defect B fix). Lock-free: it
@@ -1009,11 +1015,26 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 		maxWait = 30 * time.Second
 		deadln  = 2 * time.Minute // bound: don't retry forever (§7.2 有界重试 + 告警)
 	)
+	var lastSeq uint64
 	defer func() {
+		var restart bool
 		a.rehomeMu.Lock()
-		delete(a.rehomeRunning, port)
-		delete(a.rehomeWant, port)
+		if a.rehomeSeq[port] == lastSeq {
+			delete(a.rehomeRunning, port)
+			delete(a.rehomeWant, port)
+		} else if ctx.Err() == nil {
+			// A newer directive arrived after this loop's final wantChanged check while
+			// applyHomeDirectives still saw rehomeRunning=true. Keep the want and hand it
+			// to a fresh single worker instead of deleting it in cleanup.
+			a.rehomeRunning[port] = true
+			restart = true
+		} else {
+			delete(a.rehomeRunning, port)
+		}
 		a.rehomeMu.Unlock()
+		if restart {
+			go a.applyOneHome(ctx, applier, port)
+		}
 	}()
 	sleep := base
 	start := time.Now()
@@ -1024,6 +1045,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 		a.rehomeMu.Lock()
 		d := a.rehomeWant[port]
 		seq := a.rehomeSeq[port]
+		lastSeq = seq
 		deferred := a.deferredReplay[port]
 		a.rehomeMu.Unlock()
 
@@ -1050,7 +1072,18 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 		} else {
 			// An OPEN expose: ApplyHome rehomes (epoch>) or pure-pin-updates (epoch==)
 			// without tearing a live transport on a same-epoch reconnect.
-			err = applier.ApplyHome(d.PublicPort, d.BrokerAddr, d.Epoch, d.CertPins)
+			if checker, ok := applier.(homeSessionChecker); ok && !checker.HasSession(d.PublicPort) {
+				outcome, oerr := a.openHomeFromState(d)
+				switch outcome {
+				case openStateUnavailable:
+					return
+				case openPortAbsent:
+					return
+				}
+				err = oerr
+			} else {
+				err = applier.ApplyHome(d.PublicPort, d.BrokerAddr, d.Epoch, d.CertPins)
+			}
 		}
 		if err == nil {
 			if deferred {
@@ -1067,6 +1100,9 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 			if a.wantChanged(port, seq) {
 				sleep = base
 				continue // a newer directive (higher epoch OR same-epoch pin update, RF2) arrived
+			}
+			if afterRehomeWantSettledHook != nil {
+				afterRehomeWantSettledHook(a, port)
 			}
 			return
 		}
@@ -1087,6 +1123,9 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 			if a.wantChanged(port, seq) {
 				sleep, start = base, time.Now() // a newer directive supersedes; apply it
 				continue
+			}
+			if afterRehomeWantSettledHook != nil {
+				afterRehomeWantSettledHook(a, port)
 			}
 			return
 		}
@@ -1123,9 +1162,9 @@ func (a *Agent) clearDeferred(port int) {
 type openOutcome int
 
 const (
-	openedOK            openOutcome = iota // AddProxy was attempted; the returned error carries its result
-	openStateUnavailable                   // state.json unreadable/unparseable — keep deferred, give up until next reconnect
-	openPortAbsent                         // the persisted entry is gone — nothing to open, clear deferred
+	openedOK             openOutcome = iota // AddProxy was attempted; the returned error carries its result
+	openStateUnavailable                    // state.json unreadable/unparseable — keep deferred, give up until next reconnect
+	openPortAbsent                          // the persisted entry is gone — nothing to open, clear deferred
 )
 
 // openHomeFromState opens (or replaces) an expose's tunnel from its persisted

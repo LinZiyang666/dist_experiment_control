@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -68,6 +69,81 @@ func TestD6DenyTransientClassification(t *testing.T) {
 	// Pin the SSOT: the emit-side const equals the literal the classifier matches.
 	if proto.ReasonHomeCatchingUp != "home_catching_up" {
 		t.Fatalf("proto.ReasonHomeCatchingUp drifted: %q", proto.ReasonHomeCatchingUp)
+	}
+}
+
+func TestD9CloseProxyIfFencesPortReuse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	port := ln.Addr().(*net.TCPAddr).Port
+	srv := &Server{
+		sessions:             map[int]*serverSession{},
+		killGen:              map[int]int64{},
+		killGenAllocation:    map[sessionFenceKey]int64{},
+		inflightByAllocation: map[sessionFenceKey]int{},
+		closedAllocation:     map[sessionFenceKey]bool{},
+	}
+	oldKey := sessionFenceKeyFor(port, "lab", "lab-1", "old-token-hash")
+	newKey := sessionFenceKeyFor(port, "lab", "lab-1", "new-token-hash")
+	srv.inflightByAllocation[oldKey] = 1
+	srv.sessions[port] = &serverSession{
+		sid:        "lab",
+		nid:        "lab-1",
+		publicPort: port,
+		tokenHash:  "new-token-hash",
+		epoch:      7,
+		listener:   ln,
+		cancel:     func() {},
+	}
+
+	infos := srv.SessionInfos()
+	if len(infos) != 1 || infos[0].TokenHash != "new-token-hash" || infos[0].Epoch != 7 {
+		t.Fatalf("SessionInfos = %#v, want installed identity", infos)
+	}
+	if srv.CloseProxyIf(SessionInfo{PublicPort: port, SID: "lab", NID: "lab-1", TokenHash: "old-token-hash", Epoch: 6}) {
+		t.Fatal("stale close for a reused port/token must not close the installed new session")
+	}
+	if _, ok := srv.sessions[port]; !ok {
+		t.Fatal("mismatched CloseProxyIf removed the current session")
+	}
+	if srv.killGen[port] != 0 {
+		t.Fatalf("mismatched installed session bumped killGen = %d, want 0", srv.killGen[port])
+	}
+	if srv.killGenAllocation[oldKey] != 1 {
+		t.Fatalf("stale close did not fence old in-flight allocation; got %d", srv.killGenAllocation[oldKey])
+	}
+	if srv.killGenAllocation[newKey] != 0 {
+		t.Fatalf("stale close fenced new allocation token; got %d", srv.killGenAllocation[newKey])
+	}
+	if !srv.CloseProxyIf(SessionInfo{PublicPort: port, SID: "lab", NID: "lab-1", TokenHash: "new-token-hash", Epoch: 7}) {
+		t.Fatal("matching CloseProxyIf did not close the installed session")
+	}
+	if _, ok := srv.sessions[port]; ok {
+		t.Fatal("matching CloseProxyIf left the session installed")
+	}
+	if srv.killGen[port] != 0 {
+		t.Fatalf("matching close bumped bare-port killGen = %d, want 0", srv.killGen[port])
+	}
+	if srv.killGenAllocation[newKey] != 0 {
+		t.Fatalf("matching close leaked allocation fence without in-flight register; got %d", srv.killGenAllocation[newKey])
+	}
+	if srv.CloseProxyIf(SessionInfo{PublicPort: port, SID: "lab", NID: "lab-1", TokenHash: "old-token-hash", Epoch: 6}) {
+		t.Fatal("no-session stale CloseProxyIf must return false")
+	}
+	if srv.killGen[port] != 0 {
+		t.Fatalf("no-session close bumped bare-port killGen = %d, want 0", srv.killGen[port])
+	}
+	if srv.killGenAllocation[oldKey] != 2 {
+		t.Fatalf("no-session stale close did not fence old in-flight allocation; got %d", srv.killGenAllocation[oldKey])
+	}
+	if srv.CloseProxyIf(SessionInfo{PublicPort: port, SID: "lab", NID: "lab-1", TokenHash: "new-token-hash", Epoch: 7}) {
+		t.Fatal("second CloseProxyIf with no installed session must return false")
+	}
+	if srv.killGenAllocation[newKey] != 0 {
+		t.Fatalf("no-session close leaked fence for non-in-flight new allocation; got %d", srv.killGenAllocation[newKey])
 	}
 }
 
@@ -276,6 +352,66 @@ func TestD6ReviewPurePinUpdateSameEpoch(t *testing.T) {
 	c.mu.Unlock()
 	if got != "sha256:new" {
 		t.Fatalf("same-epoch pure-pin directive did not update session pins: got %q", got)
+	}
+}
+
+func TestD6SameEpochDirectiveCannotClearClusterPins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+
+	c := NewClient("fallback:7000", "lab", "lab-1", nil, nil)
+	c.ctx = ctx
+	c.sessions[14000] = &clientSession{
+		publicPort: 14000,
+		localPort:  9000,
+		token:      "tok",
+		cancel:     sessCancel,
+		brokerAddr: "10.0.0.2:7000",
+		epoch:      3,
+		certPins:   proto.CertPins{Current: "sha256:old"},
+	}
+
+	err := c.ApplyHome(14000, "10.0.0.2:7000", 3, proto.CertPins{})
+	if !errors.Is(err, ErrHomePinsRequired) {
+		t.Fatalf("same-epoch clustered directive without pins err=%v, want ErrHomePinsRequired", err)
+	}
+	c.mu.Lock()
+	got := c.sessions[14000].certPins.Current
+	c.mu.Unlock()
+	if got != "sha256:old" {
+		t.Fatalf("empty same-epoch directive cleared existing pin: got %q", got)
+	}
+}
+
+func TestD6SameEpochEmptyFallbackDirectiveCannotClearClusterPins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+
+	c := NewClient("fallback:7000", "lab", "lab-1", nil, nil)
+	c.ctx = ctx
+	c.sessions[14000] = &clientSession{
+		publicPort: 14000,
+		localPort:  9000,
+		token:      "tok",
+		cancel:     sessCancel,
+		brokerAddr: "10.0.0.2:7000",
+		epoch:      3,
+		certPins:   proto.CertPins{Current: "sha256:old"},
+	}
+
+	err := c.ApplyHome(14000, "", 3, proto.CertPins{})
+	if !errors.Is(err, ErrHomePinsRequired) {
+		t.Fatalf("same-epoch fallback directive without pins err=%v, want ErrHomePinsRequired", err)
+	}
+	c.mu.Lock()
+	got := c.sessions[14000].certPins.Current
+	c.mu.Unlock()
+	if got != "sha256:old" {
+		t.Fatalf("empty fallback directive cleared existing cluster pin: got %q", got)
 	}
 }
 

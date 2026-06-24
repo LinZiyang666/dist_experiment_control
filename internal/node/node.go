@@ -72,6 +72,10 @@ type RegisterInput struct {
 // operator knows to create the session first.
 var ErrSessionMissing = errors.New("node: target session does not exist")
 
+// ErrSessionNotActive is returned when the target session exists but is not
+// ACTIVE. Register must not resurrect node/liveness state during session deletion.
+var ErrSessionNotActive = errors.New("node: target session is not active")
+
 // Register inserts (or updates) the node row and forces status to ONLINE.
 //
 // The target session MUST already exist (caller responsibility — owner
@@ -89,12 +93,14 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var existsSid string
+	var state string
 	switch err := tx.QueryRow(
-		`SELECT sid FROM sessions WHERE sid = ?`, in.SID,
-	).Scan(&existsSid); err {
+		`SELECT state FROM sessions WHERE sid = ?`, in.SID,
+	).Scan(&state); err {
 	case nil:
-		// row found
+		if state != "ACTIVE" {
+			return ErrSessionNotActive
+		}
 	case sql.ErrNoRows:
 		return ErrSessionMissing
 	default:

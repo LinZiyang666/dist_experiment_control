@@ -30,6 +30,9 @@ func TestSessionRmCascadesProxySubscribers(t *testing.T) {
 	}
 	h := proxysub.HashToken(s.Token)
 
+	if err := session.Tombstone(db, "lab", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	if err := dropSessionRows(db, "lab"); err != nil {
 		t.Fatalf("dropSessionRows: %v", err)
 	}
@@ -53,5 +56,22 @@ func TestSessionRmCascadesProxySubscribers(t *testing.T) {
 	}
 	if _, err := proxysub.LookupSIDByTokenHash(db, h); !errors.Is(err, proxysub.ErrNotFound) {
 		t.Fatal("old token resolved against a rebuilt same-sid session")
+	}
+}
+
+func TestSessionHardDeleteRequiresDeletingState(t *testing.T) {
+	db := openDB(t)
+	if _, err := session.Create(db, "lab", "lab", "SHA256:o", "ph", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := dropSessionRows(db, "lab"); !errors.Is(err, session.ErrDeleting) {
+		t.Fatalf("active session hard delete err=%v, want ErrDeleting", err)
+	}
+	var state string
+	if err := db.QueryRow(`SELECT state FROM sessions WHERE sid='lab'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(session.StateActive) {
+		t.Fatalf("active session was modified by stale hard delete, state=%q", state)
 	}
 }

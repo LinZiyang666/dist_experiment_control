@@ -150,7 +150,7 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd, err = session.PlanHardDelete("lab")
+	cmd, err = session.PlanHardDelete(db, "lab")
 	if err != nil {
 		t.Fatal(err)
 	}

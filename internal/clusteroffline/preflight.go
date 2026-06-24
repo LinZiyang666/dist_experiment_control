@@ -16,24 +16,33 @@ import (
 // (psk_at_rest_unprotected) — security-pragmatic under the single-home, all-trusted-team
 // threat model (proxy/psk are out of v1 HA, so the at-rest justification is weak).
 
-// requiredSecrets are the §15 files a cluster-mode broker must have. The keys (private
-// material) must be 0600; the certs/CA may be group/world-readable.
-var requiredSecrets = []struct {
+type requiredSecret struct {
 	name      string
 	isPrivate bool
-}{
+}
+
+// SecretsPreflightOptions tunes which optional deployment groups are checked.
+type SecretsPreflightOptions struct {
+	// RequireAuthSeeds checks broker.nk/account.nk in secretsDir. Operator-facing
+	// doctor/init use true. Daemon startup can use false when an explicit
+	// --auth-callout-seeds-dir was already loaded successfully from another dir.
+	RequireAuthSeeds bool
+}
+
+// requiredSecrets are the §15 files a cluster-mode broker must have. The keys (private
+// material) must be 0600; the certs/CA may be group/world-readable.
+var requiredSecrets = []requiredSecret{
 	{"cluster-ca.pem", false},
 	{"route-cert.pem", false},
 	{"route-key.pem", true},
 	{"tunnel-cert.pem", false},
 	{"tunnel-key.pem", true},
-	// node-ident.nk is the CLUSTER join identity (cluster sign-join signs the join nonce
-	// with it) — genuinely a cluster-secrets-dir file. broker.nk / account.nk are NOT here:
-	// they are the auth_callout bus + account seeds, loaded from the auth_callout config
-	// (broker.yaml's own path), so the auth_callout layer validates THEM at its own startup
-	// — checking them in the cluster secrets dir would be a misleading false-validation
-	// (round-2 MAJOR: they may legitimately live elsewhere).
 	{"node-ident.nk", true},
+}
+
+var requiredAuthSeeds = []requiredSecret{
+	{"broker.nk", true},
+	{"account.nk", true},
 }
 
 // SecretsPreflight checks the §15 secrets dir. It returns a list of non-fatal ADVISORIES
@@ -41,15 +50,29 @@ var requiredSecrets = []struct {
 // (last, per ST1008) if any required file is missing/unreadable or any private key is
 // too-permissive. nil error means the secrets are usable; advisories may still be present.
 func SecretsPreflight(secretsDir string) (advisories []string, fatal error) {
+	return SecretsPreflightWithOptions(secretsDir, SecretsPreflightOptions{RequireAuthSeeds: true})
+}
+
+// SecretsPreflightWithOptions checks the §15 secrets dir with an explicit auth-seed
+// requirement. It is otherwise identical to SecretsPreflight.
+func SecretsPreflightWithOptions(secretsDir string, opts SecretsPreflightOptions) (advisories []string, fatal error) {
 	if secretsDir == "" {
 		return nil, errors.New("clusteroffline: secrets_dir is empty (cluster mode requires §15 secrets)")
 	}
-	var missing, unreadable, tooOpen []string
-	for _, s := range requiredSecrets {
+	required := append([]requiredSecret{}, requiredSecrets...)
+	if opts.RequireAuthSeeds {
+		required = append(required, requiredAuthSeeds...)
+	}
+	var missing, unreadable, tooOpen, nonRegular []string
+	for _, s := range required {
 		p := filepath.Join(secretsDir, s.name)
-		info, err := os.Stat(p)
+		info, err := os.Lstat(p)
 		if err != nil {
 			missing = append(missing, s.name)
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			nonRegular = append(nonRegular, s.name)
 			continue
 		}
 		// Readability: actually attempt to open (a 0600 file owned by another user is
@@ -73,6 +96,10 @@ func SecretsPreflight(secretsDir string) (advisories []string, fatal error) {
 	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
 		problems = append(problems, "unreadable: "+strings.Join(unreadable, ", "))
+	}
+	if len(nonRegular) > 0 {
+		sort.Strings(nonRegular)
+		problems = append(problems, "not regular file(s): "+strings.Join(nonRegular, ", "))
 	}
 	if len(tooOpen) > 0 {
 		sort.Strings(tooOpen)

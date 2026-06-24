@@ -23,6 +23,10 @@ func TestD9BroadcastClusterSubjectClassification(t *testing.T) {
 		p + ".s.*.ev.node.*.transfer.*.failed",
 		p + ".ctrl.by.*.s.*.transfer.*.finalize.req",
 		p + ".s.*.cmd.by.*.node.*.expose.req", // external-review F3: leader-local → broadcast
+		p + ".s.*.cmd.by.*.node.*.expose-rm.req",
+		p + ".s.*.cmd.by.*.node.*.run.req",
+		p + ".s.*.cmd.by.*.node.*.exec.req",
+		p + ".s.*.cmd.by.*.node.*.kill.req",
 	}
 	for _, s := range broadcast {
 		if !isBroadcastClusterSubject(s) {
@@ -33,8 +37,6 @@ func TestD9BroadcastClusterSubjectClassification(t *testing.T) {
 	queued := []string{
 		p + ".ctrl.by.*.session.create.req",
 		p + ".ctrl.by.*.session.*.rm.req",
-		p + ".s.*.cmd.by.*.node.*.exec.req",
-		p + ".s.*.cmd.by.*.node.*.kill.req",
 		p + ".ctrl.by.*.s.*.ps.req",
 		p + ".s.*.ev.node.*.proc.*.exit",
 		p + ".ctrl.by.*.s.*.caps.req",

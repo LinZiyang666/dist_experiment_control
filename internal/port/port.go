@@ -81,12 +81,13 @@ type Allocation struct {
 	// re-derive it (only the hash is persisted).
 	Token string
 
-	// HomeBroker + Epoch (D6 §7.1-7.2) are populated ONLY by LookupByTokenHash
-	// (the tunnelTokenLookup read path). HomeBroker is the cluster_nodes.node_id
-	// of the broker that serves this expose ('' = no cluster home, the
-	// migration-0010 default / single-node); Epoch is the per-port monotone
-	// reassign counter (0 baseline). All other lookups leave these at the zero
-	// value — they do not read the columns.
+	// HomeBroker + Epoch (D6 §7.1-7.2) are populated by lookup paths that need
+	// allocation identity for the distributed tunnel plane: LookupByTokenHash
+	// (REGISTER authorization), LookupByName (expose-rm close broadcast), and
+	// ListAllocatedForOfflineNodes (revoke close broadcast). HomeBroker is the
+	// cluster_nodes.node_id of the broker that serves this expose ('' = no
+	// cluster home, the migration-0010 default / single-node); Epoch is the
+	// per-port monotone reassign counter (0 baseline).
 	HomeBroker string
 	Epoch      int64
 }
@@ -260,10 +261,11 @@ func findFreePort(tx rowsQueryer, low, high int) (int, error) {
 // types the public port number, only the logical name they assigned at
 // expose time.
 func LookupByName(db *sql.DB, sid, name string) (*Allocation, error) {
-	return scanOne(db.QueryRow(
+	return scanOneWithHome(db.QueryRow(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
-		 FROM port_allocations
-		 WHERE sid=? AND name=? AND state='ALLOCATED'`,
+		        , home_broker, epoch
+			 FROM port_allocations
+			 WHERE sid=? AND name=? AND state='ALLOCATED'`,
 		sid, name,
 	))
 }
@@ -274,40 +276,13 @@ func LookupByName(db *sql.DB, sid, name string) (*Allocation, error) {
 // looks up here, and authorizes only if the row is ALLOCATED AND the
 // claimed remote_port matches the row's port.
 func LookupByTokenHash(db *sql.DB, tokenHash string) (*Allocation, error) {
-	// D6 §7.1-7.2: this is the ONE read path that needs home_broker + epoch (for
-	// tunnelTokenLookup's home==self / catch-up ladder), so it scans a WIDER
-	// column set than the shared scanOne. Legacy / single-node rows return
-	// home_broker='' (migration-0010 default) + epoch=0, which keeps
-	// tunnelTokenLookup byte-equivalent to pre-D6 (the home/epoch branch is inert
-	// when home_broker==''). A differential test pins that equivalence.
-	var (
-		a         Allocation
-		revokedAt sql.NullTime
-		stateStr  string
-	)
-	err := db.QueryRow(
+	return scanOneWithHome(db.QueryRow(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
-		        home_broker, epoch
-		 FROM port_allocations
-		 WHERE token_hash=? AND state='ALLOCATED'`,
+			        home_broker, epoch
+			 FROM port_allocations
+			 WHERE token_hash=? AND state='ALLOCATED'`,
 		tokenHash,
-	).Scan(
-		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
-		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-		&a.HomeBroker, &a.Epoch,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	a.State = State(stateStr)
-	if revokedAt.Valid {
-		t := revokedAt.Time
-		a.RevokedAt = &t
-	}
-	return &a, nil
+	))
 }
 
 // ListBySession returns every row (any state) for sid, sorted by port
@@ -367,6 +342,40 @@ func Free(db *sql.DB, port int, now time.Time) error {
 	return nil
 }
 
+// FreeAllocation transitions exactly the selected ALLOCATED row to FREED.
+// It is used by expose-rm after resolving a logical name to an allocation; the
+// extra predicates prevent a stale lookup from freeing a reused public port.
+func FreeAllocation(db *sql.DB, a Allocation, now time.Time) error {
+	return updateAllocationState(db, a, StateFreed, "free allocation", now)
+}
+
+// RevokeAllocation transitions exactly the selected ALLOCATED row to REVOKED.
+// Offline-node reconciliation uses the full row identity from its scan so a
+// delayed revoke cannot affect a later allocation that reused the same port.
+func RevokeAllocation(db *sql.DB, a Allocation, now time.Time) error {
+	return updateAllocationState(db, a, StateRevoked, "revoke allocation", now)
+}
+
+func updateAllocationState(db *sql.DB, a Allocation, next State, label string, now time.Time) error {
+	res, err := db.Exec(
+		`UPDATE port_allocations
+		   SET state=?, revoked_at=?
+		 WHERE port=? AND sid=? AND nid=? AND name=? AND token_hash=? AND state='ALLOCATED'`,
+		string(next), now.UTC(), a.Port, a.SID, a.NID, a.Name, a.TokenHash,
+	)
+	if err != nil {
+		return fmt.Errorf("port: %s: %w", label, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("port: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Revoke transitions ALLOCATED → REVOKED. Same shape as Free but used
 // by the broker reconciler when the owning node has been OFFLINE long
 // enough (architecture D.4 / F.3, default 15min). Idempotent.
@@ -406,9 +415,10 @@ func Revoke(db *sql.DB, port int, now time.Time) error {
 func ListAllocatedForOfflineNodes(db *sql.DB, now time.Time, threshold time.Duration) ([]Allocation, error) {
 	cutoff := now.UTC().Add(-threshold)
 	rows, err := db.Query(`
-		SELECT pa.port, pa.sid, pa.nid, pa.name, pa.local_port, pa.token_hash,
-		       pa.state, pa.created_by_fp, pa.created_at, pa.revoked_at
-		FROM port_allocations pa
+			SELECT pa.port, pa.sid, pa.nid, pa.name, pa.local_port, pa.token_hash,
+			       pa.state, pa.created_by_fp, pa.created_at, pa.revoked_at,
+			       pa.home_broker, pa.epoch
+			FROM port_allocations pa
 		JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
 		WHERE pa.state='ALLOCATED'
 		  AND n.status='OFFLINE'
@@ -421,7 +431,7 @@ func ListAllocatedForOfflineNodes(db *sql.DB, now time.Time, threshold time.Dura
 	defer func() { _ = rows.Close() }()
 	var out []Allocation
 	for rows.Next() {
-		a, err := scanRow(rows)
+		a, err := scanRowWithHome(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -523,6 +533,29 @@ func scanOne(row *sql.Row) (*Allocation, error) {
 	return &a, nil
 }
 
+func scanOneWithHome(row *sql.Row) (*Allocation, error) {
+	var a Allocation
+	var revokedAt sql.NullTime
+	var stateStr string
+	err := row.Scan(
+		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
+		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
+		&a.HomeBroker, &a.Epoch,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.State = State(stateStr)
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		a.RevokedAt = &t
+	}
+	return &a, nil
+}
+
 func scanRow(rows *sql.Rows) (*Allocation, error) {
 	var a Allocation
 	var revokedAt sql.NullTime
@@ -530,6 +563,25 @@ func scanRow(rows *sql.Rows) (*Allocation, error) {
 	if err := rows.Scan(
 		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
 		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
+	); err != nil {
+		return nil, err
+	}
+	a.State = State(stateStr)
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		a.RevokedAt = &t
+	}
+	return &a, nil
+}
+
+func scanRowWithHome(rows *sql.Rows) (*Allocation, error) {
+	var a Allocation
+	var revokedAt sql.NullTime
+	var stateStr string
+	if err := rows.Scan(
+		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
+		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
+		&a.HomeBroker, &a.Epoch,
 	); err != nil {
 		return nil, err
 	}

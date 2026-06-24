@@ -60,7 +60,7 @@ func TestD8PublisherReplaysTransferAudit(t *testing.T) {
 	if len(js.subs) != 1 || js.subs[0] != proto.SubjAuditTransfer("lab") {
 		t.Fatalf("publish subjects = %v, want one %s", js.subs, proto.SubjAuditTransfer("lab"))
 	}
-	wantID := "q" + xferaudit.TransferReqID("tid-1", "complete") + ":xfer:0"
+	wantID := "q" + cmd.ReqID + ":xfer:0"
 	if len(gotIDs) != 1 || gotIDs[0] != wantID {
 		t.Fatalf("dedup id = %v, want %q", gotIDs, wantID)
 	}

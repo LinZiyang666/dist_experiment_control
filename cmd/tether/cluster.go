@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -25,7 +26,7 @@ func newClusterCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "cluster",
 		Short: "Cluster lifecycle: membership, drain/retire, status, and the force-single escape hatch",
-		Long: `Cluster admin commands. ONLINE verbs (add/remove/drain/retire/transfer-leader/
+		Long: `Cluster admin commands. ONLINE verbs (add/remove/drain --retire/transfer-leader/
 status/rotate-tunnel-cert) talk to the broker's local admin socket and must run on a
 broker host. OFFLINE verbs (force-single/recover) run with the daemon STOPPED and
 operate directly on disk (see the runbook in docs/).`,
@@ -149,6 +150,9 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	if asJSON {
 		b, _ := json.MarshalIndent(rep, "", "  ")
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
+		if rep.ExitCode != 0 {
+			os.Exit(rep.ExitCode)
+		}
 		return nil
 	}
 	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
@@ -165,6 +169,9 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	}
 	_ = tw.Flush()
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\n** offline roster view (disk snapshot + advisory raft-port ping) **\n%s\n", rep.Banner)
+	if rep.ExitCode != 0 {
+		os.Exit(rep.ExitCode)
+	}
 	return nil
 }
 
@@ -225,7 +232,7 @@ func newClusterAddCmd(socketPath *string) *cobra.Command {
 			}
 			if resp.Nonce != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"challenge nonce: %s\non the joining node run:  tether cluster sign-join %s %s\nthen re-run:  tether cluster add %s %s %s --join-token <nonce>:<sig>\n",
+					"challenge nonce: %s\non the joining node run:  tether cluster sign-join %s %s\nthen re-run:  tether cluster add %s %s %s --join-token <nonce>:<sig> --tunnel-addr <host:7000> --cert-fp <sha256:...> --public-host <dns> --nats-route nats://<host>:6222\n",
 					resp.Nonce, args[0], resp.Nonce, args[0], args[1], args[2])
 				return nil
 			}
@@ -352,7 +359,7 @@ func newClusterRotateCertCmd(socketPath *string) *cobra.Command {
 			if resp.Error != "" {
 				return fmt.Errorf("cluster rotate-tunnel-cert: %s", resp.Error)
 			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "cert rotation requested")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "cert rotation committed; target broker hot-swapped its live tunnel certificate")
 			return nil
 		},
 	}
@@ -383,8 +390,16 @@ func newClusterInitCmd() *cobra.Command {
 				return fmt.Errorf("cluster init: pass --from-existing to migrate this broker's DB into a cluster " +
 					"(there is no fresh-bootstrap path; a node always migrates an existing DB)")
 			}
-			if selfID == "" || raftAddr == "" {
-				return fmt.Errorf("cluster init --from-existing requires --self-id and --raft-addr")
+			if missing := missingClusterInitFields(map[string]string{
+				"--self-id":        selfID,
+				"--name":           name,
+				"--node-ident-pub": nodeIdentPub,
+				"--raft-addr":      raftAddr,
+				"--nats-route":     natsRoute,
+				"--tunnel-addr":    tunnelAddr,
+				"--public-host":    publicHost,
+			}); len(missing) > 0 {
+				return fmt.Errorf("cluster init --from-existing requires %s", strings.Join(missing, ", "))
 			}
 			// Loud v1→v2 wire-break warning: a one-way, flag-day migration. The daemon
 			// MUST be stopped, and ALL agents reinstalled on v2 afterward (a v1 agent
@@ -408,15 +423,20 @@ func newClusterInitCmd() *cobra.Command {
 			// Halt-and-print the restart sequence (tether does NOT orchestrate systemctl;
 			// d9-plan OQ-3). cluster mode needs the new nats.conf authorization{} ACL live
 			// before the broker connects.
+			routeURL := natsRoute
+			if routeURL != "" && !strings.Contains(routeURL, "://") {
+				routeURL = "nats://" + routeURL
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"cluster init --from-existing complete — %s is now a single-voter cluster (data_dir %s).\n"+
 					"NEXT (run in order):\n"+
-					"  1. tether cluster takeover-natsconf --secrets-dir %s   # rewrite /etc/tether/nats.conf (cluster + auth_callout)\n"+
+					"  1. tether cluster takeover-natsconf --secrets-dir %s --server-name %s --route-url %s --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>\n"+
+					"     # --account-issuer may be read from existing auth_callout; --broker-nkey is auto-read only from a single-user authorization block\n"+
 					"  2. systemctl restart nats-server                       # bring up the new conf\n"+
 					"  3. set broker.cluster.{data_dir,raft_addr,secrets_dir} in broker.yaml\n"+
 					"  4. systemctl start tether-broker                       # starts in cluster mode (N=1)\n"+
 					"  5. reinstall ALL agents on v2, then `tether cluster add` to grow to N>=3\n",
-				selfID, dataDir, secretsDir)
+				selfID, dataDir, secretsDir, selfID, routeURL)
 			return nil
 		},
 	}
@@ -432,6 +452,17 @@ func newClusterInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "this node's public tunnel control address")
 	cmd.Flags().StringVar(&publicHost, "public-host", "", "this node's public DNS host")
 	return cmd
+}
+
+func missingClusterInitFields(fields map[string]string) []string {
+	order := []string{"--self-id", "--name", "--node-ident-pub", "--raft-addr", "--nats-route", "--tunnel-addr", "--public-host"}
+	var missing []string
+	for _, name := range order {
+		if fields[name] == "" {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 // errNonLeader is a sentinel so RunE exits non-zero after the leader-redirect hint

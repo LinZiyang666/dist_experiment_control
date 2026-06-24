@@ -55,12 +55,16 @@ func TestD7ComputeHealth(t *testing.T) {
 		{NodeID: "c", Phase: phaseVoter, Role: "voter"},
 	}
 	// force-single dominates everything.
-	if h, _, _ := computeHealth(true, "a", 3, healthy); h != healthForceSingle {
+	if h, _, next := computeHealth(true, "a", 3, healthy); h != healthForceSingle {
 		t.Errorf("force-single: got %s", h)
+	} else if !strings.Contains(next, "--self-id") {
+		t.Errorf("force-single next step missing --self-id: %q", next)
 	}
 	// no leader => quorum-lost (exit 2), NOT from absence of reports but a positive empty-leader.
-	if h, _, _ := computeHealth(false, "", 3, healthy); h != healthQuorumLost {
+	if h, _, next := computeHealth(false, "", 3, healthy); h != healthQuorumLost {
 		t.Errorf("no-leader: got %s", h)
+	} else if !strings.Contains(next, "--self-id") || !strings.Contains(next, "--self-addr") {
+		t.Errorf("quorum-lost next step missing force-single identity flags: %q", next)
 	}
 	// N=3 all VOTER, leader present => HEALTHY_HA.
 	if h, _, _ := computeHealth(false, "a", 3, healthy); h != healthHealthyHA {
@@ -68,8 +72,10 @@ func TestD7ComputeHealth(t *testing.T) {
 	}
 	// N=2 => F==0 => DEGRADED even with a leader + all VOTER.
 	twoVoters := healthy[:2]
-	if h, _, _ := computeHealth(false, "a", 2, twoVoters); h != healthDegraded {
+	if h, _, next := computeHealth(false, "a", 2, twoVoters); h != healthDegraded {
 		t.Errorf("N=2: got %s", h)
+	} else if !strings.Contains(next, "<node-id>") || !strings.Contains(next, "--tunnel-addr") {
+		t.Errorf("F==0 next step missing full add workflow: %q", next)
 	}
 	// A CATCHING_UP node => DEGRADED.
 	joining := []adminsock.ClusterNodeStatus{

@@ -107,14 +107,23 @@ func writeD9Secrets(t *testing.T, ca *d9CA) string {
 	tunCert, tunKey := ca.signedLeafPEM(t, "tether-d9-tunnel")
 	mustWrite(t, filepath.Join(dir, "tunnel-cert.pem"), tunCert)
 	mustWrite(t, filepath.Join(dir, "tunnel-key.pem"), tunKey)
-	// node-ident.nk is the cluster join identity the startup SecretsPreflight requires (0600;
-	// presence + perms only). broker.nk/account.nk belong to auth_callout's own config, not
-	// the cluster secrets dir, so they are no longer required here.
+	// node-ident.nk is the cluster join identity; broker.nk/account.nk are the broker-bus
+	// and auth_callout account seeds cluster-mode serve defaults to cluster secrets for.
 	seed, err := auth.GenerateUserSeed()
 	if err != nil {
 		t.Fatalf("gen node-ident.nk: %v", err)
 	}
 	mustWrite(t, filepath.Join(dir, "node-ident.nk"), string(seed))
+	brokerSeed, err := auth.GenerateUserSeed()
+	if err != nil {
+		t.Fatalf("gen broker.nk: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "broker.nk"), string(brokerSeed))
+	accountSeed, err := auth.GenerateUserSeed()
+	if err != nil {
+		t.Fatalf("gen account.nk: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "account.nk"), string(accountSeed))
 	return dir
 }
 

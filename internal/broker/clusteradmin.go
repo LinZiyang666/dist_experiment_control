@@ -60,6 +60,11 @@ type ClusterAdmin struct {
 	// or an incomplete observation ⇒ actual is reported 0 (unknown / fail-closed, not green).
 	streamObserve func() (ReplicaReport, error)
 
+	// prepareTunnelCertRotate, when set by the production broker, verifies that the
+	// target fingerprint is present on disk and returns a commit callback that hot-swaps
+	// the live tunnel server cert after the DB pin update commits.
+	prepareTunnelCertRotate func(newFP string) (func(), error)
+
 	// issuedNonces is the leader-local single-use join-nonce store (OQ-5). `cluster
 	// add` step 1 issues a fresh nonce; step 2 (with the signed token) consumes it.
 	// This is a CONSISTENCY property, not a security boundary — §18.2.4 accepts a

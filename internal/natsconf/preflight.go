@@ -153,11 +153,10 @@ func hasIncludeDirective(raw string) bool {
 }
 
 // AuthIdentity extracts the cluster identity from the existing conf's §3.4 authorization
-// block: the auth_callout.issuer (the shared account pub == AccountIssuer) and the broker
-// bus nkey (the single user's nkey == this broker's NkeyPub). These are the LIVE identity
-// — feeding them into the regenerated authorization keeps server_name/issuer/nkey an SSOT
-// by construction (a mismatch would silently break auth_callout). Empty strings if the
-// block is absent (a fresh install.sh conf with no §3.4 auth yet).
+// block: the auth_callout.issuer (the shared account pub == AccountIssuer) and, only when
+// unambiguous, the broker bus nkey. Generated cluster configs contain one user per broker,
+// so a multi-user block cannot identify "this" node by position; callers must pass
+// --broker-nkey explicitly in that case. Empty strings if the block is absent or ambiguous.
 func (o *Ownership) AuthIdentity() (issuer, brokerNkey string) {
 	auth, ok := o.Parsed["authorization"].(map[string]any)
 	if !ok {
@@ -166,11 +165,18 @@ func (o *Ownership) AuthIdentity() (issuer, brokerNkey string) {
 	if ac, ok := auth["auth_callout"].(map[string]any); ok {
 		issuer, _ = ac["issuer"].(string)
 	}
-	// users: [{ nkey: "U..." }] — take the first user's nkey as the broker bus identity.
-	if users, ok := auth["users"].([]any); ok && len(users) > 0 {
-		if u, ok := users[0].(map[string]any); ok {
-			brokerNkey, _ = u["nkey"].(string)
+	var userNkeys []string
+	if users, ok := auth["users"].([]any); ok {
+		for _, raw := range users {
+			if u, ok := raw.(map[string]any); ok {
+				if nk, _ := u["nkey"].(string); nk != "" {
+					userNkeys = append(userNkeys, nk)
+				}
+			}
 		}
+	}
+	if len(userNkeys) == 1 {
+		brokerNkey = userNkeys[0]
 	}
 	return issuer, brokerNkey
 }

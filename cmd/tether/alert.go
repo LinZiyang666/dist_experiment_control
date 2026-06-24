@@ -30,6 +30,9 @@ func newAlertLsCmd() *cobra.Command {
 		Short: "List active cluster alerts (with cluster-level ack)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sid := cli.ReadCurrentSession(home)
+			if sid == "" {
+				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+			}
 			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {
@@ -63,6 +66,9 @@ func newAlertAckCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sid := cli.ReadCurrentSession(home)
+			if sid == "" {
+				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
+			}
 			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
 			if err != nil {

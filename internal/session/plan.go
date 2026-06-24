@@ -69,23 +69,40 @@ func PlanTombstone(db *sql.DB, sid string, now time.Time) (*cluster.Command, err
 	return cluster.NewCommand(cluster.OpSessionTombstone, cluster.Stmt(sql)), nil
 }
 
-// PlanHardDelete renders OpSessionHardDelete — the 7 ordered DELETEs of
+// PlanHardDelete renders OpSessionHardDelete — the ordered DELETEs of
 // dropSessionRows (internal/broker/audit.go) as ONE Command, so Apply removes the
 // whole session subtree in a single FSM txn (matching today's one-tx semantics).
-// No timestamps; sid is the only baked value.
-func PlanHardDelete(sid string) (*cluster.Command, error) {
+// It is fenced to the DELETING state: a stale finalizer for a previously deleted
+// same-sid session must not delete a newly-created ACTIVE replacement.
+func PlanHardDelete(db *sql.DB, sid string) (*cluster.Command, error) {
+	var state string
+	switch err := db.QueryRow(`SELECT state FROM sessions WHERE sid=?`, sid).Scan(&state); err {
+	case nil:
+		if state != string(StateDeleting) {
+			return nil, ErrDeleting
+		}
+	case sql.ErrNoRows:
+		// Idempotent retry after another finalizer already removed the row. Still
+		// return a no-op command so the forward/propose path has a concrete op.
+	default:
+		return nil, fmt.Errorf("session: plan hard delete lookup: %w", err)
+	}
 	sidL, err := cluster.LitText(sid)
 	if err != nil {
 		return nil, fmt.Errorf("session: plan hard delete literal: %w", err)
 	}
-	tables := []string{
+	childTables := []string{
 		"port_allocations", "processes", "proxy_subscribers",
-		"agent_provisioning", "nodes", "members", "sessions",
+		"agent_provisioning", "nodes", "members",
 	}
-	stmts := make([]cluster.Statement, len(tables))
-	for i, tbl := range tables {
-		stmts[i] = cluster.Stmt(`DELETE FROM ` + tbl + ` WHERE sid=` + sidL)
+	stmts := make([]cluster.Statement, 0, len(childTables)+1)
+	for _, tbl := range childTables {
+		stmts = append(stmts, cluster.Stmt(
+			`DELETE FROM `+tbl+` WHERE sid IN (`+
+				`SELECT sid FROM sessions WHERE sid=`+sidL+` AND state=`+cluster.MustLitText(string(StateDeleting))+`)`))
 	}
+	stmts = append(stmts, cluster.Stmt(
+		`DELETE FROM sessions WHERE sid=`+sidL+` AND state=`+cluster.MustLitText(string(StateDeleting))))
 	return cluster.NewCommand(cluster.OpSessionHardDelete, stmts...), nil
 }
 

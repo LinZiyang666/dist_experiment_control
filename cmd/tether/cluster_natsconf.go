@@ -27,8 +27,10 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 			if err != nil {
 				return err // refuses fail-closed on an unknown/include directive
 			}
-			// Identity SSOT: prefer the existing conf's §3.4 auth_callout; flags fill/override
-			// (a fresh install.sh conf has no auth yet, so the operator passes them).
+			// Identity SSOT: prefer the existing conf's §3.4 auth_callout; flags fill/override.
+			// Broker nkey auto-read is allowed only when the auth block has exactly one nkey
+			// user; generated multi-broker configs require --broker-nkey to avoid selecting a
+			// peer's nkey by list position.
 			ci, cn := own.AuthIdentity()
 			if accountIssuer == "" {
 				accountIssuer = ci
@@ -38,7 +40,8 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 			}
 			if accountIssuer == "" || brokerNkey == "" {
 				return fmt.Errorf("takeover-natsconf: need --account-issuer + --broker-nkey " +
-					"(or an existing §3.4 authorization block to read them from)")
+					"(account issuer may be read from existing auth_callout; broker nkey is auto-read only when " +
+					"the existing authorization block has exactly one nkey user)")
 			}
 			if serverName == "" || routeURL == "" {
 				return fmt.Errorf("takeover-natsconf: --server-name and --route-url are required")
@@ -104,7 +107,7 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (CA + route leaf)")
 	cmd.Flags().StringVar(&serverName, "server-name", "", "this broker's deterministic server_name (== cluster node_id)")
 	cmd.Flags().StringVar(&accountIssuer, "account-issuer", "", "shared account nkey pub; empty => read from the existing conf")
-	cmd.Flags().StringVar(&brokerNkey, "broker-nkey", "", "this broker's bus nkey pub; empty => read from the existing conf")
+	cmd.Flags().StringVar(&brokerNkey, "broker-nkey", "", "this broker's bus nkey pub; empty => read only when the existing conf has exactly one nkey user")
 	cmd.Flags().StringVar(&routeURL, "route-url", "", "this broker's NATS route URL, e.g. nats://10.0.0.1:6222")
 	cmd.Flags().StringVar(&clusterListen, "cluster-listen", "0.0.0.0:6222", "route listen address")
 	cmd.Flags().StringVar(&natsServerBin, "nats-server", "nats-server", "nats-server binary for the -t dry-run validation")

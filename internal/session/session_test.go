@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
@@ -62,6 +63,65 @@ func TestCreateRejectsDuplicate(t *testing.T) {
 	_, err := Create(db, "lab", "lab", ownerFP, pinHashed, time.Now())
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("expected ErrAlreadyExists, got %v", err)
+	}
+}
+
+func TestPlanHardDeleteRejectsActiveSession(t *testing.T) {
+	db := openDB(t)
+	if _, err := Create(db, "lab", "lab", ownerFP, pinHashed, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PlanHardDelete(db, "lab"); !errors.Is(err, ErrDeleting) {
+		t.Fatalf("PlanHardDelete active session err = %v, want ErrDeleting", err)
+	}
+	var state string
+	if err := db.QueryRow(`SELECT state FROM sessions WHERE sid='lab'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(StateActive) {
+		t.Fatalf("active session state changed to %q", state)
+	}
+}
+
+func TestPlanHardDeleteDeletesFullSubtree(t *testing.T) {
+	db := openDB(t)
+	now := time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC)
+	if _, err := Create(db, "lab", "lab", ownerFP, pinHashed, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(sid,nid,last_heartbeat_at,status) VALUES('lab','lab-1',?, 'ONLINE')`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO processes(pid, sid, nid, argv, started_at, status, started_by_fp) VALUES('p1','lab','lab-1','[]',?,'RUNNING',?)`, now, ownerFP); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO port_allocations(port,sid,nid,name,local_port,token_hash,state,created_by_fp,created_at) VALUES(14000,'lab','lab-1','web',8080,'hash','ALLOCATED',?,?)`, ownerFP, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO agent_provisioning(sid,nid,agent_fp,joined_at) VALUES('lab','lab-1','SHA256:agent',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO proxy_subscribers(sid,sub_id,name,token_hash,psk,cipher,created_by_fp,created_at) VALUES('lab','sub1','alice','subhash','psk','2022-blake3-aes-256-gcm',?,?)`, ownerFP, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := Tombstone(db, "lab", now); err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := PlanHardDelete(db, "lab")
+	if err != nil {
+		t.Fatalf("PlanHardDelete: %v", err)
+	}
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatalf("ExecCommand: %v", err)
+	}
+	for _, tbl := range []string{"sessions", "members", "nodes", "processes", "port_allocations", "agent_provisioning", "proxy_subscribers"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + tbl + ` WHERE sid='lab'`).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", tbl, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s rows after hard delete = %d, want 0", tbl, n)
+		}
 	}
 }
 

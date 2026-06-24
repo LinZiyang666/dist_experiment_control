@@ -28,6 +28,48 @@ func PlanFree(db *sql.DB, publicPort int, now time.Time) (*cluster.Command, erro
 	return planPortStateChange(db, cluster.OpPortFree, "FREED", publicPort, now)
 }
 
+// PlanFreeAllocation renders a fenced expose-rm free. Unlike PlanFree, the leader
+// re-checks the allocation identity selected by the caller before freeing so a stale
+// name->port read or a concurrent port reuse cannot free someone else's live row.
+func PlanFreeAllocation(db *sql.DB, a Allocation, now time.Time) (*cluster.Command, error) {
+	return planAllocationStateChange(db, cluster.OpPortFree, "FREED", "free", a, now)
+}
+
+// PlanRevokeAllocation renders a fenced offline-node revoke. It carries the
+// full allocation identity selected by the leader's offline scan so a stale scan
+// cannot revoke a newly-reused public port.
+func PlanRevokeAllocation(db *sql.DB, a Allocation, now time.Time) (*cluster.Command, error) {
+	return planAllocationStateChange(db, cluster.OpPortRevoke, "REVOKED", "revoke", a, now)
+}
+
+func planAllocationStateChange(db *sql.DB, op cluster.OpType, newState, label string, a Allocation, now time.Time) (*cluster.Command, error) {
+	var exists int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM port_allocations
+		  WHERE port=? AND sid=? AND nid=? AND name=? AND token_hash=? AND state='ALLOCATED'`,
+		a.Port, a.SID, a.NID, a.Name, a.TokenHash,
+	).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("port: plan %s allocation lookup: %w", label, err)
+	}
+	if exists == 0 {
+		return nil, ErrNotFound
+	}
+	lits, err := cluster.LitTextAll(a.SID, a.NID, a.Name, a.TokenHash)
+	if err != nil {
+		return nil, fmt.Errorf("port: plan %s allocation literal: %w", label, err)
+	}
+	sidL, nidL, nameL, hashL := lits[0], lits[1], lits[2], lits[3]
+	sql := `UPDATE port_allocations SET state=` + cluster.MustLitText(newState) +
+		`, revoked_at=` + cluster.LitTime(now.UTC()) +
+		` WHERE port=` + cluster.LitInt(int64(a.Port)) +
+		` AND sid=` + sidL +
+		` AND nid=` + nidL +
+		` AND name=` + nameL +
+		` AND token_hash=` + hashL +
+		` AND state='ALLOCATED'`
+	return cluster.NewCommand(op, cluster.Stmt(sql)), nil
+}
+
 // PlanRevoke renders OpPortRevoke (ALLOCATED -> REVOKED). Same shape as PlanFree.
 func PlanRevoke(db *sql.DB, publicPort int, now time.Time) (*cluster.Command, error) {
 	return planPortStateChange(db, cluster.OpPortRevoke, "REVOKED", publicPort, now)
@@ -53,7 +95,7 @@ func PlanRevoke(db *sql.DB, publicPort int, now time.Time) (*cluster.Command, er
 // home_broker=<lit>, epoch=0 (the per-port counter baseline, DA-3). When EMPTY
 // (every current caller — build-and-prove, cutover=D9) the INSERT is BYTE-
 // IDENTICAL to pre-D6 (home_broker/epoch take their migration-0010 defaults
-// '' / 0). The live port.Allocate direct mutator is unchanged and always EMPTY.
+// ” / 0). The live port.Allocate direct mutator is unchanged and always EMPTY.
 func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP, homeBroker string, cfg *Config) (*Allocation, *cluster.Command, error) {
 	low, high, now := cfgWithDefaults(cfg)
 
@@ -169,7 +211,7 @@ func PlanReassignHome(db *sql.DB, publicPort int, newHome string) (int64, *clust
 		state    string
 	)
 	switch err := db.QueryRow(
-		`SELECT epoch, state FROM port_allocations WHERE port=?`, publicPort,
+		`SELECT epoch, state FROM port_allocations WHERE port=? AND state='ALLOCATED'`, publicPort,
 	).Scan(&curEpoch, &state); {
 	case err == sql.ErrNoRows:
 		return 0, nil, ErrNotFound

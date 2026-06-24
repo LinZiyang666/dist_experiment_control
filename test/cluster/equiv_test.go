@@ -342,13 +342,12 @@ func TestDifferential_MultiOp_NonUTC(t *testing.T) {
 	compareMultiOp(t, buildMultiOp(t, false, now, cfg), buildMultiOp(t, true, now, cfg), "+0800")
 }
 
-// TestNodeRegister_IdentityOnly_NoLivenessColumns is the Stage C T7 column-level
-// liveness lint (§3.5 / d2-plan §6(c)): the OpNodeRegister rendered SQL must NEVER
-// name a leader-local liveness column (status/last_heartbeat_at/proxy_ready) — those
-// are owned by the leader-local liveness write + RebuildLiveness, not Apply. It MUST
-// name identity columns (non-vacuity). Also exercises the ON CONFLICT re-register
-// path (Stage C minor): the baked SQL carries the DO UPDATE clause.
-func TestNodeRegister_IdentityOnly_NoLivenessColumns(t *testing.T) {
+// TestNodeRegister_IdentityOnly_PreservesLivenessOnConflict is the Stage C T7
+// column-level liveness lint (§3.5 / d2-plan §6(c)). OpNodeRegister may set the
+// INSERT baseline status='OFFLINE' so a replicated identity row is not live before
+// a heartbeat, but its ON CONFLICT identity update must never touch status,
+// last_heartbeat_at, or proxy_ready.
+func TestNodeRegister_IdentityOnly_PreservesLivenessOnConflict(t *testing.T) {
 	now := time.Date(2026, 6, 21, 13, 14, 15, 0, time.UTC)
 	db := freshDB(t)
 	if _, err := session.Create(db, "lab", "lab", "o", "p", now); err != nil {
@@ -359,10 +358,20 @@ func TestNodeRegister_IdentityOnly_NoLivenessColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlText := strings.ToLower(cmd.Body[0].SQL)
-	for _, liveness := range []string{"status", "last_heartbeat_at", "proxy_ready"} {
+	for _, liveness := range []string{"last_heartbeat_at", "proxy_ready"} {
 		if strings.Contains(sqlText, liveness) {
 			t.Fatalf("OpNodeRegister SQL names leader-local liveness column %q — Apply must never write it (§3.5):\n%s", liveness, cmd.Body[0].SQL)
 		}
+	}
+	parts := strings.Split(sqlText, "do update set")
+	if len(parts) != 2 {
+		t.Fatalf("OpNodeRegister SQL missing ON CONFLICT DO UPDATE clause:\n%s", cmd.Body[0].SQL)
+	}
+	if !strings.Contains(parts[0], "status") || !strings.Contains(parts[0], "'offline'") {
+		t.Fatalf("OpNodeRegister insert must create an OFFLINE baseline status:\n%s", cmd.Body[0].SQL)
+	}
+	if strings.Contains(parts[1], "status") {
+		t.Fatalf("OpNodeRegister conflict update must preserve status:\n%s", cmd.Body[0].SQL)
 	}
 	// non-vacuity: it MUST write identity columns + carry the ON CONFLICT re-register clause.
 	for _, identity := range []string{"registered_at", "boot_id", "on conflict"} {
@@ -630,8 +639,11 @@ func TestSessionHardDelete_Equivalence(t *testing.T) {
 		if err := node.Register(db, node.RegisterInput{SID: "lab", NID: "lab-1", ProtoVersion: 2}, now); err != nil {
 			t.Fatal(err)
 		}
+		if err := session.Tombstone(db, "lab", now); err != nil {
+			t.Fatal(err)
+		}
 		if useFSM {
-			cmd, err := session.PlanHardDelete("lab")
+			cmd, err := session.PlanHardDelete(db, "lab")
 			if err != nil {
 				t.Fatal(err)
 			}

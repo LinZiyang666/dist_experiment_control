@@ -34,7 +34,7 @@ agent。三种角色全部由同一个二进制 `tether` 提供，子命令切�
 
 | 角色 | 子命令 | 部署位置 | 数量 |
 |---|---|---|---|
-| broker | `tether serve` | 公网服务器（需 sudo / 域名 / TLS） | 1 |
+| broker | `tether serve` | 公网服务器（需 sudo / 域名 / TLS） | 1；分布式 HA 时每个 broker 节点 1 个 |
 | agent  | `tether agent` | 实验机（NAT 后） | N |
 | ctl    | `tether login` / `exec` / `run` / `expose` / `ps` / `history` / ... | 使用者笔记本 | M |
 
@@ -50,6 +50,10 @@ ctl  ──── NATS WSS 443 ────►   |           ◄── NATS 4222
 
 - **控制面**：NATS（命令、注册、心跳、审计）。CLI 走 wss://，agent 走 wss://，
   broker 与本机 nats-server 走 nats://。
+  分布式 HA 时 ctl/agent 的 `--nats-url` / `broker_url` 可写逗号分隔 seed list，
+  例如 `wss://b1.example:443,wss://b2.example:443,wss://b3.example:443`；NATS
+  客户端会自动发现/切换其它 server。broker 自己仍连本机 NATS
+  `nats://127.0.0.1:4222`。
 - **数据面**：内置 yamux-over-TCP 反向隧道（`internal/tunnel`）。`tether expose`
   把 agent 上的本地端口反向打到 broker 的 14000-14999 公网带，URL 形如
   `http://<broker>:<port>`。
@@ -64,7 +68,7 @@ ctl  ──── NATS WSS 443 ────►   |           ◄── NATS 4222
 
 | 术语 | 含义 |
 |---|---|
-| **broker**   | 公网中心节点，跑 `tether serve` + nats-server + Caddy。集群唯一。 |
+| **broker**   | 公网中心节点，跑 `tether serve` + nats-server + Caddy。单机模式唯一；分布式 HA 时每个 broker 节点各跑一套。 |
 | **agent**    | NAT 后被远程操作的实验机，跑 `tether agent`。一台一个进程，可多 session。 |
 | **ctl**      | 使用者本地的 CLI（不长驻），跑 `tether login` / `exec` / `run` 等。 |
 | **session (sid)** | 隔离单位 = 一组 agent + 一组使用者 + 一段 history。形如 `01HABC...`。 |
@@ -156,8 +160,8 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 - `/etc/systemd/system/{nats-server, tether-broker, caddy}.service`
 - `/var/{lib,log,run}/tether`（属主 `tether` 系统用户，`install.sh` 自动 useradd）
 
-> **分布式 HA（proto v2）补充**：升级成集群时，tether 接管 `nats.conf`（`tether cluster
-> takeover-natsconf`，见 §3.4）并留 `nats.conf.bak.<ts>`；§15 secrets（`/etc/tether/secrets/`：
+> **分布式 HA（proto v2）安装边界**：升级成集群时，tether 接管 `nats.conf`（`tether cluster
+> takeover-natsconf`，见 §3.4）并留 `nats.conf.bak.<ts>`；cluster secrets（`/etc/tether/secrets/`：
 > `cluster-ca.pem`、`route-cert.pem`/`route-key.pem`、稳定 `tunnel-cert.pem`/`tunnel-key.pem`、
 > `broker.nk`、`node-ident.nk`、`account.nk`，私钥 0600）须先 provision（`tether cluster doctor`
 > 预检：缺/不可读/私钥权限松 = 拒；FDE 缺 = advisory）。现网单点→N≥3 的一次性迁移全流程 +
@@ -314,6 +318,10 @@ broker:
     url_allow:                         # `tether node upgrade` 白名单（可选）
       - https://github.com/LinZiyang666/dist_experiment_control/releases/
       - https://releases.example.com/tether/   # 追加自托管镜像（可选）
+  cluster:                             # 分布式 HA 时填写；空/无 raft state = 单机模式
+    data_dir: /var/lib/tether          # holds raft/ + tether.db
+    raft_addr: 10.0.0.1:7400           # 私网 Raft transport
+    secrets_dir: /etc/tether/secrets   # cluster-ca/route/tunnel/node-ident/broker/account seeds
 ```
 
 修改后 `sudo systemctl restart tether-broker` 生效（不支持热重载）。
@@ -327,6 +335,12 @@ broker:
 非法输入直接 fatal 退出（避免操作员把 `1400-1499` 写成 `14000-14999` 后默默落
 回默认）。
 
+`broker.cluster.*` 只在完成 `tether cluster init --from-existing` 后开启。cluster
+模式下 `tether serve` 不再直接打开 `broker.storage.db` 写库，而由 Raft 节点持有唯一
+WAL writer；同时默认从 `broker.cluster.secrets_dir` 读取 `broker.nk` + `account.nk`
+启用 auth_callout。只有把 seeds 放到非 secrets_dir 路径时才需要额外传
+`--auth-callout-seeds-dir`。
+
 ### 3.4 nats-server.conf 启用 auth_callout
 
 `install.sh --role broker` 默认写出的 nats.conf 已经预留 auth_callout 占位但
@@ -336,10 +350,12 @@ auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`，
 
 > **单 broker（非集群）保持本节的手动流程不变**——`install.sh` 写 nats.conf + 你按下面手动加
 > `authorization{}`，是单 broker 的受支持路径。**分布式 HA（proto v2）下不要手改 nats.conf**：改用
-> `tether cluster takeover-natsconf`（D9）让 tether 接管——它在保留 install.sh 的 websocket/jetstream +
+> `tether cluster takeover-natsconf` 让 tether 接管——它在保留 install.sh 的 websocket/jetstream +
 > 已记录的调优指令（如 `max_payload`）的前提下重写出集群指令（routes mTLS + auth_callout + per-broker
 > ACL），遇到不认识的指令会 fail-closed 拒绝（不静默覆盖手调 conf），并留一份 pristine `.bak`。整套
 > 现网单点→集群的一次性迁移见 §2.3 指向的 `docs/cluster-runbook.md` 第 4 节。
+> 已生成的多 broker `authorization.users` 里有多个 nkey，`takeover-natsconf` 不会按列表位置猜本机
+> broker nkey；这种情况下每台机器必须显式传本机的 `--broker-nkey`。
 
 #### 第 1 步：生成 broker.nk + account.nk
 
@@ -462,8 +478,9 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 # 不应再报 "nkeys not supported"
 ```
 
-未配 `--auth-callout-seeds-dir` 时 broker 以 P2 模式运行（无 NATS 层身份强制，
-仅适合 dev / 内网 demo）。
+单 broker 未配 `--auth-callout-seeds-dir` 时以 P2 模式运行（无 NATS 层身份强制，
+仅适合 dev / 内网 demo）。cluster 模式例外：`tether serve` 会默认从
+`broker.cluster.secrets_dir` 读取 `broker.nk` / `account.nk`。
 
 ---
 
@@ -479,13 +496,16 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | 创建 / 删除 session | `tether session create` / `tether session rm` |
 | 看看远端跑了什么 / 占了哪些端口 | `tether ps` |
 | 在远端跑一条命令 | `tether exec`（脚本类）/ `tether run`（交互类） |
-| 杀掉远端进程 | `tether run` 里按 Ctrl-C；或下次 v2 加 `tether kill` |
+| 杀掉远端进程 | `tether run` 里按 Ctrl-C；当前没有独立 `tether kill` 命令 |
 | 把远端服务暴露到公网 | `tether expose` / `tether expose rm` |
 | 把整组 agent 变成 Clash 订阅出口 | `tether proxy on/off` + `tether proxy sub create/ls/revoke` |
 | 把文件上传/下载到远端 | `tether push` / `tether pull` |
 | 查"过去发生了什么" | `tether history`（含 `--follow` 实时模式） |
 | 给远端 agent 升级 | `tether node upgrade` / `... --all` |
 | 在 broker 主机上做运维 | `tether admin sessions/nodes/audit/evict` |
+| 管理分布式 broker 集群 | `tether cluster init/add/status/drain/remove/...`（§5.6，完整流程见 `docs/cluster-runbook.md`） |
+| 查看 / 确认 store-backed cluster 告警 | `tether alert ls` / `tether alert ack <dedup_key>` |
+| 生成 shell 补全脚本 | `tether completion bash|zsh|fish|powershell` |
 
 完整速查：
 
@@ -496,6 +516,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether agent`                         | agent  | 启动 agent 守护进程 |
 | `tether agent --install-user-service`  | agent  | 写 systemd --user unit（不启动） |
 | `tether agent --uninstall`             | agent  | 删 systemd --user unit |
+| `tether completion <shell>`            | 任意 | 生成 shell 补全脚本 |
 | `tether login`                         | ctl    | 加载 nkey 身份；可选激活 session |
 | `tether logout`                        | ctl    | 清空 `current_session` |
 | `tether ctx`                           | ctl    | 打印当前激活 session |
@@ -503,11 +524,11 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether session ls`                    | ctl    | 列出可见 session |
 | `tether session rm <sid>`              | ctl    | tombstone（owner 限定） |
 | `tether ps [-a]`                       | ctl    | 当前 session 的进程 + 端口 |
-| `tether exec <nid> -- argv ...`        | ctl    | 非交互远程命令 |
-| `tether run <nid> -- argv ...`         | ctl    | 交互式 PTY |
+| `tether exec [flags] <nid> -- argv ...` | ctl   | 非交互远程命令 |
+| `tether run [flags] <nid> -- argv ...` | ctl    | 交互式 PTY |
 | `tether expose <nid> --local P --name N [--remote-port R]` | ctl  | 暴露端口（可选指定公网端口 R） |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
-| `tether proxy on / off`                | ctl(owner) | 代理订阅总开关（自建机场，§5.9.5） |
+| `tether proxy on / off`                | ctl(owner) | 代理订阅总开关（自建机场，§5.15；当前 cluster HA 模式不支持） |
 | `tether proxy status`                  | ctl    | 看开关/在线节点/订阅（member 可读，无密钥） |
 | `tether proxy sub create --name N`     | ctl(owner) | 签发订阅 URL（只打印一次） |
 | `tether proxy sub ls / revoke <name>`  | ctl(owner) | 列 / 撤销订阅 |
@@ -517,6 +538,19 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether node ls [-a]`                  | ctl    | 列 session 内全部 agent（含 OFFLINE / STALE） |
 | `tether node upgrade <nid>`            | ctl    | 升级单台 agent（owner） |
 | `tether node upgrade --all`            | ctl    | 升级 session 内所有 ONLINE agent |
+| `tether cluster status [--json|--offline]` | broker 本机 | 查看 cluster health / roster |
+| `tether cluster doctor`                | broker 本机 | 预检 cluster secrets |
+| `tether cluster init --from-existing`  | broker 本机/离线 | 把单 broker 迁移为第一个 cluster voter |
+| `tether cluster takeover-natsconf`     | broker 本机 | 接管 / 重渲染 NATS route + auth_callout 配置 |
+| `tether cluster add`                   | broker 本机 | 两阶段接纳新 voter |
+| `tether cluster sign-join`             | joining broker | 用 node identity 签 join nonce |
+| `tether cluster node-pub` / `keygen`   | broker 本机 | 打印 / 生成 node identity |
+| `tether cluster drain` / `remove`      | broker 本机 | 迁移或移除 broker voter |
+| `tether cluster transfer-leader`       | broker 本机 | 转移 Raft leadership |
+| `tether cluster rotate-tunnel-cert`    | broker 本机 | 轮换 broker 稳定 tunnel 证书 pin |
+| `tether cluster force-single/recover`  | broker 离线 | quorum-loss 逃生 / returning-node 清理 |
+| `tether alert ls`                      | ctl    | 列出当前 active store-backed cluster alerts |
+| `tether alert ack <dedup_key>`         | ctl    | 确认一个 store-backed cluster alert |
 | `tether admin sessions`                | broker 本机 | 列所有 session |
 | `tether admin nodes`                   | broker 本机 | 列所有节点 |
 | `tether admin audit <sid> [-n N]`      | broker 本机 | 审计尾部 N 条 |
@@ -528,12 +562,12 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 
 ### 5.1 全局 flag
 
-所有需要连 NATS 的子命令都接受：
+常用 ctl 子命令接受：
 
 | flag | 默认 | 说明 |
 |---|---|---|
-| `--nats-url`  | `nats://127.0.0.1:4222` | 连 broker 的 NATS 入口（ctl 通常 `wss://broker:443`） |
-| `--home`      | `~/.tether`             | tether 的家目录 |
+| `--nats-url`  | 显式 flag > `TETHER_NATS_URL` > `~/.tether/broker_url` > `nats://127.0.0.1:4222` | 连 broker 的 NATS 入口（ctl 通常 `wss://broker:443`；cluster 可写逗号分隔 seed list） |
+| `--home`      | `~/.tether`             | tether 的家目录；ctl 从这里读 nkey、`current_session`、默认 broker URL |
 
 `tether agent` / `tether serve` 各自还有专属 flag，详见下文。
 
@@ -541,7 +575,7 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 所有 `-flag` 都视为远程 argv 的一部分，避免 cobra 把 `ls -la` 当成自己的参数解析
 失败。
 
-### 5.1.5 `tether version`
+### 5.2 `tether version`
 
 **这是什么**：打印 tether 二进制的 release version、proto wire 版本、
 平台 (`linux/amd64`)、Go 编译器版本。**不需要任何配置或网络**。
@@ -558,12 +592,31 @@ tether version
 
 输出示例：
 ```
-tether v0.0.0-dev (proto v1)
+tether v0.0.0-dev (proto v2)
 linux/amd64
 go1.25.0
 ```
 
-### 5.1.6 控制面代理（proxy-aware dial）
+### 5.3 `tether completion`
+
+**这是什么**：生成 shell 补全脚本。它是 Cobra 自动提供的本地命令，不连接 broker，
+不读取 session，也不受 cluster 状态影响。
+
+```
+tether completion bash
+tether completion zsh
+tether completion fish
+tether completion powershell
+```
+
+参数：
+
+| 参数 / flag | 默认 | 说明 |
+|---|---|---|
+| `bash` / `zsh` / `fish` / `powershell` | (必填) | 目标 shell 类型；输出写到 stdout，由你按 shell 规则安装 |
+| `--no-descriptions` | false | 生成补全脚本时不包含命令描述；bash/zsh/fish/powershell 都支持 |
+
+### 5.4 控制面代理（proxy-aware dial）
 
 **这是什么**：让 tether 的**控制面 NATS 连接**经一个本地代理（如 Clash `127.0.0.1:7897`）出网。**默认不开**——只有设了代理 env（`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`）时才生效；没设时行为与以前逐字节一致。
 
@@ -601,15 +654,15 @@ tether ps                                      # 经代理连 weiland.top:443，
 
 **排查**：先验代理本身通：`curl -x $HTTPS_PROXY https://<broker>:443 -k`（能连上代理即说明 7897 可用）。代理不可达/认证失败/`NO_PROXY` 误把 broker 列进去导致仍直连，错误信息会点名（凭据不回显）。
 
-### 5.2 `tether serve`（broker）
+### 5.5 `tether serve`（broker）
 
 ```
 tether serve [--config /etc/tether/broker.yaml] [flag...]
 ```
 
 **这是什么**：broker 守护进程的入口。在公网服务器上长驻，扮演 NATS 订阅者
-+ 节点状态机 + 反向隧道控制端 + 审计 sink + 端口分配器。整个 tether 集群
-有且只有一个 `tether serve`。
++ 节点状态机 + 反向隧道控制端 + 审计 sink + 端口分配器。单机模式只有一个
+`tether serve`；分布式 HA 模式每个 broker 节点各运行一个 `tether serve`。
 
 **核心职责**：
 1. **NATS 鉴权与路由**：通过 `auth_callout` 校验 ctl/agent 的 nkey，把命令
@@ -632,17 +685,202 @@ debug）。普通使用者不会接触此命令。
 | `--config`               | (空)                           | — |
 | `--nats-url`             | `nats://127.0.0.1:4222`        | `broker.nats.url` |
 | `--db`                   | `./tether.db`                  | `broker.storage.db` |
-| `--auth-callout-seeds-dir` | (空 = P2 dev 模式)            | — |
+| `--auth-callout-seeds-dir` | (空 = 单机 P2 dev；cluster 默认用 `broker.cluster.secrets_dir`) | — |
 | `--public-host`          | `localhost`                    | `broker.public_host`，缺则 `broker.domain` |
 | `--tunnel-addr`          | `0.0.0.0:7000`                 | `broker.frp.control_listen` |
 | `--tunnel-public-host`   | `0.0.0.0`                      | `broker.frp.bind_addr` |
 | `--store-dir`            | (空 = 不监控)                   | `broker.storage.js_store` |
+| `--sub-http-listen`      | (空 = 禁用)                     | `broker.sub.listen` |
 | `--admin-socket`         | `/var/run/tether/admin.sock`   | `broker.admin.socket` |
 | `--upgrade-url-allow` (slice) | (空 ⇒ 退回内置默认 = 本仓库 GitHub release 前缀)  | `broker.upgrade.url_allow` |
+| `--cluster-data-dir`     | (空)                           | `broker.cluster.data_dir` |
+| `--cluster-raft-addr`    | (空)                           | `broker.cluster.raft_addr` |
+| `--cluster-secrets-dir`  | (空)                           | `broker.cluster.secrets_dir` |
+
+cluster 模式由 `--cluster-data-dir` 下的 raft state 触发，不是单靠 yaml 字段触发。
+启动前必须先跑 `tether cluster init --from-existing`；完整步骤见
+`docs/cluster-runbook.md` 第 4 节。集群内部还需要私网 `:7400` Raft 和 `:6222`
+NATS route；不要暴露到公网。
 
 启动后处理 `SIGINT/SIGTERM` 优雅退出（tunnel 等所有子组件按 ctx 拆解）。
 
-### 5.3 `tether agent`
+### 5.6 `tether cluster`（分布式 broker 管理）
+
+```
+tether cluster <command> [flag...]
+```
+
+**这是什么**：proto v2 的分布式 broker 运维入口。它不替代 `tether serve`；
+`serve` 仍是每台 broker 的守护进程，`cluster` 负责把单点 broker 迁移到 Raft
+集群、接纳/移除 voter、生成接入 nonce、接管 nats.conf、检查 cluster secrets，以及
+quorum-loss 的离线逃生。
+
+核心术语：
+
+| 术语 | 含义 |
+|---|---|
+| `node-id` / `self-id` | broker 节点的稳定 id；同时作为 Raft ServerID、NATS `server_name`、`cluster_nodes.node_id` |
+| `node-ident.nk` | 节点身份 nkey seed，私钥文件 0600；用于 `sign-join` 证明“加入者确实持有这个 node id 的身份” |
+| `node-pub` / `node-ident-pub` | `node-ident.nk` 对应公钥，`cluster add` 的第三个位置参数 |
+| `voter` | Raft 投票成员；N=3 时允许坏 1 台，N=5 时允许坏 2 台 |
+| `leader` | 当前 Raft 写入 leader；在线 membership / drain / status 经 leader 协调 |
+| `quorum` | 可写多数；失去 quorum 后集群只读，破坏性 ctl 命令会被 severe alert 拦住 |
+| `force-single` | quorum 丢失逃生：在确认其它 peer 都死后，把幸存节点离线改写成单 voter；无 HA / 无完整性保证，必须尽快 recover |
+| `returning node` | 曾经属于旧时间线、后来要回来的节点；必须先 `recover` 清理旧 DB/raft，再按新节点 rejoin |
+| `raft_addr` | broker 私网 Raft transport 地址，通常 `<private-ip>:7400` |
+| `nats_route` | broker 私网 NATS route 地址，通常 `nats://<private-ip>:6222` |
+| `tunnel_addr` | agent 反向 tunnel 连接的 broker 地址，通常 `<public-host>:7000` |
+| `public_host` | 输出给用户 / agent 的公网 DNS host，不是私网 raft 地址 |
+| `cert-fp` | 稳定 tunnel server 证书指纹，格式 `sha256:<hex>`；agent 用它 pin home broker |
+
+命令类型：
+
+| 类型 | 子命令 | 在哪里跑 |
+|---|---|---|
+| 在线 admin socket | `add` / `remove` / `drain` / `status` / `transfer-leader` / `rotate-tunnel-cert` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
+| 离线/本机磁盘操作 | `init --from-existing` / `force-single` / `recover` / `doctor` / `takeover-natsconf` / `keygen` / `node-pub` / `sign-join` | 对应 broker 主机；`force-single`、`recover` 要先停 daemon |
+
+全局 flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--socket` | `/var/run/tether/admin.sock` | 在线 admin socket 子命令连接的本机 Unix socket；离线命令通常不使用它 |
+
+最小迁移骨架：
+
+```bash
+# 现网单点 broker -> 第一个 cluster voter
+sudo systemctl stop tether-broker
+
+sudo tether cluster init --from-existing \
+  --self-id <node-1> --name <name> --node-ident-pub <Uxxxx...> \
+  --raft-addr <private-host:7400> --nats-route <private-host:6222> \
+  --tunnel-addr <public-host:7000> --public-host <public-dns> \
+  --secrets-dir /etc/tether/secrets
+
+# 让 tether 接管 nats.conf，写入 routes mTLS + auth_callout
+sudo tether cluster takeover-natsconf --server-name <node-1> \
+  --route-url nats://<private-host:6222> \
+  --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
+
+sudo systemctl restart nats-server
+sudo tether cluster status --offline --db /var/lib/tether/tether.db
+sudo systemctl start tether-broker
+tether cluster status
+```
+
+接纳新 voter 是两阶段流程：leader 先 `cluster add` 生成 nonce，joining 节点
+`cluster sign-join` 签名，leader 再带 `--join-token <nonce>:<sigHex>` 重跑
+`cluster add`。完整命令、顺序、回滚和故障演练以 `docs/cluster-runbook.md` 为准；
+`usage.md` 这里只放入口和常用边界，避免把危险的 quorum 操作写成随手复制的命令块。
+
+注意：`cluster add` 只改变 Raft membership，不会自动形成 NATS route/auth mesh。
+新增或移除 broker 后，要在每台 broker 上用完整 peer set 重跑
+`cluster takeover-natsconf`，滚动重启 `nats-server`（leader 最后），再用
+`cluster status` 验证。`drain --retire` / `remove` 也只移除 roster + Raft 成员；
+如果退役节点可能泄漏了 `account.nk` 或 CA，还要按 runbook 轮换 secrets。
+
+子命令与参数：
+
+| 命令 | 参数 / flag | 默认 | 说明 |
+|---|---|---|---|
+| `cluster status` | `--json` | false | 输出稳定 JSON schema；脚本用这个，不解析人类表格 |
+| `cluster status` | `--offline` | false | 不走 admin socket，直接读本机 DB roster；daemon 停止或排障时用 |
+| `cluster status` | `--db` | `/var/lib/tether/tether.db` | `--offline` 时读取的 DB 路径 |
+| `cluster init --from-existing` | `--from-existing` | false | 必填；只支持把现网单 broker 迁移为第一个 voter，不自动创建空集群 |
+| `cluster init --from-existing` | `--data-dir` | `/var/lib/tether` | broker data dir；`raft/` 会创建在这里 |
+| `cluster init --from-existing` | `--db` | `/var/lib/tether/tether.db` | 要迁移的现有 SQLite DB |
+| `cluster init --from-existing` | `--secrets-dir` | `/etc/tether/secrets` | cluster secrets 目录，含 cluster CA、route leaf、tunnel cert/key、node/account/broker seeds |
+| `cluster init --from-existing` | `--self-id` | (必填) | 当前 broker 的 cluster node id / Raft ServerID / NATS server_name |
+| `cluster init --from-existing` | `--name` | (必填) | 人类可读 broker 名；cluster 内唯一 |
+| `cluster init --from-existing` | `--node-ident-pub` | (必填) | 当前节点 `node-ident.nk` 的公钥 |
+| `cluster init --from-existing` | `--raft-addr` | (必填) | 当前节点私网 Raft 地址，形如 `<host>:7400` |
+| `cluster init --from-existing` | `--nats-route` | (必填) | 当前节点私网 NATS route 地址，形如 `<host>:6222` 或 `nats://<host>:6222` |
+| `cluster init --from-existing` | `--tunnel-addr` | (必填) | agent 应拨入的 tunnel control 地址，形如 `<public-host>:7000` |
+| `cluster init --from-existing` | `--public-host` | (必填) | 用户可见公网 DNS host，用于 expose URL / home directive |
+| `cluster doctor` | `--secrets-dir` | `/etc/tether/secrets` | 检查 cluster secrets；缺失/不可读/私钥权限过松为 fatal，FDE 仅 advisory |
+| `cluster takeover-natsconf` | `--conf` | `/etc/tether/nats.conf` | 要接管并重写的 nats-server.conf；会保留 pristine `.bak` |
+| `cluster takeover-natsconf` | `--secrets-dir` | `/etc/tether/secrets` | cluster CA + route cert/key 所在目录 |
+| `cluster takeover-natsconf` | `--server-name` | (必填) | 本 broker 的 deterministic NATS `server_name`，等于 cluster node id |
+| `cluster takeover-natsconf` | `--account-issuer` | 从现有 conf 读取 | shared account public nkey；空时只从现有 auth_callout issuer 读取 |
+| `cluster takeover-natsconf` | `--broker-nkey` | 从现有 conf 读取 | 本 broker bus nkey 公钥；只有现有 auth block 恰好一个 nkey user 时才自动读取，多 user 必须显式传 |
+| `cluster takeover-natsconf` | `--route-url` | (必填) | 本 broker 对其它 broker 暴露的 route URL，如 `nats://10.0.0.1:6222` |
+| `cluster takeover-natsconf` | `--cluster-listen` | `0.0.0.0:6222` | NATS route listen 地址，只应在 broker 私网开放 |
+| `cluster takeover-natsconf` | `--peer` | 可重复 | 其它 broker，格式 `server_name,route_url,bus_nkey`；多 peer 重复传，构成 full mesh |
+| `cluster takeover-natsconf` | `--nats-server` | `nats-server` | 用于 `nats-server -t` dry-run 校验的二进制 |
+| `cluster takeover-natsconf` | `--skip-dry-run` | false | 跳过 `nats-server -t` 校验；不推荐，只在目标机没有 nats-server 时临时使用 |
+| `cluster add` | `<node-id>` | (必填) | 要接纳的新 voter node id |
+| `cluster add` | `<host>` | (必填) | 新 voter 的 Raft 地址，通常 `<private-host>:7400` |
+| `cluster add` | `<node-pub>` | (必填) | 新 voter 的 node identity 公钥 |
+| `cluster add` | `--join-token` | (空) | 第二阶段必填，格式 `<nonce>:<sigHex>`；来自 joining 节点 `cluster sign-join` |
+| `cluster add` | `--tunnel-addr` | 第二阶段必填 | 新 voter 的公网 tunnel control 地址，缺失会导致该 voter 不能成为 expose home |
+| `cluster add` | `--cert-fp` | 第二阶段必填 | 新 voter 稳定 tunnel cert 指纹，`sha256:<hex>` |
+| `cluster add` | `--public-host` | `<host>` | 新 voter 的公网 host；不要让它默认成私网 raft host，公网部署应显式传 |
+| `cluster add` | `--nats-route` | 第二阶段必填 | 新 voter 的 NATS route URL，如 `nats://10.0.0.2:6222` |
+| `cluster sign-join` | `<node-id>` | (必填) | joining 节点自己的 node id，必须与 leader nonce 对应 |
+| `cluster sign-join` | `<nonce>` | (必填) | leader 第一次 `cluster add` 返回的 nonce |
+| `cluster sign-join` | `--seed` | `/etc/tether/node-ident.nk` | joining 节点的 node identity seed |
+| `cluster node-pub` | `--seed` | `/etc/tether/node-ident.nk` | 读取 seed 并打印公钥，给 leader 的 `cluster add` 使用 |
+| `cluster keygen` | `--out` | (空) | 写 node identity seed 到指定路径，0600；空值只打印 pubkey 不落 seed |
+| `cluster drain` | `<node-id>` | (必填) | 要迁移 expose / 准备退休的 voter |
+| `cluster drain` | `--retire` | false | drain 完后从 Raft config + roster 移除该节点 |
+| `cluster drain` | `--now` | false | 跳过 drain notice period，立即迁移 |
+| `cluster drain` | `--abort` | false | 取消正在进行的 drain，把节点 phase 退回 `VOTER` |
+| `cluster remove` | `<node-id>` | (必填) | 直接从 Raft config + roster 移除；优先用 `drain --retire` |
+| `cluster transfer-leader` | `<node-id>` | (必填) | 把 Raft leadership 交给一个 caught-up voter |
+| `cluster rotate-tunnel-cert` | `<node-id>` | (必填) | 目标 broker node id；必须在目标 broker 上执行并让其成为 leader |
+| `cluster rotate-tunnel-cert` | `--cert-fp` | (必填) | 新稳定 tunnel cert 指纹；DB pin 更新后当前/previous pin 进入旋转窗口 |
+| `cluster force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；daemon 必须停止 |
+| `cluster force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径 |
+| `cluster force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认 |
+| `cluster force-single` | `--self-addr` | (必填) | 当前幸存节点 Raft 地址，形如 `<host>:7400` |
+| `cluster force-single` | `--confirm-peers-dead` | (必填，可逗号分隔) | roster 中其它所有节点 id；命令会探测它们 `:7400` 仍可达则拒绝 |
+| `cluster recover` | `--data-dir` | `/var/lib/tether` | returning node 的 broker data dir；daemon 必须停止 |
+| `cluster recover` | `--db` | `/var/lib/tether/tether.db` | returning node 的 DB 路径 |
+| `cluster recover` | `--dump-divergent` | (必填) | forensic dump 输出路径，0600，必须不存在 |
+| `cluster recover` | `--self-id` | (必填) | 被清理节点 id；命令会要求人工输入它确认 |
+
+`cluster status` 退出码可用于监控：`0` = HEALTHY-HA，`1` = DEGRADED，
+`2` = read-only / quorum-lost，`3` = force-single。`drain --retire` 在退役后
+故障容忍度 F=0 时要求手工输入 node id；`cluster remove` 每次都要求手工输入
+node id；`force-single` 和 `recover` 都不会接受 `--yes`，必须停 daemon 并手工确认。
+这些交互确认是为了避免脚本误删 voter 或把旧时间线塞回新 cluster。
+
+### 5.7 `tether alert`（cluster alerts）
+
+```
+tether alert ls
+tether alert ack <dedup_key>
+```
+
+**这是什么**：查看和确认当前 active session 可见的 store-backed cluster alert。
+alert 是 broker/cluster 级别的健康信号，不是某个 agent 的进程事件；典型 kind 包括
+`manual`、`below_quorum`、`broker_draining`、`broker_down`、
+`replication_degraded`、`disk_pressure`、`raft_lag`。
+
+子命令与参数：
+
+| 命令 | 参数 / flag | 默认 | 说明 |
+|---|---|---|---|
+| `alert ls` | `--nats-url` | 同 §5.1 全局解析链 | broker NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `alert ls` | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+| `alert ack` | `<dedup_key>` | (必填) | 要确认的 alert key，来自 `alert ls` 输出 |
+| `alert ack` | `--nats-url` | 同 §5.1 全局解析链 | broker NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `alert ack` | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
+`dedup_key` 是 broker 存储 alert 的稳定去重键：同一个问题 active 期间只保留一条
+alert，不会刷屏生成重复条目。`alert ack` 是 store-backed alert 的 cluster-level
+ack：它记录“团队已经看过/有人处理”，不会删除 active alert，也不会修复底层问题。
+真正恢复仍要跑 `tether cluster status` 并按 runbook 修复。
+
+与 `--ack-alerts` 的关系：`--ack-alerts` 是某次 destructive 命令的临时确认；
+`alert ack` 是把某个 store-backed `dedup_key` 标记为已确认，方便团队协作时区分
+“没人看过”和“已有人在处理”。`quorum_lost` / `force_single_active` 是 ctl 根据
+cluster health 临时合成的 destructive gate，不会出现在 `alert ls` 的 dedup_key 里，
+也不能用 `alert ack` 解除；每次确需继续操作时只能在对应 destructive 命令上显式加
+`--ack-alerts`。两者都不绕过 broker 端权限和 quorum 规则。
+
+### 5.8 `tether agent`
 
 ```
 tether agent --session <sid> [--nid <nid>] [--pin <pin>] [flag...]
@@ -683,10 +921,19 @@ tether agent --session <sid> [--nid <nid>] [--pin <pin>] [flag...]
 写进 `ExecStart`，cobra 默认值不写（默认值由 agent.yaml 提供）。`TETHER_HOME`
 环境变量也会通过 `Environment=` 写进 unit。
 
+分布式 HA 影响：`broker_url` / `--nats-url` 可以写逗号分隔 seed list，例如
+`wss://b1.example:443,wss://b2.example:443,wss://b3.example:443`，NATS client 会自动
+重连和发现其它 broker。`--tunnel-addr` / `agent.yaml tunnel_addr` 是单 broker
+和未 homed expose 的 fallback；cluster 模式下每个 expose 会从 broker 收到 home
+directive。这里的 home directive 是 broker 下发给 agent 的隧道目标；home broker 是
+当前负责某个 expose 公网 listener 的 broker；epoch 是每次 rehome 递增的版本号，防止
+旧指令覆盖新指令。agent tunnel 会按该 expose 的 home broker 地址和 cert pin 建连，
+broker drain / rehome 时按 epoch 更新，不需要重新跑 `tether expose`。
+
 `TETHER_DEV_NO_AUTH=1` 时 agent 以匿名身份连接，**仅在 broker 同样未启用
 auth_callout 时**可用。
 
-### 5.4 `tether login` / `logout` / `ctx`
+### 5.9 `tether login` / `logout` / `ctx`
 
 ```
 tether login                                # 仅生成/加载 nkey
@@ -718,21 +965,21 @@ PIN 仅在**首次加入**时使用 —— broker 会把 PIN ↔ nkey 公钥的�
 `login -s` 会真实地走一次 NATS CONNECT（auth_callout 验证），只有连接成功才会
 写 `~/.tether/current_session`；失败时不留痕。
 
-flag（`login` 专属）：
+flag：
 
-| flag | 默认 | 说明 |
-|---|---|---|
-| `--nats-url`    | `nats://127.0.0.1:4222` | NATS broker URL |
-| `--broker`      | `nats://127.0.0.1:4222` | `--nats-url` 的别名（与 `install.sh --broker` 拼写一致；两者共享同一变量，写任一都生效） |
-| `--session, -s` | (空)                  | 要激活的 session id |
-| `--pin`         | (空)                  | 首次加入时的一次性 PIN |
-| `--home`        | `~/.tether`           | tether 家目录 |
+| 命令 | flag | 默认 | 说明 |
+|---|---|---|---|
+| `login` | `--nats-url` | 同 §5.1 全局解析链 | NATS broker URL；分布式 HA 可写逗号分隔 seed list |
+| `login` | `--broker` | 同 §5.1 全局解析链 | `--nats-url` 的别名（与 `install.sh --broker` 拼写一致；两者共享同一变量，写任一都生效） |
+| `login` | `--session, -s` | (空) | 要激活的 session id |
+| `login` | `--pin` | (空) | 首次加入时的一次性 PIN；只在同时给 `--session` 时有意义 |
+| `login` / `logout` / `ctx` | `--home` | `~/.tether` | 读取/写入 nkey、`current_session`、默认 broker URL 的目录 |
 
 `login` 显式给 `--nats-url` 或 `--broker` 之一时，broker URL 会被持久化到
 `~/.tether/broker_url`，之后所有 ctl 子命令默认读它（见 §3.1
 `TETHER_NATS_URL` 的优先级链）。
 
-### 5.5 `tether session`
+### 5.10 `tether session`
 
 **这一组命令是什么**：管理"会话"这个核心隔离单位。一个 session 是
 "一组 agent + 一组使用者 + 一段历史" 的容器：
@@ -745,7 +992,7 @@ flag（`login` 专属）：
 ```
 tether session create <name> --pin <pin>    # 创建并自动激活；调用者成 owner
 tether session ls                           # 列出可见 session
-tether session rm <sid>                     # tombstone：ACTIVE → DELETING（owner）
+tether session rm <sid> [--ack-alerts]      # tombstone：ACTIVE → DELETING（owner）
 ```
 
 **`session create` 是什么**：申请一个新的 sid（broker 自动分配，形如
@@ -771,7 +1018,22 @@ tether session rm <sid>                     # tombstone：ACTIVE → DELETING（
 `tether session ls` 输出含 `STATE`（ACTIVE / DELETING）+ `ROLE`（owner / member）+
 当前 active 标记 `*`。
 
-### 5.6 `tether ps`
+flag：
+
+| 命令 | flag | 默认 | 说明 |
+|---|---|---|---|
+| `session create` | `--pin` | (必填) | 新 session 的一次性加入 PIN；owner 创建后无法修改 |
+| `session rm` | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续删除；只确认本次风险，不会修复或清除告警 |
+| 全部 `session` 子命令 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| 全部 `session` 子命令 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
+分布式 HA 影响：`session rm` 是破坏性写操作，ctl 会先查询 cluster health；
+如果可达 broker 报告 `quorum_lost`（失去可写多数）或 `force_single_active`
+（正在单节点逃生模式），默认拒绝执行，避免在不完整时间线里删除 session。
+确认已经按 runbook 判断过风险后再加 `--ack-alerts`。`session create` 和
+`session ls` 不需要这个覆盖；真正的写入仍由 broker 端权限和 quorum 规则最终裁定。
+
+### 5.11 `tether ps`
 
 **这是什么**：当前活动 session 的"实时态"快照 —— 所有 agent 上**正在跑
 的进程** + **正在占用的公开端口**。类比 `ps -ef` + `ss -tlnp` 的合并视
@@ -792,11 +1054,24 @@ tether ps        # 默认：活跃进程（RUNNING + LOST）+ ALLOCATED 端口
 tether ps -a     # 含 EXITED 进程 + RELEASED 端口
 ```
 
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--all, -a` | false | 同时显示 EXITED 进程、释放/历史端口以及 OFFLINE / STALE 相关状态 |
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
 LOST 是 read-derived 状态——broker 的 SQLite 行还停在 RUNNING，
 但所属 node 已被 reconcile 转成 OFFLINE。`tether ps` 在响应阶段
 合成 LOST 标签，让运维一眼能看出"这个进程还没确认结束、但承载它
 的 agent 跟丢了"。当 agent 重新 register 时，G.1 reconcile 会把
 对应行收敛到 EXITED(rc=-1, missed-exit) 或重新接受 RUNNING。
+
+分布式 HA 影响：`ps` 是 read-only，不需要 `--ack-alerts`，也不会改动任何
+cluster 状态。若当前有 severe cluster alert，`ps` 会把 alert banner 打到 stderr，
+stdout 的表格保持可脚本解析。PORTS 节里看到的 expose 可能已经 rehome 到其它
+broker，但对用户仍表现为同一个 `NAME` / `PUBLIC` 端口。
 
 输出两节：
 
@@ -812,7 +1087,7 @@ PORTS
 
 无 active session 时直接报错并提示先 `tether login -s <sid>`。
 
-### 5.7 `tether exec`
+### 5.12 `tether exec`
 
 **这是什么**：在指定远端节点上跑一条**非交互**命令。等价于 SSH 的
 `ssh user@host '<argv>'` 但走 NATS 控制面 + 不需要 SSH 登录。
@@ -825,7 +1100,7 @@ PORTS
 - **退出码透传**：远端进程的 exit code 即本地 exit code，方便 `&&` /
   `||` 串联；
 - **信号杀变 128**：远端进程被信号杀 ⇒ stderr 打印 "remote process
-  terminated by signal" 然后本地 `exit 128`（v1 不传具体信号号）。
+  terminated by signal" 然后本地 `exit 128`（当前不传具体信号号）。
 
 **何时用**：`ls` / `grep` / `python script.py` / `make test` / 任何
 "输入定死、输出可流" 的命令。
@@ -834,21 +1109,29 @@ PORTS
 `tether run`（PTY 模式）。
 
 ```
-tether exec <nid> -- <argv...>  [--cwd DIR] [--timeout 10m]
+tether exec [--cwd DIR] [--timeout 10m] [--safe] <nid> -- <argv...>
 ```
 
 flag：
 
 | flag | 默认 | 说明 |
 |---|---|---|
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 | `--cwd`     | (空 = agent 端默认目录) | 远端进程的工作目录 |
 | `--timeout` | `10m`              | 整次命令最长时间（含流式输出），超时返回 `timed out after ...` |
+| `--safe` | false | 在 agent 端用去掉疑似挂死网络挂载的 PATH 解析 argv[0]，避免 NFS/CIFS 卡死；必须写在 `<nid>` 之前 |
 
 注：`--` 是可选分隔符（cobra 自动剥离）；`tether exec <nid> ls -la` 与
 `tether exec <nid> -- ls -la` 等价，因为 `SetInterspersed(false)` 已让 `-la`
 不被父命令解析。
 
-### 5.8 `tether run`
+分布式 HA 影响：`exec` 没有 ctl 侧 `--ack-alerts` 覆盖开关；它仍走当前
+NATS seed 连接到任意可达 broker，由 broker 路由到目标 agent。若集群已经失去
+写入能力，broker 端会按实际状态返回错误或超时；脚本不应把 `exec` 当成修复
+`quorum_lost` 的运维入口，集群修复走 `tether cluster status/force-single/recover`。
+
+### 5.13 `tether run`
 
 **这是什么**：在指定远端节点上跑**交互式**命令，agent 端分配一个真正的
 PTY，本地终端切 raw 模式后所有键盘字节、箭头序列、Ctrl-C、终端大小变
@@ -872,11 +1155,26 @@ PTY，本地终端切 raw 模式后所有键盘字节、箭头序列、Ctrl-C、
 轻量（不消耗 agent 端 PTY 配额）。
 
 ```
-tether run <nid> -- <argv...>  [--cwd DIR]
+tether run [--cwd DIR] [--safe] [--ack-alerts] <nid> -- <argv...>
 ```
+
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+| `--cwd` | (空 = agent 端默认目录) | 远端 PTY 进程的工作目录 |
+| `--safe` | false | 与 `exec --safe` 相同，先避开疑似挂死网络挂载再解析 argv[0]；必须写在 `<nid>` 之前 |
+| `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续启动交互进程；只确认本次风险 |
 
 非 tty 调用（如 `tether run nid -- bash <<<EOF ... EOF`）时 SIGINT 转成
 `kill.req{SIGINT}` 发往 agent 的进程组。
+
+分布式 HA 影响：`run` 会打开新的交互式远程进程，属于可能扩大损害面的写操作；
+ctl 会先检查 cluster health。看到 `quorum_lost` 或 `force_single_active` 时默认拒绝，
+除非显式加 `--ack-alerts`。这只绕过 ctl 侧提示，不会绕过 broker 端权限、session
+状态或 quorum 能力检查。
 
 调优 env vars（详见 §3.1）：
 - `TETHER_RUN_READY_TIMEOUT` — ctl 等待 agent PTY ready 的总超时，默认 `20s`；
@@ -885,7 +1183,7 @@ tether run <nid> -- <argv...>  [--cwd DIR]
   5s × 3）；agent 长时间停滞时 ctl 本地会先打印 "agent unreachable" 再退出，
   避免无限挂起。设为 `0` 关闭看门狗。
 
-### 5.9 `tether expose` / `expose rm`
+### 5.14 `tether expose` / `expose rm`
 
 **这是什么**：把 NAT 后 agent 上的某个本地端口反向打到 broker 的公网端
 口，让公网客户端可以直接访问 agent 上的 HTTP/TCP 服务。等价于 `ngrok`
@@ -911,9 +1209,21 @@ expose 出去等于把它放公网，敏感服务必须自带认证（Jupyter to
 证书等）。
 
 ```
-tether expose <nid> --local <port> --name <logical-name> [--remote-port <port>]
-tether expose rm <nid> --name <logical-name>
+tether expose <nid> --local <port> --name <logical-name> [--remote-port <port>] [--ack-alerts]
+tether expose rm <nid> --name <logical-name> [--ack-alerts]
 ```
+
+参数与 flag：
+
+| 参数 / flag | 默认 | 说明 |
+|---|---|---|
+| `<nid>` | (必填) | 目标 agent 节点 id；必须在当前 session 内 ONLINE |
+| `--local` | (必填) | agent 本机要暴露的 TCP 端口，必须为 `1..65535` |
+| `--name` | (必填) | 当前 session 内的逻辑名；同一 session 内唯一；`expose rm` 用它定位条目 |
+| `--remote-port` | `0` = 自动 | 请求一个具体公网端口；必须落在 broker 的 `frp.port_range` 内，否则 broker 拒绝 |
+| `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续 expose / expose rm；只确认本次风险 |
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 
 - `<nid>` 节点上的 `--local` 端口被反向打到 broker 的 `[14000-14999]` 公网带，
   分配的端口 + URL 在输出里：`exposed: http://broker.example:14001 → lab-1:8888`。
@@ -929,11 +1239,28 @@ tether expose rm <nid> --name <logical-name>
 - `expose rm` 立即把公网端口归还池子，agent 上对应的 tunnel client 也会
   drop。
 
-子命令：v1 只有 `expose <nid>` / `expose rm <nid>`，**没有** `expose ls` —— 想看
+分布式 HA 影响：
+- `expose` / `expose rm` 都是 destructive 操作。ctl 会先检查 cluster health；
+  可达 broker 报 `quorum_lost` 或 `force_single_active` 时默认拒绝，加
+  `--ack-alerts` 才继续。
+- 分布式模式下，端口分配行会带 `home_broker` 和 `epoch`。agent 不再总是拨自己
+  配置里的单一 `--tunnel-addr`，而是按 broker 下发的 home directive 连接该 expose
+  的 home broker tunnel 地址，并校验稳定 tunnel cert pin。`home_broker` 是当前承载
+  公网 listener 的 broker node id；`epoch` 是该分配的版本号，每次 rehome 递增。
+- `drain --retire` 或 broker 故障恢复可能把 expose rehome 到其它 voter；agent
+  通过 register reply / rehome directive 按 epoch 迁移 tunnel。rehome 指把同一个
+  port allocation 的 home broker 改到另一个 voter，公网端口和
+  `--name` 不变。
+- stale close / rehome 事件按 `port + sid + nid + token_hash` 栅栏，旧分配的关闭不会
+  误关同一公网端口上新分配的 listener；`token_hash` 是 expose token 的哈希，不泄露
+  token 本体。如果 NATS close broadcast 丢失，broker 的 tunnel reconcile tick
+  （周期性对账）会按 DB 里的 home/epoch 收敛。
+
+子命令：当前只有 `expose <nid>` / `expose rm <nid>`，**没有** `expose ls` —— 想看
 当前已分配的暴露条目，用 `tether ps` 的 PORTS 节（数据源同为 broker SQLite 的
 `port_allocations`）。
 
-### 5.9.5 `tether proxy`（v0.3.0+，代理订阅 / 自建机场）
+### 5.15 `tether proxy`（v0.3.0+，代理订阅 / 自建机场）
 
 **这是什么**：把当前 session 的**全部在线 agent** 变成一个 Clash 订阅 —— 打开总开关后,
 每个在线 agent(含后加入者)在本机启动内嵌 shadowsocks 服务端并自动 expose, broker 托管
@@ -949,6 +1276,19 @@ tether proxy sub ls                    # 列订阅(NAME/STATE/CREATED;绝不显�
 tether proxy sub revoke alice          # 撤销一个订阅(其他人不受影响,在飞连接被切断)
 ```
 
+子命令与参数：
+
+| 命令 | 参数 / flag | 默认 | 说明 |
+|---|---|---|---|
+| `proxy on` | `--yes` | false | 跳过开放出口节点确认；owner-only，脚本化开启时必须显式承担风险 |
+| `proxy off` | — | — | 关闭 session proxy 总开关，停止所有 agent 的 SS server 并切断 tunnel |
+| `proxy status` | `--json` | false | 输出原始 JSON；默认输出人类可读摘要 |
+| `proxy sub create` | `--name` | (必填) | 订阅持有人标签，1..64 printable ASCII，不允许 `/`；URL 只打印一次 |
+| `proxy sub ls` / `proxy sub list` | — | — | 列订阅，不显示 token / PSK |
+| `proxy sub revoke` | `<name>` 或 `--name` | (必填) | 撤销一个订阅；其它订阅不受影响，当前连接会被切断 |
+| 全部 `proxy` 子命令 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| 全部 `proxy` 子命令 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
 **底层与安全**：
 - 协议 = 经典 `chacha20-ietf-poly1305` shadowsocks(AEAD 加密+认证;经典 Clash for Windows 即可),
   每个订阅一把独立 PSK,所有 agent 用单端口**试解密**承载多订阅,撤销互不影响(撤销后该 PSK 的重放 salt 也立即失效)。
@@ -957,10 +1297,17 @@ tether proxy sub revoke alice          # 撤销一个订阅(其他人不受影�
   流量从你 agent 的 IP 出去,你负责。一键关闭=`tether proxy off`。`tether proxy on` 因此强制确认。
 - **出口范围默认仅公网**:agent 默认拒绝订阅流量去 loopback / 内网(RFC1918+RFC6598 共享段)/ link-local / multicast / 云 metadata(`169.254.169.254`、`100.100.100.200` 等)等**非公网地址**,按**解析后 IP** 判定(挡 DNS-rebinding,连 NAT64/6to4 编码的内网 IPv4 也挡)。即订阅持有者**只能经 agent 出公网,碰不到 agent 本机/内网**。确需私网访问,在该 agent 的 `agent.yaml` 设 `proxy.allow_private_destinations: true` 显式开启(**高危**:等于把该 agent 所在内网借给订阅持有者)。
 - 这是应用层代理,不是整机 VPN;想整机路由,在你自己设备上用 Clash 的 TUN 模式(与 agent 无关)。
-- broker 侧需在 `broker.yaml` 设 `broker.sub.listen`(或 `--sub-http-listen`,缺省 `127.0.0.1:8090`)启用订阅 HTTP 端点;
-  install.sh 生成的 Caddyfile 已把 `/sub/*` 反代到它(排在 NATS-WSS catch-all 之前)。**P13 之前装的 broker 升级到 v0.3.0 后,这两处配置不会自动出现**——见 §8.5 手动迁移。
+- broker 侧需在 `broker.yaml` 设 `broker.sub.listen` 启用订阅 HTTP 端点；`tether serve --sub-http-listen`
+  的 CLI 默认是空值（禁用），install.sh 生成的新 broker 配置通常写成 `127.0.0.1:8090`。
+  install.sh 生成的 Caddyfile 已把 `/sub/*` 反代到它(排在 NATS-WSS catch-all 之前)。**v0.3.0 之前装的 broker 升级后,这两处配置不会自动出现**——见 §8.5 手动迁移。
 
-### 5.10 `tether push` / `tether pull`（v0.2.0+）
+分布式 HA 影响：当前 cluster HA 版本不支持 proxy 数据面和订阅管理。cluster 模式下
+`proxy on/off`、`proxy sub create/ls/revoke` 会由 broker 返回 `proxy_unsupported`，
+agent register 也不会收到 proxy directive；`proxy status` 最多只能读现有 DB 状态，
+不表示 cluster 下 proxy 可用。需要 proxy 时使用单 broker 模式；迁移到 cluster 前应先
+关闭 proxy 并通知订阅使用者。
+
+### 5.16 `tether push` / `tether pull`（v0.2.0+）
 
 **这是什么**：在 ctl 与远端 agent 之间搬一个文件。无须 `expose` + `scp` /
 `rsync`，复用 NATS 控制平面 + JetStream Object Store 做传输；单次最大 2 GiB
@@ -998,18 +1345,28 @@ NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让
 **命令**：
 
 ```
-tether push <local-path> <nid>:<remote-path> [--force] [--timeout 10m]
-tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m]
+tether push <local-path> <nid>:<remote-path> [--force] [--timeout 10m] [--ack-alerts]
+tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m] [--ack-alerts]
 ```
 
 参数与语义：
 
-| 参数 | 说明 |
-|---|---|
-| `<local-path>` | ctl 所在机器上的本地文件路径，可为相对/绝对 |
-| `<nid>:<remote-path>` | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
-| `--force` | 目标已存在时覆盖；缺省直接拒（`dst_exists`） |
-| `--timeout` | 整次传输上限，缺省 10min（tier A 一般 < 30s，tier B 取决于带宽） |
+| 参数 / flag | 默认 | 说明 |
+|---|---|---|
+| `<local-path>` | (必填) | ctl 所在机器上的本地文件路径；push 源必须是普通文件，pull 目标可相对/绝对 |
+| `<nid>:<remote-path>` | (必填) | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
+| `--force` | false | 目标已存在时覆盖；缺省直接拒（`dst_exists` 或本地 path exists） |
+| `--timeout` | `10m` | 整次传输上限；tier A 一般 < 30s，tier B 取决于带宽 |
+| `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续传输；只确认本次风险 |
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
+分布式 HA 影响：push/pull 会创建 transfer tracker、ObjectStore bucket 和审计事件，
+因此在 severe alert 下默认被 `--ack-alerts` 门控。cluster 模式下所有 broker 都可能
+收到 start request，但只有目标 `<nid>` 的 home broker 会真正创建 tracker / bucket /
+转发给 agent；非 home broker 静默让路，避免同一文件传输被 N 个 broker 重复处理。
+tier-B ObjectStore bucket 按 cluster replica 策略创建；传输开始后，即使目标 node
+后续 rehome，commit/finalize 仍由最初持有 tracker 的 broker 完成。
 
 **安全模型**（plan §"Refusing dangerous paths"）：
 
@@ -1075,10 +1432,10 @@ broker 永远是 single audit writer。
 > | `allow_roots: []`（显式空列表） | 禁用 | 不变（仍禁用） |
 >
 > 想在升级后保持关闭：在 `agent.yaml` 的 `file_transfer:` 下加一行 `allow_roots: []`
-> 并重启 agent。无 wire/proto 变更（`ProtoVersion` 仍为 1），换二进制重启即可，
-> 无需重装。开放模式下 agent 启动会打一条 WARN 提示当前为全盘触达。
+> 并重启 agent。同一 `ProtoVersion` 内换二进制重启即可；跨 `ProtoVersion`
+> 升级必须走 §8.3 全量重装。开放模式下 agent 启动会打一条 WARN 提示当前为全盘触达。
 
-### 5.11 `tether history`
+### 5.17 `tether history`
 
 **这是什么**：当前活动 session 的"审计回放器"。每条**命令调用**（exec /
 run / expose / kill / upgrade...）、每个**进程生命周期**（started /
@@ -1104,6 +1461,16 @@ tether history --kind call      # 仅 call / proc / port / transfer
 tether history --follow         # 持续 tail（Ctrl-C 退出）
 ```
 
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--lines, -n` | `0` | 只显示最近 N 条；`0` 表示从最早开始；与 `--follow` 同用时被忽略 |
+| `--follow, -f` | false | 打完快照后继续 tail 新 audit message，Ctrl-C 退出 |
+| `--kind` | (空 = all) | 过滤 audit kind：`call` / `proc` / `port` / `transfer` |
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
 底层是 JetStream `history-<sid>` stream 的 ephemeral consumer（架构 H.2）。`-n N`
 带 `--kind` 时走 ring-buffer 全量过滤（filter 后 seq 稀疏，不能用 `LastSeq-N+1`
 快捷路径）。
@@ -1118,7 +1485,12 @@ tether history --follow         # 持续 tail（Ctrl-C 退出）
 
 需要原始 JSON 走 `--kind call | jq .` 之类管线。
 
-### 5.11.5 `tether node ls`
+分布式 HA 影响：`history` 是 read-only，不需要 `--ack-alerts`。ctl 可连接任意
+可达 broker seed；JetStream stream 名仍是 `history-<sid>`，由 broker 侧保证事件写入
+和复制策略。`--follow` 期间如果当前连接 broker 掉线，NATS client 会按 seed list
+重连，短窗口内可能看到 reconnect 延迟。
+
+### 5.18 `tether node ls`
 
 **这是什么**：列出当前活动 session 内**所有注册的 agent**（不仅是有进程在跑的），
 显示在线状态、心跳年龄、proto 版本、release 版本。
@@ -1141,6 +1513,14 @@ tether node ls          # 仅 ONLINE 节点
 tether node ls -a       # 含 OFFLINE / STALE（同 --all）
 ```
 
+flag：
+
+| flag | 默认 | 说明 |
+|---|---|---|
+| `--all, -a` | false | 包含 OFFLINE / STALE 节点；默认只看 ONLINE |
+| `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+
 输出列：
 
 | 列 | 含义 |
@@ -1153,7 +1533,11 @@ tether node ls -a       # 含 OFFLINE / STALE（同 --all）
 
 底层 RPC 是 `node.list.req`，与 `node upgrade --all` 共享同一枚举机制。
 
-### 5.12 `tether node upgrade`
+分布式 HA 影响：`node ls` 是 read-only，不需要 `--ack-alerts`；有 severe
+cluster alert 时会把 banner 打到 stderr。cluster 模式下 broker 会记录 agent
+当前连上的 NATS `server_name`，用于后续 expose home 选择和 transfer home gate。
+
+### 5.19 `tether node upgrade`
 
 **这是什么**：owner-only 的"远程升级 agent 二进制"命令。无需登录目标
 机，无需停服务，PID 不变，systemd 不感知 —— agent 内部用 `syscall.Exec`
@@ -1195,8 +1579,8 @@ flag：
 | `--sha256`  | (必填) | tarball 的 SHA256 hex（64 位小写） |
 | `--all`     | false  | 升级全部 ONLINE 节点（与 positional `<nid>` 互斥） |
 | `--timeout` | `60`（秒） | 单台 upgrade 的总超时；超大 tarball / 慢链路要显式调大 |
-| `--nats-url`| `nats://127.0.0.1:4222` | NATS broker URL |
-| `--home`    | `~/.tether` | tether 家目录 |
+| `--nats-url`| 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
+| `--home`    | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 
 - broker 校验：owner、URL 在 `broker.upgrade.url_allow`、proto 一致、SHA256 64 位
   小写 hex；任一不过 ⇒ 拒绝（`url_not_allowed` / `not_owner` / `proto_bump_*` /
@@ -1218,7 +1602,13 @@ flag：
 `--timeout` 默认 60s，必须大于 agent 下载 + 解压时间，超大 tarball / 慢链路记得
 显式调大。
 
-### 5.13 `tether admin *`（broker 本机）
+分布式 HA 影响：`node upgrade` 是 owner-only 写操作，但当前 CLI 没有
+`--ack-alerts` 覆盖；它连接任意可达 broker seed 后由 broker 做 owner、URL allowlist、
+proto 一致性和目标 ONLINE 校验。批量 `--all` 的节点枚举来自 cluster 复制后的
+session 视图；某个 broker 正在 drain / quorum 不足时，实际结果以 broker 返回的
+错误码和超时分类为准。
+
+### 5.20 `tether admin *`（broker 本机）
 
 **这一组命令是什么**：运维用的"broker 内部状态"工具，绕过 NATS
 auth_callout，直接通过 broker 进程的本机 Unix socket 读写 SQLite 状态。
@@ -1270,11 +1660,25 @@ tether admin evict <sid> <nid>              # 强制踢
 | `admin audit <sid>` | 直接从 JetStream `history-<sid>` stream 读最近 N 条审计 entry（不走 ctl 的 NATS path）。 | NATS 鉴权坏了 / owner 失联但需要查历史 / 合规导出。 |
 | `admin evict <sid> <nid>` | 强制把指定 (sid, nid) 从 broker 移除：删 `agent_provisioning` 行 + `nodes` 行 + 广播 `sys.events{type:agent_evicted}`。 | agent 失控 / 机器换主 / nkey 泄漏要立即吊销。 |
 
+子命令参数：
+
+| 命令 | 参数 / flag | 默认 | 说明 |
+|---|---|---|---|
+| `admin audit` | `<sid>` | (必填) | 要读取审计流的 session id |
+| `admin audit` | `--n, -n` | `50` | 读取最近 N 条 |
+| `admin evict` | `<sid>` | (必填) | 目标 session id |
+| `admin evict` | `<nid>` | (必填) | 要强制踢出的 agent node id |
+
 `evict` 行为（架构 P9 / I.2b）：
 1. 删 `agent_provisioning` 行 + `nodes` 行；
 2. broadcast `sys.events{type:agent_evicted, sid, nid}`；
 3. 在线 agent 收到后约 1s 内自杀；离线 agent 下次 CONNECT 直接被拒（不再
    provisioned）。
+
+分布式 HA 影响：`admin *` 是 broker 本机 socket 工具，不走 ctl 的 NATS
+membership 路径，也没有 `--ack-alerts`。cluster 模式下应优先用 `tether cluster`
+处理 roster/raft 层面的 broker 节点；`admin evict` 只处理 session 内 agent
+provisioning，不会移除 broker voter，也不会修复 quorum。
 
 ---
 
@@ -1318,7 +1722,7 @@ tether ps
 ```bash
 tether exec gpu-01 -- nvidia-smi
 tether exec gpu-01 -- ls -la /data       # SetInterspersed(false) 让 -la 透传
-tether exec gpu-01 --cwd /work -- python train.py --epochs 10
+tether exec --cwd /work gpu-01 -- python train.py --epochs 10
 ```
 
 ### 6.3 SSH 风格交互式 shell
@@ -1400,13 +1804,15 @@ rsync -av --progress big-dataset/ rsync@broker:14001/...
 ```bash
 sudo systemctl status tether-broker nats-server caddy
 sudo journalctl -u tether-broker --since '1 hour ago' -p warning
-sudo ss -tlnp | grep -E '(4222|7000|14[0-9]{3}|443)'
+sudo ss -tlnp | grep -E '(443|4222|6222|7000|7400|14[0-9]{3})'
 ```
 
 关键指标：
 - `tether-broker` 启动日志：`tether serve: NATS=... DB=... auth_callout=on(...)/off(...)`
 - 连接的 agent 数 = `tether admin nodes` 里 `STATE=ONLINE` 的行数
 - 占用端口 = `tether admin sessions` ↔ `port_allocations`（每条 expose 一行）
+- 分布式模式额外检查 `tether cluster status`：Raft 私网 `:7400`、NATS route `:6222`
+  只在 broker 内网开放；公网仍只需要 443、7000、`frp.port_range`。
 
 ### 7.2 disk pressure 告警
 
@@ -1441,7 +1847,9 @@ JetStream store 占用超过磁盘 80% 时 broker 会发出 `sys.events{type:dis
 2. `/var/lib/tether/jetstream/` — JetStream 文件存储。停机 + `tar` 是最稳的方法；
    在线快照需要 nats CLI：`nats stream backup history-<sid> ./snap`。
 
-恢复：复制回原目录、保持属主 `tether:tether` mode 0750、`systemctl start` 即可。
+单机恢复：复制回原目录、保持属主 `tether:tether` mode 0750、`systemctl start` 即可。
+分布式模式不要把某个旧 peer 的 `tether.db`/`raft/` 直接塞回新时间线；按
+`docs/cluster-runbook.md` 的 force-single / recover 流程处理，并重新跑 `cluster status`。
 
 ### 7.5 日志轮转
 
@@ -1561,7 +1969,7 @@ agent 内部步骤：
 
 ### 8.3 proto 升级
 
-`internal/proto/proto_version.go` 里的 `ProtoVersion` 是 wire 协议版本。bump 后
+`internal/proto/version.go` 里的 `ProtoVersion` 是 wire 协议版本。bump 后
 新 broker 不接受旧 agent（`proto_bump_requires_reinstall`）：必须先在每台 agent
 上重跑 `install.sh --role agent` 或人工 `cp` 同版本 tether 二进制，再启 broker。
 **`tether node upgrade` 不能跨 proto** —— upgrade 设计成只在同 proto 内的 patch
@@ -1582,13 +1990,13 @@ sudo journalctl -u tether-broker --since '1 minute ago' -f
 - 等待 agent 重新 register（agent 端在 NATS 重连后会自动 re-register）；
 - 期间 ctl 调用排队等待 broker 响应。
 
-### 8.5 升级到 v0.3.0 启用代理订阅（P13）的 broker 配置迁移
+### 8.5 升级到 v0.3.0 启用代理订阅的 broker 配置迁移
 
 `tether node upgrade` 只换 **agent** 二进制；§8.4 的 broker 升级只换 broker 二进制。
-两者都**不会**改 broker 的 `broker.yaml` / `Caddyfile`。所以一台 **P13 之前装的
+两者都**不会**改 broker 的 `broker.yaml` / `Caddyfile`。所以一台 **v0.3.0 之前装的
 broker** 升级到 v0.3.0 后，`tether proxy` 的控制面能用，但 `/sub/<token>` 端点
-不会自动出现——必须手动补两处配置（proto 仍是 v1，agent 用 `node upgrade` 即可，
-无需重装）：
+不会自动出现——必须手动补两处配置；如果同时从 proto v1 升到 proto v2，仍按 §8.3
+做全车队重装，不能只靠 `node upgrade`：
 
 ```bash
 # 1) broker.yaml 增加 sub 块（缺省监听 127.0.0.1:8090）
@@ -1625,7 +2033,7 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 
 | code | 含义 | 处置 |
 |---|---|---|
-| `not_owner`                     | 仅 owner 可执行 | 让 owner 来做，或 owner 把所有权转交（v1 不支持，需 owner 重建 session） |
+| `not_owner`                     | 仅 owner 可执行 | 让 owner 来做；当前不支持所有权转交，需 owner 重建 session |
 | `not_owner_or_creator`          | 仅 owner 或资源创建者可执行 | 同上 |
 | `not_a_member`                  | 你没加入此 session | 让 owner 给 PIN，`tether login -s <sid> --pin <pin>` |
 | `session_not_found_or_deleting` | session 不存在或正在删除 | `tether session ls` 确认；DELETING 中无救（等回收） |
@@ -1639,7 +2047,7 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `node_not_found`        | 该 session 下无此 nid | `tether ps` 确认；可能 nid 拼错 |
 | `node_offline`          | agent 心跳过期（超过 OfflineAfter） | 在 agent 机器：`systemctl --user start tether-agent@lab` 或检查 `agent.log` |
 | `agent_no_responders`   | agent 在 NATS 上无响应 | agent 进程死或 NATS 断；同上排查 |
-| `agent_malformed_resp`  | agent 回包格式错（多半 proto 不一致） | `tether node upgrade <nid>` 升级 |
+| `agent_malformed_resp`  | agent 回包格式错（可能是 proto 不一致或 agent bug） | 先查 `tether version` / broker-agent proto；proto 不一致走 §8.3 全量重装，同 proto patch 才用 `tether node upgrade <nid>` |
 | `proto_mismatch`        | broker / agent proto 版本不一致 | 全量重装 agent（不能用 upgrade） |
 
 ### 9.3 升级类
@@ -1691,7 +2099,8 @@ exec: cannot reach broker at nats://127.0.0.1:4222: <err> (verify the broker is 
    `nats://127.0.0.1:4222`）；
 2. broker 主机 `systemctl status tether-broker nats-server caddy`；
 3. `curl -v https://broker:443/` 能否拿到 Caddy 的握手；
-4. 防火墙 / 安全组放行 443 + 7000 + 14000-14999。
+4. 防火墙 / 安全组：公网放行 443 + 7000 + 14000-14999；分布式 broker 内网还要放行
+   `6222`（NATS route）和 `7400`（Raft），不要把这两个私网端口暴露到公网。
 
 ### 9.8 历史回放卡住
 
@@ -1757,13 +2166,13 @@ A: 远端进程崩溃没正常退出时，本地终端可能停在 raw 模式。
 
 **Q: agent 想换机器 / 改 nid？**
 A:
-1. owner 在原机：`tether admin evict <sid> <old-nid>`（或 ctl 端 v1 没有 evict
+1. owner 在原机：`tether admin evict <sid> <old-nid>`（当前没有 ctl 端 evict
    入口，必须在 broker 本机）；
 2. 新机重跑 `install.sh --role agent --nid <new-nid> --pin <pin>`；
 3. owner 改成 `evict` 后旧 agent 进程会在 1s 内自杀。
 
 **Q: 想批量 expose？**
-A: v1 没有批量入口，写个 shell loop：
+A: 当前没有批量入口，写个 shell loop：
 ```bash
 for nid in gpu-01 gpu-02 gpu-03; do
   tether expose $nid --local 8888 --name jupyter-$nid
@@ -1771,13 +2180,14 @@ done
 ```
 
 **Q: 如何只授权别人看 ps 不能 exec？**
-A: v1 不支持细粒度 RBAC。member 拿到 PIN 后即可 exec / run / expose。如需要
+A: 当前不支持细粒度 RBAC。member 拿到 PIN 后即可 exec / run / expose。如需要
 划分角色，开多个 session（每个 session 单独 PIN + member 名单）。owner-only
 操作只有 `session rm` 与 `node upgrade`。
 
 **Q: broker 能横向扩展吗？**
-A: v1 单实例。NATS 本身能 cluster，但 tether 的 SQLite + JetStream 单写副本设计
-没做多 broker 协调。需要 HA 走主备 + 共享 disk + 手动 failover。
+A: proto v2 支持用 `tether cluster` 把 broker 迁移为 Raft 管理的多 broker 集群；
+入口见 §5.6，生产步骤以 `docs/cluster-runbook.md` 为准。注意 `tether proxy`
+当前仍不支持 cluster HA 模式。
 
 **Q: 数据加密？**
 A: 控制面 wss://（Caddy 终端 TLS）；nkey 签名鉴权。数据面（`expose` 反向 TCP）
@@ -1785,7 +2195,7 @@ A: 控制面 wss://（Caddy 终端 TLS）；nkey 签名鉴权。数据面（`exp
 
 **Q: 退出会话但保留 agent？**
 A: ctl 端 `tether logout` 只清当前活动 session；agent 自己继续跑。要彻底
-清成员关系：让 owner `tether admin evict`（v1 无 ctl 入口）。
+清成员关系：让 owner `tether admin evict`（当前无 ctl 入口）。
 
 ---
 
@@ -1803,7 +2213,7 @@ A: ctl 端 `tether logout` 只清当前活动 session；agent 自己继续跑。
    agent / ctl 一律普通用户（`~/.local/bin`）。`tether agent` 不需要 root。
 6. **ports 14000-14999 是公开的**：上面的 expose 没有再次鉴权（设计如此 —— 公开
    端口供任意 HTTP 客户端访问）。敏感服务自带认证，或在 expose 前先用
-   `tunnel-only` 模式（v1 无）。
+   `tunnel-only` 模式（当前无）。
 7. **session rm 不可逆**：tombstone 后 history-<sid> 与 ports 全部回收，无 undo。
 8. **agent 二进制可写**：upgrade 路径 `O_EXCL|O_NOFOLLOW` + 仅允许 `tether`
    tar entry，但本地用户能直接覆写。共享机器上 agent 应跑独立用户 + 锁定
@@ -1850,7 +2260,7 @@ go test -count=1 -v -run TestRunExitCodePropagates ./test/p5/
 ./bin/tether serve --config /etc/tether/broker.yaml 2>&1 | tee broker.log
 
 # 看 NATS 实际订阅
-nats sub 'tether.v1.>'
+nats sub 'tether.v2.>'
 
 # 看 JetStream stream
 nats stream ls
@@ -1912,6 +2322,16 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether_darwin_arm64
     ├── broker.nk
     └── account.nk
 
+/etc/tether/secrets/            # cluster 模式必需；私钥 0600
+├── cluster-ca.pem
+├── route-cert.pem
+├── route-key.pem
+├── tunnel-cert.pem
+├── tunnel-key.pem
+├── node-ident.nk
+├── broker.nk
+└── account.nk
+
 /var/lib/tether/                # 0750 owned by tether
 ├── tether.db                   # SQLite
 ├── tether.db-wal
@@ -1945,11 +2365,14 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether_darwin_arm64
 |---|---|---|---|
 | 443        | TCP / TLS / WSS | 入站 broker | ctl + agent 的 NATS WSS（Caddy 终结 TLS） |
 | 4222       | TCP             | 仅本机 | broker → 本机 nats-server |
+| 6222       | TCP / mTLS      | broker 私网互通 | NATS route 集群连接 |
+| 7400       | TCP / mTLS      | broker 私网互通 | Raft transport |
 | 8222       | TCP             | 仅本机 | nats-server WebSocket（Caddy 反代） |
 | 7000       | TCP             | 入站 broker | 反向隧道控制连接（agent 主动连） |
 | 14000-14999| TCP             | 入站 broker | `expose` 公开端口 |
 
-防火墙最少放行：`443, 7000, 14000-14999/tcp`（入方向）。
+单机公网防火墙最少放行：`443, 7000, 14000-14999/tcp`（入方向）。
+分布式 HA 额外只在 broker 私网/安全组内放行 `6222/tcp` 和 `7400/tcp`，不对公网开放。
 
 ---
 

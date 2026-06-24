@@ -65,6 +65,81 @@ func TestD8ReviewPushCommitTrackerMissIsSilent(t *testing.T) {
 	expectNoReply(t, nc, subj, body)
 }
 
+func TestD8ReviewPushStartNonHomeIsSilentBeforeLocalDBGates(t *testing.T) {
+	url := startNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	actor := freshUserActor(t)
+	b := &Broker{cfg: Config{DB: openDB(t), Logger: silentLogger()}, transfers: newTransferTracker(), selfID: "node-B"}
+
+	subj := proto.SubjCmdBy("lab", actor, "lab-1", "push")
+	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) { b.handlePushReq(nc, msg) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(proto.PushPrepareReq{TransferID: "tid", Path: "file.txt", Tier: "a"})
+	expectNoReply(t, nc, subj, body)
+}
+
+func TestD8ReviewPullStartNonHomeIsSilentBeforeLocalDBGates(t *testing.T) {
+	url := startNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	actor := freshUserActor(t)
+	b := &Broker{cfg: Config{DB: openDB(t), Logger: silentLogger()}, transfers: newTransferTracker(), selfID: "node-B"}
+
+	subj := proto.SubjCmdBy("lab", actor, "lab-1", "pull")
+	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) { b.handlePullReq(nc, msg) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(proto.PullPrepareReq{TransferID: "tid", Path: "file.txt"})
+	expectNoReply(t, nc, subj, body)
+}
+
+func TestD8ReviewPushCommitTrackerMissIsSilentBeforeLocalDBGates(t *testing.T) {
+	url := startNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	actor := freshUserActor(t)
+	b := &Broker{cfg: Config{DB: openDB(t), Logger: silentLogger()}, transfers: newTransferTracker(), selfID: "node-B"}
+
+	subj := proto.SubjCmdBy("lab", actor, "lab-1", "push-commit")
+	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) { b.handlePushCommitReq(nc, msg) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(proto.TransferCommitReq{TransferID: "tid-missing", Bucket: "xfer-lab", ObjectKey: "tid-missing"})
+	expectNoReply(t, nc, subj, body)
+}
+
 // TestD8ReviewFinalizeTrackerMissIsSilent is the same tracker-presence rule for
 // ctrl.by.*.transfer.*.finalize.req. The sender ignores finalize best-effort errors in some
 // paths, but a spurious transfer_unknown reply still violates §9 and can surface as a false
@@ -80,6 +155,31 @@ func TestD8ReviewFinalizeTrackerMissIsSilent(t *testing.T) {
 	actor := freshUserActor(t)
 	b := &Broker{cfg: Config{DB: openDB(t), Logger: silentLogger()}, transfers: newTransferTracker(), selfID: "node-B"}
 	seedD8TransferMemberNode(t, b, actor, "lab", "lab-1")
+
+	subj := proto.SubjCtrlTransferFinalize(actor, "lab", "tid-missing")
+	sub, err := nc.Subscribe(subj, b.handleFinalizeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(proto.TransferFinalize{Kind: "complete", TransferID: "tid-missing", Tier: "b"})
+	expectNoReply(t, nc, subj, body)
+}
+
+func TestD8ReviewFinalizeTrackerMissIsSilentBeforeLocalDBGates(t *testing.T) {
+	url := startNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	actor := freshUserActor(t)
+	b := &Broker{cfg: Config{DB: openDB(t), Logger: silentLogger()}, transfers: newTransferTracker(), selfID: "node-B"}
 
 	subj := proto.SubjCtrlTransferFinalize(actor, "lab", "tid-missing")
 	sub, err := nc.Subscribe(subj, b.handleFinalizeReq)

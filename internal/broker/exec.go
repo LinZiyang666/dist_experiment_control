@@ -35,6 +35,9 @@ func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyExecErr(msg, "subject_malformed: "+msg.Subject)
 		return
 	}
+	if b.isClusterFollower() {
+		return
+	}
 
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {

@@ -31,7 +31,7 @@ func newClusterForceSingleCmd() *cobra.Command {
 		Use:   "force-single",
 		Short: "ESCAPE HATCH: rewrite this node to a single-voter cluster (daemon must be STOPPED; runbook in docs/)",
 		Long: `force-single is the quorum-loss escape hatch. STOP the daemon first
-(systemctl mask tether && systemctl stop tether). It HARD-REFUSES if any peer is
+(systemctl mask tether-broker && systemctl stop tether-broker). It HARD-REFUSES if any peer is
 still reachable, if there is no existing raft state, or if a daemon still holds the
 store. It NEVER accepts --yes; you must type this node's id to confirm.`,
 		Args: cobra.NoArgs,
@@ -57,7 +57,7 @@ store. It NEVER accepts --yes; you must type this node's id to confirm.`,
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"force-single complete: %q is now a single-voter cluster (%d nodes abandoned).\n"+
-					"systemctl unmask tether && systemctl start tether, then recover the others.\n", selfID, len(abandoned))
+					"systemctl unmask tether-broker && systemctl start tether-broker, then recover the others.\n", selfID, len(abandoned))
 			return nil
 		},
 	}
@@ -94,7 +94,9 @@ func newClusterRecoverCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("recover: %w", err)
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "recover complete: %d rows dumped to %s, node %q wiped. Run `cluster add` to rejoin.\n", n, dumpPath, selfID)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"recover complete: %d rows dumped to %s, node %q wiped. Re-run `cluster init --from-existing` on this node before starting tether-broker, then run `cluster add` on the leader to rejoin.\n",
+				n, dumpPath, selfID)
 			return nil
 		},
 	}

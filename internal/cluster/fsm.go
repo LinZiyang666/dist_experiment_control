@@ -77,6 +77,10 @@ type appliedPoison struct{ index uint64 }   // poison entry skipped, applied_ind
 type appliedDedup struct{ index uint64 }    // §4.1 D4: ReqID already committed; op SKIPPED but applied_index ADVANCED + committed (NOT a rollback — distinct from appliedNoOp)
 type appliedRejected struct{ index uint64 } // D7 §8.1: a custom applier DETERMINISTICALLY rejected the op (e.g. join-PoP verify fail); op SQL ran NONE, applied_index ADVANCED + committed, never panicked
 
+func (r appliedRejected) Error() string {
+	return fmt.Sprintf("cluster: op deterministically rejected at index %d", r.index)
+}
+
 // errAppliedRejected is the sentinel a custom Applier returns to signal a
 // DETERMINISTIC, op-level rejection (D7 §8.1: the join-PoP signature did not
 // verify). It is NOT a transient infra failure: applyCommand catches it BEFORE the

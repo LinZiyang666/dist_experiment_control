@@ -32,6 +32,10 @@ const (
 	// subject would get the leader's publish DENIED (round-1 BLOCKER: empty replies ⇒ a
 	// false broker_down for every voter every tick).
 	SubjClusterCursor = SubjClusterPrefix + ".cursor.req"
+	// SubjClusterTunnelClose is a broker-only best-effort broadcast used after a
+	// committed port free/revoke. Any broker may be the old expose home, so every
+	// broker tears down its local public listener for the port.
+	SubjClusterTunnelClose = SubjClusterPrefix + ".tunnel.close"
 )
 
 // SubjClusterApply returns "tether.v2.cluster.apply.<verb>" — the broker-only

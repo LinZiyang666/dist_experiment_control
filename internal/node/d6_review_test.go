@@ -2,6 +2,7 @@ package node
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 )
@@ -63,7 +64,7 @@ func TestD6RegisterNatsServerDiff1(t *testing.T) {
 }
 
 // TestD6NatsServerDefaultsEmpty (review A2 m3): a register that reports NO
-// server_name (the production / single-node case) stores nats_server='' (the
+// server_name (the production / single-node case) stores nats_server=” (the
 // NOT NULL DEFAULT), never NULL — so the column reads back cleanly + the home
 // resolution treats it as "no binding".
 func TestD6NatsServerDefaultsEmpty(t *testing.T) {
@@ -73,5 +74,63 @@ func TestD6NatsServerDefaultsEmpty(t *testing.T) {
 	}
 	if v := readNatsServer(t, db); v != "" {
 		t.Fatalf("unreported nats_server must default to '' (not NULL), got %q", v)
+	}
+}
+
+func TestD9PlanRegisterIdentityInsertStartsOffline(t *testing.T) {
+	db := openDB(t)
+	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
+	in := sampleInput()
+	cmd, err := PlanRegister(db, in, now)
+	if err != nil {
+		t.Fatalf("plan register: %v", err)
+	}
+	if _, err := db.Exec(cmd.Body[0].SQL); err != nil {
+		t.Fatalf("apply plan register: %v", err)
+	}
+	var status string
+	var hb sql.NullTime
+	if err := db.QueryRow(`SELECT status, last_heartbeat_at FROM nodes WHERE sid=? AND nid=?`, in.SID, in.NID).Scan(&status, &hb); err != nil {
+		t.Fatalf("read node: %v", err)
+	}
+	if status != string(StateOffline) || hb.Valid {
+		t.Fatalf("identity-only register must not create a live heartbeat: status=%q hb=%v", status, hb.Valid)
+	}
+	if err := Heartbeat(db, in.SID, in.NID, now.Add(time.Second)); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	in.ReleaseVersion = "v2"
+	cmd, err = PlanRegister(db, in, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("plan re-register: %v", err)
+	}
+	if _, err := db.Exec(cmd.Body[0].SQL); err != nil {
+		t.Fatalf("apply re-register: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status, last_heartbeat_at FROM nodes WHERE sid=? AND nid=?`, in.SID, in.NID).Scan(&status, &hb); err != nil {
+		t.Fatalf("read node after conflict: %v", err)
+	}
+	if status != string(StateOnline) || !hb.Valid {
+		t.Fatalf("identity update must preserve liveness: status=%q hb=%v", status, hb.Valid)
+	}
+}
+
+func TestD9PlanRegisterRejectsDeletingSession(t *testing.T) {
+	db := openDB(t)
+	if _, err := db.Exec(
+		`UPDATE sessions SET state='DELETING' WHERE sid='lab'`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, err := PlanRegister(db, RegisterInput{
+		SID: "lab", NID: "lab-1", ProtoVersion: 2, ReleaseVersion: "v2",
+	}, time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC))
+	if !errors.Is(err, ErrSessionNotActive) {
+		t.Fatalf("PlanRegister deleting session err = %v, want ErrSessionNotActive", err)
+	}
+	if err := Register(db, RegisterInput{
+		SID: "lab", NID: "lab-1", ProtoVersion: 2, ReleaseVersion: "v2",
+	}, time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC)); !errors.Is(err, ErrSessionNotActive) {
+		t.Fatalf("Register deleting session err = %v, want ErrSessionNotActive", err)
 	}
 }

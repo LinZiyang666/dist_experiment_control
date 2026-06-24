@@ -14,7 +14,6 @@ package broker
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -167,7 +166,7 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 	}
 
 	for _, s := range raises {
-		id := fmt.Sprintf("%s@%d", s.key, now.UnixNano())
+		id := newAlertID(s.key, now)
 		spec := s
 		if perr := r.cfg.Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return cluster.PlanAlertRaise(id, spec.kind, spec.severity, spec.key, spec.message, now)

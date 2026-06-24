@@ -70,6 +70,51 @@ func reportAtTarget() ReplicaReport {
 }
 func reportUnobserved() ReplicaReport { return ReplicaReport{Observed: false} }
 
+func TestD9AlertSignalReRaiseSameTimestampDoesNotCollide(t *testing.T) {
+	db := reconTestDB(t)
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	p := AlertSignalPayload{
+		Kind:     cluster.AlertKindDiskPressure,
+		Node:     "node-1",
+		Active:   true,
+		Severity: cluster.AlertSeverityInfo,
+		Message:  "disk pressure",
+	}
+	cmd, err := planAlertSignal(db, p, now)
+	if err != nil {
+		t.Fatalf("first raise plan: %v", err)
+	}
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatalf("first raise exec: %v", err)
+	}
+	p.Active = false
+	cmd, err = planAlertSignal(db, p, now)
+	if err != nil {
+		t.Fatalf("clear plan: %v", err)
+	}
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatalf("clear exec: %v", err)
+	}
+	p.Active = true
+	cmd, err = planAlertSignal(db, p, now)
+	if err != nil {
+		t.Fatalf("second raise plan: %v", err)
+	}
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatalf("second raise exec (same timestamp): %v", err)
+	}
+	var total, active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE state='ACTIVE'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || active != 1 {
+		t.Fatalf("alerts total/active = %d/%d, want 2/1", total, active)
+	}
+}
+
 // TestD8AlertReconcileReplicationDegraded drives the core lifecycle + the clear-condition fix:
 // raise on Degraded, NO flip on a transient unobserved pass (must not false-clear), clear ONLY
 // on a positive AllAtTarget observation.
@@ -179,7 +224,7 @@ func TestD8AlertReconcileRunCancels(t *testing.T) {
 // (production), signalDiskAlert is a no-op (the disk monitor surfaces pressure only via the
 // existing pubSysEvent) — proving the d8 guard exclusion of disk.go's seam read is non-vacuous.
 func TestD8SignalDiskAlertInert(t *testing.T) {
-	b := &Broker{} // alertSink == nil
+	b := &Broker{}           // alertSink == nil
 	b.signalDiskAlert(true)  // must not panic
 	b.signalDiskAlert(false) // must not panic
 	got := 0

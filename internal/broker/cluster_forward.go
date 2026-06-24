@@ -74,12 +74,14 @@ const (
 	// caller reads the committed row back by SID for the authoritative created_at. PlanCreate
 	// re-checks existence on the leader (ErrAlreadyExists), so no boundary ReqID is minted.
 	VerbSessionCreate = "sessioncreate"
-	// VerbPortFree / VerbPortRevoke (D9 §3) forward a port free/revoke to the leader. Both
-	// are data-less (error-only), so the caller routes the Plan and needs no read-back; the
-	// leader bakes the freed_at/revoked_at literal. PlanFree/PlanRevoke are no-ops on a row
-	// that is already gone, so a forwarder retry is harmless.
+	// VerbPortFree forwards a data-less public-port free. VerbPortRevoke carries the exact
+	// allocation identity selected by the leader's offline-node scan; it must not revoke by
+	// bare port because the public port may already have been reused.
 	VerbPortFree   = "portfree"
 	VerbPortRevoke = "portrevoke"
+	// VerbPortFreeAllocation is the expose-rm path: the leader must re-check the exact
+	// allocation identity selected by name before freeing, rather than freeing by port only.
+	VerbPortFreeAllocation = "portfreealloc"
 	// VerbNodeRegister (D9 §3, audit #1) forwards an agent register's IDENTITY columns to
 	// the leader (PlanRegister writes identity only; the liveness columns last_heartbeat_at/
 	// status are written locally by the originating broker, §3.5). The payload is the
@@ -117,6 +119,15 @@ const (
 // (free/revoke). The leader bakes the timestamp literal.
 type PortMutatePayload struct {
 	Port int `json:"port"`
+}
+
+// PortFreeAllocationPayload fences expose-rm against stale name->port reads and port reuse.
+type PortFreeAllocationPayload struct {
+	Port      int    `json:"port"`
+	SID       string `json:"sid"`
+	NID       string `json:"nid"`
+	Name      string `json:"name"`
+	TokenHash string `json:"token_hash"`
 }
 
 // SessionCreatePayload (D9) is the forwarded session-create request. The leader bakes the
@@ -231,6 +242,8 @@ func forwardErrKind(err error) string {
 		return "session_missing"
 	case errors.Is(err, agentprov.ErrSessionDeleting), errors.Is(err, session.ErrDeleting):
 		return "session_deleting"
+	case errors.Is(err, session.ErrAlreadyExists):
+		return "session_already_exists"
 	case errors.Is(err, agentprov.ErrAlreadyProvisioned):
 		return "already_provisioned"
 	default:
@@ -540,13 +553,23 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return port.PlanFree(db, p.Port, now())
 		})
-	case VerbPortRevoke:
-		var p PortMutatePayload
+	case VerbPortFreeAllocation:
+		var p PortFreeAllocationPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return err
 		}
+		a := port.Allocation{Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash}
 		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return port.PlanRevoke(db, p.Port, now())
+			return port.PlanFreeAllocation(db, a, now())
+		})
+	case VerbPortRevoke:
+		var p PortFreeAllocationPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		a := port.Allocation{Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return port.PlanRevokeAllocation(db, a, now())
 		})
 	case VerbNodeRegister:
 		var in nodepkg.RegisterInput
@@ -586,7 +609,7 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 			return err
 		}
 		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return session.PlanHardDelete(p.SID)
+			return session.PlanHardDelete(db, p.SID)
 		})
 	case VerbNodeEvict:
 		var p EvictPayload

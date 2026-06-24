@@ -136,13 +136,13 @@
 | **创建（provision）** | 运维手动装 account 签名私钥（不过网）+ 分配 nkey 身份 + `cluster add` 入 Raft |
 | **上线（join）** | 同时加入 **Raft 集群（状态）+ NATS 集群（消息）**；**追平 Raft log 前不对外服务**（不应答 auth_callout、不绑数据面口）；追平后才服务 |
 | **下线（drain，计划内）** | **宽限期 + 提前通知**（告警广播"brokerX 将在 N 分钟后下线"）→ 主动迁 expose（rebuild-ON 重建、rebuild-OFF 拆+通知）→ 若是 leader 先**交权** → 干净退出 Raft 成员 → 关机 |
-| **退役（retire）** | drain + 永久移出 Raft 成员 + 吊销身份 + 移出发现列表；状态早已复制，无丢失 |
+| **退役（retire）** | drain + 永久移出 Raft 成员 + 移出发现/路由配置；共享 account/CA 凭据的吊销需另行全 fleet 轮换 |
 
 ### 6.2 自动保护
 - 移除投票成员会改变 quorum（3→2 会从安全 HA 掉进降级档）。**退役若使集群跌破安全 HA → 先发严重告警 / 要求显式确认**才放行。
 
 ### 6.3 命令面
-- `tether cluster init / add / remove / status / promote / step-down / transfer-leader / drain / retire`
+- `tether cluster init / add / remove / status / transfer-leader / drain --retire / force-single / recover`
 - `tether alert`（见 §8）
 - **危险操作本地化**：`cluster *` 变更与 `force-single` **仅运维本地**（走现有 admin Unix socket，"能登 broker 的才是运维"）。
 

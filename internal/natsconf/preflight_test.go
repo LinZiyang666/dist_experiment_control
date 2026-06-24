@@ -117,4 +117,34 @@ authorization {
 	if !found {
 		t.Fatal("authorization not in the ownership table")
 	}
+	issuer, brokerNkey := own.AuthIdentity()
+	if issuer != "UACCOUNTPUB" || brokerNkey != "UBROKERPUB" {
+		t.Fatalf("AuthIdentity = (%q, %q), want UACCOUNTPUB/UBROKERPUB", issuer, brokerNkey)
+	}
+}
+
+func TestAuthIdentityDoesNotGuessBrokerNkeyFromMultiUserAuth(t *testing.T) {
+	body := installSHConf + `
+authorization {
+  users: [
+    { nkey: "UPEER" },
+    { nkey: "USELF" }
+  ]
+  auth_callout {
+    issuer: "UACCOUNTPUB"
+    auth_users: [ "UPEER", "USELF" ]
+  }
+}
+`
+	own, err := Preflight(writeConf(t, body))
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	issuer, brokerNkey := own.AuthIdentity()
+	if issuer != "UACCOUNTPUB" {
+		t.Fatalf("issuer = %q, want UACCOUNTPUB", issuer)
+	}
+	if brokerNkey != "" {
+		t.Fatalf("multi-user authorization is ambiguous; broker nkey = %q, want empty", brokerNkey)
+	}
 }

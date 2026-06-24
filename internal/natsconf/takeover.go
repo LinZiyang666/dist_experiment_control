@@ -143,13 +143,21 @@ func intVal(v any) int64 {
 // the directory, then renames. The caller should have run a `nats-server -t` dry-run first.
 func Apply(confPath, merged string) error {
 	bak := confPath + ".bak." + bakStamp()
+	info, err := os.Stat(confPath)
+	if err != nil {
+		return fmt.Errorf("natsconf: stat source: %w", err)
+	}
+	confPerm := info.Mode().Perm()
+	if confPerm == 0 {
+		confPerm = 0o600
+	}
 	// One-time pristine backup: only if NO .bak.* already exists.
 	if existing, _ := filepath.Glob(confPath + ".bak.*"); len(existing) == 0 {
 		raw, err := os.ReadFile(confPath)
 		if err != nil {
 			return fmt.Errorf("natsconf: read for backup: %w", err)
 		}
-		if err := writeSync(bak, raw, 0o644); err != nil {
+		if err := writeSync(bak, raw, confPerm); err != nil {
 			return fmt.Errorf("natsconf: write .bak: %w", err)
 		}
 	}
@@ -171,7 +179,7 @@ func Apply(confPath, merged string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("natsconf: close temp: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, confPerm); err != nil {
 		return fmt.Errorf("natsconf: chmod temp: %w", err)
 	}
 	if err := os.Rename(tmpName, confPath); err != nil {

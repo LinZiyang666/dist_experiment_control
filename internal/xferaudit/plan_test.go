@@ -12,9 +12,9 @@ import (
 func sampleRec(kind string) schema.AuditTransfer {
 	return schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: kind, Verb: "push",
-		Ts:         time.Date(2026, 6, 23, 10, 0, 0, 0, time.UTC),
-		Session:    "lab", Node: "lab-1",
-		ActorNkey:  "UACTOR", ActorFp: "fp",
+		Ts:      time.Date(2026, 6, 23, 10, 0, 0, 0, time.UTC),
+		Session: "lab", Node: "lab-1",
+		ActorNkey: "UACTOR", ActorFp: "fp",
 		TransferID: "tid-deadbeef", Path: "/x", Size: 4096, SHA256: "abc",
 		Tier: "b", Bucket: "xfer-lab", Bytes: 4096, DurationMs: 12, Code: "", Error: "",
 	}
@@ -50,11 +50,15 @@ func TestPlanReplayByteIdentical(t *testing.T) {
 	}
 }
 
-// TestReqIDStableAndHex: the derived reqID is 64 lowercase hex (a valid Command.ReqID),
-// stable for the same (transfer_id, kind), and DISTINCT across kinds (start/complete/failed
-// are distinct rows that must each commit) and across transfer ids.
+// TestReqIDStableAndHex: the record-level reqID is 64 lowercase hex (a valid
+// Command.ReqID), stable for the same normalized record, and DISTINCT across
+// legitimate later records even if transfer_id and kind are reused.
 func TestReqIDStableAndHex(t *testing.T) {
-	a := TransferReqID("tid-1", "complete")
+	rec := sampleRec("complete")
+	a, err := TransferRecordReqID(rec)
+	if err != nil {
+		t.Fatalf("record reqID: %v", err)
+	}
 	if len(a) != 64 {
 		t.Fatalf("reqID len = %d, want 64", len(a))
 	}
@@ -64,14 +68,32 @@ func TestReqIDStableAndHex(t *testing.T) {
 			t.Fatalf("reqID has non-lowercase-hex byte %q", c)
 		}
 	}
-	if TransferReqID("tid-1", "complete") != a {
-		t.Fatalf("reqID not stable for same input")
+	a2, err := TransferRecordReqID(rec)
+	if err != nil {
+		t.Fatalf("record reqID again: %v", err)
 	}
-	if TransferReqID("tid-1", "failed") == a {
-		t.Fatalf("reqID must differ across kinds (complete vs failed) — distinct audit rows")
+	if a2 != a {
+		t.Fatalf("reqID not stable for same record")
 	}
-	if TransferReqID("tid-2", "complete") == a {
-		t.Fatalf("reqID must differ across transfer ids")
+	rec2 := rec
+	rec2.Bytes++
+	b, err := TransferRecordReqID(rec2)
+	if err != nil {
+		t.Fatalf("record reqID changed: %v", err)
+	}
+	if b == a {
+		t.Fatalf("reqID must differ for distinct records with the same transfer_id/kind")
+	}
+	cmdA, err := PlanTransferAudit(rec)
+	if err != nil {
+		t.Fatalf("plan rec: %v", err)
+	}
+	cmdB, err := PlanTransferAudit(rec2)
+	if err != nil {
+		t.Fatalf("plan rec2: %v", err)
+	}
+	if cmdA.ReqID == cmdB.ReqID {
+		t.Fatalf("PlanTransferAudit ReqID must differ for distinct records with the same transfer_id/kind")
 	}
 }
 

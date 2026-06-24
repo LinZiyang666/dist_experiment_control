@@ -22,20 +22,22 @@ func d6Logger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, n
 // ApplyHome that records calls (count, per-port concurrency) so the agent rehome
 // retry/dedup logic can be exercised without a real tunnel.
 type fakeHomeAdapter struct {
-	mu         sync.Mutex
-	calls      int
-	addCalls   int
-	maxPerPort map[int]int // peak concurrent ApplyHome in-flight per port
-	curPerPort map[int]int
-	lastEpoch  map[int]int64
-	lastPin    map[int]string
+	mu            sync.Mutex
+	calls         int
+	addCalls      int
+	maxPerPort    map[int]int // peak concurrent ApplyHome in-flight per port
+	curPerPort    map[int]int
+	lastEpoch     map[int]int64
+	lastPin       map[int]string
+	hasSession    map[int]bool
+	checkSessions bool
 	// respond returns the error ApplyHome should return for (port,epoch). nil = success.
 	respond func(port int, epoch int64, call int) error
 }
 
 func newFakeHomeAdapter(respond func(port int, epoch int64, call int) error) *fakeHomeAdapter {
 	return &fakeHomeAdapter{
-		maxPerPort: map[int]int{}, curPerPort: map[int]int{}, lastEpoch: map[int]int64{}, lastPin: map[int]string{}, respond: respond,
+		maxPerPort: map[int]int{}, curPerPort: map[int]int{}, lastEpoch: map[int]int64{}, lastPin: map[int]string{}, hasSession: map[int]bool{}, respond: respond,
 	}
 }
 
@@ -47,6 +49,9 @@ func (f *fakeHomeAdapter) AddProxy(p PortToken) error {
 	if p.HomeBrokerAddr != "" && p.CertPins.Current == "" {
 		return tunnel.ErrHomePinsRequired
 	}
+	f.mu.Lock()
+	f.hasSession[p.Port] = true
+	f.mu.Unlock()
 	return nil
 }
 func (f *fakeHomeAdapter) RemoveProxy(string, int) error { return nil }
@@ -68,6 +73,14 @@ func (f *fakeHomeAdapter) ApplyHome(port int, _ string, epoch int64, pins proto.
 	f.curPerPort[port]--
 	f.mu.Unlock()
 	return err
+}
+func (f *fakeHomeAdapter) HasSession(port int) bool {
+	if !f.checkSessions {
+		return true
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hasSession[port]
 }
 
 func newRehomeTestAgent(t *testing.T, adapter ExposeAdapter) *Agent {
@@ -249,6 +262,40 @@ func TestD6ReviewStaleTerminalDoesNotDropNewerDirective(t *testing.T) {
 	}
 }
 
+func TestD6ReviewDirectiveArrivingDuringCleanupRestartsWorker(t *testing.T) {
+	port := 14000
+	epoch2Called := make(chan struct{})
+	fake := newFakeHomeAdapter(func(_ int, epoch int64, _ int) error {
+		if epoch == 2 {
+			close(epoch2Called)
+		}
+		return nil
+	})
+	a := newRehomeTestAgent(t, fake)
+
+	var once sync.Once
+	afterRehomeWantSettledHook = func(agent *Agent, gotPort int) {
+		if agent != a || gotPort != port {
+			return
+		}
+		once.Do(func() {
+			agent.applyHomeDirectives(context.Background(), homeAssign(port, 2))
+		})
+	}
+	defer func() { afterRehomeWantSettledHook = nil }()
+
+	a.applyHomeDirectives(context.Background(), homeAssign(port, 1))
+	select {
+	case <-epoch2Called:
+	case <-time.After(2 * time.Second):
+		fake.mu.Lock()
+		calls := fake.calls
+		lastEpoch := fake.lastEpoch[port]
+		fake.mu.Unlock()
+		t.Fatalf("new directive recorded during cleanup did not restart worker; calls=%d last_epoch=%d", calls, lastEpoch)
+	}
+}
+
 // TestD6ReviewDeferredReplayOpensWhenPinsArrive covers the documented R-22 boot
 // path: a clustered expose persisted in state.json has no persisted cert pins, so
 // replayPortsFromState defers it with ErrHomePinsRequired. The next register
@@ -258,6 +305,7 @@ func TestD6ReviewStaleTerminalDoesNotDropNewerDirective(t *testing.T) {
 func TestD6ReviewDeferredReplayOpensWhenPinsArrive(t *testing.T) {
 	port := 14000
 	fake := newFakeHomeAdapter(func(_ int, _ int64, _ int) error { return nil })
+	fake.checkSessions = true
 	a := newRehomeTestAgent(t, fake)
 	if err := a.stateStore.AddPort(PortToken{
 		Name: "svc", Port: port, LocalPort: 9000, Token: "tok",
@@ -290,6 +338,34 @@ func TestD6ReviewDeferredReplayOpensWhenPinsArrive(t *testing.T) {
 	applyCalls := fake.calls
 	fake.mu.Unlock()
 	t.Fatalf("pins-arrived directive did not reopen deferred replay from state.json: AddProxy calls=%d ApplyHome calls=%d", adds, applyCalls)
+}
+
+func TestD9PreD6StateDirectiveOpensBeforeReplay(t *testing.T) {
+	port := 14000
+	fake := newFakeHomeAdapter(func(_ int, _ int64, _ int) error { return nil })
+	fake.checkSessions = true
+	a := newRehomeTestAgent(t, fake)
+	if err := a.stateStore.AddPort(PortToken{Name: "svc", Port: port, LocalPort: 9000, Token: "tok"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a.applyHomeDirectives(context.Background(), homeAssign(port, 1))
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		fake.mu.Lock()
+		adds := fake.addCalls
+		applyCalls := fake.calls
+		fake.mu.Unlock()
+		if adds == 1 && applyCalls == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fake.mu.Lock()
+	adds := fake.addCalls
+	applyCalls := fake.calls
+	fake.mu.Unlock()
+	t.Fatalf("pre-D6 persisted expose was not opened from directive pins before replay: AddProxy=%d ApplyHome=%d", adds, applyCalls)
 }
 
 // TestD6ReviewDeferredReplaySurvivesUnreadableState checks the degraded state

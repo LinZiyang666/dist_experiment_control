@@ -219,7 +219,7 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 	if forceSingle {
 		return healthForceSingle,
 			"running in force-single (single node, no integrity) — recover as soon as peers are restored",
-			"cluster recover --dump-divergent <file>"
+			"on each returning node: cluster recover --self-id <node-id> --dump-divergent <file>, then re-add it from the leader"
 	}
 	if leaderID == "" {
 		// Review M2: this is ONE broker's local view (the multi-broker NATS
@@ -231,7 +231,7 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 		// conditions force-single on cross-checking the others.
 		return healthQuorumLost,
 			"THIS broker sees no leader — it is READ-ONLY (a single-broker view, NOT cluster consensus). Check the OTHER brokers before acting; force-single ONLY after confirming a majority is PERMANENTLY dead.",
-			"on each surviving broker: cluster status --offline ;  then (only if a majority is truly dead) force-single --confirm-peers-dead ..."
+			"on each survivor: cluster status --offline --db /var/lib/tether/tether.db ; then only after confirming peers dead: cluster force-single --self-id <this-node-id> --self-addr <this-host:7400> --confirm-peers-dead <ids...>"
 	}
 	degraded := false
 	for _, n := range nodes {
@@ -261,7 +261,7 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 	if proj.FaultTolerance == 0 {
 		return healthDegraded,
 			fmt.Sprintf("only tolerates %d failures (%d voters, quorum=%d) — add a node for HA", proj.FaultTolerance, proj.Voters, proj.Quorum),
-			"cluster add <host> <node-pub>"
+			"cluster add <node-id> <host:7400> <node-pub>, then re-run with --join-token plus --tunnel-addr/--cert-fp/--nats-route"
 	}
 	if degraded {
 		return healthDegraded, "a node is mid-join / draining or roster/raft INCONSISTENT — see the table", "cluster status"

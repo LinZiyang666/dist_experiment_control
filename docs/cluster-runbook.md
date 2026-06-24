@@ -39,6 +39,7 @@ leader$ tether cluster add <node-id> <host:7400> <Uxxxx...> --join-token <nonce>
 #    node at a time (rolling), leader LAST, verifying `cluster status` reachability after each.
 each-broker$ sudo tether cluster takeover-natsconf --secrets-dir /etc/tether/secrets \
                --server-name <self-id> --route-url nats://<self-host>:6222 \
+               --account-issuer <account-public-nkey> --broker-nkey <self-broker-public-nkey> \
                --peer <other1-id>,nats://<other1-host>:6222,<other1-bus-nkey> \
                --peer <other2-id>,nats://<other2-host>:6222,<other2-bus-nkey>
 each-broker$ sudo systemctl restart nats-server   # rolling; leader last
@@ -50,8 +51,9 @@ leader$ tether cluster status            # the new node walks JOIN_VERIFIED_PEND
 
 Half-success is visible, never silently forked: if AddVoter fails the node shows
 `VOTER_ADD_FAILED`; if catch-up stalls it stays `CATCHING_UP` with a stall hint.
-`cluster doctor` shows the stuck phase + the next command. A new leader runs a
-membership reconciliation pass on startup that forward-completes a mid-promote node.
+`cluster status` shows the stuck phase + the next command; `cluster doctor` is the
+secrets/preflight check. A new leader runs a
+membership reconciliation pass on startup that forward-completes a mid-add node.
 
 ## 2. Drain / retire a node
 
@@ -81,20 +83,25 @@ re-provision):
 leader$ tether cluster drain <node-id> --retire
 
 # 2. Generate a NEW account key + a NEW cluster CA on a trusted host.
-trusted$ tether cluster keygen --out account.nk.new          # new account signer
-trusted$ # (re-issue a fresh cluster CA + per-node leaf certs with your PKI of choice)
+trusted$ go install github.com/nats-io/nkeys/nk@latest
+trusted$ ~/go/bin/nk -gen account > account.nk.new
+trusted$ ~/go/bin/nk -inkey account.nk.new -pubout
+trusted$ # (re-issue a fresh cluster CA + per-node route leaf certs with your PKI of choice)
 
 # 3. Distribute the new account.nk + CA to EVERY surviving broker over a trusted
-#    channel (scp, never committed; 0600). Update /etc/tether/{account.nk,cluster-ca.pem}.
+#    channel (scp, never committed; 0600). Update /etc/tether/secrets/{account.nk,cluster-ca.pem}
+#    and the corresponding route-cert.pem/route-key.pem leaf files on each node.
 
-# 4. Rolling-restart the surviving brokers so they load the new secrets.
+# 4. Re-render nats.conf on every surviving node with takeover-natsconf, then rolling-restart
+#    NATS + the broker so both NATS route auth and broker auth_callout load the new secrets.
 #    Old JWTs signed by the old account key expire within their TTL; the new CA
 #    rejects the retired node's old route cert immediately.
 ```
 
-`cluster status` prints "retired node credentials remain cryptographically valid
-until rotation" so the operator is never misled. **Retire is not considered safe
-against a compromised node until this rotation is done.**
+After `drain --retire`, immediately re-run `takeover-natsconf` on every surviving
+node so the retired node's NATS route/user grants are removed from generated
+configuration. **Retire is not considered safe against a compromised node until
+this re-render/restart and the key/CA rotation above are done.**
 
 ## 3. Quorum loss — the force-single escape hatch (OFFLINE)
 
@@ -106,7 +113,7 @@ If a majority of brokers are permanently dead the cluster goes **read-only**.
 #    not merely partitioned from you. A merely-partitioned-but-alive peer WILL split-brain.
 
 # 1. STOP the daemon so the offline tool can take the disk (and systemd won't restart it).
-survivor$ sudo systemctl mask tether && sudo systemctl stop tether
+survivor$ sudo systemctl mask tether-broker && sudo systemctl stop tether-broker
 
 # 2. Inspect the on-disk state (no NATS needed).
 survivor$ sudo tether cluster status --offline --db /var/lib/tether/tether.db
@@ -120,7 +127,7 @@ survivor$ sudo tether cluster force-single \
             --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2>
 
 # 4. Bring the daemon back. It runs as a single voter (NO HA / NO integrity until recovered).
-survivor$ sudo systemctl unmask tether && sudo systemctl start tether
+survivor$ sudo systemctl unmask tether-broker && sudo systemctl start tether-broker
 ```
 
 `force-single` rewrites the raft configuration to `{self}` via `RecoverCluster`,
@@ -135,7 +142,7 @@ auto-merged):
 
 ```
 # Daemon stopped on the returning node.
-returning$ sudo systemctl mask tether && sudo systemctl stop tether
+returning$ sudo systemctl mask tether-broker && sudo systemctl stop tether-broker
 
 # Dump this node's divergent rows for forensics, THEN wipe raft/ + tether.db.
 # The dump is fsync'd (0600, never overwrites a prior dump) BEFORE any wipe; if the
@@ -143,8 +150,17 @@ returning$ sudo systemctl mask tether && sudo systemctl stop tether
 # confirm (no --yes) — this proves you are wiping the intended node.
 returning$ sudo tether cluster recover --self-id <returning-node-id> --dump-divergent /root/divergent-$(hostname).json
 
-# Then rejoin it as a clean node (section 1).
-returning$ sudo systemctl unmask tether && sudo systemctl start tether
+# Reinitialize this host as a clean single-voter seed so it has raft/ state before start.
+# Do NOT start tether-broker between recover and this init; the daemon refuses cluster
+# mode when broker.cluster.data_dir is set but raft/ is absent.
+returning$ sudo tether cluster init --from-existing \
+             --self-id <returning-node-id> --name <returning-name> --node-ident-pub <Uxxxx...> \
+             --raft-addr <host:7400> --nats-route <host:6222> \
+             --tunnel-addr <host:7000> --public-host <dns> \
+             --secrets-dir /etc/tether/secrets
+
+# Now start it and rejoin it as a clean node (section 1).
+returning$ sudo systemctl unmask tether-broker && sudo systemctl start tether-broker
 leader$    tether cluster add <returning-node-id> <host:7400> <Uxxxx...>
 ```
 
@@ -188,15 +204,24 @@ broker$ sudo tether cluster init --from-existing \
 # 3. TAKE OVER nats.conf (rewrite it with the cluster directives + auth_callout, preserving
 #    the install.sh websocket/jetstream + any documented tuning). Refuses fail-closed if the
 #    conf has a directive tether does not recognize. Prints the before/after ownership table.
-broker$ sudo tether cluster takeover-natsconf --secrets-dir /etc/tether/secrets
+broker$ sudo tether cluster takeover-natsconf \
+          --secrets-dir /etc/tether/secrets \
+          --server-name <node-id> --route-url nats://<host:6222> \
+          --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
+# --account-issuer may be read from an existing auth_callout issuer. --broker-nkey
+# is auto-read only when the existing authorization block has exactly one nkey user;
+# multi-broker generated configs must pass this node's --broker-nkey explicitly.
 
 # 4. Restart nats-server so the new authorization{} (cluster.apply.* ACL) is live BEFORE the
 #    broker connects in cluster mode (else it fails closed: no ACL).
 broker$ sudo systemctl restart nats-server
-broker$ tether cluster status   # (offline ok) confirm the seeded single-voter roster
+# Confirm the seeded single-voter roster while tether-broker is still stopped:
+broker$ sudo tether cluster status --offline --db /var/lib/tether/tether.db
 
 # 5. Point the broker at the cluster + start it (now a single-voter cluster, N=1).
 #    In /etc/tether/broker.yaml under broker.cluster: data_dir / raft_addr / secrets_dir.
+#    Cluster mode auto-loads /etc/tether/secrets/{broker.nk,account.nk}; an explicit
+#    --auth-callout-seeds-dir is only needed if those seeds live somewhere else.
 broker$ sudo systemctl start tether-broker
 
 # 6. Reinstall ALL agents on v2 (the wire break forces this), then grow to N>=3 (section 1).

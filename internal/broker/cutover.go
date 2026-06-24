@@ -149,7 +149,9 @@ func (b *Broker) buildClusterRuntime() (*clusterRuntime, error) {
 	// D9 round-1 MAJOR: run the §15 secrets preflight at STARTUP (not only the operator's
 	// `cluster doctor`) — a missing/unreadable/world-readable key is FATAL before the node
 	// loads them; FDE-absent is an advisory (logged, non-fatal).
-	adv, fatal := clusteroffline.SecretsPreflight(sec)
+	adv, fatal := clusteroffline.SecretsPreflightWithOptions(sec, clusteroffline.SecretsPreflightOptions{
+		RequireAuthSeeds: b.cfg.AuthCallout == nil,
+	})
 	for _, a := range adv {
 		b.cfg.Logger.Warn("broker: secrets preflight advisory", "detail", a)
 	}

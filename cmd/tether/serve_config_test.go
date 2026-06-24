@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -38,6 +41,46 @@ func TestPickPublicHostPrecedence(t *testing.T) {
 				t.Errorf("got %q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestEffectiveAuthSeedsDirDefaultsToClusterSecretsInClusterMode(t *testing.T) {
+	if got := effectiveAuthSeedsDir("/explicit/seeds", true, "/cluster/secrets"); got != "/explicit/seeds" {
+		t.Fatalf("explicit seeds dir = %q, want explicit", got)
+	}
+	if got := effectiveAuthSeedsDir("", true, "/cluster/secrets"); got != "/cluster/secrets" {
+		t.Fatalf("cluster default seeds dir = %q, want cluster secrets", got)
+	}
+	if got := effectiveAuthSeedsDir("", false, "/cluster/secrets"); got != "" {
+		t.Fatalf("single mode default seeds dir = %q, want empty", got)
+	}
+}
+
+func TestLoadAuthCalloutSeedsRejectsTooOpenOrSymlinkSeeds(t *testing.T) {
+	dir := t.TempDir()
+	writeSeeds := func(mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "broker.nk"), []byte("broker"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "account.nk"), []byte("account"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeSeeds(0o644)
+	if _, err := loadAuthCalloutSeeds(dir); err == nil || !strings.Contains(err.Error(), "permissions") {
+		t.Fatalf("too-open broker.nk must be rejected, got %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(dir, "broker.nk")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "account.nk"), filepath.Join(dir, "broker.nk")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAuthCalloutSeeds(dir); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlink broker.nk must be rejected, got %v", err)
 	}
 }
 

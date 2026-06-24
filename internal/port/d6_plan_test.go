@@ -112,6 +112,128 @@ func TestD6ReassignHomeMonotonic(t *testing.T) {
 	}
 }
 
+func TestD6ReassignHomeSelectsActiveReusedPort(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
+
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("allocate first: %v", err)
+	}
+	if err := Free(db, first.Port, now); err != nil {
+		t.Fatalf("free first: %v", err)
+	}
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, 0, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("allocate second: %v", err)
+	}
+	if second.Port != first.Port {
+		t.Fatalf("test setup expected port reuse, got first=%d second=%d", first.Port, second.Port)
+	}
+
+	newEpoch, cmd, err := PlanReassignHome(db, second.Port, "node-2")
+	if err != nil {
+		t.Fatalf("reassign reused active port: %v", err)
+	}
+	if newEpoch != 1 {
+		t.Fatalf("epoch = %d, want 1", newEpoch)
+	}
+	if _, err := db.Exec(cmd.Body[0].SQL); err != nil {
+		t.Fatalf("apply reassign: %v", err)
+	}
+	var oldHome, oldState, newHome, newState string
+	if err := db.QueryRow(`SELECT home_broker, state FROM port_allocations WHERE name='old'`).Scan(&oldHome, &oldState); err != nil {
+		t.Fatalf("read old row: %v", err)
+	}
+	if err := db.QueryRow(`SELECT home_broker, state FROM port_allocations WHERE name='new'`).Scan(&newHome, &newState); err != nil {
+		t.Fatalf("read new row: %v", err)
+	}
+	if oldHome != "" || oldState != "FREED" {
+		t.Fatalf("historical row mutated: home=%q state=%q", oldHome, oldState)
+	}
+	if newHome != "node-2" || newState != "ALLOCATED" {
+		t.Fatalf("active row not rehomed: home=%q state=%q", newHome, newState)
+	}
+}
+
+func TestD9PlanAllocationStateChangeFencesPortReuse(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
+
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("allocate first: %v", err)
+	}
+	if err := FreeAllocation(db, *first, now); err != nil {
+		t.Fatalf("free first: %v", err)
+	}
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("reuse port: %v", err)
+	}
+	if _, err := PlanFreeAllocation(db, *first, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale PlanFreeAllocation err = %v, want ErrNotFound", err)
+	}
+	if _, err := PlanRevokeAllocation(db, *first, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale PlanRevokeAllocation err = %v, want ErrNotFound", err)
+	}
+
+	cmd, err := PlanFreeAllocation(db, *second, now)
+	if err != nil {
+		t.Fatalf("valid PlanFreeAllocation: %v", err)
+	}
+	if _, err := db.Exec(cmd.Body[0].SQL); err != nil {
+		t.Fatalf("apply free allocation: %v", err)
+	}
+	var oldState, newState string
+	if err := db.QueryRow(`SELECT state FROM port_allocations WHERE name='old'`).Scan(&oldState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT state FROM port_allocations WHERE name='new'`).Scan(&newState); err != nil {
+		t.Fatal(err)
+	}
+	if oldState != "FREED" || newState != "FREED" {
+		t.Fatalf("states after fenced free: old=%s new=%s, want FREED/FREED", oldState, newState)
+	}
+}
+
+func TestD9PlanRevokeAllocationUpdatesOnlySelectedRow(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
+
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("allocate first: %v", err)
+	}
+	if err := FreeAllocation(db, *first, now); err != nil {
+		t.Fatalf("free first: %v", err)
+	}
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", tinyBand())
+	if err != nil {
+		t.Fatalf("reuse port: %v", err)
+	}
+	cmd, err := PlanRevokeAllocation(db, *second, now)
+	if err != nil {
+		t.Fatalf("valid PlanRevokeAllocation: %v", err)
+	}
+	if _, err := db.Exec(cmd.Body[0].SQL); err != nil {
+		t.Fatalf("apply revoke allocation: %v", err)
+	}
+	var oldState, newState string
+	if err := db.QueryRow(`SELECT state FROM port_allocations WHERE name='old'`).Scan(&oldState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT state FROM port_allocations WHERE name='new'`).Scan(&newState); err != nil {
+		t.Fatal(err)
+	}
+	if oldState != "FREED" || newState != "REVOKED" {
+		t.Fatalf("states after fenced revoke: old=%s new=%s, want FREED/REVOKED", oldState, newState)
+	}
+}
+
 func readHomeEpoch(t *testing.T, db *sql.DB, port int) (string, int64) {
 	t.Helper()
 	var home string

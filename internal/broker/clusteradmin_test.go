@@ -205,6 +205,29 @@ func TestD7DrainSelfLeaderDoesNotHalfDrain(t *testing.T) {
 	}
 }
 
+func TestD7DrainUnknownNodeDoesNotRaiseMarker(t *testing.T) {
+	n, addr := d7SingleNode(t, "single-1")
+	admin := NewClusterAdmin(n, nil)
+	in := d7JoinInput(t, "single-1", addr)
+	caughtUp := func(b uint64) (bool, error) { c, e := n.AppliedIndex(); return c >= b, e }
+	if err := admin.AddNode(in, addr, caughtUp, 5*time.Second); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	err := admin.DrainNode("ghost", false, true, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "not in cluster_nodes") {
+		t.Fatalf("drain unknown node should fail before marker, got %v", err)
+	}
+	var markers int
+	if err := n.BoundedStaleRead(func(db *sql.DB) error {
+		return db.QueryRow(`SELECT COUNT(*) FROM cluster_meta WHERE key='draining:ghost'`).Scan(&markers)
+	}); err != nil {
+		t.Fatalf("read markers: %v", err)
+	}
+	if markers != 0 {
+		t.Fatalf("unknown drain raised marker rows=%d", markers)
+	}
+}
+
 // TestD7TransferLeaderToRejectsBadTargets (external review F1): the targeted
 // transfer rejects self / unknown / non-voter rather than silently transferring to
 // some other peer.
@@ -225,6 +248,13 @@ func TestD7TransferLeaderToRejectsBadTargets(t *testing.T) {
 func TestD7RotateTunnelCertUpdatesPins(t *testing.T) {
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
+	var hotSwapped bool
+	admin.prepareTunnelCertRotate = func(newFP string) (func(), error) {
+		if newFP != "sha256:NEW" {
+			t.Fatalf("prepare fp = %q, want sha256:NEW", newFP)
+		}
+		return func() { hotSwapped = true }, nil
+	}
 	in := d7JoinInput(t, "single-1", addr) // CertFP defaults to "sha256:ab"
 	caughtUp := func(b uint64) (bool, error) { c, e := n.AppliedIndex(); return c >= b, e }
 	if err := admin.AddNode(in, addr, caughtUp, 5*time.Second); err != nil {
@@ -248,6 +278,23 @@ func TestD7RotateTunnelCertUpdatesPins(t *testing.T) {
 	}
 	if !validUntil.Valid || validUntil.String == "" {
 		t.Fatal("cert_fp_valid_until not set on rotation")
+	}
+	if !hotSwapped {
+		t.Fatal("cert rotation committed DB pins but did not hot-swap the live tunnel cert")
+	}
+}
+
+func TestD9RotateTunnelCertRejectsRemoteTarget(t *testing.T) {
+	n, addr := d7SingleNode(t, "single-1")
+	admin := NewClusterAdmin(n, nil)
+	in := d7JoinInput(t, "single-1", addr)
+	caughtUp := func(b uint64) (bool, error) { c, e := n.AppliedIndex(); return c >= b, e }
+	if err := admin.AddNode(in, addr, caughtUp, 5*time.Second); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	err := admin.RotateTunnelCert("other-1", "sha256:NEW", time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "transfer leadership") {
+		t.Fatalf("remote cert rotation must be rejected, got %v", err)
 	}
 }
 

@@ -102,6 +102,26 @@ func TestNodeUpgradeRequiresActiveSession(t *testing.T) {
 	mustNoActiveSession(t, "upgrade", err)
 }
 
+func TestNodeLsRequiresActiveSession(t *testing.T) {
+	parent := newNodeCmd()
+	home := t.TempDir()
+	parent.SetOut(&bytes.Buffer{})
+	parent.SetErr(&bytes.Buffer{})
+	parent.SetArgs([]string{"ls", "--home", home})
+	err := parent.Execute()
+	mustNoActiveSession(t, "node ls", err)
+}
+
+func TestAlertLsRequiresActiveSession(t *testing.T) {
+	err := runWithFreshHome(t, newAlertLsCmd())
+	mustNoActiveSession(t, "alert ls", err)
+}
+
+func TestAlertAckRequiresActiveSession(t *testing.T) {
+	err := runWithFreshHome(t, newAlertAckCmd(), "quorum_lost")
+	mustNoActiveSession(t, "alert ack", err)
+}
+
 func mustNoActiveSession(t *testing.T, verb string, err error) {
 	t.Helper()
 	if err == nil {

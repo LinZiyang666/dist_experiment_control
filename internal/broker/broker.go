@@ -745,6 +745,9 @@ func (b *Broker) Run(ctx context.Context) error {
 	// and start the leader-gated audit-publisher + alert-reconciler loops. After the JS
 	// probe (the loops need b.js) and the NATS connect (nc).
 	if b.clusterMode {
+		if b.js == nil {
+			return fmt.Errorf("broker: cluster mode requires JetStream; enable JetStream before starting HA broker")
+		}
 		if err := b.wireClusterLate(ctx, nc); err != nil {
 			return err
 		}
@@ -816,6 +819,9 @@ func (b *Broker) Run(ctx context.Context) error {
 	if revoked := b.reconcilePorts(bootNow); revoked > 0 {
 		b.cfg.Logger.Info("broker: boot port revocations", "count", revoked)
 	}
+	if closed := b.reconcileTunnelSessions(); closed > 0 {
+		b.cfg.Logger.Info("broker: boot stale tunnel proxies closed", "count", closed)
+	}
 
 	b.cfg.Logger.Info("broker: ready",
 		"nats", b.cfg.NATSURL,
@@ -854,11 +860,14 @@ func (b *Broker) Run(ctx context.Context) error {
 					b.cfg.Logger.Info("broker: port revocations", "count", revoked)
 				}
 			}
+			if closed := b.reconcileTunnelSessions(); closed > 0 {
+				b.cfg.Logger.Info("broker: stale tunnel proxies closed", "count", closed)
+			}
 		case <-gcTicker.C:
-			// D9 §3 (audit #5): proc GC is leader-local retention (local maintenance, not
-			// replicated state) — in cluster mode it runs only on the leader and writes the
-			// local handle (a follower GCs when it leads); single mode unchanged.
-			if b.clusterMode && !b.cl.node.IsLeader() {
+			// In cluster mode processes is replicated state, so deleting rows outside raft
+			// can fork leader/follower SQLite contents. Keep retention GC single-node only
+			// until it has a replicated command.
+			if b.clusterMode {
 				continue
 			}
 			cutoff := b.cfg.Now().Add(-b.cfg.ProcRetention)
@@ -877,6 +886,9 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	sid, nid, ok := proto.ParseSidNidFromCtrl(msg.Subject)
 	if !ok {
 		b.replyErr(msg, "subject_malformed", "cannot parse sid/nid from "+msg.Subject)
+		return
+	}
+	if b.isClusterFollower() {
 		return
 	}
 
@@ -916,17 +928,6 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		return
 	}
 
-	// D9 round-2 MAJOR: register sits on a BROADCAST subject (nc.Subscribe), so in a ≥2-node
-	// cluster EVERY broker would otherwise run the full identity-forward + G.1 reconcile +
-	// reply + audit — N× the reconcile audit (reconciled_closed/killed_orphan emitted N
-	// times) and N stale-RODB directive computations. Make register LEADER-ONLY: a follower
-	// returns silently (no reply, no reconcile, no audit). Liveness stays fresh on every
-	// broker because handleHeartbeat is ALSO broadcast (each broker updates its own local
-	// last_heartbeat_at), so the leader-only OFFLINE/revoke scan sees current heartbeats.
-	if b.clusterMode && !b.cl.node.IsLeader() {
-		return
-	}
-
 	in := node.RegisterInput{
 		SID: sid, NID: nid,
 		ProtoVersion:   req.ProtoVersion,
@@ -946,6 +947,11 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		if errors.Is(err, node.ErrSessionMissing) {
 			b.replyErr(msg, "session_not_found",
 				fmt.Sprintf("session %q does not exist; have an owner run `tether session create %s` first", sid, sid))
+			return
+		}
+		if errors.Is(err, node.ErrSessionNotActive) {
+			b.replyErr(msg, "session_not_found_or_deleting",
+				fmt.Sprintf("session %q is missing or being deleted", sid))
 			return
 		}
 		b.replyErr(msg, "store_error", err.Error())

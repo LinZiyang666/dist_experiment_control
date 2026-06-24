@@ -14,11 +14,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/session"
 )
 
 // pubSysEvent emits one tether.v2.sys.events message. Always best-
@@ -99,6 +101,19 @@ func dropSessionRows(db *sql.DB, sid string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	var state string
+	switch err := tx.QueryRow(`SELECT state FROM sessions WHERE sid = ?`, sid).Scan(&state); {
+	case err == nil:
+		if state != string(session.StateDeleting) {
+			return session.ErrDeleting
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	default:
+		return fmt.Errorf("dropSessionRows lookup: %w", err)
+	}
+
 	for _, q := range []string{
 		`DELETE FROM port_allocations  WHERE sid = ?`,
 		`DELETE FROM processes         WHERE sid = ?`,

@@ -112,6 +112,66 @@ func TestFreeReturnsPortToPool(t *testing.T) {
 	}
 }
 
+func TestFreeAllocationFencesReusedPort(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+
+	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	if err := Free(db, first.Port, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Port != first.Port {
+		t.Fatalf("test setup expected port reuse, got first=%d second=%d", first.Port, second.Port)
+	}
+	if err := FreeAllocation(db, *first, time.Now().UTC()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale allocation free err = %v, want ErrNotFound", err)
+	}
+	got, err := LookupByName(db, "lab", "second")
+	if err != nil {
+		t.Fatalf("current allocation was freed by stale request: %v", err)
+	}
+	if got.TokenHash != second.TokenHash {
+		t.Fatalf("current allocation changed: got hash %q want %q", got.TokenHash, second.TokenHash)
+	}
+	if err := FreeAllocation(db, *second, time.Now().UTC()); err != nil {
+		t.Fatalf("current allocation free: %v", err)
+	}
+}
+
+func TestRevokeAllocationFencesReusedPort(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+
+	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	if err := Revoke(db, first.Port, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Port != first.Port {
+		t.Fatalf("test setup expected port reuse, got first=%d second=%d", first.Port, second.Port)
+	}
+	if err := RevokeAllocation(db, *first, time.Now().UTC()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale allocation revoke err = %v, want ErrNotFound", err)
+	}
+	got, err := LookupByName(db, "lab", "second")
+	if err != nil {
+		t.Fatalf("current allocation was revoked by stale request: %v", err)
+	}
+	if got.TokenHash != second.TokenHash {
+		t.Fatalf("current allocation changed: got hash %q want %q", got.TokenHash, second.TokenHash)
+	}
+	if err := RevokeAllocation(db, *second, time.Now().UTC()); err != nil {
+		t.Fatalf("current allocation revoke: %v", err)
+	}
+}
+
 func TestRevokeReturnsPortToPool(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")

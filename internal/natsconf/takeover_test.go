@@ -88,3 +88,26 @@ func TestApplyAtomicSwapAndOneTimeBackup(t *testing.T) {
 		t.Fatalf("second apply must not add a .bak, got %d", len(baks2))
 	}
 }
+
+func TestApplyBackupPreservesPrivatePermissions(t *testing.T) {
+	conf := writeConf(t, "authorization { users = [{user: \"u\", password: \"secret\"}] }\n")
+	if err := os.Chmod(conf, 0o600); err != nil {
+		t.Fatalf("chmod source: %v", err)
+	}
+	if err := Apply(conf, "server_name: \"tether-a\"\n"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	baks, _ := filepath.Glob(conf + ".bak.*")
+	if len(baks) != 1 {
+		t.Fatalf("want exactly one backup, got %d", len(baks))
+	}
+	for _, path := range []string{conf, baks[0]} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got&0o077 != 0 {
+			t.Fatalf("%s mode = %o, group/world bits must be clear", path, got)
+		}
+	}
+}

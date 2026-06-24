@@ -404,12 +404,12 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPushErr(msg, "actor_invalid", err.Error())
 		return
 	}
+	if !b.transferHomeGate(sid, nid) {
+		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
+	}
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyPushErr(msg, err, "")
 		return
-	}
-	if !b.transferHomeGate(sid, nid) {
-		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
 	}
 	var req proto.PushPrepareReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
@@ -530,12 +530,12 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPullErr(msg, "actor_invalid", err.Error())
 		return
 	}
+	if !b.transferHomeGate(sid, nid) {
+		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
+	}
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyPullErr(msg, err, "")
 		return
-	}
-	if !b.transferHomeGate(sid, nid) {
-		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
 	}
 	var req proto.PullPrepareReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
@@ -636,10 +636,6 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyCommitErr(msg, "actor_invalid", err.Error())
 		return
 	}
-	if err := b.transferGate(sid, fp, nid); err != "" {
-		b.replyCommitErr(msg, err, "")
-		return
-	}
 	var req proto.TransferCommitReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		b.replyCommitErr(msg, "json_parse", err.Error())
@@ -655,6 +651,10 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		if b.selfNodeID() == "" {
 			b.replyCommitErr(msg, "transfer_unknown", req.TransferID)
 		}
+		return
+	}
+	if err := b.transferGate(sid, fp, nid); err != "" {
+		b.replyCommitErr(msg, err, "")
 		return
 	}
 	if entry.actor != actor || entry.verb != "push" {
@@ -912,11 +912,6 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "actor_invalid", Error: err.Error()})
 		return
 	}
-	if code := b.transferGate(sid, fp, ""); code != "" {
-		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: code})
-		return
-	}
-
 	var fin proto.TransferFinalize
 	if err := json.Unmarshal(msg.Data, &fin); err != nil {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "json_parse", Error: err.Error()})
@@ -946,6 +941,10 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		if b.selfNodeID() == "" {
 			b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "transfer_unknown"})
 		}
+		return
+	}
+	if code := b.transferGate(sid, fp, ""); code != "" {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: code})
 		return
 	}
 	if preview.actor != actor {

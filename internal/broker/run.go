@@ -28,6 +28,9 @@ func (b *Broker) handleRunReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyRunFailed(msg, "subject_malformed")
 		return
 	}
+	if b.isClusterFollower() {
+		return
+	}
 
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {
@@ -117,6 +120,9 @@ func (b *Broker) handleKillReq(nc *nats.Conn, msg *nats.Msg) {
 	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
 	if !ok || verb != "kill" {
 		b.replyKillFailed(msg, "subject_malformed")
+		return
+	}
+	if b.isClusterFollower() {
 		return
 	}
 

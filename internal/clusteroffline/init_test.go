@@ -71,7 +71,7 @@ func writeSecrets(t *testing.T, dir string) string {
 			t.Fatal(err)
 		}
 	}
-	for _, f := range []string{"route-key.pem", "node-ident.nk"} {
+	for _, f := range []string{"route-key.pem", "node-ident.nk", "broker.nk", "account.nk"} {
 		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}

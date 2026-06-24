@@ -161,14 +161,16 @@ func newServeCmd() *cobra.Command {
 				DBPath:              dbPath,
 			}
 
-			// auth_callout: enabled iff --auth-callout-seeds-dir is supplied
-			// and contains both broker.nk and account.nk. The matching
+			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)
+			// auth_callout: enabled iff an explicit --auth-callout-seeds-dir is supplied
+			// or cluster mode defaults it to broker.cluster.secrets_dir. The directory
+			// must contain both private 0600 seed files: broker.nk and account.nk. The matching
 			// nats-server.conf must list the broker pubkey under
 			// `nkeys` + `authorization.auth_callout.auth_users`, and the
 			// account pubkey under `authorization.auth_callout.issuer`.
 			// (See architecture E.2 / K.3 for the full deployment shape.)
-			if authSeedsDir != "" {
-				ac, err := loadAuthCalloutSeeds(authSeedsDir)
+			if authSeedsSource != "" {
+				ac, err := loadAuthCalloutSeeds(authSeedsSource)
 				if err != nil {
 					return fmt.Errorf("auth_callout seeds: %w", err)
 				}
@@ -185,7 +187,7 @@ func newServeCmd() *cobra.Command {
 
 			authMode := "off (dev / P2-style)"
 			if cfg.AuthCallout != nil {
-				authMode = "on (seeds=" + authSeedsDir + ")"
+				authMode = "on (seeds=" + authSeedsSource + ")"
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"tether serve: NATS=%s DB=%s auth_callout=%s\n(press Ctrl-C to quit)\n",
@@ -202,7 +204,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&dbPath, "db", "./tether.db", "SQLite database file (use \":memory:\" for ephemeral)")
 	cmd.Flags().StringVar(&authSeedsDir, "auth-callout-seeds-dir", "",
-		"directory containing broker.nk + account.nk for auth_callout (P3+ secure mode); empty = dev/P2 mode")
+		"directory containing broker.nk + account.nk for auth_callout; empty = off in single mode, broker.cluster.secrets_dir in cluster mode")
 	cmd.Flags().StringVar(&publicHost, "public-host", "localhost",
 		"DNS name printed in expose URLs (operator-facing)")
 	cmd.Flags().StringVar(&tunnelCtrlAddr, "tunnel-addr", "0.0.0.0:7000",
@@ -298,21 +300,53 @@ func parsePortBand(s string) (low, high int, err error) {
 	return low, high, nil
 }
 
-// loadAuthCalloutSeeds reads broker.nk and account.nk (both 0600 files
+func effectiveAuthSeedsDir(explicit string, clusterMode bool, clusterSecretsDir string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if clusterMode {
+		return clusterSecretsDir
+	}
+	return ""
+}
+
+// loadAuthCalloutSeeds reads broker.nk and account.nk (both private regular files
 // containing nkey seeds) from dir. Both must exist.
 func loadAuthCalloutSeeds(dir string) (*broker.AuthCalloutConfig, error) {
-	brokerSeed, err := os.ReadFile(filepath.Join(dir, "broker.nk"))
+	brokerSeed, err := readPrivateSeedFile(dir, "broker.nk")
 	if err != nil {
-		return nil, fmt.Errorf("read broker.nk: %w", err)
+		return nil, err
 	}
-	accountSeed, err := os.ReadFile(filepath.Join(dir, "account.nk"))
+	accountSeed, err := readPrivateSeedFile(dir, "account.nk")
 	if err != nil {
-		return nil, fmt.Errorf("read account.nk: %w", err)
+		return nil, err
 	}
 	return &broker.AuthCalloutConfig{
 		BrokerNkeySeed: brokerSeed,
 		AccountSeed:    accountSeed,
 	}, nil
+}
+
+func readPrivateSeedFile(dir, name string) ([]byte, error) {
+	path := filepath.Join(dir, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s: seed file must be a regular file, not a symlink", name)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: seed file must be a regular file", name)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s: permissions %04o too open; want 0600 or stricter", name, info.Mode().Perm())
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	return body, nil
 }
 
 // subURLBase derives the public origin printed in P13 subscription URLs from
