@@ -1,9 +1,8 @@
-// cluster_health.go is the D8b (§10) BUILD-AND-PROVE broker-side responder file for the
-// member-reachable cluster-health + alert RPCs. The subscriptions are constructed ONLY by the
-// test/d8 harness (production builds no cluster.Node, cutover=D9); serve.go never wires them,
-// so at N=1 a ctl probe gets ErrNoResponders and the gate/banner stay silent (byte-identical).
-//
-// EXCLUDED from the TestD8ProductionWiresNoCluster guard scan.
+// cluster_health.go (D8b §10) is the broker-side responder for the member-reachable
+// cluster-health + alert RPCs. Post-D9 cutover the subscriptions are wired in CLUSTER mode
+// (wireClusterLate / SubscribeClusterHealth); in SINGLE mode they are not wired, so a ctl probe
+// gets ErrNoResponders and the gate/banner stay silent (byte-identical). (The per-phase
+// TestD8ProductionWiresNoCluster guard was a build-and-prove scaffold removed at the D9 cutover.)
 package broker
 
 import (

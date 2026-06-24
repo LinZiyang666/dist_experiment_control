@@ -22,6 +22,17 @@ import (
 // leader DB (returning ErrNodeMissing before proposing) and bakes the INSERT.
 // start_time_ticks is baked as NULL when zero (matching nullableInt64) so the
 // PID-reuse defense's exact-int64 compare is preserved.
+//
+// IDEMPOTENT BY CONSTRUCTION (audit M8 / port-plan F1): the baked statement is
+// INSERT OR IGNORE on the pid PRIMARY KEY, so a committed-but-ack-lost forwarder
+// retry that re-proposes the SAME pid at a NEW raft index is a deterministic
+// RowsAffected==0 no-op on EVERY replica — NOT a PK-violation that genericExecApplier
+// would surface as a plain error, tripping fsm.Apply's retry→panic and bricking the
+// whole cluster on log replay. The DB-state equivalence with the single-mode direct
+// mutator holds (a duplicate insert leaves the original row unchanged either way); only
+// the error return differs (live errors, op no-ops) — intentional, since the error path
+// is the brick. VerbProcInsert forwards with reqID="" (the 0011 ledger does NOT dedup it),
+// so this OR IGNORE is the SOLE idempotency anchor.
 func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 	if p.PID == "" {
 		return nil, fmt.Errorf("proc: pid required")
@@ -47,7 +58,7 @@ func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 	if p.StartTimeTicks != 0 {
 		ticks = cluster.LitInt(p.StartTimeTicks)
 	}
-	sql := `INSERT INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)` +
+	sql := `INSERT OR IGNORE INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)` +
 		` VALUES (` + lits[0] + `, ` + lits[1] + `, ` + lits[2] + `, ` + lits[3] + `, ` + lits[4] + `, ` +
 		cluster.LitTime(p.StartedAt) + `, ` + lits[5] + `, ` + lits[6] + `, ` + lits[7] + `, ` + ticks + `)`
 	return cluster.NewCommand(cluster.OpProcCreate, cluster.Stmt(sql)), nil

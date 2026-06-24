@@ -29,6 +29,17 @@ type TunnelExposeAdapter struct {
 	localFor map[int]int // publicPort → localPort
 }
 
+// Compile-time contracts: the production adapter MUST satisfy ExposeAdapter AND the
+// OPTIONAL homeApplier + homeSessionChecker (D6 §7.4 / audit M3). The agent type-asserts
+// the optionals at runtime, so a missing method is otherwise a SILENT production no-op
+// (the agent-rehome F1 / openHomeFromState-dead-branch bug). These assertions turn that
+// divergence into a compile error instead of a field-only failure.
+var (
+	_ ExposeAdapter      = (*TunnelExposeAdapter)(nil)
+	_ homeApplier        = (*TunnelExposeAdapter)(nil)
+	_ homeSessionChecker = (*TunnelExposeAdapter)(nil)
+)
+
 // NewTunnelExposeAdapter wires a tunnel.Client at brokerAddr and
 // returns the adapter. Caller MUST call Start(ctx) once before any
 // AddProxy / RemoveProxy.
@@ -82,6 +93,20 @@ func (a *TunnelExposeAdapter) ApplyHome(publicPort int, brokerAddr string, epoch
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
 	return a.client.ApplyHome(publicPort, brokerAddr, epoch, certPins)
+}
+
+// HasSession reports whether a live tunnel session is currently open for
+// publicPort. It satisfies the homeSessionChecker interface the agent
+// type-asserts in applyOneHome (audit M3 / agent-rehome F1): without it the
+// production adapter never matched homeSessionChecker, so the
+// `!HasSession -> openHomeFromState` recovery branch was DEAD in production —
+// a clustered expose whose tunnel was not yet (re)opened (e.g. the boot-order
+// race where applyReconciliation runs before replayPortsFromState) fell through
+// to ApplyHome, found no session, returned a no-op nil, and reported a FALSE
+// "rehomed" success while the expose stayed DOWN until the next NATS reconnect.
+// Delegating to the tunnel client makes the openHomeFromState recovery path live.
+func (a *TunnelExposeAdapter) HasSession(publicPort int) bool {
+	return a.client.HasSession(publicPort)
 }
 
 // RemoveProxy closes the tunnel session for publicPort. Name is

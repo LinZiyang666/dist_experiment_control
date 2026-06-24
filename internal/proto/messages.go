@@ -194,6 +194,17 @@ type RehomeDirective struct {
 // as terminal.
 const ReasonHomeCatchingUp = "home_catching_up"
 
+// CodeLeaderUnavailable is the TRANSIENT register/control reply code (audit M2 /
+// write-forward F3) a broker returns when an authoritative write could not be committed by
+// a raft leader RIGHT NOW — leadership was lost between the IsLeader() check and Apply, or a
+// forward landed during an election (cluster.ErrForwardNotLeader). It is the SINGLE SOURCE
+// OF TRUTH shared by the broker reply side (handleRegister) and the agent register loop: the
+// agent MUST retry it (its NATS reconnect / register backoff), NEVER treat it as a permanent
+// rejection — otherwise a routine raft leader failover would exit the agent process. Distinct
+// from the config-error codes (proto_mismatch / nid_mismatch / store_error) which are
+// permanent and rightly terminal.
+const CodeLeaderUnavailable = "leader_unavailable"
+
 // ReconciledProc reports one PID the broker just transitioned away
 // from RUNNING/LOST as part of the register reconciliation. NewState
 // is always "EXITED" in v1 (architecture G.1 reply payload).

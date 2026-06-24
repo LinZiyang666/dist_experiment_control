@@ -53,6 +53,18 @@ var bucketOf = map[string]Bucket{
 	"max_connections": TetherPassthrough,
 }
 
+// jetstreamSafeSubkeys / websocketSafeSubkeys are the ONLY subkeys the takeover PRESERVES:
+// BuildMergedConf re-emits exactly these (JSStoreDir → jetstream{store_dir}; websocketBlock →
+// websocket{host,port,no_tls}). jetstream{} and websocket{} are InstallSafe at the TOP level,
+// but a hand-added subkey (jetstream.domain / .max_file_store, websocket.compression) would
+// pass the top-level gate and then be SILENTLY DROPPED on re-render — exactly what the
+// package's fail-closed contract forbids. So Preflight refuses any unrecognized subkey too
+// (audit M6 / natsconf F1). install.sh writes only these, so the common path is unaffected.
+var (
+	jetstreamSafeSubkeys = map[string]bool{"store_dir": true}
+	websocketSafeSubkeys = map[string]bool{"host": true, "port": true, "no_tls": true}
+)
+
 // lowerKeys recursively lowercases every map key (nats keys are case-insensitive). Values
 // are preserved; nested maps + slices of maps are descended so the accessors that read
 // nested keys (auth_callout, users, store_dir) are also case-insensitive.
@@ -125,6 +137,12 @@ func Preflight(confPath string) (*Ownership, error) {
 		}
 		own.Entries = append(own.Entries, Owned{Key: key, Bucket: b})
 	}
+	// Subkey fail-closed (audit M6 / natsconf F1): refuse an unrecognized subkey inside
+	// jetstream{} / websocket{} too — the takeover re-emits only a fixed subset, so any other
+	// subkey would be silently dropped on re-render (e.g. a hand-set JS `domain` that breaks
+	// cross-cluster stream addressing).
+	unknown = append(unknown, unrecognizedSubkeys(parsed, "jetstream", jetstreamSafeSubkeys)...)
+	unknown = append(unknown, unrecognizedSubkeys(parsed, "websocket", websocketSafeSubkeys)...)
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
 		return nil, fmt.Errorf("natsconf: %q contains directive(s) tether does not recognize: %s — "+
@@ -133,6 +151,23 @@ func Preflight(confPath string) (*Ownership, error) {
 	}
 	sort.Slice(own.Entries, func(i, j int) bool { return own.Entries[i].Key < own.Entries[j].Key })
 	return own, nil
+}
+
+// unrecognizedSubkeys returns the dotted names (e.g. "jetstream.domain") of any subkey inside
+// the named block that is NOT in the preserved allow-list. Returns nil if the block is absent
+// or not a map (e.g. `jetstream: true`). The parsed map is already lowercased.
+func unrecognizedSubkeys(parsed map[string]any, block string, safe map[string]bool) []string {
+	m, ok := parsed[block].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for k := range m {
+		if !safe[strings.ToLower(k)] {
+			out = append(out, block+"."+k)
+		}
+	}
+	return out
 }
 
 // hasIncludeDirective reports whether the raw conf has a top-level-ish `include` token. The

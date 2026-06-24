@@ -66,6 +66,17 @@ func alertLitTime(t time.Time) (string, error) {
 // issues zero raft writes; the WHERE NOT EXISTS is the second line that keeps a racing
 // double-raise a deterministic no-op.
 func PlanAlertRaise(id, kind, severity, dedupKey, message string, raisedAt time.Time) (*Command, error) {
+	// audit S1: self-validate the enum at the single bake surface. alert ops ride the plain
+	// genericExecApplier, so an out-of-enum kind/severity would fail the 0009 CHECK on EVERY
+	// replica → a fail-stop poison entry that bricks the cluster on log replay. Callers
+	// (planAlertSignal) already validate, but enforcing it HERE means a future raise caller that
+	// forgets cannot mint a CHECK-violating row.
+	if !ValidAlertKind(kind) {
+		return nil, fmt.Errorf("cluster: plan alert-raise: invalid kind %q", kind)
+	}
+	if !ValidAlertSeverity(severity) {
+		return nil, fmt.Errorf("cluster: plan alert-raise: invalid severity %q", severity)
+	}
 	lits, err := LitTextAll(id, kind, severity, dedupKey, message)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: plan alert-raise: %w", err)

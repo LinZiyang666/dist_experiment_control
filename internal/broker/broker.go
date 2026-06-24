@@ -305,56 +305,51 @@ type Broker struct {
 	// then publish Enabled:true after a concurrent OFF has completed.
 	proxyOpMu sync.Mutex
 
-	// selfID + tunnelCert are the D6 BUILD-AND-PROVE seam (cutover=D9). Both are
-	// the zero value in production: serve.go never attaches a cluster identity nor
-	// loads a stable cert, so every D6 home-assignment path (homeForRegister /
-	// homeForExpose / selfNodeID / the tunnelTokenLookup home ladder / the stable
-	// cert) is inert and the responses stay byte-identical. The test harness sets
-	// them via AttachClusterSeam (internal/broker/home.go). The guard test
-	// TestD6ProductionWiresNoClusterNode bans AttachClusterSeam + the stable-cert
-	// constructors from production files so these can never become non-zero there.
+	// selfID + tunnelCert are the D6 home/cert seam. Post-D9 cutover, in CLUSTER mode
+	// wireClusterEarly calls AttachClusterSeam to set this broker's cluster identity + stable
+	// cert, so every D6 home-assignment path (homeForRegister / homeForExpose / selfNodeID / the
+	// tunnelTokenLookup home ladder / the stable cert) activates. In SINGLE mode both stay the
+	// zero value, the home ladder is inert, and responses stay byte-identical to pre-D6. (The
+	// per-phase TestD6ProductionWiresNoClusterNode guard was a build-and-prove scaffold removed
+	// at the D9 cutover — see test/d9.)
 	//
-	// selfID is this broker's cluster_nodes.node_id (== cluster.Node.SelfID() at
-	// D9 cutover). It is the "self" the tunnelTokenLookup home_broker==self filter
-	// compares against; "" ⇒ the whole home ladder is inert (single-node). The D6
-	// CORE (home assignment from the replicated cluster_nodes/port_allocations view
-	// + the ladder + agent rehome + cert pinning) needs only this string + the
-	// local DB; the FSM PRODUCER op OpPortReassignHome is proven by its own unit
-	// test (build-and-prove, like every D2 op), not wired into the live DB here.
+	// selfID is this broker's cluster_nodes.node_id (== cluster.Node.SelfID()). It is the "self"
+	// the tunnelTokenLookup home_broker==self filter compares against; "" ⇒ the home ladder is
+	// inert (single-node).
 	selfID     string
 	tunnelCert *tls.Certificate
 
-	// transferAuditSink + transferAuditWG are the D8a (§9) BUILD-AND-PROVE seam
-	// (cutover=D9). transferAuditSink is nil in production: serve.go never attaches it,
-	// so emitTransferAudit falls through to the byte-identical best-effort
-	// pubAuditTransfer (the read of the nil seam is the only production-visible change).
-	// The harness wires it via AttachTransferAuditSink (transfer_audit_forward.go, a
-	// guard-excluded mechanism file) to route start/complete/failed through leader Apply
-	// (OpTransferAudit, re-derivable). transferAuditWG tracks the async forward goroutines
-	// so the leak gate can drain them (WaitTransferAudit). The guard bans the write tokens
-	// (transferAuditSink: / b.transferAuditSink =) from scanned production files.
+	// transferAuditSink + transferAuditWG are the D8a (§9) transfer-audit forward seam.
+	// In CLUSTER mode (post-D9 cutover) wireClusterLate calls AttachTransferAuditSink
+	// (transfer_audit_forward.go) so start/complete/failed route through leader Apply
+	// (OpTransferAudit, re-derivable); in SINGLE mode the sink stays nil and
+	// emitTransferAudit falls through to the byte-identical best-effort pubAuditTransfer.
+	// transferAuditWG tracks the async forward goroutines so the ordered shutdown (and the
+	// leak gate) can drain them (WaitTransferAudit).
 	transferAuditSink func(schema.AuditTransfer)
 	transferAuditWG   sync.WaitGroup
 	// transferAuditDraining (D9 round-1 MAJOR): once the ordered shutdown sets it, new audit
 	// emits forward SYNCHRONOUSLY in the NATS handler instead of spawning a tracked goroutine
 	// — so a transfer event arriving in the shutdown window is drained within nc.Drain's
 	// callback wait, not lost by a goroutine spawned AFTER WaitTransferAudit already returned.
+	// transferAuditMu (audit M7 / xx-concurrency F1) makes the {check draining + WaitGroup.Add}
+	// pair in the sink INDIVISIBLE w.r.t. the shutdown's {set draining}, so an Add(1) can never
+	// land after WaitTransferAudit() observed a zero counter (the classic "Add concurrent with
+	// Wait at zero" misuse that would leak the goroutine + lose the audit). A bare atomic.Bool
+	// cannot make the check+Add atomic; the mutex must.
 	transferAuditDraining atomic.Bool
+	transferAuditMu       sync.Mutex
 
-	// xferReplicasFn is the D8a (§9) tier-B replica seam (cutover=D9). nil in production:
-	// xferTargetReplicas() returns jsstream.ReplicasSingle so a freshly-created OBJ_xfer
-	// bucket is byte-identically R=1. The harness sets it (AttachXferReplicas) to
-	// ReplicasFor(NumVoters) so a completed tier-B object survives a home-broker kill at
-	// N>=3. The guard bans the write token (b.xferReplicasFn = / xferReplicasFn:) from
-	// scanned production files.
+	// xferReplicasFn is the D8a (§9) tier-B replica seam. In CLUSTER mode (post-D9) wireClusterLate
+	// sets it (AttachXferReplicas) to ReplicasFor(NumVoters) so a completed tier-B object survives
+	// a home-broker kill at N>=3. In SINGLE mode it stays nil and xferTargetReplicas() returns
+	// jsstream.ReplicasSingle so a freshly-created OBJ_xfer bucket is byte-identically R=1.
 	xferReplicasFn func() int
 
-	// alertSink is the D8b (§10.2) disk-pressure forward seam (cutover=D9). nil in
-	// production: the disk monitor surfaces pressure only via the existing pubSysEvent
-	// (byte-identical). The harness sets it (AttachAlertSink) to forward the local disk
-	// state to the leader's replicated alert store (VerbAlertSignal). The guard bans the
-	// write token (b.alertSink = / alertSink:) from scanned production files; the disk
-	// monitor's `if b.alertSink != nil` READ is allowed.
+	// alertSink is the D8b (§10.2) disk-pressure forward seam. In CLUSTER mode (post-D9)
+	// wireClusterLate sets it (AttachAlertSink) to forward the local disk state to the leader's
+	// replicated alert store (VerbAlertSignal). In SINGLE mode it stays nil and the disk monitor
+	// surfaces pressure only via the existing pubSysEvent (byte-identical).
 	alertSink func(active bool)
 
 	// clusterMode is the D9 cutover switch, decided once in New by clusterModeEnabled
@@ -952,6 +947,14 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		if errors.Is(err, node.ErrSessionNotActive) {
 			b.replyErr(msg, "session_not_found_or_deleting",
 				fmt.Sprintf("session %q is missing or being deleted", sid))
+			return
+		}
+		// audit M2 / write-forward F3: a leadership race (raft failover) is TRANSIENT — reply
+		// the retriable code so the agent retries its register instead of treating it as a
+		// permanent rejection and EXITING the process. Must precede the store_error fallback.
+		if isLeaderUnavailable(err) {
+			b.replyErr(msg, proto.CodeLeaderUnavailable,
+				"no raft leader available to commit the registration right now; retrying")
 			return
 		}
 		b.replyErr(msg, "store_error", err.Error())

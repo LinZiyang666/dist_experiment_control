@@ -97,8 +97,13 @@ func IsMetaGroupNotReady(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	// Permanent dead-ends that mention replicas/peers but are NOT retriable.
-	for _, perm := range []string{"non-clustered", "not supported"} {
+	// Permanent dead-ends that mention replicas/peers but are NOT retriable. Checked BEFORE the
+	// transient signals so an overlapping substring resolves to permanent. "insufficient storage"
+	// (a disk-full peer; JS "insufficient storage resources available") is PERMANENT — retrying
+	// the same placement spins the reconcile loop forever, masked by Degraded() (audit jsstream
+	// F3); it must propagate as a hard failure so the operator sees it, distinct from the
+	// transient "insufficient resources"/"no suitable peer" placement-capacity signals below.
+	for _, perm := range []string{"non-clustered", "not supported", "insufficient storage"} {
 		if strings.Contains(msg, perm) {
 			return false
 		}

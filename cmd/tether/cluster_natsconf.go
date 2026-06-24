@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -10,6 +11,24 @@ import (
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/spf13/cobra"
 )
+
+// validateRouteURL fail-closes a malformed NATS route URL (audit natsconf F4): the previous
+// non-empty check let a typo'd / scheme-less URL through to the rendered conf, where only the
+// `nats-server -t` dry-run might catch it (and --skip-dry-run bypasses even that). Require an
+// explicit nats://host:port.
+func validateRouteURL(label, s string) error {
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("takeover-natsconf: %s route URL %q is not a valid URL: %w", label, s, err)
+	}
+	if u.Scheme != "nats" {
+		return fmt.Errorf("takeover-natsconf: %s route URL %q must use the nats:// scheme (got %q)", label, s, u.Scheme)
+	}
+	if u.Hostname() == "" || u.Port() == "" {
+		return fmt.Errorf("takeover-natsconf: %s route URL %q must be nats://host:port", label, s)
+	}
+	return nil
+}
 
 // cluster_natsconf.go — the D9 §11 operator commands that wire the internal/natsconf leaf
 // (takeover) + the internal/clusteroffline secrets preflight (doctor) to the CLI.
@@ -46,6 +65,9 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 			if serverName == "" || routeURL == "" {
 				return fmt.Errorf("takeover-natsconf: --server-name and --route-url are required")
 			}
+			if err := validateRouteURL("--route-url", routeURL); err != nil {
+				return err
+			}
 			// round-1 MAJOR: refuse if the client listen could not be harvested from the
 			// existing conf — an empty listen makes nats-server bind the default 0.0.0.0:4222
 			// (a surprise public-bind change), so fail loud instead of silently re-binding.
@@ -78,6 +100,14 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 				CAFile:        filepath.Join(secretsDir, "cluster-ca.pem"),
 				CertFile:      filepath.Join(secretsDir, "route-cert.pem"),
 				KeyFile:       filepath.Join(secretsDir, "route-key.pem"),
+			}
+			// audit natsconf F2: if the existing conf ENABLES JetStream but no store_dir survived
+			// (empty), REFUSE rather than render a conf that silently DISABLES JetStream (the next
+			// restart would lose all streams). Fail-closed; install.sh always writes store_dir, so
+			// the common path is unaffected.
+			if _, hasJS := own.Parsed["jetstream"]; hasJS && own.JSStoreDir() == "" {
+				return fmt.Errorf("natsconf takeover: existing conf enables jetstream but has no resolvable store_dir; " +
+					"refusing to render a conf that would silently DISABLE JetStream — set jetstream.store_dir explicitly")
 			}
 			merged, err := natsconf.BuildMergedConf(own, cfg)
 			if err != nil {
@@ -121,6 +151,9 @@ func parsePeerSpec(spec string) (natscluster.Broker, error) {
 	parts := strings.Split(spec, ",")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return natscluster.Broker{}, fmt.Errorf("takeover-natsconf: --peer %q must be server_name,route_url,bus_nkey", spec)
+	}
+	if err := validateRouteURL("--peer", parts[1]); err != nil {
+		return natscluster.Broker{}, err
 	}
 	return natscluster.Broker{ServerName: parts[0], RouteURL: parts[1], NkeyPub: parts[2]}, nil
 }

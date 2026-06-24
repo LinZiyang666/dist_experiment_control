@@ -75,6 +75,13 @@ func (b *Broker) finalizeSessionRm(ctx context.Context, sid string) error {
 		if err := jsstream.DeleteHistoryStream(ctx, b.js, sid); err != nil {
 			return fmt.Errorf("phase 2: %w", err)
 		}
+		// Phase ②.5 (audit M4 / transfer F1): delete the tier-B transfer object store too.
+		// Without this the OBJ_xfer-<sid> bucket outlives the purged session row; at N>=3 a
+		// lingering bucket below target replicas permanently fails the retire gate. Idempotent
+		// (DeleteXferBucket tolerates "already gone"), so a crash-mid-rm re-run is clean.
+		if err := jsstream.DeleteXferBucket(ctx, b.js, sid); err != nil {
+			return fmt.Errorf("phase 2.5 (xfer bucket): %w", err)
+		}
 	}
 	if err := b.dropSession(sid); err != nil {
 		return fmt.Errorf("phase 3: %w", err)
@@ -186,6 +193,33 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 				"sid", sid, "err", err)
 		} else {
 			b.cfg.Logger.Info("broker: orphan history stream deleted", "sid", sid)
+		}
+		cancel()
+	}
+
+	// audit M4 / transfer F1: reap orphan tier-B buckets the same way. A bucket whose session
+	// row is gone (no longer ACTIVE, and any DELETING session was finalized above) has no live
+	// transfer, so deleting the WHOLE bucket is safe — and necessary: a lingering OBJ_xfer-<sid>
+	// below target replicas blocks the D7 retire gate (AllAtTarget) forever. DeleteXferBucket
+	// tolerates "already gone", so concurrent brokers racing the delete in cluster mode is
+	// harmless (mirrors the history orphan reaper, which is likewise un-gated on home ownership
+	// because a truly-orphan stream cannot be live anywhere).
+	xferCtx, cancelX := context.WithTimeout(ctx, 3*time.Second)
+	xferStreams, xerr := jsstream.ListXferStreams(xferCtx, b.js)
+	cancelX()
+	if xerr != nil {
+		return fmt.Errorf("list xfer streams: %w", xerr)
+	}
+	for _, name := range xferStreams {
+		sid, ok := jsstream.SIDFromXferStream(name)
+		if !ok || activeSet[sid] {
+			continue
+		}
+		dropCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		if err := jsstream.DeleteXferBucket(dropCtx, b.js, sid); err != nil {
+			b.cfg.Logger.Warn("broker: orphan xfer bucket delete", "sid", sid, "err", err)
+		} else {
+			b.cfg.Logger.Info("broker: orphan xfer bucket deleted", "sid", sid)
 		}
 		cancel()
 	}

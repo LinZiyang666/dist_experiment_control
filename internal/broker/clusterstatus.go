@@ -119,13 +119,13 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		role[s.NodeID] = r
 	}
 
-	// Self applied lag (leader-meaningful): CommitIndex - AppliedIndex.
+	// audit-publish F5 / xx-concurrency F2: applied lag is COMMAND-DOMAIN AppliedIndex measured
+	// against the leader's OWN AppliedIndex — NEVER raft CommitIndex. CommitIndex also counts
+	// config/barrier entries the command cursor never advances on, so commit-vs-applied shows a
+	// phantom lag that would falsely DEGRADE a healthy leader right after an election. The leader
+	// is the lag reference, so its own lag is 0; a peer lags by leaderApplied - peerApplied.
 	selfApplied, _ := a.node.AppliedIndex()
-	commit := a.node.CommitIndex()
 	selfLag := uint64(0)
-	if commit > selfApplied {
-		selfLag = commit - selfApplied
-	}
 	streamTarget := jsstream.ReplicasFor(voters)
 	// External-review F1: report the REAL stream actual, not a synthesized actual==target. An
 	// unwired probe (N=1) keeps the optimistic default; a wired-but-incomplete observation
@@ -156,8 +156,8 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		}
 		if r, ok := health[nodeID]; ok {
 			l := uint64(0)
-			if commit > r.AppliedIndex {
-				l = commit - r.AppliedIndex
+			if selfApplied > r.AppliedIndex { // command-domain vs the leader's command cursor (F2/F5)
+				l = selfApplied - r.AppliedIndex
 			}
 			return true, "nats-health", l
 		}
@@ -402,10 +402,11 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 	if !ok {
 		return adminsock.Response{Op: req.Op, Error: "malformed --join-token (want <nonce>:<sigHex>)"}
 	}
-	// Peek (don't consume yet, review M9): consume only AFTER AddNode succeeds so a
-	// failed/stalled add can be retried with the SAME token (no fresh nonce + re-sign).
-	if !b.admin.nonceKnown(nonce) {
-		return adminsock.Response{Op: req.Op, Error: "unknown or already-used nonce; re-run `cluster add` (no token) for a fresh one"}
+	// audit membership F2: ATOMICALLY claim the nonce (check + mark in-flight under one lock) so
+	// two concurrent `cluster add` step-2 calls with the same token cannot both proceed. Released
+	// below on AddNode failure so a retry can re-claim with the SAME token (review M9 property).
+	if !b.admin.claimJoinNonce(nonce) {
+		return adminsock.Response{Op: req.Op, Error: "unknown, already-used, or in-flight nonce; re-run `cluster add` (no token) for a fresh one"}
 	}
 	// D9 round-1 BLOCKER: thread the joiner's full expose-home identity (else an added voter
 	// has empty nats_server_id/tunnel_addr/cert_fp → resolveHomeForAgent can never home an
@@ -431,9 +432,10 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 		return b.caughtUp(in.NodeID, barrier)
 	}
 	if err := b.admin.AddNode(in, req.Host, caughtUp, 0); err != nil {
+		b.admin.releaseJoinNonce(nonce) // release on failure so the operator can retry the same token
 		return adminsock.Response{Op: req.Op, Error: err.Error()}
 	}
-	b.admin.consumeJoinNonce(nonce) // consumed only on success
+	// success: the nonce stays claimed (single-use) — no separate consume needed.
 	return adminsock.Response{Op: req.Op, OK: true}
 }
 

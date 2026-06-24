@@ -1,14 +1,13 @@
-// alert_forward.go is the D8b (§10) BUILD-AND-PROVE mechanism file for forwarding alert
-// signals/acks from any broker to the leader's replicated alert store over the §4.1 forwarder.
-// The leader-side handlers (VerbAlertSignal / VerbAlertAck) live in cluster_forward.go's
-// dispatchForward; this file holds the originating-side seam + wire payloads.
+// alert_forward.go (D8b §10) forwards alert signals/acks from any broker to the leader's
+// replicated alert store over the §4.1 forwarder. The leader-side handlers (VerbAlertSignal /
+// VerbAlertAck) live in cluster_forward.go's dispatchForward; this file holds the
+// originating-side seam + wire payloads.
 //
-// Everything here is INERT in production (cutover=D9): serve.go never calls AttachAlertSink,
-// so b.alertSink stays nil and the disk monitor surfaces pressure only via the existing
-// pubSysEvent (byte-identical).
-//
-// EXCLUDED from the TestD8ProductionWiresNoCluster guard scan: this is where the
-// `b.alertSink =` write lives.
+// Post-D9 cutover this is LIVE in CLUSTER mode: wireClusterLate calls AttachAlertSink so the
+// disk monitor's pressure signal forwards to the leader. In SINGLE mode b.alertSink stays nil
+// and the disk monitor surfaces pressure only via the existing pubSysEvent (byte-identical).
+// (The per-phase TestD8ProductionWiresNoCluster guard was a build-and-prove scaffold removed at
+// the D9 cutover.)
 package broker
 
 import (

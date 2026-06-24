@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -113,8 +114,8 @@ func TestD6HomeForRegisterInertN1(t *testing.T) {
 	if ha := b.homeForRegister("lab", "lab-1", proto.NodeRegisterReq{}); ha != nil {
 		t.Fatalf("homeForRegister must be nil in production, got %+v", ha)
 	}
-	if hd := b.homeForExpose("lab", "lab-1", "svc", 14000); hd != nil {
-		t.Fatalf("homeForExpose must be nil in production, got %+v", hd)
+	if hd := b.homeForExpose(&port.Allocation{SID: "lab", NID: "lab-1", Name: "svc", Port: 14000, HomeBroker: "node-home", Epoch: 0}); hd != nil {
+		t.Fatalf("homeForExpose must be nil in single mode (selfID==\"\"), got %+v", hd)
 	}
 	// And the marshaled NodeRegisterResp with Home nil omits the key.
 	body, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Home: nil})
@@ -154,33 +155,29 @@ func TestD6HomeForRegisterDirectives(t *testing.T) {
 	}
 }
 
-// TestD6HomeForExposeStampsHome (DA-12 / C1; D9-updated): homeForExpose resolves the
-// agent's home from nodes.nats_server → an eligible cluster node and returns the
-// directive, READING the row's epoch. As of the D9 cutover the home_broker STAMP moved
-// to allocate (PlanAllocate's homeBroker, baked by the leader via Propose) — homeForExpose
-// no longer writes (b.cfg.DB is the FSM read-only handle in cluster mode); it reads the
-// epoch off the already-stamped row. A non-VOTER home yields nil.
+// TestD6HomeForExposeStampsHome (DA-12 / C1; audit dataplane F1/F3/F7-updated): homeForExpose
+// builds the directive from the COMMITTED home_broker + epoch the leader baked into the
+// allocation (it no longer re-resolves via nodes.nats_server nor re-queries the row), resolving
+// only the home's current tunnel_addr + cert pins by node_id. A non-VOTER home yields nil.
 func TestD6HomeForExposeStampsHome(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}, selfID: "node-self"}
-	// The agent reported server_name "tether-2"; that node is an eligible VOTER.
+	// node-home is an eligible VOTER with a cert pin.
 	seedClusterNode(t, b, "node-home", "tether-2", "10.0.0.2:7000", "sha256:xyz", "VOTER")
-	// The row is already home-stamped (as allocate would, at epoch 0).
-	seedHomedExpose(t, b, "lab", "lab-1", "svc", 14000, "th", "node-home", 0)
-	if _, err := db.Exec(`UPDATE nodes SET nats_server='tether-2' WHERE sid='lab' AND nid='lab-1'`); err != nil {
-		t.Fatal(err)
-	}
 
-	hd := b.homeForExpose("lab", "lab-1", "svc", 14000)
+	hd := b.homeForExpose(&port.Allocation{SID: "lab", NID: "lab-1", Name: "svc", Port: 14000, HomeBroker: "node-home", Epoch: 0})
 	if hd == nil || hd.NodeID != "node-home" || hd.BrokerAddr != "10.0.0.2:7000" || hd.Epoch != 0 {
 		t.Fatalf("directive mismatch: %+v", hd)
 	}
 
-	// A draining (non-VOTER) home is not eligible → nil.
+	// A draining (non-VOTER) committed home is not eligible → nil (audit dataplane F4 parity).
 	seedClusterNode(t, b, "node-drain", "tether-3", "10.0.0.3:7000", "sha256:d", "DRAINING")
-	seedHomedExpose(t, b, "lab", "lab-1", "svc2", 14001, "th2", "", 0)
-	_, _ = db.Exec(`UPDATE nodes SET nats_server='tether-3' WHERE sid='lab' AND nid='lab-1'`)
-	if hd := b.homeForExpose("lab", "lab-1", "svc2", 14001); hd != nil {
+	if hd := b.homeForExpose(&port.Allocation{SID: "lab", NID: "lab-1", Name: "svc2", Port: 14001, HomeBroker: "node-drain", Epoch: 0}); hd != nil {
 		t.Fatalf("a draining home must not be assigned, got %+v", hd)
+	}
+
+	// An un-homed allocation (HomeBroker=="") yields nil (single-home / not clustered).
+	if hd := b.homeForExpose(&port.Allocation{SID: "lab", NID: "lab-1", Name: "svc3", Port: 14002, HomeBroker: "", Epoch: 0}); hd != nil {
+		t.Fatalf("an un-homed allocation must yield no directive, got %+v", hd)
 	}
 }

@@ -1,13 +1,11 @@
-// transfer_audit_forward.go is the D8a (§9) BUILD-AND-PROVE mechanism file for routing
-// transfer audit (start/complete/failed) through leader Apply as a re-derivable
-// OpTransferAudit entry. Everything here is INERT in production: serve.go never calls
-// AttachTransferAuditSink, so b.transferAuditSink stays nil and emitTransferAudit
-// (transfer.go) is the byte-identical best-effort pubAuditTransfer (cutover=D9).
-//
-// This file is EXCLUDED from the TestD8ProductionWiresNoCluster guard scan (like home.go
-// for D6, audit_publisher.go for D5): it is where the `b.transferAuditSink =` write lives,
-// which the guard bans from the SCANNED production files so the seam can never be wired
-// there.
+// transfer_audit_forward.go (D8a §9) routes transfer audit (start/complete/failed) through
+// leader Apply as a re-derivable OpTransferAudit entry. Post-D9 cutover this is LIVE in
+// CLUSTER mode: wireClusterLate calls AttachTransferAuditSink so b.transferAuditSink routes
+// each record through the §4.1 broker→leader forwarder. In SINGLE mode the sink stays nil
+// and emitTransferAudit (transfer.go) falls through to the byte-identical best-effort
+// pubAuditTransfer. (The per-phase TestD8ProductionWiresNoCluster guard was a build-and-prove
+// scaffold and was removed at the D9 cutover — see test/d9; production now legitimately
+// constructs the cluster.Node and wires this seam.)
 package broker
 
 import (
@@ -73,11 +71,20 @@ func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error)
 		// handler so nc.Drain (which waits for handler callbacks) drains this audit too — the
 		// async goroutine could otherwise be spawned AFTER WaitTransferAudit returned and lost
 		// on Drain. Steady state stays async (OQ9-A: never block the agent-forward handler).
+		//
+		// audit M7 / xx-concurrency F1: the {check draining + WaitGroup.Add(1)} MUST be
+		// indivisible w.r.t. clusterShutdownOrdered's {set draining}, else a callback that read
+		// draining==false could be preempted, the shutdown could set draining + WaitTransferAudit
+		// (counter 0, returns), and the callback could THEN Add(1)+spawn an un-waited goroutine
+		// (leak + lost audit). transferAuditMu guards both sides; a bare atomic cannot.
+		b.transferAuditMu.Lock()
 		if b.transferAuditDraining.Load() {
+			b.transferAuditMu.Unlock()
 			runForward(payload, rec)
 			return
 		}
 		b.transferAuditWG.Add(1)
+		b.transferAuditMu.Unlock()
 		go func() {
 			defer b.transferAuditWG.Done()
 			runForward(payload, rec)

@@ -307,6 +307,14 @@ type Agent struct {
 	// cleared on teardown / fail-cleanup.
 	proxyPublicPort atomic.Int64
 
+	// reconnectInFlight (audit xx-concurrency F4) single-flights onNATSReconnect: the NATS
+	// ReconnectHandler fires once per reconnect, and a flapping link could otherwise fan out an
+	// UNBOUNDED set of concurrent re-register goroutines (each re-applying directives). The CAS
+	// gate ensures at most one runs at a time; a reconnect arriving while one is in flight is
+	// dropped (the in-flight pass re-registers against the stable nc, which is already
+	// reconnected — agent.go ncBox pointer is stable across reconnects).
+	reconnectInFlight atomic.Bool
+
 	// rehome (D6 §7.4) dedup: exactly ONE applyOneHome retry loop runs per public
 	// port regardless of how many reconnects fire (review A4 B1 — a flapping NATS
 	// link must not spawn an unbounded fan of concurrent same-port dials). rehomeWant
@@ -768,6 +776,12 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 						"attempts", attempt)
 				}
 				return resp, nil
+			case resp.Code == proto.CodeLeaderUnavailable:
+				// audit M2 / write-forward F3: a leadership race (raft failover / election) is
+				// TRANSIENT, not a config error — retry with backoff instead of exiting the agent
+				// process. break exits the switch and falls through to the backoff sleep below.
+				a.cfg.Logger.Warn("agent: register hit a transient leader failover; retrying",
+					"attempt", attempt, "next_backoff", backoff)
 			default:
 				// Authoritative reject from broker. Don't retry; the operator
 				// must fix config (proto, nid uniqueness, etc.).
@@ -1266,7 +1280,16 @@ func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 		// single re-register so the broker's register reply re-delivers the
 		// authoritative proxy directive (and re-runs G.1 reconcile).
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			go a.onNATSReconnect(nc)
+			// audit xx-concurrency F4: single-flight — drop a reconnect that arrives while a
+			// prior onNATSReconnect is still running so a flapping link cannot fan out unbounded
+			// concurrent re-register goroutines. The in-flight pass already re-registers against
+			// the (stable) reconnected conn.
+			if a.reconnectInFlight.CompareAndSwap(false, true) {
+				go func() {
+					defer a.reconnectInFlight.Store(false)
+					a.onNATSReconnect(nc)
+				}()
+			}
 		}),
 		// B1 fail-closed: arm the SS-teardown countdown on disconnect.
 		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {

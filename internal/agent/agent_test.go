@@ -165,6 +165,74 @@ func TestAgentSurfacesRegisterRejection(t *testing.T) {
 	}
 }
 
+// TestAgentRegisterRetriesOnLeaderUnavailable is the audit-M2 / write-forward-F3 regression:
+// a transient leader_unavailable reply (a raft leader failover during register) must be
+// RETRIED, not treated as a permanent rejection that EXITS the agent process. The stub
+// returns CodeLeaderUnavailable for the first two attempts, then OK — the agent must keep
+// running, retry, and succeed (contrast TestAgentSurfacesRegisterRejection, where a permanent
+// code makes Run return immediately).
+func TestAgentRegisterRetriesOnLeaderUnavailable(t *testing.T) {
+	url := startNATS(t)
+	stub, _ := nats.Connect(url)
+	defer stub.Close()
+
+	var attempts atomic.Int32
+	if _, err := stub.Subscribe(
+		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
+		func(msg *nats.Msg) {
+			var resp []byte
+			if attempts.Add(1) <= 2 {
+				resp, _ = json.Marshal(proto.NodeRegisterResp{
+					OK: false, Code: proto.CodeLeaderUnavailable, Error: "no leader right now",
+				})
+			} else {
+				resp, _ = json.Marshal(proto.NodeRegisterResp{OK: true})
+			}
+			_ = msg.Respond(resp)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+
+	a, err := New(Config{
+		NATSURL:              url,
+		SID:                  "lab",
+		NID:                  "lab-1",
+		HeartbeatInterval:    50 * time.Millisecond,
+		RegisterTimeout:      200 * time.Millisecond,
+		RegisterRetryInitial: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	// The agent must NOT exit on the transient codes — it must retry until the OK on attempt 3.
+	deadline := time.Now().Add(3 * time.Second)
+	for attempts.Load() < 3 {
+		select {
+		case err := <-done:
+			t.Fatalf("agent EXITED on a transient leader_unavailable instead of retrying: %v (attempts=%d)", err, attempts.Load())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("register did not reach attempt 3 (got %d) — retry on leader_unavailable not working", attempts.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not exit after cancel")
+	}
+}
+
 // Register must retry on transient failures (no responders, garbled reply,
 // per-attempt timeout) until the parent context is canceled or the broker
 // returns a real OK reply. Mirrors the reviewer's e2e regression test

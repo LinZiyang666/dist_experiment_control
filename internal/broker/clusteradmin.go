@@ -14,10 +14,11 @@ import (
 )
 
 // clusteradmin.go — D7 §8.1 two-phase membership orchestrator + the leader-startup
-// reconciliation pass (the no-silent-fork guarantee). BUILD-AND-PROVE: this file is
-// EXCLUDED from the TestD7ProductionWiresNoCluster guard scan (the D7 analogue of
-// home.go / audit_publisher.go). Production serve.go never constructs a cluster.Node
-// nor a ClusterAdmin; the harness wires it. cutover = D9.
+// reconciliation pass (the no-silent-fork guarantee; wired into production by runObserveLoop's
+// leader-edge, audit M1). Post-D9 cutover production CONSTRUCTS this in CLUSTER mode
+// (wireClusterLate builds the ClusterAdmin; NewClusterAdminBackend wires it into the admin
+// socket); SINGLE mode does not. (The per-phase TestD7ProductionWiresNoCluster guard was a
+// build-and-prove scaffold removed at the D9 cutover — see test/d9.)
 //
 // raft never leaks here: ClusterAdmin drives the raft config change through
 // cluster.Node's string-typed wrappers (AddVoter/RemoveServer/...), so internal/
@@ -95,24 +96,30 @@ func (a *ClusterAdmin) IssueJoinNonce() (string, error) {
 	return nonce, nil
 }
 
-// nonceKnown reports whether nonce was issued + not yet consumed (peek, no delete).
-func (a *ClusterAdmin) nonceKnown(nonce string) bool {
-	a.nonceMu.Lock()
-	defer a.nonceMu.Unlock()
-	return a.issuedNonces[nonce]
-}
-
-// consumeJoinNonce deletes nonce, reporting whether it was present. Called ONLY
-// after AddNode succeeds (review M9) so a failed add can be retried with the same
-// token rather than forcing the operator to fetch a fresh nonce + re-sign.
-func (a *ClusterAdmin) consumeJoinNonce(nonce string) bool {
+// claimJoinNonce ATOMICALLY claims an issued nonce for an in-flight AddNode (audit membership
+// F2): it removes the nonce from the issued set and returns true ONLY if it was issued and not
+// already claimed/consumed. This replaces the non-atomic peek-then-consume — adminsock dispatches
+// each connection in its own goroutine (server.go `go s.handle`), so two concurrent `cluster add`
+// step-2 calls with the SAME nonce could both pass a peek and both run the full two-phase add.
+// The caller releaseJoinNonce()s on AddNode FAILURE so a retry can re-claim with the same token
+// (preserving the review-M9 "no fresh nonce + re-sign on retry" property), and leaves it claimed
+// on SUCCESS (single-use).
+func (a *ClusterAdmin) claimJoinNonce(nonce string) bool {
 	a.nonceMu.Lock()
 	defer a.nonceMu.Unlock()
 	if !a.issuedNonces[nonce] {
 		return false
 	}
-	delete(a.issuedNonces, nonce)
+	delete(a.issuedNonces, nonce) // claimed (removed from issued) = single-use + in-flight
 	return true
+}
+
+// releaseJoinNonce returns a CLAIMED nonce to the issued set so a failed AddNode can be retried
+// with the same token (audit membership F2).
+func (a *ClusterAdmin) releaseJoinNonce(nonce string) {
+	a.nonceMu.Lock()
+	a.issuedNonces[nonce] = true
+	a.nonceMu.Unlock()
 }
 
 // AddNode runs the §8.1 two-phase admission:

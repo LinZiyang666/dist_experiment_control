@@ -39,7 +39,7 @@ func TestD5ReplicasForProperties(t *testing.T) {
 func TestD5IsMetaGroupNotReady(t *testing.T) {
 	yes := []string{
 		"no suitable peer for placement",
-		"insufficient storage resources available",
+		"insufficient resources available", // transient placement capacity (NOT storage)
 		"not enough replicas",
 		"no peers available",
 	}
@@ -50,6 +50,7 @@ func TestD5IsMetaGroupNotReady(t *testing.T) {
 	}
 	no := []string{
 		"replicas > 1 not supported in non-clustered mode", // JS-10074: PERMANENT, not retriable
+		"insufficient storage resources available",         // audit jsstream F3: disk-full peer is PERMANENT (retrying spins forever), not transient
 		"lost connection to peers",                         // a real connectivity failure
 		"stream not found",                                 // unrelated
 	}

@@ -36,8 +36,10 @@ var ErrDaemonRunning = errors.New("clusteroffline: daemon still running (raft.db
 
 // Peer is one non-self roster member the operator must confirm dead.
 type Peer struct {
-	NodeID   string
-	RaftAddr string
+	NodeID     string
+	RaftAddr   string
+	NatsRoute  string
+	TunnelAddr string
 }
 
 // ForceSingleOptions configures force-single. ConfirmedDead is the node_id list the
@@ -112,9 +114,16 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 }
 
 // checkPeersDead enforces §8.4(d): every non-self roster node must be in confirmed
-// (an unlisted peer would split-brain), and any peer whose raft_addr COMPLETES a TCP
-// connection is alive → HARD-REFUSE (a TLS-rejected-but-TCP-accepting peer is still
+// (an unlisted peer would split-brain), and any peer that COMPLETES a TCP connection on ANY of
+// its serving ports is alive → HARD-REFUSE (a TLS-rejected-but-TCP-accepting peer is still
 // alive, so TCP-completes is the conservative gate, B-8).
+//
+// audit CC-2: probe ALL of the peer's serving ports (raft_addr + nats_route + tunnel_addr), not
+// just raft_addr. A peer whose raft port is firewalled/down but whose NATS or tunnel listener
+// still answers clients is ALIVE on the data plane — force-single there would diverge two
+// writers (it keeps homing exposes / answering auth_callout from its stale local replica). The
+// operator's --confirm-peers-dead listing remains the PRIMARY control; this widens the
+// conservative auto-refuse.
 func checkPeersDead(roster []Peer, confirmed []string) error {
 	confSet := map[string]bool{}
 	for _, id := range confirmed {
@@ -127,14 +136,18 @@ func checkPeersDead(roster []Peer, confirmed []string) error {
 		}
 	}
 	for _, p := range roster {
-		if p.RaftAddr == "" {
-			continue
-		}
-		conn, err := net.DialTimeout("tcp", p.RaftAddr, peerDialTimeout)
-		if err == nil {
-			_ = conn.Close()
-			return fmt.Errorf("clusteroffline: HARD-REFUSE — peer %q (%s) accepted a TCP connection; it is ALIVE, "+
-				"force-single would split-brain", p.NodeID, p.RaftAddr)
+		for _, ap := range []struct{ kind, addr string }{
+			{"raft", p.RaftAddr}, {"nats", p.NatsRoute}, {"tunnel", p.TunnelAddr},
+		} {
+			if ap.addr == "" {
+				continue
+			}
+			conn, err := net.DialTimeout("tcp", ap.addr, peerDialTimeout)
+			if err == nil {
+				_ = conn.Close()
+				return fmt.Errorf("clusteroffline: HARD-REFUSE — peer %q accepted a TCP connection on its %s port (%s); "+
+					"it is ALIVE, force-single would split-brain", p.NodeID, ap.kind, ap.addr)
+			}
 		}
 	}
 	return nil
@@ -154,7 +167,7 @@ func readRoster(dbPath, selfID string) ([]Peer, error) {
 	if selfRows != 1 {
 		return nil, fmt.Errorf("clusteroffline: self-id %q is not present in cluster_nodes; refusing to rewrite raft config for an unknown node", selfID)
 	}
-	rows, err := db.Query(`SELECT node_id, raft_addr FROM cluster_nodes WHERE node_id != ?`, selfID)
+	rows, err := db.Query(`SELECT node_id, raft_addr, nats_route, tunnel_addr FROM cluster_nodes WHERE node_id != ?`, selfID)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +175,7 @@ func readRoster(dbPath, selfID string) ([]Peer, error) {
 	var out []Peer
 	for rows.Next() {
 		var p Peer
-		if err := rows.Scan(&p.NodeID, &p.RaftAddr); err != nil {
+		if err := rows.Scan(&p.NodeID, &p.RaftAddr, &p.NatsRoute, &p.TunnelAddr); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

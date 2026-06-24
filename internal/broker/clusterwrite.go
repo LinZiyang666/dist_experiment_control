@@ -121,7 +121,12 @@ func (b *Broker) clusterShutdownOrdered() {
 	// already-spawned async forwards. After this, any transfer event arriving during the
 	// remaining shutdown forwards inline in its NATS handler — so nc.Drain (a later defer)
 	// waits for it instead of it racing in a goroutine spawned after this Wait returned.
+	// audit M7 / xx-concurrency F1: set draining UNDER transferAuditMu so the sink's
+	// {check draining + WaitGroup.Add} is indivisible w.r.t. this set — no Add can land
+	// after WaitTransferAudit observes a zero counter.
+	b.transferAuditMu.Lock()
 	b.transferAuditDraining.Store(true)
+	b.transferAuditMu.Unlock()
 	b.WaitTransferAudit()
 	// 2. Stop + join the leader-gated loops (bounded; they poll ctx between iterations).
 	if b.cl.cancel != nil {
@@ -268,6 +273,12 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		XferState: func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error) {
 			return XferReplicaState(ctx, b.js, sid, target)
 		},
+		// audit M5: a no-stream publish error is a permanent loss only when the session is no
+		// longer ACTIVE (rm'd / DELETING — its history stream was deleted by finalizeSessionRm);
+		// an ACTIVE session's missing stream is transient (the reconcile loop ensures it) → R-22.
+		SessionExists: func(sid string) (bool, error) {
+			return session.IsActive(b.cfg.DB, sid)
+		},
 	})
 	rec := NewAlertReconciler(AlertReconcilerConfig{
 		Node: node, DB: b.cfg.DB, Propose: node.Propose, Now: b.cfg.Now, Logger: b.cfg.Logger,
@@ -350,10 +361,23 @@ func (b *Broker) livenessDB() *sql.DB {
 // runtime (single mode) is a programming error — callers gate on b.clusterMode first.
 func (b *Broker) proposeOrForward(verb, reqID string, payload []byte, plan func(db *sql.DB) (*cluster.Command, error)) error {
 	if b.cl.node.IsLeader() {
+		var err error
 		if reqID == "" {
-			return b.cl.node.Propose(plan)
+			err = b.cl.node.Propose(plan)
+		} else {
+			err = b.cl.node.ProposeWithReqID(reqID, plan)
 		}
-		return b.cl.node.ProposeWithReqID(reqID, plan)
+		// audit M2 / write-forward F3: leadership can be LOST between the IsLeader() check and
+		// raft.Apply, so Propose can return raft.ErrNotLeader / ErrLeadershipLost. Map it to the
+		// SAME retriable sentinel the forward branch returns (cluster.ErrForwardNotLeader) so a
+		// leadership race is UNIFORMLY transient across the leader-local and forward paths —
+		// mirroring the PIN seam (NewProvisionSeam). Without this the raw raft error leaked out
+		// as a terminal "store_error", which the agent's register loop treats as a PERMANENT
+		// rejection and EXITS the process on a routine raft leader failover.
+		if err != nil && cluster.IsNotLeader(err) {
+			return cluster.ErrForwardNotLeader
+		}
+		return err
 	}
 	return b.cl.forwarder.Forward(verb, reqID, payload)
 }
@@ -437,8 +461,10 @@ func (b *Broker) registerNode(in node.RegisterInput) error {
 }
 
 // recordProc routes a process-started record (D9 audit #4). Single mode: the direct
-// mutator. Cluster mode: PlanInsert via Propose/forward (data-less; PlanInsert keys on
-// pid so a forwarder retry is idempotent).
+// mutator. Cluster mode: PlanInsert via Propose/forward. PlanInsert bakes INSERT OR IGNORE
+// on the pid PRIMARY KEY, so a forwarder retry re-proposing the same pid at a new raft index
+// is a deterministic no-op at Apply (NOT a PK-violation that would fail-stop panic the FSM);
+// reqID="" because that OR IGNORE is the idempotency anchor, not the 0011 ledger (audit M8).
 func (b *Broker) recordProc(p proc.Process) error {
 	if !b.clusterMode {
 		return proc.Insert(b.cfg.DB, p)
@@ -449,23 +475,6 @@ func (b *Broker) recordProc(p proc.Process) error {
 	}
 	return b.proposeOrForward(VerbProcInsert, "", payload, func(db *sql.DB) (*cluster.Command, error) {
 		return proc.PlanInsert(db, p)
-	})
-}
-
-// freePort routes a port free (D9 audit #7). Single mode: the direct mutator. Cluster
-// mode: PlanFree via Propose/forward (data-less; PlanFree is a no-op on an absent row, so
-// a forwarder retry / a double free is harmless). proxy.go callers are cluster-OFF (the
-// P13 proxy path is disabled in cluster mode) so they only ever take the single branch.
-func (b *Broker) freePort(publicPort int) error {
-	if !b.clusterMode {
-		return port.Free(b.cfg.DB, publicPort, b.cfg.Now())
-	}
-	payload, err := json.Marshal(PortMutatePayload{Port: publicPort})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbPortFree, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanFree(db, publicPort, b.cfg.Now())
 	})
 }
 
@@ -545,16 +554,6 @@ func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
 	})
 }
 
-// revokePort is retained for single-mode/proxy-style callers that only know a public port.
-// Cluster-mode offline revocation must use revokePortAllocation so a stale scan cannot
-// revoke a row that reused the same port.
-func (b *Broker) revokePort(publicPort int, now time.Time) error {
-	if !b.clusterMode {
-		return port.Revoke(b.cfg.DB, publicPort, now)
-	}
-	return fmt.Errorf("broker: cluster port revoke requires allocation identity for port %d", publicPort)
-}
-
 // markProcExited routes a process EXIT (D9 round-1 BLOCKER: exec.go's proc.exit + the
 // reconcile missed-exit path). Single mode: the direct mutator. Cluster mode: PlanMarkExited
 // via Propose/forward (the WHERE status='RUNNING' guard makes a forwarder retry idempotent).
@@ -609,6 +608,13 @@ func (b *Broker) dropSession(sid string) error {
 // adminsock's direct tx (EvictWrite stays nil). Cluster mode: PlanEvict via Propose/forward
 // (data-less; the DELETEs are no-ops on absent rows so a forwarder retry is harmless).
 func (b *Broker) evictNode(sid, nid string) error {
+	// audit write-forward F6: evictNode is the CLUSTER-MODE EvictWrite seam (the adminsock wires
+	// it only in cluster mode; single mode leaves EvictWrite nil + does the direct tx). Guard the
+	// !clusterMode case like every other proposeOrForward router so a wiring bug fails LOUD here
+	// instead of nil-dereferencing b.cl.node inside proposeOrForward.
+	if !b.clusterMode || b.cl == nil {
+		return fmt.Errorf("broker: evictNode is cluster-mode only (single mode uses the adminsock direct tx)")
+	}
 	payload, err := json.Marshal(EvictPayload{SID: sid, NID: nid})
 	if err != nil {
 		return err

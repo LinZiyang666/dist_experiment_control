@@ -88,7 +88,9 @@ const (
 	// node.RegisterInput; PlanRegister re-checks the session exists on the leader.
 	VerbNodeRegister = "noderegister"
 	// VerbProcInsert (D9 §3, audit #4) forwards a process-started record to the leader.
-	// Data-less (error-only); a forwarder retry is idempotent (PlanInsert keys on pid).
+	// Error-only reply; a forwarder retry is idempotent because PlanInsert bakes INSERT OR
+	// IGNORE on the pid PRIMARY KEY — a re-propose at a new raft index is a deterministic
+	// Apply no-op, never a PK-violation that fail-stop panics the FSM (audit M8 / port-plan F1).
 	VerbProcInsert = "procinsert"
 	// VerbProcMarkExited (D9 round-1 review BLOCKER) forwards a process EXIT to the leader
 	// (the proc.exit event + reconcileOnRegister's missed-exit path). Carries the agent-
@@ -246,6 +248,16 @@ func forwardErrKind(err error) string {
 		return "session_already_exists"
 	case errors.Is(err, agentprov.ErrAlreadyProvisioned):
 		return "already_provisioned"
+	// audit write-forward F2: the register/proc Plan business errors must keep their typed
+	// identity across the forward boundary too, else a FOLLOWER-forwarded register against a
+	// missing/inactive session loses node.ErrSessionMissing/ErrSessionNotActive and handleRegister
+	// falls back to a generic store_error instead of the precise "session_not_found" guidance.
+	case errors.Is(err, nodepkg.ErrSessionMissing):
+		return "node_session_missing"
+	case errors.Is(err, nodepkg.ErrSessionNotActive):
+		return "node_session_not_active"
+	case errors.Is(err, proc.ErrNodeMissing):
+		return "proc_node_missing"
 	default:
 		return ""
 	}
@@ -456,17 +468,28 @@ func SubscribeClusterApply(nc *nats.Conn, node *cluster.Node, now func() time.Ti
 // re-provision) is enforced HERE at the cluster.apply WIRE BOUNDARY — not only at the
 // production seam — so a broker-bus caller, the generic Forwarder.Forward, or a future
 // seam regression cannot reintroduce the stale-ledger false-success (external RF1).
-var ErrReqIDNotAllowed = errors.New("cluster_forward: provision/join must not carry a forwarding ReqID (idempotent + deletable binding)")
+var ErrReqIDNotAllowed = errors.New("cluster_forward: this verb must not carry a forwarding ReqID (idempotent + deletable binding)")
+
+// verbAllowsReqID is the ALLOW-LIST of forward verbs that may carry a non-empty forwarding
+// ReqID (CC-4 data-driven guard). Only VerbReconcile does — its bootID-epoch key dedups an
+// ack-lost reconcile retry. Every OTHER verb forwards reqID="" (provision/join are structurally
+// idempotent with operator-deletable bindings, so a content key would falsely dedup-skip a
+// legitimate post-evict re-write — external F1/RF1; transfer-audit's key is content-derived
+// INSIDE the Plan, not in env.ReqID). The default is REJECT, so a future verb that forgets to
+// guard cannot reintroduce the stale-ledger false-success.
+var verbAllowsReqID = map[string]bool{VerbReconcile: true}
 
 // dispatchForward runs the verb's leader-only Plan on the leader. provision/join go
 // through node.Propose (NO ReqID, structurally idempotent, F1/RF1); reconcile goes
 // through node.ProposeWithReqID with its bootID-epoch key. Plan reads the LEADER DB.
 func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelope) error {
+	// CC-4: enforce the no-ReqID contract for EVERY verb not on the allow-list, at the wire
+	// boundary, so a future verb cannot reintroduce the external-F1 stale-ledger false-success.
+	if env.ReqID != "" && !verbAllowsReqID[env.Verb] {
+		return ErrReqIDNotAllowed
+	}
 	switch env.Verb {
 	case VerbProvision:
-		if env.ReqID != "" {
-			return ErrReqIDNotAllowed
-		}
 		var p ProvisionPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return err
@@ -475,9 +498,6 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 			return agentprov.PlanProvisionWithPIN(db, p.SID, p.NID, p.FP, p.PIN, auth.VerifyPIN, now())
 		})
 	case VerbJoin:
-		if env.ReqID != "" {
-			return ErrReqIDNotAllowed
-		}
 		var p JoinPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return err
@@ -622,6 +642,16 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 	default:
 		return fmt.Errorf("cluster_forward: unknown verb %q", env.Verb)
 	}
+}
+
+// isLeaderUnavailable reports whether err is the transient "no leader committed this write
+// right now" signal (cluster.ErrForwardNotLeader — returned by proposeOrForward on a
+// leadership race / election). Handlers in broker.go (which deliberately does NOT import
+// internal/cluster — L-2) use this to reply proto.CodeLeaderUnavailable so the client retries
+// instead of treating a routine raft failover as a permanent rejection (audit M2 /
+// write-forward F3).
+func isLeaderUnavailable(err error) bool {
+	return errors.Is(err, cluster.ErrForwardNotLeader)
 }
 
 // marshalForwardReply maps a Propose result to the typed reply envelope.

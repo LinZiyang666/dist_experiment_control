@@ -148,6 +148,35 @@ func DeleteHistoryStream(ctx context.Context, js jetstream.JetStream, sid string
 	return fmt.Errorf("jsstream: delete %s: %w", HistoryStreamName(sid), err)
 }
 
+// DeleteXferBucket deletes the per-session tier-B transfer object store (bucket
+// "xfer-<sid>", backed by the OBJ_xfer-<sid> stream) — the session-rm cascade's tier-B
+// analogue of DeleteHistoryStream (audit M4 / transfer F1). Without it the bucket outlives
+// its purged session row forever; at N>=3 a lingering bucket below its target replica count
+// then PERMANENTLY fails the retire gate (AllAtTarget) and latches replication_degraded.
+// Returns nil if the bucket is already gone so a crash-mid-rm re-run is idempotent.
+func DeleteXferBucket(ctx context.Context, js jetstream.JetStream, sid string) error {
+	err := js.DeleteObjectStore(ctx, proto.XferBucketName(sid))
+	if err == nil {
+		return nil
+	}
+	// DeleteObjectStore joins ErrBucketNotFound with the underlying ErrStreamNotFound; accept
+	// either as "already gone".
+	if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
+		return nil
+	}
+	return fmt.Errorf("jsstream: delete xfer bucket %s: %w", proto.XferBucketName(sid), err)
+}
+
+// SIDFromXferStream reverses the OBJ_xfer-<sid> backing-stream name. Returns ("", false)
+// if stream isn't an xfer backing stream. Used by boot orphan-bucket reaping to derive the
+// sid from the stream name and check it against the SQLite sessions table.
+func SIDFromXferStream(stream string) (string, bool) {
+	if !strings.HasPrefix(stream, XferBackingStreamPref) {
+		return "", false
+	}
+	return strings.TrimPrefix(stream, XferBackingStreamPref), true
+}
+
 // ListHistorySIDs returns every <sid> that has a corresponding
 // history-<sid> stream on the server. Used by broker startup to find
 // orphan streams (those not in the SQLite sessions table → delete).
@@ -216,7 +245,14 @@ func reconcileReplicas(ctx context.Context, js jetstream.JetStream, cfg jetstrea
 	if current >= cfg.Replicas {
 		return nil // raise-only (R-18): already at/above target
 	}
-	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+	// audit jsstream F2: raise ONLY the replica factor — start from the LIVE config and change
+	// just Replicas, so an operator's `nats stream edit` limits (MaxBytes/retention/…) survive.
+	// UpdateStream(cfg) with the full tether-default cfg would silently clobber those edits,
+	// contradicting this function's "only Replicas is reconciled" contract (the HA replica factor
+	// is cluster-owned; retention/limits are operator-owned).
+	target := info.Config
+	target.Replicas = cfg.Replicas
+	if _, err := js.UpdateStream(ctx, target); err != nil {
 		if IsMetaGroupNotReady(err) {
 			return ErrMetaGroupNotReady // R-17: retriable; meta-group not ready
 		}

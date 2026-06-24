@@ -1,14 +1,14 @@
-// alert_reconcile.go is the D8b (§10) BUILD-AND-PROVE leader-gated alert reconciler. It is a
-// SEPARATE long-lived goroutine — deliberately NOT folded into the audit publisher tick
-// (§16 D8(d)): folding it there would (1) invert liveness (PublishOnce can early-return on an
-// un-ACKed publish exactly when the cluster is degraded — the moment the degraded alert must
-// fire), (2) starve the audit drain (an alert Propose blocking under applyMu stalls the §6.3
-// publish), and (3) break D5 idle-zero-writes (a level-triggered re-propose every tick writes
-// a fresh raft entry forever). So it has its own IsLeader && !LeaderContactStale gate, its own
-// ctx-child, and proposes a raise/clear ONLY on a genuine desired-vs-current TRANSITION.
+// alert_reconcile.go (D8b §10) is the leader-gated alert reconciler. It is a SEPARATE long-lived
+// goroutine — deliberately NOT folded into the audit publisher tick (§16 D8(d)): folding it
+// there would (1) invert liveness (PublishOnce can early-return on an un-ACKed publish exactly
+// when the cluster is degraded — the moment the degraded alert must fire), (2) starve the audit
+// drain (an alert Propose blocking under applyMu stalls the §6.3 publish), and (3) break D5
+// idle-zero-writes (a level-triggered re-propose every tick writes a fresh raft entry forever).
+// So it has its own IsLeader && !LeaderContactStale gate, its own ctx-child, and proposes a
+// raise/clear ONLY on a genuine desired-vs-current TRANSITION.
 //
-// Constructed only by the test/d8 harness (production builds no cluster.Node, cutover=D9).
-// EXCLUDED from the TestD8ProductionWiresNoCluster guard scan.
+// Post-D9 cutover it is wired in CLUSTER mode (wireClusterLate starts rec.Run); SINGLE mode does
+// not construct it. (The per-phase TestD8ProductionWiresNoCluster guard was removed at cutover.)
 package broker
 
 import (

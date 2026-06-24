@@ -56,10 +56,8 @@ func TestD6EmptyCertFPYieldsNoDirective(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}, selfID: "node-self"}
 	seedClusterNode(t, b, "node-home", "tether-2", "10.0.0.2:7000", "" /* empty cert_fp */, "VOTER")
-	seedHomedExpose(t, b, "lab", "lab-1", "svc", 14000, "th", "", 0)
-	_, _ = db.Exec(`UPDATE nodes SET nats_server='tether-2' WHERE sid='lab' AND nid='lab-1'`)
 
-	if hd := b.homeForExpose("lab", "lab-1", "svc", 14000); hd != nil {
+	if hd := b.homeForExpose(&port.Allocation{SID: "lab", NID: "lab-1", Name: "svc", Port: 14000, HomeBroker: "node-home", Epoch: 0}); hd != nil {
 		t.Fatalf("empty cert_fp home must yield no expose directive, got %+v", hd)
 	}
 	// homeForRegister against a row already homed to the empty-fp node → no directive.

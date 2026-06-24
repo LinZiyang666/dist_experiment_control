@@ -71,15 +71,22 @@ type AuditPublisherConfig struct {
 	XferState func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error)
 	// OnPublish is a test tap fired AFTER a record's js.Publish ACKs (non-vacuity hooks).
 	OnPublish func(subject, msgID string)
+	// SessionExists reports whether a session row still exists in the committed DB (audit M5).
+	// publishAudit consults it to disambiguate a "no stream" publish error: a GONE session means
+	// its history-<sid> stream was permanently deleted by session-rm (bounded loss → advance),
+	// while a still-existing session means the stream is merely not-yet-ensured (transient → R-22
+	// retry). nil ⇒ conservative "exists" (always retry; preserves pre-M5 behavior in tests).
+	SessionExists func(sid string) (bool, error)
 }
 
 // AuditPublisher is the merged leader-only loop (Mechanism A publish + Mechanism B
 // reconfig). Exported so test/d5 (external package) can drive it; the guard test forbids
 // the production-wiring files from referencing it.
 type AuditPublisher struct {
-	cfg     AuditPublisherConfig
-	lossCnt atomic.Uint64 // truncation-loss counter (R-6 non-vacuity, E-A6)
-	lagCnt  atomic.Uint64 // §6.3 R-7: times the publish lag breached MaxLag (truncation-risk)
+	cfg          AuditPublisherConfig
+	lossCnt      atomic.Uint64 // truncation-loss counter (R-6 non-vacuity, E-A6)
+	lagCnt       atomic.Uint64 // §6.3 R-7: times the publish lag breached MaxLag (truncation-risk)
+	delStreamCnt atomic.Uint64 // audit M5: records dropped because the destination history-<sid> stream was deleted (racing session-rm)
 }
 
 // NewAuditPublisher validates + defaults the config.
@@ -308,7 +315,7 @@ func (p *AuditPublisher) publishReconcile(ctx context.Context, idx uint64, cmd *
 		if merr != nil {
 			return merr
 		}
-		if perr := p.publish(ctx, proto.SubjAuditProc(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "proc", seq)); perr != nil {
+		if perr := p.publishAudit(ctx, proto.SubjAuditProc(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "proc", seq), idx, rec.Session); perr != nil {
 			return perr
 		}
 	}
@@ -317,7 +324,7 @@ func (p *AuditPublisher) publishReconcile(ctx context.Context, idx uint64, cmd *
 		if merr != nil {
 			return merr
 		}
-		if perr := p.publish(ctx, proto.SubjAuditPort(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "port", seq)); perr != nil {
+		if perr := p.publishAudit(ctx, proto.SubjAuditPort(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "port", seq), idx, rec.Session); perr != nil {
 			return perr
 		}
 	}
@@ -350,7 +357,7 @@ func (p *AuditPublisher) publishTransferAudit(ctx context.Context, idx uint64, c
 	if merr != nil {
 		return merr
 	}
-	return p.publish(ctx, proto.SubjAuditTransfer(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "xfer", 0))
+	return p.publishAudit(ctx, proto.SubjAuditTransfer(rec.Session), payload, auditMsgID(idx, cmd.ReqID, "xfer", 0), idx, rec.Session)
 }
 
 func (p *AuditPublisher) publish(ctx context.Context, subject string, payload []byte, msgID string) error {
@@ -364,6 +371,54 @@ func (p *AuditPublisher) publish(ctx context.Context, subject string, payload []
 	}
 	return nil
 }
+
+// publishAudit publishes one audit record, classifying a "no stream matches subject" failure
+// for a session whose row is GONE as an ACCEPTED BOUNDED LOSS (audit M5 / transfer F2) instead
+// of an indefinite retry. A committed audit entry (transfer OR reconcile) can sit BELOW the
+// publisher cursor when a racing `session rm` deletes its history-<sid> stream — the
+// transfer-audit forward is async + lifecycle-decoupled, and a lagging publisher trails the
+// commit. Publishing to the deleted stream returns jetstream.ErrNoStreamResponse; under R-22
+// ("never advance past an un-ACKed publish") that index would be retried FOREVER, wedging ALL
+// audit publication cluster-wide.
+//
+// CRITICAL: a no-stream error is AMBIGUOUS — it is also returned when a still-active session's
+// history stream is merely NOT-YET-ENSURED (a boot race / a brand-new session), which is
+// genuinely TRANSIENT and MUST stay R-22 (the reconcile loop ensures the stream, then the
+// queued audit publishes). So bounded-loss applies ONLY when streamDeletedPermanently reports
+// the session GONE; otherwise (and with no SessionExists checker wired) the error propagates so
+// the loop retries — preserving the queue-not-drop contract. Every other publish error
+// (transient JS unavailability / timeout) likewise propagates.
+func (p *AuditPublisher) publishAudit(ctx context.Context, subject string, payload []byte, msgID string, idx uint64, sid string) error {
+	err := p.publish(ctx, subject, payload, msgID)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, jetstream.ErrNoStreamResponse) && p.streamDeletedPermanently(sid) {
+		p.delStreamCnt.Add(1)
+		p.cfg.Logger.Warn("d5: audit dropped — session + its history stream are gone (accepted bounded loss, §6.3/§17; racing session-rm)",
+			"subject", subject, "msg_id", msgID, "raft_index", idx, "sid", sid)
+		return nil
+	}
+	return err
+}
+
+// streamDeletedPermanently reports whether a no-stream publish error for sid is a PERMANENT
+// loss (the session was rm'd, so history-<sid> is gone for good) vs a TRANSIENT one (the stream
+// is merely not-yet-ensured for a still-existing session). Only a wired SessionExists that
+// reports the session GONE classifies as permanent; with no checker wired (tests / not wired)
+// the conservative answer is "not permanent" → retry, preserving R-22 queue-not-drop.
+func (p *AuditPublisher) streamDeletedPermanently(sid string) bool {
+	if p.cfg.SessionExists == nil {
+		return false
+	}
+	exists, err := p.cfg.SessionExists(sid)
+	return err == nil && !exists
+}
+
+// DeletedStreamLossCount reports how many audit records the publisher dropped because their
+// session (and thus its history-<sid> stream) had been removed (audit M5). Tests read it to
+// assert the bounded-loss branch fired (non-vacuity).
+func (p *AuditPublisher) DeletedStreamLossCount() uint64 { return p.delStreamCnt.Load() }
 
 // auditMsgID is the JetStream dedup key (R-8/R-10). For a reqID-bearing reconcile entry
 // the id keys on the CROSS-RETRY-STABLE ReqID so a D4 ack-lost retry (which commits at a

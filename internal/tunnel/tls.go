@@ -52,25 +52,6 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	}, nil
 }
 
-// serverTLSConfig returns the TLS config the broker tunnel server
-// uses on the control listener. With cert == nil we generate a fresh
-// ephemeral self-signed cert. Operators who want to pin a real cert
-// can pass a pre-loaded tls.Certificate (e.g. shared with the 443
-// Caddy via broker config).
-func serverTLSConfig(cert *tls.Certificate) (*tls.Config, error) {
-	if cert == nil {
-		c, err := generateSelfSignedCert()
-		if err != nil {
-			return nil, err
-		}
-		cert = &c
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
 // clientTLSConfig returns the TLS config the agent tunnel client uses
 // to dial the broker. v1 sets InsecureSkipVerify because the broker's
 // fallback cert is self-signed and the agent has no PKI to compare

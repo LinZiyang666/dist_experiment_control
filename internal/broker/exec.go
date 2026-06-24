@@ -155,8 +155,16 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			BootID:         ev.BootID,
 			StartTimeTicks: ev.StartTimeTicks,
 		})
-		if err != nil && !errors.Is(err, proc.ErrNodeMissing) {
-			b.cfg.Logger.Warn("broker: proc.started insert", "err", err, "pid", pid)
+		if err != nil {
+			// audit broker-core F4: the proc row did NOT land (node missing, or — in cluster mode
+			// — a forward/leadership failure), so do NOT publish a "start" audit for a process
+			// with no authoritative DB record (best-effort audit must not claim a process that has
+			// no row). A genuinely-running orphan is reconciled at the agent's next register
+			// (reconcileOnRegister), which is the authoritative missed-proc path.
+			if !errors.Is(err, proc.ErrNodeMissing) {
+				b.cfg.Logger.Warn("broker: proc.started insert", "err", err, "pid", pid)
+			}
+			return
 		}
 		b.pubAuditProc(sid, "start", nid, pid, ev.Argv, 0, ev.StartedAt)
 

@@ -255,11 +255,12 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		Token:     alloc.Token,
 		ActorFP:   fp,
 	}
-	// D6 §7.2/§6.5 (C1 fix): the initial-expose path never touches
-	// NodeRegisterResp, so the home directive must ride the forward. Self-gating —
-	// nil in production (selfID==""), so the forward stays byte-identical; in a
-	// cluster it stamps home_broker on the row + tells the agent which home to dial.
-	fwdReq.Home = b.homeForExpose(sid, nid, req.Name, alloc.Port)
+	// D6 §7.2/§6.5 (C1 fix): the initial-expose path never touches NodeRegisterResp, so the
+	// home directive must ride the forward. Self-gating — nil in single mode (selfID==""), so
+	// the forward stays byte-identical; in a cluster it tells the agent which home to dial using
+	// the COMMITTED home_broker + epoch the leader baked into the captured allocation (audit
+	// dataplane F1/F3/F7 — no re-resolve, no re-query).
+	fwdReq.Home = b.homeForExpose(alloc)
 	fwdBody, err := json.Marshal(&fwdReq)
 	if err != nil {
 		// roll back the allocation — no point keeping a row no agent saw

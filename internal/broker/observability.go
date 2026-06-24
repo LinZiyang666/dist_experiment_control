@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -33,10 +34,15 @@ type observeDecision struct {
 // decideObservabilityAlerts is the PURE §17 step-10b decision (unit-tested without a
 // cluster): for each known voter it emits a broker_down decision (active iff the voter is
 // ABSENT from responses) and a raft_lag decision (active iff the voter responded but its
-// AppliedIndex trails leaderCommit by > lagThreshold). A voter that answered with a fresh
+// AppliedIndex trails leaderApplied by > lagThreshold). A voter that answered with a fresh
 // cursor yields both inactive (clear). The leader itself (selfID) is skipped — it cannot be
-// down/lagging relative to its own commit index.
-func decideObservabilityAlerts(selfID string, leaderCommit uint64, voters []string,
+// down/lagging relative to its own cursor.
+//
+// audit xx-concurrency F2: leaderApplied MUST be the leader's COMMAND-DOMAIN AppliedIndex,
+// NOT its raft CommitIndex. The responders self-report their command-domain AppliedIndex, so
+// comparing against CommitIndex (which also counts config/barrier entries) over-reports the
+// gap and fires a FALSE raft_lag across election history. Like-for-like: applied vs applied.
+func decideObservabilityAlerts(selfID string, leaderApplied uint64, voters []string,
 	responses map[string]proto.ClusterHealthResp, lagThreshold uint64) []observeDecision {
 	var out []observeDecision
 	for _, v := range voters {
@@ -49,7 +55,7 @@ func decideObservabilityAlerts(selfID string, leaderCommit uint64, voters []stri
 			DedupKey: cluster.AlertKindBrokerDown + ":" + v,
 			Message:  "broker " + v + " is not answering cluster-health probes",
 		})
-		lag := ok && leaderCommit > r.AppliedIndex && leaderCommit-r.AppliedIndex > lagThreshold
+		lag := ok && leaderApplied > r.AppliedIndex && leaderApplied-r.AppliedIndex > lagThreshold
 		out = append(out, observeDecision{
 			Kind: cluster.AlertKindRaftLag, NodeID: v, Active: lag,
 			DedupKey: cluster.AlertKindRaftLag + ":" + v,
@@ -106,20 +112,51 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 	if b.cl == nil || !b.cl.node.IsLeader() {
 		return
 	}
-	responses := pollClusterHealth(b.nc.Load(), proto.SubjClusterCursor, observePollWindow)
-	for _, d := range decideObservabilityAlerts(b.selfID, b.cl.node.CommitIndex(), voters, responses, lagThreshold) {
-		_ = ctx // reserved for cancellation if planAlertSignal grows a ctx
-		payload := AlertSignalPayload{
-			Kind:     d.Kind,
-			Node:     d.NodeID,
-			Active:   d.Active,
-			Severity: cluster.AlertSeverityInfo,
-			Message:  d.Message,
-		}
-		_ = b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return planAlertSignal(db, payload, b.cfg.Now())
-		})
+	_ = ctx // reserved for cancellation if planAlertSignal grows a ctx
+	// audit xx-concurrency F2: measure lag against the leader's COMMAND-DOMAIN AppliedIndex
+	// (not raft CommitIndex), like-for-like with the responders' self-reported AppliedIndex.
+	leaderApplied, err := b.cl.node.AppliedIndex()
+	if err != nil {
+		return // cannot measure lag without the leader's own command cursor
 	}
+	responses := pollClusterHealth(b.nc.Load(), proto.SubjClusterCursor, observePollWindow)
+	for _, d := range decideObservabilityAlerts(b.selfID, leaderApplied, voters, responses, lagThreshold) {
+		b.proposeAlertSignal(d.Kind, d.NodeID, d.Active, d.Message)
+	}
+
+	// audit-publish F1: clear ORPHANED per-node observability alerts for nodes that LEFT the
+	// voter set — the decide loop only iterates CURRENT voters, so a removed/retired node's
+	// broker_down/raft_lag alert would otherwise stay ACTIVE forever. The clear is
+	// transition-gated (planAlertSignal), so a node still down/lagging keeps its alert.
+	voterSet := make(map[string]bool, len(voters))
+	for _, v := range voters {
+		voterSet[v] = true
+	}
+	active, aerr := cluster.ActiveAlerts(b.cfg.DB)
+	if aerr != nil {
+		return
+	}
+	for _, a := range active {
+		if a.Kind != cluster.AlertKindBrokerDown && a.Kind != cluster.AlertKindRaftLag {
+			continue
+		}
+		node := strings.TrimPrefix(a.DedupKey, a.Kind+":")
+		if node == "" || node == b.selfID || voterSet[node] {
+			continue
+		}
+		b.proposeAlertSignal(a.Kind, node, false, "")
+	}
+}
+
+// proposeAlertSignal proposes one transition-gated per-node observability raise/clear via
+// planAlertSignal (a nil command on no transition → no raft write, so idle-zero-writes holds).
+func (b *Broker) proposeAlertSignal(kind, node string, active bool, message string) {
+	payload := AlertSignalPayload{
+		Kind: kind, Node: node, Active: active, Severity: cluster.AlertSeverityInfo, Message: message,
+	}
+	_ = b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+		return planAlertSignal(db, payload, b.cfg.Now())
+	})
 }
 
 // observePollWindow bounds the health scatter-gather (a peer that does not answer within it
@@ -138,11 +175,27 @@ const (
 func (b *Broker) runObserveLoop(ctx context.Context) {
 	t := time.NewTicker(observeTickInterval)
 	defer t.Stop()
+	wasLeader := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// audit M1 / membership F1: on the leader-ACQUIRED edge run the §8.1 no-silent-fork
+			// reconciliation pass ONCE — it is the REAL guarantee that a half-completed AddNode
+			// (leader crashed between raft.AddVoter and the CATCHING_UP phase bump) gets
+			// forward-completed, and nothing ELSE in production calls it (it had only test
+			// callers). Leader-only + idempotent (phase transitions are baked WHERE phase IN
+			// (preds) no-ops), so re-running on a leadership flap is safe. Tick-sampled rather
+			// than a raft LeaderCh observer to avoid adding raft plumbing outside internal/cluster.
+			isLeader := b.cl != nil && b.cl.node != nil && b.cl.node.IsLeader()
+			if isLeader && !wasLeader && b.cl.admin != nil {
+				if err := b.cl.admin.ReconcileMembershipOnLeadership(); err != nil {
+					b.cfg.Logger.Warn("broker: membership reconciliation on leadership", "err", err)
+				}
+			}
+			wasLeader = isLeader
+
 			voters, err := b.clusterVoters()
 			if err != nil {
 				b.cfg.Logger.Debug("broker: observe loop voter read", "err", err)

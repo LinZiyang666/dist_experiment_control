@@ -63,6 +63,49 @@ func TestPreflightRefusesUnknownDirective(t *testing.T) {
 	}
 }
 
+// TestPreflightRefusesUnrecognizedSubkey is the audit-M6 / natsconf-F1 regression: a subkey
+// inside jetstream{} / websocket{} that the takeover does NOT re-emit must be REFUSED — it
+// would otherwise pass the top-level gate and be SILENTLY DROPPED on re-render (e.g. a hand-set
+// JS `domain` that breaks cross-cluster stream addressing). The install.sh subset still passes
+// (TestPreflightAcceptsInstallShape).
+func TestPreflightRefusesUnrecognizedSubkey(t *testing.T) {
+	cases := map[string]string{
+		"js_domain": `host: "127.0.0.1"
+port: 4222
+jetstream {
+  store_dir: "/var/lib/tether/jetstream"
+  domain: "tether"
+}
+`,
+		"js_max_file_store": `host: "127.0.0.1"
+port: 4222
+jetstream {
+  store_dir: "/var/lib/tether/jetstream"
+  max_file_store: 200000000
+}
+`,
+		"ws_compression": `host: "127.0.0.1"
+port: 4222
+jetstream {
+  store_dir: "/var/lib/tether/jetstream"
+}
+websocket {
+  host: "127.0.0.1"
+  port: 8222
+  no_tls: true
+  compression: true
+}
+`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Preflight(writeConf(t, body)); err == nil {
+				t.Fatalf("preflight must REFUSE an unrecognized %s subkey (would silently drop on re-render)", name)
+			}
+		})
+	}
+}
+
 func TestPreflightPreservesTuningPassthrough(t *testing.T) {
 	// usage.md:970 documents raising max_payload for tier-A transfer — it must NOT be
 	// refused (a hard-refuse would brick every file-transfer broker).

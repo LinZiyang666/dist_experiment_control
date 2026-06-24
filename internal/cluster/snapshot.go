@@ -186,6 +186,14 @@ func (f *fsm) restoreFrom(rc io.ReadCloser) error {
 	}
 	_ = mdb.Close()
 
+	// audit snapshot F4: re-verify integrity + FK AFTER the forward-migration, before the
+	// in-place restore. The pre-migration check (step 2) cannot catch corruption or an FK
+	// violation that a migration introduces; installing such a DB into the LIVE write pool would
+	// be worse than refusing the restore.
+	if err := verifyIntegrity(tmpPath); err != nil {
+		return fmt.Errorf("cluster: post-migration integrity: %w", err)
+	}
+
 	// 4. In-place restore into the live write pool (no rename over open inode).
 	if err := restoreInPlace(context.Background(), f.db, tmpPath); err != nil {
 		return err

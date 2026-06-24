@@ -653,6 +653,13 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		}
 		return
 	}
+	// audit transfer F5: the transfer_id is a shared key — cross-check it belongs to THIS
+	// subject's (sid,nid) so a valid actor cannot drive a push-commit against another session's
+	// transfer (consistency with handleEvTransfer's sid/nid guard).
+	if entry.sid != sid || entry.nid != nid {
+		b.replyCommitErr(msg, "not_owner_or_creator", "")
+		return
+	}
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyCommitErr(msg, err, "")
 		return
@@ -945,6 +952,13 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	}
 	if code := b.transferGate(sid, fp, ""); code != "" {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: code})
+		return
+	}
+	// audit transfer F5: cross-check the transfer belongs to THIS subject's sid (the transfer_id
+	// is a shared key) so a valid actor cannot finalize another session's transfer — consistency
+	// with handleEvTransfer's sid/nid guard.
+	if preview.sid != sid {
+		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "not_owner_or_creator"})
 		return
 	}
 	if preview.actor != actor {

@@ -119,6 +119,19 @@ func Render(cfg Config) (string, error) {
 	b.WriteString("  }\n")
 	b.WriteString("}\n\n")
 
+	// audit natscluster F1: dedup peers by NkeyPub. A duplicate nkey in auth_users or the static
+	// users block makes nats-server FATAL at config load — a repeated roster entry, or the local
+	// node also appearing in `peers`, must not brick the broker (especially on --skip-dry-run).
+	seenNkey := map[string]bool{}
+	var uniqueNkeys []string
+	for _, p := range peers {
+		if p.NkeyPub == "" || seenNkey[p.NkeyPub] {
+			continue
+		}
+		seenNkey[p.NkeyPub] = true
+		uniqueNkeys = append(uniqueNkeys, p.NkeyPub)
+	}
+
 	// Authorization: auth_callout (every broker pub in auth_users) + a static nkey
 	// user per broker pub carrying PermissionsForBroker (RF1, §6.2 R3F3).
 	perms := auth.PermissionsForBroker()
@@ -127,15 +140,15 @@ func Render(cfg Config) (string, error) {
 	fmt.Fprintf(&b, "    issuer: %q\n", cfg.AccountIssuer)
 	fmt.Fprintf(&b, "    account: %q\n", account)
 	b.WriteString("    auth_users: [\n")
-	for _, p := range peers {
-		fmt.Fprintf(&b, "      %q\n", p.NkeyPub)
+	for _, nkey := range uniqueNkeys {
+		fmt.Fprintf(&b, "      %q\n", nkey)
 	}
 	b.WriteString("    ]\n")
 	b.WriteString("  }\n")
 	b.WriteString("  users: [\n")
-	for _, p := range peers {
+	for _, nkey := range uniqueNkeys {
 		b.WriteString("    {\n")
-		fmt.Fprintf(&b, "      nkey: %q\n", p.NkeyPub)
+		fmt.Fprintf(&b, "      nkey: %q\n", nkey)
 		b.WriteString("      permissions {\n")
 		writeAllowBlock(&b, "publish", perms.Pub.Allow)
 		writeAllowBlock(&b, "subscribe", perms.Sub.Allow)

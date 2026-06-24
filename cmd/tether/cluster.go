@@ -147,6 +147,25 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 			Reachable: reachable, ReachSource: source,
 		})
 	}
+	// audit cli F5: derive a coarse exit code from the probe so a monitoring gate
+	// (`cluster status --offline --json || alert`) is not silently exit-0 "OK" during a total
+	// outage. With MORE THAN ONE roster node and NONE answering the raft-port probe, report
+	// DEGRADED (exit 2). The len>1 guard avoids a false positive for an N=1 cluster whose single
+	// (stopped) daemon is unreachable by design when offline status is run. FORCE_SINGLE (exit 3,
+	// set above) wins.
+	if rep.ExitCode == 0 && len(rep.Nodes) > 1 {
+		reachable := 0
+		for _, n := range rep.Nodes {
+			if n.Reachable {
+				reachable++
+			}
+		}
+		if reachable == 0 {
+			rep.Health = "DEGRADED"
+			rep.ExitCode = 2
+			rep.Banner = "no roster node answered the raft-port probe (possible quorum loss / total outage) — " + rep.Banner
+		}
+	}
 	if asJSON {
 		b, _ := json.MarshalIndent(rep, "", "  ")
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
