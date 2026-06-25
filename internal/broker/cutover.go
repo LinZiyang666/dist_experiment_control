@@ -96,6 +96,15 @@ func raftStateOnDisk(dataDir string) (bool, error) {
 // FORBIDS it (else a migrated DB was started with broker.cluster.data_dir unset ⇒ a
 // silent downgrade). This is the cross-check arm of d9-plan §2 step 1.
 func assertClusterDBConsistent(db *sql.DB, clusterMode bool) error {
+	// Audit DI-MAJOR-2: a restore that was interrupted (SIGKILL between the DB install and the raft
+	// bootstrap) leaves restore_in_progress set in the installed DB. Refuse to start (fail-closed) —
+	// the restored DB + the OLD raft log would otherwise resurrect pruned peers. Re-run `cluster
+	// restore` (idempotent) to complete it.
+	var rip string
+	if err := db.QueryRow(`SELECT value FROM cluster_meta WHERE key='restore_in_progress'`).Scan(&rip); err == nil && rip != "" {
+		return errors.New("broker: a `cluster restore` was interrupted (restore_in_progress is set) — " +
+			"re-run `tether cluster restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
+	}
 	seeded, err := clusterDBSeeded(db)
 	if err != nil {
 		return err
@@ -133,11 +142,36 @@ func readSelfNodeID(dbPath string) (string, error) {
 	return id, nil
 }
 
+// assertNoInterruptedRestore is the External-review F1 fail-closed PREFLIGHT: it checks the
+// restore_in_progress marker on a READ-ONLY handle, BEFORE any raft store / FSM / transport is
+// constructed. An interrupted `cluster restore` (SIGKILL between DB install and raft bootstrap)
+// leaves the restored DB next to the OLD raft log — and `cluster.New` (NoSnapshotRestoreOnStart)
+// would replay that log onto the restored DB, resurrecting pruned peers, BEFORE the post-construct
+// assertClusterDBConsistent could refuse. So this must run first, touching no raft state.
+func assertNoInterruptedRestore(dbPath string) error {
+	ro, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		return fmt.Errorf("broker: open DB for restore preflight: %w", err)
+	}
+	defer func() { _ = ro.Close() }()
+	var rip string
+	if err := ro.QueryRow(`SELECT value FROM cluster_meta WHERE key='restore_in_progress'`).Scan(&rip); err == nil && rip != "" {
+		return errors.New("broker: a `cluster restore` was interrupted (restore_in_progress is set) — " +
+			"re-run `tether cluster restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
+	}
+	return nil
+}
+
 // buildClusterRuntime constructs the cluster.Node (mTLS transport + raft + the merged
 // WAL DB) from the §15 secrets dir. The forwarder, seam attaches, and leader-gated
 // loops are wired later in Run (after the NATS connect + JS probe), so this returns a
 // runtime carrying only the node.
 func (b *Broker) buildClusterRuntime() (*clusterRuntime, error) {
+	// External-review F1: FAIL CLOSED on an interrupted restore BEFORE constructing raft/FSM —
+	// cluster.New would otherwise replay the old raft log onto the restored DB first.
+	if err := assertNoInterruptedRestore(b.cfg.DBPath); err != nil {
+		return nil, err
+	}
 	selfID, err := readSelfNodeID(b.cfg.DBPath)
 	if err != nil {
 		return nil, err

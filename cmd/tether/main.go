@@ -69,6 +69,10 @@ func main() {
 	defer stop()
 	if err := newRootCmd().ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		// B2 item 3: classify the terminal error into a sysexits-style code so a monitor can
+		// tell "broker unreachable" (69) from "bad arg" (64) from "permission" (77) from an
+		// unclassified tether-side fault (70). 0 still means success; only the nonzero value is
+		// now informative. (cluster status / exec / run os.Exit() before reaching here.)
+		os.Exit(classifyExit(err))
 	}
 }

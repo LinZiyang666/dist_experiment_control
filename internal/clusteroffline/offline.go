@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"golang.org/x/sys/unix"
 )
@@ -204,17 +205,28 @@ type RecoverOptions struct {
 	DataDir  string
 	DBPath   string
 	DumpPath string // O_EXCL 0600; never overwrites a prior dump
-	Logger   *slog.Logger
+	// B6 OPS#11: capture the node's IDENTITY (not the divergent business rows) into a manifest
+	// BEFORE the wipe, so `cluster init --from-manifest` can rebuild the self VOTER row without
+	// the operator re-typing 9 flags. Empty ManifestPath = no emit (back-compat). SelfID names
+	// the self row to project; SecretsDir (optional) enables the advisory account_fp.
+	SelfID       string
+	ManifestPath string
+	SecretsDir   string
+	Now          func() time.Time
+	Logger       *slog.Logger
 }
 
 // Recover takes a forensic divergence dump (DURABLY — fsync file + dir, refuse the
-// wipe if it fails), then wipes raft/ + tether.db. The node must be reinitialized
-// before the daemon can start, then `cluster add` admits it as a clean voter. The
-// dump is forensic-only / not auto-mergeable (§8.4(b)/R-7). Returns the number of
-// rows dumped.
+// wipe if it fails), OPTIONALLY emits an identity manifest (also DURABLY, also refuse-on-fail),
+// then wipes raft/ + tether.db. The node must be reinitialized before the daemon can start,
+// then `cluster add` admits it as a clean voter. The dump is forensic-only / not auto-mergeable
+// (§8.4(b)/R-7); the manifest is identity-only. Returns the number of rows dumped.
 func Recover(opts RecoverOptions) (int, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
 	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
 	if err != nil {
@@ -233,12 +245,50 @@ func Recover(opts RecoverOptions) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("clusteroffline: dump failed, WIPE REFUSED: %w", err)
 	}
+	// Emit the identity manifest BEFORE the wipe (refuse the wipe if it fails, like the dump):
+	// the self row is gone after the wipe, so capture it now or never.
+	if opts.ManifestPath != "" {
+		if err := emitRecoverManifest(opts); err != nil {
+			return 0, fmt.Errorf("clusteroffline: manifest emit failed, WIPE REFUSED: %w", err)
+		}
+	}
 	if err := wipe(opts.DataDir, opts.DBPath); err != nil {
 		return n, fmt.Errorf("clusteroffline: dumped %d rows but wipe failed: %w", n, err)
 	}
 	opts.Logger.Warn("clusteroffline: recover complete; node wiped, re-run cluster init before daemon start, then cluster add to rejoin",
-		"dump", opts.DumpPath, "rows", n)
+		"dump", opts.DumpPath, "manifest", opts.ManifestPath, "rows", n)
 	return n, nil
+}
+
+// emitRecoverManifest projects the self identity + roster into a recover-divergent manifest.
+func emitRecoverManifest(opts RecoverOptions) error {
+	if opts.SelfID == "" {
+		return fmt.Errorf("clusteroffline: --emit-manifest requires --self-id")
+	}
+	db, err := storage.OpenReadOnly("file:" + opts.DBPath)
+	if err != nil {
+		return fmt.Errorf("open db for manifest: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	m, err := ReadSelfIdentity(db, opts.SelfID)
+	if err != nil {
+		return err
+	}
+	m.Kind = ManifestKindRecover
+	m.Mode = ManifestModeCluster
+	m.CreatedAt = opts.Now().UTC().Format(time.RFC3339Nano)
+	m.ToolVersion = proto.ReleaseVersion
+	roster, err := ProjectRoster(db)
+	if err != nil {
+		return err
+	}
+	m.Roster = roster
+	if opts.SecretsDir != "" {
+		if fp, ferr := AccountFingerprint(opts.SecretsDir); ferr == nil {
+			m.AccountFP = fp
+		}
+	}
+	return WriteManifest(opts.ManifestPath, m)
 }
 
 // dumpableTables enumerates EVERY user table in the DB (not a hand-maintained list —

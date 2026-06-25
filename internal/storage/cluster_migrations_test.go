@@ -352,7 +352,7 @@ func TestPortColumns_RebuildCheck(t *testing.T) {
 }
 
 // TestPortColumns_BackfillExistingRows is the TRUE production-upgrade path: a row
-// that already existed at migration 0007 must be backfilled to (1,'',0) when
+// that already existed at migration 0007 must be backfilled to (1,”,0) when
 // 0008–0010 run. (TestPortColumns_DefaultsOnFreshInsert only exercises the
 // insert-omitting-column path; this exercises ALTER ADD COLUMN ... DEFAULT
 // rewriting pre-existing rows.)
@@ -494,9 +494,9 @@ func TestClusterMeta_KVConstraints(t *testing.T) {
 	}
 }
 
-// TestPortColumns_HomeBrokerNotNull (m4) proves the 0010 default is '' (empty
+// TestPortColumns_HomeBrokerNotNull (m4) proves the 0010 default is ” (empty
 // string), NOT NULL — Scan into a Go string would coerce NULL to "" and mask the
-// bug, so assert via IS NULL. NULL vs '' changes the D6 home==self filter +
+// bug, so assert via IS NULL. NULL vs ” changes the D6 home==self filter +
 // partial-index equality semantics.
 func TestPortColumns_HomeBrokerNotNull(t *testing.T) {
 	db := openTest(t)

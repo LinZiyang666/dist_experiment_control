@@ -104,6 +104,25 @@ func backupTo(ctx context.Context, ro *sql.DB, dstPath string) error {
 	})
 }
 
+// BackupDBFile opens srcDBPath READ-ONLY and writes a consistent paged online-backup into
+// dstPath. It is the OFFLINE counterpart to Node.BackupDBTo (no running node): the B6
+// `cluster backup --offline` path uses it on a daemon-stopped on-disk DB. It never mutates
+// the source (read-only handle) and carries no raft state. dstPath must not already exist.
+func BackupDBFile(ctx context.Context, srcDBPath, dstPath string) error {
+	ro, err := storage.OpenReadOnly("file:" + srcDBPath)
+	if err != nil {
+		return fmt.Errorf("cluster: open source for backup: %w", err)
+	}
+	defer func() { _ = ro.Close() }()
+	return backupTo(ctx, ro, dstPath)
+}
+
+// VerifyIntegrity runs integrity_check + foreign_key_check on the DB at path (the exported
+// form of the restore-path guard). B6 restore uses it on a staging copy before and after the
+// forward-migration, so a torn/corrupt/FK-violating bundle is refused before it can be
+// installed over the live DB.
+func VerifyIntegrity(path string) error { return verifyIntegrity(path) }
+
 // restoreInPlace copies srcPath INTO the live write-pool conn (modernc
 // NewRestore) — no rename over the open inode (§3.8 D1 amendment).
 func restoreInPlace(ctx context.Context, db *sql.DB, srcPath string) error {

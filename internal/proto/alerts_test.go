@@ -11,11 +11,11 @@ func TestEvalDestructiveGate(t *testing.T) {
 		return ClusterHealthResp{WritableLeaderConfirmed: wl, LeaderContactStale: st, ForceSingleActive: fs}
 	}
 	cases := []struct {
-		name          string
-		replies       []ClusterHealthResp
-		wantQuorum    bool
-		wantForce     bool
-		wantBlocked   bool
+		name        string
+		replies     []ClusterHealthResp
+		wantQuorum  bool
+		wantForce   bool
+		wantBlocked bool
 	}{
 		{"zero replies = ctl jitter / non-cluster => no gate", nil, false, false, false},
 		{"confirmed writable leader => no gate",

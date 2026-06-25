@@ -51,6 +51,13 @@ type NodeRegisterReq struct {
 	// every source build shares "v0.0.0-dev", so a version string can't prove
 	// P13 support (external review round-2 F5). Additive/omitempty.
 	Capabilities []string `json:"capabilities,omitempty"`
+
+	// RosterGen (B7 DOC#3) is the agent's currently-cached signed-roster generation, sent so the
+	// eventual agent consumer can use it as an ADVISORY tie-breaker. The broker does NOT gate roster
+	// delivery on it (Stage-C M1: the derived generation can regress on recover/retire, so gating
+	// could suppress a corrected roster) — it always sends the current roster. 0 = a pre-B7 agent /
+	// no cache. Additive/omitempty (proto stays 2).
+	RosterGen uint64 `json:"roster_gen,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -125,6 +132,12 @@ type NodeRegisterResp struct {
 	// Proxy *ProxyDirective precedent). The agent applies each directive
 	// epoch-ordered (apply iff Epoch > the clientSession's current home epoch).
 	Home *HomeAssignment `json:"home,omitempty"`
+
+	// Roster (B7 DOC#3), when non-nil, is the account-signed broker set the agent caches for
+	// discovery. A POINTER + omitempty so a single broker — which never emits it (the
+	// rosterForRegister selfID=="" gate) — produces a NodeRegisterResp byte-identical to today
+	// (the Proxy/Home precedent). Discovery-ONLY: it confers zero membership authority.
+	Roster *ClusterRoster `json:"roster,omitempty"`
 }
 
 // HomeAssignment is the register-reply container for per-expose home
@@ -411,6 +424,17 @@ type PsPortEntry struct {
 	State       string    `json:"state"` // ALLOCATED | REVOKED | FREED
 	CreatedByFP string    `json:"created_by_fp,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// HomeBroker / Epoch / RebuildOff (B4) project the D6 home-assignment columns so
+	// `ps` and `expose explain` can show where an expose is homed and its rebuild policy.
+	// All omitempty: a single broker / un-homed / rebuild-ON (default) row leaves them
+	// zero, so the ps row marshals byte-identical to pre-B4. HomeBroker is the home
+	// node_id (''=single/un-homed); Epoch is the per-port reassign counter (>0 ⇒ moved);
+	// RebuildOff is the inverted rebuild flag (true ⇒ --no-rebuild was set; omitted ⇒
+	// rebuild ON, the default).
+	HomeBroker string `json:"home_broker,omitempty"`
+	Epoch      int64  `json:"epoch,omitempty"`
+	RebuildOff bool   `json:"rebuild_off,omitempty"`
 }
 
 // RunReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.run.req.
@@ -541,6 +565,29 @@ type ExposeReq struct {
 	// ActorFP — broker-stamped at forward time; same convention as
 	// ExecReq.ActorFP. ctl-supplied value is discarded.
 	ActorFP string `json:"actor_fp,omitempty"`
+
+	// RebuildOff (B4) is the INVERTED rebuild flag for `--no-rebuild`. The product
+	// DEFAULT is rebuild ON: when this expose's home broker dies, the expose
+	// auto-rehomes to a survivor (D6 §7.x). Encoding the NON-default (OFF) case makes
+	// an OMITTED field decode to today's ON behavior:
+	//   absent / RebuildOff=false  => rebuild ON   (today's behavior, byte-identical)
+	//   "rebuild_off":true         => rebuild OFF (pin to home; cluster drain will
+	//                                 REFUSE to migrate it — the operator's choice)
+	// Mirror of ExecReq.Safe / RunReq.Safe. An old broker ignores the unknown key and
+	// keeps rebuild-ON (port_allocations.rebuild_on_failure DEFAULT 1) — the SAFE
+	// direction (a dropped --no-rebuild fails toward ON). omitempty is load-bearing:
+	// a new ctl that omits the flag sends a body byte-identical to an old ctl.
+	RebuildOff bool `json:"rebuild_off,omitempty"`
+
+	// OnBroker (B4) pins the expose's home to a NAMED cluster node (cluster_nodes.node_id
+	// == raft ServerID), the `--on-broker <node>` flag. Empty/omitted = default home
+	// resolution (the agent's connected broker via the §6.5 server-id bridge). CLUSTER-
+	// ONLY: a single broker has no roster, so a non-empty value is REJECTED with
+	// on_broker_single_mode. In cluster mode the broker validates the target is a real
+	// ELIGIBLE (VOTER) node with a usable cert pin, else on_broker_unknown. omitempty =>
+	// absent on the default path (byte-identical to an old ctl). An old broker ignores the
+	// unknown key (default home resolution; the pin is silently dropped — SAFE).
+	OnBroker string `json:"on_broker,omitempty"`
 }
 
 // ExposeResp — broker pub on the expose.req reply inbox.
@@ -555,8 +602,16 @@ type ExposeResp struct {
 	PublicHost string `json:"public_host,omitempty"` // operator-friendly URL host (e.g. broker.example.com)
 	Name       string `json:"name,omitempty"`        // echoed back
 
-	Code  string `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | port_taken | port_out_of_band | ...
+	Code  string `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | name_taken | port_exhausted | port_taken | port_out_of_band | on_broker_single_mode | on_broker_unknown | ...
 	Error string `json:"error,omitempty"`
+
+	// HomeBroker / Epoch (B4) surface where the broker homed this expose so the user can
+	// see it (and `expose explain` / `ps` can render it). HomeBroker is the home
+	// cluster_nodes.node_id; '' for a single broker or an un-homed allocation. Epoch is
+	// the per-port monotone reassign counter (0 at allocate, +1 per D6 rehome). Both
+	// omitempty: a single broker leaves them zero so the reply is byte-identical to pre-B4.
+	HomeBroker string `json:"home_broker,omitempty"`
+	Epoch      int64  `json:"epoch,omitempty"`
 }
 
 // ExposeForwardedReq — broker pub on

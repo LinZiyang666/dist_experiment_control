@@ -33,8 +33,8 @@ func (transientJS) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream
 // (the stream is not-yet-ensured) and MUST stay R-22 (retry), or the queue-not-drop contract breaks.
 func TestPublishAuditDeletedStreamIsBoundedLoss(t *testing.T) {
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	gone := func(string) (bool, error) { return false, nil }    // session removed
-	active := func(string) (bool, error) { return true, nil }   // session still ACTIVE
+	gone := func(string) (bool, error) { return false, nil }  // session removed
+	active := func(string) (bool, error) { return true, nil } // session still ACTIVE
 	subj, sid := "tether.v2.s.lab.audit.transfer", "lab"
 
 	// (a) no-stream + session GONE → bounded loss (nil), counter increments → cursor advances.

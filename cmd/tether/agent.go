@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -153,6 +152,8 @@ func newAgentCmd() *cobra.Command {
 		tunnelAddr         string
 		installUserService bool
 		uninstall          bool
+		logLevel           string
+		logJSON            bool
 	)
 	cmd := &cobra.Command{
 		Use:   "agent",
@@ -204,13 +205,18 @@ func newAgentCmd() *cobra.Command {
 				return err
 			}
 
+			logger, err := newLogger(logLevel, logJSON)
+			if err != nil {
+				return err
+			}
+
 			cfg := agent.Config{
 				NATSURL:                       natsURL,
 				SID:                           sid,
 				NID:                           nid,
 				PIN:                           pin,
 				Home:                          home,
-				Logger:                        slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				Logger:                        logger,
 				AllowRoots:                    ay.FileTransfer.AllowRoots,
 				RootsConfigured:               ay.FileTransfer.AllowRoots != nil,
 				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
@@ -276,6 +282,8 @@ func newAgentCmd() *cobra.Command {
 		"write ~/.config/systemd/user/tether-agent@<sid>.service and exit (does NOT start)")
 	cmd.Flags().BoolVar(&uninstall, "uninstall", false,
 		"remove the user systemd unit for this session and exit (does NOT stop running agents)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
+	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	return cmd
 }
 

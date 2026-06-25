@@ -159,20 +159,20 @@ func TestD2PlanErrorParity_Review(t *testing.T) {
 		planned := freshDB(t)
 		seedSessionNode(t, live, "lab", "lab-1", now)
 		seedSessionNode(t, planned, "lab", "lab-1", now)
-		if _, err := port.Allocate(live, "lab", "lab-1", "first", 1, 0, "fp", cfg); err != nil {
+		if _, err := port.Allocate(live, "lab", "lab-1", "first", 1, 0, "fp", false, cfg); err != nil {
 			t.Fatal(err)
 		}
-		_, cmd, err := port.PlanAllocate(planned, "lab", "lab-1", "first", 1, 0, "fp", "", cfg)
+		_, cmd, err := port.PlanAllocate(planned, "lab", "lab-1", "first", 1, 0, "fp", "", false, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := cluster.ExecCommand(planned, cmd); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := port.Allocate(live, "lab", "lab-1", "second", 2, 0, "fp", cfg); !errors.Is(err, port.ErrPortExhausted) {
+		if _, err := port.Allocate(live, "lab", "lab-1", "second", 2, 0, "fp", false, cfg); !errors.Is(err, port.ErrPortExhausted) {
 			t.Fatalf("live: got %v, want ErrPortExhausted", err)
 		}
-		if _, _, err := port.PlanAllocate(planned, "lab", "lab-1", "second", 2, 0, "fp", "", cfg); !errors.Is(err, port.ErrPortExhausted) {
+		if _, _, err := port.PlanAllocate(planned, "lab", "lab-1", "second", 2, 0, "fp", "", false, cfg); !errors.Is(err, port.ErrPortExhausted) {
 			t.Fatalf("plan: got %v, want ErrPortExhausted", err)
 		}
 	})

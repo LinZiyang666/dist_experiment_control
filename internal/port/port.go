@@ -90,6 +90,13 @@ type Allocation struct {
 	// per-port monotone reassign counter (0 baseline).
 	HomeBroker string
 	Epoch      int64
+
+	// RebuildOff (B4) is the read-side projection of port_allocations.rebuild_on_failure
+	// INVERTED: rebuild_on_failure=1 (the DEFAULT, rebuild ON) ⇒ RebuildOff=false;
+	// rebuild_on_failure=0 (the operator's `--no-rebuild`) ⇒ RebuildOff=true. Inverted so
+	// the zero value matches the default (a zero Allocation is rebuild-ON). Populated by
+	// the scanRowWithHome / scanOneWithHome paths (ps, expose-rm, offline reconciler).
+	RebuildOff bool
 }
 
 // Errors callers may need to distinguish. ErrNotFound is the lookup
@@ -138,7 +145,7 @@ type Config struct {
 // independent invariant that still guarantees at-most-one-ALLOCATED even
 // if that serialization were ever relaxed — exactly one INSERT wins, the
 // rest trip the constraint and get ErrPortTaken (never a duplicate row).
-func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP string, cfg *Config) (*Allocation, error) {
+func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP string, rebuildOff bool, cfg *Config) (*Allocation, error) {
 	low, high, now := cfgWithDefaults(cfg)
 
 	tx, err := db.Begin()
@@ -188,7 +195,20 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, cre
 	}
 	tokenHash := hashToken(token)
 
-	if _, err := tx.Exec(
+	// B4 conditional column: rebuild-ON (the default) leaves the INSERT byte-identical to
+	// pre-B4 — rebuild_on_failure is omitted so it takes its migration-0010 DEFAULT 1.
+	// Only --no-rebuild (rebuildOff) names the column and sets it 0. This keeps the
+	// default single-mode row byte-for-byte identical to a pre-B4 allocate.
+	if rebuildOff {
+		if _, err := tx.Exec(
+			`INSERT INTO port_allocations
+			   (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, rebuild_on_failure)
+			 VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?, 0)`,
+			port, sid, nid, name, localPort, tokenHash, createdByFP, now.UTC(),
+		); err != nil {
+			return nil, translateInsertErr(err, desiredPort)
+		}
+	} else if _, err := tx.Exec(
 		`INSERT INTO port_allocations
 		   (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?)`,
@@ -212,6 +232,7 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, cre
 		CreatedByFP: createdByFP,
 		CreatedAt:   now.UTC(),
 		Token:       token,
+		RebuildOff:  rebuildOff,
 	}, nil
 }
 
@@ -263,7 +284,7 @@ func findFreePort(tx rowsQueryer, low, high int) (int, error) {
 func LookupByName(db *sql.DB, sid, name string) (*Allocation, error) {
 	return scanOneWithHome(db.QueryRow(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
-		        , home_broker, epoch
+		        , home_broker, epoch, rebuild_on_failure
 			 FROM port_allocations
 			 WHERE sid=? AND name=? AND state='ALLOCATED'`,
 		sid, name,
@@ -278,7 +299,7 @@ func LookupByName(db *sql.DB, sid, name string) (*Allocation, error) {
 func LookupByTokenHash(db *sql.DB, tokenHash string) (*Allocation, error) {
 	return scanOneWithHome(db.QueryRow(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
-			        home_broker, epoch
+			        home_broker, epoch, rebuild_on_failure
 			 FROM port_allocations
 			 WHERE token_hash=? AND state='ALLOCATED'`,
 		tokenHash,
@@ -289,7 +310,8 @@ func LookupByTokenHash(db *sql.DB, tokenHash string) (*Allocation, error) {
 // ASC. Used by `tether ps` to render the PORTS section.
 func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 	rows, err := db.Query(
-		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
+		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
+		        home_broker, epoch, rebuild_on_failure
 		 FROM port_allocations
 		 WHERE sid=?
 		 ORDER BY port`,
@@ -302,7 +324,7 @@ func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 
 	var out []Allocation
 	for rows.Next() {
-		a, err := scanRow(rows)
+		a, err := scanRowWithHome(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -417,7 +439,7 @@ func ListAllocatedForOfflineNodes(db *sql.DB, now time.Time, threshold time.Dura
 	rows, err := db.Query(`
 			SELECT pa.port, pa.sid, pa.nid, pa.name, pa.local_port, pa.token_hash,
 			       pa.state, pa.created_by_fp, pa.created_at, pa.revoked_at,
-			       pa.home_broker, pa.epoch
+			       pa.home_broker, pa.epoch, pa.rebuild_on_failure
 			FROM port_allocations pa
 		JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
 		WHERE pa.state='ALLOCATED'
@@ -537,10 +559,11 @@ func scanOneWithHome(row *sql.Row) (*Allocation, error) {
 	var a Allocation
 	var revokedAt sql.NullTime
 	var stateStr string
+	var rebuildOnFailure int
 	err := row.Scan(
 		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
 		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-		&a.HomeBroker, &a.Epoch,
+		&a.HomeBroker, &a.Epoch, &rebuildOnFailure,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -549,24 +572,7 @@ func scanOneWithHome(row *sql.Row) (*Allocation, error) {
 		return nil, err
 	}
 	a.State = State(stateStr)
-	if revokedAt.Valid {
-		t := revokedAt.Time
-		a.RevokedAt = &t
-	}
-	return &a, nil
-}
-
-func scanRow(rows *sql.Rows) (*Allocation, error) {
-	var a Allocation
-	var revokedAt sql.NullTime
-	var stateStr string
-	if err := rows.Scan(
-		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
-		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-	); err != nil {
-		return nil, err
-	}
-	a.State = State(stateStr)
+	a.RebuildOff = rebuildOnFailure == 0 // inverted: column 1=ON ⇒ RebuildOff=false
 	if revokedAt.Valid {
 		t := revokedAt.Time
 		a.RevokedAt = &t
@@ -578,14 +584,16 @@ func scanRowWithHome(rows *sql.Rows) (*Allocation, error) {
 	var a Allocation
 	var revokedAt sql.NullTime
 	var stateStr string
+	var rebuildOnFailure int
 	if err := rows.Scan(
 		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
 		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-		&a.HomeBroker, &a.Epoch,
+		&a.HomeBroker, &a.Epoch, &rebuildOnFailure,
 	); err != nil {
 		return nil, err
 	}
 	a.State = State(stateStr)
+	a.RebuildOff = rebuildOnFailure == 0 // inverted: column 1=ON ⇒ RebuildOff=false
 	if revokedAt.Valid {
 		t := revokedAt.Time
 		a.RevokedAt = &t

@@ -12,7 +12,7 @@ import (
 func TestD6PlanAllocateHomedApplies(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
-	alloc, cmd, err := PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "node-2", tinyBand())
+	alloc, cmd, err := PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "node-2", false, tinyBand())
 	if err != nil {
 		t.Fatalf("plan allocate(home): %v", err)
 	}
@@ -40,12 +40,12 @@ func TestD6PlanAllocateHomedApplies(t *testing.T) {
 
 // TestD6LookupByTokenHashLegacy (review A1/A6 M4): the widened SELECT must scan a
 // LEGACY row (created by the live port.Allocate direct mutator, which leaves
-// home_broker='' / epoch=0) back as Allocation{HomeBroker:"", Epoch:0} — the
+// home_broker=” / epoch=0) back as Allocation{HomeBroker:"", Epoch:0} — the
 // inert-branch precondition that keeps tunnelTokenLookup byte-equivalent to pre-D6.
 func TestD6LookupByTokenHashLegacy(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
-	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", tinyBand())
+	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}

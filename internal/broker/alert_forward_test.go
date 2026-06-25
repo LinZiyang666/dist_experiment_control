@@ -72,7 +72,7 @@ func TestD8PlanAlertSignalRejectsBadEnum(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	for _, p := range []AlertSignalPayload{
-		{Kind: "quorum_lost", Node: "n", Active: true, Severity: cluster.AlertSeverityInfo}, // not store-backed
+		{Kind: "quorum_lost", Node: "n", Active: true, Severity: cluster.AlertSeverityInfo},  // not store-backed
 		{Kind: cluster.AlertKindDiskPressure, Node: "n", Active: true, Severity: "critical"}, // bad severity
 		{Kind: "", Node: "n", Active: true, Severity: cluster.AlertSeverityInfo},
 	} {

@@ -351,8 +351,8 @@ const proxyTokenName = "__proxy__"
 // broker's reconciliation + proxy directive. Runs on its own goroutine
 // (off the NATS callback goroutine) because register may retry.
 func (a *Agent) onNATSReconnect(nc *nats.Conn) {
-	a.cancelFailClosed()  // B1: a reconnect cancels the fail-closed countdown
-	a.ncBox.Store(nc)     // keep the session-state hook publishing on the live conn
+	a.cancelFailClosed() // B1: a reconnect cancels the fail-closed countdown
+	a.ncBox.Store(nc)    // keep the session-state hook publishing on the live conn
 	ctx := a.runCtx
 	if ctx == nil {
 		ctx = context.Background()

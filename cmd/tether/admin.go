@@ -38,7 +38,8 @@ with read+write access to the socket file (mode 0600 — typically the
 }
 
 func newAdminSessionsCmd(socketPath *string) *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:   "sessions",
 		Short: "List all sessions in the broker SQLite",
 		Args:  cobra.NoArgs,
@@ -49,6 +50,9 @@ func newAdminSessionsCmd(socketPath *string) *cobra.Command {
 			}
 			if resp.Error != "" {
 				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+			}
+			if asJSON {
+				return emitJSON(cmd.OutOrStdout(), adminSessionsJSON{Schema: "admin_sessions", SchemaVersion: 1, Sessions: normSlice(resp.Sessions)})
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "SID\tNAME\tSTATE\tOWNER\tCREATED")
@@ -62,10 +66,13 @@ func newAdminSessionsCmd(socketPath *string) *cobra.Command {
 			return tw.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
+	return cmd
 }
 
 func newAdminNodesCmd(socketPath *string) *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:   "nodes",
 		Short: "List all nodes (sid, nid, status, heartbeat age, version)",
 		Args:  cobra.NoArgs,
@@ -76,6 +83,9 @@ func newAdminNodesCmd(socketPath *string) *cobra.Command {
 			}
 			if resp.Error != "" {
 				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+			}
+			if asJSON {
+				return emitJSON(cmd.OutOrStdout(), adminNodesJSON{Schema: "admin_nodes", SchemaVersion: 1, Nodes: normSlice(resp.Nodes)})
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "SESSION\tNODE\tSTATE\tHEARTBEAT\tPROTO\tRELEASE")
@@ -94,10 +104,13 @@ func newAdminNodesCmd(socketPath *string) *cobra.Command {
 			return tw.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
+	return cmd
 }
 
 func newAdminAuditCmd(socketPath *string) *cobra.Command {
 	var n int
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "audit <sid>",
 		Short: "Tail the per-session audit history (last N entries)",
@@ -114,6 +127,9 @@ func newAdminAuditCmd(socketPath *string) *cobra.Command {
 			if resp.Error != "" {
 				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
 			}
+			if asJSON {
+				return emitJSON(cmd.OutOrStdout(), adminAuditJSON{Schema: "admin_audit", SchemaVersion: 1, Audit: normSlice(resp.Audit)})
+			}
 			for _, e := range resp.Audit {
 				body, _ := json.Marshal(e.Body)
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
@@ -127,6 +143,7 @@ func newAdminAuditCmd(socketPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVarP(&n, "n", "n", 50, "number of entries to tail (most recent)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
 			return nil, cobra.ShellCompDirectiveNoFileComp
@@ -191,7 +208,13 @@ denied at next CONNECT (no longer provisioned).`,
 
 func callAdmin(socketPath string, req adminsock.Request) (*adminsock.Response, error) {
 	c := &adminsock.Client{Path: socketPath}
-	return c.Call(req)
+	resp, err := c.Call(req)
+	if err != nil {
+		// Transport failure (socket missing / broker down / EOF) = service unavailable (69),
+		// NOT an internal fault — a monitor must distinguish "broker is down" from "bad reply".
+		return nil, unavailErr("admin socket %s: %w", socketPath, err)
+	}
+	return resp, nil
 }
 
 // shortFP truncates a SHA256 fp prefix for column display.

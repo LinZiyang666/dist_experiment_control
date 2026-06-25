@@ -62,3 +62,6 @@ Thumbs.db
 # Local agent scratchpad / notes
 /.codex
 /.claude/
+
+# Local build artifact — the binary is built via goreleaser/release flow, never committed
+/tether

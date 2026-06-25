@@ -28,7 +28,7 @@ func TestMultiFSM_SameStreamConverges(t *testing.T) {
 	seedSessionNode(t, b, "lab", "lab-1", now)
 
 	// Plan ONCE (on a), then apply the SAME command to both replicas.
-	_, cmd, err := port.PlanAllocate(a, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", cfg)
+	_, cmd, err := port.PlanAllocate(a, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", false, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestNode_ProposeRealRaftPath(t *testing.T) {
 
 	var alloc *port.Allocation
 	mustPropose(func(db *sql.DB) (*cluster.Command, error) {
-		a, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", cfg)
+		a, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:caller", "", false, cfg)
 		alloc = a
 		return cmd, err
 	})
@@ -95,7 +95,7 @@ func TestNode_ProposeRealRaftPath(t *testing.T) {
 	// a duplicate name must be rejected by the leader Plan (ErrNameTaken) BEFORE
 	// proposing — proving Plan-side business errors short-circuit Propose.
 	err := n.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:caller", "", cfg)
+		_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:caller", "", false, cfg)
 		return cmd, err
 	})
 	if err != port.ErrNameTaken {
@@ -165,7 +165,7 @@ func TestConcurrentPropose(t *testing.T) {
 	if w := race("same-name",
 		func() func(*sql.DB) (*cluster.Command, error) {
 			return func(db *sql.DB) (*cluster.Command, error) {
-				_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "dup", 1000, 0, "fp", "", cfg)
+				_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", "dup", 1000, 0, "fp", "", false, cfg)
 				return cmd, err
 			}
 		},
@@ -185,7 +185,7 @@ func TestConcurrentPropose(t *testing.T) {
 		func() func(*sql.DB) (*cluster.Command, error) {
 			return func(db *sql.DB) (*cluster.Command, error) {
 				// distinct names so the collision is on the PORT, not the name.
-				_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", randName(), 1000, dport, "fp", "", cfg)
+				_, cmd, err := port.PlanAllocate(db, "lab", "lab-1", randName(), 1000, dport, "fp", "", false, cfg)
 				return cmd, err
 			}
 		},

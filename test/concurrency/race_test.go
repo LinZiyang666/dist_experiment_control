@@ -75,7 +75,7 @@ func TestConcurrentPortAllocations(t *testing.T) {
 			defer wg.Done()
 			latch.wait()
 			a, err := port.Allocate(db, "lab", "lab-1",
-				fmt.Sprintf("svc-%d", i), 8000+i, 0, "fp-test", cfg)
+				fmt.Sprintf("svc-%d", i), 8000+i, 0, "fp-test", false, cfg)
 			if err != nil {
 				errs <- fmtErr("alloc %d: %w", i, err)
 				return
@@ -168,7 +168,7 @@ func TestConcurrentDesiredPortExactlyOneWins(t *testing.T) {
 			defer wg.Done()
 			latch.wait()
 			a, err := port.Allocate(db, "lab", "lab-1",
-				fmt.Sprintf("svc-%d", i), 8000+i, want, "fp-test", cfg)
+				fmt.Sprintf("svc-%d", i), 8000+i, want, "fp-test", false, cfg)
 			switch {
 			case err == nil:
 				winners.Add(1)

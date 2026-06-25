@@ -118,7 +118,9 @@ func TestAlertLsRequiresActiveSession(t *testing.T) {
 }
 
 func TestAlertAckRequiresActiveSession(t *testing.T) {
-	err := runWithFreshHome(t, newAlertAckCmd(), "quorum_lost")
+	// Use a STORE-BACKED key, not a synthetic gate name — B3 item 4 short-circuits
+	// quorum_lost/force_single_active BEFORE the session check, so they no longer reach this path.
+	err := runWithFreshHome(t, newAlertAckCmd(), "disk_pressure:n1")
 	mustNoActiveSession(t, "alert ack", err)
 }
 

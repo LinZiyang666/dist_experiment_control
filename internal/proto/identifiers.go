@@ -14,8 +14,12 @@ import (
 //        (1 prefix + 32 byte key + 2 byte CRC = 35 bytes → 56 base32 chars).
 
 var (
-	idCharset    = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
-	actorPattern = regexp.MustCompile(`^U[A-Z2-7]{55}$`)
+	idCharset = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+	// clusterNodeCharset: first char MUST be alphanumeric/underscore (NOT '-') so an option-like
+	// node_id ('-brk-a', '--help') cannot be rendered into a copy-paste CLI command and parsed as a
+	// flag by Cobra (External-review re-review). 1-63 chars total.
+	clusterNodeCharset = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$`)
+	actorPattern       = regexp.MustCompile(`^U[A-Z2-7]{55}$`)
 )
 
 var sidReserved = map[string]struct{}{
@@ -54,6 +58,20 @@ func ValidateSID(s string) error {
 func ValidateNID(s string) error {
 	if !idCharset.MatchString(s) {
 		return fmt.Errorf("nid %q: must match [a-z0-9-]{1,32}", s)
+	}
+	return nil
+}
+
+// ValidateClusterNodeID validates a cluster broker node_id (== raft ServerID == §6.5 nats_server_id).
+// Charset `[A-Za-z0-9_-]{1,63}` (External-review SEC-MAJOR-1 / F13): it rejects every injection-shaped
+// character — shell metacharacters, whitespace, newlines, path separators ('/', '.'), and NUL — that
+// would be dangerous when the node_id is rendered verbatim into operator command lines, a filesystem
+// path, or nats.conf. It is intentionally more permissive than ValidateNID on case (a broker node_id
+// is a deployment-chosen server name, not a per-session leaf nid) but equally fail-closed on danger.
+func ValidateClusterNodeID(s string) error {
+	if !clusterNodeCharset.MatchString(s) {
+		return fmt.Errorf("cluster node_id %q: must match [A-Za-z0-9_][A-Za-z0-9_-]{0,62} "+
+			"(no leading '-' / option-like ids, no shell metacharacters, whitespace, '/', '.', or NUL)", s)
 	}
 	return nil
 }

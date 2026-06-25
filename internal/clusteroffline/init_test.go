@@ -210,3 +210,72 @@ func TestD9InitFromExistingRefusesNameChange(t *testing.T) {
 		t.Fatal("re-run with a different identity must be refused, got nil")
 	}
 }
+
+// TestD9InitFromExistingRefusesLiveDaemon — Audit TEST-MAJOR-2: the irreversible live-DB migration
+// must refuse-before-mutate when a daemon holds the DB write lock (restore has this; init lacked it).
+func TestD9InitFromExistingRefusesLiveDaemon(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "tether.db")
+	secrets := filepath.Join(dataDir, "secrets")
+	writeSecrets(t, secrets)
+	// A pre-migration single-broker DB.
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold a write lock (a live daemon).
+	hold, err := storage.OpenWAL("file:" + dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hold.Close() }()
+	tx, err := hold.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO cluster_meta(key,value) VALUES('t:held','1') ON CONFLICT(key) DO UPDATE SET value='1'`); err != nil {
+		// cluster_meta exists post-migration; if not, grab the lock another way.
+		_, _ = tx.Exec(`CREATE TABLE IF NOT EXISTS t_lock(x)`)
+		_, _ = tx.Exec(`INSERT INTO t_lock(x) VALUES(1)`)
+	}
+	defer func() { _ = tx.Rollback() }()
+	_ = db.Close()
+
+	if err := clusteroffline.InitFromExisting(initOpts(dataDir, dbPath, secrets)); err == nil {
+		t.Fatal("InitFromExisting must refuse while a daemon holds the DB write lock")
+	}
+	// No .bak created (the irreversible migration never started).
+	if _, statErr := os.Stat(dbPath + ".bak"); statErr == nil {
+		t.Fatal("a refused init must NOT create a .bak (it never mutated)")
+	}
+}
+
+// TestF13InitRejectsBadIdentity — External-review F13: the offline init must apply the online path's
+// node_id + text validation (proto.ValidateNID + NUL/non-UTF-8 rejection), fail-closed pre-mutation.
+func TestF13InitRejectsBadIdentity(t *testing.T) {
+	mk := func() (string, string, string) {
+		dir := t.TempDir()
+		sec := filepath.Join(dir, "secrets")
+		writeSecrets(t, sec)
+		return dir, filepath.Join(dir, "tether.db"), sec
+	}
+	t.Run("bad node_id charset", func(t *testing.T) {
+		dir, db, sec := mk()
+		o := initOpts(dir, db, sec)
+		o.SelfID = "brk a; rm -rf /"
+		if err := clusteroffline.InitFromExisting(o); err == nil {
+			t.Fatal("must reject a node_id with shell metachars/spaces")
+		}
+		if _, statErr := os.Stat(db + ".bak"); statErr == nil {
+			t.Fatal("a rejected init must not have mutated (no .bak)")
+		}
+	})
+	t.Run("NUL in text field", func(t *testing.T) {
+		dir, db, sec := mk()
+		o := initOpts(dir, db, sec)
+		o.Name = "broker\x00evil"
+		if err := clusteroffline.InitFromExisting(o); err == nil {
+			t.Fatal("must reject a NUL byte in a text field")
+		}
+	})
+}

@@ -21,7 +21,7 @@ import (
 
 const (
 	clusterHealthWindow = 600 * time.Millisecond // broadcast corroboration collection window
-	alertLsTimeout      = 500 * time.Millisecond  // banner fetch (best-effort, one round-trip)
+	alertLsTimeout      = 500 * time.Millisecond // banner fetch (best-effort, one round-trip)
 )
 
 // probeClusterHealth broadcasts a cluster-health request and collects ALL broker replies
@@ -69,21 +69,39 @@ func probeClusterHealth(nc *nats.Conn, actor string) []proto.ClusterHealthResp {
 // quorum-serve. At N=1 (no responder) the gate never fires. A real cluster reporting
 // quorum_lost or force_single_active BLOCKS unless ackAlerts (the --ack-alerts override).
 func gateDestructive(nc *nats.Conn, actor string, ackAlerts bool) error {
+	if ackAlerts {
+		return nil // explicit --ack-alerts override: no need to probe the cluster at all
+	}
 	gate := proto.EvalDestructiveGate(probeClusterHealth(nc, actor))
-	if !gate.Blocked() || ackAlerts {
+	if !gate.Blocked() {
 		return nil
 	}
+	return errors.New(gateBlockMessage(gate))
+}
+
+// gateBlockMessage renders the BLOCKED message for a fired destructive gate (B1 item 5). It is a
+// PURE function (no NATS) so the no-nuclear-leak property is unit-testable. It deliberately does
+// NOT name the operator-only escape hatches (`cluster force-single` / `cluster recover`): a
+// regular ctl user who is merely blocked from a write must never be nudged into a split-brain-
+// risking or DB-wiping command. It points at the read-only `tether cluster status` (now runnable
+// from a laptop via --remote, B1 item 1) + the runbook, splits the transient (quorum_lost, may
+// self-clear) from the persistent (force_single_active) case, and says "condition" not "alert" so
+// the user is not misrouted to `alert ack` (which cannot clear these cluster-health gates, §5.7).
+func gateBlockMessage(gate proto.DestructiveGate) string {
 	var b strings.Builder
-	b.WriteString("BLOCKED by a severe cluster alert (re-run with --ack-alerts to override):\n")
+	b.WriteString("BLOCKED: this command needs a healthy broker cluster, and the cluster is reporting a severe\n")
+	b.WriteString("condition right now (re-run with --ack-alerts to force just this one command through).\n")
 	if gate.QuorumLost {
-		b.WriteString("  • quorum_lost: the cluster lost its writable majority (read-only). " +
-			"Confirm the other brokers are dead, then run `tether cluster force-single` on a survivor.\n")
+		b.WriteString("  • quorum_lost — the brokers cannot agree on a leader, so the cluster is read-only.\n")
+		b.WriteString("      → This sometimes clears on its own: wait ~30s and retry.\n")
+		b.WriteString("      → If it does not clear, check with `tether cluster status` and see docs/cluster-runbook.md §3.\n")
 	}
 	if gate.ForceSingleActive {
-		b.WriteString("  • force_single_active: running in force-single (no integrity guarantee). " +
-			"Recover HA as soon as possible (`tether cluster recover`).\n")
+		b.WriteString("  • force_single_active — the cluster is running on one emergency broker with no backup.\n")
+		b.WriteString("      → Waiting will NOT fix this; full redundancy must be restored on a broker host.\n")
+		b.WriteString("      → Check with `tether cluster status` and see docs/cluster-runbook.md §3.\n")
 	}
-	return errors.New(b.String())
+	return b.String()
 }
 
 // fetchAlertsStrict pulls the active alert set from any one broker (queue-group). It returns a

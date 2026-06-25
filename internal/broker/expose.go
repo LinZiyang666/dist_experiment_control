@@ -31,6 +31,17 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// B4 `--on-broker` sentinels. errOnBrokerSingleMode: a single broker has no roster, so
+// pinning a home is meaningless. errOnBrokerUnknown: the named node is not a real ELIGIBLE
+// (VOTER, cert-pinned) cluster node — eligibility is checked with the SAME predicate
+// homeForExpose uses (Eligible() && CertFP != ""), which already excludes draining/retiring/
+// catching-up/add-failed phases (those are not phase VOTER). Both abort BEFORE any raft
+// Propose, so a rejected --on-broker writes no row.
+var (
+	errOnBrokerSingleMode = errors.New("broker: --on-broker requires a clustered broker")
+	errOnBrokerUnknown    = errors.New("broker: --on-broker target is not an eligible cluster node")
+)
+
 // publicHostFor returns the operator-facing host that goes into the URL
 // printed by `tether expose`. v1 reads it from broker config; for the
 // in-process tests we fall back to "<localhost>" because there's no
@@ -221,8 +232,18 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	// single mode is the byte-identical direct mutator. The handler is leader-only in cluster
 	// mode (F3), so allocatePort runs on the leader; a leadership race falls through to the
 	// generic store_error below (raft.ErrNotLeader) and the ctl retries.
-	alloc, err := b.allocatePort(sid, nid, req.Name, req.LocalPort, req.RemotePort, fp)
+	alloc, err := b.allocatePort(sid, nid, req.Name, req.LocalPort, req.RemotePort, req.RebuildOff, req.OnBroker, fp)
 	switch {
+	case errors.Is(err, errOnBrokerSingleMode):
+		b.replyExposeErr(msg, "on_broker_single_mode",
+			"--on-broker requires a clustered broker; this broker is single-node (every expose is homed locally, nothing to pin to)")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "on_broker_single_mode", msg.Reply, nil)
+		return
+	case errors.Is(err, errOnBrokerUnknown):
+		b.replyExposeErr(msg, "on_broker_unknown",
+			req.OnBroker+": not a known eligible (VOTER, cert-pinned, non-draining) cluster node")
+		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "on_broker_unknown", msg.Reply, nil)
+		return
 	case errors.Is(err, port.ErrNameTaken):
 		b.replyExposeErr(msg, "name_taken", req.Name)
 		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "name_taken", msg.Reply, nil)
@@ -304,6 +325,11 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 		Port:       alloc.Port,
 		PublicHost: b.publicHostFor(),
 		Name:       req.Name,
+		// B4: surface where the broker homed this expose. Single mode → both zero → omitted →
+		// byte-identical to pre-B4. These come from the COMMITTED captured allocation (home_broker
+		// + epoch the leader's PlanAllocate baked), not a re-read.
+		HomeBroker: alloc.HomeBroker,
+		Epoch:      alloc.Epoch,
 	}
 	respBody, _ := json.Marshal(&resp)
 	if msg.Reply != "" {

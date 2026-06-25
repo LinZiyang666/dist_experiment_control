@@ -26,7 +26,7 @@ func TestD6InitialHomeReplicatedLadder(t *testing.T) {
 	leaderDB := openDB(t)
 	bLeader := &Broker{cfg: Config{DB: leaderDB, Logger: silentLogger()}}
 	seedFK(t, bLeader, "lab", "lab-1")
-	alloc, cmd, err := port.PlanAllocate(leaderDB, "lab", "lab-1", "svc", 9000, 0, "fp", "node-B", &port.Config{BandLow: 14000, BandHigh: 14999})
+	alloc, cmd, err := port.PlanAllocate(leaderDB, "lab", "lab-1", "svc", 9000, 0, "fp", "node-B", false, &port.Config{BandLow: 14000, BandHigh: 14999})
 	if err != nil {
 		t.Fatalf("plan allocate(home): %v", err)
 	}

@@ -6,6 +6,18 @@
 > (admin is strictly local — no network bypass). A non-leader broker fails fast and
 > names the leader host to re-run on.
 
+## 0. What is a cluster, and what is quorum? (read this first.)
+
+A tether *cluster* is several brokers that replicate one shared state via the Raft
+protocol, so if one broker dies the others keep serving — that is high availability
+(HA). Raft commits a write only when a **majority (quorum = ⌊voters/2⌋ + 1)**
+acknowledges it: 3 voters → quorum 2, tolerates 1 loss; 5 voters → quorum 3,
+tolerates 2. If live voters drop below quorum the cluster goes **read-only** (it
+refuses writes) until a majority returns — this is anti-split-brain by design, not a
+bug. Production HA therefore needs **at least 3 voters** (2 voters give no fault
+tolerance: lose one and you are read-only). If you run a single broker you do not
+need this file at all — single-broker is the fully supported default (see usage §1).
+
 ## 1. Grow the cluster (add a voter) — two-phase, challenge/response
 
 `cluster add` is a **two-phase** admission: the leader issues a single-use nonce,
@@ -70,7 +82,21 @@ you must **type the node_id to confirm** — `--yes` is never accepted. Retire i
 **refused** while any stream this node owns is still below its target replica count
 (its data is not yet redundant elsewhere).
 
-### Retire is a topology change, NOT a trust revocation (account.nk / CA rotation)
+> **Pinned exposes block silent migration.** An expose created with `tether expose
+> --no-rebuild` (rebuild-OFF) is the operator's explicit "do not move this" choice, so
+> `cluster drain` REFUSES to auto-migrate it and enumerates the offending ports — free or
+> re-decide them, then re-run drain. Inspect an expose's home/epoch/rebuild with
+> `tether expose explain <name>`; pin a new one to a specific home with `tether expose
+> --on-broker <node-id>`.
+
+> **Maintenance alerts.** Before a planned reboot, raise a cluster-wide notice from the
+> broker host: `tether alert raise --severity severe --message "brk-b maintenance
+> 02:00–03:00 UTC" --label brk-b` (operator-only, via the admin socket). It shows in
+> `tether alert ls` + the ps/node banner cluster-wide; clear it after with `tether alert
+> clear manual:brk-b`. `severe` is banner-only — it does NOT block writes (only
+> `quorum_lost` / `force_single_active` hard-gate destructive ops).
+
+### 2.1 Retire is a topology change, NOT a trust revocation (account.nk / CA rotation)
 
 A retired node's roster + raft membership are removed immediately, but its
 `account.nk` and the cluster CA are **shared and NOT rotated** — a retired node that
@@ -236,3 +262,117 @@ leader$ tether cluster add <node-2> <host:7400> <Uxxxx...>   # x2 for N=3
 > **HA guarantee** (§17): N=1 has no redundancy; N=2 is read-survives / write-zero-fault;
 > only N>=3 with JS replicas at target gives committed-0-loss HA. `cluster status` shows
 > `stream-replicas actual/target` + raises `replication_degraded` until they converge.
+
+## 5. Backup & disaster recovery (`cluster backup` / `cluster restore`)
+
+A backup is a self-describing **bundle directory** — `state.db` (a consistent copy of the
+committed FSM DB: roster, ports, sessions, alerts, the applied cursor) + `manifest.json`
+(identity + provenance fingerprints, **never keys/seeds/PINs** — those stay in the secrets dir).
+The raft log is **node-local and intentionally NOT carried**; restore re-bootstraps a fresh
+single voter. The bundle is **not a credential**: a restore *requires* the node's secrets dir.
+
+```bash
+# ONLINE backup (daemon running; any node, leader OR follower — read-only, no raft write):
+tether cluster backup --out /var/backups/tether-$(date +%F)
+
+# OFFLINE backup (daemon STOPPED):
+systemctl stop tether-broker
+tether cluster backup --offline --out /var/backups/tether-$(date +%F) \
+    --db /var/lib/tether/tether.db --secrets-dir /etc/tether/secrets
+```
+
+Take backups on a schedule + before any destructive op (drain/retire/remove/force-single). A
+single backup off ANY node is the whole committed state — you do **not** need one per node.
+
+### 5.1 Restore (OFFLINE, IRREVERSIBLE)
+
+Use restore to rebuild a destroyed node, or to roll the whole cluster back to a known-good
+point. Restore is **offline-only**, overwrites the on-disk DB (preserving it at `<db>.bak`), and
+re-bootstraps a **single voter** — you then re-grow with `cluster add`.
+
+```bash
+# 0. On the target host, place the SAME node's secrets dir (the live tunnel cert is the
+#    un-forgeable provenance anchor — a restore onto a different node's secrets is REFUSED).
+# 1. Stop the daemon.
+systemctl stop tether-broker
+# 2. Restore. You TYPE the node_id to confirm (no --yes, never a machine escape — restore is
+#    irreversible + identity-affecting). The bundle's identity must match this host's secrets.
+#    Restore is RE-RUNNABLE after a kill-9: it marks restore_in_progress and the daemon REFUSES to
+#    start until restore completes — do NOT start the daemon mid-restore; just re-run the line.
+tether cluster restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a \
+    --secrets-dir /etc/tether/secrets
+# 3. Start the daemon. It comes up as a single-voter cluster (NO HA until you re-grow).
+systemctl start tether-broker
+tether cluster status            # exit 1 DEGRADED (N=1, no redundancy) until re-grown; roster = {self}
+                                 # (NOT exit 3 — restore is not force-single; it clears that marker)
+# 4. Re-grow to N>=3 with `cluster add` (§1), re-rendering nats.conf on every node.
+```
+
+The restore **resets the applied cursor to 0** and **prunes the old peers from the roster** so
+the restored node is a clean single-voter origin (the original membership is preserved in the
+bundle's `manifest.json` for the incident record). Provenance is gated on the **live tunnel-cert
+fingerprint** (== the manifest's `self_cert_fp` == the bundle's self-row `cert_fp`) + the typed
+`--confirm-node-id` — a foreign or torn/edited bundle is refused before any disk mutation.
+
+### 5.2 Full-cluster disaster recovery (all nodes lost)
+
+```bash
+# 1. On a FRESH box, restore this node's secrets dir from your secret store.
+# 2. cluster restore the latest bundle (§5.1) with --confirm-node-id <the original node_id>.
+# 3. Start the daemon (single voter N=1), then `cluster add` new nodes to re-grow to N>=3.
+# 4. Agents reconnect + re-pin; exposes re-home onto the live broker automatically (D6).
+```
+
+### 5.3 Identity-only manifest replay (recover → re-init)
+
+`cluster recover` (§3) can capture a node's IDENTITY into a manifest before it wipes, so the
+re-init does not re-type the 9 identity flags:
+
+```bash
+# On the returning node (daemon stopped): dump forensics AND emit an identity manifest.
+tether cluster recover --self-id brk-b --dump-divergent /root/divergent-brk-b.json \
+    --emit-manifest /root/brk-b-ident.json --secrets-dir /etc/tether/secrets
+# Re-init from the manifest (cert_fp is re-derived LIVE from this host's secrets, not replayed —
+# a rotated cert still pins agents correctly). The manifest is identity-only: NO business rows.
+tether cluster init --from-manifest /root/brk-b-ident.json --secrets-dir /etc/tether/secrets
+# Then `cluster add` on the leader to rejoin (§1).
+```
+
+## 6. Rolling upgrade (followers-first, leader-last)
+
+A rolling upgrade replaces the binary on each broker one at a time WITHOUT downtime, as long as
+the new and old binaries speak the SAME proto version. A **proto bump (v2→v3) is a flag-day, NOT
+a rolling upgrade** (the wire is incompatible — stop the whole fleet, upgrade, restart).
+
+```bash
+# 0. Confirm the target release is the SAME proto. `cluster status` shows each node's running
+#    VER (a live self-report). `cluster add` HARD-REJECTS a joiner with a different proto.
+tether cluster status                    # note the leader + every node's VER
+
+# 1. Upgrade FOLLOWERS first, one at a time (the leader keeps serving):
+#    on each follower host —
+systemctl stop tether-broker
+#    (swap the binary)
+systemctl start tether-broker
+tether cluster wait <node-id> --phase VOTER     # block until it is a full voter again
+tether cluster status                            # confirm its VER updated + REACH ok before the next
+
+# 2. Upgrade the LEADER last. Hand off leadership FIRST so you never re-elect mid-rollout:
+tether cluster transfer-leader <an-already-upgraded-follower> --wait
+#    then upgrade the (now ex-leader) host as in step 1.
+
+# 3. Verify: every node shows the new VER, REACH ok, no INCONSISTENT, health HEALTHY_HA.
+tether cluster status
+```
+
+Notes:
+- A mixed-release window (some nodes new, some old) is generally safe as long as the proto is
+  unchanged — `cluster add` only WARNS on a release skew (it rejects only a proto mismatch), and a
+  re-joining drained node may legitimately be older than the now-upgraded leader during a rollback.
+  **CAVEAT (DB schema):** if the NEW release adds a DB migration, an upgraded node forward-migrates
+  its DB and you CANNOT then roll that node back to the older binary (migrations are forward-only;
+  the old binary has no downgrade path). Upgrade is one-way per node once it has migrated — keep the
+  `tether.db` backup (`cluster backup`) from BEFORE the upgrade for a true rollback. Same-proto
+  releases that add NO migration are freely roll-back-able.
+- Watch `cluster status` STREAMS (actual/target) between steps: a node restart transiently drops a
+  JS replica; wait for `replication_degraded` to clear (actual==target) before upgrading the next.

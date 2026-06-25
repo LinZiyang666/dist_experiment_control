@@ -7,8 +7,8 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/nats-io/nats.go"
 	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 // TestD9DecideObservabilityAlerts is the pure §17 step-10b decision (no cluster needed):

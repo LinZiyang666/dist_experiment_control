@@ -65,7 +65,7 @@ func TestD9ExposeRollbackUsesFencedAllocationFree(t *testing.T) {
 			_ = msg.Respond(mustJSON(proto.ExposeForwardedResp{OK: false, Code: "setup_failed", Error: err.Error()}))
 			return
 		}
-		second, err := port.Allocate(b.cfg.DB, "lab", "lab-1", "second", 9001, req.Port, fp, b.cfg.PortAllocCfg())
+		second, err := port.Allocate(b.cfg.DB, "lab", "lab-1", "second", 9001, req.Port, fp, false, b.cfg.PortAllocCfg())
 		if err != nil {
 			agentErr <- fmt.Errorf("reuse allocation: %w", err)
 			_ = msg.Respond(mustJSON(proto.ExposeForwardedResp{OK: false, Code: "setup_failed", Error: err.Error()}))

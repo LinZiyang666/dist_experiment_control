@@ -88,8 +88,8 @@ func (b *Broker) finalizeSessionRm(ctx context.Context, sid string) error {
 	}
 	// Prune the tunnel's per-session kill-generation bookkeeping now that the
 	// session is permanently gone (self-review: bounds killGenSession growth).
-	if b.tunnelSrv != nil {
-		b.tunnelSrv.ForgetSession(sid)
+	if srv := b.tunnelSrv.Load(); srv != nil {
+		srv.ForgetSession(sid)
 	}
 	b.pubSysEvent("session_destroyed", map[string]any{"sid": sid})
 	b.cfg.Logger.Info("broker: session removed", "sid", sid)

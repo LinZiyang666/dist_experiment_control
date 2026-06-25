@@ -111,8 +111,18 @@ func TestSnapshot_TornRejected(t *testing.T) {
 		name   string
 		mutate func([]byte) []byte
 	}{
-		{"header_magic", func(b []byte) []byte { c := append([]byte(nil), b...); copy(c[0:16], []byte("NOT-SQLITE-FILE\x00")); return c }},
-		{"page1_btree", func(b []byte) []byte { c := append([]byte(nil), b...); for i := 100; i < 130 && i < len(c); i++ { c[i] ^= 0xFF }; return c }},
+		{"header_magic", func(b []byte) []byte {
+			c := append([]byte(nil), b...)
+			copy(c[0:16], []byte("NOT-SQLITE-FILE\x00"))
+			return c
+		}},
+		{"page1_btree", func(b []byte) []byte {
+			c := append([]byte(nil), b...)
+			for i := 100; i < 130 && i < len(c); i++ {
+				c[i] ^= 0xFF
+			}
+			return c
+		}},
 		{"header_pagesize", func(b []byte) []byte { c := append([]byte(nil), b...); c[16], c[17] = 0x00, 0x07; return c }}, // page-size field -> invalid (not a power of two)
 		{"truncated_half", func(b []byte) []byte { return append([]byte(nil), b[:len(b)/2]...) }},
 	}

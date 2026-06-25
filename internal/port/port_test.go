@@ -44,7 +44,7 @@ func TestAllocateAssignsLowestFreePort(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", tinyBand())
+	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,10 +68,10 @@ func TestAllocateRejectsDuplicateName(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	if _, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", tinyBand()); err != nil {
+	if _, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", false, tinyBand()); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Allocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:alice", tinyBand())
+	_, err := Allocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:alice", false, tinyBand())
 	if !errors.Is(err, ErrNameTaken) {
 		t.Fatalf("want ErrNameTaken, got %v", err)
 	}
@@ -83,11 +83,11 @@ func TestAllocateExhaustsBand(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		if _, err := Allocate(db, "lab", "lab-1",
-			"name-"+string(rune('a'+i)), 8000+i, 0, "SHA256:alice", tinyBand()); err != nil {
+			"name-"+string(rune('a'+i)), 8000+i, 0, "SHA256:alice", false, tinyBand()); err != nil {
 			t.Fatalf("alloc %d: %v", i, err)
 		}
 	}
-	_, err := Allocate(db, "lab", "lab-1", "extra", 9000, 0, "SHA256:alice", tinyBand())
+	_, err := Allocate(db, "lab", "lab-1", "extra", 9000, 0, "SHA256:alice", false, tinyBand())
 	if !errors.Is(err, ErrPortExhausted) {
 		t.Fatalf("want ErrPortExhausted, got %v", err)
 	}
@@ -97,13 +97,13 @@ func TestFreeReturnsPortToPool(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	a, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	a, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Free(db, a.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Re-allocate with a different name; must immediately reuse the same port.
-	b, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	b, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", false, tinyBand())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,11 +116,11 @@ func TestFreeAllocationFencesReusedPort(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Free(db, first.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", false, tinyBand())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,11 +146,11 @@ func TestRevokeAllocationFencesReusedPort(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	first, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Revoke(db, first.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	second, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", false, tinyBand())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,11 +176,11 @@ func TestRevokeReturnsPortToPool(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	a, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", tinyBand())
+	a, _ := Allocate(db, "lab", "lab-1", "first", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Revoke(db, a.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	b, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", tinyBand())
+	b, err := Allocate(db, "lab", "lab-1", "second", 9999, 0, "SHA256:alice", false, tinyBand())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +208,13 @@ func TestLookupByNameSelectsAllocatedOnly(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 
-	a, _ := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", tinyBand())
+	a, _ := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Free(db, a.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	// Same name re-allocated; LookupByName must return the new ALLOCATED row,
 	// not the FREED one.
-	b, _ := Allocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:alice", tinyBand())
+	b, _ := Allocate(db, "lab", "lab-1", "jupyter", 9999, 0, "SHA256:alice", false, tinyBand())
 
 	got, err := LookupByName(db, "lab", "jupyter")
 	if err != nil {
@@ -228,7 +228,7 @@ func TestLookupByNameSelectsAllocatedOnly(t *testing.T) {
 func TestLookupByTokenHashRejectsNonAllocated(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
-	a, _ := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", tinyBand())
+	a, _ := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", false, tinyBand())
 	if err := Revoke(db, a.Port, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestListAllocatedForOfflineNodes(t *testing.T) {
 	cfg := tinyBand()
 	cfg.Now = func() time.Time { return now }
 	for _, nid := range []string{"old", "recent", "online"} {
-		if _, err := Allocate(db, "lab", nid, "p-"+nid, 8000, 0, "SHA256:alice", cfg); err != nil {
+		if _, err := Allocate(db, "lab", nid, "p-"+nid, 8000, 0, "SHA256:alice", false, cfg); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -295,9 +295,9 @@ func TestAllocateDesiredPort(t *testing.T) {
 	)
 	mustAlloc := func(t *testing.T, db *sql.DB, name string, local, desired int) *Allocation {
 		t.Helper()
-		a, err := Allocate(db, sid, nid, name, local, desired, fp, tinyBand())
+		a, err := Allocate(db, sid, nid, name, local, desired, fp, false, tinyBand())
 		if err != nil {
-			t.Fatalf("setup Allocate(%q, desired=%d): %v", name, desired, err)
+			t.Fatalf("setup Allocate(%q, false, desired=%d): %v", name, desired, err)
 		}
 		return a
 	}
@@ -411,7 +411,7 @@ func TestAllocateDesiredPort(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(t, db)
 			}
-			got, err := Allocate(db, sid, nid, tc.reqName, 9000, tc.desired, fp, tinyBand())
+			got, err := Allocate(db, sid, nid, tc.reqName, 9000, tc.desired, fp, false, tinyBand())
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("want err %v, got %v", tc.wantErr, err)
@@ -437,10 +437,10 @@ func TestAllocateDesiredPortTakenIsHardFailNoFallback(t *testing.T) {
 
 	// Occupy 14000 (auto). The band still has 14001/14002 free, so a
 	// fallback (if it wrongly existed) would have somewhere to go.
-	if _, err := Allocate(db, "lab", "lab-1", "occupant", 8000, 0, "SHA256:alice", tinyBand()); err != nil {
+	if _, err := Allocate(db, "lab", "lab-1", "occupant", 8000, 0, "SHA256:alice", false, tinyBand()); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Allocate(db, "lab", "lab-1", "req", 9000, 14000, "SHA256:alice", tinyBand())
+	a, err := Allocate(db, "lab", "lab-1", "req", 9000, 14000, "SHA256:alice", false, tinyBand())
 	if !errors.Is(err, ErrPortTaken) {
 		t.Fatalf("want ErrPortTaken, got alloc=%+v err=%v", a, err)
 	}
@@ -466,7 +466,7 @@ func TestAllocateDesiredPortTakenIsHardFailNoFallback(t *testing.T) {
 func TestIsUniqueViolation(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
-	if _, err := Allocate(db, "lab", "lab-1", "first", 8000, 14000, "SHA256:alice", tinyBand()); err != nil {
+	if _, err := Allocate(db, "lab", "lab-1", "first", 8000, 14000, "SHA256:alice", false, tinyBand()); err != nil {
 		t.Fatal(err)
 	}
 	// Raw INSERT of a second ALLOCATED row on the same port trips the
@@ -532,7 +532,7 @@ func TestTranslateInsertErr(t *testing.T) {
 func TestSessionDeleteCascadesPortRows(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
-	if _, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", tinyBand()); err != nil {
+	if _, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:alice", false, tinyBand()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`DELETE FROM sessions WHERE sid='lab'`); err != nil {

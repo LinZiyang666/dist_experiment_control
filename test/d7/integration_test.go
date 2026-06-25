@@ -93,9 +93,16 @@ func (c *d7Cluster) joinInput(t *testing.T, i int) cluster.ClusterNodeUpsertInpu
 	pub, _ := auth.PublicKeyFromSeed(seed)
 	nonce := "nonce-" + c.ids[i]
 	sig, _ := auth.SignWithSeed(seed, cluster.JoinSignBytes(c.ids[i], pub, nonce))
+	// The serving-port placeholders MUST be guaranteed-unreachable so the force-single
+	// ConfirmedDead TCP-liveness probe (which dials raft_addr + nats_route + tunnel_addr) treats
+	// these abandoned peers as DEAD. 127.0.0.1:1 gives an immediate connection-refused everywhere;
+	// the previous "x:7000" / "nats://x" placeholders resolve as ALIVE on a WSL2/fake-ip box (and
+	// even 192.0.2.x TEST-NET answers there), which would split-brain-HARD-REFUSE the test.
+	// raft_addr stays c.ids[i] (the InmemTransport address); it has no port so the probe dials it
+	// dead too.
 	return cluster.ClusterNodeUpsertInput{
 		NodeID: c.ids[i], Name: c.ids[i], NodeIdentPub: pub, NatsServerID: "tether-" + c.ids[i],
-		RaftAddr: c.ids[i], NatsRoute: "nats://x", TunnelAddr: "x:7000", PublicHost: "h",
+		RaftAddr: c.ids[i], NatsRoute: "nats://127.0.0.1:1", TunnelAddr: "127.0.0.1:1", PublicHost: "h",
 		CertFP: "sha256:ab", JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig), Now: time.Now(),
 	}
 }
@@ -127,6 +134,45 @@ func TestD7Matrix(t *testing.T) {
 	t.Run("DrainRetireFollower", testD7DrainRetireFollower)                  // review M4
 	t.Run("DrainLeaderTransfersAndBails", testD7DrainLeaderTransfers)        // review B5
 	t.Run("DrainRefusesRebuildOff", testD7DrainRefusesRebuildOff)            // external review F3
+	t.Run("FollowerStatusViewSource", testD7FollowerStatusViewSource)        // B1 review F3
+}
+
+// testD7FollowerStatusViewSource (B1 review F3): StatusReport on a real FOLLOWER must stamp
+// IsLeaderView=false + ViewHost=self + LeaderID=the leader, so the user-facing footer correctly
+// says "re-run on the leader". The single-node harness only ever produces IsLeaderView=true; this
+// is the only test that exercises the false POPULATION path (not just serialization of a literal).
+func testD7FollowerStatusViewSource(t *testing.T) {
+	c := startD7Cluster(t, 2)
+	in := c.joinInput(t, 1)
+	caughtUp := func(barrier uint64) (bool, error) {
+		cur, err := c.nodes[1].AppliedIndex()
+		return cur >= barrier, err
+	}
+	if err := c.addNodeRetry(in, c.ids[1], caughtUp, 5*time.Second); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	followerAdmin := broker.NewClusterAdmin(c.nodes[1], nil)
+	// Poll: the follower must both have the replicated roster AND know the leader.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rep, err := followerAdmin.StatusReport("ctl-nats")
+		if err == nil && rep.LeaderID != "" {
+			if rep.ViewHost != c.ids[1] {
+				t.Errorf("ViewHost = %q, want follower %q", rep.ViewHost, c.ids[1])
+			}
+			if rep.IsLeaderView {
+				t.Errorf("a follower must report IsLeaderView=false (leader=%q self=%q)", rep.LeaderID, c.ids[1])
+			}
+			if rep.LeaderID != c.ids[0] {
+				t.Errorf("LeaderID = %q, want leader %q", rep.LeaderID, c.ids[0])
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("follower StatusReport never populated a leader: err=%v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // testD7DrainRefusesRebuildOff (external review F3): a rebuild-OFF expose homed on
@@ -322,6 +368,15 @@ func (c *d7Cluster) addNodeRetry(in cluster.ClusterNodeUpsertInput, raftAddr str
 // dead), restart it as a writable N=1, and prove the restart does not double-apply.
 func testD7ForceSingleRecover(t *testing.T) {
 	c := startD7Cluster(t, 3)
+	// Seed the bootstrap survivor's OWN roster row. In production every cluster node has a
+	// cluster_nodes row (D9 `cluster init --from-existing` seeds the self VOTER row); force-single
+	// refuses to rewrite the raft config for a self-id absent from cluster_nodes (readRoster). The
+	// raft-only bootstrap here doesn't lay that row, so seed it via the normal committed upsert.
+	if err := c.nodes[0].Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeUpsert(c.joinInput(t, 0))
+	}); err != nil {
+		t.Fatalf("seed self roster row: %v", err)
+	}
 	// Add the other two so the survivor's roster lists them (force-single must abandon them).
 	for i := 1; i < 3; i++ {
 		in := c.joinInput(t, i)
@@ -341,9 +396,8 @@ func testD7ForceSingleRecover(t *testing.T) {
 		t.Fatalf("seed premark: %v", err)
 	}
 	appliedBefore, _ := c.nodes[survivorIdx].AppliedIndex()
-	// The bootstrapped survivor has no roster row of its own (rows come from AddNode);
-	// the roster holds the two added peers. Record it and assert it is unchanged after
-	// recovery (no double-apply), without hardcoding the count.
+	// The roster now holds the survivor's own row (seeded above) + the two added peers. Record
+	// it and assert it is unchanged after recovery (no double-apply), without hardcoding the count.
 	rosterBefore := countRows(t, c.nodes[survivorIdx], "cluster_nodes")
 
 	// Stop ALL nodes (daemon stopped — the offline tool can take the disk). Null out

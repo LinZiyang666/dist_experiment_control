@@ -157,3 +157,42 @@ func TestD9ClusterModeOffByteEquivalence(t *testing.T) {
 		t.Error("single-mode livenessDB must be the configured DB handle")
 	}
 }
+
+// TestF1RestorePreflightRefusesBeforeRaft — External-review F1: an interrupted restore
+// (restore_in_progress set) must be refused on a READ-ONLY preflight BEFORE any raft/FSM is
+// constructed. Seeding ONLY the marker (no self_node_id, no secrets dir) and calling
+// buildClusterRuntime proves the preflight short-circuits first: the error is the restore message,
+// not a self_node_id / secrets error that would mean later code ran (i.e. raft would have opened).
+func TestF1RestorePreflightRefusesBeforeRaft(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tether.db")
+	db, err := storage.OpenWAL("file:" + dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO cluster_meta(key,value) VALUES('restore_in_progress','1')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	// Direct preflight: marker set → refuse.
+	if err := assertNoInterruptedRestore(dbPath); err == nil || !strings.Contains(err.Error(), "restore_in_progress") {
+		t.Fatalf("preflight must refuse a marker-set DB, got %v", err)
+	}
+
+	// Ordering proof: buildClusterRuntime must return the restore error FIRST (before the
+	// self_node_id read + secrets preflight + cluster.NewProduction that follow it).
+	b := &Broker{}
+	b.cfg.DBPath = dbPath
+	if _, err := b.buildClusterRuntime(); err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("buildClusterRuntime must fail-closed on the restore marker BEFORE raft construction, got %v", err)
+	}
+
+	// Negative: clearing the marker lets the preflight pass.
+	db2, _ := storage.OpenWAL("file:" + dbPath)
+	_, _ = db2.Exec(`DELETE FROM cluster_meta WHERE key='restore_in_progress'`)
+	_ = db2.Close()
+	if err := assertNoInterruptedRestore(dbPath); err != nil {
+		t.Fatalf("preflight must pass once the marker is cleared, got %v", err)
+	}
+}

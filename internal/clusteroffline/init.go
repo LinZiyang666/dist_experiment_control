@@ -12,11 +12,26 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 )
+
+// rejectBadText fail-closes on a text field that would be written to the DB / rendered into operator
+// command lines: a NUL byte or invalid UTF-8 has no legitimate use and could truncate/forge output
+// (External-review F13). It is the offline mirror of the online path's LitText discipline.
+func rejectBadText(name, val string) error {
+	if strings.ContainsRune(val, 0) {
+		return fmt.Errorf("clusteroffline: %s contains a NUL byte (refused)", name)
+	}
+	if !utf8.ValidString(val) {
+		return fmt.Errorf("clusteroffline: %s is not valid UTF-8 (refused)", name)
+	}
+	return nil
+}
 
 // init.go — the D9 `cluster init --from-existing` one-time migration (§11). OFFLINE
 // surgery with the daemon STOPPED, directly on the on-disk tether.db + raft/. It mirrors
@@ -51,6 +66,47 @@ type InitFromExistingOptions struct {
 // the DB/raft store. The runbook's `systemctl stop tether-broker` must precede init.
 var ErrInitDaemonRunning = errors.New("clusteroffline: a tether daemon is still running on this DataDir; `systemctl stop tether-broker` first")
 
+// InitFromManifest is the B6 OPS#11 consume side: it reads the node IDENTITY from a manifest
+// (emitted by `recover --emit-manifest` or carried in a backup bundle) instead of nine flags,
+// then delegates to InitFromExisting. The DataDir / DBPath / SecretsDir are LOCAL (never trusted
+// from a file). cert_fp is re-derived LIVE by InitFromExisting from the local secrets dir — the
+// manifest's self_cert_fp is only CROSS-CHECKED (a rotated cert is a non-fatal WARN, since the
+// recovered node may legitimately present a new cert; the live fp is authoritative so agents
+// still pin correctly). Every identity-completeness guard / interlock in InitFromExisting applies
+// unchanged.
+func InitFromManifest(manifestPath, dataDir, dbPath, secretsDir string, now func() time.Time, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	m, err := ReadManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+	if m.Mode != ManifestModeCluster {
+		return fmt.Errorf("clusteroffline: manifest mode %q cannot seed a cluster identity", m.Mode)
+	}
+	// Audit MAJOR: `init --from-manifest` is IDENTITY-ONLY (it seeds the self row, NOT business
+	// state). A BACKUP manifest's data lives in the bundle's state.db — pointing init at it would
+	// silently discard every session/port/alert. Refuse loudly + point at `cluster restore`.
+	if m.Kind != ManifestKindRecover {
+		return fmt.Errorf("clusteroffline: manifest kind %q is not a recover manifest; for a backup bundle use `cluster restore <bundle>` (init --from-manifest only re-seeds identity)", m.Kind)
+	}
+	// Cross-check the manifest's self_cert_fp against the LIVE secrets dir (advisory; the live fp
+	// is what InitFromExisting actually seeds).
+	if m.SelfCertFP != "" {
+		if liveFP, ferr := TunnelCertFingerprint(secretsDir); ferr == nil && liveFP != m.SelfCertFP {
+			logger.Warn("clusteroffline: manifest self_cert_fp differs from the live tunnel cert (rotated?); seeding the LIVE fp",
+				"manifest", m.SelfCertFP, "live", liveFP)
+		}
+	}
+	return InitFromExisting(InitFromExistingOptions{
+		DataDir: dataDir, DBPath: dbPath, SecretsDir: secretsDir,
+		SelfID: m.SelfID, Name: m.Name, NodeIdentPub: m.NodeIdentPub,
+		RaftAddr: m.RaftAddr, NatsRoute: m.NatsRoute, TunnelAddr: m.TunnelAddr, PublicHost: m.PublicHost,
+		Now: now, Logger: logger,
+	})
+}
+
 // InitFromExisting migrates a live single-broker DB into a single-voter cluster.
 func InitFromExisting(opts InitFromExistingOptions) error {
 	if opts.Now == nil {
@@ -61,6 +117,12 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 	}
 	if opts.SelfID == "" || opts.RaftAddr == "" || opts.DBPath == "" || opts.DataDir == "" {
 		return errors.New("clusteroffline: InitFromExisting requires SelfID, RaftAddr, DBPath, DataDir")
+	}
+	// External-review F13: the offline path must apply the SAME node_id + text validation the online
+	// admission path does (proto.ValidateNID + NUL/non-UTF-8 rejection) — these fields are written to
+	// the DB and rendered into operator command lines / nats.conf. Fail-closed here, pre-mutation.
+	if err := proto.ValidateClusterNodeID(opts.SelfID); err != nil {
+		return fmt.Errorf("clusteroffline: invalid SelfID: %w", err)
 	}
 	// External-review F4: the self VOTER row must carry a COMPLETE identity, else the
 	// migrated cluster has a self row that cannot serve as an expose home, cannot be rendered
@@ -73,6 +135,9 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 		if strings.TrimSpace(f.val) == "" {
 			return fmt.Errorf("clusteroffline: InitFromExisting requires a non-empty %s "+
 				"(the self VOTER row must be a usable expose home + renderable NATS peer)", f.name)
+		}
+		if err := rejectBadText(f.name, f.val); err != nil {
+			return err
 		}
 	}
 	// Structural checks on the fields that are unambiguously host:port (raft + tunnel addrs).
@@ -123,7 +188,7 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 	// cert_fp from it, else the daemon would present a cert whose fp mismatches the seeded
 	// row and EVERY agent dial is rejected (ErrHomePinsRequired). Also require the cluster
 	// CA + this node's route leaf (cluster.NewProduction loads them at daemon start).
-	certFP, err := tunnelCertFingerprint(opts.SecretsDir)
+	certFP, err := TunnelCertFingerprint(opts.SecretsDir)
 	if err != nil {
 		return fmt.Errorf("clusteroffline: secrets precondition: %w", err)
 	}
@@ -227,9 +292,10 @@ func seedClusterState(db *sql.DB, opts InitFromExistingOptions, certFP string) e
 	return tx.Commit()
 }
 
-// tunnelCertFingerprint loads the stable tunnel cert from the secrets dir and returns its
-// canonical fingerprint (== cluster_nodes.cert_fp, §15 RF3).
-func tunnelCertFingerprint(secretsDir string) (string, error) {
+// TunnelCertFingerprint loads the stable tunnel cert from the secrets dir and returns its
+// canonical fingerprint (== cluster_nodes.cert_fp, §15 RF3). Exported for B3 sign-join, which
+// prints the real --cert-fp into the pasteable re-run line.
+func TunnelCertFingerprint(secretsDir string) (string, error) {
 	certPEM, err := os.ReadFile(filepath.Join(secretsDir, "tunnel-cert.pem"))
 	if err != nil {
 		return "", fmt.Errorf("read tunnel cert: %w", err)
@@ -253,6 +319,46 @@ func tunnelCertFingerprint(secretsDir string) (string, error) {
 		}
 	}
 	return tunnel.CertFingerprint(leaf), nil
+}
+
+// backupToUnique copies the live DB to a NON-colliding `<db>.pre-restore[-N].bak` (External-review
+// F4). Unlike backupOnce (which skips when `.bak` exists), this ALWAYS preserves the current state
+// under a fresh name and returns the actual path — so `cluster restore` can report it truthfully and
+// a second restore never silently discards the prior live DB.
+func backupToUnique(dbPath string) (string, error) {
+	if err := checkpointWALForBackup(dbPath); err != nil {
+		return "", err
+	}
+	src, err := os.Open(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("clusteroffline: open DB for backup: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	for i := 0; ; i++ {
+		bak := dbPath + ".pre-restore.bak"
+		if i > 0 {
+			bak = fmt.Sprintf("%s.pre-restore.%d.bak", dbPath, i)
+		}
+		dst, err := os.OpenFile(bak, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue // pick the next free name (never clobber a prior preservation)
+			}
+			return "", fmt.Errorf("clusteroffline: create pre-restore backup: %w", err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = dst.Close()
+			return "", fmt.Errorf("clusteroffline: copy pre-restore backup: %w", err)
+		}
+		if err := dst.Sync(); err != nil {
+			_ = dst.Close()
+			return "", fmt.Errorf("clusteroffline: fsync pre-restore backup: %w", err)
+		}
+		if err := dst.Close(); err != nil {
+			return "", err
+		}
+		return bak, nil
+	}
 }
 
 // backupOnce copies dbPath to dbPath+".bak" iff the .bak does not already exist (a prior

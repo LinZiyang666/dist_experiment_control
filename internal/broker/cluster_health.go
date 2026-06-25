@@ -44,6 +44,8 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			LeaderContactStale: node.LeaderContactStale(now()),
 			ForceSingleActive:  forceSingleActive(db),
 			NodeID:             node.SelfID(),
+			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
+			ProtoVer:           proto.ProtoVersion,
 		}
 		// D9 §17 (step 10b): self-report the command-domain AppliedIndex so the leader's
 		// observability poll can compute this broker's raft_lag.

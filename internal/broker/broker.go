@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/brokermetrics"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
@@ -87,6 +88,19 @@ type Config struct {
 	// subscription HTTP endpoint (e.g. "127.0.0.1:8090"). Empty disables
 	// the HTTP listener entirely — every pre-P13 deployment is unchanged.
 	SubHTTPAddr string
+
+	// MetricsAddr (B5 OPS#1) is the listen address for the Prometheus /metrics +
+	// /healthz + /readyz HTTP endpoint (e.g. "127.0.0.1:9090"). Empty disables it
+	// entirely — when unset ZERO new wiring runs (off-by-default byte-equivalence).
+	// Unlike SubHTTPAddr this is NOT loopback-forced (operators scrape over a private
+	// interface); it vends only public topology, never secrets.
+	MetricsAddr string
+
+	// AlertWebhookURL (B6 OPS#2), when set, makes the leader POST every committed alert
+	// raise/clear transition to this http/https endpoint (cluster mode only). Empty disables it
+	// entirely — when unset the reconciler's Webhook seam is nil and ZERO new wiring runs. The
+	// body carries only public topology (never secrets); the URL must not contain userinfo.
+	AlertWebhookURL string
 
 	// SubURLBase is the public origin printed in subscription URLs
 	// (e.g. "https://tether.example.com"). The full URL is
@@ -260,10 +274,12 @@ type Broker struct {
 	// on a different goroutine.
 	nc atomic.Pointer[nats.Conn]
 
-	// tunnelSrv is the reverse-TCP tunnel server. Non-nil only when
+	// tunnelSrv is the reverse-TCP tunnel server. Non-nil (stored) only when
 	// Config.TunnelControlAddr is set. Authorizes agent REGISTERs by
-	// looking up port_allocations.token_hash.
-	tunnelSrv *tunnel.Server
+	// looking up port_allocations.token_hash. An atomic.Pointer (mirroring nc) so the
+	// reconcile loop's read never races a concurrent install (production sets it once inside
+	// Run before the loop; a few tests inject their own server post-Run for the data-plane drills).
+	tunnelSrv atomic.Pointer[tunnel.Server]
 
 	// js is the JetStream context this broker uses for audit publish
 	// + history/events stream management. Non-nil only when the
@@ -366,6 +382,49 @@ type Broker struct {
 	// authoritative writes route through cl in cluster mode (proposeOrForward); reads
 	// use b.cfg.DB which Run re-points to cl.node.RODB().
 	cl *clusterRuntime
+
+	// lastObserveMu/lastObserve cache the leader's most recent per-peer observe (B5 OPS#1):
+	// the /metrics scrape reads THIS (up to observeTickInterval≈5s stale) instead of re-running
+	// the 2s-blocking pollClusterHealth scatter-gather on every request. nil until the first
+	// leader observe tick; a follower leaves it as-is (its scrape shows is_leader 0 + stale peers,
+	// which is honest).
+	lastObserveMu sync.Mutex
+	lastObserve   []peerObserve
+
+	// B6 OPS#4: cache the most recent JS stream replica posture (min observed actual + target)
+	// so the /metrics scrape reads it instead of re-running the blocking ObserveReplicas. The
+	// alert reconciler's Observe tick refreshes it. 0/0 until the first observe (gauge omitted).
+	lastReplicaMu     sync.Mutex
+	lastReplicaActual int
+	lastReplicaTarget int
+}
+
+// cacheReplicaSnapshot records the worst-case (min actual) stream replica posture for the
+// /metrics gauge. A report with no observed streams leaves the cache untouched (avoids flapping
+// the gauge to 0 on a transient meta-not-ready tick).
+func (b *Broker) cacheReplicaSnapshot(rep ReplicaReport) {
+	if !rep.Observed || len(rep.Streams) == 0 {
+		return
+	}
+	minActual, target := rep.Streams[0].Actual, 0
+	for _, s := range rep.Streams {
+		if s.Actual < minActual {
+			minActual = s.Actual
+		}
+		if s.Target > target {
+			target = s.Target
+		}
+	}
+	b.lastReplicaMu.Lock()
+	b.lastReplicaActual, b.lastReplicaTarget = minActual, target
+	b.lastReplicaMu.Unlock()
+}
+
+// peerObserve is one cached per-peer health datum for the metrics endpoint.
+type peerObserve struct {
+	NodeID     string
+	AppliedLag uint64
+	Reachable  bool
 }
 
 // publishOnConn pubs through the broker's persistent NATS connection.
@@ -567,10 +626,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		// in production (b.tunnelCert == nil) and the stable-cert NewServerWithCert
 		// only when the harness attached a cert. Production is byte-equivalent to
 		// the prior tunnel.NewServer call.
-		b.tunnelSrv = b.newTunnelServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
-		if err := b.tunnelSrv.Start(ctx); err != nil {
+		srv := b.newTunnelServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
+		if err := srv.Start(ctx); err != nil {
 			return err
 		}
+		b.tunnelSrv.Store(srv)
 	}
 
 	// P13: read-only subscription HTTP surface (loopback; Caddy fronts it).
@@ -592,6 +652,24 @@ func (b *Broker) Run(ctx context.Context) error {
 				Logger:     b.cfg.Logger,
 			}); err != nil {
 				b.cfg.Logger.Error("broker: subscription http server", "err", err)
+			}
+		}()
+	}
+
+	// B5 OPS#1: Prometheus /metrics + /healthz + /readyz. Off by default (MetricsAddr empty) ⇒
+	// no listener, no goroutine, byte-equivalent startup. Bind SYNCHRONOUSLY and propagate the
+	// error (an occupied port fails startup, never a healthy broker with a dead metrics port).
+	// The snapshot/ready closures are request-time (cheap raft-accessor reads + the cached
+	// observe), never the 2s-blocking StatusReport.
+	if b.cfg.MetricsAddr != "" {
+		metLn, err := brokermetrics.Bind(b.cfg.MetricsAddr)
+		if err != nil {
+			return fmt.Errorf("broker: metrics http: %w", err)
+		}
+		b.cfg.Logger.Info("broker: metrics http listening", "addr", metLn.Addr().String())
+		go func() {
+			if err := brokermetrics.ServeListener(ctx, metLn, b.metricsSnapshot, b.metricsReady); err != nil {
+				b.cfg.Logger.Error("broker: metrics http server", "err", err)
 			}
 		}()
 	}
@@ -777,14 +855,13 @@ func (b *Broker) Run(ctx context.Context) error {
 		// D9: in cluster mode the `tether cluster *` admin verbs are served by the
 		// ClusterAdmin orchestrator (D7); nil in single mode ⇒ "cluster mode not enabled".
 		if b.clusterMode {
-			// caughtUp/streamsReady nil for now: status/drain/remove/transfer work and
-			// add's catch-up gate uses the leader-applied proxy. The real per-follower
-			// cursor + stream-ready probes are wired by Step 10b (§17 observability).
-			// b.cl.admin was constructed in wireClusterLate (independent of the socket).
-			// External-review F1: wire the REAL catch-up + stream-readiness transports so
-			// the operator's `tether cluster add` (catch-up gate) + `cluster drain --retire`
-			// (AllAtTarget gate) work through the production adminsock — not just the harness.
-			backend.Cluster = NewClusterAdminBackend(b.cl.admin, b.clusterCaughtUp, b.clusterStreamsReady)
+			// b.cl.admin was constructed in wireClusterLate (independent of the socket). The REAL
+			// per-follower catch-up cursor (`cluster add` catch-up gate) + stream-readiness probe
+			// (`cluster drain --retire` AllAtTarget gate) ARE wired in production here via
+			// b.clusterCaughtUp / b.clusterStreamsReady (External-review F1) — not the harness, and
+			// NOT nil (the old D9-step-10b "nil for now" is no longer true; audit DOCS-MAJOR-2).
+			backend.Cluster = NewClusterAdminBackend(b.cl.admin, b.clusterCaughtUp, b.clusterStreamsReady,
+				b.adminAuditTail, func() ([]string, error) { return listSessionsByState(b.cfg.DB, "ACTIVE") })
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).
 			backend.EvictWrite = b.evictNode
@@ -988,6 +1065,10 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// any expose whose home was re-pointed by the leader. Self-gating — nil in
 	// production (selfID=="") so the reply stays byte-identical (the Proxy precedent).
 	resp.Home = b.homeForRegister(sid, nid, req)
+
+	// B7 DOC#3: attach the account-signed broker roster for agent discovery. Self-gating — nil in
+	// single mode (selfID=="") so the reply stays byte-identical (the Home/Proxy precedent).
+	resp.Roster = b.rosterForRegister(req)
 
 	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {

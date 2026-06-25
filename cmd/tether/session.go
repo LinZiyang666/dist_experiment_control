@@ -33,7 +33,7 @@ func newSessionCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if pin == "" {
-				return fmt.Errorf("--pin is required for session create")
+				return usageErr("--pin is required for session create")
 			}
 			natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
 			id, err := cli.EnsureIdentity(home)
@@ -42,7 +42,7 @@ func newSessionCmd() *cobra.Command {
 			}
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
-				return err
+				return connectError("session create", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -52,7 +52,7 @@ func newSessionCmd() *cobra.Command {
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlSessionCreate(id.PublicKey), body)
 			if err != nil {
-				return fmt.Errorf("session create: %w (broker unreachable on NATS)", err)
+				return unavailErr("session create: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.SessionCreateResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
@@ -87,6 +87,7 @@ func newSessionCmd() *cobra.Command {
 	}
 	create.Flags().StringVar(&pin, "pin", "", "PIN for new session (required)")
 
+	var listJSON bool
 	list := &cobra.Command{
 		Use:   "ls",
 		Short: "List sessions visible to me",
@@ -101,7 +102,7 @@ func newSessionCmd() *cobra.Command {
 			// includes session.list.req. No active session required.
 			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
-				return err
+				return connectError("session list", natsURL, err)
 			}
 			defer nc.Close()
 
@@ -110,7 +111,7 @@ func newSessionCmd() *cobra.Command {
 			msg, err := nc.RequestWithContext(ctx,
 				proto.SubjCtrlSessionList(id.PublicKey), []byte("{}"))
 			if err != nil {
-				return fmt.Errorf("session list: %w (broker unreachable on NATS)", err)
+				return unavailErr("session list: %w (broker unreachable on NATS)", err)
 			}
 			var resp proto.SessionListResp
 			if err := json.Unmarshal(msg.Data, &resp); err != nil {
@@ -121,6 +122,9 @@ func newSessionCmd() *cobra.Command {
 			}
 
 			active := cli.ReadCurrentSession(home)
+			if listJSON {
+				return emitJSON(cmd.OutOrStdout(), sessionLsJSON{Schema: "session_ls", SchemaVersion: 1, Sessions: normSlice(resp.Sessions), ActiveSID: active})
+			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "ACTIVE\tSID\tNAME\tSTATE\tROLE\tCREATED")
 			for _, s := range resp.Sessions {
@@ -204,6 +208,7 @@ func newSessionCmd() *cobra.Command {
 	}
 
 	rm.Flags().BoolVar(&rmAckAlerts, "ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
+	list.Flags().BoolVar(&listJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	root.AddCommand(create, list, rm)
 	return root
 }

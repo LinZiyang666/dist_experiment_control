@@ -61,9 +61,11 @@ func allRoundtripCases() []roundtripCase {
 		}, &RunReq{}},
 		{"ExposeReq", &ExposeReq{
 			Name: "jupyter", LocalPort: 8888, RemotePort: 14005, ActorFP: "SHA256:fp",
+			RebuildOff: true, OnBroker: "brk-b", // B4
 		}, &ExposeReq{}},
 		{"ExposeResp", &ExposeResp{
 			Port: 14000, PublicHost: "h", Name: "jupyter",
+			HomeBroker: "brk-b", Epoch: 2, // B4
 		}, &ExposeResp{}},
 		{"ExposeRmReq", &ExposeRmReq{Name: "jupyter", ActorFP: "SHA256:fp"}, &ExposeRmReq{}},
 		{"ExposeRmResp", &ExposeRmResp{OK: true, Port: 14000}, &ExposeRmResp{}},
@@ -82,6 +84,9 @@ func allRoundtripCases() []roundtripCase {
 		{"PsResp", &PsResp{Processes: []PsEntry{{
 			PID: "01h", NID: "lab-1", Argv: []string{"x"}, StartedAt: t0,
 			Status: "RUNNING", StartedByFP: "SHA256:x",
+		}}, Ports: []PsPortEntry{{ // B4: home/epoch/rebuild on the read projection
+			Port: 14000, Name: "jupyter", NID: "lab-1", LocalPort: 8888, State: "ALLOCATED",
+			CreatedAt: t0, HomeBroker: "brk-b", Epoch: 2, RebuildOff: true,
 		}}}, &PsResp{}},
 		{"NodeListReq", &NodeListReq{}, &NodeListReq{}},
 		{"NodeListResp", &NodeListResp{Nodes: []NodeListEntry{{

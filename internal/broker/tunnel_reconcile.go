@@ -12,11 +12,12 @@ import (
 // tunnel-close broadcasts and for home/epoch changes that leave an ex-home listener
 // alive until the next broker tick.
 func (b *Broker) reconcileTunnelSessions() int {
-	if b.tunnelSrv == nil {
+	srv := b.tunnelSrv.Load()
+	if srv == nil {
 		return 0
 	}
 	closed := 0
-	for _, info := range b.tunnelSrv.SessionInfos() {
+	for _, info := range srv.SessionInfos() {
 		a, err := port.LookupByTokenHash(b.cfg.DB, info.TokenHash)
 		switch {
 		case errors.Is(err, port.ErrNotFound):
@@ -47,10 +48,11 @@ func (b *Broker) reconcileTunnelSessions() int {
 }
 
 func (b *Broker) closeTunnelProxyIfStale(info tunnel.SessionInfo, reason string) bool {
-	if b.tunnelSrv == nil {
+	srv := b.tunnelSrv.Load()
+	if srv == nil {
 		return false
 	}
-	if ok := b.tunnelSrv.CloseProxyIf(info); ok {
+	if ok := srv.CloseProxyIf(info); ok {
 		b.cfg.Logger.Info("broker: stale tunnel proxy closed", "reason", reason, "port", info.PublicPort, "sid", info.SID, "nid", info.NID)
 		return true
 	}

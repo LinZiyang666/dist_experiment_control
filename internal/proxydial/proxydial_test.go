@@ -31,11 +31,11 @@ func applyToProbe(t *testing.T, opts []nats.Option) nats.Options {
 func TestOptions_ZeroRegression(t *testing.T) {
 	for _, m := range []map[string]string{
 		{},
-		{"NO_PROXY": "example.com"},   // NO_PROXY alone is not a proxy
-		{"no_proxy": "example.com"},   // lowercase NO_PROXY alone, likewise
-		{"HTTPS_PROXY": ""},           // empty value = unset
-		{"all_proxy": ""},             // empty lowercase value = unset
-		{"FTP_PROXY": "http://x:1"},   // unrelated var
+		{"NO_PROXY": "example.com"}, // NO_PROXY alone is not a proxy
+		{"no_proxy": "example.com"}, // lowercase NO_PROXY alone, likewise
+		{"HTTPS_PROXY": ""},         // empty value = unset
+		{"all_proxy": ""},           // empty lowercase value = unset
+		{"FTP_PROXY": "http://x:1"}, // unrelated var
 	} {
 		opts, err := Options(fakeEnv(m), time.Second)
 		if err != nil {
@@ -108,7 +108,7 @@ func TestOptions_FailClosed(t *testing.T) {
 	for _, bad := range []string{
 		"://nohost",
 		"ftp://host:21",
-		"http://",              // no host
+		"http://", // no host
 		"not a url with spaces",
 	} {
 		_, err := Options(fakeEnv(map[string]string{"ALL_PROXY": bad}), time.Second)

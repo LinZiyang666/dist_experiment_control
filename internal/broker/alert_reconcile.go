@@ -41,6 +41,12 @@ type AlertReconcilerConfig struct {
 	// Observe is the READ-ONLY replica observation (broker AuditPublisher.ObserveReplicas).
 	// nil disables the replication_degraded kind (events/history/xfer not observed here).
 	Observe func(context.Context) (ReplicaReport, error)
+	// Webhook (B6 OPS#2), when non-nil, is fed every COMMITTED alert transition (the delta of
+	// the committed ACTIVE set between passes) — NOT the raise/clear decision list, which can be
+	// proposed-but-not-committed (leadership lost mid-pass). nil disables the webhook entirely.
+	Webhook func(WebhookEvent)
+	// LeaderID returns the current leader's node id (stamped into the webhook body).
+	LeaderID func() string
 }
 
 // AlertReconciler raises/clears the store-backed alerts the leader can cheaply determine:
@@ -49,7 +55,15 @@ type AlertReconcilerConfig struct {
 // leader cannot read per-peer cursor/liveness pre-D9). disk_pressure is forwarded by each
 // broker's disk monitor (alert_forward.go), and manual is operator-driven — neither is owned
 // here, so the clear pass NEVER touches them.
-type AlertReconciler struct{ cfg AlertReconcilerConfig }
+type AlertReconciler struct {
+	cfg AlertReconcilerConfig
+	// webhook committed-delta state (leader-local, single-goroutine — no lock needed): the
+	// committed ACTIVE set observed on the PREVIOUS leader pass. webhookSeeded is reset whenever
+	// this node is not leader, so on (re)gaining leadership the first pass establishes a baseline
+	// WITHOUT firing (else a new leader would re-POST every already-active alert).
+	prevActive    map[string]bool
+	webhookSeeded bool
+}
 
 func NewAlertReconciler(cfg AlertReconcilerConfig) *AlertReconciler {
 	if cfg.Now == nil {
@@ -85,6 +99,59 @@ type alertSpec struct {
 	key, kind, severity, message string
 }
 
+// fireWebhookDelta posts every committed raised/cleared transition between the previous leader
+// pass and `current`. The first pass after (re)gaining leadership only seeds the baseline.
+func (r *AlertReconciler) fireWebhookDelta(current map[string]bool, now time.Time) {
+	if r.cfg.Webhook == nil {
+		return
+	}
+	if !r.webhookSeeded {
+		r.prevActive = cloneKeySet(current)
+		r.webhookSeeded = true
+		return
+	}
+	leader := ""
+	if r.cfg.LeaderID != nil {
+		leader = r.cfg.LeaderID()
+	}
+	ts := now.UTC().Format(time.RFC3339Nano)
+	for key := range current {
+		if !r.prevActive[key] {
+			r.cfg.Webhook(r.webhookEvent("raised", key, leader, ts))
+		}
+	}
+	for key := range r.prevActive {
+		if !current[key] {
+			r.cfg.Webhook(r.webhookEvent("cleared", key, leader, ts))
+		}
+	}
+	r.prevActive = cloneKeySet(current)
+}
+
+// webhookEvent builds a transition event, enriching it with the alert's kind/severity/message
+// (most-recent row for the dedup_key) + the node parsed from a node-scoped key.
+func (r *AlertReconciler) webhookEvent(transition, key, leader, ts string) WebhookEvent {
+	ev := WebhookEvent{Transition: transition, DedupKey: key, ClusterLeader: leader, Ts: ts}
+	if i := strings.IndexByte(key, ':'); i >= 0 {
+		ev.Node = key[i+1:]
+	}
+	var kind, severity, message string
+	if err := r.cfg.DB.QueryRow(
+		`SELECT kind, severity, message FROM alerts WHERE dedup_key=? ORDER BY raised_at DESC LIMIT 1`, key,
+	).Scan(&kind, &severity, &message); err == nil {
+		ev.Kind, ev.Severity, ev.Message = kind, severity, message
+	}
+	return ev
+}
+
+func cloneKeySet(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // NOTE: the loop OWNS only replication_degraded / below_quorum / broker_draining:* — each
 // clear path below is scoped to its own key, so disk_pressure (forwarded) and manual
 // (operator) are never retired here.
@@ -95,12 +162,18 @@ type alertSpec struct {
 func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 	now := r.cfg.Now()
 	if !r.cfg.Node.IsLeader() || r.cfg.Node.LeaderContactStale(now) {
+		r.webhookSeeded = false // lost leadership → re-baseline on the next leader pass (no re-fire)
 		return nil
 	}
 	current, err := cluster.ActiveAlertKeys(r.cfg.DB)
 	if err != nil {
 		return err
 	}
+	// B6 OPS#2: fire the webhook off the COMMITTED delta (current vs the previous leader pass),
+	// BEFORE computing raise/clear decisions — committed truth, idle-zero-POST, no double-fire on
+	// a leadership change. A propose-but-uncommitted raise never reaches here (current is the
+	// committed ACTIVE set), closing the swallowed-not-leader hole.
+	r.fireWebhookDelta(current, now)
 	var raises []alertSpec
 	var clears []string
 

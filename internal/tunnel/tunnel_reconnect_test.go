@@ -81,7 +81,9 @@ func newReconnectHarness(t *testing.T, logger *slog.Logger) *reconnectHarness {
 	}
 }
 
-func (h *reconnectHarness) publicURL() string { return fmt.Sprintf("http://127.0.0.1:%d/", h.publicPort) }
+func (h *reconnectHarness) publicURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d/", h.publicPort)
+}
 
 func (h *reconnectHarness) waitRoundTrip(t *testing.T, max time.Duration) {
 	t.Helper()

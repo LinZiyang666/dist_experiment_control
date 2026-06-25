@@ -72,6 +72,18 @@ type ClusterAdmin struct {
 	// compromised leader proposes anything; no replicated nonce ledger.
 	nonceMu      sync.Mutex
 	issuedNonces map[string]bool
+
+	// B5 OPS#9 capacity-probe config, injected by SetCapacityProbes after construction (avoids a
+	// NewClusterAdmin signature change rippling to every call site). All zero by default ⇒ no disk
+	// statfs, ports_total 0 → the self-row capacity fields stay absent (honest "not configured").
+	storeDir     string
+	portBandLow  int
+	portBandHigh int
+
+	// B7 DOC#5: onRehome (wireClusterLate injects the broker's pubSysEvent) emits an
+	// `expose_rehomed` observability event after migrateExposes moves an expose during a drain.
+	// nil ⇒ no event (single broker / unwired) — leader-side, single-shot, no steady-state traffic.
+	onRehome func(port int, name, sid, fromBroker, toBroker string)
 }
 
 // NewClusterAdmin builds the orchestrator. now is injectable for tests (default
@@ -81,6 +93,15 @@ func NewClusterAdmin(node *cluster.Node, logger *slog.Logger) *ClusterAdmin {
 		logger = slog.Default()
 	}
 	return &ClusterAdmin{node: node, logger: logger, catchPoll: defaultCatchUpPoll, now: time.Now, issuedNonces: map[string]bool{}}
+}
+
+// SetCapacityProbes injects the B5 OPS#9 self-row capacity config (store dir for the disk
+// statfs + the port band for ports_used/total). Called once after construction by the production
+// broker; left unset in tests that don't exercise capacity (fields stay absent — honest).
+func (a *ClusterAdmin) SetCapacityProbes(storeDir string, bandLow, bandHigh int) {
+	a.storeDir = storeDir
+	a.portBandLow = bandLow
+	a.portBandHigh = bandHigh
 }
 
 // IssueJoinNonce mints a fresh single-use nonce and records it leader-locally.

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -42,6 +41,10 @@ func newServeCmd() *cobra.Command {
 		clusterDataDir   string
 		clusterRaftAddr  string
 		clusterSecrets   string
+		logLevel         string
+		logJSON          bool
+		metricsListen    string
+		alertWebhookURL  string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -78,6 +81,13 @@ func newServeCmd() *cobra.Command {
 			clusterDataDir = pickFlagOrYaml(cmd, "cluster-data-dir", clusterDataDir, fileCfg.Broker.Cluster.DataDir)
 			clusterRaftAddr = pickFlagOrYaml(cmd, "cluster-raft-addr", clusterRaftAddr, fileCfg.Broker.Cluster.RaftAddr)
 			clusterSecrets = pickFlagOrYaml(cmd, "cluster-secrets-dir", clusterSecrets, fileCfg.Broker.Cluster.SecretsDir)
+			// B5/B6 observability knobs: flag wins, else broker.yaml, else the cobra default.
+			logLevel = pickFlagOrYaml(cmd, "log-level", logLevel, fileCfg.Broker.Obs.LogLevel)
+			metricsListen = pickFlagOrYaml(cmd, "metrics-listen", metricsListen, fileCfg.Broker.Obs.MetricsListen)
+			alertWebhookURL = pickFlagOrYaml(cmd, "alert-webhook-url", alertWebhookURL, fileCfg.Broker.Obs.AlertWebhookURL)
+			if !cmd.Flags().Changed("log-json") && fileCfg.Broker.Obs.LogJSON {
+				logJSON = true
+			}
 
 			// frp.port_range "low-high" → PortBandLow/High. Empty stays
 			// 0/0 so broker.PortAllocCfg falls back to the
@@ -139,10 +149,15 @@ func newServeCmd() *cobra.Command {
 				}
 			}
 
+			logger, err := newLogger(logLevel, logJSON)
+			if err != nil {
+				return err
+			}
+
 			cfg := broker.Config{
 				NATSURL:             natsURL,
 				DB:                  db,
-				Logger:              slog.New(slog.NewTextHandler(os.Stderr, nil)),
+				Logger:              logger,
 				PublicHost:          publicHost,
 				TunnelControlAddr:   tunnelCtrlAddr,
 				TunnelPublicHost:    tunnelPublicHost,
@@ -159,6 +174,8 @@ func newServeCmd() *cobra.Command {
 				ClusterRaftAddr:     clusterRaftAddr,
 				ClusterSecretsDir:   clusterSecrets,
 				DBPath:              dbPath,
+				MetricsAddr:         metricsListen,
+				AlertWebhookURL:     alertWebhookURL,
 			}
 
 			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)
@@ -225,6 +242,10 @@ func newServeCmd() *cobra.Command {
 		"D9 cluster: raft transport bind host:port (private net only, e.g. 0.0.0.0:7400)")
 	cmd.Flags().StringVar(&clusterSecrets, "cluster-secrets-dir", "",
 		"D9 cluster: secrets dir (cluster-ca, route leaf, tunnel-cert, broker.nk, node-ident, account.nk); required in cluster mode")
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
+	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
+	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "address for the Prometheus /metrics + /healthz + /readyz HTTP endpoint (e.g. 127.0.0.1:9090); empty disables it (B5 OPS#1)")
+	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
 	return cmd
 }
 

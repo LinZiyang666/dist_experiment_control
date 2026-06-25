@@ -258,11 +258,11 @@ func (s *Server) dispatch(req Request) Response {
 	default:
 		if clusterOps[req.Op] {
 			if s.backend.Cluster == nil {
-				return Response{Op: req.Op, Error: "cluster mode not enabled"}
+				return Response{Op: req.Op, Error: "cluster mode not enabled", Code: CodeClusterNotEnabled}
 			}
 			return s.backend.Cluster.HandleCluster(req)
 		}
-		return Response{Op: req.Op, Error: "unknown op: " + req.Op}
+		return Response{Op: req.Op, Error: "unknown op: " + req.Op, Code: CodeBadRequest}
 	}
 }
 

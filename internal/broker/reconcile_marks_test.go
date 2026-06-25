@@ -252,7 +252,7 @@ func TestD4ReconcileEquivalence_AuditSet(t *testing.T) {
 			// 01d absent -> missed-exit -> reconciled_closed(-1)
 		},
 		LocalPorts: []proto.LocalPort{
-			{Port: 14022, Name: "keepme", LocalPort: 8888, TokenHash: "hashA"},      // keep -> no audit
+			{Port: 14022, Name: "keepme", LocalPort: 8888, TokenHash: "hashA"},       // keep -> no audit
 			{Port: 15000, Name: "orphanport", LocalPort: 9999, TokenHash: "hashZZZ"}, // reconciled
 		},
 	}

@@ -48,6 +48,33 @@ func d7SingleNode(t *testing.T, id string) (*cluster.Node, string) {
 	return n, string(addr)
 }
 
+// TestB3RemoveForceRespectsPhaseGate (B3 review M2, the load-bearing safety property): --force on
+// `cluster remove` bypasses ONLY the new expose-ownership probe — it must NOT weaken the raft
+// phase-gate. A live VOTER (not RETIRING / VOTER_ADD_FAILED) is refused even WITH force=true.
+func TestB3RemoveForceRespectsPhaseGate(t *testing.T) {
+	n, addr := d7SingleNode(t, "single-1")
+	admin := NewClusterAdmin(n, nil)
+	// Unknown roster node → "no such roster node" (force irrelevant).
+	if err := admin.RemoveNode("ghost", true); err == nil || !strings.Contains(err.Error(), "no such roster node") {
+		t.Fatalf("remove of an unknown node: got %v", err)
+	}
+	// Admit single-1 → VOTER, then remove --force: must STILL hit the phase-gate (a live VOTER is
+	// refused regardless of --force — the D7 no-silent-fork guarantee).
+	in := d7JoinInput(t, "single-1", addr)
+	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }
+	if err := admin.AddNode(in, addr, caughtUp, 5*time.Second); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	err := admin.RemoveNode("single-1", true) // force=true
+	if err == nil || !strings.Contains(err.Error(), "bare remove only finishes") {
+		t.Fatalf("remove --force of a live VOTER must hit the phase-gate, got %v", err)
+	}
+	// And it must NOT be the ownership-probe error (the phase-gate precedes + returns first).
+	if strings.Contains(err.Error(), "still HOMES") {
+		t.Error("a live VOTER must hit the phase-gate, never the ownership probe")
+	}
+}
+
 func d7JoinInput(t *testing.T, nodeID, realRaftAddr string) cluster.ClusterNodeUpsertInput {
 	t.Helper()
 	seed, err := auth.GenerateUserSeed()
@@ -151,7 +178,7 @@ func TestD7RemoveRefusesLiveVoter(t *testing.T) {
 	if phase, _ := d7ReadPhase(t, n, "single-1"); phase != phaseVoter {
 		t.Fatalf("setup: want VOTER, got %q", phase)
 	}
-	err := admin.RemoveNode("single-1")
+	err := admin.RemoveNode("single-1", false)
 	if err == nil || !strings.Contains(err.Error(), "bare remove only finishes") {
 		t.Fatalf("bare remove of a live VOTER must be refused, got %v", err)
 	}

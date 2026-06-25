@@ -38,6 +38,7 @@ func newNodeLsCmd() *cobra.Command {
 		natsURL string
 		home    string
 		showAll bool
+		asJSON  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "ls",
@@ -76,16 +77,25 @@ func newNodeLsCmd() *cobra.Command {
 				return brokerErrorMessage("node ls", resp.Code, resp.Error)
 			}
 
-			now := time.Now()
 			out := cmd.OutOrStdout()
+			// Filter once (honor -a/showAll); --json changes RENDERING, not selection.
+			shown := make([]proto.NodeListEntry, 0, len(resp.Nodes))
+			for _, n := range resp.Nodes {
+				if n.Status == "ONLINE" || showAll {
+					shown = append(shown, n)
+				}
+			}
+			if asJSON {
+				if err := emitJSON(out, nodeLsJSON{Schema: "node_ls", SchemaVersion: 1, Nodes: normSlice(shown)}); err != nil {
+					return err
+				}
+				withBanner(nc, id.PublicKey, true) // suppressed under --json
+				return nil
+			}
+			now := time.Now()
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(tw, "NODE\tSTATUS\tHEARTBEAT\tPROTO\tRELEASE")
-			any := false
-			for _, n := range resp.Nodes {
-				if n.Status != "ONLINE" && !showAll {
-					continue
-				}
-				any = true
+			for _, n := range shown {
 				age := "-"
 				if !n.LastHeartbeatAt.IsZero() {
 					age = humanizeAgo(now, n.LastHeartbeatAt)
@@ -97,7 +107,7 @@ func newNodeLsCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
 					n.NID, n.Status, age, n.ProtoVersion, release)
 			}
-			if !any {
+			if len(shown) == 0 {
 				_, _ = fmt.Fprintln(tw, "(no nodes)")
 			}
 			if err := tw.Flush(); err != nil {
@@ -110,6 +120,7 @@ func newNodeLsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().BoolVarP(&showAll, "all", "a", false, "include OFFLINE / STALE nodes")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	return cmd
 }
 
@@ -143,13 +154,13 @@ testing run a single <nid> first.`, proto.SubjectPrefix),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if urlFlag == "" || shaFlag == "" {
-				return fmt.Errorf("--url and --sha256 are required")
+				return usageErr("--url and --sha256 are required")
 			}
 			if all && len(args) > 0 {
-				return fmt.Errorf("--all and explicit <nid> are mutually exclusive")
+				return usageErr("--all and explicit <nid> are mutually exclusive")
 			}
 			if !all && len(args) == 0 {
-				return fmt.Errorf("either <nid> or --all is required")
+				return usageErr("either <nid> or --all is required")
 			}
 
 			sid := cli.ReadCurrentSession(home)

@@ -105,8 +105,8 @@ func (b *Broker) enableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Msg
 				affected++
 				continue
 			}
-			if b.tunnelSrv != nil {
-				b.tunnelSrv.CloseProxy(existing.Port)
+			if srv := b.tunnelSrv.Load(); srv != nil {
+				srv.CloseProxy(existing.Port)
 			}
 			if err := port.Free(b.cfg.DB, existing.Port, b.cfg.Now()); err != nil {
 				b.cfg.Logger.Warn("broker: proxy on rotate stale port", "sid", sid, "nid", nid, "err", err)
@@ -146,8 +146,8 @@ func (b *Broker) disableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Ms
 			b.cfg.Logger.Error("broker: proxy off fallback switch failed",
 				"sid", sid, "epoch_err", switchErr, "switch_err", fallbackErr)
 		}
-		if b.tunnelSrv != nil {
-			b.tunnelSrv.CloseSession(sid)
+		if srv := b.tunnelSrv.Load(); srv != nil {
+			srv.CloseSession(sid)
 		}
 		for _, snap := range b.sessionNIDs(sid) {
 			_ = node.SetProxyReady(b.cfg.DB, sid, snap, false)
@@ -161,8 +161,8 @@ func (b *Broker) disableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Ms
 	// bumps their kill generations. This is the authoritative broker-side kill;
 	// it must not depend on the allocation-store read below succeeding. Runs after
 	// the switch is committed OFF (tunnelTokenLookup already denies new REGISTERs).
-	if b.tunnelSrv != nil {
-		b.tunnelSrv.CloseSession(sid)
+	if srv := b.tunnelSrv.Load(); srv != nil {
+		srv.CloseSession(sid)
 	}
 
 	allocs, err := port.ListBySession(b.cfg.DB, sid)
@@ -292,6 +292,14 @@ func (b *Broker) proxySubRevoke(nc *nats.Conn, sid, fp, actor string, msg *nats.
 }
 
 func (b *Broker) handleProxyStatus(msg *nats.Msg) {
+	// B7 DOC#4 seam: the proxy subscribe path is out of v1 cluster HA (§16.4). handleProxySet
+	// already fails closed in cluster mode; handleProxyStatus lacked the guard and would return a
+	// stale/empty render off RODB() (a UX trap, not an illegal write). Reply via proxyErr (it has a
+	// msg.Reply) so ctl gets a clear "unsupported" rather than hanging to timeout.
+	if b.clusterMode {
+		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
+		return
+	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok || action != "status" {
 		b.proxyErr(msg, "subject_malformed", "")

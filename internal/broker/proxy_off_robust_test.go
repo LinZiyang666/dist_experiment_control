@@ -73,7 +73,7 @@ func TestProxyOffKillsDataPlaneWhenEpochBumpFails(t *testing.T) {
 	if err := srv.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	b.tunnelSrv = srv
+	b.tunnelSrv.Store(srv)
 	cli := tunnel.NewClient(
 		net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)),
 		sid,

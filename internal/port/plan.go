@@ -96,7 +96,7 @@ func PlanRevoke(db *sql.DB, publicPort int, now time.Time) (*cluster.Command, er
 // (every current caller — build-and-prove, cutover=D9) the INSERT is BYTE-
 // IDENTICAL to pre-D6 (home_broker/epoch take their migration-0010 defaults
 // ” / 0). The live port.Allocate direct mutator is unchanged and always EMPTY.
-func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP, homeBroker string, cfg *Config) (*Allocation, *cluster.Command, error) {
+func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP, homeBroker string, rebuildOff bool, cfg *Config) (*Allocation, *cluster.Command, error) {
 	low, high, now := cfgWithDefaults(cfg)
 
 	var existing int
@@ -169,12 +169,22 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 			cluster.LitInt(int64(localPort)) + `, ` + thLit + `, 'ALLOCATED', ` + fpLit + `, ` + cluster.LitTime(nowUTC) +
 			`, ` + homeLit + `, ` + cluster.LitInt(0) + `)`
 	}
+	// B4 conditional column (composes with the home conditional above into a 2×2): only
+	// --no-rebuild (rebuildOff) appends rebuild_on_failure=0; rebuild-ON (the default)
+	// omits it so the column takes its migration-0010 DEFAULT 1 and the baked SQL stays
+	// byte-identical to pre-B4 for that home-state. Slice-then-reappend (instead of a
+	// 4th literal cols/vals pair) keeps the !rebuildOff path provably untouched.
+	if rebuildOff {
+		cols = cols[:len(cols)-1] + `, rebuild_on_failure)`
+		vals = vals[:len(vals)-1] + `, ` + cluster.LitInt(0) + `)`
+	}
 	sql := `INSERT INTO port_allocations` + cols + vals
 
 	alloc := &Allocation{
 		Port: publicPort, SID: sid, NID: nid, Name: name, LocalPort: localPort,
 		TokenHash: tokenHash, State: StateAllocated, CreatedByFP: createdByFP,
 		CreatedAt: nowUTC, Token: token, HomeBroker: homeBroker, Epoch: epoch,
+		RebuildOff: rebuildOff,
 	}
 	return alloc, cluster.NewCommand(cluster.OpPortAllocate, cluster.Stmt(sql)), nil
 }

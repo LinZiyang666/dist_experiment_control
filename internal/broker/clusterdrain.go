@@ -92,6 +92,24 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	if proj.FaultTolerance == 0 && !confirmed {
 		return &ErrQuorumConfirmRequired{Proj: proj}
 	}
+	// If draining the CURRENT leader, transfer leadership off it FIRST and bail
+	// (review B5): this broker is the leader running the orchestration; once it sheds
+	// leadership it can no longer Propose, so it must NOT proceed to raise the marker
+	// / migrate / phase-bump (that half-drains). The operator re-runs on the new
+	// leader, which drains the old leader as a follower.
+	//
+	// This MUST precede requireClusterNode (the roster-membership check): the leader is
+	// identified by the raft config, NOT the cluster_nodes roster, so the transfer-bail must
+	// fire even for a leader that has no roster row yet (e.g. a freshly-bootstrapped node before
+	// its self row is seeded). The roster check then validates the node on the re-run, where it
+	// is a follower. (Regression fix: requireClusterNode had been inserted ahead of the bail,
+	// making `drain <leader>` fail "not in cluster_nodes" instead of transferring + bailing.)
+	if _, leaderID := a.node.LeaderWithID(); leaderID == nodeID {
+		if err := a.transferLeadershipOff(nodeID); err != nil {
+			return fmt.Errorf("cluster drain %s: transfer leadership off the leader: %w", nodeID, err)
+		}
+		return &ErrLeadershipTransferred{NodeID: nodeID}
+	}
 	if err := a.requireClusterNode(nodeID); err != nil {
 		return fmt.Errorf("cluster drain %s: %w", nodeID, err)
 	}
@@ -103,18 +121,6 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 		if !ready {
 			return ErrStreamsNotAtTarget
 		}
-	}
-
-	// If draining the CURRENT leader, transfer leadership off it FIRST and bail
-	// (review B5): this broker is the leader running the orchestration; once it sheds
-	// leadership it can no longer Propose, so it must NOT proceed to raise the marker
-	// / migrate / phase-bump (that half-drains). The operator re-runs on the new
-	// leader, which drains the old leader as a follower.
-	if _, leaderID := a.node.LeaderWithID(); leaderID == nodeID {
-		if err := a.transferLeadershipOff(nodeID); err != nil {
-			return fmt.Errorf("cluster drain %s: transfer leadership off the leader: %w", nodeID, err)
-		}
-		return &ErrLeadershipTransferred{NodeID: nodeID}
 	}
 
 	// 1. raise broker_draining with the deadline (nodeID is a follower; we are leader).
@@ -177,7 +183,7 @@ func (a *ClusterAdmin) requireClusterNode(nodeID string) error {
 // phase-guarded roster DELETE, leaves the roster row stuck at VOTER while raft drops
 // the voter — a permanent silent fork the reconciliation pass cannot heal. Use
 // `drain --retire` to remove a live node.
-func (a *ClusterAdmin) RemoveNode(nodeID string) error {
+func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
 	phase, ok := a.nodePhase(nodeID)
 	if !ok {
 		return fmt.Errorf("cluster remove %s: no such roster node", nodeID)
@@ -185,12 +191,52 @@ func (a *ClusterAdmin) RemoveNode(nodeID string) error {
 	if phase != phaseRetiring && phase != phaseAddFailed {
 		return fmt.Errorf("cluster remove %s: node is %s; bare remove only finishes a RETIRING or VOTER_ADD_FAILED node — use `cluster drain %s --retire` to remove a live node (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
 	}
+	// B3 item 7: a RETIRING node already had its exposes migrated by DrainNode→migrateExposes, but
+	// a VOTER_ADD_FAILED node never drained — it can still HOME allocated exposes that a bare
+	// remove would orphan. Refuse by default; --force bypasses ONLY this ownership probe (the
+	// phase-gate above is independent and unweakened: a live VOTER still refuses regardless).
+	if phase == phaseAddFailed && !force {
+		n, err := a.countOwnedExposes(nodeID)
+		if err != nil {
+			return fmt.Errorf("cluster remove %s: count owned exposes: %w", nodeID, err)
+		}
+		if n > 0 {
+			return &ErrRemoveOwnsResources{NodeID: nodeID, Exposes: n}
+		}
+	}
 	if err := a.node.RemoveServer(nodeID); err != nil {
 		return fmt.Errorf("cluster remove %s: raft RemoveServer: %w", nodeID, err)
 	}
 	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterNodeRemove(nodeID)
 	})
+}
+
+// ErrRemoveOwnsResources is returned when `cluster remove` (no --force) targets a
+// VOTER_ADD_FAILED node that still HOMES allocated exposes (which a bare remove would orphan).
+// The "still HOMES" substring is the SINGLE authored literal (B3 item 7) — clusterCodeFor and the
+// D7 pin key on it; keep them in lockstep.
+type ErrRemoveOwnsResources struct {
+	NodeID  string
+	Exposes int
+}
+
+func (e *ErrRemoveOwnsResources) Error() string {
+	// NOTE (B3 review M1): do NOT suggest `drain --retire` here — DrainNode only accepts a live
+	// VOTER (phaseVoter), so it is a dead end for a VOTER_ADD_FAILED node. The real remedies are
+	// (a) free/re-home the exposes, or (b) --force (orphan them).
+	return fmt.Sprintf("cluster remove %s: REFUSED — this VOTER_ADD_FAILED node still HOMES %d expose(s) that would be orphaned. Free/re-home those exposes first (re-expose them on a healthy node), or pass --force to remove anyway (orphans them). (`drain --retire` does NOT apply — it drains a live VOTER, not a VOTER_ADD_FAILED node.)", e.NodeID, e.Exposes)
+}
+
+// countOwnedExposes counts ALLOCATED exposes homed on nodeID (the same single-COUNT read pattern
+// migrateExposes uses; no nested query under the single-conn pool).
+func (a *ClusterAdmin) countOwnedExposes(nodeID string) (int, error) {
+	var n int
+	err := a.node.BoundedStaleRead(func(db *sql.DB) error {
+		return db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE home_broker=? AND state=?`,
+			nodeID, string(port.StateAllocated)).Scan(&n)
+	})
+	return n, err
 }
 
 // nodePhase reads a roster row's phase (materialized read; no nested Propose).
@@ -300,20 +346,25 @@ func (e *ErrRebuildOffExposes) Error() string {
 // (the D6 lesson).
 func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 	var rebuildOn, rebuildOff []int
+	names := map[int]string{} // B7 DOC#5: port → expose name, for the expose_rehomed event
+	sids := map[int]string{}  // Stage-C m1: port → sid, so the event can correlate to a session
 	var target string
 	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
 		rows, err := db.Query(
-			`SELECT port, rebuild_on_failure FROM port_allocations WHERE home_broker=? AND state=?`,
+			`SELECT port, rebuild_on_failure, name, sid FROM port_allocations WHERE home_broker=? AND state=?`,
 			nodeID, string(port.StateAllocated))
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var p, rebuild int
-			if err := rows.Scan(&p, &rebuild); err != nil {
+			var name, sid string
+			if err := rows.Scan(&p, &rebuild, &name, &sid); err != nil {
 				_ = rows.Close()
 				return err
 			}
+			names[p] = name
+			sids[p] = sid
 			if rebuild == 1 {
 				rebuildOn = append(rebuildOn, p)
 			} else {
@@ -355,6 +406,10 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 			return cmd, err
 		}); err != nil {
 			return fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
+		}
+		// B7 DOC#5: emit an expose_rehomed observability event (leader-side, single-shot).
+		if a.onRehome != nil {
+			a.onRehome(p, names[p], sids[p], nodeID, target)
 		}
 	}
 	a.logger.Info("cluster drain: migrated rebuild-ON exposes", "node_id", nodeID, "count", len(rebuildOn), "target", target)

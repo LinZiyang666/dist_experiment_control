@@ -228,6 +228,20 @@ func (n *Node) RODB() *sql.DB { return n.ro }
 // seed path, which writes BEFORE raft is serving. Live writes go through Propose.
 func (n *Node) DB() *sql.DB { return n.db }
 
+// BackupDBTo writes a consistent online-backup of the committed FSM DB into dstPath, off the
+// read-only handle (the same paged modernc backup the snapshot path uses). It takes NO raft
+// action — it does NOT truncate the log the way Snapshot()/raft.Snapshot() does — so it is a
+// safe operator backup any node (leader or follower) can serve while the FSM keeps writing
+// through the WAL. dstPath must not already exist (modernc NewBackup creates it). This is the
+// B6 `cluster backup` seam: the bundle's state.db is exactly this file; the raft log is
+// node-local and is re-bootstrapped fresh on restore, so it is intentionally not carried.
+func (n *Node) BackupDBTo(ctx context.Context, dstPath string) error {
+	if n.ro == nil {
+		return fmt.Errorf("cluster: BackupDBTo: node has no read handle")
+	}
+	return backupTo(ctx, n.ro, dstPath)
+}
+
 // raftConfig builds the raft.Config. Timeouts come from cfg when set, else the
 // D1/D2 fast N=1 defaults (200ms / 20ms) so existing single-node tests are
 // byte-unchanged; D3 multinode harnesses pass cluster.Multinode* values via
@@ -292,6 +306,15 @@ func (n *Node) Apply(cmd *Command) error {
 		return err
 	}
 	if resp := fut.Response(); resp != nil {
+		// A committed-but-op-skipped outcome (poison / dedup / deterministic reject) is a
+		// SUCCESSFUL commit, NOT an Apply failure — the entry is durable and applied_index
+		// advanced. Never surface it as an error (the forged-sig poison-skip path relies on
+		// Apply returning nil). Only a genuine error Response is returned. (Belt-and-suspenders
+		// with the "applied* must not implement error" invariant in fsm.go.)
+		switch resp.(type) {
+		case appliedOK, appliedNoOp, appliedPoison, appliedDedup, appliedRejected:
+			return nil
+		}
 		if e, ok := resp.(error); ok {
 			return e
 		}

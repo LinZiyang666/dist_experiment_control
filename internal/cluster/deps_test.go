@@ -15,8 +15,8 @@ import (
 // Raft log/stable store in D1), and proves the §19-named APIs exist and compile
 // against the pinned versions (raft v1.7.3, raft-boltdb/v2 v2.3.1).
 var (
-	_ *raft.FileSnapshotStore  // §19 names FileSnapshotStore among the 3 pins (D1 consumes the struct)
+	_ *raft.FileSnapshotStore     // §19 names FileSnapshotStore among the 3 pins (D1 consumes the struct)
 	_ = raft.NewFileSnapshotStore // also pin the §19-NAMED constructor (catches an API rename)
-	_ *raftboltdb.BoltStore    // D1 will back the Raft log/stable store with this
+	_ *raftboltdb.BoltStore       // D1 will back the Raft log/stable store with this
 	_ raftboltdb.Options
 )

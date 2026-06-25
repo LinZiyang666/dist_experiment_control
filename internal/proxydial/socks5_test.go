@@ -324,9 +324,9 @@ func firstByte(b []byte) byte {
 func TestSOCKS5_AuthReplyTruncated(t *testing.T) {
 	pu := mustURL(t, "socks5://alice:s3cret@127.0.0.1:1080")
 	for _, reply := range [][]byte{
-		{},                       // empty
-		{socks5AuthRFC},          // 1 byte (truncated)
-		{socks5AuthRFC, 0x01},    // explicit failure
+		{},                    // empty
+		{socks5AuthRFC},       // 1 byte (truncated)
+		{socks5AuthRFC, 0x01}, // explicit failure
 	} {
 		d := &dialer{proxy: pu, timeout: time.Second}
 		// Method=UserPass, then the (truncated/failing) auth reply.

@@ -61,11 +61,11 @@ func planAlertSignal(db *sql.DB, p AlertSignalPayload, now time.Time) (*cluster.
 	}
 }
 
-// AttachAlertSink wires the D8b disk-pressure forward seam (TEST/HARNESS ONLY). After this
-// call the disk monitor's every-tick signalDiskAlert forwards the local disk state to the
-// leader as a VerbAlertSignal keyed disk_pressure:<selfID>. Best-effort: a lost signal is
-// re-asserted next tick (the leader-side transition gate makes the re-assert free). Call
-// before Run. Production never calls it.
+// AttachAlertSink wires the D8b disk-pressure forward seam. After this call the disk monitor's
+// every-tick signalDiskAlert forwards the local disk state to the leader as a VerbAlertSignal
+// keyed disk_pressure:<selfID>. Best-effort: a lost signal is re-asserted next tick (the
+// leader-side transition gate makes the re-assert free). Call before Run. Post-D9 cutover this
+// is LIVE in CLUSTER mode (wireClusterLate calls it); SINGLE mode leaves b.alertSink nil (inert).
 func (b *Broker) AttachAlertSink(fwd *Forwarder) {
 	b.alertSink = func(active bool) {
 		p := AlertSignalPayload{

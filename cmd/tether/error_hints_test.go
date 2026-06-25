@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,57 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 			}
 			if !strings.Contains(msg, tc.code) {
 				t.Errorf("raw code missing for grep / log search: got %q", msg)
+			}
+		})
+	}
+}
+
+// TestBrokerCodeHintsTransientCluster (B1 item 6): the three failover/transient codes each render
+// a "wait and retry" sentence. All three are agent-internal today (home_catching_up / try_again are
+// agent tunnel-REGISTER deny reasons, leader_unavailable is consumed by the agent register loop);
+// the entries are defensive future-proofing + a log-reading gloss. None must imply user fault.
+func TestBrokerCodeHintsTransientCluster(t *testing.T) {
+	for _, code := range []string{"home_catching_up", "leader_unavailable", "try_again"} {
+		t.Run(code, func(t *testing.T) {
+			hint, ok := brokerCodeHints[code]
+			if !ok || hint == "" {
+				t.Fatalf("%q has no hint", code)
+			}
+			if !strings.Contains(hint, "transient") || !strings.Contains(hint, "retry") {
+				t.Errorf("%q hint should frame it as transient/retry: %q", code, hint)
+			}
+		})
+	}
+}
+
+// TestBrokerErrorMessageExitClass (B2 item 3): brokerErrorMessage returns an *ExitError carrying
+// the code's exit class (prefix-stripped), so the process exit reflects the failure kind. The
+// human string is unchanged (covered by TestBrokerErrorMessageRegisteredCodes).
+func TestBrokerErrorMessageExitClass(t *testing.T) {
+	cases := []struct {
+		code string
+		want int
+	}{
+		{"not_owner", exitNoPerm},
+		{"port_exhausted", exitUsage},
+		{"store_error", exitInternal},
+		{"leader_unavailable", exitTransient},
+		{"some_unmapped_future_code", exitInternal},   // default 70
+		{"agent_rejected:sha256_mismatch", exitUsage}, // prefix-stripped class lookup
+	}
+	for _, c := range cases {
+		t.Run(c.code, func(t *testing.T) {
+			err := brokerErrorMessage("verb", c.code, "raw")
+			var ee *ExitError
+			if !errors.As(err, &ee) {
+				t.Fatalf("%s: brokerErrorMessage must return an *ExitError, got %T", c.code, err)
+			}
+			if ee.Class != c.want {
+				t.Errorf("%s: exit class = %d, want %d", c.code, ee.Class, c.want)
+			}
+			// raw code is still grep-able in the message
+			if !strings.Contains(err.Error(), c.code) {
+				t.Errorf("%s: raw code dropped from message: %q", c.code, err.Error())
 			}
 		})
 	}

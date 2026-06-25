@@ -23,6 +23,7 @@ func TestD9Matrix(t *testing.T) {
 	t.Run("SessionCreateRoutesThroughRaft", testSessionCreateRoutesThroughRaft)
 	t.Run("SessionRmCascadeRoutesThroughRaft", testSessionRmCascadeRoutesThroughRaft)
 	t.Run("TwoBrokerJoinReplicates", testTwoBrokerJoinReplicates)
+	t.Run("ClusterStatusRemoteReachable", testClusterStatusRemoteReachable) // B1
 }
 
 // testSessionRmCascadeRoutesThroughRaft is the round-1 BLOCKER regression: a `session rm`

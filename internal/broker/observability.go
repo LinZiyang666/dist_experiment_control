@@ -120,6 +120,26 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 		return // cannot measure lag without the leader's own command cursor
 	}
 	responses := pollClusterHealth(b.nc.Load(), proto.SubjClusterCursor, observePollWindow)
+	// B5 OPS#1: cache the per-peer health for the metrics scrape (so /metrics never re-runs this
+	// blocking poll). Lag is the leader's command-domain AppliedIndex minus the peer's self-report;
+	// a peer that did not answer the window is unreachable (lag unknown → 0).
+	peers := make([]peerObserve, 0, len(voters))
+	for _, v := range voters {
+		if v == b.selfID {
+			continue
+		}
+		po := peerObserve{NodeID: v}
+		if r, ok := responses[v]; ok {
+			po.Reachable = true
+			if leaderApplied > r.AppliedIndex {
+				po.AppliedLag = leaderApplied - r.AppliedIndex
+			}
+		}
+		peers = append(peers, po)
+	}
+	b.lastObserveMu.Lock()
+	b.lastObserve = peers
+	b.lastObserveMu.Unlock()
 	for _, d := range decideObservabilityAlerts(b.selfID, leaderApplied, voters, responses, lagThreshold) {
 		b.proposeAlertSignal(d.Kind, d.NodeID, d.Active, d.Message)
 	}

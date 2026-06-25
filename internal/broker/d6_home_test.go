@@ -42,7 +42,7 @@ func seedClusterNode(t *testing.T, b *Broker, nodeID, natsServer, tunnelAddr, ce
 }
 
 // TestD6TunnelTokenLookupLadder (R-9): the two-dimensional home/epoch ladder.
-// An un-homed row (home_broker=='') is INERT (allow regardless of epoch — the
+// An un-homed row (home_broker==”) is INERT (allow regardless of epoch — the
 // byte-equivalent pre-D6 path). A homed row decides on (home vs self) AND
 // (presented vs row epoch).
 func TestD6TunnelTokenLookupLadder(t *testing.T) {

@@ -77,9 +77,15 @@ type appliedPoison struct{ index uint64 }   // poison entry skipped, applied_ind
 type appliedDedup struct{ index uint64 }    // §4.1 D4: ReqID already committed; op SKIPPED but applied_index ADVANCED + committed (NOT a rollback — distinct from appliedNoOp)
 type appliedRejected struct{ index uint64 } // D7 §8.1: a custom applier DETERMINISTICALLY rejected the op (e.g. join-PoP verify fail); op SQL ran NONE, applied_index ADVANCED + committed, never panicked
 
-func (r appliedRejected) Error() string {
-	return fmt.Sprintf("cluster: op deterministically rejected at index %d", r.index)
-}
+// INVARIANT (load-bearing): the committed-OUTCOME FSM result types — appliedOK / appliedNoOp /
+// appliedPoison / appliedDedup / appliedRejected — MUST NOT implement the `error` interface. They
+// are returned as the raft Apply *Response* (a successful, durably-committed entry whose op may
+// have been skipped). Node.Apply turns any error-typed Response into a returned error, so giving
+// one of these an Error() method would make a poison-skip (a successful commit) look like an Apply
+// FAILURE to the proposer — which silently broke the D7 forged-sig poison-skip path (a `func
+// (appliedRejected) Error()` added in "v2 plish" made `Node.Apply(forged) -> error` instead of
+// nil). A genuine infra failure rides fut.Error() / a fail-stop panic, NOT a Response. Do NOT add
+// an Error() method to any applied* result type.
 
 // errAppliedRejected is the sentinel a custom Applier returns to signal a
 // DETERMINISTIC, op-level rejection (D7 §8.1: the join-PoP signature did not

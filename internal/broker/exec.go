@@ -377,6 +377,11 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 			State:       string(pa.State),
 			CreatedByFP: pa.CreatedByFP,
 			CreatedAt:   pa.CreatedAt,
+			// B4: home/epoch/rebuild for `ps` + `expose explain`. All omitempty → single
+			// broker / un-homed / rebuild-ON (default) rows marshal byte-identical to pre-B4.
+			HomeBroker: pa.HomeBroker,
+			Epoch:      pa.Epoch,
+			RebuildOff: pa.RebuildOff,
 		})
 	}
 	b.replyJSON(msg, proto.PsResp{Processes: procOut, Ports: portOut})

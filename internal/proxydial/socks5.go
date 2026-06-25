@@ -15,16 +15,16 @@ import (
 // the whole point: the proxy resolves the broker name, bypassing the local
 // fake-ip. socks5:// and socks5h:// are therefore equivalent here.
 const (
-	socks5Ver       = 0x05
-	socks5NoAuth    = 0x00
-	socks5UserPass  = 0x02
-	socks5NoAccept  = 0xFF
-	socks5CmdConn   = 0x01
-	socks5ATYPv4    = 0x01
-	socks5ATYPDom   = 0x03
-	socks5ATYPv6    = 0x04
-	socks5RepOK     = 0x00
-	socks5AuthRFC   = 0x01 // RFC1929 username/password sub-negotiation version
+	socks5Ver      = 0x05
+	socks5NoAuth   = 0x00
+	socks5UserPass = 0x02
+	socks5NoAccept = 0xFF
+	socks5CmdConn  = 0x01
+	socks5ATYPv4   = 0x01
+	socks5ATYPDom  = 0x03
+	socks5ATYPv6   = 0x04
+	socks5RepOK    = 0x00
+	socks5AuthRFC  = 0x01 // RFC1929 username/password sub-negotiation version
 )
 
 func (d *dialer) dialSOCKS5(target string, deadline time.Time) (net.Conn, error) {

@@ -1,9 +1,11 @@
 package broker
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -11,6 +13,31 @@ import (
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
+
+// clusterCodeFor derives a stable machine Code (B2 item 4) from a broker cluster error by
+// recognizing the broker's OWN error messages. These substrings are pinned by the D7 suite, so a
+// drift breaks a test rather than silently mis-coding. An unrecognized error yields "" → the CLI
+// classifies it exitInternal (70). This is server-side self-recognition (the broker owns both the
+// string and the test); the CLI never sniffs prose — it maps code→class via a table. Free-form
+// errors that match no pattern stay "" (a documented B2.1 widening target).
+func clusterCodeFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "catch_up_stalled"):
+		return adminsock.CodeCatchUpStalled
+	case strings.Contains(s, "still HOMES"): // B3 item 7 ErrRemoveOwnsResources (authored literal)
+		return adminsock.CodeRemoveOwnsResources
+	case strings.Contains(s, "not in the raft configuration"),
+		strings.Contains(s, "is not a voter"),
+		strings.Contains(s, "cannot retire the last voter"):
+		return adminsock.CodeNotAVoter
+	default:
+		return ""
+	}
+}
 
 // clusterstatus.go — D7 §17 status/doctor self-report + the adminsock adapter
 // (build-and-prove; part of the guard-excluded ClusterAdmin mechanism). This is ONE
@@ -54,6 +81,9 @@ func healthExitCode(health string) int {
 
 type rosterRow struct {
 	nodeID, name, phase string
+	certFP              string         // B5 OPS#7: current tunnel-cert fingerprint (public; '' if unset)
+	certFPPrev          sql.NullString // previous fp during a rotation window
+	certValid           sql.NullTime   // cert_fp_valid_until
 }
 
 // StatusReport builds this broker's self-report (view = "ctl-nats" or "offline").
@@ -66,14 +96,17 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// under the single-conn pool (the D6 deadlock lesson).
 	var roster []rosterRow
 	var forceSingle bool
+	var portsUsed int
+	var portsKnown bool
+	selfID := a.node.SelfID()
 	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
-		rows, err := db.Query(`SELECT node_id, name, phase FROM cluster_nodes ORDER BY node_id`)
+		rows, err := db.Query(`SELECT node_id, name, phase, cert_fp, cert_fp_prev, cert_fp_valid_until FROM cluster_nodes ORDER BY node_id`)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var r rosterRow
-			if err := rows.Scan(&r.nodeID, &r.name, &r.phase); err != nil {
+			if err := rows.Scan(&r.nodeID, &r.name, &r.phase, &r.certFP, &r.certFPPrev, &r.certValid); err != nil {
 				_ = rows.Close()
 				return err
 			}
@@ -92,9 +125,32 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		// B5 OPS#9: self-row ports_used = exposes THIS broker homes (the countOwnedExposes
+		// pattern — home_broker-scoped, since port_allocations is the replicated cluster table).
+		// Single COUNT after the roster rows are closed (single-conn safe).
+		if a.portBandHigh > 0 && a.portBandHigh >= a.portBandLow {
+			if e := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE home_broker=? AND state='ALLOCATED'`, selfID).Scan(&portsUsed); e != nil {
+				return e
+			}
+			portsKnown = true
+		}
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("cluster status: read roster: %w", err)
+	}
+
+	// B5 OPS#9: self-row disk free % via statfs (NO DB; never on the offline path — a stale/
+	// unmounted store dir can hang). Gate on StoreDir set + a non-zero total (honest absence).
+	diskFreePct, diskKnown := 0, false
+	if a.storeDir != "" {
+		if used, total, derr := diskUsage(a.storeDir); derr == nil && total > 0 {
+			diskFreePct = int((float64(total-used) / float64(total)) * 100.0)
+			diskKnown = true
+		}
+	}
+	portsTotal := 0
+	if portsKnown {
+		portsTotal = a.portBandHigh - a.portBandLow + 1
 	}
 
 	cfg, err := a.node.RaftConfiguration()
@@ -172,13 +228,39 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		inconsistent := (r.phase == phaseVoter && (!inCfg || ro == "learner")) ||
 			(!inCfg && r.phase != phaseRetiring && r.phase != phaseAddFailed)
 		reachable, source, lag := reachOf(r.nodeID)
-		rep.Nodes = append(rep.Nodes, adminsock.ClusterNodeStatus{
+		ns := adminsock.ClusterNodeStatus{
 			NodeID: r.nodeID, Name: r.name, Phase: r.phase, Role: ro,
 			AppliedLag: lag, AccountNkMatch: true,
 			StreamActual: streamActual, StreamTarget: streamTarget,
 			Reachable: reachable, ReachSource: source,
 			Inconsistent: inconsistent,
-		})
+		}
+		// B6 OPS#4: stamp each broker's live self-reported version (from the health poll).
+		if hr, ok := health[r.nodeID]; ok {
+			ns.ReleaseVersion = hr.ReleaseVersion
+			ns.ProtoVer = hr.ProtoVer
+		}
+		// B5 OPS#7: cert fingerprints (public) for every row; CertValidSecs derived now→valid.
+		ns.CertFP = r.certFP
+		if r.certFPPrev.Valid {
+			ns.CertFPPrev = r.certFPPrev.String
+		}
+		if r.certValid.Valid {
+			if secs := int64(r.certValid.Time.Sub(a.now()).Seconds()); secs > 0 {
+				ns.CertValidSecs = secs
+			}
+		}
+		// B5 OPS#9: capacity is self-row only (a leader cannot statfs a peer's disk).
+		if r.nodeID == selfID {
+			if diskKnown {
+				ns.DiskFreePct = diskFreePct
+			}
+			if portsKnown {
+				ns.PortsUsed = portsUsed
+				ns.PortsTotal = portsTotal
+			}
+		}
+		rep.Nodes = append(rep.Nodes, ns)
 	}
 	// A raft voter with NO roster row is the loud INCONSISTENT case (§8.1).
 	for _, s := range cfg {
@@ -193,7 +275,53 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 
 	rep.Health, rep.Banner, rep.NextStep = computeHealth(forceSingle, leaderID, voters, rep.Nodes)
 	rep.ExitCode = healthExitCode(rep.Health)
+	// B5 OPS#7: a tunnel-cert whose rotation window is closing is an ADVISORY only — a rotation
+	// in-window is healthy and even past valid_until only the PREVIOUS pin lapsed (the cert still
+	// serves), so it NEVER changes health/ExitCode. Appended to the banner; no-op when no cert is
+	// near expiry (so the common case is byte-identical).
+	if adv := certExpiryAdvisory(rep.Nodes, certRotationWindow); adv != "" {
+		if rep.Banner != "" {
+			rep.Banner += " "
+		}
+		rep.Banner += adv
+	}
+	// B1: stamp the view source (which broker self-reported, and whether it is the
+	// authoritative leader view) and the plain-language voter-count verdict.
+	rep.ViewHost = a.node.SelfID()
+	rep.IsLeaderView = leaderID == a.node.SelfID()
+	rep.Verdict = clusterVerdict(voters, streamsAtTarget(rep.Nodes), rep.Health)
 	return rep, nil
+}
+
+// streamsAtTarget reports whether every node row with a KNOWN target is at or above it.
+// StreamTarget==0 means "not observed" and never counts as a deficit (matches computeHealth F1).
+func streamsAtTarget(nodes []adminsock.ClusterNodeStatus) bool {
+	for _, n := range nodes {
+		if n.StreamTarget > 0 && n.StreamActual < n.StreamTarget {
+			return false
+		}
+	}
+	return true
+}
+
+// clusterVerdict renders the B1 plain-language, voter-count-keyed verdict — the AUTHORITATIVE
+// broker-host/socket view (it has the real raft voter count). The ctl-over-NATS path uses a
+// separate reachability-based verdict because it only sees lightweight health replies, never the
+// voter count. F is the literal fault tolerance from ProjectQuorum.
+func clusterVerdict(voters int, streamsOK bool, health string) string {
+	switch {
+	case voters == 0:
+		return ""
+	case voters <= 1:
+		return "1 broker — NO redundancy: if it dies, the cluster stops until restored."
+	case voters == 2:
+		return "2 brokers — NO fault-tolerant writes: losing either makes the cluster read-only (quorum needs both)."
+	case streamsOK && health == healthHealthyHA:
+		f := ProjectQuorum(voters, false).FaultTolerance
+		return fmt.Sprintf("HA active — writes are replicated; the cluster survives %d broker failure(s).", f)
+	default:
+		return "HA configured but DEGRADED right now — see the table; full redundancy is not in place."
+	}
 }
 
 // minStreamActual is the conservative cluster-wide stream actual: the smallest observed
@@ -256,6 +384,16 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 		if n.StreamTarget > 0 && n.StreamActual < n.StreamTarget {
 			degraded = true
 		}
+		// B6 OPS#4 (B5 fold): a self-row with low free disk (<10%) or near-exhausted ports
+		// (>=90% used) is DEGRADED. These are populated ONLY on the self row (a peer carries 0 =
+		// not-set, omitempty), so the >0 guards avoid false-flagging peers. This cannot override
+		// FORCE_SINGLE/QUORUM_LOST (those return BEFORE this loop).
+		if n.DiskFreePct > 0 && n.DiskFreePct < 10 {
+			degraded = true
+		}
+		if n.PortsTotal > 0 && n.PortsUsed*10 >= n.PortsTotal*9 {
+			degraded = true
+		}
 	}
 	proj := ProjectQuorum(voters, false)
 	if proj.FaultTolerance == 0 {
@@ -269,6 +407,28 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 	return healthHealthyHA, "", ""
 }
 
+// certExpiryAdvisory (B5 OPS#7) returns an advisory string when any node's tunnel-cert rotation
+// window is closing (CertValidSecs in (0, window/8] — derived from the actual rotation window, not
+// hardcoded, since a future caller may rotate with a different window). Advisory ONLY — it never
+// changes health/ExitCode. Returns "" when nothing is near expiry.
+func certExpiryAdvisory(nodes []adminsock.ClusterNodeStatus, window time.Duration) string {
+	thresh := int64((window / 8).Seconds())
+	if thresh <= 0 {
+		thresh = 1
+	}
+	var near []string
+	for _, n := range nodes {
+		if n.CertValidSecs > 0 && n.CertValidSecs <= thresh {
+			near = append(near, fmt.Sprintf("%s(%dm)", n.NodeID, n.CertValidSecs/60))
+		}
+	}
+	if len(near) == 0 {
+		return ""
+	}
+	return "ADVISORY: tunnel-cert rotation window closing for " + strings.Join(near, ", ") +
+		" — confirm agents repinned (rotate-tunnel-cert if needed)."
+}
+
 // --- adminsock adapter ---
 
 // clusterAdminBackend adapts ClusterAdmin to adminsock.ClusterAdminBackend. The
@@ -280,13 +440,19 @@ type clusterAdminBackend struct {
 	caughtUp     func(nodeID string, barrier uint64) (bool, error)
 	streamsReady func(nodeID string) (bool, error)
 	drainNotice  time.Duration
+	// B6 OPS#12 export-incident sources (may be nil in tests that don't exercise it):
+	auditTail  func(ctx context.Context, sid string, n int) ([]adminsock.AuditEntry, error)
+	activeSIDs func() ([]string, error)
 }
 
 // NewClusterAdminBackend builds the adminsock adapter. caughtUp/streamsReady may be
 // nil (status/drain/remove/transfer still work; add's catch-up gate uses a
-// leader-applied proxy when caughtUp is nil).
-func NewClusterAdminBackend(admin *ClusterAdmin, caughtUp func(string, uint64) (bool, error), streamsReady func(string) (bool, error)) adminsock.ClusterAdminBackend {
-	return &clusterAdminBackend{admin: admin, caughtUp: caughtUp, streamsReady: streamsReady, drainNotice: 30 * time.Second}
+// leader-applied proxy when caughtUp is nil). auditTail/activeSIDs back export-incident
+// (may be nil → export-incident returns history_unavailable).
+func NewClusterAdminBackend(admin *ClusterAdmin, caughtUp func(string, uint64) (bool, error), streamsReady func(string) (bool, error),
+	auditTail func(context.Context, string, int) ([]adminsock.AuditEntry, error), activeSIDs func() ([]string, error)) adminsock.ClusterAdminBackend {
+	return &clusterAdminBackend{admin: admin, caughtUp: caughtUp, streamsReady: streamsReady, drainNotice: 30 * time.Second,
+		auditTail: auditTail, activeSIDs: activeSIDs}
 }
 
 func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Response {
@@ -294,9 +460,25 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 	if req.Op == adminsock.OpClusterStatus {
 		rep, err := b.admin.StatusReport("ctl-nats")
 		if err != nil {
-			return adminsock.Response{Op: req.Op, Error: err.Error()}
+			// StatusReport only fails on a DB/roster read → a store error (B2 item 4).
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: adminsock.CodeStoreError}
 		}
 		return adminsock.Response{Op: req.Op, OK: true, Cluster: rep}
+	}
+	// B6 OPS#3: an online backup is a read-only paged copy off the RO handle — ANY node serves
+	// it (leader or follower), so it is handled BEFORE the leader-only gate.
+	if req.Op == adminsock.OpClusterBackup {
+		return b.handleBackup(req)
+	}
+	// B7 DOC#2: the ops view is a read-only derive off the replicated roster — any node serves it.
+	if req.Op == adminsock.OpClusterOps {
+		return b.handleClusterOps(req)
+	}
+	// Audit MAJOR: export-incident is a read-only RODB assembler needed EXACTLY during a leaderless
+	// QUORUM_LOST incident (the status card recommends it in that state) — handle it BEFORE the
+	// leader gate so it is available when there is no leader, like status/backup/ops.
+	if req.Op == adminsock.OpExportIncident {
+		return b.handleExportIncident(req)
 	}
 	// Mutating verbs are leader-local (§8.1, NO forwarding): fail fast naming the leader.
 	if !b.admin.node.IsLeader() {
@@ -306,31 +488,35 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 		if leaderID == "" {
 			msg = "no leader (election in progress); retry"
 		}
-		return adminsock.Response{Op: req.Op, NotLeader: true, LeaderHost: host, Error: msg}
+		return adminsock.Response{Op: req.Op, NotLeader: true, LeaderHost: host, Error: msg, Code: adminsock.CodeNotLeader}
 	}
 
 	switch req.Op {
 	case adminsock.OpClusterDrain:
 		return b.handleDrain(req)
 	case adminsock.OpClusterRemove:
-		if err := b.admin.RemoveNode(req.NodeID); err != nil {
-			return adminsock.Response{Op: req.Op, Error: err.Error()}
+		if err := b.admin.RemoveNode(req.NodeID, req.Force); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 		}
 		return adminsock.Response{Op: req.Op, OK: true}
 	case adminsock.OpClusterTransfer:
 		if err := b.admin.TransferLeaderTo(req.NodeID); err != nil {
-			return adminsock.Response{Op: req.Op, Error: err.Error()}
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 		}
 		return adminsock.Response{Op: req.Op, OK: true}
 	case adminsock.OpClusterAdd:
 		return b.handleAdd(req)
 	case adminsock.OpClusterRotateCrt:
 		if err := b.admin.RotateTunnelCert(req.NodeID, req.CertFP, certRotationWindow); err != nil {
-			return adminsock.Response{Op: req.Op, Error: err.Error()}
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 		}
 		return adminsock.Response{Op: req.Op, OK: true}
+	case adminsock.OpClusterAlertRaise:
+		return b.handleAlertRaise(req)
+	case adminsock.OpClusterAlertClear:
+		return b.handleAlertClear(req)
 	default:
-		return adminsock.Response{Op: req.Op, Error: "unknown cluster op: " + req.Op}
+		return adminsock.Response{Op: req.Op, Error: "unknown cluster op: " + req.Op, Code: adminsock.CodeBadRequest}
 	}
 }
 
@@ -378,10 +564,10 @@ func (b *clusterAdminBackend) handleDrain(req adminsock.Request) adminsock.Respo
 	if errors.As(err, &qc) {
 		return adminsock.Response{Op: req.Op, QuorumProj: &adminsock.QuorumProjection{
 			Voters: qc.Proj.Voters, Quorum: qc.Proj.Quorum, FaultTolerance: qc.Proj.FaultTolerance,
-		}, Error: qc.Error()}
+		}, Error: qc.Error(), Code: adminsock.CodeQuorumConfirmRequired}
 	}
 	if err != nil {
-		return adminsock.Response{Op: req.Op, Error: err.Error()}
+		return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 	}
 	return adminsock.Response{Op: req.Op, OK: true}
 }
@@ -400,13 +586,24 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 	// Step 2: token = "<nonce>:<sigHex>". Consume the nonce (single-use) then admit.
 	nonce, sigHex, ok := splitJoinToken(req.JoinToken)
 	if !ok {
-		return adminsock.Response{Op: req.Op, Error: "malformed --join-token (want <nonce>:<sigHex>)"}
+		return adminsock.Response{Op: req.Op, Error: "malformed --join-token (want <nonce>:<sigHex>)", Code: adminsock.CodeBadRequest}
+	}
+	// Audit SEC-MAJOR-1: validate the node_id charset fail-closed BEFORE it is persisted into the
+	// roster / rendered into operator command lines (a shell-metachar/newline/path-separator id has
+	// no legitimate use and would be echoed verbatim by status/apply/guided output).
+	if err := proto.ValidateClusterNodeID(req.NodeID); err != nil {
+		return adminsock.Response{Op: req.Op, Error: "invalid node_id: " + err.Error(), Code: adminsock.CodeBadRequest}
+	}
+	// B6 A3 version-skew gate — BEFORE claimJoinNonce so a rejected joiner does not burn the
+	// single-use nonce.
+	if resp, reject := b.versionSkewResponse(req); reject {
+		return resp
 	}
 	// audit membership F2: ATOMICALLY claim the nonce (check + mark in-flight under one lock) so
 	// two concurrent `cluster add` step-2 calls with the same token cannot both proceed. Released
 	// below on AddNode failure so a retry can re-claim with the SAME token (review M9 property).
 	if !b.admin.claimJoinNonce(nonce) {
-		return adminsock.Response{Op: req.Op, Error: "unknown, already-used, or in-flight nonce; re-run `cluster add` (no token) for a fresh one"}
+		return adminsock.Response{Op: req.Op, Error: "unknown, already-used, or in-flight nonce; re-run `cluster add` (no token) for a fresh one", Code: adminsock.CodeNonceUsed}
 	}
 	// D9 round-1 BLOCKER: thread the joiner's full expose-home identity (else an added voter
 	// has empty nats_server_id/tunnel_addr/cert_fp → resolveHomeForAgent can never home an
@@ -433,10 +630,34 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 	}
 	if err := b.admin.AddNode(in, req.Host, caughtUp, 0); err != nil {
 		b.admin.releaseJoinNonce(nonce) // release on failure so the operator can retry the same token
-		return adminsock.Response{Op: req.Op, Error: err.Error()}
+		return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 	}
 	// success: the nonce stays claimed (single-use) — no separate consume needed.
 	return adminsock.Response{Op: req.Op, OK: true}
+}
+
+// versionSkewResponse is the B6 A3 gate (extracted so the ALLOW paths are unit-testable without a
+// live raft node). Proto mismatch is the ONLY hard reject (a different proto cannot speak the
+// wire). Release skew is advisory: a rolling upgrade runs followers-first, so the leader is
+// transiently OLDER than the joiner, and a re-joining drained node may be older than the
+// now-upgraded leader during rollback — rejecting on release would brick exactly the rolling
+// upgrade this gate exists to enable. A joiner that did not declare its proto (0, an older
+// `cluster add`) is allowed with a warning — the join-PoP + the real connection remain the
+// authoritative protections; this is a friendly early check, not the only gate.
+func (b *clusterAdminBackend) versionSkewResponse(req adminsock.Request) (adminsock.Response, bool) {
+	if req.JoinerProto != 0 && req.JoinerProto != proto.ProtoVersion {
+		return adminsock.Response{Op: req.Op, Code: adminsock.CodeVersionSkew,
+			Error: fmt.Sprintf("version skew: joiner speaks proto v%d but this cluster is proto v%d — reinstall the joiner on a matching release before adding it",
+				req.JoinerProto, proto.ProtoVersion)}, true
+	}
+	if req.JoinerProto == 0 {
+		b.admin.logger.Warn("cluster add: joiner did not declare its proto version (older `cluster add`?); cannot pre-verify compatibility", "node_id", req.NodeID)
+	}
+	if req.JoinerRelease != "" && req.JoinerRelease != proto.ReleaseVersion {
+		b.admin.logger.Warn("cluster add: joiner release differs from this node (allowed — rolling upgrades mix releases)",
+			"node_id", req.NodeID, "joiner_release", req.JoinerRelease, "this_release", proto.ReleaseVersion)
+	}
+	return adminsock.Response{}, false
 }
 
 // splitJoinToken parses "<nonce>:<sigHex>" (the `cluster sign-join` output).

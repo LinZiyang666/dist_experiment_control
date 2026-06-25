@@ -24,6 +24,11 @@ type ClusterHealthResp struct {
 	// does not cleanly expose per-peer cursors/liveness, so each broker self-reports here.
 	NodeID       string `json:"node_id,omitempty"`
 	AppliedIndex uint64 `json:"applied_index"`
+	// B6 OPS#4: each broker self-reports its running version so `cluster status` renders a VER
+	// column (a live self-report — no persisted column that goes stale on upgrade). Additive
+	// omitempty: an older broker omits them; the renderer shows "?".
+	ReleaseVersion string `json:"release_version,omitempty"`
+	ProtoVer       int    `json:"proto_ver,omitempty"`
 }
 
 // AlertView is one ACTIVE alert as rendered for the banner / `alert ls` (§10.1/§10.3).

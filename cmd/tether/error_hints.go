@@ -53,27 +53,79 @@ var brokerCodeHints = map[string]string{
 	// Storage / generic
 	"store_error": "the broker hit a SQLite error; check the broker log.",
 	"json_parse":  "the broker couldn't parse our request; this is a tether bug — please report.",
+	// Cluster transient states (B1 item 6). All three are FAILOVER/transient artifacts — nothing
+	// the user did wrong, just wait and retry. NOTE: as of today NONE of these reaches a ctl
+	// reply: home_catching_up + try_again are returned from tunnelTokenLookup (the AGENT's tunnel
+	// REGISTER DENY path, which the agent auto-retries — see internal/broker/expose.go), and
+	// leader_unavailable is consumed by the agent's register loop. These entries are defensive
+	// future-proofing — so that IF a ctl path ever carries one, the user sees a sentence instead
+	// of a raw token — and a friendly gloss for anyone reading broker logs.
+	"home_catching_up":   "the broker that hosts this expose is briefly catching up after a failover; this is transient — wait a few seconds and retry.",
+	"leader_unavailable": "the broker cluster is electing a new leader (a routine failover); this is transient — wait a few seconds and retry.",
+	"try_again":          "the broker hit a transient storage hiccup (not a permanent failure); wait a moment and retry.",
+}
+
+// brokerCodeExitClasses maps a broker-reply Code to a process exit class (B2 item 3). Only codes
+// the CLI commands actually surface are listed; an unmapped code falls through to exitInternal
+// (70 = "a fault tether could not classify"). The classes are reviewed against the hint semantics:
+// permission/ownership -> 77; positively self-healing transients -> 75; operator-action-required
+// (a human must free a port / start an agent, NOT blind-retry) -> 64; our-bug/version-skew -> 70.
+var brokerCodeExitClasses = map[string]int{
+	// permission / ownership / membership
+	"not_owner": exitNoPerm, "not_owner_or_creator": exitNoPerm, "not_a_member": exitNoPerm,
+	// positively transient (self-healing) -> retry-later
+	"agent_no_responders": exitTransient, "leader_unavailable": exitTransient,
+	"home_catching_up": exitTransient, "try_again": exitTransient,
+	// operator-action-required (NOT blind-retry) -> usage
+	"node_offline": exitUsage, "node_not_found": exitUsage, "port_exhausted": exitUsage,
+	"name_taken": exitUsage, "port_taken": exitUsage, "port_out_of_band": exitUsage,
+	"local_port_invalid": exitUsage, "url_not_allowed": exitUsage, "url_not_allowed_local": exitUsage,
+	"sha256_invalid": exitUsage, "sha256_mismatch": exitUsage,
+	"session_not_found": exitUsage, "session_not_found_or_deleting": exitUsage,
+	// our bug / version skew -> internal
+	"agent_malformed_resp": exitInternal, "json_parse": exitInternal,
+	"proto_bump_requires_reinstall": exitInternal, "store_error": exitInternal,
+	// adminsock cluster codes (Item 4 sets these on the wire; the CLI maps them here)
+	"not_leader": exitNoPerm, "already_voter": exitUsage, "not_a_voter": exitUsage,
+	"catch_up_stalled": exitTransient, "quorum_confirm_required": exitUsage, "nonce_used": exitUsage,
+	// External-review F11: bad_request is operator input (backup dir exists, malformed args, bad
+	// --since) — exit 64 (usage), NOT 70. 70 is reserved for genuine internal failures.
+	"cluster_not_enabled": exitUsage, "node_unknown": exitUsage, "bad_request": exitUsage,
+	"remove_owns_resources": exitUsage, // B3 item 7: operator-actionable (drain --retire or --force)
+	"version_skew":          exitUsage, // B6 A3: reinstall the joiner on a matching release
+}
+
+// brokerCodeExitClass returns the exit class for a broker code (default exitInternal=70).
+func brokerCodeExitClass(code string) int {
+	if c, ok := brokerCodeExitClasses[code]; ok {
+		return c
+	}
+	return exitInternal
 }
 
 // brokerErrorMessage formats a broker-rejected reply as one
 // human-friendly line: "<verb> failed: <code-hint or fallback>
 // (<raw-code>: <raw-error>)". The raw pair is preserved in
 // parens so logs / bug reports can still grep the architecture-
-// stable codes.
+// stable codes. B2: the returned error is an *ExitError carrying the
+// code's exit class — the HUMAN STRING is byte-identical to before.
 func brokerErrorMessage(verb, code, errMsg string) error {
+	lookup := code
 	hint := brokerCodeHints[code]
 	if hint == "" {
 		// Some agent-rejected codes arrive prefixed:
 		// "agent_rejected:install_failed". Strip the wrapper
 		// before lookup so the underlying code can still match.
 		if rest, ok := stripPrefix(code, "agent_rejected:"); ok {
+			lookup = rest
 			hint = brokerCodeHints[rest]
 		}
 	}
-	if hint == "" {
-		return fmt.Errorf("%s failed: %s (%s)", verb, errMsg, code)
+	msg := errMsg
+	if hint != "" {
+		msg = hint
 	}
-	return fmt.Errorf("%s failed: %s (%s)", verb, hint, code)
+	return &ExitError{Class: brokerCodeExitClass(lookup), Err: fmt.Errorf("%s failed: %s (%s)", verb, msg, code)}
 }
 
 // connectError wraps a NATS connect failure with what the operator
@@ -87,7 +139,8 @@ func brokerErrorMessage(verb, code, errMsg string) error {
 // so the operator stops debugging the wrong layer.
 func connectError(verb, natsURL string, err error) error {
 	if err != nil && strings.Contains(err.Error(), "Authorization Violation") {
-		return fmt.Errorf("%s: broker auth_callout rejected the connection: %w\n"+
+		// auth_callout rejection is a PERMISSION problem (77), not unreachability.
+		return permErr("%s: broker auth_callout rejected the connection: %w\n"+
 			"  this is NOT a network problem. Check:\n"+
 			"    - session exists and is ACTIVE     (run `tether session ls`)\n"+
 			"    - you are a member of that session (run `tether login -s <sid> --pin <pin>` if first time)\n"+
@@ -95,7 +148,7 @@ func connectError(verb, natsURL string, err error) error {
 			"    - your nkey hasn't been evicted    (ask broker admin to check `tether admin sessions`)",
 			verb, err)
 	}
-	return fmt.Errorf("%s: cannot reach broker at %s: %w (verify the broker is running and --nats-url is correct)",
+	return unavailErr("%s: cannot reach broker at %s: %w (verify the broker is running and --nats-url is correct)",
 		verb, natsURL, err)
 }
 

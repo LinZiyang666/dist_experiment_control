@@ -31,6 +31,17 @@ type BrokerSection struct {
 	Storage    StorageSection `yaml:"storage"`
 	Upgrade    UpgradeSection `yaml:"upgrade"`
 	Cluster    ClusterSection `yaml:"cluster"`
+	Obs        ObsSection     `yaml:"observability"`
+}
+
+// ObsSection (B5/B6) mirrors broker.observability: the declarative form of the
+// --log-level/--log-json/--metrics-listen flags + the B6 alert webhook URL. Every key
+// absent ⇒ today's defaults (info / text / no metrics / no webhook) — byte-equivalent.
+type ObsSection struct {
+	LogLevel        string `yaml:"log_level"`         // debug | info | warn | error
+	LogJSON         bool   `yaml:"log_json"`          // structured JSON logs
+	MetricsListen   string `yaml:"metrics_listen"`    // Prometheus /metrics addr; empty disables
+	AlertWebhookURL string `yaml:"alert_webhook_url"` // B6 OPS#2 alert webhook (http/https); empty disables
 }
 
 // ClusterSection mirrors broker.cluster — the D9 cutover surface. It carries

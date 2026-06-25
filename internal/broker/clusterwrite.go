@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -189,7 +190,8 @@ func (b *Broker) loadStableTunnelCert() (*tls.Certificate, string, error) {
 }
 
 func (b *Broker) prepareTunnelCertRotate(newFP string) (func(), error) {
-	if b.tunnelSrv == nil {
+	srv := b.tunnelSrv.Load()
+	if srv == nil {
 		return nil, fmt.Errorf("live tunnel server is not running on this broker")
 	}
 	cert, gotFP, err := b.loadStableTunnelCert()
@@ -201,7 +203,7 @@ func (b *Broker) prepareTunnelCertRotate(newFP string) (func(), error) {
 	}
 	return func() {
 		b.tunnelCert = cert
-		b.tunnelSrv.SetCertificate(cert)
+		srv.SetCertificate(cert)
 	}, nil
 }
 
@@ -280,9 +282,30 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 			return session.IsActive(b.cfg.DB, sid)
 		},
 	})
+	// B6 OPS#2: an alert webhook poster, iff a URL is configured. A bad URL fails wiring loudly
+	// (the operator set it on purpose). Off-by-default: unset URL → nil poster → nil Webhook seam.
+	var webhookPost func(WebhookEvent)
+	var poster *webhookPoster
+	if b.cfg.AlertWebhookURL != "" {
+		p, werr := newWebhookPoster(b.cfg.AlertWebhookURL, b.cfg.Logger)
+		if werr != nil {
+			return fmt.Errorf("alert webhook: %w", werr)
+		}
+		poster = p
+		webhookPost = p.Post
+	}
+	// B6 OPS#4: wrap Observe so each reconciler tick also refreshes the cached stream replica
+	// posture for the /metrics gauge (no extra JS call — reuses the report the reconciler fetches).
+	observeAndCache := func(ctx context.Context) (ReplicaReport, error) {
+		rep, err := pub.ObserveReplicas(ctx)
+		if err == nil {
+			b.cacheReplicaSnapshot(rep)
+		}
+		return rep, err
+	}
 	rec := NewAlertReconciler(AlertReconcilerConfig{
 		Node: node, DB: b.cfg.DB, Propose: node.Propose, Now: b.cfg.Now, Logger: b.cfg.Logger,
-		Observe: pub.ObserveReplicas,
+		Observe: observeAndCache, Webhook: webhookPost, LeaderID: func() string { _, id := node.LeaderWithID(); return id },
 	})
 	b.cl.auditPub = pub
 	b.cl.alertRec = rec
@@ -290,6 +313,14 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// socket (the adminsock backend, wired later in Run, uses it iff the socket is set).
 	b.cl.admin = NewClusterAdmin(node, b.cfg.Logger)
 	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
+	// B5 OPS#9: self-row capacity probes (disk statfs + port band) for `cluster status`.
+	b.cl.admin.SetCapacityProbes(b.cfg.StoreDir, b.cfg.PortBandLow, b.cfg.PortBandHigh)
+	// B7 DOC#5: emit an `expose_rehomed` observability event when a drain migrates an expose.
+	b.cl.admin.onRehome = func(p int, name, sid, fromBroker, toBroker string) {
+		b.pubSysEvent("expose_rehomed", map[string]any{
+			"port": p, "name": name, "sid": sid, "from_broker": fromBroker, "to_broker": toBroker,
+		})
+	}
 	// §17 row 3: give the admin the broker-only cursor scatter-gather so `cluster status`
 	// reports REAL per-peer reachability + applied-lag (not a blanket self-report).
 	b.cl.admin.healthPoll = func() map[string]proto.ClusterHealthResp {
@@ -306,11 +337,19 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// shutdown still stops them.)
 	loopCtx, cancel := context.WithCancel(ctx)
 	b.cl.cancel = cancel
-	b.cl.loopDone = make(chan struct{}, 3)
+	// cap 4 when a webhook poster joins the ordered shutdown, else 3 (pub/rec/observe).
+	loopCount := 3
+	if poster != nil {
+		loopCount = 4
+	}
+	b.cl.loopDone = make(chan struct{}, loopCount)
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); pub.Run(loopCtx) }()
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); rec.Run(loopCtx) }()
 	// D9 §17 step 10b: the leader-gated observability poll (broker_down / raft_lag).
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); b.runObserveLoop(loopCtx) }()
+	if poster != nil {
+		go func() { defer func() { b.cl.loopDone <- struct{}{} }(); poster.Run(loopCtx) }()
+	}
 	return nil
 }
 
@@ -412,18 +451,44 @@ func (b *Broker) createSession(sid, fp, pinHash string) (*session.Session, error
 // only runs on the leader (a stray non-leader call falls through to Propose's raft.ErrNotLeader,
 // a benign election-race). The home is stamped AT allocate (PlanAllocate's homeBroker), so
 // homeForExpose only READS the epoch.
-func (b *Broker) allocatePort(sid, nid, name string, localPort, remotePort int, fp string) (*port.Allocation, error) {
+func (b *Broker) allocatePort(sid, nid, name string, localPort, remotePort int, rebuildOff bool, onBroker, fp string) (*port.Allocation, error) {
 	cfg := b.cfg.PortAllocCfg()
 	if !b.clusterMode {
-		return port.Allocate(b.cfg.DB, sid, nid, name, localPort, remotePort, fp, cfg)
+		// B4 --on-broker is cluster-only: a single broker has no roster to pin to. Reject
+		// BEFORE the write. --no-rebuild is accepted (inert here — it writes rebuild_on_failure=0,
+		// honest metadata a future `cluster init --from-existing` would carry forward).
+		if onBroker != "" {
+			return nil, errOnBrokerSingleMode
+		}
+		return port.Allocate(b.cfg.DB, sid, nid, name, localPort, remotePort, fp, rebuildOff, cfg)
 	}
+	// B4 --on-broker: validate the named node against the live roster with the SAME predicate
+	// homeForExpose uses at delivery (Eligible()==VOTER && CertFP != ""), so no arbitrary string
+	// reaches port_allocations.home_broker and a draining/non-voter/uncert-pinned target is
+	// refused. Resolved on b.cfg.DB (= RODB in cluster mode) BEFORE Propose, exactly like the
+	// default resolveHomeForAgent path below — a rejection returns before any raft append.
 	homeBroker := ""
-	if home := b.resolveHomeForAgent(sid, nid); home != nil {
+	if onBroker != "" {
+		home, err := clusternodes.LookupByNodeID(b.cfg.DB, onBroker)
+		if err != nil || !home.Eligible() || home.CertFP == "" {
+			return nil, errOnBrokerUnknown
+		}
+		// D1 (Stage-C): also reject a node mid-drain. DrainNode raises the broker_draining marker
+		// (step 1) BEFORE flipping phase->DRAINING (step 3), so during that window Eligible()
+		// (phase==VOTER) alone would accept a draining target — and step-2 migrateExposes has
+		// already run, so a fresh pin there strands the expose. The marker is the authoritative
+		// "do not place here" signal (same predicate the reconciler uses). Fail closed: a read
+		// error also rejects rather than risk pinning onto a draining node.
+		if draining, derr := cluster.DrainingNodes(b.cfg.DB); derr != nil || slices.Contains(draining, onBroker) {
+			return nil, errOnBrokerUnknown
+		}
+		homeBroker = onBroker
+	} else if home := b.resolveHomeForAgent(sid, nid); home != nil {
 		homeBroker = home.NodeID
 	}
 	var captured *port.Allocation
 	if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		a, cmd, e := port.PlanAllocate(db, sid, nid, name, localPort, remotePort, fp, homeBroker, cfg)
+		a, cmd, e := port.PlanAllocate(db, sid, nid, name, localPort, remotePort, fp, homeBroker, rebuildOff, cfg)
 		if e != nil {
 			return nil, e
 		}
@@ -504,10 +569,11 @@ func allocationSessionInfo(a port.Allocation) tunnel.SessionInfo {
 }
 
 func (b *Broker) closeTunnelProxyLocal(info tunnel.SessionInfo) {
-	if b.tunnelSrv == nil || info.PublicPort <= 0 {
+	srv := b.tunnelSrv.Load()
+	if srv == nil || info.PublicPort <= 0 {
 		return
 	}
-	if ok := b.tunnelSrv.CloseProxyIf(info); ok {
+	if ok := srv.CloseProxyIf(info); ok {
 		b.cfg.Logger.Info("broker: tunnel proxy closed", "port", info.PublicPort, "sid", info.SID, "nid", info.NID)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -39,6 +40,7 @@ func newPsCmd() *cobra.Command {
 		natsURL string
 		home    string
 		showAll bool
+		asJSON  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "ps",
@@ -104,8 +106,30 @@ EXITED processes. Architecture F.8 — unified view.`,
 				return brokerErrorMessage("ps", resp.Code, resp.Error)
 			}
 
-			now := time.Now()
 			out := cmd.OutOrStdout()
+			if asJSON {
+				// Honor -a/showAll exactly as text (RUNNING/LOST by default, +EXITED with -a;
+				// ALLOCATED ports by default). --json changes rendering, not selection.
+				procs := make([]proto.PsEntry, 0, len(resp.Processes))
+				for _, p := range resp.Processes {
+					if showAll || p.Status == "RUNNING" || p.Status == "LOST" {
+						procs = append(procs, p)
+					}
+				}
+				ports := make([]proto.PsPortEntry, 0, len(resp.Ports))
+				for _, p := range resp.Ports {
+					if showAll || p.State == "ALLOCATED" {
+						ports = append(ports, p)
+					}
+				}
+				if err := emitJSON(out, psJSON{Schema: "ps", SchemaVersion: 1, Processes: normSlice(procs), Ports: normSlice(ports)}); err != nil {
+					return err
+				}
+				withBanner(nc, id.PublicKey, true) // suppressed under --json
+				return nil
+			}
+
+			now := time.Now()
 
 			_, _ = fmt.Fprintln(out, "PROCESSES")
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -135,34 +159,73 @@ EXITED processes. Architecture F.8 — unified view.`,
 				return err
 			}
 
-			_, _ = fmt.Fprintln(out, "\nPORTS")
-			tw2 := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw2, "  NAME\tNODE\tLOCAL\tPUBLIC\tSTATE\tCREATED")
-			anyPort := false
-			for _, p := range resp.Ports {
-				if p.State != "ALLOCATED" && !showAll {
-					continue
-				}
-				anyPort = true
-				_, _ = fmt.Fprintf(tw2, "  %s\t%s\t:%d\t:%d\t%s\t%s\n",
-					p.Name, p.NID, p.LocalPort, p.Port, p.State,
-					humanizeAgo(now, p.CreatedAt))
-			}
-			if !anyPort {
-				_, _ = fmt.Fprintln(tw2, "  (none)")
-			}
-			if err := tw2.Flush(); err != nil {
+			if err := renderPortsTable(out, resp.Ports, showAll, now); err != nil {
 				return err
 			}
 			withBanner(nc, id.PublicKey, false) // D8b §10.3: severe-alert banner to stderr (stdout stays parseable)
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().BoolVarP(&showAll, "all", "a", false,
 		"include EXITED processes (default: active only — RUNNING + LOST)")
 	return cmd
+}
+
+// renderPortsTable renders the PORTS section of `tether ps`. B4: a HOME column appears ONLY when
+// some shown port carries a home (cluster mode); a single broker leaves every HomeBroker empty so
+// the table is byte-identical to pre-B4 (scripts parsing the columns are unaffected). Extracted
+// so the byte-stability is golden-testable without the full NATS RunE.
+func renderPortsTable(out io.Writer, ports []proto.PsPortEntry, showAll bool, now time.Time) error {
+	showHome := false
+	for _, p := range ports {
+		if (p.State == "ALLOCATED" || showAll) && p.HomeBroker != "" {
+			showHome = true
+			break
+		}
+	}
+	_, _ = fmt.Fprintln(out, "\nPORTS")
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if showHome {
+		_, _ = fmt.Fprintln(tw, "  NAME\tNODE\tLOCAL\tPUBLIC\tSTATE\tHOME\tCREATED")
+	} else {
+		_, _ = fmt.Fprintln(tw, "  NAME\tNODE\tLOCAL\tPUBLIC\tSTATE\tCREATED")
+	}
+	anyPort := false
+	for _, p := range ports {
+		if p.State != "ALLOCATED" && !showAll {
+			continue
+		}
+		anyPort = true
+		if showHome {
+			_, _ = fmt.Fprintf(tw, "  %s\t%s\t:%d\t:%d\t%s\t%s\t%s\n",
+				p.Name, p.NID, p.LocalPort, p.Port, p.State,
+				psHomeCell(p), humanizeAgo(now, p.CreatedAt))
+		} else {
+			_, _ = fmt.Fprintf(tw, "  %s\t%s\t:%d\t:%d\t%s\t%s\n",
+				p.Name, p.NID, p.LocalPort, p.Port, p.State,
+				humanizeAgo(now, p.CreatedAt))
+		}
+	}
+	if !anyPort {
+		_, _ = fmt.Fprintln(tw, "  (none)")
+	}
+	return tw.Flush()
+}
+
+// psHomeCell renders the HOME column for one port (B4). Un-homed rows show "-"; a homed row
+// shows the broker, and "(moved)" once it has failed over (epoch>0). The raw epoch stays out of
+// the human table — it is available in `--json` and `expose explain`.
+func psHomeCell(p proto.PsPortEntry) string {
+	if p.HomeBroker == "" {
+		return "-"
+	}
+	if p.Epoch > 0 {
+		return p.HomeBroker + " (moved)"
+	}
+	return p.HomeBroker
 }
 
 func humanizeAgo(now, then time.Time) string {

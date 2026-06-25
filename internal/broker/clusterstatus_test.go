@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -113,6 +114,110 @@ func TestD7RetireLastVoterHardRefused(t *testing.T) {
 	}
 }
 
+// TestB1ClusterVerdict pins the plain-language voter-count verdict (the authoritative socket view).
+// TestB2ClusterCodeFor (B2 item 4): the broker recognizes its OWN (D7-pinned) cluster error
+// substrings into a stable machine Code; an unrecognized error yields "" (→ CLI exit 70).
+func TestB2ClusterCodeFor(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"cluster add x: catch_up_stalled after 5s (barrier=3)", adminsock.CodeCatchUpStalled},
+		{"transfer-leader: ghost is not in the raft configuration", adminsock.CodeNotAVoter},
+		{"transfer-leader: x is not a voter (cannot be leader)", adminsock.CodeNotAVoter},
+		{"cannot retire the last voter", adminsock.CodeNotAVoter},
+		{(&ErrRemoveOwnsResources{NodeID: "x", Exposes: 2}).Error(), adminsock.CodeRemoveOwnsResources}, // B3 item 7
+		{"some random store failure", ""},
+	}
+	for _, c := range cases {
+		if got := clusterCodeFor(errors.New(c.in)); got != c.want {
+			t.Errorf("clusterCodeFor(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if clusterCodeFor(nil) != "" {
+		t.Error("clusterCodeFor(nil) must be \"\"")
+	}
+	// The authored literal "still HOMES" must be in the error (clusterCodeFor + D7 pin key on it).
+	if !strings.Contains((&ErrRemoveOwnsResources{NodeID: "x", Exposes: 1}).Error(), "still HOMES") {
+		t.Error("ErrRemoveOwnsResources must contain the authored 'still HOMES' literal")
+	}
+}
+
+func TestB1ClusterVerdict(t *testing.T) {
+	cases := []struct {
+		voters   int
+		streamOK bool
+		health   string
+		wantSub  string // "" = empty verdict
+	}{
+		{0, true, healthHealthyHA, ""},
+		{1, true, healthDegraded, "NO redundancy"},
+		{2, true, healthDegraded, "NO fault-tolerant writes"},
+		{2, true, healthHealthyHA, "NO fault-tolerant writes"}, // voters==2 branch wins over health (precedence)
+		{3, true, healthHealthyHA, "survives 1 broker failure"},
+		{4, true, healthHealthyHA, "survives 1 broker failure"}, // even voter: quorum 3, F=1
+		{5, true, healthHealthyHA, "survives 2 broker failure"},
+		{3, false, healthHealthyHA, "DEGRADED right now"}, // streams below target
+		{3, true, healthDegraded, "DEGRADED right now"},   // health not HEALTHY_HA
+	}
+	for _, c := range cases {
+		got := clusterVerdict(c.voters, c.streamOK, c.health)
+		if c.wantSub == "" {
+			if got != "" {
+				t.Errorf("clusterVerdict(%d,%v,%s) = %q, want empty", c.voters, c.streamOK, c.health, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.wantSub) {
+			t.Errorf("clusterVerdict(%d,%v,%s) = %q, want substring %q", c.voters, c.streamOK, c.health, got, c.wantSub)
+		}
+	}
+}
+
+func TestB1StreamsAtTarget(t *testing.T) {
+	cases := []struct {
+		name  string
+		nodes []adminsock.ClusterNodeStatus
+		want  bool
+	}{
+		{"empty", nil, true},
+		{"at target", []adminsock.ClusterNodeStatus{{StreamTarget: 3, StreamActual: 3}}, true},
+		{"below target", []adminsock.ClusterNodeStatus{{StreamTarget: 3, StreamActual: 1}}, false},
+		{"target 0 ignored", []adminsock.ClusterNodeStatus{{StreamTarget: 0, StreamActual: 0}}, true},
+		{"one below among many", []adminsock.ClusterNodeStatus{{StreamTarget: 3, StreamActual: 3}, {StreamTarget: 3, StreamActual: 2}}, false},
+	}
+	for _, c := range cases {
+		if got := streamsAtTarget(c.nodes); got != c.want {
+			t.Errorf("%s: streamsAtTarget = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestB1IsLeaderViewSerializes: is_leader_view=false MUST serialize (a monitor needs the
+// non-leader signal); view_host/verdict use omitempty; schema_version stays 1; and a v1-shaped
+// payload (no new keys) still unmarshals cleanly (forward-compat).
+func TestB1IsLeaderViewSerializes(t *testing.T) {
+	b, err := json.Marshal(adminsock.ClusterStatusReport{SchemaVersion: 1, IsLeaderView: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(b)
+	if !strings.Contains(js, `"is_leader_view":false`) {
+		t.Errorf("is_leader_view=false must serialize (no omitempty): %s", js)
+	}
+	if strings.Contains(js, "view_host") || strings.Contains(js, "verdict") {
+		t.Errorf("empty view_host/verdict must be omitted: %s", js)
+	}
+	if !strings.Contains(js, `"schema_version":1`) {
+		t.Errorf("schema_version must stay 1: %s", js)
+	}
+	// Forward-compat: a v1 payload without the new keys unmarshals with zero values, no error.
+	var rep adminsock.ClusterStatusReport
+	if err := json.Unmarshal([]byte(`{"schema_version":1,"view":"ctl-nats","health":"HEALTHY_HA","nodes":[]}`), &rep); err != nil {
+		t.Fatalf("v1-shaped payload must unmarshal: %v", err)
+	}
+	if rep.IsLeaderView || rep.ViewHost != "" || rep.Verdict != "" {
+		t.Errorf("missing new keys must zero-value, got %+v", rep)
+	}
+}
+
 func TestD7StatusReportRendersRoleAndHealth(t *testing.T) {
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
@@ -141,5 +246,15 @@ func TestD7StatusReportRendersRoleAndHealth(t *testing.T) {
 	// N=1 is never HA.
 	if rep.Health != healthDegraded || rep.ExitCode != 1 {
 		t.Fatalf("N=1 health = %s exit=%d, want DEGRADED/1", rep.Health, rep.ExitCode)
+	}
+	// B1: the report is stamped as this node's (leader) view, with the N=1 plain-language verdict.
+	if rep.ViewHost != "single-1" {
+		t.Errorf("ViewHost = %q, want single-1", rep.ViewHost)
+	}
+	if !rep.IsLeaderView {
+		t.Error("a single-node leader must report IsLeaderView=true")
+	}
+	if !strings.Contains(rep.Verdict, "NO redundancy") {
+		t.Errorf("N=1 verdict = %q, want 'NO redundancy'", rep.Verdict)
 	}
 }

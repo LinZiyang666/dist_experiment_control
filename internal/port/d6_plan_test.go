@@ -15,7 +15,7 @@ import (
 func TestD6PlanAllocateInertHome(t *testing.T) {
 	db := openDB(t)
 
-	_, cmd, err := PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", "", tinyBand())
+	_, cmd, err := PlanAllocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", "", false, tinyBand())
 	if err != nil {
 		t.Fatalf("plan allocate (no home): %v", err)
 	}
@@ -31,7 +31,7 @@ func TestD6PlanAllocateInertHome(t *testing.T) {
 	}
 
 	db2 := openDB(t)
-	_, cmd2, err := PlanAllocate(db2, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", "node-2", tinyBand())
+	_, cmd2, err := PlanAllocate(db2, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", "node-2", false, tinyBand())
 	if err != nil {
 		t.Fatalf("plan allocate (home): %v", err)
 	}
@@ -56,7 +56,7 @@ func TestD6ReassignHomeMonotonic(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")
 	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
-	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", tinyBand())
+	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
@@ -117,14 +117,14 @@ func TestD6ReassignHomeSelectsActiveReusedPort(t *testing.T) {
 	seedSessionAndNode(t, db, "lab", "lab-1")
 	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
 
-	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate first: %v", err)
 	}
 	if err := Free(db, first.Port, now); err != nil {
 		t.Fatalf("free first: %v", err)
 	}
-	second, err := Allocate(db, "lab", "lab-1", "new", 9999, 0, "SHA256:a", tinyBand())
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate second: %v", err)
 	}
@@ -162,14 +162,14 @@ func TestD9PlanAllocationStateChangeFencesPortReuse(t *testing.T) {
 	seedSessionAndNode(t, db, "lab", "lab-1")
 	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
 
-	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate first: %v", err)
 	}
 	if err := FreeAllocation(db, *first, now); err != nil {
 		t.Fatalf("free first: %v", err)
 	}
-	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", tinyBand())
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("reuse port: %v", err)
 	}
@@ -204,14 +204,14 @@ func TestD9PlanRevokeAllocationUpdatesOnlySelectedRow(t *testing.T) {
 	seedSessionAndNode(t, db, "lab", "lab-1")
 	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
 
-	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", tinyBand())
+	first, err := Allocate(db, "lab", "lab-1", "old", 8888, 0, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("allocate first: %v", err)
 	}
 	if err := FreeAllocation(db, *first, now); err != nil {
 		t.Fatalf("free first: %v", err)
 	}
-	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", tinyBand())
+	second, err := Allocate(db, "lab", "lab-1", "new", 9999, first.Port, "SHA256:a", false, tinyBand())
 	if err != nil {
 		t.Fatalf("reuse port: %v", err)
 	}

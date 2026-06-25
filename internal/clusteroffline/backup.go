@@ -1,0 +1,185 @@
+package clusteroffline
+
+// backup.go — the B6 `cluster backup --offline` path (OPS#3). It produces a self-describing
+// bundle directory { state.db, manifest.json } off a daemon-STOPPED on-disk DB. The ONLINE
+// path (a live cluster node) goes through adminsock → Node.BackupDBTo instead; this offline
+// path is for a stopped daemon (and is the non-cluster byte-equivalence path: a single broker
+// backs up as "the SQLite file + a single-broker manifest", no raft involved).
+//
+// A backup is read-only and can never corrupt durable state, but it still refuses to run while
+// a daemon is live (the live DB may be mid-transaction; the supported way to back up a RUNNING
+// cluster is the online path). The manifest is built from the COPY (the bundle's own state.db),
+// so manifest.applied_index is exactly the bundle's committed cursor.
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/storage"
+)
+
+// BackupOptions configures an offline backup.
+type BackupOptions struct {
+	DataDir    string // for the raft.db live-daemon probe (may have no raft/ for a single broker)
+	DBPath     string // the on-disk tether.db to back up
+	SecretsDir string // optional; enables the advisory account_fp (sha256 cluster-ca.pem)
+	OutDir     string // the bundle directory to CREATE (must not already exist)
+	Now        func() time.Time
+	Logger     *slog.Logger
+}
+
+// BackupResult summarizes a completed backup.
+type BackupResult struct {
+	BundleDir    string
+	StateDBBytes int64
+	Mode         ManifestMode
+	SelfID       string
+	AppliedIndex uint64
+}
+
+// OfflineBackup writes a { state.db, manifest.json } bundle. Steps: refuse if a daemon is live
+// → create the bundle dir (O_EXCL) → paged read-only backup into state.db → verify it →
+// build the manifest from the copy → write manifest. Any failure removes the half-written
+// bundle dir so a retry starts clean.
+func OfflineBackup(opts BackupOptions) (result *BackupResult, err error) {
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.DBPath == "" || opts.OutDir == "" {
+		return nil, fmt.Errorf("clusteroffline: OfflineBackup requires DBPath and OutDir")
+	}
+	if _, statErr := os.Stat(opts.DBPath); statErr != nil {
+		return nil, fmt.Errorf("clusteroffline: source DB %q not found: %w", opts.DBPath, statErr)
+	}
+
+	// (1) live-daemon interlock — refuse a backup while the DB may be written.
+	dataDir := opts.DataDir
+	if dataDir == "" {
+		dataDir = filepath.Dir(opts.DBPath)
+	}
+	if err := checkNoLiveDaemon(dataDir, opts.DBPath); err != nil {
+		return nil, err
+	}
+
+	// (2) create the bundle dir with O_EXCL semantics (os.Mkdir fails if it exists), so a
+	// backup never clobbers an existing bundle. Clean it up on any later failure.
+	if err := os.MkdirAll(filepath.Dir(opts.OutDir), 0o700); err != nil {
+		return nil, fmt.Errorf("clusteroffline: prepare bundle parent: %w", err)
+	}
+	if err := os.Mkdir(opts.OutDir, 0o700); err != nil {
+		return nil, fmt.Errorf("clusteroffline: create bundle dir %q (must not exist): %w", opts.OutDir, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(opts.OutDir)
+		}
+	}()
+
+	statePath := filepath.Join(opts.OutDir, "state.db")
+	manifestPath := filepath.Join(opts.OutDir, "manifest.json")
+
+	// (3) paged read-only backup into state.db (never mutates the source).
+	if err := cluster.BackupDBFile(context.Background(), opts.DBPath, statePath); err != nil {
+		return nil, fmt.Errorf("clusteroffline: backup state.db: %w", err)
+	}
+	// (4) verify the produced copy (a torn backup is refused here, not at restore time).
+	if err := cluster.VerifyIntegrity(statePath); err != nil {
+		return nil, fmt.Errorf("clusteroffline: backup verify: %w", err)
+	}
+
+	// (5) build the manifest FROM THE COPY (so applied_index == the bundle's cursor).
+	m, mode, selfID, err := buildBackupManifest(statePath, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := WriteManifest(manifestPath, m); err != nil {
+		return nil, err
+	}
+
+	st, _ := os.Stat(statePath)
+	opts.Logger.Info("clusteroffline: backup complete", "bundle", opts.OutDir, "mode", mode, "self", selfID, "applied_index", m.AppliedIndex)
+	return &BackupResult{BundleDir: opts.OutDir, StateDBBytes: sizeOf(st), Mode: mode, SelfID: selfID, AppliedIndex: m.AppliedIndex}, nil
+}
+
+// buildBackupManifest opens the bundle's state.db read-only and assembles the manifest. A DB
+// with a seeded self_node_id + a matching cluster_nodes row is ManifestModeCluster (full
+// identity + roster); anything else is ManifestModeSingleBroker (minimal — no identity).
+func buildBackupManifest(statePath string, opts BackupOptions) (*Manifest, ManifestMode, string, error) {
+	db, err := storage.OpenReadOnly("file:" + statePath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("clusteroffline: open bundle for manifest: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	now := opts.Now().UTC().Format(time.RFC3339Nano)
+	selfID, err := ReadSelfNodeID(db)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	if selfID != "" {
+		m, err := ReadSelfIdentity(db, selfID)
+		if err == nil {
+			m.Kind = ManifestKindBackup
+			m.Mode = ManifestModeCluster
+			m.CreatedAt = now
+			m.ToolVersion = proto.ReleaseVersion
+			roster, rerr := ProjectRoster(db)
+			if rerr != nil {
+				return nil, "", "", rerr
+			}
+			m.Roster = roster
+			if opts.SecretsDir != "" {
+				if fp, ferr := AccountFingerprint(opts.SecretsDir); ferr == nil {
+					m.AccountFP = fp
+				} else {
+					opts.Logger.Warn("clusteroffline: account_fp unavailable (advisory only)", "err", ferr)
+				}
+			}
+			return m, ManifestModeCluster, selfID, nil
+		}
+		// self_node_id present but no matching row: treat as a malformed/partial cluster DB —
+		// fall through to single-broker so the backup still succeeds (the bundle is then only
+		// restorable as a single broker, which the restore mode-gate enforces).
+		opts.Logger.Warn("clusteroffline: self_node_id present but self row missing; recording single-broker bundle", "self", selfID)
+	}
+
+	return &Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		Kind:          ManifestKindBackup,
+		Mode:          ManifestModeSingleBroker,
+		CreatedAt:     now,
+		ToolVersion:   proto.ReleaseVersion,
+	}, ManifestModeSingleBroker, "", nil
+}
+
+// checkNoLiveDaemon runs the two live-daemon interlock probes shared by every offline B6
+// surgery (backup + restore): the bolt raft.db lock (catches a cluster daemon) and the SQLite
+// writer lock (catches a pre-cutover single-broker daemon). Either positive → ErrDaemonRunning.
+// Each probe is skipped when its target file is absent (a fresh / non-cluster box).
+func checkNoLiveDaemon(dataDir, dbPath string) error {
+	if _, statErr := os.Stat(filepath.Join(dataDir, "raft", "raft.db")); statErr == nil {
+		if locked, err := cluster.RaftStoreLockedByDaemon(dataDir); err != nil {
+			return err
+		} else if locked {
+			return ErrDaemonRunning
+		}
+	}
+	if _, statErr := os.Stat(dbPath); statErr == nil {
+		if busy, err := storage.ProbeWriterLock(dbPath); err != nil {
+			return fmt.Errorf("clusteroffline: write-lock probe: %w", err)
+		} else if busy {
+			return ErrDaemonRunning
+		}
+	}
+	return nil
+}
