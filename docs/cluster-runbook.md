@@ -79,6 +79,21 @@ Half-success is visible, never silently forked: if AddVoter fails the node shows
 secrets/preflight check. A new leader runs a
 membership reconciliation pass on startup that forward-completes a mid-add node.
 
+### 1.1 Spread proxy load onto the new voter (optional)
+
+The auto-rehome reaper only moves a `__proxy__` home when its current home goes
+DOWN; nothing migrates a healthy proxy onto a freshly-added empty voter. After the
+new node reaches VOTER, even out the proxy homes (greedy, to max−min ≤ 1):
+
+```
+leader$ tether cluster rebalance proxy --dry-run   # preview the moves
+leader$ tether cluster rebalance proxy             # spread __proxy__ homes; each agent re-establishes on its new home
+```
+
+Each move briefly drops that proxy's public listener while the agent re-establishes
+(self-healing). Leader-only; a failure/partial pass exits transient — re-run once the
+cluster is HEALTHY-HA (re-running is idempotent).
+
 ## 2. Drain / retire a node
 
 ```
@@ -277,7 +292,7 @@ leader$   tether cluster join approve <join-bundle> --wait
 > only N>=3 with JS replicas at target gives committed-0-loss HA. `cluster status` shows
 > `stream-replicas actual/target` + raises `replication_degraded` until they converge.
 
-## 5. Backup & disaster recovery (`cluster backup` / `cluster restore`)
+## 5. Backup & disaster recovery (`cluster backup` / `cluster recovery restore`)
 
 A backup is a self-describing **bundle directory** — `state.db` (a consistent copy of the
 committed FSM DB: roster, ports, sessions, alerts, the applied cursor) + `manifest.json`

@@ -525,6 +525,9 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether agent`                         | agent  | 启动 agent 守护进程 |
 | `tether agent --install-user-service`  | agent  | 写 systemd --user unit（不启动） |
 | `tether agent --uninstall`             | agent  | 删 systemd --user unit |
+| `tether agent join <invite> [--start]` | agent  | C2：用 OOB invite 入群（写 agent.yaml + 钉 account_pub；`--start` 在进程内拉起 daemon） |
+| `tether agent config refresh --once`   | agent  | C2：拉一次签名 roster/seed bundle 刷新发现缓存（需已钉 account） |
+| `tether agent doctor`                  | agent  | C2：自检 agent 配置 / 发现缓存 / 连通性 |
 | `tether completion <shell>`            | 任意 | 生成 shell 补全脚本 |
 | `tether login`                         | ctl    | 加载 nkey 身份；可选激活 session |
 | `tether logout`                        | ctl    | 清空 `current_session` |
@@ -538,8 +541,8 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether expose <nid> --local P --name N [--remote-port R] [--no-rebuild] [--on-broker B]` | ctl  | 暴露端口（可选指定公网端口 R / 锁定 home broker） |
 | `tether expose rm <nid> --name N`      | ctl    | 撤销暴露 |
 | `tether expose explain <name>`         | ctl    | 看一个 expose 的 home / epoch / rebuild 策略（member 可读，复用 ps RPC） |
-| `tether proxy on / off`                | ctl(owner) | 代理订阅总开关（自建机场，§5.15；当前 cluster HA 模式不支持） |
-| `tether proxy status`                  | ctl    | 看开关/在线节点/订阅（member 可读，无密钥） |
+| `tether proxy on [--ha-policy …] / off` | ctl(owner) | 代理订阅总开关（自建机场，§5.15）。**cluster HA 模式可用**（C5：杀 home 自动 rehome + quorum-loss 降级）；`--ha-policy freeze-on-quorum-loss`（默认，/sub 继续服务）或 `disable-on-quorum-loss`（/sub 404） |
+| `tether proxy status`                  | ctl    | 看开关/在线节点/订阅（member 可读，无密钥）；cluster 模式多一行 `CLUSTER: <state> ha-policy=… writable=…`（ACTIVE/FROZEN_READONLY/DISABLED_NO_QUORUM/FORCE_SINGLE） |
 | `tether proxy sub create --name N`     | ctl(owner) | 签发订阅 URL（只打印一次） |
 | `tether proxy sub ls / revoke <name>`  | ctl(owner) | 列 / 撤销订阅 |
 | `tether push <local> <nid>:<remote>`   | ctl    | 上传本地文件到远端（≤2 GiB） |
@@ -555,6 +558,8 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether cluster reconcile nats --all [--plan]` | broker 本机 | 接管 / 重渲染 NATS route + auth_callout 配置（自动路径，按 roster 渲染全 mesh；`--plan` = dry-run，打印将改动 + `--json`，**不写任何文件**） |
 | `tether cluster transfer-leader <node> [--wait]` | broker 本机 | 转移 Raft leadership（`--wait` 阻塞到 leadership 落到目标） |
 | `tether cluster join prepare` / `join approve <bundle>` | joiner / leader | 两阶段接纳新 voter（joiner 出自签 bundle，leader approve） |
+| `tether cluster seeds publish --bootstrap <https-url> --endpoint <nats-url>…` | broker 本机(leader) | C2：发布签名 SeedBundle（client-dialable endpoints + bootstrap URL），供 `agent join`/`doctor` 消费 |
+| `tether cluster seeds show [--json]`    | broker 本机 | C2：读回已发布的 seeds（leader-agnostic） |
 | `tether cluster keygen --out <path>`   | broker 本机 | 生成 node identity seed（`node-pub` 现为隐藏 debug 命令） |
 | `tether cluster drain` / `retire`      | broker 本机 | 迁移（drain）或退役（retire，原 `drain --retire`）broker voter |
 | `tether cluster rebalance proxy [--dry-run]` | broker 本机(leader) | 主动把 `__proxy__` homes 均摊到各 eligible voter（reaper 只在 home down 时迁；加完 broker 后跑此填新容量；`--dry-run` 预览） |
