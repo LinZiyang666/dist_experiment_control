@@ -47,6 +47,13 @@ func TestExternalReviewCloseSessionKillsListenersWithoutDB(t *testing.T) {
 	if !waitListening(p1, true) || !waitListening(p2, true) {
 		t.Fatal("precondition: both public listeners should be up")
 	}
+	// A listener becomes DIALABLE (net.Listen) + the agent's Open() returns (server wrote "OK") BEFORE
+	// the server finishes the yamux handshake and INSTALLS it into s.sessions. CloseSession iterates
+	// s.sessions, so waiting only for dialability races a mid-install session (under load CloseSession
+	// then returns 1 of 2 ports). Wait for the authoritative install before asserting the count.
+	if !waitSessionsInstalled(srv, "lab", 2) {
+		t.Fatal("precondition: both sessions should be installed in s.sessions")
+	}
 
 	closed := srv.CloseSession("lab")
 	if len(closed) != 2 {
@@ -62,6 +69,28 @@ func TestExternalReviewCloseSessionKillsListenersWithoutDB(t *testing.T) {
 	if n := srv.CloseSession("other"); len(n) != 0 {
 		t.Fatalf("CloseSession(other) closed %v, want none", n)
 	}
+}
+
+// waitSessionsInstalled polls until the server has exactly `want` sessions installed for sid (the
+// authoritative state CloseSession reads), closing the dialable-but-not-yet-installed window. White-box
+// (same package) so it can read s.sessions under s.mu.
+func waitSessionsInstalled(s *Server, sid string, want int) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		n := 0
+		for _, sess := range s.sessions {
+			if sess.sid == sid {
+				n++
+			}
+		}
+		s.mu.Unlock()
+		if n == want {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 // waitListening polls until a TCP dial to 127.0.0.1:port matches want (up vs
