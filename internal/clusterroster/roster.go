@@ -22,6 +22,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -140,19 +143,108 @@ func VerifyAt(r *proto.ClusterRoster, pinnedAccountPub string, now time.Time) er
 }
 
 // Select returns the broker NATS routes an agent should dial, in order: VOTER brokers first (by
-// node_id), then non-voters. A caller building a nats.Connect URL list uses this. (The agent's
-// actual reconnect-URL mutation is a deferred leaf; this is the pure selector it will use.)
+// node_id), then non-voters. A caller building a nats.Connect URL list uses this. (Superseded for
+// the C1 agent consumer by DialURLs, which templates the CLIENT scheme/port/path; Select is kept as
+// the shared route-level selector the broker tests use.)
 func Select(r *proto.ClusterRoster) []string {
 	var voters, others []string
 	for _, b := range r.Brokers {
 		if b.NatsRoute == "" {
 			continue
 		}
-		if b.Phase == "VOTER" {
+		if b.Phase == proto.RosterPhaseVoter {
 			voters = append(voters, b.NatsRoute)
 		} else {
 			others = append(others, b.NatsRoute)
 		}
 	}
 	return append(voters, others...)
+}
+
+// DialURLs returns the CLIENT-dialable NATS URLs an agent should (re)connect through, derived from
+// the signed roster + the agent's own configured URL as the template for the client scheme/port/path
+// (C1 §D-3). RosterBroker.NatsRoute is the cluster ROUTE addr (port :6222), NOT dialable by a client
+// through auth_callout — so we re-template each broker's PublicHost onto the template's
+// scheme+port+path instead of trusting an un-signed client-URL field (which would force a roster
+// schema bump / break signature byte-stability against shipped v0.4.0 brokers).
+//
+// Ordering is 3-tier (c1-plan.md §D-7): VOTER (shuffled to spread fleet reconnect load) → transient
+// (CATCHING_UP / PENDING / unknown) → DRAINING / RETIRING / VOTER_ADD_FAILED LAST (de-preferred,
+// never dropped — "停止偏好" not "drop", so an all-draining roster still yields URLs). A broker with
+// an empty / loopback / unspecified PublicHost is SKIPPED (un-dialable, would strand). The caller
+// MUST union the result with its configured seed URL as a PERMANENT floor so an all-loopback roster
+// never empties the live pool. Returns (nil, err) only on an unparseable templateURL.
+func DialURLs(r *proto.ClusterRoster, templateURL string) ([]string, error) {
+	if r == nil {
+		return nil, nil
+	}
+	first := templateURL
+	if i := strings.IndexByte(first, ','); i >= 0 { // tolerate a comma-list seed; template off the first
+		first = first[:i]
+	}
+	tu, err := url.Parse(strings.TrimSpace(first))
+	if err != nil {
+		return nil, fmt.Errorf("clusterroster: bad template url %q: %w", templateURL, err)
+	}
+	scheme := tu.Scheme
+	if scheme == "" {
+		scheme = "nats"
+	}
+	port := tu.Port()        // "" when the template carries no explicit port
+	path := tu.EscapedPath() // wss/Caddy deployments carry a path the client must keep (§D-3 caveat)
+
+	var voters, transient, draining []string
+	for _, b := range r.Brokers {
+		host := b.PublicHost
+		if host == "" || isUndialableHost(host) {
+			continue
+		}
+		hostport := host
+		if port != "" {
+			hostport = net.JoinHostPort(host, port)
+		}
+		u := scheme + "://" + hostport + path
+		switch b.Phase {
+		case proto.RosterPhaseVoter:
+			voters = append(voters, u)
+		case proto.RosterPhaseDraining, proto.RosterPhaseRetiring, proto.RosterPhaseAddFailed:
+			draining = append(draining, u)
+		default: // CATCHING_UP, JOIN_VERIFIED_PENDING_VOTER, or any unknown/future phase
+			transient = append(transient, u)
+		}
+	}
+	rand.Shuffle(len(voters), func(i, j int) { voters[i], voters[j] = voters[j], voters[i] })
+	out := make([]string, 0, len(voters)+len(transient)+len(draining))
+	out = append(out, voters...)
+	out = append(out, transient...)
+	out = append(out, draining...)
+	return dedupeStable(out), nil
+}
+
+// isUndialableHost reports whether a roster PublicHost can never be reached from another machine
+// (loopback / unspecified) and so must be skipped — a broker that advertises "localhost" / "0.0.0.0"
+// (publicHostFor can fall back to "localhost") must not strand an agent onto an un-dialable target.
+func isUndialableHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
+}
+
+// dedupeStable removes duplicate URLs preserving first-seen order (a node could appear once; this
+// guards against a malformed roster or a host that collapses to the same client URL across tiers).
+func dedupeStable(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := in[:0]
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }

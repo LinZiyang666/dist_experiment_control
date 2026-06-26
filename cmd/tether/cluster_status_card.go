@@ -69,14 +69,25 @@ func renderClusterStatusCard(w io.Writer, rep *adminsock.ClusterStatusReport) {
 // cardHeadline turns the authoritative Health into a one-line headline (+ a top reason when
 // DEGRADED).
 func cardHeadline(rep *adminsock.ClusterStatusReport) string {
+	// C6 建议6: a DEGRADED at N<=2 is the NOT-HA first-class state (works, no production HA) — surfaced
+	// via health_label (the legacy Health stays "DEGRADED"). Re-key the headline off the label here.
+	if rep.HealthLabel == "NOT-HA" {
+		base := "NOT-HA (works; no production HA — add voters to N>=3)"
+		// C6-STATUS-1: a genuine degradation at N<=2 (INCONSISTENT/unreachable/stream-below-target)
+		// still has a top reason — keep it in the headline (pre-C6 rendered "DEGRADED: <reason>").
+		if r := cardTopReason(rep); r != "" {
+			return base + " — " + r
+		}
+		return base
+	}
 	switch rep.Health {
 	case "HEALTHY_HA":
 		return "HEALTHY (HA)"
 	case "DEGRADED":
 		if r := cardTopReason(rep); r != "" {
-			return "DEGRADED: " + r
+			return "DEGRADED-WRITABLE: " + r
 		}
-		return "DEGRADED"
+		return "DEGRADED-WRITABLE"
 	case "QUORUM_LOST":
 		return "READ-ONLY (quorum lost)"
 	case "FORCE_SINGLE":
@@ -130,7 +141,7 @@ func cardTopReason(rep *adminsock.ClusterStatusReport) string {
 func incidentExportHint(rep *adminsock.ClusterStatusReport) string {
 	switch rep.Health {
 	case "DEGRADED", "QUORUM_LOST", "FORCE_SINGLE":
-		return "tether cluster export-incident --since 24h --out incident.json"
+		return "tether cluster recovery incident export --since 24h --out incident.json"
 	default:
 		return ""
 	}

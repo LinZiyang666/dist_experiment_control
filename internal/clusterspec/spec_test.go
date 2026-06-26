@@ -79,14 +79,14 @@ func TestDiffRetireLearnerNotRefused(t *testing.T) {
 			t.Fatalf("non-voter %s must NOT be REFUSED: %+v", id, byID[id])
 		}
 	}
-	if strings.Contains(byID["c"].Verb, "cluster remove") || !strings.Contains(byID["c"].Verb, "cluster doctor") {
+	if strings.Contains(byID["c"].Verb, "recovery node remove") || !strings.Contains(byID["c"].Verb, "cluster doctor") {
 		t.Fatalf("a CATCHING_UP non-voter must get a diagnostic, not a backend-rejected remove: %+v", byID["c"])
 	}
-	if strings.Contains(byID["d"].Verb, "cluster remove") || !strings.Contains(byID["d"].Verb, "cluster doctor") {
+	if strings.Contains(byID["d"].Verb, "recovery node remove") || !strings.Contains(byID["d"].Verb, "cluster doctor") {
 		t.Fatalf("an INCONSISTENT non-voter must get a diagnostic, not a backend-rejected remove: %+v", byID["d"])
 	}
-	if !strings.Contains(byID["e"].Verb, "cluster remove") {
-		t.Fatalf("a VOTER_ADD_FAILED non-voter SHOULD get a real `cluster remove`: %+v", byID["e"])
+	if !strings.Contains(byID["e"].Verb, "recovery node remove") {
+		t.Fatalf("a VOTER_ADD_FAILED non-voter SHOULD get a real `recovery node remove --manual`: %+v", byID["e"])
 	}
 }
 
@@ -142,7 +142,7 @@ func TestDiffMultiRetireDoesNotDropBelowFloorBeforeAddVerified(t *testing.T) {
 	drains := 0
 	refused := 0
 	for _, s := range steps {
-		if strings.Contains(s.Verb, "drain") && strings.Contains(s.Verb, "--retire") {
+		if strings.Contains(s.Verb, "cluster retire") {
 			drains++
 		}
 		if strings.HasPrefix(s.Reason, "REFUSED") {
@@ -169,9 +169,44 @@ func TestDiffTwoVotersBothRetireNoPlaceholder(t *testing.T) {
 		if strings.Contains(s.Verb, "<another-voter>") {
 			t.Fatalf("must not emit a placeholder transfer: %+v", s)
 		}
-		if s.NodeID == "a" && strings.Contains(s.Verb, "drain") && strings.Contains(s.Verb, "--retire") {
+		if s.NodeID == "a" && strings.Contains(s.Verb, "cluster retire") {
 			t.Fatalf("leader-with-no-surviving-voter must be REFUSED, not drained: %+v", s)
 		}
+	}
+}
+
+// TestApplyPlanEmitsRunnableVerbs (C8 review M1) — every Step.Verb the reconcile plan prints must be a
+// command that EXISTS post-C8: the join step uses `join prepare --node-id` (NOT the non-existent
+// --self-id flag), retire uses `cluster retire`, a VOTER_ADD_FAILED non-voter uses `recovery node
+// remove … --manual`, and NO verb names a deleted spelling (cluster add / sign-join / drain --retire /
+// bare `cluster remove`).
+func TestApplyPlanEmitsRunnableVerbs(t *testing.T) {
+	spec, _ := Parse([]byte("nodes:\n  - node_id: a\n  - node_id: b\n  - node_id: nu\n  - node_id: e\n    desired: absent\n  - node_id: old\n    desired: absent\n"))
+	live := []LiveNode{
+		{NodeID: "a", Phase: "VOTER", Role: "leader"},
+		{NodeID: "b", Phase: "VOTER", Role: "voter"},
+		{NodeID: "e", Phase: "VOTER_ADD_FAILED", Role: ""}, // gets a real recovery node remove
+		{NodeID: "old", Phase: "VOTER", Role: "voter"},     // gets cluster retire
+		// "nu" is desired=voter but absent → the join step.
+	}
+	steps := Diff(spec, live, "a")
+	byID := map[string]Step{}
+	for _, s := range steps {
+		byID[s.NodeID] = s
+		for _, bad := range []string{"cluster add", "sign-join", "drain --retire", "--self-id", "tether cluster remove "} {
+			if strings.Contains(s.Verb, bad) {
+				t.Errorf("plan emits a deleted/non-existent verb token %q: %q", bad, s.Verb)
+			}
+		}
+	}
+	if !strings.Contains(byID["nu"].Verb, "join prepare --node-id") {
+		t.Errorf("join step must use `join prepare --node-id` (the real flag): %q", byID["nu"].Verb)
+	}
+	if !strings.Contains(byID["old"].Verb, "cluster retire") {
+		t.Errorf("a live retire must use `cluster retire`: %q", byID["old"].Verb)
+	}
+	if !strings.Contains(byID["e"].Verb, "recovery node remove") || !strings.Contains(byID["e"].Verb, "--manual") {
+		t.Errorf("a VOTER_ADD_FAILED remove must use `recovery node remove … --manual`: %q", byID["e"].Verb)
 	}
 }
 

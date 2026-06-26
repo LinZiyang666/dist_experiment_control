@@ -76,6 +76,10 @@ var brokerCodeExitClasses = map[string]int{
 	// positively transient (self-healing) -> retry-later
 	"agent_no_responders": exitTransient, "leader_unavailable": exitTransient,
 	"home_catching_up": exitTransient, "try_again": exitTransient,
+	// Mega-audit MAJ-7: C5 proxy quorum-loss is a designed self-healing transient (the leader heals on
+	// re-election) — map to 75 so a monitor retries instead of treating it as a tether bug (70).
+	"proxy_disabled_no_quorum": exitTransient, "proxy_frozen_readonly": exitTransient,
+	"ha_policy_invalid": exitUsage,
 	// operator-action-required (NOT blind-retry) -> usage
 	"node_offline": exitUsage, "node_not_found": exitUsage, "port_exhausted": exitUsage,
 	"name_taken": exitUsage, "port_taken": exitUsage, "port_out_of_band": exitUsage,

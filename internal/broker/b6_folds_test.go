@@ -40,7 +40,7 @@ func TestComputeHealthDiskBand(t *testing.T) {
 		{NodeID: "node-B", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health"}, // DiskFreePct 0 = not-set
 		{NodeID: "node-C", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health"},
 	}
-	h, _, _ := computeHealth(false, "node-A", 3, nodes)
+	h, _, _ := computeHealth(false, "node-A", 3, 0, nodes)
 	if h != healthDegraded {
 		t.Fatalf("low free disk on the self row must be DEGRADED, got %q", h)
 	}
@@ -51,7 +51,7 @@ func TestComputeHealthDiskBand(t *testing.T) {
 		{NodeID: "node-B", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health", StreamTarget: 3, StreamActual: 3},
 		{NodeID: "node-C", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health", StreamTarget: 3, StreamActual: 3},
 	}
-	if h, _, _ := computeHealth(false, "node-A", 3, healthy); h != healthHealthyHA {
+	if h, _, _ := computeHealth(false, "node-A", 3, 0, healthy); h != healthHealthyHA {
 		t.Fatalf("a healthy cluster must be HEALTHY_HA, got %q", h)
 	}
 }
@@ -79,7 +79,7 @@ func TestComputeHealthPortsBand(t *testing.T) {
 		{NodeID: "node-B", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health"},
 		{NodeID: "node-C", Phase: phaseVoter, Reachable: true, ReachSource: "nats-health"},
 	}
-	if h, _, _ := computeHealth(false, "node-A", 3, nodes); h != healthDegraded {
+	if h, _, _ := computeHealth(false, "node-A", 3, 0, nodes); h != healthDegraded {
 		t.Fatalf("ports >=90%% used must be DEGRADED, got %q", h)
 	}
 }

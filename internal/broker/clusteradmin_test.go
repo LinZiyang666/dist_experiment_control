@@ -66,7 +66,7 @@ func TestB3RemoveForceRespectsPhaseGate(t *testing.T) {
 		t.Fatalf("AddNode: %v", err)
 	}
 	err := admin.RemoveNode("single-1", true) // force=true
-	if err == nil || !strings.Contains(err.Error(), "bare remove only finishes") {
+	if err == nil || !strings.Contains(err.Error(), "raw remove only finishes") {
 		t.Fatalf("remove --force of a live VOTER must hit the phase-gate, got %v", err)
 	}
 	// And it must NOT be the ownership-probe error (the phase-gate precedes + returns first).
@@ -179,7 +179,7 @@ func TestD7RemoveRefusesLiveVoter(t *testing.T) {
 		t.Fatalf("setup: want VOTER, got %q", phase)
 	}
 	err := admin.RemoveNode("single-1", false)
-	if err == nil || !strings.Contains(err.Error(), "bare remove only finishes") {
+	if err == nil || !strings.Contains(err.Error(), "raw remove only finishes") {
 		t.Fatalf("bare remove of a live VOTER must be refused, got %v", err)
 	}
 	// The roster row is untouched (no silent fork created).

@@ -1,0 +1,12 @@
+-- Migration 0017 — port_allocations.last_rehome_at (C6 建议5 rehome observability).
+--
+-- The wall-clock of the most recent home reassignment for this allocation, stamped by PlanReassignHome
+-- inside the SAME monotone-CAS UPDATE that bumps the epoch (so a stale-epoch no-op never stamps it). It
+-- powers `cluster status --homes`' last_rehome_at field. PROVENANCE: only a planned drain-migrate or a
+-- proxy home-down rehome writes it — it is NOT a crash-history (a crash-stranded expose keeps its blank
+-- last_rehome_at + stale home_broker until a drain/return rehomes it). DEFAULT '' so a never-rehomed
+-- allocation (the common case) reads empty; ADD COLUMN preserves every existing index + the FK.
+--
+-- Additive: a non-cluster broker never calls PlanReassignHome, so the column stays '' forever and the
+-- single-mode footprint is byte-stable.
+ALTER TABLE port_allocations ADD COLUMN last_rehome_at TEXT NOT NULL DEFAULT '';

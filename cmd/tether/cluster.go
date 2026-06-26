@@ -16,58 +16,99 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// cluster.go — D7 §8.1 `tether cluster *` command plane. ONLINE verbs talk to the
+// cluster.go — D7 §8.1 / C8 `tether cluster *` command plane. ONLINE verbs talk to the
 // broker's local admin socket (admin strictly local, no network bypass); a
 // non-leader broker replies NotLeader+LeaderHost so we tell the operator where to
-// re-run (§8.1 fail-fast, NO forwarding). OFFLINE verbs (force-single / recover /
-// sign-join / node-pub / keygen) live in cluster_offline.go and touch disk directly.
+// re-run (§8.1 fail-fast, NO forwarding). The OFFLINE escape hatches (force-single /
+// rejoin prepare / restore) live under the `recovery` group + cluster_offline.go and
+// touch disk directly. C8: `add`/`sign-join`/`wait` were deleted; node-pub/keygen are
+// hidden debug; the former top-level escapes are hidden one-cycle deprecated aliases.
 
 func newClusterCmd() *cobra.Command {
 	var socketPath string
 	root := &cobra.Command{
 		Use:   "cluster",
-		Short: "Cluster lifecycle: membership, drain/retire, status, and the force-single escape hatch",
-		Long: `Cluster admin commands. ONLINE verbs (add/remove/drain --retire/transfer-leader/
+		Short: "Cluster lifecycle: join/drain/retire, status, and the recovery escape hatches",
+		Long: `Cluster admin commands. ONLINE verbs (join/drain/retire/transfer-leader/
 status/rotate-tunnel-cert) talk to the broker's local admin socket and must run on a
-broker host. OFFLINE verbs (force-single/recover) run with the daemon STOPPED and
-operate directly on disk (see the runbook in docs/).`,
+broker host. The recovery group holds the escape hatches (force-single / rejoin prepare
+/ restore / incident export / raw node remove); its OFFLINE members run with the daemon
+STOPPED and operate directly on disk (see the runbook in docs/).`,
 	}
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultAdminSocket, "broker admin Unix socket")
 
-	// B3 item 5: group the 14 subcommands by context + danger tier so `tether cluster --help`
-	// makes the where-do-I-run-this / how-dangerous-is-this obvious at a glance.
+	// B3 item 5 / C8: group the visible subcommands by context + danger tier so `tether cluster --help`
+	// makes where-do-I-run-this / how-dangerous obvious. C8 dropped the `local` group (sign-join deleted;
+	// node-pub/keygen demoted to hidden debug) → 3 groups.
 	root.AddGroup(
 		&cobra.Group{ID: "online", Title: "Online (leader, daemon running):"},
 		&cobra.Group{ID: "migrate", Title: "Migration / nats.conf takeover (one-time):"},
-		&cobra.Group{ID: "escape", Title: "DANGER -- offline escape hatches (daemon STOPPED; runbook section 3):"},
-		&cobra.Group{ID: "local", Title: "Local crypto / join helpers:"},
+		&cobra.Group{ID: "escape", Title: "DANGER -- recovery + raw escape hatches (runbook section 3):"},
 	)
 	addGrouped := func(c *cobra.Command, group string) { c.GroupID = group; root.AddCommand(c) }
 	addGrouped(newClusterStatusCmd(&socketPath), "online")
-	addGrouped(newClusterAddCmd(&socketPath), "online")
 	addGrouped(newClusterDrainCmd(&socketPath), "online")
-	addGrouped(newClusterRemoveCmd(&socketPath), "online")
 	addGrouped(newClusterTransferCmd(&socketPath), "online")
 	addGrouped(newClusterRotateCertCmd(&socketPath), "online")
-	addGrouped(newClusterWaitCmd(&socketPath), "online")
 	addGrouped(newClusterBackupCmd(&socketPath), "online")
-	addGrouped(newClusterExportIncidentCmd(&socketPath), "online")
 	addGrouped(newClusterOpsCmd(&socketPath), "online")
 	addGrouped(newClusterApplyCmd(&socketPath), "online")
+	addGrouped(newClusterSeedsCmd(&socketPath), "online")     // C2: seeds publish/show
+	addGrouped(newClusterReconcileCmd(&socketPath), "online") // C3: reconcile nats --all --wait / --manual
+	addGrouped(newClusterJoinCmd(&socketPath), "online")      // C4: join prepare/approve (recoverable; replaces `add`/`sign-join`)
+	addGrouped(newClusterRetireCmd(&socketPath), "online")    // C4: retire (recoverable; replaces `drain --retire`/`remove`)
+	addGrouped(newClusterRebalanceCmd(&socketPath), "online") // C-rebalance: rebalance proxy (spread __proxy__ homes)
 	addGrouped(newClusterInitCmd(), "migrate")
-	addGrouped(newClusterTakeoverNatsconfCmd(), "migrate")
+	addGrouped(newClusterTakeoverNatsconfCmd(), "migrate") // hidden deprecated alias for reconcile nats --manual
 	addGrouped(newClusterDoctorCmd(), "migrate")
-	addGrouped(newClusterForceSingleCmd(), "escape")
-	addGrouped(newClusterRecoverCmd(), "escape")
-	addGrouped(newClusterRestoreCmd(), "escape")
-	addGrouped(newClusterSignJoinCmd(), "local")
-	addGrouped(newClusterNodePubCmd(), "local")
-	addGrouped(newClusterKeygenCmd(), "local")
+	// C8: `recovery` is now the PRIMARY home of the escape verbs (force-single/rejoin prepare/restore/
+	// incident export/node remove) + diagnose.
+	addGrouped(newClusterRecoveryCmd(&socketPath), "escape")
+
+	// C8 hidden one-cycle DEPRECATED aliases — warn to stderr + delegate to the same constructor (so
+	// every gate is byte-preserved), then deleted next release. node-pub/keygen are hidden DEBUG (kept;
+	// keygen is the only node-ident.nk minter). The deleted `add`/`sign-join`/`wait` are simply gone.
+	root.AddCommand(
+		deprecatedClusterAlias(newClusterForceSingleCmd(), "recovery force-single"),
+		deprecatedClusterAlias(newClusterRecoverCmd(), "recovery rejoin prepare"),
+		deprecatedClusterAlias(newClusterRestoreCmd(), "recovery restore"),
+		deprecatedClusterAlias(newClusterExportIncidentCmd(&socketPath), "recovery incident export"),
+		deprecatedClusterAlias(newClusterRemoveCmd(&socketPath), "recovery node remove --manual"),
+		hiddenDebugCmd(newClusterNodePubCmd()),
+		hiddenDebugCmd(newClusterKeygenCmd()),
+	)
 	return root
 }
 
+// deprecatedClusterAlias (C8) wraps a relocated command as a HIDDEN one-release deprecated alias: it
+// warns to STDERR (never stdout — D2: cobra's own .Deprecated prints via OutOrStderr which rides the
+// SetOut writer, polluting `export-incident`'s JSON) then delegates to the SAME RunE (so every safety
+// gate is byte-preserved). GroupID="" so dropping a group can't trip checkCommandGroups. Deleted next
+// release.
+func deprecatedClusterAlias(c *cobra.Command, replacement string) *cobra.Command {
+	c.Hidden, c.GroupID = true, ""
+	inner := c.RunE
+	c.RunE = func(cmd *cobra.Command, a []string) error {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"deprecated: `tether cluster %s` moved to `tether cluster %s`; this alias is removed next release.\n",
+			c.Name(), replacement)
+		if inner == nil {
+			return cmd.Help()
+		}
+		return inner(cmd, a)
+	}
+	return c
+}
+
+// hiddenDebugCmd (C8) demotes a now-internal helper (node-pub / keygen) to a hidden debug command —
+// still runnable (keygen is the only in-binary minter of node-ident.nk) but off the documented surface.
+func hiddenDebugCmd(c *cobra.Command) *cobra.Command {
+	c.Hidden, c.GroupID = true, ""
+	return c
+}
+
 func newClusterStatusCmd(socketPath *string) *cobra.Command {
-	var asJSON, offline, remote bool
+	var asJSON, offline, remote, homes bool
 	var dbPath, natsURL, home string
 	var watch time.Duration
 	cmd := &cobra.Command{
@@ -79,6 +120,10 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 			"  tether cluster status --offline --db /var/lib/tether/tether.db   # disk roster (daemon stopped)",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if homes {
+				// C6 建议5: the homes aggregate (its own view; no exit-code contract — a descriptive read).
+				return clusterStatusHomes(cmd, *socketPath, asJSON)
+			}
 			if offline {
 				return clusterStatusOffline(cmd, dbPath, asJSON)
 			}
@@ -118,8 +163,58 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 	// remote laptop watch-looping the member broadcast amplifies ACL traffic for little value.
 	cmd.MarkFlagsMutuallyExclusive("offline", "watch")
 	cmd.MarkFlagsMutuallyExclusive("remote", "watch")
+	cmd.Flags().BoolVar(&homes, "homes", false, "C6: aggregate every expose + proxy home/epoch/ready_reason (one descriptive view; no exit-code contract)")
+	cmd.MarkFlagsMutuallyExclusive("homes", "offline")
+	cmd.MarkFlagsMutuallyExclusive("homes", "remote")
+	cmd.MarkFlagsMutuallyExclusive("homes", "watch")
 	// doctor is an alias for status (the diagnostic framing).
 	return cmd
+}
+
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// clusterStatusHomes fetches + renders the C6 homes aggregate (OpClusterHomes). No os.Exit / exit-code
+// contract — it is a descriptive read (unlike `cluster status`'s 0/1/2/3).
+func clusterStatusHomes(cmd *cobra.Command, socketPath string, asJSON bool) error {
+	resp, err := callAdmin(socketPath, adminsock.Request{Op: adminsock.OpClusterHomes})
+	if err != nil {
+		return err
+	}
+	if resp.Homes == nil {
+		msg := resp.Error
+		if msg == "" {
+			msg = "no homes report (single-broker mode?)"
+		}
+		return unavailErr("cluster status --homes: %s", msg)
+	}
+	rep := resp.Homes
+	if asJSON {
+		return emitJSON(cmd.OutOrStdout(), rep)
+	}
+	w := cmd.OutOrStdout()
+	if !rep.IsLeaderView {
+		_, _ = fmt.Fprintln(w, "(non-leader view — reachability is best-effort; run on the leader for authoritative tunnel-down)")
+	}
+	_, _ = fmt.Fprintf(w, "%-7s %-14s %-12s %-10s %-6s %-6s %-13s %-7s %-20s %s\n",
+		"KIND", "SID", "NAME", "NID", "PORT", "EPOCH", "REASON", "READY", "HOME", "PUBLIC_URL")
+	for _, h := range rep.Homes {
+		nid := dashIfEmpty(h.NID)
+		url := dashIfEmpty(h.PublicURL)
+		_, _ = fmt.Fprintf(w, "%-7s %-14s %-12s %-10s %-6d %-6d %-13s %-7v %-20s %s\n",
+			h.Kind, h.SID, h.Name, nid, h.Port, h.Epoch, h.ReadyReason, h.Ready, h.HomeBroker, url)
+	}
+	if len(rep.Homes) == 0 {
+		_, _ = fmt.Fprintln(w, "(no allocated exposes or proxies)")
+	}
+	if rep.Partial {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "** PARTIAL ** %v\n", rep.Errors)
+	}
+	return nil
 }
 
 // fetchClusterStatusReport does the online callAdmin(OpClusterStatus) + the B2-item-5 error-fold,
@@ -208,11 +303,12 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	// `cluster force-single --confirm-peers-dead` (which HARD-REFUSES any live peer).
 	rep := &adminsock.ClusterStatusReport{
 		SchemaVersion: 1, View: "offline", ExitCode: 0,
-		Banner:   "disk roster snapshot with a raft-port TCP liveness probe (advisory); for quorum loss use `cluster force-single --confirm-peers-dead ...` (it re-probes + HARD-REFUSES any live peer)",
-		NextStep: "cluster force-single --confirm-peers-dead <ids...>",
+		Banner:   "disk roster snapshot with a raft-port TCP liveness probe (advisory); for quorum loss use `cluster recovery force-single --confirm-peers-dead ...` (it re-probes + HARD-REFUSES any live peer)",
+		NextStep: "cluster recovery force-single --confirm-peers-dead <ids...>",
 	}
 	if forceSingle != "" {
 		rep.Health = "FORCE_SINGLE"
+		rep.HealthLabel = "FORCE-SINGLE" // C6 建议6 (offline can't read the voter count → label set inline)
 		rep.ExitCode = 3
 		rep.Banner = "force_single_active set at " + forceSingle + " — " + rep.Banner
 	}
@@ -250,6 +346,7 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 			// so reusing "DEGRADED" would make (health -> exit) ambiguous across views. A monitor
 			// branches on `view` first; this keeps (view, health, exit) self-consistent.
 			rep.Health = "ROSTER_UNREACHABLE"
+			rep.HealthLabel = "READ-ONLY" // C6 建议6: leaderless/unreachable maps to the READ-ONLY operator state
 			rep.ExitCode = 2
 			rep.Banner = "no roster node answered the raft-port probe (possible quorum loss / total outage) — " + rep.Banner
 		}
@@ -283,10 +380,28 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	return nil
 }
 
+// topoCell renders the C3 topology column `applied/observed→desired` with a convergence marker: "✓"
+// converged, "…" still catching up, "STUCK" when the reconcile is wedged (bad render / unknown
+// directive). "-" when the node does not report topology (older broker / nothing desired yet).
+func topoCell(n adminsock.ClusterNodeStatus, desired uint64) string {
+	if !n.TopoReported || desired == 0 {
+		return "-"
+	}
+	s := fmt.Sprintf("%d/%d→%d", n.TopoApplied, n.TopoObserved, desired)
+	switch {
+	case strings.Contains(n.TopoReconcileReason, "unrecognized directive") || strings.Contains(n.TopoReconcileReason, "nats-server -t"):
+		return s + " STUCK"
+	case n.TopoObserved >= desired:
+		return s + " ✓"
+	default:
+		return s + " …"
+	}
+}
+
 func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport) {
 	w := cmd.OutOrStdout()
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "NODE_ID\tNAME\tPHASE\tROLE\tVER\tLAG\tACCT.NK\tSTREAMS\tREACH")
+	_, _ = fmt.Fprintln(tw, "NODE_ID\tNAME\tPHASE\tROLE\tVER\tLAG\tACCT.NK\tSTREAMS\tTOPO\tREACH")
 	for _, n := range rep.Nodes {
 		acct := "N"
 		if n.AccountNkMatch {
@@ -305,8 +420,9 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 		if ver == "" {
 			ver = "?"
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d/%d\t%s%s\n",
-			n.NodeID, n.Name, n.Phase, n.Role, ver, n.AppliedLag, acct, n.StreamActual, n.StreamTarget, reach, flag)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d/%d\t%s\t%s%s\n",
+			n.NodeID, n.Name, n.Phase, n.Role, ver, n.AppliedLag, acct, n.StreamActual, n.StreamTarget,
+			topoCell(n, rep.TopoDesired), reach, flag)
 	}
 	_ = tw.Flush()
 	// B1 item 2: column legend (broker-host operator view). ACCT.NK is honest that per-node
@@ -314,7 +430,14 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 	_, _ = fmt.Fprintln(w, "\ncolumns: LAG=raft entries behind the leader (0=caught up) · ACCT.NK=Y if this node's account key")
 	_, _ = fmt.Fprintln(w, "  matches (currently always Y — per-node verification not yet wired) · STREAMS=JetStream replicas")
 	_, _ = fmt.Fprintln(w, "  actual/target (actual<target = degraded) · VER=running release (live self-report) · REACH=NATS/raft reachability")
-	_, _ = fmt.Fprintf(w, "\n** %s (exit %d) **\n", rep.Health, rep.ExitCode)
+	_, _ = fmt.Fprintln(w, "  · TOPO=NATS topology applied/observed→desired gen (✓ converged · … catching up · STUCK fix conf or `cluster reconcile nats --manual`)")
+	// C6 建议6: show the hyphenated 5-state operator label; fall back to the legacy Health when unset
+	// (an old broker that predates health_label) so legacy fixtures stay green.
+	healthHeadline := rep.HealthLabel
+	if healthHeadline == "" {
+		healthHeadline = rep.Health
+	}
+	_, _ = fmt.Fprintf(w, "\n** %s (exit %d) **\n", healthHeadline, rep.ExitCode)
 	if rep.Banner != "" {
 		_, _ = fmt.Fprintf(w, "%s\n", rep.Banner)
 	}
@@ -338,99 +461,28 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 	}
 }
 
-func newClusterAddCmd(socketPath *string) *cobra.Command {
-	var joinToken, tunnelAddr, publicHost, natsRoute, certFP, joinerRelease string
-	var joinerProto int
-	cmd := &cobra.Command{
-		Use:   "add <node-id> <host> <node-pub>",
-		Short: "Admit a new voter (two-phase: run without --join-token to get a nonce, sign it on the joiner, then re-run)",
-		Example: "  # 0. On the JOINING node, get its node-identity pubkey:\n" +
-			"  joiner$ tether cluster node-pub                       # -> U…\n" +
-			"  # 1. On the LEADER, start the add (no token) — prints a challenge nonce:\n" +
-			"  leader$ tether cluster add brk-b 10.0.0.2:7400 U…\n" +
-			"  # 2. On the JOINING node, sign it + print the complete re-run line:\n" +
-			"  joiner$ tether cluster sign-join brk-b <nonce> --raft-addr 10.0.0.2:7400 --tunnel-addr brk-b:7000 --nats-route nats://10.0.0.2:6222 --public-host brk-b\n" +
-			"  # 3. On the LEADER, paste that complete `cluster add … --join-token …` line.\n" +
-			"  # 4. THEN re-run takeover-natsconf on EVERY broker (leader last) — see the add output + runbook §1.",
-		Args: cobra.ExactArgs(3),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// D9 round-1 BLOCKER + external-review Q2: the second (token) call MUST carry the
-			// joiner's full expose-home + NATS identity (tunnel-addr + cert-fp + nats-route),
-			// else the added voter can hold raft votes but never serve as an expose home nor be
-			// rendered into a correct NATS topology.
-			if joinToken != "" && (tunnelAddr == "" || certFP == "" || natsRoute == "") {
-				return usageErr("cluster add: --tunnel-addr, --cert-fp and --nats-route are required on the " +
-					"token call (an added voter without them can never serve as an expose home or NATS peer)")
-			}
-			resp, err := callAdmin(*socketPath, adminsock.Request{
-				Op: adminsock.OpClusterAdd, NodeID: args[0], Host: args[1], NodePub: args[2], JoinToken: joinToken,
-				TunnelAddr: tunnelAddr, PublicHost: publicHost, NatsRoute: natsRoute, CertFP: certFP,
-				JoinerProto: joinerProto, JoinerRelease: joinerRelease,
-			})
-			if err != nil {
-				return err
-			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
-			}
-			if resp.Nonce != "" {
-				// B3 item 1c: the leader has NO joiner secrets (cert-fp/addrs are joiner-local), so
-				// point at sign-join --raft-addr, which PRINTS the complete pasteable add line.
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"challenge nonce: %s\n"+
-						"On the JOINING node run (with its addrs, to get a COMPLETE pasteable line):\n"+
-						"  tether cluster sign-join %s %s --raft-addr <joiner-host:7400> --tunnel-addr <host:7000> --nats-route nats://<host>:6222 --public-host <dns>\n"+
-						"That prints the full `tether cluster add … --join-token …` line — paste it back here on the leader.\n",
-					resp.Nonce, args[0], resp.Nonce)
-				return nil
-			}
-			if resp.Error != "" {
-				return clusterAdminError("add", resp)
-			}
-			// B3 item 6: a successful add only changes raft membership; the NATS mesh is unrendered
-			// until takeover-natsconf re-runs on EVERY node (leader last). Make that actionable.
-			out := cmd.OutOrStdout()
-			_, _ = fmt.Fprintf(out, "added %s as a voter.\n", args[0])
-			// B5: the new voter may still be CATCHING_UP — point at the general convergence verb.
-			_, _ = fmt.Fprintf(out, "  to block until it is a full voter: tether cluster wait %s --phase VOTER\n\n", args[0])
-			_, _ = fmt.Fprintln(out, "** NOT DONE YET — raft membership changed; the NATS mesh has NOT. **")
-			_, _ = fmt.Fprintln(out, "Re-run takeover-natsconf on EVERY broker IN ORDER (leader LAST, so you don't trigger a")
-			_, _ = fmt.Fprintln(out, "re-election mid-rollout); each run needs the COMPLETE --peer set (one --peer per broker,")
-			_, _ = fmt.Fprintln(out, "including self):")
-			_, _ = fmt.Fprintln(out, "  tether cluster takeover-natsconf --server-name <self> --route-url <self-route> \\")
-			_, _ = fmt.Fprintln(out, "      --peer <name>,nats://<host>:6222,<bus-nkey>   # repeat --peer for each broker")
-			_, _ = fmt.Fprintln(out, "Run `tether cluster status` for the node list + which is leader; source each broker's route")
-			_, _ = fmt.Fprintln(out, "URL + bus nkey from your records / each broker's nats.conf. `systemctl restart nats-server`")
-			_, _ = fmt.Fprintln(out, "after each. See docs/cluster-runbook.md §1.")
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&joinToken, "join-token", "", "<nonce>:<sigHex> from `cluster sign-join` on the joiner")
-	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "joiner's public tunnel addr host:port (required on the token call)")
-	cmd.Flags().StringVar(&certFP, "cert-fp", "", "joiner's stable tunnel cert fingerprint sha256:… (required on the token call)")
-	cmd.Flags().StringVar(&publicHost, "public-host", "", "joiner's public host (defaults to <host>)")
-	cmd.Flags().StringVar(&natsRoute, "nats-route", "", "joiner's NATS route URL, e.g. nats://10.0.0.2:6222")
-	cmd.Flags().IntVar(&joinerProto, "joiner-proto", 0, "joiner's proto version (from `cluster sign-join`); mismatch is rejected")
-	cmd.Flags().StringVar(&joinerRelease, "joiner-release", "", "joiner's release tag (from `cluster sign-join`); skew is advisory only")
-	return cmd
-}
-
 func newClusterDrainCmd(socketPath *string) *cobra.Command {
 	var retire, now, abort, confirmed bool
 	cmd := &cobra.Command{
 		Use:     "drain <node-id>",
-		Short:   "Drain (migrate exposes off) and optionally --retire a node",
-		Example: "  tether cluster drain brk-b            # migrate rebuild-ON exposes off, keep it a voter\n  tether cluster drain brk-b --retire  # then remove it from the cluster",
+		Short:   "Drain (migrate exposes off, keep it a voter)",
+		Example: "  tether cluster drain brk-b            # migrate rebuild-ON exposes off, keep it a voter",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			node := args[0]
-			req := adminsock.Request{Op: adminsock.OpClusterDrain, NodeID: node, Retire: retire, Now: now, Abort: abort, Confirmed: confirmed}
+			// C8 (D4): `drain --retire` is removed — redirect to the resumable `cluster retire` operation
+			// (NOT a deprecated flag, which would still parse + honor → a live second mutation path). A
+			// MarkHidden retire flag is kept only so this redirect can fire instead of "unknown flag".
+			if retire {
+				return usageErr("`cluster drain --retire` is removed; run `tether cluster retire %s` (resumable, same F==0 gate, migrates exposes + waits for stream redundancy)", node)
+			}
+			req := adminsock.Request{Op: adminsock.OpClusterDrain, NodeID: node, Retire: false, Now: now, Abort: abort, Confirmed: confirmed}
 			resp, err := callAdmin(*socketPath, req)
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			// F==0 confirm gate: NEVER honored by --yes; require a typed node_id.
 			if resp.QuorumProj != nil {
@@ -451,41 +503,41 @@ func newClusterDrainCmd(socketPath *string) *cobra.Command {
 				return clusterAdminError("drain", resp)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "drain %s ok\n", node)
-			// B3 item 8a: retire is a TOPOLOGY change, not a credential revocation.
-			if retire {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-					"NOTE: retire is a TOPOLOGY change, NOT a credential revocation. The retired host still holds\n"+
-						"  account.nk + the cluster CA (shared, NOT rotated) and can still authenticate until you rotate\n"+
-						"  keys. If you retired %s as possibly compromised, rotate now (docs/cluster-runbook.md §2.1).\n", node)
-			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&retire, "retire", false, "remove the node from the cluster after draining")
+	cmd.Flags().BoolVar(&retire, "retire", false, "REMOVED: use `cluster retire` instead")
 	cmd.Flags().BoolVar(&now, "now", false, "skip the drain notice period")
 	cmd.Flags().BoolVar(&abort, "abort", false, "abort an in-progress drain (return the node to VOTER)")
+	_ = cmd.Flags().MarkHidden("retire") // C8 (D4): kept only so --retire redirects, not "unknown flag"
 	return cmd
 }
 
 func newClusterRemoveCmd(socketPath *string) *cobra.Command {
-	var force bool
+	var force, manual bool
 	var confirmNodeID string
 	cmd := &cobra.Command{
 		Use:   "remove <node-id>",
-		Short: "Remove a node from the raft configuration + roster (prefer `drain --retire`)",
-		Example: "  # PREFER drain --retire (migrates exposes off + waits for stream redundancy first):\n" +
-			"  tether cluster drain brk-b --retire\n" +
-			"  # last resort — orphans any exposes a VOTER_ADD_FAILED node still homes:\n" +
-			"  tether cluster remove brk-b --force\n" +
+		Short: "RAW raft-config + roster removal (escape; prefer `cluster retire`)",
+		Example: "  # PREFER cluster retire (migrates exposes off + waits for stream redundancy first, resumable):\n" +
+			"  tether cluster retire brk-b --wait\n" +
+			"  # last resort — raw removal of a node that can't retire (e.g. VOTER_ADD_FAILED); --manual is REQUIRED:\n" +
+			"  tether cluster recovery node remove brk-b --manual --force\n" +
 			"  # unattended (CI/automation): BOTH the flag AND the env must equal the node_id:\n" +
-			"  TETHER_CONFIRM_NODE_ID=brk-b tether cluster remove brk-b --confirm-node-id brk-b",
+			"  TETHER_CONFIRM_NODE_ID=brk-b tether cluster recovery node remove brk-b --manual --confirm-node-id brk-b",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := rejectedUnattendedYes(cmd, "remove", args[0]); err != nil {
 				return err
 			}
+			// C8 (D3): raw remove is fail-closed behind --manual — the routine path is `cluster retire`
+			// (a resumable operation). Without --manual, refuse + redirect. Ordered AFTER the
+			// unattended-yes rejection so `--yes` still yields "cannot run unattended".
+			if !manual {
+				return usageErr("raw `remove` requires --manual (this is the last-resort escape); the routine path is `tether cluster retire %s` (resumable, migrates exposes + waits for stream redundancy)", args[0])
+			}
 			// remove is the ONLY machine-confirm-escapable typed-confirm (reversible: re-add with
-			// `cluster add`). The escape needs BOTH --confirm-node-id AND the env to equal the id.
+			// `cluster join`). The escape needs BOTH --confirm-node-id AND the env to equal the id.
 			if !confirmTypedNodeID(cmd, args[0], "", true, confirmNodeID) {
 				return fmt.Errorf("aborted (type the node_id to confirm, or pass --confirm-node-id + %s for unattended use)", machineConfirmEnv)
 			}
@@ -493,8 +545,8 @@ func newClusterRemoveCmd(socketPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return clusterAdminError("remove", resp)
@@ -503,7 +555,8 @@ func newClusterRemoveCmd(socketPath *string) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "remove even if a VOTER_ADD_FAILED node still homes exposes (orphans them; prefer `drain --retire`)")
+	cmd.Flags().BoolVar(&manual, "manual", false, "REQUIRED: acknowledge this is the last-resort raw removal (the routine path is `cluster retire`)")
+	cmd.Flags().BoolVar(&force, "force", false, "remove even if a VOTER_ADD_FAILED node still homes exposes (orphans them; prefer `cluster retire`)")
 	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "unattended confirm: must equal the node-id AND match $"+machineConfirmEnv+" (no TTY)")
 	registerYesRejector(cmd)
 	return cmd
@@ -522,8 +575,8 @@ func newClusterTransferCmd(socketPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return clusterAdminError("transfer-leader", resp)
@@ -557,8 +610,8 @@ func newClusterRotateCertCmd(socketPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return clusterAdminError("rotate-tunnel-cert", resp)
@@ -681,7 +734,7 @@ func newClusterInitCmd() *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "cluster init --from-existing complete — %s is now a single-voter cluster (data_dir %s).%s\n", selfID, dataDir, fillHint)
 			_, _ = fmt.Fprintln(out, "NEXT (run in order):")
-			_, _ = fmt.Fprintf(out, "  1. tether cluster takeover-natsconf --secrets-dir %s --server-name %s --route-url %s --account-issuer %s --broker-nkey %s\n",
+			_, _ = fmt.Fprintf(out, "  1. tether cluster reconcile nats --manual --secrets-dir %s --server-name %s --route-url %s --account-issuer %s --broker-nkey %s\n",
 				secretsDir, selfID, routeURL, acctTok, brkTok)
 			if ids.AccountIssuer != "" && ids.BrokerNkey != "" {
 				_, _ = fmt.Fprintln(out, "     # account-issuer auto-read from this host's secrets + verified against nats.conf")
@@ -693,7 +746,7 @@ func newClusterInitCmd() *cobra.Command {
 			_, _ = fmt.Fprintln(out, "  2. systemctl restart nats-server                       # bring up the new conf")
 			_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir} in broker.yaml")
 			_, _ = fmt.Fprintln(out, "  4. systemctl start tether-broker                       # starts in cluster mode (N=1)")
-			_, _ = fmt.Fprintln(out, "  5. reinstall ALL agents on v2, then `tether cluster add` to grow to N>=3")
+			_, _ = fmt.Fprintln(out, "  5. reinstall ALL agents on v2, then `tether cluster join prepare`/`approve` to grow to N>=3")
 			return nil
 		},
 	}
@@ -762,16 +815,19 @@ func rejectedUnattendedYes(cmd *cobra.Command, verb, want string) error {
 	return nil
 }
 
-// leaderRedirect prints the §8.1 fail-fast hint (where to re-run) and reports whether
-// the response was a non-leader bounce.
-func leaderRedirect(cmd *cobra.Command, resp *adminsock.Response) bool {
+// leaderRedirect prints the §8.1 fail-fast hint (where to re-run) and returns the right-CLASS error for
+// a non-leader bounce, or nil if the response is not a bounce. Mega-audit MAJ-8: a bounce with NO
+// LeaderHost is an election-in-progress (a routine failover) — a TRANSIENT (exit 75, "retry"), NOT a
+// terminal permission error (77). A bounce that names a leader host IS terminal-for-this-host (77): the
+// operator must re-run elsewhere.
+func leaderRedirect(cmd *cobra.Command, resp *adminsock.Response) error {
 	if !resp.NotLeader {
-		return false
+		return nil
 	}
 	if resp.LeaderHost != "" {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not the leader — re-run on the leader host: %s\n", resp.LeaderHost)
-	} else {
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "no leader (election in progress); retry shortly")
+		return errNonLeader
 	}
-	return true
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "no leader (election in progress); retry shortly")
+	return &ExitError{Class: exitTransient, Err: fmt.Errorf("no leader (election in progress)")}
 }

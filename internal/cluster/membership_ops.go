@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/nats-io/nkeys"
 )
 
 // membership_ops.go — D7 §8.1 cluster-membership ops (Plan + the one custom
@@ -260,21 +261,65 @@ func PlanClusterNodePhase(nodeID, newPhase string, allowedPreds []string, voterA
 		`, phase_changed_at=` + LitTime(now.UTC()) +
 		` WHERE node_id=` + nodeLit +
 		` AND phase IN (` + strings.Join(preds, ",") + `)`
-	return NewCommand(OpClusterNodePhase, Stmt(sqlStr)), nil
+	// C1 §D-2: bump the monotone roster_generation IN THE SAME Apply txn, change-gated
+	// (changes()>0) so a stale-leader predecessor-guard no-op does not inflate it.
+	// C1 §D-2: roster gen bump (change-gated). C3 §D-G: ALSO bump topology_generation, but ONLY on a
+	// mesh-ENTER (→CATCHING_UP) — within-mesh transitions (→VOTER/→DRAINING/→RETIRING) don't change the
+	// rendered nats.conf, so they must not flap the cluster to DEGRADED. Appended LAST so its change()
+	// gate reads rosterGenBumpStmt's RowsAffected (1 iff the phase UPDATE matched) → truth-preserving.
+	stmts := []Statement{Stmt(sqlStr), rosterGenBumpStmt(now)}
+	if newPhase == "CATCHING_UP" {
+		stmts = append(stmts, topologyGenBumpStmt(now))
+	}
+	return NewCommand(OpClusterNodePhase, stmts...), nil
 }
 
 // PlanClusterNodeRemove renders OpClusterNodeRemove (§8.1 removal order): DELETE a
 // roster row ONLY when it has walked through removal (RETIRING) or failed to join
 // (VOTER_ADD_FAILED). A live VOTER is structurally undeletable here. Idempotent
 // (RowsAffected==0 re-delete). Rides genericExecApplier.
-func PlanClusterNodeRemove(nodeID string) (*Command, error) {
+func PlanClusterNodeRemove(nodeID string, now time.Time) (*Command, error) {
 	nodeLit, err := LitText(nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: plan node-remove: node literal: %w", err)
 	}
-	sqlStr := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit +
-		` AND phase IN ('RETIRING','VOTER_ADD_FAILED')`
-	return NewCommand(OpClusterNodeRemove, Stmt(sqlStr)), nil
+	// C3-m1: split the remove by phase so topology_generation bumps ONLY for a RETIRING node (a mesh
+	// member LEAVING). A VOTER_ADD_FAILED row was NEVER in the route mesh (∉ topoMeshPhases), so its
+	// removal must NOT flap the cluster to DEGRADED. roster_generation still bumps for EITHER (any
+	// membership change). A node is exactly one of the two phases, so at most one DELETE matches.
+	delFailed := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit + ` AND phase='VOTER_ADD_FAILED'`
+	delRetiring := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit + ` AND phase='RETIRING'`
+	return NewCommand(OpClusterNodeRemove,
+		Stmt(delFailed), rosterGenBumpStmt(now), // non-mesh cleanup: roster bumps, topology does not
+		Stmt(delRetiring), rosterGenBumpStmt(now), topologyGenBumpStmt(now), // mesh leave: both bump
+	), nil
+}
+
+// PlanClusterBusNkeySet renders OpClusterBusNkeySet (C3 §D-F): record a broker's NATS bus nkey public
+// key into cluster_nodes.bus_nkey_pub so the topology reconciler can render that peer into
+// auth_callout.auth_users + the static users{} ACL. Leader-local fail-fast rejects a non-user-key
+// (a garbage nkey would break every replica's `nats-server -t`). The UPDATE is guarded `bus_nkey_pub
+// != <lit>` so an idempotent re-propose is a RowsAffected==0 no-op → the change-gated
+// topology_generation bump does not advance. Rides genericExecApplier.
+func PlanClusterBusNkeySet(nodeID, busNkeyPub string, now time.Time) (*Command, error) {
+	if !nkeys.IsValidPublicUserKey(busNkeyPub) {
+		return nil, fmt.Errorf("cluster: plan bus-nkey-set: %q is not a valid NATS user public key", busNkeyPub)
+	}
+	nodeLit, err := LitText(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan bus-nkey-set: node literal: %w", err)
+	}
+	nkLit, err := LitText(busNkeyPub)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan bus-nkey-set: nkey literal: %w", err)
+	}
+	// C3-m2: only a MESH node's bus nkey affects the rendered conf — gate the UPDATE on a mesh phase so
+	// filling a PENDING/VOTER_ADD_FAILED node's bus nkey does not spuriously bump topology_generation.
+	// (A joiner sets its nkey once it reaches CATCHING_UP; the mesh-ENTER already gates the render.)
+	sqlStr := `UPDATE cluster_nodes SET bus_nkey_pub=` + nkLit +
+		` WHERE node_id=` + nodeLit + ` AND bus_nkey_pub != ` + nkLit +
+		` AND phase IN ('CATCHING_UP','VOTER','DRAINING','RETIRING')`
+	return NewCommand(OpClusterBusNkeySet, Stmt(sqlStr), topologyGenBumpStmt(now)), nil
 }
 
 // MetaKeyForceSingle is the cluster_meta key the offline force-single tool sets and
@@ -296,7 +341,7 @@ func PlanClearForceSingle() (*Command, error) {
 // value), installs newFP as cert_fp, and sets cert_fp_valid_until so the D6 cert-pin
 // VerifyConnection accepts the previous pin until the window closes. NOT a join
 // (no PoP); just a cert update on an existing roster row. genericExecApplier.
-func PlanClusterCertRotate(nodeID, newFP string, validUntil time.Time) (*Command, error) {
+func PlanClusterCertRotate(nodeID, newFP string, validUntil, now time.Time) (*Command, error) {
 	nodeLit, err := LitText(nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: plan cert-rotate: node literal: %w", err)
@@ -308,7 +353,9 @@ func PlanClusterCertRotate(nodeID, newFP string, validUntil time.Time) (*Command
 	sqlStr := `UPDATE cluster_nodes SET cert_fp_prev=cert_fp, cert_fp=` + fpLit +
 		`, cert_fp_valid_until=` + LitTime(validUntil.UTC()) +
 		` WHERE node_id=` + nodeLit + ` AND cert_fp != ` + fpLit
-	return NewCommand(OpClusterCertRotate, Stmt(sqlStr)), nil
+	// C1 §D-2: CertFP is a signed-roster field → bump roster_generation atomically;
+	// change-gated so a cert_fp-unchanged (RowsAffected==0) no-op does not advance it.
+	return NewCommand(OpClusterCertRotate, Stmt(sqlStr), rosterGenBumpStmt(now)), nil
 }
 
 // PlanClusterDrainSet renders OpClusterDrainSet (§8.3): set or clear a broker's

@@ -232,6 +232,23 @@ func GetProxyEnabled(db *sql.DB, sid string) (bool, error) {
 	return v == 1, nil
 }
 
+// GetProxyHAPolicy returns the session's C5 proxy HA policy (the default 'freeze-on-quorum-loss' for a
+// pre-C5 session). ErrNotFound if the session row is gone.
+func GetProxyHAPolicy(db *sql.DB, sid string) (string, error) {
+	var p string
+	err := db.QueryRow(`SELECT proxy_ha_policy FROM sessions WHERE sid=?`, sid).Scan(&p)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if p == "" {
+		p = ProxyHAFreeze
+	}
+	return p, nil
+}
+
 // SetProxyEnabled flips the P13 proxy master switch. It only touches ACTIVE
 // sessions (defense-in-depth on the C.1 §6 precheck) and reports whether the
 // value actually changed. Returns ErrNotFound if no ACTIVE row matched.

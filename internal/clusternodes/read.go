@@ -47,6 +47,44 @@ func (n *HomeNode) Eligible() bool { return n.Phase == PhaseVoter }
 const selectHomeNode = `SELECT node_id, nats_server_id, tunnel_addr, public_host, cert_fp,
         cert_fp_prev, cert_fp_valid_until, phase FROM cluster_nodes WHERE `
 
+// TopoPeer is the projection of one cluster_nodes row the C3 topology reconciler needs to render this
+// broker's nats.conf mesh (routes + auth_callout auth_users + static users ACL).
+type TopoPeer struct {
+	NodeID     string
+	NatsServer string // nats_server_id (the deterministic server_name)
+	NatsRoute  string // nats_route (cluster route URL, e.g. nats://10.0.0.2:6222)
+	BusNkeyPub string // bus_nkey_pub ('' ⇒ unresolvable, reconciler waits)
+	Phase      string
+}
+
+// topoMeshPhases are the phases whose rows belong in the rendered route mesh: a node ENTERS at
+// CATCHING_UP and LEAVES only when its row is deleted (DRAINING/RETIRING stay so routes don't vanish
+// mid-drain). JOIN_VERIFIED_PENDING_VOTER / VOTER_ADD_FAILED are NOT in the mesh.
+var topoMeshPhases = map[string]bool{"CATCHING_UP": true, "VOTER": true, "DRAINING": true, "RETIRING": true}
+
+// ListPeersForTopology returns the mesh-phase cluster_nodes rows for the reconciler, fully
+// materialized BEFORE the rows are closed (the D6 deadlock lesson: no nested query under
+// MaxOpenConns(1)). Sorted by node_id for deterministic rendering.
+func ListPeersForTopology(db *sql.DB) ([]TopoPeer, error) {
+	rows, err := db.Query(`SELECT node_id, nats_server_id, nats_route, bus_nkey_pub, phase
+	        FROM cluster_nodes ORDER BY node_id`)
+	if err != nil {
+		return nil, fmt.Errorf("clusternodes: list topology peers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []TopoPeer
+	for rows.Next() {
+		var p TopoPeer
+		if err := rows.Scan(&p.NodeID, &p.NatsServer, &p.NatsRoute, &p.BusNkeyPub, &p.Phase); err != nil {
+			return nil, fmt.Errorf("clusternodes: scan topology peer: %w", err)
+		}
+		if topoMeshPhases[p.Phase] {
+			out = append(out, p)
+		}
+	}
+	return out, rows.Err()
+}
+
 // LookupByNatsServer resolves a cluster_nodes row by the nats server_name an
 // agent reported (NodeRegisterReq.ServerID == nc.ConnectedServerName()). Used for
 // the INITIAL home resolution (the agent's current connected broker, §6.5). An

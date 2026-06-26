@@ -140,21 +140,41 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 	b.lastObserveMu.Lock()
 	b.lastObserve = peers
 	b.lastObserveMu.Unlock()
+
+	// BD7: read ActiveAlerts ONCE — reused for the broker_down false→true edge detection (the
+	// broker_down_rehome_summary fires on a NEW down) AND the orphan-clear pass below (no double scan).
+	active, aerr := cluster.ActiveAlerts(b.cfg.DB)
+	prevDown := map[string]bool{}
+	if aerr == nil {
+		for _, a := range active {
+			if a.Kind == cluster.AlertKindBrokerDown {
+				if node := strings.TrimPrefix(a.DedupKey, a.Kind+":"); node != "" {
+					prevDown[node] = true
+				}
+			}
+		}
+	}
 	for _, d := range decideObservabilityAlerts(b.selfID, leaderApplied, voters, responses, lagThreshold) {
 		b.proposeAlertSignal(d.Kind, d.NodeID, d.Active, d.Message)
+		// BD7: a brand-new broker_down (false→true) → one rehome-impact summary (proxy_homes the
+		// reaper will rehome vs exposes_stranded). Honest, secret-free, once per transition. C6-BE-02:
+		// only when the ActiveAlerts read SUCCEEDED — on a read error prevDown is empty, which would make
+		// an already-down broker look like a fresh false→true edge and fire a spurious summary.
+		if aerr == nil && d.Kind == cluster.AlertKindBrokerDown && d.Active && !prevDown[d.NodeID] {
+			b.emitBrokerDownRehomeSummary(d.NodeID)
+		}
 	}
 
 	// audit-publish F1: clear ORPHANED per-node observability alerts for nodes that LEFT the
 	// voter set — the decide loop only iterates CURRENT voters, so a removed/retired node's
 	// broker_down/raft_lag alert would otherwise stay ACTIVE forever. The clear is
 	// transition-gated (planAlertSignal), so a node still down/lagging keeps its alert.
+	if aerr != nil {
+		return
+	}
 	voterSet := make(map[string]bool, len(voters))
 	for _, v := range voters {
 		voterSet[v] = true
-	}
-	active, aerr := cluster.ActiveAlerts(b.cfg.DB)
-	if aerr != nil {
-		return
 	}
 	for _, a := range active {
 		if a.Kind != cluster.AlertKindBrokerDown && a.Kind != cluster.AlertKindRaftLag {
@@ -215,6 +235,16 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 				}
 			}
 			wasLeader = isLeader
+			// C4: drive in-flight operations one idempotent step per tick (leader-gated inside). This is
+			// the resume mechanism — a kill-9/leadership-change leaves a non-terminal op that the new
+			// leader picks up + drives to terminal by re-deriving from the substrate.
+			if isLeader && b.cl.admin != nil {
+				b.cl.admin.driveInFlightOperations()
+			}
+			// C5: the leader-gated proxy data-plane reaper (allocation + home-down rehome).
+			if isLeader {
+				b.driveProxyReconcile()
+			}
 
 			voters, err := b.clusterVoters()
 			if err != nil {

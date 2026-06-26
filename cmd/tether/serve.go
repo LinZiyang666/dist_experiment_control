@@ -44,6 +44,9 @@ func newServeCmd() *cobra.Command {
 		logLevel         string
 		logJSON          bool
 		metricsListen    string
+		manifestListen   string
+		natsConfPath     string
+		natsServerBin    string
 		alertWebhookURL  string
 	)
 	cmd := &cobra.Command{
@@ -84,6 +87,9 @@ func newServeCmd() *cobra.Command {
 			// B5/B6 observability knobs: flag wins, else broker.yaml, else the cobra default.
 			logLevel = pickFlagOrYaml(cmd, "log-level", logLevel, fileCfg.Broker.Obs.LogLevel)
 			metricsListen = pickFlagOrYaml(cmd, "metrics-listen", metricsListen, fileCfg.Broker.Obs.MetricsListen)
+			manifestListen = pickFlagOrYaml(cmd, "cluster-manifest-listen", manifestListen, fileCfg.Broker.Cluster.ManifestListen)
+			natsConfPath = pickFlagOrYaml(cmd, "nats-conf-path", natsConfPath, fileCfg.Broker.Cluster.NatsConfPath)
+			natsServerBin = pickFlagOrYaml(cmd, "nats-server-bin", natsServerBin, fileCfg.Broker.Cluster.NatsServerBin)
 			alertWebhookURL = pickFlagOrYaml(cmd, "alert-webhook-url", alertWebhookURL, fileCfg.Broker.Obs.AlertWebhookURL)
 			if !cmd.Flags().Changed("log-json") && fileCfg.Broker.Obs.LogJSON {
 				logJSON = true
@@ -123,6 +129,12 @@ func newServeCmd() *cobra.Command {
 			clusterMode, err := broker.DetectClusterMode(clusterDataDir)
 			if err != nil {
 				return err
+			}
+			// C3: in cluster mode the per-broker topology reconciler manages the live nats.conf. Default
+			// the path so a standard install converges automatically; an operator can override or set it
+			// empty to opt out (then the broker reports no topology and is not held out of HEALTHY-HA).
+			if clusterMode && natsConfPath == "" && !cmd.Flags().Changed("nats-conf-path") {
+				natsConfPath = "/etc/tether/nats.conf"
 			}
 			var db *sql.DB
 			if !clusterMode {
@@ -175,6 +187,9 @@ func newServeCmd() *cobra.Command {
 				ClusterSecretsDir:   clusterSecrets,
 				DBPath:              dbPath,
 				MetricsAddr:         metricsListen,
+				ManifestAddr:        manifestListen,
+				NatsConfPath:        natsConfPath,
+				NatsServerBin:       natsServerBin,
 				AlertWebhookURL:     alertWebhookURL,
 			}
 
@@ -245,6 +260,9 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "address for the Prometheus /metrics + /healthz + /readyz HTTP endpoint (e.g. 127.0.0.1:9090); empty disables it (B5 OPS#1)")
+	cmd.Flags().StringVar(&manifestListen, "cluster-manifest-listen", "", "LOOPBACK address for the well-known cluster discovery manifest /.well-known/tether/cluster.json (e.g. 127.0.0.1:7480), Caddy-fronted; empty disables it; bound only in cluster mode (C2)")
+	cmd.Flags().StringVar(&natsConfPath, "nats-conf-path", "", "live nats.conf the topology reconciler manages in cluster mode (default /etc/tether/nats.conf; empty opts out) (C3)")
+	cmd.Flags().StringVar(&natsServerBin, "nats-server-bin", "", "nats-server binary for the topology reconciler's `-t` dry-run + `--signal reload` (default: nats-server on PATH) (C3)")
 	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
 	return cmd
 }

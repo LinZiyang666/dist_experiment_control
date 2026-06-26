@@ -54,14 +54,39 @@ type ProxyState struct {
 	LocalPort  int    `json:"local_port"`
 	Token      string `json:"token"`
 	Epoch      int64  `json:"epoch"`
+	// HomeBrokerAddr + HomeEpoch (C5) persist the proxy's authoritative home broker on a SEPARATE
+	// epoch axis from the keyset Epoch, so a restart re-targets the right home (replay). CertPins are
+	// NOT persisted (re-delivered on every register reply, like the PSKs). All omitempty so a
+	// pre-C5 / single-node state.json stays byte-stable (empty addr ⇒ the single --tunnel-addr).
+	HomeBrokerAddr string         `json:"home_broker_addr,omitempty"`
+	HomeEpoch      int64          `json:"home_epoch,omitempty"`
+	CertPins       proto.CertPins `json:"-"`
+}
+
+// RosterCache (C1) persists the last ACCEPTED signed broker roster + the durable TOFU
+// account-pub pin + the monotone generation high-water mark, so a restart can dial the
+// learned broker set (cached → bootstrap → seed) before the first register, and so the
+// anti-rollback pin/hwm survive across restarts. Pointer/omitempty so a pre-C1
+// state.json still loads (nil ⇒ no pin ⇒ the first roster TOFU-pins). The cached Roster
+// is re-VerifyAt'd on boot (its own expires_at bounds replay).
+type RosterCache struct {
+	PinAccountPub string               `json:"pin_account_pub"`  // durable TOFU anchor (first-write-wins)
+	Generation    uint64               `json:"generation"`       // monotone roster hwm
+	Roster        *proto.ClusterRoster `json:"roster,omitempty"` // last accepted roster; re-verified on boot
+	// C2: the seed bundle (client-dialable cold-start endpoints) + its own monotone hwm. The full
+	// signed SeedBundle is persisted (not bare URLs) so it can be re-VerifySeedsAt'd on boot, mirroring
+	// the roster (anti-replay survives a restart). Additive/omitempty.
+	SeedGen uint64            `json:"seed_gen,omitempty"`
+	Seeds   *proto.SeedBundle `json:"seeds,omitempty"`
 }
 
 // StateFile is the on-disk shape. Writers serialize through stateMu
 // in the agent so concurrent expose / expose-rm don't trample each
 // other's writes.
 type StateFile struct {
-	PortTokens []PortToken `json:"port_tokens"`
-	Proxy      *ProxyState `json:"proxy,omitempty"`
+	PortTokens []PortToken  `json:"port_tokens"`
+	Proxy      *ProxyState  `json:"proxy,omitempty"`
+	Roster     *RosterCache `json:"roster,omitempty"` // C1: signed-roster discovery cache
 }
 
 type stateStore struct {
@@ -203,6 +228,27 @@ func (s *stateStore) GetProxy() (*ProxyState, error) {
 		return nil, err
 	}
 	return sf.Proxy, nil
+}
+
+// SetRosterCache upserts the C1 roster discovery cache (nil clears it). Atomic write.
+func (s *stateStore) SetRosterCache(rc *RosterCache) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sf, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	sf.Roster = rc
+	return s.saveLocked(sf)
+}
+
+// GetRosterCache returns the persisted roster cache, or nil if none.
+func (s *stateStore) GetRosterCache() (*RosterCache, error) {
+	sf, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	return sf.Roster, nil
 }
 
 // saveLocked writes the StateFile via tmp+fsync+rename atomic replace

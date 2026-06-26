@@ -87,9 +87,9 @@ func InitFromManifest(manifestPath, dataDir, dbPath, secretsDir string, now func
 	}
 	// Audit MAJOR: `init --from-manifest` is IDENTITY-ONLY (it seeds the self row, NOT business
 	// state). A BACKUP manifest's data lives in the bundle's state.db — pointing init at it would
-	// silently discard every session/port/alert. Refuse loudly + point at `cluster restore`.
+	// silently discard every session/port/alert. Refuse loudly + point at `cluster recovery restore`.
 	if m.Kind != ManifestKindRecover {
-		return fmt.Errorf("clusteroffline: manifest kind %q is not a recover manifest; for a backup bundle use `cluster restore <bundle>` (init --from-manifest only re-seeds identity)", m.Kind)
+		return fmt.Errorf("clusteroffline: manifest kind %q is not a recover manifest; for a backup bundle use `cluster recovery restore <bundle>` (init --from-manifest only re-seeds identity)", m.Kind)
 	}
 	// Cross-check the manifest's self_cert_fp against the LIVE secrets dir (advisory; the live fp
 	// is what InitFromExisting actually seeds).

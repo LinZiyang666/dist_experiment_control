@@ -1,0 +1,224 @@
+package broker
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"os"
+	"os/exec"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/clusternodes"
+	"github.com/LinZiyang666/tether/internal/natscluster"
+	"github.com/LinZiyang666/tether/internal/natsreconcile"
+	"github.com/nats-io/nkeys"
+)
+
+// topology_reconcile.go (C3) — the per-broker NATS topology reconcile loop: a 5th cluster loop, NOT
+// leader-gated (every broker converges its OWN nats.conf). It watches the replicated topology
+// generation, renders+validates+swaps+reloads this host's conf, and probes the live server for a REAL
+// observed generation. It NEVER ssh/root-orchestrates: the only side effect is `nats-server --signal
+// reload` to its own same-uid co-located process (architecture §11(h) C3 amendment).
+
+const (
+	topoReconcileInterval = 5 * time.Second
+	topoMonitorListen     = "127.0.0.1:8223" // loopback monitor the reconciler renders + probes
+	topoReloadTimeout     = 10 * time.Second
+	topoProbeTimeout      = 3 * time.Second
+)
+
+// topoProbeClient (C3-M4) is built ONCE and reused across probes: a fresh http.Client+Transport per
+// 5s tick would strand a persistConn goroutine+fd each time (tripping the repo NumGoroutine/fd leak
+// gate). Proxy:nil bypasses a WSL-style HTTP_PROXY on the loopback monitor; DisableKeepAlives closes
+// the conn after each probe so no idle pool accrues.
+var topoProbeClient = &http.Client{
+	Timeout:   topoProbeTimeout,
+	Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+}
+
+// topoSelfReport returns this broker's latest topology reconcile self-report for the health responder
+// (nil if no cluster runtime or no pass yet — the responder still sets TopoReported=true).
+func (b *Broker) topoSelfReport() *topoSelfReport {
+	if b.cl == nil {
+		return nil
+	}
+	return b.cl.topoSelf.Load()
+}
+
+// runTopologyReconcileLoop converges this broker's nats.conf. Started in wireClusterLate (ctx-bounded,
+// joined by clusterShutdownOrdered, leak-gated). Inert when no live conf path is configured. The loop
+// is single-goroutine so reloadNatsServer calls are serial (no single-flight mutex needed).
+func (b *Broker) runTopologyReconcileLoop(ctx context.Context) {
+	if b.cfg.NatsConfPath == "" {
+		return // no live conf to manage → reconciler inert (status reports nothing)
+	}
+	ticker := time.NewTicker(topoReconcileInterval)
+	defer ticker.Stop()
+	var lastApplied, lastObserved uint64
+	var lastReloadMtime int64 // mega-audit MAJ-6: the conf mtime we last SIGHUP-reloaded (storm guard)
+	var lastEventKey string   // C3-m7: publish a sys.event only when the (action,reason) actually changes
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		lastApplied, lastObserved, lastReloadMtime, lastEventKey = b.reconcileTopologyOnce(ctx, lastApplied, lastObserved, lastReloadMtime, lastEventKey)
+	}
+}
+
+func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObserved uint64, lastReloadMtime int64, lastEventKey string) (uint64, uint64, int64, string) {
+	desired, err := cluster.TopologyGeneration(b.cfg.DB)
+	if err != nil {
+		return lastApplied, lastObserved, lastReloadMtime, lastEventKey
+	}
+	// Self-backfill: write our own bus nkey pub when the replicated row is empty OR wrong (C3-m3
+	// heals a mismatch, not only an empty value). Bounded — PlanClusterBusNkeySet's `WHERE
+	// bus_nkey_pub != <lit>` makes a re-propose a no-op once correct, so no per-tick raft write.
+	if b.selfBusNkeyNeedsBackfill() {
+		b.backfillSelfBusNkey()
+	}
+	in, ok := b.buildTopologyInputs(desired)
+	if !ok {
+		return lastApplied, lastObserved, lastReloadMtime, lastEventKey
+	}
+	// Mega-audit MAJ-6: gate the SIGHUP-reload on the conf mtime advancing since our last reload. The
+	// reconciler's fast-path re-issues reload() every tick whenever the probe can't CONFIRM the load
+	// (e.g. a conf with no http monitor — the probe is connection-refused forever), which without this
+	// guard is ~17k SIGHUP/day/broker. A real swap bumps the conf mtime → reload fires exactly once.
+	reloadedMtime := lastReloadMtime
+	reload := func() error {
+		mt := topoConfMtime(in.ConfPath)
+		if mt != 0 && mt == reloadedMtime {
+			return nil // already reloaded this exact conf; re-signaling won't change an unconfirmable probe
+		}
+		if rerr := b.reloadNatsServer(ctx); rerr != nil {
+			return rerr
+		}
+		reloadedMtime = mt
+		return nil
+	}
+	out := natsreconcile.ReconcileOnce(in, lastApplied, lastObserved, reload, b.probeNatsConfigLoadTime)
+	b.cl.topoSelf.Store(&topoSelfReport{Applied: out.AppliedGen, Observed: out.ObservedGen, Reason: out.Reason})
+	// C3-m7: change-gate the sys.event so a stuck broker does not spam JS every 5s (a publish per tick
+	// would also stall if JS is the unhealthy thing). Skip the steady-state noop/unresolvable.
+	eventKey := out.Action + "|" + out.Reason
+	if out.Action != natsreconcile.ActionNoop && out.Action != natsreconcile.ActionUnresolvable && eventKey != lastEventKey {
+		b.pubSysEvent("nats_topology_"+out.Action, map[string]any{
+			"applied": out.AppliedGen, "observed": out.ObservedGen, "reason": out.Reason,
+		})
+	}
+	return out.AppliedGen, out.ObservedGen, reloadedMtime, eventKey
+}
+
+// topoConfMtime returns the conf file's mtime in unix-nanos (0 if absent) — the MAJ-6 reload-storm guard
+// key. A swap rewrites the file (mtime advances) so a real change still reloads exactly once.
+func topoConfMtime(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.ModTime().UnixNano()
+}
+
+func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool) {
+	peers, err := clusternodes.ListPeersForTopology(b.cfg.DB)
+	if err != nil {
+		return natsreconcile.Inputs{}, false
+	}
+	brokers := make([]natscluster.Broker, 0, len(peers))
+	selfServer := ""
+	for _, p := range peers {
+		brokers = append(brokers, natscluster.Broker{ServerName: p.NatsServer, NkeyPub: p.BusNkeyPub, RouteURL: p.NatsRoute})
+		if p.NodeID == b.selfID {
+			selfServer = p.NatsServer
+		}
+	}
+	bin := b.cfg.NatsServerBin
+	if bin == "" {
+		bin = "nats-server"
+	}
+	return natsreconcile.Inputs{
+		SelfServerName: selfServer,
+		Peers:          brokers,
+		AccountIssuer:  b.accountPubOrEmpty(),
+		ConfPath:       b.cfg.NatsConfPath,
+		NatsServerBin:  bin,
+		DesiredGen:     desired,
+	}, true
+}
+
+// reloadNatsServer sends a SIGHUP-reload to the local nats-server via the official `--signal reload`
+// resolver (pgrep, no pidfile). Bounded by min(loop ctx, topoReloadTimeout) so a shutdown cancels it
+// promptly (C3-m9). The loop is single-goroutine so calls are serial.
+func (b *Broker) reloadNatsServer(ctx context.Context) error {
+	bin := b.cfg.NatsServerBin
+	if bin == "" {
+		bin = "nats-server"
+	}
+	rctx, cancel := context.WithTimeout(ctx, topoReloadTimeout)
+	defer cancel()
+	return exec.CommandContext(rctx, bin, "--signal", "reload").Run()
+}
+
+// probeNatsConfigLoadTime reads the live server's config_load_time off the loopback /varz monitor,
+// using the shared topoProbeClient (built once — see M4) which bypasses HTTP_PROXY for the loopback.
+func (b *Broker) probeNatsConfigLoadTime() (time.Time, error) {
+	resp, err := topoProbeClient.Get("http://" + topoMonitorListen + "/varz")
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var v struct {
+		ConfigLoadTime time.Time `json:"config_load_time"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return time.Time{}, err
+	}
+	return v.ConfigLoadTime, nil
+}
+
+// selfBusNkeyNeedsBackfill reports whether this broker's replicated bus_nkey_pub is missing OR wrong
+// (C3-m3: a mismatch — e.g. a rotated broker.nk or a bad write — must self-heal, not only an empty
+// value). Returns false on a read error or when we cannot derive our own pub (no seam to compare).
+func (b *Broker) selfBusNkeyNeedsBackfill() bool {
+	if b.selfID == "" || b.cfg.AuthCallout == nil || len(b.cfg.AuthCallout.BrokerNkeySeed) == 0 {
+		return false
+	}
+	kp, err := nkeys.FromSeed(b.cfg.AuthCallout.BrokerNkeySeed)
+	if err != nil {
+		return false
+	}
+	want, err := kp.PublicKey()
+	if err != nil {
+		return false
+	}
+	var got string
+	if err := b.cfg.DB.QueryRow(`SELECT bus_nkey_pub FROM cluster_nodes WHERE node_id = ?`, b.selfID).Scan(&got); err != nil {
+		return false
+	}
+	return got != want
+}
+
+// backfillSelfBusNkey writes this broker's OWN bus nkey pub (derived from its broker.nk) via the D9
+// proposeOrForward path. Idempotent (the Plan's WHERE guard); best-effort (a transient no-leader just
+// retries next tick).
+func (b *Broker) backfillSelfBusNkey() {
+	if b.cfg.AuthCallout == nil || len(b.cfg.AuthCallout.BrokerNkeySeed) == 0 || b.selfID == "" {
+		return
+	}
+	kp, err := nkeys.FromSeed(b.cfg.AuthCallout.BrokerNkeySeed)
+	if err != nil {
+		return
+	}
+	pub, err := kp.PublicKey()
+	if err != nil {
+		return
+	}
+	payload, _ := json.Marshal(BusNkeySetPayload{NodeID: b.selfID, BusNkeyPub: pub})
+	_ = b.proposeOrForward(VerbBusNkeySet, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterBusNkeySet(b.selfID, pub, b.cfg.Now())
+	})
+}

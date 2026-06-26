@@ -50,8 +50,18 @@ func requireLoopback(addr string) error {
 // Config wires the handler to its read-only dependencies.
 type Config struct {
 	DB         *sql.DB
-	PublicHost string // host printed in node entries (broker's public DNS name)
+	PublicHost string // host printed in node entries (broker's public DNS name; the per-node FALLBACK)
 	Logger     *slog.Logger
+
+	// ClusterMode (C5) makes LiveProxyNodes resolve each __proxy__ node's AUTHORITATIVE home broker
+	// public host (the home broker terminates that node's tunnel), instead of this broker's PublicHost.
+	// A node whose home is not a VOTER is excluded (un-vendable until it rehomes). false ⇒ P13 single
+	// broker, byte-identical.
+	ClusterMode bool
+	// Vendable (C5) is the injected /sub read gate. nil ⇒ always vend (single mode). In cluster mode the
+	// broker provides a predicate that returns false ONLY in DISABLED_NO_QUORUM (disable-on-quorum-loss
+	// + no committable quorum) — FROZEN_READONLY still vends the last committed state.
+	Vendable func(sid string) bool
 }
 
 // Handler returns the http.Handler serving GET /sub/<token>.
@@ -91,13 +101,19 @@ func serveSub(w http.ResponseWriter, r *http.Request, cfg Config) {
 		notFound(w)
 		return
 	}
+	// C5 vend gate: DISABLED_NO_QUORUM ⇒ the same 404 (no existence oracle). FROZEN_READONLY still
+	// vends the last committed state (the injected predicate returns true there).
+	if cfg.Vendable != nil && !cfg.Vendable(sid) {
+		notFound(w)
+		return
+	}
 	sub, err := proxysub.LookupByTokenHash(cfg.DB, sid, tokenHash)
 	if err != nil {
 		notFound(w)
 		return
 	}
 
-	nodes, err := LiveProxyNodes(cfg.DB, sid)
+	nodes, err := liveProxyNodes(cfg.DB, sid, cfg.ClusterMode)
 	if err != nil {
 		cfg.Logger.Warn("subhttp: live nodes query", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -120,26 +136,63 @@ func notFound(w http.ResponseWriter) {
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
-// ProxyNode is one rendered exit node.
+// ProxyNode is one rendered exit node. Host (C5) is the per-node home broker public host in cluster
+// mode (empty in single mode → the renderer falls back to cfg.PublicHost).
 type ProxyNode struct {
 	NID  string
 	Port int
+	Host string
 }
 
-// LiveProxyNodes returns the ONLINE, proxy-ready exit nodes for sid, ordered
-// by nid. The ONLINE + proxy_ready gates exclude offline / pre-P13 / not-yet-
-// bound agents, so the list auto-updates as agents come and go.
+// LiveProxyNodes is the single-mode (P13) exit-node query, kept exported for back-compat.
 func LiveProxyNodes(db *sql.DB, sid string) ([]ProxyNode, error) {
-	// round-6 F9: the render must independently honour the AUTHORITATIVE master
-	// switch + capability, not just allocation/ready. After OFF commits, a
-	// cleanup failure before readiness is cleared must not leave stale nodes in
-	// the Clash document — so require sessions.state=ACTIVE, proxy_enabled=1, and
-	// nodes.proxy_capable=1 directly in the query.
+	return liveProxyNodes(db, sid, false)
+}
+
+// liveProxyNodes returns the ONLINE, proxy-ready exit nodes for sid, ordered by nid. The ONLINE +
+// proxy_ready gates exclude offline / pre-P13 / not-yet-bound agents, so the list auto-updates as
+// agents come and go. round-6 F9: the render independently honours the AUTHORITATIVE master switch +
+// capability (state=ACTIVE, proxy_enabled=1, proxy_capable=1) so an OFF-with-cleanup-failure leaves no
+// stale node. C5: in cluster mode each node's exit Host is its AUTHORITATIVE home broker's public host
+// (the broker that terminates that node's tunnel), and a node whose home is NOT a VOTER is EXCLUDED
+// (un-vendable until it rehomes) — so /sub from any broker returns working exits.
+func liveProxyNodes(db *sql.DB, sid string, clusterMode bool) ([]ProxyNode, error) {
+	if !clusterMode {
+		rows, err := db.Query(`
+			SELECT pa.nid, pa.port
+			FROM port_allocations pa
+			JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
+			JOIN sessions s ON s.sid = pa.sid
+			WHERE pa.sid = ?
+			  AND pa.name = '__proxy__'
+			  AND pa.state = 'ALLOCATED'
+			  AND n.status = 'ONLINE'
+			  AND n.proxy_ready = 1
+			  AND n.proxy_capable = 1
+			  AND s.state = 'ACTIVE'
+			  AND s.proxy_enabled = 1
+			ORDER BY pa.nid`, sid)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		var out []ProxyNode
+		for rows.Next() {
+			var n ProxyNode
+			if err := rows.Scan(&n.NID, &n.Port); err != nil {
+				return nil, err
+			}
+			out = append(out, n)
+		}
+		return out, rows.Err()
+	}
+	// Cluster mode: JOIN the home broker (must be a VOTER) and project its public_host per node.
 	rows, err := db.Query(`
-		SELECT pa.nid, pa.port
+		SELECT pa.nid, pa.port, cn.public_host
 		FROM port_allocations pa
 		JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
 		JOIN sessions s ON s.sid = pa.sid
+		JOIN cluster_nodes cn ON cn.node_id = pa.home_broker
 		WHERE pa.sid = ?
 		  AND pa.name = '__proxy__'
 		  AND pa.state = 'ALLOCATED'
@@ -148,6 +201,8 @@ func LiveProxyNodes(db *sql.DB, sid string) ([]ProxyNode, error) {
 		  AND n.proxy_capable = 1
 		  AND s.state = 'ACTIVE'
 		  AND s.proxy_enabled = 1
+		  AND cn.phase = 'VOTER'
+		  AND cn.public_host != ''
 		ORDER BY pa.nid`, sid)
 	if err != nil {
 		return nil, err
@@ -156,7 +211,7 @@ func LiveProxyNodes(db *sql.DB, sid string) ([]ProxyNode, error) {
 	var out []ProxyNode
 	for rows.Next() {
 		var n ProxyNode
-		if err := rows.Scan(&n.NID, &n.Port); err != nil {
+		if err := rows.Scan(&n.NID, &n.Port, &n.Host); err != nil {
 			return nil, err
 		}
 		out = append(out, n)
@@ -193,8 +248,12 @@ func renderClash(sid, publicHost, cipher, psk string, nodes []ProxyNode) ([]byte
 	cfg := clashConfig{Rules: []string{"MATCH," + group}}
 	names := make([]string, 0, len(nodes))
 	for _, n := range nodes {
+		server := publicHost // C5: per-node home host in cluster mode; falls back to this broker's host
+		if n.Host != "" {
+			server = n.Host
+		}
 		cfg.Proxies = append(cfg.Proxies, clashProxy{
-			Name: n.NID, Type: "ss", Server: publicHost, Port: n.Port,
+			Name: n.NID, Type: "ss", Server: server, Port: n.Port,
 			Cipher: cipher, Password: psk, UDP: false,
 		})
 		names = append(names, n.NID)

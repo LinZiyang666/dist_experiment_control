@@ -31,7 +31,14 @@ const (
 	OpClusterDrain     = "cluster_drain"
 	OpClusterTransfer  = "cluster_transfer"
 	OpClusterStatus    = "cluster_status"
+	OpClusterHomes     = "cluster_homes" // C6 建议5: aggregate all exposes + __proxy__ home/epoch/ready_reason
 	OpClusterRotateCrt = "cluster_rotate_cert"
+
+	// C4 operation-controller verbs (leader-local; a follower replies NotLeader+LeaderHost).
+	OpClusterJoinApprove = "cluster_join_approve" // approve a join bundle → create+drive a join op
+	OpClusterRetire      = "cluster_retire"       // create+drive a recoverable retire op
+	OpClusterOpConfirm   = "cluster_op_confirm"   // mid-flight re-confirm a BLOCKED op
+	OpClusterOpAbort     = "cluster_op_abort"     // abort a stuck op (frees the active slot)
 
 	// B4 operator alert verbs: raise / clear a Raft-replicated alert from the broker
 	// host (operator trust tier, same as the cluster_* verbs above). Leader-local: a
@@ -45,6 +52,11 @@ const (
 	// (single mode) => cluster_not_enabled (use `cluster backup --offline` for a single broker).
 	OpClusterBackup = "cluster_backup"
 
+	// C2 seed publish/show: record the cluster's public client-dialable endpoints + bootstrap URL
+	// (publish, leader-only) and read them back for `agent join`/doctor (show, leader-agnostic).
+	OpClusterSeedsPublish = "cluster_seeds_publish"
+	OpClusterSeedsShow    = "cluster_seeds_show"
+
 	// B6 OPS#12 incident export: a leader-local READ-ONLY assembler over the three replicated
 	// sources (alerts + roster + per-sid audit). Secret-scrubbed (allowlist projection). nil
 	// Backend.Cluster (single mode) => cluster_not_enabled.
@@ -55,6 +67,12 @@ const (
 	// no separate state, so it can never diverge from the phase SSOT. Leader-agnostic (any node
 	// reads its replica). nil Backend.Cluster (single mode) => cluster_not_enabled.
 	OpClusterOps = "cluster_ops"
+
+	// C-rebalance: proactively spread the per-node __proxy__ homes evenly across the eligible
+	// (deliverable + reachable) voters. The reaper only rehomes on a home DOWN; this leader-local
+	// pass evens out a lopsided distribution (e.g. after `cluster add` brings a fresh empty voter,
+	// or a drained broker rejoins). DryRun previews the moves. nil Backend.Cluster => single mode.
+	OpClusterRebalanceProxy = "cluster_rebalance_proxy"
 )
 
 // Cluster-admin machine error codes (B2 item 4) — stable identifiers set on Response.Code so a
@@ -78,9 +96,13 @@ const (
 // clusterOps is the set the server routes to Backend.Cluster.
 var clusterOps = map[string]bool{
 	OpClusterAdd: true, OpClusterRemove: true, OpClusterDrain: true,
-	OpClusterTransfer: true, OpClusterStatus: true, OpClusterRotateCrt: true,
+	OpClusterTransfer: true, OpClusterStatus: true, OpClusterHomes: true, OpClusterRotateCrt: true,
 	OpClusterAlertRaise: true, OpClusterAlertClear: true,
 	OpClusterBackup: true, OpExportIncident: true, OpClusterOps: true,
+	OpClusterSeedsPublish: true, OpClusterSeedsShow: true,
+	OpClusterJoinApprove: true, OpClusterRetire: true,
+	OpClusterOpConfirm: true, OpClusterOpAbort: true,
+	OpClusterRebalanceProxy: true,
 }
 
 // Request is the on-wire admin call. Op selects the verb; the
@@ -120,6 +142,8 @@ type Request struct {
 	// B3 item 7: cluster remove --force bypasses ONLY the new expose-ownership probe on a
 	// VOTER_ADD_FAILED node (never the raft phase-gate). Additive, omitempty, LOCAL socket only.
 	Force bool `json:"force,omitempty"`
+	// C-rebalance: preview the proxy-home moves without executing them (`cluster rebalance proxy --dry-run`).
+	DryRun bool `json:"dry_run,omitempty"`
 
 	// B4 operator-alert args (all omitempty; byte-compatible with the pre-B4 ops). raise
 	// uses Kind/Severity/Message (+optional Label → dedup key manual:<label>); clear uses
@@ -143,6 +167,14 @@ type Request struct {
 
 	// B7 DOC#2 `cluster ops show <node>`: when set, scope the ops view to one node (else list all).
 	OpsNode string `json:"ops_node,omitempty"`
+
+	// C4 operation-controller fields: a join bundle to approve, and an op_id to confirm/abort/show.
+	JoinBundle string `json:"join_bundle,omitempty"`
+	OpID       string `json:"op_id,omitempty"`
+
+	// C2 `cluster seeds publish` args (all omitempty; byte-compatible with the pre-C2 ops).
+	Bootstrap string   `json:"bootstrap,omitempty"` // the well-known HTTPS manifest URL
+	Endpoints []string `json:"endpoints,omitempty"` // client-dialable NATS endpoints to publish
 }
 
 // Response is the on-wire reply. Exactly one of Sessions / Nodes /
@@ -170,11 +202,16 @@ type Response struct {
 	Alert *AlertResult `json:"alert,omitempty"`
 
 	// D7 cluster reply fields.
-	Cluster    *ClusterStatusReport `json:"cluster,omitempty"`
-	QuorumProj *QuorumProjection    `json:"quorum_proj,omitempty"` // set when an F==0 confirm is required
-	NotLeader  bool                 `json:"not_leader,omitempty"`  // admin change attempted on a follower
-	LeaderHost string               `json:"leader_host,omitempty"` // where to re-run (empty mid-election)
-	Nonce      string               `json:"nonce,omitempty"`       // cluster add step-1 challenge: sign this on the joiner
+	Cluster *ClusterStatusReport `json:"cluster,omitempty"`
+	Homes   *ClusterHomesReport  `json:"homes,omitempty"` // C6 建议5: `cluster status --homes`
+
+	// C-rebalance: `cluster rebalance proxy` result (which proxy homes moved / would move).
+	ProxyRebalance *ProxyRebalanceReport `json:"proxy_rebalance,omitempty"`
+
+	QuorumProj *QuorumProjection `json:"quorum_proj,omitempty"` // set when an F==0 confirm is required
+	NotLeader  bool              `json:"not_leader,omitempty"`  // admin change attempted on a follower
+	LeaderHost string            `json:"leader_host,omitempty"` // where to re-run (empty mid-election)
+	Nonce      string            `json:"nonce,omitempty"`       // cluster add step-1 challenge: sign this on the joiner
 
 	// B6 OPS#3 online backup result.
 	Backup *BackupResult `json:"backup,omitempty"`
@@ -184,19 +221,47 @@ type Response struct {
 
 	// B7 DOC#2 ops controller result.
 	Ops []ClusterOpEntry `json:"ops,omitempty"`
+
+	// C4: the op_id (= plan-id) a join-approve / retire created, for the CLI `--wait` poller.
+	OpID string `json:"op_id,omitempty"`
+
+	// C2 seeds publish/show result. AccountPub is included so the CLI can mint a full invite
+	// (account_pub, not a fingerprint); Generation is the new seed_generation.
+	SeedAccountPub string   `json:"seed_account_pub,omitempty"`
+	SeedGeneration uint64   `json:"seed_generation,omitempty"`
+	SeedEndpoints  []string `json:"seed_endpoints,omitempty"`
+	SeedBootstrap  string   `json:"seed_bootstrap,omitempty"`
 }
 
 // ClusterOpEntry is one membership operation, DERIVED from a cluster_nodes row (B7 DOC#2). Kind is
 // inferred from phase; State is the live phase; LastError carries voter_add_error / a stall hint.
 type ClusterOpEntry struct {
 	NodeID    string `json:"node_id"`
-	Kind      string `json:"kind"`  // add | drain | retire
-	State     string `json:"state"` // in_progress | done | failed | stalled | draining | retiring
+	Kind      string `json:"kind"`  // add | drain | retire | join
+	State     string `json:"state"` // v1 vocab: in_progress | done | failed | stalled | draining | retiring
 	Phase     string `json:"phase"`
 	StartedAt string `json:"started_at,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`
 	LastError string `json:"last_error,omitempty"`
 	Resume    string `json:"resume,omitempty"` // operator hint for an interrupted/failed op
+
+	// C4 real-operation-log fields (additive omitempty; present only for op-backed rows — a legacy
+	// phase-derived row carries only the v1 fields above). OpState is the RICH named cursor; State
+	// stays the v1 vocab a monitor negotiated on, so cluster_ops schema_version STAYS 1 (these are
+	// purely additive — a v1 monitor ignores the unknown keys).
+	OpID      string           `json:"op_id,omitempty"`
+	TargetEnd string           `json:"target_node,omitempty"`
+	OpState   string           `json:"op_state,omitempty"`
+	Terminal  bool             `json:"terminal,omitempty"`
+	CreatedAt string           `json:"created_at,omitempty"`
+	Timeline  []ClusterOpEvent `json:"timeline,omitempty"`
+}
+
+// ClusterOpEvent is one durable transition in an operation's timeline (C4).
+type ClusterOpEvent struct {
+	State string `json:"state"`
+	At    string `json:"at,omitempty"`
+	Note  string `json:"note,omitempty"`
 }
 
 // BackupResult reports a completed online backup (the server-local bundle dir + its size + the
@@ -280,6 +345,62 @@ type ClusterStatusReport struct {
 	Errors  []string            `json:"errors"`
 	Partial bool                `json:"partial"`
 	Nodes   []ClusterNodeStatus `json:"nodes"`
+	// TopoDesired (C3) is the cluster-wide desired topology generation (replicated). A voter whose
+	// per-node TopoObserved trails this is not yet converged → the cluster is not HEALTHY_HA.
+	TopoDesired uint64 `json:"topo_desired,omitempty"`
+	// HealthLabel (C6 建议6) is the hyphenated 5-state operator vocab DERIVED from Health + the voter
+	// count: HEALTHY-HA | DEGRADED-WRITABLE | READ-ONLY | FORCE-SINGLE | NOT-HA | "" (offline snapshot
+	// with no voter count). ADDITIVE — the legacy Health string + ExitCode + schema_version stay
+	// byte-stable, so an existing monitor is untouched.
+	HealthLabel string `json:"health_label"`
+}
+
+// ClusterHomesReport (C6 建议5) aggregates every ALLOCATED expose + __proxy__ allocation with its home
+// broker / epoch / readiness, for `cluster status --homes`. Own schema_version (independent of the
+// status report). Secret-free.
+type ClusterHomesReport struct {
+	SchemaVersion int         `json:"schema_version"` // starts at 1
+	IsLeaderView  bool        `json:"is_leader_view"` // reachability is leader-only; false ⇒ best-effort
+	Homes         []HomeEntry `json:"homes"`          // [] never null, sorted (proxy-first, then port)
+	Errors        []string    `json:"errors"`
+	Partial       bool        `json:"partial"`
+}
+
+// HomeEntry is one expose/proxy allocation's home view (NEVER carries a token/psk).
+type HomeEntry struct {
+	Kind         string `json:"kind"` // "proxy" | "expose"
+	SID          string `json:"sid"`
+	NID          string `json:"nid"`
+	Name         string `json:"name"`
+	Port         int    `json:"port"`
+	HomeBroker   string `json:"home_broker"`
+	Epoch        int64  `json:"epoch"`
+	Reconnects   int64  `json:"reconnects"`   // == Epoch (only PlanReassignHome bumps it, +1 monotone)
+	PublicURL    string `json:"public_url"`   // "<home public_host>:<port>", "" when home unknown/down
+	ReadyReason  string `json:"ready_reason"` // ready|no_home|catching_up|tunnel_down|keyset_stale
+	Ready        bool   `json:"ready"`        // proxyInSubRender(ReadyReason)
+	LastRehomeAt string `json:"last_rehome_at,omitempty"`
+}
+
+// ProxyRebalanceReport (C-rebalance) is the result of `cluster rebalance proxy`: how many proxy homes
+// were (or, with --dry-run, would be) moved to even out the load across the eligible voters. Secret-free.
+type ProxyRebalanceReport struct {
+	DryRun  bool                 `json:"dry_run,omitempty"`
+	Voters  int                  `json:"voters"`  // eligible (deliverable + reachable) voter homes considered
+	Proxies int                  `json:"proxies"` // movable __proxy__ allocations (ready + home is an eligible voter)
+	Planned int                  `json:"planned"` // moves the greedy planner produced (≥ len(Moves) if a pass stopped early)
+	Moves   []ProxyRebalanceMove `json:"moves"`   // [] never null; one ATTEMPTED move per entry (done or error)
+}
+
+// ProxyRebalanceMove is one __proxy__ home reassignment (NEVER carries a token/psk).
+type ProxyRebalanceMove struct {
+	SID   string `json:"sid"`
+	NID   string `json:"nid"`
+	Port  int    `json:"port"`
+	From  string `json:"from_broker"`
+	To    string `json:"to_broker"`
+	Done  bool   `json:"done,omitempty"`  // executed (false on dry-run or a failed move)
+	Error string `json:"error,omitempty"` // non-empty if the move's raft propose failed
 }
 
 // ClusterNodeStatus is one roster row joined against the live raft configuration.
@@ -317,6 +438,15 @@ type ClusterNodeStatus struct {
 	// did not report (older broker / unreachable) → rendered as "?".
 	ReleaseVersion string `json:"release_version,omitempty"`
 	ProtoVer       int    `json:"proto_ver,omitempty"`
+
+	// C3 topology reconcile self-report (additive omitempty; live from ClusterHealthResp). Applied =
+	// generation in the on-disk conf; Observed = generation the live nats-server confirmed loading.
+	// TopoReported distinguishes a C3 broker (always reports) from an older one — the HEALTHY-HA gate
+	// degrades only a REPORTING voter whose Observed trails TopoDesired.
+	TopoApplied         uint64 `json:"topo_applied,omitempty"`
+	TopoObserved        uint64 `json:"topo_observed,omitempty"`
+	TopoReconcileReason string `json:"topo_reconcile_reason,omitempty"`
+	TopoReported        bool   `json:"topo_reported,omitempty"`
 }
 
 // QuorumProjection mirrors broker.QuorumProjection on the wire (the F==0 confirm gate).

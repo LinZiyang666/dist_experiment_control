@@ -184,6 +184,25 @@ type Config struct {
 	// tables + probes so the remote-fs path runs with no real NFS.
 	RemoteFSMountSource spawnsafe.MountSource
 	RemoteFSProbe       spawnsafe.ProbeFn
+
+	// RosterRefreshInterval (C1 §D-4) is the cadence at which an online agent pulls a
+	// fresh signed roster (RosterRefreshOnly register → roster-only RODB read, no raft).
+	// 0 ⇒ default 3min, full-jittered. Tests override down. A value < 0 disables refresh
+	// (boot/reconnect adoption still happens).
+	RosterRefreshInterval time.Duration
+
+	// AccountPub (C1 §D-5), when non-empty, is an OUT-OF-BAND account public-key pin that
+	// is AUTHORITATIVE: it disables roster TOFU and is enforced against every roster's
+	// account_pub. Empty (the default) ⇒ first-roster TOFU (first-write-wins, persisted).
+	AccountPub string
+
+	// BootstrapURL (C2), when non-empty, is the well-known HTTPS manifest URL the agent fetches at
+	// cold-start (async, best-effort) to learn the signed roster + seed endpoints when its cached set
+	// is cold/expired. Empty ⇒ no HTTP bootstrap (steady-state NATS refresh + seed floor only).
+	BootstrapURL string
+
+	// Now is the agent clock seam (roster expiry / stale checks). nil ⇒ time.Now.
+	Now func() time.Time
 }
 
 // procRec is one entry in Agent.procs. Tracks the PTY session plus
@@ -221,7 +240,13 @@ type Agent struct {
 	// dispatchForwarded uses it to drop forwarded msgs that arrive
 	// after shutdown started; handleUpgradeForwarded uses it to
 	// abort an in-flight HTTP download. nil before Run is called.
-	runCtx context.Context
+	//
+	// Stage-C MAJOR-1: the C1 session loop REWRITES runCtx every session, concurrently with
+	// NATS-callback goroutines (dispatchForwarded / onNATSReconnect / armRedialWatchdog /
+	// armFailClosed) that read it — so access is now mutex-guarded (setRunCtx/loadRunCtx). Pre-C1 it
+	// was written once before any callback, so a bare field was race-free; the rebuild loop is not.
+	runCtxMu sync.Mutex
+	runCtx   context.Context
 
 	// js is the JetStream context the agent uses for file-transfer
 	// Tier-B ObjectStore Put/Get. nil when the underlying nats-server
@@ -307,6 +332,13 @@ type Agent struct {
 	// cleared on teardown / fail-cleanup.
 	proxyPublicPort atomic.Int64
 
+	// proxyTunnelUp (C5 M2) mirrors the proxy's reverse-tunnel liveness (set on the proxy port's
+	// onTunnelSessionState edge, true after AddProxy opens it, false on teardown/fail-cleanup/drop). The
+	// heartbeat's ProxyBound reflects this AND p.srv!=nil — so a pure tunnel drop (SS server still up,
+	// home alive) reports unready and the cluster broker does NOT resurrect proxy_ready over a dead
+	// tunnel. Without it ProxyBound==(p.srv!=nil) would vend a dead-tunnel exit in /sub.
+	proxyTunnelUp atomic.Bool
+
 	// reconnectInFlight (audit xx-concurrency F4) single-flights onNATSReconnect: the NATS
 	// ReconnectHandler fires once per reconnect, and a flapping link could otherwise fan out an
 	// UNBOUNDED set of concurrent re-register goroutines (each re-applying directives). The CAS
@@ -333,6 +365,46 @@ type Agent struct {
 	// review F2). A directive for such a port must OPEN it from state.json (not
 	// ApplyHome a non-existent session); cleared once opened. Guarded by rehomeMu.
 	deferredReplay map[int]bool
+
+	// --- C1 agent roster auto-discovery (consume signed roster) ---
+
+	// rosterMu guards the in-memory roster mirror (pinAccount/rosterGen/rosterURLs),
+	// loaded once at boot from state.json and updated by adoptRoster. connectNATS reads
+	// rosterURLs to build the dial pool; the register req reads rosterGen; adoptRoster
+	// enforces pinAccount. (Kept in memory so the hot dial/register paths take no
+	// per-call state.json read — Component I.)
+	rosterMu     sync.Mutex
+	pinAccount   string               // durable TOFU account-pub pin ("" until first roster / OOB)
+	rosterGen    uint64               // monotone roster generation high-water mark
+	rosterURLs   []string             // learned client-dial URLs (VOTER-first), seed is unioned at dial time
+	cachedRoster *proto.ClusterRoster // C2: last accepted roster (persisted for boot re-verification)
+	seedGen      uint64               // C2: monotone seed_generation high-water mark
+	seedURLs     []string             // C2: learned client-dialable seed endpoints (cold-start floor)
+	cachedSeeds  *proto.SeedBundle    // C2: last accepted seed bundle (persisted for boot re-verification)
+	// rosterCacheStore (C2) persists the discovery cache to its OWN roster_cache.json (split out of the
+	// daemon-owned state.json). nil when Home is unset (in-process tests) → falls back to stateStore.
+	rosterCacheStore *rosterCacheStore
+
+	// rebuilding (C1 §D-1 L3) is set while a stuck-reconnect session rebuild is in
+	// flight, making onNATSReconnect a no-op so nats.go's own late reconnect on the
+	// dying conn cannot re-subscribe on it (no double-dispatch). Cleared by Run after
+	// the dying session fully tears down.
+	rebuilding atomic.Bool
+	// rebuildRequested is set by the redial watchdog so the session loop returns
+	// rebuild=true (a fresh dial pool) rather than treating the close as a shutdown.
+	rebuildRequested atomic.Bool
+
+	// redialMu/redialTimer (C1 §D-1 L3) is the stuck-reconnect watchdog: armed on NATS
+	// disconnect, Stop'd on reconnect/connect, single-arm (one timer, re-armed not
+	// stacked, mirroring flcTimer). If it fires (disconnected > redialAfter, i.e. the
+	// boot pool is dead) it triggers a session rebuild that re-dials the freshest roster.
+	redialMu    sync.Mutex
+	redialTimer *time.Timer
+
+	// sessCancelMu/sessCancel holds the CURRENT session's cancel func so the watchdog
+	// (a separate goroutine) can unblock heartbeatLoop to force the rebuild.
+	sessCancelMu sync.Mutex
+	sessCancel   context.CancelFunc
 }
 
 // sessionStateHookSetter is the OPTIONAL capability a production ExposeAdapter
@@ -356,7 +428,18 @@ type homeSessionChecker interface {
 	HasSession(publicPort int) bool
 }
 
-var afterRehomeWantSettledHook func(*Agent, int)
+// afterRehomeWantSettledHook is a test seam fired when a per-port rehome worker settles. It is an
+// atomic.Pointer (not a bare func var) because the worker reads it from a goroutine while the test
+// sets/clears it — a bare var is a data race under -race (pre-existing, surfaced by the C1 -race
+// gate). nil pointer ⇒ no hook.
+var afterRehomeWantSettledHook atomic.Pointer[func(*Agent, int)]
+
+// fireAfterRehomeWantSettled invokes the test hook if installed (race-free load).
+func fireAfterRehomeWantSettled(a *Agent, port int) {
+	if h := afterRehomeWantSettledHook.Load(); h != nil {
+		(*h)(a, port)
+	}
+}
 
 // onTunnelSessionState is the tunnel session-state hook. It publishes proxy
 // ready/unready ONLY for the embedded proxy's public port, so /sub and
@@ -367,6 +450,7 @@ func (a *Agent) onTunnelSessionState(publicPort int, up bool) {
 	if int64(publicPort) != a.proxyPublicPort.Load() {
 		return // not the proxy port — a regular expose flap, ignore
 	}
+	a.proxyTunnelUp.Store(up) // C5 M2: the heartbeat ProxyBound tracks this tunnel-liveness edge
 	if nc := a.ncBox.Load(); nc != nil {
 		a.pubProxyReady(nc, up)
 	}
@@ -423,6 +507,7 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
+		a.rosterCacheStore = newRosterCacheStore(cfg.Home, cfg.SID) // C2: discovery cache in its own file
 	}
 
 	// Build the hung-network-filesystem-safe spawn policy. Validate the mode
@@ -476,20 +561,72 @@ func (a *Agent) spawnTimeout() time.Duration {
 	return defaultRemoteFSSpawnTimeout
 }
 
-// Run is the agent's main loop:
+// Run is the agent's main loop. It runs a SESSION (connect → register → subscribe →
+// reconcile → replay → proxy → heartbeat) and re-runs it whenever the C1 stuck-reconnect
+// watchdog requests a rebuild onto the freshest roster (live broker failover). A real
+// parent-ctx cancel / admin evict ends the loop. The NATS connection is drained on each
+// session exit.
+func (a *Agent) Run(ctx context.Context) error {
+	a.loadRosterCacheAtBoot() // seed the dial pool from state.json before the first connect
+	// C2 §2.4 tier 2: at cold-start, asynchronously fetch the well-known manifest and adopt it (never
+	// blocks Run; best-effort; a no-op without a pin). Helps when the configured NATS endpoints are
+	// all dead but the HTTPS manifest is reachable; steady-state stays the NATS refresh loop.
+	if a.cfg.BootstrapURL != "" {
+		go a.bootstrapFetchOnce(ctx)
+	}
+	// Stage-C MINOR-2: ensure no armed AfterFunc (redial watchdog / fail-closed) outlives the agent
+	// — a disconnect within redialAfter of an operator stop would otherwise leave a timer that later
+	// fires fireRedial on a returned Run (and could perturb a NumGoroutine/fd leak-gate poll).
+	defer a.stopRedialWatchdog()
+	defer a.cancelFailClosed()
+	for {
+		rebuild, err := a.session(ctx)
+		// The dying session's defers have run (conn drained, subs gone); allow the next
+		// session's onNATSReconnect to operate again, and reset the rebuild request.
+		a.rebuilding.Store(false)
+		a.rebuildRequested.Store(false)
+		if err != nil {
+			return err
+		}
+		if !rebuild || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.cfg.Logger.Info("agent: rebuilding NATS session on the freshest roster")
+	}
+}
+
+// session runs one NATS connection's lifetime:
 //  1. connect NATS (retried until ctx cancels — see connectNATS),
 //  2. register with the broker (retried per `register`),
-//  3. subscribe to `cmd.node.<nid>.*.req.forwarded` (P4 exec; P5 will
-//     add run/PTY; P6 expose; etc.),
+//  3. subscribe to `cmd.node.<nid>.*.req.forwarded` (P4 exec; P5 run/PTY; P6 expose; etc.),
 //  4. heartbeat ticker until ctx cancels.
 //
+// It returns rebuild=true (err==nil) when the C1 watchdog Closed the conn to fail over onto
+// a fresh dial pool; otherwise the terminal error (or nil on a clean parent-ctx shutdown).
 // The NATS connection is drained on exit.
-func (a *Agent) Run(ctx context.Context) error {
+func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
+	// Per-session reset: a prior session's shutdown barrier left proxyDraining=true; clear it
+	// so this session admits proxy handlers again (the loop is sequential — no overlap).
+	a.proxyDrainMu.Lock()
+	a.proxyDraining = false
+	a.proxyDrainMu.Unlock()
+
+	// Stage-C MAJOR-1: derive + PUBLISH this session's runCtx BEFORE connectNATS. a.runCtx is
+	// cross-session state read by armRedialWatchdog / armFailClosed / dispatchForwarded from other
+	// goroutines; if it still pointed at the PREVIOUS (cancelled) session's ctx during this session's
+	// connect+register setup window, the stuck-reconnect watchdog would skip arming on a disconnect
+	// (its "don't arm during shutdown" guard is `a.runCtx.Err()!=nil`) — defeating failover in a
+	// double-fault. cancelRun is deferred at its original position below (preserving teardown LIFO).
+	runCtx, cancelRun := context.WithCancel(ctx)
+	a.setRunCtx(runCtx)
+
 	nc, err := a.connectNATS(ctx)
 	if err != nil {
-		return err
+		cancelRun()
+		return false, err
 	}
-	a.ncBox.Store(nc) // publish nc for the lock-free tunnel session-state hook
+	a.stopRedialWatchdog() // connected → not stuck (clears any expired watchdog from a rebuild)
+	a.ncBox.Store(nc)      // publish nc for the lock-free tunnel session-state hook
 	defer func() { _ = nc.Drain() }()
 	// F9 / round-2 F4: drain in-flight proxy-keys handlers before the connection
 	// drains. Set proxyDraining FIRST (under the lock) so dispatch cannot Add a
@@ -504,8 +641,13 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	resp, err := a.register(ctx, nc)
 	if err != nil {
-		return err
+		cancelRun()
+		return false, err
 	}
+	// Connected + registered = healthy: cancel any fail-closed countdown a prior session's
+	// partition (preserved across a rebuild — see the conditional defer below) left armed.
+	// Parity with onNATSReconnect, which cancels it on a nats.go reconnect.
+	a.cancelFailClosed()
 	a.cfg.Logger.Info("agent: registered",
 		"sid", a.cfg.SID, "nid", a.cfg.NID,
 		"hb_interval", a.cfg.HeartbeatInterval,
@@ -540,7 +682,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("agent: subscribe forwarded: %w", err)
+		cancelRun()
+		return false, fmt.Errorf("agent: subscribe forwarded: %w", err)
 	}
 	defer func() { _ = subFwd.Unsubscribe() }()
 
@@ -549,11 +692,22 @@ func (a *Agent) Run(ctx context.Context) error {
 	// the architecture P9 1s budget instead of waiting for the
 	// next CONNECT to be denied. The handler triggers a graceful
 	// shutdown via runCtx cancel; the surrounding ctx still wins
-	// any race with parent-canceled paths.
-	runCtx, cancelRun := context.WithCancel(ctx)
+	// any race with parent-canceled paths. (runCtx/cancelRun are created at the top of
+	// session() so a.runCtx is published before connect — Stage-C MAJOR-1; the defer here
+	// preserves the original teardown LIFO order.)
 	defer cancelRun()
-	defer a.cancelFailClosed() // stop any armed fail-closed timer on shutdown
-	a.runCtx = runCtx
+	// C1 §D-1 L3: publish this session's cancel so the stuck-reconnect watchdog (a separate
+	// goroutine) can unblock heartbeatLoop to force a rebuild.
+	a.setSessionCancel(cancelRun)
+	defer a.clearSessionCancel()
+	// Stop the fail-closed timer on a CLEAN shutdown only. On a rebuild (rebuildRequested set
+	// by the watchdog) PRESERVE the countdown across the gap so a rebuild that lands back in a
+	// partition still tears the proxy down — the next session cancels it once healthy.
+	defer func() {
+		if !a.rebuildRequested.Load() {
+			a.cancelFailClosed()
+		}
+	}()
 	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) {
 		var ev struct {
 			Type string `json:"type"`
@@ -573,7 +727,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		cancelRun()
 	})
 	if err != nil {
-		return fmt.Errorf("agent: subscribe sys.events: %w", err)
+		return false, fmt.Errorf("agent: subscribe sys.events: %w", err)
 	}
 	defer func() { _ = subEvict.Unsubscribe() }()
 
@@ -594,7 +748,22 @@ func (a *Agent) Run(ctx context.Context) error {
 	// when the session's proxy switch is off → ensures it's torn down).
 	a.applyProxyDirective(runCtx, nc, resp.Proxy)
 
-	return a.heartbeatLoop(runCtx, nc)
+	// C1 §D-4: pull a fresh signed roster on a jittered cadence (roster-only register → no raft
+	// write on the broker) so an online agent converges on a new broker set ≤5min. Bound to this
+	// session via runCtx; exits when the session ends / rebuilds. Stage-C MINOR-3: start it ONLY
+	// when we are actually in a cluster (this register delivered a roster, or we have adopted one
+	// before) so a non-cluster agent sends NO new periodic register traffic (byte-equivalent).
+	if resp.Roster != nil || a.cachedRosterGen() > 0 {
+		go a.rosterRefreshLoop(runCtx, nc)
+	}
+
+	hbErr := a.heartbeatLoop(runCtx, nc)
+	// If the watchdog requested a rebuild, return rebuild=true (a fresh dial pool) rather than
+	// treating the Close as a shutdown. A real parent-ctx cancel / evict returns rebuild=false.
+	if a.rebuildRequested.Load() {
+		return true, nil
+	}
+	return false, hbErr
 }
 
 func (a *Agent) replayPortsFromState() {
@@ -670,7 +839,11 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 			return nil, err
 		}
 
-		nc, err := nats.Connect(a.cfg.NATSURL, connOpts...)
+		// C1 §D-1 L1: dial the learned roster URLs (VOTER-first) UNION the configured seed
+		// floor, so a (re)connect/rebuild prefers live voters and can fail over to a
+		// newly-added broker. effectiveDialURLs == cfg.NATSURL until a roster is adopted,
+		// so a non-cluster agent's dial string is byte-identical.
+		nc, err := nats.Connect(a.effectiveDialURLs(), connOpts...)
 		if err == nil {
 			if attempt > 1 {
 				a.cfg.Logger.Info("agent: NATS connect succeeded after retry",
@@ -745,6 +918,9 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 		// "" on a single-node bus → inert. ConnectedServerName reflects the actual
 		// connected server, updated across reconnects (drives §7.4 rehome).
 		ServerID: nc.ConnectedServerName(),
+		// C1: report our cached signed-roster generation so the leader can flag a
+		// sustained-behind agent (agent_roster_stale). 0 ⇒ pre-C1 / no cache. Advisory.
+		RosterGen: a.cachedRosterGen(),
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -976,6 +1152,11 @@ func (a *Agent) applyReconciliation(ctx context.Context, resp proto.NodeRegister
 	// D6 §7.4: apply per-expose home directives (epoch-ordered rehome). nil in
 	// N=1 (no clustered broker emits Home), so this is inert there.
 	a.applyHomeDirectives(ctx, resp.Home)
+
+	// C1: adopt the account-signed broker roster (verify → relearn dial URLs → advance the
+	// monotone generation → persist). nil in single mode → no-op (byte-equivalent). This runs on
+	// EVERY boot/reconnect register; the periodic refresh ticker uses adoptRoster directly.
+	a.adoptRoster(resp.Roster)
 }
 
 // applyHomeDirectives drives the §7.4 agent-self-driven rehome from a register
@@ -1032,6 +1213,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 	var lastSeq uint64
 	defer func() {
 		var restart bool
+		restartCtx := ctx
 		a.rehomeMu.Lock()
 		if a.rehomeSeq[port] == lastSeq {
 			delete(a.rehomeRunning, port)
@@ -1042,12 +1224,22 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 			// to a fresh single worker instead of deleting it in cleanup.
 			a.rehomeRunning[port] = true
 			restart = true
+		} else if succ := a.loadRunCtx(); succ != nil && succ.Err() == nil {
+			// Mega-audit MAJ-4: this loop's per-SESSION ctx was canceled (its session ended, e.g. a
+			// C1 rebuild) but a NEWER want arrived while applyHomeDirectives still saw
+			// rehomeRunning=true (so the new session did NOT spawn its own loop). The SUCCESSOR session
+			// is live — hand the want to a loop on ITS ctx instead of orphaning it until the next full
+			// register (the reverse tunnel would otherwise stay pinned to the dead/draining home).
+			a.rehomeRunning[port] = true
+			restart = true
+			restartCtx = succ
 		} else {
+			// Agent itself is shutting down (no live successor session) — drop cleanly.
 			delete(a.rehomeRunning, port)
 		}
 		a.rehomeMu.Unlock()
 		if restart {
-			go a.applyOneHome(ctx, applier, port)
+			go a.applyOneHome(restartCtx, applier, port)
 		}
 	}()
 	sleep := base
@@ -1115,9 +1307,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 				sleep = base
 				continue // a newer directive (higher epoch OR same-epoch pin update, RF2) arrived
 			}
-			if afterRehomeWantSettledHook != nil {
-				afterRehomeWantSettledHook(a, port)
-			}
+			fireAfterRehomeWantSettled(a, port)
 			return
 		}
 		// Transient home_catching_up (the home has not yet applied the reassign):
@@ -1138,9 +1328,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 				sleep, start = base, time.Now() // a newer directive supersedes; apply it
 				continue
 			}
-			if afterRehomeWantSettledHook != nil {
-				afterRehomeWantSettledHook(a, port)
-			}
+			fireAfterRehomeWantSettled(a, port)
 			return
 		}
 		select {
@@ -1259,7 +1447,9 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 			return ctx.Err()
 		case t := <-ticker.C:
 			pgen, pepoch := a.proxyGenEpoch()
-			payload, _ := json.Marshal(proto.HeartbeatPayload{Ts: t.UTC(), ProxyGeneration: pgen, ProxyEpoch: pepoch})
+			payload, _ := json.Marshal(proto.HeartbeatPayload{
+				Ts: t.UTC(), ProxyGeneration: pgen, ProxyEpoch: pepoch, ProxyBound: a.proxyBound(),
+			})
 			if err := nc.Publish(subject, payload); err != nil {
 				a.cfg.Logger.Warn("agent: heartbeat publish", "err", err)
 			}
@@ -1274,12 +1464,23 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 	opts := []nats.Option{
 		nats.MaxReconnects(-1),
+		// C1 §D-1: keep the dial pool in our priority order (VOTER-first / draining-last from
+		// DialURLs, seed floor last) instead of nats.go's default shuffle, so a reconnect
+		// prefers a live voter. Fleet load is spread by the intra-VOTER shuffle in DialURLs.
+		nats.DontRandomize(),
 		// P13 convergence (architecture p13-plan §5 / Critique 4): the agent
 		// registers ONCE and heartbeat is fire-and-forget. On a NATS reconnect
 		// (the agent process stayed up while its connection bounced) trigger a
 		// single re-register so the broker's register reply re-delivers the
 		// authoritative proxy directive (and re-runs G.1 reconcile).
 		nats.ReconnectHandler(func(nc *nats.Conn) {
+			// C1 §D-1 L3: while a stuck-reconnect rebuild is in flight the dying conn is being
+			// torn down by the session loop — a late nats.go reconnect on it must NOT re-subscribe
+			// (that would leave two live forwarded subscriptions → double dispatch).
+			if a.rebuilding.Load() {
+				return
+			}
+			a.stopRedialWatchdog() // a successful reconnect means we are NOT stuck
 			// audit xx-concurrency F4: single-flight — drop a reconnect that arrives while a
 			// prior onNATSReconnect is still running so a flapping link cannot fan out unbounded
 			// concurrent re-register goroutines. The in-flight pass already re-registers against
@@ -1291,9 +1492,11 @@ func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 				}()
 			}
 		}),
-		// B1 fail-closed: arm the SS-teardown countdown on disconnect.
+		// B1 fail-closed: arm the SS-teardown countdown on disconnect. C1 §D-1 L3: also arm the
+		// stuck-reconnect watchdog so a dead boot pool triggers a rebuild on the freshest roster.
 		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
 			a.armFailClosed()
+			a.armRedialWatchdog()
 		}),
 	}
 

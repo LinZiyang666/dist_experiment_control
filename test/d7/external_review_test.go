@@ -42,9 +42,23 @@ func TestD7ReviewRunbookRecoverMatchesCLI(t *testing.T) {
 	if strings.Contains(src, "Type WIPE to confirm") {
 		t.Fatal("runbook still tells operators to type WIPE, but CLI requires typed --self-id")
 	}
-	if strings.Contains(src, "tether cluster recover --dump-divergent /root/divergent-$(hostname).json") &&
-		!strings.Contains(src, "recover --self-id") {
-		t.Fatal("runbook recover command omits the required --self-id flag")
+	// C8: the recovery verb moved to `cluster recovery rejoin prepare`. The runbook must present the
+	// NEW primary spelling WITH --self-id (not the deleted bare `cluster recover`), so this guard tracks
+	// the real CLI rather than passing vacuously on an absent old string.
+	if strings.Contains(src, "tether cluster recover ") && !strings.Contains(src, "cluster recovery rejoin prepare") {
+		t.Fatal("runbook uses the deleted bare `cluster recover`; C8 moved it to `cluster recovery rejoin prepare`")
+	}
+	if !strings.Contains(src, "cluster recovery rejoin prepare") || !strings.Contains(src, "--self-id") {
+		t.Fatal("runbook must present `cluster recovery rejoin prepare … --self-id` (the C8 primary recovery verb)")
+	}
+	// C8 review M1: `cluster join prepare` takes --node-id (NOT --self-id). The runbook must never
+	// instruct the non-existent `join prepare --self-id` (the recovery rejoin prepare --self-id lines
+	// are valid + distinct). Scan both operator docs.
+	for _, doc := range []string{"docs/cluster-runbook.md", "docs/usage.md"} {
+		d := readFile(t, filepath.Join(moduleRoot(t), doc))
+		if strings.Contains(d, "cluster join prepare --self-id") {
+			t.Fatalf("%s instructs `cluster join prepare --self-id`; the flag is --node-id (M1)", doc)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
@@ -55,11 +56,31 @@ type ClusterAdmin struct {
 	// Reachable:true. nil ⇒ the honest "unverified" fallback (single-broker view).
 	healthPoll func() map[string]proto.ClusterHealthResp
 
+	// homesReport (C6 建议5), when set (wireClusterLate injects b.buildHomesReport), aggregates every
+	// ALLOCATED expose + __proxy__ allocation's home/epoch/ready_reason for `cluster status --homes`.
+	// nil ⇒ single mode (cluster_not_enabled). Leader-agnostic RODB read.
+	homesReport func() (*adminsock.ClusterHomesReport, error)
+
 	// streamObserve, when set (wireClusterLate injects the audit publisher's read-only replica
 	// observation), reports the live JS stream replica state. StatusReport uses it to render
 	// the REAL stream actual instead of synthesizing actual==target (external-review F1). nil
 	// or an incomplete observation ⇒ actual is reported 0 (unknown / fail-closed, not green).
 	streamObserve func() (ReplicaReport, error)
+
+	// topoSelf, when set (wireClusterLate), returns THIS broker's C3 topology reconcile self-report.
+	// StatusReport stamps the self row from it authoritatively (self does not poll itself for topo).
+	topoSelf func() *topoSelfReport
+
+	// caughtUpFn / streamsReadyFn (C4), when set (wireClusterLate), are the broker's catch-up + stream
+	// readiness probes the operation controller drives (same funcs AddNode/DrainNode take as params).
+	caughtUpFn     func(nodeID string, barrier uint64) (bool, error)
+	streamsReadyFn func(nodeID string) (bool, error)
+
+	// opAttempts (C4-M8) is the leader-local bounded-retry counter for an operation's failing
+	// side-effect (keyed by op_id) → BLOCKED after opMaxAttempts. Reset on a leadership change (the new
+	// leader re-counts from 0).
+	opAttemptsMu sync.Mutex
+	opAttempts   map[string]int
 
 	// prepareTunnelCertRotate, when set by the production broker, verifies that the
 	// target fingerprint is present on disk and returns a commit callback that hot-swaps
@@ -80,10 +101,10 @@ type ClusterAdmin struct {
 	portBandLow  int
 	portBandHigh int
 
-	// B7 DOC#5: onRehome (wireClusterLate injects the broker's pubSysEvent) emits an
-	// `expose_rehomed` observability event after migrateExposes moves an expose during a drain.
-	// nil ⇒ no event (single broker / unwired) — leader-side, single-shot, no steady-state traffic.
-	onRehome func(port int, name, sid, fromBroker, toBroker string)
+	// B7 DOC#5 + C6 BD6: emitEvent (wireClusterLate injects b.pubSysEvent) is the generic leader-side
+	// observability emitter the drain uses for `expose_rehomed` (back-compat) + the C6 home_reassign_*
+	// / rehome_stalled lifecycle events. nil ⇒ no event (single broker / unwired); secret-free payloads.
+	emitEvent func(kind string, fields map[string]any)
 }
 
 // NewClusterAdmin builds the orchestrator. now is injectable for tests (default
@@ -161,6 +182,10 @@ func (a *ClusterAdmin) releaseJoinNonce(nonce string) {
 func (a *ClusterAdmin) AddNode(in cluster.ClusterNodeUpsertInput, raftAddr string, caughtUp func(barrier uint64) (bool, error), maxWait time.Duration) error {
 	if maxWait <= 0 {
 		maxWait = defaultCatchUpMaxWait
+	}
+	// C4: refuse a raw add when an operation already owns this node's membership (no two-writer hole).
+	if err := a.assertNoActiveOp(in.NodeID); err != nil {
+		return err
 	}
 	// PHASE 1 — roster admission (PoP re-verified by every follower in Apply).
 	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
@@ -310,4 +335,22 @@ func (a *ClusterAdmin) setPhase(nodeID, to string, preds []string, voterAddErr s
 	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterNodePhase(nodeID, to, preds, voterAddErr, a.now())
 	})
+}
+
+// PublishSeeds (C2) records the cluster's public client-dialable endpoints + bootstrap URL via raft
+// (leader-only) and returns the new seed_generation so the CLI can echo it. Leader-side URL
+// validation lives in cluster.PlanClusterSeedsPublish (rejects bad scheme / empty host / oversize).
+func (a *ClusterAdmin) PublishSeeds(endpoints []string, bootstrap string) (gen uint64, err error) {
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterSeedsPublish(endpoints, bootstrap, a.now())
+	}); err != nil {
+		return 0, err
+	}
+	_, _, gen, err = cluster.Seeds(a.node.RODB())
+	return gen, err
+}
+
+// ReadSeeds (C2) returns the published seed config (leader-agnostic, RODB read).
+func (a *ClusterAdmin) ReadSeeds() (endpoints []string, bootstrap string, gen uint64, err error) {
+	return cluster.Seeds(a.node.RODB())
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var testRehomeTime = time.Unix(1700000000, 0).UTC()
+
 // TestD6PlanAllocateInertHome (R-6, build-and-prove): PlanAllocate with an EMPTY
 // home bakes the pre-D6 9-column INSERT (no home_broker/epoch — byte-equivalent
 // to before D6, the production path); a non-empty home bakes the 11-column form
@@ -61,7 +63,7 @@ func TestD6ReassignHomeMonotonic(t *testing.T) {
 		t.Fatalf("allocate: %v", err)
 	}
 
-	newEpoch, cmd, err := PlanReassignHome(db, a.Port, "node-2")
+	newEpoch, cmd, err := PlanReassignHome(db, a.Port, "node-2", testRehomeTime)
 	if err != nil {
 		t.Fatalf("reassign: %v", err)
 	}
@@ -90,24 +92,24 @@ func TestD6ReassignHomeMonotonic(t *testing.T) {
 	}
 
 	// A second reassign reads the now-current epoch (1) and bakes 2.
-	e2, _, err := PlanReassignHome(db, a.Port, "node-3")
+	e2, _, err := PlanReassignHome(db, a.Port, "node-3", testRehomeTime)
 	if err != nil || e2 != 2 {
 		t.Fatalf("second reassign epoch = %d err = %v, want 2/nil", e2, err)
 	}
 
 	// Absent port → ErrNotFound.
-	if _, _, err := PlanReassignHome(db, 19999, "node-2"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := PlanReassignHome(db, 19999, "node-2", testRehomeTime); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("absent port err = %v, want ErrNotFound", err)
 	}
 	// Empty home → rejected (not ErrNotFound).
-	if _, _, err := PlanReassignHome(db, a.Port, ""); err == nil || errors.Is(err, ErrNotFound) {
+	if _, _, err := PlanReassignHome(db, a.Port, "", testRehomeTime); err == nil || errors.Is(err, ErrNotFound) {
 		t.Fatalf("empty home must be a hard reject, got %v", err)
 	}
 	// Non-ALLOCATED row → ErrNotFound (free it first).
 	if err := Free(db, a.Port, now); err != nil {
 		t.Fatalf("free: %v", err)
 	}
-	if _, _, err := PlanReassignHome(db, a.Port, "node-2"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := PlanReassignHome(db, a.Port, "node-2", testRehomeTime); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("freed port err = %v, want ErrNotFound", err)
 	}
 }
@@ -132,7 +134,7 @@ func TestD6ReassignHomeSelectsActiveReusedPort(t *testing.T) {
 		t.Fatalf("test setup expected port reuse, got first=%d second=%d", first.Port, second.Port)
 	}
 
-	newEpoch, cmd, err := PlanReassignHome(db, second.Port, "node-2")
+	newEpoch, cmd, err := PlanReassignHome(db, second.Port, "node-2", testRehomeTime)
 	if err != nil {
 		t.Fatalf("reassign reused active port: %v", err)
 	}

@@ -58,6 +58,14 @@ type NodeRegisterReq struct {
 	// could suppress a corrected roster) — it always sends the current roster. 0 = a pre-B7 agent /
 	// no cache. Additive/omitempty (proto stays 2).
 	RosterGen uint64 `json:"roster_gen,omitempty"`
+
+	// RosterRefreshOnly (C1 §D-4) marks a LIGHTWEIGHT periodic refresh: the agent wants ONLY a
+	// fresh signed roster, not a full re-register. The broker short-circuits handleRegister BEFORE
+	// registerNode / agent_registered / reconcileOnRegister — a pure RODB read that signs the
+	// replicated roster — so a fleet's 3-min refresh ticker costs ZERO raft writes / events /
+	// reconcile (D5 idle-zero-writes preserved). false (boot / reconnect register) ⇒ the full path,
+	// byte-identical to today. Additive/omitempty (proto stays 2).
+	RosterRefreshOnly bool `json:"roster_refresh_only,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -238,6 +246,10 @@ type HeartbeatPayload struct {
 	// current directive. Epoch alone is insufficient to fence that case.
 	ProxyGeneration int64 `json:"proxy_generation,omitempty"`
 	ProxyEpoch      int64 `json:"proxy_epoch,omitempty"`
+	// ProxyBound (C5) reports whether the agent currently has its proxy SS server bound. In cluster mode
+	// the heartbeat is BROADCAST, so EVERY broker writes its own livenessDB proxy_ready from this — the
+	// cross-broker convergence signal that makes /sub correct on any broker (no replicated proxy_ready).
+	ProxyBound bool `json:"proxy_bound,omitempty"`
 }
 
 // ErrorReply is the canonical shape for any req that responds with an error
@@ -951,12 +963,21 @@ type ProxyDirective struct {
 	// authoritative restore; the generation does.
 	Generation int64 `json:"generation,omitempty"`
 	Epoch      int64 `json:"epoch,omitempty"`
+
+	// Home (C5) carries the proxy port's AUTHORITATIVE home broker on a SEPARATE epoch axis from the
+	// keyset (Epoch above). Home.Epoch governs WHICH broker the proxy tunnel binds (tunnelTokenLookup);
+	// the keyset Epoch governs WHICH SS keys. The agent applies a Home directive via the dedicated
+	// applyProxyDirective Home branch (re-dial), never SetKeys. nil in single mode → byte-identical.
+	Home *HomeDirective `json:"home,omitempty"`
 }
 
 // ProxySetReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.set.req. Owner-only.
 // One message carries both on (Enabled:true) and off (Enabled:false).
 type ProxySetReq struct {
 	Enabled bool `json:"enabled"`
+	// HAPolicy (C5) — "freeze-on-quorum-loss" (default) | "disable-on-quorum-loss". Per-session,
+	// Raft-committed; governs /sub behavior on quorum loss. Empty ⇒ keep the current/default policy.
+	HAPolicy string `json:"ha_policy,omitempty"`
 }
 
 // ProxySetResp — broker reply. AffectedNodes counts the ONLINE P13-capable
@@ -971,7 +992,11 @@ type ProxySetResp struct {
 
 // ProxyStatusReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.status.req.
 // Member-readable (status reveals NO secrets).
-type ProxyStatusReq struct{}
+type ProxyStatusReq struct {
+	// Cluster (C5) requests the cluster-aware view (per-agent ready reason + the degraded state). false
+	// ⇒ the P13 single-broker view (byte-identical).
+	Cluster bool `json:"cluster,omitempty"`
+}
 
 // ProxyNodeEntry is one node row in proxy status (NEVER carries a token/psk).
 type ProxyNodeEntry struct {
@@ -980,6 +1005,11 @@ type ProxyNodeEntry struct {
 	Ready      bool   `json:"ready"`  // agent ACKed SS bind (rendered in /sub)
 	PublicHost string `json:"public_host,omitempty"`
 	PublicPort int    `json:"public_port,omitempty"`
+	// C5 cluster-view fields (additive omitempty; secret-free): why the agent is/ISN'T in the subscriber
+	// set, and its authoritative proxy home + keyset epoch.
+	ReadyReason string `json:"ready_reason,omitempty"` // no_home | catching_up | tunnel_down | keyset_stale | ready
+	HomeBroker  string `json:"home_broker,omitempty"`
+	Epoch       int64  `json:"epoch,omitempty"`
 }
 
 // ProxySubEntry is one subscriber row in status/list (NEVER carries token/psk).
@@ -997,6 +1027,10 @@ type ProxyStatusResp struct {
 	SubURLPrefix string           `json:"sub_url_prefix,omitempty"` // e.g. "https://broker/sub/"
 	Code         string           `json:"code,omitempty"`
 	Error        string           `json:"error,omitempty"`
+	// C5 cluster-view fields (additive omitempty; populated only when ProxyStatusReq.Cluster).
+	ClusterState string `json:"cluster_state,omitempty"` // ACTIVE | FROZEN_READONLY | DISABLED_NO_QUORUM | FORCE_SINGLE
+	HAPolicy     string `json:"ha_policy,omitempty"`
+	Writable     bool   `json:"writable,omitempty"` // whether control writes are currently accepted
 }
 
 // ProxySubCreateReq — ctl pub on ctrl.by.<A>.s.<sid>.proxy.sub.create.req. Owner-only.

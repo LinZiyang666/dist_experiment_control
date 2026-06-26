@@ -81,7 +81,7 @@ func loadCHA(t *testing.T) *callgraph.Graph {
 // each of the given fragments (e.g. pkg path + receiver + ".Method").
 func findFunc(t *testing.T, cg *callgraph.Graph, frags ...string) *callgraph.Node {
 	t.Helper()
-	var match *callgraph.Node
+	var matches []*callgraph.Node
 	for fn, node := range cg.Nodes {
 		if fn == nil {
 			continue
@@ -95,16 +95,31 @@ func findFunc(t *testing.T, cg *callgraph.Graph, frags ...string) *callgraph.Nod
 			}
 		}
 		if ok {
-			if match != nil {
-				t.Fatalf("ambiguous function match for %v: %s AND %s", frags, match.Func.String(), s)
-			}
-			match = node
+			matches = append(matches, node)
 		}
 	}
-	if match == nil {
+	// Disambiguate a substring collision (e.g. "internal/port.PlanAllocate" is also a substring of
+	// "internal/port.PlanAllocateProxy"): when more than one matches, prefer the node whose qualified
+	// name ENDS EXACTLY with the last fragment — an exact-suffix match excludes the longer sibling.
+	if len(matches) > 1 {
+		last := frags[len(frags)-1]
+		var exact []*callgraph.Node
+		for _, m := range matches {
+			if strings.HasSuffix(m.Func.String(), last) {
+				exact = append(exact, m)
+			}
+		}
+		if len(exact) >= 1 {
+			matches = exact
+		}
+	}
+	if len(matches) > 1 {
+		t.Fatalf("ambiguous function match for %v: %s AND %s", frags, matches[0].Func.String(), matches[1].Func.String())
+	}
+	if len(matches) == 0 {
 		t.Fatalf("no function matched %v in the CHA graph", frags)
 	}
-	return match
+	return matches[0]
 }
 
 const modulePrefix = "github.com/LinZiyang666/tether/"

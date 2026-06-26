@@ -17,10 +17,63 @@ func newClusterOpsCmd(socketPath *string) *cobra.Command {
 		Use:   "ops",
 		Short: "Inspect membership operations (add / drain / retire) and their state",
 		Example: "  tether cluster ops ls              # all in-flight / recent membership operations\n" +
-			"  tether cluster ops show brk-b      # one node's op state + timeline + resume hint",
+			"  tether cluster ops show brk-b      # one node's op state + timeline + resume hint\n" +
+			"  tether cluster ops confirm op-…    # re-confirm a BLOCKED retire (worsened fault tolerance)\n" +
+			"  tether cluster ops abort op-…      # abort a stuck op (frees the active slot)",
 	}
-	cmd.AddCommand(newClusterOpsLsCmd(socketPath), newClusterOpsShowCmd(socketPath))
+	cmd.AddCommand(newClusterOpsLsCmd(socketPath), newClusterOpsShowCmd(socketPath),
+		newClusterOpsConfirmCmd(socketPath), newClusterOpsAbortCmd(socketPath))
 	return cmd
+}
+
+// newClusterOpsConfirmCmd re-confirms a BLOCKED retire op (the operator re-acknowledged the worsened
+// fault tolerance), so the controller proceeds (C4 §4).
+func newClusterOpsConfirmCmd(socketPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:     "confirm <op-id>",
+		Short:   "Re-confirm a BLOCKED operation (e.g. a retire whose fault tolerance worsened)",
+		Args:    cobra.ExactArgs(1),
+		Example: "  tether cluster ops confirm op-1a2b3c4d",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpClusterOpConfirm, OpID: args[0]})
+			if err != nil {
+				return err
+			}
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return clusterAdminError("ops confirm", resp)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s re-confirmed (resuming).\n", args[0])
+			return nil
+		},
+	}
+}
+
+// newClusterOpsAbortCmd aborts a stuck operation, freeing the per-node active slot WITHOUT touching
+// the substrate (the escape hatch — the membership stays whatever the gates left it; C4 §5).
+func newClusterOpsAbortCmd(socketPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:     "abort <op-id>",
+		Short:   "Abort a stuck operation (frees the active slot; does NOT touch membership)",
+		Args:    cobra.ExactArgs(1),
+		Example: "  tether cluster ops abort op-1a2b3c4d",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpClusterOpAbort, OpID: args[0]})
+			if err != nil {
+				return err
+			}
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return clusterAdminError("ops abort", resp)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s aborted (active slot freed; membership unchanged — heal via `cluster status`/reconcile).\n", args[0])
+			return nil
+		},
+	}
 }
 
 func fetchClusterOps(socketPath, node string) ([]adminsock.ClusterOpEntry, error) {

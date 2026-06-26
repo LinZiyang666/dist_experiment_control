@@ -20,21 +20,22 @@ import (
 // WITHOUT a Raft write. writable_leader_confirmed is set ONLY after a VerifyLeaderRead barrier
 // — a partitioned ex-leader still reporting State()==Leader within its lease FAILS VerifyLeader
 // and answers false, so the gate fires precisely in the data-loss window.
-func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now))
+func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf))
 }
 
 // SubscribeClusterCursor (D9 §17 round-1 BLOCKER fix) wires the same broadcast health
 // responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
 // observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).
 // Every broker answers (no queue group) so the leader collects each voter's AppliedIndex.
-func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now))
+func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf))
 }
 
 // clusterHealthResponder builds the shared health-reply handler used by both the member-
-// facing cluster-health RPC and the broker-only §17 cursor probe.
-func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time) func(*nats.Msg) {
+// facing cluster-health RPC and the broker-only §17 cursor probe. topoSelf returns this broker's
+// latest C3 topology reconcile self-report (nil until the first pass / non-cluster).
+func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -46,6 +47,16 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			NodeID:             node.SelfID(),
 			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
 			ProtoVer:           proto.ProtoVersion,
+		}
+		// C3 §2.7: a C3 broker ALWAYS reports topology (TopoReported=true), even at gen 0, so the
+		// HEALTHY-HA gate can distinguish "reporting + behind" from "not reporting (old broker)".
+		if topoSelf != nil {
+			resp.TopoReported = true
+			if ts := topoSelf(); ts != nil {
+				resp.TopoApplied = ts.Applied
+				resp.TopoObserved = ts.Observed
+				resp.TopoReconcileReason = ts.Reason
+			}
 		}
 		// D9 §17 (step 10b): self-report the command-domain AppliedIndex so the leader's
 		// observability poll can compute this broker's raft_lag.

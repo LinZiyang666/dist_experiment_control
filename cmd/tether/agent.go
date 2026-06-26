@@ -24,9 +24,15 @@ import (
 // `install.sh --role agent`. Field names match install.sh exactly so
 // new operators can hand-edit the file without surprises.
 type agentYAML struct {
-	BrokerURL    string             `yaml:"broker_url"`
-	Session      string             `yaml:"session"`
-	NID          string             `yaml:"nid"`
+	BrokerURL string `yaml:"broker_url"`
+	Session   string `yaml:"session"`
+	NID       string `yaml:"nid"`
+	// AccountPub (C2) is the OOB-pinned cluster account public key (written by `agent join`). When
+	// set it disables roster TOFU and is enforced against every roster/seed bundle. BootstrapURL is
+	// the well-known HTTPS manifest URL for cold-start discovery. Both additive; a pre-C2 agent.yaml
+	// (no keys) still round-trips through KnownFields(true) → "" → C1 TOFU behavior.
+	AccountPub   string             `yaml:"account_pub,omitempty"`
+	BootstrapURL string             `yaml:"bootstrap_url,omitempty"`
 	TunnelAddr   string             `yaml:"tunnel_addr"`
 	FileTransfer fileTransferConfig `yaml:"file_transfer"`
 	Proxy        proxyConfig        `yaml:"proxy"`
@@ -211,12 +217,15 @@ func newAgentCmd() *cobra.Command {
 			}
 
 			cfg := agent.Config{
-				NATSURL:                       natsURL,
-				SID:                           sid,
-				NID:                           nid,
-				PIN:                           pin,
-				Home:                          home,
-				Logger:                        logger,
+				NATSURL:      natsURL,
+				SID:          sid,
+				NID:          nid,
+				PIN:          pin,
+				Home:         home,
+				Logger:       logger,
+				AccountPub:   ay.AccountPub,   // C2: OOB account-pub pin (disables TOFU)
+				BootstrapURL: ay.BootstrapURL, // C2: cold-start manifest URL
+
 				AllowRoots:                    ay.FileTransfer.AllowRoots,
 				RootsConfigured:               ay.FileTransfer.AllowRoots != nil,
 				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
@@ -284,6 +293,8 @@ func newAgentCmd() *cobra.Command {
 		"remove the user systemd unit for this session and exit (does NOT stop running agents)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
+	// C2: agent join / config refresh / doctor (the daemon RunE still runs when no subcommand is given).
+	cmd.AddCommand(newAgentJoinCmd(), newAgentConfigCmd(), newAgentDoctorCmd())
 	return cmd
 }
 

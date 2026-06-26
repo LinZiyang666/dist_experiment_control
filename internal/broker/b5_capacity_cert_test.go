@@ -129,7 +129,7 @@ func TestB5CertRoundTripAndAdvisoryNoHealthChange(t *testing.T) {
 	// Rotate with a SHORT window so CertValidSecs lands inside window/8 → advisory.
 	// window/8 of 24h = 3h; pick valid_until = now + 1h (well within), window arg 24h.
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterCertRotate("single-1", "sha256:NEW", admin.now().Add(time.Hour))
+		return cluster.PlanClusterCertRotate("single-1", "sha256:NEW", admin.now().Add(time.Hour), admin.now())
 	}); err != nil {
 		t.Fatalf("cert rotate propose: %v", err)
 	}

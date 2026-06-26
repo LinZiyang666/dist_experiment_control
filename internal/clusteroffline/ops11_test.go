@@ -159,7 +159,7 @@ func TestInitFromManifestRefusesBackupKind(t *testing.T) {
 	if err == nil {
 		t.Fatal("init --from-manifest must refuse a backup-kind manifest")
 	}
-	if !strings.Contains(err.Error(), "cluster restore") {
-		t.Fatalf("error should point at `cluster restore`: %v", err)
+	if !strings.Contains(err.Error(), "cluster recovery restore") {
+		t.Fatalf("error should point at the C8 primary `cluster recovery restore`: %v", err)
 	}
 }

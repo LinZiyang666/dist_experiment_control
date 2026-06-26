@@ -36,8 +36,8 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// draining nats.Conn. Drop early if runCtx is gone — the
 	// caller already told subFwd.Unsubscribe to stop new
 	// dispatches; this catches the in-flight race.
-	if a.runCtx != nil {
-		if err := a.runCtx.Err(); err != nil {
+	if rc := a.loadRunCtx(); rc != nil {
+		if err := rc.Err(); err != nil {
 			return
 		}
 	}

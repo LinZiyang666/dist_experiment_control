@@ -12,6 +12,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/agent/ssproxy"
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/clusternodes"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -37,10 +38,6 @@ func (b *Broker) proxyErr(msg *nats.Msg, code, errMsg string) {
 }
 
 func (b *Broker) handleProxySet(nc *nats.Conn, msg *nats.Msg) {
-	if b.clusterMode {
-		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
-		return
-	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok || action != "set" {
 		b.proxyErr(msg, "subject_malformed", "")
@@ -59,6 +56,13 @@ func (b *Broker) handleProxySet(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	if code := b.proxyActiveOwnerGate(sid, fp, actor, "proxy", msg); code != "" {
+		return
+	}
+	// C5: in cluster mode the switch is a Raft-committed control write (the leader-gated reaper
+	// performs the per-node allocation + the token-bearing directive push). proxy.set is broadcast +
+	// leader-only (clusterwrite.go isBroadcastClusterSubject), so the LEADER serves this.
+	if b.clusterMode {
+		b.handleProxySetCluster(sid, fp, actor, req.HAPolicy, req.Enabled, msg)
 		return
 	}
 	b.proxyOpMu.Lock()
@@ -197,10 +201,6 @@ func (b *Broker) disableProxy(nc *nats.Conn, sid, fp, actor string, msg *nats.Ms
 }
 
 func (b *Broker) handleProxySub(nc *nats.Conn, msg *nats.Msg) {
-	if b.clusterMode {
-		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
-		return
-	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok {
 		b.proxyErr(msg, "subject_malformed", "")
@@ -227,11 +227,33 @@ func (b *Broker) handleProxySub(nc *nats.Conn, msg *nats.Msg) {
 		if code := b.proxyActiveOwnerGate(sid, fp, actor, "proxy.sub.create", msg); code != "" {
 			return
 		}
+		if b.clusterMode {
+			var req proto.ProxySubCreateReq
+			if err := json.Unmarshal(msg.Data, &req); err != nil {
+				b.replyJSON(msg, proto.ProxySubCreateResp{Code: "json_parse"})
+				return
+			}
+			if !validSubName(req.Name) {
+				b.replyJSON(msg, proto.ProxySubCreateResp{Code: "sub_name_invalid"})
+				return
+			}
+			b.handleProxySubCreateCluster(sid, fp, actor, req.Name, msg)
+			return
+		}
 		b.proxyOpMu.Lock()
 		defer b.proxyOpMu.Unlock()
 		b.proxySubCreate(nc, sid, fp, actor, msg)
 	case "sub.revoke":
 		if code := b.proxyActiveOwnerGate(sid, fp, actor, "proxy.sub.revoke", msg); code != "" {
+			return
+		}
+		if b.clusterMode {
+			var req proto.ProxySubRevokeReq
+			if err := json.Unmarshal(msg.Data, &req); err != nil {
+				b.replyJSON(msg, proto.ProxySubRevokeResp{Code: "json_parse"})
+				return
+			}
+			b.handleProxySubRevokeCluster(sid, fp, actor, req.Name, msg)
 			return
 		}
 		b.proxyOpMu.Lock()
@@ -292,14 +314,6 @@ func (b *Broker) proxySubRevoke(nc *nats.Conn, sid, fp, actor string, msg *nats.
 }
 
 func (b *Broker) handleProxyStatus(msg *nats.Msg) {
-	// B7 DOC#4 seam: the proxy subscribe path is out of v1 cluster HA (§16.4). handleProxySet
-	// already fails closed in cluster mode; handleProxyStatus lacked the guard and would return a
-	// stale/empty render off RODB() (a UX trap, not an illegal write). Reply via proxyErr (it has a
-	// msg.Reply) so ctl gets a clear "unsupported" rather than hanging to timeout.
-	if b.clusterMode {
-		b.proxyErr(msg, "proxy_unsupported", "the proxy subscribe path is out of v1 cluster HA (§16.4)")
-		return
-	}
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok || action != "status" {
 		b.proxyErr(msg, "subject_malformed", "")
@@ -329,29 +343,90 @@ func (b *Broker) handleProxyStatus(msg *nats.Msg) {
 		b.proxyErr(msg, "not_a_member", "")
 		return
 	}
+	var req proto.ProxyStatusReq
+	_ = json.Unmarshal(msg.Data, &req) // empty body ⇒ single-broker view (Cluster=false)
 	enabled, _ := session.GetProxyEnabled(b.cfg.DB, sid)
-	nodes, err := b.proxyStatusNodes(sid)
-	if err != nil {
-		b.proxyErr(msg, "store_error", err.Error())
-		return
-	}
 	subs, err := proxysub.ListBySession(b.cfg.DB, sid)
 	if err != nil {
 		b.proxyErr(msg, "store_error", err.Error())
 		return
 	}
-	b.replyJSON(msg, proto.ProxyStatusResp{
-		Enabled: enabled, Nodes: nodes, Subscribers: redactSubs(subs),
-		SubURLPrefix: b.subURLBase() + "/sub/",
-	})
+	resp := proto.ProxyStatusResp{
+		Enabled: enabled, Subscribers: redactSubs(subs), SubURLPrefix: b.subURLBase() + "/sub/",
+	}
+	if b.clusterMode && req.Cluster {
+		// C5 cluster view: per-agent ready reason + home + the derived degraded state.
+		nodes, nerr := b.proxyStatusNodesCluster(sid)
+		if nerr != nil {
+			b.proxyErr(msg, "store_error", nerr.Error())
+			return
+		}
+		st := b.proxyClusterStatusFor(sid)
+		policy, _ := session.GetProxyHAPolicy(b.cfg.DB, sid)
+		resp.Nodes, resp.ClusterState, resp.HAPolicy, resp.Writable = nodes, st.State, policy, st.Writable
+		b.replyJSON(msg, resp)
+		return
+	}
+	nodes, err := b.proxyStatusNodes(sid)
+	if err != nil {
+		b.proxyErr(msg, "store_error", err.Error())
+		return
+	}
+	resp.Nodes = nodes
+	b.replyJSON(msg, resp)
+}
+
+// proxyStatusNodesCluster builds the C5 per-agent status rows: the readiness REASON (why a node is /
+// isn't vended), its authoritative proxy home, and the keyset epoch. Secret-free. The agent's reported
+// keyset epoch isn't persisted per-node, so keyset_stale is not surfaced here (a ready node serving an
+// old keyset still renders); the reason precedence collapses to {no_home, catching_up, tunnel_down,
+// ready} from replicated facts.
+func (b *Broker) proxyStatusNodesCluster(sid string) ([]proto.ProxyNodeEntry, error) {
+	sessionEpoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
+	rows, err := b.cfg.DB.Query(`SELECT nid, status FROM nodes WHERE sid=? AND proxy_capable=1 ORDER BY nid`, sid)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	type nodeRow struct{ nid, status string }
+	var nrs []nodeRow
+	for rows.Next() {
+		var nr nodeRow
+		if err := rows.Scan(&nr.nid, &nr.status); err != nil {
+			return nil, err
+		}
+		nrs = append(nrs, nr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []proto.ProxyNodeEntry
+	for _, nr := range nrs {
+		e := proto.ProxyNodeEntry{NID: nr.nid, Status: nr.status, Epoch: sessionEpoch}
+		homeBroker := ""
+		if alloc, err := port.LookupProxyByNode(b.cfg.DB, sid, nr.nid); err == nil && alloc != nil {
+			homeBroker = alloc.HomeBroker
+			e.HomeBroker = alloc.HomeBroker
+			if b.proxyHomeHealthy(alloc.HomeBroker) {
+				e.PublicPort = alloc.Port
+				// N3: project the HOME broker's public host (where /sub points subscribers), NOT this
+				// answering broker's host — else status would disagree with the /sub render.
+				if home, herr := clusternodes.LookupByNodeID(b.cfg.DB, alloc.HomeBroker); herr == nil {
+					e.PublicHost = home.PublicHost
+				}
+			}
+		}
+		// BD12: the SAME shared reason builder `--homes` uses → status ⟺ /sub render-equivalence.
+		e.ReadyReason = b.proxyReadyFor(sid, nr.nid, homeBroker)
+		e.Ready = proxyInSubRender(e.ReadyReason)
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // handleProxyReadyEvent records the agent's SS-bind ACK on
 // s.<sid>.ev.node.<nid>.proxy.<ready|unready>.
 func (b *Broker) handleProxyReadyEvent(msg *nats.Msg) {
-	if b.clusterMode {
-		return // D9 round-1 MAJOR: P13 proxy is off in cluster mode; never touch the RODB handle
-	}
 	p := splitDot(msg.Subject)
 	// 0:tether 1:v2 2:s 3:sid 4:ev 5:node 6:nid 7:proxy 8:kind
 	if len(p) != 9 || p[2] != "s" || p[4] != "ev" || p[5] != "node" || p[7] != "proxy" {
@@ -374,7 +449,9 @@ func (b *Broker) handleProxyReadyEvent(msg *nats.Msg) {
 			return
 		}
 	}
-	if err := node.SetProxyReady(b.cfg.DB, sid, nid, ready); err != nil {
+	// proxy_ready is a LIVENESS column — write the local liveness handle (in single mode
+	// livenessDB() == b.cfg.DB, byte-identical; in cluster mode each broker tracks its own, never raft).
+	if err := node.SetProxyReady(b.livenessDB(), sid, nid, ready); err != nil {
 		b.cfg.Logger.Warn("broker: set proxy_ready", "err", err)
 	}
 }
@@ -401,7 +478,29 @@ func (b *Broker) sessionNIDs(sid string) []string {
 // mint a fresh port+token.
 func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegisterReq) *proto.ProxyDirective {
 	if b.clusterMode {
-		return nil // D9 round-1 MAJOR: proxy off in cluster mode (no AllocateProxy on the RODB handle)
+		// C5: deliver the AUTHORITATIVE directive for an EXISTING reaper-allocated __proxy__ row — the
+		// PRIMARY rehome-delivery path (the D6 server-id bridge co-locates home with the agent's
+		// connected broker, so a home death bounces the agent → re-register → the new Home here). No
+		// allocation here (the leader-gated reaper owns the token-correct mint); a missing row ⇒ nil and
+		// the reaper pushes once it allocates.
+		enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
+		if err != nil || !enabled || !nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) {
+			return nil
+		}
+		existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid)
+		if err != nil || existing == nil {
+			return nil
+		}
+		keys, err := b.activeProxyKeys(sid)
+		if err != nil {
+			return nil
+		}
+		epoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
+		// No token (the agent reuses its persisted one; Generation=0 in cluster mode → epoch-only order).
+		return &proto.ProxyDirective{
+			Enabled: true, PublicPort: existing.Port, Cipher: ssproxy.Cipher, Keys: keys, Epoch: epoch,
+			Home: b.homeForExpose(existing),
+		}
 	}
 	enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
 	if err != nil || !enabled {
@@ -796,7 +895,13 @@ func (b *Broker) nodeProxyReady(sid, nid string) bool {
 }
 
 func (b *Broker) pushProxyDirective(nc *nats.Conn, sid, nid string, d *proto.ProxyDirective) {
-	d.Generation = b.proxyGenLoad() // round-3/5: stamp the (escalatable) ordering generation on every push
+	// C5: in cluster mode the ordering is EPOCH-ONLY (Generation constant 0) — the register-reply
+	// directives (proxyDirectiveForRegister) carry no generation, so a pushed directive must not stamp
+	// b.proxyGen either, or the two delivery paths would order against different generations and the
+	// agent's proxyNewer would drop one. Single mode keeps the escalatable ordering generation.
+	if !b.clusterMode {
+		d.Generation = b.proxyGenLoad() // round-3/5: stamp the (escalatable) ordering generation on every push
+	}
 	body, err := json.Marshal(d)
 	if err != nil {
 		return

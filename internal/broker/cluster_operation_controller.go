@@ -1,0 +1,736 @@
+package broker
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+)
+
+// mintOpID derives a deterministic, stable operation id from (kind, target, discriminator). For a
+// join the discriminator is the joiner's nonce (stable across resume); for a retire it is a leader-
+// baked timestamp (a fresh retire after a terminal one gets a new id; the single-active guard prevents
+// two concurrent).
+func mintOpID(kind, target, discriminator string) string {
+	sum := sha256.Sum256([]byte(kind + "|" + target + "|" + discriminator))
+	return "op-" + hex.EncodeToString(sum[:8])
+}
+
+// assertNoActiveOp refuses a raw membership mutation (AddNode/DrainNode/RemoveNode) when an operation
+// is already in flight for the target (no two-writer hole — the controller owns the node's membership
+// while an op is active). Leader-agnostic RODB read.
+func (a *ClusterAdmin) assertNoActiveOp(target string) error {
+	op, err := cluster.ActiveOperationForTarget(a.node.RODB(), target)
+	if err != nil {
+		return err
+	}
+	if op != nil {
+		return fmt.Errorf("an operation (%s, %s) is already in flight for %q — drive it via `cluster ops`/`apply` or `cluster ops abort %s`", op.OpID, op.OpState, target, op.OpID)
+	}
+	return nil
+}
+
+// StartJoinOperation admits a join from a joiner-local bundle (the `approve`/`apply` leader path): it
+// pre-verifies the PoP, refuses a replayed nonce, creates the operation row (single-active-guarded),
+// and commits the roster admission (re-verified on every replica). The controller then drives it to
+// SERVING. Returns the op_id (= plan-id) for `--wait`.
+func (a *ClusterAdmin) StartJoinOperation(bundleStr string) (string, error) {
+	b, err := cluster.DecodeJoinBundle(bundleStr)
+	if err != nil {
+		return "", err
+	}
+	if err := cluster.VerifyBundlePoP(b); err != nil {
+		return "", err
+	}
+	consumed, err := cluster.NonceConsumed(a.node.RODB(), b.NodeID, b.JoinNonce)
+	if err != nil {
+		return "", err
+	}
+	if consumed {
+		return "", fmt.Errorf("cluster join: nonce already consumed for %q (replay) — `cluster join prepare` mints a fresh one", b.NodeID)
+	}
+	opID := mintOpID(cluster.OpKindJoin, b.NodeID, b.JoinNonce)
+	// C4-M2: if an operation already owns this node, ATTACH idempotently iff it is THIS op_id (a plain
+	// re-approve of the same bundle self-heals); a DIFFERENT active op (e.g. a fresh-bundle re-approve
+	// while one drives) is refused — never clobber the in-flight identity (two-writer hole).
+	if active, err := cluster.ActiveOperationForTarget(a.node.RODB(), b.NodeID); err != nil {
+		return "", err
+	} else if active != nil && active.OpID != opID {
+		return "", fmt.Errorf("cluster join: another operation (%s, %s) is already in flight for %q — `cluster ops abort %s` first", active.OpID, active.OpState, b.NodeID, active.OpID)
+	}
+	// F1 (external review): PREFLIGHT the deterministic roster-admission constraint leader-side BEFORE
+	// consuming operator intent into an op row. The clusterNodeUpsertApplier converts a SQL constraint
+	// failure on Apply into a poison-skip no-op (errAppliedRejected → Node.Propose returns nil; §3.7
+	// never-wedge), so a downstream caller cannot tell a REJECTED admission from a committed one. The
+	// dominant cause is UNIQUE(name): a NEW node joining under a name another node already holds. Reject
+	// it up front with an explainable error and NO op row (a re-approve of the SAME node keeps its own
+	// name, so owner==b.NodeID is allowed through for idempotent self-heal).
+	if owner, err := a.rosterNameOwner(b.Name); err != nil {
+		return "", err
+	} else if owner != "" && owner != b.NodeID {
+		return "", fmt.Errorf("cluster join: name %q is already used by node %q — choose a different --name (nothing was admitted)", b.Name, owner)
+	}
+	params, _ := json.Marshal(map[string]string{"raft_addr": b.RaftAddr, "public_host": b.PublicHost})
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterOpStart(cluster.OpStartInput{
+			OpID: opID, Kind: cluster.OpKindJoin, TargetNode: b.NodeID, InitState: cluster.OpStateJoinProofVerified,
+			JoinNonce: b.JoinNonce, Params: string(params),
+			Timeline: a.initTimeline(cluster.OpStateJoinProofVerified),
+		}, a.now())
+	}); err != nil {
+		return "", fmt.Errorf("cluster join: create operation: %w", err)
+	}
+	// Verify the active op IS ours (the single-active guard may have no-op'd a racing create) before
+	// committing the roster — never return a phantom op_id (M2) or admit under another op.
+	active, err := cluster.ActiveOperationForTarget(a.node.RODB(), b.NodeID)
+	if err != nil {
+		return "", err
+	}
+	if active == nil || active.OpID != opID {
+		return "", fmt.Errorf("cluster join: lost the create race for %q — retry", b.NodeID)
+	}
+	// Commit the roster row (PoP re-verified on every replica by clusterNodeUpsertApplier). Idempotent:
+	// a re-approve re-commits the same identity (self-heals a crash between op-create and roster admit).
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeUpsert(b.ToUpsertInput(a.now()))
+	}); err != nil {
+		// A HARD propose error (leadership loss / store error) — not a poison-skip. Tear the op down so a
+		// failed admission never leaves a non-terminal op, then surface the error.
+		a.abortRejectedJoinOp(active, "roster admission propose failed: "+err.Error())
+		return "", fmt.Errorf("cluster join: roster admission: %w", err)
+	}
+	// F1 BACKSTOP: Node.Propose returns nil even when the FSM POISON-SKIPPED a deterministic constraint
+	// failure (errAppliedRejected → committed-but-no-op). VERIFY the roster row actually reflects this
+	// admission (exists + carries the bundle's identity) before reporting success. If it was rejected,
+	// drive the op to a terminal ABORTED (no lingering active op the controller would spin on) and return
+	// an explainable synchronous error — never a usable op_id for an admission that did not happen.
+	if admitted, err := a.rosterAdmitted(b.NodeID, b.NodeIdentPub); err != nil {
+		return "", err
+	} else if !admitted {
+		a.abortRejectedJoinOp(active, "roster admission rejected by the FSM (duplicate name/identity or constraint)")
+		return "", fmt.Errorf("cluster join: roster admission for %q was rejected (name %q likely already in use, or an identity/constraint conflict) — nothing was admitted; the operation was aborted", b.NodeID, b.Name)
+	}
+	return opID, nil
+}
+
+// rosterNameOwner returns the node_id that already holds `name` in the replicated roster ("" if none) —
+// a leader-side preflight of the UNIQUE(name) constraint the baked upsert would otherwise hit as a
+// deterministic poison-skip (F1). Leader RODB read.
+func (a *ClusterAdmin) rosterNameOwner(name string) (string, error) {
+	var owner string
+	err := a.node.RODB().QueryRow(`SELECT node_id FROM cluster_nodes WHERE name = ?`, name).Scan(&owner)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("cluster join: check name uniqueness: %w", err)
+	}
+	return owner, nil
+}
+
+// rosterAdmitted reports whether the roster row for nodeID exists AND carries the expected node-identity
+// pubkey — the post-propose proof that the admission COMMITTED rather than being poison-skipped (F1).
+func (a *ClusterAdmin) rosterAdmitted(nodeID, wantIdentPub string) (bool, error) {
+	var gotPub string
+	err := a.node.RODB().QueryRow(`SELECT node_ident_pub FROM cluster_nodes WHERE node_id = ?`, nodeID).Scan(&gotPub)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("cluster join: verify roster admission: %w", err)
+	}
+	return gotPub == wantIdentPub, nil
+}
+
+// abortRejectedJoinOp drives a just-created join op to terminal ABORTED so a rejected admission never
+// leaves a non-terminal operation behind (F1). Best-effort: a transition failure (e.g. concurrent
+// leadership loss) is logged, not fatal — the operator can `cluster ops abort` any residual.
+func (a *ClusterAdmin) abortRejectedJoinOp(op *cluster.Operation, reason string) {
+	if op == nil {
+		return
+	}
+	if err := a.transition(op, cluster.OpStateAborted, true, reason, nil); err != nil {
+		a.logger.Warn("cluster join: abort rejected-admission op", "op", op.OpID, "err", err)
+	}
+}
+
+// StartRetireOperation creates a recoverable retire operation. The F==0 typed-confirm + refuse-last-
+// voter gates are checked SYNCHRONOUSLY here (so the CLI prompts immediately), AND re-run on every
+// drive by the controller. Returns the op_id for `--wait`.
+func (a *ClusterAdmin) StartRetireOperation(target string, confirmed bool) (string, error) {
+	if err := a.assertNoActiveOp(target); err != nil {
+		return "", err
+	}
+	if err := a.requireClusterNode(target); err != nil {
+		return "", fmt.Errorf("cluster retire %s: %w", target, err)
+	}
+	// C4-m3: only a VOTER or an already-DRAINING node may be retired (the legacy DrainNode hard-fails a
+	// CATCHING_UP / VOTER_ADD_FAILED node; the op machine's conditional phase bumps would silently skip).
+	if phase, ok := a.nodePhase(target); !ok {
+		return "", fmt.Errorf("cluster retire %s: no such roster node", target)
+	} else if phase != phaseVoter && phase != phaseDraining {
+		return "", fmt.Errorf("cluster retire %s: node is %s; only a VOTER or DRAINING node may be retired (use `cluster recovery node remove --manual` for a failed join)", target, phase)
+	}
+	voters, err := a.node.NumVoters()
+	if err != nil {
+		return "", fmt.Errorf("cluster retire %s: count voters: %w", target, err)
+	}
+	proj := ProjectQuorum(voters, true)
+	if proj.Voters < 1 {
+		return "", fmt.Errorf("cluster retire %s: cannot retire the last voter (force-single/recover territory, not retire)", target)
+	}
+	if proj.FaultTolerance == 0 && !confirmed {
+		return "", &ErrQuorumConfirmRequired{Proj: proj}
+	}
+	opID := mintOpID(cluster.OpKindRetire, target, a.now().UTC().Format(time.RFC3339Nano))
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterOpStart(cluster.OpStartInput{
+			OpID: opID, Kind: cluster.OpKindRetire, TargetNode: target, InitState: cluster.OpStateDrainRequested,
+			Confirmed: confirmed, ConfirmedFT: int64(proj.FaultTolerance),
+			Timeline: a.initTimeline(cluster.OpStateDrainRequested),
+		}, a.now())
+	}); err != nil {
+		return "", fmt.Errorf("cluster retire %s: create operation: %w", target, err)
+	}
+	// m6: read back the active op — never return a phantom op_id from a racing no-op insert.
+	active, err := cluster.ActiveOperationForTarget(a.node.RODB(), target)
+	if err != nil {
+		return "", err
+	}
+	if active == nil {
+		return "", fmt.Errorf("cluster retire %s: operation did not persist — retry", target)
+	}
+	return active.OpID, nil
+}
+
+// ConfirmOp re-confirms / retries a BLOCKED op (C4-M6: works for BOTH kinds). A retire re-acknowledges
+// the worsened fault tolerance and re-enters the ladder; a BLOCKED join (catch-up deadline / AddVoter
+// retries exhausted) re-enters CATCHING_UP with a FRESH barrier + deadline so a slow-but-healthy
+// joiner is recoverable, not a permanent dead-end.
+func (a *ClusterAdmin) ConfirmOp(opID string) error {
+	op, err := cluster.OperationByID(a.node.RODB(), opID)
+	if err != nil {
+		return err
+	}
+	if op == nil || op.Terminal {
+		return fmt.Errorf("operation %q is not an in-flight op", opID)
+	}
+	a.clearOpAttempts(opID)
+	if op.Kind == cluster.OpKindRetire {
+		voters, err := a.node.NumVoters()
+		if err != nil {
+			return fmt.Errorf("count voters: %w", err)
+		}
+		ft := int64(ProjectQuorum(voters, true).FaultTolerance)
+		if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClusterOpConfirm(opID, ft, a.now())
+		}); err != nil {
+			return err
+		}
+		if op.OpState == cluster.OpStateBlocked {
+			return a.transition(op, cluster.OpStateDrainRequested, false, "", nil)
+		}
+		return nil
+	}
+	// Join: re-enter at ROSTER_COMMITTED (NOT CATCHING_UP) so the ladder re-captures the barrier AND
+	// re-issues the idempotent AddVoter at RAFT_ADDING — recovering a join BLOCKED at EITHER the
+	// catch-up deadline OR exhausted AddVoter attempts (the closure-review M6 residual).
+	if op.Kind == cluster.OpKindJoin && op.OpState == cluster.OpStateBlocked {
+		return a.transition(op, cluster.OpStateRosterCommitted, false, "", nil)
+	}
+	return fmt.Errorf("operation %q (%s/%s) is not awaiting a confirm", opID, op.Kind, op.OpState)
+}
+
+// AbortOp transitions a non-terminal op to ABORTED (predecessor-CAS), freeing the per-node active slot
+// WITHOUT touching the substrate (the membership stays whatever the gates left it; reconcile/doctor
+// heals). The stuck-op escape hatch.
+func (a *ClusterAdmin) AbortOp(opID string) error {
+	op, err := cluster.OperationByID(a.node.RODB(), opID)
+	if err != nil {
+		return err
+	}
+	if op == nil {
+		return fmt.Errorf("operation %q not found", opID)
+	}
+	if op.Terminal {
+		return nil // already terminal — idempotent
+	}
+	return a.transition(op, cluster.OpStateAborted, true, "aborted by operator", nil)
+}
+
+// initTimeline bakes the single-entry initial timeline for a new op.
+func (a *ClusterAdmin) initTimeline(state string) string {
+	return appendTimeline("[]", opTimelineEntry{S: state, T: a.now().UTC().Format(time.RFC3339)})
+}
+
+// cluster_operation_controller.go (C4) — the leader-gated driver of the replicated operation log. It
+// reads each non-terminal cluster_operations row, derives the live substrate (cluster_nodes.phase +
+// raft config + topology_generation), computes the NEXT idempotent transition, performs its
+// side-effect (reusing the EXISTING D7/C3 primitives), and commits the cursor advance AFTER the
+// substrate fact lands (advance-after-observe). A kill-9 / leadership change resumes by re-deriving
+// from the substrate — no double-apply, no orphaned half-state. Every retire safety gate is re-run on
+// EVERY drive (never trusted from a stale plan).
+
+const (
+	opTimelineCap    = 32              // cap the durable in-row timeline
+	opCatchupTimeout = 2 * time.Minute // join catch-up stall deadline
+	opMaxAttempts    = 5               // bounded retry of a failing side-effect before BLOCKED (C4-M8)
+)
+
+// opTimelineEntry is one durable transition record (compact keys — the row is capped).
+type opTimelineEntry struct {
+	S string `json:"s"`           // op_state
+	T string `json:"t"`           // RFC3339 timestamp
+	E string `json:"e,omitempty"` // error/note
+}
+
+// substrate is the live membership ground truth for one target node (the membership SSOT).
+type substrate struct {
+	phase          string // cluster_nodes.phase ("" = absent)
+	inRaft         bool   // present in the raft configuration
+	isVoter        bool
+	numVoters      int
+	isLeaderTarget bool // the target node IS the current raft leader
+}
+
+// driveInFlightOperations is the leader-gated tick: it advances every non-terminal operation by one
+// idempotent step. Called from the observe loop (leader-edge + each tick). A non-leader is a no-op.
+func (a *ClusterAdmin) driveInFlightOperations() {
+	if a == nil || a.node == nil || !a.node.IsLeader() {
+		return
+	}
+	ops, err := cluster.NonTerminalOperations(a.node.RODB())
+	if err != nil {
+		a.logger.Warn("cluster op controller: list non-terminal", "err", err)
+		return
+	}
+	for i := range ops {
+		a.driveOne(&ops[i])
+	}
+}
+
+// driveOne advances ONE operation by a single transition (best-effort; errors are recorded in
+// last_error + surfaced via `ops show`, never fatal to the loop).
+func (a *ClusterAdmin) driveOne(op *cluster.Operation) {
+	sub, err := a.readSubstrate(op.TargetNode)
+	if err != nil {
+		a.logger.Warn("cluster op controller: read substrate", "op", op.OpID, "err", err)
+		return
+	}
+	switch op.Kind {
+	case cluster.OpKindJoin:
+		a.driveJoin(op, sub)
+	case cluster.OpKindRetire:
+		a.driveRetire(op, sub)
+	}
+}
+
+// readSubstrate reads the membership ground truth for a target (bounded-stale leader read).
+func (a *ClusterAdmin) readSubstrate(target string) (substrate, error) {
+	var s substrate
+	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
+		var phase string
+		err := db.QueryRow(`SELECT phase FROM cluster_nodes WHERE node_id = ?`, target).Scan(&phase)
+		if err == nil {
+			s.phase = phase
+		} else if err != sql.ErrNoRows {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return s, err
+	}
+	cfg, err := a.node.RaftConfiguration()
+	if err != nil {
+		return s, err
+	}
+	for _, srv := range cfg {
+		if srv.NodeID == target {
+			s.inRaft = true
+			s.isVoter = srv.Voter
+		}
+	}
+	if nv, err := a.node.NumVoters(); err == nil {
+		s.numVoters = nv
+	}
+	if _, leaderID := a.node.LeaderWithID(); leaderID == target {
+		s.isLeaderTarget = true
+	}
+	return s, nil
+}
+
+// transition commits one predecessor-CAS cursor advance with a fresh timeline entry. The new timeline
+// is computed leader-side (current + entry, capped) and baked as a literal — deterministic on every
+// replica. opt mutators (SetBarrier) are passed through.
+func (a *ClusterAdmin) transition(op *cluster.Operation, to string, terminal bool, lastErr string, mut func(*cluster.OpTransitionInput)) error {
+	tl := appendTimeline(op.Timeline, opTimelineEntry{S: to, T: a.now().UTC().Format(time.RFC3339), E: lastErr})
+	in := cluster.OpTransitionInput{
+		OpID: op.OpID, FromState: op.OpState, ToState: to, Terminal: terminal, LastError: lastErr, Timeline: tl,
+	}
+	if mut != nil {
+		mut(&in)
+	}
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterOpTransition(in, a.now())
+	})
+}
+
+// recordOpError records last_error WITHOUT a state change (stays in the current state for the next
+// drive). C4-M4: it is CHANGE-GATED — if last_error is already this message it does NOT re-write (a
+// self-CAS would commit a raft entry every 5s tick while merely waiting, violating idle-zero-writes).
+func (a *ClusterAdmin) recordOpError(op *cluster.Operation, stepErr error) {
+	if stepErr == nil || op.LastError == stepErr.Error() {
+		return
+	}
+	_ = a.transition(op, op.OpState, false, stepErr.Error(), nil)
+}
+
+func appendTimeline(cur string, e opTimelineEntry) string {
+	var entries []opTimelineEntry
+	_ = json.Unmarshal([]byte(cur), &entries)
+	entries = append(entries, e)
+	if len(entries) > opTimelineCap {
+		entries = entries[len(entries)-opTimelineCap:]
+	}
+	b, err := json.Marshal(entries)
+	if err != nil {
+		return cur
+	}
+	return string(b)
+}
+
+// ---- JOIN state machine ------------------------------------------------------------------------
+
+func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
+	switch op.OpState {
+	case cluster.OpStateBlocked:
+		// awaiting an explicit `approve`/`apply` (the bundle's PoP) — the controller does not auto-drive.
+		return
+	case cluster.OpStateJoinProofVerified:
+		// Admission: the PoP was pre-verified at approve; commit the roster row (re-verified on every
+		// replica by clusterNodeUpsertApplier). If the row already exists (resume), advance.
+		if sub.phase != "" {
+			_ = a.transition(op, cluster.OpStateRosterCommitted, false, "", nil)
+			return
+		}
+		// The roster admit itself is performed by the approve/apply caller (it holds the bundle/PoP);
+		// the controller only advances once it OBSERVES the row. If it never appears, the op stalls
+		// loud (last_error set by the caller). Nothing to do here without the PoP.
+		return
+	case cluster.OpStateRosterCommitted:
+		// C4-BLOCKER-2: capture + PERSIST the catch-up barrier BEFORE any AddVoter, so a kill-9 after
+		// AddVoter's config change commits resumes against a REAL goalpost (never promotes a node that
+		// has not actually caught up). No side-effect here — only the barrier persist.
+		barrier, err := a.captureBarrier()
+		if err != nil {
+			a.recordOpError(op, fmt.Errorf("capture barrier: %w", err))
+			return
+		}
+		deadline := a.now().Add(opCatchupTimeout).UnixNano()
+		_ = a.transition(op, cluster.OpStateRaftAdding, false, "", func(in *cluster.OpTransitionInput) {
+			in.SetBarrier = true
+			in.Barrier = barrier
+			in.CatchupDeadline = deadline
+			in.TopoTargetGen = op.TopoTargetGen
+		})
+	case cluster.OpStateRaftAdding:
+		// The barrier is persisted now. AddVoter (idempotent) if not yet a voter, then phase→CATCHING_UP.
+		if !sub.isVoter {
+			raftAddr, err := a.nodeRaftAddr(op.TargetNode)
+			if err != nil {
+				a.recordOpError(op, err)
+				return
+			}
+			if err := a.node.AddVoter(op.TargetNode, raftAddr); err != nil {
+				a.blockAfterAttempts(op, "AddVoter", err)
+				return
+			}
+			return // wait a tick for the config change to reflect in sub.isVoter
+		}
+		// phase → CATCHING_UP (mesh enter; bumps topology_generation). Always runs from a pre-mesh phase,
+		// so a resume where AddVoter committed but this setPhase did not still heals (no stuck PENDING).
+		if sub.phase != phaseVoter && sub.phase != phaseCatchingUp {
+			if err := a.setPhase(op.TargetNode, phaseCatchingUp, []string{"JOIN_VERIFIED_PENDING_VOTER", "VOTER_ADD_FAILED"}, ""); err != nil {
+				a.recordOpError(op, fmt.Errorf("phase->CATCHING_UP: %w", err))
+				return
+			}
+		}
+		_ = a.transition(op, cluster.OpStateCatchingUp, false, "", nil)
+	case cluster.OpStateCatchingUp:
+		// op.Barrier is guaranteed non-zero (persisted at ROSTER_COMMITTED) — the catch-up gate is real.
+		caught, err := a.caughtUpFn(op.TargetNode, op.Barrier)
+		if err != nil {
+			a.recordOpError(op, fmt.Errorf("catch-up probe: %w", err))
+			return
+		}
+		if caught {
+			// Promote to VOTER (from CATCHING_UP; tolerate an already-VOTER resume). Heals any phase.
+			if sub.phase == phaseCatchingUp {
+				if err := a.setPhase(op.TargetNode, phaseVoter, []string{phaseCatchingUp}, ""); err != nil {
+					a.recordOpError(op, fmt.Errorf("phase->VOTER: %w", err))
+					return
+				}
+			}
+			a.toNatsRolledOut(op)
+			return
+		}
+		if op.CatchupDeadline != 0 && a.now().UnixNano() > op.CatchupDeadline {
+			_ = a.transition(op, cluster.OpStateBlocked, false, "catch-up exceeded the deadline — check the joining broker, then `cluster ops confirm <op-id>` to retry", nil)
+		}
+	case cluster.OpStateNatsRolledOut:
+		ok, reason := a.topoConvergedForOp(op, true)
+		if !ok {
+			a.recordOpError(op, errors.New(reason))
+			return
+		}
+		// C4-m1: clear force_single_active BEFORE the terminal transition — a kill-9 between a terminal
+		// SERVING and a later clear would strand a stale FORCE_SINGLE marker (the op is never revisited).
+		if nv, err := a.node.NumVoters(); err == nil && nv > 1 {
+			_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearForceSingle() })
+		}
+		a.clearOpAttempts(op.OpID)
+		_ = a.transition(op, cluster.OpStateServing, true, "", nil)
+	}
+}
+
+// blockAfterAttempts bounds a retried side-effect: it records the error and, after opMaxAttempts
+// consecutive failures, transitions the op to BLOCKED (loud, operator-recoverable) instead of
+// re-issuing the side-effect every tick forever (C4-M8). The counter is leader-local (reset on a
+// leadership change is fine — the new leader re-counts from 0).
+func (a *ClusterAdmin) blockAfterAttempts(op *cluster.Operation, what string, stepErr error) {
+	a.opAttemptsMu.Lock()
+	if a.opAttempts == nil {
+		a.opAttempts = map[string]int{}
+	}
+	a.opAttempts[op.OpID]++
+	n := a.opAttempts[op.OpID]
+	a.opAttemptsMu.Unlock()
+	if n >= opMaxAttempts {
+		_ = a.transition(op, cluster.OpStateBlocked, false,
+			fmt.Sprintf("%s failed %d times (%v) — fix the target, then `cluster ops confirm %s` to retry or `cluster ops abort %s`", what, n, stepErr, op.OpID, op.OpID), nil)
+		return
+	}
+	a.recordOpError(op, fmt.Errorf("%s (attempt %d/%d): %w", what, n, opMaxAttempts, stepErr))
+}
+
+func (a *ClusterAdmin) clearOpAttempts(opID string) {
+	a.opAttemptsMu.Lock()
+	delete(a.opAttempts, opID)
+	a.opAttemptsMu.Unlock()
+}
+
+// ---- RETIRE state machine ----------------------------------------------------------------------
+
+func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
+	switch op.OpState {
+	case cluster.OpStateBlocked:
+		return // awaiting `cluster ops confirm`
+	case cluster.OpStateDrainRequested:
+		// Re-run the safety gates EVERY drive from CURRENT ground truth (never trust stale consent).
+		if !a.retireGatePasses(op, sub) {
+			return // gate routed to RETIRE_FAILED / BLOCKED
+		}
+		_ = a.transition(op, cluster.OpStateNoNewHome, false, "", nil)
+	case cluster.OpStateNoNewHome:
+		if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			d := a.now().Add(opCatchupTimeout)
+			return cluster.PlanClusterDrainSet(op.TargetNode, &d)
+		}); err != nil {
+			a.recordOpError(op, fmt.Errorf("raise broker_draining: %w", err))
+			return
+		}
+		_ = a.transition(op, cluster.OpStateRehomeExposes, false, "", nil)
+	case cluster.OpStateRehomeExposes:
+		if err := a.migrateExposes(op.TargetNode); err != nil {
+			a.recordOpError(op, fmt.Errorf("migrate exposes: %w", err)) // rebuild-OFF refusal surfaces here, loud
+			return
+		}
+		if sub.phase == phaseVoter {
+			if err := a.setPhase(op.TargetNode, phaseDraining, []string{phaseVoter}, ""); err != nil {
+				a.recordOpError(op, fmt.Errorf("phase->DRAINING: %w", err))
+				return
+			}
+		}
+		_ = a.transition(op, cluster.OpStateStreamsAtTarget, false, "", nil)
+	case cluster.OpStateStreamsAtTarget:
+		ready, err := a.streamsReadyFn(op.TargetNode)
+		if err != nil {
+			a.recordOpError(op, fmt.Errorf("stream readiness: %w", err))
+			return
+		}
+		if !ready {
+			a.recordOpError(op, errors.New("streams not at target replica count yet"))
+			return
+		}
+		_ = a.transition(op, cluster.OpStateSeedWithdrawn, false, "", nil)
+	case cluster.OpStateSeedWithdrawn:
+		// Advisory only (C2 seeds are free-form, not roster-keyed) — never blocks, and (C4-m5) must NOT
+		// set last_error so a healthy retire shows no error. The advisory lives in the runbook, not the op.
+		_ = a.transition(op, cluster.OpStateLeaderTransferred, false, "", nil)
+	case cluster.OpStateLeaderTransferred:
+		if sub.isLeaderTarget {
+			if err := a.transferLeadershipOff(op.TargetNode); err != nil {
+				a.recordOpError(op, fmt.Errorf("transfer leadership off: %w", err))
+				return
+			}
+			// We just shed leadership; the NEW leader's controller resumes from here.
+			return
+		}
+		_ = a.transition(op, cluster.OpStateRaftRemoved, false, "", nil)
+	case cluster.OpStateRaftRemoved:
+		// C4-BLOCKER-1 + M3: FINAL re-check of the IRREVERSIBLE-removal gates from current ground truth,
+		// using the SAME isVoter-aware decision as DRAIN_REQUESTED. Once the target is no longer a voter
+		// (resume after the removal committed), the gate passes (already removed) → fall through to
+		// RETIRED instead of false-failing. While it IS still a voter, a worsened F==0 (e.g. a concurrent
+		// retire eroded fault tolerance) routes to BLOCKED — never barrels through the irreversible step.
+		if sub.isVoter && !a.retireGatePasses(op, sub) {
+			return
+		}
+		if ready, err := a.streamsReadyFn(op.TargetNode); err != nil || !ready {
+			a.recordOpError(op, errors.New("streams regressed below target before removal — holding"))
+			return
+		}
+		if sub.phase == phaseDraining {
+			if err := a.setPhase(op.TargetNode, phaseRetiring, []string{phaseDraining}, ""); err != nil {
+				a.recordOpError(op, fmt.Errorf("phase->RETIRING: %w", err))
+				return
+			}
+		}
+		if sub.inRaft {
+			if err := a.node.RemoveServer(op.TargetNode); err != nil {
+				a.recordOpError(op, fmt.Errorf("raft RemoveServer: %w", err))
+				return
+			}
+		}
+		if sub.phase != "" {
+			if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+				return cluster.PlanClusterNodeRemove(op.TargetNode, a.now())
+			}); err != nil {
+				a.recordOpError(op, fmt.Errorf("roster delete: %w", err))
+				return
+			}
+		}
+		// Capture the topology generation the removal (mesh-leave) bumped — the NATS_ROLLED_OUT target.
+		a.toNatsRolledOut(op)
+	case cluster.OpStateNatsRolledOut:
+		ok, reason := a.topoConvergedForOp(op, false)
+		if !ok {
+			a.recordOpError(op, errors.New(reason))
+			return
+		}
+		// clear the drain marker; terminal RETIRED (the op row is the only record of RETIRED).
+		_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClusterDrainSet(op.TargetNode, nil)
+		})
+		_ = a.transition(op, cluster.OpStateRetired, true, "", nil)
+	}
+}
+
+// ---- shared helpers ----------------------------------------------------------------------------
+
+// retireGatePasses re-runs the retire safety gates from CURRENT ground truth (C4-BLOCKER-1/M3). It
+// returns true only if the op may proceed; otherwise it routes the op to RETIRE_FAILED (last voter)
+// or BLOCKED (F==0 needs a fresh confirm) and returns false. isVoter-aware: once the target is no
+// longer a voter (resume after removal), the gate passes (the removal already happened).
+func (a *ClusterAdmin) retireGatePasses(op *cluster.Operation, sub substrate) bool {
+	if !sub.isVoter {
+		return true // already removed from the raft config — nothing left to gate
+	}
+	proj := ProjectQuorum(sub.numVoters, true)
+	if proj.Voters < 1 {
+		// Clear any drain marker raised earlier (the node stays serving) so it isn't orphaned on a node
+		// that did NOT get removed (closure-review minor).
+		_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterDrainSet(op.TargetNode, nil) })
+		_ = a.transition(op, cluster.OpStateRetireFailed, true, "cannot retire the last voter — force-single/recover territory", nil)
+		return false
+	}
+	if proj.FaultTolerance == 0 && !op.Confirmed {
+		_ = a.transition(op, cluster.OpStateBlocked, false,
+			"fault tolerance would drop to 0 — `cluster ops confirm "+op.OpID+"` to proceed", nil)
+		return false
+	}
+	return true
+}
+
+// topoConvergedForOp reports whether EVERY current raft voter (for retire: every REMAINING voter) has
+// observed this op's target topology generation. FAIL-CLOSED: an unreachable/UNKNOWN voter counts as
+// NOT converged (never false-greens SERVING/RETIRED). Deliberately differs from computeHealth's
+// inlined predicate, which excludes unreachable voters.
+func (a *ClusterAdmin) topoConvergedForOp(op *cluster.Operation, joining bool) (bool, string) {
+	if op.TopoTargetGen == 0 {
+		return true, "" // nothing to converge (no topology managed)
+	}
+	rep, err := a.StatusReport("ctl-nats")
+	if err != nil || rep == nil {
+		return false, "topology convergence: status unavailable"
+	}
+	for _, n := range rep.Nodes {
+		if n.Role != "leader" && n.Role != "voter" {
+			continue // only voters carry topology
+		}
+		if !joining && n.NodeID == op.TargetNode {
+			continue // retire: skip the leaving node
+		}
+		if !n.TopoReported || !n.Reachable {
+			return false, fmt.Sprintf("topology convergence: voter %q not yet reporting/reachable", n.NodeID)
+		}
+		if n.TopoObserved < op.TopoTargetGen {
+			return false, fmt.Sprintf("topology convergence: voter %q at gen %d < %d", n.NodeID, n.TopoObserved, op.TopoTargetGen)
+		}
+	}
+	return true, ""
+}
+
+// toNatsRolledOut transitions into NATS_ROLLED_OUT, capturing the CURRENT topology_generation as the
+// op's convergence target (the gen this op's membership change bumped). Barrier/deadline are preserved.
+func (a *ClusterAdmin) toNatsRolledOut(op *cluster.Operation) {
+	gen, err := cluster.TopologyGeneration(a.node.RODB())
+	if err != nil {
+		// C4-M5: do NOT advance with topo_target_gen=0 — that would short-circuit topoConvergedForOp to
+		// "converged" (fail-OPEN). Record + retry next tick.
+		a.recordOpError(op, fmt.Errorf("read topology generation: %w", err))
+		return
+	}
+	a.clearOpAttempts(op.OpID)
+	_ = a.transition(op, cluster.OpStateNatsRolledOut, false, "", func(in *cluster.OpTransitionInput) {
+		in.SetBarrier = true
+		in.Barrier = op.Barrier
+		in.CatchupDeadline = op.CatchupDeadline
+		in.TopoTargetGen = gen
+	})
+}
+
+// captureBarrier reads the leader's command-domain AppliedIndex under a VerifyLeaderRead barrier (a
+// genuinely-writable leader), the catch-up goalpost the joiner must reach.
+func (a *ClusterAdmin) captureBarrier() (uint64, error) {
+	var barrier uint64
+	err := a.node.VerifyLeaderRead(func(*sql.DB) error {
+		b, e := a.node.AppliedIndex()
+		if e != nil {
+			return e
+		}
+		barrier = b
+		return nil
+	})
+	return barrier, err
+}
+
+// nodeRaftAddr reads the target's raft_addr from the SUBSTRATE (cluster_nodes), not from op params.
+func (a *ClusterAdmin) nodeRaftAddr(target string) (string, error) {
+	var addr string
+	err := a.node.BoundedStaleRead(func(db *sql.DB) error {
+		return db.QueryRow(`SELECT raft_addr FROM cluster_nodes WHERE node_id = ?`, target).Scan(&addr)
+	})
+	if err != nil {
+		return "", fmt.Errorf("read raft_addr for %q: %w", target, err)
+	}
+	if addr == "" {
+		return "", fmt.Errorf("node %q has no raft_addr", target)
+	}
+	return addr, nil
+}

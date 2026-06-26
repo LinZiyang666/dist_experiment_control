@@ -77,6 +77,16 @@ const (
 	// VerbPortFree forwards a data-less public-port free. VerbPortRevoke carries the exact
 	// allocation identity selected by the leader's offline-node scan; it must not revoke by
 	// bare port because the public port may already have been reused.
+	// VerbBusNkeySet (C3) forwards a broker's self-reported bus nkey pub to the leader for
+	// OpClusterBusNkeySet (each broker writes its OWN row; followers forward).
+	VerbBusNkeySet = "busnkeyset"
+
+	// NOTE (C5, Stage-C N0): proxy.set / proxy.sub.create / proxy.sub.revoke are ALL broadcast +
+	// leader-only (isBroadcastClusterSubject), consistent with expose/run/kill — the leader proposes
+	// locally (b.cl.node.Propose) and a follower stays silent, so there is NO proxy forward verb (an
+	// earlier queue-group design had VerbProxySetEnabled/VerbProxySubRevoke; both were dead wire under
+	// broadcast+leader-only and were removed).
+
 	VerbPortFree   = "portfree"
 	VerbPortRevoke = "portrevoke"
 	// VerbPortFreeAllocation is the expose-rm path: the leader must re-check the exact
@@ -121,6 +131,12 @@ const (
 // (free/revoke). The leader bakes the timestamp literal.
 type PortMutatePayload struct {
 	Port int `json:"port"`
+}
+
+// BusNkeySetPayload (C3) is a broker self-reporting its bus nkey pub for OpClusterBusNkeySet.
+type BusNkeySetPayload struct {
+	NodeID     string `json:"node_id"`
+	BusNkeyPub string `json:"bus_nkey_pub"`
 }
 
 // PortFreeAllocationPayload fences expose-rm against stale name->port reads and port reuse.
@@ -564,6 +580,16 @@ func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelo
 		}
 		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return session.PlanCreate(db, p.Name, p.Name, p.FP, p.PinHash, now())
+		})
+	case VerbBusNkeySet:
+		// C3: each broker self-reports its bus nkey pub; the leader bakes the all-literal UPDATE +
+		// topology_generation bump (PlanClusterBusNkeySet re-validates the nkey on the leader).
+		var p BusNkeySetPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClusterBusNkeySet(p.NodeID, p.BusNkeyPub, now())
 		})
 	case VerbPortFree:
 		var p PortMutatePayload

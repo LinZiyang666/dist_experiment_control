@@ -56,27 +56,27 @@ func TestD7ComputeHealth(t *testing.T) {
 		{NodeID: "c", Phase: phaseVoter, Role: "voter"},
 	}
 	// force-single dominates everything.
-	if h, _, next := computeHealth(true, "a", 3, healthy); h != healthForceSingle {
+	if h, _, next := computeHealth(true, "a", 3, 0, healthy); h != healthForceSingle {
 		t.Errorf("force-single: got %s", h)
 	} else if !strings.Contains(next, "--self-id") {
 		t.Errorf("force-single next step missing --self-id: %q", next)
 	}
 	// no leader => quorum-lost (exit 2), NOT from absence of reports but a positive empty-leader.
-	if h, _, next := computeHealth(false, "", 3, healthy); h != healthQuorumLost {
+	if h, _, next := computeHealth(false, "", 3, 0, healthy); h != healthQuorumLost {
 		t.Errorf("no-leader: got %s", h)
 	} else if !strings.Contains(next, "--self-id") || !strings.Contains(next, "--self-addr") {
 		t.Errorf("quorum-lost next step missing force-single identity flags: %q", next)
 	}
 	// N=3 all VOTER, leader present => HEALTHY_HA.
-	if h, _, _ := computeHealth(false, "a", 3, healthy); h != healthHealthyHA {
+	if h, _, _ := computeHealth(false, "a", 3, 0, healthy); h != healthHealthyHA {
 		t.Errorf("healthy: got %s", h)
 	}
 	// N=2 => F==0 => DEGRADED even with a leader + all VOTER.
 	twoVoters := healthy[:2]
-	if h, _, next := computeHealth(false, "a", 2, twoVoters); h != healthDegraded {
+	if h, _, next := computeHealth(false, "a", 2, 0, twoVoters); h != healthDegraded {
 		t.Errorf("N=2: got %s", h)
-	} else if !strings.Contains(next, "<node-id>") || !strings.Contains(next, "--tunnel-addr") {
-		t.Errorf("F==0 next step missing full add workflow: %q", next)
+	} else if !strings.Contains(next, "join prepare") || !strings.Contains(next, "join approve") || !strings.Contains(next, "--tunnel-addr") {
+		t.Errorf("F==0 next step must name the C8 join workflow (prepare/approve), not the deleted `cluster add`: %q", next)
 	}
 	// A CATCHING_UP node => DEGRADED.
 	joining := []adminsock.ClusterNodeStatus{
@@ -84,8 +84,29 @@ func TestD7ComputeHealth(t *testing.T) {
 		{NodeID: "b", Phase: phaseVoter, Role: "voter"},
 		{NodeID: "c", Phase: phaseCatchingUp, Role: "voter"},
 	}
-	if h, _, _ := computeHealth(false, "a", 3, joining); h != healthDegraded {
+	if h, _, _ := computeHealth(false, "a", 3, 0, joining); h != healthDegraded {
 		t.Errorf("catching-up: got %s", h)
+	}
+}
+
+func TestExternalReviewRereviewForceSingleNextStepUsesRecoveryRejoinPrepare(t *testing.T) {
+	healthy := []adminsock.ClusterNodeStatus{
+		{NodeID: "a", Phase: phaseVoter, Role: "leader"},
+		{NodeID: "b", Phase: phaseVoter, Role: "voter"},
+		{NodeID: "c", Phase: phaseVoter, Role: "voter"},
+	}
+	h, _, next := computeHealth(true, "a", 3, 0, healthy)
+	if h != healthForceSingle {
+		t.Fatalf("force-single health = %s, want %s", h, healthForceSingle)
+	}
+	// Forbid the BARE deleted command `cluster recover <args>` — matched as "cluster recover " with a
+	// trailing space so the valid C8 spelling `cluster recovery rejoin prepare` (which contains "cluster
+	// recover" as a substring, but "cluster recover y", never "cluster recover ") is not a false positive.
+	if strings.Contains(next, "cluster recover ") {
+		t.Fatalf("force-single next step names deleted C8 command `cluster recover`: %q", next)
+	}
+	if !strings.Contains(next, "cluster recovery rejoin prepare") {
+		t.Fatalf("force-single next step must name C8 primary recovery rejoin flow: %q", next)
 	}
 }
 

@@ -79,6 +79,10 @@ func (e *ErrLeadershipTransferred) Error() string {
 // VOTER->DRAINING -> (retire) RETIRING -> RemoveServer -> ClusterNodeRemove -> clear
 // the drain marker. Each step's failure leaves a status-visible stuck phase.
 func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline time.Time, streamsReady func() (bool, error)) error {
+	// C4: refuse a raw drain/retire when an operation already owns this node's membership.
+	if err := a.assertNoActiveOp(nodeID); err != nil {
+		return err
+	}
 	voters, err := a.node.NumVoters()
 	if err != nil {
 		return fmt.Errorf("cluster drain %s: count voters: %w", nodeID, err)
@@ -151,7 +155,7 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 		return fmt.Errorf("cluster retire %s: raft RemoveServer (roster stuck at RETIRING, status shows next step): %w", nodeID, err)
 	}
 	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterNodeRemove(nodeID)
+		return cluster.PlanClusterNodeRemove(nodeID, a.now())
 	}); err != nil {
 		return fmt.Errorf("cluster retire %s: roster delete: %w", nodeID, err)
 	}
@@ -184,12 +188,16 @@ func (a *ClusterAdmin) requireClusterNode(nodeID string) error {
 // the voter — a permanent silent fork the reconciliation pass cannot heal. Use
 // `drain --retire` to remove a live node.
 func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
+	// C4: refuse a raw remove when an operation already owns this node's membership.
+	if err := a.assertNoActiveOp(nodeID); err != nil {
+		return err
+	}
 	phase, ok := a.nodePhase(nodeID)
 	if !ok {
-		return fmt.Errorf("cluster remove %s: no such roster node", nodeID)
+		return fmt.Errorf("recovery node remove %s: no such roster node", nodeID)
 	}
 	if phase != phaseRetiring && phase != phaseAddFailed {
-		return fmt.Errorf("cluster remove %s: node is %s; bare remove only finishes a RETIRING or VOTER_ADD_FAILED node — use `cluster drain %s --retire` to remove a live node (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+		return fmt.Errorf("recovery node remove %s: node is %s; raw remove only finishes a RETIRING or VOTER_ADD_FAILED node — use `cluster retire %s` to remove a live node (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
 	}
 	// B3 item 7: a RETIRING node already had its exposes migrated by DrainNode→migrateExposes, but
 	// a VOTER_ADD_FAILED node never drained — it can still HOME allocated exposes that a bare
@@ -198,17 +206,17 @@ func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
 	if phase == phaseAddFailed && !force {
 		n, err := a.countOwnedExposes(nodeID)
 		if err != nil {
-			return fmt.Errorf("cluster remove %s: count owned exposes: %w", nodeID, err)
+			return fmt.Errorf("recovery node remove %s: count owned exposes: %w", nodeID, err)
 		}
 		if n > 0 {
 			return &ErrRemoveOwnsResources{NodeID: nodeID, Exposes: n}
 		}
 	}
 	if err := a.node.RemoveServer(nodeID); err != nil {
-		return fmt.Errorf("cluster remove %s: raft RemoveServer: %w", nodeID, err)
+		return fmt.Errorf("recovery node remove %s: raft RemoveServer: %w", nodeID, err)
 	}
 	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterNodeRemove(nodeID)
+		return cluster.PlanClusterNodeRemove(nodeID, a.now())
 	})
 }
 
@@ -225,7 +233,7 @@ func (e *ErrRemoveOwnsResources) Error() string {
 	// NOTE (B3 review M1): do NOT suggest `drain --retire` here — DrainNode only accepts a live
 	// VOTER (phaseVoter), so it is a dead end for a VOTER_ADD_FAILED node. The real remedies are
 	// (a) free/re-home the exposes, or (b) --force (orphan them).
-	return fmt.Sprintf("cluster remove %s: REFUSED — this VOTER_ADD_FAILED node still HOMES %d expose(s) that would be orphaned. Free/re-home those exposes first (re-expose them on a healthy node), or pass --force to remove anyway (orphans them). (`drain --retire` does NOT apply — it drains a live VOTER, not a VOTER_ADD_FAILED node.)", e.NodeID, e.Exposes)
+	return fmt.Sprintf("recovery node remove %s: REFUSED — this VOTER_ADD_FAILED node still HOMES %d expose(s) that would be orphaned. Free/re-home those exposes first (re-expose them on a healthy node), or pass `recovery node remove %s --manual --force` to remove anyway (orphans them). (`cluster retire` does NOT apply — it retires a live VOTER, not a VOTER_ADD_FAILED node.)", e.NodeID, e.Exposes, e.NodeID)
 }
 
 // countOwnedExposes counts ALLOCATED exposes homed on nodeID (the same single-COUNT read pattern
@@ -259,6 +267,14 @@ func (a *ClusterAdmin) nodePhase(nodeID string) (string, bool) {
 
 // AbortDrain clears broker_draining and returns the node to VOTER (the --abort path).
 func (a *ClusterAdmin) AbortDrain(nodeID string) error {
+	// Mega-audit MAJ-1: a node DRAINING as part of a recoverable retire operation must NOT be flipped
+	// back to VOTER by a raw `drain --abort` (that desyncs the op's phase machine from raft — a later
+	// RAFT_REMOVED tick then RemoveServer's the voter while PlanClusterNodeRemove leaves the roster row
+	// VOTER → a silent roster/raft fork). Refuse like the other raw drain-family mutators; the operator
+	// aborts the operation via `cluster ops abort <id>` instead.
+	if err := a.assertNoActiveOp(nodeID); err != nil {
+		return err
+	}
 	if err := a.setPhase(nodeID, phaseVoter, []string{phaseDraining}, ""); err != nil {
 		return fmt.Errorf("cluster drain --abort %s: phase->VOTER: %w", nodeID, err)
 	}
@@ -295,7 +311,7 @@ func (a *ClusterAdmin) RotateTunnelCert(nodeID, newFP string, window time.Durati
 	}
 	validUntil := a.now().Add(window)
 	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterCertRotate(nodeID, newFP, validUntil)
+		return cluster.PlanClusterCertRotate(nodeID, newFP, validUntil, a.now())
 	}); err != nil {
 		return err
 	}
@@ -394,24 +410,62 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 		return nil // nothing to migrate
 	}
 	if target == "" {
+		// C6: rehome_stalled{expose,no_eligible_target} per port BEFORE returning the error (so the
+		// operator sees WHICH exposes are stuck), then still return ErrNoMigrationTarget.
+		for _, p := range rebuildOn {
+			a.emitDrainEvent(evRehomeStalled, map[string]any{
+				"kind": "expose", "name": names[p], "sid": sids[p], "port": p,
+				"home_broker": nodeID, "reason": reasonNoEligibleTarget,
+			})
+		}
 		return ErrNoMigrationTarget
 	}
 	for _, p := range rebuildOn {
 		p := p
+		skipped := false
+		var newEpoch int64
 		if err := a.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			_, cmd, err := port.PlanReassignHome(db, p, target)
+			ne, cmd, err := port.PlanReassignHome(db, p, target, a.now())
 			if errors.Is(err, port.ErrNotFound) {
-				return nil, nil // raced free/revoke — skip
+				skipped = true // BD8: raced free/revoke — emit NO started / succeeded / expose_rehomed
+				return nil, nil
 			}
+			newEpoch = ne
 			return cmd, err
 		}); err != nil {
+			// C6-EVT-5: started fires only on a real attempt, so a failed (but not raced-away) rehome
+			// gets a matched started→failed pair; a raced-away (skipped) expose emits nothing at all.
+			a.emitDrainEvent(evHomeReassignStarted, map[string]any{
+				"kind": "expose", "name": names[p], "sid": sids[p], "port": p, "from_broker": nodeID, "to_broker": target,
+			})
+			a.emitDrainEvent(evHomeReassignFailed, map[string]any{
+				"kind": "expose", "name": names[p], "sid": sids[p], "port": p,
+				"from_broker": nodeID, "to_broker": target, "reason": classifyRehomeErr(err),
+			})
 			return fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
 		}
-		// B7 DOC#5: emit an expose_rehomed observability event (leader-side, single-shot).
-		if a.onRehome != nil {
-			a.onRehome(p, names[p], sids[p], nodeID, target)
+		if skipped {
+			continue // BD8/C6-EVT-5: no started/succeeded/expose_rehomed for a raced-away row
 		}
+		// started→succeeded as a matched pair (HR2: carry the authoritative post-Apply epoch) + the
+		// legacy expose_rehomed (back-compat).
+		a.emitDrainEvent(evHomeReassignStarted, map[string]any{
+			"kind": "expose", "name": names[p], "sid": sids[p], "port": p, "from_broker": nodeID, "to_broker": target,
+		})
+		a.emitDrainEvent(evHomeReassignSucceeded, map[string]any{
+			"kind": "expose", "name": names[p], "sid": sids[p], "port": p, "from_broker": nodeID, "to_broker": target, "epoch": newEpoch,
+		})
+		a.emitDrainEvent("expose_rehomed", map[string]any{
+			"port": p, "name": names[p], "sid": sids[p], "from_broker": nodeID, "to_broker": target,
+		})
 	}
 	a.logger.Info("cluster drain: migrated rebuild-ON exposes", "node_id", nodeID, "count", len(rebuildOn), "target", target)
 	return nil
+}
+
+// emitDrainEvent fires a leader-side drain observability event (nil emitter ⇒ no-op).
+func (a *ClusterAdmin) emitDrainEvent(kind string, fields map[string]any) {
+	if a.emitEvent != nil {
+		a.emitEvent(kind, fields)
+	}
 }

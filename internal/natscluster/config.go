@@ -45,9 +45,13 @@ type Config struct {
 	ClientListen  string   // client listen, e.g. "127.0.0.1:4222"
 	ClusterName   string   // cluster name (empty => "tether")
 	ClusterListen string   // route listen, e.g. "0.0.0.0:6222"
-	CAFile        string   // cluster CA (routes mTLS trust anchor)
-	CertFile      string   // this server's route leaf
-	KeyFile       string   // this server's route key
+	// MonitorListen (C3), when set (e.g. "127.0.0.1:8223"), emits the nats-server HTTP monitor so the
+	// topology reconciler can probe /varz config_load_time for a REAL observed_generation. Loopback-
+	// only (no new external exposure). Empty => no monitor (single-mode bootstrap conf unchanged).
+	MonitorListen string
+	CAFile        string // cluster CA (routes mTLS trust anchor)
+	CertFile      string // this server's route leaf
+	KeyFile       string // this server's route key
 }
 
 // Render returns the nats-server.conf text for cfg.Local. It is deterministic
@@ -82,6 +86,9 @@ func Render(cfg Config) (string, error) {
 	fmt.Fprintf(&b, "server_name: %q\n", cfg.Local.ServerName)
 	if cfg.ClientListen != "" {
 		fmt.Fprintf(&b, "listen: %q\n", cfg.ClientListen)
+	}
+	if cfg.MonitorListen != "" {
+		fmt.Fprintf(&b, "http: %q\n", cfg.MonitorListen) // C3: loopback monitor for the observed-gen probe
 	}
 	b.WriteString("\n")
 

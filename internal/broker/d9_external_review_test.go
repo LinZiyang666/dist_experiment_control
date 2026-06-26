@@ -52,7 +52,7 @@ func TestD9ExternalReviewStatusHealthReflectsPeerReachabilityAndLag(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			health, _, _ := computeHealth(false, "a", 3, tc.nodes)
+			health, _, _ := computeHealth(false, "a", 3, 0, tc.nodes)
 			if health == healthHealthyHA {
 				t.Fatalf("cluster status reported HEALTHY-HA despite %s", tc.name)
 			}
@@ -66,7 +66,7 @@ func TestD9ExternalReviewStatusHealthReflectsStreamReplicaDeficit(t *testing.T) 
 		{NodeID: "b", Phase: phaseVoter, Reachable: true, StreamActual: 1, StreamTarget: 3},
 		{NodeID: "c", Phase: phaseVoter, Reachable: true, StreamActual: 1, StreamTarget: 3},
 	}
-	health, _, _ := computeHealth(false, "a", 3, nodes)
+	health, _, _ := computeHealth(false, "a", 3, 0, nodes)
 	if health == healthHealthyHA {
 		t.Fatal("cluster status reported HEALTHY-HA despite stream replicas below target")
 	}

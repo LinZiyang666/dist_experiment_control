@@ -29,6 +29,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
+	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
@@ -95,6 +96,12 @@ type Config struct {
 	// Unlike SubHTTPAddr this is NOT loopback-forced (operators scrape over a private
 	// interface); it vends only public topology, never secrets.
 	MetricsAddr string
+
+	// ManifestAddr (C2) is the LOOPBACK listen address for the well-known cluster discovery manifest
+	// (/.well-known/tether/cluster.json), Caddy-fronted. Empty disables it entirely; even when set it
+	// binds NOTHING unless the broker runs clustered (selfID != "") → non-cluster byte-equivalence.
+	// The endpoint is unauthenticated but serves only an account-SIGNED, discovery-only manifest.
+	ManifestAddr string
 
 	// AlertWebhookURL (B6 OPS#2), when set, makes the leader POST every committed alert
 	// raise/clear transition to this http/https endpoint (cluster mode only). Empty disables it
@@ -215,6 +222,12 @@ type Config struct {
 	// tunnel-cert, broker.nk, node-ident, account.nk). Required in cluster mode.
 	ClusterSecretsDir string
 
+	// NatsServerBin / NatsConfPath (C3) locate this host's nats-server binary + the live nats.conf the
+	// topology reconciler renders/swaps/reloads. Empty NatsServerBin ⇒ "nats-server" (PATH). Empty
+	// NatsConfPath disables the reconciler (no live conf to manage) — inert, status reports nothing.
+	NatsServerBin string
+	NatsConfPath  string
+
 	// DBPath is the SQLite file path (storage.DB / --db). In cluster mode
 	// cluster.Node owns the sole WAL handle on it (storage.OpenWAL) and serve.go
 	// does NOT pre-open DB via storage.Open; in single mode DB carries the
@@ -301,6 +314,20 @@ type Broker struct {
 	// built a context.Background-derived one). Nil before Run.
 	runCtx context.Context
 
+	// rosterStaleMu/rosterStaleWarned (C1 §6) track the per-(sid,nid) last-warned roster
+	// generation so maybeEmitRosterStale emits at most one agent_roster_stale event per
+	// agent per generation. Leader-only (handleRegister early-returns on a follower);
+	// the map is created under the mutex on first use (zero-value safe, no New() change),
+	// bounded (approx-evicted). Concurrent agent registers share the mutex.
+	rosterStaleMu     sync.Mutex
+	rosterStaleWarned map[string]uint64
+
+	// manifestCache/manifestMu (C2) hold the time-bucketed, pre-signed cluster manifest served at the
+	// well-known HTTP endpoint. The GET hot path is a pure atomic load; manifestMu single-flights the
+	// re-sign (rate-limited, generation/age-gated). nil until the first GET in cluster mode.
+	manifestCache atomic.Pointer[manifestSnapshot]
+	manifestMu    sync.Mutex
+
 	// transfers tracks in-flight file transfers (push/pull) so the
 	// broker can write audit + reap OBJ_xfer-* buckets when the
 	// receiver-finalization signal arrives or the watchdog fires.
@@ -320,6 +347,19 @@ type Broker struct {
 	// their callbacks may otherwise interleave: a sub mutation can observe ON,
 	// then publish Enabled:true after a concurrent OFF has completed.
 	proxyOpMu sync.Mutex
+
+	// proxyDwell (C5) is the leader-local consecutive-home-down tick counter (port → count) for the
+	// proxy rehome hysteresis. Reset on a leadership change is fine (the new leader re-counts).
+	proxyDwell sync.Map
+
+	// rehomeEvt / proxyEvtCounts (C6) are the leader-local change caches that make the rehome + proxy
+	// observability events idle-zero-writes: the reaper re-enters every ~5s, so a rehome event fires
+	// only when its port→mark changes, and the proxy-count events fire only on a real prev→cur
+	// transition (proxyEvtCounts holds the last proxyEventCounts per sid, fed to decideProxyEvents — the
+	// single source of truth, C6-EVT-4). Reset on leadership change re-announces the current condition
+	// once, which is the desired "new leader states the world" behavior.
+	rehomeEvt      sync.Map
+	proxyEvtCounts sync.Map
 
 	// selfID + tunnelCert are the D6 home/cert seam. Post-D9 cutover, in CLUSTER mode
 	// wireClusterEarly calls AttachClusterSeam to set this broker's cluster identity + stable
@@ -647,9 +687,11 @@ func (b *Broker) Run(ctx context.Context) error {
 		b.cfg.Logger.Info("broker: subscription http listening", "addr", subLn.Addr().String())
 		go func() {
 			if err := subhttp.ServeListener(ctx, subLn, subhttp.Config{
-				DB:         b.cfg.DB,
-				PublicHost: b.publicHostFor(),
-				Logger:     b.cfg.Logger,
+				DB:          b.cfg.DB,
+				PublicHost:  b.publicHostFor(),
+				Logger:      b.cfg.Logger,
+				ClusterMode: b.clusterMode, // C5: resolve each node's authoritative home host
+				Vendable:    b.proxyVendable,
 			}); err != nil {
 				b.cfg.Logger.Error("broker: subscription http server", "err", err)
 			}
@@ -670,6 +712,23 @@ func (b *Broker) Run(ctx context.Context) error {
 		go func() {
 			if err := brokermetrics.ServeListener(ctx, metLn, b.metricsSnapshot, b.metricsReady); err != nil {
 				b.cfg.Logger.Error("broker: metrics http server", "err", err)
+			}
+		}()
+	}
+
+	// C2: the well-known cluster discovery manifest (loopback, Caddy-fronted). Gated on cluster mode
+	// AND the opt-in flag → a non-cluster broker (or one without --cluster-manifest-listen) binds
+	// NOTHING, starts NO goroutine → byte-equivalent startup. Bind SYNCHRONOUSLY (loopback-forced;
+	// an occupied/non-loopback addr fails startup, never a healthy broker with a dead manifest port).
+	if b.selfID != "" && b.cfg.ManifestAddr != "" {
+		manLn, err := clustermanifest.Bind(b.cfg.ManifestAddr)
+		if err != nil {
+			return fmt.Errorf("broker: cluster manifest http: %w", err)
+		}
+		b.cfg.Logger.Info("broker: cluster manifest http listening", "addr", manLn.Addr().String())
+		go func() {
+			if err := clustermanifest.ServeListener(ctx, manLn, b.manifestBytes); err != nil {
+				b.cfg.Logger.Error("broker: cluster manifest http server", "err", err)
 			}
 		}()
 	}
@@ -736,7 +795,16 @@ func (b *Broker) Run(ctx context.Context) error {
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.set.req",
 			func(msg *nats.Msg) { b.handleProxySet(nc, msg) }},
 		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.status.req", b.handleProxyStatus},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.*.req",
+		// Mega-audit MAJ-2: register the CONCRETE create/revoke/list leaves, NOT the wildcard
+		// `.proxy.sub.*.req`. The wildcard never matched isBroadcastClusterSubject's per-leaf
+		// HasSuffix check, so it was queue-grouped and the leader-only create/revoke landed on a
+		// silent follower ~(N-1)/N of the time → ctl timeout. create/revoke → broadcast+leader-only
+		// (the handler's follower gate collapses the fan-out); list → queue-grouped RODB read.
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.create.req",
+			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.revoke.req",
+			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
+		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.list.req",
 			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
 		{proto.SubjectPrefix + ".s.*.ev.node.*.proxy.*", b.handleProxyReadyEvent},
 	} {
@@ -861,7 +929,14 @@ func (b *Broker) Run(ctx context.Context) error {
 			// b.clusterCaughtUp / b.clusterStreamsReady (External-review F1) — not the harness, and
 			// NOT nil (the old D9-step-10b "nil for now" is no longer true; audit DOCS-MAJOR-2).
 			backend.Cluster = NewClusterAdminBackend(b.cl.admin, b.clusterCaughtUp, b.clusterStreamsReady,
-				b.adminAuditTail, func() ([]string, error) { return listSessionsByState(b.cfg.DB, "ACTIVE") })
+				b.adminAuditTail, func() ([]string, error) { return listSessionsByState(b.cfg.DB, "ACTIVE") },
+				b.accountPubOrEmpty)
+			// C-rebalance: wire the leader-local proxy-home spread pass (`cluster rebalance proxy`). The
+			// concrete backend type is package-local, so set it via assertion (no NewClusterAdminBackend
+			// signature ripple). nil in single mode ⇒ the op replies cluster_not_enabled.
+			if cab, ok := backend.Cluster.(*clusterAdminBackend); ok {
+				cab.rebalanceProxy = b.rebalanceProxyHomes
+			}
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).
 			backend.EvictWrite = b.evictNode
@@ -1000,6 +1075,22 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		return
 	}
 
+	// C1 §D-4: a lightweight periodic roster refresh wants ONLY a fresh signed roster, not a full
+	// re-register. Short-circuit BEFORE registerNode / agent_registered / reconcileOnRegister — a
+	// pure RODB read that signs the replicated roster — so a fleet's ≤3-min refresh ticker costs
+	// ZERO raft writes / events / reconcile (D5 idle-zero-writes preserved). The session-active gate
+	// above still applies; the stale event still fires (the agent reported its cached generation).
+	if req.RosterRefreshOnly {
+		resp := proto.NodeRegisterResp{OK: true}
+		resp.Roster = b.rosterForRegister(req)
+		b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
+		payload, _ := json.Marshal(resp)
+		if msg.Reply != "" {
+			_ = msg.Respond(payload)
+		}
+		return
+	}
+
 	in := node.RegisterInput{
 		SID: sid, NID: nid,
 		ProtoVersion:   req.ProtoVersion,
@@ -1070,6 +1161,9 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// single mode (selfID=="") so the reply stays byte-identical (the Home/Proxy precedent).
 	resp.Roster = b.rosterForRegister(req)
 
+	// C1 §6: flag a sustained-behind agent (leader-only here; nil roster ⇒ no-op, byte-equiv).
+	b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
+
 	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {
 		_ = msg.Respond(payload)
@@ -1099,6 +1193,23 @@ func (b *Broker) handleHeartbeat(msg *nats.Msg) {
 	var hp proto.HeartbeatPayload
 	if len(msg.Data) > 0 {
 		_ = json.Unmarshal(msg.Data, &hp)
+	}
+	if b.clusterMode {
+		// C5: cluster mode does not run the single-mode repairProxy (it would write port_allocations
+		// via the RODB handle). Instead each broker writes its OWN liveness proxy_ready from the
+		// BROADCAST heartbeat's ProxyBound — the cross-broker convergence signal that makes /sub correct
+		// on any broker (no replicated proxy_ready). Gate ready on the switch being ON so a stale bound
+		// can't mark a node serving past `proxy off`.
+		ready := hp.ProxyBound
+		if ready {
+			if on, _ := session.GetProxyEnabled(b.cfg.DB, sid); !on {
+				ready = false
+			}
+		}
+		if err := node.SetProxyReady(b.livenessDB(), sid, nid, ready); err != nil {
+			b.cfg.Logger.Debug("broker: cluster proxy_ready from heartbeat", "sid", sid, "nid", nid, "err", err)
+		}
+		return
 	}
 	b.repairProxy(sid, nid, hp.ProxyGeneration, hp.ProxyEpoch)
 }

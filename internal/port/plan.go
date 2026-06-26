@@ -189,6 +189,53 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 	return alloc, cluster.NewCommand(cluster.OpPortAllocate, cluster.Stmt(sql)), nil
 }
 
+// PlanAllocateProxy renders OpProxyAllocate (C5): the leader-baked __proxy__ allocation for one
+// (sid, nid), home-stamped. Unlike PlanAllocate it prechecks per-(sid, nid) uniqueness (NOT
+// per-(sid, name) — '__proxy__' is the shared name, so a per-name check would reject a 2nd node's
+// proxy), and it FREES any existing ALLOCATED __proxy__ row for the node first (reuse-or-replace) in
+// the SAME Command. The leader picks the free port + mints the token; the raw token rides
+// Allocation.Token leak-once (only its hash is baked). homeBroker is the resolved D6 home (epoch=0).
+//
+// MUST run under Node.Propose (applyMu) on the live n.db — like PlanAllocate, findFreePort reads the
+// committed, serialized view so two concurrent allocations cannot bake the same port (the global
+// idx_port_alloc_unique_active would otherwise trip at Apply and fail-stop the FSM, Stage-C B2).
+func PlanAllocateProxy(db *sql.DB, sid, nid, homeBroker string, cfg *Config) (*Allocation, *cluster.Command, error) {
+	low, high, now := cfgWithDefaults(cfg)
+	if homeBroker == "" {
+		return nil, nil, fmt.Errorf("port: plan proxy allocate: homeBroker required (cluster mode)")
+	}
+	// Per-(sid,nid) precheck: an EXISTING ALLOCATED __proxy__ row is freed (not a conflict) — but a
+	// concurrent insert is fenced by the baked free-then-insert order on the serial Apply.
+	freePort, err := findFreePort(db, low, high)
+	if err != nil {
+		return nil, nil, err
+	}
+	token, err := genToken()
+	if err != nil {
+		return nil, nil, fmt.Errorf("port: plan proxy allocate token: %w", err)
+	}
+	tokenHash := hashToken(token)
+	nowUTC := now.UTC()
+	lits, err := cluster.LitTextAll(sid, nid, ProxyPortName, tokenHash, homeBroker)
+	if err != nil {
+		return nil, nil, fmt.Errorf("port: plan proxy allocate literal: %w", err)
+	}
+	sidLit, nidLit, nameLit, thLit, homeLit := lits[0], lits[1], lits[2], lits[3], lits[4]
+	// 1. FREE any existing ALLOCATED __proxy__ for this (sid,nid) (reuse-or-replace).
+	freeExisting := `UPDATE port_allocations SET state='FREED', revoked_at=` + cluster.LitTime(nowUTC) +
+		` WHERE sid=` + sidLit + ` AND nid=` + nidLit + ` AND name=` + nameLit + ` AND state='ALLOCATED'`
+	// 2. INSERT the fresh home-stamped row (epoch=0, created_by_fp='' = system-owned).
+	ins := `INSERT INTO port_allocations (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, home_broker, epoch) ` +
+		`VALUES (` + cluster.LitInt(int64(freePort)) + `, ` + sidLit + `, ` + nidLit + `, ` + nameLit + `, 0, ` + thLit +
+		`, 'ALLOCATED', '', ` + cluster.LitTime(nowUTC) + `, ` + homeLit + `, 0)`
+	alloc := &Allocation{
+		Port: freePort, SID: sid, NID: nid, Name: ProxyPortName, LocalPort: 0,
+		TokenHash: tokenHash, State: StateAllocated, CreatedByFP: "", CreatedAt: nowUTC,
+		Token: token, HomeBroker: homeBroker, Epoch: 0,
+	}
+	return alloc, cluster.NewCommand(cluster.OpProxyAllocate, cluster.Stmt(freeExisting), cluster.Stmt(ins)), nil
+}
+
 // PlanReassignHome renders OpPortReassignHome (D6 §7.1-7.2): re-point one
 // expose's home broker and bump its per-port epoch by exactly 1. The leader
 // reads the current epoch on its DB (MUST run under Node.Propose's applyMu so a
@@ -203,8 +250,10 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 // leader-driven backup path carries NO reqID (R-8): the CAS guard is the sole
 // idempotency anchor, since a leader-push has no originating-broker-minted key.
 //
-// Reassign stamps NO timestamp (the row's created_at is immutable across a
-// rehome), so unlike the other Plan* it takes no `now` (review A2 m4).
+// C6 (建议5): Reassign now stamps last_rehome_at = LitTime(now.UTC()) INSIDE the CAS-guarded UPDATE
+// (the row's created_at stays immutable; last_rehome_at is the rehome observability stamp powering
+// `cluster status --homes`). Because it is in the same `WHERE … epoch < newEpoch` UPDATE, a stale-epoch
+// RowsAffected==0 no-op never stamps it. All-literal → deterministic on every replica.
 //
 // NOTE (review A2 m2): the returned newEpoch is computed PRE-Apply; a caller must
 // stamp its HomeDirective from the post-Apply row (homeForRegister/homeForExpose
@@ -212,7 +261,7 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 // committing a lower epoch — impossible under single-leader raft, defense only)
 // can never point an agent at the losing home. The CAS guard makes Apply a
 // deterministic RowsAffected==0 no-op on every replica regardless.
-func PlanReassignHome(db *sql.DB, publicPort int, newHome string) (int64, *cluster.Command, error) {
+func PlanReassignHome(db *sql.DB, publicPort int, newHome string, now time.Time) (int64, *cluster.Command, error) {
 	if newHome == "" {
 		return 0, nil, fmt.Errorf("port: plan reassign-home requires a non-empty home")
 	}
@@ -240,6 +289,7 @@ func PlanReassignHome(db *sql.DB, publicPort int, newHome string) (int64, *clust
 	}
 	sql := `UPDATE port_allocations SET home_broker=` + homeLit +
 		`, epoch=` + cluster.LitInt(newEpoch) +
+		`, last_rehome_at=` + cluster.LitTime(now.UTC()) +
 		` WHERE port=` + cluster.LitInt(int64(publicPort)) +
 		` AND state='ALLOCATED' AND epoch < ` + cluster.LitInt(newEpoch)
 	return newEpoch, cluster.NewCommand(cluster.OpPortReassignHome, cluster.Stmt(sql)), nil

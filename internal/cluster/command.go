@@ -103,6 +103,38 @@ const (
 	// Rides genericExecApplier; bakes a fixed-key DELETE (no external input).
 	OpClusterMetaClear OpType = "ClusterMetaClear"
 
+	// OpClusterBusNkeySet (C3) records a broker's NATS bus nkey public key into cluster_nodes so the
+	// topology reconciler can render that peer into auth_callout.auth_users + the static users{} ACL.
+	// Each broker self-writes its OWN row (from its broker.nk) via proposeOrForward; it also backfills
+	// pre-C3 voters (DEFAULT ''). All-literal UPDATE + topology_generation bump (change-gated, so an
+	// idempotent re-propose is a no-op); rides genericExecApplier.
+	OpClusterBusNkeySet OpType = "ClusterBusNkeySet"
+
+	// OpClusterOpStart/Transition/Confirm (C4) drive the replicated operation log (cluster_operations):
+	// a single-active-guarded INSERT, a predecessor-CAS state advance, and a (re-)confirm. All-literal
+	// leader-baked SQL on genericExecApplier; guards are baked WHERE clauses (RowsAffected==0 no-op),
+	// NEVER an Apply-time CHECK/UNIQUE (which would fsm-panic on every replica).
+	OpClusterOpStart      OpType = "ClusterOpStart"
+	OpClusterOpTransition OpType = "ClusterOpTransition"
+	OpClusterOpConfirm    OpType = "ClusterOpConfirm"
+
+	// OpProxy* (C5) drive the proxy CONTROL plane through Raft (majority-write): the per-session
+	// enable/HA-policy + keyset epoch bump, the subscriber set, and the per-agent __proxy__ allocation.
+	// All all-literal leader-baked on genericExecApplier (baked WHERE guards, no Apply CHECK/UNIQUE —
+	// uniqueness is prechecked on the leader). The subscriber PSK is the one replicated secret (C5
+	// §D-SECRET, recoverable-by-contract within the broker-only mTLS boundary); raw tokens stay hash-only.
+	OpProxySetEnabled OpType = "ProxySetEnabled"
+	OpProxySubCreate  OpType = "ProxySubCreate"
+	OpProxySubRevoke  OpType = "ProxySubRevoke"
+	OpProxyAllocate   OpType = "ProxyAllocate"
+
+	// OpClusterSeedsPublish (C2) records the cluster's public CLIENT-DIALABLE seed endpoints +
+	// bootstrap (well-known) URL into cluster_meta and bumps the dedicated monotone seed_generation
+	// counter, so a brand-new agent (which has no NATS template) can be served an account-signed
+	// SeedBundle for its first connection. All-literal (leader bakes the endpoints/bootstrap + the
+	// MAX-floored seed_generation); rides genericExecApplier.
+	OpClusterSeedsPublish OpType = "ClusterSeedsPublish"
+
 	// OpClusterCertRotate (§15 RF3 / external review F2) rotates a node's stable tunnel
 	// cert fingerprint: SET cert_fp_prev=cert_fp (the row's current value, deterministic
 	// self-reference), cert_fp=<new>, cert_fp_valid_until=<now+window>. The D6 cert-pin
@@ -274,30 +306,39 @@ func validReqID(s string) bool {
 }
 
 var knownOps = map[OpType]bool{
-	OpClusterMetaSet:     true,
-	OpSessionCreate:      true,
-	OpSessionTombstone:   true,
-	OpSessionHardDelete:  true,
-	OpMemberJoin:         true,
-	OpNodeRegister:       true,
-	OpNodeEvict:          true,
-	OpProcCreate:         true,
-	OpProcMarkExited:     true,
-	OpReconcileBatch:     true,
-	OpPortAllocate:       true,
-	OpPortFree:           true,
-	OpPortRevoke:         true,
-	OpAgentProvision:     true,
-	OpAuditCheckpointSet: true,
-	OpPortReassignHome:   true,
-	OpClusterNodeUpsert:  true,
-	OpClusterNodePhase:   true,
-	OpClusterNodeRemove:  true,
-	OpClusterDrainSet:    true,
-	OpClusterMetaClear:   true,
-	OpClusterCertRotate:  true,
-	OpTransferAudit:      true,
-	OpAlertRaise:         true,
-	OpAlertClear:         true,
-	OpAlertAck:           true,
+	OpClusterMetaSet:      true,
+	OpSessionCreate:       true,
+	OpSessionTombstone:    true,
+	OpSessionHardDelete:   true,
+	OpMemberJoin:          true,
+	OpNodeRegister:        true,
+	OpNodeEvict:           true,
+	OpProcCreate:          true,
+	OpProcMarkExited:      true,
+	OpReconcileBatch:      true,
+	OpPortAllocate:        true,
+	OpPortFree:            true,
+	OpPortRevoke:          true,
+	OpAgentProvision:      true,
+	OpAuditCheckpointSet:  true,
+	OpPortReassignHome:    true,
+	OpClusterNodeUpsert:   true,
+	OpClusterNodePhase:    true,
+	OpClusterNodeRemove:   true,
+	OpClusterDrainSet:     true,
+	OpClusterMetaClear:    true,
+	OpClusterCertRotate:   true,
+	OpClusterSeedsPublish: true,
+	OpClusterBusNkeySet:   true,
+	OpClusterOpStart:      true,
+	OpClusterOpTransition: true,
+	OpClusterOpConfirm:    true,
+	OpProxySetEnabled:     true,
+	OpProxySubCreate:      true,
+	OpProxySubRevoke:      true,
+	OpProxyAllocate:       true,
+	OpTransferAudit:       true,
+	OpAlertRaise:          true,
+	OpAlertClear:          true,
+	OpAlertAck:            true,
 }

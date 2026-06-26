@@ -79,6 +79,30 @@ func healthExitCode(health string) int {
 	}
 }
 
+// healthLabel maps the legacy internal health string (+ the voter count) to the C6 建议6 five-state
+// operator vocab, WITHOUT changing the legacy Health string or the 0/1/2/3 ExitCode contract. NOT-HA is
+// the N<=2 case (works, but no production HA) — PROMOTED from a verdict to a first-class state. It
+// shares exit 1 with DEGRADED-WRITABLE (the FaultTolerance==0 branch already returns healthDegraded →
+// exit 1 before any topo check, and ProjectQuorum(v,false).FaultTolerance==0 ⟺ v<=2), disambiguated by
+// this label. "" for an offline snapshot with no computed health (the caller sets it inline there).
+func healthLabel(health string, voters int) string {
+	switch health {
+	case healthHealthyHA:
+		return "HEALTHY-HA"
+	case healthDegraded:
+		if voters <= 2 {
+			return "NOT-HA"
+		}
+		return "DEGRADED-WRITABLE"
+	case healthQuorumLost:
+		return "READ-ONLY"
+	case healthForceSingle:
+		return "FORCE-SINGLE"
+	default:
+		return ""
+	}
+}
+
 type rosterRow struct {
 	nodeID, name, phase string
 	certFP              string         // B5 OPS#7: current tunnel-cert fingerprint (public; '' if unset)
@@ -182,6 +206,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// is the lag reference, so its own lag is 0; a peer lags by leaderApplied - peerApplied.
 	selfApplied, _ := a.node.AppliedIndex()
 	selfLag := uint64(0)
+	topoDesired, _ := cluster.TopologyGeneration(a.node.RODB()) // C3: cluster-wide desired topology gen
 	streamTarget := jsstream.ReplicasFor(voters)
 	// External-review F1: report the REAL stream actual, not a synthesized actual==target. An
 	// unwired probe (N=1) keeps the optimistic default; a wired-but-incomplete observation
@@ -236,9 +261,14 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			Inconsistent: inconsistent,
 		}
 		// B6 OPS#4: stamp each broker's live self-reported version (from the health poll).
+		// C3: stamp the topology reconcile self-report (applied/observed/reason/reported).
 		if hr, ok := health[r.nodeID]; ok {
 			ns.ReleaseVersion = hr.ReleaseVersion
 			ns.ProtoVer = hr.ProtoVer
+			ns.TopoApplied = hr.TopoApplied
+			ns.TopoObserved = hr.TopoObserved
+			ns.TopoReconcileReason = hr.TopoReconcileReason
+			ns.TopoReported = hr.TopoReported
 		}
 		// B5 OPS#7: cert fingerprints (public) for every row; CertValidSecs derived now→valid.
 		ns.CertFP = r.certFP
@@ -259,6 +289,16 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 				ns.PortsUsed = portsUsed
 				ns.PortsTotal = portsTotal
 			}
+			// C3: the self row's topology report is authoritative from the local reconciler (self does
+			// not poll itself), overriding any health-map echo.
+			if a.topoSelf != nil {
+				ns.TopoReported = true
+				if ts := a.topoSelf(); ts != nil {
+					ns.TopoApplied = ts.Applied
+					ns.TopoObserved = ts.Observed
+					ns.TopoReconcileReason = ts.Reason
+				}
+			}
 		}
 		rep.Nodes = append(rep.Nodes, ns)
 	}
@@ -273,8 +313,10 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		}
 	}
 
-	rep.Health, rep.Banner, rep.NextStep = computeHealth(forceSingle, leaderID, voters, rep.Nodes)
+	rep.TopoDesired = topoDesired // C3: cluster-wide desired topology generation
+	rep.Health, rep.Banner, rep.NextStep = computeHealth(forceSingle, leaderID, voters, topoDesired, rep.Nodes)
 	rep.ExitCode = healthExitCode(rep.Health)
+	rep.HealthLabel = healthLabel(rep.Health, voters) // C6 建议6: additive 5-state label; legacy Health/ExitCode unchanged
 	// B5 OPS#7: a tunnel-cert whose rotation window is closing is an ADVISORY only — a rotation
 	// in-window is healthy and even past valid_until only the PREVIOUS pin lapsed (the cert still
 	// serves), so it NEVER changes health/ExitCode. Appended to the banner; no-op when no cert is
@@ -343,11 +385,11 @@ func minStreamActual(rep ReplicaReport, target int) int {
 // computeHealth derives the health verdict from the self-report. QUORUM_LOST is
 // emitted ONLY from a positive no-leader observation (§B-9: never from absence of
 // reports — that false-quorum-lost chain induces a wrong force-single).
-func computeHealth(forceSingle bool, leaderID string, voters int, nodes []adminsock.ClusterNodeStatus) (health, banner, nextStep string) {
+func computeHealth(forceSingle bool, leaderID string, voters int, topoDesired uint64, nodes []adminsock.ClusterNodeStatus) (health, banner, nextStep string) {
 	if forceSingle {
 		return healthForceSingle,
 			"running in force-single (single node, no integrity) — recover as soon as peers are restored",
-			"on each returning node: cluster recover --self-id <node-id> --dump-divergent <file>, then re-add it from the leader"
+			"on each returning node: cluster recovery rejoin prepare --self-id <node-id> --dump-divergent <file>, then re-admit it with cluster join approve from the leader"
 	}
 	if leaderID == "" {
 		// Review M2: this is ONE broker's local view (the multi-broker NATS
@@ -359,9 +401,10 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 		// conditions force-single on cross-checking the others.
 		return healthQuorumLost,
 			"THIS broker sees no leader — it is READ-ONLY (a single-broker view, NOT cluster consensus). Check the OTHER brokers before acting; force-single ONLY after confirming a majority is PERMANENTLY dead.",
-			"on each survivor: cluster status --offline --db /var/lib/tether/tether.db ; then only after confirming peers dead: cluster force-single --self-id <this-node-id> --self-addr <this-host:7400> --confirm-peers-dead <ids...>"
+			"on each survivor: cluster status --offline --db /var/lib/tether/tether.db ; then only after confirming peers dead: cluster recovery force-single --self-id <this-node-id> --self-addr <this-host:7400> --confirm-peers-dead <ids...>"
 	}
 	degraded := false
+	var topoStuck, topoBehind bool // C3-M5: distinguish a wedged reconcile from a still-catching-up one
 	for _, n := range nodes {
 		if n.Inconsistent || n.Phase == phaseCatchingUp || n.Phase == phaseAddFailed || n.Phase == phaseDraining || n.Phase == phaseRetiring {
 			degraded = true
@@ -376,6 +419,24 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 			}
 			if n.AppliedLag > observeLagThreshold {
 				degraded = true
+			}
+			// C3 acceptance ("任一 broker 未完成 topology apply 时不显 HEALTHY-HA"): a REACHED, REPORTING
+			// voter whose live NATS topology has not caught the desired generation is DEGRADED. Gated on
+			// TopoReported (presence) — NOT a TopoObserved>0 magnitude guard — so a just-promoted voter at
+			// observed=0 with topoDesired>0 still degrades. observed<desired subsumes applied<desired
+			// (never rendered) AND observed<applied (swapped-not-reloaded), since observed≤applied≤desired.
+			reached := n.ReachSource == "self" || (n.ReachSource == "nats-health" && n.Reachable)
+			if topoDesired > 0 && n.TopoReported && reached && n.TopoObserved < topoDesired {
+				degraded = true
+				// C3-M5: a STUCK reconcile (rejected render / unknown directive) needs a DIFFERENT next
+				// step (fix the conf / `reconcile nats --manual`) than a broker still catching up.
+				if strings.Contains(n.TopoReconcileReason, "unrecognized directive") ||
+					strings.Contains(n.TopoReconcileReason, "nats-server -t") ||
+					strings.Contains(n.TopoReconcileReason, "render") {
+					topoStuck = true
+				} else {
+					topoBehind = true
+				}
 			}
 		}
 		// External-review F1: a JS stream below its target replica count (observed actual <
@@ -399,7 +460,19 @@ func computeHealth(forceSingle bool, leaderID string, voters int, nodes []admins
 	if proj.FaultTolerance == 0 {
 		return healthDegraded,
 			fmt.Sprintf("only tolerates %d failures (%d voters, quorum=%d) — add a node for HA", proj.FaultTolerance, proj.Voters, proj.Quorum),
-			"cluster add <node-id> <host:7400> <node-pub>, then re-run with --join-token plus --tunnel-addr/--cert-fp/--nats-route"
+			"on the NEW broker: cluster join prepare --node-id <id> --raft-addr <host:7400> --nats-route nats://<host:6222> --tunnel-addr <host:7000>; then on the leader: cluster join approve <bundle> --wait"
+	}
+	// C3-M5: topology-specific banner + next-step (the TOPO column shows which broker). A STUCK
+	// reconcile wins over a merely-behind one (it needs operator action, not just waiting).
+	if topoStuck {
+		return healthDegraded,
+			"a broker's NATS topology reconcile is STUCK (see the TOPO column) — its nats.conf cannot be rendered/validated",
+			"fix that broker's nats.conf, or run `tether cluster reconcile nats --manual` on it"
+	}
+	if topoBehind {
+		return healthDegraded,
+			"a broker's NATS topology has not caught the desired generation yet (see the TOPO column)",
+			"tether cluster reconcile nats --all --wait"
 	}
 	if degraded {
 		return healthDegraded, "a node is mid-join / draining or roster/raft INCONSISTENT — see the table", "cluster status"
@@ -443,6 +516,12 @@ type clusterAdminBackend struct {
 	// B6 OPS#12 export-incident sources (may be nil in tests that don't exercise it):
 	auditTail  func(ctx context.Context, sid string, n int) ([]adminsock.AuditEntry, error)
 	activeSIDs func() ([]string, error)
+	// C2: the cluster account public key (for minting invites on `cluster seeds publish`). nil/"" when
+	// no account seed (single mode / unwired) — the CLI then prints the invite without a pin.
+	accountPub func() string
+	// C-rebalance: the leader-local proxy-home spread pass (`cluster rebalance proxy`). nil in single
+	// mode / tests that don't wire it ⇒ the op replies cluster_not_enabled.
+	rebalanceProxy func(dryRun bool) (*adminsock.ProxyRebalanceReport, error)
 }
 
 // NewClusterAdminBackend builds the adminsock adapter. caughtUp/streamsReady may be
@@ -450,9 +529,9 @@ type clusterAdminBackend struct {
 // leader-applied proxy when caughtUp is nil). auditTail/activeSIDs back export-incident
 // (may be nil → export-incident returns history_unavailable).
 func NewClusterAdminBackend(admin *ClusterAdmin, caughtUp func(string, uint64) (bool, error), streamsReady func(string) (bool, error),
-	auditTail func(context.Context, string, int) ([]adminsock.AuditEntry, error), activeSIDs func() ([]string, error)) adminsock.ClusterAdminBackend {
+	auditTail func(context.Context, string, int) ([]adminsock.AuditEntry, error), activeSIDs func() ([]string, error), accountPub func() string) adminsock.ClusterAdminBackend {
 	return &clusterAdminBackend{admin: admin, caughtUp: caughtUp, streamsReady: streamsReady, drainNotice: 30 * time.Second,
-		auditTail: auditTail, activeSIDs: activeSIDs}
+		auditTail: auditTail, activeSIDs: activeSIDs, accountPub: accountPub}
 }
 
 func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Response {
@@ -465,6 +544,17 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 		}
 		return adminsock.Response{Op: req.Op, OK: true, Cluster: rep}
 	}
+	// C6 建议5: `--homes` is a leader-agnostic RODB aggregate (any broker serves it) — before the gate.
+	if req.Op == adminsock.OpClusterHomes {
+		if b.admin.homesReport == nil {
+			return adminsock.Response{Op: req.Op, Error: "cluster mode not enabled", Code: adminsock.CodeClusterNotEnabled}
+		}
+		rep, err := b.admin.homesReport()
+		if err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: adminsock.CodeStoreError}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, Homes: rep}
+	}
 	// B6 OPS#3: an online backup is a read-only paged copy off the RO handle — ANY node serves
 	// it (leader or follower), so it is handled BEFORE the leader-only gate.
 	if req.Op == adminsock.OpClusterBackup {
@@ -473,6 +563,10 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 	// B7 DOC#2: the ops view is a read-only derive off the replicated roster — any node serves it.
 	if req.Op == adminsock.OpClusterOps {
 		return b.handleClusterOps(req)
+	}
+	// C2: seeds SHOW is a read-only RODB derive — any node serves it (for `agent join`/doctor).
+	if req.Op == adminsock.OpClusterSeedsShow {
+		return b.handleSeedsShow(req)
 	}
 	// Audit MAJOR: export-incident is a read-only RODB assembler needed EXACTLY during a leaderless
 	// QUORUM_LOST incident (the status card recommends it in that state) — handle it BEFORE the
@@ -506,6 +600,34 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 		return adminsock.Response{Op: req.Op, OK: true}
 	case adminsock.OpClusterAdd:
 		return b.handleAdd(req)
+	case adminsock.OpClusterJoinApprove:
+		opID, err := b.admin.StartJoinOperation(req.JoinBundle)
+		if err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, OpID: opID}
+	case adminsock.OpClusterRetire:
+		opID, err := b.admin.StartRetireOperation(req.NodeID, req.Confirmed)
+		var qc *ErrQuorumConfirmRequired
+		if errors.As(err, &qc) {
+			return adminsock.Response{Op: req.Op, QuorumProj: &adminsock.QuorumProjection{
+				Voters: qc.Proj.Voters, Quorum: qc.Proj.Quorum, FaultTolerance: qc.Proj.FaultTolerance,
+			}, Error: qc.Error(), Code: adminsock.CodeQuorumConfirmRequired}
+		}
+		if err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, OpID: opID}
+	case adminsock.OpClusterOpConfirm:
+		if err := b.admin.ConfirmOp(req.OpID); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, OpID: req.OpID}
+	case adminsock.OpClusterOpAbort:
+		if err := b.admin.AbortOp(req.OpID); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, OpID: req.OpID}
 	case adminsock.OpClusterRotateCrt:
 		if err := b.admin.RotateTunnelCert(req.NodeID, req.CertFP, certRotationWindow); err != nil {
 			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
@@ -515,6 +637,17 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 		return b.handleAlertRaise(req)
 	case adminsock.OpClusterAlertClear:
 		return b.handleAlertClear(req)
+	case adminsock.OpClusterSeedsPublish:
+		return b.handleSeedsPublish(req)
+	case adminsock.OpClusterRebalanceProxy:
+		if b.rebalanceProxy == nil {
+			return adminsock.Response{Op: req.Op, Error: "proxy rebalance not available (cluster mode not enabled)", Code: adminsock.CodeClusterNotEnabled}
+		}
+		rep, err := b.rebalanceProxy(req.DryRun)
+		if err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true, ProxyRebalance: rep}
 	default:
 		return adminsock.Response{Op: req.Op, Error: "unknown cluster op: " + req.Op, Code: adminsock.CodeBadRequest}
 	}
@@ -654,7 +787,14 @@ func (b *clusterAdminBackend) versionSkewResponse(req adminsock.Request) (admins
 		b.admin.logger.Warn("cluster add: joiner did not declare its proto version (older `cluster add`?); cannot pre-verify compatibility", "node_id", req.NodeID)
 	}
 	if req.JoinerRelease != "" && req.JoinerRelease != proto.ReleaseVersion {
-		b.admin.logger.Warn("cluster add: joiner release differs from this node (allowed — rolling upgrades mix releases)",
+		// Mega-audit MAJ-11 (tracked enforcement gap): release skew is advisory ONLY, but a column-adding
+		// migration (e.g. 0017 last_rehome_at) makes a same-proto OLDER-release member FSM-fail-stop on the
+		// first committed op that bakes the new column once leadership moves to a newer-release node. The
+		// reinstall-not-upgrade invariant (CLAUDE.md §5) governs this: a joiner MUST be on a
+		// migration-compatible release. An IN-BAND schema/migration-version floor in the join handshake
+		// (reject below the cluster's schema version, not just proto) is a tracked v2.x follow-up; until
+		// then this Warn + the runbook are the enforcement.
+		b.admin.logger.Warn("cluster add: joiner release differs from this node (allowed — rolling upgrades mix releases; the joiner MUST be migration-compatible, see runbook §schema)",
 			"node_id", req.NodeID, "joiner_release", req.JoinerRelease, "this_release", proto.ReleaseVersion)
 	}
 	return adminsock.Response{}, false

@@ -15,6 +15,11 @@ func TestClusterSubcommandsHaveExamplesAndGroups(t *testing.T) {
 		if c.Name() == "help" || c.Name() == "completion" {
 			continue
 		}
+		// Hidden deprecated aliases (e.g. takeover-natsconf → reconcile nats --manual, C3) are not part
+		// of the documented surface and legitimately carry no Example/group.
+		if c.Hidden {
+			continue
+		}
 		if strings.TrimSpace(c.Example) == "" {
 			t.Errorf("cluster %s has no Example block", c.Name())
 		}
@@ -22,8 +27,8 @@ func TestClusterSubcommandsHaveExamplesAndGroups(t *testing.T) {
 			t.Errorf("cluster %s is not assigned to a group", c.Name())
 		}
 	}
-	if g := root.Groups(); len(g) != 4 {
-		t.Errorf("want 4 cluster groups, got %d", len(g))
+	if g := root.Groups(); len(g) != 3 {
+		t.Errorf("want 3 cluster groups (C8 dropped `local`), got %d", len(g))
 	}
 }
 
@@ -43,11 +48,22 @@ func TestClusterSafetyWording(t *testing.T) {
 	if s := find("force-single").Short; !strings.Contains(s, "split-brain") {
 		t.Errorf("force-single Short should lead with split-brain risk: %q", s)
 	}
-	if s := find("takeover-natsconf").Short; !strings.Contains(s, "nats-server -t") || !strings.Contains(s, ".bak") {
-		t.Errorf("takeover-natsconf Short should lead with the safety net: %q", s)
+	// C3: takeover-natsconf is now a HIDDEN DEPRECATED alias for `reconcile nats --manual` — its Short
+	// must point users at the replacement. The safety-net wording moved to the reconcile nats command.
+	if s := find("takeover-natsconf").Short; !strings.Contains(s, "DEPRECATED") || !strings.Contains(s, "reconcile nats --manual") {
+		t.Errorf("takeover-natsconf Short should point at the replacement: %q", s)
 	}
-	if ex := find("add").Example; !strings.Contains(ex, "node-pub") || !strings.Contains(ex, "sign-join") {
-		t.Errorf("add Example should show the node-pub prereq + sign-join: %q", ex)
+	// C8: `add`/`sign-join` are DELETED; `cluster join prepare` is the replacement. Its Example shows the
+	// required identity flags (raft-addr/nats-route/tunnel-addr).
+	join := find("join")
+	var prepare *cobra.Command
+	for _, c := range join.Commands() {
+		if c.Name() == "prepare" {
+			prepare = c
+		}
+	}
+	if prepare == nil || !strings.Contains(prepare.Example, "nats-route") || !strings.Contains(prepare.Example, "tunnel-addr") {
+		t.Errorf("join prepare Example should show the required identity flags")
 	}
 	// init carries the migrate-to-cluster alias (item 3).
 	if al := find("init").Aliases; len(al) == 0 || al[0] != "migrate-to-cluster" {

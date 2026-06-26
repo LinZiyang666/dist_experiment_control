@@ -538,6 +538,16 @@ broker:
   storage:
     db: $LIB_DIR/tether.db
     js_store: $LIB_DIR/jetstream
+  # cluster: HA mode (opt-in via 'tether cluster init --from-existing'). Uncomment when joining/forming
+  # a cluster. The C3 topology reconciler manages nats.conf in cluster mode; the loopback http:127.0.0.1:8223
+  # monitor it probes is established by the one-time 'cluster reconcile nats --manual' cutover (reload
+  # cannot hot-add it), so a FRESH single-mode install needs none of this.
+  # cluster:
+  #   data_dir: $LIB_DIR/raft           # presence of raft/ here = cluster mode
+  #   secrets_dir: $ETC_DIR/secrets     # cluster-ca.pem, route-cert/key, broker.nk, account.nk, node-ident.nk
+  #   manifest_listen: "127.0.0.1:7480" # C2 well-known cluster discovery manifest (Caddy fronts /.well-known/tether/*)
+  #   nats_conf_path: /etc/tether/nats.conf   # C3 reconciler target (default; empty opts out)
+  #   nats_server_bin: nats-server      # C3 reconciler -t dry-run + --signal reload binary
 EOF
         chmod 644 "$ETC_DIR/broker.yaml"
     else

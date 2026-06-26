@@ -83,21 +83,30 @@ func TestRemoveMachineEscapeEndToEnd(t *testing.T) {
 
 	t.Run("flag+env passes the confirm gate", func(t *testing.T) {
 		t.Setenv(machineConfirmEnv, "brk-b")
-		err := run("brk-b", "--confirm-node-id", "brk-b")
-		// It gets PAST the confirm gate; the only remaining failure is the admin dial (no socket).
+		// C8: raw remove now requires --manual (the last-resort gate, ordered before the confirm gate).
+		err := run("brk-b", "--manual", "--confirm-node-id", "brk-b")
+		// It gets PAST the --manual + confirm gates; the only remaining failure is the admin dial (no socket).
 		if err == nil {
 			t.Fatal("expected a downstream admin error (no socket), not nil")
 		}
-		if strings.Contains(err.Error(), "aborted") {
-			t.Fatalf("must NOT abort at the confirm gate with flag+env: %v", err)
+		if strings.Contains(err.Error(), "aborted") || strings.Contains(err.Error(), "requires --manual") {
+			t.Fatalf("must NOT abort at the --manual/confirm gate with --manual + flag + env: %v", err)
 		}
 	})
 
 	t.Run("flag without env aborts at the confirm gate", func(t *testing.T) {
 		t.Setenv(machineConfirmEnv, "")
-		err := run("brk-b", "--confirm-node-id", "brk-b")
+		err := run("brk-b", "--manual", "--confirm-node-id", "brk-b")
 		if err == nil || !strings.Contains(err.Error(), "aborted") {
-			t.Fatalf("flag alone (no env) must abort at the confirm gate, got %v", err)
+			t.Fatalf("flag alone (no env), with --manual, must abort at the confirm gate, got %v", err)
+		}
+	})
+
+	t.Run("without --manual refuses (fail-closed) before the confirm gate", func(t *testing.T) {
+		t.Setenv(machineConfirmEnv, "brk-b")
+		err := run("brk-b", "--confirm-node-id", "brk-b")
+		if err == nil || !strings.Contains(err.Error(), "requires --manual") {
+			t.Fatalf("raw remove without --manual must fail-closed naming `cluster retire`, got %v", err)
 		}
 	})
 }

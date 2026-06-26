@@ -274,7 +274,7 @@ func TestD6ReviewDirectiveArrivingDuringCleanupRestartsWorker(t *testing.T) {
 	a := newRehomeTestAgent(t, fake)
 
 	var once sync.Once
-	afterRehomeWantSettledHook = func(agent *Agent, gotPort int) {
+	hook := func(agent *Agent, gotPort int) {
 		if agent != a || gotPort != port {
 			return
 		}
@@ -282,7 +282,8 @@ func TestD6ReviewDirectiveArrivingDuringCleanupRestartsWorker(t *testing.T) {
 			agent.applyHomeDirectives(context.Background(), homeAssign(port, 2))
 		})
 	}
-	defer func() { afterRehomeWantSettledHook = nil }()
+	afterRehomeWantSettledHook.Store(&hook)
+	defer afterRehomeWantSettledHook.Store(nil)
 
 	a.applyHomeDirectives(context.Background(), homeAssign(port, 1))
 	select {

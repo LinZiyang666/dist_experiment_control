@@ -139,6 +139,24 @@ func ListBySession(db *sql.DB, sid string) ([]Subscriber, error) {
 	return scanRows(rows)
 }
 
+// LookupActiveByName returns the ACTIVE subscriber for (sid, name), or nil if none. The C5 cluster
+// create handler uses it to confirm a committed row is ITS (the guarded INSERT no-ops a duplicate).
+func LookupActiveByName(db *sql.DB, sid, name string) (*Subscriber, error) {
+	rows, err := db.Query(
+		`SELECT sid, sub_id, name, token_hash, psk, cipher, state, created_by_fp, created_at, revoked_at
+		 FROM proxy_subscribers WHERE sid=? AND name=? AND state='ACTIVE' LIMIT 1`, sid, name,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("proxysub: lookup by name: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	subs, err := scanRows(rows)
+	if err != nil || len(subs) == 0 {
+		return nil, err
+	}
+	return &subs[0], nil
+}
+
 // ListActive returns the ACTIVE subscribers for sid (with PSK), oldest first
 // for a stable keyset order. Used to build the ssproxy keyset pushed to agents.
 func ListActive(db *sql.DB, sid string) ([]Subscriber, error) {

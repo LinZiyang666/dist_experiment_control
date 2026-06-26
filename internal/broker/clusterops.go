@@ -2,9 +2,11 @@ package broker
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
 // clusterops.go — B7 DOC#2: the READ-ONLY membership-operations view. It DERIVES each op from the
@@ -17,11 +19,79 @@ import (
 // ledger table. The persistent retire-then-re-add history is an additive post-v2 follow-up.)
 
 func (b *clusterAdminBackend) handleClusterOps(req adminsock.Request) adminsock.Response {
-	ops, err := deriveClusterOps(b.admin.node.RODB(), req.OpsNode)
+	ro := b.admin.node.RODB()
+	// C4: the REAL operation log is authoritative; the phase-derived view is a FALLBACK for legacy
+	// rows (a `cluster add` one-shot / a pre-C4 membership state) with no op record.
+	realOps, err := cluster.RecentOperations(ro, 200)
 	if err != nil {
 		return adminsock.Response{Op: req.Op, Error: err.Error(), Code: adminsock.CodeStoreError}
 	}
-	return adminsock.Response{Op: req.Op, OK: true, Ops: ops}
+	covered := map[string]bool{}
+	var out []adminsock.ClusterOpEntry
+	for i := range realOps {
+		op := realOps[i]
+		covered[op.TargetNode] = true
+		if req.OpsNode != "" && req.OpsNode != op.OpID && req.OpsNode != op.TargetNode {
+			continue
+		}
+		out = append(out, opEntryFromOperation(op))
+	}
+	// Phase-derived fallback for nodes WITHOUT a real op (so `ops ls` still lists every membership state).
+	derived, err := deriveClusterOps(ro, req.OpsNode)
+	if err != nil {
+		return adminsock.Response{Op: req.Op, Error: err.Error(), Code: adminsock.CodeStoreError}
+	}
+	for _, d := range derived {
+		if !covered[d.NodeID] {
+			out = append(out, d)
+		}
+	}
+	return adminsock.Response{Op: req.Op, OK: true, Ops: out}
+}
+
+// opEntryFromOperation maps a real cluster_operations row to the wire entry, mapping the rich
+// op_state down to the STABLE v1 State vocab (so a monitor that negotiated schema_version 1 keeps
+// working) while exposing the rich OpState + the durable timeline additively.
+func opEntryFromOperation(op cluster.Operation) adminsock.ClusterOpEntry {
+	e := adminsock.ClusterOpEntry{
+		NodeID: op.TargetNode, Kind: op.Kind, OpID: op.OpID, TargetEnd: op.TargetNode, OpState: op.OpState,
+		Terminal: op.Terminal, CreatedAt: op.CreatedAt, StartedAt: op.CreatedAt, UpdatedAt: op.UpdatedAt,
+		LastError: op.LastError,
+	}
+	switch op.OpState {
+	case cluster.OpStateServing, cluster.OpStateRetired:
+		e.State = "done"
+	case cluster.OpStateRetireFailed, cluster.OpStateAborted:
+		e.State = "failed"
+		e.Resume = "operation ended: " + op.OpState + " — see last_error; `cluster ops show " + op.OpID + "`"
+	case cluster.OpStateBlocked:
+		e.State = "stalled"
+		e.Resume = "blocked awaiting operator — `cluster ops confirm " + op.OpID + "` (or `cluster ops abort " + op.OpID + "`)"
+	case cluster.OpStateDrainRequested, cluster.OpStateNoNewHome, cluster.OpStateRehomeExposes,
+		cluster.OpStateStreamsAtTarget, cluster.OpStateSeedWithdrawn, cluster.OpStateLeaderTransferred:
+		e.State = "draining"
+	case cluster.OpStateRaftRemoved:
+		e.State = "retiring"
+	default:
+		e.State = "in_progress"
+	}
+	if e.Resume == "" && !op.Terminal {
+		e.Resume = "in flight — `cluster ops show " + op.OpID + "` for the timeline; `cluster ops abort " + op.OpID + "` to cancel"
+	}
+	var tl []adminsock.ClusterOpEvent
+	if err := json.Unmarshal([]byte(op.Timeline), &tl); err == nil {
+		// the op timeline uses compact keys {s,t,e}; re-map to the wire {state,at,note}.
+		var compact []struct {
+			S, T, E string
+		}
+		if json.Unmarshal([]byte(op.Timeline), &compact) == nil {
+			e.Timeline = nil
+			for _, c := range compact {
+				e.Timeline = append(e.Timeline, adminsock.ClusterOpEvent{State: c.S, At: c.T, Note: c.E})
+			}
+		}
+	}
+	return e
 }
 
 // deriveClusterOps reads cluster_nodes and maps each row to a membership operation. If node != ""
@@ -67,7 +137,7 @@ func opFromPhase(id, phase, addedAt, changedAt, addErr string) adminsock.Cluster
 		e.Kind, e.State = "add", "done"
 	case "JOIN_VERIFIED_PENDING_VOTER":
 		e.Kind, e.State = "add", "in_progress"
-		e.Resume = "AddVoter pending — the leader-startup reconciliation completes it; re-run `cluster add` with the same token if it stalls"
+		e.Resume = "AddVoter pending — the leader-startup reconciliation completes it; re-run `cluster join approve <bundle>` if it stalls"
 	case "CATCHING_UP":
 		e.Kind = "add"
 		if addErr == "catch_up_stalled" {
@@ -78,10 +148,10 @@ func opFromPhase(id, phase, addedAt, changedAt, addErr string) adminsock.Cluster
 		}
 	case "VOTER_ADD_FAILED":
 		e.Kind, e.State = "add", "failed"
-		e.Resume = "AddVoter failed — see last_error; `cluster remove " + id + " --force` to clear, then re-add"
+		e.Resume = "AddVoter failed — see last_error; `cluster recovery node remove " + id + " --manual --force` to clear, then re-join with `cluster join prepare`/`approve`"
 	case "DRAINING":
 		e.Kind, e.State = "drain", "draining"
-		e.Resume = "drain in progress — `cluster drain " + id + " --abort` to cancel, or `--retire` to complete removal"
+		e.Resume = "drain in progress — `cluster drain " + id + " --abort` to cancel, or `cluster retire " + id + "` to complete removal"
 	case "RETIRING":
 		e.Kind, e.State = "retire", "retiring"
 		e.Resume = "retire in progress — completes when its exposes finish migrating + streams reach target"

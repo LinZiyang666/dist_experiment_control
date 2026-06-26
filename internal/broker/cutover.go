@@ -102,8 +102,8 @@ func assertClusterDBConsistent(db *sql.DB, clusterMode bool) error {
 	// restore` (idempotent) to complete it.
 	var rip string
 	if err := db.QueryRow(`SELECT value FROM cluster_meta WHERE key='restore_in_progress'`).Scan(&rip); err == nil && rip != "" {
-		return errors.New("broker: a `cluster restore` was interrupted (restore_in_progress is set) — " +
-			"re-run `tether cluster restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
+		return errors.New("broker: a `cluster recovery restore` was interrupted (restore_in_progress is set) — " +
+			"re-run `tether cluster recovery restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
 	}
 	seeded, err := clusterDBSeeded(db)
 	if err != nil {
@@ -156,8 +156,8 @@ func assertNoInterruptedRestore(dbPath string) error {
 	defer func() { _ = ro.Close() }()
 	var rip string
 	if err := ro.QueryRow(`SELECT value FROM cluster_meta WHERE key='restore_in_progress'`).Scan(&rip); err == nil && rip != "" {
-		return errors.New("broker: a `cluster restore` was interrupted (restore_in_progress is set) — " +
-			"re-run `tether cluster restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
+		return errors.New("broker: a `cluster recovery restore` was interrupted (restore_in_progress is set) — " +
+			"re-run `tether cluster recovery restore <bundle> --confirm-node-id <id>` to complete it before starting the daemon")
 	}
 	return nil
 }

@@ -219,7 +219,7 @@ type RecoverOptions struct {
 // Recover takes a forensic divergence dump (DURABLY — fsync file + dir, refuse the
 // wipe if it fails), OPTIONALLY emits an identity manifest (also DURABLY, also refuse-on-fail),
 // then wipes raft/ + tether.db. The node must be reinitialized before the daemon can start,
-// then `cluster add` admits it as a clean voter. The dump is forensic-only / not auto-mergeable
+// then `cluster join prepare`/`cluster join approve` admits it as a clean voter. The dump is forensic-only / not auto-mergeable
 // (§8.4(b)/R-7); the manifest is identity-only. Returns the number of rows dumped.
 func Recover(opts RecoverOptions) (int, error) {
 	if opts.Logger == nil {
@@ -255,7 +255,7 @@ func Recover(opts RecoverOptions) (int, error) {
 	if err := wipe(opts.DataDir, opts.DBPath); err != nil {
 		return n, fmt.Errorf("clusteroffline: dumped %d rows but wipe failed: %w", n, err)
 	}
-	opts.Logger.Warn("clusteroffline: recover complete; node wiped, re-run cluster init before daemon start, then cluster add to rejoin",
+	opts.Logger.Warn("clusteroffline: recover complete; node wiped, re-run cluster init before daemon start, then `cluster join prepare`/`cluster join approve` to rejoin",
 		"dump", opts.DumpPath, "manifest", opts.ManifestPath, "rows", n)
 	return n, nil
 }

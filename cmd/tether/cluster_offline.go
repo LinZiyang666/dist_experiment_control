@@ -1,15 +1,12 @@
 package main
 
 import (
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/LinZiyang666/tether/internal/auth"
-	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
-	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -44,7 +41,7 @@ if a daemon still holds the store. It NEVER accepts --yes; you must type this no
 confirm (and the split-brain consequence is shown at the prompt).`,
 		Example: "  # quorum-loss drill (the majority is PERMANENTLY dead):\n" +
 			"  systemctl mask tether-broker && systemctl stop tether-broker\n" +
-			"  tether cluster force-single --self-id brk-a --self-addr 10.0.0.1:7400 --confirm-peers-dead brk-b,brk-c\n" +
+			"  tether cluster recovery force-single --self-id brk-a --self-addr 10.0.0.1:7400 --confirm-peers-dead brk-b,brk-c\n" +
 			"  systemctl unmask tether-broker && systemctl start tether-broker   # then recover each returning node",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -101,11 +98,11 @@ func newClusterRecoverCmd() *cobra.Command {
 		Use:   "recover",
 		Short: "Wipe a returning node after a forensic divergence dump, so it can rejoin clean (daemon STOPPED)",
 		Example: "  systemctl mask tether-broker && systemctl stop tether-broker\n" +
-			"  tether cluster recover --self-id brk-b --dump-divergent /root/divergent-brk-b.json\n" +
-			"  # then `cluster init --from-existing` on this node, and `cluster add` on the leader to rejoin",
+			"  tether cluster recovery rejoin prepare --self-id brk-b --dump-divergent /root/divergent-brk-b.json\n" +
+			"  # then `cluster init --from-existing` on this node, and `cluster join approve` on the leader to rejoin",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// B7 DOC#7: --guided prints the sequenced recover→init→add commands (read-only); executes nothing.
+			// B7 DOC#7: --guided prints the sequenced rejoin-prepare→init→join-approve commands (read-only); executes nothing.
 			if guided {
 				return recoverGuided(cmd, selfID, dumpPath, emitManifest, secretsDir)
 			}
@@ -138,7 +135,7 @@ func newClusterRecoverCmd() *cobra.Command {
 				reinit = fmt.Sprintf("`cluster init --from-manifest %s`", emitManifest)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"recover complete: %d rows dumped to %s, node %q wiped. Re-run %s on this node before starting tether-broker, then run `cluster add` on the leader to rejoin.\n",
+				"recover complete: %d rows dumped to %s, node %q wiped. Re-run %s on this node before starting tether-broker, then run `cluster join approve` on the leader to rejoin.\n",
 				n, dumpPath, selfID, reinit)
 			return nil
 		},
@@ -149,91 +146,8 @@ func newClusterRecoverCmd() *cobra.Command {
 	cmd.Flags().StringVar(&selfID, "self-id", "", "the node_id being wiped (typed to confirm)")
 	cmd.Flags().StringVar(&emitManifest, "emit-manifest", "", "also capture this node's identity to a manifest (0600) for `cluster init --from-manifest`")
 	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "", "secrets dir for the advisory account_fp in the emitted manifest (optional)")
-	cmd.Flags().BoolVar(&guided, "guided", false, "print the sequenced recover→init→add commands with real values; executes nothing (B7 DOC#7)")
+	cmd.Flags().BoolVar(&guided, "guided", false, "print the sequenced rejoin-prepare→init→join-approve commands with real values; executes nothing (B7 DOC#7)")
 	registerYesRejector(cmd)
-	return cmd
-}
-
-func newClusterSignJoinCmd() *cobra.Command {
-	var seedPath, secretsDir, raftAddr, tunnelAddr, natsRoute, publicHost, releaseVersion string
-	var protoVer int
-	cmd := &cobra.Command{
-		Use:   "sign-join <node-id> <nonce>",
-		Short: "Sign a leader-issued join nonce; with --raft-addr it prints the COMPLETE `cluster add` re-run line (run on the JOINING node)",
-		Example: "  # bare token (paste as --join-token on the leader):\n" +
-			"  tether cluster sign-join brk-b 7f3a…\n\n" +
-			"  # complete pasteable re-run line (stdout is the SOLE line; 2>/dev/null for just it):\n" +
-			"  tether cluster sign-join brk-b 7f3a… --raft-addr 10.0.0.2:7400 \\\n" +
-			"      --tunnel-addr brk-b.example:7000 --nats-route nats://10.0.0.2:6222 --public-host brk-b.example",
-		Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			nodeID, nonce := args[0], args[1]
-			seed, err := os.ReadFile(seedPath)
-			if err != nil {
-				return fmt.Errorf("read node-ident seed %s: %w", seedPath, err)
-			}
-			seed = []byte(strings.TrimSpace(string(seed)))
-			pub, err := auth.PublicKeyFromSeed(seed)
-			if err != nil {
-				return fmt.Errorf("derive pubkey: %w", err)
-			}
-			sig, err := auth.SignWithSeed(seed, cluster.JoinSignBytes(nodeID, pub, nonce))
-			if err != nil {
-				return fmt.Errorf("sign: %w", err)
-			}
-			token := nonce + ":" + hex.EncodeToString(sig)
-			out, errw := cmd.OutOrStdout(), cmd.ErrOrStderr()
-
-			// Backward-compatible: without --raft-addr, emit the bare token (the pre-B3 contract)
-			// + a hint. The token NEVER depends on cert/addr reads — it derives only from the
-			// node-ident seed (which already gates the command).
-			if raftAddr == "" {
-				_, _ = fmt.Fprintln(out, token)
-				_, _ = fmt.Fprintf(errw, "node-pub: %s\n", pub)
-				_, _ = fmt.Fprintln(errw, "(paste the token above as --join-token on the leader; or pass --raft-addr (+ --tunnel-addr/--nats-route/--public-host) to print the COMPLETE `cluster add` line)")
-				return nil
-			}
-
-			// cert-fp is INDEPENDENT of the token: a cert read failure must not lose the token.
-			certFP, certErr := clusteroffline.TunnelCertFingerprint(secretsDir)
-			if certErr != nil {
-				_, _ = fmt.Fprintf(errw, "# WARN: could not read tunnel cert-fp (%v); the line below is incomplete — fill --cert-fp\n", certErr)
-			}
-			// B3 review n3: warn (to stderr) about any addr flag left as a placeholder, so an
-			// operator piping `2>/dev/null` isn't surprised by an unfilled <…> the leader rejects.
-			var missingAddrs []string
-			if tunnelAddr == "" {
-				missingAddrs = append(missingAddrs, "--tunnel-addr")
-			}
-			if natsRoute == "" {
-				missingAddrs = append(missingAddrs, "--nats-route")
-			}
-			if publicHost == "" {
-				missingAddrs = append(missingAddrs, "--public-host")
-			}
-			if len(missingAddrs) > 0 {
-				_, _ = fmt.Fprintf(errw, "# WARN: the line below has <…> placeholders for %s — fill them before running it on the leader.\n", strings.Join(missingAddrs, ", "))
-			}
-			_, _ = fmt.Fprintf(errw, "Re-run on the LEADER (node-pub %s):\n", pub)
-			// stdout is the SOLE pasteable line (so `2>/dev/null` yields exactly one line). The
-			// --joiner-proto/--joiner-release are this JOINER binary's versions (B6 A3): the leader
-			// hard-rejects a proto mismatch, advisory-warns on a release skew.
-			_, _ = fmt.Fprintf(out, "tether cluster add %s %s %s --join-token %s --tunnel-addr %s --cert-fp %s --nats-route %s --public-host %s --joiner-proto %d --joiner-release %s\n",
-				nodeID, raftAddr, pub, token,
-				orPlaceholder(tunnelAddr, "<tunnel-host:7000>"), orPlaceholder(certFP, "<sha256:…>"),
-				orPlaceholder(natsRoute, "<nats://host:6222>"), orPlaceholder(publicHost, "<public-dns>"),
-				protoVer, releaseVersion)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&seedPath, "seed", defaultSeed, "node-identity seed file")
-	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (for the tunnel cert-fp)")
-	cmd.Flags().StringVar(&raftAddr, "raft-addr", "", "this joiner's raft address (host:7400) — required to print the complete add line")
-	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "this joiner's public tunnel addr (host:7000)")
-	cmd.Flags().StringVar(&natsRoute, "nats-route", "", "this joiner's NATS route URL (nats://host:6222)")
-	cmd.Flags().StringVar(&publicHost, "public-host", "", "this joiner's public DNS host")
-	cmd.Flags().IntVar(&protoVer, "proto-ver", proto.ProtoVersion, "this joiner's proto version (default: this binary's)")
-	cmd.Flags().StringVar(&releaseVersion, "release-version", proto.ReleaseVersion, "this joiner's release tag (default: this binary's)")
 	return cmd
 }
 
@@ -241,8 +155,8 @@ func newClusterNodePubCmd() *cobra.Command {
 	var seedPath string
 	cmd := &cobra.Command{
 		Use:     "node-pub",
-		Short:   "Print this node's identity public key (for `cluster add`)",
-		Example: "  tether cluster node-pub   # -> U…  (the 3rd positional arg to `cluster add` on the leader)",
+		Short:   "Print this node's identity public key (debug; `cluster join prepare` derives it)",
+		Example: "  tether cluster node-pub   # -> U…  (debug; join prepare derives this automatically)",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			seed, err := os.ReadFile(seedPath)

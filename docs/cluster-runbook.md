@@ -6,6 +6,26 @@
 > (admin is strictly local — no network bypass). A non-leader broker fails fast and
 > names the leader host to re-run on.
 
+## C8 command migration (read if you used an older runbook)
+
+The cluster CLI was consolidated in C8. Old spellings → new spellings:
+
+| old (≤ C7) | new (C8) |
+|---|---|
+| `tether cluster add <id> <host:7400> <pub> [--join-token …]` | joiner: `tether cluster join prepare --node-id <id> --raft-addr <host:7400> --nats-route nats://<host:6222> --tunnel-addr <host:7000> [--public-host <host>]` → emits a bundle; leader: `tether cluster join approve <bundle> --wait` |
+| `tether cluster sign-join <id> <nonce>` | folded into `tether cluster join prepare` (prepare self-signs — no separate sign-join step) |
+| `tether cluster node-pub` | hidden debug command; bootstrap prereq is `tether cluster keygen --out /etc/tether/node-ident.nk` (`join prepare` derives the pubkey automatically) |
+| `tether cluster wait <id> --phase VOTER` | per-operation `--wait` (e.g. `join approve … --wait`, `retire … --wait`, `transfer-leader … --wait`), or `tether cluster ops show <op-id>` / `tether cluster status --watch` |
+| `tether cluster drain <n> --retire` | `tether cluster retire <n>` (plain `cluster drain <n>` is unchanged) |
+| `tether cluster remove <n>` | `tether cluster recovery node remove <n> --manual` (routine path is `cluster retire`) |
+| `tether cluster force-single …` | `tether cluster recovery force-single …` |
+| `tether cluster recover --self-id …` | `tether cluster recovery rejoin prepare --self-id …` |
+| `tether cluster restore <bundle> …` | `tether cluster recovery restore <bundle> …` |
+| `tether cluster export-incident …` | `tether cluster recovery incident export …` |
+| `tether cluster takeover-natsconf …` | `tether cluster reconcile nats --all --wait` |
+
+The old top-level spellings (force-single/recover/restore/export-incident/remove/takeover-natsconf) remain as HIDDEN deprecated aliases for one release, then are deleted; `add`/`sign-join`/`wait` are deleted now.
+
 ## 0. What is a cluster, and what is quorum? (read this first.)
 
 A tether *cluster* is several brokers that replicate one shared state via the Raft
@@ -18,45 +38,37 @@ bug. Production HA therefore needs **at least 3 voters** (2 voters give no fault
 tolerance: lose one and you are read-only). If you run a single broker you do not
 need this file at all — single-broker is the fully supported default (see usage §1).
 
-## 1. Grow the cluster (add a voter) — two-phase, challenge/response
+## 1. Grow the cluster (add a voter) — two-phase, prepare/approve
 
-`cluster add` is a **two-phase** admission: the leader issues a single-use nonce,
-the joining node signs it with its node-identity key, then the leader admits it.
+Admission is **two-phase**: the joining node prepares a self-signed join bundle
+(carrying its node identity + raft/nats/tunnel addresses), then the leader approves it.
 
 ```
-# 0. On the JOINING node: print its node-identity public key.
-joiner$ tether cluster node-pub                       # -> Uxxxx...   (or `cluster keygen --out /etc/tether/node-ident.nk`)
+# 0. ONCE per fresh node — mint the node-identity seed on the JOINING node. `cluster keygen`
+#    is a hidden debug command; run it once on each new broker before it can join.
+joiner$ tether cluster keygen --out /etc/tether/node-ident.nk      # mints the 0600 seed
 
-# 1. On the LEADER: start the add (no token yet). It prints a challenge nonce.
-leader$ tether cluster add <node-id> <host:7400> <Uxxxx...>
-        challenge nonce: <nonce>
-        on the joining node run:  tether cluster sign-join <node-id> <nonce>
+# 1. On the JOINING node: prepare a self-signed join bundle. It derives its node-identity
+#    public key from the seed and carries its full expose-home + NATS identity, so the new
+#    voter can serve as an expose home AND be rendered into the NATS topology (external-review F4/Q2).
+joiner$ tether cluster join prepare --node-id <node-id> --raft-addr <host:7400> \
+          --nats-route nats://<host:6222> --tunnel-addr <host:7000> --public-host <host>
+        <join-bundle>
 
-# 2. On the JOINING node: sign the nonce. It prints <nonce>:<sigHex>.
-joiner$ tether cluster sign-join <node-id> <nonce>
-        <nonce>:<sigHex>
+# 2. On the LEADER: approve the bundle. --wait blocks until the new voter is admitted.
+leader$ tether cluster join approve <join-bundle> --wait
+        approved <node-id>
 
-# 3. On the LEADER: re-run with the token. The token call MUST carry the joiner's full
-#    expose-home + NATS identity (else the new voter can hold raft votes but can never serve
-#    as an expose home nor be rendered into the NATS topology — external-review F4/Q2).
-leader$ tether cluster add <node-id> <host:7400> <Uxxxx...> --join-token <nonce>:<sigHex> \
-          --tunnel-addr <host:7000> --cert-fp <sha256:...> --public-host <host> \
-          --nats-route nats://<host>:6222
-        added <node-id>
-
-# 4. RE-RENDER nats.conf on EVERY node with the COMPLETE peer set, then restart NATS.
-#    `cluster add` grows RAFT membership; it does NOT form the NATS route/auth mesh. Each
-#    broker's nats.conf must list every peer's {server_name, route_url, bus_nkey}; growth
-#    therefore re-runs takeover-natsconf on ALL nodes (external-review F2). Restart NATS one
-#    node at a time (rolling), leader LAST, verifying `cluster status` reachability after each.
-each-broker$ sudo tether cluster takeover-natsconf --secrets-dir /etc/tether/secrets \
-               --server-name <self-id> --route-url nats://<self-host>:6222 \
-               --account-issuer <account-public-nkey> --broker-nkey <self-broker-public-nkey> \
-               --peer <other1-id>,nats://<other1-host>:6222,<other1-bus-nkey> \
-               --peer <other2-id>,nats://<other2-host>:6222,<other2-bus-nkey>
+# 3. RE-RENDER nats.conf across the WHOLE cluster (one auto command renders every broker's
+#    conf from the live roster), then rolling-restart NATS. Growth grows RAFT membership; it
+#    does NOT form the NATS route/auth mesh — each broker's nats.conf must list every peer's
+#    {server_name, route_url, bus_nkey} (external-review F2).
+leader$ sudo tether cluster reconcile nats --all --wait
+#    Restart NATS one node at a time (rolling), leader LAST, verifying `cluster status`
+#    reachability after each:
 each-broker$ sudo systemctl restart nats-server   # rolling; leader last
 
-# 5. Verify.
+# 4. Verify.
 leader$ tether cluster status            # the new node walks JOIN_VERIFIED_PENDING_VOTER -> CATCHING_UP -> VOTER
                                          # + every voter shows reachable (nats-health), no applied-lag
 ```
@@ -71,7 +83,7 @@ membership reconciliation pass on startup that forward-completes a mid-add node.
 
 ```
 leader$ tether cluster drain <node-id>            # migrate exposes off, keep it a voter (sheds serving load)
-leader$ tether cluster drain <node-id> --retire   # drain THEN remove from the cluster
+leader$ tether cluster retire <node-id>           # drain THEN remove from the cluster (resumable; was `drain --retire`)
 leader$ tether cluster drain <node-id> --abort    # cancel an in-progress drain
 leader$ tether cluster drain <node-id> --now       # skip the notice period
 ```
@@ -106,7 +118,7 @@ re-provision):
 
 ```
 # 1. Retire + power off the suspect node.
-leader$ tether cluster drain <node-id> --retire
+leader$ tether cluster retire <node-id>
 
 # 2. Generate a NEW account key + a NEW cluster CA on a trusted host.
 trusted$ go install github.com/nats-io/nkeys/nk@latest
@@ -118,14 +130,14 @@ trusted$ # (re-issue a fresh cluster CA + per-node route leaf certs with your PK
 #    channel (scp, never committed; 0600). Update /etc/tether/secrets/{account.nk,cluster-ca.pem}
 #    and the corresponding route-cert.pem/route-key.pem leaf files on each node.
 
-# 4. Re-render nats.conf on every surviving node with takeover-natsconf, then rolling-restart
-#    NATS + the broker so both NATS route auth and broker auth_callout load the new secrets.
-#    Old JWTs signed by the old account key expire within their TTL; the new CA
-#    rejects the retired node's old route cert immediately.
+# 4. Re-render nats.conf across the cluster (`tether cluster reconcile nats --all --wait`),
+#    then rolling-restart NATS + the broker so both NATS route auth and broker auth_callout
+#    load the new secrets. Old JWTs signed by the old account key expire within their TTL;
+#    the new CA rejects the retired node's old route cert immediately.
 ```
 
-After `drain --retire`, immediately re-run `takeover-natsconf` on every surviving
-node so the retired node's NATS route/user grants are removed from generated
+After `cluster retire`, immediately run `tether cluster reconcile nats --all --wait`
+so the retired node's NATS route/user grants are removed from generated
 configuration. **Retire is not considered safe against a compromised node until
 this re-render/restart and the key/CA rotation above are done.**
 
@@ -148,7 +160,7 @@ survivor$ sudo tether cluster status --offline --db /var/lib/tether/tether.db
 #    HARD-REFUSES if any of them still accepts a TCP connection on :7400 (alive ->
 #    split-brain), if there is no existing raft state, or if the daemon still holds
 #    the store. You must TYPE this node's id to confirm — no --yes.
-survivor$ sudo tether cluster force-single \
+survivor$ sudo tether cluster recovery force-single \
             --self-id <this-node-id> --self-addr <this-host:7400> \
             --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2>
 
@@ -174,7 +186,7 @@ returning$ sudo systemctl mask tether-broker && sudo systemctl stop tether-broke
 # The dump is fsync'd (0600, never overwrites a prior dump) BEFORE any wipe; if the
 # dump fails, the wipe is refused. You must pass --self-id and TYPE the node_id to
 # confirm (no --yes) — this proves you are wiping the intended node.
-returning$ sudo tether cluster recover --self-id <returning-node-id> --dump-divergent /root/divergent-$(hostname).json
+returning$ sudo tether cluster recovery rejoin prepare --self-id <returning-node-id> --dump-divergent /root/divergent-$(hostname).json
 
 # Reinitialize this host as a clean single-voter seed so it has raft/ state before start.
 # Do NOT start tether-broker between recover and this init; the daemon refuses cluster
@@ -185,12 +197,15 @@ returning$ sudo tether cluster init --from-existing \
              --tunnel-addr <host:7000> --public-host <dns> \
              --secrets-dir /etc/tether/secrets
 
-# Now start it and rejoin it as a clean node (section 1).
+# Now start it and rejoin it as a clean node (section 1: `join prepare` on the returning
+# node, then `join approve <bundle> --wait` on the leader).
 returning$ sudo systemctl unmask tether-broker && sudo systemctl start tether-broker
-leader$    tether cluster add <returning-node-id> <host:7400> <Uxxxx...>
+returning$ tether cluster join prepare --node-id <returning-node-id> --raft-addr <host:7400> \
+             --nats-route nats://<host:6222> --tunnel-addr <host:7000> --public-host <host>
+leader$    tether cluster join approve <join-bundle> --wait
 ```
 
-> **Drill it.** Practice force-single -> recover on a 3-node staging cluster before
+> **Drill it.** Practice force-single -> rejoin on a 3-node staging cluster before
 > you need it in production (§13.12). The safety gates are the (b)/(c)/(d) hard
 > preconditions + the typed confirmation, NOT the displayed peer-unreachable timer.
 
@@ -230,13 +245,9 @@ broker$ sudo tether cluster init --from-existing \
 # 3. TAKE OVER nats.conf (rewrite it with the cluster directives + auth_callout, preserving
 #    the install.sh websocket/jetstream + any documented tuning). Refuses fail-closed if the
 #    conf has a directive tether does not recognize. Prints the before/after ownership table.
-broker$ sudo tether cluster takeover-natsconf \
-          --secrets-dir /etc/tether/secrets \
-          --server-name <node-id> --route-url nats://<host:6222> \
-          --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
-# --account-issuer may be read from an existing auth_callout issuer. --broker-nkey
-# is auto-read only when the existing authorization block has exactly one nkey user;
-# multi-broker generated configs must pass this node's --broker-nkey explicitly.
+#    The auto path derives the server-name / route-url / account-issuer / per-broker bus
+#    nkey from the live roster + secrets, so there are no per-broker flags to pass by hand.
+broker$ sudo tether cluster reconcile nats --all --wait
 
 # 4. Restart nats-server so the new authorization{} (cluster.apply.* ACL) is live BEFORE the
 #    broker connects in cluster mode (else it fails closed: no ACL).
@@ -250,8 +261,11 @@ broker$ sudo tether cluster status --offline --db /var/lib/tether/tether.db
 #    --auth-callout-seeds-dir is only needed if those seeds live somewhere else.
 broker$ sudo systemctl start tether-broker
 
-# 6. Reinstall ALL agents on v2 (the wire break forces this), then grow to N>=3 (section 1).
-leader$ tether cluster add <node-2> <host:7400> <Uxxxx...>   # x2 for N=3
+# 6. Reinstall ALL agents on v2 (the wire break forces this), then grow to N>=3 (section 1:
+#    `join prepare` on each new node, `join approve <bundle> --wait` on the leader). x2 for N=3.
+new-node$ tether cluster join prepare --node-id <node-2> --raft-addr <host:7400> \
+            --nats-route nats://<host:6222> --tunnel-addr <host:7000> --public-host <host>
+leader$   tether cluster join approve <join-bundle> --wait
 ```
 
 > **Rollback** (before agents are reinstalled): `systemctl stop tether-broker`, restore
@@ -288,7 +302,7 @@ single backup off ANY node is the whole committed state — you do **not** need 
 
 Use restore to rebuild a destroyed node, or to roll the whole cluster back to a known-good
 point. Restore is **offline-only**, overwrites the on-disk DB (preserving it at `<db>.bak`), and
-re-bootstraps a **single voter** — you then re-grow with `cluster add`.
+re-bootstraps a **single voter** — you then re-grow with the §1 join flow (`cluster join prepare` / `join approve`).
 
 ```bash
 # 0. On the target host, place the SAME node's secrets dir (the live tunnel cert is the
@@ -299,13 +313,14 @@ systemctl stop tether-broker
 #    irreversible + identity-affecting). The bundle's identity must match this host's secrets.
 #    Restore is RE-RUNNABLE after a kill-9: it marks restore_in_progress and the daemon REFUSES to
 #    start until restore completes — do NOT start the daemon mid-restore; just re-run the line.
-tether cluster restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a \
+tether cluster recovery restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a \
     --secrets-dir /etc/tether/secrets
 # 3. Start the daemon. It comes up as a single-voter cluster (NO HA until you re-grow).
 systemctl start tether-broker
 tether cluster status            # exit 1 DEGRADED (N=1, no redundancy) until re-grown; roster = {self}
                                  # (NOT exit 3 — restore is not force-single; it clears that marker)
-# 4. Re-grow to N>=3 with `cluster add` (§1), re-rendering nats.conf on every node.
+# 4. Re-grow to N>=3 with the §1 join flow (`cluster join prepare` / `join approve`),
+#    re-rendering nats.conf with `tether cluster reconcile nats --all --wait`.
 ```
 
 The restore **resets the applied cursor to 0** and **prunes the old peers from the roster** so
@@ -318,24 +333,25 @@ fingerprint** (== the manifest's `self_cert_fp` == the bundle's self-row `cert_f
 
 ```bash
 # 1. On a FRESH box, restore this node's secrets dir from your secret store.
-# 2. cluster restore the latest bundle (§5.1) with --confirm-node-id <the original node_id>.
-# 3. Start the daemon (single voter N=1), then `cluster add` new nodes to re-grow to N>=3.
+# 2. cluster recovery restore the latest bundle (§5.1) with --confirm-node-id <the original node_id>.
+# 3. Start the daemon (single voter N=1), then re-grow to N>=3 with the §1 join flow
+#    (`cluster join prepare` on each new node, `join approve <bundle> --wait` on the leader).
 # 4. Agents reconnect + re-pin; exposes re-home onto the live broker automatically (D6).
 ```
 
 ### 5.3 Identity-only manifest replay (recover → re-init)
 
-`cluster recover` (§3) can capture a node's IDENTITY into a manifest before it wipes, so the
-re-init does not re-type the 9 identity flags:
+`cluster recovery rejoin prepare` (§3) can capture a node's IDENTITY into a manifest before it
+wipes, so the re-init does not re-type the 9 identity flags:
 
 ```bash
 # On the returning node (daemon stopped): dump forensics AND emit an identity manifest.
-tether cluster recover --self-id brk-b --dump-divergent /root/divergent-brk-b.json \
+tether cluster recovery rejoin prepare --self-id brk-b --dump-divergent /root/divergent-brk-b.json \
     --emit-manifest /root/brk-b-ident.json --secrets-dir /etc/tether/secrets
 # Re-init from the manifest (cert_fp is re-derived LIVE from this host's secrets, not replayed —
 # a rotated cert still pins agents correctly). The manifest is identity-only: NO business rows.
 tether cluster init --from-manifest /root/brk-b-ident.json --secrets-dir /etc/tether/secrets
-# Then `cluster add` on the leader to rejoin (§1).
+# Then rejoin via the §1 join flow on the leader (`join approve <bundle> --wait`).
 ```
 
 ## 6. Rolling upgrade (followers-first, leader-last)
@@ -346,7 +362,7 @@ a rolling upgrade** (the wire is incompatible — stop the whole fleet, upgrade,
 
 ```bash
 # 0. Confirm the target release is the SAME proto. `cluster status` shows each node's running
-#    VER (a live self-report). `cluster add` HARD-REJECTS a joiner with a different proto.
+#    VER (a live self-report). `cluster join approve` HARD-REJECTS a joiner with a different proto.
 tether cluster status                    # note the leader + every node's VER
 
 # 1. Upgrade FOLLOWERS first, one at a time (the leader keeps serving):
@@ -354,7 +370,7 @@ tether cluster status                    # note the leader + every node's VER
 systemctl stop tether-broker
 #    (swap the binary)
 systemctl start tether-broker
-tether cluster wait <node-id> --phase VOTER     # block until it is a full voter again
+tether cluster status --watch                     # block until it is a full voter again (was `cluster wait`)
 tether cluster status                            # confirm its VER updated + REACH ok before the next
 
 # 2. Upgrade the LEADER last. Hand off leadership FIRST so you never re-elect mid-rollout:
@@ -367,7 +383,7 @@ tether cluster status
 
 Notes:
 - A mixed-release window (some nodes new, some old) is generally safe as long as the proto is
-  unchanged — `cluster add` only WARNS on a release skew (it rejects only a proto mismatch), and a
+  unchanged — `cluster join approve` only WARNS on a release skew (it rejects only a proto mismatch), and a
   re-joining drained node may legitimately be older than the now-upgraded leader during a rollback.
   **CAVEAT (DB schema):** if the NEW release adds a DB migration, an upgraded node forward-migrates
   its DB and you CANNOT then roll that node back to the older binary (migrations are forward-only;

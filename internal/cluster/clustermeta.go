@@ -107,12 +107,21 @@ func defaultAppliers() map[OpType]Applier {
 		// baked roster UPSERT — a verify failure is a deterministic poison-skip
 		// (errAppliedRejected), never a panic. The other three ride the shared applier
 		// (their CAS/phase-predecessor guards are baked into the leader-rendered SQL).
-		OpClusterNodeUpsert: clusterNodeUpsertApplier{},
-		OpClusterNodePhase:  exec,
-		OpClusterNodeRemove: exec,
-		OpClusterDrainSet:   exec,
-		OpClusterMetaClear:  exec,
-		OpClusterCertRotate: exec,
+		OpClusterNodeUpsert:   clusterNodeUpsertApplier{},
+		OpClusterNodePhase:    exec,
+		OpClusterNodeRemove:   exec,
+		OpClusterDrainSet:     exec,
+		OpClusterMetaClear:    exec,
+		OpClusterCertRotate:   exec,
+		OpClusterSeedsPublish: exec, // C2 §D-5: all-literal endpoints/bootstrap UPSERT + seed_generation bump
+		OpClusterBusNkeySet:   exec, // C3 §D-F: all-literal bus_nkey_pub UPDATE + topology_generation bump
+		OpClusterOpStart:      exec, // C4: single-active-guarded operation-log INSERT
+		OpClusterOpTransition: exec, // C4: predecessor-CAS operation-state advance + timeline
+		OpClusterOpConfirm:    exec, // C4: operation (re-)confirm bit
+		OpProxySetEnabled:     exec, // C5: proxy enable/HA-policy + keyset epoch bump
+		OpProxySubCreate:      exec, // C5: subscriber INSERT (PSK literal) + epoch bump
+		OpProxySubRevoke:      exec, // C5: subscriber REVOKE + epoch bump
+		OpProxyAllocate:       exec, // C5: __proxy__ port allocation (home-stamped)
 
 		// D8a §9: empty-Body, pure-Aux re-derivable transfer audit. Apply is a
 		// deterministic no-op (0 statements); the publisher replays cmd.Aux.

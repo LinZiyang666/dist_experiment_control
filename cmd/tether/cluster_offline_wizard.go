@@ -45,7 +45,7 @@ func forceSingleGuided(cmd *cobra.Command, dbPath, selfID, selfAddr string) erro
 		addr = "<this-node-host:7400>"
 	}
 	_, _ = fmt.Fprintf(out, "\n  All peers are dead. Run this on THIS node (daemon STOPPED) — you will be asked to type %q to confirm:\n\n"+
-		"  tether cluster force-single --self-id %s --self-addr %s --confirm-peers-dead %s\n", selfID, selfID, addr, ids)
+		"  tether cluster recovery force-single --self-id %s --self-addr %s --confirm-peers-dead %s\n", selfID, selfID, addr, ids)
 	return nil
 }
 
@@ -66,10 +66,11 @@ func recoverGuided(cmd *cobra.Command, selfID, dumpPath, manifestPath, secretsDi
 	}
 	_, _ = fmt.Fprintf(out, "recover guide for %q (read-only; nothing executed). Run on THIS node (daemon STOPPED):\n\n", selfID)
 	_, _ = fmt.Fprintf(out, "  1. Dump forensics + capture this node's identity, then wipe:\n"+
-		"     tether cluster recover --self-id %s --dump-divergent %s --emit-manifest %s --secrets-dir %s\n\n", selfID, dumpPath, manifestPath, sec)
+		"     tether cluster recovery rejoin prepare --self-id %s --dump-divergent %s --emit-manifest %s --secrets-dir %s\n\n", selfID, dumpPath, manifestPath, sec)
 	_, _ = fmt.Fprintf(out, "  2. Re-init from the captured identity (cert_fp re-derived live):\n"+
 		"     tether cluster init --from-manifest %s --secrets-dir %s\n\n", manifestPath, sec)
-	_, _ = fmt.Fprintf(out, "  3. On the LEADER, re-admit this node as a clean voter:\n"+
-		"     tether cluster add %s <this-host:7400> <node-pub>   # then sign-join on this node + paste the line back\n", selfID)
+	_, _ = fmt.Fprintf(out, "  3. On THIS node emit a join bundle, then approve it on the LEADER:\n"+
+		"     tether cluster join prepare --node-id %s --raft-addr <this-host:7400> --nats-route nats://<this-host:6222> --tunnel-addr <this-host:7000>\n"+
+		"     # then on the LEADER: tether cluster join approve <bundle> --wait\n", selfID)
 	return nil
 }

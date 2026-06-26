@@ -94,17 +94,23 @@ func proxyRequest(cmd *cobra.Command, natsURL, home, subjectVerb string, body []
 
 func newProxyOnCmd(natsURL, home *string) *cobra.Command {
 	var yes bool
+	var haPolicy string
 	cmd := &cobra.Command{
 		Use:   "on",
 		Short: "Turn the proxy subscription ON for this session (owner-only)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// C5: validate the HA policy ctl-side so a typo fails fast (the broker + the 0016 CHECK also
+			// reject it). Empty ⇒ keep the current/default (freeze-on-quorum-loss).
+			if haPolicy != "" && haPolicy != "freeze-on-quorum-loss" && haPolicy != "disable-on-quorum-loss" {
+				return fmt.Errorf("invalid --ha-policy %q (want freeze-on-quorum-loss or disable-on-quorum-loss)", haPolicy)
+			}
 			if !yes {
 				if !confirmProxyOn(cmd) {
 					return fmt.Errorf("aborted (pass --yes to skip the prompt)")
 				}
 			}
-			body, _ := json.Marshal(proto.ProxySetReq{Enabled: true})
+			body, _ := json.Marshal(proto.ProxySetReq{Enabled: true, HAPolicy: haPolicy})
 			var resp proto.ProxySetResp
 			if err := proxyRequest(cmd, *natsURL, *home, "set", body, &resp); err != nil {
 				return err
@@ -119,6 +125,7 @@ func newProxyOnCmd(natsURL, home *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "skip the open-exit-node confirmation prompt")
+	cmd.Flags().StringVar(&haPolicy, "ha-policy", "", "cluster HA policy when quorum is lost: freeze-on-quorum-loss (default, /sub keeps serving) | disable-on-quorum-loss (/sub 404s)")
 	return cmd
 }
 
@@ -144,13 +151,15 @@ func newProxyOffCmd(natsURL, home *string) *cobra.Command {
 
 func newProxyStatusCmd(natsURL, home *string) *cobra.Command {
 	var asJSON bool
+	var clusterView bool
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show proxy switch state, live nodes, and subscribers (member-readable)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			reqBody, _ := json.Marshal(proto.ProxyStatusReq{Cluster: clusterView})
 			var resp proto.ProxyStatusResp
-			if err := proxyRequest(cmd, *natsURL, *home, "status", []byte("{}"), &resp); err != nil {
+			if err := proxyRequest(cmd, *natsURL, *home, "status", reqBody, &resp); err != nil {
 				return err
 			}
 			if resp.Code != "" {
@@ -166,14 +175,31 @@ func newProxyStatusCmd(natsURL, home *string) *cobra.Command {
 			if resp.Enabled {
 				state = "ON"
 			}
-			_, _ = fmt.Fprintf(w, "PROXY: %s\n\nNODES\n", state)
-			_, _ = fmt.Fprintf(w, "  %-20s %-8s %-6s %s\n", "NID", "STATUS", "READY", "EXIT")
-			for _, n := range resp.Nodes {
-				exit := "-"
-				if n.PublicPort != 0 {
-					exit = fmt.Sprintf("%s:%d", n.PublicHost, n.PublicPort)
+			_, _ = fmt.Fprintf(w, "PROXY: %s\n", state)
+			// C5 cluster view: the degraded state + HA policy + writability, then per-agent ready REASON.
+			if resp.ClusterState != "" {
+				_, _ = fmt.Fprintf(w, "CLUSTER: %s   ha-policy=%s   writable=%v\n", resp.ClusterState, resp.HAPolicy, resp.Writable)
+				_, _ = fmt.Fprintf(w, "\nNODES\n  %-20s %-8s %-14s %-22s %s\n", "NID", "STATUS", "REASON", "HOME", "EXIT")
+				for _, n := range resp.Nodes {
+					exit := "-"
+					if n.PublicPort != 0 {
+						exit = fmt.Sprintf("%s:%d", n.PublicHost, n.PublicPort)
+					}
+					home := n.HomeBroker
+					if home == "" {
+						home = "-"
+					}
+					_, _ = fmt.Fprintf(w, "  %-20s %-8s %-14s %-22s %s\n", n.NID, n.Status, n.ReadyReason, home, exit)
 				}
-				_, _ = fmt.Fprintf(w, "  %-20s %-8s %-6v %s\n", n.NID, n.Status, n.Ready, exit)
+			} else {
+				_, _ = fmt.Fprintf(w, "\nNODES\n  %-20s %-8s %-6s %s\n", "NID", "STATUS", "READY", "EXIT")
+				for _, n := range resp.Nodes {
+					exit := "-"
+					if n.PublicPort != 0 {
+						exit = fmt.Sprintf("%s:%d", n.PublicHost, n.PublicPort)
+					}
+					_, _ = fmt.Fprintf(w, "  %-20s %-8s %-6v %s\n", n.NID, n.Status, n.Ready, exit)
+				}
 			}
 			_, _ = fmt.Fprintf(w, "\nSUBSCRIBERS\n  %-20s %-8s %s\n", "NAME", "STATE", "CREATED")
 			for _, s := range resp.Subscribers {
@@ -186,6 +212,7 @@ func newProxyStatusCmd(natsURL, home *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit raw JSON")
+	cmd.Flags().BoolVar(&clusterView, "cluster", false, "show the cluster-aware view: per-agent ready reason + home + the degraded state")
 	return cmd
 }
 

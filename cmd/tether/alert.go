@@ -58,8 +58,8 @@ the always-on ps/node banner until an operator clears it. Cluster mode only.`,
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return alertAdminError("alert raise", resp)
@@ -100,8 +100,8 @@ func newAlertClearCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return alertAdminError("alert clear", resp)

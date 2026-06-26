@@ -21,7 +21,7 @@ func TestStatusCardHealthy(t *testing.T) {
 	if !strings.Contains(out, "HEALTHY (HA)") {
 		t.Fatalf("healthy headline missing:\n%s", out)
 	}
-	if strings.Contains(out, "export-incident") {
+	if strings.Contains(out, "recovery incident export") {
 		t.Fatalf("healthy cluster must NOT show an incident hint:\n%s", out)
 	}
 }
@@ -37,10 +37,10 @@ func TestStatusCardDegradedShowsTopReasonAndIncidentHint(t *testing.T) {
 		},
 	})
 	out := buf.String()
-	if !strings.Contains(out, "DEGRADED: node brk-b roster/raft INCONSISTENT") {
-		t.Fatalf("degraded headline must carry the top reason:\n%s", out)
+	if !strings.Contains(out, "DEGRADED-WRITABLE: node brk-b roster/raft INCONSISTENT") {
+		t.Fatalf("degraded headline must carry the top reason (C6 建议6 DEGRADED-WRITABLE):\n%s", out)
 	}
-	if !strings.Contains(out, "export-incident") {
+	if !strings.Contains(out, "recovery incident export") {
 		t.Fatalf("a degraded cluster must show the incident-export hint:\n%s", out)
 	}
 	if !strings.Contains(out, "what to do:") {
@@ -52,7 +52,7 @@ func TestStatusCardForceSingle(t *testing.T) {
 	var buf bytes.Buffer
 	renderClusterStatusCard(&buf, &adminsock.ClusterStatusReport{Health: "FORCE_SINGLE", ExitCode: 3, LeaderID: "brk-a"})
 	out := buf.String()
-	if !strings.Contains(out, "FORCE-SINGLE") || !strings.Contains(out, "export-incident") {
+	if !strings.Contains(out, "FORCE-SINGLE") || !strings.Contains(out, "recovery incident export") {
 		t.Fatalf("force-single card wrong:\n%s", out)
 	}
 }

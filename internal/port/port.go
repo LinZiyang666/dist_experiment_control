@@ -533,28 +533,6 @@ func cfgWithDefaults(cfg *Config) (low, high int, now time.Time) {
 	return low, high, now
 }
 
-func scanOne(row *sql.Row) (*Allocation, error) {
-	var a Allocation
-	var revokedAt sql.NullTime
-	var stateStr string
-	err := row.Scan(
-		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
-		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	a.State = State(stateStr)
-	if revokedAt.Valid {
-		t := revokedAt.Time
-		a.RevokedAt = &t
-	}
-	return &a, nil
-}
-
 func scanOneWithHome(row *sql.Row) (*Allocation, error) {
 	var a Allocation
 	var revokedAt sql.NullTime
@@ -615,11 +593,16 @@ func scanRowWithHome(rows *sql.Rows) (*Allocation, error) {
 // proxy port. User `tether expose --name __proxy__` is rejected at the broker.
 const ProxyPortName = "__proxy__"
 
-// LookupProxyByNode returns the ALLOCATED proxy row for (sid, nid), or
-// ErrNotFound. Used at register time to decide keep-vs-replace.
+// LookupProxyByNode returns the ALLOCATED proxy row for (sid, nid), or ErrNotFound. Used at register
+// time to decide keep-vs-replace AND by the C5/C6 proxy reaper + status to read the row's authoritative
+// home_broker/epoch. C6 Stage-C root-cause fix: it MUST use the home-aware scan (13 columns) — the
+// plain scanOne dropped home_broker/epoch, so the reaper saw HomeBroker="" Epoch=0 and perpetually
+// rehomed every healthy proxy (HR3), the rehome events carried epoch:0 (HR2), and proxy status
+// disagreed with --homes (HR1). Mirrors LookupByName / LookupByTokenHash.
 func LookupProxyByNode(db *sql.DB, sid, nid string) (*Allocation, error) {
-	return scanOne(db.QueryRow(
+	return scanOneWithHome(db.QueryRow(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at
+		        , home_broker, epoch, rebuild_on_failure
 		 FROM port_allocations
 		 WHERE sid=? AND nid=? AND name=? AND state='ALLOCATED'`,
 		sid, nid, ProxyPortName,

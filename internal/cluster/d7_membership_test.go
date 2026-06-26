@@ -294,7 +294,7 @@ func TestD7RemoveOnlyTerminalPhases(t *testing.T) {
 	d7Apply(t, f, 3, mustPhase(t, "r1", "VOTER", []string{"CATCHING_UP"}, now))
 
 	// Remove on a VOTER is a no-op.
-	rm, _ := PlanClusterNodeRemove("r1")
+	rm, _ := PlanClusterNodeRemove("r1", now)
 	d7Apply(t, f, 4, rm)
 	if d7CountNode(t, f, "r1") != 1 {
 		t.Fatal("a live VOTER was removed by OpClusterNodeRemove")

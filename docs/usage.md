@@ -170,7 +170,7 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 - `/var/{lib,log,run}/tether`（属主 `tether` 系统用户，`install.sh` 自动 useradd）
 
 > **分布式 HA（proto v2）安装边界**：升级成集群时，tether 接管 `nats.conf`（`tether cluster
-> takeover-natsconf`，见 §3.4）并留 `nats.conf.bak.<ts>`；cluster secrets（`/etc/tether/secrets/`：
+> reconcile nats --all --wait`，见 §3.4）并留 `nats.conf.bak.<ts>`；cluster secrets（`/etc/tether/secrets/`：
 > `cluster-ca.pem`、`route-cert.pem`/`route-key.pem`、稳定 `tunnel-cert.pem`/`tunnel-key.pem`、
 > `broker.nk`、`node-ident.nk`、`account.nk`，私钥 0600）须先 provision（`tether cluster doctor`
 > 预检：缺/不可读/私钥权限松 = 拒；FDE 缺 = advisory）。现网单点→N≥3 的一次性迁移全流程 +
@@ -359,12 +359,12 @@ auth_callout**，否则 ctl 会得 `nats: nkeys not supported by the server`，
 
 > **单 broker（非集群）保持本节的手动流程不变**——`install.sh` 写 nats.conf + 你按下面手动加
 > `authorization{}`，是单 broker 的受支持路径。**分布式 HA（proto v2）下不要手改 nats.conf**：改用
-> `tether cluster takeover-natsconf` 让 tether 接管——它在保留 install.sh 的 websocket/jetstream +
+> `tether cluster reconcile nats --all --wait` 让 tether 接管——它在保留 install.sh 的 websocket/jetstream +
 > 已记录的调优指令（如 `max_payload`）的前提下重写出集群指令（routes mTLS + auth_callout + per-broker
 > ACL），遇到不认识的指令会 fail-closed 拒绝（不静默覆盖手调 conf），并留一份 pristine `.bak`。整套
 > 现网单点→集群的一次性迁移见 §2.3 指向的 `docs/cluster-runbook.md` 第 4 节。
-> 已生成的多 broker `authorization.users` 里有多个 nkey，`takeover-natsconf` 不会按列表位置猜本机
-> broker nkey；这种情况下每台机器必须显式传本机的 `--broker-nkey`。
+> 这条**自动路径**从 live roster + secrets 派生每台 broker 的 server-name / route-url / bus nkey，
+> 因此**不再手传 per-broker `--broker-nkey`**——多 broker 也由 `--all` 一次性按 roster 渲染全 mesh。
 
 #### 第 1 步：生成 broker.nk + account.nk
 
@@ -549,20 +549,20 @@ tether session create lab --pin 040415 --nats-url wss://your-broker.example:443
 | `tether node upgrade <nid>`            | ctl    | 升级单台 agent（owner） |
 | `tether node upgrade --all`            | ctl    | 升级 session 内所有 ONLINE agent |
 | `tether cluster status [--json|--offline|--watch <dur>]` | broker 本机 | 查看 cluster health / roster（`--watch` 每隔 ≥2s 重绘，Ctrl-C 退出；含 cert/容量字段 + cert 临期 advisory） |
-| `tether cluster wait <node> --phase <P>` | broker 本机 | 阻塞到节点到达某 phase（含伪 `GONE`）；timeout/Ctrl-C → exit 75 |
+| `… --wait`（每操作 flag）/ `tether cluster status --watch` | broker 本机 | 阻塞到 membership 操作完成 / 节点到达某 phase（取代旧的独立 `cluster wait`）；亦可 `cluster ops show <op-id>` |
 | `tether cluster doctor`                | broker 本机 | 预检 cluster secrets |
 | `tether cluster init --from-existing`  | broker 本机/离线 | 把单 broker 迁移为第一个 cluster voter |
-| `tether cluster takeover-natsconf [--plan]` | broker 本机 | 接管 / 重渲染 NATS route + auth_callout 配置（`--plan` = dry-run，打印将改动 + `--json`，**不写任何文件**） |
+| `tether cluster reconcile nats --all [--plan]` | broker 本机 | 接管 / 重渲染 NATS route + auth_callout 配置（自动路径，按 roster 渲染全 mesh；`--plan` = dry-run，打印将改动 + `--json`，**不写任何文件**） |
 | `tether cluster transfer-leader <node> [--wait]` | broker 本机 | 转移 Raft leadership（`--wait` 阻塞到 leadership 落到目标） |
-| `tether cluster add`                   | broker 本机 | 两阶段接纳新 voter |
-| `tether cluster sign-join`             | joining broker | 用 node identity 签 join nonce |
-| `tether cluster node-pub` / `keygen`   | broker 本机 | 打印 / 生成 node identity |
-| `tether cluster drain` / `remove`      | broker 本机 | 迁移或移除 broker voter |
+| `tether cluster join prepare` / `join approve <bundle>` | joiner / leader | 两阶段接纳新 voter（joiner 出自签 bundle，leader approve） |
+| `tether cluster keygen --out <path>`   | broker 本机 | 生成 node identity seed（`node-pub` 现为隐藏 debug 命令） |
+| `tether cluster drain` / `retire`      | broker 本机 | 迁移（drain）或退役（retire，原 `drain --retire`）broker voter |
+| `tether cluster rebalance proxy [--dry-run]` | broker 本机(leader) | 主动把 `__proxy__` homes 均摊到各 eligible voter（reaper 只在 home down 时迁；加完 broker 后跑此填新容量；`--dry-run` 预览） |
 | `tether cluster rotate-tunnel-cert`    | broker 本机 | 轮换 broker 稳定 tunnel 证书 pin |
-| `tether cluster force-single/recover`  | broker 离线 | quorum-loss 逃生 / returning-node 清理 |
+| `tether cluster recovery force-single` / `recovery rejoin prepare` | broker 离线 | quorum-loss 逃生 / returning-node 清理 |
 | `tether cluster backup [--offline] --out <dir>` | broker 本机/离线 | 写 `{state.db, manifest.json}` 备份 bundle（online 任意节点；`--offline` daemon 停止时） |
-| `tether cluster restore <bundle> --confirm-node-id <id>` | broker 离线 | 从 bundle 恢复为单 voter cluster（不可逆、typed-confirm、再 `cluster add` 长回去） |
-| `tether cluster export-incident [--since <dur>] [--out f.json]` | broker 本机 | 导出只读取证 bundle（告警 + membership + 审计）；对 secret-shaped key 做**尽力**脱敏（非保证——分享前请人工复核；写文件用 O_EXCL+O_NOFOLLOW 防符号链接覆盖） |
+| `tether cluster recovery restore <bundle> --confirm-node-id <id>` | broker 离线 | 从 bundle 恢复为单 voter cluster（不可逆、typed-confirm、再用 §1 join 流程长回去） |
+| `tether cluster recovery incident export [--since <dur>] [--out f.json]` | broker 本机 | 导出只读取证 bundle（告警 + membership + 审计）；对 secret-shaped key 做**尽力**脱敏（非保证——分享前请人工复核；写文件用 O_EXCL+O_NOFOLLOW 防符号链接覆盖） |
 | `tether cluster ops ls` / `ops show <node>` | broker 本机 | 查看 membership 操作（add/drain/retire）状态 + resume 提示（派生自 roster） |
 | `tether cluster apply -f roster.yaml [--json]` | broker 本机 | 对期望 roster 差分、印 quorum-safe 收敛计划（**仅 plan、不执行**） |
 | `tether cluster doctor [--offline]` | broker 本机 | 诊断集群——daemon 在则 online 健康检查，否则 init 前 preflight |
@@ -741,8 +741,26 @@ tether cluster <command> [flag...]
 
 **这是什么**：proto v2 的分布式 broker 运维入口。它不替代 `tether serve`；
 `serve` 仍是每台 broker 的守护进程，`cluster` 负责把单点 broker 迁移到 Raft
-集群、接纳/移除 voter、生成接入 nonce、接管 nats.conf、检查 cluster secrets，以及
+集群、接纳/退役 voter、重渲染 nats.conf、检查 cluster secrets，以及
 quorum-loss 的离线逃生。
+
+> **C8 命令迁移。** cluster CLI 在 C8 做了整合，旧拼写 → 新拼写：
+>
+> | old (≤ C7) | new (C8) |
+> |---|---|
+> | `tether cluster add <id> <host:7400> <pub> [--join-token …]` | joiner: `tether cluster join prepare --node-id <id> --raft-addr <host:7400> --nats-route nats://<host:6222> --tunnel-addr <host:7000> [--public-host <host>]`（出 bundle）；leader: `tether cluster join approve <bundle> --wait` |
+> | `tether cluster sign-join <id> <nonce>` | 折进 `tether cluster join prepare`（prepare 自签，无独立 sign-join） |
+> | `tether cluster node-pub` | 隐藏 debug 命令；bootstrap 前置改为 `tether cluster keygen --out /etc/tether/node-ident.nk`（`join prepare` 自动派生公钥） |
+> | `tether cluster wait <id> --phase VOTER` | 每操作 `--wait`（如 `join approve … --wait`、`retire … --wait`、`transfer-leader … --wait`），或 `tether cluster ops show <op-id>` / `tether cluster status --watch` |
+> | `tether cluster drain <n> --retire` | `tether cluster retire <n>`（纯 `cluster drain <n>` 不变） |
+> | `tether cluster remove <n>` | `tether cluster recovery node remove <n> --manual`（routine path 用 `cluster retire`） |
+> | `tether cluster force-single …` | `tether cluster recovery force-single …` |
+> | `tether cluster recover --self-id …` | `tether cluster recovery rejoin prepare --self-id …` |
+> | `tether cluster restore <bundle> …` | `tether cluster recovery restore <bundle> …` |
+> | `tether cluster export-incident …` | `tether cluster recovery incident export …` |
+> | `tether cluster takeover-natsconf …` | `tether cluster reconcile nats --all --wait` |
+>
+> 旧顶层拼写（force-single/recover/restore/export-incident/remove/takeover-natsconf）作为 HIDDEN deprecated 别名保留一个 release，之后删除；`add`/`sign-join`/`wait` 现在已删除。
 
 > **什么是 cluster / quorum（一句话版）。** 一个 *cluster* 是多台 broker 用 Raft 把同一份
 > 控制面状态复制成多副本，任一台宕机其余继续服务——这就是高可用（HA）。每次写入要被**多数派
@@ -755,13 +773,13 @@ quorum-loss 的离线逃生。
 | 术语 | 含义 |
 |---|---|
 | `node-id` / `self-id` | broker 节点的稳定 id；同时作为 Raft ServerID、NATS `server_name`、`cluster_nodes.node_id` |
-| `node-ident.nk` | 节点身份 nkey seed，私钥文件 0600；用于 `sign-join` 证明“加入者确实持有这个 node id 的身份” |
-| `node-pub` / `node-ident-pub` | `node-ident.nk` 对应公钥，`cluster add` 的第三个位置参数 |
+| `node-ident.nk` | 节点身份 nkey seed，私钥文件 0600；`cluster join prepare` 用它自签 join bundle，证明“加入者确实持有这个 node id 的身份” |
+| `node-ident-pub` | `node-ident.nk` 对应公钥；`cluster join prepare` 自动从 seed 派生（旧的 `cluster add` 第三位置参数已删；`node-pub` 现为隐藏 debug 命令） |
 | `voter` | Raft 投票成员；N=3 时允许坏 1 台，N=5 时允许坏 2 台 |
 | `leader` | 当前 Raft 写入 leader；在线 membership / drain / status 经 leader 协调 |
 | `quorum` | 可写多数；失去 quorum 后集群只读，破坏性 ctl 命令会被 severe alert 拦住 |
 | `force-single` | quorum 丢失逃生：在确认其它 peer 都死后，把幸存节点离线改写成单 voter；无 HA / 无完整性保证，必须尽快 recover |
-| `returning node` | 曾经属于旧时间线、后来要回来的节点；必须先 `recover` 清理旧 DB/raft，再按新节点 rejoin |
+| `returning node` | 曾经属于旧时间线、后来要回来的节点；必须先 `cluster recovery rejoin prepare` 清理旧 DB/raft，再按新节点 rejoin |
 | `raft_addr` | broker 私网 Raft transport 地址，通常 `<private-ip>:7400` |
 | `nats_route` | broker 私网 NATS route 地址，通常 `nats://<private-ip>:6222` |
 | `tunnel_addr` | agent 反向 tunnel 连接的 broker 地址，通常 `<public-host>:7000` |
@@ -772,8 +790,8 @@ quorum-loss 的离线逃生。
 
 | 类型 | 子命令 | 在哪里跑 |
 |---|---|---|
-| 在线 admin socket | `add` / `remove` / `drain` / `status` / `transfer-leader` / `rotate-tunnel-cert` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
-| 离线/本机磁盘操作 | `init --from-existing` / `force-single` / `recover` / `doctor` / `takeover-natsconf` / `keygen` / `node-pub` / `sign-join` | 对应 broker 主机；`force-single`、`recover` 要先停 daemon |
+| 在线 admin socket | `join approve` / `drain` / `retire` / `status` / `transfer-leader` / `rotate-tunnel-cert` / `reconcile nats` / `ops` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
+| 离线/本机磁盘操作 | `init --from-existing` / `join prepare` / `recovery force-single` / `recovery rejoin prepare` / `recovery restore` / `recovery node remove --manual` / `recovery incident export` / `doctor` / `keygen` | 对应 broker 主机；`recovery force-single`、`recovery rejoin prepare` 要先停 daemon |
 
 全局 flag：
 
@@ -793,10 +811,8 @@ sudo tether cluster init --from-existing \
   --tunnel-addr <public-host:7000> --public-host <public-dns> \
   --secrets-dir /etc/tether/secrets
 
-# 让 tether 接管 nats.conf，写入 routes mTLS + auth_callout
-sudo tether cluster takeover-natsconf --server-name <node-1> \
-  --route-url nats://<private-host:6222> \
-  --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
+# 让 tether 接管 nats.conf，写入 routes mTLS + auth_callout（自动路径，按 roster 渲染全 mesh）
+sudo tether cluster reconcile nats --all --wait
 
 sudo systemctl restart nats-server
 sudo tether cluster status --offline --db /var/lib/tether/tether.db
@@ -804,15 +820,15 @@ sudo systemctl start tether-broker
 tether cluster status
 ```
 
-接纳新 voter 是两阶段流程：leader 先 `cluster add` 生成 nonce，joining 节点
-`cluster sign-join` 签名，leader 再带 `--join-token <nonce>:<sigHex>` 重跑
-`cluster add`。完整命令、顺序、回滚和故障演练以 `docs/cluster-runbook.md` 为准；
-`usage.md` 这里只放入口和常用边界，避免把危险的 quorum 操作写成随手复制的命令块。
+接纳新 voter 是两阶段流程：joining 节点先 `cluster join prepare` 出一个自签 join
+bundle，leader 再 `cluster join approve <bundle> --wait` 接纳。完整命令、顺序、
+回滚和故障演练以 `docs/cluster-runbook.md` 为准；`usage.md` 这里只放入口和常用边界，
+避免把危险的 quorum 操作写成随手复制的命令块。
 
-注意：`cluster add` 只改变 Raft membership，不会自动形成 NATS route/auth mesh。
-新增或移除 broker 后，要在每台 broker 上用完整 peer set 重跑
-`cluster takeover-natsconf`，滚动重启 `nats-server`（leader 最后），再用
-`cluster status` 验证。`drain --retire` / `remove` 也只移除 roster + Raft 成员；
+注意：`cluster join approve` 只改变 Raft membership，不会自动形成 NATS route/auth
+mesh。新增或退役 broker 后，要跑 `cluster reconcile nats --all --wait`（自动按 roster
+渲染全 mesh），滚动重启 `nats-server`（leader 最后），再用 `cluster status` 验证。
+`cluster retire` / `recovery node remove` 也只移除 roster + Raft 成员；
 如果退役节点可能泄漏了 `account.nk` 或 CA，还要按 runbook 轮换 secrets。
 
 子命令与参数：
@@ -836,51 +852,49 @@ tether cluster status
 | `cluster init --from-existing` | `--tunnel-addr` | (必填) | agent 应拨入的 tunnel control 地址，形如 `<public-host>:7000` |
 | `cluster init --from-existing` | `--public-host` | (必填) | 用户可见公网 DNS host，用于 expose URL / home directive |
 | `cluster doctor` | `--secrets-dir` | `/etc/tether/secrets` | 检查 cluster secrets；缺失/不可读/私钥权限过松为 fatal，FDE 仅 advisory |
-| `cluster takeover-natsconf` | `--conf` | `/etc/tether/nats.conf` | 要接管并重写的 nats-server.conf；会保留 pristine `.bak` |
-| `cluster takeover-natsconf` | `--secrets-dir` | `/etc/tether/secrets` | cluster CA + route cert/key 所在目录 |
-| `cluster takeover-natsconf` | `--server-name` | (必填) | 本 broker 的 deterministic NATS `server_name`，等于 cluster node id |
-| `cluster takeover-natsconf` | `--account-issuer` | 从现有 conf 读取 | shared account public nkey；空时只从现有 auth_callout issuer 读取 |
-| `cluster takeover-natsconf` | `--broker-nkey` | 从现有 conf 读取 | 本 broker bus nkey 公钥；只有现有 auth block 恰好一个 nkey user 时才自动读取，多 user 必须显式传 |
-| `cluster takeover-natsconf` | `--route-url` | (必填) | 本 broker 对其它 broker 暴露的 route URL，如 `nats://10.0.0.1:6222` |
-| `cluster takeover-natsconf` | `--cluster-listen` | `0.0.0.0:6222` | NATS route listen 地址，只应在 broker 私网开放 |
-| `cluster takeover-natsconf` | `--peer` | 可重复 | 其它 broker，格式 `server_name,route_url,bus_nkey`；多 peer 重复传，构成 full mesh |
-| `cluster takeover-natsconf` | `--nats-server` | `nats-server` | 用于 `nats-server -t` dry-run 校验的二进制 |
-| `cluster takeover-natsconf` | `--skip-dry-run` | false | 跳过 `nats-server -t` 校验；不推荐，只在目标机没有 nats-server 时临时使用 |
-| `cluster add` | `<node-id>` | (必填) | 要接纳的新 voter node id |
-| `cluster add` | `<host>` | (必填) | 新 voter 的 Raft 地址，通常 `<private-host>:7400` |
-| `cluster add` | `<node-pub>` | (必填) | 新 voter 的 node identity 公钥 |
-| `cluster add` | `--join-token` | (空) | 第二阶段必填，格式 `<nonce>:<sigHex>`；来自 joining 节点 `cluster sign-join` |
-| `cluster add` | `--tunnel-addr` | 第二阶段必填 | 新 voter 的公网 tunnel control 地址，缺失会导致该 voter 不能成为 expose home |
-| `cluster add` | `--cert-fp` | 第二阶段必填 | 新 voter 稳定 tunnel cert 指纹，`sha256:<hex>` |
-| `cluster add` | `--public-host` | `<host>` | 新 voter 的公网 host；不要让它默认成私网 raft host，公网部署应显式传 |
-| `cluster add` | `--nats-route` | 第二阶段必填 | 新 voter 的 NATS route URL，如 `nats://10.0.0.2:6222` |
-| `cluster sign-join` | `<node-id>` | (必填) | joining 节点自己的 node id，必须与 leader nonce 对应 |
-| `cluster sign-join` | `<nonce>` | (必填) | leader 第一次 `cluster add` 返回的 nonce |
-| `cluster sign-join` | `--seed` | `/etc/tether/node-ident.nk` | joining 节点的 node identity seed |
-| `cluster node-pub` | `--seed` | `/etc/tether/node-ident.nk` | 读取 seed 并打印公钥，给 leader 的 `cluster add` 使用 |
-| `cluster keygen` | `--out` | (空) | 写 node identity seed 到指定路径，0600；空值只打印 pubkey 不落 seed |
+| `cluster reconcile nats` | `--all` / `--wait` | — | **C8 主用（自动路径）**：从 live roster + secrets 派生每台 broker 的 server-name/route-url/bus nkey，按 roster 渲染全 mesh nats.conf；`--wait` 阻塞到收敛。亦支持 `--plan`（dry-run）+ `--json`。`takeover-natsconf` 是其隐藏 deprecated 别名（下列手动 flag 保留一个 release） |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--conf` | `/etc/tether/nats.conf` | 要接管并重写的 nats-server.conf；会保留 pristine `.bak` |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--secrets-dir` | `/etc/tether/secrets` | cluster CA + route cert/key 所在目录 |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--server-name` | (必填) | 本 broker 的 deterministic NATS `server_name`，等于 cluster node id |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--account-issuer` | 从现有 conf 读取 | shared account public nkey；空时只从现有 auth_callout issuer 读取 |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--broker-nkey` | 从现有 conf 读取 | 本 broker bus nkey 公钥；只有现有 auth block 恰好一个 nkey user 时才自动读取，多 user 必须显式传 |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--route-url` | (必填) | 本 broker 对其它 broker 暴露的 route URL，如 `nats://10.0.0.1:6222` |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--cluster-listen` | `0.0.0.0:6222` | NATS route listen 地址，只应在 broker 私网开放 |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--peer` | 可重复 | 其它 broker，格式 `server_name,route_url,bus_nkey`；多 peer 重复传，构成 full mesh |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--nats-server` | `nats-server` | 用于 `nats-server -t` dry-run 校验的二进制 |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--skip-dry-run` | false | 跳过 `nats-server -t` 校验；不推荐，只在目标机没有 nats-server 时临时使用 |
+| `cluster join prepare` | `--node-id` | (必填) | joining 节点自己的 node id |
+| `cluster join prepare` | `--raft-addr` | (必填) | joining 节点私网 Raft 地址，形如 `<host>:7400` |
+| `cluster join prepare` | `--nats-route` | (必填) | joining 节点私网 NATS route，形如 `nats://<host>:6222` |
+| `cluster join prepare` | `--tunnel-addr` | (必填) | joining 节点公网 tunnel control 地址，形如 `<host>:7000`；缺失会导致该 voter 不能成为 expose home |
+| `cluster join prepare` | `--public-host` | `<host>` | joining 节点公网 host；公网部署应显式传，别默认成私网 raft host |
+| `cluster join prepare` | `--seed` | `/etc/tether/node-ident.nk` | 本节点 node identity seed；prepare 用它自签 bundle 并派生公钥（折自旧 `sign-join --seed`） |
+| `cluster join approve` | `<bundle>` | (必填) | joining 节点 `cluster join prepare` 出的自签 join bundle（含完整 expose-home + NATS 身份 + cert 指纹） |
+| `cluster join approve` | `--wait` | false | 阻塞到新 voter 被接纳（取代旧的 `cluster wait`） |
+| `cluster keygen` | `--out` | (空) | 写 node identity seed 到指定路径，0600；`join prepare` 的前置（每台新 broker 一次）；空值只打印 pubkey 不落 seed |
 | `cluster drain` | `<node-id>` | (必填) | 要迁移 expose / 准备退休的 voter |
-| `cluster drain` | `--retire` | false | drain 完后从 Raft config + roster 移除该节点 |
 | `cluster drain` | `--now` | false | 跳过 drain notice period，立即迁移 |
 | `cluster drain` | `--abort` | false | 取消正在进行的 drain，把节点 phase 退回 `VOTER` |
-| `cluster remove` | `<node-id>` | (必填) | 直接从 Raft config + roster 移除；优先用 `drain --retire` |
+| `cluster retire` | `<node-id>` | (必填) | drain 完后从 Raft config + roster 移除该节点（原 `drain --retire`）；可 resume；迁移 expose + 等 stream 冗余达标；F==0 时手输 node-id 确认 |
+| `cluster recovery node remove` | `<node-id>` | (必填) | 直接从 Raft config + roster 移除（最后手段）；**必须**带 `--manual`；routine path 用 `cluster retire` |
+| `cluster recovery node remove` | `--manual` | (必填) | 确认这是 last-resort raw remove（缺它直接拒绝） |
 | `cluster transfer-leader` | `<node-id>` | (必填) | 把 Raft leadership 交给一个 caught-up voter |
 | `cluster rotate-tunnel-cert` | `<node-id>` | (必填) | 目标 broker node id；必须在目标 broker 上执行并让其成为 leader |
 | `cluster rotate-tunnel-cert` | `--cert-fp` | (必填) | 新稳定 tunnel cert 指纹；DB pin 更新后当前/previous pin 进入旋转窗口 |
-| `cluster force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；daemon 必须停止 |
-| `cluster force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径 |
-| `cluster force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认 |
-| `cluster force-single` | `--self-addr` | (必填) | 当前幸存节点 Raft 地址，形如 `<host>:7400` |
-| `cluster force-single` | `--confirm-peers-dead` | (必填，可逗号分隔) | roster 中其它所有节点 id；命令会探测它们 `:7400` 仍可达则拒绝 |
-| `cluster recover` | `--data-dir` | `/var/lib/tether` | returning node 的 broker data dir；daemon 必须停止 |
-| `cluster recover` | `--db` | `/var/lib/tether/tether.db` | returning node 的 DB 路径 |
-| `cluster recover` | `--dump-divergent` | (必填) | forensic dump 输出路径，0600，必须不存在 |
-| `cluster recover` | `--self-id` | (必填) | 被清理节点 id；命令会要求人工输入它确认 |
+| `cluster recovery force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；daemon 必须停止 |
+| `cluster recovery force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径 |
+| `cluster recovery force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认 |
+| `cluster recovery force-single` | `--self-addr` | (必填) | 当前幸存节点 Raft 地址，形如 `<host>:7400` |
+| `cluster recovery force-single` | `--confirm-peers-dead` | (必填，可逗号分隔) | roster 中其它所有节点 id；命令会探测它们 `:7400` 仍可达则拒绝 |
+| `cluster recovery rejoin prepare` | `--data-dir` | `/var/lib/tether` | returning node 的 broker data dir；daemon 必须停止 |
+| `cluster recovery rejoin prepare` | `--db` | `/var/lib/tether/tether.db` | returning node 的 DB 路径 |
+| `cluster recovery rejoin prepare` | `--dump-divergent` | (必填) | forensic dump 输出路径，0600，必须不存在 |
+| `cluster recovery rejoin prepare` | `--self-id` | (必填) | 被清理节点 id；命令会要求人工输入它确认 |
 
 `cluster status` 退出码可用于监控：`0` = HEALTHY-HA，`1` = DEGRADED，
-`2` = read-only / quorum-lost，`3` = force-single。`drain --retire` 在退役后
-故障容忍度 F=0 时要求手工输入 node id；`cluster remove` 每次都要求手工输入
-node id；`force-single` 和 `recover` 都不会接受 `--yes`，必须停 daemon 并手工确认。
+`2` = read-only / quorum-lost，`3` = force-single。`cluster retire` 在退役后
+故障容忍度 F=0 时要求手工输入 node id；`cluster recovery node remove` 每次都要求手工输入
+node id；`recovery force-single` 和 `recovery rejoin prepare` 都不会接受 `--yes`，必须停 daemon 并手工确认。
 这些交互确认是为了避免脚本误删 voter 或把旧时间线塞回新 cluster。
 
 **怎么读 `cluster status` 的输出**（broker 主机 / socket 视图）：
@@ -898,8 +912,8 @@ node id；`force-single` 和 `recover` 都不会接受 `--yes`，必须停 daemo
 
 **ctl 远程视图**（`tether cluster status --remote`，无需 broker 主机）：登录的 ctl 经 NATS 复用现有
 `cluster-health` responder（**无需额外 broker 配置 / ACL**），返回**用户摘要**——"几台 broker 应答 +
-reachability 判定 + 指向 leader"，**不是** 8 列表，**也不含** 操作员逃生命令（`force-single` / `recover` /
-`add` / `drain` 仍只在 broker 主机经 socket 执行）。其退出码更薄、永不出 `1/DEGRADED`：零应答→`0`
+reachability 判定 + 指向 leader"，**不是** 8 列表，**也不含** 操作员逃生命令（`recovery force-single` /
+`recovery rejoin prepare` / `join approve` / `drain` 仍只在 broker 主机经 socket 执行）。其退出码更薄、永不出 `1/DEGRADED`：零应答→`0`
 （单 broker 受支持）；可写 leader→`0`；force-single→`3`；只读（无 leader 且全 stale）→`2`；选举中→`0`。
 
 **`--offline` 退出码语义不同**（磁盘 roster + `:7400` ping，不走 NATS）：`0`=探测正常或 N=1；`2`=
@@ -910,11 +924,11 @@ roster >1 台且无人应答 `:7400`（`health` 串为 `ROSTER_UNREACHABLE`，�
 **确认机制如何工作（how confirmations work）。** cluster 命令有两档确认 + 两个正交开关，别混（B3）：
 
 - **Tier-1 可逆操作**（`drain` 在 F>0、`transfer-leader`、`rotate-tunnel-cert`）：**无需确认**，也**没有** `--yes`（加一个 no-op flag 只会误导）。
-- **Tier-2 不可逆 / 影响 quorum 操作**：必须**在 TTY 手输 node-id 确认**，**永不接受 `--yes`**。其中 `remove` / `force-single` / `recover` / `init` 对 `--yes` 给明确报错"this is an irreversible / quorum-affecting op…there is NO --yes override by design"；`drain --retire` 在 F==0 同样要手输 node-id（它本身没有 `--yes` flag，传了就是 cobra 的 `unknown flag: --yes`）。这是设计上的无人值守禁区，防脚本误删 voter / 误把旧时间线塞回新集群。
+- **Tier-2 不可逆 / 影响 quorum 操作**：必须**在 TTY 手输 node-id 确认**，**永不接受 `--yes`**。其中 `recovery node remove` / `recovery force-single` / `recovery rejoin prepare` / `init` 对 `--yes` 给明确报错"this is an irreversible / quorum-affecting op…there is NO --yes override by design"；`cluster retire` 在 F==0 同样要手输 node-id（它本身没有 `--yes` flag，传了就是 cobra 的 `unknown flag: --yes`）。这是设计上的无人值守禁区，防脚本误删 voter / 误把旧时间线塞回新集群。
 - **正交开关 A：`--ack-alerts`**（`session rm`/`expose`/`run` 等破坏性 ctl 命令）——在 severe cluster alert 下**强推这一条命令**通过，**不是**确认、不修、不清除告警。
 - **正交开关 B：`tether alert ack <dedup_key>`**——store-backed 团队协调 ack，**不能**清除 `quorum_lost`/`force_single_active`（这两个是实时合成的健康条件、非 store-backed alert；对它们 `alert ack` 会解释拒绝）。
 
-`force-single` 在输 node-id 前还会内联打印劈脑裂后果；`drain --retire` 成功后提醒"retire 是拓扑改、非凭据撤销"（见 `cluster-runbook.md` §2.1）。
+`recovery force-single` 在输 node-id 前还会内联打印劈脑裂后果；`cluster retire` 成功后提醒"retire 是拓扑改、非凭据撤销"（见 `cluster-runbook.md` §2.1）。
 
 ### 5.7 `tether alert`（cluster alerts）
 
@@ -1330,7 +1344,7 @@ tether expose explain <name>
   配置里的单一 `--tunnel-addr`，而是按 broker 下发的 home directive 连接该 expose
   的 home broker tunnel 地址，并校验稳定 tunnel cert pin。`home_broker` 是当前承载
   公网 listener 的 broker node id；`epoch` 是该分配的版本号，每次 rehome 递增。
-- `drain --retire` 或 broker 故障恢复可能把 expose rehome 到其它 voter；agent
+- `cluster retire` 或 broker 故障恢复可能把 expose rehome 到其它 voter；agent
   通过 register reply / rehome directive 按 epoch 迁移 tunnel。rehome 指把同一个
   port allocation 的 home broker 改到另一个 voter，公网端口和
   `--name` 不变。

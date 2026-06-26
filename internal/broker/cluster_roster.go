@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusterroster"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
@@ -49,9 +50,27 @@ func (b *Broker) buildSignedRoster() *proto.ClusterRoster {
 	if err != nil {
 		return nil
 	}
-	brokers, gen, err := readRosterBrokers(b.cfg.DB)
+	brokers, derived, err := readRosterBrokers(b.cfg.DB)
 	if err != nil || len(brokers) == 0 {
 		return nil
+	}
+	// C1 §D-2: stamp the TRULY-MONOTONE roster_generation counter (cluster_meta), NOT the
+	// derived max(added_at,phase_changed_at) — which regresses on retire-of-newest/recover and
+	// would make a strict-monotone agent reject the corrected roster.
+	gen, err := cluster.RosterGeneration(b.cfg.DB)
+	if err != nil {
+		return nil
+	}
+	// Stage-C BLOCKER-1 (rolling-upgrade floor): the counter row is ABSENT (reads 0) until the
+	// first membership/phase/cert op bumps it. Shipped v0.4.0 stamped the DERIVED max (~now.UnixNano)
+	// as the generation, so an agent that cached that high hwm from a v0.4.0 broker would reject a
+	// freshly-upgraded C1 broker's gen=0 roster as a rollback. FLOOR the wire gen with the derived
+	// max (which readRosterBrokers already computes): the floor only ever applies before the counter
+	// overtakes it (the first real op bumps it to >now > any prior hwm), after which the counter's
+	// strict monotonicity governs and the derived max's own regressions are irrelevant. Net: the wire
+	// gen is monotone AND never presents below what v0.4.0 served — closing the mixed-version wedge.
+	if derived > gen {
+		gen = derived
 	}
 	// External-review re-review: STAMP a TTL so the anti-replay seam (clusterroster.VerifyAt) is
 	// fully armed when the deferred agent consumer lands — a captured old roster cannot then be

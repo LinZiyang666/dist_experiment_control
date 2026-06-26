@@ -88,7 +88,7 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		return nil, err
 	}
 	if m.Mode != ManifestModeCluster {
-		return nil, fmt.Errorf("clusteroffline: bundle mode %q is not a cluster bundle; `cluster restore` restores cluster bundles only", m.Mode)
+		return nil, fmt.Errorf("clusteroffline: bundle mode %q is not a cluster bundle; `cluster recovery restore` restores cluster bundles only", m.Mode)
 	}
 	// Stage-C M-d: a recover-divergent manifest is identity-only (no state.db) and is consumed by
 	// `init --from-manifest`, not restore — refuse it loudly here rather than relying on the
@@ -207,7 +207,7 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		return nil, fmt.Errorf("clusteroffline: clear restore_in_progress: %w", err)
 	}
 
-	opts.Logger.Warn("clusteroffline: restore complete; node is a single-voter cluster — re-grow with `cluster add`",
+	opts.Logger.Warn("clusteroffline: restore complete; node is a single-voter cluster — re-grow with `cluster join prepare`/`cluster join approve`",
 		"self", m.SelfID, "bundle_applied_index", m.AppliedIndex, "pruned_peers", pruned, "pre_restore_backup", preBak)
 	return &RestoreResult{SelfID: m.SelfID, BundleAppliedIdx: m.AppliedIndex, PrunedPeers: pruned, PreRestoreBackup: preBak}, nil
 }

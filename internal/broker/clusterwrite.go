@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -63,6 +64,10 @@ func isBroadcastClusterSubject(subj string) bool {
 		// Correctness-sensitive ingress that reads authoritative session/node/port state
 		// before publishing to an agent or freeing a port must run on the leader's view.
 		".run.req", ".exec.req", ".kill.req", ".expose-rm.req",
+		// C5: proxy CONTROL writes are leader-only (the leak-once subscriber token is minted on the
+		// leader + returned in the reply; forwardReply carries no token). sub.list + status stay a
+		// queue-group RODB read (any broker).
+		".proxy.set.req", ".proxy.sub.create.req", ".proxy.sub.revoke.req",
 	} {
 		if strings.HasSuffix(subj, leaf) {
 			return true
@@ -97,6 +102,17 @@ type clusterRuntime struct {
 	// admin is the D7 membership orchestrator wired into the adminsock cluster backend;
 	// kept here so the d9_integration harness can drive `cluster add` (AddNode) directly.
 	admin *ClusterAdmin
+	// topoSelf (C3) is this broker's latest topology-reconcile self-report (applied/observed/reason),
+	// published by the per-broker reconcile loop and read by the status/health responders. atomic so
+	// the responder (other goroutine) reads it race-free; nil until the first reconcile pass.
+	topoSelf atomic.Pointer[topoSelfReport]
+}
+
+// topoSelfReport is one broker's reconcile state, read by the status/health responders (C3 §2.7).
+type topoSelfReport struct {
+	Applied  uint64
+	Observed uint64
+	Reason   string
 }
 
 // ClusterAdminForTest exposes the membership orchestrator for the d9_integration harness
@@ -247,13 +263,26 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	})
 	b.AttachAlertSink(fwd)
 
+	// C3-B2: a broker reports topology ONLY when it actually manages a live nats.conf. Otherwise the
+	// health gate would mark every grown cluster DEGRADED forever (TopoReported=true, Observed=0,
+	// never converging because the loop never runs). nil topoSelf ⇒ TopoReported=false (the documented
+	// "inert ⇒ reports nothing" contract), so a cluster-mode misconfig fails loud, not silently wedges.
+	var topoSelf func() *topoSelfReport
+	if b.cfg.NatsConfPath != "" {
+		topoSelf = b.topoSelfReport
+	}
+
 	// D4 write-forward responder + D8b health/alert responders. Each stays silent on a
 	// follower (the leader answers); collected for ordered unsubscribe.
 	subscribers := []func() (*nats.Subscription, error){
 		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now) },
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
-		func() (*nats.Subscription, error) { return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now) },
-		func() (*nats.Subscription, error) { return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now) },
+		func() (*nats.Subscription, error) {
+			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
+		},
+		func() (*nats.Subscription, error) {
+			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
+		},
 		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB) },
 		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd) },
 	}
@@ -315,12 +344,11 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
 	// B5 OPS#9: self-row capacity probes (disk statfs + port band) for `cluster status`.
 	b.cl.admin.SetCapacityProbes(b.cfg.StoreDir, b.cfg.PortBandLow, b.cfg.PortBandHigh)
-	// B7 DOC#5: emit an `expose_rehomed` observability event when a drain migrates an expose.
-	b.cl.admin.onRehome = func(p int, name, sid, fromBroker, toBroker string) {
-		b.pubSysEvent("expose_rehomed", map[string]any{
-			"port": p, "name": name, "sid": sid, "from_broker": fromBroker, "to_broker": toBroker,
-		})
-	}
+	// B7 DOC#5 + C6 BD6: the generic leader-side event emitter the drain uses for `expose_rehomed`
+	// (back-compat) + the C6 home_reassign_* / rehome_stalled lifecycle events.
+	b.cl.admin.emitEvent = b.pubSysEvent
+	// C6 建议5: the `cluster status --homes` aggregate (leader-agnostic RODB read).
+	b.cl.admin.homesReport = b.buildHomesReport
 	// §17 row 3: give the admin the broker-only cursor scatter-gather so `cluster status`
 	// reports REAL per-peer reachability + applied-lag (not a blanket self-report).
 	b.cl.admin.healthPoll = func() map[string]proto.ClusterHealthResp {
@@ -331,22 +359,28 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.streamObserve = func() (ReplicaReport, error) {
 		return pub.ObserveReplicas(context.Background())
 	}
+	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
+	b.cl.admin.caughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
+	b.cl.admin.streamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
 
 	// The loops run on a child ctx so the ordered shutdown can cancel + JOIN them; each
 	// signals loopDone on exit. (Run's ctx cancel also reaches this child, so a hard
 	// shutdown still stops them.)
 	loopCtx, cancel := context.WithCancel(ctx)
 	b.cl.cancel = cancel
-	// cap 4 when a webhook poster joins the ordered shutdown, else 3 (pub/rec/observe).
-	loopCount := 3
+	// Base 3 (pub/rec/observe) + 1 for the C3 topology reconciler (always started in cluster mode,
+	// even when inert) + 1 when a webhook poster joins the ordered shutdown.
+	loopCount := 4
 	if poster != nil {
-		loopCount = 4
+		loopCount = 5
 	}
 	b.cl.loopDone = make(chan struct{}, loopCount)
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); pub.Run(loopCtx) }()
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); rec.Run(loopCtx) }()
 	// D9 §17 step 10b: the leader-gated observability poll (broker_down / raft_lag).
 	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); b.runObserveLoop(loopCtx) }()
+	// C3: the per-broker (NOT leader-gated) NATS topology reconcile loop.
+	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); b.runTopologyReconcileLoop(loopCtx) }()
 	if poster != nil {
 		go func() { defer func() { b.cl.loopDone <- struct{}{} }(); poster.Run(loopCtx) }()
 	}

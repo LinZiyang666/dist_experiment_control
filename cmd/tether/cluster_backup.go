@@ -80,12 +80,12 @@ func newClusterRestoreCmd() *cobra.Command {
 		Use:   "restore <bundle> --confirm-node-id <id>",
 		Short: "Restore a backup bundle as a fresh single-voter cluster (OFFLINE, daemon STOPPED, IRREVERSIBLE)",
 		Example: "  systemctl stop tether-broker\n" +
-			"  tether cluster restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a --secrets-dir /etc/tether/secrets",
+			"  tether cluster recovery restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a --secrets-dir /etc/tether/secrets",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			bundle := args[0]
 			if confirmNodeID == "" {
-				return usageErr("cluster restore requires --confirm-node-id <id> (the node this bundle is for)")
+				return usageErr("restore requires --confirm-node-id <id> (the node this bundle is for)")
 			}
 			if err := rejectedUnattendedYes(cmd, "restore", confirmNodeID); err != nil {
 				return err
@@ -93,7 +93,7 @@ func newClusterRestoreCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 				"restore will OVERWRITE this host's DB with the bundle and re-bootstrap a single-voter cluster.\n"+
 					"The current DB is preserved under a unique <db>.pre-restore[.N].bak (printed on completion);\n"+
-					"the cluster re-grows with `cluster add`.\n")
+					"the cluster re-grows with `cluster join approve`.\n")
 			// Tier-2 typed-confirm: irreversible + identity-affecting ⇒ NO --yes, NEVER a machine escape.
 			if !confirmTypedNodeID(cmd, confirmNodeID,
 				"CONSEQUENCE: the live DB is replaced; the restored node is a single voter with NO HA until you re-grow.",
@@ -115,7 +115,7 @@ func newClusterRestoreCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"restore complete: node %s is now a single-voter cluster (pruned %d stale peers; bundle applied_index %d reset to 0).\n"+
 					"prior DB preserved at: %s\n"+
-					"NEXT: start tether-broker, then `cluster add` to re-grow to N>=3.\n",
+					"NEXT: start tether-broker, then `cluster join approve` to re-grow to N>=3.\n",
 				res.SelfID, res.PrunedPeers, res.BundleAppliedIdx, preserved)
 			return nil
 		},
@@ -136,16 +136,16 @@ func newClusterExportIncidentCmd(socketPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "export-incident",
 		Short: "Export a read-only forensic bundle (alert + membership timeline + per-session audit) with best-effort secret-key redaction (review before sharing)",
-		Example: "  tether cluster export-incident --since 24h --out incident.json\n" +
-			"  tether cluster export-incident --sid abc --sid def      # scope to specific sessions",
+		Example: "  tether cluster recovery incident export --since 24h --out incident.json\n" +
+			"  tether cluster recovery incident export --sid abc --sid def      # scope to specific sessions",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpExportIncident, Since: since, SIDs: sids})
 			if err != nil {
 				return err
 			}
-			if leaderRedirect(cmd, resp) {
-				return errNonLeader
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
 			}
 			if resp.Error != "" {
 				return clusterAdminError("export-incident", resp)

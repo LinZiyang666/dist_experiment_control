@@ -74,7 +74,7 @@ func newClusterApplyCmd(socketPath *string) *cobra.Command {
 					_, _ = fmt.Fprintf(out, "     (%s)\n", s.Reason)
 				}
 			}
-			_, _ = fmt.Fprintln(out, "\nAfter each `cluster add`, re-run takeover-natsconf on every broker (leader last). See docs/cluster-runbook.md §1.")
+			_, _ = fmt.Fprintln(out, "\nAfter each `cluster join approve`, run `cluster reconcile nats --all --wait`. See docs/cluster-runbook.md §1.")
 			return nil
 		},
 	}

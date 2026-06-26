@@ -35,158 +35,181 @@ func validateRouteURL(label, s string) error {
 // cluster_natsconf.go — the D9 §11 operator commands that wire the internal/natsconf leaf
 // (takeover) + the internal/clusteroffline secrets preflight (doctor) to the CLI.
 
-func newClusterTakeoverNatsconfCmd() *cobra.Command {
-	var confPath, secretsDir, serverName, accountIssuer, brokerNkey, routeURL, clusterListen, natsServerBin string
-	var skipDryRun, plan, asJSON, allowPartialMesh bool
-	var peerSpecs []string
-	var takeoverSocket string
-	cmd := &cobra.Command{
-		Use:   "takeover-natsconf",
-		Short: "Safely re-render nats.conf for cluster mode: validates with `nats-server -t` before swapping, keeps a pristine .bak, REFUSES unknown directives (fail-closed); preserves install.sh bits",
-		Long: "takeover-natsconf re-renders nats.conf for cluster mode (routes mTLS + auth_callout).\n" +
-			"Three safety nets: (1) it validates the candidate conf with `nats-server -t` before swapping\n" +
-			"(unless --skip-dry-run), (2) it keeps a pristine .bak of the original, and (3) it REFUSES to\n" +
-			"run if the existing conf has an include or any unrecognized directive (fail-closed — never\n" +
-			"silently drops a hand-tuned conf). It does NOT restart anything — it prints the NEXT steps.",
-		Example: "  # re-run on EVERY broker after any membership change (leader LAST), full --peer mesh:\n" +
-			"  tether cluster takeover-natsconf --server-name brk-a --route-url nats://10.0.0.1:6222 \\\n" +
-			"      --peer brk-a,nats://10.0.0.1:6222,U… --peer brk-b,nats://10.0.0.2:6222,U…\n" +
-			"  systemctl restart nats-server",
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			own, err := natsconf.Preflight(confPath)
-			if err != nil {
-				return err // refuses fail-closed on an unknown/include directive
+// natsconfTakeoverFlags holds the manual nats.conf takeover flag set, shared by the (deprecated,
+// hidden) `cluster takeover-natsconf` alias and `cluster reconcile nats --manual` (C3 demotion).
+type natsconfTakeoverFlags struct {
+	confPath, secretsDir, serverName, accountIssuer, brokerNkey, routeURL, clusterListen, natsServerBin string
+	skipDryRun, plan, asJSON, allowPartialMesh                                                          bool
+	peerSpecs                                                                                           []string
+	takeoverSocket                                                                                      string
+}
+
+func bindNatsconfTakeoverFlags(cmd *cobra.Command, f *natsconfTakeoverFlags) {
+	cmd.Flags().StringVar(&f.confPath, "conf", "/etc/tether/nats.conf", "nats-server.conf to take over")
+	cmd.Flags().StringVar(&f.secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (CA + route leaf)")
+	cmd.Flags().StringVar(&f.serverName, "server-name", "", "this broker's deterministic server_name (== cluster node_id)")
+	cmd.Flags().StringVar(&f.accountIssuer, "account-issuer", "", "shared account nkey pub; empty => read from the existing conf")
+	cmd.Flags().StringVar(&f.brokerNkey, "broker-nkey", "", "this broker's bus nkey pub; empty => read only when the existing conf has exactly one nkey user")
+	cmd.Flags().StringVar(&f.routeURL, "route-url", "", "this broker's NATS route URL, e.g. nats://10.0.0.1:6222")
+	cmd.Flags().StringVar(&f.clusterListen, "cluster-listen", "0.0.0.0:6222", "route listen address")
+	cmd.Flags().StringVar(&f.natsServerBin, "nats-server", "nats-server", "nats-server binary for the -t dry-run validation")
+	cmd.Flags().BoolVar(&f.skipDryRun, "skip-dry-run", false, "skip the `nats-server -t` validation (NOT recommended)")
+	cmd.Flags().StringArrayVar(&f.peerSpecs, "peer", nil, "another broker as server_name,route_url,bus_nkey (repeat for each peer; the full mesh)")
+	cmd.Flags().BoolVar(&f.plan, "plan", false, "dry-run: print the would-be change (ownership diff + mesh + dry-run + restart hint) and exit WITHOUT writing anything (B5 OPS#10)")
+	cmd.Flags().BoolVar(&f.asJSON, "json", false, "with --plan: emit the stable machine JSON schema")
+	cmd.Flags().StringVar(&f.takeoverSocket, "socket", defaultAdminSocket, "admin socket to cross-check the peer mesh against the live roster (F8)")
+	cmd.Flags().BoolVar(&f.allowPartialMesh, "allow-partial-mesh", false, "skip the live-roster voter-coverage check (render a deliberately partial mesh)")
+}
+
+// runNatsconfTakeover is the shared manual-takeover engine (extracted so both the deprecated alias
+// and `reconcile nats --manual` call it verbatim).
+func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
+	confPath, secretsDir, serverName := f.confPath, f.secretsDir, f.serverName
+	accountIssuer, brokerNkey, routeURL := f.accountIssuer, f.brokerNkey, f.routeURL
+	clusterListen, natsServerBin := f.clusterListen, f.natsServerBin
+	skipDryRun, plan, asJSON, allowPartialMesh := f.skipDryRun, f.plan, f.asJSON, f.allowPartialMesh
+	peerSpecs, takeoverSocket := f.peerSpecs, f.takeoverSocket
+	{
+		own, err := natsconf.Preflight(confPath)
+		if err != nil {
+			return err // refuses fail-closed on an unknown/include directive
+		}
+		// Identity SSOT: prefer the existing conf's §3.4 auth_callout; flags fill/override.
+		// Broker nkey auto-read is allowed only when the auth block has exactly one nkey
+		// user; generated multi-broker configs require --broker-nkey to avoid selecting a
+		// peer's nkey by list position.
+		ci, cn := own.AuthIdentity()
+		if accountIssuer == "" {
+			accountIssuer = ci
+		}
+		if brokerNkey == "" {
+			brokerNkey = cn
+		}
+		if accountIssuer == "" || brokerNkey == "" {
+			return fmt.Errorf("takeover-natsconf: need --account-issuer + --broker-nkey " +
+				"(account issuer may be read from existing auth_callout; broker nkey is auto-read only when " +
+				"the existing authorization block has exactly one nkey user)")
+		}
+		if serverName == "" || routeURL == "" {
+			return fmt.Errorf("takeover-natsconf: --server-name and --route-url are required")
+		}
+		if err := validateRouteURL("--route-url", routeURL); err != nil {
+			return err
+		}
+		// round-1 MAJOR: refuse if the client listen could not be harvested from the
+		// existing conf — an empty listen makes nats-server bind the default 0.0.0.0:4222
+		// (a surprise public-bind change), so fail loud instead of silently re-binding.
+		clientListen := own.ClientListen()
+		if clientListen == "" {
+			return fmt.Errorf("takeover-natsconf: could not determine the client listen address from %q "+
+				"(no host/port/listen) — refusing to emit a conf that would default-bind 0.0.0.0:4222", confPath)
+		}
+		self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey, RouteURL: routeURL}
+		// External-review F2: render the FULL peer mesh, not just self. Each --peer is a
+		// "server_name,route_url,bus_nkey" triple for ANOTHER broker; growth re-runs takeover
+		// on EVERY node with the complete set so routes + auth_users + per-broker ACLs form a
+		// real multi-node NATS mesh (Raft membership alone does not). N=1 takeover passes no
+		// --peer and renders just self.
+		peers := []natscluster.Broker{self}
+		for _, spec := range peerSpecs {
+			p, perr := parsePeerSpec(spec)
+			if perr != nil {
+				return perr
 			}
-			// Identity SSOT: prefer the existing conf's §3.4 auth_callout; flags fill/override.
-			// Broker nkey auto-read is allowed only when the auth block has exactly one nkey
-			// user; generated multi-broker configs require --broker-nkey to avoid selecting a
-			// peer's nkey by list position.
-			ci, cn := own.AuthIdentity()
-			if accountIssuer == "" {
-				accountIssuer = ci
-			}
-			if brokerNkey == "" {
-				brokerNkey = cn
-			}
-			if accountIssuer == "" || brokerNkey == "" {
-				return fmt.Errorf("takeover-natsconf: need --account-issuer + --broker-nkey " +
-					"(account issuer may be read from existing auth_callout; broker nkey is auto-read only when " +
-					"the existing authorization block has exactly one nkey user)")
-			}
-			if serverName == "" || routeURL == "" {
-				return fmt.Errorf("takeover-natsconf: --server-name and --route-url are required")
-			}
-			if err := validateRouteURL("--route-url", routeURL); err != nil {
-				return err
-			}
-			// round-1 MAJOR: refuse if the client listen could not be harvested from the
-			// existing conf — an empty listen makes nats-server bind the default 0.0.0.0:4222
-			// (a surprise public-bind change), so fail loud instead of silently re-binding.
-			clientListen := own.ClientListen()
-			if clientListen == "" {
-				return fmt.Errorf("takeover-natsconf: could not determine the client listen address from %q "+
-					"(no host/port/listen) — refusing to emit a conf that would default-bind 0.0.0.0:4222", confPath)
-			}
-			self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey, RouteURL: routeURL}
-			// External-review F2: render the FULL peer mesh, not just self. Each --peer is a
-			// "server_name,route_url,bus_nkey" triple for ANOTHER broker; growth re-runs takeover
-			// on EVERY node with the complete set so routes + auth_users + per-broker ACLs form a
-			// real multi-node NATS mesh (Raft membership alone does not). N=1 takeover passes no
-			// --peer and renders just self.
-			peers := []natscluster.Broker{self}
-			for _, spec := range peerSpecs {
-				p, perr := parsePeerSpec(spec)
-				if perr != nil {
-					return perr
-				}
-				peers = append(peers, p)
-			}
-			// External-review F8: a `nats-server -t` dry-run cannot tell that a voter is MISSING from
-			// the peer set — it would happily validate a syntactically-correct but mesh-INCOMPLETE conf
-			// (missing routes / auth users / per-broker ACLs). When the admin socket is reachable,
-			// cross-check the rendered peers against the live LEADER roster's voters and REFUSE on any
-			// omission (unless --allow-partial-mesh). When unreachable, we cannot verify — warn.
-			if !allowPartialMesh {
-				if missing, checked := missingVotersInMesh(takeoverSocket, peers); checked && len(missing) > 0 {
-					return usageErr("takeover-natsconf: the --peer mesh is missing voter(s) present in the live roster: %v.\n"+
-						"  A conf that omits a voter passes `nats-server -t` but loses that broker's routes/auth/ACLs.\n"+
-						"  Add a --peer triple for each, or pass --allow-partial-mesh if this omission is deliberate.", missing)
-				} else if !checked {
-					_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
-						"takeover-natsconf: could not reach the admin socket to verify the peer mesh against the live roster — "+
-							"ensure --peer lists EVERY current voter (a missing voter yields a valid-but-incomplete conf).")
-				}
-			}
-			cfg := natscluster.Config{
-				Local:         self,
-				Peers:         peers,
-				AccountIssuer: accountIssuer,
-				JSStoreDir:    own.JSStoreDir(),
-				ClientListen:  clientListen,
-				ClusterListen: clusterListen,
-				CAFile:        filepath.Join(secretsDir, "cluster-ca.pem"),
-				CertFile:      filepath.Join(secretsDir, "route-cert.pem"),
-				KeyFile:       filepath.Join(secretsDir, "route-key.pem"),
-			}
-			// audit natsconf F2: if the existing conf ENABLES JetStream but no store_dir survived
-			// (empty), REFUSE rather than render a conf that silently DISABLES JetStream (the next
-			// restart would lose all streams). Fail-closed; install.sh always writes store_dir, so
-			// the common path is unaffected.
-			if _, hasJS := own.Parsed["jetstream"]; hasJS && own.JSStoreDir() == "" {
-				return fmt.Errorf("natsconf takeover: existing conf enables jetstream but has no resolvable store_dir; " +
-					"refusing to render a conf that would silently DISABLE JetStream — set jetstream.store_dir explicitly")
-			}
-			merged, err := natsconf.BuildMergedConf(own, cfg)
-			if err != nil {
-				return err
-			}
-			// round-1 BLOCKER: validate with `nats-server -t` BEFORE swapping — never commit
-			// an invalid conf that bricks the broker on its next restart (takeover is the LAST
-			// live-box step). --skip-dry-run is an explicit escape hatch (e.g. a box without
-			// nats-server on PATH), logged loudly.
-			// B5 OPS#10 --plan: a pure dry-run. It captures (does NOT fail on) the dry-run result
-			// and renders the would-be change, then returns BEFORE Apply — it mutates NOTHING (no
-			// write, no .bak, no rename).
-			if plan {
-				dryRunResult := "ok"
-				if skipDryRun {
-					dryRunResult = "skipped"
-				} else if e := natsconf.DryRun(natsServerBin, merged); e != nil {
-					dryRunResult = e.Error()
-				}
-				return renderTakeoverPlan(cmd, confPath, serverName, clientListen, own.JSStoreDir(), peers, merged, dryRunResult, asJSON)
-			}
-			if skipDryRun {
+			peers = append(peers, p)
+		}
+		// External-review F8: a `nats-server -t` dry-run cannot tell that a voter is MISSING from
+		// the peer set — it would happily validate a syntactically-correct but mesh-INCOMPLETE conf
+		// (missing routes / auth users / per-broker ACLs). When the admin socket is reachable,
+		// cross-check the rendered peers against the live LEADER roster's voters and REFUSE on any
+		// omission (unless --allow-partial-mesh). When unreachable, we cannot verify — warn.
+		if !allowPartialMesh {
+			if missing, checked := missingVotersInMesh(takeoverSocket, peers); checked && len(missing) > 0 {
+				return usageErr("takeover-natsconf: the --peer mesh is missing voter(s) present in the live roster: %v.\n"+
+					"  A conf that omits a voter passes `nats-server -t` but loses that broker's routes/auth/ACLs.\n"+
+					"  Add a --peer triple for each, or pass --allow-partial-mesh if this omission is deliberate.", missing)
+			} else if !checked {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
-					"WARNING: --skip-dry-run set — swapping nats.conf WITHOUT `nats-server -t` validation")
-			} else if err := natsconf.DryRun(natsServerBin, merged); err != nil {
-				return err
+					"takeover-natsconf: could not reach the admin socket to verify the peer mesh against the live roster — "+
+						"ensure --peer lists EVERY current voter (a missing voter yields a valid-but-incomplete conf).")
 			}
-			if err := natsconf.Apply(confPath, merged); err != nil {
-				return err
+		}
+		cfg := natscluster.Config{
+			Local:         self,
+			Peers:         peers,
+			AccountIssuer: accountIssuer,
+			JSStoreDir:    own.JSStoreDir(),
+			ClientListen:  clientListen,
+			ClusterListen: clusterListen,
+			// C3-B3: emit the loopback HTTP monitor so a manual cutover (the ONE restart-bearing step)
+			// establishes `http:`; the per-broker reconciler then PRESERVES it (it can never hot-add a
+			// monitor via SIGHUP). Keep this addr in sync with the broker's topoMonitorListen.
+			MonitorListen: "127.0.0.1:8223",
+			CAFile:        filepath.Join(secretsDir, "cluster-ca.pem"),
+			CertFile:      filepath.Join(secretsDir, "route-cert.pem"),
+			KeyFile:       filepath.Join(secretsDir, "route-key.pem"),
+		}
+		// audit natsconf F2: if the existing conf ENABLES JetStream but no store_dir survived
+		// (empty), REFUSE rather than render a conf that silently DISABLES JetStream (the next
+		// restart would lose all streams). Fail-closed; install.sh always writes store_dir, so
+		// the common path is unaffected.
+		if _, hasJS := own.Parsed["jetstream"]; hasJS && own.JSStoreDir() == "" {
+			return fmt.Errorf("natsconf takeover: existing conf enables jetstream but has no resolvable store_dir; " +
+				"refusing to render a conf that would silently DISABLE JetStream — set jetstream.store_dir explicitly")
+		}
+		merged, err := natsconf.BuildMergedConf(own, cfg)
+		if err != nil {
+			return err
+		}
+		// round-1 BLOCKER: validate with `nats-server -t` BEFORE swapping — never commit
+		// an invalid conf that bricks the broker on its next restart (takeover is the LAST
+		// live-box step). --skip-dry-run is an explicit escape hatch (e.g. a box without
+		// nats-server on PATH), logged loudly.
+		// B5 OPS#10 --plan: a pure dry-run. It captures (does NOT fail on) the dry-run result
+		// and renders the would-be change, then returns BEFORE Apply — it mutates NOTHING (no
+		// write, no .bak, no rename).
+		if plan {
+			dryRunResult := "ok"
+			if skipDryRun {
+				dryRunResult = "skipped"
+			} else if e := natsconf.DryRun(natsServerBin, merged); e != nil {
+				dryRunResult = e.Error()
 			}
-			_, _ = fmt.Fprint(cmd.OutOrStdout(), natsconf.OwnershipTable(own))
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(),
-				"nats.conf taken over (pristine .bak kept). NEXT: `systemctl restart nats-server`, "+
-					"then start tether-broker in cluster mode.")
-			return nil
+			return renderTakeoverPlan(cmd, confPath, serverName, clientListen, own.JSStoreDir(), peers, merged, dryRunResult, asJSON)
+		}
+		if skipDryRun {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+				"WARNING: --skip-dry-run set — swapping nats.conf WITHOUT `nats-server -t` validation")
+		} else if err := natsconf.DryRun(natsServerBin, merged); err != nil {
+			return err
+		}
+		if err := natsconf.Apply(confPath, merged); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprint(cmd.OutOrStdout(), natsconf.OwnershipTable(own))
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+			"nats.conf taken over (pristine .bak kept). NEXT: `systemctl restart nats-server`, "+
+				"then start tether-broker in cluster mode.")
+		return nil
+	}
+}
+
+// newClusterTakeoverNatsconfCmd is the DEPRECATED hidden alias for `cluster reconcile nats --manual`
+// (C3 demotion — the per-broker reconciler now converges automatically; manual takeover is the
+// one-time single→cluster cutover escape hatch).
+func newClusterTakeoverNatsconfCmd() *cobra.Command {
+	var f natsconfTakeoverFlags
+	cmd := &cobra.Command{
+		Use:    "takeover-natsconf",
+		Short:  "DEPRECATED: use `cluster reconcile nats --manual` (one-time manual nats.conf takeover)",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "deprecated: use `tether cluster reconcile nats --manual`")
+			return runNatsconfTakeover(cmd, &f)
 		},
 	}
-	cmd.Flags().StringVar(&confPath, "conf", "/etc/tether/nats.conf", "nats-server.conf to take over")
-	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (CA + route leaf)")
-	cmd.Flags().StringVar(&serverName, "server-name", "", "this broker's deterministic server_name (== cluster node_id)")
-	cmd.Flags().StringVar(&accountIssuer, "account-issuer", "", "shared account nkey pub; empty => read from the existing conf")
-	cmd.Flags().StringVar(&brokerNkey, "broker-nkey", "", "this broker's bus nkey pub; empty => read only when the existing conf has exactly one nkey user")
-	cmd.Flags().StringVar(&routeURL, "route-url", "", "this broker's NATS route URL, e.g. nats://10.0.0.1:6222")
-	cmd.Flags().StringVar(&clusterListen, "cluster-listen", "0.0.0.0:6222", "route listen address")
-	cmd.Flags().StringVar(&natsServerBin, "nats-server", "nats-server", "nats-server binary for the -t dry-run validation")
-	cmd.Flags().BoolVar(&skipDryRun, "skip-dry-run", false, "skip the `nats-server -t` validation (NOT recommended)")
-	cmd.Flags().StringArrayVar(&peerSpecs, "peer", nil, "another broker as server_name,route_url,bus_nkey (repeat for each peer; the full mesh)")
-	cmd.Flags().BoolVar(&plan, "plan", false, "dry-run: print the would-be change (ownership diff + mesh + dry-run + restart hint) and exit WITHOUT writing anything (B5 OPS#10)")
-	cmd.Flags().BoolVar(&asJSON, "json", false, "with --plan: emit the stable machine JSON schema")
-	cmd.Flags().StringVar(&takeoverSocket, "socket", defaultAdminSocket, "admin socket to cross-check the peer mesh against the live roster (F8)")
-	cmd.Flags().BoolVar(&allowPartialMesh, "allow-partial-mesh", false, "skip the live-roster voter-coverage check (render a deliberately partial mesh)")
+	bindNatsconfTakeoverFlags(cmd, &f)
 	return cmd
 }
 

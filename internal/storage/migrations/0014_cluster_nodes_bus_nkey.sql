@@ -1,0 +1,21 @@
+-- Migration 0014 — cluster_nodes.bus_nkey_pub (C3 topology reconciler).
+--
+-- ALTER ADD COLUMN, NOT a table rebuild: preserves the node_id PRIMARY KEY, the
+-- UNIQUE(name) constraint, and every index/column from 0008/0013 (the 0012
+-- convention).
+--
+-- bus_nkey_pub is each broker's NATS BUS nkey public key — the per-peer identity
+-- the cluster nats.conf renderer (internal/natscluster.Render) lists in
+-- auth_callout.auth_users + the static users{} ACL so routes between brokers
+-- authenticate. It is DISTINCT from node_ident_pub (the join-PoP identity key,
+-- 0008/0013) — they are different keys (preflight.go enforces node_ident_pub !=
+-- bus nkey). The topology reconciler needs every peer's bus nkey to render a
+-- complete conf; before C3 this was NOT replicated.
+--
+-- Default '' = "bus nkey unknown". A mesh-eligible VOTER with bus_nkey_pub='' is
+-- treated FAIL-CLOSED by the reconciler (the topology is "unresolvable" — it never
+-- renders a conf that silently drops that voter from auth_users). Each broker
+-- self-backfills its OWN row's bus_nkey_pub (derived from its broker.nk) via the
+-- C3 OpClusterBusNkeySet op (D9 proposeOrForward write path), which also backfills
+-- voters admitted before C3. INERT in single mode (no reconciler runs).
+ALTER TABLE cluster_nodes ADD COLUMN bus_nkey_pub TEXT NOT NULL DEFAULT '';

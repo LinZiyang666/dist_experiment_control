@@ -58,6 +58,28 @@ func DryRun(natsServerBin string, mergedConf string) error {
 // websocket{} block + the recognized tuning passthrough directives from own. The result is
 // the full nats-server.conf for the cluster-mode broker.
 func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
+	// C3-B1: when the caller (the reconciler) does not supply the routes-mTLS identity, harvest it
+	// from the LIVE conf's cluster{} block so the render is COMPLETE (Render rejects empty cert paths).
+	// Fail-closed via ClusterMTLS if the live conf carries no cluster TLS.
+	if cfg.CAFile == "" && cfg.CertFile == "" && cfg.KeyFile == "" {
+		ca, cert, key, listen, name, err := own.ClusterMTLS()
+		if err != nil {
+			return "", err
+		}
+		cfg.CAFile, cfg.CertFile, cfg.KeyFile = ca, cert, key
+		if cfg.ClusterListen == "" {
+			cfg.ClusterListen = listen
+		}
+		if cfg.ClusterName == "" {
+			cfg.ClusterName = name
+		}
+	}
+	// C3-B3: when the caller does not set a monitor, PRESERVE the live conf's `http:` (if any) — never
+	// hot-add one (nats-server rejects an http-port add on SIGHUP). A new monitor is established only by
+	// a manual takeover that sets MonitorListen explicitly, followed by a restart.
+	if cfg.MonitorListen == "" {
+		cfg.MonitorListen = own.MonitorHTTP()
+	}
 	rendered, err := natscluster.Render(cfg)
 	if err != nil {
 		return "", fmt.Errorf("natsconf: render cluster conf: %w", err)

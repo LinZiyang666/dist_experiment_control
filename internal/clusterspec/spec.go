@@ -81,11 +81,11 @@ func Parse(data []byte) (*Spec, error) {
 }
 
 // Diff renders the quorum-safe, topologically-ordered convergence plan. It NEVER mutates — every
-// step is a printed verb the operator runs. A node desired=voter but absent from the live roster
-// → `cluster add` (+ the "requires sign-join first" note, because admission needs the joiner's
-// PoP over a leader-issued nonce — a YAML row cannot produce that signature, so unattended
-// auto-add is code-forced out of scope). A live node desired=absent → `cluster drain --retire`,
-// ordered LAST and refusing the last voter; a retiring leader gets a transfer-leader step first.
+// step is a printed verb the operator runs (C8: must be a command that EXISTS). A node desired=voter
+// but absent from the live roster → `cluster join prepare`/`approve` (admission needs the joiner's
+// self-signed PoP, which a YAML row cannot produce, so unattended auto-join is code-forced out of
+// scope). A live node desired=absent → `cluster retire`, ordered LAST and refusing the last voter;
+// a retiring leader gets a transfer-leader step first.
 func Diff(spec *Spec, live []LiveNode, leaderID string) []Step {
 	liveByID := map[string]LiveNode{}
 	for _, n := range live {
@@ -107,7 +107,7 @@ func Diff(spec *Spec, live []LiveNode, leaderID string) []Step {
 		}
 		steps = append(steps, Step{
 			Order: 0, NodeID: n.NodeID, Reason: "desired voter, not in the cluster",
-			Verb: fmt.Sprintf("tether cluster sign-join %s <nonce>   # on %s, then paste the printed `cluster add …` line on the leader", n.NodeID, n.NodeID),
+			Verb: fmt.Sprintf("tether cluster join prepare --node-id %s …   # on %s, then on the leader: tether cluster join approve <bundle> --wait", n.NodeID, n.NodeID),
 		})
 	}
 
@@ -165,12 +165,12 @@ func Diff(spec *Spec, live []LiveNode, leaderID string) []Step {
 			case "RETIRING", "VOTER_ADD_FAILED":
 				steps = append(steps, Step{
 					Order: 9, NodeID: id, Reason: "finish a RETIRING / VOTER_ADD_FAILED node (no quorum impact)",
-					Verb: fmt.Sprintf("tether cluster remove %s   # roster cleanup — %s is %s", id, id, liveByID[id].Phase),
+					Verb: fmt.Sprintf("tether cluster recovery node remove %s --manual   # roster cleanup — %s is %s", id, id, liveByID[id].Phase),
 				})
 			default:
 				steps = append(steps, Step{
-					Order: 9, NodeID: id, Reason: fmt.Sprintf("DIAGNOSE — %s is %s (a non-voter mid-join / inconsistent row); bare `cluster remove` is refused for this phase", id, liveByID[id].Phase),
-					Verb: fmt.Sprintf("tether cluster doctor   # inspect %s (phase %s); let it reach VOTER then `cluster drain %s --retire`, or recover the inconsistency — do NOT bare-remove", id, liveByID[id].Phase, id),
+					Order: 9, NodeID: id, Reason: fmt.Sprintf("DIAGNOSE — %s is %s (a non-voter mid-join / inconsistent row); a bare `recovery node remove` is refused for this phase", id, liveByID[id].Phase),
+					Verb: fmt.Sprintf("tether cluster doctor   # inspect %s (phase %s); let it reach VOTER then `cluster retire %s`, or recover the inconsistency — do NOT bare-remove", id, liveByID[id].Phase, id),
 				})
 			}
 			continue
@@ -188,7 +188,7 @@ func Diff(spec *Spec, live []LiveNode, leaderID string) []Step {
 		if pendingAdds > 0 && projected < 2 {
 			steps = append(steps, Step{
 				Order: 9, NodeID: id, Reason: "REFUSED — would drop below 2 voters while adds are still pending",
-				Verb: fmt.Sprintf("# REFUSED: complete the pending add(s) (sign-join + cluster add, confirm VOTER), then re-run apply before retiring %s below 2 voters.", id),
+				Verb: fmt.Sprintf("# REFUSED: complete the pending join(s) (cluster join approve, confirm VOTER), then re-run apply before retiring %s below 2 voters.", id),
 			})
 			continue
 		}
@@ -211,7 +211,7 @@ func Diff(spec *Spec, live []LiveNode, leaderID string) []Step {
 		}
 		steps = append(steps, Step{
 			Order: 9, NodeID: id, Reason: "live voter, desired absent",
-			Verb: fmt.Sprintf("tether cluster drain %s --retire   # migrate exposes off + remove from the cluster", id),
+			Verb: fmt.Sprintf("tether cluster retire %s   # migrate exposes off + remove (resumable)", id),
 		})
 		liveVoters-- // projected voter count after this retire (so a later retire sees the right floor)
 	}

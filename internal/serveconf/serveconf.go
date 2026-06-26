@@ -63,6 +63,15 @@ type ClusterSection struct {
 	// route leaf cert/key, tunnel-cert.pem/.key, broker.nk, node-ident.nk,
 	// account.nk). Required in cluster mode; preflight refuses if unreadable.
 	SecretsDir string `yaml:"secrets_dir"`
+	// ManifestListen (C2) is the LOOPBACK addr for the well-known cluster discovery manifest
+	// (/.well-known/tether/cluster.json), Caddy-fronted. Empty disables it; bound only in cluster mode.
+	ManifestListen string `yaml:"manifest_listen"`
+	// NatsConfPath / NatsServerBin (C3) locate the live nats.conf the per-broker topology reconciler
+	// renders/swaps/reloads + the nats-server binary for the `-t` dry-run and `--signal reload`. Empty
+	// NatsConfPath disables the reconciler (it reports no topology, so the cluster is not held out of
+	// HEALTHY-HA on a node that does not manage its conf). Default path /etc/tether/nats.conf.
+	NatsConfPath  string `yaml:"nats_conf_path"`
+	NatsServerBin string `yaml:"nats_server_bin"`
 }
 
 // UpgradeSection mirrors broker.upgrade — the architecture J.4

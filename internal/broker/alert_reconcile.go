@@ -211,7 +211,7 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 		if below && !current[key] {
 			raises = append(raises, alertSpec{
 				key: key, kind: cluster.AlertKindBelowQuorum, severity: cluster.AlertSeverityInfo,
-				message: "cluster tolerates 0 broker failures — one more makes it read-only; run `tether cluster add`",
+				message: "cluster tolerates 0 broker failures — one more makes it read-only; add a voter with `tether cluster join prepare` then `join approve`",
 			})
 		} else if !below && current[key] {
 			clears = append(clears, key)

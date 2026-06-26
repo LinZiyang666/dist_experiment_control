@@ -3,8 +3,9 @@ package proto
 // D8b (§10) wire types for the member-reachable cluster-health + alert RPCs, and the pure
 // client-synthesized destructive-gate decision.
 
-// ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape.
-const ClusterHealthSchemaVersion = 1
+// ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
+// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported).
+const ClusterHealthSchemaVersion = 2
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -29,6 +30,15 @@ type ClusterHealthResp struct {
 	// omitempty: an older broker omits them; the renderer shows "?".
 	ReleaseVersion string `json:"release_version,omitempty"`
 	ProtoVer       int    `json:"proto_ver,omitempty"`
+	// TopoApplied/TopoObserved/TopoReconcileReason (C3 §2.7) are this broker's NATS topology reconcile
+	// self-report: Applied = the generation rendered into the on-disk conf, Observed = the generation
+	// the LIVE nats-server confirmed loading (via the /varz probe). TopoReported distinguishes a C3
+	// broker that genuinely reports (always true) from an older/non-reporting one — so the HEALTHY-HA
+	// gate degrades only a reporting voter that is behind, never false-greens via a >0 magnitude guard.
+	TopoApplied         uint64 `json:"topo_applied,omitempty"`
+	TopoObserved        uint64 `json:"topo_observed,omitempty"`
+	TopoReconcileReason string `json:"topo_reconcile_reason,omitempty"`
+	TopoReported        bool   `json:"topo_reported,omitempty"`
 }
 
 // AlertView is one ACTIVE alert as rendered for the banner / `alert ls` (§10.1/§10.3).
