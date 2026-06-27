@@ -7,7 +7,9 @@ import "testing"
 
 func TestD7ClusterModeNotEnabled(t *testing.T) {
 	s := New("/unused", Backend{}) // Backend.Cluster == nil
-	for _, op := range []string{OpClusterStatus, OpClusterAdd, OpClusterDrain, OpClusterRemove, OpClusterTransfer, OpClusterRotateCrt} {
+	// OpClusterAdd is intentionally omitted — v0.4.2 retired it from clusterOps (its direct-AddVoter
+	// backend could wedge N=1); it is now an unrouted op, not a cluster op.
+	for _, op := range []string{OpClusterStatus, OpClusterDrain, OpClusterRemove, OpClusterTransfer, OpClusterRotateCrt, OpClusterSetRaftAddr} {
 		resp := s.dispatch(Request{Op: op})
 		if resp.Error != "cluster mode not enabled" {
 			t.Errorf("op %s with nil cluster backend: got %q, want \"cluster mode not enabled\"", op, resp.Error)

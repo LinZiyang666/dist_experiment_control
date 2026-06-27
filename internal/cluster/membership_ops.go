@@ -5,6 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -289,9 +292,16 @@ func PlanClusterNodeRemove(nodeID string, now time.Time) (*Command, error) {
 	// membership change). A node is exactly one of the two phases, so at most one DELETE matches.
 	delFailed := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit + ` AND phase='VOTER_ADD_FAILED'`
 	delRetiring := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit + ` AND phase='RETIRING'`
+	// review F1: a CATCHING_UP node (a STAGED NONVOTER left behind by a failed/aborted grow) DID enter
+	// the route mesh (∈ topoMeshPhases, rendered into the nats.conf routes), so cleaning it up is a mesh
+	// LEAVE and must bump BOTH generations — exactly like a RETIRING voter, unlike a never-meshed
+	// VOTER_ADD_FAILED. A node is exactly one phase, so at most one DELETE matches; the gen bumps are
+	// change-gated off the immediately-preceding statement, so the other phases are unaffected.
+	delCatchingUp := `DELETE FROM cluster_nodes WHERE node_id=` + nodeLit + ` AND phase='CATCHING_UP'`
 	return NewCommand(OpClusterNodeRemove,
 		Stmt(delFailed), rosterGenBumpStmt(now), // non-mesh cleanup: roster bumps, topology does not
 		Stmt(delRetiring), rosterGenBumpStmt(now), topologyGenBumpStmt(now), // mesh leave: both bump
+		Stmt(delCatchingUp), rosterGenBumpStmt(now), topologyGenBumpStmt(now), // staged nonvoter, mesh leave: both bump
 	), nil
 }
 
@@ -356,6 +366,97 @@ func PlanClusterCertRotate(nodeID, newFP string, validUntil, now time.Time) (*Co
 	// C1 §D-2: CertFP is a signed-roster field → bump roster_generation atomically;
 	// change-gated so a cert_fp-unchanged (RowsAffected==0) no-op does not advance it.
 	return NewCommand(OpClusterCertRotate, Stmt(sqlStr), rosterGenBumpStmt(now)), nil
+}
+
+// PlanClusterNodeReaddr renders OpClusterNodeReaddr (v0.4.2 phase-fluidity): rewrite a node's
+// cluster_nodes.raft_addr — the replicated copy of its raft advertise address. The raft
+// Configuration self-address is rewritten separately by node.AddVoter (an online in-place
+// address update on an existing voter); this op keeps the SQLite roster copy in sync so status,
+// the :7400 liveness probe, and a future force-single read the same address. Change-gated
+// (RowsAffected==0 no-op on re-propose) and — critically — NO generation bump: raft_addr is
+// absent from the agent-facing roster SELECT (cluster_roster.go) and the rendered nats.conf, so
+// a raft_addr change must not spuriously recompute the roster or push agents. The
+// loopback/unspecified policy lives at the admin/CLI boundary (SetRaftAddr + --allow-loopback);
+// here we only structurally validate host:port + LitText safety. genericExecApplier.
+func PlanClusterNodeReaddr(nodeID, newRaftAddr string) (*Command, error) {
+	if _, _, err := net.SplitHostPort(newRaftAddr); err != nil {
+		return nil, fmt.Errorf("cluster: plan node-readdr: invalid raft addr %q: %w", newRaftAddr, err)
+	}
+	nodeLit, err := LitText(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan node-readdr: node literal: %w", err)
+	}
+	addrLit, err := LitText(newRaftAddr)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan node-readdr: addr literal: %w", err)
+	}
+	sqlStr := `UPDATE cluster_nodes SET raft_addr=` + addrLit +
+		` WHERE node_id=` + nodeLit + ` AND raft_addr != ` + addrLit
+	return NewCommand(OpClusterNodeReaddr, Stmt(sqlStr)), nil
+}
+
+// PlanClusterNodeRoute renders OpClusterNodeRoute (v0.4.2 phase-fluidity): rewrite a node's
+// cluster_nodes.nats_route — the NATS route-mesh advertise (the twin of raft_addr for the :6222
+// cluster{} routes). UNLIKE raft_addr, nats_route IS rendered into nats.conf
+// (topology_reconcile.go builds natscluster.Broker.RouteURL from it), so the change bumps
+// topology_generation (change-gated, so an unchanged re-propose does not advance it) to drive a
+// re-render + reload. URL-format validation lives at the admin/CLI boundary; here we LitText-guard
+// only. genericExecApplier.
+// ValidateBareNatsRoute is the SINGLE shared grammar for a broker NATS route (review F6/R4), called by
+// BOTH the CLI/admin validator (broker.validateNatsRoute) and the replicated planner
+// (PlanClusterNodeRoute) so the two admission boundaries cannot drift. A route must be a BARE
+// nats://host:port authority: the nats scheme, a host, a numeric 1-65535 port, and NO userinfo (a URL
+// credential would be distributed to every agent via the signed roster), path (incl. a lone "/"),
+// query, or fragment. Errors are REDACTED — never echo the route (it may carry a secret).
+func ValidateBareNatsRoute(route string) error {
+	u, err := url.Parse(route)
+	if err != nil {
+		return fmt.Errorf("nats route is not a parseable URL")
+	}
+	if u.Scheme != "nats" {
+		return fmt.Errorf("nats route must use the nats:// scheme")
+	}
+	if u.User != nil {
+		return fmt.Errorf("nats route must not carry credentials (userinfo) — broker routes authenticate by mTLS")
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("nats route must be a bare nats://host:port authority (no path/query/fragment)")
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("nats route has no host")
+	}
+	if p, perr := strconv.Atoi(u.Port()); perr != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("nats route port must be a number 1-65535")
+	}
+	return nil
+}
+
+func PlanClusterNodeRoute(nodeID, newNatsRoute string, now time.Time) (*Command, error) {
+	// review m9: structurally validate the route (a nats:// URL with a host), mirroring readdr's
+	// host:port check — a non-CLI caller bypassing clusterdrain.validateNatsRoute must not
+	// deterministically commit a garbage route that renders a broken cluster{} routes URL on every
+	// replica.
+	// SECURITY (review F6/R4): nats_route is folded into the account-signed agent roster body, so it
+	// must be a BARE nats://host:port authority. This replicated planner is its OWN trust boundary (a
+	// non-CLI caller can reach it without broker.validateNatsRoute), so it enforces the SAME shared
+	// grammar — including the 1-65535 numeric port range and a rejection of ANY path (incl. "/").
+	if err := ValidateBareNatsRoute(newNatsRoute); err != nil {
+		return nil, fmt.Errorf("cluster: plan node-route: %w", err)
+	}
+	nodeLit, err := LitText(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan node-route: node literal: %w", err)
+	}
+	routeLit, err := LitText(newNatsRoute)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan node-route: route literal: %w", err)
+	}
+	sqlStr := `UPDATE cluster_nodes SET nats_route=` + routeLit +
+		` WHERE node_id=` + nodeLit + ` AND nats_route != ` + routeLit
+	// nats_route is BOTH rendered into nats.conf (topology) AND part of the account-signed roster
+	// body (review m4 — it is in cluster_roster.go's SELECT), so bump BOTH generations. Change-gated:
+	// an unchanged re-propose (RowsAffected==0) advances neither.
+	return NewCommand(OpClusterNodeRoute, Stmt(sqlStr), topologyGenBumpStmt(now), rosterGenBumpStmt(now)), nil
 }
 
 // PlanClusterDrainSet renders OpClusterDrainSet (§8.3): set or clear a broker's

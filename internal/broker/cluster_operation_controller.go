@@ -317,6 +317,16 @@ func (a *ClusterAdmin) driveInFlightOperations() {
 // driveOne advances ONE operation by a single transition (best-effort; errors are recorded in
 // last_error + surfaced via `ops show`, never fatal to the loop).
 func (a *ClusterAdmin) driveOne(op *cluster.Operation) {
+	// R1: the controller SNAPSHOTS non-terminal operations (driveInFlightOperations) before executing
+	// any side effect; an AbortOp — or any transition — may COMMIT between that snapshot and now. Re-read
+	// the LATEST replicated op state and bail if it became terminal/absent, so an irreversible raft side
+	// effect (AddNonvoter/AddVoter) never runs for an operation that is no longer in flight. driveJoin
+	// re-confirms again immediately before each AddNonvoter/AddVoter to close the residual TOCTOU.
+	fresh, err := cluster.OperationByID(a.node.RODB(), op.OpID)
+	if err != nil || fresh == nil || fresh.Terminal {
+		return
+	}
+	op = fresh
 	sub, err := a.readSubstrate(op.TargetNode)
 	if err != nil {
 		a.logger.Warn("cluster op controller: read substrate", "op", op.OpID, "err", err)
@@ -328,6 +338,14 @@ func (a *ClusterAdmin) driveOne(op *cluster.Operation) {
 	case cluster.OpKindRetire:
 		a.driveRetire(op, sub)
 	}
+}
+
+// opStillLive re-reads an operation's LATEST replicated terminal state (review R1) so an irreversible
+// side effect is skipped when an AbortOp/transition committed since the controller's snapshot.
+// Fail-closed: any read error or absent op counts as "not live" (do not run the side effect).
+func (a *ClusterAdmin) opStillLive(opID string) bool {
+	cur, err := cluster.OperationByID(a.node.RODB(), opID)
+	return err == nil && cur != nil && !cur.Terminal
 }
 
 // readSubstrate reads the membership ground truth for a target (bounded-stale leader read).
@@ -439,21 +457,31 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			in.TopoTargetGen = op.TopoTargetGen
 		})
 	case cluster.OpStateRaftAdding:
-		// The barrier is persisted now. AddVoter (idempotent) if not yet a voter, then phase→CATCHING_UP.
-		if !sub.isVoter {
+		// The barrier is persisted now. v0.4.2 wedge-prevention (the keystone): stage the joiner as
+		// a NON-VOTER first, not a voter. A nonvoter does not count toward quorum, so adding an
+		// UNREACHABLE peer can never wedge the cluster — the config change commits at the OLD quorum
+		// and the peer simply never catches up (online-RemoveServer-able). Promotion to VOTER happens
+		// in CATCHING_UP, only once the peer is actually caught up (hence reachable). AddNonvoter is
+		// idempotent; guard on inRaft (present as voter OR nonvoter) so a staged nonvoter — for which
+		// isVoter stays false — progresses past this state instead of looping.
+		if !sub.inRaft {
 			raftAddr, err := a.nodeRaftAddr(op.TargetNode)
 			if err != nil {
 				a.recordOpError(op, err)
 				return
 			}
-			if err := a.node.AddVoter(op.TargetNode, raftAddr); err != nil {
-				a.blockAfterAttempts(op, "AddVoter", err)
+			if !a.opStillLive(op.OpID) {
+				return // R1: aborted between the controller tick and this irreversible AddNonvoter
+			}
+			if err := a.node.AddNonvoter(op.TargetNode, raftAddr); err != nil {
+				a.blockAfterAttempts(op, "AddNonvoter", err)
 				return
 			}
-			return // wait a tick for the config change to reflect in sub.isVoter
+			return // wait a tick for the config change to reflect in sub.inRaft
 		}
-		// phase → CATCHING_UP (mesh enter; bumps topology_generation). Always runs from a pre-mesh phase,
-		// so a resume where AddVoter committed but this setPhase did not still heals (no stuck PENDING).
+		// staged (nonvoter, or already a voter on a resume); phase → CATCHING_UP (mesh enter; bumps
+		// topology_generation). Always runs from a pre-mesh phase, so a resume where AddNonvoter
+		// committed but this setPhase did not still heals (no stuck PENDING).
 		if sub.phase != phaseVoter && sub.phase != phaseCatchingUp {
 			if err := a.setPhase(op.TargetNode, phaseCatchingUp, []string{"JOIN_VERIFIED_PENDING_VOTER", "VOTER_ADD_FAILED"}, ""); err != nil {
 				a.recordOpError(op, fmt.Errorf("phase->CATCHING_UP: %w", err))
@@ -469,6 +497,26 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			return
 		}
 		if caught {
+			// v0.4.2: PROMOTE the caught-up nonvoter to VOTER. AddVoter on an existing server flips
+			// its suffrage to Voter — an online config change that NOW commits because the peer is
+			// reachable AND caught up (it could not have wedged the cluster while it was a nonvoter).
+			// Idempotent; guard on isVoter so an already-promoted resume falls through. Bound retries
+			// like the staging step.
+			if !sub.isVoter {
+				raftAddr, err := a.nodeRaftAddr(op.TargetNode)
+				if err != nil {
+					a.recordOpError(op, err)
+					return
+				}
+				if !a.opStillLive(op.OpID) {
+					return // R1: aborted between the controller tick and this irreversible promotion
+				}
+				if err := a.node.AddVoter(op.TargetNode, raftAddr); err != nil {
+					a.blockAfterAttempts(op, "AddVoter (promote)", err)
+					return
+				}
+				return // wait a tick for the promotion to reflect in sub.isVoter
+			}
 			// Promote to VOTER (from CATCHING_UP; tolerate an already-VOTER resume). Heals any phase.
 			if sub.phase == phaseCatchingUp {
 				if err := a.setPhase(op.TargetNode, phaseVoter, []string{phaseCatchingUp}, ""); err != nil {
@@ -550,6 +598,10 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 			a.recordOpError(op, fmt.Errorf("migrate exposes: %w", err)) // rebuild-OFF refusal surfaces here, loud
 			return
 		}
+		// R6: expose migration can BLOCK; re-confirm the op is live before the phase->DRAINING write.
+		if !a.opStillLive(op.OpID) {
+			return
+		}
 		if sub.phase == phaseVoter {
 			if err := a.setPhase(op.TargetNode, phaseDraining, []string{phaseVoter}, ""); err != nil {
 				a.recordOpError(op, fmt.Errorf("phase->DRAINING: %w", err))
@@ -574,6 +626,10 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		_ = a.transition(op, cluster.OpStateLeaderTransferred, false, "", nil)
 	case cluster.OpStateLeaderTransferred:
 		if sub.isLeaderTarget {
+			// R6: never shed leadership for an op aborted before this tick reached the transfer.
+			if !a.opStillLive(op.OpID) {
+				return
+			}
 			if err := a.transferLeadershipOff(op.TargetNode); err != nil {
 				a.recordOpError(op, fmt.Errorf("transfer leadership off: %w", err))
 				return
@@ -593,6 +649,13 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		}
 		if ready, err := a.streamsReadyFn(op.TargetNode); err != nil || !ready {
 			a.recordOpError(op, errors.New("streams regressed below target before removal — holding"))
+			return
+		}
+		// R6: the readiness probe can BLOCK, and an operator may abort DURING it (the driveOne-entry
+		// re-read cannot see an abort that commits mid-tick). Re-confirm the op is still in flight before
+		// ANY irreversible removal side effect (phase->RETIRING / RemoveServer / roster delete) — an
+		// ABORTED op must never mutate raft membership or the roster.
+		if !a.opStillLive(op.OpID) {
 			return
 		}
 		if sub.phase == phaseDraining {

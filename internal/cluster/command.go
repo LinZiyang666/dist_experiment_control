@@ -142,6 +142,23 @@ const (
 	// rotation). Rides genericExecApplier.
 	OpClusterCertRotate OpType = "ClusterCertRotate"
 
+	// OpClusterNodeReaddr (v0.4.2 phase-fluidity) rewrites a node's cluster_nodes.raft_addr —
+	// the replicated copy of its raft advertise address. The raft Configuration self-address is
+	// rewritten separately via node.AddVoter (an online in-place address update); this op keeps
+	// the SQLite roster copy in sync so status, the :7400 liveness probe, and a future
+	// force-single read the same address. Change-gated all-literal UPDATE with NO generation
+	// bump: raft_addr is absent from the agent-facing roster SELECT (cluster_roster.go) and the
+	// rendered nats.conf, so a raft_addr change must not spuriously recompute the roster or push
+	// agents. Rides genericExecApplier.
+	OpClusterNodeReaddr OpType = "ClusterNodeReaddr"
+
+	// OpClusterNodeRoute (v0.4.2 phase-fluidity) rewrites a node's cluster_nodes.nats_route —
+	// the NATS route-mesh advertise (the twin of raft_addr for the :6222 cluster{} routes).
+	// UNLIKE raft_addr, nats_route IS rendered into nats.conf (topology_reconcile.go builds
+	// natscluster.Broker.RouteURL from it), so the change bumps topology_generation (change-gated)
+	// to drive a re-render + reload. Rides genericExecApplier.
+	OpClusterNodeRoute OpType = "ClusterNodeRoute"
+
 	// OpTransferAudit (D8a §9/§6.3) makes transfer audit (start/complete/failed)
 	// re-derivable. It carries the full schema.AuditTransfer record apply-inert in
 	// cmd.Aux and an EMPTY Body — transfer audit lives only in the JS history-<sid>
@@ -328,6 +345,8 @@ var knownOps = map[OpType]bool{
 	OpClusterDrainSet:     true,
 	OpClusterMetaClear:    true,
 	OpClusterCertRotate:   true,
+	OpClusterNodeReaddr:   true,
+	OpClusterNodeRoute:    true,
 	OpClusterSeedsPublish: true,
 	OpClusterBusNkeySet:   true,
 	OpClusterOpStart:      true,
@@ -341,4 +360,13 @@ var knownOps = map[OpType]bool{
 	OpAlertRaise:          true,
 	OpAlertClear:          true,
 	OpAlertAck:            true,
+}
+
+// HasPhaseFluidityOps reports whether THIS binary's knownOps includes the v0.4.2 phase-fluidity
+// membership ops (OpClusterNodeReaddr/Route). A broker advertises this in its health report so the
+// leader can gate SetRaftAddr/SetNatsRoute on EVERY voter supporting them — an older binary lacking
+// the ops would decodeCommand-poison the replicated entry and deterministically fork its replica
+// (review F5). Self-describing: a future binary that drops the ops reports false.
+func HasPhaseFluidityOps() bool {
+	return knownOps[OpClusterNodeReaddr] && knownOps[OpClusterNodeRoute]
 }

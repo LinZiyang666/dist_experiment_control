@@ -4,10 +4,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/port"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // clusterdrain.go — D7 §8.3 drain / retire orchestration (build-and-prove; part of
@@ -196,8 +200,21 @@ func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
 	if !ok {
 		return fmt.Errorf("recovery node remove %s: no such roster node", nodeID)
 	}
-	if phase != phaseRetiring && phase != phaseAddFailed {
-		return fmt.Errorf("recovery node remove %s: node is %s; raw remove only finishes a RETIRING or VOTER_ADD_FAILED node — use `cluster retire %s` to remove a live node (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+	if phase != phaseRetiring && phase != phaseAddFailed && phase != phaseCatchingUp {
+		return fmt.Errorf("recovery node remove %s: node is %s; raw remove only finishes a RETIRING, VOTER_ADD_FAILED, or aborted staged CATCHING_UP node — use `cluster retire %s` to remove a live voter (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+	}
+	// review F1: a CATCHING_UP node is a STAGED NONVOTER left behind by a failed/aborted grow — it is
+	// online-removable (a nonvoter is not a committed voter, so RemoveServer cannot fork quorum), which
+	// is the whole point of nonvoter staging. Defensively confirm it is NOT already a committed raft
+	// VOTER (a divergent voter would be the exact B1 silent-fork hazard → refuse, point to retire).
+	if phase == phaseCatchingUp {
+		sub, serr := a.readSubstrate(nodeID)
+		if serr != nil {
+			return fmt.Errorf("recovery node remove %s: read raft membership: %w", nodeID, serr)
+		}
+		if sub.isVoter {
+			return fmt.Errorf("recovery node remove %s: node is CATCHING_UP yet already a committed raft VOTER — use `cluster retire %s` (refusing a bare remove to avoid a roster/raft fork)", nodeID, nodeID)
+		}
 	}
 	// B3 item 7: a RETIRING node already had its exposes migrated by DrainNode→migrateExposes, but
 	// a VOTER_ADD_FAILED node never drained — it can still HOME allocated exposes that a bare
@@ -319,6 +336,230 @@ func (a *ClusterAdmin) RotateTunnelCert(nodeID, newFP string, window time.Durati
 		commitCert()
 	}
 	return nil
+}
+
+// assertAllVotersSupportPhaseFluidityOps refuses the v0.4.2 phase-fluidity ops (OpClusterNodeReaddr/
+// Route) when any OTHER raft voter cannot apply them (review F5). Those ops are REPLICATED to every
+// voter; an older binary whose knownOps lacks them decodeCommand-poisons the entry — advancing
+// applied_index but skipping the SQL — so the leader updates its SQLite while the old follower does
+// not: a deterministic, silent replica fork. The cluster permits release-skew rolling upgrade, so
+// "operators upgrade first" is NOT a safety property; we gate instead. N=1 (only self applies the op)
+// is always safe. For N>=2 every NON-self voter must advertise PhaseFluidityOps in its live health
+// report; an unreachable or older voter fails CLOSED.
+func (a *ClusterAdmin) assertAllVotersSupportPhaseFluidityOps(opName string) error {
+	cfg, err := a.node.RaftConfiguration()
+	if err != nil {
+		return fmt.Errorf("%s: read raft config: %w", opName, err)
+	}
+	var health map[string]proto.ClusterHealthResp
+	if a.healthPoll != nil {
+		health = a.healthPoll()
+	}
+	return checkVotersSupportPhaseFluidityOps(opName, cfg, a.node.SelfID(), health)
+}
+
+// checkVotersSupportPhaseFluidityOps is the pure F5 gate (testable without a multi-voter raft
+// harness): every NON-self voter must advertise PhaseFluidityOps in the live health map; an
+// unreachable (absent) or older (false) voter fails CLOSED. N=1 (<=1 voter) is always allowed.
+func checkVotersSupportPhaseFluidityOps(opName string, cfg []cluster.ServerInfo, self string, health map[string]proto.ClusterHealthResp) error {
+	var voters []string
+	for _, s := range cfg {
+		if s.Voter {
+			voters = append(voters, s.NodeID)
+		}
+	}
+	if len(voters) <= 1 {
+		return nil // N=1: only self applies the op — no mixed-version fork is possible
+	}
+	for _, v := range voters {
+		if v == self {
+			continue // this binary is proposing the op, so it self-evidently supports it
+		}
+		hr, ok := health[v]
+		if !ok {
+			return fmt.Errorf("%s: cannot confirm voter %q supports the v0.4.2 phase-fluidity ops (unreachable) — refusing to avoid a mixed-version replica fork; upgrade ALL voters to v0.4.2 and ensure they are reachable", opName, v)
+		}
+		if !hr.PhaseFluidityOps {
+			return fmt.Errorf("%s: voter %q is an older binary without the v0.4.2 phase-fluidity ops — upgrade ALL voters to v0.4.2 first (an old voter would poison-skip the op and fork its replica)", opName, v)
+		}
+	}
+	return nil
+}
+
+// SetRaftAddr rebinds a node's raft ADVERTISE address ONLINE — the routine replacement for
+// force-single (v0.4.2 phase-fluidity). It updates BOTH replicated authorities consistently: the
+// cluster_nodes.raft_addr roster column (Propose, committed first) and the raft Configuration
+// server address (node.AddVoter on the existing voter — an in-place address update, NOT a wipe /
+// snapshot reset / log replay). ORDER is column-first so a crash between the two heals on a safe
+// idempotent re-run; both steps no-op when the target already matches. Self-rebind at N=1 is
+// unconditionally safe (the lone leader rewrites its own address at quorum=1, retaining
+// leadership); a peer-rebind at N>=2 changes where the leader DIALS that peer, so it must run only
+// AFTER that peer is already listening on newAddr. Loopback/unspecified is refused unless
+// allowLoopback (single-host dev). Refused while another membership op is in flight.
+func (a *ClusterAdmin) SetRaftAddr(nodeID, newAddr string, allowLoopback bool) error {
+	if nodeID == "" {
+		nodeID = a.node.SelfID() // default: rebind self (the common N=1 grow-prep case)
+	}
+	// v0.4.2 review B1 — set-raft-addr is SELF-ONLY. Rebinding a PEER's advertised address from the
+	// leader re-points the leader's replication target to the new addr immediately; if that peer is
+	// not already serving it the config entry never reaches the new quorum and the cluster WEDGES
+	// (the exact failure this feature removes). The safe way to readdress a FOLLOWER is to transfer
+	// leadership to it, then run set-raft-addr there (self-rebind). Self-rebind is always safe — the
+	// node serves the address it just bound, so the followers' re-dial succeeds.
+	if nodeID != a.node.SelfID() {
+		return fmt.Errorf("set-raft-addr: only the leader's OWN address can be rebound (asked for %q, self is %q) — rebinding a peer would wedge the cluster; `cluster transfer-leader %s` first, then run set-raft-addr there", nodeID, a.node.SelfID(), nodeID)
+	}
+	if err := validateAdvertiseHostPort(newAddr, allowLoopback); err != nil {
+		return fmt.Errorf("set-raft-addr %s: %w", nodeID, err)
+	}
+	if err := a.requireClusterNode(nodeID); err != nil {
+		return err
+	}
+	if err := a.assertNoActiveOp(nodeID); err != nil {
+		return err
+	}
+	if err := a.assertAllVotersSupportPhaseFluidityOps("set-raft-addr " + nodeID); err != nil {
+		return err
+	}
+	// Read the committed config once: REJECT a newAddr that collides with another voter's address
+	// (raft FATALs the config change on a duplicate), and capture self's current addr so the raft
+	// write is SKIPPED when it already matches — appendConfigurationEntry always logs a config entry
+	// even for an unchanged re-affirm, so guarding here keeps a redundant set-raft-addr write-free
+	// (review m2; this also retires the unused SelfConfiguredAddr helper).
+	cfg, err := a.node.RaftConfiguration()
+	if err != nil {
+		return fmt.Errorf("set-raft-addr %s: read raft config: %w", nodeID, err)
+	}
+	curAddr := ""
+	for _, s := range cfg {
+		if s.NodeID == nodeID {
+			curAddr = s.Addr
+		} else if s.Addr == newAddr {
+			return fmt.Errorf("set-raft-addr %s: %s already advertises %s (duplicate raft address)", nodeID, s.NodeID, newAddr)
+		}
+	}
+	// (1) Roster column first, committed through raft. Change-gated, so a re-run after the
+	// addr already matches is a RowsAffected==0 no-op.
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeReaddr(nodeID, newAddr)
+	}); err != nil {
+		return fmt.Errorf("set-raft-addr %s: roster update: %w", nodeID, err)
+	}
+	// (2) Then the raft Configuration in place — only when it actually differs. raft.AddVoter on an
+	// EXISTING voter just rewrites that server's Address (no wipe), an online replicated
+	// config-change. At N=1 it commits at quorum=1; a crash between (1) and (2) heals on re-run.
+	if curAddr != newAddr {
+		if err := a.node.AddVoter(nodeID, newAddr); err != nil {
+			return fmt.Errorf("set-raft-addr %s: raft config update: %w", nodeID, err)
+		}
+	}
+	return nil
+}
+
+// SetNatsRoute rebinds a node's NATS route-mesh ADVERTISE (the twin of raft_addr for the :6222
+// cluster{} routes; v0.4.2 phase-fluidity). It Proposes the cluster_nodes.nats_route UPDATE, which
+// bumps topology_generation (nats_route IS rendered into nats.conf) so the topology reconcile
+// re-renders + reloads the mesh. No raft Configuration change (nats_route is not a raft address).
+// Loopback/unspecified is refused unless allowLoopback. Refused while a membership op is in flight.
+func (a *ClusterAdmin) SetNatsRoute(nodeID, newRoute string, allowLoopback bool) error {
+	if nodeID == "" {
+		nodeID = a.node.SelfID()
+	}
+	// Self-only, consistent with set-raft-addr (B1) and the combined `set-raft-addr --route` command:
+	// a node advertises its OWN route; readdress a follower by transferring leadership to it first.
+	if nodeID != a.node.SelfID() {
+		return fmt.Errorf("set-route: only the leader's OWN nats route can be rebound (asked for %q, self is %q); `cluster transfer-leader %s` first", nodeID, a.node.SelfID(), nodeID)
+	}
+	if err := validateNatsRoute(newRoute, allowLoopback); err != nil {
+		return fmt.Errorf("set-route %s: %w", nodeID, err)
+	}
+	if err := a.requireClusterNode(nodeID); err != nil {
+		return err
+	}
+	if err := a.assertNoActiveOp(nodeID); err != nil {
+		return err
+	}
+	if err := a.assertAllVotersSupportPhaseFluidityOps("set-route " + nodeID); err != nil {
+		return err
+	}
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodeRoute(nodeID, newRoute, a.now())
+	}); err != nil {
+		return fmt.Errorf("set-route %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// validateAdvertiseHostPort checks addr is a structural host:port and (unless allowLoopback)
+// rejects a loopback/unspecified host — the whole point of a rebind is a peer-reachable address;
+// a loopback advertise is exactly the pc732 defect this feature exists to fix. Note 0.0.0.0 is a
+// legitimate BIND but never a valid ADVERTISE (peers cannot dial the unspecified address).
+func validateAdvertiseHostPort(addr string, allowLoopback bool) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid host:port %q: %w", addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("invalid host:port %q: empty port", addr)
+	}
+	// review suggestion: reject port 0 / out-of-range (SplitHostPort splits but does not range-check).
+	if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("invalid host:port %q: port must be 1-65535", addr)
+	}
+	if allowLoopback {
+		return nil
+	}
+	if host == "" {
+		return fmt.Errorf("advertise host is empty (0.0.0.0 is a BIND, not an advertise)")
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return fmt.Errorf("advertise host %q is loopback/unspecified — peers cannot reach it; use the node's reachable address (or --allow-loopback for single-host dev)", host)
+	}
+	return nil
+}
+
+// validateNatsRoute checks route is a nats:// URL with a peer-reachable host (unless
+// allowLoopback). The NATS route-mesh advertise is the twin of raft_addr; a loopback route splits
+// the data plane cross-host even after the raft rebind succeeds.
+func validateNatsRoute(route string, allowLoopback bool) error {
+	// SHARED grammar (review F6/R4): the structural bare-authority check lives in ONE function
+	// (cluster.ValidateBareNatsRoute) that BOTH this CLI/admin validator and the replicated planner
+	// call, so the two trust boundaries cannot drift. This wrapper adds only the CLI-side loopback gate.
+	if err := cluster.ValidateBareNatsRoute(route); err != nil {
+		return err
+	}
+	if allowLoopback {
+		return nil
+	}
+	u, _ := url.Parse(route) // already validated parseable above
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return fmt.Errorf("nats route host %q is loopback/unspecified — peers cannot reach it (or --allow-loopback for single-host dev)", host)
+	}
+	return nil
+}
+
+// isLoopbackAdvertiseHostPort reports whether addr parses as host:port with a loopback/unspecified
+// host — the grow-blocking condition the status report + doctor surface (a peer cannot dial it). A
+// non-IP host (a DNS name) is NOT flagged: it may resolve to a routable address.
+func isLoopbackAdvertiseHostPort(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+// isLoopbackNatsRoute reports whether a nats:// route URL has a loopback/unspecified host — the
+// twin of isLoopbackAdvertiseHostPort for the :6222 route mesh.
+func isLoopbackNatsRoute(route string) bool {
+	u, err := url.Parse(route)
+	if err != nil || u.Scheme != "nats" {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 // transferLeadershipOff hands raft leadership to a specific voter that is NOT

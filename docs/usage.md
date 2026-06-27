@@ -795,7 +795,7 @@ quorum-loss 的离线逃生。
 
 | 类型 | 子命令 | 在哪里跑 |
 |---|---|---|
-| 在线 admin socket | `join approve` / `drain` / `retire` / `status` / `transfer-leader` / `rotate-tunnel-cert` / `reconcile nats` / `ops` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
+| 在线 admin socket | `join approve` / `drain` / `retire` / `status` / `transfer-leader` / `rotate-tunnel-cert` / `set-raft-addr` / `reconcile nats` / `ops` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
 | 离线/本机磁盘操作 | `init --from-existing` / `join prepare` / `recovery force-single` / `recovery rejoin prepare` / `recovery restore` / `recovery node remove --manual` / `recovery incident export` / `doctor` / `keygen` | 对应 broker 主机；`recovery force-single`、`recovery rejoin prepare` 要先停 daemon |
 
 全局 flag：
@@ -803,6 +803,19 @@ quorum-loss 的离线逃生。
 | flag | 默认 | 说明 |
 |---|---|---|
 | `--socket` | `/var/run/tether/admin.sock` | 在线 admin socket 子命令连接的本机 Unix socket；离线命令通常不使用它 |
+
+**v0.4.2 — N=1↔2↔N grow / shrink 顺畅流动（不靠 force-single）。** 这批命令把单机→多机的
+升级、多机→单机的降级，从代码层面变成日常运维（force-single 退回为「只在真 quorum 丢失时」的逃生）：
+
+| 命令 | 作用 | 有效规模 / 语义 |
+|---|---|---|
+| `cluster set-raft-addr <host:port> [--route nats://h:p] [--allow-loopback]` | **在线**重绑本 broker 的 raft（+可选 NATS route）advertise 地址（AddVoter 原地改、非 force-single 的 wipe）；N=1 loopback→公网的 grow 前置 | 任意 N，**仅自身**（改 follower 须先 `transfer-leader` 过去）；leader-only；保护模式下拒绝 |
+| `cluster reconcile nats --to-standalone --confirm-single --server-name <self>` | **降级末步**：把 lone 幸存者的 nats.conf 重渲染成无 cluster{} 的 standalone（之后 JS reset + 全量重启 nats-server） | **仅 N=1**（先 `retire` 到单 voter）；拒已 standalone |
+
+**完整 grow / shrink 演练 + 保护模式语义见 `docs/cluster-runbook.md` §1.0(grow 前置 rebind)、§2.2(de-cluster 降级)、§2.3(命令语义表 + 边界情形)。** 要点:
+- **有多台却要降级**:先 `cluster retire` 逐台降到 N=1,再 `reconcile nats --to-standalone`(有 peer 时硬拒)。
+- **只有一台却要升级**:正常 N=1→2 grow(loopback 先 `set-raft-addr`,再 `join`)。
+- **保护模式(quorum-lost/只读)**:所有 routine 集群命令都拒(写不进 raft),唯一能动的是 `recovery force-single`(离线)。
 
 最小迁移骨架：
 

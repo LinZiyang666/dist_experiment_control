@@ -122,6 +122,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	var forceSingle bool
 	var portsUsed int
 	var portsKnown bool
+	var selfNatsRoute string
 	selfID := a.node.SelfID()
 	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
 		rows, err := db.Query(`SELECT node_id, name, phase, cert_fp, cert_fp_prev, cert_fp_valid_until FROM cluster_nodes ORDER BY node_id`)
@@ -157,6 +158,11 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 				return e
 			}
 			portsKnown = true
+		}
+		// v0.4.2 grow-readiness: the self row's nats_route (the :6222 route-mesh advertise) for the
+		// loopback gate. Single read after the roster rows are closed (single-conn safe).
+		if e := db.QueryRow(`SELECT nats_route FROM cluster_nodes WHERE node_id=?`, selfID).Scan(&selfNatsRoute); e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return e
 		}
 		return nil
 	}); err != nil {
@@ -332,6 +338,16 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	rep.ViewHost = a.node.SelfID()
 	rep.IsLeaderView = leaderID == a.node.SelfID()
 	rep.Verdict = clusterVerdict(voters, streamsAtTarget(rep.Nodes), rep.Health)
+	// v0.4.2 phase-fluidity grow-readiness: surface a loopback self-advertise (raft and/or NATS
+	// route) so the doctor/status can warn that a cross-network grow needs `cluster set-raft-addr`
+	// first. Computed from the committed raft Configuration (self addr) + the self roster nats_route.
+	for _, s := range cfg {
+		if s.NodeID == selfID {
+			rep.SelfRaftAdvertise = s.Addr
+		}
+	}
+	rep.SelfRaftAdvertiseLoopback = isLoopbackAdvertiseHostPort(rep.SelfRaftAdvertise)
+	rep.SelfNatsRouteLoopback = isLoopbackNatsRoute(selfNatsRoute)
 	return rep, nil
 }
 
@@ -630,6 +646,16 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 		return adminsock.Response{Op: req.Op, OK: true, OpID: req.OpID}
 	case adminsock.OpClusterRotateCrt:
 		if err := b.admin.RotateTunnelCert(req.NodeID, req.CertFP, certRotationWindow); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true}
+	case adminsock.OpClusterSetRaftAddr:
+		if err := b.admin.SetRaftAddr(req.NodeID, req.Host, req.AllowLoopback); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true}
+	case adminsock.OpClusterSetRoute:
+		if err := b.admin.SetNatsRoute(req.NodeID, req.NatsRoute, req.AllowLoopback); err != nil {
 			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 		}
 		return adminsock.Response{Op: req.Op, OK: true}

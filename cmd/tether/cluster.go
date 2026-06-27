@@ -50,6 +50,7 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	addGrouped(newClusterDrainCmd(&socketPath), "online")
 	addGrouped(newClusterTransferCmd(&socketPath), "online")
 	addGrouped(newClusterRotateCertCmd(&socketPath), "online")
+	addGrouped(newClusterSetRaftAddrCmd(&socketPath), "online")
 	addGrouped(newClusterBackupCmd(&socketPath), "online")
 	addGrouped(newClusterOpsCmd(&socketPath), "online")
 	addGrouped(newClusterApplyCmd(&socketPath), "online")
@@ -621,6 +622,63 @@ func newClusterRotateCertCmd(socketPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&certFP, "cert-fp", "", "new cert fingerprint (sha256:...)")
+	return cmd
+}
+
+// newClusterSetRaftAddrCmd is the v0.4.2 ONLINE raft/NATS advertise-address rebind — the routine
+// replacement for force-single when preparing a single broker to grow cross-network. It rewrites
+// the raft advertise address in place (roster column + raft Configuration via AddVoter, NOT a
+// wipe); --route also rebinds the NATS route-mesh advertise (the twin defect). Leader-only
+// (fails fast naming the leader). Defaults to self.
+func newClusterSetRaftAddrCmd(socketPath *string) *cobra.Command {
+	var route string
+	var allowLoopback bool
+	cmd := &cobra.Command{
+		Use:   "set-raft-addr <host:port>",
+		Short: "Rebind THIS broker's raft advertise address ONLINE (routine replacement for force-single)",
+		Long: "Rewrite the LEADER's OWN raft advertise address IN PLACE — both the cluster_nodes.raft_addr\n" +
+			"roster column and the committed raft Configuration (via AddVoter on the existing voter, an online\n" +
+			"address update, NOT the force-single wipe). This is the routine localhost->public rebind that\n" +
+			"prepares a single broker to grow cross-network; force-single is reserved for genuine quorum loss.\n" +
+			"SELF-ONLY by design — rebinding a peer's address would wedge the cluster, so to readdress a\n" +
+			"follower `cluster transfer-leader` to it first, then run this there. --route also rebinds the\n" +
+			"NATS route-mesh advertise (the twin). Run on the raft leader.",
+		Example: "  tether cluster set-raft-addr 155.98.36.32:7400 --route nats://155.98.36.32:6222   # on the leader",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resp, err := callAdmin(*socketPath, adminsock.Request{
+				Op: adminsock.OpClusterSetRaftAddr, Host: args[0], AllowLoopback: allowLoopback,
+			})
+			if err != nil {
+				return err
+			}
+			if err := leaderRedirect(cmd, resp); err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return clusterAdminError("set-raft-addr", resp)
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "raft advertise address rebound (roster column + raft config updated in place)")
+			if route != "" {
+				rresp, err := callAdmin(*socketPath, adminsock.Request{
+					Op: adminsock.OpClusterSetRoute, NatsRoute: route, AllowLoopback: allowLoopback,
+				})
+				if err != nil {
+					return err
+				}
+				if err := leaderRedirect(cmd, rresp); err != nil {
+					return err
+				}
+				if rresp.Error != "" {
+					return clusterAdminError("set-route", rresp)
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "NATS route advertise rebound; run `tether cluster reconcile nats` to re-render the mesh")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&route, "route", "", "also rebind the NATS route-mesh advertise (nats://host:port)")
+	cmd.Flags().BoolVar(&allowLoopback, "allow-loopback", false, "allow a loopback/unspecified advertise (single-host dev only)")
 	return cmd
 }
 

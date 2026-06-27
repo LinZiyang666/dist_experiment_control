@@ -92,7 +92,16 @@ func ReconcileOnce(in Inputs, lastApplied, lastObserved uint64, reload func() er
 			self = p
 		}
 	}
+	// review F4 + R3: at N=1 the reconciler PRESERVES the current NATS mode — it never crosses the
+	// destructive cluster↔standalone boundary on its own. The automatic loop has no operator-intent
+	// input, so "one peer" alone must NOT silently strip cluster{} from a still-clustered conf (that
+	// would bypass `--to-standalone --confirm-single`, the backup warning, the full restart, and the
+	// clustered→standalone JS reset). So render standalone ONLY when the live conf is ALREADY standalone
+	// JetStream (the post-`--to-standalone` shape) — keeping it converged across restart/gen-bump/regrow
+	// (F4); a still-clustered N=1 stays clustered, pending an explicit operator de-cluster (R3).
+	standalone := len(in.Peers) == 1 && in.Peers[0].ServerName == in.SelfServerName && own.IsStandaloneJetStream()
 	cfg := natscluster.Config{
+		Standalone:    standalone,
 		Local:         self,
 		Peers:         in.Peers,
 		AccountIssuer: in.AccountIssuer,

@@ -224,6 +224,25 @@ func TestD5Matrix(t *testing.T) {
 	}
 }
 
+func TestPhaseFluidityMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	// -tags phasefluidity_integration builds the v0.4.2 phase-fluidity LIFECYCLE drill (external-review
+	// R5): a failed-join staged nonvoter survives a leader kill/restart and stays online-removable
+	// (never a force-single dead end) — the gap the sequential unit tests could not reach. Gated out of
+	// `make test` (a real raft node + restart); runs here in its own -race subprocess. The companion
+	// real-mTLS rebind + shrink→regrow drills ride TestD5Matrix / TestD9Matrix (their d5/d9 tags +
+	// ./test/d5/... / ./test/d9/... globs already build them).
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-tags", "phasefluidity_integration", "-timeout", "120s",
+		"-run", "TestPhaseFluidityLifecycle", "./internal/broker/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("phase-fluidity matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
 func TestD6Matrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))

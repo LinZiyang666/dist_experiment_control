@@ -43,6 +43,41 @@ need this file at all — single-broker is the fully supported default (see usag
 Admission is **two-phase**: the joining node prepares a self-signed join bundle
 (carrying its node identity + raft/nats/tunnel addresses), then the leader approves it.
 
+### 1.0 FIRST make the leader grow-ready — rebind a loopback advertise (v0.4.2; ONLINE, NOT force-single)
+
+A broker migrated by `cluster init --from-existing` advertises whatever `broker.cluster.raft_addr`
+was at init. If that was a **loopback** (`127.0.0.1:7400`) — the install default — a cross-network
+voter can never dial this leader, and the grow stalls (the new voter is staged as a NON-VOTER and
+never catches up — it does NOT wedge the cluster; you just `cluster recovery node remove --manual`
+it and fix the address). `cluster doctor`/`status` shows a `raft_advertise` ADVISORY when self is
+loopback. **The fix is ONLINE — do NOT use force-single for this** (force-single is the quorum-loss
+escape hatch only; running it live is what crashed the broker once):
+
+```
+# (a) Bind the socket to all interfaces so peers can connect, then ONE clean broker restart.
+#     This is a normal restart — agents reconnect on the same tunnel cert_fp (NOT a fatal-auth drop).
+leader$ sudoedit /etc/tether/broker.yaml      # cluster.raft_addr: 0.0.0.0:7400   (BIND, not advertise)
+leader$ sudo systemctl restart tether-broker
+
+# (b) FIREWALL :7400 (raft) and :6222 (NATS routes) to the peer IPs BEFORE they are externally
+#     reachable — route mTLS verifies chain-to-CA only (no SAN/hostname), so a leaked route leaf
+#     could otherwise join/observe raft. HARD gate, not advisory.
+
+# (c) Rebind the ADVERTISE addresses ONLINE (rewrites cluster_nodes.raft_addr + the raft Configuration
+#     in place via AddVoter — an online address update, NO wipe). --route fixes the NATS-mesh twin.
+leader$ sudo tether cluster set-raft-addr 155.98.36.32:7400 --route nats://155.98.36.32:6222
+leader$ sudo tether cluster reconcile nats --all --wait      # re-render the mesh with the new route
+```
+
+`set-raft-addr` is idempotent (a re-run when the address already matches is a no-op) and refuses a
+loopback/unspecified advertise unless `--allow-loopback` (single-host dev). It is **SELF-ONLY** — it
+rebinds the LEADER's OWN advertise address (rebinding a peer from the leader would wedge the cluster,
+so to readdress a follower `cluster transfer-leader` to it first, then run set-raft-addr there). For
+the **one-time fix of a localhost-bootstrapped broker (pc732)**:
+upgrade it to v0.4.2 first, then run (a)→(c) above. If a PRIOR failed grow left a half-added voter,
+`cluster status` shows it; remove it with `cluster recovery node remove --manual <id>` before
+re-growing.
+
 ```
 # 0. ONCE per fresh node — mint the node-identity seed on the JOINING node. `cluster keygen`
 #    is a hidden debug command; run it once on each new broker before it can join.
@@ -201,6 +236,47 @@ After `cluster retire`, immediately run `tether cluster reconcile nats --all --w
 so the retired node's NATS route/user grants are removed from generated
 configuration. **Retire is not considered safe against a compromised node until
 this re-render/restart and the key/CA rotation above are done.**
+
+### 2.2 De-cluster the LONE survivor back to standalone JetStream (v0.4.2 shrink)
+
+`cluster retire` shrinks the voter set down to ONE (it refuses the last voter — that is force-single
+territory). The lone survivor is still running a CLUSTERED nats.conf (a `cluster{}` block + a
+clustered-JS meta-group-of-1 it can never reach a quorum for). The FINAL downgrade step re-renders it
+standalone:
+
+```
+# ONLY when exactly ONE voter remains (retire the rest FIRST). De-clustering with live peers tears the
+# route mesh, so --confirm-single is mandatory and a FULL restart is required (dropping cluster{} is
+# NOT SIGHUP-reloadable).
+lone$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self>
+lone$ sudo systemctl restart nats-server      # FULL restart loads the standalone conf
+# ⚠ clustered-JS → standalone-JS does NOT migrate in place — RESET the JS store (the command prints
+#   the exact rm -rf). DATA IMPACT: drops ALL JetStream audit/history (history-<sid>, events, in-flight
+#   OBJ_xfer — drain first; `nats stream backup`/`restore` to preserve). Mirror of grow §1 step 3a.
+lone$ sudo systemctl stop nats-server && sudo rm -rf /var/lib/tether/jetstream && sudo systemctl start nats-server
+```
+
+Lands at "N=1 single-voter cluster, standalone JS" — the supported post-init shape. (Fully EXITING
+cluster mode — clearing `broker.cluster.*`, handing the WAL back to plain `storage.Open` — is a
+separate epic; it crosses the cluster.Node-owns-the-WAL invariant.)
+
+### 2.3 Operator-command semantics (grow / shrink / protected mode) — read before edge operations
+
+| command | valid at | who | in PROTECTED MODE (quorum-lost) | notes |
+|---|---|---|---|---|
+| `set-raft-addr` | any N, **self-only** | leader | **refused** (Proposes a raft write — no quorum, no commit) → force-single | rebinds the LEADER's OWN advertise; readdress a follower by `transfer-leader` to it first |
+| `join approve` (grow) | N≥1 | leader | **refused** | N=1→2 allowed (the pc732 case); prereq: self-advertise reachable (§1.0) |
+| `retire` / `drain` (shrink) | N≥2 (refuses the last voter) | leader | **refused** | N=2→1 forces a typed F==0 confirm |
+| `reconcile nats --to-standalone` | **N=1 ONLY** (`--confirm-single`) | lone survivor | n/a (N=1 has quorum-of-1) | refuses if already standalone; FULL restart + JS reset required |
+| `recovery force-single` (escape) | quorum-lost | OFFLINE | **the ONLY operable path** | recovers to N=1, then routine ops work again |
+
+**Edge cases.** (1) *Multiple brokers but you want to downgrade*: `retire` one at a time down to N=1
+FIRST, THEN `reconcile nats --to-standalone` (it refuses while peers remain). (2) *One broker but you
+want to upgrade*: the normal N=1→2 grow (§1.0 rebind if loopback, then join). (3) *Protected mode
+(quorum-lost / read-only)*: every routine cluster op is refused — they Propose raft writes that cannot
+commit without a quorum — so only `cluster recovery force-single` (OFFLINE) can recover. After it
+lands you at N=1 (`force_single_active`), routine cluster ops work again (quorum-of-1), though
+destructive DATA ops stay hard-gated until you regrow to HA (N≥3).
 
 ## 3. Quorum loss — the force-single escape hatch (OFFLINE)
 

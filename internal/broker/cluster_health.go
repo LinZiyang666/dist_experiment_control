@@ -47,6 +47,7 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			NodeID:             node.SelfID(),
 			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
 			ProtoVer:           proto.ProtoVersion,
+			PhaseFluidityOps:   cluster.HasPhaseFluidityOps(), // F5: advertise capability for the v0.4.2 readdr/route ops
 		}
 		// C3 §2.7: a C3 broker ALWAYS reports topology (TopoReported=true), even at gen 0, so the
 		// HEALTHY-HA gate can distinguish "reporting + behind" from "not reporting (old broker)".

@@ -52,6 +52,12 @@ type Config struct {
 	CAFile        string // cluster CA (routes mTLS trust anchor)
 	CertFile      string // this server's route leaf
 	KeyFile       string // this server's route key
+	// Standalone (v0.4.2 shrink), when true, renders a STANDALONE nats.conf — JetStream WITHOUT the
+	// cluster{} block (a lone N=1 broker can never reach the clustered JS meta quorum-of-2, so the
+	// last voter shrinking to N=1 must drop routes and run JS standalone — the reverse of the grow
+	// render). The routes mTLS files are not required in this mode; the JetStream + authorization
+	// blocks are unchanged.
+	Standalone bool
 }
 
 // Render returns the nats-server.conf text for cfg.Local. It is deterministic
@@ -66,7 +72,7 @@ func Render(cfg Config) (string, error) {
 	if len(cfg.Peers) == 0 {
 		return "", fmt.Errorf("natscluster: at least one peer (incl. self) required")
 	}
-	if cfg.CAFile == "" || cfg.CertFile == "" || cfg.KeyFile == "" {
+	if !cfg.Standalone && (cfg.CAFile == "" || cfg.CertFile == "" || cfg.KeyFile == "") {
 		return "", fmt.Errorf("natscluster: routes mTLS requires CAFile, CertFile, KeyFile")
 	}
 	account := cfg.Account
@@ -104,27 +110,31 @@ func Render(cfg Config) (string, error) {
 		b.WriteString("}\n\n")
 	}
 
-	// Cluster — flat full-mesh routes over cluster-CA mTLS (verify = mutual).
-	b.WriteString("cluster {\n")
-	fmt.Fprintf(&b, "  name: %q\n", clusterName)
-	if cfg.ClusterListen != "" {
-		fmt.Fprintf(&b, "  listen: %q\n", cfg.ClusterListen)
-	}
-	b.WriteString("  routes: [\n")
-	for _, p := range peers {
-		if p.RouteURL == "" || p.ServerName == cfg.Local.ServerName {
-			continue // skip self; nats dedups but keep the conf clean
+	// Cluster — flat full-mesh routes over cluster-CA mTLS (verify = mutual). SKIPPED in standalone
+	// mode (v0.4.2 shrink to N=1): a lone node has no routes and runs JetStream standalone, so the
+	// rendered conf must NOT carry a cluster{} block (the reverse of the grow transition).
+	if !cfg.Standalone {
+		b.WriteString("cluster {\n")
+		fmt.Fprintf(&b, "  name: %q\n", clusterName)
+		if cfg.ClusterListen != "" {
+			fmt.Fprintf(&b, "  listen: %q\n", cfg.ClusterListen)
 		}
-		fmt.Fprintf(&b, "    %q\n", p.RouteURL)
+		b.WriteString("  routes: [\n")
+		for _, p := range peers {
+			if p.RouteURL == "" || p.ServerName == cfg.Local.ServerName {
+				continue // skip self; nats dedups but keep the conf clean
+			}
+			fmt.Fprintf(&b, "    %q\n", p.RouteURL)
+		}
+		b.WriteString("  ]\n")
+		b.WriteString("  tls {\n")
+		fmt.Fprintf(&b, "    ca_file: %q\n", cfg.CAFile)
+		fmt.Fprintf(&b, "    cert_file: %q\n", cfg.CertFile)
+		fmt.Fprintf(&b, "    key_file: %q\n", cfg.KeyFile)
+		b.WriteString("    verify: true\n")
+		b.WriteString("  }\n")
+		b.WriteString("}\n\n")
 	}
-	b.WriteString("  ]\n")
-	b.WriteString("  tls {\n")
-	fmt.Fprintf(&b, "    ca_file: %q\n", cfg.CAFile)
-	fmt.Fprintf(&b, "    cert_file: %q\n", cfg.CertFile)
-	fmt.Fprintf(&b, "    key_file: %q\n", cfg.KeyFile)
-	b.WriteString("    verify: true\n")
-	b.WriteString("  }\n")
-	b.WriteString("}\n\n")
 
 	// audit natscluster F1: dedup peers by NkeyPub. A duplicate nkey in auth_users or the static
 	// users block makes nats-server FATAL at config load — a repeated roster entry, or the local

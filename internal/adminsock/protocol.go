@@ -33,6 +33,11 @@ const (
 	OpClusterStatus    = "cluster_status"
 	OpClusterHomes     = "cluster_homes" // C6 建议5: aggregate all exposes + __proxy__ home/epoch/ready_reason
 	OpClusterRotateCrt = "cluster_rotate_cert"
+	// v0.4.2 phase-fluidity: online raft/NATS advertise-address rebind — the routine replacement
+	// for force-single. SetRaftAddr (Host) rewrites raft_addr + the raft config in place;
+	// SetRoute (NatsRoute) rewrites the NATS route-mesh advertise (the twin).
+	OpClusterSetRaftAddr = "cluster_set_raft_addr"
+	OpClusterSetRoute    = "cluster_set_route"
 
 	// C4 operation-controller verbs (leader-local; a follower replies NotLeader+LeaderHost).
 	OpClusterJoinApprove = "cluster_join_approve" // approve a join bundle → create+drive a join op
@@ -94,9 +99,16 @@ const (
 )
 
 // clusterOps is the set the server routes to Backend.Cluster.
+//
+// v0.4.2: OpClusterAdd is deliberately NOT routed. Its backend (AddNode) does a DIRECT AddVoter,
+// which can wedge an N=1 cluster by admitting an unreachable voter — the exact failure this epic
+// removes. The `cluster add` CLI was deleted in C8; grows now go through OpClusterJoinApprove ->
+// driveJoin (nonvoter-staged, wedge-safe). Dropping OpClusterAdd here closes the last reachable
+// direct-AddVoter admission path (a raw socket request is rejected as an unrouted op).
 var clusterOps = map[string]bool{
-	OpClusterAdd: true, OpClusterRemove: true, OpClusterDrain: true,
+	OpClusterRemove: true, OpClusterDrain: true,
 	OpClusterTransfer: true, OpClusterStatus: true, OpClusterHomes: true, OpClusterRotateCrt: true,
+	OpClusterSetRaftAddr: true, OpClusterSetRoute: true,
 	OpClusterAlertRaise: true, OpClusterAlertClear: true,
 	OpClusterBackup: true, OpExportIncident: true, OpClusterOps: true,
 	OpClusterSeedsPublish: true, OpClusterSeedsShow: true,
@@ -128,7 +140,9 @@ type Request struct {
 	// derived from node_id (the §6.5 SSOT), not carried here.
 	TunnelAddr string `json:"tunnel_addr,omitempty"` // cluster add: the joiner's public tunnel addr
 	PublicHost string `json:"public_host,omitempty"` // cluster add: the joiner's public host
-	NatsRoute  string `json:"nats_route,omitempty"`  // cluster add: the joiner's NATS route URL
+	NatsRoute  string `json:"nats_route,omitempty"`  // cluster add / set-route: the NATS route URL
+	// v0.4.2 set-raft-addr / set-route: allow a loopback/unspecified advertise (single-host dev only).
+	AllowLoopback bool `json:"allow_loopback,omitempty"`
 	// B6 A3 version-skew gate (additive, omitempty): the joiner declares what it will run, read
 	// from `cluster sign-join` (defaulted from the JOINER binary's proto.{ProtoVersion,ReleaseVersion}).
 	// Proto mismatch is a HARD reject; release skew is advisory (a rolling upgrade legitimately
@@ -353,6 +367,14 @@ type ClusterStatusReport struct {
 	// with no voter count). ADDITIVE — the legacy Health string + ExitCode + schema_version stay
 	// byte-stable, so an existing monitor is untouched.
 	HealthLabel string `json:"health_label"`
+	// v0.4.2 phase-fluidity grow-readiness (additive omitempty; schema_version stays 1). The self
+	// broker's committed raft advertise address is loopback/unspecified — peers cannot dial it, so a
+	// cross-network grow cannot catch up the new voter until it is rebound with `cluster
+	// set-raft-addr`. SelfNatsRouteLoopback is the twin for the :6222 route mesh. SelfRaftAdvertise
+	// carries the actual committed self address for the banner/doctor detail.
+	SelfRaftAdvertiseLoopback bool   `json:"self_raft_advertise_loopback,omitempty"`
+	SelfNatsRouteLoopback     bool   `json:"self_nats_route_loopback,omitempty"`
+	SelfRaftAdvertise         string `json:"self_raft_advertise,omitempty"`
 }
 
 // ClusterHomesReport (C6 建议5) aggregates every ALLOCATED expose + __proxy__ allocation with its home

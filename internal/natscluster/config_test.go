@@ -107,6 +107,50 @@ func threeBrokerConfig(t *testing.T, dir string) (Config, []string, string) {
 	return cfg, pubs, acctPub
 }
 
+// TestRenderStandaloneOmitsClusterBlock (v0.4.2 shrink) renders a STANDALONE conf — the post-shrink
+// N=1 shape — and loads it with the REAL nats-server parser, asserting: NO cluster routes (a lone
+// node can never reach the clustered JS meta quorum-of-2, so it runs JS standalone), but JetStream
+// IS still enabled and auth_callout is intact. The reverse of the grow render.
+func TestRenderStandaloneOmitsClusterBlock(t *testing.T) {
+	dir := t.TempDir()
+	acctKp, _ := nkeys.CreateAccount()
+	acctPub, _ := acctKp.PublicKey()
+	acctKp.Wipe()
+	pub := freshBrokerPub(t)
+	cfg := Config{
+		Local:         Broker{ServerName: "tether-solo", NkeyPub: pub},
+		Peers:         []Broker{{ServerName: "tether-solo", NkeyPub: pub}},
+		AccountIssuer: acctPub, Account: "$G",
+		JSDomain: "tether", JSStoreDir: filepath.Join(dir, "js"),
+		ClientListen: "127.0.0.1:4222",
+		Standalone:   true, // the shrink mode: no cluster{} block, no routes mTLS required
+	}
+	confText, err := Render(cfg)
+	if err != nil {
+		t.Fatalf("Render(standalone): %v", err)
+	}
+	confPath := filepath.Join(dir, "nats.conf")
+	if err := os.WriteFile(confPath, []byte(confText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(confPath)
+	if err != nil {
+		t.Fatalf("standalone conf does not parse with the real nats-server parser: %v\n--- conf ---\n%s", err, confText)
+	}
+	// THE point: no clustered routes (a lone node runs JS standalone, not clustered).
+	if opts.Cluster.Port != 0 || len(opts.Routes) != 0 {
+		t.Errorf("standalone render must have NO cluster routes; got cluster.port=%d routes=%d", opts.Cluster.Port, len(opts.Routes))
+	}
+	// JetStream still enabled (standalone JS, just without the cluster meta).
+	if !opts.JetStream {
+		t.Error("standalone render must still enable JetStream")
+	}
+	// auth_callout intact — agents still authenticate against the lone broker.
+	if opts.AuthCallout == nil || opts.AuthCallout.Issuer != acctPub {
+		t.Error("standalone render must keep the auth_callout block")
+	}
+}
+
 // TestD3NatsClusterRendersAllBrokerPubsEveryServer renders a 3-broker conf and
 // loads it with the REAL nats-server parser (not a golden string compare),
 // asserting: every broker pub is in auth_users, the shared account is the Issuer,

@@ -85,6 +85,159 @@ func warnStandaloneJSGrow(w io.Writer, storeDir string) {
 		storeDir)
 }
 
+// warnClusteredJSShrink is the REVERSE of warnStandaloneJSGrow (v0.4.2 shrink): de-clustering the
+// lone survivor to standalone drops the cluster{} block, so the clustered JS meta — which needs a
+// quorum-of-2 a lone node can never reach — must be RESET to standalone. NATS does not migrate
+// clustered JS back to standalone in place. Same data-impact warning as the grow direction.
+func warnClusteredJSShrink(w io.Writer, storeDir string) {
+	if storeDir == "" {
+		storeDir = "<jetstream store_dir from nats.conf>"
+	}
+	// review suggestion: shell-quote the store_dir in the copy-paste `rm -rf` — a path with spaces or
+	// shell metacharacters would otherwise mis-delete or inject. Single-quote with embedded-quote escape.
+	quoted := "'" + strings.ReplaceAll(storeDir, "'", `'\''`) + "'"
+	_, _ = fmt.Fprintf(w,
+		"\n⚠ CLUSTERED-JS → STANDALONE-JS on THIS node (shrinking to N=1): a lone node can never reach\n"+
+			"  the clustered JS meta quorum-of-2, so the cluster{} block is dropped and the clustered JS\n"+
+			"  store must be RESET to standalone — NATS does not migrate clustered JS back in place.\n"+
+			"  After the FULL restart that loads this standalone conf, RESET the JS store:\n"+
+			"      sudo systemctl stop nats-server && sudo rm -rf %s && sudo systemctl start nats-server\n"+
+			"  ⚠ DATA IMPACT: drops ALL JetStream audit/history (history-<sid> incl. the forensic incident\n"+
+			"  bundle, the events stream, in-flight OBJ_xfer — drain those first). The re-derive cursor\n"+
+			"  survives the wipe, so it does NOT backfill. To PRESERVE it: `nats stream backup` before /\n"+
+			"  `restore` after. See cluster-runbook.md §2.2 (shrink / de-cluster).\n",
+		quoted)
+}
+
+// runReconcileToStandalone is the v0.4.2 SHRINK de-cluster step: re-render the lone survivor's
+// nats.conf WITHOUT the cluster{} block (standalone JetStream), validate it, swap it, and surface
+// the clustered→standalone JS-store-reset warning. SEMANTIC: this is the FINAL N=1 step — running it
+// while peers remain would tear the route mesh, so the operator must `cluster retire` down to a
+// single voter first and assert it via --confirm-single. A FULL nats-server restart is required
+// afterwards (dropping cluster{} is not SIGHUP-reloadable).
+func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, confirmSingle bool) error {
+	own, err := natsconf.Preflight(f.confPath)
+	if err != nil {
+		return err
+	}
+	if !own.IsClusteredJetStream() {
+		return fmt.Errorf("reconcile nats --to-standalone: %q is already standalone (no cluster{} block) — nothing to de-cluster", f.confPath)
+	}
+	if !confirmSingle {
+		return fmt.Errorf("reconcile nats --to-standalone: de-clustering is the FINAL N=1 step — `cluster retire` down to a SINGLE voter first, then re-run with --confirm-single (de-clustering with live peers would tear the route mesh)")
+	}
+	// F3 fail-closed: the source enables clustered JetStream, but natscluster.Render OMITS jetstream{}
+	// entirely when store_dir is empty — so a source `jetstream {}` with no explicit store_dir would
+	// SILENTLY disable JetStream on the next restart while this command claims standalone JS. Mirror
+	// the grow-takeover guard: refuse unless an explicit store_dir is present (and reuse it below).
+	storeDir := own.JSStoreDir()
+	if storeDir == "" {
+		return fmt.Errorf("reconcile nats --to-standalone: source JetStream has no explicit store_dir — refusing (a standalone render would silently disable JetStream); set store_dir in the jetstream{} block first")
+	}
+	// F2 fail-CLOSED machine gate: --confirm-single is the typed intent, but typed intent is NOT proof
+	// of cluster size. De-clustering is destructive (it tears this node out of the route mesh), so we
+	// REFUSE unless a live status report proves EXACTLY ONE voter. Socket error / no report / unknown
+	// role / voters!=1 all refuse (the broker daemon is UP during this command — only nats-server
+	// restarts — so the socket MUST answer). This applies even to --plan: an operator must never be
+	// shown "standalone is safe" without the live proof.
+	rep, e := fetchClusterStatusReport(f.takeoverSocket)
+	if e != nil || rep == nil {
+		return fmt.Errorf("reconcile nats --to-standalone: cannot confirm N=1 (admin socket unreachable: %v) — de-clustering is destructive and fail-closed; retire to a single voter and ensure the leader is reachable", e)
+	}
+	// R2: "one visible voter" is NOT by itself destructive authorization — a follower may hold a stale
+	// raft config, and a partial/errored report says its node list is incomplete. Only a COMPLETE
+	// LEADER view proves removing cluster{} won't tear a still-live route mesh. Require leader view +
+	// non-partial + no errors, and every node an EXPLICITLY recognized role (an unknown/empty role
+	// could hide a voter), then exactly one voter.
+	if !rep.IsLeaderView {
+		return fmt.Errorf("reconcile nats --to-standalone: status is not a leader view — run on the leader; cannot prove N=1, refusing")
+	}
+	if rep.Partial || len(rep.Errors) > 0 {
+		return fmt.Errorf("reconcile nats --to-standalone: status is partial/errored (partial=%v, %d errors) — cannot prove N=1, refusing", rep.Partial, len(rep.Errors))
+	}
+	voters := 0
+	for _, nd := range rep.Nodes {
+		switch nd.Role {
+		case "leader", "voter":
+			voters++
+		case "nonvoter":
+			// a known non-voting role — does not count toward the voter total
+		default:
+			return fmt.Errorf("reconcile nats --to-standalone: node %q has an unrecognized raft role %q — cannot prove N=1, refusing", nd.NodeID, nd.Role)
+		}
+	}
+	if voters != 1 {
+		return fmt.Errorf("reconcile nats --to-standalone: the cluster has %d voters (need EXACTLY 1) — `cluster retire` down to N=1 first", voters)
+	}
+	serverName := f.serverName
+	accountIssuer, brokerNkey := f.accountIssuer, f.brokerNkey
+	ci, cn := own.AuthIdentity()
+	if accountIssuer == "" {
+		accountIssuer = ci
+	}
+	if brokerNkey == "" {
+		brokerNkey = cn
+	}
+	if serverName == "" {
+		return fmt.Errorf("reconcile nats --to-standalone: --server-name required (the lone broker's server_name)")
+	}
+	if accountIssuer == "" || brokerNkey == "" {
+		return fmt.Errorf("reconcile nats --to-standalone: need --account-issuer + --broker-nkey (auto-read from the existing auth_callout when it carries exactly one nkey user)")
+	}
+	clientListen := own.ClientListen()
+	if clientListen == "" {
+		return fmt.Errorf("reconcile nats --to-standalone: could not determine the client listen address from %q", f.confPath)
+	}
+	self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey}
+	standalonePeers := []natscluster.Broker{self} // a lone survivor advertises only itself (standalone JS, no routes)
+	cfg := natscluster.Config{
+		Standalone:    true,
+		Local:         self,
+		Peers:         standalonePeers,
+		AccountIssuer: accountIssuer,
+		JSStoreDir:    storeDir,
+		ClientListen:  clientListen,
+		MonitorListen: own.MonitorHTTP(), // preserve any existing loopback monitor
+	}
+	merged, err := natsconf.BuildMergedConf(own, cfg)
+	if err != nil {
+		return err
+	}
+	if f.plan {
+		dry := "ok"
+		if f.skipDryRun {
+			dry = "skipped"
+		} else if e := natsconf.DryRun(f.natsServerBin, merged); e != nil {
+			dry = e.Error()
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "--to-standalone plan: would render a STANDALONE (no cluster{}) conf for %s; nats-server -t: %s\n", serverName, dry)
+		warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
+		return nil
+	}
+	if f.skipDryRun {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "WARNING: --skip-dry-run set — swapping nats.conf WITHOUT `nats-server -t` validation")
+	} else if err := natsconf.DryRun(f.natsServerBin, merged); err != nil {
+		return err
+	}
+	if err := natsconf.Apply(f.confPath, merged); err != nil {
+		return err
+	}
+	// F3 post-apply proof: re-parse the swapped conf and assert it is standalone JetStream with the
+	// SAME store_dir — never silently JS-less, never a moved store. Apply preserves the pristine .bak.
+	if post, perr := natsconf.Preflight(f.confPath); perr != nil {
+		return fmt.Errorf("reconcile nats --to-standalone: applied conf failed to re-parse: %w", perr)
+	} else if !post.IsStandaloneJetStream() {
+		return fmt.Errorf("reconcile nats --to-standalone: applied conf is not standalone JetStream — aborting (the .bak is preserved for rollback)")
+	} else if post.JSStoreDir() != storeDir {
+		return fmt.Errorf("reconcile nats --to-standalone: applied conf store_dir %q != source %q (refusing to move the JS store)", post.JSStoreDir(), storeDir)
+	}
+	warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+		"nats.conf de-clustered to STANDALONE (pristine .bak kept). A FULL `systemctl restart nats-server` "+
+			"is REQUIRED — dropping the cluster{} block is NOT SIGHUP-reloadable — then RESET the JS store as warned above.")
+	return nil
+}
+
 func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 	confPath, secretsDir, serverName := f.confPath, f.secretsDir, f.serverName
 	accountIssuer, brokerNkey, routeURL := f.accountIssuer, f.brokerNkey, f.routeURL

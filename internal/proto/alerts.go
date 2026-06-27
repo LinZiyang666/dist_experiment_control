@@ -39,6 +39,12 @@ type ClusterHealthResp struct {
 	TopoObserved        uint64 `json:"topo_observed,omitempty"`
 	TopoReconcileReason string `json:"topo_reconcile_reason,omitempty"`
 	TopoReported        bool   `json:"topo_reported,omitempty"`
+	// PhaseFluidityOps (review F5): this broker's binary advertises support for the v0.4.2
+	// phase-fluidity membership ops (OpClusterNodeReaddr/Route). The leader gates SetRaftAddr/
+	// SetNatsRoute on ALL voters advertising it — an older binary's knownOps lacks those ops and would
+	// decodeCommand-poison the replicated entry (advance applied_index, skip the SQL), forking its
+	// replica. Additive omitempty: an older broker omits it (false ⇒ treated as NOT capable, fail-closed).
+	PhaseFluidityOps bool `json:"phase_fluidity_ops,omitempty"`
 }
 
 // AlertView is one ACTIVE alert as rendered for the banner / `alert ls` (§10.1/§10.3).

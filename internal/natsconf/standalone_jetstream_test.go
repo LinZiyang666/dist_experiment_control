@@ -29,6 +29,31 @@ func TestIsStandaloneJetStream(t *testing.T) {
 	}
 }
 
+// TestIsClusteredJetStream pins the REVERSE predicate (v0.4.2 shrink): it fires on exactly
+// jetstream{} + cluster{} (a voter that must be reset to standalone when it shrinks to N=1), and is
+// false for standalone (jetstream, no cluster) and for non-JS confs.
+func TestIsClusteredJetStream(t *testing.T) {
+	cases := []struct {
+		name   string
+		parsed map[string]any
+		want   bool
+	}{
+		{"jetstream + cluster ⇒ clustered", map[string]any{"jetstream": map[string]any{}, "cluster": map[string]any{"name": "c"}}, true},
+		{"jetstream + empty cluster{} ⇒ clustered (cluster key present)", map[string]any{"jetstream": map[string]any{}, "cluster": map[string]any{}}, true},
+		{"jetstream, no cluster ⇒ standalone, NOT clustered", map[string]any{"jetstream": map[string]any{"store_dir": "/x"}}, false},
+		{"cluster, no jetstream ⇒ not JS", map[string]any{"cluster": map[string]any{}}, false},
+		{"neither", map[string]any{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &Ownership{Parsed: tc.parsed}
+			if got := o.IsClusteredJetStream(); got != tc.want {
+				t.Errorf("IsClusteredJetStream()=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestIsStandaloneJetStreamRealInstallConf locks the detector to the ACTUAL shape `cluster
 // init --from-existing` leaves an N=1 broker in: the install.sh conf (jetstream{} + no
 // cluster{}) must be flagged standalone, so the takeover warns before the operator grows.

@@ -31,7 +31,7 @@ func newClusterReconcileCmd(socketPath *string) *cobra.Command {
 
 func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 	var f natsconfTakeoverFlags
-	var manual, all, wait bool
+	var manual, all, wait, toStandalone, confirmSingle bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "nats",
@@ -49,6 +49,12 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 			"      --peer brk-a,nats://10.0.0.1:6222,U… --peer brk-b,nats://10.0.0.2:6222,U…",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if toStandalone {
+				if all || wait || manual {
+					return usageErr("reconcile nats: --to-standalone cannot be combined with --all/--wait/--manual")
+				}
+				return runReconcileToStandalone(cmd, &f, confirmSingle)
+			}
 			if manual {
 				if all || wait {
 					return usageErr("reconcile nats: --manual cannot be combined with --all/--wait")
@@ -63,6 +69,8 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&all, "all", false, "ensure ALL brokers converge their nats.conf (the reconciler runs automatically; pair with --wait to block)")
 	cmd.Flags().BoolVar(&wait, "wait", false, "block until every voter's live NATS topology reaches the desired generation (or --timeout), naming any laggard")
 	cmd.Flags().DurationVar(&timeout, "timeout", 60*time.Second, "with --wait: give up after this long, exit non-zero naming the laggard(s)")
+	cmd.Flags().BoolVar(&toStandalone, "to-standalone", false, "SHRINK: re-render this lone survivor's nats.conf WITHOUT the cluster{} block (standalone JetStream). The FINAL N=1 de-cluster step; requires --confirm-single + a full nats-server restart")
+	cmd.Flags().BoolVar(&confirmSingle, "confirm-single", false, "with --to-standalone: assert this is the SINGLE remaining voter (`cluster retire` to N=1 first — de-clustering with live peers tears the route mesh)")
 	return cmd
 }
 

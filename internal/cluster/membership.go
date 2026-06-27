@@ -40,6 +40,24 @@ func (n *Node) AddVoter(nodeID, raftAddr string) error {
 	return nil
 }
 
+// AddNonvoter adds (or idempotently re-affirms) a NON-VOTER to the raft configuration.
+// Leader-only. A nonvoter receives the replicated log and catches up but does NOT count toward
+// quorum, so staging a joiner as a nonvoter FIRST means an UNREACHABLE peer can never wedge the
+// cluster: the config-change entry commits at the OLD quorum, the peer simply never catches up,
+// and it stays online-RemoveServer-able. The join controller promotes it to a Voter via AddVoter
+// once it is caught up (§8.1 / v0.4.2 phase-fluidity wedge-prevention — the keystone fix).
+// Idempotent by node_id (re-affirming an already-present server is a no-op).
+func (n *Node) AddNonvoter(nodeID, raftAddr string) error {
+	if n.raft.State() != raft.Leader {
+		return raft.ErrNotLeader
+	}
+	fut := n.raft.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, n.applyTimeout)
+	if err := fut.Error(); err != nil {
+		return fmt.Errorf("cluster: add nonvoter %s: %w", nodeID, err)
+	}
+	return nil
+}
+
 // RemoveServer removes a server from the raft configuration. Leader-only. The §8.1
 // removal ORDER is roster ClusterNodePhase(RETIRING) -> RemoveServer -> roster
 // ClusterNodeRemove; this is the middle step. Idempotent (removing an absent server

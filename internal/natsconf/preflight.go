@@ -292,6 +292,17 @@ func (o *Ownership) IsStandaloneJetStream() bool {
 	return hasJS && !hasCluster
 }
 
+// IsClusteredJetStream reports whether the conf runs JetStream WITH a cluster{} block — the shape a
+// node holds while it is a cluster voter. The REVERSE of IsStandaloneJetStream (v0.4.2 shrink): when
+// the last voter shrinks to N=1 it must drop the cluster{} block and reset its JS store back to
+// standalone (the mirror of the grow §3a transition), since a lone node can never reach the
+// clustered JS meta quorum-of-2.
+func (o *Ownership) IsClusteredJetStream() bool {
+	_, hasJS := o.Parsed["jetstream"]
+	_, hasCluster := o.Parsed["cluster"]
+	return hasJS && hasCluster
+}
+
 // ClientListen harvests the client listen address from the parsed conf: install.sh writes
 // host + port (NOT a `listen` key), so this joins them; an explicit `listen` wins if present.
 func (o *Ownership) ClientListen() string {

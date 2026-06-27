@@ -60,8 +60,11 @@ func DryRun(natsServerBin string, mergedConf string) error {
 func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
 	// C3-B1: when the caller (the reconciler) does not supply the routes-mTLS identity, harvest it
 	// from the LIVE conf's cluster{} block so the render is COMPLETE (Render rejects empty cert paths).
-	// Fail-closed via ClusterMTLS if the live conf carries no cluster TLS.
-	if cfg.CAFile == "" && cfg.CertFile == "" && cfg.KeyFile == "" {
+	// Fail-closed via ClusterMTLS if the live conf carries no cluster TLS. v0.4.2 shrink (review minor):
+	// a Standalone render has NO cluster{} block, so it never needs the mTLS identity — skip the
+	// harvest, else de-clustering a hand-edited clustered conf whose cluster{} lacks tls{} would fail
+	// confusingly while trying to DISCARD that very block.
+	if !cfg.Standalone && cfg.CAFile == "" && cfg.CertFile == "" && cfg.KeyFile == "" {
 		ca, cert, key, listen, name, err := own.ClusterMTLS()
 		if err != nil {
 			return "", err

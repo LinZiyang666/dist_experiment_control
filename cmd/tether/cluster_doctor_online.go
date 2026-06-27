@@ -92,5 +92,22 @@ func clusterDoctorOnline(rep *adminsock.ClusterStatusReport) []clusteroffline.Do
 	} else {
 		out = append(out, check("version_skew", clusteroffline.DoctorPass, "all nodes on one release"))
 	}
+
+	// v0.4.2 phase-fluidity: a loopback self-advertise blocks a cross-network grow (the new voter
+	// cannot dial this leader). ADVISORY, not FATAL — a single-host cluster legitimately runs
+	// loopback; this only matters when you intend to grow. Names set-raft-addr (NOT force-single).
+	switch {
+	case rep.SelfRaftAdvertiseLoopback && rep.SelfNatsRouteLoopback:
+		out = append(out, check("raft_advertise", clusteroffline.DoctorAdvisory,
+			fmt.Sprintf("self raft advertise (%s) AND nats_route are loopback — a cross-network grow cannot reach this broker; run `cluster set-raft-addr <public:7400> --route nats://<public:6222>` before `join approve` (NOT force-single)", rep.SelfRaftAdvertise)))
+	case rep.SelfRaftAdvertiseLoopback:
+		out = append(out, check("raft_advertise", clusteroffline.DoctorAdvisory,
+			fmt.Sprintf("self raft advertise (%s) is loopback — a cross-network grow cannot reach this broker; run `cluster set-raft-addr <public:7400>` before `join approve` (NOT force-single)", rep.SelfRaftAdvertise)))
+	case rep.SelfNatsRouteLoopback:
+		out = append(out, check("nats_route", clusteroffline.DoctorAdvisory,
+			"self nats_route is loopback — the NATS route mesh cannot form cross-network; run `cluster set-raft-addr --route nats://<public:6222>` before growing"))
+	default:
+		out = append(out, check("raft_advertise", clusteroffline.DoctorPass, "self advertise addresses are peer-reachable (grow-ready)"))
+	}
 	return out
 }

@@ -113,6 +113,8 @@ func defaultAppliers() map[OpType]Applier {
 		OpClusterDrainSet:     exec,
 		OpClusterMetaClear:    exec,
 		OpClusterCertRotate:   exec,
+		OpClusterNodeReaddr:   exec, // v0.4.2: all-literal raft_addr UPDATE, NO generation bump (not roster/conf-facing)
+		OpClusterNodeRoute:    exec, // v0.4.2: all-literal nats_route UPDATE + topology_generation bump (conf-facing)
 		OpClusterSeedsPublish: exec, // C2 §D-5: all-literal endpoints/bootstrap UPSERT + seed_generation bump
 		OpClusterBusNkeySet:   exec, // C3 §D-F: all-literal bus_nkey_pub UPDATE + topology_generation bump
 		OpClusterOpStart:      exec, // C4: single-active-guarded operation-log INSERT
