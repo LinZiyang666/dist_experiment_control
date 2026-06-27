@@ -278,6 +278,20 @@ func (o *Ownership) JSStoreDir() string {
 	return ""
 }
 
+// IsStandaloneJetStream reports whether the live conf runs JetStream WITHOUT a cluster{}
+// block — i.e. STANDALONE JS (the shape `cluster init --from-existing` leaves an N=1 broker
+// in, since clustered JS refuses to start without configured routes). Such a node CANNOT be
+// restarted with a cluster{} block in place: NATS does not migrate standalone JS state into a
+// clustered meta, so the meta wedges and the streams orphan (test/d9
+// TestD9Matrix/GrowStandaloneRestartWedgesJS). Converting it to clustered REQUIRES wiping its
+// JetStream store first — the takeover/reconcile surfaces this so an operator cannot grow into
+// the wedge silently.
+func (o *Ownership) IsStandaloneJetStream() bool {
+	_, hasJS := o.Parsed["jetstream"]
+	_, hasCluster := o.Parsed["cluster"]
+	return hasJS && !hasCluster
+}
+
 // ClientListen harvests the client listen address from the parsed conf: install.sh writes
 // host + port (NOT a `listen` key), so this joins them; an explicit `listen` wins if present.
 func (o *Ownership) ClientListen() string {

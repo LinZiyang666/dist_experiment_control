@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -63,6 +64,27 @@ func bindNatsconfTakeoverFlags(cmd *cobra.Command, f *natsconfTakeoverFlags) {
 
 // runNatsconfTakeover is the shared manual-takeover engine (extracted so both the deprecated alias
 // and `reconcile nats --manual` call it verbatim).
+// warnStandaloneJSGrow tells the operator that THIS node ran standalone JetStream and the
+// clustered restart will orphan its streams unless the JS store is reset — with the accurate
+// data impact (the wipe drops ALL audit/history; the re-derive cursor survives it). The runbook
+// §1 step 3a is the authoritative procedure; this fires on the manual takeover / `--plan` paths.
+func warnStandaloneJSGrow(w io.Writer, storeDir string) {
+	if storeDir == "" {
+		storeDir = "<jetstream store_dir from nats.conf>"
+	}
+	_, _ = fmt.Fprintf(w,
+		"\n⚠ STANDALONE-JS → CLUSTERED-JS on THIS node (the former N=1 broker): NATS does NOT migrate\n"+
+			"  standalone JS into the clustered meta — restarting in place ORPHANS every pre-existing\n"+
+			"  stream (the meta forms, but the streams go invisible to it). RESET the JS store first:\n"+
+			"      sudo systemctl stop nats-server && sudo rm -rf %s && sudo systemctl start nats-server\n"+
+			"  ⚠ DATA IMPACT: drops ALL JetStream audit/history (history-<sid> incl. the forensic incident\n"+
+			"  bundle, the events stream, in-flight OBJ_xfer — drain those first). There is no separate\n"+
+			"  audit stream and the re-derive cursor survives the wipe, so it does NOT backfill. To\n"+
+			"  PRESERVE it: `nats stream backup` before / `restore` after. Fresh new voters need NO\n"+
+			"  reset. See cluster-runbook.md §1 step 3a.\n",
+		storeDir)
+}
+
 func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 	confPath, secretsDir, serverName := f.confPath, f.secretsDir, f.serverName
 	accountIssuer, brokerNkey, routeURL := f.accountIssuer, f.brokerNkey, f.routeURL
@@ -175,6 +197,9 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			} else if e := natsconf.DryRun(natsServerBin, merged); e != nil {
 				dryRunResult = e.Error()
 			}
+			if own.IsStandaloneJetStream() {
+				warnStandaloneJSGrow(cmd.ErrOrStderr(), own.JSStoreDir())
+			}
 			return renderTakeoverPlan(cmd, confPath, serverName, clientListen, own.JSStoreDir(), peers, merged, dryRunResult, asJSON)
 		}
 		if skipDryRun {
@@ -187,6 +212,9 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			return err
 		}
 		_, _ = fmt.Fprint(cmd.OutOrStdout(), natsconf.OwnershipTable(own))
+		if own.IsStandaloneJetStream() {
+			warnStandaloneJSGrow(cmd.ErrOrStderr(), own.JSStoreDir())
+		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
 			"nats.conf taken over (pristine .bak kept). NEXT: `systemctl restart nats-server`, "+
 				"then start tether-broker in cluster mode.")

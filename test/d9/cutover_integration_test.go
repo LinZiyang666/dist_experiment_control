@@ -24,6 +24,8 @@ func TestD9Matrix(t *testing.T) {
 	t.Run("SessionRmCascadeRoutesThroughRaft", testSessionRmCascadeRoutesThroughRaft)
 	t.Run("TwoBrokerJoinReplicates", testTwoBrokerJoinReplicates)
 	t.Run("ClusterStatusRemoteReachable", testClusterStatusRemoteReachable) // B1
+	t.Run("GrowInPlaceOrphansStreams", testGrowInPlaceOrphansStreams)   // grow finding: in-place restart orphans streams
+	t.Run("GrowResetThenStaggeredWorks", testGrowResetThenStaggeredWorks) // grow fix: reset + production rolling order
 }
 
 // testSessionRmCascadeRoutesThroughRaft is the round-1 BLOCKER regression: a `session rm`

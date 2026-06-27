@@ -59,14 +59,60 @@ joiner$ tether cluster join prepare --node-id <node-id> --raft-addr <host:7400> 
 leader$ tether cluster join approve <join-bundle> --wait
         approved <node-id>
 
+# 2a. PRE-CHECK the former-N1 node BEFORE re-rendering. Its conf is STILL standalone here, so
+#     this preview prints the standalone-JS → JS-reset warning, mutating NOTHING — you learn that
+#     step 3a is required before you touch anything. (Run it NOW: after step 3's `--all` renders
+#     the conf clustered, this can no longer detect the transition, and `--all` itself does not
+#     print the warning.)
+former-N1$ sudo tether cluster reconcile nats --manual --plan
+
 # 3. RE-RENDER nats.conf across the WHOLE cluster (one auto command renders every broker's
-#    conf from the live roster), then rolling-restart NATS. Growth grows RAFT membership; it
-#    does NOT form the NATS route/auth mesh — each broker's nats.conf must list every peer's
-#    {server_name, route_url, bus_nkey} (external-review F2).
+#    conf from the live roster). Growth grows RAFT membership; it does NOT form the NATS
+#    route/auth mesh — each broker's nats.conf must list every peer's {server_name, route_url,
+#    bus_nkey} (external-review F2).
 leader$ sudo tether cluster reconcile nats --all --wait
-#    Restart NATS one node at a time (rolling), leader LAST, verifying `cluster status`
-#    reachability after each:
-each-broker$ sudo systemctl restart nats-server   # rolling; leader last
+#    Then bring NATS into the mesh ONE node at a time. FRESH new voters (empty JS store) just
+#    restart. The former N=1 node is the EXCEPTION — do NOT plain-restart it (that orphans its
+#    streams); bring it in LAST via 3a. Restart the fresh voters here:
+fresh-voter$ sudo systemctl restart nats-server   # fresh voters only; one at a time
+
+# 3a. ⚠ STANDALONE-JS → CLUSTERED-JS, the former N=1 node ONLY (fresh voters DON'T need this).
+#     A broker migrated by `cluster init --from-existing` runs STANDALONE JetStream (no cluster{}
+#     block — clustered JS refuses to start without configured routes, and a lone node can never
+#     reach the JS meta quorum-of-2, so N=1 MUST run JS standalone). NATS does NOT migrate that
+#     standalone JS state into the clustered meta: restarting with the cluster{} block IN PLACE
+#     forms the meta FINE but ORPHANS every pre-existing stream (invisible to the clustered meta;
+#     on-disk files linger as garbage the broker then re-creates over). Verified:
+#     test/d9 TestD9Matrix/GrowInPlaceOrphansStreams.
+#
+#     RESET this node's JetStream store while stopped, then start it clustered LAST:
+former-N1$ sudo systemctl stop nats-server
+former-N1$ sudo rm -rf /var/lib/tether/jetstream      # the jetstream.store_dir from nats.conf — NOT raft/ or the DB
+former-N1$ sudo systemctl start nats-server           # joins the mesh with a FRESH clustered JS meta
+#     The broker re-creates its streams CLUSTERED on the next register/reconcile; reconcile then
+#     raises them to R=ReplicasFor(voters). Verified end-to-end (reset + PRODUCTION rolling order,
+#     new-node-first/former-N1-last, reaches working R=2): test/d9 GrowResetThenStaggeredWorks.
+#
+#     ⚠ DATA IMPACT — the reset DROPS ALL of this node's JetStream audit/history. There is NO
+#     separate "audit stream": audit records ARE the contents of history-<sid>, and the
+#     re-derivation cursor (audit_published_index) lives in SQLite and SURVIVES the `rm -rf`, so
+#     the publisher backfills NOTHING. Reset: history-<sid> (incl. `tether history` + the
+#     incident-export forensic bundle), the events stream, and in-flight OBJ_xfer transfers
+#     (drain/finish them FIRST). Effectively NOTHING re-derives (at most the cursor-to-commit lag
+#     at the moment of the wipe). For a fresh/test cluster this is fine — accept it and skip the
+#     next paragraph.
+#
+#     TO PRESERVE audit/history across the first grow (data-preserving alternative): while the
+#     node is STILL standalone (JS serving), snapshot every stream, then restore after the meta
+#     forms (restores at R=1; reconcile then raises to target R):
+#       former-N1$ for s in $(nats stream ls -n); do nats stream backup "$s" "/var/backups/js/$s"; done
+#       former-N1$  ... stop / rm -rf jetstream / start clustered (above) ...
+#       former-N1$ for d in /var/backups/js/*; do nats stream restore "$(basename "$d")" "$d"; done
+
+# 3b. VERIFY the JetStream meta formed (the failure mode is a SILENT JS problem, so check it,
+#     not just raft): `nats --server <broker> stream ls` must RETURN (not hang) on each broker.
+#     NOTE: this drill is proven on the embedded nats-server (go.mod); if the production
+#     nats-server (scripts/install.sh) version diverges, re-run the live grow drill first.
 
 # 4. Verify.
 leader$ tether cluster status            # the new node walks JOIN_VERIFIED_PENDING_VOTER -> CATCHING_UP -> VOTER
