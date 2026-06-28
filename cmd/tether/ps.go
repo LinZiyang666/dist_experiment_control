@@ -61,9 +61,9 @@ EXITED processes. Architecture F.8 — unified view.`,
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "ps", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("ps", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

@@ -148,9 +148,9 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 	if err != nil {
 		return err
 	}
-	nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	nc, err := connectCtl(cmd, "push", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 	if err != nil {
-		return connectError("push", natsURL, err)
+		return err
 	}
 	defer nc.Close()
 
@@ -409,9 +409,9 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 	if err != nil {
 		return err
 	}
-	nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	nc, err := connectCtl(cmd, "pull", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 	if err != nil {
-		return connectError("pull", natsURL, err)
+		return err
 	}
 	defer nc.Close()
 

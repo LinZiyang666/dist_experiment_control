@@ -139,9 +139,9 @@ func newAlertLsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "alert ls", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("alert ls", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 			// Explicit operator command → STRICT (F4): a no-responder / timeout / malformed
@@ -192,9 +192,9 @@ func newAlertAckCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "alert ack", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("alert ack", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 			reply, err := ackAlert(nc, id.PublicKey, args[0])

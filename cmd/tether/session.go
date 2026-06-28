@@ -40,9 +40,9 @@ func newSessionCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
+			nc, err := connectCtl(cmd, "session create", home, natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
-				return connectError("session create", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
@@ -100,9 +100,9 @@ func newSessionCmd() *cobra.Command {
 			}
 			// Listing uses the unactivated template — its pub allow already
 			// includes session.list.req. No active session required.
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
+			nc, err := connectCtl(cmd, "session list", home, natsURL, id, nats.Name(cli.CtlNameUnactivated))
 			if err != nil {
-				return connectError("session list", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
@@ -160,9 +160,9 @@ func newSessionCmd() *cobra.Command {
 			}
 			// rm needs the activated-member template (it grants pub allow
 			// for session.<sid>.rm.req). Require active session = arg sid.
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(args[0])))
+			nc, err := connectCtl(cmd, "session rm", home, natsURL, id, nats.Name(cli.CtlNameForSession(args[0])))
 			if err != nil {
-				return connectError("session rm", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

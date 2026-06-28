@@ -56,9 +56,9 @@ func proxyRequest(cmd *cobra.Command, natsURL, home, subjectVerb string, body []
 	if err != nil {
 		return err
 	}
-	nc, err := cli.ConnectNATSWithNkey(url, id, nats.Name(cli.CtlNameForSession(sid)))
+	nc, err := connectCtl(cmd, "proxy", home, url, id, nats.Name(cli.CtlNameForSession(sid)))
 	if err != nil {
-		return connectError("proxy", url, err)
+		return err
 	}
 	defer nc.Close()
 

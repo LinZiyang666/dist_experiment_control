@@ -55,9 +55,9 @@ func newNodeLsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "node ls", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("node ls", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
@@ -173,9 +173,9 @@ testing run a single <nid> first.`, proto.SubjectPrefix),
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "upgrade", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("upgrade", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

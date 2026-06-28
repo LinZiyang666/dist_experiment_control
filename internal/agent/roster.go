@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/clusterroster"
@@ -284,29 +283,9 @@ func (a *Agent) effectiveDialURLs() string {
 	learned := append([]string(nil), a.rosterURLs...)
 	seeds := append([]string(nil), a.seedURLs...)
 	a.rosterMu.Unlock()
-	seen := make(map[string]struct{}, len(learned)+len(seeds)+2)
-	out := make([]string, 0, len(learned)+len(seeds)+2)
-	add := func(u string) {
-		u = strings.TrimSpace(u)
-		if u == "" {
-			return
-		}
-		if _, ok := seen[u]; ok {
-			return
-		}
-		seen[u] = struct{}{}
-		out = append(out, u)
-	}
-	for _, u := range learned { // roster (steady-state, NATS-refreshed) first
-		add(u)
-	}
-	for _, u := range seeds { // verified seed endpoints (cold-start / rotation) next
-		add(u)
-	}
-	for _, s := range strings.Split(a.cfg.NATSURL, ",") { // configured seed floor, last
-		add(s)
-	}
-	return strings.Join(out, ",")
+	// Delegates to the shared clusterroster.BuildDialString so the agent and the ctl/cli honor ONE
+	// floor-last invariant (the ctl reuses it for broker auto-failover) with no drift.
+	return clusterroster.BuildDialString(learned, seeds, a.cfg.NATSURL)
 }
 
 // cachedRosterGen / pinnedAccountPub expose the in-memory mirror (register req / tests / grep-guard).

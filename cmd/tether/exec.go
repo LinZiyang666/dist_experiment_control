@@ -65,9 +65,9 @@ remote command, not parsed here, and the safe-spawn lifeline silently no-ops.
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "exec", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("exec", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

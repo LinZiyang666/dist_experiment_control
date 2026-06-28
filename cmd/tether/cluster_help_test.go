@@ -27,8 +27,8 @@ func TestClusterSubcommandsHaveExamplesAndGroups(t *testing.T) {
 			t.Errorf("cluster %s is not assigned to a group", c.Name())
 		}
 	}
-	if g := root.Groups(); len(g) != 3 {
-		t.Errorf("want 3 cluster groups (C8 dropped `local`), got %d", len(g))
+	if g := root.Groups(); len(g) != 4 {
+		t.Errorf("want 4 cluster groups (online/client/migrate/escape; cli-failover added `client`), got %d", len(g))
 	}
 }
 

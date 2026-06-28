@@ -92,9 +92,9 @@ func newHistoryCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "history", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("history", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

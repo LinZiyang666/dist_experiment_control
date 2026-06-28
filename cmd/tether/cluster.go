@@ -42,6 +42,7 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	// node-pub/keygen demoted to hidden debug) → 3 groups.
 	root.AddGroup(
 		&cobra.Group{ID: "online", Title: "Online (leader, daemon running):"},
+		&cobra.Group{ID: "client", Title: "Client discovery (laptop): broker auto-failover pin/invite:"},
 		&cobra.Group{ID: "migrate", Title: "Migration / nats.conf takeover (one-time):"},
 		&cobra.Group{ID: "escape", Title: "DANGER -- recovery + raw escape hatches (runbook section 3):"},
 	)
@@ -59,6 +60,8 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	addGrouped(newClusterJoinCmd(&socketPath), "online")      // C4: join prepare/approve (recoverable; replaces `add`/`sign-join`)
 	addGrouped(newClusterRetireCmd(&socketPath), "online")    // C4: retire (recoverable; replaces `drain --retire`/`remove`)
 	addGrouped(newClusterRebalanceCmd(&socketPath), "online") // C-rebalance: rebalance proxy (spread __proxy__ homes)
+	addGrouped(newClusterPinCmd(), "client")                  // cli-failover: pin a cluster from an OOB discovery invite
+	addGrouped(newClusterInviteCmd(), "client")               // cli-failover: mint an OOB discovery invite
 	addGrouped(newClusterInitCmd(), "migrate")
 	addGrouped(newClusterTakeoverNatsconfCmd(), "migrate") // hidden deprecated alias for reconcile nats --manual
 	addGrouped(newClusterDoctorCmd(), "migrate")

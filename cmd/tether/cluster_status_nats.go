@@ -173,9 +173,9 @@ func clusterStatusRemote(cmd *cobra.Command, home, natsURL string, asJSON bool) 
 	if err != nil {
 		return err
 	}
-	nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	nc, err := connectCtl(cmd, "cluster status", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 	if err != nil {
-		return connectError("cluster status", natsURL, err)
+		return err
 	}
 	defer nc.Close()
 	s := summarizeClusterHealth(probeClusterHealth(nc, id.PublicKey))

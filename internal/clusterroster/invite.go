@@ -101,6 +101,82 @@ func ParseInvite(token string) (Invite, error) {
 	return in, nil
 }
 
+// MintDiscoveryInvite renders a SID-LESS ctl discovery invite to the canonical
+// `tether-invite:v1?pin=[&url=][&seed=]` token. Unlike MintInvite (agent join, SID required + carries a
+// session), this is the OPERATOR→OPERATOR cold-start bootstrap a ctl uses to learn the cluster pin +
+// failover endpoints. Requires a valid account-pub pin and AT LEAST ONE of bootstrap url (https, tier-2
+// HTTP manifest) or seed (nats/tls/wss, tier-1 cold-start dial floor) — else it carries no endpoint and
+// is useless. Carries ZERO secrets (no PIN, no seed material, no key).
+func MintDiscoveryInvite(in Invite) (string, error) {
+	if !nkeys.IsValidPublicAccountKey(in.Pin) {
+		return "", fmt.Errorf("%w: pin must be an account public key", ErrBadInvite)
+	}
+	if strings.TrimSpace(in.BootstrapURL) == "" && strings.TrimSpace(in.Seed) == "" {
+		return "", fmt.Errorf("%w: discovery invite needs a bootstrap url or a seed", ErrBadInvite)
+	}
+	if in.BootstrapURL != "" {
+		if err := validateBootstrapURL(in.BootstrapURL); err != nil {
+			return "", err
+		}
+	}
+	if in.Seed != "" {
+		if err := validateSeedURL(in.Seed); err != nil {
+			return "", err
+		}
+	}
+	q := url.Values{}
+	q.Set("pin", in.Pin)
+	if in.BootstrapURL != "" {
+		q.Set("url", in.BootstrapURL)
+	}
+	if in.Seed != "" {
+		q.Set("seed", in.Seed)
+	}
+	return inviteScheme + ":" + inviteVersion + "?" + q.Encode(), nil
+}
+
+// ParseDiscoveryInvite strictly parses a ctl discovery invite. Same scheme/version/param allowlist as
+// ParseInvite, but SID is OPTIONAL (ignored if present — an agent-join token also parses here, its sid is
+// simply unused for ctl discovery) and a bootstrap url OR seed is REQUIRED. A discovery-only invite
+// (no sid) deliberately FAILS ParseInvite, so it can never be mistaken for an agent-join token.
+func ParseDiscoveryInvite(token string) (Invite, error) {
+	u, err := url.Parse(strings.TrimSpace(token))
+	if err != nil {
+		return Invite{}, fmt.Errorf("%w: %v", ErrBadInvite, err)
+	}
+	if u.Scheme != inviteScheme || u.Opaque != inviteVersion {
+		return Invite{}, fmt.Errorf("%w: expected scheme %q version %q", ErrBadInvite, inviteScheme, inviteVersion)
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return Invite{}, fmt.Errorf("%w: bad query: %v", ErrBadInvite, err)
+	}
+	allowed := map[string]bool{"pin": true, "url": true, "sid": true, "seed": true}
+	for k := range q {
+		if !allowed[k] {
+			return Invite{}, fmt.Errorf("%w: unknown param %q", ErrBadInvite, k)
+		}
+	}
+	in := Invite{Pin: q.Get("pin"), BootstrapURL: q.Get("url"), SID: q.Get("sid"), Seed: q.Get("seed")}
+	if !nkeys.IsValidPublicAccountKey(in.Pin) {
+		return Invite{}, fmt.Errorf("%w: pin must be an account public key", ErrBadInvite)
+	}
+	if strings.TrimSpace(in.BootstrapURL) == "" && strings.TrimSpace(in.Seed) == "" {
+		return Invite{}, fmt.Errorf("%w: discovery invite needs a bootstrap url or a seed", ErrBadInvite)
+	}
+	if in.BootstrapURL != "" {
+		if err := validateBootstrapURL(in.BootstrapURL); err != nil {
+			return Invite{}, err
+		}
+	}
+	if in.Seed != "" {
+		if err := validateSeedURL(in.Seed); err != nil {
+			return Invite{}, err
+		}
+	}
+	return in, nil
+}
+
 func validateBootstrapURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {

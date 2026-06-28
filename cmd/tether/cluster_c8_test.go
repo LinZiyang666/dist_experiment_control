@@ -33,11 +33,12 @@ func TestC8DeletedCommandsGone(t *testing.T) {
 	}
 }
 
-// TestC8ClusterGroupsThree: exactly 3 groups (online/migrate/escape); `local` is gone.
+// TestC8ClusterGroupsThree: 4 groups (online/client/migrate/escape); `local` is gone, `client` added by
+// the cli-failover increment (cluster pin/invite).
 func TestC8ClusterGroupsThree(t *testing.T) {
 	root := newClusterCmd()
-	if g := root.Groups(); len(g) != 3 {
-		t.Fatalf("want 3 groups, got %d", len(g))
+	if g := root.Groups(); len(g) != 4 {
+		t.Fatalf("want 4 groups, got %d", len(g))
 	}
 	for _, g := range root.Groups() {
 		if g.ID == "local" {

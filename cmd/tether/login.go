@@ -48,9 +48,9 @@ performs a real NATS CONNECT and only writes current_session on success.
 
 			if sid == "" {
 				// Pure auth, no activation.
-				nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameUnactivated))
+				nc, err := connectCtl(cmd, "login", home, natsURL, id, nats.Name(cli.CtlNameUnactivated))
 				if err != nil {
-					return fmt.Errorf("login: %w", err)
+					return err
 				}
 				nc.Close()
 				if cmd.Flags().Changed("nats-url") || cmd.Flags().Changed("broker") {
@@ -75,9 +75,9 @@ performs a real NATS CONNECT and only writes current_session on success.
 			if pin != "" {
 				opts = append(opts, nats.Token(pin))
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, opts...)
+			nc, err := connectCtlOpts(cmd, "login: activation for session "+sid, home, natsURL, id, opts...)
 			if err != nil {
-				return fmt.Errorf("login: activation refused for session %q: %w", sid, err)
+				return err
 			}
 			nc.Close()
 

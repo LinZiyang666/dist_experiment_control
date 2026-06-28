@@ -82,9 +82,9 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "run", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("run", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 

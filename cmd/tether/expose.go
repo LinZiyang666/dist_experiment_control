@@ -74,9 +74,9 @@ restart without a re-expose.
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "expose", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("expose", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
@@ -183,9 +183,9 @@ policy. Reads the same data as ` + "`tether ps`" + `; member-safe (no operator s
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "expose explain", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("expose explain", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
@@ -310,9 +310,9 @@ error you can ignore in scripts.
 			if err != nil {
 				return err
 			}
-			nc, err := cli.ConnectNATSWithNkey(natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := connectCtl(cmd, "expose rm", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
 			if err != nil {
-				return connectError("expose rm", natsURL, err)
+				return err
 			}
 			defer nc.Close()
 
