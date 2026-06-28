@@ -213,9 +213,27 @@ func (f *fsm) restoreFrom(rc io.ReadCloser) error {
 		return fmt.Errorf("cluster: post-migration integrity: %w", err)
 	}
 
+	// PRESERVE node-local identity across the install (v0.4.4 grow fix). A raft InstallSnapshot copies the
+	// LEADER's DB byte-for-byte, and cluster_meta.self_node_id in it is the LEADER's id. A joiner that
+	// installs the leader's snapshot to catch up MUST keep ITS OWN id — otherwise the next restart's
+	// readSelfNodeID returns the leader's id and the joiner comes up with the leader's identity (two nodes
+	// claiming the same raft ServerID → split brain). Read it BEFORE the in-place overwrite, re-write AFTER.
+	// For a same-node force-single restore the id is identical, so the re-write is a harmless no-op. This
+	// path had NO test coverage because no prior test exercised a real InstallSnapshot (the d9 2-broker
+	// join aligned via log replay at a low index instead of installing the leader's snapshot).
+	var selfID string
+	_ = f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key='self_node_id'`).Scan(&selfID)
+
 	// 4. In-place restore into the live write pool (no rename over open inode).
 	if err := restoreInPlace(context.Background(), f.db, tmpPath); err != nil {
 		return err
+	}
+
+	if selfID != "" {
+		if _, err := f.db.Exec(`INSERT INTO cluster_meta(key,value) VALUES('self_node_id',?) `+
+			`ON CONFLICT(key) DO UPDATE SET value=excluded.value`, selfID); err != nil {
+			return fmt.Errorf("cluster: restore preserve self_node_id: %w", err)
+		}
 	}
 
 	// 5. Liveness baseline reset (§3.5 D1 amendment).

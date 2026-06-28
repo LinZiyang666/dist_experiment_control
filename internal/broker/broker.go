@@ -887,7 +887,23 @@ func (b *Broker) Run(ctx context.Context) error {
 	// probe (the loops need b.js) and the NATS connect (nc).
 	if b.clusterMode {
 		if b.js == nil {
-			return fmt.Errorf("broker: cluster mode requires JetStream; enable JetStream before starting HA broker")
+			// ACTIONABLE error (v0.4.4): the bare "enable JetStream" message cost a multi-step incident
+			// diagnosis. The usual cause is a lone N=1 broker whose nats.conf still carries a `cluster{}`
+			// block — a single node cannot form the clustered JetStream meta quorum, so JS never comes up
+			// and the broker crash-loops with no self-recovery. Name the real remedy (de-cluster to
+			// standalone) vs. the N>=2 mesh-not-formed case.
+			voters, verr := b.cl.node.NumVoters()
+			if verr == nil && voters <= 1 {
+				return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 " +
+					"node — a single node cannot form the clustered JetStream meta quorum. The nats.conf almost " +
+					"certainly still has a `cluster{}` block: de-cluster it to standalone JS with " +
+					"`tether cluster reconcile nats --to-standalone --confirm-single` (or, if mid-grow, finish the " +
+					"grow / remove the half-added peer). N=1 MUST run standalone JetStream")
+			}
+			return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE (voters=%d) — the "+
+				"NATS routes mesh is likely not formed (clustered JetStream meta needs quorum). Verify the routes "+
+				"in /etc/tether/nats.conf and that peer brokers are reachable; see `tether cluster status` / "+
+				"`tether cluster doctor`", voters)
 		}
 		if err := b.wireClusterLate(ctx, nc); err != nil {
 			return err
