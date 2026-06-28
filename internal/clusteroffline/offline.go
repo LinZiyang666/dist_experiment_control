@@ -183,24 +183,29 @@ func Resnapshot(opts ResnapshotOptions) error {
 			"— retire/remove them first (resnapshot rewrites the raft config to {self} and would drop peers)", len(roster), ids)
 	}
 
-	// AUDIT-WINDOW guard: the unconditional log truncation must not drop unpublished audit.
+	// AUDIT-WINDOW guard: the unconditional log truncation must not drop unpublished audit. v0.4.4 review
+	// STEP1: count ONLY genuine audit-bearing ops above the cursor (OpReconcileBatch / OpTransferAudit) —
+	// NOT the raw LastIndex, which on every real migrated broker sits at audit_published_index + trailing
+	// config/noop/checkpoint (the D5 publisher self-skips its cursor op without advancing), so a raw
+	// `LastIndex > published` guard ALWAYS fired with zero real loss and the restart-drain-stop remedy
+	// could provably never clear it. With the scan, a clean broker passes and the remedy genuinely works.
 	pub, err := readAuditPublishedIndex(opts.DBPath)
 	if err != nil {
 		return fmt.Errorf("clusteroffline: read audit cursor: %w", err)
 	}
-	last, err := cluster.RaftLastIndex(opts.DataDir)
+	unpub, firstIdx, err := cluster.UnpublishedAuditOpsInLog(opts.DataDir, pub)
 	if err != nil {
 		return err
 	}
-	if last > pub {
+	if unpub > 0 {
 		if !opts.AcceptAuditLoss {
 			return fmt.Errorf("clusteroffline: resnapshot would truncate %d UNPUBLISHED audit entr(ies) "+
-				"(audit_published_index=%d < raft last_index=%d) — restart tether-broker briefly so the D5 "+
-				"publisher drains to the head, stop it, and re-run; or pass --accept-audit-loss (bounded loud loss)",
-				last-pub, pub, last)
+				"(audit_published_index=%d, first unpublished audit op at raft index=%d) — restart tether-broker "+
+				"briefly so the D5 publisher drains to the head, stop it, and re-run; or pass --accept-audit-loss "+
+				"(bounded loud loss)", unpub, pub, firstIdx)
 		}
 		opts.Logger.Warn("clusteroffline: resnapshot ACCEPTING bounded audit loss",
-			"unpublished", last-pub, "audit_published_index", pub, "raft_last_index", last)
+			"unpublished_audit_ops", unpub, "audit_published_index", pub, "first_unpublished_index", firstIdx)
 	}
 
 	if err := cluster.GrowReadySnapshot(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr, opts.Logger); err != nil {

@@ -92,8 +92,12 @@ func TestPhaseFluidityShrinkRegrowLifecycle(t *testing.T) {
 
 	// (3) a still-CLUSTERED N=1 conf is NOT auto-de-clustered by the reconciler (R3) — the destructive
 	// transition requires an explicit operator `reconcile nats --to-standalone`.
+	// The fixture carries a real (now-gone) peer so the clustered render has a route — a lone-self
+	// clustered render is unbootable and is now refused by natscluster.Render (audit D); this models the
+	// shape left after an N=2 cluster lost a node down to N=1 (the reconcile input below is still N=1).
+	pfGonePeer := natscluster.Broker{ServerName: "pf-gone", NkeyPub: "UPFGONE", RouteURL: "nats://127.0.0.2:6222"}
 	clusteredConf, err := natscluster.Render(natscluster.Config{
-		Local: self, Peers: []natscluster.Broker{self}, AccountIssuer: acc,
+		Local: self, Peers: []natscluster.Broker{self, pfGonePeer}, AccountIssuer: acc,
 		JSStoreDir: filepath.Join(t.TempDir(), "js2"), ClientListen: "127.0.0.1:-1",
 		ClusterListen: "127.0.0.1:6222", ClusterName: "tether",
 		CAFile: "/run/tether/ca.pem", CertFile: "/run/tether/cert.pem", KeyFile: "/run/tether/key.pem",

@@ -151,6 +151,37 @@ func TestRenderStandaloneOmitsClusterBlock(t *testing.T) {
 	}
 }
 
+// TestRenderClusteredZeroRoutesFailsClosed (v0.4.4 review audit-D keystone): a clustered render
+// (Standalone:false) whose only peer is self yields a cluster{} block with ZERO routes — a conf
+// nats-server FATAL-refuses at boot ("JetStream cluster requires configured routes") YET `nats-server -t`
+// PASSES, so the unbootable conf slips dry-run and bricks the broker. Render must FAIL CLOSED rather than
+// emit it; a lone node must render Standalone. Exercised DIRECTLY here (the phase-fluidity test only
+// reaches this transitively with NatsServerBin=/bin/true, so a refactor could silently revert the gate).
+func TestRenderClusteredZeroRoutesFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	ca, cert, key := writeClusterCertPEMs(t, dir)
+	acctKp, _ := nkeys.CreateAccount()
+	acctPub, _ := acctKp.PublicKey()
+	acctKp.Wipe()
+	pub := freshBrokerPub(t)
+	cfg := Config{
+		Local:         Broker{ServerName: "tether-solo", NkeyPub: pub, RouteURL: "nats://127.0.0.1:6222"},
+		Peers:         []Broker{{ServerName: "tether-solo", NkeyPub: pub, RouteURL: "nats://127.0.0.1:6222"}},
+		AccountIssuer: acctPub, Account: "$G",
+		JSDomain: "tether", JSStoreDir: filepath.Join(dir, "js"),
+		ClientListen: "127.0.0.1:4222", ClusterName: "tether", ClusterListen: "127.0.0.1:6222",
+		CAFile: ca, CertFile: cert, KeyFile: key,
+		// Standalone deliberately FALSE — the bug shape: a lone node mis-rendered clustered.
+	}
+	_, err := Render(cfg)
+	if err == nil {
+		t.Fatal("clustered render with zero routes (only self) must FAIL CLOSED, got nil — an empty-routes cluster{} bricks nats-server at boot")
+	}
+	if !strings.Contains(err.Error(), "ZERO routes") {
+		t.Fatalf("want a 'ZERO routes' fail-closed error, got: %v", err)
+	}
+}
+
 // TestD3NatsClusterRendersAllBrokerPubsEveryServer renders a 3-broker conf and
 // loads it with the REAL nats-server parser (not a golden string compare),
 // asserting: every broker pub is in auth_users, the shared account is the Issuer,

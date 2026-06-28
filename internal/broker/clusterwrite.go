@@ -432,7 +432,14 @@ func (b *Broker) livenessDB() *sql.DB {
 // cluster mode only a CAUGHT-UP LEADER has a local view that reflects the true cluster state; a fresh
 // joiner / not-yet-caught-up follower would classify every cluster-wide stream as orphan and wipe live
 // history + in-flight tier-B buckets (audit G — CRITICAL data loss). Raft-free (L-2): only the narrow
-// Node accessors IsLeader/AppliedIndex/CommitIndex.
+// Node accessors IsLeader/RaftAppliedIndex/CommitIndex.
+//
+// Caught-up is measured in the RAFT domain (RaftAppliedIndex vs CommitIndex), NOT the command domain.
+// The SQLite command cursor AppliedIndex never advances on the leader-election LogNoop (or config
+// entries), so a steady-state leader has SQLite-AppliedIndex == CommitIndex-1 PERMANENTLY — comparing it
+// against CommitIndex is cross-domain and structurally never true, which silently disabled this gate on
+// every cluster-mode boot (v0.4.4 review G-reaper-gate). RaftAppliedIndex advances on the noop too, so a
+// caught-up leader reads RaftAppliedIndex == CommitIndex.
 func (b *Broker) reaperMayDelete() bool {
 	if b.cl == nil {
 		return true
@@ -440,8 +447,7 @@ func (b *Broker) reaperMayDelete() bool {
 	if b.cl.node == nil || !b.cl.node.IsLeader() {
 		return false
 	}
-	applied, err := b.cl.node.AppliedIndex()
-	return err == nil && applied >= b.cl.node.CommitIndex()
+	return b.cl.node.RaftAppliedIndex() >= b.cl.node.CommitIndex()
 }
 
 // proposeOrForward routes one authoritative write through raft. Leader ⇒ run the Plan

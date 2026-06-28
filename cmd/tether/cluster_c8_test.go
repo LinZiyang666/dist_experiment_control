@@ -174,12 +174,21 @@ func TestC8KeygenJoinPrepareRoundTrip(t *testing.T) {
 	if _, err := os.Stat(seedPath); err != nil {
 		t.Fatalf("keygen did not write the seed: %v", err)
 	}
+	// broker.nk in the same dir so bus_nkey derives (audit A fail-closed); --cert-fp is the escape hatch.
+	bnk := newClusterKeygenCmd()
+	bnk.SetOut(&strings.Builder{})
+	bnk.SetErr(&strings.Builder{})
+	bnk.SetArgs([]string{"--out", filepath.Join(dir, "broker.nk")})
+	if err := bnk.Execute(); err != nil {
+		t.Fatal(err)
+	}
 	jp := newClusterJoinPrepareCmd()
 	var jout strings.Builder
 	jp.SetOut(&jout)
 	jp.SetErr(&strings.Builder{})
 	jp.SetArgs([]string{"--node-id", "brk-b", "--seed", seedPath, "--raft-addr", "10.0.0.2:7400",
-		"--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000"})
+		"--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000",
+		"--secrets-dir", dir, "--cert-fp", "ABCDEF1234"})
 	if err := jp.Execute(); err != nil {
 		t.Fatalf("join prepare must derive a bundle from a keygen seed: %v", err)
 	}
@@ -204,13 +213,27 @@ func TestC8JoinPrepareNewlineSeed(t *testing.T) {
 	if err := os.WriteFile(nl, append(append([]byte{}, b...), '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// secrets dir with a broker.nk so bus_nkey derives (audit A fail-closed); --cert-fp is the explicit
+	// escape hatch so no generated tunnel-cert.pem is needed. This test is about --seed newline tolerance.
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bnk := newClusterKeygenCmd()
+	bnk.SetOut(&strings.Builder{})
+	bnk.SetErr(&strings.Builder{})
+	bnk.SetArgs([]string{"--out", filepath.Join(secrets, "broker.nk")})
+	if err := bnk.Execute(); err != nil {
+		t.Fatal(err)
+	}
 	prep := func(seed string) string {
 		jp := newClusterJoinPrepareCmd()
 		var out strings.Builder
 		jp.SetOut(&out)
 		jp.SetErr(&strings.Builder{})
 		jp.SetArgs([]string{"--node-id", "brk-b", "--seed", seed, "--raft-addr", "10.0.0.2:7400",
-			"--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000"})
+			"--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000",
+			"--secrets-dir", secrets, "--cert-fp", "ABCDEF1234"})
 		if err := jp.Execute(); err != nil {
 			t.Fatalf("join prepare(%s): %v", seed, err)
 		}
@@ -249,9 +272,26 @@ func TestC8JoinPrepareRequiresHomeIdentity(t *testing.T) {
 	if err := run("--tunnel-addr", "brk-b:7000"); err == nil || !strings.Contains(err.Error(), "nats-route") {
 		t.Errorf("missing --nats-route must refuse, got %v", err)
 	}
-	// cert-fp stays OPTIONAL: with both home flags + no cert-fp it succeeds.
-	if err := run("--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000"); err != nil {
-		t.Errorf("--cert-fp must remain optional (D6 backfills): %v", err)
+	home := []string{"--nats-route", "nats://10.0.0.2:6222", "--tunnel-addr", "brk-b:7000"}
+	// v0.4.4 review F1: join prepare now FAILS CLOSED if it cannot derive bus_nkey/cert_fp — an empty
+	// bundle re-arms the learner self-backfill DEADLOCK (bus_nkey) + crash-loops the joiner (cert_fp),
+	// the exact failures audit A removes. A missing/wrong secrets dir (no broker.nk) must REFUSE, not
+	// WARN-and-emit a poisoned bundle.
+	if err := run(append(home, "--secrets-dir", filepath.Join(dir, "nonexistent"))...); err == nil || !strings.Contains(err.Error(), "broker.nk") {
+		t.Errorf("missing broker.nk must fail closed (no poisoned empty-bus_nkey bundle), got %v", err)
+	}
+	// With broker.nk present (bus_nkey derives) + --cert-fp as the explicit escape hatch (so no generated
+	// tunnel-cert.pem is needed here) it succeeds.
+	secrets := t.TempDir()
+	bnk := newClusterKeygenCmd()
+	bnk.SetOut(&strings.Builder{})
+	bnk.SetErr(&strings.Builder{})
+	bnk.SetArgs([]string{"--out", filepath.Join(secrets, "broker.nk")})
+	if err := bnk.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(append(home, "--secrets-dir", secrets, "--cert-fp", "ABCDEF1234")...); err != nil {
+		t.Errorf("join prepare with broker.nk + --cert-fp override must succeed: %v", err)
 	}
 }
 

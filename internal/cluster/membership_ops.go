@@ -132,8 +132,12 @@ func PlanClusterNodeUpsert(in ClusterNodeUpsertInput) (*Command, error) {
 		`NULL, ` + pending + `, ` + tsLit + `, ` + nonceLit + `, ` + sigLit + `, NULL, ` + tsLit + `) ` +
 		`ON CONFLICT(node_id) DO UPDATE SET name=excluded.name, node_ident_pub=excluded.node_ident_pub, ` +
 		`nats_server_id=excluded.nats_server_id, raft_addr=excluded.raft_addr, nats_route=excluded.nats_route, ` +
-		`tunnel_addr=excluded.tunnel_addr, public_host=excluded.public_host, cert_fp=excluded.cert_fp, ` +
-		`bus_nkey_pub=excluded.bus_nkey_pub, ` +
+		`tunnel_addr=excluded.tunnel_addr, public_host=excluded.public_host, ` +
+		// v0.4.4 review F2: empty-PRESERVE cert_fp + bus_nkey_pub. An idempotent grow-retry re-approve that
+		// carries an empty bundle must NOT clobber a previously-good value back to '' — that re-arms the
+		// learner self-backfill deadlock (bus_nkey) / crash-loop (cert_fp) with zero runtime signal.
+		`cert_fp=CASE WHEN excluded.cert_fp != '' THEN excluded.cert_fp ELSE cluster_nodes.cert_fp END, ` +
+		`bus_nkey_pub=CASE WHEN excluded.bus_nkey_pub != '' THEN excluded.bus_nkey_pub ELSE cluster_nodes.bus_nkey_pub END, ` +
 		`phase=` + pending + `, join_nonce=excluded.join_nonce, join_sig=excluded.join_sig, ` +
 		`voter_add_error=NULL, phase_changed_at=excluded.phase_changed_at ` +
 		`WHERE cluster_nodes.phase IN ('JOIN_VERIFIED_PENDING_VOTER','VOTER_ADD_FAILED')`

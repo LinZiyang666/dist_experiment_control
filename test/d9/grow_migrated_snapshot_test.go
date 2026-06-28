@@ -59,4 +59,16 @@ func TestD9GrowReadySnapshotAtInit(t *testing.T) {
 		t.Fatalf("grow-ready snapshot index = %d, want >= 1 (must sit at/after the bootstrap config@1 so a "+
 			"joiner whose nextIndex decays to 1 receives InstallSnapshot, not the truncated log)", idx)
 	}
+	// COMPACTION is the load-bearing half (v0.4.4 review): existence alone does NOT distinguish the real
+	// fix from a v0.4.3-class no-op (raft.Snapshot writes a snapshot file but won't compact a log shorter
+	// than TrailingLogs=10240 → FirstIndex stays 1 → the leader ships the LOG, joiner replays → FK crash).
+	// RecoverCluster's UNCONDITIONAL DeleteRange empties the offline raft log, so a joiner whose nextIndex
+	// decays past it hits ErrLogNotFound → InstallSnapshot. Assert the log is truly compacted (==0 offline).
+	if last, lerr := cluster.RaftLastIndex(dir); lerr != nil {
+		t.Fatalf("RaftLastIndex: %v", lerr)
+	} else if last != 0 {
+		t.Fatalf("grow-ready log NOT compacted: RaftLastIndex=%d, want 0 — init wrote a snapshot but left the "+
+			"log un-truncated (the v0.4.3 no-op class); a joiner would replay the log, not InstallSnapshot. "+
+			"GrowReadySnapshot must DeleteRange the log via raft.RecoverCluster.", last)
+	}
 }

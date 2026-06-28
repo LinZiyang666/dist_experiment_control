@@ -105,6 +105,14 @@ func (n *Node) CommitIndex() uint64 { return n.raft.CommitIndex() }
 func (n *Node) LogFirstIndex() (uint64, error) { return n.store.FirstIndex() }
 func (n *Node) LogLastIndex() (uint64, error)  { return n.store.LastIndex() }
 
+// RaftAppliedIndex is raft's OWN applied cursor — it advances on EVERY committed entry, including the
+// leader-election LogNoop and config entries, which the SQLite command cursor (AppliedIndex) does NOT.
+// A caught-up steady-state leader has RaftAppliedIndex == CommitIndex. Comparing the SQLite AppliedIndex
+// against CommitIndex would be CROSS-DOMAIN and structurally never true (the trailing noop bumps
+// CommitIndex but never the SQLite cursor), which is why reaperMayDelete uses this raft-domain index
+// instead (v0.4.4 review G-reaper-gate). Stays in internal/cluster so internal/broker keeps L-2 raft-free.
+func (n *Node) RaftAppliedIndex() uint64 { return n.raft.AppliedIndex() }
+
 // CommittedCommandAt decodes the *Command at a committed raft index, reading the local
 // raft log via the SAME unexported decodeCommand the FSM uses (identical poison /
 // version verdicts). Pure read — no apply, no DB mutation. Typed sentinels let the

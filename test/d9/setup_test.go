@@ -167,7 +167,7 @@ func startD9Broker(t *testing.T, selfID string) *d9Broker {
 // CA) and starts a broker in cluster mode against the given (possibly shared) NATS URL. It
 // returns the handle + this broker's raft address (for a join). Used by both startD9Broker
 // (own NATS) and startD9Pair (shared NATS + shared CA → a real 2-broker cluster).
-func startD9BrokerOn(t *testing.T, selfID string, ca *d9CA, natsURL string) (*d9Broker, string) {
+func startD9BrokerOn(t *testing.T, selfID string, ca *d9CA, natsURL string, seed ...func(*testing.T, string)) (*d9Broker, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "tether.db")
@@ -176,6 +176,13 @@ func startD9BrokerOn(t *testing.T, selfID string, ca *d9CA, natsURL string) (*d9
 		t.Fatalf("seed DB: %v", err)
 	}
 	_ = db.Close()
+	// Optional pre-init seed (v0.4.4 review STEP0 e2e): write FK-bearing app rows BEFORE InitFromExisting
+	// so they live ONLY in the GrowReadySnapshot (no raft-log entry created them) — exactly the migrated
+	// broker shape (`cluster init --from-existing` direct-seeds a live v1 DB), proving a joiner installs the
+	// snapshot (gets the rows) rather than replaying an empty log onto an un-seeded DB (hollow voter / FK).
+	for _, s := range seed {
+		s(t, dbPath)
+	}
 
 	secrets := writeD9Secrets(t, ca)
 	raftAddr := freeTCPAddr(t)

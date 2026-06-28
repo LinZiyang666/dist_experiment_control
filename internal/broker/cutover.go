@@ -228,6 +228,15 @@ func (b *Broker) AppliedIndexForTest() uint64 {
 	return ai
 }
 
+// RODBForTest exposes the cluster node's read-only DB handle so the d9_integration grow drill can assert
+// a joiner gained the leader's snapshot-only rows (row parity). TEST-ONLY. nil if not clustered.
+func (b *Broker) RODBForTest() *sql.DB {
+	if b.cl == nil || b.cl.node == nil {
+		return nil
+	}
+	return b.cl.node.RODB()
+}
+
 // clusterDBSeeded reports whether the DB carries the `cluster init` marker (the seeded
 // applied_index key AND >=1 cluster_nodes row). Both cluster_meta and cluster_nodes
 // always exist on a v2 binary (storage.Open runs migrations 0008-0013), so emptiness —

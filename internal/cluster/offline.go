@@ -118,6 +118,65 @@ func RaftLastIndex(dataDir string) (uint64, error) {
 	return last, nil
 }
 
+// UnpublishedAuditOpsInLog scans the on-disk raft log range (afterIndex, LastIndex] (offline, read-only)
+// and counts the entries that are RE-DERIVABLE AUDIT-SOURCE ops — OpReconcileBatch / OpTransferAudit, the
+// ONLY ops the D5 publisher turns into replicated audit that a log truncation could actually lose.
+//
+// It deliberately IGNORES everything else: the trailing OpAuditCheckpointSet (self-begetting — it commits
+// at LastIndex and keeps audit_published_index == LastIndex-1 FOREVER, so a raw LastIndex>published delta
+// is structurally always >=1 and would force --accept-audit-loss on every broker), raft config/noop
+// entries, and register/heartbeat/port/session ops (whose state is fully preserved in the snapshotted
+// SQLite DB). An undecodable command in the window is counted (fail-closed). Returns (count, firstIndex).
+// Lives here so raft + decodeCommand stay in internal/cluster (L-2); the resnapshot audit-window guard
+// (internal/clusteroffline) calls it so the no-loss remediation path is actually reachable (v0.4.4 review).
+func UnpublishedAuditOpsInLog(dataDir string, afterIndex uint64) (count int, firstIndex uint64, err error) {
+	_, boltPath := raftPaths(dataDir)
+	store, err := raftboltdb.New(raftboltdb.Options{
+		Path:        boltPath,
+		BoltOptions: &bolt.Options{Timeout: boltLockProbeTimeout},
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("cluster: open boltstore for audit scan: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	first, err := store.FirstIndex()
+	if err != nil {
+		return 0, 0, fmt.Errorf("cluster: audit scan first index: %w", err)
+	}
+	last, err := store.LastIndex()
+	if err != nil {
+		return 0, 0, fmt.Errorf("cluster: audit scan last index: %w", err)
+	}
+	if first == 0 || last == 0 {
+		return 0, 0, nil // empty log (e.g. already compacted)
+	}
+	lo := afterIndex + 1
+	if lo < first {
+		lo = first // the floor below FirstIndex was snapshotted; only scan what is still on disk
+	}
+	for idx := lo; idx <= last; idx++ {
+		var lg raft.Log
+		if e := store.GetLog(idx, &lg); e != nil {
+			if errors.Is(e, raft.ErrLogNotFound) {
+				continue
+			}
+			return 0, 0, fmt.Errorf("cluster: audit scan get log %d: %w", idx, e)
+		}
+		if lg.Type != raft.LogCommand {
+			continue // noop / config carry no audit
+		}
+		cmd, derr := decodeCommand(lg.Data)
+		isAudit := derr != nil || cmd.Op == OpReconcileBatch || cmd.Op == OpTransferAudit
+		if isAudit {
+			count++
+			if firstIndex == 0 {
+				firstIndex = idx
+			}
+		}
+	}
+	return count, firstIndex, nil
+}
+
 // ErrAlreadyBootstrapped is BootstrapSingleNode's idempotent signal: raft/ already holds
 // state (a prior `cluster init` created it), so there is nothing to bootstrap. The caller
 // treats it as success (the init is idempotent).

@@ -67,7 +67,9 @@ func DecodeJoinBundle(s string) (*JoinBundle, error) {
 	// C8 (D10): preserve the D9 expose-home/NATS-peer identity-completeness gate the deleted `cluster
 	// add` enforced — a voter that can never serve as an expose home (no tunnel_addr) or join the NATS
 	// mesh (no nats_route) is admission-rejected here, leader-side authoritative (a hand-crafted bundle
-	// can't bypass). cert_fp stays OPTIONAL (D6 backfills it on first reconnect — intentional divergence).
+	// can't bypass). cert_fp + bus_nkey are NOT required HERE for backward-tolerance, but `cluster join
+	// prepare` now derives + carries them fail-closed (audit A / v0.4.4 review F1), so a well-formed bundle
+	// always has them; a bundle that omits cert_fp only crash-loops the joiner itself (wireClusterEarly).
 	if b.NodeIdentPub == "" || b.JoinNonce == "" || b.JoinSigHex == "" || b.RaftAddr == "" || b.TunnelAddr == "" || b.NatsRoute == "" {
 		return nil, fmt.Errorf("cluster: join bundle missing required field(s) (ident_pub/nonce/sig/raft_addr/tunnel_addr/nats_route)")
 	}

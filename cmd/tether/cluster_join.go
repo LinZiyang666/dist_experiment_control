@@ -66,7 +66,7 @@ func newClusterJoinPrepareCmd() *cobra.Command {
 			}
 			// C8 (D10): require the expose-home/NATS-peer identity that the deleted `cluster add`
 			// enforced — else the admitted voter can never serve as an expose home or join the mesh.
-			// cert_fp stays optional (D6 backfills). JoinBundle.Validate re-enforces leader-side.
+			// cert_fp + bus_nkey are derived fail-closed below (audit A / v0.4.4 review F1), not D6-backfilled.
 			if tunnelAddr == "" || natsRoute == "" {
 				return usageErr("cluster join prepare: --tunnel-addr (host:7000) and --nats-route (nats://host:6222) are required (a voter must be able to serve exposes + join the NATS mesh)")
 			}
@@ -80,29 +80,30 @@ func newClusterJoinPrepareCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("sign join PoP: %w", err)
 			}
-			// audit A: derive the bus nkey (from broker.nk) + cert_fp (from the tunnel cert) at PREPARE so
-			// the leader bakes cluster_nodes.bus_nkey_pub + cert_fp AT ADMISSION. This breaks the learner
-			// bus_nkey self-backfill deadlock (the write needs a mesh that needs the value) and the empty-
-			// cert_fp wireClusterEarly crash-loop, and keeps the new voter home-eligible + topology-renderable.
+			// audit A (+ v0.4.4 review F1): derive the bus nkey (from broker.nk) + cert_fp (from the tunnel
+			// cert) at PREPARE so the leader bakes cluster_nodes.bus_nkey_pub + cert_fp AT ADMISSION. This
+			// breaks the learner bus_nkey self-backfill deadlock (the write needs a mesh that needs the value)
+			// and the empty-cert_fp wireClusterEarly crash-loop, and keeps the new voter home-eligible +
+			// topology-renderable. FAIL-CLOSED: an empty bus_nkey/cert_fp bundle re-introduces the EXACT
+			// deadlock + crash this fix removes (cert_fp='' trips wireClusterEarly BEFORE nats.Connect →
+			// permanent crash-loop on the grown leader), so a derivation failure must ABORT, never WARN-and-emit.
 			if natsServerID == "" {
 				natsServerID = nodeID // §6.5 SSOT: server_name == node_id
 			}
-			busNkey := ""
-			if raw, e := os.ReadFile(filepath.Join(secretsDir, "broker.nk")); e == nil {
-				if bp, e2 := auth.PublicKeyFromSeed([]byte(strings.TrimSpace(string(raw)))); e2 == nil {
-					busNkey = bp
-				} else {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not derive bus nkey from %s/broker.nk: %v (the learner bus_nkey backfill may deadlock)\n", secretsDir, e2)
-				}
-			} else {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not read %s/broker.nk: %v — pass --secrets-dir (the leader needs the bus nkey at admission)\n", secretsDir, e)
+			raw, e := os.ReadFile(filepath.Join(secretsDir, "broker.nk"))
+			if e != nil {
+				return fmt.Errorf("cluster join prepare: cannot read %s/broker.nk: %w — pass --secrets-dir pointing at this broker's secrets (the leader needs the bus nkey at admission)", secretsDir, e)
 			}
-			if certFP == "" {
-				if fp, e := clusteroffline.TunnelCertFingerprint(secretsDir); e == nil {
-					certFP = fp
-				} else {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not derive cert_fp from %s tunnel cert: %v (an empty cert_fp can crash-loop the joiner on restart)\n", secretsDir, e)
+			busNkey, e := auth.PublicKeyFromSeed([]byte(strings.TrimSpace(string(raw))))
+			if e != nil || busNkey == "" {
+				return fmt.Errorf("cluster join prepare: cannot derive bus nkey from %s/broker.nk: %v (an empty bus_nkey re-arms the learner self-backfill deadlock)", secretsDir, e)
+			}
+			if certFP == "" { // --cert-fp is the explicit override escape hatch (stays non-empty)
+				fp, ferr := clusteroffline.TunnelCertFingerprint(secretsDir)
+				if ferr != nil || fp == "" {
+					return fmt.Errorf("cluster join prepare: cannot derive cert_fp from %s tunnel cert: %v — pass --secrets-dir or --cert-fp (an empty cert_fp crash-loops the joiner: wireClusterEarly fails before nats.Connect)", secretsDir, ferr)
 				}
+				certFP = fp
 			}
 			bundle, err := cluster.EncodeJoinBundle(cluster.JoinBundle{
 				NodeID: nodeID, Name: name, NodeIdentPub: pub, NatsServerID: natsServerID,

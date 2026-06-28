@@ -84,6 +84,62 @@ func d7Phase(t *testing.T, f *fsm, nodeID string) string {
 	return p
 }
 
+func d7Col(t *testing.T, f *fsm, nodeID, col string) string {
+	t.Helper()
+	var v string
+	if err := f.db.QueryRow(`SELECT COALESCE(`+col+`,'') FROM cluster_nodes WHERE node_id=?`, nodeID).Scan(&v); err != nil {
+		t.Fatalf("read %s: %v", col, err)
+	}
+	return v
+}
+
+// TestD7UpsertEmptyReadmitPreservesIdentity (v0.4.4 review F2): an idempotent grow-retry re-approve that
+// carries an EMPTY bus_nkey / cert_fp must NOT clobber a previously-good value back to '' via the ON
+// CONFLICT DO UPDATE — that silently re-arms the learner self-backfill DEADLOCK (bus_nkey) and the joiner
+// crash-loop (cert_fp), the exact failures audit A removes. The upsert must be empty-PRESERVING.
+func TestD7UpsertEmptyReadmitPreservesIdentity(t *testing.T) {
+	f, _ := freshFSM(t, t.TempDir())
+	seed, pub := d7GenKey(t)
+	const node = "n1"
+
+	// (1) admit with a GOOD bus_nkey + cert_fp.
+	nonce1 := "nonce-good"
+	in1 := d7UpsertInput(node, pub, nonce1, d7Sign(t, seed, JoinSignBytes(node, pub, nonce1)))
+	in1.BusNkey = "UGOODBUSNKEY"
+	in1.CertFP = "sha256:goodfp"
+	cmd1, err := PlanClusterNodeUpsert(in1)
+	if err != nil {
+		t.Fatalf("plan admit: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 1, cmd1).(appliedOK); !ok {
+		t.Fatal("admit: want appliedOK")
+	}
+	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != "UGOODBUSNKEY" {
+		t.Fatalf("after admit bus_nkey_pub=%q, want UGOODBUSNKEY", bn)
+	}
+
+	// (2) re-admit (still PENDING → the DO UPDATE fires) carrying an EMPTY bundle.
+	nonce2 := "nonce-empty"
+	in2 := d7UpsertInput(node, pub, nonce2, d7Sign(t, seed, JoinSignBytes(node, pub, nonce2)))
+	in2.BusNkey = ""
+	in2.CertFP = ""
+	cmd2, err := PlanClusterNodeUpsert(in2)
+	if err != nil {
+		t.Fatalf("plan re-admit: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 2, cmd2).(appliedOK); !ok {
+		t.Fatal("re-admit: want appliedOK")
+	}
+
+	// (3) the good values must be PRESERVED, not clobbered to ''.
+	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != "UGOODBUSNKEY" {
+		t.Fatalf("empty re-admit CLOBBERED bus_nkey_pub to %q — must preserve UGOODBUSNKEY (re-arms the deadlock)", bn)
+	}
+	if fp := d7Col(t, f, node, "cert_fp"); fp != "sha256:goodfp" {
+		t.Fatalf("empty re-admit CLOBBERED cert_fp to %q — must preserve sha256:goodfp (re-arms the crash-loop)", fp)
+	}
+}
+
 // TestD7PlanUpsertVerifiesLeaderSide: the leader refuses to PROPOSE an entry whose
 // join PoP does not verify (fail-closed pre-propose), and produces a well-formed
 // command (with Aux) for a valid signature.

@@ -39,19 +39,16 @@ func TestD9ResnapshotRemediatesUnSnapshottedNode(t *testing.T) {
 		t.Fatal("precondition: a freshly bootstrapped (pre-fix) node must have NO snapshot")
 	}
 
-	// AUDIT-WINDOW guard: raft last_index (config@1) > audit_published_index (0) → refuse without the flag.
+	// AUDIT-WINDOW guard (v0.4.4 review STEP1): a clean migrated broker's log holds ONLY config@1 (and any
+	// trailing noop/checkpoint) — ZERO audit-bearing ops (OpReconcileBatch/OpTransferAudit) above the
+	// cursor. The fixed guard counts only those, so resnapshot must SUCCEED here WITHOUT --accept-audit-loss
+	// (the old raw `last_index > published` guard wrongly fired on the config@1 entry and forced the flag on
+	// every real broker, with the restart-drain-stop remedy provably unable to clear it). Discrimination
+	// (a real unpublished audit op DOES refuse) is unit-tested white-box in internal/cluster.
 	if err := clusteroffline.Resnapshot(clusteroffline.ResnapshotOptions{
 		DataDir: dir, DBPath: dbPath, SelfID: "pc732", SelfRaftAddr: "10.0.0.1:7400",
-	}); err == nil {
-		t.Fatal("resnapshot must REFUSE while raft last_index > audit_published_index without --accept-audit-loss (would truncate unpublished audit)")
-	}
-
-	// With --accept-audit-loss → remediates: a snapshot now exists, so a joiner installs it instead
-	// of replaying the log onto an un-seeded DB and FK-fail-stopping.
-	if err := clusteroffline.Resnapshot(clusteroffline.ResnapshotOptions{
-		DataDir: dir, DBPath: dbPath, SelfID: "pc732", SelfRaftAddr: "10.0.0.1:7400", AcceptAuditLoss: true,
 	}); err != nil {
-		t.Fatalf("resnapshot --accept-audit-loss: %v", err)
+		t.Fatalf("resnapshot on a clean migrated broker (no unpublished audit) must succeed without --accept-audit-loss: %v", err)
 	}
 	ex, idx, _, err := cluster.RaftSnapshotMeta(dir)
 	if err != nil {
@@ -62,5 +59,14 @@ func TestD9ResnapshotRemediatesUnSnapshottedNode(t *testing.T) {
 	}
 	if idx < 1 {
 		t.Fatalf("resnapshot snapshot index = %d, want >= 1", idx)
+	}
+	// COMPACTION (v0.4.4 review): existence alone can't tell the real remediation from a snapshot-without-
+	// compaction no-op. RecoverCluster's unconditional DeleteRange empties the offline log so a joiner
+	// gets InstallSnapshot; assert it (==0 offline post-RecoverCluster), the load-bearing grow-readiness.
+	if last, lerr := cluster.RaftLastIndex(dir); lerr != nil {
+		t.Fatalf("RaftLastIndex: %v", lerr)
+	} else if last != 0 {
+		t.Fatalf("resnapshot did NOT compact the log: RaftLastIndex=%d, want 0 — a joiner would replay the "+
+			"log instead of InstallSnapshot (the v0.4.3 no-op class)", last)
 	}
 }
