@@ -114,6 +114,121 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	return roster, nil
 }
 
+// ResnapshotOptions configures the STEP-1 grow-onto-migrated-broker remediation.
+type ResnapshotOptions struct {
+	DataDir         string
+	DBPath          string
+	SelfID          string
+	SelfRaftAddr    string
+	AcceptAuditLoss bool
+	Now             func() time.Time
+	Logger          *slog.Logger
+}
+
+// Resnapshot makes an ALREADY-init'd single-voter migrated broker grow-ready by writing a full FSM
+// snapshot + compacting the log (cluster.GrowReadySnapshot). It is the one-time remediation for a
+// broker init'd BEFORE the grow-onto-migrated-broker fix (e.g. the live pc732): such a node has the
+// migrated rows direct-seeded in SQLite, NO raft snapshot, and a short un-compacted log, so a fresh
+// joiner replays its log from index 1 and FK-fail-stops. After Resnapshot FirstIndex>1 → the joiner
+// installs the snapshot. OFFLINE: daemon STOPPED.
+//
+// SINGLE-VOTER ONLY: refuses if any non-self roster node exists — GrowReadySnapshot rewrites the raft
+// config to {self}, which on a multi-voter cluster would silently drop the peers. AUDIT-WINDOW GUARD:
+// the log truncation is unconditional, so if the D5 audit publisher has not published up to LastIndex,
+// those audit entries are LOST. Resnapshot refuses unless AcceptAuditLoss, naming the remedy (restart
+// the daemon briefly to let the publisher drain, then re-run); when AcceptAuditLoss it logs loudly.
+func Resnapshot(opts ResnapshotOptions) error {
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.SelfID == "" || opts.SelfRaftAddr == "" {
+		return errors.New("clusteroffline: Resnapshot requires SelfID and SelfRaftAddr")
+	}
+	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// no live daemon (bolt lock) + state must exist.
+	locked, err := cluster.RaftStoreLockedByDaemon(opts.DataDir)
+	if err != nil {
+		return err
+	}
+	if locked {
+		return ErrDaemonRunning
+	}
+	exists, err := cluster.RaftStateExists(opts.DataDir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return cluster.ErrNoExistingState
+	}
+
+	// SINGLE-VOTER guard: GrowReadySnapshot rewrites the config to {self}; a non-self node would be dropped.
+	roster, err := readRoster(opts.DBPath, opts.SelfID)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: read roster: %w", err)
+	}
+	if len(roster) > 0 {
+		ids := make([]string, len(roster))
+		for i, p := range roster {
+			ids[i] = p.NodeID
+		}
+		return fmt.Errorf("clusteroffline: resnapshot is SINGLE-VOTER only but the roster has %d non-self node(s) %v "+
+			"— retire/remove them first (resnapshot rewrites the raft config to {self} and would drop peers)", len(roster), ids)
+	}
+
+	// AUDIT-WINDOW guard: the unconditional log truncation must not drop unpublished audit.
+	pub, err := readAuditPublishedIndex(opts.DBPath)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: read audit cursor: %w", err)
+	}
+	last, err := cluster.RaftLastIndex(opts.DataDir)
+	if err != nil {
+		return err
+	}
+	if last > pub {
+		if !opts.AcceptAuditLoss {
+			return fmt.Errorf("clusteroffline: resnapshot would truncate %d UNPUBLISHED audit entr(ies) "+
+				"(audit_published_index=%d < raft last_index=%d) — restart tether-broker briefly so the D5 "+
+				"publisher drains to the head, stop it, and re-run; or pass --accept-audit-loss (bounded loud loss)",
+				last-pub, pub, last)
+		}
+		opts.Logger.Warn("clusteroffline: resnapshot ACCEPTING bounded audit loss",
+			"unpublished", last-pub, "audit_published_index", pub, "raft_last_index", last)
+	}
+
+	if err := cluster.GrowReadySnapshot(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr, opts.Logger); err != nil {
+		return fmt.Errorf("clusteroffline: grow-ready snapshot: %w", err)
+	}
+	opts.Logger.Warn("clusteroffline: resnapshot complete; this single-voter broker is now grow-ready "+
+		"(a future joiner installs the snapshot instead of replaying the log)", "self", opts.SelfID)
+	return nil
+}
+
+// readAuditPublishedIndex reads the D5 audit-publish cursor from cluster_meta (0 if absent).
+func readAuditPublishedIndex(dbPath string) (uint64, error) {
+	db, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	var v uint64
+	switch err := db.QueryRow(`SELECT CAST(value AS INTEGER) FROM cluster_meta WHERE key='audit_published_index'`).Scan(&v); err {
+	case nil:
+		return v, nil
+	case sql.ErrNoRows:
+		return 0, nil
+	default:
+		return 0, err
+	}
+}
+
 // checkPeersDead enforces §8.4(d): every non-self roster node must be in confirmed
 // (an unlisted peer would split-brain), and any peer that COMPLETES a TCP connection on ANY of
 // its serving ports is alive → HARD-REFUSE (a TLS-rejected-but-TCP-accepting peer is still

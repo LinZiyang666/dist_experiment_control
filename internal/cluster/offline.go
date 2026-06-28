@@ -98,6 +98,26 @@ func RaftSnapshotMeta(dataDir string) (exists bool, index, term uint64, err erro
 	return true, list[0].Index, list[0].Term, nil // List() is newest-first
 }
 
+// RaftLastIndex returns the on-disk raft log's last index (offline, read-only). Used by the
+// resnapshot audit-window guard: if audit_published_index < LastIndex, compacting the log would
+// truncate unpublished audit. Returns 0 on an empty log (e.g. just after a compaction).
+func RaftLastIndex(dataDir string) (uint64, error) {
+	_, boltPath := raftPaths(dataDir)
+	store, err := raftboltdb.New(raftboltdb.Options{
+		Path:        boltPath,
+		BoltOptions: &bolt.Options{Timeout: boltLockProbeTimeout},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("cluster: open boltstore for last-index: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	last, err := store.LastIndex()
+	if err != nil {
+		return 0, fmt.Errorf("cluster: read last index: %w", err)
+	}
+	return last, nil
+}
+
 // ErrAlreadyBootstrapped is BootstrapSingleNode's idempotent signal: raft/ already holds
 // state (a prior `cluster init` created it), so there is nothing to bootstrap. The caller
 // treats it as success (the init is idempotent).

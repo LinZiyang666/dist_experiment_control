@@ -95,6 +95,62 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 	return cmd
 }
 
+// newClusterResnapshotCmd is the STEP-1 grow-onto-migrated-broker remediation: make an ALREADY-init'd
+// single-voter migrated broker grow-ready (write a raft snapshot + compact the log so a fresh joiner
+// installs the snapshot instead of replaying the log and FK-fail-stopping). Brokers init'd by
+// `cluster init --from-existing` BEFORE the fix (e.g. the live pc732) have no snapshot + a short log
+// and cannot grow until resnapshot'd. OFFLINE (daemon STOPPED). Single-voter only; audit-window guarded.
+func newClusterResnapshotCmd() *cobra.Command {
+	var dataDir, dbPath, selfID, selfAddr, confirmNodeID string
+	var acceptAuditLoss bool
+	cmd := &cobra.Command{
+		Use:   "resnapshot",
+		Short: "OFFLINE: make an already-init'd single-voter migrated broker grow-ready (raft snapshot + log compaction); daemon STOPPED",
+		Long: `resnapshot writes a full FSM snapshot of THIS single-voter broker + compacts its raft log so a
+future joiner catches up via InstallSnapshot (the full DB) instead of replaying the log from index 1
+onto an un-seeded DB and FK-fail-stopping. It is the one-time remediation for a broker migrated by
+` + "`cluster init --from-existing`" + ` BEFORE the grow-onto-migrated-broker fix (no snapshot + short log).
+
+STOP the daemon first (systemctl stop tether-broker). SINGLE-VOTER only — it refuses if the roster has
+any non-self node (it rewrites the raft config to {self} and would drop peers). It REFUSES if the log
+carries UNPUBLISHED audit (audit_published_index < raft last_index): restart the daemon briefly so the
+D5 publisher drains, stop it, and re-run — or pass --accept-audit-loss to accept a bounded loud loss.
+The SQLite DB is preserved (the snapshot is a copy); only the raft log is compacted.`,
+		Example: "  systemctl stop tether-broker\n" +
+			"  TETHER_CONFIRM_NODE_ID=pc732 tether cluster recovery resnapshot --self-id pc732 --raft-addr 155.98.36.32:7400 --confirm-node-id pc732\n" +
+			"  systemctl start tether-broker",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectedUnattendedYes(cmd, "resnapshot", selfID); err != nil {
+				return err
+			}
+			if selfID == "" || selfAddr == "" {
+				return usageErr("resnapshot requires --self-id and --raft-addr (this node's current raft advertise addr)")
+			}
+			if !confirmTypedNodeID(cmd, selfID,
+				"CONSEQUENCE: rewrites the raft log (snapshot + compaction). The SQLite DB is preserved; only the raft log is compacted.",
+				true, confirmNodeID) {
+				return fmt.Errorf("resnapshot: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
+			}
+			if err := clusteroffline.Resnapshot(clusteroffline.ResnapshotOptions{
+				DataDir: dataDir, DBPath: dbPath, SelfID: selfID, SelfRaftAddr: selfAddr, AcceptAuditLoss: acceptAuditLoss,
+			}); err != nil {
+				return fmt.Errorf("resnapshot: %w", err)
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "resnapshot complete: %q is now grow-ready (start the daemon + `cluster join approve` the joiner).\n", selfID)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&dataDir, "data-dir", defaultDataDir, "broker data dir (holds raft/ + tether.db)")
+	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "tether.db path")
+	cmd.Flags().StringVar(&selfID, "self-id", "", "this node's cluster node_id — REQUIRED")
+	cmd.Flags().StringVar(&selfAddr, "raft-addr", "", "this node's CURRENT raft advertise addr (host:7400) — REQUIRED (preserved in the new config)")
+	cmd.Flags().BoolVar(&acceptAuditLoss, "accept-audit-loss", false, "proceed even if unpublished audit would be truncated (bounded loud loss)")
+	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "unattended confirm: must equal --self-id AND match $"+machineConfirmEnv+" (no TTY)")
+	registerYesRejector(cmd)
+	return cmd
+}
+
 func newClusterRecoverCmd() *cobra.Command {
 	var dataDir, dbPath, dumpPath, selfID, emitManifest, secretsDir string
 	var guided bool

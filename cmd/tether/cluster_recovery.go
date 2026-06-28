@@ -51,6 +51,9 @@ func newClusterRecoveryCmd(socketPath *string) *cobra.Command {
 	// recovery force-single — the existing force-single command (gates byte-identical; only the parent differs).
 	forceSingle := newClusterForceSingleCmd()
 
+	// recovery resnapshot — STEP-1 grow-onto-migrated-broker remediation (snapshot + log compaction).
+	resnapshot := newClusterResnapshotCmd()
+
 	// recovery rejoin prepare — `cluster recover` re-parented under a `rejoin` group as `prepare`.
 	rejoin := &cobra.Command{
 		Use:   "rejoin",
@@ -84,6 +87,6 @@ func newClusterRecoveryCmd(socketPath *string) *cobra.Command {
 	nodeRemove.Use = "remove <node-id>"
 	node.AddCommand(nodeRemove)
 
-	root.AddCommand(diagnose, forceSingle, rejoin, restore, incident, node)
+	root.AddCommand(diagnose, forceSingle, resnapshot, rejoin, restore, incident, node)
 	return root
 }
