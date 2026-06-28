@@ -27,8 +27,13 @@ type JoinBundle struct {
 	TunnelAddr   string `json:"tunnel_addr"`
 	PublicHost   string `json:"public_host"`
 	CertFP       string `json:"cert_fp"`
-	JoinNonce    string `json:"join_nonce"`
-	JoinSigHex   string `json:"join_sig_hex"`
+	// BusNkey is the joiner broker's NATS bus nkey pub (derived from its broker.nk). Carried at
+	// ADMISSION so the leader bakes cluster_nodes.bus_nkey_pub immediately — breaking the learner
+	// self-backfill DEADLOCK (the self-backfill write must forward over a mesh that cannot render
+	// until bus_nkey exists). audit finding A.
+	BusNkey    string `json:"bus_nkey,omitempty"`
+	JoinNonce  string `json:"join_nonce"`
+	JoinSigHex string `json:"join_sig_hex"`
 }
 
 // EncodeJoinBundle renders a bundle as the base64url string the operator carries OOB from the joiner
@@ -90,9 +95,13 @@ func (b *JoinBundle) ToUpsertInput(now time.Time) ClusterNodeUpsertInput {
 	if name == "" {
 		name = b.NodeID
 	}
+	natsSrv := b.NatsServerID
+	if natsSrv == "" {
+		natsSrv = b.NodeID // §6.5 SSOT: server_name == node_id; default so the node stays home-eligible (audit A)
+	}
 	return ClusterNodeUpsertInput{
-		NodeID: b.NodeID, Name: name, NodeIdentPub: b.NodeIdentPub, NatsServerID: b.NatsServerID,
+		NodeID: b.NodeID, Name: name, NodeIdentPub: b.NodeIdentPub, NatsServerID: natsSrv,
 		RaftAddr: b.RaftAddr, NatsRoute: b.NatsRoute, TunnelAddr: b.TunnelAddr, PublicHost: b.PublicHost,
-		CertFP: b.CertFP, JoinNonce: b.JoinNonce, JoinSigHex: b.JoinSigHex, Now: now,
+		CertFP: b.CertFP, BusNkey: b.BusNkey, JoinNonce: b.JoinNonce, JoinSigHex: b.JoinSigHex, Now: now,
 	}
 }

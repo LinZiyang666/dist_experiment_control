@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
 )
@@ -34,7 +36,7 @@ func newClusterJoinCmd(socketPath *string) *cobra.Command {
 }
 
 func newClusterJoinPrepareCmd() *cobra.Command {
-	var seedPath, nodeID, name, natsServerID, raftAddr, natsRoute, tunnelAddr, publicHost, certFP string
+	var seedPath, nodeID, name, natsServerID, raftAddr, natsRoute, tunnelAddr, publicHost, certFP, secretsDir string
 	cmd := &cobra.Command{
 		Use:   "prepare",
 		Short: "On the JOINING broker: mint a self-signed join bundle (no leader call needed)",
@@ -78,10 +80,34 @@ func newClusterJoinPrepareCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("sign join PoP: %w", err)
 			}
+			// audit A: derive the bus nkey (from broker.nk) + cert_fp (from the tunnel cert) at PREPARE so
+			// the leader bakes cluster_nodes.bus_nkey_pub + cert_fp AT ADMISSION. This breaks the learner
+			// bus_nkey self-backfill deadlock (the write needs a mesh that needs the value) and the empty-
+			// cert_fp wireClusterEarly crash-loop, and keeps the new voter home-eligible + topology-renderable.
+			if natsServerID == "" {
+				natsServerID = nodeID // §6.5 SSOT: server_name == node_id
+			}
+			busNkey := ""
+			if raw, e := os.ReadFile(filepath.Join(secretsDir, "broker.nk")); e == nil {
+				if bp, e2 := auth.PublicKeyFromSeed([]byte(strings.TrimSpace(string(raw)))); e2 == nil {
+					busNkey = bp
+				} else {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not derive bus nkey from %s/broker.nk: %v (the learner bus_nkey backfill may deadlock)\n", secretsDir, e2)
+				}
+			} else {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not read %s/broker.nk: %v — pass --secrets-dir (the leader needs the bus nkey at admission)\n", secretsDir, e)
+			}
+			if certFP == "" {
+				if fp, e := clusteroffline.TunnelCertFingerprint(secretsDir); e == nil {
+					certFP = fp
+				} else {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARN: could not derive cert_fp from %s tunnel cert: %v (an empty cert_fp can crash-loop the joiner on restart)\n", secretsDir, e)
+				}
+			}
 			bundle, err := cluster.EncodeJoinBundle(cluster.JoinBundle{
 				NodeID: nodeID, Name: name, NodeIdentPub: pub, NatsServerID: natsServerID,
 				RaftAddr: raftAddr, NatsRoute: natsRoute, TunnelAddr: tunnelAddr, PublicHost: publicHost,
-				CertFP: certFP, JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig),
+				CertFP: certFP, BusNkey: busNkey, JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig),
 			})
 			if err != nil {
 				return err
@@ -100,7 +126,8 @@ func newClusterJoinPrepareCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsRoute, "nats-route", "", "this joiner's NATS route URL (nats://host:6222)")
 	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "", "this joiner's public tunnel addr (host:7000)")
 	cmd.Flags().StringVar(&publicHost, "public-host", "", "this joiner's public host")
-	cmd.Flags().StringVar(&certFP, "cert-fp", "", "this joiner's tunnel-cert fingerprint pin (optional; D6 backfills)")
+	cmd.Flags().StringVar(&certFP, "cert-fp", "", "this joiner's tunnel-cert fingerprint pin (default: auto-derived from <secrets-dir>/tunnel-cert.pem)")
+	cmd.Flags().StringVar(&secretsDir, "secrets-dir", defaultClusterSecretsDir, "§15 secrets dir — read broker.nk (bus nkey) + tunnel-cert.pem (cert_fp) to carry at admission (audit A)")
 	return cmd
 }
 

@@ -75,6 +75,7 @@ type ClusterNodeUpsertInput struct {
 	TunnelAddr   string
 	PublicHost   string
 	CertFP       string
+	BusNkey      string // NATS bus nkey pub, baked at admission to break the learner backfill deadlock (audit A)
 	JoinNonce    string
 	JoinSigHex   string
 	Now          time.Time
@@ -109,25 +110,30 @@ func PlanClusterNodeUpsert(in ClusterNodeUpsertInput) (*Command, error) {
 
 	lits, err := LitTextAll(in.NodeID, in.Name, in.NodeIdentPub, in.NatsServerID,
 		in.RaftAddr, in.NatsRoute, in.TunnelAddr, in.PublicHost, in.CertFP,
-		in.JoinNonce, in.JoinSigHex)
+		in.JoinNonce, in.JoinSigHex, in.BusNkey)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: plan node-upsert: bake literal: %w", err)
 	}
 	nodeID, name, identPub, natsSrv := lits[0], lits[1], lits[2], lits[3]
 	raftAddr, natsRoute, tunnelAddr := lits[4], lits[5], lits[6]
 	publicHost, certFP, nonceLit, sigLit := lits[7], lits[8], lits[9], lits[10]
+	busNkey := lits[11]
 	tsLit := LitTime(in.Now.UTC())
 	const pending = "'JOIN_VERIFIED_PENDING_VOTER'"
 
+	// bus_nkey_pub is baked at column 10 (right after cert_fp) so the positional Aux cross-check in
+	// clusterNodeUpsertApplier — which matches the contiguous identFrag (cols 1-3) and joinFrag
+	// (nonce/sig/voter_add_error) — stays intact (audit A; the splice is order-sensitive).
 	sqlStr := `INSERT INTO cluster_nodes(node_id, name, node_ident_pub, nats_server_id, ` +
-		`raft_addr, nats_route, tunnel_addr, public_host, cert_fp, cert_fp_prev, ` +
+		`raft_addr, nats_route, tunnel_addr, public_host, cert_fp, bus_nkey_pub, cert_fp_prev, ` +
 		`cert_fp_valid_until, phase, added_at, join_nonce, join_sig, voter_add_error, phase_changed_at) VALUES(` +
 		nodeID + `, ` + name + `, ` + identPub + `, ` + natsSrv + `, ` +
-		raftAddr + `, ` + natsRoute + `, ` + tunnelAddr + `, ` + publicHost + `, ` + certFP + `, NULL, ` +
+		raftAddr + `, ` + natsRoute + `, ` + tunnelAddr + `, ` + publicHost + `, ` + certFP + `, ` + busNkey + `, NULL, ` +
 		`NULL, ` + pending + `, ` + tsLit + `, ` + nonceLit + `, ` + sigLit + `, NULL, ` + tsLit + `) ` +
 		`ON CONFLICT(node_id) DO UPDATE SET name=excluded.name, node_ident_pub=excluded.node_ident_pub, ` +
 		`nats_server_id=excluded.nats_server_id, raft_addr=excluded.raft_addr, nats_route=excluded.nats_route, ` +
 		`tunnel_addr=excluded.tunnel_addr, public_host=excluded.public_host, cert_fp=excluded.cert_fp, ` +
+		`bus_nkey_pub=excluded.bus_nkey_pub, ` +
 		`phase=` + pending + `, join_nonce=excluded.join_nonce, join_sig=excluded.join_sig, ` +
 		`voter_add_error=NULL, phase_changed_at=excluded.phase_changed_at ` +
 		`WHERE cluster_nodes.phase IN ('JOIN_VERIFIED_PENDING_VOTER','VOTER_ADD_FAILED')`
