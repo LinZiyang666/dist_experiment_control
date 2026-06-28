@@ -51,8 +51,13 @@ func TestBuildMergedConfHarvestsClusterTLSAndMonitor(t *testing.T) {
 	// The reconciler builds a cfg with NO cluster TLS / listen / name / monitor — exactly the case B1
 	// said could never render. BuildMergedConf must harvest them from `own` and succeed.
 	cfg := natscluster.Config{
-		Local:         natscluster.Broker{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
-		Peers:         []natscluster.Broker{{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"}},
+		Local: natscluster.Broker{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+		// self + a REAL peer so the clustered render carries a route (a lone-self clustered conf is
+		// unbootable and now refused by natscluster.Render — audit D).
+		Peers: []natscluster.Broker{
+			{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+			{ServerName: "brk-b", NkeyPub: "UBUSNKEYB", RouteURL: "nats://10.0.0.2:6222"},
+		},
 		AccountIssuer: "ABROKERACCOUNTPUB",
 		JSStoreDir:    own.JSStoreDir(),
 		ClientListen:  own.ClientListen(),

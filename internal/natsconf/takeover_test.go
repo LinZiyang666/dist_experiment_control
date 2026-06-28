@@ -11,9 +11,12 @@ import (
 
 func sampleClusterConfig() natscluster.Config {
 	self := natscluster.Broker{ServerName: "tether-a", NkeyPub: "UBROKERA", RouteURL: "nats://10.0.0.1:6222"}
+	// a REAL peer so the clustered render carries a route (a lone-self clustered conf is unbootable
+	// and now correctly refused by natscluster.Render — audit D).
+	peer := natscluster.Broker{ServerName: "tether-b", NkeyPub: "UBROKERB", RouteURL: "nats://10.0.0.2:6222"}
 	return natscluster.Config{
 		Local:         self,
-		Peers:         []natscluster.Broker{self},
+		Peers:         []natscluster.Broker{self, peer},
 		AccountIssuer: "UACCOUNT",
 		JSStoreDir:    "/var/lib/tether/jetstream",
 		ClientListen:  "127.0.0.1:4222",

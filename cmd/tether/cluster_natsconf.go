@@ -310,6 +310,10 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			}
 		}
 		cfg := natscluster.Config{
+			// audit D: a lone node (no --peer, just self) MUST render Standalone — a clustered conf with
+			// empty routes makes nats-server FATAL ("JetStream cluster requires configured routes") at boot
+			// while `nats-server -t` passes it. The grow re-renders clustered once the peer mesh is supplied.
+			Standalone:    len(peers) == 1,
 			Local:         self,
 			Peers:         peers,
 			AccountIssuer: accountIssuer,

@@ -49,8 +49,12 @@ func TestExternalSinglePeerClusteredConfRequiresExplicitDeclusterIntent(t *testi
 	self := natscluster.Broker{
 		ServerName: "solo", NkeyPub: "UBROKER", RouteURL: "nats://127.0.0.1:6222",
 	}
+	// The FIXTURE is a VALID clustered conf (self + a former peer) — the shape left after an N=2
+	// cluster lost a node down to N=1. (A lone-self clustered render is unbootable and now refused by
+	// natscluster.Render — audit D — so we cannot use it as the fixture.)
+	gonePeer := natscluster.Broker{ServerName: "gone", NkeyPub: "UGONE", RouteURL: "nats://127.0.0.2:6222"}
 	conf, err := natscluster.Render(natscluster.Config{
-		Local: self, Peers: []natscluster.Broker{self}, AccountIssuer: "AISSUER",
+		Local: self, Peers: []natscluster.Broker{self, gonePeer}, AccountIssuer: "AISSUER",
 		JSStoreDir: filepath.Join(t.TempDir(), "js"), ClientListen: "127.0.0.1:4222",
 		ClusterListen: "127.0.0.1:6222", CAFile: "/run/tether/ca.pem",
 		CertFile: "/run/tether/cert.pem", KeyFile: "/run/tether/key.pem",
@@ -73,5 +77,11 @@ func TestExternalSinglePeerClusteredConfRequiresExplicitDeclusterIntent(t *testi
 	}
 	if !post.IsClusteredJetStream() {
 		t.Fatalf("automatic reconcile removed cluster{} without explicit de-cluster intent; outcome=%+v", out)
+	}
+	// audit D: at N=1 the reconciler must REFUSE (ActionRejected/STUCK) to swap in a lone-self clustered
+	// conf (empty routes = unbootable) rather than silently bricking the broker — the existing clustered
+	// conf is preserved untouched, pending an explicit `reconcile nats --to-standalone --confirm-single`.
+	if out.Action != ActionRejected {
+		t.Fatalf("N=1 with a still-clustered conf must be ActionRejected (refuse the unbootable empty-routes re-render), got %q (outcome=%+v)", out.Action, out)
 	}
 }

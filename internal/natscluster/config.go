@@ -113,6 +113,7 @@ func Render(cfg Config) (string, error) {
 	// Cluster — flat full-mesh routes over cluster-CA mTLS (verify = mutual). SKIPPED in standalone
 	// mode (v0.4.2 shrink to N=1): a lone node has no routes and runs JetStream standalone, so the
 	// rendered conf must NOT carry a cluster{} block (the reverse of the grow transition).
+	clusterRoutes := 0
 	if !cfg.Standalone {
 		b.WriteString("cluster {\n")
 		fmt.Fprintf(&b, "  name: %q\n", clusterName)
@@ -125,6 +126,7 @@ func Render(cfg Config) (string, error) {
 				continue // skip self; nats dedups but keep the conf clean
 			}
 			fmt.Fprintf(&b, "    %q\n", p.RouteURL)
+			clusterRoutes++
 		}
 		b.WriteString("  ]\n")
 		b.WriteString("  tls {\n")
@@ -134,6 +136,14 @@ func Render(cfg Config) (string, error) {
 		b.WriteString("    verify: true\n")
 		b.WriteString("  }\n")
 		b.WriteString("}\n\n")
+	}
+	// FAIL-CLOSED (audit D): a clustered render with ZERO routes (all peers self/empty) produces a
+	// cluster{} block that nats-server FATAL-refuses ("JetStream cluster requires configured routes or
+	// solicited leafnode") — yet `nats-server -t` PASSES it, so the unbootable conf slips dry-run. A
+	// lone node MUST render Standalone (no cluster{}); refuse rather than brick the broker at boot.
+	if !cfg.Standalone && clusterRoutes == 0 {
+		return "", fmt.Errorf("natscluster: refusing a clustered render with ZERO routes (peers=%d, all "+
+			"self/empty) — nats-server would FATAL at boot; a lone node must render Standalone", len(peers))
 	}
 
 	// audit natscluster F1: dedup peers by NkeyPub. A duplicate nkey in auth_users or the static
