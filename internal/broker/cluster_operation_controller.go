@@ -473,15 +473,16 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			if !a.opStillLive(op.OpID) {
 				return // R1: aborted between the controller tick and this irreversible AddNonvoter
 			}
-			// GROW-ONTO-MIGRATED-LEADER FIX: force a leader raft snapshot BEFORE staging the joiner.
-			// A leader migrated by `cluster init --from-existing` seeds its DB rows DIRECTLY (not
-			// through the raft log) and may have NO snapshot yet (short log < SnapshotThreshold). A
-			// fresh joiner with no such snapshot to install would replay the leader's log from index 1
-			// onto its own (differently seeded) DB and FK-fail on rows the log assumes but never
-			// created (it fail-stops). Snapshotting here guarantees the joiner catches up via
-			// InstallSnapshot (fsm.Restore = the full SQLite DB). Runs once per join (guarded by
-			// !sub.inRaft). A persistent snapshot error blocks (visible) instead of staging a
-			// guaranteed-crash joiner; SnapshotForJoin treats ErrNothingNewToSnapshot as success.
+			// Refresh the leader snapshot before staging the joiner so the joiner installs the LATEST
+			// state with the least log replay. The PRIMARY grow-onto-migrated-leader fix is at INIT
+			// (clusteroffline.InitFromExisting → cluster.GrowReadySnapshot compacts the log so
+			// FirstIndex>1, which is what makes raft choose SEND_SNAP over log replay — a leader migrated
+			// by `cluster init --from-existing` direct-seeds DB rows no log entry created, so a joiner
+			// that replays from index 1 FK-fail-stops). This call is complementary, NOT the fix: on a
+			// short un-compacted log raft.Snapshot writes a snapshot FILE but compacts nothing (the gate
+			// is TrailingLogs, not SnapshotThreshold), so it cannot by itself trigger InstallSnapshot —
+			// the init/resnapshot compaction does. Runs once per join (guarded by !sub.inRaft); a
+			// persistent error blocks (visible); SnapshotForJoin treats ErrNothingNewToSnapshot as success.
 			if err := a.node.SnapshotForJoin(); err != nil {
 				a.recordOpError(op, fmt.Errorf("pre-join leader snapshot: %w", err))
 				return

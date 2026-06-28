@@ -17,9 +17,13 @@ import (
 // honor --yes — a typed node_id is mandatory (§8.1).
 
 const (
-	defaultDataDir      = "/var/lib/tether"
-	defaultDBPath       = "/var/lib/tether/tether.db"
-	defaultSeed         = "/etc/tether/node-ident.nk"
+	defaultDataDir = "/var/lib/tether"
+	defaultDBPath  = "/var/lib/tether/tether.db"
+	// defaultSeed MUST equal <secrets_dir>/node-ident.nk: the broker's cluster-mode preflight
+	// (SecretsPreflight) requires node-ident.nk INSIDE the secrets dir, so keygen/node-pub/join-prepare
+	// must default there too — else the documented `keygen` flow mints the seed at /etc/tether/node-ident.nk
+	// and the broker FATALs at start on a missing secrets/node-ident.nk (audit finding F).
+	defaultSeed         = defaultClusterSecretsDir + "/node-ident.nk"
 	defaultNatsConfPath = "/etc/tether/nats.conf"
 )
 

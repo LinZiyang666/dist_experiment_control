@@ -78,6 +78,26 @@ func RaftStateExists(dataDir string) (bool, error) {
 	return existing, nil
 }
 
+// RaftSnapshotMeta reports the newest persisted raft snapshot (index/term) for an on-disk store,
+// or exists=false if there is none. Offline, read-only. The grow-onto-migrated-broker fix asserts a
+// snapshot EXISTS after `cluster init --from-existing` / `recovery resnapshot` — without it a fresh
+// joiner replays the leader's log onto an un-seeded DB and FK-fail-stops. Used by tests + doctor.
+func RaftSnapshotMeta(dataDir string) (exists bool, index, term uint64, err error) {
+	raftDir, _ := raftPaths(dataDir)
+	snaps, e := raft.NewFileSnapshotStore(raftDir, 2, io.Discard)
+	if e != nil {
+		return false, 0, 0, fmt.Errorf("cluster: open snapshot store: %w", e)
+	}
+	list, e := snaps.List()
+	if e != nil {
+		return false, 0, 0, fmt.Errorf("cluster: list snapshots: %w", e)
+	}
+	if len(list) == 0 {
+		return false, 0, 0, nil
+	}
+	return true, list[0].Index, list[0].Term, nil // List() is newest-first
+}
+
 // ErrAlreadyBootstrapped is BootstrapSingleNode's idempotent signal: raft/ already holds
 // state (a prior `cluster init` created it), so there is nothing to bootstrap. The caller
 // treats it as success (the init is idempotent).
@@ -151,11 +171,36 @@ func BootstrapSingleNode(dataDir, selfID, selfRaftAddr string, logger *slog.Logg
 // Caller MUST already hold the flock, have confirmed no live daemon (the bolt lock),
 // have confirmed RaftStateExists, and have HARD-REFUSED on any reachable peer.
 func RecoverSingleNode(dataDir, dbPath, selfID, selfRaftAddr string, logger *slog.Logger) error {
+	return recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr, logger)
+}
+
+// GrowReadySnapshot makes a freshly-bootstrapped (or already-init'd) single-voter store
+// GROW-READY by writing a full FSM snapshot (the online SQLite backup carrying every
+// direct-seeded row) and DeleteRange-truncating the log so FirstIndex advances PAST the
+// bootstrap/seed entries. This is the keystone of the grow-onto-migrated-broker fix: a
+// broker migrated by `cluster init --from-existing` direct-seeds rows into SQLite that no
+// log entry created, so without a snapshot a fresh joiner replays the log from index 1 onto
+// an un-seeded DB and FK-fail-stops (or — silently worse — replays an FK-safe log onto empty
+// tables and is promoted as a hollow voter). After this call FirstIndex>1, so a joiner's
+// nextIndex decays below FirstIndex, raft ships InstallSnapshot (not the log), and fsm.Restore
+// loads the full DB — no replay, no FK crash, no hollow fork.
+//
+// It is mechanically identical to RecoverSingleNode (both raft.RecoverCluster to {self}), but
+// semantically distinct: the caller does NOT raise the force_single marker and the config is
+// already {self} (a no-op rewrite at N=1). Offline only — daemon STOPPED, flock held. The
+// caller is responsible for the D5 audit-window guard (drain audit_published_index up to the
+// snapshot index BEFORE compacting, else accept a bounded LOUD loss — RecoverCluster's
+// DeleteRange is unconditional).
+func GrowReadySnapshot(dataDir, dbPath, selfID, selfRaftAddr string, logger *slog.Logger) error {
+	return recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr, logger)
+}
+
+func recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr string, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if selfID == "" || selfRaftAddr == "" {
-		return errors.New("cluster: RecoverSingleNode requires selfID and selfRaftAddr")
+		return errors.New("cluster: recoverClusterToSelf requires selfID and selfRaftAddr")
 	}
 	raftDir, boltPath := raftPaths(dataDir)
 

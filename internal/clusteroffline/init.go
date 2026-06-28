@@ -223,12 +223,25 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 		return fmt.Errorf("clusteroffline: close after seed: %w", err)
 	}
 
-	// (7) bootstrap raft/ — the FINAL step (idempotent: ErrAlreadyBootstrapped on re-run).
+	// (7) bootstrap raft/ — config@1 (idempotent: ErrAlreadyBootstrapped on re-run).
 	if err := cluster.BootstrapSingleNode(opts.DataDir, opts.SelfID, opts.RaftAddr, opts.Logger); err != nil &&
 		!errors.Is(err, cluster.ErrAlreadyBootstrapped) {
 		return err
 	}
-	opts.Logger.Warn("clusteroffline: cluster init --from-existing complete; this node is now a single-voter cluster",
+	// (8) GROW-READY snapshot — the KEYSTONE of the grow-onto-migrated-broker fix. seedClusterState
+	// direct-seeds migrated rows into SQLite that NO log entry created, so the FSM is not
+	// reconstructable from (snapshot + log-from-1). Without a snapshot, a future joiner replays this
+	// node's log from index 1 onto its own un-seeded DB and FK-fail-stops (or, silently worse, replays
+	// an FK-safe log onto empty tables and is promoted as a hollow voter). GrowReadySnapshot writes a
+	// full FSM snapshot (the online SQLite backup carrying every seeded row) and compacts the log past
+	// config@1 so FirstIndex>1 — then a joiner's nextIndex decays below FirstIndex, raft ships
+	// InstallSnapshot (not the log), and fsm.Restore loads the full DB. No replay, no FK crash, no fork.
+	// The freshly-init'd log is just config@1 (zero unpublished cluster audit), so no D5 audit-window
+	// guard is needed here (the publisher floors at LogFirstIndex). Idempotent on re-run.
+	if err := cluster.GrowReadySnapshot(opts.DataDir, opts.DBPath, opts.SelfID, opts.RaftAddr, opts.Logger); err != nil {
+		return fmt.Errorf("clusteroffline: grow-ready snapshot: %w", err)
+	}
+	opts.Logger.Warn("clusteroffline: cluster init --from-existing complete; this node is now a single-voter cluster (grow-ready snapshot taken)",
 		"self", opts.SelfID, "data_dir", opts.DataDir)
 	return nil
 }
