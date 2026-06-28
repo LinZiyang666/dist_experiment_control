@@ -401,8 +401,23 @@ func (n *Node) ProposeWithReqID(reqID string, plan func(db *sql.DB) (*Command, e
 func (n *Node) DedupCount() uint64 { return n.fsm.dedupCount.Load() }
 
 // Snapshot forces raft to take a snapshot now (tests; raft's automatic cadence is
-// time/threshold based).
+// time/threshold based). Returns the raw raft error, including ErrNothingNewToSnapshot
+// when there is nothing to snapshot (contract pinned by TestNode_SnapshotNothingNewContract).
 func (n *Node) Snapshot() error { return n.raft.Snapshot().Error() }
+
+// SnapshotForJoin forces a snapshot before staging a joiner so the joiner catches up via
+// InstallSnapshot (fsm.Restore = the full SQLite DB) instead of replaying the log from index 1.
+// A leader migrated by `cluster init --from-existing` seeds rows DIRECTLY (not through the raft
+// log) and may have no snapshot yet (short log < SnapshotThreshold); a log-replaying joiner then
+// hits FOREIGN KEY failures on rows the log assumes but never created and fail-stops. Unlike
+// Snapshot(), ErrNothingNewToSnapshot is NOT an error here — it means an existing snapshot already
+// covers the current state, which is exactly what the joiner needs. Leader-only.
+func (n *Node) SnapshotForJoin() error {
+	if err := n.raft.Snapshot().Error(); err != nil && !errors.Is(err, raft.ErrNothingNewToSnapshot) {
+		return err
+	}
+	return nil
+}
 
 // Barrier blocks until every log entry preceding the call has been applied to the
 // FSM (architecture §3.2 read-after-write). On a freshly recovered node it forces

@@ -63,5 +63,8 @@ Thumbs.db
 /.codex
 /.claude/
 
+# Local-only operational test plan — contains fleet credentials (root passwords, etc.); never commit
+/docs/cluster-ha-realmachine-test-plan.md
+
 # Local build artifact — the binary is built via goreleaser/release flow, never committed
 /tether

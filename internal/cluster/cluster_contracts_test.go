@@ -35,3 +35,19 @@ func TestNode_SnapshotNothingNewContract(t *testing.T) {
 		t.Fatalf("Snapshot after one op must succeed: %v", err)
 	}
 }
+
+// TestNode_SnapshotForJoinSwallowsNothingNew pins the grow-path contract: SnapshotForJoin
+// must NOT surface ErrNothingNewToSnapshot (an existing snapshot already covers the state —
+// exactly what the joiner installs). The driveJoin grow path calls it before staging a joiner
+// so the joiner catches up via InstallSnapshot, not log replay (grow-onto-migrated-leader fix).
+func TestNode_SnapshotForJoinSwallowsNothingNew(t *testing.T) {
+	n := mustNode(t, t.TempDir(), "s")
+	// Fresh node: Snapshot() would wrap ErrNothingNewToSnapshot, but SnapshotForJoin swallows it.
+	if err := n.SnapshotForJoin(); err != nil {
+		t.Fatalf("SnapshotForJoin on a fresh node must swallow ErrNothingNewToSnapshot, got %v", err)
+	}
+	mustApply(t, n, "t:x", "1")
+	if err := n.SnapshotForJoin(); err != nil {
+		t.Fatalf("SnapshotForJoin after an op must succeed: %v", err)
+	}
+}

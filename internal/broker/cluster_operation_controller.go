@@ -473,6 +473,19 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			if !a.opStillLive(op.OpID) {
 				return // R1: aborted between the controller tick and this irreversible AddNonvoter
 			}
+			// GROW-ONTO-MIGRATED-LEADER FIX: force a leader raft snapshot BEFORE staging the joiner.
+			// A leader migrated by `cluster init --from-existing` seeds its DB rows DIRECTLY (not
+			// through the raft log) and may have NO snapshot yet (short log < SnapshotThreshold). A
+			// fresh joiner with no such snapshot to install would replay the leader's log from index 1
+			// onto its own (differently seeded) DB and FK-fail on rows the log assumes but never
+			// created (it fail-stops). Snapshotting here guarantees the joiner catches up via
+			// InstallSnapshot (fsm.Restore = the full SQLite DB). Runs once per join (guarded by
+			// !sub.inRaft). A persistent snapshot error blocks (visible) instead of staging a
+			// guaranteed-crash joiner; SnapshotForJoin treats ErrNothingNewToSnapshot as success.
+			if err := a.node.SnapshotForJoin(); err != nil {
+				a.recordOpError(op, fmt.Errorf("pre-join leader snapshot: %w", err))
+				return
+			}
 			if err := a.node.AddNonvoter(op.TargetNode, raftAddr); err != nil {
 				a.blockAfterAttempts(op, "AddNonvoter", err)
 				return
