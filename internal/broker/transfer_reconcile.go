@@ -28,6 +28,12 @@ func (b *Broker) reconcileXferObjectsOnBoot(ctx context.Context) (int, error) {
 	if b.js == nil {
 		return 0, nil
 	}
+	// audit G: a not-caught-up node's empty in-memory tracker would treat live cluster-wide objects as
+	// orphan. Only a caught-up leader (or a single-mode broker) may delete from the shared JS meta. (The
+	// per-bucket homeOwnsXferBucket gate below is a second layer; this is the primary catch-up gate.)
+	if !b.reaperMayDelete() {
+		return 0, nil
+	}
 	active := b.transfers.activeOBJStreams()
 	infos := b.js.ListStreams(ctx)
 	deleted := 0

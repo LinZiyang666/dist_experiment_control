@@ -177,6 +177,17 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 		cancel()
 	}
 
+	// audit G (CRITICAL data-loss): the orphan DELETE arms below list the SHARED JS meta
+	// (ListHistorySIDs / ListXferStreams) but classify "orphan" against the LOCAL activeSet. On a fresh
+	// joiner — or ANY not-yet-caught-up follower — the local SQLite view is stale/empty, so EVERY
+	// cluster-wide stream looks orphan and would be WIPED (the first real grow would delete all cluster
+	// history + every in-flight tier-B bucket). Only a CAUGHT-UP LEADER has an activeSet that reflects
+	// the true cluster state. In single mode (b.cl == nil) the local DB IS the authority — reap as before.
+	if !b.reaperMayDelete() {
+		b.cfg.Logger.Info("broker: skipping boot orphan stream/bucket reap (not a caught-up leader — refuses to wipe cluster-wide history from a stale local view)")
+		return nil
+	}
+
 	listCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	streamSIDs, err := jsstream.ListHistorySIDs(listCtx, b.js)
 	cancel()

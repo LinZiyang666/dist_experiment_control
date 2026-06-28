@@ -427,6 +427,23 @@ func (b *Broker) livenessDB() *sql.DB {
 	return b.cfg.DB
 }
 
+// reaperMayDelete reports whether a boot/periodic orphan reaper may DELETE shared JetStream
+// streams/buckets. In single mode (b.cl == nil) the local DB is the authority — always true. In
+// cluster mode only a CAUGHT-UP LEADER has a local view that reflects the true cluster state; a fresh
+// joiner / not-yet-caught-up follower would classify every cluster-wide stream as orphan and wipe live
+// history + in-flight tier-B buckets (audit G — CRITICAL data loss). Raft-free (L-2): only the narrow
+// Node accessors IsLeader/AppliedIndex/CommitIndex.
+func (b *Broker) reaperMayDelete() bool {
+	if b.cl == nil {
+		return true
+	}
+	if b.cl.node == nil || !b.cl.node.IsLeader() {
+		return false
+	}
+	applied, err := b.cl.node.AppliedIndex()
+	return err == nil && applied >= b.cl.node.CommitIndex()
+}
+
 // proposeOrForward routes one authoritative write through raft. Leader ⇒ run the Plan
 // locally (Propose / ProposeWithReqID for cross-retry idempotency via the 0011 ledger);
 // follower ⇒ forward the request to the leader over the D4 wire (the leader's
