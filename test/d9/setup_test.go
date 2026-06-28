@@ -140,11 +140,12 @@ func freeTCPAddr(t *testing.T) string {
 
 // d9Broker is a single cluster-mode broker + its embedded NATS server.
 type d9Broker struct {
-	b      *broker.Broker
-	nats   *natsserver.Server
-	url    string
-	cancel func()
-	done   chan error
+	b       *broker.Broker
+	nats    *natsserver.Server
+	url     string
+	cancel  func()
+	done    chan error
+	dataDir string
 }
 
 // startD9Broker seeds+bootstraps a fresh single-voter cluster DB (InitFromExisting),
@@ -222,7 +223,7 @@ func startD9BrokerOn(t *testing.T, selfID string, ca *d9CA, natsURL string, seed
 		cancel()
 		t.Fatalf("broker.Run(%s) not ready within 30s", selfID)
 	}
-	h := &d9Broker{b: b, url: natsURL, cancel: cancel, done: done}
+	h := &d9Broker{b: b, url: natsURL, cancel: cancel, done: done, dataDir: dataDir}
 	t.Cleanup(func() {
 		cancel()
 		select {

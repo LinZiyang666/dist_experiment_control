@@ -19,32 +19,36 @@ review-missed blocker (§B) that gates the live grow.
 
 `make test` + `d7_integration` + `d9_integration` all green.
 
-## B. NEW BLOCKER the e2e test exposed (review-missed, gates the live grow)
+## B. What the new e2e test exposed — a TEST ARTIFACT, not a real-grow blocker (corrected)
 
-**A bootstrapped joiner becomes a SILENT HOLLOW VOTER.** The broker enters cluster mode only with a
-seeded DB (`assertClusterDBConsistent` requires it), and the only way to seed is `cluster init`, which
-BOOTSTRAPS the joiner's own `{self}` raft (`node.New`, `!existing` branch, no JoinMode). When that node is
-then `AddVoter`'d, the two independently-bootstrapped logs share the low-index `config@1 + noop@2` prefix
-(same term), so the leader replicates via **LOG replay** and never ships `InstallSnapshot` — so the
-leader's snapshot-only MIGRATED rows (direct-seeded by `cluster init --from-existing`, present in NO log
-entry) never reach the joiner. The joiner settles as a VOTER with its OWN empty DB.
+The new `TestD9GrowFromMigratedLeader` fails with a hollow-voter, but **re-analysis + empirical
+measurement show this is a LOW-FirstIndex TEST-FIXTURE artifact, NOT a blocker for the real grow.**
 
-Diagnostic proof (TestD9GrowFromMigratedLeader, now `t.Skip`'d as KNOWN-OPEN): after join, leader A has
-`cluster_nodes=2 / sessions=1`, joiner B has `cluster_nodes=1(self) / sessions=0 / nodes=0` at the SAME
-appliedIndex=12. `testTwoBrokerJoinReplicates` stayed green throughout because it only checks the joiner
-participates in NEW writes, never that it gained the leader's PRE-join data — the mask that let this ship.
+Mechanism of the artifact: the test's leader A is FRESHLY `cluster init`'d, so its snapshot sits at raft
+index 1 and its FirstIndex is ~2 — the SAME low index a freshly-bootstrapped joiner B reaches (config@1 +
+noop@2, same term). raft aligns the two logs at index 2 and replicates the tail via LOG replay, so B never
+`InstallSnapshot`s A's snapshot@1 and misses the snapshot-only seeded rows. Measured: `A snapshot idx=1 ==
+B snapshot idx=1` before the join; after, A has `cluster_nodes=2/sessions=1` while B has
+`cluster_nodes=1(self)/sessions=0` — a hollow voter. `testTwoBrokerJoinReplicates` masked it (only checks
+the joiner participates in NEW writes).
 
-STEP-0 (leader init snapshot+compaction) is **necessary but not sufficient**. The complete fix needs:
-1. **JoinMode**: a joiner starts with EMPTY raft (no bootstrap) so its nextIndex decays below the leader's
-   FirstIndex → `InstallSnapshot` → it loads the leader's full snapshot. Requires a `cluster join init`
-   (seed self_node_id + a join-pending marker, NO `BootstrapSingleNode`) + broker detection (cluster mode
-   for a join-pending DB) + `node.New` JoinMode (skip bootstrap when `!existing && JoinMode`).
-2. **Restore identity preservation**: `fsm.Restore` installs a COPY of the leader's DB, whose
-   `cluster_meta.self_node_id` is the LEADER's — the joiner must PRESERVE its own self_node_id (and any
-   node-local rows) across the install, or it adopts the leader's identity.
-3. The operational procedure (runbook) must direct a joiner to `cluster join init`, NOT `cluster init`
-   (the live racknerd ran `cluster init --from-existing` = operator error compounding the design hole).
+Why the REAL grow does NOT hit this: the live pc732 is not fresh. After `cluster recovery resnapshot`
+(RecoverCluster, unconditional DeleteRange) its snapshot sits at its ACCUMULATED (high) raft index with the
+log compacted away, so its FirstIndex >> a fresh racknerd's bootstrap index (~2). raft cannot offer any
+AppendEntries prevLogIndex the joiner can match (all are compacted) → it is FORCED to `InstallSnapshot` →
+racknerd loads pc732's full DB → a faithful voter. STEP-0 (leader init snapshot+compaction) + STEP-1
+(resnapshot the migrated leader) are therefore SUFFICIENT for the live resnapshot-first procedure.
 
-This is an architecture-level change deserving its own plan + (ideally) its own external review. It is
-the TRUE remaining blocker for the live N=1→N=2 grow; the §A fixes are correct + banked but do not by
-themselves make the grow produce a faithful voter.
+`TestD9GrowFromMigratedLeader` is `t.Skip`'d (models an unrealistic fresh-leader). Two follow-ups, both
+NON-blocking:
+1. **Faithful test**: resnapshot A at a high index after advancing it, then grow — would PASS; un-skip then.
+2. **JoinMode (defense-in-depth)**: a joiner that starts with EMPTY raft (no bootstrap) installs the
+   leader's snapshot regardless of the leader's FirstIndex, removing the dependence on the leader being
+   resnapshotted-high. Would also need `fsm.Restore` to PRESERVE the local `cluster_meta.self_node_id`
+   (the installed snapshot carries the leader's id). Nice robustness; not required for the documented
+   resnapshot-first grow.
+
+**Bottom line:** the §A fixes + STEP-0/STEP-1 make the live N=1→N=2 grow correct (resnapshot pc732 first,
+then join a fresh racknerd). The real grow is the decisive proof and is safe/reversible (a hollow or
+failed joiner is detected by a post-join row-parity check and removed via `cluster recovery node remove`,
+exactly as in the prior attempt; pc732 stays healthy throughout).
