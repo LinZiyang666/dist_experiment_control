@@ -310,6 +310,8 @@ create=装二进制 + **生成/分发本机全套 secrets：`account.nk`(共享�
 ```
 `status` 实测的 peer-unreachable 秒数仅供展示（默认展示阈值 120s，**非** force-single 依据）；真正的安全闸是 step2 的 (b)(c)(d) 硬前置 + `--confirm-peers-dead`。`status`/`force-single`/`recover` 属 **no-leader-safe 子集**（纯本地磁盘、不重定向 leader），每条 severe banner 的下一步只引用该子集（模拟 quorum 丢失下测试）。runbook 须在 3 节点实跑演练过外审。
 
+> **post-D9 增量 — ONLINE in-process force-single（首选路径，offline 仍是 floor）**：上面的 offline 模型要求**先停 daemon** 才能 `raft.RecoverCluster`——即"用一次新停机换恢复"，且无法在健康集群上演练。新增 `force-single --online` 在 RUNNING broker 内**只热交换 raft 实例**（`cluster.Node.RecoverToSelfOnline`：`atomic.Pointer[raft.Raft]` 下 `old.Shutdown()`→对**活的**两存储 `RecoverCluster({self})`→重建 mTLS transport→`NewRaft` fresh-FSM→**全成功才 atomic Store**；任一步失败保留旧 Shutdown 实例=只读不 brick，offline 即 floor），进程不停、读不断。经 **LOCAL root-only admin socket** 的两步 **arm→commit**，闸：① 持续 quorum-loss **dwell**（`forceSingleDwell≈15s`，防选举抖动误触）② 与 offline **同一** `CheckPeersDead`（raft/nats/tunnel 三端口 TCP 探活 HARD-REFUSE，commit 再探一次抓 arm 窗口内复活的 peer）③ 单发 broker-minted **arm token**（fail-closed：CSPRNG 不可用即拒，不回落可预测 token）④ CLI 不变的 **TTY 输 node_id** 确认（`--self-id` **发给 broker 校验** == socket 所属节点，不符即拒，防误指错节点；`--yes` 永拒）。`--dry-run` 在健康集群上零改动演练。commit 成功边界**含** `force_single_active` marker + recovery `epoch` 的 raft 持久化（任一失败返回 loud 错误并指明重跑，非静默成功——marker 缺失=可写却无可见 emergency）。recovery `epoch` 已持久化作未来跨节点 split-brain DETECTOR 的 durable input；**DETECTOR 本体（跨节点比对+SEVERE 告警）暂缩范围**为后续增量（在线版安全性 ≥ offline floor——offline 本就无 detector，且 total-partition 残留风险已被 commit 前 re-probe 的 peer-liveness HARD-REFUSE 大幅收窄）。
+
 ---
 
 ## 9. 文件传输（分布式，补全为真 §9）

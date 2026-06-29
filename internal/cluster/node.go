@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -54,6 +55,12 @@ type Config struct {
 	// => bootstrap a {self}-only single-node cluster (production / D1 / D2).
 	// Dynamic membership (raft.AddVoter + join-PoP) is D7, NOT this.
 	BootstrapPeers []raft.Server
+
+	// TransportFactory rebuilds the raft Transport for an ONLINE recover (the in-process
+	// force-single, RecoverToSelfOnline). NewProduction passes a real mTLS NewMTLSTransport
+	// builder; tests inject an inmem factory. nil => online recover is unavailable (the offline
+	// floor still works). Declarative wiring here keeps the field test-settable from any package.
+	TransportFactory func() (raft.Transport, error)
 }
 
 // Multinode raft timeouts (§8.4 / d3-plan R6): the safe values D3 harnesses and
@@ -68,15 +75,25 @@ const (
 
 // Node is a single-node raft state layer.
 type Node struct {
-	raft         *raft.Raft
-	fsm          *fsm
-	store        *raftboltdb.BoltStore
-	db           *sql.DB        // write pool (owned)
-	ro           *sql.DB        // read-only backup handle (owned)
-	transport    raft.Transport // injected; closed by Shutdown (raft does not reap it)
-	applyTimeout time.Duration
-	localID      raft.ServerID // this node's raft ServerID (== cluster_nodes.node_id); see SelfID
-	logger       *slog.Logger
+	// raft is an atomic.Pointer so RecoverToSelfOnline can hot-swap the raft instance in-process
+	// (the online force-single escape hatch) without stopping the broker. Every read goes through
+	// n.raft.Load(); New/RecoverToSelfOnline .Store() the live instance. A Shutdown old instance is
+	// left in place on a failed swap (never nil) so Propose's State()!=Leader gate stays retriable.
+	raft      atomic.Pointer[raft.Raft]
+	fsm       *fsm
+	store     *raftboltdb.BoltStore
+	snaps     raft.SnapshotStore // retained for the in-process RecoverToSelfOnline RecoverCluster+NewRaft
+	db        *sql.DB            // write pool (owned)
+	ro        *sql.DB            // read-only backup handle (owned)
+	transport raft.Transport     // injected; closed by Shutdown (raft does not reap it)
+	// transportFactory rebuilds the raft Transport for an online recover (NewProduction wires the real
+	// mTLS NewMTLSTransport; tests inject an inmem factory). nil => online recover is unavailable
+	// (the offline floor still works).
+	transportFactory func() (raft.Transport, error)
+	cfg              Config // retained for raftConfig()/DBPath/LocalID in RecoverToSelfOnline
+	applyTimeout     time.Duration
+	localID          raft.ServerID // this node's raft ServerID (== cluster_nodes.node_id); see SelfID
+	logger           *slog.Logger
 
 	// applyMu serializes the leader-side {Plan reads leader DB} + {raft.Apply} +
 	// {await} window so two concurrent compound mutators (e.g. PlanAllocate's
@@ -197,17 +214,21 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	success = true // Node now owns the transport; Shutdown will close it.
-	return &Node{
-		raft:         r,
-		fsm:          f,
-		store:        store,
-		db:           db,
-		ro:           ro,
-		transport:    cfg.Transport,
-		applyTimeout: applyTimeout,
-		localID:      cfg.LocalID,
-		logger:       logger,
-	}, nil
+	n := &Node{
+		fsm:              f,
+		store:            store,
+		snaps:            snaps,
+		db:               db,
+		ro:               ro,
+		transport:        cfg.Transport,
+		transportFactory: cfg.TransportFactory, // online-recover seam (nil => offline floor only)
+		cfg:              cfg,
+		applyTimeout:     applyTimeout,
+		localID:          cfg.LocalID,
+		logger:           logger,
+	}
+	n.raft.Store(r)
+	return n, nil
 }
 
 // SelfID returns this node's raft ServerID as a string (== cluster_nodes.node_id).
@@ -301,7 +322,7 @@ func (n *Node) Apply(cmd *Command) error {
 	if err != nil {
 		return err
 	}
-	fut := n.raft.Apply(data, n.applyTimeout)
+	fut := n.raft.Load().Apply(data, n.applyTimeout)
 	if err := fut.Error(); err != nil {
 		return err
 	}
@@ -379,7 +400,7 @@ func (n *Node) ProposeWithReqID(reqID string, plan func(db *sql.DB) (*Command, e
 	}
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
-	if n.raft.State() != raft.Leader {
+	if n.raft.Load().State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
 	cmd, err := plan(n.db)
@@ -403,7 +424,7 @@ func (n *Node) DedupCount() uint64 { return n.fsm.dedupCount.Load() }
 // Snapshot forces raft to take a snapshot now (tests; raft's automatic cadence is
 // time/threshold based). Returns the raw raft error, including ErrNothingNewToSnapshot
 // when there is nothing to snapshot (contract pinned by TestNode_SnapshotNothingNewContract).
-func (n *Node) Snapshot() error { return n.raft.Snapshot().Error() }
+func (n *Node) Snapshot() error { return n.raft.Load().Snapshot().Error() }
 
 // SnapshotForJoin forces a snapshot before staging a joiner so the joiner catches up via
 // InstallSnapshot (fsm.Restore = the full SQLite DB) instead of replaying the log from index 1.
@@ -413,7 +434,7 @@ func (n *Node) Snapshot() error { return n.raft.Snapshot().Error() }
 // Snapshot(), ErrNothingNewToSnapshot is NOT an error here — it means an existing snapshot already
 // covers the current state, which is exactly what the joiner needs. Leader-only.
 func (n *Node) SnapshotForJoin() error {
-	if err := n.raft.Snapshot().Error(); err != nil && !errors.Is(err, raft.ErrNothingNewToSnapshot) {
+	if err := n.raft.Load().Snapshot().Error(); err != nil && !errors.Is(err, raft.ErrNothingNewToSnapshot) {
 		return err
 	}
 	return nil
@@ -422,13 +443,13 @@ func (n *Node) SnapshotForJoin() error {
 // Barrier blocks until every log entry preceding the call has been applied to the
 // FSM (architecture §3.2 read-after-write). On a freshly recovered node it forces
 // the startup log replay to drain before reads. Leader-only.
-func (n *Node) Barrier(timeout time.Duration) error { return n.raft.Barrier(timeout).Error() }
+func (n *Node) Barrier(timeout time.Duration) error { return n.raft.Load().Barrier(timeout).Error() }
 
 // WaitForLeader blocks until this node is the raft leader or timeout elapses.
 func (n *Node) WaitForLeader(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if n.raft.State() == raft.Leader {
+		if n.raft.Load().State() == raft.Leader {
 			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -438,20 +459,20 @@ func (n *Node) WaitForLeader(timeout time.Duration) error {
 
 // IsLeader reports whether this node currently believes it is leader (bounded
 // stale; for correctness-sensitive checks use VerifyLeaderRead).
-func (n *Node) IsLeader() bool { return n.raft.State() == raft.Leader }
+func (n *Node) IsLeader() bool { return n.raft.Load().State() == raft.Leader }
 
 // TransferLeadership asks raft to hand leadership to a caught-up follower and blocks
 // until the transfer completes or fails. Leader-only (returns raft.ErrNotLeader
 // otherwise). Used by the D4 forwarding tests to deterministically land a retry under
 // a NEW leader (decoupling the commit fact from the leadership change, §0bis-C) and
 // by D7 drain. Not part of the §5 op set (it is a raft config/leadership action).
-func (n *Node) TransferLeadership() error { return n.raft.LeadershipTransfer().Error() }
+func (n *Node) TransferLeadership() error { return n.raft.Load().LeadershipTransfer().Error() }
 
 // Shutdown stops raft and closes the stores + DB handles in deterministic order.
 func (n *Node) Shutdown() error {
 	var errs []error
-	if n.raft != nil {
-		errs = append(errs, n.raft.Shutdown().Error())
+	if r := n.raft.Load(); r != nil {
+		errs = append(errs, r.Shutdown().Error())
 	}
 	// Close the injected transport ourselves — raft.Shutdown() does not reap an
 	// externally-supplied transport (d3-plan R5). NetworkTransport holds a listener
@@ -469,4 +490,80 @@ func (n *Node) Shutdown() error {
 		errs = append(errs, n.db.Close())
 	}
 	return errors.Join(errs...)
+}
+
+// RecoverToSelfOnline hot-swaps this node's raft instance to a lone single-voter {self} cluster
+// IN-PROCESS — the online force-single escape hatch (the broker process never stops; reads keep
+// serving). Leadership is NOT required (a quorum-lost survivor is never leader). selfRaftAddr is the
+// DIALABLE advertised addr the caller resolved from cluster_nodes (never transport.LocalAddr(), which
+// may be 0.0.0.0). The CALLER (broker) MUST already have passed every anti-split-brain gate (sustained
+// quorum-loss dwell + peer-liveness HARD-REFUSE + operator TTY confirm) — this method does the raft
+// surgery only.
+//
+// Lifecycle (mirrors the proven offline recoverClusterToSelf, but on the LIVE stores + a fresh FSM):
+// Shutdown old raft (frees the stores; old stays in the field = State()!=Leader => Propose returns the
+// retriable ErrNotLeader, reads keep working) → RecoverCluster({self}) on the live stores → rebuild the
+// transport → NewRaft(fresh FSM) → atomic Store on FULL SUCCESS ONLY. On any failure the field keeps the
+// old Shutdown instance (never nil), so the survivor is never bricked and never panics.
+func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
+	if n.transportFactory == nil {
+		return errors.New("cluster: online recover unavailable (no transport factory wired)")
+	}
+	if selfRaftAddr == "" {
+		return errors.New("cluster: RecoverToSelfOnline requires a self raft addr")
+	}
+	// applyMu serializes vs Propose's {gate->Plan->Apply}, guaranteeing NO in-flight raft.Apply across
+	// the swap. Liveness/GC writes hit n.db directly (NOT under applyMu); they serialize against
+	// RecoverCluster's replay on MaxOpenConns(1) and touch disjoint columns.
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	old := n.raft.Load()
+	if err := old.Shutdown().Error(); err != nil {
+		return fmt.Errorf("cluster: shutdown old raft for online recover: %w", err)
+	}
+	// Fresh FSM — RecoverCluster's documented discard-FSM contract (raft v1.7.3 api.go). The externalized
+	// state lives in SQLite (n.db/n.ro), so a fresh fsm only resets in-memory counters.
+	f := &fsm{
+		db:       n.db,
+		ro:       n.ro,
+		tmpDir:   filepath.Dir(n.cfg.DBPath),
+		dbPath:   n.cfg.DBPath,
+		appliers: defaultAppliers(),
+		logger:   n.logger,
+	}
+	rc := raftConfig(n.cfg)
+	// RecoverCluster performs NO network IO (the transport only feeds snapshot peer-encode) → a throwaway
+	// inmem transport, exactly as the offline path. The live transport's :7400 listener stays bound here.
+	_, tmp := raft.NewInmemTransport(raft.ServerAddress(selfRaftAddr))
+	defer func() { _ = tmp.Close() }()
+	cfgr := raft.Configuration{Servers: []raft.Server{{
+		Suffrage: raft.Voter, ID: n.localID, Address: raft.ServerAddress(selfRaftAddr),
+	}}}
+	if err := raft.RecoverCluster(rc, f, n.store, n.store, n.snaps, tmp, cfgr); err != nil {
+		// ROLLBACK-CLEAN: on-disk config unchanged, transport untouched, n.raft = old (Shutdown,
+		// read-only) — byte-identical to the pre-attempt state. Re-runnable; offline is the floor.
+		return fmt.Errorf("cluster: online RecoverCluster({%s}): %w", n.localID, err)
+	}
+	// Disk is now {self}. Any failure PAST here leaves a valid single-voter store on disk, so the floor
+	// degrades to a plain restart (NewProduction on the {self} stores comes up N=1 leader) — strictly
+	// better than today's stop+surgery+restart.
+	if c, ok := n.transport.(io.Closer); ok {
+		_ = c.Close() // free :7400 for the rebuild
+	}
+	newTrans, err := n.transportFactory()
+	if err != nil {
+		return fmt.Errorf("cluster: rebuild transport after recover: %w", err)
+	}
+	r, err := raft.NewRaft(rc, f, n.store, n.store, n.snaps, newTrans)
+	if err != nil {
+		if c, ok := newTrans.(io.Closer); ok {
+			_ = c.Close()
+		}
+		return fmt.Errorf("cluster: NewRaft after online recover: %w", err)
+	}
+	n.fsm = f
+	n.transport = newTrans
+	n.raft.Store(r) // ATOMIC — the new instance is now visible to every n.raft.Load() reader
+	return nil
 }

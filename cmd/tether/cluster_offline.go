@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/spf13/cobra"
@@ -31,6 +32,7 @@ func newClusterForceSingleCmd() *cobra.Command {
 	var dataDir, dbPath, selfID, selfAddr string
 	var confirmDead []string
 	var guided bool
+	var online, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "force-single",
 		Short: "DANGER (split-brain risk): force this node to a lone single-voter cluster — quorum-loss escape hatch only; daemon STOPPED; type node_id to confirm",
@@ -49,6 +51,12 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			"  systemctl unmask tether-broker && systemctl start tether-broker   # then recover each returning node",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// ONLINE: the preferred path — recover via the running broker's admin socket WITHOUT stopping
+			// it (no second outage). --dry-run is a zero-mutation drill runnable on a HEALTHY cluster.
+			if online {
+				socket, _ := cmd.Flags().GetString("socket")
+				return runForceSingleOnline(cmd, socket, selfID, confirmDead, dryRun)
+			}
 			// B7 DOC#7: --guided diagnoses (read-only) and PRINTS the exact command — it auto-derives
 			// the --confirm-peers-dead list + TCP-probes each peer, and BLOCKS if any is still alive.
 			// It executes nothing (the unchanged hard gates stay the only mutating path).
@@ -91,8 +99,100 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 	cmd.Flags().StringVar(&selfAddr, "self-addr", "", "this node's raft address (host:7400)")
 	cmd.Flags().StringSliceVar(&confirmDead, "confirm-peers-dead", nil, "node_ids of EVERY other roster node (comma-separated)")
 	cmd.Flags().BoolVar(&guided, "guided", false, "diagnose + print the exact force-single command (auto-derives --confirm-peers-dead, probes peers); executes nothing (B7 DOC#7)")
+	cmd.Flags().BoolVar(&online, "online", false, "recover via the RUNNING broker's admin socket — no daemon stop, no second outage (the preferred path)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "with --online: a zero-mutation drill (evaluate the gates + report) runnable on a HEALTHY cluster")
 	registerYesRejector(cmd)
 	return cmd
+}
+
+// runForceSingleOnline drives the online force-single arm->confirm->commit flow over the broker's admin
+// socket. The broker (not this CLI) runs the dwell + peer-liveness gates; the unchanged TTY-typed node_id
+// confirm sits between arm and commit. If the socket is unreachable (the broker is truly down) it prints
+// the OFFLINE floor command. --dry-run stops after arm (zero mutation).
+func runForceSingleOnline(cmd *cobra.Command, socket, selfID string, confirmDead []string, dryRun bool) error {
+	if selfID == "" {
+		return usageErr("force-single --online requires --self-id (the node_id you will type to confirm)")
+	}
+	// F2: the operator-confirmed --self-id is SENT to the broker (NodeID) so it can reject a mistyped
+	// id (else a wrong --self-id on the right socket would prompt for the wrong node yet recover the
+	// socket owner). Both arm and commit carry it.
+	arm, err := callAdmin(socket, adminsock.Request{
+		Op: adminsock.OpClusterForceSingleArm, NodeID: selfID, ConfirmPeersDead: confirmDead, DryRun: dryRun,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"online force-single: broker admin socket unreachable (%v).\n"+
+				"The broker may be DOWN — use the OFFLINE floor (daemon stopped, disk surgery):\n"+
+				"  systemctl mask tether-broker && systemctl stop tether-broker\n"+
+				"  tether cluster recovery force-single --self-id %s --self-addr <host:7400> --confirm-peers-dead %s\n",
+			err, selfID, strings.Join(confirmDead, ","))
+		return err
+	}
+	if arm.ForceSingle != nil {
+		printForceSingleReport(cmd, arm.ForceSingle)
+	}
+	if !arm.OK {
+		return clusterAdminError("force-single", arm) // a gate refusal (peer alive / quorum not lost / ...)
+	}
+	if dryRun {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "dry-run: gates evaluated, NO changes made.")
+		return nil
+	}
+	// Confirm against the id the BROKER reports it owns (not the locally-typed --self-id), so the
+	// prompt names the node that will actually be force-singled. The broker already rejected a
+	// mismatched --self-id above, so confirmTarget == selfID here; this is belt-and-braces.
+	confirmTarget := selfID
+	if arm.ForceSingle != nil && arm.ForceSingle.BrokerSelfID != "" {
+		confirmTarget = arm.ForceSingle.BrokerSelfID
+	}
+	// Unchanged hands-on confirm: TTY-only, --yes rejected, never env-escapable (brain-split-capable op).
+	if !confirmTypedNodeID(cmd, confirmTarget,
+		"CONSEQUENCE: no HA + no integrity until you recover; if ANY listed peer is alive (merely partitioned) this SPLITS THE BRAIN into two divergent timelines.",
+		false, "") {
+		return fmt.Errorf("aborted (type this node's id to confirm; --yes is never accepted)")
+	}
+	commit, err := callAdmin(socket, adminsock.Request{
+		Op: adminsock.OpClusterForceSingleCommit, NodeID: confirmTarget, ArmToken: arm.ForceSingle.ArmToken, ConfirmPeersDead: confirmDead,
+	})
+	if err != nil {
+		return err
+	}
+	if !commit.OK {
+		return clusterAdminError("force-single", commit)
+	}
+	abandoned := 0
+	if commit.ForceSingle != nil {
+		abandoned = len(commit.ForceSingle.Abandoned)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n",
+		selfID, abandoned)
+	return nil
+}
+
+func printForceSingleReport(cmd *cobra.Command, r *adminsock.ForceSingleReport) {
+	out := cmd.ErrOrStderr()
+	if r.BrokerSelfID != "" {
+		_, _ = fmt.Fprintf(out, "  broker (this socket): %s\n", r.BrokerSelfID)
+	}
+	for _, p := range r.Peers {
+		mark := "confirmed-dead"
+		if !p.Confirmed {
+			mark = "NOT in --confirm-peers-dead"
+		}
+		if p.Alive {
+			mark += fmt.Sprintf(" — ALIVE on %s (HARD-REFUSE: would split-brain)", p.OnPort)
+		}
+		_, _ = fmt.Fprintf(out, "  peer %s: %s\n", p.NodeID, mark)
+	}
+	if r.DwellRemaining != "" {
+		_, _ = fmt.Fprintf(out, "  quorum-loss dwell remaining: %s\n", r.DwellRemaining)
+	}
+	if r.WouldProceed {
+		_, _ = fmt.Fprintln(out, "  verdict: all gates pass — force-single WOULD proceed")
+	} else if r.Reason != "" {
+		_, _ = fmt.Fprintf(out, "  verdict: would NOT proceed — %s\n", r.Reason)
+	}
 }
 
 // newClusterResnapshotCmd is the STEP-1 grow-onto-migrated-broker remediation: make an ALREADY-init'd

@@ -30,10 +30,10 @@ type ServerInfo struct {
 // is idempotent by node_id (an already-present voter is a no-op), so a retry — even
 // across a leadership change that re-runs the orchestrator — is safe.
 func (n *Node) AddVoter(nodeID, raftAddr string) error {
-	if n.raft.State() != raft.Leader {
+	if n.raft.Load().State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
-	fut := n.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, n.applyTimeout)
+	fut := n.raft.Load().AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, n.applyTimeout)
 	if err := fut.Error(); err != nil {
 		return fmt.Errorf("cluster: add voter %s: %w", nodeID, err)
 	}
@@ -48,10 +48,10 @@ func (n *Node) AddVoter(nodeID, raftAddr string) error {
 // once it is caught up (§8.1 / v0.4.2 phase-fluidity wedge-prevention — the keystone fix).
 // Idempotent by node_id (re-affirming an already-present server is a no-op).
 func (n *Node) AddNonvoter(nodeID, raftAddr string) error {
-	if n.raft.State() != raft.Leader {
+	if n.raft.Load().State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
-	fut := n.raft.AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, n.applyTimeout)
+	fut := n.raft.Load().AddNonvoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, n.applyTimeout)
 	if err := fut.Error(); err != nil {
 		return fmt.Errorf("cluster: add nonvoter %s: %w", nodeID, err)
 	}
@@ -63,10 +63,10 @@ func (n *Node) AddNonvoter(nodeID, raftAddr string) error {
 // ClusterNodeRemove; this is the middle step. Idempotent (removing an absent server
 // is a no-op).
 func (n *Node) RemoveServer(nodeID string) error {
-	if n.raft.State() != raft.Leader {
+	if n.raft.Load().State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
-	fut := n.raft.RemoveServer(raft.ServerID(nodeID), 0, n.applyTimeout)
+	fut := n.raft.Load().RemoveServer(raft.ServerID(nodeID), 0, n.applyTimeout)
 	if err := fut.Error(); err != nil {
 		return fmt.Errorf("cluster: remove server %s: %w", nodeID, err)
 	}
@@ -77,10 +77,10 @@ func (n *Node) RemoveServer(nodeID string) error {
 // step: transfer-leader off a node before removing it). Leader-only. Distinct from
 // TransferLeadership (which lets raft pick any follower).
 func (n *Node) LeadershipTransferToServer(nodeID, raftAddr string) error {
-	if n.raft.State() != raft.Leader {
+	if n.raft.Load().State() != raft.Leader {
 		return raft.ErrNotLeader
 	}
-	fut := n.raft.LeadershipTransferToServer(raft.ServerID(nodeID), raft.ServerAddress(raftAddr))
+	fut := n.raft.Load().LeadershipTransferToServer(raft.ServerID(nodeID), raft.ServerAddress(raftAddr))
 	if err := fut.Error(); err != nil {
 		return fmt.Errorf("cluster: transfer leadership to %s: %w", nodeID, err)
 	}
@@ -92,11 +92,11 @@ func (n *Node) LeadershipTransferToServer(nodeID, raftAddr string) error {
 // reconciliation pass). Generalizes NumVoters' GetConfiguration. Marks the leader
 // via LeaderWithID (empty mid-election).
 func (n *Node) RaftConfiguration() ([]ServerInfo, error) {
-	fut := n.raft.GetConfiguration()
+	fut := n.raft.Load().GetConfiguration()
 	if err := fut.Error(); err != nil {
 		return nil, fmt.Errorf("cluster: get configuration: %w", err)
 	}
-	_, leaderID := n.raft.LeaderWithID()
+	_, leaderID := n.raft.Load().LeaderWithID()
 	servers := fut.Configuration().Servers
 	out := make([]ServerInfo, 0, len(servers))
 	for _, s := range servers {
@@ -114,6 +114,6 @@ func (n *Node) RaftConfiguration() ([]ServerInfo, error) {
 // both empty mid-election. The non-leader fail-fast (§8.1) uses node_id to look up
 // the leader's public_host in the roster and tell the operator where to re-run.
 func (n *Node) LeaderWithID() (addr, nodeID string) {
-	a, id := n.raft.LeaderWithID()
+	a, id := n.raft.Load().LeaderWithID()
 	return string(a), string(id)
 }

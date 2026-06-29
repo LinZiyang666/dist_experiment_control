@@ -94,7 +94,7 @@ func d7Col(t *testing.T, f *fsm, nodeID, col string) string {
 }
 
 // TestD7UpsertEmptyReadmitPreservesIdentity (v0.4.4 review F2): an idempotent grow-retry re-approve that
-// carries an EMPTY bus_nkey / cert_fp must NOT clobber a previously-good value back to '' via the ON
+// carries an EMPTY bus_nkey / cert_fp must NOT clobber a previously-good value back to "" via the ON
 // CONFLICT DO UPDATE — that silently re-arms the learner self-backfill DEADLOCK (bus_nkey) and the joiner
 // crash-loop (cert_fp), the exact failures audit A removes. The upsert must be empty-PRESERVING.
 func TestD7UpsertEmptyReadmitPreservesIdentity(t *testing.T) {

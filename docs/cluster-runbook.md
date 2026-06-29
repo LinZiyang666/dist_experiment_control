@@ -268,20 +268,54 @@ separate epic; it crosses the cluster.Node-owns-the-WAL invariant.)
 | `join approve` (grow) | N≥1 | leader | **refused** | N=1→2 allowed (the pc732 case); prereq: self-advertise reachable (§1.0) |
 | `retire` / `drain` (shrink) | N≥2 (refuses the last voter) | leader | **refused** | N=2→1 forces a typed F==0 confirm |
 | `reconcile nats --to-standalone` | **N=1 ONLY** (`--confirm-single`) | lone survivor | n/a (N=1 has quorum-of-1) | refuses if already standalone; FULL restart + JS reset required |
-| `recovery force-single` (escape) | quorum-lost | OFFLINE | **the ONLY operable path** | recovers to N=1, then routine ops work again |
+| `recovery force-single --online` (escape) | quorum-lost | **RUNNING broker** (admin socket) | **the preferred path** (no second outage) | recovers to N=1 IN-PROCESS; routine ops work again. OFFLINE disk path is the floor if the broker won't start |
 
 **Edge cases.** (1) *Multiple brokers but you want to downgrade*: `retire` one at a time down to N=1
 FIRST, THEN `reconcile nats --to-standalone` (it refuses while peers remain). (2) *One broker but you
 want to upgrade*: the normal N=1→2 grow (§1.0 rebind if loopback, then join). (3) *Protected mode
 (quorum-lost / read-only)*: every routine cluster op is refused — they Propose raft writes that cannot
-commit without a quorum — so only `cluster recovery force-single` (OFFLINE) can recover. After it
-lands you at N=1 (`force_single_active`), routine cluster ops work again (quorum-of-1), though
-destructive DATA ops stay hard-gated until you regrow to HA (N≥3).
+commit without a quorum — so `cluster recovery force-single` is the escape. Prefer `--online`: it
+recovers IN-PROCESS on the RUNNING survivor broker via its admin socket (no second outage, and it can
+be drilled with `--dry-run` on a healthy cluster). The OFFLINE disk-surgery path stays the floor for a
+broker that cannot start. After it lands you at N=1 (`force_single_active`), routine cluster ops work
+again (quorum-of-1), though destructive DATA ops stay hard-gated until you regrow to HA (N≥3).
 
-## 3. Quorum loss — the force-single escape hatch (OFFLINE)
+## 3. Quorum loss — the force-single escape hatch
 
 If a majority of brokers are permanently dead the cluster goes **read-only**.
-`cluster status` reports `QUORUM_LOST` (exit 2). To resume service on a survivor:
+`cluster status` reports `QUORUM_LOST` (exit 2). To resume service on a survivor, force this node to a
+lone single-voter cluster. There are TWO paths — **prefer ONLINE**; OFFLINE is the floor.
+
+### 3.0 ONLINE (preferred — the survivor broker keeps RUNNING)
+
+When the survivor's daemon is still up (its admin socket answers), recover **in-process** — no daemon
+stop, no second outage. The broker hot-swaps only its raft instance to `{self}`; the data plane keeps
+serving reads throughout. A two-step **arm→commit** flow gates it:
+
+```
+# 0. CONFIRM the other brokers are TRULY dead (powered off / unreachable to AGENTS), not merely
+#    partitioned from you. A merely-partitioned-but-alive peer WILL split-brain.
+
+# 1. (optional) DRILL it on the LIVE cluster — zero mutation, evaluates the gates + prints the peer probe:
+survivor$ sudo tether cluster recovery force-single --online --dry-run \
+            --self-id <this-node-id> --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2>
+
+# 2. Recover. The broker REFUSES unless it has been CONTINUOUSLY quorum-lost for the dwell (~15s), and
+#    HARD-REFUSES if any listed peer still answers a TCP probe on its raft/nats/tunnel port (alive ->
+#    split-brain). You TYPE this node's id to confirm (no --yes); the broker validates --self-id matches
+#    the socket owner, swaps raft to {self} IN-PROCESS, then raises force_single_active.
+survivor$ sudo tether cluster recovery force-single --online \
+            --self-id <this-node-id> --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2>
+```
+
+The broker never restarts; once the command returns, the node is a writable single voter
+(`force_single_active`, `status` exit 3) — routine cluster ops (quorum-of-1) work again. If the admin
+socket is unreachable (the broker is truly DOWN), the command prints the OFFLINE floor command below.
+
+### 3.1 OFFLINE (the floor — for a broker that will not start)
+
+If the survivor's daemon cannot start (crash-loop / corrupt config) so its admin socket is dead, take
+the disk directly with the daemon STOPPED:
 
 ```
 # 0. CONFIRM the other brokers are TRULY dead (powered off / unreachable to AGENTS),

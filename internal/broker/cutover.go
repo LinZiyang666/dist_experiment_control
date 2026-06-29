@@ -204,7 +204,7 @@ func (b *Broker) buildClusterRuntime() (*clusterRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &clusterRuntime{node: node}, nil
+	return &clusterRuntime{node: node, fsArm: newForceSingleArm()}, nil
 }
 
 // ClusterStateForTest reports whether the broker constructed its cluster runtime and

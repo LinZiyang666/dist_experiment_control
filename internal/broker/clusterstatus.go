@@ -538,6 +538,9 @@ type clusterAdminBackend struct {
 	// C-rebalance: the leader-local proxy-home spread pass (`cluster rebalance proxy`). nil in single
 	// mode / tests that don't wire it ⇒ the op replies cluster_not_enabled.
 	rebalanceProxy func(dryRun bool) (*adminsock.ProxyRebalanceReport, error)
+	// fsArm tracks the online force-single sustained-quorum-loss dwell + single-shot arm token. nil ⇒
+	// the online force-single replies cluster_not_enabled (offline floor still works).
+	fsArm *forceSingleArm
 }
 
 // NewClusterAdminBackend builds the adminsock adapter. caughtUp/streamsReady may be
@@ -589,6 +592,15 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 	// leader gate so it is available when there is no leader, like status/backup/ops.
 	if req.Op == adminsock.OpExportIncident {
 		return b.handleExportIncident(req)
+	}
+	// Online force-single (the quorum-loss escape hatch): dispatch BEFORE the leader gate — a quorum-lost
+	// survivor is never leader, so there is no leader to gate on or forward to. Local-socket-only by
+	// construction (root-only Unix socket; no NATS path dispatches admin ops).
+	if req.Op == adminsock.OpClusterForceSingleArm {
+		return b.handleForceSingleArm(req)
+	}
+	if req.Op == adminsock.OpClusterForceSingleCommit {
+		return b.handleForceSingleCommit(req)
 	}
 	// Mutating verbs are leader-local (§8.1, NO forwarding): fail fast naming the leader.
 	if !b.admin.node.IsLeader() {

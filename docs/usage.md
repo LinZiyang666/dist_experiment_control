@@ -899,11 +899,13 @@ mesh。新增或退役 broker 后，要跑 `cluster reconcile nats --all --wait`
 | `cluster transfer-leader` | `<node-id>` | (必填) | 把 Raft leadership 交给一个 caught-up voter |
 | `cluster rotate-tunnel-cert` | `<node-id>` | (必填) | 目标 broker node id；必须在目标 broker 上执行并让其成为 leader |
 | `cluster rotate-tunnel-cert` | `--cert-fp` | (必填) | 新稳定 tunnel cert 指纹；DB pin 更新后当前/previous pin 进入旋转窗口 |
-| `cluster recovery force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；daemon 必须停止 |
-| `cluster recovery force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径 |
-| `cluster recovery force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认 |
-| `cluster recovery force-single` | `--self-addr` | (必填) | 当前幸存节点 Raft 地址，形如 `<host>:7400` |
-| `cluster recovery force-single` | `--confirm-peers-dead` | (必填，可逗号分隔) | roster 中其它所有节点 id；命令会探测它们 `:7400` 仍可达则拒绝 |
+| `cluster recovery force-single` | `--online` | false | **首选**：经 RUNNING broker 的 admin socket 在线恢复，**不停 daemon、不制造第二次停机**；socket 不可达（broker 真死）才回落 OFFLINE 磁盘路径 |
+| `cluster recovery force-single` | `--dry-run` | false | 配合 `--online`：零改动演练（评估 gate + 打印 peer 探测），可在**健康集群**上跑，用来排练命令与核对 peer 列表 |
+| `cluster recovery force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；**OFFLINE 路径用**，daemon 必须停止 |
+| `cluster recovery force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径（OFFLINE 路径用） |
+| `cluster recovery force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认。`--online` 下该值会发给 broker 校验（与 socket 所属节点不符即拒，防误指错节点） |
+| `cluster recovery force-single` | `--self-addr` | (`--online` 时不需要) | 当前幸存节点 Raft 地址，形如 `<host>:7400`；仅 OFFLINE 路径需要（在线路径由 broker 从 roster 自取） |
+| `cluster recovery force-single` | `--confirm-peers-dead` | (必填，可逗号分隔) | roster 中其它所有节点 id；命令会探测它们 raft/nats/tunnel 端口仍可达则 HARD-REFUSE（活着=会脑裂） |
 | `cluster recovery rejoin prepare` | `--data-dir` | `/var/lib/tether` | returning node 的 broker data dir；daemon 必须停止 |
 | `cluster recovery rejoin prepare` | `--db` | `/var/lib/tether/tether.db` | returning node 的 DB 路径 |
 | `cluster recovery rejoin prepare` | `--dump-divergent` | (必填) | forensic dump 输出路径，0600，必须不存在 |

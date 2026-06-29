@@ -40,7 +40,7 @@ const TFence = 10 * time.Second
 // step-down (raft setLastContact), so the worst-case authorize-while-isolated
 // window is LeaderLeaseTimeout + TFence — bounded and accepted (§8.4(b)).
 func (n *Node) LeaderContactStale(now time.Time) bool {
-	return leaderContactStaleAt(n.raft.State(), n.raft.LastContact(), now)
+	return leaderContactStaleAt(n.raft.Load().State(), n.raft.Load().LastContact(), now)
 }
 
 // leaderContactStaleAt is the pure decision behind LeaderContactStale, split out so
@@ -64,7 +64,7 @@ func (n *Node) AppliedIndex() (uint64, error) {
 // trivially succeeds; the seam exists so D2+ consumers (auth_callout, catch-up
 // barrier, force-single) attach to the correct path. D1 wires NO real consumer.
 func (n *Node) VerifyLeaderRead(fn func(*sql.DB) error) error {
-	if err := n.raft.VerifyLeader().Error(); err != nil {
+	if err := n.raft.Load().VerifyLeader().Error(); err != nil {
 		return fmt.Errorf("cluster: verify leader: %w", err)
 	}
 	return fn(n.db)
@@ -96,7 +96,7 @@ const TrailingLogs uint64 = 10240
 // cursor lags CommitIndex during FSM catch-up, which would needlessly delay the
 // post-election sweep — and the audit derives purely from the committed log bytes, not
 // a locally-applied SQL row, so AppliedIndex is not needed for durability.
-func (n *Node) CommitIndex() uint64 { return n.raft.CommitIndex() }
+func (n *Node) CommitIndex() uint64 { return n.raft.Load().CommitIndex() }
 
 // LogFirstIndex / LogLastIndex expose the retained raft-log range (the BoltStore log
 // is truncated below FirstIndex after a snapshot). The publisher clamps its sweep
@@ -111,7 +111,7 @@ func (n *Node) LogLastIndex() (uint64, error)  { return n.store.LastIndex() }
 // against CommitIndex would be CROSS-DOMAIN and structurally never true (the trailing noop bumps
 // CommitIndex but never the SQLite cursor), which is why reaperMayDelete uses this raft-domain index
 // instead (v0.4.4 review G-reaper-gate). Stays in internal/cluster so internal/broker keeps L-2 raft-free.
-func (n *Node) RaftAppliedIndex() uint64 { return n.raft.AppliedIndex() }
+func (n *Node) RaftAppliedIndex() uint64 { return n.raft.Load().AppliedIndex() }
 
 // CommittedCommandAt decodes the *Command at a committed raft index, reading the local
 // raft log via the SAME unexported decodeCommand the FSM uses (identical poison /
@@ -179,7 +179,7 @@ func (n *Node) AdvanceAuditPublished(to uint64) error {
 // follower's configuration may be stale, but the reconfig pass is leader-only. Raft
 // passthrough; no NATS.
 func (n *Node) NumVoters() (int, error) {
-	fut := n.raft.GetConfiguration()
+	fut := n.raft.Load().GetConfiguration()
 	if err := fut.Error(); err != nil {
 		return 0, fmt.Errorf("cluster: get configuration: %w", err)
 	}

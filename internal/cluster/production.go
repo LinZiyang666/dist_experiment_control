@@ -62,17 +62,18 @@ func NewProduction(cfg ProductionConfig) (*Node, error) {
 		return nil, fmt.Errorf("cluster: load route leaf: %w", err)
 	}
 
-	trans, err := NewMTLSTransport(MTLSTransportConfig{
+	mtlsCfg := MTLSTransportConfig{
 		BindAddr: cfg.RaftBind,
 		CACert:   pool,
 		Leaf:     leaf,
 		Timeout:  10 * time.Second,
-	})
+	}
+	trans, err := NewMTLSTransport(mtlsCfg)
 	if err != nil {
 		return nil, err
 	}
 
-	return New(Config{
+	n, err := New(Config{
 		LocalID:            raft.ServerID(cfg.LocalID),
 		DataDir:            cfg.DataDir,
 		DBPath:             cfg.DBPath,
@@ -84,5 +85,15 @@ func NewProduction(cfg ProductionConfig) (*Node, error) {
 		// `cluster init [--from-existing]`), so cluster.New takes the HasExistingState
 		// path and never auto-bootstraps. The detection gate (broker.clusterModeEnabled)
 		// has already refused startup if raft/ is absent.
+		//
+		// TransportFactory lets the online force-single (RecoverToSelfOnline) rebuild the mTLS
+		// transport after re-recovering raft IN-PROCESS — it re-binds the same RaftBind (Go sets
+		// SO_REUSEADDR; harmless at N=1 with confirmed-dead peers). Without it the online path
+		// refuses and the offline floor is used. Captures mtlsCfg (the pool + leaf are immutable).
+		TransportFactory: func() (raft.Transport, error) { return NewMTLSTransport(mtlsCfg) },
 	})
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
 }

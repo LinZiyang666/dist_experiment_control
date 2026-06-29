@@ -42,12 +42,12 @@ func TestValidateNatsRoute(t *testing.T) {
 	}{
 		{"nats://203.0.113.5:6222", false, true},
 		{"nats://broker.example.com:6222", false, true},
-		{"nats://127.0.0.1:6222", false, false},   // loopback
-		{"nats://0.0.0.0:6222", false, false},     // unspecified
-		{"http://203.0.113.5:6222", false, false}, // wrong scheme
-		{"nats://", false, false},                 // no host
-		{"nats://h", false, false},                // no port
-		{"nats://203.0.113.5:0", false, false},    // port 0 (review suggestion)
+		{"nats://127.0.0.1:6222", false, false},                // loopback
+		{"nats://0.0.0.0:6222", false, false},                  // unspecified
+		{"http://203.0.113.5:6222", false, false},              // wrong scheme
+		{"nats://", false, false},                              // no host
+		{"nats://h", false, false},                             // no port
+		{"nats://203.0.113.5:0", false, false},                 // port 0 (review suggestion)
 		{"nats://alice:s3cret@203.0.113.5:6222", false, false}, // userinfo credential (F6)
 		{"nats://203.0.113.5:6222/x", false, false},            // path decoration (F6)
 		{"garbage", false, false},

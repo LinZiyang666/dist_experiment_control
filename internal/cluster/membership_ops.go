@@ -355,6 +355,31 @@ func PlanClearForceSingle() (*Command, error) {
 	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit)), nil
 }
 
+// MetaKeyForceSingleEpoch is the cluster_meta key holding the per-recovery epoch token. The
+// post-recover split-brain detector compares it across the cluster-health broadcast: hearing a peer
+// advertise force_single_active with a DIFFERENT epoch means two divergent single-voter timelines.
+const MetaKeyForceSingleEpoch = "force_single_epoch"
+
+// PlanSetForceSingle renders OpClusterMetaSet: UPSERT the replicated force_single_active marker
+// (value = now, RFC3339Nano) — the ONLINE force-single counterpart to the offline raiseForceSingleMarker.
+// The leader bakes the timestamp as a literal, so every replica applies the identical value (deterministic).
+func PlanSetForceSingle(now time.Time) (*Command, error) {
+	keyLit := MustLitText(MetaKeyForceSingle)
+	valLit := MustLitText(now.UTC().Format(time.RFC3339Nano))
+	return NewCommand(OpClusterMetaSet, Stmt(
+		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
+			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+}
+
+// PlanForceSingleEpoch renders OpClusterMetaSet: UPSERT the per-recovery epoch token (baked literal).
+func PlanForceSingleEpoch(epoch string) (*Command, error) {
+	keyLit := MustLitText(MetaKeyForceSingleEpoch)
+	valLit := MustLitText(epoch)
+	return NewCommand(OpClusterMetaSet, Stmt(
+		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
+			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+}
+
 // PlanClusterCertRotate renders OpClusterCertRotate (§15 RF3 / external review F2):
 // rotate node's stable tunnel cert pin. It moves the current cert_fp to cert_fp_prev
 // (a deterministic SQL self-reference — every replica's row holds the same current

@@ -952,6 +952,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			// signature ripple). nil in single mode ⇒ the op replies cluster_not_enabled.
 			if cab, ok := backend.Cluster.(*clusterAdminBackend); ok {
 				cab.rebalanceProxy = b.rebalanceProxyHomes
+				cab.fsArm = b.cl.fsArm // online force-single dwell+token (shared with the observe tick that feeds it)
 			}
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).

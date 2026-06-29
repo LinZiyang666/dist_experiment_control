@@ -102,6 +102,9 @@ type clusterRuntime struct {
 	// admin is the D7 membership orchestrator wired into the adminsock cluster backend;
 	// kept here so the d9_integration harness can drive `cluster add` (AddNode) directly.
 	admin *ClusterAdmin
+	// fsArm tracks the online force-single sustained-quorum-loss dwell + arm token. Shared between the
+	// (non-leader-gated) observe tick that feeds it and the adminsock backend handlers that read it.
+	fsArm *forceSingleArm
 	// topoSelf (C3) is this broker's latest topology-reconcile self-report (applied/observed/reason),
 	// published by the per-broker reconcile loop and read by the status/health responders. atomic so
 	// the responder (other goroutine) reads it race-free; nil until the first reconcile pass.

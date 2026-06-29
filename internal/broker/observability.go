@@ -228,6 +228,13 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 			// callers). Leader-only + idempotent (phase transitions are baked WHERE phase IN
 			// (preds) no-ops), so re-running on a leadership flap is safe. Tick-sampled rather
 			// than a raft LeaderCh observer to avoid adding raft plumbing outside internal/cluster.
+			// Online force-single dwell: record leader-contact state EVERY tick, NOT leader-gated — a
+			// quorum-lost survivor is never leader, so this is the only loop that can observe the
+			// sustained loss the force-single gate requires.
+			if b.cl != nil && b.cl.node != nil && b.cl.fsArm != nil {
+				now := time.Now()
+				b.cl.fsArm.observeLeadership(b.cl.node.LeaderContactStale(now), now)
+			}
 			isLeader := b.cl != nil && b.cl.node != nil && b.cl.node.IsLeader()
 			if isLeader && !wasLeader && b.cl.admin != nil {
 				if err := b.cl.admin.ReconcileMembershipOnLeadership(); err != nil {

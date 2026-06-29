@@ -78,6 +78,15 @@ const (
 	// pass evens out a lopsided distribution (e.g. after `cluster add` brings a fresh empty voter,
 	// or a drained broker rejoins). DryRun previews the moves. nil Backend.Cluster => single mode.
 	OpClusterRebalanceProxy = "cluster_rebalance_proxy"
+
+	// Online force-single (the quorum-loss escape hatch WITHOUT a broker stop). Two-step armed flow over
+	// the LOCAL root-only admin socket (never reachable from a remote ctl): Arm runs the gates (sustained
+	// quorum-loss dwell + peer-liveness HARD-REFUSE) and, unless DryRun, mints an ArmToken; Commit
+	// re-checks the gates and does the in-process raft RecoverToSelfOnline. DryRun makes Arm a zero-mutation
+	// drill runnable on a healthy cluster. Dispatched BEFORE the leader gate (a quorum-lost survivor is
+	// never leader).
+	OpClusterForceSingleArm    = "cluster_force_single_arm"
+	OpClusterForceSingleCommit = "cluster_force_single_commit"
 )
 
 // Cluster-admin machine error codes (B2 item 4) — stable identifiers set on Response.Code so a
@@ -96,6 +105,12 @@ const (
 	CodeBadRequest            = "bad_request"
 	CodeRemoveOwnsResources   = "remove_owns_resources" // B3 item 7: a VOTER_ADD_FAILED node still homes exposes
 	CodeVersionSkew           = "version_skew"          // B6 A3: joiner proto != cluster proto (hard reject; CLI exit 64)
+
+	// Online force-single refusal codes (the anti-split-brain gates).
+	CodePeerAlive          = "peer_alive"           // a confirmed-dead peer answered a TCP probe → HARD-REFUSE
+	CodeQuorumNotLost      = "quorum_not_lost"      // not (yet) continuously quorum-lost for T_dwell
+	CodeForceSingleRefused = "force_single_refused" // generic force-single gate refusal
+	CodeArmExpired         = "arm_expired"          // commit without a fresh arm token (missing/expired/wrong)
 )
 
 // clusterOps is the set the server routes to Backend.Cluster.
@@ -115,6 +130,10 @@ var clusterOps = map[string]bool{
 	OpClusterJoinApprove: true, OpClusterRetire: true,
 	OpClusterOpConfirm: true, OpClusterOpAbort: true,
 	OpClusterRebalanceProxy: true,
+	// Online force-single: routed to the backend so HandleCluster can dispatch them BEFORE the leader
+	// gate. They are local-socket-only by construction (the admin socket is a root-only Unix socket; no
+	// NATS path dispatches admin ops), so a remote ctl can never reach them.
+	OpClusterForceSingleArm: true, OpClusterForceSingleCommit: true,
 }
 
 // Request is the on-wire admin call. Op selects the verb; the
@@ -157,7 +176,14 @@ type Request struct {
 	// VOTER_ADD_FAILED node (never the raft phase-gate). Additive, omitempty, LOCAL socket only.
 	Force bool `json:"force,omitempty"`
 	// C-rebalance: preview the proxy-home moves without executing them (`cluster rebalance proxy --dry-run`).
+	// Also: online force-single Arm DryRun = a zero-mutation drill (runs the gates + reports, mints no token).
 	DryRun bool `json:"dry_run,omitempty"`
+
+	// Online force-single args (local socket only). ConfirmPeersDead must list EVERY other node_id (the
+	// operator's typed assertion that they are TRULY dead); ArmToken is the broker-minted token from Arm,
+	// presented on Commit (a stray lone Commit is refused).
+	ConfirmPeersDead []string `json:"confirm_peers_dead,omitempty"`
+	ArmToken         string   `json:"arm_token,omitempty"`
 
 	// B4 operator-alert args (all omitempty; byte-compatible with the pre-B4 ops). raise
 	// uses Kind/Severity/Message (+optional Label → dedup key manual:<label>); clear uses
@@ -221,6 +247,10 @@ type Response struct {
 
 	// C-rebalance: `cluster rebalance proxy` result (which proxy homes moved / would move).
 	ProxyRebalance *ProxyRebalanceReport `json:"proxy_rebalance,omitempty"`
+
+	// Online force-single Arm/Commit result: the per-peer probe verdict, whether the gates would pass,
+	// the arm token (Arm, non-dry-run), the dwell remaining, and the abandoned peers (Commit).
+	ForceSingle *ForceSingleReport `json:"force_single,omitempty"`
 
 	QuorumProj *QuorumProjection `json:"quorum_proj,omitempty"` // set when an F==0 confirm is required
 	NotLeader  bool              `json:"not_leader,omitempty"`  // admin change attempted on a follower
@@ -412,6 +442,28 @@ type ProxyRebalanceReport struct {
 	Proxies int                  `json:"proxies"` // movable __proxy__ allocations (ready + home is an eligible voter)
 	Planned int                  `json:"planned"` // moves the greedy planner produced (≥ len(Moves) if a pass stopped early)
 	Moves   []ProxyRebalanceMove `json:"moves"`   // [] never null; one ATTEMPTED move per entry (done or error)
+}
+
+// ForceSingleReport is the online force-single Arm/Commit result.
+type ForceSingleReport struct {
+	WouldProceed bool `json:"would_proceed"` // Arm/dry-run: all gates pass → commit would proceed
+	// BrokerSelfID is the node_id of the broker that OWNS this admin socket (F2). The CLI renders
+	// the TTY confirm prompt from THIS value (not the operator-supplied --self-id) so a mistyped
+	// --self-id can never quietly confirm the wrong node — and the broker rejects a mismatched arm.
+	BrokerSelfID   string                 `json:"broker_self_id,omitempty"`
+	Reason         string                 `json:"reason,omitempty"`          // why WouldProceed is false (dry-run drill detail / gate refusal)
+	Peers          []ForceSinglePeerProbe `json:"peers,omitempty"`           // per-peer liveness verdict
+	DwellRemaining string                 `json:"dwell_remaining,omitempty"` // time left before the quorum-loss dwell is satisfied ("" = satisfied)
+	ArmToken       string                 `json:"arm_token,omitempty"`       // Arm (non-dry-run): present this on Commit
+	Abandoned      []string               `json:"abandoned,omitempty"`       // Commit: node_ids removed from the new {self} config
+}
+
+// ForceSinglePeerProbe is one peer's liveness verdict in a ForceSingleReport.
+type ForceSinglePeerProbe struct {
+	NodeID    string `json:"node_id"`
+	Confirmed bool   `json:"confirmed"`         // operator listed it in --confirm-peers-dead
+	Alive     bool   `json:"alive"`             // a TCP probe completed on some port → HARD-REFUSE
+	OnPort    string `json:"on_port,omitempty"` // which port answered (raft/nats/tunnel addr), if alive
 }
 
 // ProxyRebalanceMove is one __proxy__ home reassignment (NEVER carries a token/psk).

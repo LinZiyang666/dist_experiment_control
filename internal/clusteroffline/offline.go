@@ -257,21 +257,59 @@ func checkPeersDead(roster []Peer, confirmed []string) error {
 		}
 	}
 	for _, p := range roster {
-		for _, ap := range []struct{ kind, addr string }{
-			{"raft", p.RaftAddr}, {"nats", p.NatsRoute}, {"tunnel", p.TunnelAddr},
-		} {
-			if ap.addr == "" {
-				continue
-			}
-			conn, err := net.DialTimeout("tcp", ap.addr, peerDialTimeout)
-			if err == nil {
-				_ = conn.Close()
-				return fmt.Errorf("clusteroffline: HARD-REFUSE — peer %q accepted a TCP connection on its %s port (%s); "+
-					"it is ALIVE, force-single would split-brain", p.NodeID, ap.kind, ap.addr)
-			}
+		if alive, kind, addr := probePeer(p); alive {
+			return fmt.Errorf("clusteroffline: HARD-REFUSE — peer %q accepted a TCP connection on its %s port (%s); "+
+				"it is ALIVE, force-single would split-brain", p.NodeID, kind, addr)
 		}
 	}
 	return nil
+}
+
+// probePeer TCP-probes a peer's serving ports (raft/nats/tunnel) IN ORDER and returns the FIRST
+// that completes a connection (the peer is alive on that port). A completed TCP connect — even if
+// a later TLS handshake would fail — proves the peer is alive (the conservative gate, B-8). Shared
+// by the offline HARD-REFUSE gate (checkPeersDead) and the display-only ProbePeers, so both probe
+// identically.
+func probePeer(p Peer) (alive bool, kind, addr string) {
+	for _, ap := range []struct{ kind, addr string }{
+		{"raft", p.RaftAddr}, {"nats", stripScheme(p.NatsRoute)}, {"tunnel", p.TunnelAddr},
+	} {
+		if ap.addr == "" {
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", ap.addr, peerDialTimeout)
+		if err == nil {
+			_ = conn.Close()
+			return true, ap.kind, ap.addr
+		}
+	}
+	return false, "", ""
+}
+
+// PeerLiveness is one peer's DISPLAY-only probe verdict for the online force-single report. The
+// authoritative anti-split-brain HARD-REFUSE remains CheckPeersDead; this only enriches the
+// operator's view (the report's Alive / OnPort fields).
+type PeerLiveness struct {
+	NodeID string
+	Alive  bool
+	OnPort string // "<kind> <addr>" that answered (e.g. "raft 10.0.0.2:7400"), "" if dead
+}
+
+// ProbePeers returns a per-peer liveness verdict (TCP-probing each peer's raft/nats/tunnel ports)
+// for the online force-single report. It does NOT gate — CheckPeersDead is the authoritative gate;
+// this populates the report so the operator sees WHICH peer is alive on WHICH port, not just a
+// terse refusal string.
+func ProbePeers(roster []Peer) []PeerLiveness {
+	out := make([]PeerLiveness, 0, len(roster))
+	for _, p := range roster {
+		pl := PeerLiveness{NodeID: p.NodeID}
+		if alive, kind, addr := probePeer(p); alive {
+			pl.Alive = true
+			pl.OnPort = kind + " " + addr
+		}
+		out = append(out, pl)
+	}
+	return out
 }
 
 // readRoster reads every non-self cluster_nodes row from the offline DB (read-only).
@@ -281,14 +319,22 @@ func readRoster(dbPath, selfID string) ([]Peer, error) {
 		return nil, err
 	}
 	defer func() { _ = db.Close() }()
+	return ReadRoster(db, selfID)
+}
+
+// ReadRoster returns the OTHER cluster nodes (peers) off an ALREADY-OPEN read-only handle. It is the
+// exported form readRoster delegates to, so the offline force-single tool (its own DB handle) and the
+// online broker path (node.RODB()) share ONE roster read — guaranteed parity. Refuses if selfID is not
+// in cluster_nodes (won't rewrite raft config for an unknown node).
+func ReadRoster(ro *sql.DB, selfID string) ([]Peer, error) {
 	var selfRows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM cluster_nodes WHERE node_id = ?`, selfID).Scan(&selfRows); err != nil {
+	if err := ro.QueryRow(`SELECT COUNT(*) FROM cluster_nodes WHERE node_id = ?`, selfID).Scan(&selfRows); err != nil {
 		return nil, err
 	}
 	if selfRows != 1 {
 		return nil, fmt.Errorf("clusteroffline: self-id %q is not present in cluster_nodes; refusing to rewrite raft config for an unknown node", selfID)
 	}
-	rows, err := db.Query(`SELECT node_id, raft_addr, nats_route, tunnel_addr FROM cluster_nodes WHERE node_id != ?`, selfID)
+	rows, err := ro.Query(`SELECT node_id, raft_addr, nats_route, tunnel_addr FROM cluster_nodes WHERE node_id != ?`, selfID)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +348,14 @@ func readRoster(dbPath, selfID string) ([]Peer, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// CheckPeersDead is the exported form of the peer-liveness HARD-REFUSE (the anti-split-brain gate): it
+// requires confirmed to list EVERY peer and TCP-probes each peer's raft/nats/tunnel ports, refusing if
+// ANY completes a connection (the peer is ALIVE → force-single would split-brain). Shared by the offline
+// tool and the online broker handler so both gate identically.
+func CheckPeersDead(roster []Peer, confirmed []string) error {
+	return checkPeersDead(roster, confirmed)
 }
 
 func raiseForceSingleMarker(dbPath string, now time.Time) error {
