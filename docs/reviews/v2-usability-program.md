@@ -1,10 +1,10 @@
 # v2 易用性改造程序（program backlog + 分批序列）
 
-> 触发：外部用户反馈"v2 cluster 太麻烦"（`../v2-usability-proposals.md`，7 条建议）。
+> 触发：外部用户反馈"v2 cluster 太麻烦"（`v2-usability-proposals.md`，7 条建议）。
 > 本轮在那 7 条之外，另用 4 个独立视角 agent（产品经理 / 非专家新用户 / Ops-SRE / 集成自动化）对 v2（distributed-broker HA, D0–D9, proto v2）做易用性审视，合并去重后得 ~57 条 finding。
 > 用户决策：**全部落实**。本文件把全集分解为可独立交付的叶子批次 B1–B7，逐批走 CLAUDE.md §3 的 3 阶段（workflow 起草 plan → 主进程实现+测试 → 独立 agent 闭合核验 + 用户外审），一次一批、先父后子。
 >
-> finding 溯源：`PM#n`=产品经理视角，`NEW#n`=新用户视角，`OPS#n`=Ops/SRE 视角，`AUTO#n`=自动化视角，`DOC#n`=`../v2-usability-proposals.md` 原 7 条。
+> finding 溯源：`PM#n`=产品经理视角，`NEW#n`=新用户视角，`OPS#n`=Ops/SRE 视角，`AUTO#n`=自动化视角，`DOC#n`=`v2-usability-proposals.md` 原 7 条。
 
 ## 0. 跨视角主线（多个 agent 独立撞到 = 最强信号）
 

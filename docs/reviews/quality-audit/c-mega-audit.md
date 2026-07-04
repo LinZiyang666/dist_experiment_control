@@ -68,7 +68,7 @@ Ordered by operational risk.
 
 ### MAJ-5 · `--require-credential-rotation` raise-failure is a durable-surface false-safe (rejection #5) + misleading guide, exit 0
 - file:line: `cmd/tether/cluster_retire.go:62-66` (best-effort raise, WARNING-only), `:65` (hardcoded `true /* alert raised */`), guide text `cmd/tether/cluster_rotation.go:58-60,105-107`.
-- proof: After the retire op commits (`cluster_retire.go:50`), a leadership loss before the *separate* `raiseCredRotationAlert` Propose drops the durable `manual:credrot:<node>` row; only a stderr WARNING prints and control returns `nil` → **exit 0**. `computeHealth` never reads `alerts` (`clusterstatus.go:388-481`), so health/`alert ls`/severe banner all read clean — the durable surfaces default to "safe restored," the exact rejection-#5 hazard (`docs/v2-usability-proposals.md:306`). The guide still prints "NOT-SAFE (severe alert manual:credrot:<node>) … `tether alert clear manual:credrot:<node>`" pointing at a non-existent alert. Re-running hits `assertNoActiveOp` and returns before re-raising (`:57-58`). Runtime WARNING + NOT-SAFE banner DO print, and the rejection holds in the common path — so windowed, but the durable-surface false-safe is real.
+- proof: After the retire op commits (`cluster_retire.go:50`), a leadership loss before the *separate* `raiseCredRotationAlert` Propose drops the durable `manual:credrot:<node>` row; only a stderr WARNING prints and control returns `nil` → **exit 0**. `computeHealth` never reads `alerts` (`clusterstatus.go:388-481`), so health/`alert ls`/severe banner all read clean — the durable surfaces default to "safe restored," the exact rejection-#5 hazard (`docs/reviews/v2-usability-proposals.md:306`). The guide still prints "NOT-SAFE (severe alert manual:credrot:<node>) … `tether alert clear manual:credrot:<node>`" pointing at a non-existent alert. Re-running hits `assertNoActiveOp` and returns before re-raising (`:57-58`). Runtime WARNING + NOT-SAFE banner DO print, and the rejection holds in the common path — so windowed, but the durable-surface false-safe is real.
 - invariant: rejection #5 (never default to safety restored; the persistent alert IS the mechanism).
 - fix: pass `raised := (aerr==nil)` into the guide; treat a failed raise as a non-zero exit and/or bounded retry/local marker for `--require-credential-rotation`.
 
@@ -92,7 +92,7 @@ Ordered by operational risk.
 ### MAJ-9 · `cluster status` F==0 next-step names the C8-deleted `cluster add` + `--join-token` + `<node-pub>`
 - file:line: `internal/broker/clusterstatus.go:463` (rendered live at `cmd/tether/cluster.go:458-460`).
 - proof: For `proj.FaultTolerance==0` (every N=1 — i.e. the exact state after `cluster init --from-existing` — and N=2) the authoritative `next:` line is "cluster add <node-id> <host:7400> <node-pub>, then re-run with --join-token…". `cluster add`/`<node-pub>`/the nonce dance were deleted in C8 (`TestC8DeletedCommandsGone`; grep `OpClusterAdd` over `cmd/`=empty). It contradicts `init`'s own success output (`cmd/tether/cluster.go:744-748`, correctly `join prepare/approve`) and tells the operator to run `unknown command`. No test locks the string.
-- invariant: `docs/v2-cli-consolidation-proposal.md` §6/§7 (hints name only existing commands; no resurrection of deleted surface).
+- invariant: `docs/reviews/v2-cli-consolidation-proposal.md` §6/§7 (hints name only existing commands; no resurrection of deleted surface).
 - fix: replace with `cluster join prepare … (new broker)` + `cluster join approve <bundle> --wait (leader)`.
 
 ### MAJ-10 · DIFF-1 break: proxysub cluster Plan bakes raw `now` (local zone + monotonic), live mutator binds `now.UTC()`
@@ -147,7 +147,7 @@ Ordered by operational risk.
 
 ## Requirement-fidelity scorecard
 
-**docs/v2-usability-proposals.md (建议1–7 + rejections)**
+**docs/reviews/v2-usability-proposals.md (建议1–7 + rejections)**
 - 建议1 (auto NATS topology convergence / C3): **partial** — MAJ-6 (reload storm), MAJ-12 (false coverage comment + happy path untested).
 - 建议2 (invite/bootstrap-URL join / C2): **PASS** (3 MINOR defense-in-depth only).
 - 建议3 (roster auto-refresh ≤5 min / C1): **partial** — refresh loop dormant on sub-20 s single→cluster reconnect (MINOR).
@@ -162,9 +162,9 @@ Ordered by operational risk.
 - #5 retire is not a security boundary / never signal safe: **REFUSED in the common path**, but MAJ-5 is a windowed durable-surface false-safe (raise-failure → exit 0 + clean health/alert/banner) — the one rejection wrinkle; flag for external elevation.
 - (Remaining rejection items — never `--yes` on force-single, no theoretical-attack complexity — verified refused: `cluster_machineconfirm_test.go`, gate-preservation lens.) test-adequacy lens confirms all 5 carry real enforcing tests.
 
-**docs/v2-cli-consolidation-proposal.md (§6 discipline):** **partial** — MAJ-9 (status names deleted `cluster add`); MINORs (latent live `handleAdd`/`OpClusterAdd` + `OpClusterDrain Retire:true`, deleted-verb hint strings). CLI *surface* genuinely consolidated (5 relocated escapes = hidden alias + visible child sharing one constructor; deleted constructors absent; gates byte-preserved; deprecation→stderr) — the residue is broker-layer dead-code + stale strings, not a live user-facing dual surface.
+**docs/reviews/v2-cli-consolidation-proposal.md (§6 discipline):** **partial** — MAJ-9 (status names deleted `cluster add`); MINORs (latent live `handleAdd`/`OpClusterAdd` + `OpClusterDrain Retire:true`, deleted-verb hint strings). CLI *surface* genuinely consolidated (5 relocated escapes = hidden alias + visible child sharing one constructor; deleted constructors absent; gates byte-preserved; deprecation→stderr) — the residue is broker-layer dead-code + stale strings, not a live user-facing dual surface.
 
-**docs/v2-usability-proposals-gap.md / v2-automation-program.md:** decomposition implemented end-to-end (every op proposed, every loop production-gated, every CLI surface registered — deadcode-wiring PASS); fidelity gaps are the test-coverage MAJ-12 and the `proxy_node_ready` alias row (should be recorded as alias+doc-mapping, not ✅-unqualified).
+**docs/reviews/v2-usability-proposals-gap.md / v2-automation-program.md:** decomposition implemented end-to-end (every op proposed, every loop production-gated, every CLI surface registered — deadcode-wiring PASS); fidelity gaps are the test-coverage MAJ-12 and the `proxy_node_ready` alias row (should be recorded as alias+doc-mapping, not ✅-unqualified).
 
 ---
 

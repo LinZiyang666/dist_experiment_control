@@ -2,7 +2,7 @@
 
 > 本文件记录当前 openpi pi0.5 实验所使用的 4 台设备：硬件配置、角色、
 > openpi 项目路径、公网暴露策略，以及 tmux 会话命名规则。
-> tether 操作细节请参考 `docs/usage.md`。
+> tether 操作细节请参考 `docs/usage.md`（使用者）、`docs/broker-ops.md`（broker 运维）、`docs/cluster.md`（集群 HA）。
 
 ---
 

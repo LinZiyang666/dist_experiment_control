@@ -13,7 +13,9 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 tether expose --name web --local-port 3000
 ```
 
-- **Full usage / deployment / troubleshooting:** [`docs/usage.md`](docs/usage.md)
+- **Usage (`ctl` / `agent` — connect, run commands, transfer files, troubleshoot):** [`docs/usage.md`](docs/usage.md)
+- **Broker operations (deploy / configure / maintain a public broker):** [`docs/broker-ops.md`](docs/broker-ops.md)
+- **Cluster HA (`cluster` / `alert` commands + quorum concepts):** [`docs/cluster.md`](docs/cluster.md)
 - **Architecture (single-broker baseline):** [`docs/architecture.md`](docs/architecture.md)
 - **Distributed-broker HA (proto v2):** [`docs/distributed-broker-architecture.md`](docs/distributed-broker-architecture.md)
   and the operator runbook [`docs/cluster-runbook.md`](docs/cluster-runbook.md)

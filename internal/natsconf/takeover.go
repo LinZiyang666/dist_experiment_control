@@ -100,7 +100,7 @@ func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
 		b.WriteString(ws)
 	}
 	// Preserve recognized tuning directives (max_payload etc.) verbatim — refusing them
-	// would brick a docs-compliant file-transfer broker (usage.md:970).
+	// would brick a docs-compliant file-transfer broker (usage.md §5.16).
 	if pt := passthroughBlock(own); pt != "" {
 		b.WriteString("\n")
 		b.WriteString(pt)
@@ -241,7 +241,7 @@ func fsyncDir(dir string) error {
 func bakStamp() string { return time.Now().UTC().Format("20060102T150405Z") }
 
 // OwnershipTable renders the before/after ownership table (printed to stdout + embedded in
-// usage.md §2.3) so the operator can see which directives tether now owns.
+// broker-ops.md §2.3) so the operator can see which directives tether now owns.
 func OwnershipTable(own *Ownership) string {
 	var b strings.Builder
 	b.WriteString("nats.conf directive ownership after takeover:\n")

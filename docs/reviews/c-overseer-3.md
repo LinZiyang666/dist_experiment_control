@@ -1,6 +1,6 @@
 # 监工 #3 — 独立需求审查 C5–C6（after C6）
 
-> 独立 agent（general-purpose, Opus 4.8），按 /goal「C6 后 spawn 监工查阳奉阴违 + 是否满足 4 个 v2 文件精神」。审计 C5（proxy cluster 化）+ C6（可观测/命名/recovery 别名）against docs/v2-{usability-proposals,usability-proposals-gap,automation-program,cli-consolidation-proposal}.md。CLI 精简按用户决定已挪 C8，本次只查 C5/C6 自身功能需求。
+> 独立 agent（general-purpose, Opus 4.8），按 /goal「C6 后 spawn 监工查阳奉阴违 + 是否满足 4 个 v2 文件精神」。审计 C5（proxy cluster 化）+ C6（可观测/命名/recovery 别名）against docs/reviews/v2-{usability-proposals,usability-proposals-gap,automation-program,cli-consolidation-proposal}.md。CLI 精简按用户决定已挪 C8，本次只查 C5/C6 自身功能需求。
 
 ## 裁决：CONDITIONAL PASS
 

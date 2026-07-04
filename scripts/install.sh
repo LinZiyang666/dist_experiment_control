@@ -462,7 +462,7 @@ install_broker() {
 
     detect_os_arch
     # broker is Linux-only: useradd, systemd units, and /etc layout below
-    # all assume a Linux host (architecture A.3 / K). docs/usage.md §2.3
+    # all assume a Linux host (architecture A.3 / K). docs/broker-ops.md §2.3
     # also positions broker as the public-internet node.
     [ "$OS" = "darwin" ] && die "--role broker is not supported on macOS (only --role ctl is); broker requires a Linux host"
     log "tether install (role=broker, version=$VERSION, os=$OS, arch=$ARCH, domain=$DOMAIN)"

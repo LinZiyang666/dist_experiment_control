@@ -22,7 +22,7 @@ import (
 )
 
 // §15 secrets-dir filenames the cluster-mode daemon loads (the provisioning runbook +
-// `cluster init` write them; usage.md §2.3 documents them). The route leaf is this
+// `cluster init` write them; broker-ops.md §2.3 documents them). The route leaf is this
 // node's cluster-CA-signed raft/route mTLS cert; the CA is the shared trust anchor.
 const (
 	secretClusterCA = "cluster-ca.pem"

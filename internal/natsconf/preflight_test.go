@@ -107,7 +107,7 @@ websocket {
 }
 
 func TestPreflightPreservesTuningPassthrough(t *testing.T) {
-	// usage.md:970 documents raising max_payload for tier-A transfer — it must NOT be
+	// usage.md §5.16 documents raising max_payload for tier-A transfer — it must NOT be
 	// refused (a hard-refuse would brick every file-transfer broker).
 	own, err := Preflight(writeConf(t, installSHConf+"\nmax_payload: 16777216\n"))
 	if err != nil {

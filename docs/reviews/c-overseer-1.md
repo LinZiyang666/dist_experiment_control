@@ -25,7 +25,7 @@ Every requirement maps to real code + a test that asserts the behavior (not a va
 
 ## Non-blocking caveats (doc-only / already tracked — NOT delivery gaps)
 
-1. **gap-doc bookkeeping not yet flipped.** `docs/v2-usability-proposals-gap.md` still shows ❌ for 建议3 rows (a pre-C1/C2 snapshot). DoD requires flipping them ✅ at closure → **flip at the C-program external review.**
+1. **gap-doc bookkeeping not yet flipped.** `docs/reviews/v2-usability-proposals-gap.md` still shows ❌ for 建议3 rows (a pre-C1/C2 snapshot). DoD requires flipping them ✅ at closure → **flip at the C-program external review.**
 2. **"broker_url 降级为 bootstrap URL" wording** — implementation keeps broker_url as an authenticated NATS dial floor + adds bootstrap_url additively (D-7 sound; intent met). Doc-only (c2-review m7).
 3. **Documented residuals** (c2-review "Known follow-ups", non-code): install.sh Caddy `/.well-known/tether/*` route, usage.md flow, `FetchManifest` SSRF private-IP block.
 

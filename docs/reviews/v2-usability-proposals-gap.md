@@ -1,6 +1,6 @@
 # v2-usability 需求文档落差分析（proposals ↔ 实现）
 
-> 对照 `docs/v2-usability-proposals.md`（原始 7 条产品建议）逐条核对实际交付。
+> 对照 `docs/reviews/v2-usability-proposals.md`（原始 7 条产品建议）逐条核对实际交付。
 > 图例：✅ 实现 · 🟡 部分（只做了 seam / 安全 / 观测，核心机制缺）· ❌ 没做。
 > 核对方式：grep 代码确认命令/字段/事件是否真实存在（非注释/文档提及）。
 >

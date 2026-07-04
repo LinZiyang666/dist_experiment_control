@@ -29,7 +29,7 @@ const (
 	// OperatorAuth: the §3.4 hand-added authorization{} — READ for the cluster identity
 	// (auth_callout.issuer + broker nkey), then SUPERSEDED by the generated authorization.
 	OperatorAuth Bucket = "operator_auth"
-	// TetherPassthrough: recognized tuning directives PRESERVED verbatim (usage.md:970
+	// TetherPassthrough: recognized tuning directives PRESERVED verbatim (usage.md §5.16
 	// documents max_payload>=16MiB for tier-A transfer — refusing it would brick a
 	// docs-compliant file-transfer broker).
 	TetherPassthrough Bucket = "tether_passthrough"
