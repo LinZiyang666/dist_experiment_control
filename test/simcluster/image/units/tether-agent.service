@@ -1,0 +1,22 @@
+# sim-owned agent unit. install.sh --role agent writes a `systemctl --user` unit keyed on a
+# broker URL + session; under PID1 systemd in a container a SYSTEM unit run as User=sim is the
+# clean fit. Onboarding is the real product path: `tether agent join <invite>` binds the nkey into
+# /home/sim/.tether first, then this unit runs the daemon. SID/NID come from /etc/tether/agent.env
+# (written by `simcluster` after join), so the unit body is node-agnostic.
+[Unit]
+Description=tether agent (sim)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sim
+Group=sim
+Environment=HOME=/home/sim
+EnvironmentFile=/etc/tether/agent.env
+ExecStart=/usr/local/bin/tether agent --session ${SID} --nid ${NID}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
