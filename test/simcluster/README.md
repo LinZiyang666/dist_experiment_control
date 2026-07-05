@@ -49,6 +49,59 @@ It is bound by the following, without exception:
   in-process with an embedded NATS; this runs the *real* out-of-process stack. It **replaces** "SSH to the
   real fleet and pray."
 
+## Architecture
+
+Two layers — a **driver on your WSL dev box** and a **brain on the sim server** — because the server has
+no Go toolchain and WSL's docker+systemd is awkward:
+
+```
+  WSL dev box                          dedicated Ubuntu server
+  -----------                          -----------------------
+  remote.sh  ──build tether────────>   docker build the image
+             ──stage vendor/ + rsync>  (nats-server / nats / nk / install.sh)
+             ──ssh: run simcluster──>   simcluster orchestrates N containers.
+
+     each container = one node (brk1, brk2, brk3, agt1, ctl1, …) on a docker
+     bridge where container-name == hostname == node_id:
+
+        +- brk1 ------------------------------------------+
+        |  systemd (PID1)  +  sshd                        |
+        |  nats-server  (real, SEPARATE service, :6222)   |   <- raft   :7400
+        |  tether-broker (real binary, cluster mode)      |   <- client :4222
+        |  volumes: /etc/tether  +  /var/lib/tether       |   (persistent)
+        +-------------------------------------------------+
+        (brk2, brk3 identical brokers; agt1 = agent; ctl1 = ctl role)
+```
+
+- **One container = one node = one machine.** Real systemd is PID1 (manages services just like a real
+  box); `nats-server` and `tether-broker` are TWO SEPARATE systemd services — exactly like production, NOT
+  an embedded in-process NATS. That is the whole point: deploy-layer bugs (install paths, nats.conf
+  ownership, unit behavior on nats loss, cross-process route mTLS) only exist with the real stack.
+- **Addressing = hostname.** `node_id == hostname == server_name == raft ServerID == cert CN/SAN`
+  (`brk1:7400` raft, `nats://brk1:6222` route, `brk1:4222` client) — no IP bookkeeping.
+- **Persistent.** Each node mounts two docker named volumes (`/etc/tether` config, `/var/lib/tether`
+  data), so state survives restart/upgrade — that is how "upgrade like real usage" gets tested.
+
+### File map
+
+| File | Runs where | Job |
+|---|---|---|
+| `remote.sh` | **your WSL** | The driver you actually type. Compiles `tether` + stages `vendor/` binaries (server has no Go) + rsyncs the tree + ssh-runs `simcluster` on the server. |
+| `simcluster` | server | The brain: ~19 verbs. Orchestrates docker + in-container `systemctl` + the real `tether` CLI. |
+| `lib/log.sh` | server | logging + `poll_until` (wait-for-condition, never a fixed sleep) |
+| `lib/docker.sh` | server | docker primitives (`dexec`, `ctr_name`, `run_node`, hostname addressing) |
+| `lib/tether.sh` | server | tether helpers (`leader_node`, `wait_phase`, `cluster_status_json`; defaults to `User=tether`) |
+| `lib/secrets.sh` | server | mints the §15 secrets with host `openssl` (ed25519) + `nk` (CA, account, route/tunnel certs WITH SANs, node-ident, broker nkey) + distributes them into containers |
+| `lib/assert.sh` | server | the RED/GREEN drill harness: `assert_ok` / `assert_refuses` / `assert_bug` (signature-guarded so a bug only "passes" for its DOCUMENTED cause) |
+| `Dockerfile` | build | base image: ubuntu:24.04 + systemd + sshd + baked binaries |
+| `image/provision-node.sh` | in container | lays down a node's disk tree via the REAL `install.sh` (`--skip-download`), exactly as a real machine installs; deliberately leaves `/etc/tether` root-owned (reproduces #22) |
+| `image/pty-confirm.py` | in container | feeds the typed confirm to interactive `tether` commands (e.g. `cluster init` demands a TTY) |
+| `image/units/tether-agent.service` | in container | the agent systemd unit |
+| `drills/*.sh` | server | one reproducible deploy scenario each (acceptance/regression); see the Drills table |
+
+**Edit-loop:** the control scripts (`simcluster`, `lib/*`, `drills/*`) take effect via rsync alone — just
+re-run `remote.sh`. The baked files (`Dockerfile`, `image/*`, the vendored binaries) need `remote.sh build`.
+
 ## Server
 
 Runs on a dedicated Ubuntu host (see `docs/devices-ops.local.md §6` for the credentials). Requirements:
@@ -76,10 +129,62 @@ run on isolated throwaway instances** and never wedge the persistent cluster. `r
 the server after an rsync; edit files locally and re-run. Baked files (`Dockerfile`, `image/*`) need
 `build`; the control scripts (`simcluster`, `lib/*.sh`, `drills/*`) take effect via rsync alone.
 
-## Verbs
+## Walkthrough (what each step does + how to debug)
 
-`build · up · init · grow · force-single · session · agent-join · ctl · status · exec · shell · ssh ·
-logs · nats-conf · drill · down [-v] · nuke · doctor`. See `./simcluster` (no args) for the summary.
+The Quickstart, explained. Everything is typed on your WSL box; `remote.sh` ships it to the server.
+
+1. `remote.sh --build build` — compile `tether`, fetch/cache `nats-server` (pinned to install.sh's
+   version), stage `vendor/`, rsync the tree, and `docker build` the image on the server. Run once, and
+   again after you change `tether` source or `Dockerfile`/`image/*`. (Changed only a control script or
+   drill? Drop `--build` — any verb re-rsyncs.)
+2. `remote.sh up --brokers 3 --agents 1 --ctl 1` — create + boot + provision the containers (real systemd
+   + install.sh per node). Does NOT form a cluster yet — every broker is a lone standalone.
+3. `remote.sh init brk1` — cut brk1 from standalone to a **single-voter cluster** (`cluster init
+   --from-existing` + the nats.conf takeover + start in cluster mode). brk1 is now the N=1 leader.
+4. `remote.sh grow brk2 && remote.sh grow brk3` — add each as a voter via the REAL cross-process join
+   (secrets → joiner `cluster init` → `join prepare`/`approve` → render the route mesh → catch up →
+   VOTER). This is the honest grow: it runs tether's real commands, labels every workaround `[GAP #N]`,
+   and prints a `GREW-VIA-WORKAROUNDS:` trailer (see the Mandate).
+5. `remote.sh session lab --pin 135790` — create a session on a broker + log the ctl node in.
+6. `remote.sh agent-join agt1 --session lab --pin 135790` — bind agt1's nkey + start its persistent agent
+   unit (reconnects as a bound member).
+7. `remote.sh ctl -- node ls` — run any `tether` subcommand from the ctl container (its session +
+   broker URL persist).
+
+**Debugging (like ssh-ing into a machine):** `remote.sh shell brk1` (or `ssh brk1`) for a shell inside a
+node · `remote.sh logs brk1 tether-broker` for journalctl · `remote.sh status` for the node table + leader
+view · `remote.sh nats-conf brk1` to inspect nats.conf (the #20 probe) · `remote.sh exec brk1 -- <cmd>`
+for any command · `remote.sh doctor` for PID1 + ownership drift checks (the #22 tripwire).
+
+**Teardown:** `remote.sh down` (stop, keep data) · `remote.sh down -v` (remove volumes) · `remote.sh nuke`
+(delete everything — containers + volumes + secrets — for a clean slate).
+
+**Isolation:** `--instance <name>` (or env `INSTANCE=`) namespaces containers/volumes/network, so
+destructive `drill`s run on throwaway `drill-*` instances that never touch your persistent cluster (each
+drill nukes its own instance on exit).
+
+## Verbs (reference)
+
+| Verb | Does |
+|---|---|
+| `build` | build the tether-sim image from `vendor/` + install.sh |
+| `up --brokers N --agents M --ctl K` | create + boot + provision nodes (does not cluster) |
+| `init <brk>` | standalone → N=1 cluster |
+| `grow <brk>` | add a fresh broker as a voter (honest, gap-labeled) |
+| `force-single <brk> --dead <n>` | online quorum-loss escape (the #20/#12 setup) |
+| `session <name> --pin <p>` | create a session + ctl login |
+| `agent-join <agt> --session <s> --pin <p>` | bind + start a persistent agent |
+| `ctl -- <tether args…>` | run tether from the ctl container |
+| `status [--json]` | node table + the leader's cluster status |
+| `exec <node> -- <cmd…>` | docker exec inside a node |
+| `shell <node>` / `ssh <node>` | interactive shell (docker exec / real sshd) |
+| `logs <node> [unit]` | journalctl inside a node |
+| `nats-conf <node>` | inspect `/etc/tether/nats.conf` (the #20 probe) |
+| `drill <name>` | run `drills/<name>.sh` on an isolated throwaway instance |
+| `down [-v]` · `nuke` | stop (keep volumes; `-v` removes) · full clean slate |
+| `doctor` | PID1 + provisioning + ownership drift checks |
+
+`./simcluster` with no args prints the same summary.
 
 ## Drills
 
