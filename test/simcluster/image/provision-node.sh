@@ -41,12 +41,17 @@ broker)
     mkdir -p "$ETC/secrets"
     chmod 700 "$ETC/secrets"
     chown -R tether:tether "$ETC/secrets" 2>/dev/null || true
-    # M6/#22: DELIBERATELY leave /etc/tether ROOT-owned (exactly as install.sh does — it chowns only
-    #     LIB/LOG/RUN, never ETC). That IS gotcha #22: the in-broker C3 reconciler (User=tether) then
-    #     perm-denies its atomic temp write and topology never auto-converges. The sim must NOT chown it
-    #     (that would MASK #22, the very defect this tool exists to catch). Grow still works because the
-    #     MANUAL `reconcile nats` runs as root (the operator path); only the automatic reconcile is broken,
-    #     exactly as on the fleet. `doctor` flags a root-owned /etc/tether as the reproduced-#22 tripwire.
+    # M6/#22: DELIBERATELY do NOT chown /etc/tether — a root-owned ETC DIRECTORY IS gotcha #22 (the
+    #     in-broker C3 reconciler, User=tether, perm-denies its atomic CreateTemp there, so topology never
+    #     auto-converges). This matches the real fleet: a fresh docker named volume mounts root:root and
+    #     install.sh's `mkdir -p /etc/tether` leaves it root-owned (it chowns only LIB/LOG/RUN, never ETC),
+    #     so /etc/tether is NATURALLY root-owned here — no sim chown needed, and adding one would MASK a
+    #     future install.sh #22 fix (install.sh chowning ETC → tether-owned → drill 13 must then flip). The
+    #     secrets/ subdir is tether-owned above; nats-server (User=tether) still reads the world-readable
+    #     root:root 0644 nats.conf and the broker runs; only the AUTOMATIC in-broker reconcile is broken,
+    #     exactly as on the fleet. `doctor` tripwires a tether-owned /etc/tether as the MASKED-#22 warning.
+    #     (History: an earlier build baked a provision that DID chown ETC → the sim silently masked #22 for
+    #     a while; that chown was removed. Verify with `doctor` after any image rebuild.)
     ;;
 agent)
     # Agents onboard via the real product path: `tether agent join <invite>` binds the nkey, then a

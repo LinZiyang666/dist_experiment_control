@@ -113,27 +113,35 @@ _broker_up() {
     printf '%s' "$_bu_out" | jq -e '(.schema_version != null) or (.leader_id != null)' >/dev/null 2>&1
 }
 
-# _reconcile_clustered <node> <own_broker_pub> <account_pub> <peer_triple...> : render <node>'s
-# nats.conf CLUSTERED (cluster{} block + routes to the peers) via a manual takeover, chown to tether,
-# nats-server -t validate. Both grow participants need this so the 2-node clustered JS meta forms.
+# _reconcile_clustered <node> <own_broker_pub> <account_pub> <peer_triple...> : [workaround #22/#3]
+# hand-render <node>'s nats.conf CLUSTERED via `reconcile nats --manual --peer …` (run as ROOT). This is
+# the operator doing tether's topology-formation job by hand ONLY because tether can't do it automatically:
+# (#22) the in-broker C3 reconciler runs User=tether and is perm-denied writing the root-owned /etc/tether,
+# and (#3) `reconcile nats --all` can't harvest route mTLS from a standalone conf on the first grow. We do
+# NOT chown the result (Mandate ①): install.sh leaves nats.conf root:root 0644 and nats-server (User=tether)
+# reads it fine; chowning masks nothing real — CreateTemp needs the DIRECTORY, which stays root-owned (=#22
+# preserved). The rigorous #22 reproduction is drills/13-inbroker-reconcile-perm.sh.
 _reconcile_clustered() {
     _rc_node=$1; _rc_brk=$2; _rc_acct=$3; shift 3
     _rc_peers=""
     for _rc_p in "$@"; do _rc_peers="$_rc_peers --peer $_rc_p"; done
-    log "grow: render $_rc_node clustered nats.conf (peers: $*)"
+    log "grow: [workaround #22/#3] hand-render $_rc_node clustered nats.conf as root (peers: $*)"
     # shellcheck disable=SC2086
     dexec "$_rc_node" -- tether cluster reconcile nats --manual --secrets-dir /etc/tether/secrets \
         --server-name "$_rc_node" --route-url "nats://$_rc_node:6222" \
         --account-issuer "$_rc_acct" --broker-nkey "$_rc_brk" $_rc_peers --conf /etc/tether/nats.conf \
         || die "grow: reconcile $_rc_node failed"
-    dexec "$_rc_node" -- chown tether:tether /etc/tether/nats.conf
     dexec "$_rc_node" -- nats-server -t -c /etc/tether/nats.conf >/dev/null 2>&1 || die "grow: $_rc_node nats.conf failed -t"
 }
 
-# grow <joiner> : join a fresh broker as a voter (§4.2 / runbook §1). Empirically-pinned ordering:
-# secrets → joiner init raft/ → joiner CLUSTERED nats.conf (route to leader, gotcha #8: mesh before
-# catch-up) → join prepare (offline) → leader approve (AddVoter) → joiner start cluster mode →
-# leader reconcile --all (bidirectional mesh) → former-N1 JS reset → wait VOTER.
+# grow <joiner> : add a broker as a voter, running tether's REAL grow commands + the DOCUMENTED runbook
+# manual steps, LABELING every step [env] (sim provisioning) / [tether] (a real tether command) /
+# [workaround #N] (the sim doing tether's job by hand because tether can't) / [GAP #N] (a defect surfaced
+# live) — NOT smoothing tether's gaps into a silent success (sim Mandate; plan
+# docs/reviews/simcluster-grow-honest-plan.md). The gaps are ASSERTED by their real signatures in
+# drills/{11-grow-gaps (#8/#I1 + full trailer set), 13-inbroker-reconcile-perm (#22)}.sh. Grow still reaches
+# VOTER (option B) so the other drills can run; every expected-to-fail attempt is captured, never `|| die`.
+# It ends by printing a `GREW-VIA-WORKAROUNDS: …` trailer listing which tether gaps it had to hand-fix.
 cmd_grow() {
     _j=${1:?joiner broker node}
     [ "$(role_of "$_j")" = broker ] || die "grow: $_j is not a broker"
@@ -141,32 +149,43 @@ cmd_grow() {
     _L=$(leader_node) || die "grow: no leader — init a broker first"
     [ "$_L" != "$_j" ] || die "grow: $_j is already the leader"
     log "grow: join $_j → cluster (leader=$_L)"
+    _gaps="#I1"   # every grow relies on the joiner running `cluster init` — `join` does NOT bootstrap the
+                  # joiner's raft state, and the runbook §1 joiner path omits it (I1, proven on the server).
 
-    log "grow: mint + distribute secrets for $_j"
+    log "grow: [env] mint + distribute secrets for $_j (route/tunnel leaves carry a SAN — works around [GAP #24])"
     secrets_mint_node "$INSTANCE" "$_j"
     secrets_distribute "$INSTANCE" "$_j"
     _jpub=$(secrets_node_ident_pub "$INSTANCE" "$_j")
+    _gaps="$_gaps,#24"   # minting SAN-bearing route/tunnel certs works around #24 (tether has no cert tooling)
 
-    # joiner needs a tether.db to migrate; boot standalone once if absent, then stop for offline init.
+    # [env] a fresh broker runs standalone first (creating its tether.db) — exactly as an operator
+    # provisions a new broker host before joining it.
     if ! dexec "$_j" -- test -f /var/lib/tether/tether.db; then
-        log "grow: $_j — standalone boot to create tether.db"
+        log "grow: [env] $_j — standalone boot to create tether.db"
         cmd_start_broker "$_j"
         poll_until 20 1 "tether.db on $_j" -- dexec "$_j" -- test -f /var/lib/tether/tether.db || die "grow: $_j tether.db never appeared"
     fi
     sctl "$_j" stop tether-broker 2>/dev/null || true
 
-    log "grow: cluster init --from-existing on $_j (create raft/)"
+    # [tether] REQUIRED: cluster-mode `serve` hard-refuses to start without pre-existing raft state
+    # (internal/broker/cutover.go:60 "the daemon never auto-bootstraps a cluster onto a live DB"), so the
+    # joiner MUST `cluster init --from-existing` to bootstrap raft/ before it can serve — proven on the
+    # server (I1). The pty feed is [GAP #5] (init has no machine-escape confirm).
+    log "grow: [tether] cluster init --from-existing on $_j (REQUIRED — join does not bootstrap raft/; pty=[GAP #5])"
     dexec -u tether "$_j" -- python3 /opt/sim/pty-confirm.py "$_j" -- \
         tether cluster init --from-existing --self-id "$_j" --name "$_j" \
           --data-dir /var/lib/tether --db /var/lib/tether/tether.db \
           --secrets-dir /etc/tether/secrets --node-ident-pub "$_jpub" \
           --raft-addr "$_j:7400" --nats-route "nats://$_j:6222" \
           --tunnel-addr "$_j:7000" --public-host "$_j" >/dev/null 2>&1 || die "grow: $_j init failed"
+    _gaps="$_gaps,#5"   # init has no machine-escape confirm → must fake a TTY via pty-confirm.py
 
-    # broker.yaml cluster seam so serve boots cluster mode from raft/ (joiner broker stays STOPPED here).
+    # [workaround: cluster init PRINTS the broker.yaml cluster seam as its NEXT step 3 but does NOT apply
+    # it — the operator/sim must set broker.cluster.{data_dir,raft_addr,secrets_dir} by hand (cluster.go:808).
+    # A real `cluster init` that emitted the seam would drop this step.] serve boots cluster mode from raft/.
     dexec "$_j" -- sh -c "grep -qE '^    raft_addr:' /etc/tether/broker.yaml || printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: %s:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.conf\n    nats_server_bin: nats-server\n' '$_j' >> /etc/tether/broker.yaml"
 
-    log "grow: join prepare on $_j (offline, self-signed bundle)"
+    log "grow: [tether] cluster join prepare on $_j (offline, self-signed bundle)"
     # the bundle is a single "tether-join:v1:<base64>" line on stdout (the "run on the LEADER" hint
     # goes to stderr). grep the tether-join: line (it contains colons, so no naive base64 charset match).
     _bundle=$(dexec -u tether "$_j" -- tether cluster join prepare --node-id "$_j" \
@@ -174,17 +193,35 @@ cmd_grow() {
         --public-host "$_j" --secrets-dir /etc/tether/secrets 2>/dev/null | tr -d '\r' | grep -E '^tether-join:' | tail -1)
     [ -n "$_bundle" ] || die "grow: join prepare produced no bundle"
 
-    # AddVoter — NO --wait. The joiner cannot catch up until the clustered JS meta forms (below), and
-    # `approve --wait` would block forever (this was the 20-min hang). approve just stages the raft
-    # config change; catch-up follows once the joiner broker starts.
-    log "grow: join approve on leader $_L (AddVoter, async)"
-    dexec -u tether "$_L" -- tether cluster join approve "$_bundle" || die "grow: join approve failed"
+    # [tether] approve with tether's OWN bounded --wait, which SURFACES #8 live. 30s < the 2-min catch-up
+    # deadline, so the op is still CATCHING_UP and the CLI prints the stable give-up line
+    # `operation <id> still in flight (<state>) after 30s` (cluster_join.go:197, exit 75) — that IS the #8
+    # surface: catch-up cannot complete before the NATS mesh + joiner nats exist (chicken-and-egg with the
+    # runbook order). The op is STAGED regardless (the leader controller `driveJoin` promotes it once the
+    # mesh forms), so we do NOT re-approve — a second approve is a silent idempotent no-op, and after the
+    # op turns terminal it is refused as a consumed nonce. The un-bounded `--wait` hangs ~20min (old bug).
+    log "grow: [tether] cluster join approve on leader $_L (--wait --timeout 30s; expect the #8 pre-mesh stall)"
+    _appr=$(dexec -u tether "$_L" -- tether cluster join approve "$_bundle" --wait --timeout 30s 2>&1) || true
+    # waitForOp emits ONLY 'still in flight (<state>) after <t>' (timeout, cluster_join.go:197) or 'is
+    # BLOCKED (…)' (stalled, :194) on the non-terminal paths — NOT 'catch-up exceeded' (not a CLI string).
+    # Terminal success is 'operation <id> reached <state>' (:187); the always-printed '(driving to SERVING)'
+    # preamble is NOT a success signal, so we must not key the success branch on 'SERVING'.
+    if printf '%s' "$_appr" | grep -qiE 'still in flight|is BLOCKED'; then
+        # echo tether's OWN give-up line (not just the sim label) so a drill can key on the REAL string.
+        log "grow: [GAP #8] join approve --wait could not complete pre-mesh (bounded 30s) — op is staged, proceeding. tether said: $(printf '%s' "$_appr" | grep -iE 'still in flight|is BLOCKED' | tail -1)"
+        _gaps="$_gaps,#8"
+    elif printf '%s' "$_appr" | grep -qiE 'operation .* reached|is now a VOTER|^approved'; then
+        log "grow: join approve reached a terminal state before the timeout (mesh may have been pre-formed) — no #8 this run"
+    else
+        warn "grow: join approve --wait unexpected output (proceeding; the op may still be staged): $(printf '%s' "$_appr" | tr '\n' ' ' | tail -c 200)"
+    fi
 
-    # Every broker must be CLUSTERED + routed to every OTHER (full mesh) so the clustered JS meta forms
-    # at quorum ⌈(N+1)/2⌉ — else the joiner hits the N=1-clustered-JS trap (#10) and crash-loops. Render
-    # the full mesh on each (gotcha #8: mesh BEFORE catch-up), reset the former-N1 JS store on the FIRST
-    # grow only (#4/#3a: standalone JS does not migrate into the clustered meta; fresh voters need none),
-    # restart every nats so the meta reforms, THEN start the joiner broker.
+    # [workaround #10] Every broker must be CLUSTERED + routed to every OTHER (full mesh) BEFORE the joiner
+    # broker starts, so the clustered JS meta forms at quorum ⌈(N+1)/2⌉ — else the joiner boots
+    # clustered-but-alone and hits the N=1-clustered-JS trap (#10, exit-70 crash-loop). This precise
+    # ordering (mesh-then-start-joiner) exists ONLY to dodge #10; a real `tether cluster add` would own it.
+    # The per-broker render itself is [workaround #22/#3] (see _reconcile_clustered). #10 is labeled +
+    # trailer-named (11-grow-gaps asserts the trailer set); a dedicated clustered-alone-exit-70 probe is deferred.
     # NB: guard every command-substitution against `set -e`/`pipefail` (an unguarded `grep -c` that finds
     # nothing, or a transient empty status, would silently kill grow right here — the first-cut bug).
     _acct=$(secrets_account_pub "$INSTANCE" || true)
@@ -200,6 +237,31 @@ cmd_grow() {
     done
     [ -n "$_voters" ] || die "grow: no existing VOTER found in leader status"
     _n_before=$(printf '%s\n' "$_voters" | grep -c . || true); _n_before=${_n_before:-1}
+
+    # [tether] FIRST attempt the operator's ONE-command mesh render, so the failure it works around is ON
+    # THE RECORD (Mandate ②: expose the gap, don't just narrate it) — and so the #3/#22 trailer token is
+    # generated from an OBSERVED failure, not a static ordinal guess (external-review F1: an ordinal-only
+    # token false-greens if the product fixes the auto path). It cannot auto-converge: first grow → the
+    # former-N1 conf is standalone so the in-broker reconciler can't harvest route mTLS (#3); later grows →
+    # it perm-denies the /etc/tether write (#22). Capture the real 'timed out … not converged' string + the
+    # laggard's topo_reconcile_reason. If it EVER converges (exit 0), the auto path is FIXED → we do NOT add
+    # #3/#22 to the trailer → 11-grow-gaps flips (the honest promote-signal).
+    log "grow: [tether] attempt reconcile nats --all --wait --timeout 25s (expect it can't auto-converge → #3 first grow / #22 later)"
+    _all=$(dexec -u tether "$_L" -- tether cluster reconcile nats --all --wait --timeout 25s 2>&1) || true
+    _allfailed=0
+    if printf '%s' "$_all" | grep -qiE 'timed out.*not converged|not converged|no cluster.{0,4}block to harvest|permission denied'; then
+        _allfailed=1
+        _allreason=$(cluster_status_json "$_L" 2>/dev/null | jq -r '[.nodes[]?|.topo_reconcile_reason//empty]|map(select(.!=""))|first//""' 2>/dev/null || true)
+        if [ "$_n_before" -ge 2 ]; then
+            log "grow: [GAP #22] reconcile nats --all could not auto-converge (in-broker reconciler perm-denied /etc/tether) — hand-render required. tether: $(printf '%s' "$_all" | grep -iE 'timed out|not converged|permission' | tail -1) | reason: ${_allreason:-?}"
+        else
+            log "grow: [GAP #3] reconcile nats --all could not harvest route mTLS from the standalone conf — hand-render required. tether: $(printf '%s' "$_all" | grep -iE 'timed out|not converged|harvest' | tail -1) | reason: ${_allreason:-?}"
+        fi
+    else
+        log "grow: reconcile nats --all did NOT fail as expected (auto path may be fixed): $(printf '%s' "$_all" | tr '\n' ' ' | tail -c 160)"
+    fi
+
+    log "grow: [workaround #10] render full route mesh on all brokers BEFORE starting the joiner (dodges the #10 clustered-alone trap)"
     _allnodes=$(printf '%s\n%s' "$_voters" "$_j")
     for _node in $_allnodes; do
         _peers=""
@@ -207,53 +269,78 @@ cmd_grow() {
         # shellcheck disable=SC2086
         _reconcile_clustered "$_node" "$(secrets_broker_pub "$INSTANCE" "$_node")" "$_acct" $_peers
     done
+    # mesh-before-joiner ordering dodges #10 (always). The hand-render works around the BROKEN auto path,
+    # whose blocker is grow-ordinal-specific + MUTUALLY EXCLUSIVE (plan §0): first grow → the former-N1
+    # conf is standalone → `reconcile nats --all` can't harvest route mTLS (#3); later grows → conf already
+    # clustered → the in-broker reconciler perm-denies the /etc/tether write (#22). #3 is added on the first
+    # grow below (with #4); add #22 only on later grows so the trailer is never self-contradictory (#3+#22).
+    _gaps="$_gaps,#10"
+    # #22 (later grows) only when the --all attempt ACTUALLY failed above (observed, not an ordinal guess) —
+    # so a product fix to the auto path drops the token → 11-grow-gaps flips (external-review F1).
+    [ "$_n_before" -ge 2 ] && [ "${_allfailed:-0}" = 1 ] && _gaps="$_gaps,#22"
 
     _fn1=""
     if [ "$_n_before" = 1 ]; then
         _fn1=$(printf '%s\n' "$_voters" | head -1)
-        log "grow: reset former-N1 JS store ($_fn1) — standalone JS does not migrate into clustered meta (#4)"
+        # [workaround #4] standalone JS does not migrate into the clustered meta; the former-N1's store
+        # must be reset (tether should auto reset / backup+restore). #4 is labeled + trailer-named (dedicated orphan-stream probe deferred).
+        log "grow: [workaround #4] reset former-N1 JS store ($_fn1) — standalone JS does not migrate into the clustered meta"
         sctl "$_fn1" stop nats-server
         dexec "$_fn1" -- sh -c 'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.grow-bak.$(date +%s) 2>/dev/null || true'
         sctl "$_fn1" start nats-server
-        # F1 (external review): the former-N1's tether-broker was RUNNING (it is the leader) when we
-        # restarted its nats — that is exactly the #23 hazard (clean-exit on nats loss + Restart=on-failure
-        # → stays inactive). We SIGHUP-reload the OTHER voters to dodge #23, but the JS reset MUST stop nats,
-        # so the former-N1 broker is exposed. Idempotently (re)start it here; we VERIFY it recovered at the
-        # END of grow (below) — polling NOW would race the not-yet-formed JS meta (#10) and false-die.
+        # [workaround #23] the former-N1's tether-broker was RUNNING (it is the leader) when its nats was
+        # stopped for the JS reset — exactly the #23 hazard (clean-exit on nats loss + Restart=on-failure →
+        # stays inactive). Idempotently (re)start it; we VERIFY recovery at the END (polling NOW races the
+        # not-yet-formed JS meta #10 and false-dies). reset-failed FIRST (mirror the post-poll recovery):
+        # the crash-loop during the nats-down window can trip systemd StartLimitBurst → a bare `start` is
+        # REFUSED → the leader's driveJoin stays dead → the joiner never reaches VOTER (deadlock: joiner
+        # waits for leader, leader recovery is gated inside the VOTER-success branch below). #23 defer: no
+        # deterministic RED drill (its clean-exit trigger is unlocated; grow labels + recovers it).
+        dexec "$_fn1" -- systemctl reset-failed tether-broker 2>/dev/null || true
         sctl "$_fn1" start tether-broker 2>/dev/null || true
+        _gaps="$_gaps,#4"
+        # #3 (first grow) only when the --all attempt ACTUALLY failed to harvest (observed) — drops the
+        # token if the product fixes the standalone-conf harvest path → 11-grow-gaps flips (external-review F1).
+        [ "${_allfailed:-0}" = 1 ] && _gaps="$_gaps,#3"
     fi
 
-    # RELOAD (SIGHUP) already-running voters to pick up the new route — do NOT restart them: a running
-    # tether-broker whose nats-server restarts loses its connection, exits CLEANLY, and Restart=on-failure
-    # (install.sh) does NOT bring a clean exit back → the broker dies permanently (this killed brk2 on the
-    # 2nd grow). Reload adds the route without dropping the broker connection or the JS meta.
-    log "grow: reload existing voters' nats (add route to $_j) + start $_j nats (${_n_before}→$((_n_before+1))-node JS meta)"
+    # [workaround #23/#10] reload already-running voters' nats via SIGHUP to pick up the new route. The
+    # DOCUMENTED runbook step (cluster-runbook.md §1) is `systemctl restart nats-server`, but a restart
+    # clean-exits the running tether-broker (#23; Restart=on-failure won't revive it) AND bounces an
+    # in-mesh voter back to CATCHING_UP (#10). SIGHUP dodges BOTH — it is the sim doing tether's job (a
+    # real `cluster add` would manage the reload), NOT neutral ops. (Downside: SIGHUP does not advance
+    # /varz config_load_time, so the health label lingers DEGRADED-WRITABLE though routes/JS converge.)
+    log "grow: [workaround #23/#10] SIGHUP-reload existing voters' nats (restart would trip #23/#10) + start $_j nats"
     for _node in $_voters; do
         [ "$_node" = "$_fn1" ] && continue   # former-N1 already stop/reset/started above
         dexec "$_node" -- sh -c 'pkill -HUP -x nats-server' 2>/dev/null || sctl "$_node" reload nats-server 2>/dev/null || true
     done
+    case "$_gaps" in *"#23"*) ;; *) _gaps="$_gaps,#23" ;; esac
     sctl "$_j" restart nats-server
 
-    log "grow: start $_j tether-broker in cluster mode (JS now available) → catch up"
+    log "grow: [tether] start $_j tether-broker in cluster mode (JS now available) → catch up"
     sctl "$_j" start tether-broker
 
     if poll_until 150 3 "$_j reaches VOTER" -- _phase_is "$_j" VOTER; then
-        # F1: NOW that the joiner is a VOTER and the JS meta has re-formed, recover the former-N1's
-        # tether-broker — it CAN clean-exit on the JS-reset nats restart (#23) AND crash-loop (exit 70) in
-        # the window before the meta forms (#10), tripping systemd's StartLimit → stranded. A `restart` here
-        # resets the StartLimit and starts fresh against the now-healthy meta; then confirm it answers.
+        # [workaround #23] NOW that the joiner is a VOTER and the JS meta has re-formed, recover the
+        # former-N1's tether-broker — it can clean-exit on the JS-reset nats restart (#23) AND crash-loop
+        # (exit 70) in the window before the meta forms (#10). reset-failed clears the StartLimit, start
+        # brings it up only if inactive (no leadership blip if it survived). Never `restart` (re-election).
         if [ -n "$_fn1" ]; then
-            # reset-failed clears the StartLimit "failed" state (systemd may have given up after the crash-
-            # loop), then start brings it up ONLY if inactive (no-op + no leadership blip if it survived).
-            # Never `restart` — restarting the healthy leader mid-grow triggers a re-election cascade.
             dexec "$_fn1" -- systemctl reset-failed tether-broker 2>/dev/null || true
             sctl "$_fn1" start tether-broker 2>/dev/null || true
             poll_until 90 3 "$_fn1 tether-broker recovered after JS reset" -- _broker_up "$_fn1" \
                 || die "grow: former-N1 $_fn1 tether-broker did not recover after its nats reset (gotcha #23)"
         fi
         ok "grow: $_j is now a VOTER (cluster=$(list_nodes broker | tr '\n' ' '))"
+        # Mandate ④: grow reached VOTER, but ONLY via the hand-fixes above — emit a machine-parseable
+        # trailer naming exactly which tether gaps it had to work around, so the smoothness can never be
+        # consumed as if it were a clean `tether cluster add`. 11-grow-gaps.sh asserts this trailer is
+        # present; the day a real fix removes a workaround, the list changes and the assertion flips.
+        printf 'GREW-VIA-WORKAROUNDS: %s\n' "$_gaps"
     else
         err "grow: $_j did not reach VOTER — check: ./simcluster status ; ./simcluster logs $_j tether-broker"
+        printf 'GREW-VIA-WORKAROUNDS: %s (INCOMPLETE — did not reach VOTER)\n' "$_gaps"
         return 1
     fi
 }
@@ -300,11 +387,12 @@ cmd_init() {
     _recon=$(printf '%s\n' "$_out" | sed -n 's/^ *1\. tether //p' | head -1)
     [ -n "$_recon" ] || die "init: could not extract the reconcile step from init output"
     log "init: manual nats.conf cutover: tether $_recon"
-    # reconcile writes /etc/tether/nats.conf (root-owned) → run as root, then hand nats.conf to tether
-    # so the in-broker C3 reconciler can manage it in cluster mode.
+    # reconcile writes /etc/tether/nats.conf as root (install.sh leaves it root:root 0644; the takeover
+    # preserves 0644). We do NOT chown it (Mandate ①): nats-server (User=tether) reads the world-readable
+    # root-owned conf fine, and the root-owned /etc/tether DIRECTORY stays as install.sh made it so the
+    # in-broker reconciler's #22 perm-denial is faithfully reproduced (never masked by a chown).
     # shellcheck disable=SC2086
     dexec "$_n" -- tether $_recon || die "init: reconcile nats failed"
-    dexec "$_n" -- chown tether:tether /etc/tether/nats.conf
 
     log "init: validate nats.conf (-t) + restart nats-server"
     dexec "$_n" -- nats-server -t -c /etc/tether/nats.conf >/dev/null 2>&1 || die "init: nats.conf failed nats-server -t validation"
@@ -525,14 +613,20 @@ cmd_doctor() {
     done
     for b in $(list_nodes broker); do
         node_running "$b" || continue
-        # #22 tripwire (M6, INVERTED): install.sh leaves /etc/tether ROOT-owned → the in-broker C3
-        # reconciler (User=tether) perm-denies its atomic nats.conf temp write. That is the REPRODUCED
-        # defect, not an error. If /etc/tether is tether-owned, someone applied the workaround → the sim
-        # is MASKING #22 and can no longer regression-detect it — warn loudly.
+        # #22 tripwire (M6, INVERTED): install.sh leaves /etc/tether ROOT-owned → a User=tether nats.conf
+        # write (the in-broker C3 reconciler's path) perm-denies its atomic temp/.bak write. Root-owned is
+        # the #22 PRECONDITION, not an error. If /etc/tether is tether-owned, the sim is MASKING #22 (an
+        # earlier build once baked a masking chown) and can no longer regression-detect it — warn loudly.
         if [ "$(dexec "$b" -- stat -c %U /etc/tether 2>/dev/null)" = tether ]; then
             warn "$b /etc/tether is tether-owned — this MASKS gotcha #22 (leave it root-owned to reproduce it)"
         else
-            ok "$b /etc/tether root-owned — faithfully reproduces #22 (in-broker reconciler perm-denied)"
+            ok "$b /etc/tether root-owned — #22 precondition holds (a User=tether reconcile write would perm-deny; drill 13 exercises it)"
+        fi
+        # symmetric artifact guard: /var/lib/tether MUST be tether-owned (install.sh chowns LIB to tether;
+        # the broker User=tether writes DB/JS/raft there). If a docker/install change flipped it to root,
+        # the broker would be bricked as a SIM ARTIFACT (not a tether bug) — catch it, don't misattribute.
+        if [ "$(dexec "$b" -- stat -c %U /var/lib/tether 2>/dev/null)" != tether ]; then
+            err "$b /var/lib/tether is NOT tether-owned — sim artifact would brick the broker (install.sh chowns LIB to tether)"; _dr_rc=1
         fi
         # #21/OQ-5 guard: max_file_store as a jetstream subkey bricks `reconcile nats` (use a tmpfs cap).
         if dexec "$b" -- grep -q max_file_store /etc/tether/nats.conf 2>/dev/null; then

@@ -14,6 +14,7 @@
 - `docs/devices.md` — 实机/设备清单。
 - `docs/reviews/` — 每个 phase / feature 的 plan 与各轮 review 报告（`p<N>-plan.md`、`p<N>-review.md`(+`-round2`/`-round3`)、`p<N>-external-review.md`；历史 feature 增量用 `<feature>-plan.md`）。
 - `docs/reviews/quality-audit/` — 横切质量审计（concurrency / security / storage-protocol / cli-ux / tests / deadcode）。
+- `test/simcluster/` — Docker 模拟集群 dev 工具（deploy-tier drills：真 systemd + 真独立 nats-server + 真跨进程/跨机 route mTLS，抓 hermetic Go 套件够不到的部署/升级 bug 类）。**定位铁律见 §5 「模拟集群定位铁律」+ 该目录 `README.md` 顶部 Mandate**——模拟真实部署、暴露缺陷、绝不替 tether 弥补。
 
 ## 2. 工作单元：一次一个 phase
 
@@ -61,6 +62,7 @@
   - 端到端矩阵 `make e2e`（`-tags e2e_matrix`，`test/e2e/all_phases_test.go` 每 phase 一个子进程子测试；单 phase 用 `go test ./test/pX/...`）。**新 phase 的 e2e 进矩阵，作为跨 phase 回归网。**
   - 并发安全：`-race` + **仓库内建泄漏门**（`runtime.NumGoroutine` poll-with-tolerance + fd 基线，见 `test/concurrency/helpers_test.go`；**刻意不用 `go.uber.org/goleak`**）；触碰隧道/PTY/reconcile/传输/Raft 等并发面必须带 race + leak 门。
   - lint：`make lint`（golangci-lint **v2**；v1 在 Go 1.25 模块上会拒跑）。
+- **模拟集群定位铁律（`test/simcluster/`，dev 工具、不进 make test/e2e）**：唯一职责是**忠实复现"真实服务器集群的部署环境"**（真 systemd + 真独立 nats-server + 真跨进程/跨机 route mTLS + 真持久盘 + 真 install.sh 路径），并**如实暴露 tether 在真实部署下的一切缺陷**——不是让集群"跑起来"，而是让 tether 的问题"露出来"。四条不可违背：① **绝不迎合 tether 的错误设计**——环境按真实生产搭（如 `/etc/tether` 由 install.sh 留 root-owned），绝不为规避缺陷擅改环境（不 chown、不打补丁、不预置 workaround），tether 该踩的坑照踩；② **有问题就暴露、绝不替 tether 弥补**——凡 tether 本应"几条命令自动完成"、现实却要人工绕过的操作（grow/shrink/upgrade/去集群化…），职责是**原样呈现缺口并断言其存在**，绝不用脚本替 tether 把活干完从而掩盖缺口；每处不得不手动的绕过必须显式标注为 tether 缺陷（`[GAP #N]`）、尽量以 signature-guarded 断言钉住，产品修复落地后再翻成普通 GREEN 回归；③ **界限分明**——部署/供给机器（install.sh 安装、铸/放密钥、起容器）是模拟集群的活，集群操作（init/grow/retire/force-single…）是 **tether 的活**，tether 干不了或干不干净的只呈现、不代劳；④ **判定反转**——一次操作若靠模拟集群写的复杂脚本才"成功"，那不是模拟集群的成就、而是 tether 的失败被掩盖，应视为**缺陷**并改成暴露；模拟集群越"省事"越可疑。详见 `test/simcluster/README.md` 顶部 Mandate。
 - **提交前硬闸**：`make test` + `make e2e` + `make lint` 全绿，并发改动另过 `-race` + 内建 NumGoroutine/fd 泄漏门（非 goleak）；**任一不过不算 done**。
 
 ## 6. Git
