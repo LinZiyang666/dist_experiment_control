@@ -1,4 +1,5 @@
-// Package natsconf is the D9 §11 tether-takeover of /etc/tether/nats.conf. install.sh
+// Package natsconf is the D9 §11 tether-takeover of /etc/tether/nats.d/nats.conf (G1 #22: a
+// tether-owned subdir the User=tether reconciler can atomically rewrite). install.sh
 // hand-writes that file today (host/port/jetstream/websocket, no auth/cluster); the D9
 // cutover has tether REWRITE it with the cluster directives (routes mTLS + auth_callout +
 // per-broker ACLs) while PRESERVING the install.sh client/websocket/jetstream bits and any

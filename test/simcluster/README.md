@@ -94,7 +94,7 @@ no Go toolchain and WSL's docker+systemd is awkward:
 | `lib/secrets.sh` | server | mints the §15 secrets with host `openssl` (ed25519) + `nk` (CA, account, route/tunnel certs WITH SANs, node-ident, broker nkey) + distributes them into containers |
 | `lib/assert.sh` | server | the RED/GREEN drill harness: `assert_ok` / `assert_refuses` / `assert_bug` (signature-guarded so a bug only "passes" for its DOCUMENTED cause) |
 | `Dockerfile` | build | base image: ubuntu:24.04 + systemd + sshd + baked binaries |
-| `image/provision-node.sh` | in container | lays down a node's disk tree via the REAL `install.sh` (`--skip-download`), exactly as a real machine installs; deliberately leaves `/etc/tether` root-owned (reproduces #22) |
+| `image/provision-node.sh` | in container | lays down a node's disk tree via the REAL `install.sh` (`--skip-download`), exactly as a real machine installs; keeps `/etc/tether` root-owned (the Option B invariant post-G1 — install.sh makes `/etc/tether/nats.d/` tether-owned; a tether-owned `/etc/tether` would be a tether→root privesc) |
 | `image/pty-confirm.py` | in container | feeds the typed confirm to interactive `tether` commands (e.g. `cluster init` demands a TTY) |
 | `image/units/tether-agent.service` | in container | the agent systemd unit |
 | `drills/*.sh` | server | one reproducible deploy scenario each (acceptance/regression); see the Drills table |
@@ -179,7 +179,7 @@ drill nukes its own instance on exit).
 | `exec <node> -- <cmd…>` | docker exec inside a node |
 | `shell <node>` / `ssh <node>` | interactive shell (docker exec / real sshd) |
 | `logs <node> [unit]` | journalctl inside a node |
-| `nats-conf <node>` | inspect `/etc/tether/nats.conf` (the #20 probe) |
+| `nats-conf <node>` | inspect `/etc/tether/nats.d/nats.conf` (the #20 probe) |
 | `drill <name>` | run `drills/<name>.sh` on an isolated throwaway instance |
 | `down [-v]` · `nuke` | stop (keep volumes; `-v` removes) · full clean slate |
 | `doctor` | PID1 + provisioning + ownership drift checks |
@@ -203,7 +203,7 @@ isolated instance on exit); do not loop all drills in one shot on a busy box.
 | `00-skeleton` | GREEN acceptance gate: N=1 cutover + `agent join` + tier-A/B push/pull round-trip |
 | `10-grow-to-3` | GREEN: real N=1→2→3 grow, 3 VOTER + streams R=3 + 3-node JS meta + follower-kill quorum proof |
 | `11-grow-gaps` | RED (#8/#I1): `grow` reaches VOTER only via labeled workarounds — `join approve --wait` stalls pre-mesh (#8, tether's own "still in flight"); a fresh joiner without `cluster init` can't serve (#I1, `serve` refuses "no raft state"); asserts the `GREW-VIA-WORKAROUNDS` trailer |
-| `13-inbroker-reconcile-perm` | RED (#22): the in-broker reconciler (User=tether) can't `CreateTemp` in the root-owned `/etc/tether` — auto-reconcile is broken, so the operator must hand-render as root (why `grow`'s mesh render is `[workaround #22/#3]`) |
+| `13-inbroker-reconcile-perm` | GREEN (#22 FIXED, G1 Option B): the reconciler's nats.conf now lives in tether-owned `/etc/tether/nats.d/` (`/etc/tether` STAYS root-owned — Caddyfile safe), so the `User=tether` in-broker reconciler writes it + auto-converges. Asserts `/etc/tether` root-owned + `nats.d/` tether-owned + every voter's `nats_conf_path` at nats.d/ + a `User=tether` write into nats.d/ succeeds + grow drops the #22 token |
 | `20-forcesingle-natsconf` | RED (#20): force-single leaves nats.conf clustered → tier-B JS 503-rots |
 | `21-smalldisk-tierb` | RED (#21): 8 GiB OBJ_xfer reservation denies tier-B on a small (tmpfs-capped) store |
 | `12-ghost-voter` | RED (#12): force-single ghost VOTER — all three online removal paths refuse |
@@ -213,17 +213,19 @@ isolated instance on exit); do not loop all drills in one shot on a busy box.
 This tool caught cross-process deployment defects unreachable by the in-process suites, logged in
 `docs/v0.4.5-ha-grow-ops-gotchas.md`:
 
-- **#22** install.sh leaves `/etc/tether` root-owned → a `User=tether` nats.conf write (the in-broker C3
-  reconciler's path) can't create its temp/`.bak` there → topology never auto-converges (drill `13`
-  exercises this WRITE via a manual `reconcile nats --manual` as tether — it does NOT observe the auto
-  reconciler firing, which grow's root render front-runs). `/etc/tether` is NATURALLY root-owned here (a
-  fresh docker named volume mounts root:root + install.sh never chowns ETC), so the sim reproduces #22
-  without any sim chown. **Correction (2026-07-05):** an earlier BAKED image had once masked #22 (a stale
-  provision that chowned ETC to tether, from before that chown was removed but not rebuilt); `doctor`
-  tripwires a tether-owned `/etc/tether`. `provision-node.sh` deliberately does NOT force the owner, so a
-  future install.sh #22 fix (chowning ETC → tether) makes drill 13 flip RED-for-promotion — its
-  "`/etc/tether` DIRECTORY is root-owned" control fails AND the write succeeds (`assert_bug` "APPEARS
-  FIXED") — signalling "promote to a plain regression".
+- **#22 (FIXED in G1, 2026-07-05 — Option B).** Pre-G1: install.sh left the reconciler's nats.conf in the
+  root-owned `/etc/tether`, so a `User=tether` in-broker C3 reconciler write (temp/`.bak` + atomic rename,
+  which need DIRECTORY write) perm-denied → topology never auto-converged. **G1 fix = Option B**: relocate
+  ONLY the reconciler's nats.conf into a tether-owned `/etc/tether/nats.d/` subdir; `/etc/tether` ITSELF
+  STAYS root-owned (the root-run caddy reads `/etc/tether/Caddyfile` — a tether-owned `/etc/tether` would be
+  a tether→root local privesc, so **chowning ETC was REJECTED**). drill `13` is now a **GREEN regression**
+  (driven by the REAL vendored install.sh): it asserts `/etc/tether` root-owned + `/etc/tether/nats.d`
+  tether-owned + every voter's broker.yaml pins `nats_conf_path` at nats.d/ + the second grow's `reconcile
+  nats --all` has NO natsconf permission-denied reason + a `User=tether` write into nats.d/ SUCCEEDS + grow
+  drops the #22 trailer token. `doctor` asserts `/etc/tether` STAYS root-owned (errs if hand-chowned) AND
+  nats.d/ is tether-owned. (History: an earlier BAKED image once masked #22 via a stale provision that
+  chowned ETC to tether; that chown was removed. `provision-node.sh` adds NO chown — nats.d/'s tether
+  ownership comes from the real install.sh.)
 - **#I1** (new, 2026-07-05) cluster-mode `serve` fail-closed refuses without pre-existing raft state, so a
   fresh joiner MUST `cluster init` before it can serve — yet the `join` flow does NOT bootstrap the
   joiner's raft state and the runbook §1 joiner path omits the init step (drill `11`, `assert_refuses` —

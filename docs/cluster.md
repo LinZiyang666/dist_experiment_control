@@ -100,7 +100,7 @@ quorum-loss 的离线逃生。
 | 类型 | 子命令 | 在哪里跑 |
 |---|---|---|
 | 在线 admin socket | `join approve` / `drain` / `retire` / `status` / `transfer-leader` / `rotate-tunnel-cert` / `set-raft-addr` / `reconcile nats` / `ops` | broker 主机，daemon 正在运行；默认走 `--socket /var/run/tether/admin.sock` |
-| 离线/本机磁盘操作 | `init --from-existing` / `join prepare` / `recovery force-single` / `recovery rejoin prepare` / `recovery restore` / `recovery node remove --manual` / `recovery incident export` / `doctor` / `keygen` | 对应 broker 主机；`recovery force-single`、`recovery rejoin prepare` 要先停 daemon |
+| 离线/本机磁盘操作 | `init --from-existing` / `join prepare` / `recovery force-single` / `recovery rejoin prepare` / `recovery restore` / `recovery node remove --manual` / `recovery incident export` / `doctor` / `keygen` | 对应 broker 主机；`recovery force-single`、`recovery rejoin prepare` 要先停 daemon；**#6：全部以 `sudo -u tether` 跑**（root 跑会把 `tether.lock`/`raft/`/`tether.db` 建成 root-owned，后续 `sudo -u tether` op 开不了；CLI 会 WARN，详见 broker-ops §8.6） |
 
 全局 flag：
 
@@ -175,7 +175,7 @@ mesh。新增或退役 broker 后，要跑 `cluster reconcile nats --all --wait`
 | `cluster init --from-existing` | `--public-host` | (必填) | 用户可见公网 DNS host，用于 expose URL / home directive |
 | `cluster doctor` | `--secrets-dir` | `/etc/tether/secrets` | 检查 cluster secrets；缺失/不可读/私钥权限过松为 fatal，FDE 仅 advisory |
 | `cluster reconcile nats` | `--all` / `--wait` | — | **C8 主用（自动路径）**：从 live roster + secrets 派生每台 broker 的 server-name/route-url/bus nkey，按 roster 渲染全 mesh nats.conf；`--wait` 阻塞到收敛。亦支持 `--plan`（dry-run）+ `--json`。`takeover-natsconf` 是其隐藏 deprecated 别名（下列手动 flag 保留一个 release） |
-| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--conf` | `/etc/tether/nats.conf` | 要接管并重写的 nats-server.conf；会保留 pristine `.bak` |
+| `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--conf` | `/etc/tether/nats.d/nats.conf` | 要接管并重写的 nats-server.conf（#22：tether-owned 子目录）；会保留 pristine `.bak` |
 | `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--secrets-dir` | `/etc/tether/secrets` | cluster CA + route cert/key 所在目录 |
 | `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--server-name` | (必填) | 本 broker 的 deterministic NATS `server_name`，等于 cluster node id |
 | `cluster takeover-natsconf`（隐藏 deprecated 别名） | `--account-issuer` | 从现有 conf 读取 | shared account public nkey；空时只从现有 auth_callout issuer 读取 |

@@ -60,8 +60,12 @@ leader$ sudoedit /etc/tether/broker.yaml      # cluster.raft_addr: 0.0.0.0:7400 
 leader$ sudo systemctl restart tether-broker
 
 # (b) FIREWALL :7400 (raft) and :6222 (NATS routes) to the peer IPs BEFORE they are externally
-#     reachable — route mTLS verifies chain-to-CA only (no SAN/hostname), so a leaked route leaf
-#     could otherwise join/observe raft. HARD gate, not advisory.
+#     reachable — any leaf that chains to the cluster CA is accepted as a peer, so a leaked route
+#     leaf could otherwise join/observe raft. HARD gate, not advisory. (#24: the raft transport
+#     :7400 skips hostname verification entirely and accepts a CN-only leaf; the NATS route mesh
+#     :6222 does standard x509 and REQUIRES a SAN matching the route-URL host — but a same-CA leaf
+#     WITH a matching SAN still joins, so the firewall, not the SAN, is the containment. See the
+#     route-cert minting recipe below.)
 
 # (c) Rebind the ADVERTISE addresses ONLINE (rewrites cluster_nodes.raft_addr + the raft Configuration
 #     in place via AddVoter — an online address update, NO wipe). --route fixes the NATS-mesh twin.
@@ -221,6 +225,20 @@ trusted$ go install github.com/nats-io/nkeys/nk@latest
 trusted$ ~/go/bin/nk -gen account > account.nk.new
 trusted$ ~/go/bin/nk -inkey account.nk.new -pubout
 trusted$ # (re-issue a fresh cluster CA + per-node route leaf certs with your PKI of choice)
+trusted$ # IMPORTANT (#24): each per-node route (and tunnel) leaf MUST carry a subjectAltName
+trusted$ #   matching that node's route-URL host, or the NATS route mesh (cluster{tls{verify:true}},
+trusted$ #   standard Go x509) rejects it — "x509: certificate relies on legacy Common Name field,
+trusted$ #   use SANs instead" — and routes never form (new voters stall CATCHING_UP). Use a DNS SAN
+trusted$ #   for a hostname route URL, an IP SAN for an IP one (e.g. nats://10.0.0.2:6222 -> IP SAN):
+trusted$ #     openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+trusted$ #       -keyout route-key.pem -subj "/CN=<node>" \
+trusted$ #       -addext "subjectAltName=DNS:<node>"          # or IP:<addr> for an IP route URL
+trusted$ #       -addext "extendedKeyUsage=serverAuth,clientAuth" -out route.csr
+trusted$ #     # then sign route.csr with the cluster CA (copying the SAN + EKU into the cert)
+trusted$ #   tether's OWN raft transport skips hostname checks and would accept a CN-only leaf — do
+trusted$ #   NOT be misled by that (see internal/cluster/transport.go): the nats route mesh reusing
+trusted$ #   the same route-cert.pem needs the SAN. The sim's test/simcluster/lib/secrets.sh mints
+trusted$ #   SAN-bearing leaves as a working reference.
 
 # 3. Distribute the new account.nk + CA to EVERY surviving broker over a trusted
 #    channel (scp, never committed; 0600). Update /etc/tether/secrets/{account.nk,cluster-ca.pem}

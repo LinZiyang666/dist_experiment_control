@@ -219,13 +219,18 @@ sudo rm /tmp/broker.nk /tmp/account.nk    # 清临时副本
 
 #### 第 3 步：改 nats.conf 加 authorization 块
 
+> **注意（#22）**：nats-server.service 加载的是 `/etc/tether/nats.d/nats.conf`（G1 起 install.sh 写这份、
+> unit `ExecStart -c` 指这份），**不是** `/etc/tether/nats.conf`。authorization 块必须写进 nats.d/ 那份 ——
+> 写错到 `/etc/tether/nats.conf` 会得到一个 nats-server 永不加载的孤儿文件（`nats-server -t` 仍会校验通过、
+> 看似完成），重启后 auth_callout 静默未生效。`sudo tee` 以 root 跑，能写进 tether-owned 的 `nats.d/`。
+
 ⚠️ **nkey 用户不能带 `user:` 或 `password:` 字段**（写错会得
 `Nkey users do not take usernames or passwords`，nats-server 拒绝启动）。
 `auth_callout.auth_users` 必须用 nkey 公钥本身做身份引用，不是 alias 字符串。
 把下面两处 `$BROKER_PUB` 与一处 `$ACCOUNT_PUB` 替换成第 1 步打印的实际值：
 
 ```bash
-sudo tee /etc/tether/nats.conf > /dev/null <<EOF
+sudo tee /etc/tether/nats.d/nats.conf > /dev/null <<EOF
 host: "127.0.0.1"
 port: 4222
 
@@ -259,7 +264,7 @@ EOF
 - `auth_callout.auth_users:` 哪些身份会触发 callout —— 这里就是 broker 自己
   的 nkey 公钥；除它之外的所有连接都走 callout 流程，由 broker 决定放不放行。
 
-写完先 `nats-server -c /etc/tether/nats.conf -t` dry-run 一下，输出
+写完先 `nats-server -c /etc/tether/nats.d/nats.conf -t` dry-run 一下，输出
 `configuration file ... is valid` 再继续。
 
 #### 第 4 步：改 tether-broker.service 传 seeds dir + 重启
@@ -565,6 +570,60 @@ curl -fsS "https://$DOMAIN/sub/<任一已签发 token>"   # 应回 Clash YAML
 重写 `broker.yaml` + `Caddyfile`（它幂等、不动 SQLite/JetStream 数据），但会覆盖
 你对这两个文件做过的任何手改，谨慎。
 
+### 8.6 G1 部署面加固迁移（#22 nats.conf 迁址 / #23 Restart drop-in / #6 offline-op 属主 / #24 证书 SAN）
+
+G1（本批部署面加固）起，几处部署面缺陷已在 `install.sh` / 二进制层修复。**新装机自动生效、无需本节**；
+本节只给**已装的现网 broker** 的一次性迁移。四条互相独立，可分别做。
+
+**#22 — reconciler 的 nats.conf 迁到 tether-owned 子目录**。in-broker 拓扑 reconciler 以 `User=tether`
+跑、要原子重写 nats.conf，但旧版把它放在 root-owned 的 `/etc/tether/`（`os.CreateTemp`+rename 需目录可写）
+→ 成员变更后拓扑永不自动收敛（`cluster status` 卡 DEGRADED，即使 raft/JS/routes 全 HA）。G1 把 conf 迁到
+tether-owned 的 `/etc/tether/nats.d/`；`/etc/tether` 本身**保持 root-owned**——root 跑的 caddy 读
+`/etc/tether/Caddyfile`，若 `/etc/tether` 归 tether 会成 tether→root 本地提权面。**现网迁移（clustered
+成员，逐台，务必按序）**：
+```
+sudo install -d -o tether -g tether -m 0750 /etc/tether/nats.d
+sudo mv /etc/tether/nats.conf /etc/tether/nats.d/nats.conf
+sudo sed -i 's#-c /etc/tether/nats.conf#-c /etc/tether/nats.d/nats.conf#' /etc/systemd/system/nats-server.service
+# broker.yaml 的 broker.cluster 块必须显式含 nats_conf_path 指向新路径。真实 `cluster init` 历史上不写
+# 这行（只写 data_dir/raft_addr/secrets_dir；G1 起 init 的 step 3 会提示补它），故现网多数 clustered
+# broker 没有它、靠代码默认——而升级二进制会把默认翻到 nats.d/，所以升级前务必补上（与 data_dir 同级、
+# 缩进 4 空格）：
+#     nats_conf_path: /etc/tether/nats.d/nats.conf
+# 已有该行的机器改用 sed：s#nats_conf_path:.*#nats_conf_path: /etc/tether/nats.d/nats.conf#
+sudo systemctl daemon-reload
+# nats-server 重启会断经 broker 的 ctl 通道 → 用 detached：
+sudo systemd-run --collect systemctl restart nats-server
+```
+**然后再升级 tether 二进制**（默认路径同步迁到 `nats.d/`）。**关键顺序**：conf 迁址 + broker.yaml 补
+`nats_conf_path` 必须在升级二进制**之前**完成——二进制升级把代码默认从旧路径翻到 `nats.d/`，若届时 conf
+还在旧址且 broker.yaml 无显式行，reconciler 会指向不存在的路径。
+**⛔ 切勿在 clustered 成员上裸重跑 `install.sh`**：它**无条件覆盖** `broker.yaml`（抹掉整个
+`broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path}` 块 → 该成员重启退回**单机模式**、脱离集群，
+比 nats.conf 被覆盖更严重的 R3 静默去集群化）、覆盖 `Caddyfile`、并用 standalone 模板覆盖 clustered
+nats.conf，且不 daemon-reload。
+
+**#23 — broker 丢 nats 连接后不再永久停摆（unit drop-in）**。旧版 `tether-broker.service` 是
+`Restart=on-failure`，而 broker 在某些 nats-loss 路径上 clean-exit(0)（`serve.go` 把 `context.Canceled` 当
+exit 0）→ 不被拉起、停死（inactive 而非 failed）。G1 改 `Restart=always`。**现网用 drop-in（不重跑
+install.sh、不重启在跑的 broker）**：
+```
+sudo systemctl edit tether-broker    # 加三行：[Service] / Restart=always / RestartSec=2
+sudo systemctl daemon-reload         # 下次退出即生效；无需重启 broker
+```
+drop-in 跨 `install.sh` 重跑存活，且不碰 nats.conf。`Restart=always` **不会**拉起 `systemctl stop` 主动停
+的服务（systemd 知道是自己停的），故不影响运维 stop/restart；默认 StartLimit 仍拦真崩溃循环。
+
+**#6 — offline op 必须以 data_dir 属主（tether）跑**。`cluster init` / `force-single` / `recover` /
+`resnapshot` / `restore` 以 **root** 跑，会把 `tether.lock` / `raft/` / `tether.db` 建成 root-owned，之后
+`sudo -u tether` 的 offline op 开不了（flock EACCES，或 raft.db bolt 探测硬报错）。**一律
+`sudo -u tether tether cluster …`**（G1 的 offline CLI 会在 root 跑对 tether-owned dir 时 WARN 提示）。已被
+root-init 污染的机器：停 daemon → `sudo chown -R tether:tether /var/lib/tether`（整树，因整树都被污染）→ 再跑。
+
+**#24 — route/tunnel 证书须带 SAN**：见 [`cluster-runbook.md`](cluster-runbook.md) 的 route-cert 铸证段
+（nats route mesh 走标准 x509、需 `subjectAltName` 匹配 route-URL host；tether 自己的 raft transport 不需要，
+勿被 `internal/cluster/transport.go` 的注释误导）。
+
 ---
 
 ## 9. 错误码与故障排查（broker 侧）
@@ -597,9 +656,11 @@ admin: dial /var/run/tether/admin.sock: connect: permission denied
 
 ## 附录 A：broker 主机目录结构
 ```
-/etc/tether/
+/etc/tether/                    # root-owned（root 跑的 caddy 读这里的 Caddyfile）
 ├── broker.yaml
 ├── Caddyfile
+├── nats.d/                     # tether-owned 0750（#22）：reconciler 管理的 nats.conf 放这里
+│   └── nats.conf               #   （cluster 模式；nats-server -c 指向此）
 └── seeds/                      # 可选 auth_callout 种子
     ├── broker.nk
     └── account.nk

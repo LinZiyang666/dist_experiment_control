@@ -16,7 +16,7 @@ drill_begin "#20 force-single → nats.conf stays clustered → JS 503 rot"
 setup_forcesingle_n2
 
 # record nats.conf mtime before force-single (to prove the conf is NOT touched).
-MT0=$("$SIM" exec brk1 -- stat -c %Y /etc/tether/nats.conf 2>/dev/null)
+MT0=$("$SIM" exec brk1 -- stat -c %Y /etc/tether/nats.d/nats.conf 2>/dev/null)
 assert_ok "force-single brk1 --dead brk2"                 "$SIM" force-single brk1 --dead brk2
 
 # GREEN positive controls: the control plane is ALIVE — only JetStream rots. (Use JS-INDEPENDENT
@@ -27,9 +27,9 @@ assert_ok "control plane alive: exec on survivor works"    "$SIM" exec brk1 -- s
 
 # RED mechanism proof: nats.conf STILL has a cluster{} block and its mtime is UNCHANGED across
 # force-single (proves the lingering-conf mechanism, not an assumption).
-assert_ok "nats.conf STILL has a cluster{} block"          sh -c "$SIM exec brk1 -- grep -qE '^cluster' /etc/tether/nats.conf"
+assert_ok "nats.conf STILL has a cluster{} block"          sh -c "$SIM exec brk1 -- grep -qE '^cluster' /etc/tether/nats.d/nats.conf"
 assert_ok "nats.conf mtime UNCHANGED across force-single (conf not touched)" \
-    sh -c "[ \"\$($SIM exec brk1 -- stat -c %Y /etc/tether/nats.conf 2>/dev/null)\" = \"$MT0\" ]"
+    sh -c "[ \"\$($SIM exec brk1 -- stat -c %Y /etc/tether/nats.d/nats.conf 2>/dev/null)\" = \"$MT0\" ]"
 
 # re-activate the ctl session (force-single can drop the ctl's connection state) so the push reaches
 # the JetStream path rather than failing "no active session" (which would NOT match the #20 signature).

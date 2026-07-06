@@ -2261,7 +2261,7 @@ file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-
 >
 > **安全(external-review F6)**:`nats_route` 进签名 agent roster,故 validator 只收 bare `nats://host:port`——拒 userinfo/path/query/fragment(凭据会扩散给全 agent),错误不回显原始 route。
 >
-> **命令语义**(runbook §2.3):set-raft-addr 自身-only、reconcile --to-standalone 仅 N=1、**保护模式(quorum-lost)下 routine 集群命令全拒**(Propose 写不进)、唯 `force-single` 可动。**无新 migration、`commandVersion` 仍 2、`ProtoVersion` 仍 2、无 cert/SAN 改动**(route mTLS 仅验 chain-to-CA)。proto v2(在 main,不发给现网 proto-v1 车队;给 v1 车队的 patch 仍走 v0.3.x 线)。
+> **命令语义**(runbook §2.3):set-raft-addr 自身-only、reconcile --to-standalone 仅 N=1、**保护模式(quorum-lost)下 routine 集群命令全拒**(Propose 写不进)、唯 `force-single` 可动。**无新 migration、`commandVersion` 仍 2、`ProtoVersion` 仍 2、无 cert/SAN 改动**(该 phase 的 tether 自有 raft transport 仅验 chain-to-CA、跳 hostname/SAN)。**更正(G1 #24)**:此处"仅验 chain-to-CA"只描述 tether **自己的 raft transport**;复用同一 `route-cert.pem` 的 **nats-server cluster route mesh** 走标准 Go x509、**要求 SAN 匹配 route-URL host**(hostname→`DNS:`、IP→`IP:`,见 `docs/cluster-runbook.md`)——勿据此认为 route 证书不需要 SAN。proto v2(在 main,不发给现网 proto-v1 车队;给 v1 车队的 patch 仍走 v0.3.x 线)。
 >
 > **已交付的 gated `-race` 生命周期 drill(external-review R5)**:① failed-join kill/restart——`internal/broker/phasefluidity_lifecycle_test.go`(`-tags phasefluidity_integration`,入 `TestPhaseFluidityMatrix`);② production mTLS rebind——`test/d5/phasefluidity_rebind_test.go`(`-tags d5_integration`,入 `TestD5Matrix`);③ shrink→regrow mode-preserving——`test/d9/phasefluidity_shrink_regrow_test.go`(`-tags d9_integration`,入 `TestD9Matrix`)。
 >

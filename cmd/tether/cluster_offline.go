@@ -25,7 +25,11 @@ const (
 	// must default there too — else the documented `keygen` flow mints the seed at /etc/tether/node-ident.nk
 	// and the broker FATALs at start on a missing secrets/node-ident.nk (audit finding F).
 	defaultSeed         = defaultClusterSecretsDir + "/node-ident.nk"
-	defaultNatsConfPath = "/etc/tether/nats.conf"
+	// #22 (G1): the reconciler-managed nats.conf lives in the tether-owned /etc/tether/nats.d/ subdir
+	// so the User=tether in-broker reconciler can atomically rewrite it; /etc/tether itself stays
+	// root-owned (the root-run caddy reads /etc/tether/Caddyfile — a tether-owned /etc/tether would be
+	// a tether->root privesc). SSOT for the default across init / reconcile / retire / preflight / serve.
+	defaultNatsConfPath = "/etc/tether/nats.d/nats.conf"
 )
 
 func newClusterForceSingleCmd() *cobra.Command {

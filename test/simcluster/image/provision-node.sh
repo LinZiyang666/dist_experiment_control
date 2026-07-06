@@ -29,10 +29,12 @@ broker)
 
     # --- thin overlay (§2), the ONLY sim-specific deltas over the real tree ---
     # (a) client bind 0.0.0.0 so cross-container clients reach :4222 (install.sh defaults to loopback).
-    if [ -f "$ETC/nats.conf" ]; then
+    # G1 #22: install.sh now writes the reconciler's nats.conf into the tether-owned
+    # /etc/tether/nats.d/ subdir (NOT root-owned /etc/tether). Follow the product path.
+    if [ -f "$ETC/nats.d/nats.conf" ]; then
         # standalone install.sh nats.conf: set/insert a 0.0.0.0 host for the client listener.
-        if grep -qE '^\s*host:' "$ETC/nats.conf"; then
-            sed -i -E 's/^\s*host:.*/host: 0.0.0.0/' "$ETC/nats.conf"
+        if grep -qE '^\s*host:' "$ETC/nats.d/nats.conf"; then
+            sed -i -E 's/^\s*host:.*/host: 0.0.0.0/' "$ETC/nats.d/nats.conf"
         fi
     fi
     # (b) secrets dir (§15; keys land here, chowned tether:tether 0600 by the control script). The
@@ -41,17 +43,19 @@ broker)
     mkdir -p "$ETC/secrets"
     chmod 700 "$ETC/secrets"
     chown -R tether:tether "$ETC/secrets" 2>/dev/null || true
-    # M6/#22: DELIBERATELY do NOT chown /etc/tether — a root-owned ETC DIRECTORY IS gotcha #22 (the
-    #     in-broker C3 reconciler, User=tether, perm-denies its atomic CreateTemp there, so topology never
-    #     auto-converges). This matches the real fleet: a fresh docker named volume mounts root:root and
-    #     install.sh's `mkdir -p /etc/tether` leaves it root-owned (it chowns only LIB/LOG/RUN, never ETC),
-    #     so /etc/tether is NATURALLY root-owned here — no sim chown needed, and adding one would MASK a
-    #     future install.sh #22 fix (install.sh chowning ETC → tether-owned → drill 13 must then flip). The
-    #     secrets/ subdir is tether-owned above; nats-server (User=tether) still reads the world-readable
-    #     root:root 0644 nats.conf and the broker runs; only the AUTOMATIC in-broker reconcile is broken,
-    #     exactly as on the fleet. `doctor` tripwires a tether-owned /etc/tether as the MASKED-#22 warning.
-    #     (History: an earlier build baked a provision that DID chown ETC → the sim silently masked #22 for
-    #     a while; that chown was removed. Verify with `doctor` after any image rebuild.)
+    # #22 (G1 fix landed, Option B): DELIBERATELY do NOT chown anything under /etc/tether by hand — the
+    #     fix is the PRODUCT's job. install.sh now `install -d -o tether`s a dedicated /etc/tether/nats.d/
+    #     subdir and writes the reconciler's nats.conf there, while /etc/tether ITSELF stays root-owned (a
+    #     root-owned /etc/tether is CORRECT under Option B — the root-run caddy reads /etc/tether/Caddyfile,
+    #     so a tether-owned /etc/tether would be a tether->root privesc). Post-fix invariants the sim asserts:
+    #     /etc/tether root-owned (unchanged) AND /etc/tether/nats.d tether-owned (so the User=tether in-broker
+    #     reconciler can now atomically rewrite its nats.conf). The sim adds NO chown: nats.d's tether
+    #     ownership comes from the REAL install.sh (never a sim override — Mandate ①). The secrets/ subdir is
+    #     tether-owned above. `doctor` asserts /etc/tether stays root-owned AND nats.d is tether-owned; a
+    #     root-owned/missing nats.d = an un-upgraded / pre-#22-fix host. drills/13 exercises the User=tether
+    #     write into nats.d/. (History: an earlier build baked a provision that chowned /etc/tether → masked
+    #     #22; removed. The pre-Option-B idea of chowning /etc/tether itself was rejected for the Caddyfile
+    #     privesc — verify ownership with `doctor` after any image rebuild.)
     ;;
 agent)
     # Agents onboard via the real product path: `tether agent join <invite>` binds the nkey, then a

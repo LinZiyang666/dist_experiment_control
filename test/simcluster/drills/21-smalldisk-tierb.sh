@@ -19,7 +19,7 @@ assert_ok "init brk1 (N=1)"          "$SIM" init brk1
 assert_ok "session + ctl login"      "$SIM" session "$SID" --pin "$PIN"
 assert_ok "agent-join agt1"          "$SIM" agent-join agt1 --session "$SID" --pin "$PIN"
 # guard: the store cap must NOT be a max_file_store subkey (that bricks reconcile — §9 OQ-5).
-assert_ok "no max_file_store in nats.conf (cap is tmpfs, not the forbidden subkey)"  sh -c "! $SIM exec brk1 -- grep -q max_file_store /etc/tether/nats.conf"
+assert_ok "no max_file_store in nats.conf (cap is tmpfs, not the forbidden subkey)"  sh -c "! $SIM exec brk1 -- grep -q max_file_store /etc/tether/nats.d/nats.conf"
 # GREEN control: the control plane is alive on the small disk (JS-independent — node ls over core NATS +
 # raft). We do NOT assert a tier-A push here: even tier-A records to JS history/audit, which the tiny
 # store also constrains, so it is not a clean "only the 8 GiB OBJ_xfer bucket fails" control.

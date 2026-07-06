@@ -805,7 +805,8 @@ func newClusterInitCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(out, "     %s\n", ids.Note)
 			}
 			_, _ = fmt.Fprintln(out, "  2. systemctl restart nats-server                       # bring up the new conf")
-			_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir} in broker.yaml")
+			_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} in broker.yaml")
+			_, _ = fmt.Fprintln(out, "     # nats_conf_path: /etc/tether/nats.d/nats.conf  (the reconciler's conf; #22 — set it explicitly so a future binary upgrade can't repoint it)")
 			_, _ = fmt.Fprintln(out, "  4. systemctl start tether-broker                       # starts in cluster mode (N=1)")
 			_, _ = fmt.Fprintln(out, "  5. reinstall ALL agents on v2, then `tether cluster join prepare`/`approve` to grow to N>=3")
 			return nil

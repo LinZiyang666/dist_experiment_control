@@ -67,6 +67,7 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
 	if err != nil {
 		return nil, err
@@ -147,6 +148,7 @@ func Resnapshot(opts ResnapshotOptions) error {
 	if opts.SelfID == "" || opts.SelfRaftAddr == "" {
 		return errors.New("clusteroffline: Resnapshot requires SelfID and SelfRaftAddr")
 	}
+	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
 	if err != nil {
 		return err
@@ -402,6 +404,7 @@ func Recover(opts RecoverOptions) (int, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
 	if err != nil {
 		return 0, err
@@ -625,6 +628,37 @@ func acquireFlock(path string) (func(), error) {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		_ = f.Close()
 	}, nil
+}
+
+// RootAgainstNonRootDir reports the #6 hazard: an offline op running as euid==0 against a data dir
+// owned by a DIFFERENT (non-root) user. A root-run `cluster init` / offline op then creates
+// root-owned tether.lock / raft/ / tether.db that a later `sudo -u tether` op cannot open — EACCES
+// at the flock, or the raft.db bolt probe's HARD error (cluster.RaftStoreLockedByDaemon returns a
+// hard error, not ErrTimeout, on an unreadable raft.db). Pure so it is table-testable off-root.
+func RootAgainstNonRootDir(euid int, dirUID uint32) bool {
+	return euid == 0 && dirUID != 0
+}
+
+// warnRootDataDirOwner emits the #6 WARN (best-effort; it NEVER fails the op) when an offline op
+// runs as root against a data dir owned by the (non-root) broker user. The durable guidance is the
+// docs mandate to run offline ops as `sudo -u tether`; this is a loud nudge, not a gate (a hard
+// refuse could strand a legitimate root recovery). A stat error is ignored — the op's own
+// preconditions handle a missing/unreadable data dir.
+func warnRootDataDirOwner(dataDir string, logger *slog.Logger) {
+	if logger == nil {
+		return
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(dataDir, &st); err != nil {
+		return
+	}
+	if RootAgainstNonRootDir(os.Geteuid(), st.Uid) {
+		logger.Warn("clusteroffline: offline op running as root against a non-root-owned data dir; "+
+			"files it creates (tether.lock, raft/, tether.db) will be root-owned and a later "+
+			"`sudo -u tether` op will be denied — run this as the data-dir owner "+
+			"(e.g. `sudo -u tether tether cluster …`)",
+			"data_dir", dataDir, "dir_uid", st.Uid, "euid", os.Geteuid())
+	}
 }
 
 func fsyncDir(dir string) error {

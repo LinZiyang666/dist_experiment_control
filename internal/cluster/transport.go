@@ -49,10 +49,18 @@ type MTLSTransportConfig struct {
 	Timeout  time.Duration // 0 => 10s
 }
 
-// clusterTLSConfigs builds the (server, client) mutual-TLS configs anchored on
-// the cluster CA. Both reject a leaf that does not chain to the CA: the server via
-// the standard RequireAndVerifyClientCert path, the client via VerifyPeerCertificate
-// (hostname verification is skipped because raft peer addresses carry no SANs).
+// clusterTLSConfigs builds the (server, client) mutual-TLS configs for tether's OWN raft
+// TCP transport, anchored on the cluster CA. Both reject a leaf that does not chain to the CA:
+// the server via the standard RequireAndVerifyClientCert path, the client via
+// VerifyPeerCertificate. Hostname verification is skipped HERE because raft peers are dialed by
+// IP:port and this transport's leaf need carry no SAN — a CN-only cert is fine for raft.
+//
+// NOTE (G1 #24): the SAME route-cert.pem is ALSO consumed by nats-server's cluster route mesh
+// (internal/natscluster renders `cluster{ tls{ verify: true } }`), which does STANDARD Go x509
+// verification and REQUIRES a subjectAltName matching the route-URL host (DNS: for a hostname
+// route URL, IP: for an IP one). So a CN-only route leaf works for raft here yet breaks the nats
+// route mesh (`x509: certificate relies on legacy Common Name field`) — the route/tunnel leaf
+// MUST carry that SAN. See docs/cluster-runbook.md. Do NOT read the skip below as "no SAN needed".
 func clusterTLSConfigs(cfg MTLSTransportConfig) (server, client *tls.Config, err error) {
 	if cfg.CACert == nil {
 		return nil, nil, fmt.Errorf("cluster: mTLS requires CACert")
@@ -88,7 +96,7 @@ func clusterTLSConfigs(cfg MTLSTransportConfig) (server, client *tls.Config, err
 	client = &tls.Config{
 		Certificates:          []tls.Certificate{cfg.Leaf},
 		RootCAs:               cfg.CACert,
-		InsecureSkipVerify:    true, // skip HOSTNAME only (raft addrs have no SANs)
+		InsecureSkipVerify:    true, // skip HOSTNAME only for THIS raft transport (IP:port peers, CN-only leaf ok); the nats route mesh reusing route-cert.pem still REQUIRES a SAN (#24, see doc comment above)
 		VerifyPeerCertificate: verifyChainToCA,
 		MinVersion:            tls.VersionTLS12,
 	}

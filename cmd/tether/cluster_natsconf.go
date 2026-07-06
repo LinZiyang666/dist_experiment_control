@@ -46,7 +46,7 @@ type natsconfTakeoverFlags struct {
 }
 
 func bindNatsconfTakeoverFlags(cmd *cobra.Command, f *natsconfTakeoverFlags) {
-	cmd.Flags().StringVar(&f.confPath, "conf", "/etc/tether/nats.conf", "nats-server.conf to take over")
+	cmd.Flags().StringVar(&f.confPath, "conf", defaultNatsConfPath, "nats-server.conf to take over")
 	cmd.Flags().StringVar(&f.secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir (CA + route leaf)")
 	cmd.Flags().StringVar(&f.serverName, "server-name", "", "this broker's deterministic server_name (== cluster node_id)")
 	cmd.Flags().StringVar(&f.accountIssuer, "account-issuer", "", "shared account nkey pub; empty => read from the existing conf")

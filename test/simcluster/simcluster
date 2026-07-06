@@ -113,25 +113,26 @@ _broker_up() {
     printf '%s' "$_bu_out" | jq -e '(.schema_version != null) or (.leader_id != null)' >/dev/null 2>&1
 }
 
-# _reconcile_clustered <node> <own_broker_pub> <account_pub> <peer_triple...> : [workaround #22/#3]
-# hand-render <node>'s nats.conf CLUSTERED via `reconcile nats --manual --peer …` (run as ROOT). This is
-# the operator doing tether's topology-formation job by hand ONLY because tether can't do it automatically:
-# (#22) the in-broker C3 reconciler runs User=tether and is perm-denied writing the root-owned /etc/tether,
-# and (#3) `reconcile nats --all` can't harvest route mTLS from a standalone conf on the first grow. We do
-# NOT chown the result (Mandate ①): install.sh leaves nats.conf root:root 0644 and nats-server (User=tether)
-# reads it fine; chowning masks nothing real — CreateTemp needs the DIRECTORY, which stays root-owned (=#22
-# preserved). The rigorous #22 reproduction is drills/13-inbroker-reconcile-perm.sh.
+# _reconcile_clustered <node> <own_broker_pub> <account_pub> <peer_triple...> : [workaround #3/#10]
+# hand-render <node>'s nats.conf CLUSTERED via `reconcile nats --manual --peer …` (writes the tether-owned
+# /etc/tether/nats.d/nats.conf). This is the operator doing tether's topology-formation job by hand because
+# tether can't do it automatically on the FIRST grow: (#3) `reconcile nats --all` can't harvest route mTLS
+# from a standalone conf, and (#10) the mesh must exist before the joiner starts. #22 (the in-broker
+# reconciler being perm-denied writing a root-owned /etc/tether) is FIXED in G1: the conf now lives in the
+# tether-owned nats.d/ subdir the User=tether reconciler CAN write, so on a SECOND grow the auto path
+# converges and grow drops the #22 token. We add NO chown (Mandate ①): nats.d/ is tether-owned by the REAL
+# install.sh, not the sim. The rigorous #22 reproduction is drills/13-inbroker-reconcile-perm.sh.
 _reconcile_clustered() {
     _rc_node=$1; _rc_brk=$2; _rc_acct=$3; shift 3
     _rc_peers=""
     for _rc_p in "$@"; do _rc_peers="$_rc_peers --peer $_rc_p"; done
-    log "grow: [workaround #22/#3] hand-render $_rc_node clustered nats.conf as root (peers: $*)"
+    log "grow: [workaround #3/#10] hand-render $_rc_node clustered nats.conf (tether-owned nats.d/; #22 fixed) (peers: $*)"
     # shellcheck disable=SC2086
     dexec "$_rc_node" -- tether cluster reconcile nats --manual --secrets-dir /etc/tether/secrets \
         --server-name "$_rc_node" --route-url "nats://$_rc_node:6222" \
-        --account-issuer "$_rc_acct" --broker-nkey "$_rc_brk" $_rc_peers --conf /etc/tether/nats.conf \
+        --account-issuer "$_rc_acct" --broker-nkey "$_rc_brk" $_rc_peers --conf /etc/tether/nats.d/nats.conf \
         || die "grow: reconcile $_rc_node failed"
-    dexec "$_rc_node" -- nats-server -t -c /etc/tether/nats.conf >/dev/null 2>&1 || die "grow: $_rc_node nats.conf failed -t"
+    dexec "$_rc_node" -- nats-server -t -c /etc/tether/nats.d/nats.conf >/dev/null 2>&1 || die "grow: $_rc_node nats.conf failed -t"
 }
 
 # grow <joiner> : add a broker as a voter, running tether's REAL grow commands + the DOCUMENTED runbook
@@ -183,7 +184,7 @@ cmd_grow() {
     # [workaround: cluster init PRINTS the broker.yaml cluster seam as its NEXT step 3 but does NOT apply
     # it — the operator/sim must set broker.cluster.{data_dir,raft_addr,secrets_dir} by hand (cluster.go:808).
     # A real `cluster init` that emitted the seam would drop this step.] serve boots cluster mode from raft/.
-    dexec "$_j" -- sh -c "grep -qE '^    raft_addr:' /etc/tether/broker.yaml || printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: %s:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.conf\n    nats_server_bin: nats-server\n' '$_j' >> /etc/tether/broker.yaml"
+    dexec "$_j" -- sh -c "grep -qE '^    raft_addr:' /etc/tether/broker.yaml || printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: %s:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.d/nats.conf\n    nats_server_bin: nats-server\n' '$_j' >> /etc/tether/broker.yaml"
 
     log "grow: [tether] cluster join prepare on $_j (offline, self-signed bundle)"
     # the bundle is a single "tether-join:v1:<base64>" line on stdout (the "run on the LEADER" hint
@@ -252,10 +253,15 @@ cmd_grow() {
     if printf '%s' "$_all" | grep -qiE 'timed out.*not converged|not converged|no cluster.{0,4}block to harvest|permission denied'; then
         _allfailed=1
         _allreason=$(cluster_status_json "$_L" 2>/dev/null | jq -r '[.nodes[]?|.topo_reconcile_reason//empty]|map(select(.!=""))|first//""' 2>/dev/null || true)
-        if [ "$_n_before" -ge 2 ]; then
-            log "grow: [GAP #22] reconcile nats --all could not auto-converge (in-broker reconciler perm-denied /etc/tether) — hand-render required. tether: $(printf '%s' "$_all" | grep -iE 'timed out|not converged|permission' | tail -1) | reason: ${_allreason:-?}"
-        else
+        # LOG attribution kept CONSISTENT with the #22 token gate below (only a real natsconf perm-denied
+        # reason is #22). A later-grow non-perm timeout (e.g. the #8/#10 pre-mesh stall) is NOT #22 —
+        # post-#22-fix the in-broker reconciler writes the tether-owned nats.d/ and this #22 branch drops.
+        if [ "$_n_before" -ge 2 ] && printf '%s' "$_all" | grep -qiE 'natsconf: *(temp|write \.bak):.*permission denied'; then
+            log "grow: [GAP #22] reconcile nats --all could not auto-converge (in-broker reconciler perm-denied /etc/tether) — hand-render required. tether: $(printf '%s' "$_all" | grep -iE 'permission' | tail -1) | reason: ${_allreason:-?}"
+        elif [ "$_n_before" = 1 ]; then
             log "grow: [GAP #3] reconcile nats --all could not harvest route mTLS from the standalone conf — hand-render required. tether: $(printf '%s' "$_all" | grep -iE 'timed out|not converged|harvest' | tail -1) | reason: ${_allreason:-?}"
+        else
+            log "grow: reconcile nats --all did not converge for a non-#22 reason (likely #8/#10 pre-mesh timeout; #22 is fixed) — hand-render proceeds. tether: $(printf '%s' "$_all" | grep -iE 'timed out|not converged' | tail -1) | reason: ${_allreason:-?}"
         fi
     else
         log "grow: reconcile nats --all did NOT fail as expected (auto path may be fixed): $(printf '%s' "$_all" | tr '\n' ' ' | tail -c 160)"
@@ -275,9 +281,13 @@ cmd_grow() {
     # clustered → the in-broker reconciler perm-denies the /etc/tether write (#22). #3 is added on the first
     # grow below (with #4); add #22 only on later grows so the trailer is never self-contradictory (#3+#22).
     _gaps="$_gaps,#10"
-    # #22 (later grows) only when the --all attempt ACTUALLY failed above (observed, not an ordinal guess) —
-    # so a product fix to the auto path drops the token → 11-grow-gaps flips (external-review F1).
-    [ "$_n_before" -ge 2 ] && [ "${_allfailed:-0}" = 1 ] && _gaps="$_gaps,#22"
+    # #22 (later grows) attribution SHARPENED (G1): key the token specifically on the natsconf
+    # permission-denied reason, NOT the coarse _allfailed (which also trips on non-#22 timeouts like the
+    # #8/#10 pre-mesh stall). Post-#22-fix the in-broker reconciler writes the tether-owned nats.d/ and the
+    # perm-denied reason disappears → the #22 token drops (11-grow-gaps flips — the honest promote signal).
+    if [ "$_n_before" -ge 2 ] && printf '%s' "$_all" | grep -qiE 'natsconf: *(temp|write \.bak):.*permission denied'; then
+        _gaps="$_gaps,#22"
+    fi
 
     _fn1=""
     if [ "$_n_before" = 1 ]; then
@@ -387,19 +397,19 @@ cmd_init() {
     _recon=$(printf '%s\n' "$_out" | sed -n 's/^ *1\. tether //p' | head -1)
     [ -n "$_recon" ] || die "init: could not extract the reconcile step from init output"
     log "init: manual nats.conf cutover: tether $_recon"
-    # reconcile writes /etc/tether/nats.conf as root (install.sh leaves it root:root 0644; the takeover
-    # preserves 0644). We do NOT chown it (Mandate ①): nats-server (User=tether) reads the world-readable
-    # root-owned conf fine, and the root-owned /etc/tether DIRECTORY stays as install.sh made it so the
-    # in-broker reconciler's #22 perm-denial is faithfully reproduced (never masked by a chown).
+    # reconcile writes the tether-owned /etc/tether/nats.d/nats.conf (G1 #22 fix: install.sh creates that
+    # subdir tether-owned so the User=tether in-broker reconciler can atomically write it; /etc/tether
+    # itself stays root-owned — the root-run caddy's Caddyfile stays root-only). We add NO chown (Mandate
+    # ①): nats.d/ is tether-owned by the REAL install.sh, not the sim.
     # shellcheck disable=SC2086
     dexec "$_n" -- tether $_recon || die "init: reconcile nats failed"
 
     log "init: validate nats.conf (-t) + restart nats-server"
-    dexec "$_n" -- nats-server -t -c /etc/tether/nats.conf >/dev/null 2>&1 || die "init: nats.conf failed nats-server -t validation"
+    dexec "$_n" -- nats-server -t -c /etc/tether/nats.d/nats.conf >/dev/null 2>&1 || die "init: nats.conf failed nats-server -t validation"
     sctl "$_n" restart nats-server
 
     log "init: enable cluster mode in broker.yaml"
-    dexec "$_n" -- sh -c "grep -qE '^    raft_addr:' /etc/tether/broker.yaml || printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: %s:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.conf\n    nats_server_bin: nats-server\n' '$_n' >> /etc/tether/broker.yaml"
+    dexec "$_n" -- sh -c "grep -qE '^    raft_addr:' /etc/tether/broker.yaml || printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: %s:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.d/nats.conf\n    nats_server_bin: nats-server\n' '$_n' >> /etc/tether/broker.yaml"
 
     log "init: start tether-broker in cluster mode"
     sctl "$_n" start tether-broker
@@ -531,7 +541,7 @@ _forced_single() {
 cmd_exec()  { _n=${1:?node}; shift; [ "${1:-}" = "--" ] && shift; dexec "$_n" -- "$@"; }
 cmd_shell() { dexec_it "${1:?node}" -- bash; }
 cmd_logs()  { _n=${1:?node}; _u=${2:-}; if [ -n "$_u" ]; then dexec "$_n" -- journalctl -u "$_u" --no-pager -n 200; else dexec "$_n" -- journalctl --no-pager -n 200; fi; }
-cmd_natsconf() { _n=${1:?node}; dexec "$_n" -- sh -c 'echo "--- /etc/tether/nats.conf ($(stat -c %y /etc/tether/nats.conf 2>/dev/null)) ---"; grep -nE "cluster|route|host|jetstream" /etc/tether/nats.conf 2>/dev/null || echo "(no nats.conf)"'; }
+cmd_natsconf() { _n=${1:?node}; dexec "$_n" -- sh -c 'echo "--- /etc/tether/nats.d/nats.conf ($(stat -c %y /etc/tether/nats.d/nats.conf 2>/dev/null)) ---"; grep -nE "cluster|route|host|jetstream" /etc/tether/nats.d/nats.conf 2>/dev/null || echo "(no nats.conf)"'; }
 
 cmd_status() {
     # F4 / round-2 R1: `--json` is the documented machine surface — it must emit the AUTHORITATIVE LEADER
@@ -606,6 +616,10 @@ cmd_drill() {
 cmd_doctor() {
     log "doctor: PID1 + provisioning + drift checks (instance=$INSTANCE)"
     _dr_rc=0
+    # external-review residual: an EMPTY instance must NOT report "clean" (false confidence). Require nodes.
+    if [ -z "$(list_nodes)" ]; then
+        err "doctor: no nodes in instance '$INSTANCE' — nothing to check (up the instance first)"; return 1
+    fi
     for n in $(list_nodes); do
         node_running "$n" || { warn "$n not running"; continue; }
         _s=$(dexec "$n" -- systemctl is-system-running 2>/dev/null || true)
@@ -613,14 +627,27 @@ cmd_doctor() {
     done
     for b in $(list_nodes broker); do
         node_running "$b" || continue
-        # #22 tripwire (M6, INVERTED): install.sh leaves /etc/tether ROOT-owned → a User=tether nats.conf
-        # write (the in-broker C3 reconciler's path) perm-denies its atomic temp/.bak write. Root-owned is
-        # the #22 PRECONDITION, not an error. If /etc/tether is tether-owned, the sim is MASKING #22 (an
-        # earlier build once baked a masking chown) and can no longer regression-detect it — warn loudly.
-        if [ "$(dexec "$b" -- stat -c %U /etc/tether 2>/dev/null)" = tether ]; then
-            warn "$b /etc/tether is tether-owned — this MASKS gotcha #22 (leave it root-owned to reproduce it)"
+        # #22 (G1 fix, Option B): the reconciler's nats.conf lives in the tether-owned /etc/tether/nats.d/
+        # subdir so the User=tether in-broker reconciler can atomically rewrite it, WHILE /etc/tether itself
+        # STAYS root-owned (the root-run caddy loads /etc/tether/Caddyfile — a tether-owned /etc/tether would
+        # be a tether->root privesc, and would signal a hand chown, NOT the install.sh fix). Assert BOTH.
+        _etc_owner=$(dexec "$b" -- stat -c %U /etc/tether 2>/dev/null || true)
+        if [ "$_etc_owner" = tether ]; then
+            err "$b /etc/tether is tether-owned — Option B VIOLATED (tether->root Caddyfile privesc; a hand chown, not install.sh's nats.d/ #22 fix)"; _dr_rc=1
         else
-            ok "$b /etc/tether root-owned — #22 precondition holds (a User=tether reconcile write would perm-deny; drill 13 exercises it)"
+            ok "$b /etc/tether root-owned — Option B invariant holds (Caddyfile stays root-only)"
+        fi
+        _natsd_owner=$(dexec "$b" -- stat -c %U /etc/tether/nats.d 2>/dev/null || true)
+        if [ "$_natsd_owner" = tether ]; then
+            ok "$b /etc/tether/nats.d tether-owned — #22 fix present (User=tether reconciler can write its nats.conf)"
+        else
+            warn "$b /etc/tether/nats.d is '${_natsd_owner:-missing}', not tether — un-upgraded / pre-#22-fix host (in-broker reconcile would perm-deny)"
+        fi
+        # #22 seam guard: if broker.yaml pins an explicit nats_conf_path it MUST be the nats.d/ path — a
+        # straggler at the old /etc/tether/nats.conf strands the reconciler at a nonexistent file.
+        _ncp=$(dexec "$b" -- sh -c "grep -E '^[[:space:]]*nats_conf_path:' /etc/tether/broker.yaml 2>/dev/null | awk '{print \$2}'" 2>/dev/null || true)
+        if [ -n "$_ncp" ] && [ "$_ncp" != /etc/tether/nats.d/nats.conf ]; then
+            err "$b broker.yaml nats_conf_path='$_ncp' — must be /etc/tether/nats.d/nats.conf (#22 seam straggler)"; _dr_rc=1
         fi
         # symmetric artifact guard: /var/lib/tether MUST be tether-owned (install.sh chowns LIB to tether;
         # the broker User=tether writes DB/JS/raft there). If a docker/install change flipped it to root,
@@ -629,13 +656,23 @@ cmd_doctor() {
             err "$b /var/lib/tether is NOT tether-owned — sim artifact would brick the broker (install.sh chowns LIB to tether)"; _dr_rc=1
         fi
         # #21/OQ-5 guard: max_file_store as a jetstream subkey bricks `reconcile nats` (use a tmpfs cap).
-        if dexec "$b" -- grep -q max_file_store /etc/tether/nats.conf 2>/dev/null; then
+        if dexec "$b" -- grep -q max_file_store /etc/tether/nats.d/nats.conf 2>/dev/null; then
             err "$b nats.conf has max_file_store — bricks reconcile (use --cap-store tmpfs, #21/OQ-5)"; _dr_rc=1
         fi
         # units laid down by the REAL install.sh (drift tripwire: presence — a forked provisioner would miss them).
         for u in nats-server tether-broker; do
             dexec "$b" -- test -f "/etc/systemd/system/$u.service" || { err "$b missing unit $u.service (install.sh drift?)"; _dr_rc=1; }
         done
+        # #23 (G1): tether-broker.service MUST carry Restart=always so a clean-exit(0) on nats loss is
+        # revived (Restart=on-failure would strand it inactive). This drift assertion is #23's regression
+        # guard — it has no deterministic RED drill (the clean-exit trigger is unlocated). Reaches the sim
+        # via the real vendored install.sh; a live-fleet drop-in would also show here.
+        _restart=$(dexec "$b" -- systemctl show tether-broker -p Restart --value 2>/dev/null || true)
+        if [ "$_restart" = always ]; then
+            ok "$b tether-broker Restart=always (#23 durable-revival fix present)"
+        else
+            err "$b tether-broker Restart='${_restart:-?}' (want always; #23 fix missing/reverted — a nats-loss clean-exit would strand the broker)"; _dr_rc=1
+        fi
     done
     [ "$_dr_rc" = 0 ] && ok "doctor: clean" || err "doctor: issues found"
     return $_dr_rc
@@ -655,7 +692,7 @@ simcluster — docker simulated-cluster dev tool (instance=\$INSTANCE, image=\$I
   shell <node>                  interactive bash in a node
   ssh <node>                    ssh into a node (real sshd)
   logs <node> [unit]            journalctl inside a node
-  nats-conf <node>              inspect /etc/tether/nats.conf (the #20 probe)
+  nats-conf <node>              inspect /etc/tether/nats.d/nats.conf (the #20 probe)
   down [-v]                     stop nodes (keep volumes; -v removes them)
   nuke                          remove containers + volumes (clean slate)
   doctor                        PID1 re-smoke + drift checks

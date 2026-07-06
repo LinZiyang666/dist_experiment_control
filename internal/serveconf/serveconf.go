@@ -69,7 +69,8 @@ type ClusterSection struct {
 	// NatsConfPath / NatsServerBin (C3) locate the live nats.conf the per-broker topology reconciler
 	// renders/swaps/reloads + the nats-server binary for the `-t` dry-run and `--signal reload`. Empty
 	// NatsConfPath disables the reconciler (it reports no topology, so the cluster is not held out of
-	// HEALTHY-HA on a node that does not manage its conf). Default path /etc/tether/nats.conf.
+	// HEALTHY-HA on a node that does not manage its conf). Default path /etc/tether/nats.d/nats.conf
+	// (#22: a tether-owned subdir the User=tether reconciler can atomically rewrite; $ETC_DIR stays root-owned).
 	NatsConfPath  string `yaml:"nats_conf_path"`
 	NatsServerBin string `yaml:"nats_server_bin"`
 }

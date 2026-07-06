@@ -902,7 +902,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE (voters=%d) — the "+
 				"NATS routes mesh is likely not formed (clustered JetStream meta needs quorum). Verify the routes "+
-				"in /etc/tether/nats.conf and that peer brokers are reachable; see `tether cluster status` / "+
+				"in /etc/tether/nats.d/nats.conf and that peer brokers are reachable; see `tether cluster status` / "+
 				"`tether cluster doctor`", voters)
 		}
 		if err := b.wireClusterLate(ctx, nc); err != nil {

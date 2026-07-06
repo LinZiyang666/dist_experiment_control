@@ -67,7 +67,7 @@ assert_ok "brk3 is a fresh broker with no raft state (never grown)" \
 secrets_mint_node "$INSTANCE" brk3 >/dev/null 2>&1
 secrets_distribute "$INSTANCE" brk3 >/dev/null 2>&1
 assert_ok "add the cluster seam to fresh brk3 (NO init — as a naive operator following runbook §1 would)" \
-    dexec brk3 -- sh -c "printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: brk3:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.conf\n    nats_server_bin: nats-server\n' >> /etc/tether/broker.yaml"
+    dexec brk3 -- sh -c "printf '  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: brk3:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.d/nats.conf\n    nats_server_bin: nats-server\n' >> /etc/tether/broker.yaml"
 assert_refuses "#I1 cluster-mode serve refuses a fresh joiner (join does not bootstrap raft state; runbook §1 omits the joiner init)" \
     "no raft state exists|never auto-bootstraps" \
     dexec -u tether brk3 -- sh -c "timeout 8 tether serve --config /etc/tether/broker.yaml 2>&1"

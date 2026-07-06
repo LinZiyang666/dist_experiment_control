@@ -133,8 +133,12 @@ func newServeCmd() *cobra.Command {
 			// C3: in cluster mode the per-broker topology reconciler manages the live nats.conf. Default
 			// the path so a standard install converges automatically; an operator can override or set it
 			// empty to opt out (then the broker reports no topology and is not held out of HEALTHY-HA).
+			// G1 #22: the reconciler (User=tether) rewrites this conf atomically, so it lives in the
+			// tether-owned /etc/tether/nats.d/ subdir ($ETC_DIR itself stays root-owned; see install.sh).
+			// A pre-G1 host whose conf is still /etc/tether/nats.conf MUST migrate it (or set an explicit
+			// nats_conf_path) BEFORE this binary upgrade repoints the default — see broker-ops.md.
 			if clusterMode && natsConfPath == "" && !cmd.Flags().Changed("nats-conf-path") {
-				natsConfPath = "/etc/tether/nats.conf"
+				natsConfPath = defaultNatsConfPath
 			}
 			var db *sql.DB
 			if !clusterMode {
@@ -261,7 +265,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "address for the Prometheus /metrics + /healthz + /readyz HTTP endpoint (e.g. 127.0.0.1:9090); empty disables it (B5 OPS#1)")
 	cmd.Flags().StringVar(&manifestListen, "cluster-manifest-listen", "", "LOOPBACK address for the well-known cluster discovery manifest /.well-known/tether/cluster.json (e.g. 127.0.0.1:7480), Caddy-fronted; empty disables it; bound only in cluster mode (C2)")
-	cmd.Flags().StringVar(&natsConfPath, "nats-conf-path", "", "live nats.conf the topology reconciler manages in cluster mode (default /etc/tether/nats.conf; empty opts out) (C3)")
+	cmd.Flags().StringVar(&natsConfPath, "nats-conf-path", "", "live nats.conf the topology reconciler manages in cluster mode (default /etc/tether/nats.d/nats.conf; empty opts out) (C3)")
 	cmd.Flags().StringVar(&natsServerBin, "nats-server-bin", "", "nats-server binary for the topology reconciler's `-t` dry-run + `--signal reload` (default: nats-server on PATH) (C3)")
 	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
 	return cmd
