@@ -128,6 +128,7 @@ func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool
 	if err != nil {
 		return natsreconcile.Inputs{}, false
 	}
+	peers = b.filterGhostPeers(peers)
 	brokers := make([]natscluster.Broker, 0, len(peers))
 	selfServer := ""
 	for _, p := range peers {
@@ -148,6 +149,57 @@ func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool
 		NatsServerBin:  bin,
 		DesiredGen:     desired,
 	}, true
+}
+
+// filterGhostPeers drops mesh-phase roster rows that are ABSENT from the committed raft config — a
+// force-single ghost (e.g. the live racknerd pc732: phase=VOTER yet moved out of raft by a prior
+// force-single). Without this the ghost keeps len(Peers)>1, so the reconciler renders a CLUSTERED conf
+// and clobbers a hand-de-clustered survivor conf on upgrade (the G2 #12 double-break). The route mesh
+// must mirror raft membership; a not-in-config peer never belongs in it. TWO DISTINCT fallbacks: (1)
+// cluster NOT WIRED (nil cl/node) returns peers UNCHANGED — there is no raft, hence no ghost risk, and the
+// guard is a no-op (defense-in-depth: force-single prune already removes fresh abandoned rows at the
+// source); (2) a raft-config READ ERROR on a wired node returns SELF-ONLY (fail-SAFE, NOT fail-open) — a
+// fail-open pass would re-widen len(Peers)>1 and let the reconciler re-cluster a hand-de-clustered survivor
+// (the exact G2 #12 double-break). Self is always kept.
+func (b *Broker) filterGhostPeers(peers []clusternodes.TopoPeer) []clusternodes.TopoPeer {
+	if b.cl == nil || b.cl.node == nil {
+		return peers
+	}
+	servers, err := b.cl.node.RaftConfiguration()
+	if err != nil {
+		// Internal review: on a config-read error, keep ONLY self rather than fail-open to ALL peers — a
+		// fail-open pass would re-widen len(Peers)>1 and let the reconciler render a CLUSTERED conf over a
+		// hand-de-clustered survivor (the exact double-break this guard prevents). With peers=[self] the
+		// reconciler renders standalone (live conf standalone) or fail-closes (clustered-zero-routes), never
+		// a wrong clustered mesh; a genuinely multi-node cluster just skips one tick until the read recovers.
+		b.cfg.Logger.Warn("topology reconcile: cannot read raft config for the G2 #12 ghost filter; keeping only self to avoid re-clustering a de-clustered survivor", "err", err)
+		return filterSelfOnly(peers, b.selfID)
+	}
+	inCfg := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		inCfg[s.NodeID] = true
+	}
+	out := make([]clusternodes.TopoPeer, 0, len(peers))
+	for _, p := range peers {
+		if p.NodeID == b.selfID || inCfg[p.NodeID] {
+			out = append(out, p)
+			continue
+		}
+		b.cfg.Logger.Warn("topology reconcile: excluding force-single ghost from the route mesh (roster row present but absent from committed raft config)",
+			"node_id", p.NodeID, "phase", p.Phase)
+	}
+	return out
+}
+
+// filterSelfOnly returns just the self peer (or nil) — the fail-safe fallback when the raft config is
+// unreadable, so the reconciler never renders a clustered conf over a de-clustered survivor.
+func filterSelfOnly(peers []clusternodes.TopoPeer, selfID string) []clusternodes.TopoPeer {
+	for _, p := range peers {
+		if p.NodeID == selfID {
+			return []clusternodes.TopoPeer{p}
+		}
+	}
+	return nil
 }
 
 // reloadNatsServer sends a SIGHUP-reload to the local nats-server via the official `--signal reload`

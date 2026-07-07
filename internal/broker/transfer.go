@@ -52,11 +52,20 @@ const (
 	transferTierAMaxBytes = 8 * 1024 * 1024
 )
 
-// transferMaxBytes is the hard upper bound for one tier-B transfer.
-// Bumped 200 MiB → 2 GiB in v0.2.5; the per-session bucket MaxBytes
-// (ensureXferBucket) was already set to 4 GiB which leaves 2 GiB
-// headroom for one in-flight + one staging transfer per session.
+// transferMaxBytes is the GLOBAL hard upper bound for one tier-B transfer (2 GiB). On a small-disk
+// broker the per-session bucket ceiling (xferBucketMaxBytes, G6 #21) can be LOWER, and the push
+// admission gate rejects at min(transferMaxBytes, that bucket ceiling).
 const transferMaxBytes = 2 * 1024 * 1024 * 1024
+
+// G6 #21: OBJ_xfer per-session bucket sizing. The bucket MaxBytes is disk-aware — a fraction of the JS
+// store ceiling left after the events/history reservations — clamped to [floor, cap]. Below the floor we
+// REFUSE (never emit MaxBytes<=0, which nats treats as UNLIMITED → a worse silent re-brick). The cap is
+// the legacy 8 GiB, so large-disk brokers keep today's behavior.
+const (
+	xferEventsHistoryReserve = 2 * 1024 * 1024 * 1024 // events(1 GiB)+history(1 GiB) — the other JS reservations
+	xferBucketFloor          = 256 * 1024 * 1024      // smallest useful per-session tier-B ceiling
+	xferBucketCap            = 8 * 1024 * 1024 * 1024  // legacy ceiling (large-disk brokers unchanged)
+)
 
 // transferTrackerMaxEntries caps the in-memory tracker map so a fast
 // attacker spamming push.req / pull.req can't OOM the broker before
@@ -183,9 +192,64 @@ func (t *transferTracker) activeOBJStreams() map[string]struct{} {
 // until the session is removed; per-transfer cleanup happens via
 // deleteXferObject (object delete inside the bucket).
 //
-// MaxBytes covers many concurrent transfers + their staging space:
-// ceil at 4 GiB per session. Per-transfer ObjectMeta caps individual
-// objects via the chunked-message TTL on the underlying stream.
+// jsStoreCeiling returns the JetStream file-store ceiling in bytes: nats's own AccountInfo.MaxStore when
+// finite (the EXACT admission number), else a statfs-derived ~0.75 of the store partition, else 0 (caller
+// falls back to the legacy cap). Never negative.
+func (b *Broker) jsStoreCeiling(ctx context.Context) int64 {
+	if b.js != nil {
+		if info, err := b.js.AccountInfo(ctx); err == nil && info.Limits.MaxStore > 0 {
+			return info.Limits.MaxStore // finite configured/derived JS store limit
+		}
+		// MaxStore <= 0 ⇒ UNLIMITED (nats reports -1) → fall through to statfs
+	}
+	if b.cfg.StoreDir != "" {
+		if used, total, err := diskUsage(b.cfg.StoreDir); err == nil && total > used {
+			free := total - used
+			return int64(free) / 4 * 3 // ~0.75 of AVAILABLE space (nats sizes its default limit off free disk, not total)
+		}
+	}
+	return 0
+}
+
+// xferBucketMaxBytes computes the disk-aware per-session OBJ_xfer bucket ceiling (G6 #21): a fraction of
+// the JS store ceiling left after the events/history reservations, clamped to [floor, min(cap, avail)]. It
+// REFUSES (rather than emit MaxBytes<=0, which nats treats as UNLIMITED) when the store is too small even
+// for the floor. Unknown ceiling ⇒ the legacy 8 GiB cap (preserves large-disk behavior).
+func (b *Broker) xferBucketMaxBytes(ctx context.Context) (int64, error) {
+	return xferMaxBytesForCeiling(b.jsStoreCeiling(ctx))
+}
+
+// xferMaxBytesForCeiling is the pure disk-aware clamp (G6 #21), split out for testing. ceiling<=0
+// (unknown) ⇒ the legacy cap. Otherwise a fraction of what's left after the events/history reservation,
+// clamped to [floor, min(cap, avail)]; too small for the floor ⇒ refuse (never MaxBytes<=0, which nats
+// treats as UNLIMITED → a worse silent re-brick).
+func xferMaxBytesForCeiling(ceiling int64) (int64, error) {
+	if ceiling <= 0 {
+		return xferBucketCap, nil // unknown ceiling → legacy cap (never <=0/unlimited)
+	}
+	avail := ceiling - xferEventsHistoryReserve
+	if avail < xferBucketFloor {
+		return 0, fmt.Errorf("js store too small for tier-B: ceiling=%d bytes, need >= %d (events+history %d + floor %d)",
+			ceiling, int64(xferEventsHistoryReserve)+int64(xferBucketFloor), int64(xferEventsHistoryReserve), int64(xferBucketFloor))
+	}
+	maxBytes := avail / 4 * 3 // 0.75 of what's left, integer-safe
+	if maxBytes < xferBucketFloor {
+		maxBytes = xferBucketFloor
+	}
+	hi := int64(xferBucketCap)
+	if avail < hi {
+		hi = avail
+	}
+	if maxBytes > hi {
+		maxBytes = hi
+	}
+	return maxBytes, nil
+}
+
+// ensureXferBucket creates (or raise-reconciles) the per-session OBJ_xfer object store. Its MaxBytes is
+// DISK-AWARE (xferBucketMaxBytes, G6 #21) — previously a hardcoded 8 GiB that denied tier-B on small-disk
+// brokers. Per-transfer ObjectMeta caps individual objects via the chunked-message TTL on the underlying
+// stream.
 //
 // v0.2.2 change: previously each transfer got its own bucket
 // `xfer-<sid>-<id>`, but NATS perm wildcards can't address that
@@ -196,9 +260,13 @@ func (b *Broker) ensureXferBucket(ctx context.Context, sid string, targetReplica
 		return "", fmt.Errorf("jetstream_unavailable")
 	}
 	bucket := proto.XferBucketName(sid)
+	maxBytes, err := b.xferBucketMaxBytes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("xfer bucket sizing: %w", err)
+	}
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
-		MaxBytes: 8 * 1024 * 1024 * 1024, // 8 GiB per-session ceiling (allows ~3 in-flight 2-GiB transfers + headroom)
+		MaxBytes: maxBytes, // G6 #21: disk-aware (was a hardcoded 8 GiB that denied tier-B on small-disk brokers)
 		Storage:  jetstream.FileStorage,
 		Replicas: targetReplicas, // D5 §6.4/§9: replicasFor(nVoters); live callers pass jsstream.ReplicasSingle
 	}
@@ -243,9 +311,25 @@ func raiseXferReplicas(ctx context.Context, js jetstream.JetStream, bucket strin
 	if cur >= target {
 		return nil // raise-only
 	}
+	// G6 #21: PRESERVE the existing bucket's MaxBytes on a replica raise — recomputing could shrink it
+	// below already-used bytes (UpdateObjectStore would reject → replication_degraded latch). Read it off
+	// the backing stream; fall back to the legacy cap (never 0 = UNLIMITED) if unreadable.
+	curMax := int64(0)
+	if si, serr := js.Stream(ctx, "OBJ_"+bucket); serr == nil {
+		if info, ierr := si.Info(ctx); ierr == nil && info.Config.MaxBytes > 0 {
+			curMax = info.Config.MaxBytes
+		}
+	}
+	if curMax <= 0 {
+		// G6 #21 (internal review): could not read the existing bucket's MaxBytes → do NOT raise with a
+		// guessed ceiling (a wrong 8 GiB over-provisions a small disk; a shrink-below-used latches
+		// replication_degraded). Skip this raise and retry next cycle via the retriable channel the callers
+		// already handle.
+		return jsstream.ErrMetaGroupNotReady
+	}
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
-		MaxBytes: 8 * 1024 * 1024 * 1024,
+		MaxBytes: curMax,
 		Storage:  jetstream.FileStorage,
 		Replicas: target,
 	}
@@ -453,6 +537,14 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// G6 #21: on a small-disk broker the per-session bucket ceiling can be BELOW the global 2 GiB
+		// per-transfer cap; reject an over-ceiling transfer at ADMISSION rather than accept-then-fail with
+		// an opaque 10047 mid-stream.
+		if bm, berr := b.xferBucketMaxBytes(ctx); berr == nil && req.Size > bm {
+			cancel()
+			b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > per-session tier-B ceiling %d on this broker (small disk)", req.Size, bm))
+			return
+		}
 		bucket, err := b.ensureXferBucket(ctx, sid, b.xferTargetReplicas())
 		cancel()
 		if err != nil {

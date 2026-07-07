@@ -11,6 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -321,6 +322,19 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 
 	rep.TopoDesired = topoDesired // C3: cluster-wide desired topology generation
 	rep.Health, rep.Banner, rep.NextStep = computeHealth(forceSingle, leaderID, voters, topoDesired, rep.Nodes)
+	// G2 #20: DATA-PLANE-DEGRADED signal. force-single restores the CONTROL plane, but if the survivor's
+	// on-disk nats.conf still carries a cluster{} block the embedded JetStream is wedged at 503 (no
+	// quorum-of-2) — SILENTLY, because the alert path itself rides JetStream (this is what let racknerd rot
+	// for days). Surface it OUT-OF-BAND on the status banner, keyed on the LIVE conf. Best-effort: a
+	// missing/unreadable conf just skips the extra banner (never fails the report).
+	if forceSingle && a.natsConfPath != "" {
+		if own, perr := natsconf.Preflight(a.natsConfPath); perr == nil && own.IsClusteredJetStream() {
+			if rep.Banner != "" {
+				rep.Banner += " "
+			}
+			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE — nats.conf is still clustered after force-single (file transfers / history / audit return 503). De-cluster it: `tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> --broker-nkey <self-bus-nkey>` (server-name = the conf's server_name; broker-nkey = the bus nkey from the broker.nk seed in secrets_dir or cluster_nodes.bus_nkey_pub, NOT broker.yaml), then restart nats-server."
+		}
+	}
 	rep.ExitCode = healthExitCode(rep.Health)
 	rep.HealthLabel = healthLabel(rep.Health, voters) // C6 建议6: additive 5-state label; legacy Health/ExitCode unchanged
 	// B5 OPS#7: a tunnel-cert whose rotation window is closing is an ADVISORY only — a rotation

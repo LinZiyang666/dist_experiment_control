@@ -266,7 +266,10 @@ standalone:
 # ONLY when exactly ONE voter remains (retire the rest FIRST). De-clustering with live peers tears the
 # route mesh, so --confirm-single is mandatory and a FULL restart is required (dropping cluster{} is
 # NOT SIGHUP-reloadable).
-lone$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self>
+lone$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self> --broker-nkey <self-bus-nkey>
+# (--broker-nkey = this broker's bus nkey — derive from the broker.nk seed in secrets_dir, or read
+#  cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A multi-broker conf lists every peer's nkey so
+#  --to-standalone cannot auto-pick self's — pass it explicitly. A single-broker conf auto-reads it.)
 lone$ sudo systemctl restart nats-server      # FULL restart loads the standalone conf
 # ⚠ clustered-JS → standalone-JS does NOT migrate in place — RESET the JS store (the command prints
 #   the exact rm -rf). DATA IMPACT: drops ALL JetStream audit/history (history-<sid>, events, in-flight
@@ -361,6 +364,48 @@ survivor$ sudo systemctl unmask tether-broker && sudo systemctl start tether-bro
 which forward-replays this node's local log into SQLite (the recovery point is the
 node's last local log index — its uncommitted tail is committed by fiat, logged
 loudly). The node raises a persistent `force_single_active` severe (`status` exit 3).
+
+### 3.2 After force-single: restore the data plane (JetStream) + clean up abandoned peers (G2)
+
+force-single restores the CONTROL plane instantly, but the DATA plane (JetStream — file transfers,
+history, audit) needs one more step, and the abandoned peers must leave the client roster.
+
+**Restore JetStream (#20).** A survivor whose nats.conf still carries a `cluster{}` block after
+force-single wedges JetStream at `503` (no quorum-of-2) — *silently*, since the alert path itself rides
+JetStream. `cluster status` now raises a **DATA-PLANE DEGRADED** banner when this is the case.
+
+- **OFFLINE force-single already fixed it**: it re-renders the survivor's nats.conf to standalone
+  JetStream BEFORE you restart the broker (§3.1 step 3 prints "nats.conf de-clustered to standalone").
+  Just RESET the JS store as warned (it prints the `mv jetstream …` guidance) before the restart.
+- **ONLINE force-single leaves the daemon running** and does NOT restart nats-server (that would blip the
+  shared core-NATS control plane). De-cluster it explicitly, then restart ONLY nats-server:
+
+  ```
+  survivor$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self> --broker-nkey <self-bus-nkey>
+  # (--broker-nkey is this broker's bus nkey — derive from the broker.nk seed in secrets_dir, or read
+  #  cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A still-clustered conf lists every peer's nkey
+  #  so --to-standalone cannot auto-pick self's — pass it explicitly)
+  # detached so stopping nats-server does not cut the ctl channel mid-command:
+  survivor$ sudo systemd-run --collect --unit tether-nats-restart \
+              sh -c 'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.clustered-bak.$(date +%s); systemctl restart nats-server'
+  ```
+
+  The abandoned peers are already pruned (below), so the N=1 voter tally passes and `--to-standalone`
+  is unlocked.
+
+**Abandoned-peer roster (#12).** force-single now PRUNES the abandoned peers from the roster automatically
+(both the online and offline paths), so agents/ctl converge to N=1 immediately — the dead endpoints stop
+appearing in every client's failover list. If you upgraded from an older binary and a **ghost VOTER**
+lingers (a roster row still phase=VOTER but absent from the raft config — force-single moved it out of
+raft, but the old code left the row), remove it explicitly on the leader:
+
+```
+leader$ sudo tether cluster recovery node remove <ghost-node-id> --manual
+```
+
+This now passes through a VOTER row that is not in the committed raft config (proven leader-side) —
+deleting it cannot fork quorum (it is already out of raft). `cluster status` then shows N=1 with no
+INCONSISTENT rows and no DEGRADED banner.
 
 ### Bring a recovered/returning node back
 

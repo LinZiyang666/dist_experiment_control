@@ -1,41 +1,56 @@
 #!/bin/sh
-# 12-ghost-voter.sh — #12 RED: after online force-single the ejected peer is left phase==VOTER in the
-# roster (raft config dropped it, roster row didn't) and ALL THREE online removal paths refuse it — the
-# "three-non" deadlock (plan §5.4). RED (open backlog). The refusal SIGNATURES are captured broad; if a
-# path fails for an UNDOCUMENTED reason the guard HARD-FAILs (not a false green). Env: SIM, HERE, INSTANCE.
+# 12-ghost-voter.sh — #12 GREEN regression: the old "three-non deadlock" is ROOT-CAUSED AWAY. force-single
+# now AUTO-PRUNES the abandoned peer (#12), so it never lingers as a phase==VOTER ghost, and the three
+# online removal paths that used to deadlock have nothing to refuse.
+#
+# Uses OFFLINE force-single (RELIABLE): online force-single's quorum-loss dwell is reset every time the #23
+# `Restart=always` bounces the survivor after the peer dies, so online is timing-fragile in the container
+# harness (see drill 20 — same reason it went offline). Offline (daemon stopped) has no dwell.
+#
+# The UPGRADE-LEFTOVER-ghost path — a VOTER roster row ABSENT from the committed raft config, left by a
+# pre-#12 binary — is removed via `recovery node remove` (ghost passthrough). That legacy ghost CANNOT be
+# manufactured on this deploy tier (the container has no sqlite3 and there is no old binary), so it is
+# covered HERMETICALLY by internal/broker: TestG2RemoveNodeGhostPassthrough (passthrough delete + ownership
+# guard + in-config-VOTER still refused + leader-gate) and TestFilterGhostPeersDropsNotInConfig (the
+# upgrade migration guard). Env: SIM, HERE, INSTANCE, SIMPIN.
 set -u
 . "$HERE/lib/log.sh"
 . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/setup-forcesingle.sh"
 SIM="${SIM:-$HERE/simcluster}"
 PIN=${SIMPIN:-135790}; SID=lab
+INST="${INSTANCE:-sim}"
 
-drill_begin "#12 force-single ghost VOTER — three-non deadlock"
+drill_begin "#12 GREEN: force-single AUTO-PRUNES the abandoned peer → no ghost VOTER, three-non deadlock gone"
 
 setup_forcesingle_n2
-assert_ok "force-single brk1 --dead brk2"  "$SIM" force-single brk1 --dead brk2
 
-# GREEN control: the ghost is visible — brk2 still listed phase==VOTER in the survivor's roster.
-assert_ok "ghost brk2 still listed phase==VOTER in the roster" \
-    sh -c "$SIM exec brk1 -- tether cluster status --json 2>/dev/null | jq -e '[.nodes[]?|select((.node_id//.id//.name)==\"brk2\" and .phase==\"VOTER\")]|length==1' >/dev/null"
+# brk2 must be provably dead (offline force-single HARD-REFUSES a peer that still answers :7400).
+assert_ok "docker-kill brk2 (provably dead)" \
+    sh -c "docker kill sim-$INST-brk2 >/dev/null 2>&1"
 
-# RED: the online removal paths refuse the ghost today (the three-non deadlock). node remove needs the
-# machine-escape confirm (--confirm-node-id + TETHER_CONFIRM_NODE_ID env) to get PAST the TTY-confirm and
-# reach the real removal gate. Signatures are broad — they cover the captured refusals for BOTH the
-# ghost-retained shape (phase-gate: "node is VOTER…") and the fully-ejected shape ("no such roster node"
-# / "not in cluster_nodes"); either way the ghost cannot be cleanly removed online.
-# M2: signatures pinned to CAPTURED product strings only (no success-adjacent / over-broad tokens that
-# would false-green or defeat the flip-to-regression signal). Covers both observed shapes: ghost-retained
-# (phase-gate "node is VOTER") and fully-ejected ("no such roster node" / "not in cluster_nodes").
-assert_bug "recovery node remove brk2 --manual refuses" "#12" \
-    "no such roster node|is VOTER|only.*(RETIRING|VOTER_ADD_FAILED|CATCHING_UP)" \
-    "$SIM" exec brk1 -- env TETHER_CONFIRM_NODE_ID=brk2 tether cluster recovery node remove brk2 --manual --confirm-node-id brk2
-assert_bug "cluster retire brk2 refuses" "#12" \
-    "not in cluster_nodes|cannot retire.*last voter|cannot retire the last" \
-    "$SIM" exec brk1 -- tether cluster retire brk2
-assert_bug "reconcile nats --to-standalone refuses (ghost blocks proving N=1)" "#12" \
-    "unrecognized raft role.*cannot prove N=1|cannot prove N=1.*unrecognized raft role" \
-    "$SIM" exec brk1 -- tether cluster reconcile nats --to-standalone --confirm-single --server-name brk1
+# OFFLINE force-single on brk1 (reliable — no online dwell/leadership race). #12: it AUTO-PRUNES brk2.
+assert_ok "stop brk1 broker daemon (an operator stop — #23 Restart=always does NOT revive it)" \
+    sh -c "$SIM exec brk1 -- systemctl stop tether-broker"
+assert_ok "offline force-single brk1 (auto-prunes the abandoned brk2)" \
+    sh -c "$SIM exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 2>&1 | grep -q 'single-voter cluster'"
+assert_ok "restart nats-server + broker (provisioning)" \
+    sh -c "$SIM exec brk1 -- sh -c 'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.\$(date +%s) 2>/dev/null; systemctl restart nats-server; systemctl start tether-broker'"
+sleep 6
 
-# FLIP TO PURE-REGRESSION WHEN force-single downgrades the ejected roster row / a removal path succeeds.
+# #12 FIX (the root cause): brk2 is PRUNED — it never lingers as a phase==VOTER ghost, so the "three-non
+# deadlock" (all three online removal paths refuse an undeletable VOTER ghost) simply cannot arise.
+assert_ok "#12 FIXED: brk2 auto-pruned from the roster (no ghost VOTER — the RED deadlock premise is gone)" \
+    sh -c "! $SIM exec brk1 -- sh -c \"tether cluster status --json 2>/dev/null | jq -e '.nodes[]?|select((.node_id//.id//.name)==\\\"brk2\\\")' >/dev/null\""
+
+# and the removal path that USED to deadlock now cleanly reports the row is gone (a clean 'no such roster
+# node', NOT the old three-non phase-gate refusal on an undeletable VOTER).
+assert_ok "#12 FIXED: recovery node remove of the pruned brk2 reports 'no such roster node' (not a deadlock refusal)" \
+    sh -c "$SIM exec brk1 -- env TETHER_CONFIRM_NODE_ID=brk2 tether cluster recovery node remove brk2 --manual --confirm-node-id brk2 2>&1 | grep -q 'no such roster node'"
+
+# GREEN regression since the #12 fix (force-single auto-prune). Was RED: force-single left brk2 phase==VOTER
+# and all three online removal paths refused it (the three-non deadlock). The upgrade-leftover ghost
+# (VOTER-not-in-committed-config from a pre-#12 binary) → `recovery node remove` passthrough is covered by
+# hermetic TestG2RemoveNodeGhostPassthrough (this deploy tier has no sqlite3 + no old binary to manufacture
+# that legacy ghost — verified 2026-07-07).
 drill_end

@@ -444,9 +444,11 @@ func testD7ForceSingleRecover(t *testing.T) {
 	if appliedAfter < appliedBefore {
 		t.Fatalf("applied_index regressed after force-single: before=%d after=%d", appliedBefore, appliedAfter)
 	}
-	// State preserved EXACTLY (review M7): the seeded marker has its exact value (not
-	// lost, not corrupted) and the roster has EXACTLY its pre-force-single rows (not
-	// doubled by a replay double-apply).
+	// State preserved EXACTLY (review M7): the seeded marker keeps its exact value (not lost, not corrupted).
+	// The roster converges to the survivor's OWN row only — G2 #12: force-single PRUNES the abandoned peers
+	// (rosterBefore - abandoned). The restart must NOT double-apply (re-materialize the pruned peers from
+	// the replayed log), so the count stays at the pruned value EXACTLY — this also pins that an offline
+	// prune survives a restart (the abandoned peers do not resurrect).
 	var marker string
 	_ = nd.BoundedStaleRead(func(db *sql.DB) error {
 		return db.QueryRow(`SELECT value FROM cluster_meta WHERE key='t:premark'`).Scan(&marker)
@@ -454,8 +456,9 @@ func testD7ForceSingleRecover(t *testing.T) {
 	if marker != "preval" {
 		t.Fatalf("committed state lost/corrupted across force-single: t:premark = %q, want preval", marker)
 	}
-	if got := countRows(t, nd, "cluster_nodes"); got != rosterBefore {
-		t.Fatalf("roster row count changed across force-single: %d, want %d (double-apply?)", got, rosterBefore)
+	wantRoster := rosterBefore - len(abandoned)
+	if got := countRows(t, nd, "cluster_nodes"); got != wantRoster {
+		t.Fatalf("roster row count after force-single prune + restart: %d, want %d (rosterBefore=%d - abandoned=%d; prune undone or double-apply?)", got, wantRoster, rosterBefore, len(abandoned))
 	}
 	// Writable: a fresh op commits.
 	if err := nd.ApplyMetaSet("t:post-recover", "ok"); err != nil {

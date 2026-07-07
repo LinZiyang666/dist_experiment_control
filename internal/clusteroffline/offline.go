@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -109,6 +110,17 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	// banner on the now single-node DB.
 	if err := raiseForceSingleMarker(opts.DBPath, opts.Now()); err != nil {
 		return roster, fmt.Errorf("clusteroffline: recovered but failed to mark force_single_active: %w", err)
+	}
+	// G2 #12: prune the abandoned peers from cluster_nodes so the survivor's signed roster converges to
+	// {self} (clients stop failover-preferring the dead endpoints). RecoverSingleNode already rewrote the
+	// raft config to {self} above, so deleting the abandoned roster rows cannot fork quorum. Direct-SQL
+	// (the daemon is down; same post-recover raw-write durability as the marker). BEST-EFFORT: on failure
+	// the rows linger for `cluster recovery node remove <peer>` to finish — the recovery itself stands.
+	if len(roster) > 0 {
+		if err := pruneRosterPeers(opts.DBPath, roster, opts.Now()); err != nil {
+			opts.Logger.Warn("clusteroffline: force-single recovered but roster prune of abandoned peers failed; run `cluster recovery node remove <peer>` to finish",
+				"err", err)
+		}
 	}
 	opts.Logger.Warn("clusteroffline: force-single complete; node is now a single-voter cluster (no HA / no integrity until recover)",
 		"self", opts.SelfID, "abandoned", len(roster))
@@ -374,6 +386,50 @@ func raiseForceSingleMarker(dbPath string, now time.Time) error {
 			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		cluster.MetaKeyForceSingle, now.UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+// pruneRosterPeers DELETEs the abandoned peers from cluster_nodes and bumps the roster + topology
+// generation counters via direct-SQL — the offline (daemon-down) equivalent of
+// cluster.PlanClusterNodePrune, so the online and offline force-single paths leave the SAME cluster_nodes
+// state ({self} only). One transaction: the per-peer deletes + both monotone MAX(existing+1, now) gen
+// bumps. Node IDs come from the trusted recovered roster read; parameterized regardless.
+func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
+	db, err := storage.OpenWAL("file:" + dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var total int64
+	for _, p := range peers {
+		res, derr := tx.Exec(`DELETE FROM cluster_nodes WHERE node_id = ?`, p.NodeID)
+		if derr != nil {
+			return derr
+		}
+		if n, aerr := res.RowsAffected(); aerr == nil {
+			total += n
+		}
+	}
+	// Change-gated (parity with the online rosterGenBumpStmt/topologyGenBumpStmt): bump ONLY if a row was
+	// actually deleted, so a re-prune of already-absent rows advances NEITHER counter (idempotent, matching
+	// PlanClusterNodePrune). MAX(existing+1, now.UnixNano()) mirrors the online monotone shape; keys are
+	// cluster's exported SSOT.
+	if total > 0 {
+		nowNano := strconv.FormatInt(now.UTC().UnixNano(), 10)
+		for _, key := range []string{cluster.MetaKeyRosterGeneration, cluster.MetaKeyTopologyGeneration} {
+			if _, err := tx.Exec(
+				`INSERT INTO cluster_meta(key, value) VALUES(?, ?) `+
+					`ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(cluster_meta.value AS INTEGER)+1, CAST(excluded.value AS INTEGER))`,
+				key, nowNano); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // RecoverOptions configures recover --dump-divergent.

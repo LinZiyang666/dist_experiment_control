@@ -315,6 +315,32 @@ func PlanClusterNodeRemove(nodeID string, now time.Time) (*Command, error) {
 	), nil
 }
 
+// PlanClusterNodePrune renders OpClusterNodeRemove for the G2 force-single abandoned set AND the
+// membership-aware ghost passthrough (recovery node remove of a VOTER-not-in-committed-config ghost):
+// DELETE the given roster rows UNCONDITIONALLY by node_id, regardless of phase. Unlike
+// PlanClusterNodeRemove — which only finishes RETIRING/VOTER_ADD_FAILED/CATCHING_UP rows and
+// STRUCTURALLY refuses a live VOTER (the roster/raft anti-fork guard) — this is the force-single /
+// ghost-removal path: the CALLER has ALREADY proven the node is OUT of the committed raft config
+// (force-single's RecoverToSelf* moved it, or RemoveNode read the LEADER-committed config), so deleting
+// its roster row cannot fork quorum. It rides OpClusterNodeRemove's genericExecApplier (a DELETE is a
+// DELETE — no new op code, so a mixed-version fleet cannot decode-poison it). Both gen counters bump (a
+// prune is BOTH a roster change AND a mesh leave), change-gated off the DELETE's RowsAffected via the
+// standard rosterGen→topologyGen chain, so a re-prune of already-absent rows is a RowsAffected==0 no-op
+// that inflates neither counter (idempotent). ids must be non-empty and LitText-safe.
+func PlanClusterNodePrune(ids []string, now time.Time) (*Command, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("cluster: plan node-prune: empty id set")
+	}
+	lits, err := LitTextAll(ids...)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: plan node-prune: id literal: %w", err)
+	}
+	del := `DELETE FROM cluster_nodes WHERE node_id IN (` + strings.Join(lits, ",") + `)`
+	return NewCommand(OpClusterNodeRemove,
+		Stmt(del), rosterGenBumpStmt(now), topologyGenBumpStmt(now),
+	), nil
+}
+
 // PlanClusterBusNkeySet renders OpClusterBusNkeySet (C3 §D-F): record a broker's NATS bus nkey public
 // key into cluster_nodes.bus_nkey_pub so the topology reconciler can render that peer into
 // auth_callout.auth_users + the static users{} ACL. Leader-local fail-fast rejects a non-user-key

@@ -204,6 +204,15 @@ func hasIncludeDirective(raw string) bool {
 	return false
 }
 
+// ServerName harvests the nats server_name directive from the live conf (a tether-generated field). The
+// offline force-single de-cluster render needs it to name the lone survivor; empty if absent.
+func (o *Ownership) ServerName() string {
+	if s, ok := o.Parsed["server_name"].(string); ok {
+		return s
+	}
+	return ""
+}
+
 // AuthIdentity extracts the cluster identity from the existing conf's §3.4 authorization
 // block: the auth_callout.issuer (the shared account pub == AccountIssuer) and, only when
 // unambiguous, the broker bus nkey. Generated cluster configs contain one user per broker,

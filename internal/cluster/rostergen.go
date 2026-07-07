@@ -22,7 +22,11 @@ import (
 // always immediately walks PENDING_VOTER → CATCHING_UP via PlanClusterNodePhase (which
 // DOES bump) before the new broker is a dialable VOTER — so the PENDING-only window is
 // agent-irrelevant (the selector de-prefers non-VOTER anyway).
-const metaKeyRosterGeneration = "roster_generation"
+// MetaKeyRosterGeneration is the cluster_meta key of the monotone roster-generation counter, exported
+// so internal/clusteroffline's offline force-single prune can bump it via direct-SQL (daemon down ⇒ no
+// raft applier runs rosterGenBumpStmt). Internal code keeps using the lowercase alias.
+const MetaKeyRosterGeneration = "roster_generation"
+const metaKeyRosterGeneration = MetaKeyRosterGeneration
 
 // RosterGeneration reads the monotone roster generation counter (bounded-stale, no txn).
 // A missing row reads as 0 (the D0-empty cluster_meta convention, shared with

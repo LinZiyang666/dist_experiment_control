@@ -200,8 +200,25 @@ func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
 	if !ok {
 		return fmt.Errorf("recovery node remove %s: no such roster node", nodeID)
 	}
+	// G2 #12: ghost passthrough. A roster row in a non-removable phase (a stale VOTER after force-single)
+	// that is ABSENT from the committed raft config is a force-single ghost — otherwise undeletable online
+	// (the phase-gate refuses its VOTER phase AND PlanClusterNodeRemove's phase-scoped deletes never match
+	// it: the live racknerd pc732 deadlock). Deleting a not-in-config row cannot fork quorum. The
+	// not-in-config proof MUST be a LEADER-committed config read (a stale follower could misjudge a live
+	// voter as absent → B1 fork), so require leadership before treating absence as proof.
 	if phase != phaseRetiring && phase != phaseAddFailed && phase != phaseCatchingUp {
-		return fmt.Errorf("recovery node remove %s: node is %s; raw remove only finishes a RETIRING, VOTER_ADD_FAILED, or aborted staged CATCHING_UP node — use `cluster retire %s` to remove a live voter (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+		_, leaderID := a.node.LeaderWithID()
+		if leaderID != a.node.SelfID() {
+			return fmt.Errorf("recovery node remove %s: node is %s and this broker is not the raft leader — run on the leader (only a leader-committed config read can prove a removable ghost vs a live voter)", nodeID, phase)
+		}
+		inCfg, err := a.nodeInCommittedConfig(nodeID)
+		if err != nil {
+			return fmt.Errorf("recovery node remove %s: read committed raft config: %w", nodeID, err)
+		}
+		if inCfg {
+			return fmt.Errorf("recovery node remove %s: node is %s; raw remove only finishes a RETIRING, VOTER_ADD_FAILED, or aborted staged CATCHING_UP node — use `cluster retire %s` to remove a live voter (refusing to avoid a roster/raft silent fork)", nodeID, phase, nodeID)
+		}
+		return a.removeGhost(nodeID, force)
 	}
 	// review F1: a CATCHING_UP node is a STAGED NONVOTER left behind by a failed/aborted grow — it is
 	// online-removable (a nonvoter is not a committed voter, so RemoveServer cannot fork quorum), which
@@ -262,6 +279,49 @@ func (a *ClusterAdmin) countOwnedExposes(nodeID string) (int, error) {
 			nodeID, string(port.StateAllocated)).Scan(&n)
 	})
 	return n, err
+}
+
+// nodeInCommittedConfig reports whether nodeID is in THIS broker's raft configuration. RaftConfiguration()
+// returns the LATEST configuration (on the leader that includes any appended-but-uncommitted membership
+// change); it is only trustworthy on the LEADER (a follower may hold a stale config), so every caller MUST
+// leader-gate before treating a false result as proof of a removable ghost. On the leader hashicorp raft
+// permits only one in-flight config change, so an in-flight add of the SAME id reads present → safely
+// refuses (G2 #12).
+func (a *ClusterAdmin) nodeInCommittedConfig(nodeID string) (bool, error) {
+	servers, err := a.node.RaftConfiguration()
+	if err != nil {
+		return false, err
+	}
+	for _, s := range servers {
+		if s.NodeID == nodeID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// removeGhost deletes a force-single ghost roster row — a node ABSENT from the committed raft config
+// (proven by the LEADER-gated caller in RemoveNode). It reuses the ownership guard (a ghost that still
+// HOMES exposes would orphan them on a bare delete; --force bypasses only this probe), calls RemoveServer
+// as a defensive idempotent no-op (harmless on an already-absent node; catches a racing re-add), then
+// prunes the row via PlanClusterNodePrune — a plain by-node_id DELETE, because PlanClusterNodeRemove's
+// phase-scoped deletes would not match a VOTER-phase ghost. Not-in-config ⇒ the delete cannot fork quorum.
+func (a *ClusterAdmin) removeGhost(nodeID string, force bool) error {
+	if !force {
+		n, err := a.countOwnedExposes(nodeID)
+		if err != nil {
+			return fmt.Errorf("recovery node remove %s: count owned exposes: %w", nodeID, err)
+		}
+		if n > 0 {
+			return &ErrRemoveOwnsResources{NodeID: nodeID, Exposes: n}
+		}
+	}
+	if err := a.node.RemoveServer(nodeID); err != nil {
+		return fmt.Errorf("recovery node remove %s (ghost): raft RemoveServer: %w", nodeID, err)
+	}
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterNodePrune([]string{nodeID}, a.now())
+	})
 }
 
 // nodePhase reads a roster row's phase (materialized read; no nested Propose).

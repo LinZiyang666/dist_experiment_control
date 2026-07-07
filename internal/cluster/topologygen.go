@@ -12,7 +12,11 @@ import (
 // PlanClusterCertRotate, and a tunnel-cert rotation changes NOTHING in the rendered conf (the conf
 // emits cert FILE PATHS, never fingerprints) — reusing it would flap the cluster to DEGRADED on every
 // routine cert rotation. Mirrors rostergen.go (same monotone + change-gated + all-literal pattern).
-const metaKeyTopologyGeneration = "topology_generation"
+// MetaKeyTopologyGeneration is the cluster_meta key of the monotone topology-generation counter,
+// exported for internal/clusteroffline's offline force-single prune (direct-SQL, daemon down). Internal
+// code keeps using the lowercase alias.
+const MetaKeyTopologyGeneration = "topology_generation"
+const metaKeyTopologyGeneration = MetaKeyTopologyGeneration
 
 // TopologyGeneration reads the monotone topology generation counter (bounded-stale, no txn). Missing
 // row reads as 0 (the D0-empty cluster_meta convention, shared with applied_index / roster_generation).

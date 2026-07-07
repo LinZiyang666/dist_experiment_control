@@ -897,8 +897,37 @@ func (b *Broker) Run(ctx context.Context) error {
 				return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 " +
 					"node — a single node cannot form the clustered JetStream meta quorum. The nats.conf almost " +
 					"certainly still has a `cluster{}` block: de-cluster it to standalone JS with " +
-					"`tether cluster reconcile nats --to-standalone --confirm-single` (or, if mid-grow, finish the " +
-					"grow / remove the half-added peer). N=1 MUST run standalone JetStream")
+					"`tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> " +
+					"--broker-nkey <self-bus-nkey>` (server-name = the conf's server_name; broker-nkey = the bus nkey " +
+					"from the broker.nk seed in secrets_dir or cluster_nodes.bus_nkey_pub, NOT broker.yaml; or, if " +
+					"mid-grow, finish the grow / remove the half-added peer). N=1 MUST run standalone JetStream")
+			}
+			// G2 #10: voters>=2 but no JetStream at boot is the force-single-EJECTED trap — this node's
+			// on-disk raft config still lists {this, peer(s)} (voters>=2), but a survivor may have
+			// force-singled to {survivor} WITHOUT it, so clustered JS can never reach quorum-of-2 and the
+			// broker crash-loops (exit 70). Ejection is NOT locally provable (no quorum; peers unreachable
+			// by design), so emit a RANKED DIFFERENTIAL (transient-mesh vs ejected) from the local raft
+			// config only — never a hard assertion — and point at the crash-loop stop + rejoin runbook.
+			if verr == nil && voters >= 2 {
+				if cfg, cerr := b.cl.node.RaftConfiguration(); cerr == nil {
+					var peers []string
+					for _, s := range cfg {
+						if s.NodeID != b.selfID {
+							peers = append(peers, s.NodeID)
+						}
+					}
+					if len(peers) > 0 {
+						return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE at boot with "+
+							"voters=%d — this node's on-disk raft config still lists peer(s) %v, yet clustered JetStream cannot "+
+							"reach quorum. TWO likely causes: (1) TRANSIENT — the NATS routes mesh is not yet formed / peers are "+
+							"down (verify routes in /etc/tether/nats.d/nats.conf and that peers are up; JS self-heals once quorum "+
+							"returns); or (2) EJECTED — a survivor ran force-single WITHOUT this node, orphaning it (a restart will "+
+							"NOT self-heal). STOP the crash-loop now: systemctl stop tether-broker. Confirm which on a survivor via "+
+							"`tether cluster status --remote`; if this node was force-singled out, WIPE its stale raft state and "+
+							"rejoin: `tether cluster recovery rejoin prepare --self-id %s --dump-divergent <file>`, then `tether "+
+							"cluster join approve` from the leader (see docs/cluster-runbook.md)", voters, peers, b.selfID)
+					}
+				}
 			}
 			return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE (voters=%d) — the "+
 				"NATS routes mesh is likely not formed (clustered JetStream meta needs quorum). Verify the routes "+

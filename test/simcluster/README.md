@@ -204,9 +204,9 @@ isolated instance on exit); do not loop all drills in one shot on a busy box.
 | `10-grow-to-3` | GREEN: real N=1→2→3 grow, 3 VOTER + streams R=3 + 3-node JS meta + follower-kill quorum proof |
 | `11-grow-gaps` | RED (#8/#I1): `grow` reaches VOTER only via labeled workarounds — `join approve --wait` stalls pre-mesh (#8, tether's own "still in flight"); a fresh joiner without `cluster init` can't serve (#I1, `serve` refuses "no raft state"); asserts the `GREW-VIA-WORKAROUNDS` trailer |
 | `13-inbroker-reconcile-perm` | GREEN (#22 FIXED, G1 Option B): the reconciler's nats.conf now lives in tether-owned `/etc/tether/nats.d/` (`/etc/tether` STAYS root-owned — Caddyfile safe), so the `User=tether` in-broker reconciler writes it + auto-converges. Asserts `/etc/tether` root-owned + `nats.d/` tether-owned + every voter's `nats_conf_path` at nats.d/ + a `User=tether` write into nats.d/ succeeds + grow drops the #22 token |
-| `20-forcesingle-natsconf` | RED (#20): force-single leaves nats.conf clustered → tier-B JS 503-rots |
-| `21-smalldisk-tierb` | RED (#21): 8 GiB OBJ_xfer reservation denies tier-B on a small (tmpfs-capped) store |
-| `12-ghost-voter` | RED (#12): force-single ghost VOTER — all three online removal paths refuse |
+| `20-forcesingle-natsconf` | GREEN (#20/#12 FIXED, G2): OFFLINE force-single auto-de-clusters the survivor's nats.conf to standalone (identity from cluster_nodes) + prunes the abandoned peer → after a JS-store reset + restart, tier-B WORKS at N=1 (14 assertions). Was RED: force-single left the conf clustered → silent JS 503-rot |
+| `21-smalldisk-tierb` | GREEN (#21 FIXED, G6): disk-aware OBJ_xfer MaxBytes (sized off the JS store ceiling, not a hardcoded 8 GiB) fits under a 4g tmpfs store → tier-B push works + file lands (8 assertions). Was RED: 8 GiB reservation → JS storage admission 10047 |
+| `12-ghost-voter` | GREEN (#12 FIXED, G2): force-single now AUTO-PRUNES the abandoned peer → no phase==VOTER ghost, so the old three-non deadlock premise is gone; the removal path cleanly reports 'no such roster node' (13 assertions, OFFLINE force-single). Upgrade-leftover ghost passthrough covered hermetically (`TestG2RemoveNodeGhostPassthrough` — the deploy tier has no sqlite3 / old binary to manufacture that legacy ghost). Was RED: force-single left the ejected peer phase==VOTER, all three online removal paths deadlocked |
 
 ## Real `tether` findings surfaced (2026-07-05)
 

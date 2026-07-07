@@ -347,6 +347,9 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
 	// B5 OPS#9: self-row capacity probes (disk statfs + port band) for `cluster status`.
 	b.cl.admin.SetCapacityProbes(b.cfg.StoreDir, b.cfg.PortBandLow, b.cfg.PortBandHigh)
+	// G2 #20: the live nats.conf path so status can raise the DATA-PLANE-DEGRADED banner when
+	// force-single left the survivor conf clustered (JetStream 503).
+	b.cl.admin.SetNatsConfPath(b.cfg.NatsConfPath)
 	// B7 DOC#5 + C6 BD6: the generic leader-side event emitter the drain uses for `expose_rehomed`
 	// (back-compat) + the C6 home_reassign_* / rehome_stalled lifecycle events.
 	b.cl.admin.emitEvent = b.pubSysEvent

@@ -8,6 +8,9 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
+	"github.com/LinZiyang666/tether/internal/natscluster"
+	"github.com/LinZiyang666/tether/internal/natsconf"
+	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -32,8 +35,100 @@ const (
 	defaultNatsConfPath = "/etc/tether/nats.d/nats.conf"
 )
 
+// readSelfIdentity reads this survivor's server_name (nats_server_id) + bus nkey (bus_nkey_pub) from its
+// OWN cluster_nodes row — the identity source for the offline de-cluster render, since a clustered conf's
+// multi-user authorization block cannot disambiguate which auth_user nkey is self's.
+func readSelfIdentity(dbPath, selfID string) (serverName, busNkey string, err error) {
+	db, derr := storage.OpenReadOnly("file:" + dbPath)
+	if derr != nil {
+		return "", "", derr
+	}
+	defer func() { _ = db.Close() }()
+	err = db.QueryRow(`SELECT nats_server_id, COALESCE(bus_nkey_pub,'') FROM cluster_nodes WHERE node_id=?`, selfID).
+		Scan(&serverName, &busNkey)
+	return serverName, busNkey, err
+}
+
+// buildStandaloneConf harvests THIS survivor's identity from its cluster_nodes row + the live conf, then
+// renders the merged STANDALONE nats.conf (no DryRun/Apply — PURE + hermetically testable, no external
+// nats-server binary). already==true (with the current store_dir) means the conf is ALREADY standalone (a
+// benign no-op for a hand-de-clustered survivor). The identity source is the plan's: a CLUSTERED conf's
+// authorization block lists one auth_user PER PEER, so own.AuthIdentity() cannot pick THIS survivor's
+// broker nkey (it returns "" for a multi-user block — the shape every N>=2 conf has); read the node's
+// server_name + bus nkey from its OWN cluster_nodes row instead. The account issuer IS the single
+// auth_callout.issuer, which AuthIdentity resolves.
+func buildStandaloneConf(confPath, selfID, dbPath string) (merged, storeDir string, already bool, err error) {
+	own, perr := natsconf.Preflight(confPath)
+	if perr != nil {
+		return "", "", false, perr
+	}
+	if !own.IsClusteredJetStream() {
+		return "", own.JSStoreDir(), true, nil // already standalone — nothing to de-cluster (idempotent)
+	}
+	storeDir = own.JSStoreDir()
+	if storeDir == "" {
+		return "", "", false, fmt.Errorf("source JetStream has no explicit store_dir (a standalone render would silently disable JetStream); set store_dir first")
+	}
+	serverName, brokerNkey, ierr := readSelfIdentity(dbPath, selfID)
+	if ierr != nil {
+		return "", "", false, fmt.Errorf("read self identity from cluster_nodes (node_id=%q): %w", selfID, ierr)
+	}
+	accountIssuer, _ := own.AuthIdentity()
+	if serverName == "" || accountIssuer == "" || brokerNkey == "" {
+		return "", "", false, fmt.Errorf("could not resolve de-cluster identity (server_name=%q account_issuer=%q broker_nkey_empty=%v)", serverName, accountIssuer, brokerNkey == "")
+	}
+	clientListen := own.ClientListen()
+	if clientListen == "" {
+		return "", "", false, fmt.Errorf("could not determine the client listen address from %q", confPath)
+	}
+	self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey}
+	cfg := natscluster.Config{
+		Standalone:    true,
+		Local:         self,
+		Peers:         []natscluster.Broker{self},
+		AccountIssuer: accountIssuer,
+		JSStoreDir:    storeDir,
+		ClientListen:  clientListen,
+		MonitorListen: own.MonitorHTTP(),
+	}
+	merged, err = natsconf.BuildMergedConf(own, cfg)
+	if err != nil {
+		return "", "", false, err
+	}
+	return merged, storeDir, false, nil
+}
+
+// deClusterStandaloneConf re-renders confPath to STANDALONE JetStream (drops the cluster{} block) via
+// buildStandaloneConf, validating with `nats-server -t`, atomically swapping (.bak kept), and proving the
+// applied conf is standalone with the SAME store_dir. It does NOT prove N=1 via the admin socket (offline
+// force-single already established {self} raft + a peer-dead HARD-REFUSE) and does NOT restart
+// nats-server. Returns the store_dir (for the JS-reset warning). already-standalone is a benign no-op.
+func deClusterStandaloneConf(confPath, natsServerBin, selfID, dbPath string) (storeDir string, changed bool, err error) {
+	merged, storeDir, already, err := buildStandaloneConf(confPath, selfID, dbPath)
+	if err != nil {
+		return "", false, err
+	}
+	if already {
+		return storeDir, false, nil // no-op — already standalone: no render, no swap, NO destructive JS-store reset
+	}
+	if err := natsconf.DryRun(natsServerBin, merged); err != nil {
+		return "", false, fmt.Errorf("rendered conf failed `nats-server -t` (not swapping; .bak intact): %w", err)
+	}
+	if err := natsconf.Apply(confPath, merged); err != nil {
+		return "", false, fmt.Errorf("apply: %w", err)
+	}
+	if post, perr := natsconf.Preflight(confPath); perr != nil {
+		return "", false, fmt.Errorf("applied conf failed to re-parse: %w", perr)
+	} else if !post.IsStandaloneJetStream() {
+		return "", false, fmt.Errorf("applied conf is not standalone JetStream (the .bak is preserved for rollback)")
+	} else if post.JSStoreDir() != storeDir {
+		return "", false, fmt.Errorf("applied conf store_dir %q != source %q (refusing to move the JS store)", post.JSStoreDir(), storeDir)
+	}
+	return storeDir, true, nil
+}
+
 func newClusterForceSingleCmd() *cobra.Command {
-	var dataDir, dbPath, selfID, selfAddr string
+	var dataDir, dbPath, selfID, selfAddr, natsConf, natsServerBin string
 	var confirmDead []string
 	var guided bool
 	var online, dryRun bool
@@ -91,9 +186,28 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			if err != nil {
 				return fmt.Errorf("force-single: %w", err)
 			}
+			// G2 #20: de-cluster the survivor's nats.conf to STANDALONE now, BEFORE the operator restarts
+			// the broker. Offline force-single leaves the daemon STOPPED, so the socket-gated `reconcile
+			// nats --to-standalone` would deadlock (it needs a running broker) and a restart with the
+			// clustered conf would exit 70 (clustered JS cannot form quorum-of-2 at N=1). already-standalone
+			// is a no-op, so this is always safe to run.
+			declustered := "; nats.conf de-clustered to standalone"
+			if storeDir, changed, derr := deClusterStandaloneConf(natsConf, natsServerBin, selfID, dbPath); derr != nil {
+				declustered = ""
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"WARNING: force-single succeeded but auto de-cluster of %s FAILED (%v).\n"+
+						"Before restarting the broker you MUST de-cluster nats.conf by hand (drop the cluster{} block), or it will exit 70 (clustered JS at N=1).\n", natsConf, derr)
+			} else if changed {
+				warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
+			} else {
+				// already standalone (e.g. a hand-de-clustered survivor) — a proven byte no-op: NO destructive
+				// JS-store reset warning, no false "de-clustered" claim (plan §4 铁律).
+				declustered = "; nats.conf already standalone (no change)"
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"force-single complete: %q is now a single-voter cluster (%d nodes abandoned).\n"+
-					"systemctl unmask tether-broker && systemctl start tether-broker, then recover the others.\n", selfID, len(abandoned))
+				"force-single complete: %q is now a single-voter cluster (%d nodes abandoned)%s.\n"+
+					"RESET the JS store as warned (if any), then systemctl unmask tether-broker && systemctl start tether-broker, then recover the others.\n",
+				selfID, len(abandoned), declustered)
 			return nil
 		},
 	}
@@ -105,6 +219,8 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 	cmd.Flags().BoolVar(&guided, "guided", false, "diagnose + print the exact force-single command (auto-derives --confirm-peers-dead, probes peers); executes nothing (B7 DOC#7)")
 	cmd.Flags().BoolVar(&online, "online", false, "recover via the RUNNING broker's admin socket — no daemon stop, no second outage (the preferred path)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "with --online: a zero-mutation drill (evaluate the gates + report) runnable on a HEALTHY cluster")
+	cmd.Flags().StringVar(&natsConf, "nats-conf", defaultNatsConfPath, "nats.conf to de-cluster to standalone after an OFFLINE force-single (#20)")
+	cmd.Flags().StringVar(&natsServerBin, "nats-server", "nats-server", "nats-server binary for the de-cluster -t dry-run validation")
 	registerYesRejector(cmd)
 	return cmd
 }
@@ -169,7 +285,11 @@ func runForceSingleOnline(cmd *cobra.Command, socket, selfID string, confirmDead
 		abandoned = len(commit.ForceSingle.Abandoned)
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n",
+		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n"+
+			"NEXT — the DATA plane (JetStream: file transfers / history / audit) stays 503 until you de-cluster this survivor's nats.conf:\n"+
+			"  tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> --broker-nkey <self-bus-nkey>\n"+
+			"  (server-name is this broker's nats_server_id — the conf's server_name: line; broker-nkey is its bus nkey — derive it from the broker.nk seed in secrets_dir, or read cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A multi-broker conf can't auto-pick self's nkey)\n"+
+			"then a FULL `systemctl restart nats-server` (the abandoned peers are already pruned, so the N=1 proof now passes). `cluster status` shows a DATA-PLANE-DEGRADED banner until you do.\n",
 		selfID, abandoned)
 	return nil
 }

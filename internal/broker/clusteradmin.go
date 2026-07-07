@@ -105,6 +105,11 @@ type ClusterAdmin struct {
 	// observability emitter the drain uses for `expose_rehomed` (back-compat) + the C6 home_reassign_*
 	// / rehome_stalled lifecycle events. nil ⇒ no event (single broker / unwired); secret-free payloads.
 	emitEvent func(kind string, fields map[string]any)
+
+	// G2 #20: natsConfPath (injected by SetNatsConfPath at wire time) lets StatusReport read the LIVE
+	// nats.conf to surface the DATA-PLANE-DEGRADED banner when force-single left the survivor conf
+	// clustered (JetStream 503, silently). "" ⇒ the banner check is skipped (tests / single mode).
+	natsConfPath string
 }
 
 // NewClusterAdmin builds the orchestrator. now is injectable for tests (default
@@ -124,6 +129,10 @@ func (a *ClusterAdmin) SetCapacityProbes(storeDir string, bandLow, bandHigh int)
 	a.portBandLow = bandLow
 	a.portBandHigh = bandHigh
 }
+
+// SetNatsConfPath injects the live nats.conf path (G2 #20) so StatusReport can surface the
+// DATA-PLANE-DEGRADED banner when force-single left the survivor conf clustered. Called once at wire time.
+func (a *ClusterAdmin) SetNatsConfPath(path string) { a.natsConfPath = path }
 
 // IssueJoinNonce mints a fresh single-use nonce and records it leader-locally.
 func (a *ClusterAdmin) IssueJoinNonce() (string, error) {

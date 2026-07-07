@@ -285,6 +285,20 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	for _, p := range roster {
 		abandoned = append(abandoned, p.NodeID)
 	}
+	// G2 #12: prune the abandoned peers from cluster_nodes so the signed roster converges to {self} and
+	// clients stop dialing (and failover-preferring) the dead endpoints. The raft config is ALREADY {self}
+	// (RecoverToSelfOnline moved the abandoned out above), so deleting their roster rows cannot fork quorum.
+	// BEST-EFFORT: a re-run to retry a failed prune is REFUSED by the dwell gate (the node now HAS leader
+	// contact → CodeQuorumNotLost), so a LOUD fail here would be an unreachable dead-end; log + carry on,
+	// and `cluster recovery node remove <ghost>` is the deterministic operator finalizer.
+	if len(abandoned) > 0 {
+		if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClusterNodePrune(abandoned, time.Now())
+		}); err != nil {
+			b.admin.logger.Warn("online force-single: roster prune of abandoned peers failed; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is a roster/status blemish, not a quorum risk)",
+				"abandoned", abandoned, "err", err)
+		}
+	}
 	return adminsock.Response{Op: op, OK: true, ForceSingle: &adminsock.ForceSingleReport{BrokerSelfID: selfID, Abandoned: abandoned}}
 }
 
