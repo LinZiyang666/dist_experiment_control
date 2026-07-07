@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/clusterroster"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
@@ -57,19 +59,29 @@ func connectCtlOpts(cmd *cobra.Command, verb, home, natsURL string, id *cli.Iden
 		return nil, connectError(verb, base, err)
 	}
 	if expandable {
-		refreshCtlEndpoints(cmd.Context(), home, base)
+		refreshCtlEndpoints(cmd.Context(), nc, home, base, id.PublicKey)
 	}
 	return nc, nil
 }
 
 // refreshCtlEndpoints is the tier-2 opportunistic discovery refresh: best-effort, TTL-gated, and
-// PIN-gated (no pin ⇒ return ⇒ NEVER HTTP-TOFUs, the tested agent invariant). It fetches the signed
-// manifest and funnels it through the agent's single adopt authority against the EXISTING pin — a
-// forged/foreign/expired/rollback manifest is rejected and leaves the cache bytes UNCHANGED (no poison).
-// No bootstrap URL configured (tier-1 invite-seed only) ⇒ no fetch ⇒ zero cost.
-func refreshCtlEndpoints(ctx context.Context, home, base string) {
+// PIN-gated. It funnels a signed manifest through the agent's single adopt authority (AdoptDecision)
+// against the EXISTING pin — a forged/foreign/expired/rollback manifest is rejected and leaves the cache
+// bytes UNCHANGED (no poison).
+//
+// G3 #17 — two changes to escape the "floor single-point" of the shipped version:
+//   - 改法二 (primary): pull the signed manifest from the ACTUALLY-CONNECTED broker over the live conn
+//     (SubjCtrlClusterRoster), so discovery converges from whichever survivor a transparent failover
+//     landed on — not the one pinned floor/bootstrap host. HTTP bootstrap is kept as a secondary fallback.
+//   - 改法一: the FloorURL==base gate B is REMOVED. A signed manifest self-authenticates against the OOB
+//     pin, so WHICH broker delivered it is cryptographically irrelevant. On the accepted path FloorURL is
+//     migrated to base so DialFor's FloorURL==base expansion gate self-heals after an operator re-point.
+//
+// 门A (PIN) stays ABSOLUTE and structural: a nil/empty pin ⇒ return BEFORE any consume — never TOFU-pin
+// off a network responder's self-claimed AccountPub (AdoptDecision would otherwise TOFU the roster path).
+func refreshCtlEndpoints(ctx context.Context, nc *nats.Conn, home, base, actor string) {
 	ce, err := cli.ReadClusterEndpoints(home)
-	if err != nil || ce == nil || ce.PinAccountPub == "" || ce.FloorURL != base || ce.BootstrapURL == "" {
+	if err != nil || ce == nil || ce.PinAccountPub == "" {
 		return
 	}
 	if ce.FetchedAt != "" {
@@ -77,24 +89,81 @@ func refreshCtlEndpoints(ctx context.Context, home, base string) {
 			return
 		}
 	}
-	fctx, cancel := context.WithTimeout(ctx, ctlManifestFetchTimeout)
-	defer cancel()
-	m, err := clusterroster.FetchManifest(fctx, ce.BootstrapURL, 0)
-	if err != nil || m == nil {
+	// templateURL = the STABLE cached FloorURL (fallback base) so DialURLs scheme/port/path templating is
+	// consistent regardless of which survivor answered (homogeneous-port assumption; only host varies).
+	tmpl := ce.FloorURL
+	if tmpl == "" {
+		tmpl = base
+	}
+	// Nothing to refresh FROM (no live conn AND no bootstrap URL) → return WITHOUT touching FetchedAt: we
+	// never attempted a fetch, so we must not throttle the next eligible connect.
+	if nc == nil && ce.BootstrapURL == "" {
 		return
 	}
 	prev := agent.RosterState{
 		Pin: ce.PinAccountPub, RosterGen: ce.RosterGen, SeedGen: ce.SeedGen,
 		Roster: ce.Roster, Seeds: ce.Seeds,
 	}
-	next, accepted := agent.AdoptDecision(prev, m.Roster, m.Seeds, base, time.Now())
-	if !accepted {
-		return // reject leaves the cache untouched (no poison)
+	next := prev
+	accepted := false
+	adopt := func(m *proto.ClusterManifest) {
+		if m == nil {
+			return
+		}
+		if n2, ok := agent.AdoptDecision(next, m.Roster, m.Seeds, tmpl, time.Now()); ok {
+			next = n2 // accumulate — AdoptDecision's monotone gate keeps the higher generation
+			accepted = true
+		}
 	}
-	ce.RosterGen = next.RosterGen
-	ce.Roster = next.Roster
-	ce.SeedGen = next.SeedGen
-	ce.Seeds = next.Seeds
+	// 改法二 primary: pull from the actually-connected survivor (escapes the floor/bootstrap single point).
+	adopt(fetchManifestOverNATS(ctx, nc, actor))
+	// External-review F1: if the NATS pull did not advance EITHER generation (a cached-but-stale roster-pull
+	// in the ≥30s manifest window, or nil / rejected — note the roster and seed gens advance independently,
+	// so a manifest can bump seed but not roster), consult the HTTP bootstrap too so a FRESHER manifest is
+	// not masked by the stale one. Both candidates flow through the SAME AdoptDecision monotone gate — the
+	// higher generation wins, a rollback/foreign one is still rejected (no poison). Only when NATS advanced
+	// BOTH gens (fully fresh) do we skip HTTP, preserving 改法二's "no bootstrap dependency" property.
+	if (next.RosterGen <= prev.RosterGen || next.SeedGen <= prev.SeedGen) && ce.BootstrapURL != "" {
+		fctx, cancel := context.WithTimeout(ctx, ctlManifestFetchTimeout)
+		defer cancel()
+		httpM, _ := clusterroster.FetchManifest(fctx, ce.BootstrapURL, 0)
+		adopt(httpM)
+	}
+	// Stage-C M2: we ATTEMPTED a refresh — advance FetchedAt to throttle it to at most once per ctlRefreshTTL,
+	// so a FAILING/non-advancing refresh does NOT re-incur the (possibly multi-second) fetch on every ctl
+	// command; it retries once per TTL, like a successful one.
 	ce.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	if accepted {
+		ce.RosterGen = next.RosterGen
+		ce.Roster = next.Roster
+		ce.SeedGen = next.SeedGen
+		ce.Seeds = next.Seeds
+		ce.FloorURL = base // 改法一: self-heal the DialFor expansion gate after a re-point (accepted path only)
+	}
+	// reject/no-progress → roster/seed/FloorURL fields untouched (no poison); only FetchedAt advanced.
 	_ = cli.WriteClusterEndpoints(home, ce)
+}
+
+// fetchManifestOverNATS pulls the signed cluster manifest from the connected broker over the live conn
+// (G3 #17 改法二). Returns nil on ANY request failure — ErrNoResponders (an old broker that never wired
+// the responder), a TIMEOUT (a cluster-mode-but-unsigned broker that is subscribed but silent, or a new
+// ctl whose JWT was minted by an OLD broker lacking the cluster-roster.req pub-allow so the publish is
+// refused), or a bad reply — so the caller falls back to the HTTP bootstrap. nil is NOT an error, it is
+// "this broker cannot answer over NATS". The reply is verified downstream by AdoptDecision against the
+// OOB pin (this never trusts it blindly).
+func fetchManifestOverNATS(ctx context.Context, nc *nats.Conn, actor string) *proto.ClusterManifest {
+	if nc == nil || actor == "" {
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, ctlManifestFetchTimeout)
+	defer cancel()
+	msg, err := nc.RequestWithContext(rctx, proto.SubjCtrlClusterRoster(actor), nil)
+	if err != nil || msg == nil || len(msg.Data) == 0 {
+		return nil
+	}
+	var m proto.ClusterManifest
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		return nil
+	}
+	return &m
 }

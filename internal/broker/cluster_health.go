@@ -24,6 +24,32 @@ func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf))
 }
 
+// SubscribeClusterRosterPull (G3 #17) wires the member-reachable roster-pull responder: a ctl connected
+// to ANY broker requests that broker's signed manifest on the live conn, so discovery converges from the
+// actually-connected survivor instead of the pinned floor/bootstrap host. It serves the broker's
+// PRE-SIGNED, ≥30s-rate-limited manifestBytes() cache — NEVER buildSignedRoster/buildSeedBundle per
+// request (that would be an unauthenticated-adjacent ed25519 signing DoS amplifier). Broadcast (no queue
+// group). In single mode / with no account seed manifestBytes() returns ok=false → the responder stays
+// silent → a ctl probe gets ErrNoResponders and falls back (byte-identical to today). The reply is the
+// discovery-only, account-signed ClusterManifest (roster + seeds; zero secrets).
+func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool)) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjCtrlClusterRosterWildcard, func(msg *nats.Msg) {
+		if msg.Reply == "" {
+			return
+		}
+		body, ok := manifestFn()
+		if !ok || body == nil {
+			// Stage-C m12: SINGLE mode → this responder is never wired (cluster-only mount) → no interest →
+			// the server fast-fails the ctl request with ErrNoResponders. CLUSTER mode with no account seed
+			// yet (or the sub-second window before the first sign) → the responder IS subscribed, so this
+			// silent return makes the ctl wait out its request timeout before falling back. Latency-only, a
+			// narrow window; correctness holds (the ctl still falls back to HTTP/cache).
+			return
+		}
+		_ = msg.Respond(body)
+	})
+}
+
 // SubscribeClusterCursor (D9 §17 round-1 BLOCKER fix) wires the same broadcast health
 // responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
 // observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).

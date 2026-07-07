@@ -283,6 +283,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
 		},
+		func() (*nats.Subscription, error) { return SubscribeClusterRosterPull(nc, b.manifestBytes) }, // G3 #17
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
 		},

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -405,13 +406,24 @@ func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	var total int64
+	var departedHosts []string // G3 #1: public_hosts of the peers actually deleted (for seed drop-only)
 	for _, p := range peers {
+		// Read the peer's public_host BEFORE deleting so we can drop its client endpoint from the seeds
+		// in the same txn (INV: prune + seed-write share ONE atomic boundary — a mid-crash never leaves
+		// "roster pruned but seeds still advertise the dead peer").
+		var host string
+		if err := tx.QueryRow(`SELECT public_host FROM cluster_nodes WHERE node_id = ?`, p.NodeID).Scan(&host); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		res, derr := tx.Exec(`DELETE FROM cluster_nodes WHERE node_id = ?`, p.NodeID)
 		if derr != nil {
 			return derr
 		}
-		if n, aerr := res.RowsAffected(); aerr == nil {
+		if n, aerr := res.RowsAffected(); aerr == nil && n > 0 {
 			total += n
+			if host != "" {
+				departedHosts = append(departedHosts, host)
+			}
 		}
 	}
 	// Change-gated (parity with the online rosterGenBumpStmt/topologyGenBumpStmt): bump ONLY if a row was
@@ -428,8 +440,56 @@ func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
 				return err
 			}
 		}
+		// G3 #1: converge the published seeds too — drop the departed peers' client endpoints (drop-only:
+		// the offline path synthesizes NO new endpoint, so it needs no scheme/port template and introduces
+		// no un-vetted dial target). Change-gated on an actual removal; the empty-set floor (INV-2) keeps
+		// the stored set if the drop would empty it (never wipe / strand cold-start clients).
+		if err := convergeSeedsDropHosts(tx, departedHosts, nowNano); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+// convergeSeedsDropHosts drops the departed peers' client endpoints from the replicated seed set within
+// the caller's txn (G3 #1 offline drop-only). It reads stored seed_endpoints, removes any URL whose host
+// is a departed peer, and — ONLY if that actually changed the set AND left it non-empty (INV-2: never
+// wipe / strand cold-start clients) — writes it back + MAX-floor bumps seed_generation (anti-rollback
+// across a restart replay). A VIP/LB host that is not a departed peer is kept.
+func convergeSeedsDropHosts(tx *sql.Tx, departedHosts []string, nowNano string) error {
+	if len(departedHosts) == 0 {
+		return nil
+	}
+	var epRaw string
+	if err := tx.QueryRow(`SELECT value FROM cluster_meta WHERE key = ?`, cluster.MetaKeySeedEndpoints).Scan(&epRaw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // no seeds published → nothing to converge
+		}
+		return err
+	}
+	var endpoints []string
+	for _, e := range strings.Split(epRaw, "\n") {
+		if e != "" {
+			endpoints = append(endpoints, e)
+		}
+	}
+	filtered := cluster.SeedEndpointsDropHosts(endpoints, departedHosts)
+	if len(filtered) == 0 || len(filtered) == len(endpoints) {
+		return nil // empty-set floor (never wipe) OR nothing dropped (change-gate)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO cluster_meta(key, value) VALUES(?, ?) `+
+			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		cluster.MetaKeySeedEndpoints, strings.Join(filtered, "\n")); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO cluster_meta(key, value) VALUES(?, ?) `+
+			`ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(cluster_meta.value AS INTEGER)+1, CAST(excluded.value AS INTEGER))`,
+		cluster.MetaKeySeedGeneration, nowNano); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RecoverOptions configures recover --dump-divergent.

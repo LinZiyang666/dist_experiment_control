@@ -258,6 +258,12 @@ func (a *ClusterAdmin) AddNode(in cluster.ClusterNodeUpsertInput, raftAddr strin
 			a.logger.Warn("cluster add: failed to clear force_single_active marker", "err", perr)
 		}
 	}
+	// G3 #1: converge the published seeds so the new VOTER's client endpoint reaches fresh agents/ctl
+	// without a manual `cluster seeds publish`. Best-effort — never fail an established member; a later
+	// membership op or the leadership backstop re-converges.
+	if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
+		a.logger.Warn("cluster add: seed auto-converge failed (new member not yet in published seeds)", "err", serr)
+	}
 	return nil
 }
 
@@ -334,6 +340,14 @@ func (a *ClusterAdmin) ReconcileMembershipOnLeadership() error {
 			a.logger.Error("cluster: INCONSISTENT — roster row in a live phase but NOT a raft voter; run `cluster doctor` (a bare remove of a live node, or a lost AddVoter)",
 				"node_id", id, "phase", phase)
 		}
+	}
+	// G3 #1: leadership-edge backstop for seed convergence. A per-commit deriveAndConvergeSeedsFromRoster
+	// is best-effort; if one failed (or was lost with leadership) and no further membership op follows, the
+	// published seeds stay stale forever. Re-running it on every leadership acquisition closes that hole —
+	// the deterministic change-gate (seedSetEqual) makes it a no-op (no seed_generation bump) when nothing
+	// changed, so this backstop never churns the fleet on routine elections.
+	if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
+		a.logger.Warn("cluster reconcile: seed auto-converge failed", "err", serr)
 	}
 	return nil
 }

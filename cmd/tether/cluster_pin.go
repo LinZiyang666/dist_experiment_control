@@ -71,9 +71,11 @@ first so failover knows your primary broker_url.`,
 				return fmt.Errorf("cluster pin: %w", err)
 			}
 			// Eager best-effort warm so a bootstrap-only invite (no inline seed) is useful immediately
-			// instead of only after the next File-source connect. No-op without a bootstrap URL.
+			// instead of only after the next File-source connect. No-op without a bootstrap URL. Pin is OOB
+			// (no broker conn yet) → nil nc + empty actor → the NATS roster-pull is skipped, HTTP bootstrap
+			// serves the warm (G3 #17).
 			if ce.BootstrapURL != "" {
-				refreshCtlEndpoints(cmd.Context(), home, base)
+				refreshCtlEndpoints(cmd.Context(), nil, home, base, "")
 			}
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "pinned cluster %s\n", shortPub(inv.Pin))

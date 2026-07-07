@@ -22,6 +22,13 @@ func PermissionsForUnactivated(actor string) jwt.Permissions {
 		Pub: jwt.Permission{Allow: []string{
 			subjectPrefix + ".ctrl.by." + actor + ".session.create.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session.list.req",
+			// G3 #17: roster-pull. refreshCtlEndpoints fires on EVERY expandable connect — including
+			// unactivated ones (session list / login) — so an unactivated ctl must be able to pub it or
+			// the refresh would silently fail on a NATS permission violation. The reply is discovery-only
+			// public topology (zero secrets) served from the broker's O(1) pre-signed manifestBytes()
+			// cache, so the widened surface is a memcpy, not a signing amplifier. Actor-scoped
+			// (unforgeable) and under ctrl.by.<actor>.* — §13.8 (member denied cluster.*) stays green.
+			subjectPrefix + ".ctrl.by." + actor + ".cluster-roster.req",
 			"_INBOX.>",
 		}},
 		Sub: jwt.Permission{Allow: []string{
@@ -66,6 +73,7 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			// NOT broker-only tether.v2.cluster.* (the §13.8 negative test that a member cannot
 			// pub cluster.apply.* stays green; a positive test asserts member reach to these).
 			subjectPrefix + ".ctrl.by." + actor + ".cluster-health.req",
+			subjectPrefix + ".ctrl.by." + actor + ".cluster-roster.req", // G3 #17 roster-pull (same rationale as unactivated)
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ls.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ack.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",

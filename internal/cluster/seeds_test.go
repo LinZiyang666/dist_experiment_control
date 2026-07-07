@@ -12,7 +12,7 @@ func TestPlanClusterSeedsPublishValidation(t *testing.T) {
 			t.Fatalf("endpoints %v must be rejected", eps)
 		}
 	}
-	many := make([]string, maxSeedEndpoints+1)
+	many := make([]string, MaxSeedEndpoints+1)
 	for i := range many {
 		many[i] = "nats://b:4222"
 	}

@@ -131,6 +131,28 @@ func TestD8bMemberAlertACLCarveOut(t *testing.T) {
 	}
 }
 
+// TestG3RosterPullGrantedBothTemplates (G3 #17): roster-pull is granted in BOTH templates — UNLIKE the
+// activated-only cluster-health carve-out — because refreshCtlEndpoints fires on every expandable connect,
+// including unactivated ones (session list / login). The §13.8 invariant still holds: ".cluster-roster."
+// is a DISTINCT token from ".cluster.", so a member grant of it never reaches the broker-only namespace.
+func TestG3RosterPullGrantedBothTemplates(t *testing.T) {
+	want := subjectPrefix + ".ctrl.by." + sampleActor + ".cluster-roster.req"
+	if !contains(PermissionsForUnactivated(sampleActor).Pub.Allow, want) {
+		t.Errorf("unactivated CLI must be granted %q (refresh fires on unactivated connects)", want)
+	}
+	if !contains(PermissionsForActivatedMember(sampleActor, "lab").Pub.Allow, want) {
+		t.Errorf("activated member must be granted %q", want)
+	}
+	for _, allow := range append(
+		append([]string{}, PermissionsForUnactivated(sampleActor).Pub.Allow...),
+		PermissionsForActivatedMember(sampleActor, "lab").Pub.Allow...,
+	) {
+		if strings.Contains(allow, ".cluster.") {
+			t.Errorf("pub allow %q reaches the broker-only cluster.* namespace (§13.8)", allow)
+		}
+	}
+}
+
 // agents are NEVER allowed to publish `audit.*` — audit is tetherd-single-
 // writer (architecture C.1 §4 / B.2 note).
 func TestAgentCannotPublishAudit(t *testing.T) {

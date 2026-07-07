@@ -169,6 +169,11 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	}); err != nil {
 		a.logger.Warn("cluster retire: clear broker_draining marker failed", "node_id", nodeID, "err", err)
 	}
+	// G3 #1: the retired node's roster row is DELETEd (PlanClusterNodeRemove above), so converge the
+	// published seeds to drop its now-dead client endpoint. Best-effort — never fail a completed retire.
+	if err := a.deriveAndConvergeSeedsFromRoster(); err != nil {
+		a.logger.Warn("cluster retire: seed auto-converge failed (retired node's endpoint lingers in published seeds)", "node_id", nodeID, "err", err)
+	}
 	return nil
 }
 
@@ -249,9 +254,13 @@ func (a *ClusterAdmin) RemoveNode(nodeID string, force bool) error {
 	if err := a.node.RemoveServer(nodeID); err != nil {
 		return fmt.Errorf("recovery node remove %s: raft RemoveServer: %w", nodeID, err)
 	}
-	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterNodeRemove(nodeID, a.now())
-	})
+	}); err != nil {
+		return err
+	}
+	a.convergeSeedsAfterRemoval(nodeID) // G3 #1 M1
+	return nil
 }
 
 // ErrRemoveOwnsResources is returned when `cluster remove` (no --force) targets a
@@ -319,9 +328,13 @@ func (a *ClusterAdmin) removeGhost(nodeID string, force bool) error {
 	if err := a.node.RemoveServer(nodeID); err != nil {
 		return fmt.Errorf("recovery node remove %s (ghost): raft RemoveServer: %w", nodeID, err)
 	}
-	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterNodePrune([]string{nodeID}, a.now())
-	})
+	}); err != nil {
+		return err
+	}
+	a.convergeSeedsAfterRemoval(nodeID) // G3 #1 M1: converge seeds so the cleared ghost's endpoint leaves the bundle
+	return nil
 }
 
 // nodePhase reads a roster row's phase (materialized read; no nested Propose).

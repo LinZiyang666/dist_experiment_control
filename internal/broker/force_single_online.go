@@ -297,6 +297,12 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 		}); err != nil {
 			b.admin.logger.Warn("online force-single: roster prune of abandoned peers failed; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is a roster/status blemish, not a quorum risk)",
 				"abandoned", abandoned, "err", err)
+		} else if serr := b.admin.deriveAndConvergeSeedsFromRoster(); serr != nil {
+			// G3 #1: prune succeeded → roster is {self}; converge the published seeds so clients stop
+			// dialing (and failover-preferring) the abandoned endpoints. GATED on prune success (INV-4):
+			// deriving before the prune commits would re-derive the dead endpoints straight back into seeds.
+			b.admin.logger.Warn("online force-single: seed auto-converge failed (abandoned endpoints linger in published seeds until a later op / leadership backstop)",
+				"err", serr)
 		}
 	}
 	return adminsock.Response{Op: op, OK: true, ForceSingle: &adminsock.ForceSingleReport{BrokerSelfID: selfID, Abandoned: abandoned}}

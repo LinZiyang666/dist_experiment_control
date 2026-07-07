@@ -254,6 +254,17 @@ roster >1 台且无人应答 `:7400`（`health` 串为 `ROSTER_UNREACHABLE`，�
 
 `recovery force-single` 在输 node-id 前还会内联打印劈脑裂后果；`cluster retire` 成功后提醒"retire 是拓扑改、非凭据撤销"（见 `cluster-runbook.md` §2.1）。
 
+### 5.6.9 客户端视图自动收敛（seeds / roster discovery，G3）
+
+成员变化（`join approve` / `retire` / `force-single`）后，客户端（agent 与 ctl）的连接名册**自动收敛到真实成员**，无需手动运维：
+
+- **seed 自动发布（#1）**：leader 在每次成员提交后，从当前 roster 各 broker 的 `public_host` 派生 client-dialable 端点并**自动重发签名 seeds**——**首次** `cluster seeds publish` 仍需运维手动执行（它确立端点的 scheme/port/path 模板，如 `wss://<host>:443`），此后 grow 增员、retire/force-single 减员都自动收敛，`cluster seeds show` 自动反映真实成员。change-gated：端点集不变时不重发（不惊扰车队）。存量集群（已手动 publish 过、seeds 含某 broker 的 `public_host`）下次 leader 换届即自动接管收敛，**无需额外 opt-in**。
+- **operator VIP/LB 端点受保护（仅纯集）**：若你手动 publish 的 seeds **不含任何 broker 的 `public_host`**（纯 VIP/LB 集），自动收敛判定它为运维精心配置、**完全不覆盖**。但**durable 自定义/IP 端点应放 ctl 端 `InviteSeeds`**（`cluster pin` 的 invite `seed=` 参数、client-side OOB 永久 floor、never-clobber），而非 broker 托管的签名 seed 层——这条权责分离是推荐做法。
+  - ⚠ **混合集会被静默抹除自定义部分**：若你把 VIP/自定义端点**混入**一个含某 broker `public_host` 的集，下次成员变/换届收敛会判定整集为"broker 端点集"并从 roster **wholesale 重建**，**静默丢弃**混入的自定义端点（且模板 scheme/port 取自集中第一个 tls/wss 项，混入异端口的自定义项还会让派生端口出错）。故 durable 自定义端点**必须**单独放 `InviteSeeds`，**切勿**与 broker 端点混在一个 `cluster seeds publish` 里。
+  - ⚠ **纯被弃端点集不自动收敛（残留 GAP）**：极少数情况下若 published seeds 恰好**只含已被弃 broker 的端点**（survivor 从未被 publish 进 seeds、或先前的非对称状态），host-match 无法区分它与纯 VIP 集 → 判为 operator 集、**不自动收敛**（死端点滞留、活 survivor 缺席）。此时冷启动仍有 HTTP bootstrap / 配置的 `broker_url` floor 兜底（degraded-not-fatal），恢复靠一次手动 `cluster seeds publish <survivor-endpoint>` 或把 survivor 端点放进 `InviteSeeds`。（**稳态 seeds 含所有 broker，此例不现实**；仅在你手动 publish 过一个不含任一现存 broker 的集时出现。）
+- **ctl 从任一幸存者刷新（#17）**：`ctl` 连上**任一** broker 后，会在该连接上直接拉取该 broker 的签名名册刷新本地缓存（`cluster_endpoints.json`），不再要求"连的正好是 pin 时的 floor broker"。故 floor/bootstrap broker 死亡、经 failover 连到幸存者时，名册仍能收敛。旧 broker（无此响应者）时自动回退到 HTTP bootstrap（无副作用）。**信任锚不变**：无 OOB pin 的 ctl 绝不从网络应答者 TOFU。
+- **DNS-独立 IP fallback（#11）**：域名解析/代理链（如 Clash fake-ip）依赖单点时，把 `tls://<真实IP>:443` 放进 ctl `InviteSeeds` 作 fallback floor。**注意**：对 Caddy-fronted broker（`wss://$DOMAIN:443`、证书 SNI 绑域名、无 IP SAN、无公网 raw-NATS listener），`tls://<ip>` 直连**不可用除非做部署层改造**（IP-SAN 证书 + Caddy default site + 公网 raw-NATS listener）——这是拓扑改造、不在自动收敛范围内。
+
 ### 5.7 `tether alert`（cluster alerts）
 
 ```

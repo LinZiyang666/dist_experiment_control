@@ -251,11 +251,23 @@ func SubjCtrlAlertAck(actor string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.alert.ack.req", SubjectPrefix, actor)
 }
 
+// SubjCtrlClusterRoster (G3 #17) — the member-reachable, actor-scoped roster-pull: a ctl connected to
+// ANY broker requests that broker's signed cluster manifest (roster + seeds) on the live conn, so
+// discovery converges from the actually-connected survivor instead of the pinned floor/bootstrap host.
+// Deliberately UNDER ctrl.by.<actor>.* (actor-locked, unforgeable) — NOT broker-only tether.v2.cluster.*
+// — so the §13.8 negative test (member denied cluster.apply.*) stays green (the leaf token is
+// ".cluster-roster." not ".cluster."). The reply is the discovery-only, account-signed manifest (zero
+// secrets); the broker serves its pre-signed, rate-limited manifestBytes() cache (no per-request sign).
+func SubjCtrlClusterRoster(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.cluster-roster.req", SubjectPrefix, actor)
+}
+
 // Broker-side wildcard subscriptions for the D8b ctl RPCs (any actor segment). cluster-health
 // is broadcast (every broker answers, ctl corroborates); alert.ls uses a queue group (any one
 // broker serves the bounded-stale replicated read); alert.ack any broker forwards to leader.
 const (
 	SubjCtrlClusterHealthWildcard = SubjectPrefix + ".ctrl.by.*.cluster-health.req"
+	SubjCtrlClusterRosterWildcard = SubjectPrefix + ".ctrl.by.*.cluster-roster.req" // G3 #17 roster-pull
 	SubjCtrlAlertLsWildcard       = SubjectPrefix + ".ctrl.by.*.alert.ls.req"
 	SubjCtrlAlertAckWildcard      = SubjectPrefix + ".ctrl.by.*.alert.ack.req"
 )

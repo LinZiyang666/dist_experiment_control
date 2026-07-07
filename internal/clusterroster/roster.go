@@ -196,7 +196,7 @@ func DialURLs(r *proto.ClusterRoster, templateURL string) ([]string, error) {
 	var voters, transient, draining []string
 	for _, b := range r.Brokers {
 		host := b.PublicHost
-		if host == "" || isUndialableHost(host) {
+		if host == "" || IsUndialableHost(host) {
 			continue
 		}
 		hostport := host
@@ -221,10 +221,10 @@ func DialURLs(r *proto.ClusterRoster, templateURL string) ([]string, error) {
 	return dedupeStable(out), nil
 }
 
-// isUndialableHost reports whether a roster PublicHost can never be reached from another machine
+// IsUndialableHost reports whether a roster PublicHost can never be reached from another machine
 // (loopback / unspecified) and so must be skipped — a broker that advertises "localhost" / "0.0.0.0"
 // (publicHostFor can fall back to "localhost") must not strand an agent onto an un-dialable target.
-func isUndialableHost(host string) bool {
+func IsUndialableHost(host string) bool {
 	if host == "localhost" {
 		return true
 	}
