@@ -210,6 +210,11 @@ const metaTestKeyPrefix = "t:"
 // applied_index, never wedges) rather than silently replaying an empty audit set.
 const commandVersion = 2
 
+// CommandVersion exports the raft command-encoding version (DECOUPLED from proto.ProtoVersion). G5 #13
+// folds it into ClusterHealthResp so `cluster upgrade` can refuse a rolling upgrade whose target bumps
+// it (a commandVersion mismatch POISONs the log per-replica — a rolling roll would silently fork the FSM).
+func CommandVersion() int { return commandVersion }
+
 // Statement is one baked, leader-rendered SQL statement plus its already-frozen
 // SQL parameters.
 //

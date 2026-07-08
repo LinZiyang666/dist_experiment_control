@@ -60,6 +60,7 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	addGrouped(newClusterJoinCmd(&socketPath), "online")      // C4: join prepare/approve (recoverable; replaces `add`/`sign-join`)
 	addGrouped(newClusterRetireCmd(&socketPath), "online")    // C4: retire (recoverable; replaces `drain --retire`/`remove`)
 	addGrouped(newClusterRebalanceCmd(&socketPath), "online") // C-rebalance: rebalance proxy (spread __proxy__ homes)
+	addGrouped(newClusterUpgradeCmd(), "online")              // G5 #13/#14: rolling broker-daemon upgrade (over NATS, signed)
 	addGrouped(newClusterPinCmd(), "client")                  // cli-failover: pin a cluster from an OOB discovery invite
 	addGrouped(newClusterInviteCmd(), "client")               // cli-failover: mint an OOB discovery invite
 	addGrouped(newClusterInitCmd(), "migrate")
@@ -124,6 +125,10 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 			"  tether cluster status --offline --db /var/lib/tether/tether.db   # disk roster (daemon stopped)",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if homes && remote {
+				// G7b #16: the over-NATS homes aggregate (per-broker __proxy__ home counts, no socket).
+				return clusterStatusHomesRemote(cmd, home, natsURL, asJSON)
+			}
 			if homes {
 				// C6 建议5: the homes aggregate (its own view; no exit-code contract — a descriptive read).
 				return clusterStatusHomes(cmd, *socketPath, asJSON)
@@ -169,7 +174,8 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 	cmd.MarkFlagsMutuallyExclusive("remote", "watch")
 	cmd.Flags().BoolVar(&homes, "homes", false, "C6: aggregate every expose + proxy home/epoch/ready_reason (one descriptive view; no exit-code contract)")
 	cmd.MarkFlagsMutuallyExclusive("homes", "offline")
-	cmd.MarkFlagsMutuallyExclusive("homes", "remote")
+	// G7b #16: --homes + --remote is now ALLOWED (the over-NATS home-count aggregate). The other
+	// homes combinations stay mutually exclusive (offline = disk snapshot, watch = socket repaint).
 	cmd.MarkFlagsMutuallyExclusive("homes", "watch")
 	// doctor is an alias for status (the diagnostic framing).
 	return cmd

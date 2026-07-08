@@ -38,6 +38,11 @@ const (
 	// SetRoute (NatsRoute) rewrites the NATS route-mesh advertise (the twin).
 	OpClusterSetRaftAddr = "cluster_set_raft_addr"
 	OpClusterSetRoute    = "cluster_set_route"
+	// OpBrokerUpgradeReload (G5 #13) reloads THIS broker daemon into the freshly-staged on-disk binary
+	// via a PID-preserving syscall.Exec. Local-socket-only (root Unix socket); dispatched BEFORE the
+	// leader gate and REFUSES if this broker is the raft leader (the orchestrator transfers leadership
+	// off first). Idempotent (skip if already at ToVersion) + sha-gated (never re-exec a stale binary).
+	OpBrokerUpgradeReload = "broker_upgrade_reload"
 
 	// C4 operation-controller verbs (leader-local; a follower replies NotLeader+LeaderHost).
 	OpClusterJoinApprove = "cluster_join_approve" // approve a join bundle → create+drive a join op
@@ -111,6 +116,8 @@ const (
 	CodeQuorumNotLost      = "quorum_not_lost"      // not (yet) continuously quorum-lost for T_dwell
 	CodeForceSingleRefused = "force_single_refused" // generic force-single gate refusal
 	CodeArmExpired         = "arm_expired"          // commit without a fresh arm token (missing/expired/wrong)
+	CodeIsLeader           = "is_leader"            // G5 #13: reload refused because this broker is the raft leader
+	CodeShaMismatch        = "sha_mismatch"         // G5 #13: on-disk binary sha != the staged target (staging didn't land)
 )
 
 // clusterOps is the set the server routes to Backend.Cluster.
@@ -178,6 +185,11 @@ type Request struct {
 	// C-rebalance: preview the proxy-home moves without executing them (`cluster rebalance proxy --dry-run`).
 	// Also: online force-single Arm DryRun = a zero-mutation drill (runs the gates + reports, mints no token).
 	DryRun bool `json:"dry_run,omitempty"`
+	// G5 #13 OpBrokerUpgradeReload: the target release (idempotency skip if already running it) + the
+	// hex sha256 the STAGED on-disk binary must match (staging is the privileged precondition; the reload
+	// refuses if the on-disk binary is stale so it never re-execs a bad/unstaged image).
+	ToVersion    string `json:"to_version,omitempty"`
+	ExpectSHA256 string `json:"expect_sha256,omitempty"`
 
 	// Online force-single args (local socket only). ConfirmPeersDead must list EVERY other node_id (the
 	// operator's typed assertion that they are TRULY dead); ArmToken is the broker-minted token from Arm,
@@ -229,6 +241,11 @@ type Response struct {
 	// B2 item 4: stable machine error code (one of the Code* consts), "" on success / legacy.
 	// Additive + omitempty ⇒ an old CLI ignores it and an old broker never sets it.
 	Code string `json:"code,omitempty"`
+
+	// G5 #13 OpBrokerUpgradeReload result: Reloading = a re-exec into the staged binary was armed (the ctl
+	// channel drops momentarily as the broker restarts); AlreadyAtVersion = idempotent no-op skip.
+	Reloading        bool `json:"reloading,omitempty"`
+	AlreadyAtVersion bool `json:"already_at_version,omitempty"`
 
 	Sessions []SessionEntry `json:"sessions,omitempty"`
 	Nodes    []NodeEntry    `json:"nodes,omitempty"`

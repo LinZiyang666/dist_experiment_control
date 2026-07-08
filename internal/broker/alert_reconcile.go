@@ -47,6 +47,10 @@ type AlertReconcilerConfig struct {
 	Webhook func(WebhookEvent)
 	// LeaderID returns the current leader's node id (stamped into the webhook body).
 	LeaderID func() string
+	// SetJSUnavailable (G7b #20③), when non-nil, is called with the leader's SUSTAINED JetStream-503
+	// verdict: true once Observe has failed with the 10008 signature for >= jsDownThreshold, false on
+	// the first positive observation OR when this node is no longer leader. nil disables JS-503 signalling.
+	SetJSUnavailable func(bool)
 }
 
 // AlertReconciler raises/clears the store-backed alerts the leader can cheaply determine:
@@ -63,7 +67,15 @@ type AlertReconciler struct {
 	// WITHOUT firing (else a new leader would re-POST every already-active alert).
 	prevActive    map[string]bool
 	webhookSeeded bool
+	// jsDownSince (G7b #20③) is the leader-local wall-clock of the FIRST JS-503 in the current run of
+	// failures (zero = not currently down). Reset on a positive observation or on losing leadership.
+	jsDownSince time.Time
 }
+
+// jsDownThreshold is how long the leader's replica observation must fail with the JS-503 (10008)
+// signature before the sustained-outage signal is raised — long enough that an election / meta-reform
+// blip does not false-alarm, short enough that a multi-day silent rot is impossible.
+const jsDownThreshold = 60 * time.Second
 
 func NewAlertReconciler(cfg AlertReconcilerConfig) *AlertReconciler {
 	if cfg.Now == nil {
@@ -163,6 +175,11 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 	now := r.cfg.Now()
 	if !r.cfg.Node.IsLeader() || r.cfg.Node.LeaderContactStale(now) {
 		r.webhookSeeded = false // lost leadership → re-baseline on the next leader pass (no re-fire)
+		// G7b #20③: a demoted leader drops its JS-503 state so it never answers a stale-true self-report.
+		r.jsDownSince = time.Time{}
+		if r.cfg.SetJSUnavailable != nil {
+			r.cfg.SetJSUnavailable(false)
+		}
 		return nil
 	}
 	current, err := cluster.ActiveAlertKeys(r.cfg.DB)
@@ -184,7 +201,33 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 		rep, oerr := r.cfg.Observe(ctx)
 		if oerr != nil {
 			r.cfg.Logger.Warn("d8b: replica observation failed (state unchanged)", "err", oerr)
+			// G7b #20③: sustained JS-503 detection. Advance the down-since clock ONLY on the 10008
+			// "system temporarily unavailable" signature (a stream-not-found / timeout / no-responder is
+			// NOT a wedged JS and must not raise). Raise the synthetic signal once it has persisted for
+			// >= jsDownThreshold, so an election / meta-reform blip never false-alarms.
+			if r.cfg.SetJSUnavailable != nil {
+				if classifyJSUnavailable(oerr) {
+					if r.jsDownSince.IsZero() {
+						r.jsDownSince = now
+					}
+					if now.Sub(r.jsDownSince) >= jsDownThreshold {
+						r.cfg.SetJSUnavailable(true)
+					}
+				} else {
+					// Stage-C M1: a NON-10008 error (stream-not-found / timeout / no-responder) is NOT a
+					// wedged-at-503 JS — a code that would never RAISE the signal must never PERPETUATE it
+					// (inv-6 no-stuck-ACTIVE; a force-single N=1 leader never demotes, so this is its only
+					// clear path). Symmetric with the positive-observe clear below.
+					r.jsDownSince = time.Time{}
+					r.cfg.SetJSUnavailable(false)
+				}
+			}
 		} else if rep.Observed {
+			// G7b #20③: a POSITIVE observation means JS is answering again → clear the JS-503 signal.
+			r.jsDownSince = time.Time{}
+			if r.cfg.SetJSUnavailable != nil {
+				r.cfg.SetJSUnavailable(false)
+			}
 			key := cluster.DedupKeyGlobal(cluster.AlertKindReplicationDegraded)
 			switch {
 			case rep.Degraded() && !current[key]:

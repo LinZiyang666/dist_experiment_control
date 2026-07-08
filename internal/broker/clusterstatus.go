@@ -327,12 +327,33 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// quorum-of-2) — SILENTLY, because the alert path itself rides JetStream (this is what let racknerd rot
 	// for days). Surface it OUT-OF-BAND on the status banner, keyed on the LIVE conf. Best-effort: a
 	// missing/unreadable conf just skips the extra banner (never fails the report).
+	jsClusteredForceSingle := false
 	if forceSingle && a.natsConfPath != "" {
 		if own, perr := natsconf.Preflight(a.natsConfPath); perr == nil && own.IsClusteredJetStream() {
-			if rep.Banner != "" {
-				rep.Banner += " "
-			}
+			jsClusteredForceSingle = true
+		}
+	}
+	// External-review m2 / round2 M1: surface the SAME runtime sustained-JS-503 signal `cluster status
+	// --remote` shows, not only the force-single+clustered-conf inference. sustained-503 is LEADER-observed,
+	// so an operator SSHed to a FOLLOWER (whose local jsUnavail is false) must still see it — OR-aggregate
+	// `JetStreamUnavailable` across the health-poll map (the same peer replies `--remote` folds), not only
+	// this broker's local flag. Emit ONE banner (dedup): force-single keeps its specific remedy; any other
+	// sustained-503 gets the generic degraded banner.
+	anyPeerJSUnavail := false
+	for _, h := range health {
+		if h.JetStreamUnavailable {
+			anyPeerJSUnavail = true
+			break
+		}
+	}
+	if jsClusteredForceSingle || (a.jsUnavail != nil && a.jsUnavail()) || anyPeerJSUnavail {
+		if rep.Banner != "" {
+			rep.Banner += " "
+		}
+		if jsClusteredForceSingle {
 			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE — nats.conf is still clustered after force-single (file transfers / history / audit return 503). De-cluster it: `tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> --broker-nkey <self-bus-nkey>` (server-name = the conf's server_name; broker-nkey = the bus nkey from the broker.nk seed in secrets_dir or cluster_nodes.bus_nkey_pub, NOT broker.yaml), then restart nats-server."
+		} else {
+			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE (sustained 503) — file transfers / history / audit are failing. Check `tether cluster status`, nats-server, and JetStream meta quorum."
 		}
 	}
 	rep.ExitCode = healthExitCode(rep.Health)
@@ -552,6 +573,9 @@ type clusterAdminBackend struct {
 	// C-rebalance: the leader-local proxy-home spread pass (`cluster rebalance proxy`). nil in single
 	// mode / tests that don't wire it ⇒ the op replies cluster_not_enabled.
 	rebalanceProxy func(dryRun bool) (*adminsock.ProxyRebalanceReport, error)
+	// requestReExec (G5 #13) arms the broker-daemon self-re-exec (Broker.RequestReExec). nil in single
+	// mode / tests that don't wire it ⇒ the reload op still replies but no restart is armed.
+	requestReExec func()
 	// fsArm tracks the online force-single sustained-quorum-loss dwell + single-shot arm token. nil ⇒
 	// the online force-single replies cluster_not_enabled (offline floor still works).
 	fsArm *forceSingleArm
@@ -615,6 +639,11 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 	}
 	if req.Op == adminsock.OpClusterForceSingleCommit {
 		return b.handleForceSingleCommit(req)
+	}
+	// G5 #13: the broker-daemon reload REFUSES if this broker is the leader (dispatch before the leader
+	// gate so it reaches the handler on the very node being restarted; the handler self-refuses on leader).
+	if req.Op == adminsock.OpBrokerUpgradeReload {
+		return b.handleBrokerUpgradeReload(req)
 	}
 	// Mutating verbs are leader-local (§8.1, NO forwarding): fail fast naming the leader.
 	if !b.admin.node.IsLeader() {

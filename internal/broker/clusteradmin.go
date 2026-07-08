@@ -110,6 +110,10 @@ type ClusterAdmin struct {
 	// nats.conf to surface the DATA-PLANE-DEGRADED banner when force-single left the survivor conf
 	// clustered (JetStream 503, silently). "" ⇒ the banner check is skipped (tests / single mode).
 	natsConfPath string
+	// jsUnavail (External-review m2) reads the broker's leader-observed SUSTAINED JS-503 signal so socket
+	// StatusReport surfaces the SAME runtime DATA-PLANE-DEGRADED banner as `cluster status --remote` (not
+	// only the force-single+clustered-conf inference). nil ⇒ skipped.
+	jsUnavail func() bool
 }
 
 // NewClusterAdmin builds the orchestrator. now is injectable for tests (default
@@ -133,6 +137,9 @@ func (a *ClusterAdmin) SetCapacityProbes(storeDir string, bandLow, bandHigh int)
 // SetNatsConfPath injects the live nats.conf path (G2 #20) so StatusReport can surface the
 // DATA-PLANE-DEGRADED banner when force-single left the survivor conf clustered. Called once at wire time.
 func (a *ClusterAdmin) SetNatsConfPath(path string) { a.natsConfPath = path }
+
+// SetJSUnavailFn (External-review m2) wires the broker's runtime JS-503 signal into StatusReport.
+func (a *ClusterAdmin) SetJSUnavailFn(fn func() bool) { a.jsUnavail = fn }
 
 // IssueJoinNonce mints a fresh single-use nonce and records it leader-locally.
 func (a *ClusterAdmin) IssueJoinNonce() (string, error) {

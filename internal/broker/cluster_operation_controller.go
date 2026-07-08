@@ -40,6 +40,9 @@ func (a *ClusterAdmin) assertNoActiveOp(target string) error {
 // and commits the roster admission (re-verified on every replica). The controller then drives it to
 // SERVING. Returns the op_id (= plan-id) for `--wait`.
 func (a *ClusterAdmin) StartJoinOperation(bundleStr string) (string, error) {
+	if upgradeActive(a.node.RODB()) {
+		return "", fmt.Errorf("cluster join: a `cluster upgrade` roll is in progress — retry after it completes (External-review B2)")
+	}
 	b, err := cluster.DecodeJoinBundle(bundleStr)
 	if err != nil {
 		return "", err
@@ -163,6 +166,9 @@ func (a *ClusterAdmin) abortRejectedJoinOp(op *cluster.Operation, reason string)
 // voter gates are checked SYNCHRONOUSLY here (so the CLI prompts immediately), AND re-run on every
 // drive by the controller. Returns the op_id for `--wait`.
 func (a *ClusterAdmin) StartRetireOperation(target string, confirmed bool) (string, error) {
+	if upgradeActive(a.node.RODB()) {
+		return "", fmt.Errorf("cluster retire %s: a `cluster upgrade` roll is in progress — retry after it completes (External-review B2)", target)
+	}
 	if err := a.assertNoActiveOp(target); err != nil {
 		return "", err
 	}
@@ -302,6 +308,13 @@ type substrate struct {
 // idempotent step. Called from the observe loop (leader-edge + each tick). A non-leader is a no-op.
 func (a *ClusterAdmin) driveInFlightOperations() {
 	if a == nil || a.node == nil || !a.node.IsLeader() {
+		return
+	}
+	// External-review round2 B2: a cluster-scoped `cluster upgrade` roll lock is a real MUTEX, not just a
+	// start-gate. While it is held, FREEZE every non-terminal membership op — do NOT drive phase
+	// transitions / AddVoter / drain / RemoveServer — so an already-in-flight join/retire cannot cross the
+	// rolling restart. The op state persists in raft; driving resumes automatically once the lock releases.
+	if upgradeActive(a.node.RODB()) {
 		return
 	}
 	ops, err := cluster.NonTerminalOperations(a.node.RODB())

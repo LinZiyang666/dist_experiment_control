@@ -73,6 +73,10 @@ type ClusterSection struct {
 	// (#22: a tether-owned subdir the User=tether reconciler can atomically rewrite; $ETC_DIR stays root-owned).
 	NatsConfPath  string `yaml:"nats_conf_path"`
 	NatsServerBin string `yaml:"nats_server_bin"`
+	// ColocatedAgentNID (G5 #19) is the nid of the tether agent co-located on this broker host. It is
+	// self-reported in ClusterHealthResp so `node ls --brokers` correlates the broker daemon's version
+	// with its agent's RELEASE. Empty ⇒ the CLI assumes node_id==nid (labelled "(assumed)").
+	ColocatedAgentNID string `yaml:"colocated_agent_nid"`
 }
 
 // UpgradeSection mirrors broker.upgrade — the architecture J.4

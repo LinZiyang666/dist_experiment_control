@@ -174,6 +174,43 @@ func TestC4JoinBarrierPersistedBeforeAddVoter(t *testing.T) {
 	}
 }
 
+// TestB2UpgradeLockBlocksMembership (External-review B2): while a `cluster upgrade` roll holds the
+// cluster-scoped lock marker, StartJoinOperation AND StartRetireOperation must BOTH refuse — a concurrent
+// grow/retire crossing a rolling broker restart could turn "temporarily down one voter" into a quorum
+// break. The lock check is the FIRST gate (before nonce/roster checks), so the refusal is unconditional
+// and does NOT consume the join nonce; releasing the marker restores membership.
+func TestB2UpgradeLockBlocksMembership(t *testing.T) {
+	n, _ := d7SingleNode(t, "ctl-1")
+	admin := NewClusterAdmin(n, nil)
+	bundle, _ := makeJoinBundle(t, "join-2", "10.0.0.2:7400", "nonce-a")
+
+	// Acquire the roll lock (exactly what the orchestrator's acquire-lock trigger Proposes on the leader).
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetUpgradeActive(time.Now()) }); err != nil {
+		t.Fatalf("set upgrade marker: %v", err)
+	}
+	if !upgradeActive(n.RODB()) {
+		t.Fatal("upgradeActive must read the marker once it is committed")
+	}
+	if _, err := admin.StartJoinOperation(bundle); err == nil || !strings.Contains(err.Error(), "upgrade") {
+		t.Fatalf("join must refuse while a roll holds the upgrade lock: %v", err)
+	}
+	if _, err := admin.StartRetireOperation("ctl-1", true); err == nil || !strings.Contains(err.Error(), "upgrade") {
+		t.Fatalf("retire must refuse while a roll holds the upgrade lock: %v", err)
+	}
+
+	// Release → membership resumes. The refused join above never consumed the nonce, so the SAME bundle
+	// now proceeds (proving the lock gate rejected BEFORE any state mutation).
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearUpgradeActive() }); err != nil {
+		t.Fatalf("clear upgrade marker: %v", err)
+	}
+	if upgradeActive(n.RODB()) {
+		t.Fatal("upgradeActive must be false after the marker is cleared")
+	}
+	if _, err := admin.StartJoinOperation(bundle); err != nil {
+		t.Fatalf("join must proceed once the lock is released: %v", err)
+	}
+}
+
 // TestC4DriveNoOpOnEmpty (guard): driveInFlightOperations is a safe no-op with no ops + a
 // fresh admin (the leader-gate + empty work-list). Proves the controller never panics / writes idly.
 func TestC4DriveNoOpOnEmpty(t *testing.T) {

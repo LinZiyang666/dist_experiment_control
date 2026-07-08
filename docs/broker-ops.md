@@ -352,6 +352,10 @@ debug）。普通使用者不会接触此命令。
 - **磁盘/端口 DEGRADE band（B6 OPS#4）**：本节点自身 disk_free<10% 或 ports≥90% used 会让 `cluster status` 进 **DEGRADED（exit 1）**——但**绝不**覆盖 FORCE_SINGLE(3)/QUORUM_LOST(2)（容量是次要降级）。容量值仍在 `cluster status --json` 与 `/metrics` 可见，磁盘吃紧也仍发 replicated `disk_pressure` 告警（`tether alert ls` / `alerts_active`）。`/metrics` 另有 `tether_broker_stream_replicas_{actual,target}`（仅集群 + 已观测时）。
 - **告警 webhook（B6 OPS#2）**：`broker.observability.alert_webhook_url`（或 `--alert-webhook-url`，仅集群模式）令 leader 在每次 committed 告警 raise/clear 时 POST 到该 http/https 端点（body 仅公开拓扑、绝无密钥；URL 不得含 userinfo）。非阻塞投递、队列满即丢（端点挂死不卡 reconcile）。空 = 关闭、零额外 wiring。
 
+**环境变量**：
+- `TETHER_VERSION` — 等价 `--version`（见 §5 其它命令注）。
+- `TETHER_AUTO_REBALANCE`（G7 #18，默认关）——设为 `on` 时,leader 在某 broker **回归**后主动把 `__proxy__` homes 迁回、均摊到 eligible voter（受 cooldown + 静默期门控）。**默认关**是有意的:rehome 是 break-before-make,已缓存旧 `/sub` 的客户端会短暂 black-hole 到 refetch,而客户端刷新周期未验证——故除非你确认车队客户端能及时刷订阅,否则保持关。手动预览/触发用 `tether cluster rebalance proxy --dry-run`（见 [`cluster.md`](cluster.md) §5.6.11）。写进 `tether-broker.service` 的 `Environment=` 即持久生效。
+
 cluster 模式由 `--cluster-data-dir` 下的 raft state 触发，不是单靠 yaml 字段触发。
 启动前必须先跑 `tether cluster init --from-existing`；完整步骤见
 `docs/cluster-runbook.md` 第 4 节。集群内部还需要私网 `:7400` Raft 和 `:6222`

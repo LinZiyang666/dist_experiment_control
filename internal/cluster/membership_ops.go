@@ -381,6 +381,26 @@ func PlanClearForceSingle() (*Command, error) {
 	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit)), nil
 }
 
+// MetaKeyUpgradeActive is the cluster_meta key a `cluster upgrade` roll sets for its whole duration
+// (External-review B2). Membership ops (join/retire) refuse while it is set, so a concurrent grow/retire
+// cannot cross a rolling broker restart (which could turn "temporarily down one voter" into "permanently
+// down one + restarting one"). A marker (not an operation) so it never self-blocks the roll's own reloads.
+const MetaKeyUpgradeActive = "cluster_upgrade_active"
+
+// PlanSetUpgradeActive / PlanClearUpgradeActive UPSERT/DELETE the roll-lock marker (mirrors force-single).
+func PlanSetUpgradeActive(now time.Time) (*Command, error) {
+	keyLit := MustLitText(MetaKeyUpgradeActive)
+	valLit := MustLitText(now.UTC().Format(time.RFC3339Nano))
+	return NewCommand(OpClusterMetaSet, Stmt(
+		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
+			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+}
+
+func PlanClearUpgradeActive() (*Command, error) {
+	keyLit := MustLitText(MetaKeyUpgradeActive)
+	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit)), nil
+}
+
 // MetaKeyForceSingleEpoch is the cluster_meta key holding the per-recovery epoch token. The
 // post-recover split-brain detector compares it across the cluster-health broadcast: hearing a peer
 // advertise force_single_active with a DIFFERENT epoch means two divergent single-voter timelines.

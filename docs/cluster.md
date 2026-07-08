@@ -265,6 +265,43 @@ roster >1 台且无人应答 `:7400`（`health` 串为 `ROSTER_UNREACHABLE`，�
 - **ctl 从任一幸存者刷新（#17）**：`ctl` 连上**任一** broker 后，会在该连接上直接拉取该 broker 的签名名册刷新本地缓存（`cluster_endpoints.json`），不再要求"连的正好是 pin 时的 floor broker"。故 floor/bootstrap broker 死亡、经 failover 连到幸存者时，名册仍能收敛。旧 broker（无此响应者）时自动回退到 HTTP bootstrap（无副作用）。**信任锚不变**：无 OOB pin 的 ctl 绝不从网络应答者 TOFU。
 - **DNS-独立 IP fallback（#11）**：域名解析/代理链（如 Clash fake-ip）依赖单点时，把 `tls://<真实IP>:443` 放进 ctl `InviteSeeds` 作 fallback floor。**注意**：对 Caddy-fronted broker（`wss://$DOMAIN:443`、证书 SNI 绑域名、无 IP SAN、无公网 raw-NATS listener），`tls://<ip>` 直连**不可用除非做部署层改造**（IP-SAN 证书 + Caddy default site + 公网 raw-NATS listener）——这是拓扑改造、不在自动收敛范围内。
 
+### 5.6.10 滚动升级 `tether cluster upgrade`（G5，#13/#14/#19）
+
+把整队 broker **一台一台**滚动升级到目标版本,**先 transfer-leader 再重启**,使 N≥3 集群全程保 quorum。它填补 `node upgrade` 够不到 broker 守护进程的缺口(`node upgrade` 只 re-exec agent);`cluster upgrade` 重载 **broker 守护 + 同机 agent** 两个进程。
+
+```bash
+# 预览滚动计划(followers-first / leader-last / 已达标跳过 / N=2 写栅栏警告)
+tether cluster upgrade --to-version v0.5.0 --dry-run
+
+# 执行(前置条件都满足后)
+tether cluster upgrade --to-version v0.5.0 \
+  --expect-sha256 <staged-binary-sha256> \
+  --account-seed /etc/tether/secrets/account.nk \
+  --backup-taken
+```
+
+**机理与安全**:
+- **重载 = 免特权 self-re-exec**:目标版本二进制上盘后,broker 守护经 `syscall.Exec` 原地重载(PID 保持,systemd `Type=simple` 无感,规避 clean-exit 陷阱),同机 agent 同样 re-exec。无需 sudo/systemctl。
+- **⚠ 二进制 staging 是特权前置(v1)**:`/usr/local/bin/tether` 是 root-owned、`User=tether` 写不了,故**换二进制这一步须运维在每台先做**(SSH + root `install`,或车队既有 NOPASSWD-sudo staging),`cluster upgrade` 只做免特权的重载编排。`--expect-sha256` = 已 staged 二进制的 sha256,每台重载前校验、不符则拒(绝不 re-exec 未 staged/错的 image)。
+- **account-seed 签名**:每台的重载/transfer 请求用**集群 account seed 签名**(operator 根权威,与签名 roster 同信任锚),broker 对 pinned account_pub 验签才行动。故 `--account-seed <path>`(某 broker `secrets_dir` 的 `account.nk`)必需。
+- **⚠ 强制预备份**:目标版本首启可能跑**单向** forward migration,唯一恢复是 restore。执行前先在 leader 上跑一次 `tether cluster backup`,再带 `--backup-taken` 确认。
+- **N≥3 推荐,N=2 仅过渡**:重启任一 broker 时 quorum 短暂降级——**N≥3** 时 transfer-leader-first 保证零写中断;**N=2**(F=0)时任一重启都会**写栅栏 ~重启时长**(读+存量代理续),这是固有脆弱,须显式 `--ack-writefence` 才继续。**生产应 N≥3**。
+- **幂等可恢复**:中途任何拒绝都 **HALT**(留安全部分态,绝不 de-cluster),修好后重跑即从断点续(已达标的 host 跳过,不重启)。
+- **whole-host 判据 + skew**:一台"升完"= broker **且** 同机 agent 都到目标版本;`tether node ls --brokers`(#19)并列显示每台 broker+agent 版本,skew 一目了然(需 broker 配 `broker.cluster.colocated_agent_nid` / `--colocated-agent-nid` 自声明同机 agent;未配则 CLI 按 `node_id==nid` 假设、标 `(assumed)`)。
+- **命令版本三轴门**:滚动仅当 proto + raft commandVersion 都不变才安全(commandVersion 变会 per-replica 毒化 raft log)——canary(首台升级后)实测其命令版本,与未升 broker 不符则 HALT、必须整队重装而非滚动;未升 broker 太旧(不自报命令版本)时**响亮 WARN**(无法验证该轴,须人工确认 release 不 bump)。
+- **⚠ 同机 agent re-exec 走"当前 session"作用域**:whole-host 升级的 agent leg 经 **session-scoped** 转发主题(`SubjCmdForwarded(<你的 SID>, <colocated_agent_nid>, upgrade)`)投递,故**运行 `cluster upgrade` 的 ctl 必须登录在一个能看见这些同机 agent 的 session**(即这些 broker 主机上的 agent 以你当前 `current_session` 的 SID 注册)。若同机 agent 在别的 session,agent leg 会 `agent_no_responders` 而 HALT——此时先切到正确 session(或把同机 agent 挪进该 session)再重跑。broker 守护重载走 account-signed 广播、不受 session 影响;只有 agent leg 有此前提。
+- **B2 滚动锁 · 与 grow/retire 真互斥**:roll 开始时经 leader 取一把 **cluster-scoped 滚动锁**(复制进 `cluster_meta`,故跨越 roll 自身触发的 leader 切换仍在)。这是**真互斥、非仅入口门**:① 取锁前若已有在飞 membership op(join/retire)则**拒绝开 roll**(让它先跑完);② 持锁期间 leader 的 operation controller **冻结**所有非终态 membership op(不推进 phase / AddVoter / drain / RemoveServer),锁释放后自动续跑;③ 新的 `cluster join` / `cluster retire` 一律拒。三管齐下杜绝"临时少一票"叠加"成员正在变更"击穿 quorum/拓扑。
+- **B2 锁的释放与自愈**:**仅干净跑完时释放**;中途 **HALT / Ctrl-C 保留持锁**——成员变更在部分升级态持续被挡。`release-lock` 现**如实回报清锁失败**(不再假 OK),失败会打响亮 WARNING 指向重跑恢复。锁是幂等 UPSERT:重跑(继续升 **或** 回滚旧版本)重新取锁、跑完释放。**即使一次 roll 全升完但清锁失败**(leader 切换/raft 异常),再跑一次同 `--to-version`——此时 plan 为空(全达标),命令会**探测到残留锁并主动清除**(打印"cleared a stale upgrade lock"),不再需要未文档化的手动清理。
+- **B3 · 计划基于验签的新鲜 roster**:滚动的 voter 全集取自 leader 的 **account-signed roster**,带 `--account-seed` 执行时**校验其签名 + 有效期**(拒未验证/过期/错账户的 roster)。且**双向一致**:配置态 voter 必须都回答 health(缺席则拒)、**且**任何自报 VOTER 的应答者必须在签名 roster 内(否则说明 roster 快照过期,如刚 grow 完新 voter 尚未进 ≤30s 的 discovery cache)——不一致即 fail-closed,提示等 ~30s 重跑,绝不按过期快照漏升真实 voter。
+
+### 5.6.11 数据面再均衡 + 可观测补充（G7，#2/#18/#16/#20③）
+
+- **`proxy status` 按真实 home 渲染(#2)**:默认 `tether proxy status` 现在把每个 exit 标成**它自己 home broker 的 public_host**(而非应答 broker 的),与 `/sub` 订阅体下发给客户端的 host 一致;home 不健康的 exit 显示为不可达(与 `--cluster` 视图、`/sub` 排除逻辑对齐)。单 broker 输出不变。
+- **broker 回归自动再均衡(#18,默认关)**:某 broker 崩溃后其 home 的代理会迁到幸存者;它回归后分布默认**不自动迁回**(failover 是"粘"的,数据面不断=好性质)。回归自动再均衡机制已就位但**默认关**——因迁移是 break-before-make、缓存客户端会短暂 black-hole 到 refetch `/sub`,而客户端刷新周期未验证。运维要开:broker 起动带 `TETHER_AUTO_REBALANCE=on`(受 cooldown + 静默期门控);手动预览/触发用 `tether cluster rebalance proxy --dry-run`。
+  - ⚠ **rehome 后客户端订阅缓存会短暂过期**:代理迁 home 后,已缓存旧 `/sub` 的客户端(如 Clash Verge proxy-provider)会指旧 host 超时,直到它 refetch 订阅。这是 break-before-make 的固有窗口,自动再均衡的 cooldown 意在把它界定在可接受范围。
+- **远程可观测(#16)**:`tether cluster status --homes --remote`(经 NATS 看各 broker 的代理 home 分布聚合,无需 SSH 上 broker)、`tether cluster seeds show --remote`(经 NATS 看签名 seed bundle);`cluster status --remote` 在 force-single 下 **exit 3**(监控可按退出码抓紧急态)。
+- **JetStream 持续 503 告警(#20③)**:某 broker 的 JetStream 持续不可用(如 force-single 后 nats.conf 滞留 clustered、meta 无 quorum,返 503)时,`tether cluster status --remote` 会打出**响亮的 `DATA-PLANE DEGRADED — JetStream UNAVAILABLE` 告警**(此前只有 socket 端 banner、`--remote` 看不到)——杜绝"JS 静默烂数天无人察觉"的运维盲区。JS 恢复(首次成功观测)即自动清除。
+
 ### 5.7 `tether alert`（cluster alerts）
 
 ```

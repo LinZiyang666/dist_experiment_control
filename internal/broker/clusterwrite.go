@@ -281,11 +281,12 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now) },
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
+			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
 		},
 		func() (*nats.Subscription, error) { return SubscribeClusterRosterPull(nc, b.manifestBytes) }, // G3 #17
+		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) },             // G5 #13 W2b
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf)
+			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
 		},
 		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB) },
 		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd) },
@@ -339,6 +340,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	rec := NewAlertReconciler(AlertReconcilerConfig{
 		Node: node, DB: b.cfg.DB, Propose: node.Propose, Now: b.cfg.Now, Logger: b.cfg.Logger,
 		Observe: observeAndCache, Webhook: webhookPost, LeaderID: func() string { _, id := node.LeaderWithID(); return id },
+		SetJSUnavailable: func(v bool) { b.jsUnavail.Store(v) }, // G7b #20③: leader-observed sustained JS-503 → health self-report
 	})
 	b.cl.auditPub = pub
 	b.cl.alertRec = rec
@@ -351,6 +353,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// G2 #20: the live nats.conf path so status can raise the DATA-PLANE-DEGRADED banner when
 	// force-single left the survivor conf clustered (JetStream 503).
 	b.cl.admin.SetNatsConfPath(b.cfg.NatsConfPath)
+	b.cl.admin.SetJSUnavailFn(b.jsUnavail.Load) // External-review m2: socket status surfaces runtime JS-503 too
 	// B7 DOC#5 + C6 BD6: the generic leader-side event emitter the drain uses for `expose_rehomed`
 	// (back-compat) + the C6 home_reassign_* / rehome_stalled lifecycle events.
 	b.cl.admin.emitEvent = b.pubSysEvent

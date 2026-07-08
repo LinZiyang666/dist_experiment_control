@@ -988,7 +988,7 @@ func nodeHasProxyCap(capabilities []string, release string) bool {
 
 func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 	rows, err := b.cfg.DB.Query(`
-		SELECT n.nid, n.status, n.proxy_ready, COALESCE(pa.port, 0)
+		SELECT n.nid, n.status, n.proxy_ready, COALESCE(pa.port, 0), COALESCE(pa.home_broker, '')
 		FROM nodes n
 		LEFT JOIN port_allocations pa
 		  ON pa.sid = n.sid AND pa.nid = n.nid
@@ -999,21 +999,50 @@ func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []proto.ProxyNodeEntry
+	// Drain the outer query FULLY before any per-home lookup: proxyHomeHealthy/LookupByNodeID issue
+	// nested queries, and the store runs on a single connection (MaxOpenConns=1) — doing them inside the
+	// rows.Next() loop would deadlock on the connection this iterator holds. Mirrors proxyStatusNodesCluster.
+	type row struct {
+		nid, status, homeBroker string
+		ready, pport            int
+	}
+	var rs []row
 	for rows.Next() {
-		var e proto.ProxyNodeEntry
-		var ready, pport int
-		if err := rows.Scan(&e.NID, &e.Status, &ready, &pport); err != nil {
+		var r row
+		if err := rows.Scan(&r.nid, &r.status, &r.ready, &r.pport, &r.homeBroker); err != nil {
 			return nil, err
 		}
-		e.Ready = ready == 1
-		if pport != 0 {
-			e.PublicPort = pport
-			e.PublicHost = b.publicHostFor()
+		rs = append(rs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]proto.ProxyNodeEntry, 0, len(rs))
+	for _, r := range rs {
+		e := proto.ProxyNodeEntry{NID: r.nid, Status: r.status, Ready: r.ready == 1}
+		if r.pport != 0 {
+			// G7a #2: the default (non---cluster) view must label each exit with its OWN home broker's
+			// public host (where /sub points subscribers) — NOT this answering broker's host. In cluster
+			// mode gate the vended port+host on the home's health and render the home's public_host,
+			// mirroring proxyStatusNodesCluster (:405) so the default `proxy status` agrees with the /sub
+			// body on which exits are reachable and at what host. A single broker (home_broker=='') has no
+			// home concept and stays byte-identical to pre-G7a.
+			if b.clusterMode && r.homeBroker != "" {
+				e.HomeBroker = r.homeBroker
+				if b.proxyHomeHealthy(r.homeBroker) {
+					e.PublicPort = r.pport
+					if home, herr := clusternodes.LookupByNodeID(b.cfg.DB, r.homeBroker); herr == nil {
+						e.PublicHost = home.PublicHost
+					}
+				}
+			} else {
+				e.PublicPort = r.pport
+				e.PublicHost = b.publicHostFor()
+			}
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func redactSubs(subs []proxysub.Subscriber) []proto.ProxySubEntry {

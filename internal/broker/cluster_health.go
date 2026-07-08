@@ -20,8 +20,8 @@ import (
 // WITHOUT a Raft write. writable_leader_confirmed is set ONLY after a VerifyLeaderRead barrier
 // — a partitioned ex-leader still reporting State()==Leader within its lease FAILS VerifyLeader
 // and answers false, so the gate fires precisely in the data-loss window.
-func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf))
+func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID))
 }
 
 // SubscribeClusterRosterPull (G3 #17) wires the member-reachable roster-pull responder: a ctl connected
@@ -54,14 +54,14 @@ func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool))
 // responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
 // observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).
 // Every broker answers (no queue group) so the leader collects each voter's AppliedIndex.
-func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf))
+func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID))
 }
 
 // clusterHealthResponder builds the shared health-reply handler used by both the member-
 // facing cluster-health RPC and the broker-only §17 cursor probe. topoSelf returns this broker's
 // latest C3 topology reconcile self-report (nil until the first pass / non-cluster).
-func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport) func(*nats.Msg) {
+func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -70,9 +70,12 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			SchemaVersion:      proto.ClusterHealthSchemaVersion,
 			LeaderContactStale: node.LeaderContactStale(now()),
 			ForceSingleActive:  forceSingleActive(db),
+			UpgradeLockActive:  upgradeActive(db), // External-review round2 B1: expose the roll lock for stale-lock self-heal
 			NodeID:             node.SelfID(),
 			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
 			ProtoVer:           proto.ProtoVersion,
+			CommandVer:         cluster.CommandVersion(), // G5 #13: three-axis rolling-upgrade gate (proto+command+ops)
+			ColocatedAgentNID:  colocatedAgentNID,        // G5 #19: dual-version correlation ("" ⇒ CLI (assumed) fallback)
 			PhaseFluidityOps:   cluster.HasPhaseFluidityOps(), // F5: advertise capability for the v0.4.2 readdr/route ops
 		}
 		// C3 §2.7: a C3 broker ALWAYS reports topology (TopoReported=true), even at gen 0, so the
@@ -89,6 +92,25 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		// observability poll can compute this broker's raft_lag.
 		if ai, err := node.AppliedIndex(); err == nil {
 			resp.AppliedIndex = ai
+		}
+		// G7b #16: self-report this broker's ALLOCATED __proxy__ home count for the `cluster status
+		// --homes --remote` aggregate (a scalar count, no per-SID identity → no cross-session leak).
+		if self := node.SelfID(); self != "" {
+			var homeCount int
+			if db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE name='__proxy__' AND state='ALLOCATED' AND home_broker=?`, self).Scan(&homeCount) == nil {
+				resp.ProxyHomeCount = homeCount
+				resp.ProxyHomeReported = true // External-review m1: distinguish real 0 from unreported
+			}
+			// G5 Stage-C M2: self-report VOTER status so `cluster upgrade` plans over the real voter roster.
+			var phase string
+			if db.QueryRow(`SELECT phase FROM cluster_nodes WHERE node_id=?`, self).Scan(&phase) == nil {
+				resp.IsVoter = phase == "VOTER"
+			}
+		}
+		// G7b #20③: self-report the sustained JetStream-503 signal (leader-observed; false on a follower
+		// or a healthy leader). Additive omitempty — an old broker omits it and the ctl sees false.
+		if jsUnavail != nil {
+			resp.JetStreamUnavailable = jsUnavail()
 		}
 		if verr := node.VerifyLeaderRead(func(*sql.DB) error { return nil }); verr == nil {
 			resp.WritableLeaderConfirmed = true
@@ -167,5 +189,13 @@ func SubscribeAlertAck(nc *nats.Conn, fwd *Forwarder) (*nats.Subscription, error
 func forceSingleActive(db *sql.DB) bool {
 	var one int
 	err := db.QueryRow(`SELECT 1 FROM cluster_meta WHERE key=? LIMIT 1`, cluster.MetaKeyForceSingle).Scan(&one)
+	return err == nil
+}
+
+// upgradeActive reports whether a `cluster upgrade` roll holds the cluster-scoped lock marker
+// (External-review B2). Membership ops refuse while it is set.
+func upgradeActive(db *sql.DB) bool {
+	var one int
+	err := db.QueryRow(`SELECT 1 FROM cluster_meta WHERE key=? LIMIT 1`, cluster.MetaKeyUpgradeActive).Scan(&one)
 	return err == nil
 }

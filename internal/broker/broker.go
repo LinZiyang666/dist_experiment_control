@@ -80,6 +80,11 @@ type Config struct {
 	// — fine for tests, useless in prod.
 	PublicHost string
 
+	// ColocatedAgentNID (G5 #19) is the nid of the tether agent co-located on this broker host, self-
+	// declared into ClusterHealthResp so `node ls --brokers` correlates the broker daemon's version with
+	// its agent's RELEASE. Empty ⇒ the CLI falls back to the node_id==nid convention, labelled "(assumed)".
+	ColocatedAgentNID string
+
 	// PortBandLow / PortBandHigh override the public port range
 	// (architecture A.3 / F.3). Defaults 14000-14999.
 	PortBandLow  int
@@ -352,6 +357,10 @@ type Broker struct {
 	// proxy rehome hysteresis. Reset on a leadership change is fine (the new leader re-counts).
 	proxyDwell sync.Map
 
+	// autoRebalanceArm (G7a #18) is the leader-local debounce state for auto-rebalance-on-broker-return.
+	// Confined to the single observe-loop goroutine; reset on a leadership-lost edge. Zero value usable.
+	autoRebalanceArm autoRebalanceArm
+
 	// rehomeEvt / proxyEvtCounts (C6) are the leader-local change caches that make the rehome + proxy
 	// observability events idle-zero-writes: the reaper re-enters every ~5s, so a rehome event fires
 	// only when its port→mark changes, and the proxy-count events fire only on a real prev→cur
@@ -394,6 +403,27 @@ type Broker struct {
 	// Wait at zero" misuse that would leak the goroutine + lose the audit). A bare atomic.Bool
 	// cannot make the check+Add atomic; the mutex must.
 	transferAuditDraining atomic.Bool
+
+	// jsUnavail (G7b #20③) is the leader-observed SUSTAINED JetStream-503 signal: the AlertReconciler
+	// sets it after the replica observation fails with code 10008 for >= the sustained window, and clears
+	// it on the first positive observation or when this node is no longer leader. The cluster-health
+	// responder reads it into ClusterHealthResp.JetStreamUnavailable (cross-goroutine → atomic).
+	jsUnavail atomic.Bool
+
+	// reExecRequested (G5 #13) is set by RequestReExec so serve.go, AFTER Run's ordered shutdown returns,
+	// re-execs the (freshly-staged) on-disk binary in place (PID-preserving; immune to the #23 clean-exit
+	// trap). reloadTrigger is the run-context cancel serve.go injects so RequestReExec unwinds Run through
+	// its EXISTING teardown rather than a bespoke shutdown path.
+	reExecRequested atomic.Bool
+	reloadTrigger   context.CancelFunc
+
+	// clusterAdminHandle (G5 #13 W2b) routes an account-signature-verified remote upgrade trigger through
+	// the SAME local admin backend the root Unix socket uses, so the reload/transfer gates are not
+	// duplicated. It is set AFTER wireClusterLate (once the admin backend exists) but the trigger responder
+	// subscribes earlier, so access is mutex-guarded (External-review M1: the plain-field read raced the
+	// write) and the responder returns a RETRIABLE cluster_not_ready until it is set (not a terminal HALT).
+	clusterAdminMu     sync.RWMutex
+	clusterAdminHandle func(adminsock.Request) adminsock.Response
 	transferAuditMu       sync.Mutex
 
 	// xferReplicasFn is the D8a (§9) tier-B replica seam. In CLUSTER mode (post-D9) wireClusterLate
@@ -982,6 +1012,8 @@ func (b *Broker) Run(ctx context.Context) error {
 			if cab, ok := backend.Cluster.(*clusterAdminBackend); ok {
 				cab.rebalanceProxy = b.rebalanceProxyHomes
 				cab.fsArm = b.cl.fsArm // online force-single dwell+token (shared with the observe tick that feeds it)
+				cab.requestReExec = b.RequestReExec // G5 #13: broker-daemon reload arms the self-re-exec
+				b.setClusterAdminHandle(cab.HandleCluster) // G5 #13 W2b: remote signed trigger routes through the same gates
 			}
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).

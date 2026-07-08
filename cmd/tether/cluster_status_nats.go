@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -41,6 +42,10 @@ type ctlClusterSummary struct {
 	ForceSingleActive  bool   `json:"force_single_active"`  // some reply reports the persisted force-single marker
 	AllStale           bool   `json:"all_stale"`            // every reply reports stale leader contact (mirrors EvalDestructiveGate)
 	AnyReply           bool   `json:"any_reply"`            // at least one broker answered
+	// JetStreamUnavailable (G7b #20③) is true when SOME broker self-reports a sustained JS-503 — the
+	// data plane (push/pull, history, audit) is wedged even though the control plane answered. Surfaced
+	// in the verdict/banner; does NOT change the 0/2/3 exit taxonomy (it is a hint, not a new exit class).
+	JetStreamUnavailable bool `json:"jetstream_unavailable,omitempty"`
 }
 
 // summarizeClusterHealth folds the broadcast replies into the ctl summary. It dedups by distinct
@@ -66,6 +71,9 @@ func summarizeClusterHealth(replies []proto.ClusterHealthResp) ctlClusterSummary
 		}
 		if r.ForceSingleActive {
 			s.ForceSingleActive = true
+		}
+		if r.JetStreamUnavailable {
+			s.JetStreamUnavailable = true // G7b #20③: some broker's JetStream is wedged at 503
 		}
 	}
 	if !s.AnyReply {
@@ -150,6 +158,15 @@ func renderCtlStatus(w io.Writer, s ctlClusterSummary, jsonMode bool) {
 	n := s.brokersDisplayCount()
 	_, _ = fmt.Fprintf(w, "cluster: %d broker(s) answered over NATS\n", n)
 	_, _ = fmt.Fprintf(w, "verdict: %s\n", ctlVerdictLine(s))
+	if s.JetStreamUnavailable {
+		// G7b #20③: the control plane answered but a broker's JetStream is wedged at 503 — the data
+		// plane (file transfer / history / audit) is DOWN. Loud + actionable so a multi-day silent rot
+		// (the racknerd incident) is impossible to miss from a laptop.
+		_, _ = fmt.Fprintln(w, "ALERT:   DATA-PLANE DEGRADED — a broker reports JetStream UNAVAILABLE (sustained 503).")
+		_, _ = fmt.Fprintln(w, "         File transfers / history / audit are failing. Common cause: a survivor's nats.conf")
+		_, _ = fmt.Fprintln(w, "         left clustered after force-single. Run `tether cluster status` on the broker host for")
+		_, _ = fmt.Fprintln(w, "         the remedy (`reconcile nats --to-standalone`).")
+	}
 	leader := s.LeaderID
 	if leader == "" {
 		leader = "unknown"
@@ -181,5 +198,95 @@ func clusterStatusRemote(cmd *cobra.Command, home, natsURL string, asJSON bool) 
 	s := summarizeClusterHealth(probeClusterHealth(nc, id.PublicKey))
 	renderCtlStatus(cmd.OutOrStdout(), s, asJSON)
 	os.Exit(ctlExitCode(s))
+	return nil
+}
+
+// brokerHomeCount is one broker's aggregate __proxy__ home count (G7b #16). NEVER on the wire — folded
+// ctl-side from ClusterHealthResp.ProxyHomeCount; carries no per-SID identity.
+type brokerHomeCount struct {
+	NodeID   string `json:"node_id"`
+	Homes    int    `json:"homes"`
+	Reported bool   `json:"reported"` // External-review m1: false ⇒ a pre-G7 broker that did not report — unknown, not 0
+}
+
+// foldProxyHomeCounts dedups the health replies by NodeID (a flapping broker answering twice cannot
+// double-count) and returns the per-broker __proxy__ home counts, sorted by NodeID for a stable render.
+// A broker that did not report the count (pre-G7) is kept with Reported=false so the render shows "?"
+// instead of silently counting it as 0 (which would understate the distribution in a mixed-version window).
+func foldProxyHomeCounts(replies []proto.ClusterHealthResp) []brokerHomeCount {
+	seen := map[string]proto.ClusterHealthResp{}
+	for _, r := range replies {
+		if r.NodeID != "" {
+			if _, dup := seen[r.NodeID]; !dup {
+				seen[r.NodeID] = r
+			}
+		}
+	}
+	out := make([]brokerHomeCount, 0, len(seen))
+	for id, r := range seen {
+		out = append(out, brokerHomeCount{NodeID: id, Homes: r.ProxyHomeCount, Reported: r.ProxyHomeReported})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// renderHomesRemote writes the per-broker proxy-home distribution. Descriptive read — NO exit-code
+// contract (mirrors the socket `--homes` view, which also has none).
+func renderHomesRemote(w io.Writer, homes []brokerHomeCount, jsonMode bool) {
+	if jsonMode {
+		b, _ := json.MarshalIndent(struct {
+			Schema        string            `json:"schema"`
+			SchemaVersion int               `json:"schema_version"`
+			View          string            `json:"view"`
+			Brokers       []brokerHomeCount `json:"brokers"`
+		}{"ctl_homes_summary", 1, "ctl-remote", homes}, "", "  ")
+		_, _ = fmt.Fprintln(w, string(b))
+		return
+	}
+	if len(homes) == 0 {
+		_, _ = fmt.Fprintln(w, "homes: no broker answered over NATS (single-broker, or not logged in / brokers unreachable)")
+		return
+	}
+	_, _ = fmt.Fprintf(w, "proxy home distribution (over NATS, %d broker(s)):\n", len(homes))
+	_, _ = fmt.Fprintf(w, "  %-24s %s\n", "BROKER", "PROXY_HOMES")
+	total, unknown := 0, 0
+	for _, h := range homes {
+		if h.Reported {
+			_, _ = fmt.Fprintf(w, "  %-24s %d\n", h.NodeID, h.Homes)
+			total += h.Homes
+		} else {
+			// External-review m1: a pre-G7 broker did not report — show unknown, do NOT sum as 0.
+			_, _ = fmt.Fprintf(w, "  %-24s ?  (broker predates the count report)\n", h.NodeID)
+			unknown++
+		}
+	}
+	if unknown > 0 {
+		_, _ = fmt.Fprintf(w, "  %-24s %d (+%d unknown)\n", "(total)", total, unknown)
+	} else {
+		_, _ = fmt.Fprintf(w, "  %-24s %d\n", "(total)", total)
+	}
+	_, _ = fmt.Fprintln(w, "view:  aggregate per-broker counts from the connected brokers; run `cluster status --homes` on a broker host for the full per-expose table.")
+}
+
+// clusterStatusHomesRemote (G7b #16) renders the per-broker __proxy__ home distribution over NATS — the
+// `--homes --remote` variant, so the spread is checkable from a laptop without SSHing to a broker. It
+// reuses the member-granted cluster-health broadcast (no new subject/ACL) and reports only aggregate
+// per-broker COUNTS (no per-SID identity). Descriptive: no exit-code contract, no os.Exit.
+func clusterStatusHomesRemote(cmd *cobra.Command, home, natsURL string, asJSON bool) error {
+	sid := cli.ReadCurrentSession(home)
+	if sid == "" {
+		return fmt.Errorf("no active session — run `tether login -s <sid>` first (cluster status --homes --remote needs a ctl identity)")
+	}
+	natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
+	id, err := cli.EnsureIdentity(home)
+	if err != nil {
+		return err
+	}
+	nc, err := connectCtl(cmd, "cluster status", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	renderHomesRemote(cmd.OutOrStdout(), foldProxyHomeCounts(probeClusterHealth(nc, id.PublicKey)), asJSON)
 	return nil
 }

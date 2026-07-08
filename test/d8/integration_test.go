@@ -237,7 +237,7 @@ func testClusterHealthGate(t *testing.T) {
 	}
 
 	for i := 0; i < c.n; i++ {
-		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil) // C3 topoSelf: nil = no topo self-report in this drill
+		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil, nil, "") // C3 topoSelf nil; G5/G7 jsUnavail nil + colocatedAgentNID "" = drill defaults
 		if err != nil {
 			t.Fatalf("subscribe health %d: %v", i, err)
 		}

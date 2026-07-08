@@ -66,6 +66,13 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
+	// G5 #13: a co-located broker-host agent RE-EXECS the already-staged shared binary — it does NOT
+	// download/install (it cannot write the root-owned bin dir; staging is the privileged precondition).
+	if req.ReExecOnly {
+		a.handleReExecOnly(msg, req)
+		return
+	}
+
 	allow := a.cfg.UpgradeURLAllowlist
 	if len(allow) == 0 {
 		allow = defaultAgentURLAllowlist
@@ -134,24 +141,67 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// non-systemd setsid-nohup path has no supervisor at all.
 	// Tests pin UpgradeNoExit=true so the in-process harness
 	// doesn't replace the go-test binary.
-	if !a.cfg.UpgradeNoExit {
-		go func() {
-			// Tiny delay so the OK reply has a chance to drain
-			// over NATS before we exec out.
-			time.Sleep(100 * time.Millisecond)
-			argv := append([]string(nil), os.Args...)
-			argv[0] = exePath
-			if err := syscall.Exec(exePath, argv, os.Environ()); err != nil {
-				// Exec failed — last-ditch fall back to os.Exit
-				// with a non-zero code so Restart=on-failure has
-				// something to grab onto. Logged so the operator
-				// can see why the in-place upgrade didn't take.
-				a.cfg.Logger.Error("agent: re-exec failed; exiting non-zero for supervisor restart",
-					"err", err, "exe", exePath)
-				os.Exit(1)
-			}
-		}()
+	a.reExecInPlace(exePath)
+}
+
+// handleReExecOnly (G5 #13) is the co-located-agent leg of a `cluster upgrade`: the shared binary is
+// already staged on disk, so the agent SKIPS download/install and only re-execs. SHA256, when set, is
+// the expected ON-DISK BINARY digest — the agent refuses to re-exec a stale/unstaged image.
+func (a *Agent) handleReExecOnly(msg *nats.Msg, req proto.UpgradeForwardedReq) {
+	exePath := a.cfg.UpgradeExecutablePath
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil {
+			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: err.Error()})
+			return
+		}
 	}
+	// Stage-C M7: after a rename-replace staging the running inode is gone, so os.Executable() can return
+	// the path with a " (deleted)" suffix — trim it or both the sha hash AND the syscall.Exec would target
+	// a nonexistent path. (The broker reload path already trims this; the agent leg must too.)
+	exePath = strings.TrimSuffix(exePath, " (deleted)")
+	// External-review doubt (symmetry with the broker reload primitive): the sha guard is MANDATORY. An
+	// unguarded re-exec would launch whatever is on disk; every legitimate trigger threads the staged digest,
+	// so fail-closed on an empty digest rather than skipping the check.
+	if req.SHA256 == "" {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "sha256_required",
+			Error: "re-exec requires sha256 (the staged-binary digest guard) — refusing an unguarded re-exec"})
+		return
+	}
+	got, err := sha256OfFile(exePath)
+	if err != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: err.Error()})
+		return
+	}
+	if got != strings.ToLower(req.SHA256) {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "sha256_mismatch",
+			Error: fmt.Sprintf("on-disk binary %s != staged target %s (staging did not land)", got, req.SHA256)})
+		return
+	}
+	a.cfg.Logger.Info("agent: re-exec-only into the staged on-disk binary", "exe", exePath)
+	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{OK: true})
+	a.reExecInPlace(exePath)
+}
+
+// reExecInPlace replaces this agent process image with the on-disk binary at exePath (same PID; the old
+// NATS conn drops as the kernel closes fds across exec). A tiny delay lets the OK reply drain first. On
+// exec failure it exits non-zero so a supervisor (systemd Restart=on-failure) relaunches. Tests pin
+// UpgradeNoExit so the in-process harness does not replace the go-test binary.
+func (a *Agent) reExecInPlace(exePath string) {
+	if a.cfg.UpgradeNoExit {
+		return
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		argv := append([]string(nil), os.Args...)
+		argv[0] = exePath
+		if err := syscall.Exec(exePath, argv, os.Environ()); err != nil {
+			a.cfg.Logger.Error("agent: re-exec failed; exiting non-zero for supervisor restart",
+				"err", err, "exe", exePath)
+			os.Exit(1)
+		}
+	}()
 }
 
 func (a *Agent) replyUpgradeForwarded(msg *nats.Msg, resp proto.UpgradeForwardedResp) {
@@ -214,6 +264,21 @@ func fetchURL(url string, timeout time.Duration) ([]byte, error) {
 func sha256OfBytes(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// sha256OfFile streams the hex sha256 of a file on disk (G5 #13 re-exec-only: verify the staged binary
+// before re-execing it, without loading the whole binary into memory).
+func sha256OfFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // installNewBinary atomically replaces dst with the `tether` binary

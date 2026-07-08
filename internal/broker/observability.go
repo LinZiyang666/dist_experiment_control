@@ -154,14 +154,23 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 			}
 		}
 	}
+	// G7a #18: collect this tick's broker_down edges. downNow = voters reporting down (a fire-gate);
+	// returned = voters whose broker_down CLEARED this tick (down→true→false edge) = a broker RETURNED,
+	// the auto-rebalance trigger. Both are only trustworthy when the ActiveAlerts read succeeded.
+	var returned, downNow []string
 	for _, d := range decideObservabilityAlerts(b.selfID, leaderApplied, voters, responses, lagThreshold) {
 		b.proposeAlertSignal(d.Kind, d.NodeID, d.Active, d.Message)
-		// BD7: a brand-new broker_down (false→true) → one rehome-impact summary (proxy_homes the
-		// reaper will rehome vs exposes_stranded). Honest, secret-free, once per transition. C6-BE-02:
-		// only when the ActiveAlerts read SUCCEEDED — on a read error prevDown is empty, which would make
-		// an already-down broker look like a fresh false→true edge and fire a spurious summary.
-		if aerr == nil && d.Kind == cluster.AlertKindBrokerDown && d.Active && !prevDown[d.NodeID] {
-			b.emitBrokerDownRehomeSummary(d.NodeID)
+		if aerr == nil && d.Kind == cluster.AlertKindBrokerDown {
+			if d.Active {
+				downNow = append(downNow, d.NodeID)
+				// BD7: a brand-new broker_down (false→true) → one rehome-impact summary (proxy_homes the
+				// reaper will rehome vs exposes_stranded). Honest, secret-free, once per transition.
+				if !prevDown[d.NodeID] {
+					b.emitBrokerDownRehomeSummary(d.NodeID)
+				}
+			} else if prevDown[d.NodeID] {
+				returned = append(returned, d.NodeID)
+			}
 		}
 	}
 
@@ -186,6 +195,10 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 		}
 		b.proposeAlertSignal(a.Kind, node, false, "")
 	}
+
+	// G7a #18: after all alert bookkeeping (aerr==nil is guaranteed here — the orphan-clear pass above
+	// returns early on a read error), evaluate the auto-rebalance-on-return trigger with this tick's edges.
+	b.driveAutoRebalanceOnReturn(returned, downNow)
 }
 
 // proposeAlertSignal proposes one transition-gated per-node observability raise/clear via
@@ -240,6 +253,9 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 				if err := b.cl.admin.ReconcileMembershipOnLeadership(); err != nil {
 					b.cfg.Logger.Warn("broker: membership reconciliation on leadership", "err", err)
 				}
+			}
+			if wasLeader && !isLeader {
+				b.autoRebalanceArm.reset() // G7a #18: a demoted leader drops its debounce state
 			}
 			wasLeader = isLeader
 			// C4: drive in-flight operations one idempotent step per tick (leader-gated inside). This is

@@ -262,12 +262,22 @@ func SubjCtrlClusterRoster(actor string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.cluster-roster.req", SubjectPrefix, actor)
 }
 
+// SubjCtrlClusterUpgrade (G5 #13 W2b) is the account-signed remote-trigger subject the `cluster upgrade`
+// orchestrator uses to reach each broker's local reload op + transfer-leader over NATS (so the roll runs
+// external to all brokers and re-resolves the leader after each restart). Hyphen-leaf "cluster-upgrade."
+// (not ".cluster.") keeps §13.8 (member denied cluster.*) green. The request is account-seed-signed and
+// each broker verifies it against its pinned account_pub before acting (the operator's root authority).
+func SubjCtrlClusterUpgrade(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.cluster-upgrade.req", SubjectPrefix, actor)
+}
+
 // Broker-side wildcard subscriptions for the D8b ctl RPCs (any actor segment). cluster-health
 // is broadcast (every broker answers, ctl corroborates); alert.ls uses a queue group (any one
 // broker serves the bounded-stale replicated read); alert.ack any broker forwards to leader.
 const (
 	SubjCtrlClusterHealthWildcard = SubjectPrefix + ".ctrl.by.*.cluster-health.req"
-	SubjCtrlClusterRosterWildcard = SubjectPrefix + ".ctrl.by.*.cluster-roster.req" // G3 #17 roster-pull
+	SubjCtrlClusterRosterWildcard = SubjectPrefix + ".ctrl.by.*.cluster-roster.req"  // G3 #17 roster-pull
+	SubjCtrlClusterUpgradeWildcard = SubjectPrefix + ".ctrl.by.*.cluster-upgrade.req" // G5 #13 remote reload/transfer trigger
 	SubjCtrlAlertLsWildcard       = SubjectPrefix + ".ctrl.by.*.alert.ls.req"
 	SubjCtrlAlertAckWildcard      = SubjectPrefix + ".ctrl.by.*.alert.ack.req"
 )

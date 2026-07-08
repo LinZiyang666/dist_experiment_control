@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/clusterroster"
+	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
 
@@ -73,10 +76,20 @@ func newClusterSeedsPublishCmd(socketPath *string) *cobra.Command {
 }
 
 func newClusterSeedsShowCmd(socketPath *string) *cobra.Command {
-	return &cobra.Command{
+	var remote bool
+	var natsURL, home string
+	cmd := &cobra.Command{
 		Use:   "show",
 		Short: "Show the published seed endpoints + bootstrap URL + seed_generation (leader-agnostic)",
+		Example: "  tether cluster seeds show            # on a broker host (admin socket)\n" +
+			"  tether cluster seeds show --remote   # over NATS from a laptop (no socket; the connected broker's signed bundle)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// G7b #16: over-NATS variant so seeds are inspectable from a laptop without SSHing to a broker.
+			// Reuses the G3 roster-pull manifest (no new subject / ACL); it is a diagnostic READ of the
+			// connected broker's signed seed bundle (a coarse view, like `cluster status --remote`).
+			if remote {
+				return clusterSeedsShowRemote(cmd, home, natsURL)
+			}
 			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpClusterSeedsShow})
 			if err != nil {
 				return err
@@ -92,4 +105,42 @@ func newClusterSeedsShowCmd(socketPath *string) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&remote, "remote", false, "read the signed seed bundle over NATS as a ctl (no broker admin socket)")
+	cmd.Flags().StringVar(&natsURL, "nats-url", "", "broker NATS URL (with --remote)")
+	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir (with --remote)")
+	return cmd
+}
+
+// clusterSeedsShowRemote pulls the connected broker's signed cluster manifest over NATS (the same G3
+// roster-pull responder — zero new subject / ACL) and renders its seed bundle. No published bundle /
+// unreachable → exit 69 (EX_UNAVAILABLE), so a monitor distinguishes "no data" from a healthy empty set.
+func clusterSeedsShowRemote(cmd *cobra.Command, home, natsURL string) error {
+	sid := cli.ReadCurrentSession(home)
+	if sid == "" {
+		return fmt.Errorf("no active session — run `tether login -s <sid>` first (seeds show --remote needs a ctl identity)")
+	}
+	natsURL = cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home)
+	id, err := cli.EnsureIdentity(home)
+	if err != nil {
+		return err
+	}
+	nc, err := connectCtl(cmd, "seeds show", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	ctx, cancel := context.WithTimeout(cmd.Context(), ctlManifestFetchTimeout)
+	defer cancel()
+	m := fetchManifestOverNATS(ctx, nc, id.PublicKey)
+	if m == nil || m.Seeds == nil {
+		return unavailErr("seeds show --remote: no signed seed bundle available over NATS (broker unreachable, an old broker without the roster-pull responder, or no seeds published yet)")
+	}
+	s := m.Seeds
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(out, "seed_generation: %d\n", s.Generation)
+	_, _ = fmt.Fprintf(out, "bootstrap_url:   %s\n", s.BootstrapURL)
+	_, _ = fmt.Fprintf(out, "account_pub:     %s\n", s.AccountPub)
+	_, _ = fmt.Fprintf(out, "endpoints:       %s\n", strings.Join(s.Endpoints, ", "))
+	_, _ = fmt.Fprintln(out, "view:            the connected broker's signed bundle over NATS (run `seeds show` on a broker host for the authoritative admin view)")
+	return nil
 }

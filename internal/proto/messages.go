@@ -734,6 +734,11 @@ type UpgradeForwardedReq struct {
 	URL     string `json:"url"`
 	SHA256  string `json:"sha256"`
 	ActorFP string `json:"actor_fp"`
+	// ReExecOnly (G5 #13) tells a co-located broker-host agent to SKIP download+install and only re-exec
+	// the already-staged shared on-disk binary (it cannot write the root-owned bin dir anyway; staging is
+	// the privileged precondition). In this mode SHA256, when set, is the EXPECTED ON-DISK BINARY digest
+	// (not a tarball digest) — the agent refuses to re-exec a stale/unstaged image. Additive omitempty.
+	ReExecOnly bool `json:"reexec_only,omitempty"`
 }
 
 // UpgradeForwardedResp — agent pub on the forwarded inbox. OK=true

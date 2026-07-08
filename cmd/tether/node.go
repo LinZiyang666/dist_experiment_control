@@ -35,10 +35,11 @@ func newNodeCmd() *cobra.Command {
 // uses to enumerate ONLINE targets.
 func newNodeLsCmd() *cobra.Command {
 	var (
-		natsURL string
-		home    string
-		showAll bool
-		asJSON  bool
+		natsURL     string
+		home        string
+		showAll     bool
+		asJSON      bool
+		showBrokers bool
 	)
 	cmd := &cobra.Command{
 		Use:   "ls",
@@ -75,6 +76,13 @@ func newNodeLsCmd() *cobra.Command {
 			}
 			if resp.Code != "" {
 				return brokerErrorMessage("node ls", resp.Code, resp.Error)
+			}
+
+			// G5 #19: the broker-host dual-version view — correlate each broker daemon's version (from the
+			// cluster-health probe) with its co-located agent's RELEASE (from this node list), flagging
+			// same-host skew so "whole-host upgraded" has one trusted criterion.
+			if showBrokers {
+				return renderNodeLsBrokers(cmd, nc, id.PublicKey, resp.Nodes, asJSON)
 			}
 
 			out := cmd.OutOrStdout()
@@ -120,6 +128,7 @@ func newNodeLsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsURL, "nats-url", "nats://127.0.0.1:4222", "NATS server URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().BoolVarP(&showAll, "all", "a", false, "include OFFLINE / STALE nodes")
+	cmd.Flags().BoolVar(&showBrokers, "brokers", false, "G5 #19: show each broker HOST's daemon + co-located agent version (skew ⇒ whole-host upgrade incomplete)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	return cmd
 }

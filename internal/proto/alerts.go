@@ -5,7 +5,7 @@ package proto
 
 // ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
 // reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported).
-const ClusterHealthSchemaVersion = 2
+const ClusterHealthSchemaVersion = 3
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -30,6 +30,40 @@ type ClusterHealthResp struct {
 	// omitempty: an older broker omits them; the renderer shows "?".
 	ReleaseVersion string `json:"release_version,omitempty"`
 	ProtoVer       int    `json:"proto_ver,omitempty"`
+	// ProxyHomeCount (G7b #16, schema v3) is this broker's ALLOCATED __proxy__ home count — an
+	// AGGREGATE the ctl folds per-broker for `cluster status --homes --remote`. It carries NO per-SID
+	// identity, so it cannot leak another session's topology (ACL-clean; rides the member-granted
+	// cluster-health.req, no new subject). Additive omitempty: an older broker omits it → 0.
+	ProxyHomeCount int `json:"proxy_home_count,omitempty"`
+	// ProxyHomeReported (External-review m1) distinguishes "this broker has 0 proxy homes" from "this
+	// broker predates the field and did not report it" (like TopoReported). A G7+ broker always sets it
+	// true; an older broker omits it → false → the ctl renders "?" instead of silently summing it as 0.
+	ProxyHomeReported bool `json:"proxy_home_reported,omitempty"`
+	// JetStreamUnavailable (G7b #20③, schema v3) is this leader's SUSTAINED JetStream-503 self-report:
+	// the leader's replica observation has failed with the 10008 "system temporarily unavailable"
+	// signature for >= the sustained window (the racknerd force-single-clustered-conf rot). The ctl folds
+	// it into the `cluster status --remote` verdict/banner (Option C: a synthetic signal, no store-backed
+	// alert kind => zero FSM-poison migration). Additive omitempty: an older broker omits it => false.
+	JetStreamUnavailable bool `json:"jetstream_unavailable,omitempty"`
+	// CommandVer (G5 #13, schema v3) is this broker's raft command-encoding version (cluster.CommandVersion,
+	// DECOUPLED from ProtoVer). `cluster upgrade` refuses a rolling roll whose canary reports a different
+	// CommandVer than the un-upgraded voters — a commandVersion bump POISONs the log per-replica, so it must
+	// be a flag-day reinstall, never a roll. Additive omitempty: an older broker omits it → 0 (fail-closed).
+	CommandVer int `json:"command_ver,omitempty"`
+	// ColocatedAgentNID (G5 #19) is the co-located agent's nid this broker self-declares, so `node ls
+	// --brokers` correlates the broker daemon's version with its agent's RELEASE (a pre-G5 broker omits it
+	// → the CLI falls back to the node_id==nid convention, labelled "(assumed)"). Additive omitempty.
+	ColocatedAgentNID string `json:"colocated_agent_nid,omitempty"`
+	// IsVoter (G5 Stage-C M2) is true when this broker's cluster_nodes.phase == VOTER. `cluster upgrade`
+	// uses it so the roll plans over the REAL voter roster (an answering learner/draining broker is not a
+	// voter, must not be counted toward the N=2 fence, and is never a transfer-leader target). Additive
+	// omitempty: a pre-G5 broker omits it → false → the orchestrator falls back to "answered ⇒ voter".
+	IsVoter bool `json:"is_voter,omitempty"`
+	// UpgradeLockActive (External-review round2 B1) is true when this broker's committed cluster_meta holds
+	// the `cluster_upgrade_active` roll-lock marker. `cluster upgrade` reads it so a re-run whose plan is a
+	// no-op (all hosts already at target) can still DETECT + clear a stale lock left by a prior roll whose
+	// release-lock did not confirm — the self-heal path that would otherwise never run. Additive omitempty.
+	UpgradeLockActive bool `json:"upgrade_lock_active,omitempty"`
 	// TopoApplied/TopoObserved/TopoReconcileReason (C3 §2.7) are this broker's NATS topology reconcile
 	// self-report: Applied = the generation rendered into the on-disk conf, Observed = the generation
 	// the LIVE nats-server confirmed loading (via the /varz probe). TopoReported distinguishes a C3

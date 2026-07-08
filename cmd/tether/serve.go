@@ -39,8 +39,9 @@ func newServeCmd() *cobra.Command {
 		upgradeURLAllow  []string
 		subHTTPListen    string
 		clusterDataDir   string
-		clusterRaftAddr  string
-		clusterSecrets   string
+		clusterRaftAddr   string
+		clusterSecrets    string
+		colocatedAgentNID string
 		logLevel         string
 		logJSON          bool
 		metricsListen    string
@@ -84,6 +85,7 @@ func newServeCmd() *cobra.Command {
 			clusterDataDir = pickFlagOrYaml(cmd, "cluster-data-dir", clusterDataDir, fileCfg.Broker.Cluster.DataDir)
 			clusterRaftAddr = pickFlagOrYaml(cmd, "cluster-raft-addr", clusterRaftAddr, fileCfg.Broker.Cluster.RaftAddr)
 			clusterSecrets = pickFlagOrYaml(cmd, "cluster-secrets-dir", clusterSecrets, fileCfg.Broker.Cluster.SecretsDir)
+			colocatedAgentNID = pickFlagOrYaml(cmd, "colocated-agent-nid", colocatedAgentNID, fileCfg.Broker.Cluster.ColocatedAgentNID)
 			// B5/B6 observability knobs: flag wins, else broker.yaml, else the cobra default.
 			logLevel = pickFlagOrYaml(cmd, "log-level", logLevel, fileCfg.Broker.Obs.LogLevel)
 			metricsListen = pickFlagOrYaml(cmd, "metrics-listen", metricsListen, fileCfg.Broker.Obs.MetricsListen)
@@ -189,6 +191,7 @@ func newServeCmd() *cobra.Command {
 				ClusterDataDir:      clusterDataDir,
 				ClusterRaftAddr:     clusterRaftAddr,
 				ClusterSecretsDir:   clusterSecrets,
+				ColocatedAgentNID:   colocatedAgentNID,
 				DBPath:              dbPath,
 				MetricsAddr:         metricsListen,
 				ManifestAddr:        manifestListen,
@@ -220,6 +223,11 @@ func newServeCmd() *cobra.Command {
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
+			// G5 #13: a cancellable run context so an in-broker RequestReExec (the reload admin-op) can
+			// unwind Run through its ordered shutdown, then trampoline into the freshly-staged on-disk binary.
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			b.SetReloadTrigger(cancel)
 
 			authMode := "off (dev / P2-style)"
 			if cfg.AuthCallout != nil {
@@ -229,8 +237,11 @@ func newServeCmd() *cobra.Command {
 				"tether serve: NATS=%s DB=%s auth_callout=%s\n(press Ctrl-C to quit)\n",
 				natsURL, dbPath, authMode)
 
-			if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := b.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				return err
+			}
+			if b.ReExecRequested() {
+				return reExecBrokerInPlace(cmd) // G5 #13: syscall.Exec the on-disk binary, same PID
 			}
 			return nil
 		},
@@ -259,6 +270,8 @@ func newServeCmd() *cobra.Command {
 		"D9 cluster: raft sub-tree parent (raft/ lives here); empty = single mode. Cluster mode requires `tether cluster init` to have created raft/ first")
 	cmd.Flags().StringVar(&clusterRaftAddr, "cluster-raft-addr", "",
 		"D9 cluster: raft transport bind host:port (private net only, e.g. 0.0.0.0:7400)")
+	cmd.Flags().StringVar(&colocatedAgentNID, "colocated-agent-nid", "",
+		"G5 #19: the nid of the tether agent co-located on this broker host (self-reported so `node ls --brokers` correlates broker+agent versions)")
 	cmd.Flags().StringVar(&clusterSecrets, "cluster-secrets-dir", "",
 		"D9 cluster: secrets dir (cluster-ca, route leaf, tunnel-cert, broker.nk, node-ident, account.nk); required in cluster mode")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
@@ -269,6 +282,21 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsServerBin, "nats-server-bin", "", "nats-server binary for the topology reconciler's `-t` dry-run + `--signal reload` (default: nats-server on PATH) (C3)")
 	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
 	return cmd
+}
+
+// reExecBrokerInPlace (G5 #13) replaces this process image with the on-disk binary at the SAME path the
+// daemon was started from — the freshly-STAGED target. syscall.Exec preserves the PID, so systemd
+// Type=simple sees no exit (structurally immune to the #23 clean-exit trap). It only returns on FAILURE,
+// in which case it yields a non-zero-exit error so Restart=always (G1) revives with the new binary.
+func reExecBrokerInPlace(cmd *cobra.Command) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return &ExitError{Class: exitInternal, Err: fmt.Errorf("broker re-exec: resolve executable: %w", err)}
+	}
+	exe = strings.TrimSuffix(exe, " (deleted)") // the running inode was replaced on disk by staging
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "broker: re-exec into %s (same PID, new binary)\n", exe)
+	err = syscall.Exec(exe, os.Args, os.Environ()) // returns ONLY on failure
+	return &ExitError{Class: exitInternal, Err: fmt.Errorf("broker re-exec failed: %w", err)}
 }
 
 // pickFlagOrYaml returns flagVal when the user explicitly passed the

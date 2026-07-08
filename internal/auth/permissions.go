@@ -74,6 +74,11 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			// pub cluster.apply.* stays green; a positive test asserts member reach to these).
 			subjectPrefix + ".ctrl.by." + actor + ".cluster-health.req",
 			subjectPrefix + ".ctrl.by." + actor + ".cluster-roster.req", // G3 #17 roster-pull (same rationale as unactivated)
+			// G5 #13 remote reload/transfer trigger. Publish-only ACL is NOT the real gate — the broker
+			// verifies the request's ACCOUNT SIGNATURE against its pinned account_pub before acting, so
+			// only the operator holding the cluster account seed is honored. Hyphen-leaf (not cluster.*)
+			// keeps §13.8 green; a member that reaches it without a valid signature is refused.
+			subjectPrefix + ".ctrl.by." + actor + ".cluster-upgrade.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ls.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ack.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",
