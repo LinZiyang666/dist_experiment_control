@@ -29,8 +29,12 @@ test:
 # heavy matrix; see the note in all_phases_test.go). For fast LOCAL iteration run the ONE suite
 # you touched: `go test ./test/pX/...`, or `go test -tags dN_integration -race ./test/dN/`. The
 # test is gated by the e2e_matrix build tag so a bare `go test ./...` doesn't recursively fork.
+# -timeout 20m: the matrix runs SERIALLY in ONE test binary (all_phases + the D-matrices), so the whole
+# suite shares the OUTER go-test deadline — NOT the default 10m, which the ~10min serial runtime tips over
+# on a loaded CI runner (each subtest still has its own inner timeout: phaseTimeout for the forked phase
+# subprocesses, per-suite deadlines for the D-matrices — so a genuine hang is still caught quickly).
 e2e:
-	go test -count=1 -tags e2e_matrix -v ./test/e2e/...
+	go test -count=1 -tags e2e_matrix -timeout 20m -v ./test/e2e/...
 
 lint:
 	@GOPATH_BIN="$$(go env GOPATH)/bin/golangci-lint"; \
