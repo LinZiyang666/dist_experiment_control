@@ -714,7 +714,13 @@ Wants=network-online.target
 Type=simple
 User=tether
 ExecStart=$bin/nats-server -c $etc/nats.d/nats.conf
-Restart=on-failure
+# G4 §B / #23: Restart=always (not on-failure). The `cluster add` grow cutover restarts nats-server with a
+# same-uid SIGKILL (nats-server --signal stop) — the one lifecycle restart tether owns, since it never
+# orchestrates systemctl and the reconciler is SIGHUP-only. Restart=always makes that revival deterministic
+# and completes the #23 clean-exit hardening the broker unit already uses. The default StartLimit still trips
+# a genuine crash-loop; a single deliberate SIGKILL is well under StartLimitBurst.
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

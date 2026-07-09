@@ -401,6 +401,36 @@ func PlanClearUpgradeActive() (*Command, error) {
 	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit)), nil
 }
 
+// MetaKeyGrowActive is the cluster_meta key a `cluster add` grow sets for its whole duration (G4 §B). Its
+// VALUE is the joiner's node_id, so the leader can refuse a lock for a DIFFERENT joiner while one grow is in
+// flight (strict serialization) and a re-run of the SAME joiner recognizes the marker as its own (resume).
+// Symmetric with the upgrade lock: a grow refuses while upgrade is set and vice-versa. A marker (not an
+// operation) so it never self-blocks the grow's own OpKindJoin op (see the driveInFlightOperations carve-out).
+const MetaKeyGrowActive = "cluster_grow_active"
+
+// PlanSetGrowActive UPSERTs the grow marker with the joiner id as the value (mirrors force-single/upgrade).
+func PlanSetGrowActive(joinerID string) (*Command, error) {
+	keyLit := MustLitText(MetaKeyGrowActive)
+	valLit := MustLitText(joinerID)
+	return NewCommand(OpClusterMetaSet, Stmt(
+		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
+			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+}
+
+// PlanClearGrowActive DELETEs the grow marker (release). External review M1: when joinerID is non-empty the
+// clear is CONDITIONAL on the marker's value matching it (`AND value=<joiner>`), so a completed/aborted re-run of
+// `cluster add <joinerA>` can NEVER wipe a DIFFERENT grow's in-flight marker (<joinerB>) — that would drop the
+// strict-serialize mutex mid-grow. An empty joinerID is a break-glass unconditional clear (a stale marker whose
+// joiner the caller no longer knows); the release path always passes the joiner it is releasing.
+func PlanClearGrowActive(joinerID string) (*Command, error) {
+	keyLit := MustLitText(MetaKeyGrowActive)
+	where := `key=` + keyLit
+	if joinerID != "" {
+		where += ` AND value=` + MustLitText(joinerID)
+	}
+	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE `+where)), nil
+}
+
 // MetaKeyForceSingleEpoch is the cluster_meta key holding the per-recovery epoch token. The
 // post-recover split-brain detector compares it across the cluster-health broadcast: hearing a peer
 // advertise force_single_active with a DIFFERENT epoch means two divergent single-voter timelines.

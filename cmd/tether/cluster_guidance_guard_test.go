@@ -34,8 +34,10 @@ var relocatedSpellings = []string{
 }
 
 // deletedAddSpellings are forbidden in pure operator-output files but NOT in clusterstatus.go (whose
-// latent OpClusterAdd handler legitimately keeps them in internal error/log context).
-var deletedAddSpellings = []string{"cluster add", "cluster sign-join"}
+// latent OpClusterAdd handler legitimately keeps them in internal error/log context). G4 §B REVIVED the
+// `cluster add` verb (grow orchestration), so it is no longer a deleted/stale command — pointing an operator
+// at `cluster add` is now correct guidance. Only `cluster sign-join` stays deleted here.
+var deletedAddSpellings = []string{"cluster sign-join"}
 
 func TestExternalReviewF2NoStaleCommandGuidanceInLiveOutput(t *testing.T) {
 	full := append(append([]string{}, relocatedSpellings...), deletedAddSpellings...)

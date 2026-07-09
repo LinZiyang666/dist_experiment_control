@@ -26,10 +26,17 @@ func c8Child(root *cobra.Command, name string) *cobra.Command {
 // TestC8DeletedCommandsGone: add / sign-join / wait are absent from the cluster command set.
 func TestC8DeletedCommandsGone(t *testing.T) {
 	root := newClusterCmd()
-	for _, gone := range []string{"add", "sign-join", "wait"} {
+	// C8 deleted `sign-join`/`wait` permanently. `add` was ALSO deleted by C8 (the old direct-AddVoter
+	// primitive), but G4 §B REVIVES the `add` verb with entirely NEW grow-orchestration semantics — there is
+	// no alias collision (the old one isn't registered) and it is a first-class online command again. So `add`
+	// must once more be PRESENT; only sign-join/wait stay gone.
+	for _, gone := range []string{"sign-join", "wait"} {
 		if c := c8Child(root, gone); c != nil {
 			t.Errorf("`cluster %s` must be DELETED, but it is still registered (hidden=%v)", gone, c.Hidden)
 		}
+	}
+	if c := c8Child(root, "add"); c == nil {
+		t.Error("`cluster add` must be REGISTERED again (G4 §B grow orchestration revived the verb)")
 	}
 }
 

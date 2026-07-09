@@ -4,8 +4,9 @@ package proto
 // client-synthesized destructive-gate decision.
 
 // ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
-// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported).
-const ClusterHealthSchemaVersion = 3
+// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v4 (G4) adds
+// GrowLockActive.
+const ClusterHealthSchemaVersion = 4
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -64,6 +65,11 @@ type ClusterHealthResp struct {
 	// no-op (all hosts already at target) can still DETECT + clear a stale lock left by a prior roll whose
 	// release-lock did not confirm — the self-heal path that would otherwise never run. Additive omitempty.
 	UpgradeLockActive bool `json:"upgrade_lock_active,omitempty"`
+	// GrowLockActive (G4 §B) is true when this broker's committed cluster_meta holds the
+	// `cluster_grow_active` marker. `cluster add` reads it so a re-run whose grow already completed can still
+	// DETECT + clear a stale lock left by a prior grow whose release-lock did not confirm (the self-heal path,
+	// mirroring UpgradeLockActive). Additive omitempty → pre-G4 brokers decode false.
+	GrowLockActive bool `json:"grow_lock_active,omitempty"`
 	// TopoApplied/TopoObserved/TopoReconcileReason (C3 §2.7) are this broker's NATS topology reconcile
 	// self-report: Applied = the generation rendered into the on-disk conf, Observed = the generation
 	// the LIVE nats-server confirmed loading (via the /varz probe). TopoReported distinguishes a C3

@@ -7,7 +7,10 @@ package natsreconcile
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/natscluster"
@@ -22,6 +25,12 @@ const (
 	ActionRejected             = "rejected"               // nats-server -t rejected the render (kept old conf + .bak)
 	ActionUnresolvable         = "unresolvable"           // missing peer bus identity / self not in peers (fail-closed)
 	ActionUnknownDirective     = "unknown_directive"      // an unknown/include directive in the live conf (fail-closed)
+	// ActionAwaitingClusteredCutover (G4 #3/#10/#4): the standalone→clustered FIRST-GROW delta is rendered +
+	// DryRun-validated (proving the secrets-dir mTLS fallback works) but the swap is WITHHELD. The autonomous
+	// reconciler is SIGHUP-only (§11(h)); applying a clustered conf under a running-standalone nats-server and
+	// SIGHUPing it would form a clustered-alone JS meta (#10) or orphan the standalone store (#4). The
+	// orchestrated `cluster add` cutover owns the apply + the full restart. Not an error — a deliberate hold.
+	ActionAwaitingClusteredCutover = "awaiting_clustered_cutover"
 )
 
 // Inputs is the per-pass reconcile input. AccountIssuer comes from the broker's own account seam,
@@ -36,6 +45,11 @@ type Inputs struct {
 	ConfPath       string
 	NatsServerBin  string
 	DesiredGen     uint64
+	// SecretsDir (G4 #3), when set, lets the FIRST standalone→clustered grow render succeed: the live
+	// standalone conf has no cluster{} block to harvest routes mTLS from (BuildMergedConf hard-fails), so
+	// the reconciler derives CA/cert/key from the secrets dir + synthesizes the route listen instead. Empty
+	// preserves the pre-G4 harvest-only behavior (a first grow stays ActionRejected until secrets-dir is wired).
+	SecretsDir string
 }
 
 // Outcome reports the result. AppliedGen is recomputed from the on-disk conf (the conf bytes ARE the
@@ -113,6 +127,20 @@ func ReconcileOnce(in Inputs, lastApplied, lastObserved uint64, reload func() er
 		// BuildMergedConf (C3-B1/B3): the reconciler PRESERVES them rather than forcing new values, so
 		// it never drops routes mTLS and never hot-adds an http monitor nats-server can't reload.
 	}
+	// G4 #3: the FIRST standalone→clustered grow renders clustered (peers≥2) over a live conf that is still
+	// standalone JetStream — which has NO cluster{} block for BuildMergedConf to harvest routes mTLS from, so
+	// it would hard-fail ("no cluster{} block to harvest"). When SecretsDir is wired, supply the routes-mTLS
+	// identity from the secrets dir + synthesize the route listen, so BuildMergedConf skips the harvest and
+	// the render succeeds. This delta is ALSO the destructive cutover the reconciler must WITHHOLD (below).
+	clusteredOverStandalone := !standalone && own.IsStandaloneJetStream()
+	if clusteredOverStandalone && in.SecretsDir != "" {
+		cfg.CAFile = filepath.Join(in.SecretsDir, "cluster-ca.pem")
+		cfg.CertFile = filepath.Join(in.SecretsDir, "route-cert.pem")
+		cfg.KeyFile = filepath.Join(in.SecretsDir, "route-key.pem")
+		cfg.ClusterListen = SynthesizeClusterListen(self.RouteURL)
+		// ClusterName left empty → natscluster.Render defaults it to "tether" (the harvest default), so a
+		// fallback-rendered cluster name matches an already-clustered peer's harvested name.
+	}
 	merged, err := natsconf.BuildMergedConf(own, cfg)
 	if err != nil {
 		// C3-M3: a render/merge failure is a PERMANENT (mis)configuration, NOT a transient "awaiting
@@ -146,6 +174,16 @@ func ReconcileOnce(in Inputs, lastApplied, lastObserved uint64, reload func() er
 	if err := natsconf.DryRun(in.NatsServerBin, merged); err != nil {
 		return Outcome{AppliedGen: lastApplied, ObservedGen: lastObserved, Action: ActionRejected,
 			Reason: "rendered conf failed `nats-server -t` (not swapping; .bak intact): " + err.Error(), Err: err}
+	}
+
+	// 6b. G4 #3/#10/#4 WITHHOLD: the standalone→clustered first-grow delta is now rendered + validated, but
+	//     the autonomous reconciler must NOT swap it. It is SIGHUP-only (§11(h)); swapping a clustered conf
+	//     under a running-standalone nats + SIGHUP would form a clustered-alone JS meta (#10) or orphan the
+	//     standalone store (#4). Hold here — the orchestrated `cluster add` cutover owns the apply + the full
+	//     restart (with the JS-store reset). Applied/Observed stay put: topology is honestly NOT converged.
+	if clusteredOverStandalone {
+		return Outcome{AppliedGen: lastApplied, ObservedGen: lastObserved, Action: ActionAwaitingClusteredCutover,
+			Reason: "standalone→clustered cutover rendered + validated but WITHHELD — a reconciler SIGHUP cannot safely cross it; run `tether cluster add <this-broker>` to perform the coordinated restart"}
 	}
 
 	// 7. Atomic swap (.bak + tmp + rename + fsync).
@@ -184,6 +222,18 @@ func observedConfirmed(probe func() (time.Time, error), notBefore time.Time) boo
 		return false
 	}
 	return !loadTime.Before(notBefore)
+}
+
+// SynthesizeClusterListen derives the local route listen ("0.0.0.0:<port>") from this broker's route URL
+// ("nats://host:6222") for the G4 #3 secrets-dir fallback, when there is no live cluster{} block to harvest
+// the listen from. Falls back to the nats default route port 6222 if the URL carries no parseable port.
+// Exported so the grow cutover (which APPLIES the swap the reconciler WITHHELD) renders the identical listen.
+func SynthesizeClusterListen(routeURL string) string {
+	h := strings.TrimPrefix(strings.TrimSpace(routeURL), "nats://")
+	if _, port, err := net.SplitHostPort(h); err == nil && port != "" {
+		return "0.0.0.0:" + port
+	}
+	return "0.0.0.0:6222"
 }
 
 func fileMtime(path string) time.Time {

@@ -284,10 +284,17 @@ func pollUntil(ctx context.Context, timeout time.Duration, pred func() bool, tim
 // notifyUpgrade POSTs a best-effort JSON milestone to the webhook (no-op if empty). Failures are ignored
 // — the roll's correctness never depends on the webhook.
 func notifyUpgrade(webhook, event string, fields map[string]any) {
+	notifyMilestone(webhook, "cluster_upgrade_"+event, fields)
+}
+
+// notifyMilestone POSTs a best-effort JSON milestone {"event": fullEvent, ...fields} to the webhook (no-op if
+// empty). Failures are ignored — orchestration correctness never depends on the webhook. Shared by the
+// upgrade and grow orchestrators.
+func notifyMilestone(webhook, fullEvent string, fields map[string]any) {
 	if webhook == "" {
 		return
 	}
-	body := map[string]any{"event": "cluster_upgrade_" + event}
+	body := map[string]any{"event": fullEvent}
 	for k, v := range fields {
 		body[k] = v
 	}

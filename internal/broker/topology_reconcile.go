@@ -148,6 +148,10 @@ func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool
 		ConfPath:       b.cfg.NatsConfPath,
 		NatsServerBin:  bin,
 		DesiredGen:     desired,
+		// G4 #3: let the FIRST standalone→clustered grow render routes mTLS from the secrets dir when the
+		// live standalone conf has no cluster{} block to harvest. The reconciler still WITHHOLDS that swap
+		// (ActionAwaitingClusteredCutover) so only `cluster add` performs the coordinated restart.
+		SecretsDir: b.cfg.ClusterSecretsDir,
 	}, true
 }
 

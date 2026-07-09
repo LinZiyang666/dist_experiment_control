@@ -12,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
+	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -60,7 +61,8 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	addGrouped(newClusterJoinCmd(&socketPath), "online")      // C4: join prepare/approve (recoverable; replaces `add`/`sign-join`)
 	addGrouped(newClusterRetireCmd(&socketPath), "online")    // C4: retire (recoverable; replaces `drain --retire`/`remove`)
 	addGrouped(newClusterRebalanceCmd(&socketPath), "online") // C-rebalance: rebalance proxy (spread __proxy__ homes)
-	addGrouped(newClusterUpgradeCmd(), "online")              // G5 #13/#14: rolling broker-daemon upgrade (over NATS, signed)
+	addGrouped(newClusterUpgradeCmd(), "online")              // G5 #13/#14: rolling broker-daemon upgrade
+	addGrouped(newClusterAddCmd(&socketPath), "online")       // G4 §B: grow orchestration (joiner-local + leader-over-NATS)
 	addGrouped(newClusterPinCmd(), "client")                  // cli-failover: pin a cluster from an OOB discovery invite
 	addGrouped(newClusterInviteCmd(), "client")               // cli-failover: mint an OOB discovery invite
 	addGrouped(newClusterInitCmd(), "migrate")
@@ -693,20 +695,22 @@ func newClusterSetRaftAddrCmd(socketPath *string) *cobra.Command {
 
 func newClusterInitCmd() *cobra.Command {
 	var (
-		fromExisting bool
-		dataDir      string
-		dbPath       string
-		secretsDir   string
-		selfID       string
-		name         string
-		nodeIdentPub string
-		raftAddr     string
-		natsRoute    string
-		tunnelAddr   string
-		publicHost   string
-		fromManifest string
-		check        bool
-		dryRun       bool
+		fromExisting  bool
+		dataDir       string
+		dbPath        string
+		secretsDir    string
+		selfID        string
+		name          string
+		nodeIdentPub  string
+		raftAddr      string
+		natsRoute     string
+		tunnelAddr    string
+		publicHost    string
+		fromManifest  string
+		check         bool
+		dryRun        bool
+		confirmNodeID string // G4 #5: machine-escape confirm (with $TETHER_CONFIRM_NODE_ID) for unattended grow
+		configPath    string // G4 #5: broker.yaml to auto-apply the cluster seam into (was print-only)
 	)
 	cmd := &cobra.Command{
 		Use:     "init --from-existing",
@@ -765,8 +769,14 @@ func newClusterInitCmd() *cobra.Command {
 					"  - Stop the broker first (systemctl stop tether-broker).\n"+
 					"  - proto v2 breaks the wire: EVERY agent must be reinstalled on v2 afterward.\n"+
 					"  - Rollback = restore tether.db.bak (to the v2 SINGLE broker; no path back to a v1 fleet).")
-			if !confirmTypedNodeID(cmd, selfID, "", false, "") { // never-escapable: irreversible one-way migration
-				return fmt.Errorf("cluster init: aborted (node_id not confirmed)")
+			// G4 #5: machine-ESCAPABLE confirm. init is irreversible but NOT quorum-destructive (it migrates
+			// this node's own/empty DB and cannot fork an existing quorum), so it joins resnapshot/remove's
+			// escapable tier — `cluster add` can drive it unattended via --confirm-node-id + $TETHER_CONFIRM_NODE_ID.
+			// The TTY path still HARD-REFUSES a non-interactive terminal unless BOTH flag AND env equal self-id.
+			if !confirmTypedNodeID(cmd, selfID,
+				"CONSEQUENCE: one-way v1→v2 migration of this broker's DB in place; rollback = restore tether.db.bak.",
+				true, confirmNodeID) {
+				return fmt.Errorf("cluster init: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
 			}
 			var initErr error
 			if fromManifest != "" {
@@ -780,6 +790,17 @@ func newClusterInitCmd() *cobra.Command {
 			}
 			if initErr != nil {
 				return initErr
+			}
+			// G4 #5: APPLY the broker.yaml cluster seam (it was previously only PRINTED as NEXT-step 3, so an
+			// operator/automation had to hand-append it). Idempotent: skips if a cluster.raft_addr seam is
+			// already present. This lets `cluster add` (and a manual init) leave a serve-ready broker.yaml.
+			seamApplied := false
+			if configPath != "" {
+				applied, aerr := applyClusterSeam(configPath, dataDir, raftAddr, secretsDir)
+				if aerr != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: could not auto-apply the broker.yaml cluster seam (%v) — set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} by hand\n", aerr)
+				}
+				seamApplied = applied
 			}
 			// Halt-and-print the restart sequence (tether does NOT orchestrate systemctl;
 			// d9-plan OQ-3). cluster mode needs the new nats.conf authorization{} ACL live
@@ -811,8 +832,12 @@ func newClusterInitCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(out, "     %s\n", ids.Note)
 			}
 			_, _ = fmt.Fprintln(out, "  2. systemctl restart nats-server                       # bring up the new conf")
-			_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} in broker.yaml")
-			_, _ = fmt.Fprintln(out, "     # nats_conf_path: /etc/tether/nats.d/nats.conf  (the reconciler's conf; #22 — set it explicitly so a future binary upgrade can't repoint it)")
+			if seamApplied {
+				_, _ = fmt.Fprintf(out, "  3. ✓ broker.cluster seam auto-applied to %s (#5)\n", configPath)
+			} else {
+				_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} in broker.yaml")
+				_, _ = fmt.Fprintln(out, "     # nats_conf_path: /etc/tether/nats.d/nats.conf  (the reconciler's conf; #22 — set it explicitly so a future binary upgrade can't repoint it)")
+			}
 			_, _ = fmt.Fprintln(out, "  4. systemctl start tether-broker                       # starts in cluster mode (N=1)")
 			_, _ = fmt.Fprintln(out, "  5. reinstall ALL agents on v2, then `tether cluster join prepare`/`approve` to grow to N>=3")
 			return nil
@@ -835,8 +860,75 @@ func newClusterInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&publicHost, "public-host", "", "this node's public DNS host")
 	cmd.Flags().BoolVar(&check, "check", false, "dry-run: run the read-only doctor preflight and exit WITHOUT mutating")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "alias of --check")
+	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "unattended confirm (#5): must equal --self-id AND match $"+machineConfirmEnv+" (no TTY; for `cluster add`)")
+	cmd.Flags().StringVar(&configPath, "config", "/etc/tether/broker.yaml", "broker.yaml to auto-apply the cluster seam into (#5; empty = only print it)")
 	registerYesRejector(cmd)
 	return cmd
+}
+
+// applyClusterSeam (G4 #5) writes the broker.cluster seam into broker.yaml so a freshly-init'd broker is
+// serve-ready without a hand edit. It is idempotent: a config that already carries a cluster.raft_addr is
+// left untouched (returns applied=false). A missing config file is not an error (returns applied=false).
+//
+// External review B1: the seam is INSERTED as the first child of the top-level `broker:` block, NOT appended at
+// EOF. An EOF append only lands under broker.cluster when `broker:` happens to be the LAST top-level key — a
+// broker.yaml with any block after it (a `storage:` section, a trailing comment) would attach the seam to the
+// wrong parent, leaving broker.cluster unset. The broker then boots SINGLE mode, which `cluster add` used to
+// misjudge as clustered and stall. Inserting right after the `broker:` line is placement-independent, and the
+// write is FAIL-CLOSED VERIFIED: the result must decode back with broker.cluster.raft_addr set, else this
+// returns an error so the caller never proceeds on a config that will boot single-mode.
+func applyClusterSeam(configPath, dataDir, raftAddr, secretsDir string) (bool, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	// External re-review R2-B1 / R3-B1: decide idempotency by DECODING broker.cluster, not a `raft_addr:`
+	// substring match, and require the seam to be COMPLETE + matching. An existing broker.cluster block is
+	// idempotent ONLY if every field matches this node (raft_addr, data_dir, secrets_dir, nats_conf_path);
+	// anything else — a stale/wrong raft_addr OR a partial seam missing the cluster-mode-trigger data_dir — is a
+	// HARD error, never left in place (serve keys cluster mode on a non-empty data_dir, so a partial seam boots
+	// SINGLE mode) and never inserted over (a second `cluster:` block would be malformed).
+	if existing, lerr := serveconf.Load(configPath); lerr == nil {
+		ec := existing.Broker.Cluster
+		if ec.RaftAddr != "" || ec.DataDir != "" || ec.SecretsDir != "" || ec.NatsConfPath != "" {
+			if ec.RaftAddr == raftAddr && ec.DataDir == dataDir && ec.SecretsDir == secretsDir && ec.NatsConfPath == defaultNatsConfPath {
+				return false, nil // complete + matching (idempotent)
+			}
+			return false, fmt.Errorf("broker.yaml %s already has a broker.cluster seam that is stale/incomplete for this node "+
+				"(have raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q; want raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q) — "+
+				"fix or remove it, then re-run", configPath, ec.RaftAddr, ec.DataDir, ec.SecretsDir, ec.NatsConfPath, raftAddr, dataDir, secretsDir, defaultNatsConfPath)
+		}
+	}
+	seam := fmt.Sprintf("  cluster:\n    data_dir: %s\n    raft_addr: %s\n    secrets_dir: %s\n    nats_conf_path: %s\n    nats_server_bin: nats-server",
+		dataDir, raftAddr, secretsDir, defaultNatsConfPath)
+	lines := strings.Split(string(data), "\n")
+	out := make([]string, 0, len(lines)+7)
+	inserted := false
+	for _, ln := range lines {
+		out = append(out, ln)
+		if !inserted && strings.TrimRight(ln, " \t\r") == "broker:" {
+			out = append(out, seam)
+			inserted = true
+		}
+	}
+	if !inserted {
+		return false, fmt.Errorf("no top-level `broker:` block in %s to attach the cluster seam to", configPath)
+	}
+	if werr := os.WriteFile(configPath, []byte(strings.Join(out, "\n")), 0o644); werr != nil {
+		return false, werr
+	}
+	// Fail-closed: the write must actually decode into broker.cluster (catches wrong placement / a partial write).
+	c, lerr := serveconf.Load(configPath)
+	if lerr != nil {
+		return false, fmt.Errorf("cluster seam written to %s but it no longer decodes: %w", configPath, lerr)
+	}
+	if c.Broker.Cluster.RaftAddr != raftAddr {
+		return false, fmt.Errorf("cluster seam written to %s but broker.cluster.raft_addr did not take effect (got %q) — check the file structure", configPath, c.Broker.Cluster.RaftAddr)
+	}
+	return true, nil
 }
 
 func missingClusterInitFields(fields map[string]string) []string {

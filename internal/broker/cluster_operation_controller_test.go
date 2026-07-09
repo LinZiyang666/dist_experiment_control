@@ -179,6 +179,52 @@ func TestC4JoinBarrierPersistedBeforeAddVoter(t *testing.T) {
 // grow/retire crossing a rolling broker restart could turn "temporarily down one voter" into a quorum
 // break. The lock check is the FIRST gate (before nonce/roster checks), so the refusal is unconditional
 // and does NOT consume the join nonce; releasing the marker restores membership.
+// TestG4GrowMarkerFenceAndCarveout (review m1/M6): the cluster_grow_active marker is joiner-id-valued, so it
+// (a) refuses a DIFFERENT-node join + any retire (strict serialize), yet (b) does NOT block the grow's OWN
+// join op (the Q7 self-op carve-out — else the grow deadlocks its own membership change). Pins the asymmetry
+// the review flagged (StartJoinOperation previously had no grow fence) + the carve-out.
+func TestG4GrowMarkerFenceAndCarveout(t *testing.T) {
+	n, _ := d7SingleNode(t, "ctl-1")
+	admin := NewClusterAdmin(n, nil)
+	bundleA, _ := makeJoinBundle(t, "join-A", "10.0.0.3:7400", "nonce-a")
+	bundleB, _ := makeJoinBundle(t, "join-B", "10.0.0.4:7400", "nonce-b")
+
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetGrowActive("join-A") }); err != nil {
+		t.Fatalf("set grow marker: %v", err)
+	}
+	if growActiveJoiner(n.RODB()) != "join-A" {
+		t.Fatalf("growActiveJoiner must read the joiner id, got %q", growActiveJoiner(n.RODB()))
+	}
+	if _, err := admin.StartJoinOperation(bundleB); err == nil || !strings.Contains(err.Error(), "grow") {
+		t.Fatalf("a join of a DIFFERENT node must refuse during a grow (m1): %v", err)
+	}
+	if _, err := admin.StartRetireOperation("ctl-1", true); err == nil || !strings.Contains(err.Error(), "grow") {
+		t.Fatalf("retire must refuse during a grow: %v", err)
+	}
+	// The grow's OWN join (join-A == the marker's joiner) is ALLOWED (self-op carve-out — M6: else self-deadlock).
+	if _, err := admin.StartJoinOperation(bundleA); err != nil {
+		t.Fatalf("the grow's OWN join (self-op carve-out) must be allowed while the marker is held: %v", err)
+	}
+	// External review M1: a release BOUND TO A DIFFERENT JOINER must be a NO-OP — clearing join-A's marker via a
+	// release of "join-B" (a stale/errant re-run of another grow) must NOT drop this grow's mutex. The marker survives.
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearGrowActive("join-B") }); err != nil {
+		t.Fatalf("clear (wrong joiner) propose: %v", err)
+	}
+	if growActiveJoiner(n.RODB()) != "join-A" {
+		t.Fatalf("M1: a release bound to a DIFFERENT joiner must NOT clear join-A's marker, got %q", growActiveJoiner(n.RODB()))
+	}
+	// A release bound to the OWNING joiner (join-A) clears it.
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearGrowActive("join-A") }); err != nil {
+		t.Fatalf("clear (owning joiner) propose: %v", err)
+	}
+	if growActiveJoiner(n.RODB()) != "" {
+		t.Fatal("growActiveJoiner must be empty after the owning-joiner clear")
+	}
+	if _, err := admin.StartJoinOperation(bundleB); err != nil {
+		t.Fatalf("a different-node join must resume after the grow marker clears: %v", err)
+	}
+}
+
 func TestB2UpgradeLockBlocksMembership(t *testing.T) {
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)

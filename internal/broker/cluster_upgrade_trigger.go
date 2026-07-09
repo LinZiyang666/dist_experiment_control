@@ -139,6 +139,13 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		if b.cl == nil || b.cl.node == nil {
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeClusterNotEnabled, Error: "cluster not enabled"}
 		}
+		// G4 §B: symmetric fence — refuse to start a roll while a `cluster add` grow holds its marker (grow
+		// blocks upgrade, upgrade blocks grow). The grow's join op may be briefly terminal between phases
+		// while the marker stays held (cutover/seed/rebalance), so check the marker, not just NonTerminalOperations.
+		if j := growActiveJoiner(b.cl.node.RODB()); j != "" {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest,
+				Error: "a `cluster add` grow of " + j + " is in progress — let it finish before starting a rolling upgrade"}
+		}
 		// External-review round2 B2: refuse to START a roll while a membership op is already in flight — the
 		// roll must own a topology-stable window. (Belt-and-suspenders with the driveInFlightOperations freeze:
 		// this stops the roll at acquire; the freeze stops any op that slips through the check→commit gap.)

@@ -27,7 +27,7 @@ const (
 	// (SecretsPreflight) requires node-ident.nk INSIDE the secrets dir, so keygen/node-pub/join-prepare
 	// must default there too — else the documented `keygen` flow mints the seed at /etc/tether/node-ident.nk
 	// and the broker FATALs at start on a missing secrets/node-ident.nk (audit finding F).
-	defaultSeed         = defaultClusterSecretsDir + "/node-ident.nk"
+	defaultSeed = defaultClusterSecretsDir + "/node-ident.nk"
 	// #22 (G1): the reconciler-managed nats.conf lives in the tether-owned /etc/tether/nats.d/ subdir
 	// so the User=tether in-broker reconciler can atomically rewrite it; /etc/tether itself stays
 	// root-owned (the root-run caddy reads /etc/tether/Caddyfile — a tether-owned /etc/tether would be
@@ -501,12 +501,15 @@ const machineConfirmEnv = "TETHER_CONFIRM_NODE_ID"
 // path for a quorum-affecting op (B3 item 4).
 //
 // allowMachineEscape is a PER-CALL-SITE capability (default false), NEVER a property of the
-// shared funnel: the never-escapable ops (force-single / recover / F==0-drain / init / restore)
-// pass false, so even a correct flag+env STILL falls through to the TTY refuse — an env var in a
-// systemd unit or CI is not "attended" for an irreversible / quorum-destructive op. Only non-F==0
-// `cluster remove` passes true. When escape IS allowed, it fires ONLY if BOTH the --confirm-node-id
-// flag (flagNodeID) AND the env exactly equal want; either alone refuses (a stray env or a stray
-// history flag must not be enough). --yes is never the escape (rejectedUnattendedYes is unchanged).
+// shared funnel: the never-escapable ops (force-single / recover / F==0-drain / restore) pass false,
+// so even a correct flag+env STILL falls through to the TTY refuse — an env var in a systemd unit or
+// CI is not "attended" for a quorum-DESTRUCTIVE / brain-split-capable op. The escapable tier (non-F==0
+// `cluster remove`, `resnapshot`, and — G4 #5 — `cluster init`) passes true: these are irreversible but
+// NOT quorum-destructive (init on a fresh joiner migrates an empty/own DB; it cannot fork an existing
+// quorum), so unattended grow orchestration (`cluster add`) must be able to escape the TTY. When escape
+// IS allowed, it fires ONLY if BOTH the --confirm-node-id flag (flagNodeID) AND the env exactly equal
+// want; either alone refuses (a stray env or a stray history flag must not be enough). --yes is never
+// the escape (rejectedUnattendedYes is unchanged).
 func confirmTypedNodeID(cmd *cobra.Command, want, consequence string, allowMachineEscape bool, flagNodeID string) bool {
 	if allowMachineEscape {
 		envID := os.Getenv(machineConfirmEnv)

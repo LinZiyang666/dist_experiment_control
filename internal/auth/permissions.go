@@ -79,6 +79,10 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			// only the operator holding the cluster account seed is honored. Hyphen-leaf (not cluster.*)
 			// keeps §13.8 green; a member that reaches it without a valid signature is refused.
 			subjectPrefix + ".ctrl.by." + actor + ".cluster-upgrade.req",
+			// G4 §B remote grow trigger. Same rationale as cluster-upgrade: publish-only ACL is defence in
+			// depth, NOT the gate — the broker verifies the ACCOUNT SIGNATURE + TargetNode==self + replay
+			// skew before acting. Hyphen-leaf keeps §13.8 green.
+			subjectPrefix + ".ctrl.by." + actor + ".cluster-grow.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ls.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ack.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",

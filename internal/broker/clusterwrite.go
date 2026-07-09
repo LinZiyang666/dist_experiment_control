@@ -284,7 +284,8 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
 		},
 		func() (*nats.Subscription, error) { return SubscribeClusterRosterPull(nc, b.manifestBytes) }, // G3 #17
-		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) },             // G5 #13 W2b
+		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) },            // G5 #13 W2b
+		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) },               // G4 §B grow trigger
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
 		},

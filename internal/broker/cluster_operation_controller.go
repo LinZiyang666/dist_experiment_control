@@ -50,6 +50,13 @@ func (a *ClusterAdmin) StartJoinOperation(bundleStr string) (string, error) {
 	if err := cluster.VerifyBundlePoP(b); err != nil {
 		return "", err
 	}
+	// m1 (review): symmetric with StartRetireOperation — refuse a join of a DIFFERENT node while a `cluster
+	// add` grow holds the marker (strict serialize). The marker is joiner-id-valued, so the grow's OWN join
+	// (b.NodeID == the active joiner) is NOT blocked (the self-op carve-out — else the grow would deadlock its
+	// own op). This closes the asymmetry the orchestrator's "join/retire stay BLOCKED" warning promised.
+	if j := growActiveJoiner(a.node.RODB()); j != "" && j != b.NodeID {
+		return "", fmt.Errorf("cluster join %s: a `cluster add` grow of %q is in progress — retry after it completes (G4 §B)", b.NodeID, j)
+	}
 	consumed, err := cluster.NonceConsumed(a.node.RODB(), b.NodeID, b.JoinNonce)
 	if err != nil {
 		return "", err
@@ -169,6 +176,9 @@ func (a *ClusterAdmin) StartRetireOperation(target string, confirmed bool) (stri
 	if upgradeActive(a.node.RODB()) {
 		return "", fmt.Errorf("cluster retire %s: a `cluster upgrade` roll is in progress — retry after it completes (External-review B2)", target)
 	}
+	if j := growActiveJoiner(a.node.RODB()); j != "" {
+		return "", fmt.Errorf("cluster retire %s: a `cluster add` grow of %q is in progress — retry after it completes (G4 §B)", target, j)
+	}
 	if err := a.assertNoActiveOp(target); err != nil {
 		return "", err
 	}
@@ -284,8 +294,14 @@ func (a *ClusterAdmin) initTimeline(state string) string {
 
 const (
 	opTimelineCap    = 32              // cap the durable in-row timeline
-	opCatchupTimeout = 2 * time.Minute // join catch-up stall deadline
+	opCatchupTimeout = 2 * time.Minute // join catch-up base deadline (small DBs / fresh joiners)
 	opMaxAttempts    = 5               // bounded retry of a failing side-effect before BLOCKED (C4-M8)
+	// #7: the fixed 2-min deadline false-BLOCKs a large/slow-but-healthy joiner whose InstallSnapshot takes
+	// longer over a WAN. Scale the persisted catch-up deadline by the command-domain DB size at a conservative
+	// transfer floor, clamped to a max window, so a big cluster gets proportionally more time without ever
+	// waiting unboundedly on a genuinely dead joiner.
+	opCatchupMaxWindow   = 30 * time.Minute // upper clamp on the size-scaled deadline
+	opCatchupBytesPerSec = 512 * 1024       // conservative WAN InstallSnapshot floor (512 KiB/s)
 )
 
 // opTimelineEntry is one durable transition record (compact keys — the row is capped).
@@ -317,6 +333,11 @@ func (a *ClusterAdmin) driveInFlightOperations() {
 	if upgradeActive(a.node.RODB()) {
 		return
 	}
+	// G4 §B / review M6: do NOT add a growActive() freeze here. Unlike upgrade, a `cluster add` grow DRIVES its
+	// OWN OpKindJoin op through this loop (AddNonvoter → catch-up → AddVoter); freezing on growActive would
+	// deadlock the grow's own op forever (it never reaches SERVING, the marker never releases). Grow serializes
+	// against OTHER membership ops at the entry points (StartJoinOperation/StartRetireOperation refuse a
+	// different-node op while the marker is held), not by freezing the driver — that is the deliberate Q7 carve-out.
 	ops, err := cluster.NonTerminalOperations(a.node.RODB())
 	if err != nil {
 		a.logger.Warn("cluster op controller: list non-terminal", "err", err)
@@ -462,7 +483,7 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			a.recordOpError(op, fmt.Errorf("capture barrier: %w", err))
 			return
 		}
-		deadline := a.now().Add(opCatchupTimeout).UnixNano()
+		deadline := a.adaptiveCatchupDeadline()
 		_ = a.transition(op, cluster.OpStateRaftAdding, false, "", func(in *cluster.OpTransitionInput) {
 			in.SetBarrier = true
 			in.Barrier = barrier
@@ -568,9 +589,46 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		if nv, err := a.node.NumVoters(); err == nil && nv > 1 {
 			_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearForceSingle() })
 		}
+		// G4 §B (P7): converge discovery seeds on the ASYNC join path. The deprecated sync AddNode converged
+		// seeds inline and a leadership edge is a backstop, but a normal driveJoin promotion never did — so a
+		// grown broker would not appear in published seeds until the next leadership change. Best-effort +
+		// logged: seeds are advisory, so a transient failure must not block the terminal SERVING transition.
+		if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
+			a.logger.Warn("cluster add: seed auto-converge failed (new voter not yet in published seeds)", "op_id", op.OpID, "err", serr)
+		}
 		a.clearOpAttempts(op.OpID)
 		_ = a.transition(op, cluster.OpStateServing, true, "", nil)
 	}
+}
+
+// adaptiveCatchupDeadline (#7) returns the persisted catch-up deadline scaled by the command-domain DB size:
+// base + dbBytes/rate, clamped to [base, maxWindow]. A fresh/small joiner keeps the 2-min base; a large
+// cluster whose InstallSnapshot legitimately takes longer over a WAN gets proportionally more time, so a
+// slow-but-healthy joiner is never false-BLOCKED — while a genuinely dead joiner still hits the max clamp.
+// On any DB-size read error it falls back to the fixed base (never a shorter deadline).
+func (a *ClusterAdmin) adaptiveCatchupDeadline() int64 {
+	d := opCatchupTimeout
+	if bytes, err := a.commandDomainDBBytes(); err == nil && bytes > 0 {
+		d = opCatchupTimeout + time.Duration(bytes/opCatchupBytesPerSec)*time.Second
+		if d > opCatchupMaxWindow {
+			d = opCatchupMaxWindow
+		}
+	}
+	return a.now().Add(d).UnixNano()
+}
+
+// commandDomainDBBytes estimates the command-domain SQLite size (page_count × page_size) — the InstallSnapshot
+// a joiner must transfer + apply. Read-only PRAGMAs on the committed RODB.
+func (a *ClusterAdmin) commandDomainDBBytes() (int64, error) {
+	db := a.node.RODB()
+	var pageCount, pageSize int64
+	if err := db.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return 0, err
+	}
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	return pageCount * pageSize, nil
 }
 
 // blockAfterAttempts bounds a retried side-effect: it records the error and, after opMaxAttempts

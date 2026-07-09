@@ -70,12 +70,13 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			SchemaVersion:      proto.ClusterHealthSchemaVersion,
 			LeaderContactStale: node.LeaderContactStale(now()),
 			ForceSingleActive:  forceSingleActive(db),
-			UpgradeLockActive:  upgradeActive(db), // External-review round2 B1: expose the roll lock for stale-lock self-heal
+			UpgradeLockActive:  upgradeActive(db),          // External-review round2 B1: expose the roll lock for stale-lock self-heal
+			GrowLockActive:     growActiveJoiner(db) != "", // G4 §B: expose the grow lock for stale-lock self-heal (cluster add)
 			NodeID:             node.SelfID(),
 			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
 			ProtoVer:           proto.ProtoVersion,
-			CommandVer:         cluster.CommandVersion(), // G5 #13: three-axis rolling-upgrade gate (proto+command+ops)
-			ColocatedAgentNID:  colocatedAgentNID,        // G5 #19: dual-version correlation ("" ⇒ CLI (assumed) fallback)
+			CommandVer:         cluster.CommandVersion(),      // G5 #13: three-axis rolling-upgrade gate (proto+command+ops)
+			ColocatedAgentNID:  colocatedAgentNID,             // G5 #19: dual-version correlation ("" ⇒ CLI (assumed) fallback)
 			PhaseFluidityOps:   cluster.HasPhaseFluidityOps(), // F5: advertise capability for the v0.4.2 readdr/route ops
 		}
 		// C3 §2.7: a C3 broker ALWAYS reports topology (TopoReported=true), even at gen 0, so the
@@ -198,4 +199,17 @@ func upgradeActive(db *sql.DB) bool {
 	var one int
 	err := db.QueryRow(`SELECT 1 FROM cluster_meta WHERE key=? LIMIT 1`, cluster.MetaKeyUpgradeActive).Scan(&one)
 	return err == nil
+}
+
+// growActiveJoiner returns the joiner node_id a `cluster add` grow holds the cluster_grow_active marker for
+// (G4 §B), or "" when no grow is in flight. The VALUE (joiner id) lets the leader refuse a lock for a
+// DIFFERENT joiner while one grow runs, yet recognize a re-run of the SAME joiner as its own (resume). A
+// retire refuses while any grow is active; the grow's OWN join op is NOT gated on this (the carve-out in
+// StartJoinOperation/driveInFlightOperations) — else the grow would deadlock its own membership change.
+func growActiveJoiner(db *sql.DB) string {
+	var joiner string
+	if err := db.QueryRow(`SELECT value FROM cluster_meta WHERE key=? LIMIT 1`, cluster.MetaKeyGrowActive).Scan(&joiner); err != nil {
+		return ""
+	}
+	return joiner
 }

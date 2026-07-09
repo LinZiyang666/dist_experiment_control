@@ -424,7 +424,7 @@ type Broker struct {
 	// write) and the responder returns a RETRIABLE cluster_not_ready until it is set (not a terminal HALT).
 	clusterAdminMu     sync.RWMutex
 	clusterAdminHandle func(adminsock.Request) adminsock.Response
-	transferAuditMu       sync.Mutex
+	transferAuditMu    sync.Mutex
 
 	// xferReplicasFn is the D8a (§9) tier-B replica seam. In CLUSTER mode (post-D9) wireClusterLate
 	// sets it (AttachXferReplicas) to ReplicasFor(NumVoters) so a completed tier-B object survives
@@ -1011,8 +1011,8 @@ func (b *Broker) Run(ctx context.Context) error {
 			// signature ripple). nil in single mode ⇒ the op replies cluster_not_enabled.
 			if cab, ok := backend.Cluster.(*clusterAdminBackend); ok {
 				cab.rebalanceProxy = b.rebalanceProxyHomes
-				cab.fsArm = b.cl.fsArm // online force-single dwell+token (shared with the observe tick that feeds it)
-				cab.requestReExec = b.RequestReExec // G5 #13: broker-daemon reload arms the self-re-exec
+				cab.fsArm = b.cl.fsArm                     // online force-single dwell+token (shared with the observe tick that feeds it)
+				cab.requestReExec = b.RequestReExec        // G5 #13: broker-daemon reload arms the self-re-exec
 				b.setClusterAdminHandle(cab.HandleCluster) // G5 #13 W2b: remote signed trigger routes through the same gates
 			}
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits

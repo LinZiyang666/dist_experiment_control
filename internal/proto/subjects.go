@@ -271,15 +271,25 @@ func SubjCtrlClusterUpgrade(actor string) string {
 	return fmt.Sprintf("%s.ctrl.by.%s.cluster-upgrade.req", SubjectPrefix, actor)
 }
 
+// SubjCtrlClusterGrow (G4 §B) is the account-signed remote-trigger subject the `cluster add` grow
+// orchestrator uses to reach a broker's lock/approve-join/mesh-cutover/rebalance steps over NATS (so the
+// grow runs external to all brokers and re-resolves the leader after each restart the grow causes).
+// Hyphen-leaf "cluster-grow." (not ".cluster.") keeps §13.8 (member denied cluster.*) green. The request is
+// account-seed-signed and each broker verifies it against its pinned account_pub before acting.
+func SubjCtrlClusterGrow(actor string) string {
+	return fmt.Sprintf("%s.ctrl.by.%s.cluster-grow.req", SubjectPrefix, actor)
+}
+
 // Broker-side wildcard subscriptions for the D8b ctl RPCs (any actor segment). cluster-health
 // is broadcast (every broker answers, ctl corroborates); alert.ls uses a queue group (any one
 // broker serves the bounded-stale replicated read); alert.ack any broker forwards to leader.
 const (
-	SubjCtrlClusterHealthWildcard = SubjectPrefix + ".ctrl.by.*.cluster-health.req"
-	SubjCtrlClusterRosterWildcard = SubjectPrefix + ".ctrl.by.*.cluster-roster.req"  // G3 #17 roster-pull
+	SubjCtrlClusterHealthWildcard  = SubjectPrefix + ".ctrl.by.*.cluster-health.req"
+	SubjCtrlClusterRosterWildcard  = SubjectPrefix + ".ctrl.by.*.cluster-roster.req"  // G3 #17 roster-pull
 	SubjCtrlClusterUpgradeWildcard = SubjectPrefix + ".ctrl.by.*.cluster-upgrade.req" // G5 #13 remote reload/transfer trigger
-	SubjCtrlAlertLsWildcard       = SubjectPrefix + ".ctrl.by.*.alert.ls.req"
-	SubjCtrlAlertAckWildcard      = SubjectPrefix + ".ctrl.by.*.alert.ack.req"
+	SubjCtrlClusterGrowWildcard    = SubjectPrefix + ".ctrl.by.*.cluster-grow.req"    // G4 §B remote grow trigger
+	SubjCtrlAlertLsWildcard        = SubjectPrefix + ".ctrl.by.*.alert.ls.req"
+	SubjCtrlAlertAckWildcard       = SubjectPrefix + ".ctrl.by.*.alert.ack.req"
 )
 
 // ParseEvProc extracts (sid, nid, pid, kind) from a process-lifecycle
