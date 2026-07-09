@@ -53,10 +53,7 @@ func correlateBrokerVersions(brokers map[string]brokerDaemon, agentRelease map[s
 			row.Assumed = true
 		}
 		av, ok := agentRelease[row.AgentNID]
-		row.AgentVer = orQ(av)
-		if !ok {
-			row.AgentVer = "?"
-		}
+		row.AgentVer = orQ(av) // C7: orQ already maps a missing/empty release ("" when !ok) to "?" — no separate !ok branch needed
 		// Skew: both sides KNOWN and different. Two "?" (both unknown) is not a skew claim.
 		row.Skew = d.BrokerVer != "" && ok && av != "" && d.BrokerVer != av
 		if target != "" {

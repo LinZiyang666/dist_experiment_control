@@ -39,9 +39,11 @@ const (
 	OpClusterSetRaftAddr = "cluster_set_raft_addr"
 	OpClusterSetRoute    = "cluster_set_route"
 	// OpBrokerUpgradeReload (G5 #13) reloads THIS broker daemon into the freshly-staged on-disk binary
-	// via a PID-preserving syscall.Exec. Local-socket-only (root Unix socket); dispatched BEFORE the
-	// leader gate and REFUSES if this broker is the raft leader (the orchestrator transfers leadership
-	// off first). Idempotent (skip if already at ToVersion) + sha-gated (never re-exec a stale binary).
+	// via a PID-preserving syscall.Exec. Reached ONLY via the in-process account-signed NATS upgrade
+	// trigger (cluster_upgrade_trigger.go dispatches it into HandleCluster directly) — it is deliberately
+	// NOT in the clusterOps routing table, so the raw admin socket answers `unknown op` for it (no CLI
+	// sends it). REFUSES if this broker is the raft leader (the orchestrator transfers leadership off
+	// first). Idempotent (skip if already at ToVersion) + sha-gated (never re-exec a stale binary).
 	OpBrokerUpgradeReload = "broker_upgrade_reload"
 
 	// C4 operation-controller verbs (leader-local; a follower replies NotLeader+LeaderHost).

@@ -3,6 +3,7 @@ package broker
 import (
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -193,6 +194,12 @@ func (b *Broker) moveProxyHomeTo(nc *nats.Conn, existing *port.Allocation, targe
 // eligibleProxyHomes returns every DELIVERABLE + REACHABLE voter (the valid rebalance target set),
 // sorted for determinism. Mirrors pickProxyRehomeTarget's gate but returns the whole set.
 func (b *Broker) eligibleProxyHomes() []string {
+	// A9: fetch the draining set FIRST (before opening the rows iterator — the store is single-connection,
+	// so a nested query mid-iteration deadlocks). A DrainNode marks broker_draining and migrates exposes
+	// BEFORE flipping VOTER->DRAINING, so a draining node is still phase=VOTER in this window and must be
+	// excluded as a rebalance target (mirrors the allocatePort guard, clusterwrite.go:550). A read error →
+	// treat as no-draining and proceed unfiltered rather than stall EVERY rehome on a transient error.
+	draining, _ := cluster.DrainingNodes(b.cfg.DB)
 	rows, err := b.cfg.DB.Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' ORDER BY node_id`)
 	if err != nil {
 		return nil
@@ -203,6 +210,9 @@ func (b *Broker) eligibleProxyHomes() []string {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return out
+		}
+		if slices.Contains(draining, id) {
+			continue // A9: never rebalance a proxy home onto a draining broker
 		}
 		// Self (the leader) is always reachable to itself; a remote home must be REACHABLE per §17.
 		if id == b.selfID || b.homeReachable(id) {

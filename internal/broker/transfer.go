@@ -259,11 +259,22 @@ func (b *Broker) ensureXferBucket(ctx context.Context, sid string, targetReplica
 	if b.js == nil {
 		return "", fmt.Errorf("jetstream_unavailable")
 	}
-	bucket := proto.XferBucketName(sid)
 	maxBytes, err := b.xferBucketMaxBytes(ctx)
-	if err != nil {
-		return "", fmt.Errorf("xfer bucket sizing: %w", err)
+	return b.ensureXferBucketSized(ctx, sid, targetReplicas, maxBytes, err)
+}
+
+// ensureXferBucketSized is ensureXferBucket with a PRE-COMPUTED disk-aware ceiling (A11): the tier-B push
+// admission path already computes the ceiling for its size check, so threading it in avoids a SECOND
+// AccountInfo round-trip per transfer (each xferBucketMaxBytes issues a live AccountInfo, which nats.go
+// does not cache). sizeErr carries a G6 #21 too-small refusal so it surfaces identically to the old path.
+func (b *Broker) ensureXferBucketSized(ctx context.Context, sid string, targetReplicas int, maxBytes int64, sizeErr error) (string, error) {
+	if b.js == nil {
+		return "", fmt.Errorf("jetstream_unavailable")
 	}
+	if sizeErr != nil {
+		return "", fmt.Errorf("xfer bucket sizing: %w", sizeErr)
+	}
+	bucket := proto.XferBucketName(sid)
 	cfg := jetstream.ObjectStoreConfig{
 		Bucket:   bucket,
 		MaxBytes: maxBytes, // G6 #21: disk-aware (was a hardcoded 8 GiB that denied tier-B on small-disk brokers)
@@ -537,15 +548,18 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		// G6 #21: on a small-disk broker the per-session bucket ceiling can be BELOW the global 2 GiB
-		// per-transfer cap; reject an over-ceiling transfer at ADMISSION rather than accept-then-fail with
-		// an opaque 10047 mid-stream.
-		if bm, berr := b.xferBucketMaxBytes(ctx); berr == nil && req.Size > bm {
+		// G6 #21 + A11: compute the disk-aware ceiling ONCE and reuse it for BOTH the size-admission check
+		// and the bucket sizing — ensureXferBucket used to recompute it, costing a second AccountInfo
+		// round-trip per push. On a small-disk broker the per-session ceiling can be BELOW the global 2 GiB
+		// per-transfer cap; reject at ADMISSION rather than accept-then-fail with an opaque 10047 mid-stream.
+		// A sizing error (disk too small for tier-B) is surfaced as bucket_create_failed, exactly as before.
+		maxBytes, sizeErr := b.xferBucketMaxBytes(ctx)
+		if sizeErr == nil && req.Size > maxBytes {
 			cancel()
-			b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > per-session tier-B ceiling %d on this broker (small disk)", req.Size, bm))
+			b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > per-session tier-B ceiling %d on this broker (small disk)", req.Size, maxBytes))
 			return
 		}
-		bucket, err := b.ensureXferBucket(ctx, sid, b.xferTargetReplicas())
+		bucket, err := b.ensureXferBucketSized(ctx, sid, b.xferTargetReplicas(), maxBytes, sizeErr)
 		cancel()
 		if err != nil {
 			b.replyPushErr(msg, "bucket_create_failed", err.Error())

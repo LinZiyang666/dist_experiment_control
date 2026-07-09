@@ -112,7 +112,13 @@ func (b *Broker) driveAutoRebalanceOnReturn(returned, downNow []string) {
 	if !autoRebalanceEnabled() {
 		return // mechanism inert until opted in (black-hole-bounded invariant, KD-3b)
 	}
-	gatesClear := len(downNow) == 0 && !forceSingleActive(b.cfg.DB) && b.noInflightOps() && !b.recentProxyRehome()
+	// A10: gatesClear drives ONLY the fire decision, which can only happen when a node's dwell is satisfied
+	// (the arm has pending work). In the common steady state (no returns, empty pending) skip the three DB
+	// reads entirely — tick never consults gatesClear then, so a false value is indistinguishable.
+	gatesClear := false
+	if len(returned) > 0 || len(b.autoRebalanceArm.pending) > 0 {
+		gatesClear = len(downNow) == 0 && !forceSingleActive(b.cfg.DB) && b.noInflightOps() && !b.recentProxyRehome()
+	}
 	if !b.autoRebalanceArm.tick(returned, b.proxyHomeHealthy, gatesClear) {
 		return
 	}

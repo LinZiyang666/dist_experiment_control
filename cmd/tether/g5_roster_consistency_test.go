@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestBuildUpgradeNodesAllowsRosterKnownPreG5Learner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nodes, err := buildUpgradeNodes(context.Background(), nc, actor, sid, pub)
+	nodes, err := buildUpgradeNodes(context.Background(), nc, actor, sid, pub, io.Discard)
 	if err != nil {
 		t.Fatalf("a roster-known learner answering health must NOT be refused: %v", err)
 	}

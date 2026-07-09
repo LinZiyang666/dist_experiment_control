@@ -31,6 +31,14 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	out := cmd.OutOrStdout()
 	ctx := cmd.Context()
 
+	// A5: a --dry-run promises "touching nothing", yet the P0 preflight runs BEFORE the dry-run short-circuit,
+	// so a preflight failure would fire a real "halt" webhook POST. Suppress the webhook for the whole dry-run
+	// (the read-only preflight still runs so the plan can be printed; the only reachable notify in dry-run is
+	// the two preflight halts below).
+	if dryRun {
+		webhook = ""
+	}
+
 	// P0 PREFLIGHT: resolve the writable leader + the joiner's SAN. Read-only; always safe to re-run.
 	leader, lerr := currentLeader(ctx, nc, actor)
 	if lerr != nil {
@@ -99,7 +107,10 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 
 	// P4 APPROVE-JOIN: prepare a bundle locally, then approve NON-BLOCKING on the leader (#8). If a join op
 	// already exists for this joiner (a resume), skip prepare (a fresh nonce → a different op → refused).
-	opID := findJoinOp(ctx, nc, actor, accountSeed, leader, jp.Joiner)
+	opID, foErr := findJoinOp(ctx, nc, actor, accountSeed, leader, jp.Joiner)
+	if foErr != nil {
+		return haltAdd(webhook, "find-join-op", jp.Joiner, foErr)
+	}
 	if opID == "" {
 		bundle, berr := runSelfJoinPrepare(cmd, jp)
 		if berr != nil {
@@ -240,12 +251,39 @@ func runSelfJoinPrepare(cmd *cobra.Command, jp joinerParams) (string, error) {
 
 // findJoinOp returns the op_id of an in-flight join op for the joiner ("" if none), via a join-status probe on
 // a scan — used to skip a fresh prepare on a resume. It reads the leader's ops through the grow trigger.
-func findJoinOp(ctx context.Context, nc *nats.Conn, actor string, seed []byte, leader, joiner string) string {
+func findJoinOp(ctx context.Context, nc *nats.Conn, actor string, seed []byte, leader, joiner string) (string, error) {
 	// A cheap targeted read: ask the leader for any op whose op_id OR target is the joiner. join-status keys on
 	// OpID; since we do not know the op_id yet, resolve it from the cluster ops list via a status probe.
 	resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "join-status", TargetNode: leader, OpID: joiner})
-	if err != nil || resp == nil || !resp.OK {
-		return ""
+	return resolveJoinOp(resp, err, leader)
+}
+
+// resolveJoinOp classifies a join-status probe reply into (op_id-to-resume, error) — pure, so the A4
+// transient-vs-absent distinction is table-testable without a NATS harness. Three outcomes:
+//   - a LIVE (OK, non-terminal) op        → its op_id (resume it)
+//   - a genuine absence (node_unknown) OR a stale TERMINAL op → ("", nil): a fresh prepare/approve
+//   - a TRANSPORT error or any unexpected non-OK reply       → ("", err): driveAdd HALTs with a retry hint
+//
+// A4: the transport-error case is the fix. Conflating it with "no op" (the old `err!=nil → ""`) made a
+// resume-after-cutover — the leader's nats was just SIGKILL-restarted and is mid-reconnect — fall to a
+// FRESH prepare → a new nonce → a different op_id → StartJoinOperation refuses "another operation is in
+// flight — abort first", defeating the resume promise and tempting the operator to destroy healthy progress.
+func resolveJoinOp(resp *proto.ClusterGrowResp, err error, leader string) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("join-status: empty reply from leader %s", leader)
+	}
+	// Genuine absence: the leader replies node_unknown (no op for this joiner). → "" → a fresh prepare/approve
+	// (first run, or a resume after a terminal op was `recovery node remove`d). This is the ONLY "" absence.
+	if resp.Code == adminsock.CodeNodeUnknown {
+		return "", nil
+	}
+	if !resp.OK {
+		// Any OTHER non-OK reply (cluster_not_ready is already retried inside sendGrowTrigger) is unexpected —
+		// fail closed so a resume does not fork on it.
+		return "", fmt.Errorf("join-status probe failed: %s %s", resp.Code, resp.Error)
 	}
 	// B1: attach ONLY to a LIVE (non-terminal) op. A stale TERMINAL row (an ABORTED op after an operator
 	// `cluster ops abort`, or a SERVING op left after the node was later `recovery node remove`d) must NOT be
@@ -253,15 +291,17 @@ func findJoinOp(ctx context.Context, nc *nats.Conn, actor string, seed []byte, l
 	// falsely report success on an absent node. A terminal op → "" → a fresh prepare/approve (StartJoinOperation
 	// mints a new op from the fresh nonce; the already-VOTER case is short-circuited earlier in driveAdd).
 	if resp.Terminal {
-		return ""
+		return "", nil
 	}
-	return resp.OpID
+	return resp.OpID, nil
 }
 
 // waitJoinServing polls join-status until the op is terminal SERVING, optionally auto-confirming a BLOCKED op.
 func waitJoinServing(ctx context.Context, nc *nats.Conn, actor string, seed []byte, leader, opID string, jp joinerParams, timeout time.Duration, out interface{ Write([]byte) (int, error) }) error {
 	deadline := time.Now().Add(timeout)
 	confirms := 0
+	prevBlocked := false // C1: track the BLOCKED edge so one stall spends at most one confirm
+	lastBlockedErr := "" // C1 (Stage-C): remember the last BLOCKED cause so a stuck stall's timeout surfaces it
 	for {
 		if joinerIsVoter(nc, actor, jp.Joiner) {
 			return nil
@@ -274,16 +314,44 @@ func waitJoinServing(ctx context.Context, nc *nats.Conn, actor string, seed []by
 			case resp.Terminal:
 				return fmt.Errorf("join op %s ended non-SERVING: %s (%s)", opID, resp.OpState, resp.LastError)
 			case resp.OpState == "BLOCKED":
-				if confirms < jp.AutoConfirmCatchup {
-					confirms++
-					_, _ = fmt.Fprintf(out, "  join op BLOCKED — auto-confirming (%d/%d)\n", confirms, jp.AutoConfirmCatchup)
-					_, _ = sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "confirm-op", TargetNode: leader, OpID: opID})
-				} else {
+				// C1: --auto-confirm-catchup N means N distinct catch-up STALLS, not N polls. Spend a confirm
+				// only on the ENTER-BLOCKED edge (!prevBlocked); a single op that sits BLOCKED across several
+				// polls previously burned the whole budget in ~3*N s.
+				lastBlockedErr = resp.LastError
+				errBudget, spendConfirm := blockedConfirmDecision(confirms, jp.AutoConfirmCatchup, prevBlocked)
+				switch {
+				case errBudget:
 					return fmt.Errorf("join op %s is BLOCKED (%s) — the joiner is not catching up; check it, then `cluster ops confirm %s` on the leader (or re-run with --auto-confirm-catchup N)", opID, resp.LastError, opID)
+				case spendConfirm:
+					// F1 (external review): send the confirm-op and only COUNT it (spend budget + arm the edge)
+					// if it actually LANDED. A transient confirm failure — its reply lost during the grow mesh/
+					// cutover restart, or a non-OK reply other than the already-retried cluster_not_ready — must
+					// NOT burn the budget or arm the edge, else the same BLOCKED state would never re-send the
+					// confirm and would stall to the full join timeout. On a failure, leave prevBlocked false so
+					// the NEXT BLOCKED poll re-sends it (restoring the old repeated-confirm resilience).
+					cresp, cerr := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "confirm-op", TargetNode: leader, OpID: opID})
+					if confirmLanded(cresp, cerr) {
+						confirms++
+						_, _ = fmt.Fprintf(out, "  join op BLOCKED — auto-confirmed (%d/%d)\n", confirms, jp.AutoConfirmCatchup)
+						prevBlocked = true
+					} else {
+						_, _ = fmt.Fprintf(out, "  join op BLOCKED — confirm did not land (%s); retrying next poll\n", confirmFailDetail(cresp, cerr))
+						prevBlocked = false
+					}
+				default:
+					// same stall, budget remains, the prior confirm LANDED → keep polling for it to take effect.
+					prevBlocked = true
 				}
+			default:
+				prevBlocked = false // any other live state clears the edge so a distinct later stall re-arms
 			}
 		}
 		if time.Now().After(deadline) {
+			// C1 (Stage-C): a stall the confirm(s) never cleared must SURFACE the BLOCKED cause, not decay into
+			// a bare generic timeout that hides it (the M2-class regression the cutover path also guards against).
+			if lastBlockedErr != "" {
+				return fmt.Errorf("join op %s did not reach SERVING within %s — last state BLOCKED (%s); the joiner is not catching up, `cluster ops confirm %s` on the leader (or re-run with a larger --auto-confirm-catchup)", opID, timeout, lastBlockedErr, opID)
+			}
 			return fmt.Errorf("join op %s did not reach SERVING within %s", opID, timeout)
 		}
 		select {
@@ -292,6 +360,41 @@ func waitJoinServing(ctx context.Context, nc *nats.Conn, actor string, seed []by
 		case <-time.After(growConvergePoll):
 		}
 	}
+}
+
+// blockedConfirmDecision is waitJoinServing's pure BLOCKED-handling decision (C1). Given the confirm budget,
+// how many confirms are already spent, and whether the op was BLOCKED on the PREVIOUS poll, it decides
+// whether to error out (budget exhausted → surface the actionable BLOCKED hint now) or spend one confirm
+// (only on the ENTER-BLOCKED edge). Extracted so the edge-count semantics are table-testable without a live
+// NATS poll loop. A same-stall poll with budget remaining returns (false,false) → keep polling, do NOT
+// re-confirm (a persistent stall the first confirm did not clear is surfaced by the deadline path above).
+func blockedConfirmDecision(confirms, budget int, prevBlocked bool) (errBudgetExhausted, spendConfirm bool) {
+	if confirms >= budget {
+		return true, false
+	}
+	if !prevBlocked {
+		return false, true
+	}
+	return false, false
+}
+
+// confirmLanded reports whether a confirm-op reply actually took effect (F1). A transport error or a non-OK
+// reply means the confirm did NOT land and must be RETRIED on the next poll, not counted against the
+// --auto-confirm-catchup budget or used to arm the BLOCKED edge. (cluster_not_ready is already retried
+// inside sendGrowTrigger before we ever see the reply here.)
+func confirmLanded(resp *proto.ClusterGrowResp, err error) bool {
+	return err == nil && resp != nil && resp.OK
+}
+
+// confirmFailDetail renders a short reason for a confirm-op that did not land (for the retry log line).
+func confirmFailDetail(resp *proto.ClusterGrowResp, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	if resp != nil {
+		return strings.TrimSpace(resp.Code + " " + resp.Error)
+	}
+	return "no reply"
 }
 
 // catchupBarrier decides whether a join-status reply clears the AddNonvoter barrier. External review M3:
@@ -532,10 +635,6 @@ func dirExists(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// verifyClusterSeam confirms the joiner's broker.yaml carries a broker.cluster seam (raft_addr set), so the
-// joiner boots in CLUSTER mode rather than single mode. A root-owned config that `cluster init` (running as the
-// tether user) could not write leaves this unset; a HALT with the exact operator step here is far better than a
-// later opaque catch-up timeout on a broker that came up single-mode (external review B1).
 // verifyClusterSeam confirms the joiner's broker.yaml carries a broker.cluster seam whose EVERY cluster-mode
 // field MATCHES this `cluster add`'s parameters — not merely present/non-empty. External re-review
 // R2-B1/R3-B1/R4-B1 walked this in: raft_addr must equal the roster's raft addr (R2), the cluster-mode-trigger

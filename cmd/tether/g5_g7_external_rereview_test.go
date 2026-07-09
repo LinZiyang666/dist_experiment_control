@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +62,7 @@ func TestExternalReviewBuildUpgradeNodesRejectsResponderAbsentFromRosterEvenPreG
 		t.Fatal(err)
 	}
 
-	nodes, err := buildUpgradeNodes(context.Background(), nc, actor, sid, pub)
+	nodes, err := buildUpgradeNodes(context.Background(), nc, actor, sid, pub, io.Discard)
 	if err == nil {
 		t.Fatalf("expected stale roster refusal for responder absent from signed roster, got nodes=%+v", nodes)
 	}

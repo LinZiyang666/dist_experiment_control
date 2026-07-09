@@ -149,8 +149,15 @@ func TestUpgradeTriggerReexecAgentNoNID(t *testing.T) {
 	b := newTriggerTestBroker("brk-a", seed, triggerNow, &routed) // no ColocatedAgentNID configured
 	req := &proto.ClusterUpgradeReq{Op: "reexec-agent", TargetNode: "brk-a", SID: "lab", IssuedAt: triggerNow.Format(time.RFC3339)}
 	resp := b.handleUpgradeTrigger(signUpgradeReq(t, seed, req), triggerNow)
-	if resp == nil || resp.Code != adminsock.CodeBadRequest {
-		t.Fatalf("reexec-agent without colocated_agent_nid must refuse bad_request: %+v", resp)
+	// A12: an UNSET colocated_agent_nid no longer HARD-REFUSES at the config gate — it falls back to
+	// b.selfID (the node_id==nid convention detect/plan already use) so the one-command roll keeps working
+	// on a host that left the field unset. With no live nats.Conn in this unit broker, the fallback path
+	// then stops at the "broker not connected" check — proving it got PAST the old bad_request gate.
+	// Assert on the Error too: CodeClusterNotEnabled is ALSO the account-key-missing gate's code, so keying
+	// only on the code could false-pass if signature/seed setup broke. "broker not connected" is specific to
+	// the reexec-agent nil-nc guard reached AFTER the selfID fallback — proving the config gate was passed.
+	if resp == nil || resp.Code != adminsock.CodeClusterNotEnabled || !strings.Contains(resp.Error, "broker not connected") {
+		t.Fatalf("reexec-agent without colocated_agent_nid must fall back to selfID and reach the nc check (cluster_not_enabled / broker not connected), not refuse at the config gate: %+v", resp)
 	}
 	if len(routed) != 0 {
 		t.Fatal("reexec-agent must NOT route through the admin backend (it forwards to the co-located agent)")

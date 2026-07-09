@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -26,6 +27,14 @@ import (
 
 const cutoverGraceTimeout = 45 * time.Second // how long to wait for the revived nats to report clustered
 
+// A1: the cutover liveness probe is retried a few times before it concludes "not clustered" — a single
+// transient /varz error (a 3s timeout, DisableKeepAlives, a reload/GC hiccup) must never make a healthy
+// clustered broker fall through to an unconditional SIGKILL of its own data plane.
+const (
+	cutoverProbeRetries    = 3
+	cutoverProbeRetryDelay = 500 * time.Millisecond
+)
+
 // growCutoverRevivalFailed is the ClusterGrowResp code when the SIGKILL'd nats-server did not come back
 // clustered — a systemd StartLimit / clean-exit stranding the data plane. The operator hint is loud.
 const growCutoverRevivalFailed = "cutover_revival_failed"
@@ -44,8 +53,10 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "no nats.conf path configured — cannot cut over"}
 	}
 
-	// Stage A: live already clustered → done.
-	if name, err := b.probeNatsClusterName(); err == nil && name != "" {
+	// Stage A: live already clustered → done. A1: TOLERANT probe — a transient monitor error must not fall
+	// through to a spurious SIGKILL of a healthy clustered broker (mesh-cutover is re-invoked on any grow
+	// resume, so a re-run against an already-cutover broker + one probe blip could otherwise bounce it).
+	if clustered, _ := b.probeNatsClusteredTolerant(); clustered {
 		return &proto.ClusterGrowResp{OK: true, AlreadyDone: true}
 	}
 
@@ -117,12 +128,65 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 	return resp
 }
 
-// restartAndVerifyClustered SIGKILLs the local nats-server (revived clustered by systemd Restart=always) and
-// polls the loopback /varz until it reports a cluster name, or BLOCKs loudly on a revival failure.
+// cutoverAction is the Stage-B restart decision derived from a tolerant liveness probe (A1).
+type cutoverAction int
+
+const (
+	cutoverAlreadyClustered cutoverAction = iota // healthy clustered — return OK, never bounce
+	cutoverSIGKILLToRevive                       // up but standalone — SIGKILL so systemd revives it clustered
+	cutoverAwaitRevival                          // down/unreachable — skip SIGKILL, just wait for systemd Restart=always
+)
+
+// cutoverRestartDecision maps a (clustered, reachable) probe verdict to the Stage-B action. Pure, so the
+// three-way choice is table-testable without an http monitor. A down nats needs NO SIGKILL: `--signal stop`
+// on an absent process just errors, and systemd Restart=always is already reviving it against the (now
+// clustered) on-disk conf — so we only poll for its clustered return.
+func cutoverRestartDecision(clustered, reachable bool) cutoverAction {
+	switch {
+	case clustered:
+		return cutoverAlreadyClustered
+	case reachable:
+		return cutoverSIGKILLToRevive
+	default:
+		return cutoverAwaitRevival
+	}
+}
+
+// probeNatsClusteredTolerant probes the loopback monitor up to cutoverProbeRetries times before concluding,
+// so a single transient /varz error does not misread a healthy clustered nats as down (A1). A clean reply
+// short-circuits immediately; a persistent error over the retry window yields (false, false = unreachable).
+func (b *Broker) probeNatsClusteredTolerant() (clustered, reachable bool) {
+	for i := 0; i < cutoverProbeRetries; i++ {
+		if name, err := b.probeNatsClusterName(); err == nil {
+			return name != "", true
+		}
+		if i < cutoverProbeRetries-1 {
+			time.Sleep(cutoverProbeRetryDelay)
+		}
+	}
+	return false, false
+}
+
+// restartAndVerifyClustered brings the local nats-server up CLUSTERED and polls the loopback /varz until it
+// reports a cluster name, or BLOCKs loudly on a revival failure. A1: a THREE-WAY tolerant liveness check
+// runs BEFORE any SIGKILL — a healthy clustered broker returns immediately (no bounce), an up-standalone
+// broker is SIGKILL'd (the real revive), and a down broker is only waited on (systemd Restart=always revives
+// it; SIGKILLing an absent process would just error). The store move already happened in performGrowCutover.
 func (b *Broker) restartAndVerifyClustered() *proto.ClusterGrowResp {
-	if err := b.hardRestartNatsServer(); err != nil {
-		return &proto.ClusterGrowResp{Code: growCutoverRevivalFailed,
-			Error: "SIGKILL nats-server (`--signal stop`) failed: " + err.Error()}
+	switch cutoverRestartDecision(b.probeNatsClusteredTolerant()) {
+	case cutoverAlreadyClustered:
+		return &proto.ClusterGrowResp{OK: true, AlreadyDone: true} // already clustered — do NOT bounce a healthy data plane
+	case cutoverSIGKILLToRevive:
+		if err := b.hardRestartNatsServer(); err != nil {
+			return &proto.ClusterGrowResp{Code: growCutoverRevivalFailed,
+				Error: "SIGKILL nats-server (`--signal stop`) failed: " + err.Error()}
+		}
+	case cutoverAwaitRevival:
+		// nats is down/unreachable → no SIGKILL; systemd Restart=always is already reviving it clustered. Poll.
+		// Note (A1 Stage-C): a LIVE up-standalone nats whose loopback monitor is persistently unprobeable is
+		// classified here (unreachable) and its needed SIGKILL is deferred to the STAGED-idempotent driver
+		// retry rather than fired blind — a rare, loud (revival_failed), self-healing edge we accept over
+		// re-introducing the ambiguity the tolerant three-way probe exists to eliminate.
 	}
 	deadline := b.cfg.Now().Add(cutoverGraceTimeout)
 	for b.cfg.Now().Before(deadline) {
@@ -203,10 +267,13 @@ func (b *Broker) moveAsideJetStreamStore(storeDir, epoch string, ack bool) (stri
 	// idempotency on it alone wedged a resume with ENOTEMPTY (rename of the recreated-empty store over the
 	// data-bearing backup). If the backup already exists, this epoch's move already happened → no-op.
 	if _, berr := os.Stat(backup); berr == nil {
-		return "", nil // already moved for this grow epoch (durable backup present) — idempotent no-op
+		return backup, nil // already moved this grow epoch (durable backup present) — idempotent no-op; C3: still report the restore hint
 	}
 	if _, serr := os.Stat(sentinel); serr == nil {
-		return "", nil // sentinel present (belt-and-suspenders) — idempotent no-op
+		// Sentinel present but the backup dir is GONE (the Stat above failed) — the move happened yet the
+		// operator has since moved/removed the backup. Idempotent no-op; return "" (external review F1-doubt:
+		// do NOT hand back a computed path to a directory that no longer exists as the restore hint).
+		return "", nil
 	}
 	if fi, serr := os.Stat(storeDir); serr != nil || !fi.IsDir() {
 		return "", nil // no store dir on disk yet — nothing to reset
@@ -242,7 +309,12 @@ func (b *Broker) hardRestartNatsServer() error {
 	if bin == "" {
 		bin = "nats-server"
 	}
-	return exec.Command(bin, "--signal", "stop").Run()
+	// A6: bound the signal-send with a timeout (mirrors reloadNatsServer's C3-m9 guard) so a hung signal
+	// resolver cannot block the grow-trigger subscription goroutine forever. No ctx flows through the async
+	// NATS callback chain, so derive from Background; the enclosing 45s verify poll stays synchronous by design.
+	ctx, cancel := context.WithTimeout(context.Background(), topoReloadTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, bin, "--signal", "stop").Run()
 }
 
 // probeNatsClusterName reads the loopback /varz and returns the live server's cluster name ("" = standalone /

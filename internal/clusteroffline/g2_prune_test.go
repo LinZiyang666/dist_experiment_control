@@ -66,7 +66,7 @@ func TestPruneRosterPeersDeletesAbandonedBumpsGens(t *testing.T) {
 	now := time.Date(2026, 7, 6, 2, 0, 0, 0, time.UTC)
 
 	peers := []Peer{{NodeID: "dead-1"}, {NodeID: "dead-2"}}
-	if err := pruneRosterPeers(dbPath, peers, now); err != nil {
+	if err := pruneRosterPeers(dbPath, peers, now, nil); err != nil {
 		t.Fatalf("pruneRosterPeers: %v", err)
 	}
 	if rowCount(t, dbPath, "dead-1") != 0 || rowCount(t, dbPath, "dead-2") != 0 {
@@ -86,7 +86,7 @@ func TestPruneRosterPeersDeletesAbandonedBumpsGens(t *testing.T) {
 	// generation (parity with the online rosterGenBumpStmt's `WHERE changes()>0`), not merely stay monotone.
 	rgBefore := metaUint(t, dbPath, cluster.MetaKeyRosterGeneration)
 	tgBefore := metaUint(t, dbPath, cluster.MetaKeyTopologyGeneration)
-	if err := pruneRosterPeers(dbPath, peers, now.Add(time.Second)); err != nil {
+	if err := pruneRosterPeers(dbPath, peers, now.Add(time.Second), nil); err != nil {
 		t.Fatalf("re-prune: %v", err)
 	}
 	if rgAfter := metaUint(t, dbPath, cluster.MetaKeyRosterGeneration); rgAfter != rgBefore {

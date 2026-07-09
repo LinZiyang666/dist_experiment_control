@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -86,12 +87,12 @@ func newClusterUpgradeCmd() *cobra.Command {
 				}
 			}
 
-			nodes, err := buildUpgradeNodes(cmd.Context(), nc, id.PublicKey, sid, accountPub)
+			out := cmd.OutOrStdout()
+			nodes, err := buildUpgradeNodes(cmd.Context(), nc, id.PublicKey, sid, accountPub, out)
 			if err != nil {
 				return err
 			}
 			plan := clusterupgrade.Compute(nodes, toVersion)
-			out := cmd.OutOrStdout()
 			renderUpgradePlan(out, plan, toVersion)
 			if len(plan.Refused) > 0 {
 				return unavailErr("cluster upgrade refused (restore HA first): %v", plan.Refused)
@@ -164,19 +165,36 @@ func newClusterUpgradeCmd() *cobra.Command {
 // nid) with the node list (agent RELEASEs) into the planner's []Node. A broker that answers the health
 // probe is a current voter (the observe target IS the voter roster); CaughtUp is approximated true here and
 // re-verified live by the per-host converge wait during the roll.
-func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPub string) ([]clusterupgrade.Node, error) {
+func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPub string, out io.Writer) ([]clusterupgrade.Node, error) {
+	// A7: the node list gives each host's co-located AGENT release (the #19 whole-host at-target check needs
+	// it). FAIL CLOSED on a transport/decode failure — silently swallowing it left agentRelease empty, so
+	// EVERY host looked stale (AgentVer=="") and an already-at-target cluster got planned into a full,
+	// disruptive roll (a spurious leader transfer + agent re-execs) with no diagnostic. A genuinely-unpaired
+	// agent (the reply arrives but its nid is absent from Nodes) still yields "" → not-at-target, intended.
 	agentRelease := map[string]string{}
-	if body, err := json.Marshal(proto.NodeListReq{}); err == nil {
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if msg, err := nc.RequestWithContext(rctx, proto.SubjCtrlNodeList(actor, sid), body); err == nil {
-			var resp proto.NodeListResp
-			if json.Unmarshal(msg.Data, &resp) == nil {
-				for _, n := range resp.Nodes {
-					agentRelease[n.NID] = n.ReleaseVersion
-				}
-			}
-		}
+	body, merr := json.Marshal(proto.NodeListReq{})
+	if merr != nil {
+		return nil, unavailErr("marshal node-list request: %v", merr)
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	msg, rerr := nc.RequestWithContext(rctx, proto.SubjCtrlNodeList(actor, sid), body)
+	cancel()
+	if rerr != nil {
+		return nil, unavailErr("node-list RPC failed (%v) — cannot determine co-located agent versions; refusing to plan a roll on incomplete data (every host would falsely look stale)", rerr)
+	}
+	var nlResp proto.NodeListResp
+	if uerr := json.Unmarshal(msg.Data, &nlResp); uerr != nil {
+		return nil, unavailErr("decode node-list reply: %v — refusing to plan a roll on incomplete data", uerr)
+	}
+	// A7 (Stage-C): an application-error reply (store_error / not_a_member / session_not_found_or_deleting /
+	// actor_invalid) decodes cleanly but carries a non-empty Code and an EMPTY Nodes slice — which would
+	// leave agentRelease empty and make EVERY host look stale, the exact symptom the transport/decode guards
+	// above exist to prevent. Fail closed on it too. A legitimately-empty node list returns Code=="".
+	if nlResp.Code != "" {
+		return nil, unavailErr("node-list RPC returned %s (%s) — refusing to plan a roll on incomplete data (every host would falsely look stale)", nlResp.Code, nlResp.Error)
+	}
+	for _, n := range nlResp.Nodes {
+		agentRelease[n.NID] = n.ReleaseVersion
 	}
 	replies := probeClusterHealth(nc, actor)
 	if len(replies) == 0 {
@@ -205,7 +223,12 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 	// be silently dropped (dropping it can dip quorum, miscount the N=2 fence, or print complete while a
 	// real voter is never upgraded). Only when there is NO roster (single mode / a pre-G3 broker) do we
 	// fall back to the responders — there is no quorum to lose there.
-	if m := fetchManifestOverNATS(ctx, nc, actor); m != nil && m.Roster != nil && len(m.Roster.Brokers) > 0 {
+	// A2: the signed roster is the SAFETY basis for a quorum-touching roll, but fetchManifestOverNATS
+	// returns nil on ANY transient failure (timeout / no responder / decode). RETRY a few times before
+	// conceding — a single blip must not silently drop to the fail-OPEN responder path below (which cannot
+	// detect a momentarily-absent voter or miscount the N=2 fence). A genuine no-roster cluster (single
+	// mode / pre-G3) returns nil on every attempt and correctly reaches the fallback.
+	if m := fetchUpgradeRosterWithRetry(ctx, nc, actor); m != nil && m.Roster != nil && len(m.Roster.Brokers) > 0 {
 		// External-review round2 B3: this roster is the SAFETY basis for a quorum-touching roll, but the fetch
 		// path does not adopt/VerifyAt it. When the operator supplied the account seed, VERIFY the roster's
 		// account signature + expiry against the pinned account pub before trusting it — never plan a roll over
@@ -254,7 +277,13 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 		return nodes, nil
 	}
 	// Fallback (no signed roster ⇒ single mode / a pre-G3 broker): plan over the responders. There is no
-	// quorum to lose in the single/degraded case the authoritative-roster path does not cover.
+	// quorum to lose in the single/degraded case the authoritative-roster path does not cover. A2: this path
+	// is fail-OPEN (no signature, no absent-voter guard), legitimately needed for a pre-G3 cluster that
+	// answers health but has no roster responder — but WARN loudly when >1 broker answered, so an operator
+	// whose roster fetch merely blipped is not silently planning a quorum-touching roll over responders.
+	if len(replies) > 1 {
+		_, _ = fmt.Fprintf(out, "  ⚠ WARNING: the signed cluster roster was unavailable — planning the roll over the %d broker(s) that answered the health probe. A momentarily-absent voter CANNOT be detected this way; verify every voter is present (`tether cluster status`) before proceeding, or retry.\n", len(replies))
+	}
 	seen := map[string]bool{}
 	var nodes []clusterupgrade.Node
 	for _, h := range replies {
@@ -277,6 +306,26 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 		}
 	}
 	return nodes, nil
+}
+
+// fetchUpgradeRosterWithRetry pulls the signed cluster manifest, retrying a few times (A2). fetchManifest
+// OverNATS collapses every transient failure (timeout / no responder / decode) to nil, so a single blip
+// must not drop the quorum-touching roll to the fail-OPEN responder path. Returns nil only after the
+// retries are exhausted — a genuine no-roster cluster (single mode / pre-G3) returns nil on every attempt.
+func fetchUpgradeRosterWithRetry(ctx context.Context, nc *nats.Conn, actor string) *proto.ClusterManifest {
+	for attempt := 0; attempt < 3; attempt++ {
+		if m := fetchManifestOverNATS(ctx, nc, actor); m != nil && m.Roster != nil && len(m.Roster.Brokers) > 0 {
+			return m
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(400 * time.Millisecond):
+			}
+		}
+	}
+	return nil
 }
 
 // upgradeLockHeld probes cluster-health and reports whether ANY broker still advertises the cluster-scoped

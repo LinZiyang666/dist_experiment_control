@@ -4,8 +4,10 @@ package proto
 // client-synthesized destructive-gate decision.
 
 // ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
-// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v4 (G4) adds
-// GrowLockActive.
+// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v3 (G5/G7b) adds the
+// version-skew + JS-503 + voter self-report batch (ProxyHomeCount/ProxyHomeReported/JetStreamUnavailable/
+// CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive. No consumer gates
+// on this value — decoding is omitempty-additive — so it is a documentation ledger, not a compat switch.
 const ClusterHealthSchemaVersion = 4
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The

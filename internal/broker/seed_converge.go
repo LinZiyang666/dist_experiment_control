@@ -34,8 +34,8 @@ import (
 //   - all brokers undialable → nil (loopback/empty public_host; the caller keeps the stored set, INV-2).
 //
 // Ordering: VOTER first, then transient (CATCHING_UP/PENDING/unknown), then DRAINING/RETIRING/
-// VOTER_ADD_FAILED last — each tier sorted (deterministic). Capped to maxDerivedSeedEndpoints keeping
-// VOTERs preferred.
+// VOTER_ADD_FAILED last — each tier sorted (deterministic). Capped to cluster.MaxSeedEndpoints (the single
+// SSOT, Stage-C n23) keeping VOTERs preferred.
 func DeriveSeedEndpoints(prev []string, brokers []proto.RosterBroker) []string {
 	// Stage-C m18: use the FIRST parseable tls/wss entry in prev as the template (robust to a garbage /
 	// nats:// prev[0] that would otherwise wedge convergence forever via the empty-set floor). nats:// and

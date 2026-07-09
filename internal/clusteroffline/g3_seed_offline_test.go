@@ -1,6 +1,8 @@
 package clusteroffline
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -66,7 +68,7 @@ func TestPruneRosterPeersDropsDepartedSeeds(t *testing.T) {
 	setMeta(t, dbPath, cluster.MetaKeySeedGeneration, "100")
 	now := time.Date(2026, 7, 6, 3, 0, 0, 0, time.UTC)
 
-	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now); err != nil {
+	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now, nil); err != nil {
 		t.Fatalf("pruneRosterPeers: %v", err)
 	}
 	// m17 (atomicity): ONE pruneRosterPeers call removes the roster row AND drops its seed endpoint — both
@@ -97,7 +99,7 @@ func TestPruneRosterPeersSeedEmptyFloor(t *testing.T) {
 	setMeta(t, dbPath, cluster.MetaKeySeedGeneration, "100")
 	now := time.Date(2026, 7, 6, 3, 0, 0, 0, time.UTC)
 
-	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now); err != nil {
+	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now, nil); err != nil {
 		t.Fatalf("pruneRosterPeers: %v", err)
 	}
 	if got := metaText(t, dbPath, cluster.MetaKeySeedEndpoints); got != "wss://dead1.example:443" {
@@ -108,13 +110,37 @@ func TestPruneRosterPeersSeedEmptyFloor(t *testing.T) {
 	}
 }
 
+func TestPruneRosterPeersAllDeadWarns(t *testing.T) {
+	// A8: when the drop would EMPTY the seed set (every published seed points at a departed broker), the
+	// empty-set floor keeps the stale set — but it must now WARN loudly (parity with the online sibling
+	// deriveAndConvergeSeedsFromRoster), since the survivor otherwise silently advertises only dead endpoints.
+	_, dbPath := mustDataDir(t)
+	insertNodeHost(t, dbPath, "self", "self.example")
+	insertNodeHost(t, dbPath, "dead-1", "dead1.example")
+	setMeta(t, dbPath, cluster.MetaKeySeedEndpoints, "wss://dead1.example:443") // ONLY the dead host
+	now := time.Date(2026, 7, 6, 3, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now, logger); err != nil {
+		t.Fatalf("pruneRosterPeers: %v", err)
+	}
+	if !strings.Contains(buf.String(), "only dead endpoints") {
+		t.Errorf("A8: an all-dead seed drop must WARN loudly; log was %q", buf.String())
+	}
+	// The empty-set floor still holds: the stale set is kept (never wiped).
+	if got := metaText(t, dbPath, cluster.MetaKeySeedEndpoints); got != "wss://dead1.example:443" {
+		t.Errorf("empty-set floor: the stale set must be kept, got %q", got)
+	}
+}
+
 func TestPruneRosterPeersNoSeedsNoOp(t *testing.T) {
 	// No seeds published → the seed convergence is a clean no-op (roster/topology still bump).
 	_, dbPath := mustDataDir(t)
 	insertNodeHost(t, dbPath, "self", "self.example")
 	insertNodeHost(t, dbPath, "dead-1", "dead1.example")
 	now := time.Date(2026, 7, 6, 3, 0, 0, 0, time.UTC)
-	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now); err != nil {
+	if err := pruneRosterPeers(dbPath, []Peer{{NodeID: "dead-1"}}, now, nil); err != nil {
 		t.Fatalf("pruneRosterPeers: %v", err)
 	}
 	if metaText(t, dbPath, cluster.MetaKeySeedEndpoints) != "" {

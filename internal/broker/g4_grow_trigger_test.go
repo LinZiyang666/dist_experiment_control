@@ -239,13 +239,19 @@ func TestMoveAsideJetStreamStore_IdempotentPerEpoch(t *testing.T) {
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.moveAsideJetStreamStore(store, "epochA", false); err != nil {
+	backup1, err := b.moveAsideJetStreamStore(store, "epochA", false)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// A second call for the SAME epoch must be a no-op (sentinel present) — never double-move a fresh store.
+	// A second call for the SAME epoch must be a no-op (sentinel present) — never double-move a fresh store —
+	// but C3: it must still REPORT the backup path (was "", which dropped resp.BackupPath's restore hint on
+	// the common SIGKILL-lost-reply resume). Same path, no new move.
 	backup2, err := b.moveAsideJetStreamStore(store, "epochA", false)
-	if err != nil || backup2 != "" {
-		t.Fatalf("a same-epoch re-run must be an idempotent no-op, got backup=%q err=%v", backup2, err)
+	if err != nil {
+		t.Fatalf("a same-epoch re-run must be an idempotent no-op, got err=%v", err)
+	}
+	if backup2 != backup1 {
+		t.Fatalf("C3: the idempotent re-run must report the SAME backup path %q, got %q", backup1, backup2)
 	}
 }
 
@@ -269,8 +275,10 @@ func TestMoveAsideJetStreamStore_CrashWindowBackupExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume with a durable backup present must be a no-op, not error (M3 ENOTEMPTY wedge): %v", err)
 	}
-	if got != "" {
-		t.Fatalf("no-op resume must return empty backup path, got %q", got)
+	// C3: a no-op resume must REPORT the existing backup path (was "" — which dropped the operator's
+	// restore-source hint on the common SIGKILL-lost-reply cutover resume), without touching the backup.
+	if got != backup {
+		t.Fatalf("C3: no-op resume must report the existing backup path %q, got %q", backup, got)
 	}
 	if _, serr := os.Stat(filepath.Join(backup, "$G")); serr != nil {
 		t.Fatal("the data-bearing backup must NOT be touched on a no-op resume")

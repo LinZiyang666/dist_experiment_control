@@ -119,3 +119,59 @@ func TestG7JSUnavailableSustainedDetection(t *testing.T) {
 		t.Fatal("a non-leader must clear its JS-503 self-report (no stale-true answer)")
 	}
 }
+
+// TestG7JSUnavailableNonDemoteClear (A3 audit) pins the ONLY JS-503 clear path for a force-single N=1
+// leader that never demotes: once the sustained-10008 signal is ACTIVE, a subsequent NON-10008 observe
+// error (a timeout / stream-not-found / no-responder — JS answering again, just not wedged-at-503) must
+// CLEAR it, with leadership held true throughout (so it exercises the reconcile clear at alert_reconcile.go
+// :216, NOT the leadership-lost clear at :176 or the positive-observe clear at :225). Without this branch a
+// regression that advanced jsDownSince on a non-10008 error would leave JetStreamUnavailable stuck-true
+// forever on an N=1 survivor whose JS recovered-but-degraded, and CI would stay green.
+func TestG7JSUnavailableNonDemoteClear(t *testing.T) {
+	db := reconTestDB(t)
+	f := &alertFake{leader: true, voters: 1} // force-single N=1: never demotes → the reconcile clear is the only path
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	var jsFlag bool
+	var observeErr error
+	var observeRep ReplicaReport
+	rec := NewAlertReconciler(AlertReconcilerConfig{
+		Node: f, DB: db,
+		Now:              func() time.Time { return now },
+		Observe:          func(context.Context) (ReplicaReport, error) { return observeRep, observeErr },
+		SetJSUnavailable: func(v bool) { jsFlag = v },
+		Propose: func(plan func(*sql.DB) (*cluster.Command, error)) error {
+			cmd, err := plan(db)
+			if err != nil {
+				return err
+			}
+			if cmd == nil {
+				return nil
+			}
+			return cluster.ExecCommand(db, cmd)
+		},
+	})
+	js503 := &jetstream.APIError{ErrorCode: jsErrCodeUnavailable}
+	tick := func() { _ = rec.ReconcileAlertsOnce(context.Background()) }
+
+	// Raise the sustained signal.
+	observeErr = js503
+	tick()
+	now = now.Add(jsDownThreshold + time.Second)
+	tick()
+	if !jsFlag {
+		t.Fatal("precondition: a 503 sustained past jsDownThreshold must raise")
+	}
+
+	// A NON-10008 observe error while STILL leader must clear it (the non-demote reconcile clear).
+	observeErr = &jetstream.APIError{ErrorCode: 10059} // stream-not-found: JS answering, not wedged-at-503
+	tick()
+	if jsFlag {
+		t.Fatal("a non-10008 observe error must CLEAR the JS-503 signal (inv-6 no-stuck-ACTIVE), even while leader")
+	}
+	if !rec.jsDownSince.IsZero() {
+		t.Fatal("the non-10008 clear must also zero jsDownSince so a later real 503 re-accrues the full threshold")
+	}
+	if !f.leader {
+		t.Fatal("this test must exercise the reconcile clear (leader held true), not the leadership-lost clear")
+	}
+}

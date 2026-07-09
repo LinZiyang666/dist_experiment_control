@@ -118,7 +118,7 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	// (the daemon is down; same post-recover raw-write durability as the marker). BEST-EFFORT: on failure
 	// the rows linger for `cluster recovery node remove <peer>` to finish — the recovery itself stands.
 	if len(roster) > 0 {
-		if err := pruneRosterPeers(opts.DBPath, roster, opts.Now()); err != nil {
+		if err := pruneRosterPeers(opts.DBPath, roster, opts.Now(), opts.Logger); err != nil {
 			opts.Logger.Warn("clusteroffline: force-single recovered but roster prune of abandoned peers failed; run `cluster recovery node remove <peer>` to finish",
 				"err", err)
 		}
@@ -394,7 +394,7 @@ func raiseForceSingleMarker(dbPath string, now time.Time) error {
 // cluster.PlanClusterNodePrune, so the online and offline force-single paths leave the SAME cluster_nodes
 // state ({self} only). One transaction: the per-peer deletes + both monotone MAX(existing+1, now) gen
 // bumps. Node IDs come from the trusted recovered roster read; parameterized regardless.
-func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
+func pruneRosterPeers(dbPath string, peers []Peer, now time.Time, logger *slog.Logger) error {
 	db, err := storage.OpenWAL("file:" + dbPath)
 	if err != nil {
 		return err
@@ -444,7 +444,7 @@ func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
 		// the offline path synthesizes NO new endpoint, so it needs no scheme/port template and introduces
 		// no un-vetted dial target). Change-gated on an actual removal; the empty-set floor (INV-2) keeps
 		// the stored set if the drop would empty it (never wipe / strand cold-start clients).
-		if err := convergeSeedsDropHosts(tx, departedHosts, nowNano); err != nil {
+		if err := convergeSeedsDropHosts(tx, departedHosts, nowNano, logger); err != nil {
 			return err
 		}
 	}
@@ -456,7 +456,7 @@ func pruneRosterPeers(dbPath string, peers []Peer, now time.Time) error {
 // is a departed peer, and — ONLY if that actually changed the set AND left it non-empty (INV-2: never
 // wipe / strand cold-start clients) — writes it back + MAX-floor bumps seed_generation (anti-rollback
 // across a restart replay). A VIP/LB host that is not a departed peer is kept.
-func convergeSeedsDropHosts(tx *sql.Tx, departedHosts []string, nowNano string) error {
+func convergeSeedsDropHosts(tx *sql.Tx, departedHosts []string, nowNano string, logger *slog.Logger) error {
 	if len(departedHosts) == 0 {
 		return nil
 	}
@@ -474,8 +474,20 @@ func convergeSeedsDropHosts(tx *sql.Tx, departedHosts []string, nowNano string) 
 		}
 	}
 	filtered := cluster.SeedEndpointsDropHosts(endpoints, departedHosts)
-	if len(filtered) == 0 || len(filtered) == len(endpoints) {
-		return nil // empty-set floor (never wipe) OR nothing dropped (change-gate)
+	if len(filtered) == len(endpoints) {
+		return nil // change-gate: nothing dropped
+	}
+	if len(filtered) == 0 {
+		// A8: the drop would EMPTY the published seed set — every published endpoint pointed at a
+		// now-departed broker (self absent from the set: undialable/loopback host, or an operator-curated
+		// subset). Keep the stale set (INV-2 floor: never wipe / strand cold-start clients) but WARN loudly
+		// (parity with the online sibling deriveAndConvergeSeedsFromRoster's empty-derive warning), since the
+		// survivor now advertises ONLY dead endpoints via the signed SeedBundle.
+		if logger != nil {
+			logger.Warn("clusteroffline: force-single dropped every published seed (all pointed at departed brokers) — keeping the stale set so cold-start clients are not stranded, but it now advertises only dead endpoints; run `cluster seeds publish` on the survivor to converge them",
+				"stale_endpoint_count", len(endpoints))
+		}
+		return nil // empty-set floor (never wipe)
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO cluster_meta(key, value) VALUES(?, ?) `+
@@ -673,8 +685,8 @@ func sizeOf(st os.FileInfo) int64 {
 }
 
 // dumpTable returns every row of tbl as a slice of column->value maps. tbl comes
-// from the fixed applyOwnedTables list (never user input), so the interpolation is
-// safe.
+// from dumpableTables' runtime sqlite_master enumeration (schema names, never user
+// input), so the "SELECT * FROM "+tbl interpolation is safe.
 func dumpTable(db *sql.DB, tbl string) ([]map[string]any, error) {
 	rows, err := db.QueryContext(context.Background(), "SELECT * FROM "+tbl)
 	if err != nil {

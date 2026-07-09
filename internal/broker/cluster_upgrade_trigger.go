@@ -113,15 +113,22 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		// Stage-C B1: re-exec THIS broker's co-located agent into the staged binary (the broker daemon
 		// already reloaded; a whole-host upgrade needs the agent leg too). Forward ReExecOnly to the agent
 		// on its session-scoped upgrade subject; the agent verifies the on-disk sha + re-execs.
-		if b.cfg.ColocatedAgentNID == "" {
-			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest, Error: "no colocated_agent_nid configured — cannot re-exec this host's agent"}
+		// A12: when colocated_agent_nid is UNSET, fall back to b.selfID — the node_id==nid convention the
+		// detect/plan sides already assume (serveconf documents the field as optional). b.selfID is this
+		// broker's OWN validated node_id (== req.TargetNode, checked above), NOT an advertised/spoofable
+		// field, so the g5 "never fan out by an advertised nid" invariant holds. Without this, a host that
+		// left the field unset (agent registered nid==node_id) HALTed the whole roll at bad_request even
+		// though detect/plan resolved its agent fine — the documented one-command roll broke mid-flight.
+		agentNID := b.cfg.ColocatedAgentNID
+		if agentNID == "" {
+			agentNID = b.selfID
 		}
 		nc := b.nc.Load()
 		if nc == nil {
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeClusterNotEnabled, Error: "broker not connected"}
 		}
 		fwd, _ := json.Marshal(&proto.UpgradeForwardedReq{ReExecOnly: true, SHA256: req.ExpectSHA256})
-		reply, err := nc.Request(proto.SubjCmdForwarded(req.SID, b.cfg.ColocatedAgentNID, "upgrade"), fwd, b.cfg.UpgradeForwardTimeout())
+		reply, err := nc.Request(proto.SubjCmdForwarded(req.SID, agentNID, "upgrade"), fwd, b.cfg.UpgradeForwardTimeout())
 		if err != nil {
 			return &proto.ClusterUpgradeResp{Code: "agent_no_responders", Error: err.Error()}
 		}

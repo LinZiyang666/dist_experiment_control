@@ -2,6 +2,7 @@ package broker
 
 import (
 	"database/sql"
+	"slices"
 
 	"github.com/LinZiyang666/tether/internal/agent/ssproxy"
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -327,8 +328,15 @@ func (b *Broker) pickProxyRehomeTarget(currentHome string) string {
 		}
 		ids = append(ids, id)
 	}
+	// A9: exclude a mid-drain broker (broker_draining marker up but phase still VOTER during DrainNode's
+	// migrate window) as a rehome target, mirroring the allocatePort guard. Queried AFTER the rows above are
+	// fully drained (single store connection); a read error → no-draining, proceed unfiltered.
+	draining, _ := cluster.DrainingNodes(b.cfg.DB)
 	best, bestLoad := "", int(^uint(0)>>1)
 	for _, id := range ids {
+		if slices.Contains(draining, id) {
+			continue // A9: never rehome onto a draining broker
+		}
 		if id != b.selfID && !b.homeReachable(id) {
 			continue // skip an unreachable target
 		}

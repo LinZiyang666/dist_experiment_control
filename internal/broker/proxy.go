@@ -1019,7 +1019,17 @@ func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 	}
 	out := make([]proto.ProxyNodeEntry, 0, len(rs))
 	for _, r := range rs {
-		e := proto.ProxyNodeEntry{NID: r.nid, Status: r.status, Ready: r.ready == 1}
+		// C6: gate Ready on the home broker's health in cluster mode so it agrees with the home-gated
+		// PublicPort/PublicHost below (and with the --cluster view + the /sub render). Otherwise an
+		// unhealthy-home row rendered Ready=true with an empty port/host — a self-contradictory entry.
+		// Compute the home health ONCE (proxyHomeHealthy issues a DB lookup) and reuse it for both gates.
+		clusterHome := b.clusterMode && r.homeBroker != ""
+		homeHealthy := clusterHome && b.proxyHomeHealthy(r.homeBroker)
+		ready := r.ready == 1
+		if clusterHome && !homeHealthy {
+			ready = false
+		}
+		e := proto.ProxyNodeEntry{NID: r.nid, Status: r.status, Ready: ready}
 		if r.pport != 0 {
 			// G7a #2: the default (non---cluster) view must label each exit with its OWN home broker's
 			// public host (where /sub points subscribers) — NOT this answering broker's host. In cluster
@@ -1027,9 +1037,9 @@ func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 			// mirroring proxyStatusNodesCluster (:405) so the default `proxy status` agrees with the /sub
 			// body on which exits are reachable and at what host. A single broker (home_broker=='') has no
 			// home concept and stays byte-identical to pre-G7a.
-			if b.clusterMode && r.homeBroker != "" {
+			if clusterHome {
 				e.HomeBroker = r.homeBroker
-				if b.proxyHomeHealthy(r.homeBroker) {
+				if homeHealthy {
 					e.PublicPort = r.pport
 					if home, herr := clusternodes.LookupByNodeID(b.cfg.DB, r.homeBroker); herr == nil {
 						e.PublicHost = home.PublicHost
