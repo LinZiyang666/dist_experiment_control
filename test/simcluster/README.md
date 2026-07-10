@@ -98,6 +98,7 @@ no Go toolchain and WSL's docker+systemd is awkward:
 | `image/pty-confirm.py` | in container | feeds the typed confirm to interactive `tether` commands (e.g. `cluster init` demands a TTY) |
 | `image/units/tether-agent.service` | in container | the agent systemd unit |
 | `drills/*.sh` | server | one reproducible deploy scenario each (acceptance/regression); see the Drills table |
+| `run-drills.sh` | server | run the WHOLE drill suite in PARALLEL — inotify preflight + concurrency cap (`-j`) + infra-flake re-run; the preferred way to run all drills (see Drills) |
 
 **Edit-loop:** the control scripts (`simcluster`, `lib/*`, `drills/*`) take effect via rsync alone — just
 re-run `remote.sh`. The baked files (`Dockerfile`, `image/*`, the vendored binaries) need `remote.sh build`.
@@ -193,10 +194,37 @@ drill** asserts a *currently-broken* behavior that has **no green code path toda
 signature-guarded (`lib/assert.sh`) so it can only pass for the DOCUMENTED cause — flip it to a plain
 GREEN regression the day the product fix lands.
 
-**Run drills ONE AT A TIME.** The heavy clustered-JetStream drills starve each other's meta-group
-formation when several run back-to-back on one host (the same contention that keeps `make e2e` serial;
-see `Makefile`) — `grow` / `node ls` then flake. Run `simcluster drill <name>` singly (each nukes its
-isolated instance on exit); do not loop all drills in one shot on a busy box.
+**Running the whole suite — PREFER `./run-drills.sh` (parallel).** The drills are docker-isolated (own
+network/volumes/containers per instance) and parallelize freely; the host has ~20× the capacity the
+full suite needs (measured 2026-07-09: ~600 concurrent systemd containers before a CPU boot-storm
+ceiling; the 7 drills are ~25 containers). What *used* to force serial runs was a single misdiagnosed
+kernel limit — **`fs.inotify.max_user_instances` (default 128, a PER-UID cap shared by ALL privileged
+containers)**. Every systemd container opens several inotify instances under host uid 0; parallel
+drills exhaust the 128 and the next container's systemd PID1 dies (exit 255 → "container not running"
+→ `up`'s `wait_sysd` times out at 60s). It *looks* like a boot/IO storm but is not — CPU/mem/io stay
+near idle; it is a counter, not saturation (decisive test: 40 containers → 13 fail at 128, 0 at 8192,
+12 again back at 128). Raise it once and the suite parallelizes cleanly:
+
+```sh
+echo 'fs.inotify.max_user_instances=8192' | sudo tee /etc/sysctl.d/99-simcluster.conf && sudo sysctl --system
+```
+
+Then run the whole suite in parallel — **this is the preferred path**:
+
+```sh
+./run-drills.sh                 # ALL drills, full parallel; preflights the inotify cap first
+./run-drills.sh -j 4            # cap concurrency on a smaller host
+./run-drills.sh 10-grow-to-3    # a named subset
+```
+
+`run-drills.sh` preflights `max_user_instances` (raising it if it has passwordless sudo, else printing
+the fix), fires every drill concurrently on its own throwaway instance, then serially re-runs any infra
+flake. A single drill by hand is still fine: `simcluster drill <name>`.
+
+**CAVEAT (grow-concurrency, INDEPENDENT of inotify).** The heaviest clustered-JetStream grow
+(`10-grow-to-3`: two grows + follower-kill) can still time out its VOTER promotion (150s) when ALL
+drills grow at the same instant — raft/JS-meta formation is timing-sensitive at peak concurrency. If it
+goes RED alone in an otherwise-green full parallel run, re-run it singly or cap with `-j`.
 
 | Drill | Proves |
 |---|---|

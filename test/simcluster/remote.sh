@@ -69,12 +69,15 @@ rsync -a --delete \
     "$here/" "$SERVER:$REMOTE_DIR/"
 
 if [ "$#" -gt 0 ]; then
-    echo "[remote] ssh → simcluster $*"
+    # `drill-all` dispatches to run-drills.sh (parallel whole-suite runner); everything else to simcluster.
+    entry=./simcluster
+    if [ "$1" = "drill-all" ]; then entry=./run-drills.sh; shift; fi
+    echo "[remote] ssh → ${entry##*/} $*"
     # F3 (external review): quote REMOTE_DIR + EACH arg with printf %q so argv boundaries survive the remote
     # shell. `$*` flattens everything into one string — args with spaces/quotes/;/$()/nested `sh -c` payloads
     # (exactly what `exec <node> -- <cmd…>` / `ctl -- <tether…>` pass) would break apart or become remote
     # shell syntax (injection). This preserves exact argv and is injection-safe.
-    remote_cmd="cd $(printf '%q' "$REMOTE_DIR") && ./simcluster"
+    remote_cmd="cd $(printf '%q' "$REMOTE_DIR") && $entry"
     for a in "$@"; do remote_cmd="$remote_cmd $(printf '%q' "$a")"; done
     ssh -t "$SERVER" "$remote_cmd"
 fi

@@ -219,6 +219,16 @@ cmd_grow() {
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s\n' "$_j"
     else
         err "grow: $_j did not reach VOTER via cluster add — check: ./simcluster status ; ./simcluster logs $_j tether-broker"
+        # DO-NOT-RE-INVESTIGATE (established 2026-07-10): a VOTER-timeout HERE during a FULL-PARALLEL
+        # suite run (run-drills.sh with no -j cap) is almost always the grow-timing CONCURRENCY flake,
+        # NOT a product/G1-G7 defect. clustered-JS meta-group formation + raft VOTER promotion is
+        # timing-sensitive; at peak concurrency (7 drills growing at once) it can miss the 150s window.
+        # Proven flake, not bug: the same grow is GREEN run SOLO (10-grow-to-3 = 19/19) and at 30s
+        # stagger; only the 7-way no-stagger sweep RED'd here. Confirm by re-running the drill SOLO or
+        # with run-drills.sh -j <N>. Only a SOLO/low-concurrency VOTER-timeout is a real regression.
+        warn "grow: if this was a PARALLEL full-suite run, a VOTER-timeout here is usually the grow-timing"
+        warn "  concurrency flake (see the code comment + README 'CAVEAT (grow-concurrency)'), NOT a defect."
+        warn "  Verify SOLO: 'simcluster drill <name>' or 'run-drills.sh -j <N>'. Only a SOLO timeout is real."
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s (INCOMPLETE — did not reach VOTER)\n' "$_j"
         return 1
     fi
