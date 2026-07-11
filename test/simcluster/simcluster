@@ -142,7 +142,8 @@ _reconcile_clustered() {
 # docs/reviews/simcluster-grow-honest-plan.md). The gaps are ASSERTED by their real signatures in
 # drills/{11-grow-gaps (#8/#I1 + full trailer set), 13-inbroker-reconcile-perm (#22)}.sh. Grow still reaches
 # VOTER (option B) so the other drills can run; every expected-to-fail attempt is captured, never `|| die`.
-# It ends by printing a `GREW-VIA-WORKAROUNDS: …` trailer listing which tether gaps it had to hand-fix.
+# Since G4 it drives `tether cluster add` end-to-end (no hand cluster-lifecycle steps) and ends by printing
+# a `GREW-VIA-TETHER-CLUSTER-ADD: <joiner>` trailer; the only `[env]` steps left are provisioning.
 cmd_grow() {
     _j=${1:?joiner broker node}
     [ "$(role_of "$_j")" = broker ] || die "grow: $_j is not a broker"

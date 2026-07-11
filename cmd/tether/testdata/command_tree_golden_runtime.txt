@@ -1,0 +1,99 @@
+tether	flags:
+tether admin	flags: --socket
+tether admin audit	flags: --json --n --socket
+tether admin evict	flags: --socket
+tether admin nodes	flags: --json --socket
+tether admin sessions	flags: --json --socket
+tether agent	flags: --install-user-service --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall
+tether agent config	flags:
+tether agent config refresh	flags: --once --session
+tether agent doctor	flags: --session
+tether agent join	flags: --expect-account-pub --nid --pin --start
+tether alert	flags:
+tether alert ack	flags: --home --nats-url
+tether alert clear	flags: --socket
+tether alert ls	flags: --home --json --nats-url
+tether alert raise	flags: --kind --label --message --severity --socket
+tether cluster	flags: --socket
+tether cluster add	flags: --account-seed --auto-confirm-catchup --config --confirm-node-id --data-dir --db --dry-run --home --name --nats-route --nats-url --node-ident-pub --notify-webhook --preserve-js-data --public-host --raft-addr --reset-former-js --secrets-dir --self-id --socket --timeout --tunnel-addr --yes(hidden)
+tether cluster apply	flags: --file --json --socket
+tether cluster backup	flags: --allow-stale-follower --data-dir --db --offline --out --secrets-dir --socket
+tether cluster doctor	flags: --conf --db --json --nats-route --offline --raft-addr --secrets-dir --socket
+tether cluster drain	flags: --abort --now --retire(hidden) --socket
+tether cluster export-incident [hidden]	flags: --force --out --sid --since --socket
+tether cluster force-single [hidden]	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --self-addr --self-id --socket --yes(hidden)
+tether cluster init	flags: --check --config --confirm-node-id --data-dir --db --dry-run --from-existing --from-manifest --name --nats-route --node-ident-pub --public-host --raft-addr --secrets-dir --self-id --socket --tunnel-addr --yes(hidden)
+tether cluster invite	flags: --account-pub --bootstrap --seed --socket
+tether cluster join	flags: --socket
+tether cluster join approve	flags: --socket --timeout --wait
+tether cluster join prepare	flags: --cert-fp --name --nats-route --nats-server-id --node-id --public-host --raft-addr --secrets-dir --seed --socket --tunnel-addr
+tether cluster keygen [hidden]	flags: --out --socket
+tether cluster node-pub [hidden]	flags: --seed --socket
+tether cluster ops	flags: --socket
+tether cluster ops abort	flags: --socket
+tether cluster ops confirm	flags: --socket
+tether cluster ops ls	flags: --json --socket
+tether cluster ops show	flags: --json --socket
+tether cluster pin	flags: --force --home --socket
+tether cluster rebalance	flags: --socket
+tether cluster rebalance proxy	flags: --dry-run --socket
+tether cluster reconcile	flags: --socket
+tether cluster reconcile nats	flags: --account-issuer --all --allow-partial-mesh --broker-nkey --cluster-listen --conf --confirm-single --json --manual --nats-server --peer --plan --route-url --secrets-dir --server-name --skip-dry-run --socket --timeout --to-standalone --wait
+tether cluster recover [hidden]	flags: --data-dir --db --dump-divergent --emit-manifest --guided --secrets-dir --self-id --socket --yes(hidden)
+tether cluster recovery	flags: --socket
+tether cluster recovery diagnose	flags: --db --offline --self-id --socket
+tether cluster recovery force-single	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --self-addr --self-id --socket --yes(hidden)
+tether cluster recovery incident	flags: --socket
+tether cluster recovery incident export	flags: --force --out --sid --since --socket
+tether cluster recovery node	flags: --socket
+tether cluster recovery node remove	flags: --confirm-node-id --force --manual --socket --yes(hidden)
+tether cluster recovery rejoin	flags: --socket
+tether cluster recovery rejoin prepare	flags: --data-dir --db --dump-divergent --emit-manifest --guided --secrets-dir --self-id --socket --yes(hidden)
+tether cluster recovery resnapshot	flags: --accept-audit-loss --confirm-node-id --data-dir --db --raft-addr --self-id --socket --yes(hidden)
+tether cluster recovery restore	flags: --confirm-node-id --data-dir --db --raft-addr --secrets-dir --socket --yes(hidden)
+tether cluster remove [hidden]	flags: --confirm-node-id --force --manual --socket --yes(hidden)
+tether cluster restore [hidden]	flags: --confirm-node-id --data-dir --db --raft-addr --secrets-dir --socket --yes(hidden)
+tether cluster retire	flags: --compromised --require-credential-rotation --secrets-dir --socket --timeout --wait
+tether cluster rotate-tunnel-cert	flags: --cert-fp --socket
+tether cluster seeds	flags: --socket
+tether cluster seeds publish	flags: --bootstrap --endpoint --sid --socket
+tether cluster seeds show	flags: --home --nats-url --remote --socket
+tether cluster set-raft-addr	flags: --allow-loopback --route --socket
+tether cluster status	flags: --card --db --home --homes --json --nats-url --offline --remote --socket --watch
+tether cluster takeover-natsconf [hidden]	flags: --account-issuer --allow-partial-mesh --broker-nkey --cluster-listen --conf --json --nats-server --peer --plan --route-url --secrets-dir --server-name --skip-dry-run --socket
+tether cluster transfer-leader	flags: --socket --timeout --wait
+tether cluster upgrade	flags: --account-seed --ack-writefence --backup-taken --dry-run --expect-sha256 --home --nats-url --notify-webhook --socket --to-version
+tether completion	flags:
+tether completion bash	flags: --no-descriptions
+tether completion fish	flags: --no-descriptions
+tether completion powershell	flags: --no-descriptions
+tether completion zsh	flags: --no-descriptions
+tether ctx	flags: --home
+tether exec	flags: --cwd --home --nats-url --safe --timeout
+tether expose	flags: --ack-alerts --home --json --local --name --nats-url --no-rebuild --on-broker --remote-port
+tether expose explain	flags: --home --json --nats-url
+tether expose rm	flags: --ack-alerts --home --json --name --nats-url
+tether history	flags: --follow --home --kind --lines --nats-url
+tether login	flags: --broker --home --nats-url --pin --session
+tether logout	flags: --home
+tether node	flags:
+tether node ls	flags: --all --brokers --home --json --nats-url
+tether node upgrade	flags: --all --home --nats-url --sha256 --timeout --url
+tether proxy	flags: --home --nats-url
+tether proxy off	flags: --home --nats-url
+tether proxy on	flags: --ha-policy --home --nats-url --yes
+tether proxy status	flags: --cluster --home --json --nats-url
+tether proxy sub	flags: --home --nats-url
+tether proxy sub create	flags: --home --name --nats-url
+tether proxy sub ls	flags: --home --nats-url
+tether proxy sub revoke	flags: --home --name --nats-url
+tether ps	flags: --all --home --json --nats-url
+tether pull	flags: --ack-alerts --force --home --nats-url --timeout
+tether push	flags: --ack-alerts --force --home --nats-url --timeout
+tether run	flags: --ack-alerts --cwd --home --nats-url --safe
+tether serve	flags: --admin-socket --alert-webhook-url --auth-callout-seeds-dir --cluster-data-dir --cluster-manifest-listen --cluster-raft-addr --cluster-secrets-dir --colocated-agent-nid --config --db --log-json --log-level --metrics-listen --nats-conf-path --nats-server-bin --nats-url --public-host --store-dir --sub-http-listen --tunnel-addr --tunnel-public-host --upgrade-url-allow
+tether session	flags: --home --nats-url
+tether session create	flags: --home --nats-url --pin
+tether session ls	flags: --home --json --nats-url
+tether session rm	flags: --ack-alerts --home --nats-url
+tether version	flags:

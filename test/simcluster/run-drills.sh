@@ -180,7 +180,7 @@ for d in "${DRILLS[@]}"; do
 done
 echo "-------------------------------------------------------------------------------"
 printf '  %d drills, %d RED, %ds elapsed' "${#DRILLS[@]}" "$fails" "$(( $(secs) - started ))"
-[ "${#retried[@]:-0}" -gt 0 ] 2>/dev/null && printf ' (%d retried)' "${#retried[@]}"
+[ "${#retried[@]}" -gt 0 ] && printf ' (%d retried)' "${#retried[@]}"
 echo
 if [ "$fails" -eq 0 ]; then echo "  ${C_G}ALL GREEN${C_0}"; else echo "  ${C_R}$fails RED${C_0} — inspect $LOGDIR/<name>.log"; fi
 exit "$fails"

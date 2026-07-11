@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server \
         python3 \
         jq openssl iproute2 curl ca-certificates procps iputils-ping less vim-tiny \
+        fuse3 libfuse2t64 python3-fusepy \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Mask the units that fight docker PID1 / DNS (re-smoke via `simcluster doctor` if this set changes).
@@ -40,11 +41,13 @@ COPY vendor/nk           /usr/local/bin/nk
 COPY vendor/install.sh   /opt/sim/install.sh
 RUN chmod +x /usr/local/bin/tether /usr/local/bin/nats-server /usr/local/bin/nats /usr/local/bin/nk /opt/sim/install.sh
 
-# Provisioning + typed-confirm helpers (run inside the container by the control script via docker exec).
+# Provisioning + typed-confirm/interactive-pty helpers (run inside the container via docker exec).
 COPY image/provision-node.sh          /opt/sim/provision-node.sh
 COPY image/pty-confirm.py             /opt/sim/pty-confirm.py
+COPY image/pty-run.py                 /opt/sim/pty-run.py
+COPY image/hangfs.py                  /opt/sim/hangfs.py
 COPY image/units/tether-agent.service /opt/sim/tether-agent.service
-RUN chmod +x /opt/sim/provision-node.sh /opt/sim/pty-confirm.py
+RUN chmod +x /opt/sim/provision-node.sh /opt/sim/pty-confirm.py /opt/sim/pty-run.py /opt/sim/hangfs.py
 
 # STOPSIGNAL SIGRTMIN+3 is mandatory: default SIGTERM 10s-kills PID1 mid-write and corrupts
 # SQLite/BoltDB, masking real bugs as sim artifacts. Pair with --stop-signal at run time.

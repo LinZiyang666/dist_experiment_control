@@ -8,7 +8,7 @@ rev3/rev4/rev5 = 外审 round1（11 findings + 4 doubts）/round2（8 findings +
 `docs/reviews/simcluster-coverage-inventory.md` 完成全量生成，rev6 补安全门 flag 面，
 **rev7**（round5：2 Major → round6 **Pass**）用构造后 Cobra 树的完整遍历系统性重建附录 §2
 并修正 restore 的 never-escapable 安全模型。
-Status: **ROADMAP（总纲，未开工）**。本文件**不是**单批 plan、**不**进入实现——它把「**已发布至 v0.4.7
+Status: **ROADMAP（总纲）；S1 已落地（S0-pty + S0-台账 + 60/61/62 drills；外审整改中，commit 待填）、S2–S9 未开工**。本文件**不是**单批 plan、**不**进入实现——它把「**已发布至 v0.4.7
 的全部产品功能面中尚无 deploy-tier 覆盖者**（含 G 系列 plan 已认账未落地的 sim 验收欠账；simcluster
 本体登场于 f460148, 2026-07-05）」的模拟集群测试补完，按内聚场景族 + 依赖顺序 + 使用频率拆成
 **9 个独立叶子批次 S1–S9**。每批开工时各自按 CLAUDE.md §3 走 3 阶段 7 步（Workflow 对抗草拟 →
@@ -206,8 +206,8 @@ S0-台账（全批共用底座）。每项落地受 §0.2 反掩盖细则约束�
 | S0-artifact | 发布制品库 | https 静态服务 + 实例作用域自签 CA 入容器 trust（OQ-3；CA 设施与 S0-ingress 共用） | S5 | S5-30/31 | 未落地 |
 | S0-备份库 | 离簇备份库 | **实例命名空间化的 host 侧目录**：在 `rm_node --vols`（灾难注入）作用域**之外**、但在 `simcluster nuke` 作用域**之内**（nuke 学会删它——不跨轮泄漏状态）；fresh/空预检、0700、bundle 名唯一、trap 清理 | S7 | S7-50/51 | 未落地 |
 | S0-故障原语 | 故障注入原语 | 目标 netns 内 nftables/iptables DROP / tc（分区）、SIGSTOP、卷级灾难（保留-secrets 变体）——每件带 Mandate ④ 说明模板 + 无条件清理 trap | S9（分区）/S7（卷级） | S9-96/97、S7-50/51 | 未落地 |
-| S0-pty | 通用交互 pty 驱动 | `image/pty-run.py`（交互式 `run` 会话驱动；**typed-confirm 臂用既有 `pty-confirm.py`，不依赖本项**） | S1 | S1-60、S9-96（PTY 混沌臂） | 未落地 |
-| S0-台账 | 台账 + README 底座 | `docs/deploy-tier-gotchas.md` 建档 + README drill 表/编号族重构（含 11 号行漂移清偿）+ 清单附录（`simcluster-coverage-inventory.md`，rev4 建档、rev5 全量生成）维护权移交 | S1（或首开批） | 全部批 | 清单附录已全量建档；其余未落地 |
+| S0-pty | 通用交互 pty 驱动 | `image/pty-run.py`（交互式 `run` 会话驱动；**typed-confirm 臂用既有 `pty-confirm.py`，不依赖本项**） | S1 | S1-60、S9-96（PTY 混沌臂） | **已落地（S1；`image/pty-run.py` 烘焙进镜像；commit 待填——外审整改中）** |
+| S0-台账 | 台账 + README 底座 | `docs/deploy-tier-gotchas.md` 建档 + README drill 表/编号族重构（含 11 号行漂移清偿）+ 清单附录（`simcluster-coverage-inventory.md`，rev4 建档、rev5 全量生成）维护权移交 | S1（或首开批） | 全部批 | **已落地（S1；`docs/deploy-tier-gotchas.md` 建档 + README 编号族/drill 表重构（含 11 号行漂移清偿）+ 提交入仓命令树 golden gate `cmd/tether/command_tree_inventory_test.go`；commit 待填——外审整改中）** |
 
 ```
 S1 用户平面核心旅程 (exec/run/ps/history/node ls/transfer 边界)      ── 无依赖；落 S0-pty/S0-台账

@@ -103,8 +103,9 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 > `recover`/`restore`/`export-incident`/`remove` 五个 cluster 顶层旧拼写
 > （`deprecatedClusterAlias`，与 recovery 本体同 RunE + stderr 警告）、`node-pub`/`keygen`
 > （`hiddenDebugCmd`）。Hidden **flag**：`drain --retire`（MarkHidden REMOVED-redirect）+
-> 七处 `registerYesRejector` 的 Hidden `--yes`。`completion` 由 cobra 运行期注入
-> （构造树不含此节点——生成器对照时排除并注记）。
+> 七处 `registerYesRejector` 的 Hidden `--yes`。`completion` 由 cobra 运行期注入（构造树不含此节点）——
+> **自 S1 外审 MINOR-3 起，命令树门另用第二份 runtime golden** 遍历 `InitDefaultCompletionCmd()` 注入后的树
+> （**99 path** = 构造 94 + `completion` + bash/fish/powershell/zsh + `--no-descriptions`），故 completion 面亦入结构门。
 
 ### 2.1 使用者 / agent / admin 面
 
@@ -112,7 +113,7 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 |---|---|---|---|---|
 | `version` / `logout` / `ctx` | — | — | S1-60 顺带 | 本地纯逻辑，hermetic 密（logout/ctx 参与 60 的 G.3 臂） |
 | `completion <shell>` | —（运行期内建） | `--no-descriptions` | S1-60 顺带 | 同上 |
-| `login` | — | `--session/--pin/--broker`（别名+持久化 broker_url） | S1-60 + S2-80 | 激活/CONNECT 拒/G.3 重连 |
+| `login` | — | `--session/--pin/--broker`（别名+持久化 broker_url） | S1-60 + S2-80 | 激活/CONNECT 拒/G.3 重连（登出→经 broker admin socket 证 agt2 STALE→重登**首个** node ls 即反映=重连读当前态，非 login 取快照） |
 | `session create <name>` | — | `--pin` | 既有 10（写提交）+ S2-81 | |
 | `session ls` | — | — | S2-81 | STATE/ROLE/active 标记 |
 | `session rm <sid>` | — | `--ack-alerts` | S2-81 + S8-92(a) | 三阶段 + 告警态强推臂 |
@@ -198,3 +199,57 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
   **首个落地二者之一的批**成为设施 owner；后开批**复用同一实例 CA、绝不重铸**（重铸会使已
   运行容器的 trust 漂移）——写入该批 plan 的生命周期元组。
 - 新增项：先在本文件落行（归属或 NOT-COVERED/probe）→ 再收工。
+
+## 4. 批次落地记录（consume/update 日志；每批收工闸落此）
+
+### S1 landing（2026-07-11）
+
+**命令树生成器已落地（S0-台账，test-tier）**：`cmd/tether/command_tree_inventory_test.go`
+（`TestCommandTreeInventory`）+ **两份** golden：构造树 `command_tree_golden.txt` + **运行期树**
+`command_tree_golden_runtime.txt`（S1 外审 MINOR-3 加：含 cobra 注入的 completion 子树，**99 path = 构造 94 + 5**）。
+收工闸重枚举实测 = **94 command path、8 hidden command、11 处 `--yes(hidden)`**（构造树）——与 §2 的
+「94 path / 8 hidden」**零 diff 吻合**（`--yes` 的 11 = 7 canonical `registerYesRejector` + 4 个共享 RunE 的
+deprecated alias 复制，生成器如实展开）；运行期 golden 另断 99 path（含 completion）。漂移诊断写 `t.TempDir()`
+（S1 外审 MINOR-2：不再落源码树 `.actual`）。此生成器接替 §3「临时诊断测试」，每批收工闸
+`go test ./cmd/tether -run TestCommandTreeInventory` 断零 diff；产品 CLI 面漂移即 fail、逼迫本附录重对账后才
+`-update-command-tree-golden`。
+
+**§2 命令行 S1 勾（臂级，部分勾约定）**：
+- `login/logout/ctx` → **S1✓**（激活 + logout 清空 + G.3 重连臂〔60 J1/J-G.3：登出窗口内经 **broker admin
+  socket**（无 ctl session）证 agt2 STALE、**重登后首个** node ls 即反映=重连读取当前态；login 本身无 snapshot
+  语义〕）· S2☐（CONNECT 拒非成员）。
+- `login --broker` 别名 → S2☐（未测）。`completion <shell>` → **S1✓**（`completion bash` 烟测；
+  `--no-descriptions` 未测 → 部分）。`version` → **S1✓**（60 J18）。
+- `exec` → **S1✓**（`--cwd`〔flag 须在 node 前，SetInterspersed〕、exit 0/精确非零/信号→扁平 128/256 KiB 流〕；
+  `--safe` → 62；`--timeout` → 未跑过期臂，**S1◐ 部分**（留 S 后续或 hermetic）。
+- `run` → **S1✓**（真 PTY/`stty size`/resize/Ctrl-C→进程组/attach 无孤儿，经 `image/pty-run.py`）；
+  `--safe` → 62；`--ack-alerts` → S9☐。
+- `ps` `--all` → **S1✓**（RUNNING→EXITED、PORTS 表头〔N=1 无 HOME 列〕）· S3☐（有值 PORTS/HOME）· S9☐（LOST 合成）。
+- `push`/`pull` `--force` → **S1✓**（双向码 path_parent_missing〔push〕/path_not_found〔pull〕/path_outside_roots/
+  not_a_regular_file/transfer_disabled/dst_exists/too_large〔pull >2 GiB〕、tier 分界、`--force`）；
+  `sha_mismatch`/`path_race` **显式 hermetic**（§0.3）；`--timeout` → hermetic/部分。
+- `history` `--lines/--kind/--follow` → **S1✓**（`-n` 界、`--kind call/proc/transfer`、非法-kind 拒
+  `must be one of`、`--follow` 烟测）。注：history 行首是**时间戳**、KIND 是第二列（`^KIND` 锚点是假绿，S1 已修）。
+- `node ls` `--all` → **S1✓**（`-a` OFFLINE/STALE 视图 + PROTO int/RELEASE 非空）；`--brokers` → S5☐。
+- `agent`（daemon 注册/心跳/重连）→ **S1✓**（60 setup + G.3）；`agent.yaml` `file_transfer.allow_roots`
+  三态 → **S1✓**（61 open/narrow/disabled，经 `drills/lib/agentyaml.sh` 忠实供给〔install.sh 形态、flagless
+  unit、0600/0700 sim:sim〕）· `remote_fs` → **S1◐**（62 auto/off+--safe FUSE-approx；真-D NOT-COVERED，OQ-2）·
+  `proxy` → S4☐。**`agent join` flag 集 = S2，未勾。**
+
+**§1 事件/告警面 — NULL-DIFF 收工闸（必需步、非跳过）**：S1 的三个 drill 勾 **0 条** §1.1/§1.2 `pubSysEvent`
+/alert 行——用户面命令（exec/run/ps/history/node ls/push/pull）**不发** `sys.events` kind；transfer
+在独立 subject `audit.transfer` 发、经 `history --kind transfer` 可见（非 pubSysEvent kind，§1.1 已如此登记）。
+**`login` 例外须精确（S1-08 内审订正）**：ctl 的 **PIN 首连** *会* 经 authcallout **发** `member_joined`
+（`internal/broker/authcallout.go:81` 接 `pubSysEvent` → `internal/authcallout/handler.go:353`；§1.1 已登该
+kind、归 **S2-80**）。60-user-journey 的 setup `session … --pin`（60:53，展开 `session create --pin` +
+`login -s --pin`）正走此首连路径，**exercise 了但从不 assert** `member_joined`（断言归 S2-80），故 S1 仍勾
+**0 event 行**——结论不变、仅理由须精确。（登出后再 `login`〔60:68〕是 already-member 的 steady-state，走
+`handler.go:324` 的 if-member 分支、不发；60 的首连才是矛盾所在。）收工时按 §3 生成法重跑（`grep pubSysEvent`
++ authcallout `h.emit` + `emitDrainEvent` + `proxy_cluster.go` + `alert_ops.go`）**记：0 条 S1-引入 kind**
+（null-diff——`member_joined` 是既有 kind、非 S1 引入）。
+
+**DOC 缺陷（S1 顺带经命令树 golden 暴露）**：**DOC-3 确认**——`tether agent` 无 `--upgrade-url-allow` flag
+（golden 证实），但 `error_hints.go:34` + `usage.md:1443` 指向「agent 的 --upgrade-url-allow」（只 `serve` 有）。
+登 `docs/deploy-tier-gotchas.md`，随 S5-31 定格。**DOC-5 非缺陷**（usage.md §669 已正确记扁平-128）。
+
+**保真度债**：FD-1（sim 顶层 `/home/sim/.tether` 0755 vs install.sh 0700）登 gotchas 台账，S1 不依赖、不阻塞。
