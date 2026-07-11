@@ -2,12 +2,12 @@
 
 Date: 2026-07-05
 Status: **ROADMAP（总纲，未开工）**。本文件**不是**单批 plan、**不**进入实现——它把
-`docs/v0.4.5-ha-grow-ops-gotchas.md` 的 24 条 backlog（#1–#24）+ §B 终极自动化目标，按内聚子系统 +
+`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md` 的 24 条 backlog（#1–#24）+ §B 终极自动化目标，按内聚子系统 +
 依赖顺序 + 现网止血优先级拆成 **7 个独立叶子增量 G1–G7**。每批**开工时**各自按 CLAUDE.md §3 走
 3 阶段 7 步（Workflow 对抗草拟 → 主进程定稿 `docs/reviews/g<N>-plan.md` → 实现 → 对抗内审 → 外审 →
 commit），彼此不阻塞主线。**范围以本文件为总纲，精度以各批 plan 为准。**
 
-> 来源真相：`docs/v0.4.5-ha-grow-ops-gotchas.md`（gotcha 编号 SSOT）。
+> 来源真相：`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`（gotcha 编号 SSOT）。
 > 验收网：`test/simcluster/`（每批修好，对应 signature-guarded RED drill 翻成普通 GREEN 回归，
 > `grow` 的 `GREW-VIA-WORKAROUNDS` trailer 逐个掉 token——**验收标准已写好**）。
 > 约束尺：`docs/distributed-broker-architecture.md`（R3「不静默 de-cluster」等不变量），

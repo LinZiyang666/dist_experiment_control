@@ -19,7 +19,7 @@ on a docker bridge with per-node IPs and persistent named volumes. The tool is a
 that drives the **real** `tether` grow/shrink/failover flows + `docker` + in-container `systemctl`, so it
 exercises the cross-process / on-disk / nats.conf-drift / install-path bug class that the hermetic
 `make test` and in-process `d*_integration` suites structurally cannot reach (the 21 real-fleet failures in
-`docs/v0.4.5-ha-grow-ops-gotchas.md`).
+`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`).
 
 **First increment =** control tool + one base image + walking skeleton (N=1 standalone → clustered,
 `node ls` + real `agent join` + `push`/`pull` round-trip) + grow to N=3 (**including a migrated-broker-grow

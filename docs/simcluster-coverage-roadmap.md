@@ -1,11 +1,13 @@
 # 模拟集群测试补完 — 总纲 Roadmap（S1–S9）
 
-Date: 2026-07-10（rev5）。修订史：rev2 = 61 条内审 findings 裁决（`simcluster-coverage-roadmap-review.md`）；
+Date: 2026-07-10（rev7；本文件后移至 `docs/`，审查史/清单附录仍在 `docs/reviews/`）。修订史：
+rev2 = 61 条内审 findings 裁决（`docs/reviews/simcluster-coverage-roadmap-review.md`）；
 rev3/rev4/rev5 = 外审 round1（11 findings + 4 doubts）/round2（8 findings + 3 questions）/round3
 （2 Major + 1 Minor）/round4（1 Major + 2 Minor）逐轮全采纳，逐条回复见各轮
-`…-external-review*.md` 文件尾；rev5 把清单附录 `simcluster-coverage-inventory.md` 完成全量
-生成，rev6 补安全门 flag 面，**rev7**（round5：2 Major）用构造后 Cobra 树的完整遍历系统性重建
-附录 §2 并修正 restore 的 never-escapable 安全模型。
+`docs/reviews/simcluster-coverage-roadmap-external-review*.md` 文件尾；rev5 把清单附录
+`docs/reviews/simcluster-coverage-inventory.md` 完成全量生成，rev6 补安全门 flag 面，
+**rev7**（round5：2 Major → round6 **Pass**）用构造后 Cobra 树的完整遍历系统性重建附录 §2
+并修正 restore 的 never-escapable 安全模型。
 Status: **ROADMAP（总纲，未开工）**。本文件**不是**单批 plan、**不**进入实现——它把「**已发布至 v0.4.7
 的全部产品功能面中尚无 deploy-tier 覆盖者**（含 G 系列 plan 已认账未落地的 sim 验收欠账；simcluster
 本体登场于 f460148, 2026-07-05）」的模拟集群测试补完，按内聚场景族 + 依赖顺序 + 使用频率拆成
@@ -24,7 +26,7 @@ Status: **ROADMAP（总纲，未开工）**。本文件**不是**单批 plan、*
 > 对照**（`docs/reviews/simcluster-coverage-inventory.md`，单一真相源附录；cobra 的
 > `Hidden: true` 命令在 `--help` 里**不可见**，故文本 help 不得作为清单来源——见 §4 闸门规则；
 > 已知手册即漏 `recovery diagnose`/`resnapshot`，登记为 DOC 缺陷，§5）。
-> 既有缺陷台账：`docs/v0.4.5-ha-grow-ops-gotchas.md`（#1–#24，SSOT）；本工程新发现从 **#25** 起
+> 既有缺陷台账：`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`（#1–#24，SSOT）；本工程新发现从 **#25** 起
 > 记入新台账 `docs/deploy-tier-gotchas.md`（见 §5）。
 
 ---
@@ -790,7 +792,7 @@ S9 混沌对账与长稳 (G.1/G.2/#23 行为级/分区/中断注入/soak)       
 ## 5. 新 gap 台账与编号
 
 - 新台账：**`docs/deploy-tier-gotchas.md`**，编号自 **#25** 起**全局连续**（#1–#24 留在
-  `docs/v0.4.5-ha-grow-ops-gotchas.md`，两文件头部互链）。全局连续保证 `assert_bug` 的
+  `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`，两文件头部互链）。全局连续保证 `assert_bug` 的
   gotcha token 与 `[GAP #N]` 标注跨文件唯一。
 - **#I\* 过渡族收编**：既有 `#I1`（drill 11 断言的 serve fail-closed 不变量，只登记在 sim
   README）迁册/互链进新台账序言并**关族**——此后不再新增 `#I*` 号，一律用 #25+。

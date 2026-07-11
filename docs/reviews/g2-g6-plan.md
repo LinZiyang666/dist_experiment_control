@@ -9,7 +9,7 @@
 
 ## 0. 主进程定稿裁决（OQ1–OQ10）
 
-Stage-A synth 骨架在现场代码核验中**推翻了背景文档 `docs/v0.4.5-ha-grow-ops-gotchas.md` 的两个前提**，
+Stage-A synth 骨架在现场代码核验中**推翻了背景文档 `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md` 的两个前提**，
 定稿全部采纳这些核验：
 
 - **[已核实] `RemoveServer` 对已不在 raft config 的节点是幂等 no-op、不报错**（`internal/cluster/

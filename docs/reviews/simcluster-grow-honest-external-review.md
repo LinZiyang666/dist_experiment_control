@@ -1,6 +1,6 @@
 # Fail - simcluster grow-honest external review
 
-Reviewer role: external reviewer. Scope: unstaged/untracked simcluster grow-honest rework on top of the current worktree: `CLAUDE.md`, `docs/v0.4.5-ha-grow-ops-gotchas.md`, `test/simcluster/README.md`, `test/simcluster/image/provision-node.sh`, `test/simcluster/simcluster`, `test/simcluster/drills/11-grow-gaps.sh`, `test/simcluster/drills/13-inbroker-reconcile-perm.sh`, and the new plan/review docs.
+Reviewer role: external reviewer. Scope: unstaged/untracked simcluster grow-honest rework on top of the current worktree: `CLAUDE.md`, `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`, `test/simcluster/README.md`, `test/simcluster/image/provision-node.sh`, `test/simcluster/simcluster`, `test/simcluster/drills/11-grow-gaps.sh`, `test/simcluster/drills/13-inbroker-reconcile-perm.sh`, and the new plan/review docs.
 
 结论：Fail。整体方向比上一版诚实得多，尤其是不再 chown `/etc/tether`、#I1 改成 `assert_refuses`、#22 drill 直接跑 User=tether 的写路径；但当前实现仍把至少一个本应由真实产品命令暴露的 grow 缺口降级成了无条件 trailer 文案，存在 false-green 风险。另有一个提交前检查失败。
 
@@ -50,7 +50,7 @@ Passing:
 - `sh -n test/simcluster/drills/11-grow-gaps.sh`
 - `sh -n test/simcluster/drills/13-inbroker-reconcile-perm.sh`
 - `sh -n test/simcluster/image/provision-node.sh`
-- `git diff --check -- test/simcluster/README.md test/simcluster/image/provision-node.sh test/simcluster/simcluster docs/v0.4.5-ha-grow-ops-gotchas.md`
+- `git diff --check -- test/simcluster/README.md test/simcluster/image/provision-node.sh test/simcluster/simcluster docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`
 - `git diff --check -- test/simcluster/drills/11-grow-gaps.sh test/simcluster/drills/13-inbroker-reconcile-perm.sh docs/reviews/simcluster-grow-honest-plan.md docs/reviews/simcluster-grow-honest-review.md`
 
 Failing:

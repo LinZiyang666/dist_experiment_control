@@ -5,7 +5,7 @@ fleet on one Linux host. Each container is one node running **real systemd (PID1
 out-of-process `nats-server` + the real `tether` binary**, on a docker bridge with per-node hostnames and
 persistent named volumes. It exercises the **cross-process / on-disk / nats.conf-drift / install-path**
 bug class that the hermetic `make test` and the in-process `d*_integration` suites structurally cannot
-reach (the 21 real-fleet failures in `docs/v0.4.5-ha-grow-ops-gotchas.md`).
+reach (the 21 real-fleet failures in `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`).
 
 **Plan of record:** `docs/reviews/simcluster-plan.md`.
 
@@ -239,7 +239,7 @@ goes RED alone in an otherwise-green full parallel run, re-run it singly or cap 
 ## Real `tether` findings surfaced (2026-07-05)
 
 This tool caught cross-process deployment defects unreachable by the in-process suites, logged in
-`docs/v0.4.5-ha-grow-ops-gotchas.md`:
+`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`:
 
 - **#22 (FIXED in G1, 2026-07-05 — Option B).** Pre-G1: install.sh left the reconciler's nats.conf in the
   root-owned `/etc/tether`, so a `User=tether` in-broker C3 reconciler write (temp/`.bak` + atomic rename,

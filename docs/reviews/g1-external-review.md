@@ -69,7 +69,7 @@ old conclusion:
   `:7400` / `:6222`.
 - `docs/architecture.md` still says “无 cert/SAN 改动 (route mTLS 仅验 chain-to-CA)” in the
   cluster-phase-fluidity section.
-- `docs/v0.4.5-ha-grow-ops-gotchas.md` still lists the automation target as “/etc/tether 须 tether 可写
+- `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md` still lists the automation target as “/etc/tether 须 tether 可写
   (#22)” in §B, while G1’s accepted security boundary is `/etc/tether` root-owned plus tether-owned
   `/etc/tether/nats.d`.
 
@@ -199,7 +199,7 @@ Verdict: **PASS**.
 - **MAJOR-1 CLOSED** — `test/simcluster/README.md` 已把 drill 13 从旧 RED 复现改为 G1 后 GREEN 回归，
   并明确 #22 的修复边界是 `/etc/tether` root-owned + `/etc/tether/nats.d/` tether-owned；旧的
   “chown 整个 /etc/tether” 不再作为目标方案出现。
-- **MAJOR-2 CLOSED** — `docs/architecture.md`、`docs/v0.4.5-ha-grow-ops-gotchas.md`、以及
+- **MAJOR-2 CLOSED** — `docs/architecture.md`、`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`、以及
   `docs/cluster-ha-realmachine-test-plan.md` 的相关位置已补 G1 更正：raft `:7400` 可跳过 hostname/SAN，
   但 NATS route mesh `:6222` 走标准 x509 校验，route URL host 必须匹配证书 SAN；#22 目标也改为
   `nats.d/` 可写而不是 `/etc/tether` 整体可写。

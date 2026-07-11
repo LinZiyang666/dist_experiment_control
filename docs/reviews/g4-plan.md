@@ -4,7 +4,7 @@
 > **largest and last** leaf of the HA grow/force-single/deploy remediation roadmap
 > (`docs/reviews/ha-grow-ops-remediation-roadmap.md §G4`); siblings G1/G2/G3/G5/G6/G7 are shipped.
 > Source-of-truth for scope: gotchas `#3/#4/#5/#7/#8` + folds `#10/#23` + §B "cluster add" ultimate goal
-> (`docs/v0.4.5-ha-grow-ops-gotchas.md`). Depends on **G1** (nats.d/ tether-owned, Restart=always broker,
+> (`docs/reviews/v0.4.5-ha-grow-ops-gotchas.md`). Depends on **G1** (nats.d/ tether-owned, Restart=always broker,
 > route-SAN) — satisfied.
 >
 > This plan was drafted by an adversarial multi-expert workflow (6 lenses → 3 critics → synthesis) and then

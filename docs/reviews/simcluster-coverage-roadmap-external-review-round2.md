@@ -2,7 +2,7 @@
 
 Date: 2026-07-10
 
-Review target: unstaged rev3 changes to `docs/reviews/simcluster-coverage-roadmap.md`, relative to the
+Review target: unstaged rev3 changes to `docs/simcluster-coverage-roadmap.md`, relative to the
 staged rev2 baseline, plus the maintainer response appended to the round-1 external review.
 
 ## Conclusion

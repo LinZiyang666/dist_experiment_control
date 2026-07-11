@@ -78,7 +78,7 @@ Locations:
 - `test/simcluster/simcluster:199`-`211` explicitly knows that restarting a running voter's NATS can make
   `tether-broker` clean-exit, but only starts the joiner's `tether-broker`.
 - `scripts/install.sh:717`-`734` generates `tether-broker.service` with `Restart=on-failure`.
-- `docs/v0.4.5-ha-grow-ops-gotchas.md:232`-`243` records the real failure mode: NATS loss can make
+- `docs/reviews/v0.4.5-ha-grow-ops-gotchas.md:232`-`243` records the real failure mode: NATS loss can make
   `tether-broker` exit 0 and stay inactive.
 
 Why this fails:

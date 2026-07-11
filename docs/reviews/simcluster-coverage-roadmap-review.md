@@ -1,7 +1,7 @@
 # simcluster-coverage-roadmap — 多专家对抗审查报告 + 主进程裁决
 
 Date: 2026-07-10
-对象: `docs/reviews/simcluster-coverage-roadmap.md`（rev1 → 本轮裁决后修订为 rev2）
+对象: `docs/simcluster-coverage-roadmap.md`（rev1 → 本轮裁决后修订为 rev2）
 Status: **内审完成，roadmap 已按裁决修订（rev2），停在外审门。**
 
 ## 工艺
@@ -123,4 +123,4 @@ Status: **内审完成，roadmap 已按裁决修订（rev2），停在外审门�
 roadmap rev2 已整合 60 项采纳（含 12 项按核验修正稿）。批次结构不变（S1–S9），drill 提案数
 27→**30**（新增 43-migrate-live-data、97-soak-cycles；22/31 重定性为探索→定格），全套预计
 ~37 个。**停在外审门**：未 commit、未 git add，待用户外审
-`docs/reviews/simcluster-coverage-roadmap.md`（本报告随同）。
+`docs/simcluster-coverage-roadmap.md`（本报告随同）。
