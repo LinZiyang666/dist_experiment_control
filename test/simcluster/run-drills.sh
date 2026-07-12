@@ -54,6 +54,14 @@ DRILLS=()
 # A drill failure is an infra FLAKE (safe to re-run) only with one of these signatures — the inotify
 # starvation surfaces exactly here. A plain assertion failure (real regression, or assert_bug "APPEARS
 # FIXED") matches none of these and is NEVER auto-re-run (that would hide real signal).
+# EXTERNAL-REVIEW ROUND-2 R2-F1 (reverts round-1 R12): a VOTER-promotion timeout is DELIBERATELY NOT a flake
+# signature. `is_flake` has no concurrency input, so auto-retrying a VOTER timeout would (a) misclassify a
+# `-j 1` SOLO timeout — which simcluster:223-232 says is a REAL regression, not the flake — as retryable, and
+# (b) let the retry overwrite the first-run evidence. Only the genuine INFRA flakes below (systemd PID1 dying
+# under the inotify-cap exhaustion, container-not-running) are auto-retried. A grow-timing timeout in a
+# FULL-PARALLEL sweep shows RED and is re-run SINGLY by the operator per the CAVEAT — that manual step is
+# correct, because a solo/low-concurrency timeout must NOT be silently swallowed. OQ-8's two-wave family
+# split (grow serial/-j2 + N=1 parallel) is the primary mitigation that keeps the flake from arising at all.
 FLAKE_SIG='systemd never came up|timed out after [0-9]+s waiting for: systemd responsive|is not running|container not running'
 
 usage() { sed -n '2,/^set -u/p' "$0" | sed 's/^# \{0,1\}//; s/^set -u$//'; }
@@ -158,6 +166,9 @@ if [ "$RETRY" = 1 ]; then
         echo "${C_Y}run-drills: re-running ${#flakes[@]} infra flake(s) serially: ${flakes[*]}${C_0}"
         for d in "${flakes[@]}"; do
             printf '[%s] retry  %-30s\n' "$(date +%H:%M:%S)" "$d"
+            # R2-F1: PRESERVE the first-run evidence (never silently truncate it) before the retry overwrites.
+            cp -f "$LOGDIR/$d.log" "$LOGDIR/$d.attempt1.log" 2>/dev/null || true
+            cp -f "$LOGDIR/$d.rc"  "$LOGDIR/$d.attempt1.rc"  2>/dev/null || true
             run_one "$d"
             retried+=("$d")
         done
@@ -183,4 +194,6 @@ printf '  %d drills, %d RED, %ds elapsed' "${#DRILLS[@]}" "$fails" "$(( $(secs) 
 [ "${#retried[@]}" -gt 0 ] && printf ' (%d retried)' "${#retried[@]}"
 echo
 if [ "$fails" -eq 0 ]; then echo "  ${C_G}ALL GREEN${C_0}"; else echo "  ${C_R}$fails RED${C_0} — inspect $LOGDIR/<name>.log"; fi
+# R2-F1: retried drills keep their FIRST-run log/rc as <name>.attempt1.log (evidence is never silently erased).
+[ "${#retried[@]}" -gt 0 ] && echo "  ${C_Y}retried (infra flake): ${retried[*]} — first-run evidence in $LOGDIR/<name>.attempt1.log${C_0}"
 exit "$fails"

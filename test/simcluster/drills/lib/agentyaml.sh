@@ -11,8 +11,9 @@
 #
 # Mandate-④: writes the exact file install.sh writes (0600 file, 0700 agent/<sid> tree, sim:sim) + the
 # operator's documented file_transfer/remote_fs edit, and runs the agent flagless so the yaml broker_url
-# is authoritative — NOT compensating for a tether gap. (S0-隧道 wiring/assertion of the reverse tunnel
-# is S3's job; S1 writes tunnel_addr faithfully but asserts no expose reachability. If a set tunnel_addr
+# is authoritative — NOT compensating for a tether gap. (S0-隧道 landed in S2 (roadmap §2.1): S1 wrote
+# tunnel_addr faithfully but asserted no expose reachability; S2 FIRES that assertion — drill 81's active-
+# expose arm + the T0-T6 feasibility gate curl a real body through the reverse tunnel. If a set tunnel_addr
 # ever prevented the agent from reaching ONLINE, the ONLINE poll below FAILS LOUD — an exposure, not a mask.)
 #
 # Prereq: `cmd_agent_join <agt>` must have run first (binds the nkey via --pin first-connect into

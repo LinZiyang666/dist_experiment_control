@@ -46,8 +46,9 @@ COPY image/provision-node.sh          /opt/sim/provision-node.sh
 COPY image/pty-confirm.py             /opt/sim/pty-confirm.py
 COPY image/pty-run.py                 /opt/sim/pty-run.py
 COPY image/hangfs.py                  /opt/sim/hangfs.py
+COPY image/ingress-proxy.py           /opt/sim/ingress-proxy.py
 COPY image/units/tether-agent.service /opt/sim/tether-agent.service
-RUN chmod +x /opt/sim/provision-node.sh /opt/sim/pty-confirm.py /opt/sim/pty-run.py /opt/sim/hangfs.py
+RUN chmod +x /opt/sim/provision-node.sh /opt/sim/pty-confirm.py /opt/sim/pty-run.py /opt/sim/hangfs.py /opt/sim/ingress-proxy.py
 
 # STOPSIGNAL SIGRTMIN+3 is mandatory: default SIGTERM 10s-kills PID1 mid-write and corrupts
 # SQLite/BoltDB, masking real bugs as sim artifacts. Pair with --stop-signal at run time.

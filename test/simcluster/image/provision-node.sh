@@ -24,8 +24,16 @@ broker)
     # REUSE the production installer headlessly: --skip-download early-returns the nats-server/caddy
     # fetch and starts nothing; dummy --domain/--acme-email satisfy its hard-die. The tether +
     # nats-server binaries are already baked at /usr/local/bin (install.sh --skip-download uses them).
+    # S0-隧道 (roadmap S2 §2.1, Option A): --domain is the resolvable CONTAINER HOSTNAME (== node_id), so
+    # install.sh writes broker.yaml `public_host: <node>` (install.sh:529) and `serve` advertises a name the
+    # ctl/agent containers can resolve via docker DNS — so `expose` URLs (http://<public_host>:<port>) are
+    # curl-able cross-container (the real reverse-tunnel data plane, verified live). This is the FAITHFUL
+    # operator choice (an operator sets public_host to their resolvable domain; the sim's resolvable name IS
+    # the container hostname) — NOT a mask (no /etc/hosts spoofing). install.sh has no FQDN/dot check
+    # (install.sh:460 is just `[ -n ]`). Caddy never runs in the sim, so the `<node>:443` Caddyfile is inert;
+    # route/tunnel cert SANs are minted on <node> independently (secrets.sh), so route mTLS is unaffected.
     sh /opt/sim/install.sh --role broker --skip-download --prefix /usr/local/bin \
-        --domain "sim-${NODE}.tether.test" --acme-email dev@sim.tether.test
+        --domain "${NODE}" --acme-email dev@sim.tether.test
 
     # --- thin overlay (§2), the ONLY sim-specific deltas over the real tree ---
     # (a) client bind 0.0.0.0 so cross-container clients reach :4222 (install.sh defaults to loopback).
@@ -58,9 +66,12 @@ broker)
     #     privesc — verify ownership with `doctor` after any image rebuild.)
     ;;
 agent)
-    # Agents onboard via the real product path: `tether agent join <invite>` binds the nkey, then a
-    # sim-owned system unit runs the daemon. install.sh --role agent is broker-URL-centric (die at
-    # :298) and writes a systemctl --user unit; a system unit is the clean fit under PID1 systemd.
+    # DOC-13 (roadmap S2 §4.2): this fresh-agent role lays down ONLY the sim user + $HOME/.tether + the baked
+    # (un-enabled) system unit — it binds NO nkey and joins NO session. Two onboarding paths exercise it:
+    # (1) `cmd_agent_join` / `bind_agent` bind via the `--pin` first-connect (usage §5.8 first-class path,
+    #     kept) + a hand-written system unit (a system unit is the clean fit under PID1 systemd; install.sh
+    #     --role agent is broker-URL-centric — die at :298 — and writes a systemctl --user unit);
+    # (2) the REAL C2 `tether agent join <invite> --start` path, exercised end-to-end by drill 82.
     id -u sim >/dev/null 2>&1 || useradd -m -s /bin/bash sim
     install -o sim -g sim -m 0755 -d /home/sim/.tether
     if [ -f /opt/sim/tether-agent.service ]; then

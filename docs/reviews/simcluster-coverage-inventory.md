@@ -253,3 +253,64 @@ kind、归 **S2-80**）。60-user-journey 的 setup `session … --pin`（60:53�
 登 `docs/deploy-tier-gotchas.md`，随 S5-31 定格。**DOC-5 非缺陷**（usage.md §669 已正确记扁平-128）。
 
 **保真度债**：FD-1（sim 顶层 `/home/sim/.tether` 0755 vs install.sh 0700）登 gotchas 台账，S1 不依赖、不阻塞。
+
+### S2 landing（2026-07-11）
+
+**drill**（断言数 = live `drill_end` verdict，外审 round1-F4 / round2-R2-F2 订正 42/40/29）：
+`80-session-isolation`（GREEN，42）· `81-admin-evict-session-rm`（GREEN，40）·
+`82-agent-onboarding-invite`（GREEN，29）。**机械 count 交叉核对**（R2-F2 采纳）：
+`grep -cE '^[[:space:]]*assert_(ok|refuses|bug)\b' drills/<name>.sh` = **80→42、81→40**（与 live verdict 一致，
+无条件断言）；**82→33 静态 ≠ 29 live**——差 4 = U 臂（U1/U2/U3/U4）在 `systemd --user` NOT-COVERED 路径**不执行**
+（else 分支只 `warn`、非 assert），故 82 以 **live drill_end verdict 29 为真值**（静态 grep 对含条件臂的 drill 不适用）。**S0 落地**：S0-隧道（S3→S2）+ S0-ingress（S4→S2；S2=实例-CA
+facility owner）。**零产品 Go diff**（只碰 `test/simcluster/` shell + `docs/`）。
+
+**收工闸（必跑必记）**：
+- **命令树重枚举**：`go test ./cmd/tether -run TestCommandTreeInventory` → **零 diff**（S2 无 CLI 改；实测 rc=0）。
+- **事件生成法**：`git status internal/ cmd/` 零 diff → **0 条 S2-引入 pubSysEvent kind**（80/81/82 只断既有
+  kind：member_joined/pin_failed/agent_evicted/session_created/session_destroyed；null-diff）。
+- **守恒硬闸**：`make lint`（0 issues）+ `make test`（cached，零 diff）绿；`make e2e` 守恒跑。
+
+**§2.1/§2.2 命令树行 S2 勾（臂级）**：
+- `login/logout/ctx` → **S2✓**（I1-neg CONNECT-拒非成员 + I1-persist 非持久 current_session + I1-broker `--broker`
+  别名持久 broker_url）。
+- `session rm` → **S2✓**（3-phase RESULT E2a/E2b/E2c + non-owner not_owner I3-rm + post-rm CONNECT-拒 E3a/E3b） ·
+  S8-92(a)☐（`--ack-alerts` 告警态强推）。`session create/ls` → **S2✓**（setup + E-base）。
+- `admin sessions/nodes/audit/evict` → **S2✓**（A1/A2/A3/B1 + 非授权 EACCES A4）。**订正**：`admin nodes` 输出
+  `SESSION NODE STATE`（SESSION 首列），非 NODE 首列——匹配须无 `^nid` 锚（sim harness 注记，非产品缺陷）。
+- `node upgrade` → **S2✓**（non-owner not_owner I3-up）。`node ls` → 复用（dual-home CTLH + TS 隔离）。
+- `exec` → 复用（node_not_found I2c + post-rm CONNECT-拒 E3a）；`run` → **S2✓**（supervised managed child leak 注入
+  C-base-proc via backgrounded `tether exec`，探索→定格）。
+- `expose` → **S2◐**（active-expose fixture C-base-expose SENTINEL curl + evict 后口命运 C-port，探索→定格 #26）·
+  S3-70☐（expose 主旅程/rehome）。
+- `agent join` → **S2✓**（--nid/--pin/--expect/伪造 T1/篡改 T3-T5 + 无-expect 残留现实 T2 + --start ONLINE J1）。
+  `agent config refresh` → **S2✓**（--once J4 + C1 收敛）。`agent doctor` → **S2✓**（全绿 J5 + FATAL exit77 T2）。
+  `agent --install-user-service/--uninstall` → **S2 spike**（U 臂 NOT-COVERED-in-sim：容器无 systemd --user，实测理由）。
+- `cluster seeds publish/show` → **S2✓**（P0 首发前空 + P1 首发+MintInvite）。
+- **`cluster invite` 不勾 S2**（line 167 remap：**归 S8-91 cli-failover**——它铸 SID-less discovery token 供
+  `cluster pin`，`agent join` 用 ParseInvite 要 sid、永不接受；roadmap 82 规格混淆已纠正）。
+- **Tier-2 hidden `--yes` rejectors + machine-confirm 面**：**S2 不触**（rm 无 typed-confirm gate；evict 无 --yes）→
+  显式 NOT-COVERED-this-batch（owner=后续 destructive-confirm 批）。
+
+**§1.1/§1.2 事件面 S2 勾 + 订正**：
+- `member_joined`（row-27）→ **S2-80✓**（E-joined ctl via=pin 经真 sys.events core sub）+ **DOC-9 订正**：只发
+  `via=pin`（无 `via=fp`）；fp-reconnect 不发事件。row-27「via=pin/fp」→「via=pin only」。
+- `pin_failed`（§1.1）→ **S2-80✓**（E-pinfailed 独立正向 oracle；与 rate-limit probe 分立）。
+- `session_created`（row-26）→ **S2-81✓**（setup exercised）+ **DOC-10 订正**：去 `events` 流（tether.v2.sys.events），
+  非 history-<sid>；`admin audit` 只 tail history-<sid> 故看不到。
+- `session_destroyed`（row-26）→ **S2-81✓**（E2c 直接 sys.events oracle，member observer 真收）。
+- `agent_evicted`（§1.2）→ **S2-81✓**（B2a/C-exit 跨进程自退=广播证据）。
+- `agent_registered`（row-30）→ **S2-82 exercised**（J1 fresh register）；直断留 S9-94，82 主 oracle=node ls ONLINE。
+- `agent_roster_stale`（row-32）→ **S2-82 NOT-COVERED-in-sim**（`rosterStaleGrace=6min` 结构上不触发 + 收敛-agent
+  报同 gen；谓词 hermetic）；C1 改用 roster_gen 跳变展示。row-32 处置：「S2-82 断言」→「S2-82 NOT-COVERED + 谓词留 hermetic」。
+- H.1 无-writer probe：`kicked`/`agent_unregistered`（81）·`rotated_pin`（80）·`session_deleting`（81）→ 全
+  **DOC candidate**（DOC-11/12），不因旅程跑通记 covered。
+
+**台账**：**#25**（PIN 无限速，80 Arm R）· **#26**（evict 不清理 OS 子进程，部署条件式，81 Arm C）·
+**#27**（manifest_listen 默认关+未文档化，82 setup）+ **DOC-6…14**（含 O4 裁定两项归 DOC + 注释漂移 DOC-13/14 随批修）。
+详见 `docs/deploy-tier-gotchas.md`。
+
+**Stage-B 调试保真度注记（非产品缺陷，避免误归因）**：① post-rm session-scoped 调用是 **CONNECT-deny**（session 已删
+→ auth_callout 拒），非 app-layer `session_not_found_or_deleting`——后者需 session 存在但 DELETING（N=1 同步 rm 窗口
+不可达，taxonomy 留 hermetic）；E3 按现实断（DOC-11 结论不变）。② manifest 有 30s 重签节流（`manifestRecheckInterval`）
+→ seeds publish 后 loopback manifest 至多滞后 30s 反映 seed bundle（缓存设计、非缺陷；onboarding 不依赖即时新鲜=invite
+带 inline seed）；M1/M2 poll 过节流。③ `tether admin nodes` 写 STDOUT（fd 分离实测；tether 正确）。
