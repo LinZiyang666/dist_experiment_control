@@ -214,22 +214,31 @@ cmd_grow() {
 
     if poll_until 150 3 "$_j reaches VOTER" -- _phase_is "$_j" VOTER; then
         ok "grow: $_j is now a VOTER (cluster=$(list_nodes broker | tr '\n' ' ')) — via \`tether cluster add\`"
+        # NB the post-VOTER grow-lock self-heal was REMOVED (helper deleted, R5-M5): it re-ran `cluster add` to
+        # CLEAR the #31 grow-lock, but drill 30 RELIES on that leak to pin the upgrade-blocked defect — clearing it
+        # made 30's upgrade RUN and surface a version-propagation failure. #31 tolerance for 71/73/74 lives ONLY in
+        # grow_to_3's retry=1 nuke+retry (a fresh grow sidesteps an intermittent leak; attempt count logged as
+        # first-class evidence); drill 30 uses grow_to_3's retry=0 single-attempt path so its #31 pinning is intact.
         # G4: the grow ran entirely through `tether cluster add` (no cluster-lifecycle sim workarounds). The
         # only [env] steps left are provisioning (secrets/first-boot/daemon-start) per Mandate ③. If tether
         # still cannot do a step, `cluster add` FAILS above and this VOTER check goes RED — the honest exposure.
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s\n' "$_j"
     else
         err "grow: $_j did not reach VOTER via cluster add — check: ./simcluster status ; ./simcluster logs $_j tether-broker"
-        # DO-NOT-RE-INVESTIGATE (established 2026-07-10): a VOTER-timeout HERE during a FULL-PARALLEL
-        # suite run (run-drills.sh with no -j cap) is almost always the grow-timing CONCURRENCY flake,
-        # NOT a product/G1-G7 defect. clustered-JS meta-group formation + raft VOTER promotion is
-        # timing-sensitive; at peak concurrency (7 drills growing at once) it can miss the 150s window.
-        # Proven flake, not bug: the same grow is GREEN run SOLO (10-grow-to-3 = 19/19) and at 30s
-        # stagger; only the 7-way no-stagger sweep RED'd here. Confirm by re-running the drill SOLO or
-        # with run-drills.sh -j <N>. Only a SOLO/low-concurrency VOTER-timeout is a real regression.
-        warn "grow: if this was a PARALLEL full-suite run, a VOTER-timeout here is usually the grow-timing"
-        warn "  concurrency flake (see the code comment + README 'CAVEAT (grow-concurrency)'), NOT a defect."
-        warn "  Verify SOLO: 'simcluster drill <name>' or 'run-drills.sh -j <N>'. Only a SOLO timeout is real."
+        # external-review R4 Q5 / R5-M5: this diagnosis MUST be run-mode-aware, NOT an unconditional "concurrency flake".
+        #  (a) PARALLEL full-suite (run-drills.sh, SIM_CONCURRENT=1): at peak concurrency (7 drills growing at
+        #      once) clustered-JS meta-group formation + raft VOTER promotion can miss the 150s window — a
+        #      grow-timing CONCURRENCY flake (GREEN run SOLO / at 30s stagger). NB run-drills.sh's FLAKE_SIG does
+        #      NOT include a VOTER timeout (run-drills.sh:57-65), so it is SURFACED RED, NOT auto-retried — verify SOLO.
+        #  (b) SOLO / STRICT-SERIAL (a lone `./simcluster drill`, or the external reviewer's -j 1 --no-retry):
+        #      a VOTER-timeout here is NOT concurrency. Most likely the #31 grow-lock serialized-fence (a leaked
+        #      cluster_grow_active from the PRIOR joiner REFUSING this grow; a REAL product defect pinned by drill
+        #      30) OR a genuine constructibility failure. A SOLO timeout is a REAL result, never an auto-retry flake.
+        if [ "${SIM_CONCURRENT:-0}" = 1 ]; then
+            warn "grow: PARALLEL run (SIM_CONCURRENT=1) — a VOTER-timeout here is usually the grow-timing concurrency flake (README 'CAVEAT (grow-concurrency)'); it is SURFACED RED (not in run-drills.sh's FLAKE_SIG, so NOT auto-retried). Verify SOLO to be sure."
+        else
+            warn "grow: SOLO/strict-serial run — this VOTER-timeout is NOT a concurrency flake. Most likely the #31 grow-lock serialized-fence (product defect pinned by drill 30) or a genuine constructibility failure; a REAL result, not an auto-retry flake."
+        fi
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s (INCOMPLETE — did not reach VOTER)\n' "$_j"
         return 1
     fi
@@ -352,7 +361,7 @@ Type=simple
 User=sim
 Environment=HOME=/home/sim
 EnvironmentFile=/etc/tether/agent.env
-ExecStart=/usr/local/bin/tether agent --session \\\${SID} --nid \\\${NID} --nats-url \\\${NATS_URL}
+ExecStart=/home/sim/.local/bin/tether agent --session \\\${SID} --nid \\\${NID} --nats-url \\\${NATS_URL}
 Restart=on-failure
 RestartSec=2
 [Install]

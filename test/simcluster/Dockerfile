@@ -17,7 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         jq openssl iproute2 curl ca-certificates procps iputils-ping less vim-tiny \
         fuse3 libfuse2t64 python3-fusepy \
+        shadowsocks-libev python3-yaml sqlite3 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+# shadowsocks-libev = `ss-local` client for drill 72's real Shadowsocks egress legs (OQ-1); the SS
+# server is tether's proxy exit, stock ss-local interops (chacha20-ietf-poly1305 + evpBytesToKey MD5 +
+# HKDF-SHA1 "ss-subkey"). python3-yaml parses the /sub body (Clash YAML, application/yaml — NOT SIP008
+# JSON, so jq won't do). Both are ubuntu universe; if `ss-local` is unavailable at build the OQ-1
+# fallback ladder (AEAD-gate + TCP-reachability) applies (s3-s5-plan §7 / §11-U3).
 
 # Mask the units that fight docker PID1 / DNS (re-smoke via `simcluster doctor` if this set changes).
 RUN systemctl mask systemd-resolved.service systemd-networkd.service systemd-networkd.socket \

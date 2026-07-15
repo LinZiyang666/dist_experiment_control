@@ -85,7 +85,7 @@ Type=simple
 User=sim
 Environment=HOME=/home/sim
 EnvironmentFile=/etc/tether/agent.env
-ExecStart=/usr/local/bin/tether agent --session \\\${SID} --nid \\\${NID} --nats-url \\\${NATS_URL}
+ExecStart=/home/sim/.local/bin/tether agent --session \\\${SID} --nid \\\${NID} --nats-url \\\${NATS_URL}
 Restart=on-failure
 RestartSec=2
 [Install]

@@ -84,3 +84,16 @@ rm_node() {  # rm_node <node> [--vols]
         d volume rm "$(vol_etc "$_rmn_node")" "$(vol_lib "$_rmn_node")" >/dev/null 2>&1 || true
     fi
 }
+
+# node_kill / node_stop / node_start: crash/return primitives that KEEP the container + its named
+# volumes (persistent raft/etc/lib state), so the SAME node can rejoin via node_start. Distinct from
+# rm_node, which destroys container+vols (a node that can NEVER return). Used by the failover/rehome
+# arms where a broker must come BACK and catch up to VOTER (71-C/D return, 73-REHOME, 74-return).
+# Only the "killed forever" arms (73 quorum-loss victims) use rm_node. Poll death with tcp_refused.
+#   node_kill  <node> [signal] : hard SIGKILL of PID1 (power-loss class; default KILL).
+#   node_stop  <node>          : graceful stop (--stop-signal SIGRTMIN+3 → systemd clean shutdown).
+#   node_start <node>          : bring a killed/stopped node back (same vols; --restart no means it
+#                                stays down until this). Provisioning persists (sentinel-guarded).
+node_kill()  { run d kill ${2:+--signal "$2"} "$(ctr_name "$1")" >/dev/null; }
+node_stop()  { run d stop "$(ctr_name "$1")" >/dev/null; }
+node_start() { run d start "$(ctr_name "$1")" >/dev/null; }

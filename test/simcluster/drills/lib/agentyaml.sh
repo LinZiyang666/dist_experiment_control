@@ -53,6 +53,11 @@ agent_provision_yaml() {
                      # quote the mode: bare `off` is a YAML 1.1 false; the field is a string wanting "off".
                      _apy_block="remote_fs:
   mode: \"$_apy_mode\"" ;;
+        proxyprivate) # S4-72: agent.yaml opts into proxying to RFC1918 destinations (the docker bridge is all
+                     # private), so this agent carries the POSITIVE SS egress leg. HIGH-RISK per usage §5.15
+                     # (lends the agent's private network to subscription holders); exercised only in the sim.
+                     _apy_block="proxy:
+  allow_private_destinations: true" ;;
         badkey)      # S1-02 guard self-test: an UNKNOWN key → strict KnownFields(true) rejects → the
                      # agent New() fails → the daemon crash-loops → the ONLINE gate below MUST time out +
                      # FAIL (proves the guard actually catches a bad reprovision, not a residual-ONLINE pass).
@@ -98,7 +103,7 @@ Type=simple
 User=sim
 Group=sim
 Environment=HOME=/home/sim
-ExecStart=/usr/local/bin/tether agent --session $_apy_sid --nid $_apy_agt
+ExecStart=/home/sim/.local/bin/tether agent --session $_apy_sid --nid $_apy_agt
 Restart=on-failure
 RestartSec=2
 [Install]

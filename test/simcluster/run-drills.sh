@@ -146,6 +146,9 @@ echo "  drills: ${DRILLS[*]}"
 echo
 
 # ── parallel pass ──────────────────────────────────────────────────────────────────────────────────
+# external-review R4 Q5: tell drills whether this is a CONCURRENT run so a grow VOTER-timeout is diagnosed as the
+# grow-timing concurrency flake (JOBS>1) vs the #31 grow-lock serialized-fence / real constructibility (solo).
+[ "$JOBS" -gt 1 ] && export SIM_CONCURRENT=1 || export SIM_CONCURRENT=0
 launched=0
 for d in "${DRILLS[@]}"; do
     if [ "$launched" -gt 0 ] && [ "$STAGGER" -gt 0 ]; then sleep "$STAGGER"; fi
@@ -157,6 +160,7 @@ done
 wait
 
 # ── retry pass: serially re-run only infra flakes (assertion failures are real, left alone) ─────────
+export SIM_CONCURRENT=0   # retries are SOLO/serial — a grow timeout here is the #31/real path, not concurrency
 retried=()
 if [ "$RETRY" = 1 ]; then
     flakes=()

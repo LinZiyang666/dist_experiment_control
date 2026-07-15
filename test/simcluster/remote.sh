@@ -29,6 +29,16 @@ stage_binaries() {
     ( cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build VERSION="${SIM_VERSION:-v0.0.0-simcluster}" )
     cp "$repo/bin/tether" "$vendor/tether"
 
+    # S5 / s3-s5-plan §1.E: a SECOND build with ONLY the version string bumped → vendor/tether-next, the
+    # staged "new" binary drills 30/31 upgrade to. SAME source / proto / commandVersion / schema (g5
+    # rolling-safety hard precondition — a real proto/command delta is an incompatible reinstall, not a
+    # rolling upgrade). artifact.sh serves it with a host-computed SHA256SUMS; 30 stages it per-host, 31
+    # serves it as the self-hosted mirror the agent allow-list (#28) refuses. Version-string-only delta is
+    # enough to drive `node ls --brokers` skew, whole-host readback, and PID-preserving re-exec.
+    echo "[remote] building tether-next (VERSION=${SIM_VERSION_NEXT:-v0.0.0-simcluster-next}, same source)…"
+    ( cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build VERSION="${SIM_VERSION_NEXT:-v0.0.0-simcluster-next}" )
+    cp "$repo/bin/tether" "$vendor/tether-next"
+
     # nats-server pinned to the production install.sh version (NOT go.mod's embedded newer one).
     if [ ! -x "$vendor/nats-server" ] || ! "$vendor/nats-server" --version 2>/dev/null | grep -q "${NATS_VERSION#v}"; then
         echo "[remote] fetching nats-server $NATS_VERSION…"

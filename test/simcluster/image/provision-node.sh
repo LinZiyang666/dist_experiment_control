@@ -74,6 +74,15 @@ agent)
     # (2) the REAL C2 `tether agent join <invite> --start` path, exercised end-to-end by drill 82.
     id -u sim >/dev/null 2>&1 || useradd -m -s /bin/bash sim
     install -o sim -g sim -m 0755 -d /home/sim/.tether
+    # S0-layout (roadmap S5 / s3-s5-plan §1.D): install the agent binary to the user-writable ~/.local/bin,
+    # exactly as the real install.sh agent role does (install.sh BIN_DIR=$HOME/.local/bin). `node upgrade`'s
+    # atomic replace (MkdirTemp(dirOf(dst))+Rename, agent/upgrade.go) needs WRITE on the binary's PARENT dir;
+    # User=sim lacks it on the root-owned /usr/local/bin baked into the image — that EACCES is a wall the real
+    # deployment does NOT have. All agent units (baked / agent-join / bind_agent / agent_provision_yaml) point
+    # ExecStart here so os.Executable() is the writable path. (Broker + colocated agent for drill 30 keep the
+    # root-owned /usr/local/bin + re-exec-only path — syscall.Exec needs no dir write; do NOT apply this there.)
+    install -o sim -g sim -m 0755 -d /home/sim/.local/bin
+    install -o sim -g sim -m 0755 /usr/local/bin/tether /home/sim/.local/bin/tether
     if [ -f /opt/sim/tether-agent.service ]; then
         cp /opt/sim/tether-agent.service /etc/systemd/system/tether-agent.service
         systemctl daemon-reload

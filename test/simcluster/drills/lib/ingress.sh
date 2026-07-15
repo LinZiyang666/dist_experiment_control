@@ -53,15 +53,23 @@ _ingress_manifest_answers() {
     [ -n "$_code" ] && [ "$_code" != "000" ]
 }
 
-# ingress_up <brk> [listen_port=443] [leaf=ingress] : start the same-netns HTTPS reverse-proxy sidecar. It
-# shares the broker's netns (--network container:<brk>) so it is addressable as https://<brk>:<port> from
-# peers AND reaches the broker's 127.0.0.1:<manifest_listen>. Labeled so cmd_down/cmd_nuke reap it.
+# ingress_up <brk> [listen_port=443] [leaf=ingress] [route...] : start the same-netns HTTPS reverse-proxy
+# sidecar. It shares the broker's netns (--network container:<brk>) so it is addressable as https://<brk>:<port>
+# from peers AND reaches the broker's 127.0.0.1 loopback listeners. Each `route` is a `PREFIX=host:port` pair
+# for ingress-proxy.py --route (repeatable). With no route given it defaults to the well-known manifest route
+# (back-compat for drill 82); drills 72/73 pass `/sub/=127.0.0.1:8090`, artifact.sh passes `/=127.0.0.1:<port>`.
+# Labeled so cmd_down/cmd_nuke reap it.
 ingress_up() {
     _iu_brk=$1; _iu_port=${2:-443}; _iu_leaf=${3:-ingress}
+    [ $# -ge 1 ] && shift; [ $# -ge 1 ] && shift; [ $# -ge 1 ] && shift   # drop brk/port/leaf; rest = routes
+    [ "$#" -gt 0 ] || set -- "/.well-known/tether/=127.0.0.1:$INGRESS_MANIFEST_PORT"   # default: manifest (82)
     _iu_nd=$(_secrets_node_dir "$INSTANCE" "$_iu_brk")
     [ -f "$_iu_nd/$_iu_leaf-cert.pem" ] || die "ingress_up: leaf '$_iu_leaf' not minted for $_iu_brk (call secrets_mint_ingress first)"
     _iu_name=$(ctr_name "$_iu_brk-ingress-$_iu_port")
     d rm -f "$_iu_name" >/dev/null 2>&1 || true
+    _iu_routes=""
+    for _iu_r in "$@"; do _iu_routes="$_iu_routes --route $_iu_r"; done
+    # shellcheck disable=SC2086
     run d run -d --name "$_iu_name" \
         --network "container:$(ctr_name "$_iu_brk")" --stop-signal SIGTERM \
         --label sim.instance="$INSTANCE" --label sim.role=ingress --label sim.nodeid="$_iu_brk-ingress-$_iu_port" \
@@ -69,12 +77,14 @@ ingress_up() {
         --entrypoint python3 "$IMAGE" \
         /opt/sim/ingress-proxy.py --listen ":$_iu_port" \
         --cert "/ingress-secrets/$_iu_leaf-cert.pem" --key "/ingress-secrets/$_iu_leaf-key.pem" \
-        --route "/.well-known/tether/=127.0.0.1:$INGRESS_MANIFEST_PORT" >/dev/null \
+        $_iu_routes >/dev/null \
         || die "ingress_up: could not start sidecar for $_iu_brk:$_iu_port"
-    # readiness: from a THROWAWAY bridge container, curl the https front with the instance CA trusted.
+    # readiness: curl the https front (curl -k) at `/` — an unmatched route returns HTTP 404 (front still
+    # answered ≠ 000); a `/=` route forwards. Decoupled from which route is configured. -k is deliberate:
+    # readiness must NOT depend on cert correctness (a wrong-SAN negative front is a VALID running front).
     poll_until 20 2 "$_iu_brk:$_iu_port https ingress up" -- _ingress_front_up "$_iu_brk" "$_iu_port" \
         || die "ingress_up: $_iu_brk:$_iu_port https front never answered (check: docker logs $_iu_name)"
-    ok "ingress: HTTPS front up on $_iu_brk:$_iu_port (same-netns → 127.0.0.1:$INGRESS_MANIFEST_PORT)"
+    ok "ingress: HTTPS front up on $_iu_brk:$_iu_port (same-netns; routes:$_iu_routes)"
 }
 
 # _ingress_front_up <brk> <port> : predicate — the https front is up + TLS-handshakes (any HTTP code). Curls
@@ -84,7 +94,7 @@ ingress_up() {
 # (I-NEG-SAN) is a VALID running front whose cert the drill then deliberately fails to verify (J4/M2/I-NEG-*).
 _ingress_front_up() {
     _code=$(dexec "$1" -- curl -sk -o /dev/null -w '%{http_code}' --max-time 4 \
-        "https://127.0.0.1:$2/.well-known/tether/cluster.json" 2>/dev/null)
+        "https://127.0.0.1:$2/" 2>/dev/null)
     [ -n "$_code" ] && [ "$_code" != "000" ]
 }
 

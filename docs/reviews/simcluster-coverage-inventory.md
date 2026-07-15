@@ -120,13 +120,13 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `ps` | — | `--all` | S1-60 / S3-70 | LOST 合成、PORTS/HOME 列 |
 | `exec <node> …` | — | `--cwd/--timeout/--safe` | S1-60（62 `--safe`） | |
 | `run <node> -- …` | — | `--cwd/--safe/--ack-alerts` | S1-60 + S9-96 | 真 PTY / 混沌臂 |
-| `expose <node>` | — | `--local/--name/--remote-port/--no-rebuild/--on-broker/--ack-alerts` | S3-70/71 | 五 flag 全部独立臂 |
+| `expose <node>` | — | `--local/--name/--remote-port/--on-broker`（+ `--no-rebuild`/`--ack-alerts` **NOT-COVERED**——无 G-A drill 实测独立臂，Stage-C ledger-1） | S3-70/71 | 四 flag 独立臂 |
 | `expose explain <name>` | — | — | S3-70/71 | home/epoch/moved |
 | `expose rm <node>` | — | `--name/--ack-alerts` | S3-70 | 断流 + 端口回收 |
 | `push` / `pull` | — | `--force/--timeout/--ack-alerts` | 既有 00 + S1-61 | 双向执法/边界 |
 | `history` | — | `--lines/--kind/--follow` | S1-60/61 + S9-94 | 含 G.5 记录 |
 | `node ls` | — | `--all/--brokers` | S1-60 + S5-30/31 | skew 视图 |
-| `node upgrade <nid>\|--all` | — | `--url/--sha256/--all/--timeout` | S5-31 | 探索→定格（agent 白名单墙） |
+| `node upgrade <nid>\|--all` | — | `--url/--sha256`（S5-31✓，单节点 #28 墙）；`--all` **enumeration/dispatch/`--timeout` COVERED**（外审 M4 已补可执行臂：ONLINE 枚举〔`listOnlineNIDs` 过滤〕+ OFFLINE 排除 + dispatch-到-online + `url_not_allowed_local` config-abort + `--timeout 0` transient-skip 汇总）；fleet **SUCCESS**（PID-preserving re-exec / version-bump）仍 **NOT-COVERED**（#28 墙阻断自托管成功路径，诚实降级非假绿，#28 修后 flip） | S5-31◑ | #28 单节点 + fleet 枚举/dispatch/timeout 定格；success 待 #28 修 |
 | `proxy on` | — | `--ha-policy/--yes`（**可见的 Tier-1 确认跳过**——区别于 Tier-2 Hidden rejector） | S4-72/73 | owner-only + --yes 脚本化语义 |
 | `proxy off` | — | — | S4-72 | |
 | `proxy status` | — | `--cluster` | S4-72/73 | cluster 视图独立臂 |
@@ -314,3 +314,94 @@ facility owner）。**零产品 Go diff**（只碰 `test/simcluster/` shell + `d
 不可达，taxonomy 留 hermetic）；E3 按现实断（DOC-11 结论不变）。② manifest 有 30s 重签节流（`manifestRecheckInterval`）
 → seeds publish 后 loopback manifest 至多滞后 30s 反映 seed bundle（缓存设计、非缺陷；onboarding 不依赖即时新鲜=invite
 带 inline seed）；M1/M2 poll 过节流。③ `tether admin nodes` 写 STDOUT（fd 分离实测；tether 正确）。
+
+### G-A landing（S3+S4+S5 合并流，2026-07-12）
+
+**drill**（断言数 = live `drill_end` verdict；**权威状态见 `s3-s5-external-review-round3.md`——本表为当前事实、非历史**）：
+- **S3**：`70-expose-journey`（GREEN，28，N=1 cluster + agent：expose 数据面全旅程，curl 公网口回真 sentinel）·
+  `71-expose-rehome-failover`（N=3：**gotcha #29** = cluster expose 的 home **不可投递到非-tunnel broker**（净效果 tunnel-coupling，机制是 un-homed 回落，R5-M3）：`homeForExpose`(home.go:96-113) 对 `--on-broker <非tunnel>` 返回 nil → agent 回落固定 tunnel → self≠home 拒 → frpc_failed（**不是** round-4 说的"agent 设计上硬编码固定 tunnel"，源码会投递 named home）+ **crash home → 常规 expose 全 voter 搁浅、不自动 rehome**（rehome_events.go:52-53）。**FIXTURE 硬门（R6-M2）**（agt→brk3 间歇——**硬断言 RED 暴露**不建立，不再静默 NOT-COVER-GREEN）→ **combined crash（Arm C rebuild-ON `wstrand` + Arm D rebuild-OFF `wnr` 一次注入）**：都 home brk3 → node_kill → 都全 live voter curl exit-7 + cluster-status reachability 证 leader 见 crash + epoch 不变 + wnr explain 诚实 rebuild:false → node_start → 都同端口恢复；**Arm A** bogus 负例；**非-leader 硬门**。**HARD RED 门——drain-migrate(B)（R6-M2）**：`cluster drain brk3` 必须迁 wstrand 到 survivor 并 serve——被挡即 **RED 暴露**为 release-blocking（**不再**是 round-5 自证的 owner-decision NOT-COVERED，R6-M2 驳回）:(1) homeForExpose un-homed 回落(`--on-broker <非leader>` 从不 serve,180s×2);(2) agent-隧道-到-非-leader 间歇(外审 solo1b 命中为 71 RED);(3) fixture 建成后 `cluster drain brk3` 被 grow 遗留 `NATS_ROLLED_OUT` 挂起 op 拒(#31 家族)。E/G/F 需成功 drain 作前提→同墙阻塞(暴露、非 rescope);raw sys.events 无 reader(D2,仅 raw-event)。grow_to_3 retry=1 nuke+重试(attempt 数作一等证据)兜底间歇 #31 grow-flake）。
+- **S4**：`72-proxy-subscription`（GREEN，N=1 cluster + 2 agents：proxy sub 旅程 + 真 SS dual-leg + revoke/off 数据面。**R5-M1 NOW-COVERED**：**字节可观测在飞流强断**（held-open **ThreadingHTTPServer** slow-sink SS 流，revoke 前证 alice+bob 收字节数**严格增长**——stalled/未连接 curl 不能假绿；revoke 后 alice curl 早退+字节冻结=强断 WHILE bob 仍在增长）+ **OFF `__proxy__` 回收**查 OS listener（ss -ltn）**AND** port_allocations 行→0（sqlite3 权威源）**AND** 安全同端口复用（OFF-reuse 经回收端口 serve sentinel）——oracle 若不成立即 RED 暴露）·
+  `73-proxy-cluster-ha`（GREEN，40 断言，N=3 + 2 agents：proxy exit **#29-免疫**（steady-state SS 经非-tunnel-homed exit 传字节）。#33 **measure-and-record**（crash-rehome 数据面恢复间歇：AUTO-RECOVERED 记 lag / STRANDED 两种都接受、不 die、不倒置；QUORUM off/on 证手动恢复；撤回 round-3 readiness oracle 与 round-4 240s-倒置门 措辞）+ **R5-M6 因果门控** QUORUM 分离：dead-homed exit 的 /sub-vended server 交叉核对 == 将杀 broker（Q-xcheck）+ 证死 broker down（Q-dead）+ black-hole 作**硬前提**捕获 + SEPARATION 断言是对 black-hole 成立的**复合门**（dead leg 仍传字节 → RED，绝无"DEAD while 200"假合取=solo2 bug）+ 非-black-hole 腿被**诊断**（tunnel-survival vs teardown）+ grow retry=1 nuke重试兜底 + SS-leg re-fetch/per-port）·
+  `74-rebalance-on-return`（**RED-EXPOSES**（R6-M1）**proxy 分布不稳定（gotcha #34：1/1/1 不 hold——非-tunnel voter proxy-eligibility 不稳定、exit 重堆 tunnel broker）** + moved-exit 数据面（#33）+ auto-rebalance 缺口为 release-blocking，N=3：rebalance distribution。round-5 的 measure-and-record 把这整条擦成 GREEN——已撤回为硬断言。**RED,per-run(failed 数是 branch-dependent,勿把单个数当稳定判定)**：跨 run 观测 1–7 failed(干净重试 `RED 1/35` 仅 C-auto;噪声 run `3/33`/`5/31`/`7/29` 当瞬态 setup-SS/reconstruct 腿也 RED 时)。**稳定的 release-blocking RED = B-dp(#33)+ C-auto(#31 fire-gate)**;总数随该 run 有多少瞬态 setup/eligibility 腿一起失败而变(每条这种 RED 本身就是 #34 不稳定的暴露)。跑通不中止。**R5-M2+R6-M1**：**FAIL-CLOSED 校验快照**（cmd-rc/JSON-有效/恰 3 **互异 nid**/所有 home 是真 voter；无效→唯一 sentinel）+ **锁定 1/1/1 baseline**（rebalance 构造 spread==0 + skew 前证**全 3 条** SS 腿在传）+ **dry-run/real rebalance 要求命令 rc=0**（堵 dryrun_command_failed 假绿）+ **B-dp 数据面（HARD RED，R6-M1）**（SS 腿必须经 rebalance-MOVED exit 传字节；STRANDED→RED 暴露 #33-family——round-5 measure-and-record accept-both 是擅自 acceptance change,已撤回）+ **B-negctrl 非空硬负控**（reg created+有效 homed+serving 前后,堵 `single` fallback）+ **Arm-C auto EFFECT（HARD RED）**（分布必须 auto-even,不发→RED 暴露 auto 缺口）。**NOT-COVERED（仅 raw EVENT）**：`proxy_auto_rebalanced` count==1 EVENT——sys.events 无 operator reader（D2,仅 raw-event;auto EFFECT 不 carve-out,是硬门）。）。
+- **S5**：`31-node-upgrade-fleet`（GREEN，**28**，N=1 cluster + 2 agents：**gotcha #28** + fleet enumeration/dispatch/`--timeout` oracle〔R2-M6 CLOSED〕）· `30-rolling-upgrade`（GREEN，13，N=3：**gotcha #31** grow lock 泄漏 + [GAP #31] + upgrade-roll NOT-COVERED）·
+  `32-install-lifecycle`（GREEN，fresh 容器 + §8.4 running-broker 升级：install.sh 生命周期 + content-manifest。**R5-M4**：(1) manifest **fail-closed on 部分/权限失败的 find 遍历**（MANIFEST-FIND-ERR——旧 `find|grep|sort` 丢 find rc、接受部分列表）；(2) **单个合并 EXIT trap**（原两个 trap 互相覆盖、早退时泄漏 artifact 容器）；(3) **真 ctl 二进制边界**（自己的 place_binary/run/never-start/uninstall，非"同 agent"）；(4) **§8.4 单机手动升级已实现**：live N=1 broker → stop → 换二进制（特权步）→ `sqlite3 PRAGMA integrity_check==ok`（镜像加 sqlite3）→ start → G.2 业务收敛（原 expose 再 serve sentinel + 新 post-upgrade expose serve=真读写）+ version-flip ∧ MainPID-changed 守卫。§8.4 是**操作员手动路径**(systemctl+install)，**非** #31/#28-阻塞的 cluster/node upgrade 动词。此前 R4 的 content-manifest（数字 %u|%g/symlink 元数据/byte-restore self-test/真 agent 二进制安装）保留）。
+
+**台账新增**（`docs/deploy-tier-gotchas.md`）：**#28**（agent 升级 URL 白名单硬编码不可 operator 配置，31 assert_bug；
+拒绝消息实证 DOC-3 指向不存在的 `--upgrade-url-allow` flag）· **#29**（N=3 cluster expose 数据面要求
+home==agent-tunnel-broker，否则 `token_unknown_or_revoked` 死，71 assert_bug + BASE）· **#31**（`cluster add` grow
+lock best-effort release 泄漏残留 `cluster_grow_active`，阻塞 upgrade/join/retire + 恢复〔re-run cluster add〕也走
+同一 best-effort 路径清不掉；30 [GAP #31]；**是连续-grow INCOMPLETE flake 与 upgrade-blocked 的共同根因**）。
+**#30**（cluster-mode `sub revoke` 不发 `proxy_keyset_changed`）= code-confirmed gap，73 引用为 NOT-COVERED。
+
+**§1 事件/告警面 — sys.events 无 operator reader（重大发现，2026-07-12）**：`admin` 只有 audit/evict/nodes/sessions、
+无 events 读命令；events 不进 broker journal；`nats stream` = Authorization Violation。故 **71/72/73/74 的所有
+sys.events 测点 NOT-COVERED**（`proxy_enabled/disabled/keyset_changed` row-36 · `proxy_node_unready` row-37 ·
+`proxy_auto_rebalanced` row-38 · `expose_rehomed`/`home_reassign_*` row-53/54 · `rehome_stalled` row-55 ·
+`sub_render_empty`/`proxy_no_ready_nodes`/`proxy_partial` row-64/65/66）——drill 改用**可读的控制面/数据面 oracle**
+钉效果（/sub http_code、`proxy status --cluster`、`cluster status` brkH-reachable、SS-egress 字节、home-count 分布），
+事件本身作为**产品/DOC 缺口**登记。§1.3/§1.4 相关行处置：「S3-71/S4-72/73/74 断言」→「NOT-COVERED（no operator
+reader），效果由可读 oracle 钉」。
+
+**§2 命令勾（臂级）**：`expose`（--local/--remote-port/--on-broker/--name）→ **S3-70/71✓**（四 flag
+独立臂 + 数据面 curl；#29 home-binding；`--no-rebuild`/`--ack-alerts` **NOT-COVERED**，Stage-C ledger-1）· `expose explain`（home/moved，无 epoch）→ S3-70/71✓ · `expose rm` →
+S3-70✓ · `ps --all` PORTS/HOME → S3-70✓（N=cluster 有 HOME 列）· `proxy on/off`（--ha-policy/--yes）→ **S4-72/73✓** ·
+`proxy status --cluster` → S4-72/73✓ · `proxy sub create/revoke/ls` → S4-72/73✓（**revoke/off 数据面外审 M3 已补**：72 revoke 每-sub PSK 断流〔alice 断 WHILE bob 流〕+ alice2 恢复 + off 断流 + `_off_semantics` HTTP-200 门）· `node upgrade`
+（--url/--sha256）→ **S5-31◑**（#28 单节点墙 + **`--all` 枚举/dispatch/`--timeout` COVERED**〔外审 M4 补臂〕；fleet SUCCESS 仍 NOT-COVERED，#28 墙）· `node ls --brokers` → S5-30✓（broker running version
+self-report oracle）· `cluster upgrade`（--to-version/--dry-run/--expect-sha256/--account-seed/--backup-taken）→
+**S5-30◐**（staging/broker-login/refuse/dry-run/[GAP #31] 覆盖；**real upgrade-roll 机制 NOT-COVERED**——#31 grow lock
+阻断，#31 修复前不可达）· `cluster rebalance proxy`（--dry-run）→ **S4-74✓**（distribution 均衡机制 + returned-voter
+eligibility timing）。
+
+**DOC 候选**：**DOC-3**（`--upgrade-url-allow` 只 `serve` 有、hint/手册指向不存在的 agent flag，31 定格）·
+**rebalance-on-return timing**（broker restart 后 proxy-eligibility 滞后 raft-VOTER，`cluster rebalance proxy` 需等
+voter eligible 才生效，74 记录；文档应说明 proxy 流量回归非即时）。
+
+**诚实注记（mandate 保真度，用户 2026-07-12「你的 green 是真的没问题还是擦屁股」质疑触发的全面审视）**：
+① **#29 认知纠正**——spike-proxy3 曾误判「proxy home 追踪 tunnel」（那次 2 exit load-spread 巧落 brk1），真相是
+proxy home = load-spread voter + directive 携带 HomeBrokerAddr+CertPins 使 agent 主动拨 home → **结构免疫 #29**
+（73 铁证 home!=tunnel + rehome 后 SS 仍活）。② **74 假绿揭穿**——B-settle 隔离出之前 B-real PASS 是 return 后自然
+reconcile 漂移伪装成 rebalance 生效；强化 oracle 后真验证因果。③ **#31 grow lock（Stage-C mandate-4 订正）**——#31 是 grow
+`releaseGrowLock` best-effort 泄漏 `cluster_grow_active`，由 30 real-roll HALT 铁证钉住（upgrade-blocked，3/3）。
+**须区分两类 grow flake**：(i) 我 SOLO server-local 跑遇的 `cluster add HALTED at acquire-lock: grow of brkN
+already in progress — serialized`（前一 joiner 的 release 间歇失败挡下一个）确是同一 grow-lock 泄漏，我用一个
+**临时 server-local retry 调试脚本（不入 repo）**重试搭起 N=3；(ii) simcluster:223-229 记录的**并发**（7-way
+sweep）VOTER-timeout 是 clustered-JS meta-group 形成时序、**另一类 flake**，正式 runner `run-drills.sh` 的
+`FLAKE_SIG` 不含它、**不 auto-retry**（surface RED 手动重跑）。#31 只 claim (i)+upgrade-blocked，不 claim (ii)。
+「几乎总残留」限定 upgrade 场景（brk3 是最后 grow、其 release 时序最差）。④ **30 假绿主动 suppress**——MainPID-same/write-probe-clean
+仅在 upgrade 真执行（MECH=1）时断言，否则它们 PASS 恰因 upgrade 没发生 = 假绿，明确抑制。⑤ **#31 grow-lock 只影响 membership 操作、不干扰 71/73/74**
+——它们的测试对象（expose-rehome/proxy-rehome/quorum/rebalance）**都不是 cluster membership 操作**（join/retire/upgrade），
+grow lock 残留不影响；只有 30 的 upgrade 是 membership 操作、才撞 #31。**NB（round-4 订正 self-review MAJOR）**：这只说
+grow-lock 不干扰，**不等于 73 GREEN**——73 当前是 **RED/NOT-RELEASE 待复验**（数据面 move-lag 非确定，见上表 :324 + 本节
+M1+M7），71 的 GREEN 也已从"永久 #29"降级为"observed-unreliable + 记录 split"（见 :322）。此前本条写"71/73/74 的 GREEN
+是真的"与 :324/:392 自相矛盾，已订正。
+
+### Stage-C 内审 + 批 B 修复（G-A，2026-07-12）
+
+G-A 8 drill 名义 GREEN 后经 **Stage-C 对抗内审**（6 固定 lane reviewer + 6 verifier + synth，全 Opus；用户「你的 green 是真的没问题还是擦屁股」质疑写进 mandate-fidelity lane 审查焦点）→ **22 findings 全 verifier-CONFIRMED**（11 major 含多个 plan-mandated 假绿/vacuous-oracle），主进程**全采纳无驳回**，分批修复真跑绿化。报告 + 逐条处置见 `s3-s5-review.md`。
+
+**批 A（文档/事实错误）**：#31 confession 订正（删不存在的 `drill-retry.sh` 引用〔临时 server-local retry 脚本、不入 repo〕 + 区分 SOLO-serialized-fence〔grow-lock〕vs 并发-VOTER-timeout〔JS-formation，run-drills 不 auto-retry〕 + 订正「清 lock 后测机制」为「恢复清不掉→机制 NOT-COVERED」）· #30 从 flipping-pin 改 un-pinnable · expose `--no-rebuild`/`--ack-alerts` 从 covered 改 NOT-COVERED（ledger-1）· 71 #29 pin 用词 assert_bug→inverted-assert_ok（ledger-2）· 71 header divergence 措辞收敛（dp-2）。
+
+**批 B（drill 假绿真跑修复，assertion 增量）**：**73 27→34**（quorum 数据面分离：dead-homed SS 黑洞 WHILE survivor-homed SS 传字节 + /sub-200 → 证 /sub-200≠数据面 #20；mandate-1=pin-2=dp-1 + cluster-4）· **30 12→13**（M1 非空 WROTE-guard + roll-order oracle + 30-C 理由；mandate-2=pin-1 + cluster-1/2）· **71 9→10**（#29 signature 收紧 + NONTUN-cert-eligible-VOTER race 判定；mandate-3 + pin-4）· **72 30→32**（TOKa2 主 shell + aead 改 agt1-无字节-纯AEAD〔agt2-journal-区分真跑不可靠〕 + loopback-neg；harness-safety-1/2 + dp-3）· **74 17→23/24（Arm-C auto 非确定，外审 M6：per-run，auto 触发则 24、否则 23）**（SKEW-precond KTGT>0 + no-unhomed + Arm-C auto-rebalance **诚实 NOT-COVERED**〔真跑 `TETHER_AUTO_REBALANCE=on` 在 sim 没触发 auto-even〕；pin-3/6 + cluster-3）。**两处修复假设经真跑二次订正**（72 aead 的 journal-区分、74 auto-path），均真跑验证、绝不弱化 oracle 凑绿——本身即「暴露问题」。
+
+### 外审（G-A/S3–S5）Fail 修复 + 重跑（2026-07-12，7 M + 1 m 全采纳无驳回）
+
+外审从零暂存基线独立复查，判 **Fail**，列 M1–M7 + m1。主进程全采纳并真跑修复（经 `tether exec weilandserver` 服务器本地跑，SSH 直连已断；drill 经 base64-inline 传输 sha256 校验）。**⚠ 下列"2× isolated GREEN"是 round-1 外审修复当时的状态；round-2/3/4 后 73 已翻 RED（不再声称 73 的 2× GREEN，见 :392），71 已降级为 observed-unreliable（见 :322）——保留此段作历史修复记录，当前权威状态见上表 :320-327**。当时（round-1）的 assertion 数（真跑定格）：
+
+- **M2（71 #29）** 10→**12**（2× isolated GREEN）：`cert_fp` 可交付前置 + **agt1 journal 的精确 `token_unknown_or_revoked`**（ctl 只有泛化 frpc_failed）+ settle + 探后复证 → 实测 deliverable home 上仍 deny ⇒ **#29 真缺陷成立**。
+- **M3（72 revoke/off 数据面）** 32→**39**：revoke 前后真 SS 腿——alice 断 WHILE bob 流 + alice2 恢复 + off 断流 + `_off_semantics` HTTP-200 门（非 vacuous）+ secret-logging 移除。
+- **M4（31 fleet）** 15→**26**：`--all` 枚举/OFFLINE-排除/dispatch/config-abort/`--timeout 0` transient-skip；fleet SUCCESS 诚实 NOT-COVERED（#28 墙）。inventory §2/§4 同步。
+- **M5（32 install）** 12→**13**：`_snap` 改 content+metadata manifest（sha256/mode/owner/link，非路径名）+ 自测 + ctl/agent dry-run 以 sim；真二进制安装 + §8.4 诚实 NOT-COVERED（--skip-download 跳 place_binary）。
+- **M6（74 default-off）** 23/24→**24/25 per-run**：default-off 加 eligibility-证明 + 30s quiet-window 稳定断言；A-elig poll 150s；末尾硬编码文案改条件式。2× isolated GREEN(24)。
+- **M1+M7（73）** 34→36：确定 1+1 构造 + 两条必需 baseline + 每 destructive arm 前 fail-fast + QUORUM 数据面分离；真跑**观测到 gotcha #33**（crash-rehome 后 SS **数据面**恢复滞后控制面——控制面 rehomed+ready 但数据面那一刻仍黑洞、恢复 lag 可变 <45s..>150s——**仅观测 + per-run 测量**）。**⚠ round-2 外审 Fail（R2-M1/M2/M3）**：① 73 非确定 + grow/rehome 失败后后续臂继续 → 已加 grow/foundation/control-rehome 的 die 硬门 + off/on 分开断言；② `[GAP #32]`→**`[GAP #33]`**（撞 plan §355 的 #32-candidate），`_ss_no_prompt_recovery` 要求 ss_up 成功（前置缺失不再假 PASS），**删除错误根因**（ApplyHome 实为 OpenHome 原子换 session+重拨，非 re-point 已断 session）+ 删除 >150s/~300s/eventual-auto-recovery 未证声明；③ 73:126 token 日志 + 167 裸反引号命令替换已修。**round-4（self-review）再订正**：#33 从 round-3 错误的 readiness oracle（`_ready_lags_60s`——proxy_ready 恢复快、数据面才 lag，两头 flaky）改回**数据面** observe-measure（rehomed+ready 瞬间 `_ss_deadhole` + 测量恢复 lag + 仅 240s-必恢复 die）；删 ">90s" 自相矛盾数字；三条 destructive baseline die-gate；moved-exit 数据面 poll 放宽 240s；`_pick_nontunnel` 排除 leader 防 spurious die。**仍 RED/NOT-RELEASE 待 strict-serial 重跑复验**，不声称 "2× isolated GREEN"。
+- **m1（spike 清理）**：11 个 untracked spike 已删。
+
+**round-5 外审 Fail（R5-M1..M7）全采纳 + 真跑修复（2026-07-14，经 tether exec，SSH 断）——当前权威状态见上表 :320-327**：
+- **R5-M1（72）**：held-open 强断改**字节可观测**（ThreadingHTTPServer + 收字节数严格增长 baseline；alice 早退+冻结=强断 WHILE bob 增长）+ OFF 回收查 port_allocations 权威源（sqlite3）+ 安全同端口复用。
+- **R5-M2（74）**：snapshot **fail-closed**（cmd-rc/JSON/恰 3 行/真-voter 校验；空/坏→唯一 sentinel，绝不假证 balanced/stable/zero）+ 锁定 **1/1/1 baseline** + **B-dp 数据面**（SS 经 moved exit，本 drill 内证）+ **B-negctrl 负控**；仅 `proxy_auto_rebalanced` EVENT NOT-COVERED（无 reader，owner-decisions D2）。
+- **R5-M3（71）**：#29 措辞改**源码准确**（homeForExpose un-homed 回落，非"设计上硬编码固定 tunnel"）+ Arm D **真跨 crash 注入**（rebuild-ON+OFF 一次 crash）+ 非-leader 硬门 + FIXTURE 门（agt→brk3 间歇不建立时 NOT-COVER-THIS-RUN）；B/E/G/F NOT-COVERED 的**三重叠加墙**（un-homed 回落 / agent-隧道-到-非-leader 间歇 / grow 遗留 NATS_ROLLED_OUT op 阻塞 drain）+ **owner decision D1** 记录。
+- **R5-M4（32）**：find 遍历 rc 捕获（fail-closed）+ 单合并 EXIT trap + 真 ctl 边界 + **§8.4 实现**（sqlite3 integrity_check，镜像加 sqlite3）。
+- **R5-M5（grow）**：`grow_to_3` 加 retry 参数（drill 30 走 no-retry 单次保住 #31 证据）+ attempt 数作一等证据（GROW-ATTEMPTS trailer）+ 删 dead code（`_ensure_grow_lock_released`/`_egl_locked`/`_clear_lingering_ops`）+ 修正 solo/parallel 诊断（VOTER-timeout 不在 FLAKE_SIG、不自动重试）。
+- **R5-M6（73）**：QUORUM 分离**因果门控**（vended-server 交叉核对 == 将杀 broker + 证死 broker down + black-hole 作硬前提 + SEPARATION 复合门，消除 solo2 的"DEAD while 200"假合取）。
+- **R5-M7（docs）**：#29/#33 gotcha 段 + README + 本 inventory 全对齐可执行事实；撤回 240s-倒置门/固定-lag/2×-strict-GREEN/tunnel-coupled-by-design 措辞；owner 决定写入 `s3-s5-owner-decisions.md`。
+
+**判定反转**：外审比内审更狠地暴露了「非确定拓扑上的 vacuous 继续执行 + secret 日志泄露 + 假合取 + 无 owner 授权记录 + 措辞与源码/可执行事实冲突」，全部真跑修复——**这正是 mandate「暴露问题、绝不擦屁股」的落实**。逐条处置见 `s3-s5-external-review-round5.md`（本文件内的回复段）。

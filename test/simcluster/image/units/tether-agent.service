@@ -14,7 +14,7 @@ User=sim
 Group=sim
 Environment=HOME=/home/sim
 EnvironmentFile=/etc/tether/agent.env
-ExecStart=/usr/local/bin/tether agent --session ${SID} --nid ${NID}
+ExecStart=/home/sim/.local/bin/tether agent --session ${SID} --nid ${NID}
 Restart=on-failure
 RestartSec=2
 
