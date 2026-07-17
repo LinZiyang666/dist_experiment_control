@@ -27,28 +27,28 @@ const defaultUpgradeURLPrefix = "https://github.com/LinZiyang666/dist_experiment
 
 func newServeCmd() *cobra.Command {
 	var (
-		configPath       string
-		natsURL          string
-		dbPath           string
-		authSeedsDir     string
-		tunnelCtrlAddr   string
-		tunnelPublicHost string
-		publicHost       string
-		storeDir         string
-		adminSocket      string
-		upgradeURLAllow  []string
-		subHTTPListen    string
-		clusterDataDir   string
+		configPath        string
+		natsURL           string
+		dbPath            string
+		authSeedsDir      string
+		tunnelCtrlAddr    string
+		tunnelPublicHost  string
+		publicHost        string
+		storeDir          string
+		adminSocket       string
+		upgradeURLAllow   []string
+		subHTTPListen     string
+		clusterDataDir    string
 		clusterRaftAddr   string
 		clusterSecrets    string
 		colocatedAgentNID string
-		logLevel         string
-		logJSON          bool
-		metricsListen    string
-		manifestListen   string
-		natsConfPath     string
-		natsServerBin    string
-		alertWebhookURL  string
+		logLevel          string
+		logJSON           bool
+		metricsListen     string
+		manifestListen    string
+		natsConfPath      string
+		natsServerBin     string
+		alertWebhookURL   string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -201,6 +201,7 @@ func newServeCmd() *cobra.Command {
 			}
 
 			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)
+			cfg.StableTunnelCertDir = authSeedsSource
 			// auth_callout: enabled iff an explicit --auth-callout-seeds-dir is supplied
 			// or cluster mode defaults it to broker.cluster.secrets_dir. The directory
 			// must contain both private 0600 seed files: broker.nk and account.nk. The matching

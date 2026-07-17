@@ -31,10 +31,12 @@
 #   ./run-drills.sh --stagger 15             # 15s between launches (default 0 — not needed post-fix)
 #   ./run-drills.sh --no-retry               # do not auto-re-run infra flakes (raw parallel result)
 #   ./run-drills.sh --skip-preflight         # do not check/raise fs.inotify.max_user_instances
+#   ./run-drills.sh --allow-product-red       # explicit owner waiver: known product defects do not fail suite
+#   ./run-drills.sh --allow-incomplete        # explicit owner waiver: coverage gaps do not fail suite
 #   ./run-drills.sh 10-grow-to-3 20-forcesingle-natsconf   # only the named drills
 #
-# EXIT CODE: number of drills still RED after the retry pass (0 == all green). Per-drill combined logs
-# land in $LOGDIR (default /tmp/simdrills); inspect $LOGDIR/<name>.log on any RED.
+# EXIT CODE: number of unwaived non-GREEN drills after retry, saturated at 125 (0 == all green, or every
+# PRODUCT-RED/INCOMPLETE explicitly waived). Per-drill logs land in $LOGDIR (default /tmp/simdrills).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,6 +48,8 @@ STAGGER=0                           # seconds between launches; 0 = fire togethe
                                     # stagger, is what makes parallelism safe — see the header)
 RETRY=1                             # 1 == serially re-run infra flakes after the parallel pass
 PREFLIGHT=1                         # 1 == check (and try to raise) fs.inotify.max_user_instances
+ALLOW_PRODUCT_RED=0                 # fail closed unless an owner explicitly supplies the waiver
+ALLOW_INCOMPLETE=0                  # fail closed unless an owner explicitly supplies the waiver
 INOTIFY_MIN=2048                    # cap must be >= this to run (40 containers already exhaust 128)
 INOTIFY_WANT=8192                   # value we raise it to when too low
 LOGDIR="${LOGDIR:-/tmp/simdrills}"
@@ -76,6 +80,8 @@ while [ $# -gt 0 ]; do
         --retry)            RETRY=1; shift ;;
         --no-retry)         RETRY=0; shift ;;
         --skip-preflight)   PREFLIGHT=0; shift ;;
+        --allow-product-red) ALLOW_PRODUCT_RED=1; shift ;;
+        --allow-incomplete)  ALLOW_INCOMPLETE=1; shift ;;
         --logdir)           LOGDIR="${2:?}"; shift 2 ;;
         --logdir=*)         LOGDIR="${1#--logdir=}"; shift ;;
         -h|--help)          usage; exit 0 ;;
@@ -133,11 +139,39 @@ rm -f "$LOGDIR"/*.log "$LOGDIR"/*.rc 2>/dev/null || true
 if [ -t 1 ]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[0m'; else C_G=; C_R=; C_Y=; C_0=; fi
 
 run_one() { ( "$SIM" drill "$1" >"$LOGDIR/$1.log" 2>&1; echo $? >"$LOGDIR/$1.rc" ); }
-verdict_of() {
-    local v; v="$(grep -oE ': (GREEN|RED) \([^)]*\) ===' "$LOGDIR/$1.log" 2>/dev/null | tail -1 | sed -E 's/^: //; s/ ===$//')"
-    [ -n "$v" ] && printf '%s' "$v" || printf '(no verdict — infra failure before drill_end)'
+# effective_verdict is the one strict parser for the verdict contract. It requires exactly one line, the
+# complete anchored grammar, a known enum, canonical enum/rc/counter precedence, and process-rc agreement.
+# A missing line is an INFRA-ABORT; every malformed, duplicate, injected, or contradictory line is a
+# CONTRACT-ERROR. Contract errors are blockers and are NEVER eligible for retry.
+effective_verdict() {
+    local log="$LOGDIR/$1.log" line count v lrc af sr pr nc pass prc expected
+    count=$(grep -c '^DRILL-VERDICT\([[:space:]]\|$\)' "$log" 2>/dev/null || true)
+    if [ "$count" = 0 ]; then printf 'INFRA-ABORT'; return; fi
+    if [ "$count" != 1 ]; then printf 'CONTRACT-ERROR'; return; fi
+    line=$(grep '^DRILL-VERDICT\([[:space:]]\|$\)' "$log")
+    if [[ ! "$line" =~ ^DRILL-VERDICT\ verdict=(GREEN|ASSERT-FAIL|SETUP-RED|PRODUCT-RED|INCOMPLETE)\ rc=([0-9]+)\ assert_fail=([0-9]+)\ setup_red=([0-9]+)\ product_red=([0-9]+)\ not_covered=([0-9]+)\ pass=([0-9]+)\ --\ .+$ ]]; then
+        printf 'CONTRACT-ERROR'; return
+    fi
+    v=${BASH_REMATCH[1]}; lrc=${BASH_REMATCH[2]}; af=${BASH_REMATCH[3]}; sr=${BASH_REMATCH[4]}
+    pr=${BASH_REMATCH[5]}; nc=${BASH_REMATCH[6]}; pass=${BASH_REMATCH[7]}
+    prc=$(cat "$LOGDIR/$1.rc" 2>/dev/null || echo '?')
+    case "$v" in
+        GREEN)       expected=0; [ "$af" = 0 ] && [ "$sr" = 0 ] && [ "$pr" = 0 ] && [ "$nc" = 0 ] || { printf 'CONTRACT-ERROR'; return; } ;;
+        ASSERT-FAIL) expected=1; [ "$af" -gt 0 ] 2>/dev/null || { printf 'CONTRACT-ERROR'; return; } ;;
+        SETUP-RED)   expected=2; [ "$af" = 0 ] && [ "$sr" -gt 0 ] 2>/dev/null || { printf 'CONTRACT-ERROR'; return; } ;;
+        PRODUCT-RED) expected=3; [ "$af" = 0 ] && [ "$sr" = 0 ] && [ "$pr" -gt 0 ] 2>/dev/null || { printf 'CONTRACT-ERROR'; return; } ;;
+        INCOMPLETE)  expected=4; [ "$af" = 0 ] && [ "$sr" = 0 ] && [ "$pr" = 0 ] && [ "$nc" -gt 0 ] 2>/dev/null || { printf 'CONTRACT-ERROR'; return; } ;;
+    esac
+    if [ "$lrc" != "$expected" ] || [ "$prc" != "$expected" ]; then printf 'CONTRACT-ERROR'; else printf '%s' "$v"; fi
 }
-is_flake() { [ "$(cat "$LOGDIR/$1.rc" 2>/dev/null || echo 1)" != 0 ] && grep -qE "$FLAKE_SIG" "$LOGDIR/$1.log" 2>/dev/null; }
+# An INFRA flake (safe to auto-re-run) is: the inotify-starvation signature present AND the drill did not
+# reach a PRODUCT/ASSERT signal — i.e. it aborted (INFRA-ABORT) or the prerequisite fixture died (SETUP-RED,
+# e.g. grow_to_3 could not bring systemd up). A real ASSERT-FAIL / PRODUCT-RED / INCOMPLETE is NEVER a flake
+# (retrying would hide real signal / overwrite evidence).
+is_flake() {
+    grep -qE "$FLAKE_SIG" "$LOGDIR/$1.log" 2>/dev/null || return 1
+    case "$(effective_verdict "$1")" in INFRA-ABORT|SETUP-RED) return 0 ;; *) return 1 ;; esac
+}
 secs() { date +%s; }
 
 started=$(secs)
@@ -180,24 +214,37 @@ if [ "$RETRY" = 1 ]; then
 fi
 
 # ── summary ────────────────────────────────────────────────────────────────────────────────────────
+# Classify EACH drill by its complete DRILL-VERDICT contract. Every non-GREEN state blocks by default.
+# PRODUCT-RED/INCOMPLETE may be waived only by their explicit command-line flags; a waiver is displayed.
 echo
 echo "================================ drill summary ================================"
-fails=0
+n_green=0; n_prod=0; n_inc=0; n_setup=0; n_assert=0; n_abort=0; blockers=0
 for d in "${DRILLS[@]}"; do
     rc="$(cat "$LOGDIR/$d.rc" 2>/dev/null || echo '?')"
+    v="$(effective_verdict "$d")"
     tag=""; for r in "${retried[@]:-}"; do [ "$r" = "$d" ] && tag=" ${C_Y}(retried)${C_0}"; done
-    if [ "$rc" = 0 ]; then
-        printf '  %sGREEN%s  %-30s rc=%s  %s%s\n' "$C_G" "$C_0" "$d" "$rc" "$(verdict_of "$d")" "$tag"
-    else
-        printf '  %sRED  %s  %-30s rc=%s  %s%s\n' "$C_R" "$C_0" "$d" "$rc" "$(verdict_of "$d")" "$tag"
-        fails=$((fails+1))
-    fi
+    case "$v" in
+        GREEN)              col="$C_G"; n_green=$((n_green+1));   note="" ;;
+        PRODUCT-RED)        col="$C_Y"; n_prod=$((n_prod+1));     if [ "$ALLOW_PRODUCT_RED" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-product-red]${C_0}"; else blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: known product defect]${C_0}"; fi ;;
+        INCOMPLETE)         col="$C_Y"; n_inc=$((n_inc+1));       if [ "$ALLOW_INCOMPLETE" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-incomplete]${C_0}"; else blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: coverage incomplete]${C_0}"; fi ;;
+        SETUP-RED)          col="$C_R"; n_setup=$((n_setup+1));   blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: prereq/infra]${C_0}" ;;
+        ASSERT-FAIL)        col="$C_R"; n_assert=$((n_assert+1)); blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: broken invariant]${C_0}" ;;
+        CONTRACT-ERROR)     col="$C_R"; n_abort=$((n_abort+1));  blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: malformed/duplicate/inconsistent verdict contract]${C_0}" ;;
+        *)                  col="$C_R"; n_abort=$((n_abort+1));   blockers=$((blockers+1)); v="INFRA-ABORT"; note=" ${C_R}[BLOCKER: aborted before drill_end — no verdict]${C_0}" ;;
+    esac
+    printf '  %s%-19s%s %-30s rc=%s%s%s\n' "$col" "$v" "$C_0" "$d" "$rc" "$note" "$tag"
 done
 echo "-------------------------------------------------------------------------------"
-printf '  %d drills, %d RED, %ds elapsed' "${#DRILLS[@]}" "$fails" "$(( $(secs) - started ))"
-[ "${#retried[@]}" -gt 0 ] && printf ' (%d retried)' "${#retried[@]}"
-echo
-if [ "$fails" -eq 0 ]; then echo "  ${C_G}ALL GREEN${C_0}"; else echo "  ${C_R}$fails RED${C_0} — inspect $LOGDIR/<name>.log"; fi
-# R2-F1: retried drills keep their FIRST-run log/rc as <name>.attempt1.log (evidence is never silently erased).
+printf '  %d drills: %sGREEN=%d%s  %sPRODUCT-RED=%d%s  %sINCOMPLETE=%d%s  %sSETUP-RED=%d%s  %sASSERT-FAIL=%d%s  %sINFRA-ABORT=%d%s  (%ds)\n' \
+    "${#DRILLS[@]}" "$C_G" "$n_green" "$C_0" "$C_Y" "$n_prod" "$C_0" "$C_Y" "$n_inc" "$C_0" \
+    "$C_R" "$n_setup" "$C_0" "$C_R" "$n_assert" "$C_0" "$C_R" "$n_abort" "$C_0" "$(( $(secs) - started ))"
 [ "${#retried[@]}" -gt 0 ] && echo "  ${C_Y}retried (infra flake): ${retried[*]} — first-run evidence in $LOGDIR/<name>.attempt1.log${C_0}"
-exit "$fails"
+if [ "$blockers" -eq 0 ]; then
+    if [ "$((n_prod+n_inc))" -eq 0 ]; then echo "  ${C_G}ALL GREEN${C_0}"
+    else echo "  ${C_Y}WAIVED NON-GREEN${C_0} — PRODUCT-RED=$n_prod INCOMPLETE=$n_inc; explicit owner waiver flags supplied. NOT all-green."; fi
+else
+    echo "  ${C_R}$blockers BLOCKER(S)${C_0} — inspect $LOGDIR/<name>.log"
+fi
+# Keep shell exit status meaningful instead of wrapping modulo 256 for very large suites.
+[ "$blockers" -le 125 ] || blockers=125
+exit "$blockers"

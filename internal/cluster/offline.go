@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -272,6 +273,196 @@ func RecoverSingleNode(dataDir, dbPath, selfID, selfRaftAddr string, logger *slo
 // DeleteRange is unconditional).
 func GrowReadySnapshot(dataDir, dbPath, selfID, selfRaftAddr string, logger *slog.Logger) error {
 	return recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr, logger)
+}
+
+// RebuildSingleNodeFromDB atomically replaces an offline node's Raft store with a
+// fresh {self} store whose first configuration/snapshot index is above baseIndex.
+// The SQLite DB is the authoritative, already-recovered FSM image. Keeping the
+// new Raft indices above its durable applied_index is load-bearing: bootstrapping
+// again at index 1 would make the FSM skip all new commands until Raft caught up
+// with the old timeline.
+//
+// The replacement store is fully built in a sibling directory, then exchanged
+// with raft/ using renameat2(RENAME_EXCHANGE). There is no crash window with a
+// missing or half-built live raft directory; a failure before the exchange leaves
+// the original untouched, and the old store is removed only after the exchange.
+func RebuildSingleNodeFromDB(dataDir, dbPath, selfID, selfRaftAddr string, baseIndex uint64, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if baseIndex == ^uint64(0) {
+		return errors.New("cluster: cannot rebuild raft above maximum applied_index")
+	}
+	stageRoot, err := os.MkdirTemp(dataDir, ".raft-rebuild-")
+	if err != nil {
+		return fmt.Errorf("cluster: create staged raft rebuild: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stageRoot) }()
+
+	// Build the replacement from a snapshot directly. Moving only a bootstrap
+	// configuration log from index 1 to baseIndex+1 creates a log hole: with no
+	// preceding snapshot, RecoverCluster still replays from index 1 and fails.
+	// A snapshot at baseIndex+1 is the correct representation of the authoritative
+	// DB: the one-index gap is a non-command boundary, and the embedded {self}
+	// configuration lets the next real command start strictly above applied_index.
+	stagedRaft := filepath.Join(stageRoot, "raft")
+	if err := os.MkdirAll(stagedRaft, 0o700); err != nil {
+		return fmt.Errorf("cluster: mkdir staged raft rebuild: %w", err)
+	}
+	// Production's fail-closed cluster-mode probe intentionally requires the
+	// raft.db path before it opens any Raft store (opening one has the side effect
+	// of creating it). A snapshot-only replacement is valid to Hashicorp Raft but
+	// is therefore invisible to the broker and crash-loops as "no raft state".
+	// Create the empty stable/log store alongside the snapshot; HasExistingState
+	// then proves state from the snapshot without weakening that startup guard.
+	store, err := raftboltdb.New(raftboltdb.Options{Path: filepath.Join(stagedRaft, "raft.db")})
+	if err != nil {
+		return fmt.Errorf("cluster: create staged raft store: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("cluster: close staged raft store: %w", err)
+	}
+	snaps, err := raft.NewFileSnapshotStore(stagedRaft, 2, io.Discard)
+	if err != nil {
+		return fmt.Errorf("cluster: open staged snapshot store: %w", err)
+	}
+	config := raft.Configuration{Servers: []raft.Server{{
+		Suffrage: raft.Voter,
+		ID:       raft.ServerID(selfID),
+		Address:  raft.ServerAddress(selfRaftAddr),
+	}}}
+	snapshotIndex := baseIndex + 1
+	_, trans := raft.NewInmemTransport(raft.ServerAddress(selfRaftAddr))
+	defer func() { _ = trans.Close() }()
+	sink, err := snaps.Create(raft.SnapshotVersionMax, snapshotIndex, 1, config, snapshotIndex, trans)
+	if err != nil {
+		return fmt.Errorf("cluster: create staged raft snapshot: %w", err)
+	}
+	ro, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		_ = sink.Cancel()
+		return fmt.Errorf("cluster: open DB for staged raft snapshot: %w", err)
+	}
+	persistErr := (&fsmSnapshot{ro: ro, tmpDir: filepath.Dir(dbPath)}).Persist(sink)
+	closeErr := ro.Close()
+	if persistErr != nil {
+		return fmt.Errorf("cluster: persist staged raft snapshot: %w", persistErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("cluster: close DB after staged raft snapshot: %w", closeErr)
+	}
+
+	liveRaft := filepath.Join(dataDir, "raft")
+	// Round-5 S5-02: the staged tree is owned by whoever RAN the tool. The runbook says to run force-single
+	// with sudo, so a root-run rebuild would transplant root:root onto raft/ and the `User=tether` daemon
+	// would then EACCES-crash-loop FOREVER on the last surviving broker — with every documented recovery
+	// command also failing EACCES. Mirror the LIVE store's ownership+mode onto the staged tree BEFORE the
+	// swap so the daemon that has to open it afterwards still can.
+	if err := mirrorTreeOwnership(liveRaft, stagedRaft); err != nil {
+		return fmt.Errorf("cluster: mirror raft store ownership onto the rebuilt tree: %w", err)
+	}
+	// Round-5 B2: ONE atomic exchange, no fallback — a three-step rename would pass through a window with no
+	// raft/ at all. AtomicExchangeCapable proved the capability before any mutation began.
+	//
+	// Round-6 HONESTY: that precheck is NOT a total guarantee, and this comment used to claim it was. The
+	// probe exchanges two fresh EMPTY siblings; the real target is the long-lived dataDir/raft, so a separate
+	// mount there still yields EBUSY, and ENOSPC is not probed at all (the rebuild writes ~2x tether.db
+	// between the prune and this point). Both surface HERE — after the prune. The rename is crash-consistent;
+	// the surrounding transaction is not yet. The recovery journal is what makes those cases forward-
+	// completable rather than terminal.
+	if err := swapDirs(stagedRaft, liveRaft); err != nil {
+		return fmt.Errorf("cluster: swap the rebuilt raft store into place: %w", err)
+	}
+	if dir, err := os.Open(dataDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	logger.Warn("cluster: rebuilt single-node raft store from recovered FSM",
+		"self", selfID, "base_index", baseIndex, "snapshot_floor", snapshotIndex)
+	return nil
+}
+
+// mirrorTreeOwnership copies ref's uid/gid + directory mode onto every entry under dst. Round-5 S5-02: the
+// offline tools are run by an operator (the runbook says `sudo`), but the store is re-opened by the
+// `User=tether` daemon — a rebuilt tree carrying the operator's ownership permanently EACCES-crash-loops the
+// survivor. Best-effort per entry only when we CAN read ref's owner (a non-unix FileInfo is not fatal: the
+// caller is then on a platform that does not run the daemon).
+func mirrorTreeOwnership(ref, dst string) error {
+	fi, err := os.Stat(ref)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no live store to mirror (fresh node) — leave the staged ownership as-is
+		}
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	uid, gid := int(st.Uid), int(st.Gid)
+	mode := fi.Mode().Perm()
+	return filepath.Walk(dst, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := os.Lchown(p, uid, gid); err != nil {
+			return fmt.Errorf("chown %s: %w", p, err)
+		}
+		if info.IsDir() {
+			if err := os.Chmod(p, mode); err != nil {
+				return fmt.Errorf("chmod %s: %w", p, err)
+			}
+		}
+		return nil
+	})
+}
+
+// ErrAtomicExchangeUnsupported is the fail-CLOSED precondition for any offline store rebuild: this
+// filesystem/platform cannot swap the store atomically, so the rebuild would have to pass through a state
+// where raft/ does not exist. Round-5 B2: that is NOT crash-consistent, so the operation is REFUSED UP
+// FRONT — before a single byte of SQLite/Raft is touched — instead of being discovered after the roster
+// prune has already made the node un-recoverable.
+var ErrAtomicExchangeUnsupported = errors.New("cluster: this filesystem cannot atomically exchange directories (RENAME_EXCHANGE), so an offline raft-store rebuild cannot be made crash-consistent here — run the recovery on a broker host whose data dir is on a filesystem that supports it (ext4/xfs/btrfs on Linux ≥3.15)")
+
+// AtomicExchangeCapable probes — WITHOUT touching anything real — whether dataDir's filesystem can perform
+// the atomic directory exchange the rebuild depends on. It exchanges two throwaway probe directories and
+// removes them. Round-5 B2: callers MUST run this before any destructive mutation.
+func AtomicExchangeCapable(dataDir string) error {
+	a, err := os.MkdirTemp(dataDir, ".xchg-probe-a-")
+	if err != nil {
+		return fmt.Errorf("cluster: create exchange probe: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(a) }()
+	b, err := os.MkdirTemp(dataDir, ".xchg-probe-b-")
+	if err != nil {
+		return fmt.Errorf("cluster: create exchange probe: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(b) }()
+	switch err := exchangeDirs(a, b); {
+	case err == nil:
+		return nil
+	case errors.Is(err, errExchangeUnsupported):
+		return ErrAtomicExchangeUnsupported
+	default:
+		return fmt.Errorf("cluster: probe atomic directory exchange: %w", err)
+	}
+}
+
+// swapDirs puts staged where live is (and live where staged is, so the caller's cleanup removes the old
+// store) in ONE atomic step. Round-5 B2: there is deliberately NO non-atomic fallback — a three-step rename
+// passes through a window in which raft/ is missing (the production startup probe then reports "no raft
+// state") and, worse, it would run AFTER the roster prune already mutated the node. Capability is a
+// PRECONDITION (AtomicExchangeCapable), checked before any mutation; reaching an unsupported filesystem
+// here means the caller skipped that check.
+func swapDirs(staged, live string) error {
+	switch err := exchangeDirs(staged, live); {
+	case err == nil:
+		return nil
+	case errors.Is(err, errExchangeUnsupported):
+		return fmt.Errorf("%w (this should have been refused by the AtomicExchangeCapable precondition)", ErrAtomicExchangeUnsupported)
+	default:
+		return err
+	}
 }
 
 func recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr string, logger *slog.Logger) error {

@@ -65,14 +65,22 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	}
 	notifyGrow(webhook, "start", map[string]any{"joiner": jp.Joiner, "leader": leader})
 
-	// B1: a re-run of an ALREADY-COMPLETED grow — the joiner is already a VOTER. Do NOT re-prepare/approve (a
-	// fresh nonce would mint a duplicate op, and the terminal op must never be resumed); converge idempotently
-	// by releasing the lock (if still held) and reporting done. This is the crash-post-SERVING resume (§4 P9).
+	// B1: VOTER is necessary but NOT sufficient for a completed grow: the join operation promotes raft
+	// membership before NATS_ROLLED_OUT reaches terminal SERVING. Check for a live op first, otherwise this
+	// shortcut false-greens the exact topology stall and releases the grow lock under an active controller.
+	// Only a VOTER with no live join op is the crash-post-SERVING idempotent resume (§4 P9).
 	if joinerIsVoter(nc, actor, jp.Joiner) {
-		_, _ = fmt.Fprintf(out, "  %s is already a VOTER — grow already complete\n", jp.Joiner)
-		releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out)
-		notifyGrow(webhook, "complete", map[string]any{"joiner": jp.Joiner, "already": true})
-		return nil
+		liveOp, err := findJoinOp(ctx, nc, actor, accountSeed, leader, jp.Joiner)
+		if err != nil {
+			return haltAdd(webhook, "find-join-op", jp.Joiner, err)
+		}
+		if liveOp == "" {
+			_, _ = fmt.Fprintf(out, "  %s is already a VOTER with no live join op — grow complete\n", jp.Joiner)
+			releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out)
+			notifyGrow(webhook, "complete", map[string]any{"joiner": jp.Joiner, "already": true})
+			return nil
+		}
+		_, _ = fmt.Fprintf(out, "  %s is a VOTER but join op %s is still active — resuming to terminal SERVING\n", jp.Joiner, liveOp)
 	}
 
 	// P1 ACQUIRE LOCK (before the join op exists, so no window where a concurrent grow slips in).
@@ -303,9 +311,6 @@ func waitJoinServing(ctx context.Context, nc *nats.Conn, actor string, seed []by
 	prevBlocked := false // C1: track the BLOCKED edge so one stall spends at most one confirm
 	lastBlockedErr := "" // C1 (Stage-C): remember the last BLOCKED cause so a stuck stall's timeout surfaces it
 	for {
-		if joinerIsVoter(nc, actor, jp.Joiner) {
-			return nil
-		}
 		resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "join-status", TargetNode: leader, OpID: opID})
 		if err == nil && resp != nil && resp.OK {
 			switch {

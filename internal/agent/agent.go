@@ -381,6 +381,11 @@ type Agent struct {
 	seedGen      uint64               // C2: monotone seed_generation high-water mark
 	seedURLs     []string             // C2: learned client-dialable seed endpoints (cold-start floor)
 	cachedSeeds  *proto.SeedBundle    // C2: last accepted seed bundle (persisted for boot re-verification)
+	// rosterRefreshNow is a coalescing edge trigger from signed-topology sys.events to the
+	// roster-only refresh loop. It closes the healthy-connection island window during consecutive
+	// retires; the periodic timer remains the loss-tolerant fallback.
+	rosterRefreshNow         chan struct{}
+	rosterRefreshFailBackoff time.Duration // test seam; immutable after New/Run begins
 	// rosterCacheStore (C2) persists the discovery cache to its OWN roster_cache.json (split out of the
 	// daemon-owned state.json). nil when Home is unset (in-process tests) → falls back to stateStore.
 	rosterCacheStore *rosterCacheStore
@@ -487,15 +492,17 @@ func New(cfg Config) (*Agent, error) {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
 	a := &Agent{
-		cfg:             cfg,
-		procs:           map[string]*procRec{},
-		canonAllowRoots: CanonAllowRoots(cfg.AllowRoots),
-		transferMode:    resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
-		proxy:           &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
-		rehomeWant:      map[int]proto.HomeDirective{},
-		rehomeRunning:   map[int]bool{},
-		rehomeSeq:       map[int]uint64{},
-		deferredReplay:  map[int]bool{},
+		cfg:                      cfg,
+		procs:                    map[string]*procRec{},
+		canonAllowRoots:          CanonAllowRoots(cfg.AllowRoots),
+		transferMode:             resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
+		proxy:                    &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
+		rehomeWant:               map[int]proto.HomeDirective{},
+		rehomeRunning:            map[int]bool{},
+		rehomeSeq:                map[int]uint64{},
+		deferredReplay:           map[int]bool{},
+		rosterRefreshNow:         make(chan struct{}, 1),
+		rosterRefreshFailBackoff: defaultRosterRefreshFailBackoff,
 	}
 	if a.transferMode == modeOpen {
 		// Posture-change signal: with no allow_roots configured, push/pull
@@ -715,6 +722,15 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 			NID  string `json:"nid"`
 		}
 		if err := json.Unmarshal(msg.Data, &ev); err != nil {
+			return
+		}
+		if strings.HasPrefix(ev.Type, "nats_topology_") {
+			// Events are only a wake-up hint: refreshRosterOnce still verifies the account-signed
+			// roster and its monotone generation. Coalesce a burst from multiple brokers.
+			select {
+			case a.rosterRefreshNow <- struct{}{}:
+			default:
+			}
 			return
 		}
 		if ev.Type != "agent_evicted" {
@@ -1464,6 +1480,12 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 	opts := []nats.Option{
 		nats.MaxReconnects(-1),
+		// A reconnect can race a rolling NATS/broker restart: nats-server may accept CONNECT while
+		// the auth_callout responder is not subscribed yet and return an authorization violation.
+		// nats.go aborts reconnect after seeing the same auth error twice unless this option is set,
+		// leaving a healthy agent process permanently disconnected. Initial authentication remains
+		// fail-fast in connectNATS above; this only keeps an already-authenticated daemon retrying.
+		nats.IgnoreAuthErrorAbort(),
 		// C1 §D-1: keep the dial pool in our priority order (VOTER-first / draining-last from
 		// DialURLs, seed floor last) instead of nats.go's default shuffle, so a reconnect
 		// prefers a live voter. Fleet load is spread by the intra-VOTER shuffle in DialURLs.

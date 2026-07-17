@@ -8,7 +8,7 @@ rev3/rev4/rev5 = 外审 round1（11 findings + 4 doubts）/round2（8 findings +
 `docs/reviews/simcluster-coverage-inventory.md` 完成全量生成，rev6 补安全门 flag 面，
 **rev7**（round5：2 Major → round6 **Pass**）用构造后 Cobra 树的完整遍历系统性重建附录 §2
 并修正 restore 的 never-escapable 安全模型。
-Status: **ROADMAP（总纲）；S1 已落地（S0-pty + S0-台账 + 60/61/62 drills；commit `10e9a5f`，外审 3 轮 Pass）；S2 已落地（80/81/82 + S0-隧道/ingress；`3bacc11`，外审 3 轮 Pass）；S3–S9 改按 §2.1 合并分组（G-A/G-B/G-C）推进、尚未开工**。本文件**不是**单批 plan、**不**进入实现——它把「**已发布至 v0.4.7
+Status: **ROADMAP（总纲）；S1 已落地（S0-pty + S0-台账 + 60/61/62 drills；commit `10e9a5f`，外审 3 轮 Pass）；S2 已落地（80/81/82 + S0-隧道/ingress；`3bacc11`，外审 3 轮 Pass）；G-A 已落地（S3+S4+S5；`627e334`，外审多轮 Pass）；**G-B 已落地（S6+S8：22/40/41/42/43/90/91/92/93 九 drill + 五态 verdict 契约 + 计划外但已过审的 raft 恢复产品修复；外审 8 轮 Pass，2026-07-17）**；G-C（S7+S9）尚未开工**。本文件**不是**单批 plan、**不**进入实现——它把「**已发布至 v0.4.7
 的全部产品功能面中尚无 deploy-tier 覆盖者**（含 G 系列 plan 已认账未落地的 sim 验收欠账；simcluster
 本体登场于 f460148, 2026-07-05）」的模拟集群测试补完，按内聚场景族 + 依赖顺序 + 使用频率拆成
 **9 个独立叶子批次 S1–S9**。每批开工时各自按 CLAUDE.md §3 走 3 阶段 7 步（Workflow 对抗草拟 →
@@ -852,10 +852,27 @@ plan 在 Stage-A 一次覆盖全组、逐批分节（`s<组>-plan.md`，如 `s3-
   `run-drills.sh` 无需注册（自动发现），但新 drill 的预计时长/资源写进头注。
 - **RED→GREEN 翻转纪律**（继承 G 系列）：某 gotcha 将来修好 → 对应 `assert_bug` 翻
   `assert_ok`、trailer token 移除——由修复批负责，S 系列 drill 头注写明翻转条件。
-- **运行结果术语**（消除「全绿（已知 RED 除外）」歧义）：**已知缺陷运行** = drill 整体
-  harness-GREEN、内部以 signature-guarded `assert_bug` 复现已登记 gotcha（这是合格态）；
-  区别于 **infra flake**（run-drills 白名单签名，可重跑）与 **unexpected failure**（真回归/
-  未登记缺陷，必须停下分诊）。「N 连绿」一律指前者 + 纯 GREEN，绝不含后两者。
+- **运行结果术语（外审 round-3 M2 改版：废止「已知缺陷=harness-GREEN」的连绿契约）**：drill 落**唯一
+  landing verdict**，由 `lib/assert.sh` 五态契约按优先级判定（SSOT = `lib/assert.sh` 头注真值表 +
+  `tests/verdict-contract-test.sh`）：
+  - `GREEN` — 每条断言都是被保留的 invariant，零 gap、零缺陷。**只有全 GREEN 才叫「全绿」。**
+  - `PRODUCT-RED` — signature-guarded `assert_bug`/`product_red` 复现了已登记 gotcha。这是 harness **按预期
+    工作**（真缺陷被暴露），但产品仍不合格；默认阻断 suite/release，**不再算 GREEN**。只有 owner 在本次
+    命令显式给 `--allow-product-red` 才可 waiver，摘要必须写 `WAIVED NON-GREEN`。
+  - `INCOMPLETE` — `not_covered()` 记录的 explore→pin 覆盖缺口；默认阻断。只有 owner 显式给
+    `--allow-incomplete` 才可 waiver，且仍不得称为 GREEN。
+  - `SETUP-RED` / `ASSERT-FAIL` — 前置/供给失败（含 harness 误用）/ 被保留 invariant 破裂或 signature
+    失配。二者是 **release blocker**（真 test/infra 破裂，落地前必修）。
+  - `run-drills.sh` 五列分栏计数：五类非 GREEN **全部默认 blocker**；suite 退出码为未 waiver blocker 数
+    （饱和到 125）。runner 对唯一完整 verdict 行做 anchored grammar、枚举/计数/rc/进程退出码交叉校验；
+    缺失为 INFRA-ABORT，重复/畸形/矛盾为 CONTRACT-ERROR，二者不可 waiver、不可重试。
+  - **infra flake**（run-drills 白名单签名 + 非 blocker verdict，可重跑）与 **unexpected failure**
+    （ASSERT-FAIL：真回归/未登记缺陷，停下分诊）仍分明。**「暴露缺陷」是测试目标，但不是发布豁免；
+    PRODUCT-RED/INCOMPLETE 必须保持 RED 并默认阻断，绝不为凑绿削弱 oracle。**
+- **S6-S8 round-4 执行注记（2026-07-16）**：首次严格九项单跑实际为 3 GREEN / 3 SETUP-RED /
+  3 ASSERT-FAIL；修复后的本地独立测试已通过，但远端额度阻止同 oracle 的 post-fix 真栈复验，故现行
+  disposition 仍是 **Fail / remote verification pending**。SETUP-RED 的夹具修复不得抹去同一次运行里暴露的
+  tether 缺陷；41 仍禁止 restart agent/改 cache，91 仍禁止 manual seed publish，runner 仍禁止 retry 洗红。
 - **不可违背**：Mandate ①–④ 全文适用（含 §0.2 反掩盖细则）；drill 一律 `drill_begin`
   throwaway-instance 门；poll_until 不许固定 sleep（既有纪律）；断言「验结果不验退出码」用于
   一切异步收敛；破坏/恢复断言先立注入前基线（§0.4 对照纪律）。

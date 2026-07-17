@@ -193,16 +193,27 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			// is a no-op, so this is always safe to run.
 			declustered := "; nats.conf de-clustered to standalone"
 			if storeDir, changed, derr := deClusterStandaloneConf(natsConf, natsServerBin, selfID, dbPath); derr != nil {
-				declustered = ""
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-					"WARNING: force-single succeeded but auto de-cluster of %s FAILED (%v).\n"+
-						"Before restarting the broker you MUST de-cluster nats.conf by hand (drop the cluster{} block), or it will exit 70 (clustered JS at N=1).\n", natsConf, derr)
+				// Round-5 B1: this is NOT a warning. The raft/DB phases are already committed and
+				// irreversible; without this de-cluster the broker cannot start at all (clustered JS
+				// cannot form a quorum at N=1 -> exit 70 crash-loop). Returning nil here reported SUCCESS
+				// for a bricked node. Fail LOUDLY and non-zero, and leave the journal in place so a re-run
+				// forward-completes exactly this phase.
+				return fmt.Errorf("force-single: the raft/DB phases COMMITTED but auto de-cluster of %s FAILED: %w\n"+
+					"  This node canNOT start until nats.conf is standalone (clustered JS cannot form a quorum at N=1 -> exit 70).\n"+
+					"  The recovery is JOURNALLED - re-run this exact force-single command to forward-complete it\n"+
+					"  (the peers you already confirmed dead are recorded, so you need not re-list them),\n"+
+					"  or de-cluster %s by hand (drop the cluster{} block) and re-run to finish", natsConf, derr, natsConf)
 			} else if changed {
 				warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
 			} else {
 				// already standalone (e.g. a hand-de-clustered survivor) — a proven byte no-op: NO destructive
 				// JS-store reset warning, no false "de-clustered" claim (plan §4 铁律).
 				declustered = "; nats.conf already standalone (no change)"
+			}
+			// Round-5 B1: the node is bootable again ONLY now - the first moment the sequence is truly
+			// complete - so this is the only place the recovery journal may be cleared.
+			if jerr := clusteroffline.ClearForceSingleJournal(dataDir); jerr != nil {
+				return fmt.Errorf("force-single: completed but could not clear the recovery journal: %w", jerr)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"force-single complete: %q is now a single-voter cluster (%d nodes abandoned)%s.\n"+

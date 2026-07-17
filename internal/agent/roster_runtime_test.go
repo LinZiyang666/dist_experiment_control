@@ -99,6 +99,69 @@ func TestRosterRefreshConvergesNoRaft(t *testing.T) {
 	<-done
 }
 
+// TestTopologyEventTriggersSignedRosterRefresh covers the consecutive-retire
+// island found by simcluster-41. A healthy NATS connection does not reconnect on
+// its own when its broker leaves the mesh, so a topology edge must wake the
+// roster-only pull immediately; the response remains account-signed and
+// generation-checked by the normal adoption path.
+func TestTopologyEventTriggersSignedRosterRefresh(t *testing.T) {
+	url := startNATS(t)
+	stub, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stub.Close()
+
+	seed, err := auth.GenerateUserSeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := auth.PublicKeyFromSeed(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refreshOnlySeen atomic.Int32
+	if _, err := stub.Subscribe(proto.SubjectPrefix+".ctrl.s.*.node.*.register.req", func(msg *nats.Msg) {
+		var req proto.NodeRegisterReq
+		_ = json.Unmarshal(msg.Data, &req)
+		gen := uint64(10)
+		if req.RosterRefreshOnly {
+			refreshOnlySeen.Add(1)
+			gen = 20
+		}
+		body, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Roster: signedRoster(t, seed, pub, gen)})
+		_ = msg.Respond(body)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+
+	a, err := New(Config{
+		NATSURL: url, SID: "lab", NID: "lab-1", AccountPub: pub,
+		HeartbeatInterval: 30 * time.Millisecond, RegisterTimeout: 2 * time.Second,
+		RosterRefreshInterval: time.Hour, // prove the event, not the periodic timer, caused the pull.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool { return a.cachedRosterGen() == 10 })
+
+	event, _ := json.Marshal(map[string]any{"type": "nats_topology_applied", "desired_gen": 2})
+	if err := stub.Publish(proto.SubjSysEvents, event); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+	waitFor(t, 3*time.Second, func() bool {
+		return refreshOnlySeen.Load() > 0 && a.cachedRosterGen() == 20
+	})
+	cancel()
+	<-done
+}
+
 // TestSessionRebuildReconnects: firing the stuck-reconnect watchdog (fireRedial) must rebuild the
 // session — the Run loop tears the old conn down and re-connects + re-registers on the freshest
 // dial pool — without deadlocking. Validates the L3 session-loop machinery.
@@ -239,10 +302,6 @@ func TestRebuildNoDoubleForwardedDispatch(t *testing.T) {
 // CodeLeaderUnavailable; the agent must still converge to the newer roster via the SHORT fail-backoff
 // (not a full interval later), well under the 5min budget.
 func TestRefreshConvergesUnderLeaderFailover(t *testing.T) {
-	old := rosterRefreshFailBackoff
-	rosterRefreshFailBackoff = 30 * time.Millisecond
-	defer func() { rosterRefreshFailBackoff = old }()
-
 	url := startNATS(t)
 	stub, err := nats.Connect(url)
 	if err != nil {
@@ -277,6 +336,7 @@ func TestRefreshConvergesUnderLeaderFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.rosterRefreshFailBackoff = 30 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)

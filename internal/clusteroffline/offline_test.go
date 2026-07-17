@@ -63,19 +63,18 @@ func TestD7ForceSingleEmptyStateRefuse(t *testing.T) {
 
 func TestD7OfflineFlockExclusive(t *testing.T) {
 	dir := t.TempDir()
-	lock := filepath.Join(dir, lockFileName)
-	release, err := acquireFlock(lock)
+	release, err := cluster.AcquireDataDirLock(dir)
 	if err != nil {
 		t.Fatalf("first flock: %v", err)
 	}
 	// A SECOND open file description on the same path must be denied (flock is
 	// per-open-file-description, so two os.OpenFile's conflict even in-process).
-	if _, err := acquireFlock(lock); err == nil {
+	if _, err := cluster.AcquireDataDirLock(dir); err == nil {
 		t.Fatal("second flock acquired while first held — exclusivity broken")
 	}
 	release()
 	// After release, it can be re-acquired.
-	r2, err := acquireFlock(lock)
+	r2, err := cluster.AcquireDataDirLock(dir)
 	if err != nil {
 		t.Fatalf("re-acquire after release: %v", err)
 	}

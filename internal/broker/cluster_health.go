@@ -66,9 +66,18 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		if msg.Reply == "" {
 			return
 		}
+		// VerifyLeaderRead is the authoritative "writable right now" probe. Hashicorp Raft can remain
+		// in State()==Leader while VerifyLeader already fails after quorum loss; treating every State
+		// leader as contact-fresh leaves the off-box summary in "electing (transient)" forever. Fold the
+		// failed barrier into the contact verdict for that ex-leader. Followers still use LastContact+TFence.
+		t := now()
+		writable := node.VerifyLeaderRead(func(*sql.DB) error { return nil }) == nil
+		stateLeader := node.IsLeader()
+		_, leaderID := node.LeaderWithID()
+		contactStale := healthContactStale(node.LeaderContactStale(t), stateLeader, writable, leaderID, node.SelfID())
 		resp := proto.ClusterHealthResp{
 			SchemaVersion:      proto.ClusterHealthSchemaVersion,
-			LeaderContactStale: node.LeaderContactStale(now()),
+			LeaderContactStale: contactStale,
 			ForceSingleActive:  forceSingleActive(db),
 			UpgradeLockActive:  upgradeActive(db),          // External-review round2 B1: expose the roll lock for stale-lock self-heal
 			GrowLockActive:     growActiveJoiner(db) != "", // G4 §B: expose the grow lock for stale-lock self-heal (cluster add)
@@ -113,10 +122,10 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		if jsUnavail != nil {
 			resp.JetStreamUnavailable = jsUnavail()
 		}
-		if verr := node.VerifyLeaderRead(func(*sql.DB) error { return nil }); verr == nil {
+		if writable {
 			resp.WritableLeaderConfirmed = true
 		}
-		if _, leaderID := node.LeaderWithID(); leaderID != "" {
+		if leaderID != "" {
 			resp.LeaderID = leaderID // best-effort, banner text only
 		}
 		b, err := json.Marshal(resp)
@@ -125,6 +134,20 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		}
 		_ = msg.Respond(b)
 	}
+}
+
+// healthContactStale is deliberately stateless so a systemd restart during quorum loss cannot reset a
+// grace timer and leave the off-box verdict "electing" forever. A real writable leader is fresh. A
+// follower is fresh only when it has bounded-fresh evidence of a DIFFERENT current leader; no leader,
+// or a demoted ex-leader still naming itself, is already read-only and therefore stale.
+func healthContactStale(fenced, stateLeader, writable bool, leaderID, selfID string) bool {
+	if writable {
+		return false
+	}
+	if stateLeader || fenced {
+		return true
+	}
+	return leaderID == "" || leaderID == selfID
 }
 
 // SubscribeAlertLs wires the QUEUE-GROUP alert-ls responder (§10.1/§10.3): any ONE broker

@@ -2,7 +2,7 @@
 # 21-smalldisk-tierb.sh — #21 RED: on a small-disk broker the hardcoded 8 GiB OBJ_xfer bucket
 # reservation overshoots the store → tier-B (JetStream Object Store) is denied by JS storage admission
 # (10047), while tier-A (inline) still works (plan §5.3). The small disk is modeled DETERMINISTICALLY
-# with a size-capped tmpfs at the JS store_dir (never max_file_store — that subkey bricks reconcile;
+# with a size-capped tmpfs at the broker data-dir filesystem (never max_file_store — that subkey bricks reconcile;
 # §9 OQ-5). Cap is > events+history (so the cluster works) but < the 8 GiB OBJ_xfer MaxBytes (so the
 # FIRST tier-B bucket alone deterministically fails). Env: SIM, HERE, INSTANCE.
 set -u
@@ -14,7 +14,7 @@ PIN=${SIMPIN:-135790}; SID=lab
 drill_begin "#21 small-disk: disk-aware OBJ_xfer fits under the store → tier-B WORKS (GREEN regression)"
 
 "$SIM" nuke >/dev/null 2>&1 || true
-assert_ok "up 1 broker (JS store capped to 4g tmpfs) + agent + ctl"  "$SIM" up --brokers 1 --agents 1 --ctl 1 --cap-store 4g
+assert_ok "up 1 broker (JS filesystem capped to 4g tmpfs) + agent + ctl"  "$SIM" up --brokers 1 --agents 1 --ctl 1 --cap-store 4g
 assert_ok "init brk1 (N=1)"          "$SIM" init brk1
 assert_ok "session + ctl login"      "$SIM" session "$SID" --pin "$PIN"
 assert_ok "agent-join agt1"          "$SIM" agent-join agt1 --session "$SID" --pin "$PIN"

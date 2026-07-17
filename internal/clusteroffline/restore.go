@@ -72,7 +72,7 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 
 	// (1) flock + (2) live-daemon interlock.
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
-	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
 		return nil, err
 	}

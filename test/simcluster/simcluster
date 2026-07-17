@@ -76,15 +76,17 @@ cmd_up() {
         --brokers) _brokers=$2; shift 2;;
         --agents)  _agents=$2;  shift 2;;
         --ctl)     _ctl=$2;     shift 2;;
-        --cap-store) _capstore=$2; shift 2;;   # #21: cap broker JS store via a small tmpfs (e.g. 1g)
+        --cap-store) _capstore=$2; shift 2;;   # #21: cap broker data filesystem via a small tmpfs (e.g. 1g)
         *) die "up: unknown arg $1";;
     esac; done
     ensure_net
-    # #21 store cap: a size-capped tmpfs at the JS store_dir makes nats-server statfs a small free-disk,
-    # so the hardcoded 8 GiB OBJ_xfer bucket reservation overshoots → tier-B is denied (10047). tmpfs
-    # (not loopback) consumes no host-global loop devices on the shared box (§9 OQ-5).
+    # #21 store cap: a size-capped tmpfs at the broker DATA DIR makes the child JS store_dir report a
+    # small filesystem without turning store_dir itself into a mountpoint. The latter is an invalid
+    # grow fixture: the product's deliberate move-aside (`jetstream` → `jetstream.grow-bak.<op>`) cannot
+    # rename a mountpoint and fails EBUSY before the disk-pressure behavior under test. tmpfs at the
+    # parent still gives deterministic statfs and consumes no host-global loop devices (§9 OQ-5).
     _brk_extra=""
-    [ -n "$_capstore" ] && _brk_extra="--tmpfs /var/lib/tether/jetstream:size=$_capstore"
+    [ -n "$_capstore" ] && _brk_extra="--sim-lib-tmpfs $_capstore"
     # shellcheck disable=SC2086
     _i=1; while [ "$_i" -le "$_brokers" ]; do _bring_up_node broker "brk$_i" $_brk_extra; _i=$((_i+1)); done
     _i=1; while [ "$_i" -le "$_agents" ];  do _bring_up_node agent  "agt$_i"; _i=$((_i+1)); done
@@ -189,11 +191,19 @@ cmd_grow() {
     # former-N1 clustered cutover + JS reset. It HALTs (exit 75) at the start-joiner boundary because tether
     # NEVER runs systemctl — the joiner's cold daemon start is provisioning's job (the boundary it brackets). ──
     log "grow: [tether] cluster add $_j — invocation 1 (init/approve/cutover; HALTs at start-joiner)"
-    dexec -u tether "$_j" -- env HOME=/var/lib/tether TETHER_CONFIRM_NODE_ID="$_j" tether cluster add "$_j" \
+    if _add1=$(dexec -u tether "$_j" -- env HOME=/var/lib/tether TETHER_CONFIRM_NODE_ID="$_j" tether cluster add "$_j" \
         --raft-addr "$_j:7400" --nats-route "nats://$_j:6222" --tunnel-addr "$_j:7000" \
         --public-host "$_j" --node-ident-pub "$_jpub" --secrets-dir /etc/tether/secrets \
         --account-seed /etc/tether/secrets/account.nk --confirm-node-id "$_j" \
-        --nats-url "$_url" --reset-former-js --timeout 4m 2>&1 | sed 's/^/  add1| /' || true
+        --nats-url "$_url" --reset-former-js --timeout 4m 2>&1); then _add1_rc=0; else _add1_rc=$?; fi
+    printf '%s\n' "$_add1" | sed 's/^/  add1| /'
+    # Invocation 1 has one valid outcome in this fixture: the product committed enough state to reach
+    # its explicit daemon-start boundary and returned the temporary/resume exit class.  A generic I/O,
+    # auth or internal failure must not be laundered merely because raft promotion happens later.
+    if [ "$_add1_rc" -ne 75 ] || ! printf '%s' "$_add1" | grep -qiE 'PAUSED at start-joiner|RESUME: start the joiner'; then
+        err "grow: invocation 1 violated the start-joiner contract (rc=$_add1_rc, expected rc=75 + resume signature)"
+        return 1
+    fi
 
     # ── [env] PROVISIONING: start the joiner's daemons (the systemctl boundary `cluster add` brackets). ──
     # RESTART nats-server (not start): the standalone-boot left nats running the STANDALONE conf, and `cluster
@@ -203,17 +213,31 @@ cmd_grow() {
     sctl "$_j" restart nats-server
     sctl "$_j" start tether-broker
 
+    # `active` only means systemd exec'd the process. Prove the ctl/auth_callout path is actually ready
+    # before invoking the resumable operation; this removes a fixture race without accepting any product
+    # failure. A broker that never becomes auth-ready is a hard grow failure.
+    poll_until 60 2 "$_j ctl/auth_callout ready after daemon start" -- _grow_ctl_ready "$_j" "$_url" \
+        || { err "grow: ctl/auth_callout never became ready after starting $_j"; return 1; }
+
     # ── [tether] `cluster add` invocation 2: RESUME — joiner clustered cutover, catch-up → VOTER, seed,
     # rebalance, release the grow lock. Re-run is how the orchestrator resumes past the provisioning boundary. ──
     log "grow: [tether] cluster add $_j — invocation 2 (resume → SERVING)"
-    dexec -u tether "$_j" -- env HOME=/var/lib/tether tether cluster add "$_j" \
+    if _add2=$(dexec -u tether "$_j" -- env HOME=/var/lib/tether tether cluster add "$_j" \
         --raft-addr "$_j:7400" --nats-route "nats://$_j:6222" --tunnel-addr "$_j:7000" \
         --public-host "$_j" --node-ident-pub "$_jpub" --secrets-dir /etc/tether/secrets \
         --account-seed /etc/tether/secrets/account.nk --confirm-node-id "$_j" \
-        --nats-url "$_url" --reset-former-js --timeout 4m 2>&1 | sed 's/^/  add2| /' || true
+        --nats-url "$_url" --reset-former-js --timeout 4m 2>&1); then _add2_rc=0; else _add2_rc=$?; fi
+    printf '%s\n' "$_add2" | sed 's/^/  add2| /'
+    if [ "$_add2_rc" -ne 0 ]; then
+        err "grow: invocation 2 failed its resume-to-SERVING contract (rc=$_add2_rc)"
+        log "grow: DIAG authoritative join operation + cluster status after invocation-2 failure"
+        dexec -u tether "$_L" -- tether cluster ops show "$_j" --json 2>&1 | sed 's/^/  grow-op| /' || true
+        dexec -u tether "$_L" -- tether cluster status --json 2>&1 | sed 's/^/  grow-status| /' || true
+        return 1
+    fi
 
-    if poll_until 150 3 "$_j reaches VOTER" -- _phase_is "$_j" VOTER; then
-        ok "grow: $_j is now a VOTER (cluster=$(list_nodes broker | tr '\n' ' ')) — via \`tether cluster add\`"
+    if poll_until 150 3 "$_j reaches VOTER and its join op reaches terminal SERVING" -- _grow_terminal_serving "$_j"; then
+        ok "grow: $_j is VOTER with terminal join op SERVING (cluster=$(list_nodes broker | tr '\n' ' ')) — via \`tether cluster add\`"
         # NB the post-VOTER grow-lock self-heal was REMOVED (helper deleted, R5-M5): it re-ran `cluster add` to
         # CLEAR the #31 grow-lock, but drill 30 RELIES on that leak to pin the upgrade-blocked defect — clearing it
         # made 30's upgrade RUN and surface a version-propagation failure. #31 tolerance for 71/73/74 lives ONLY in
@@ -242,6 +266,18 @@ cmd_grow() {
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s (INCOMPLETE — did not reach VOTER)\n' "$_j"
         return 1
     fi
+}
+
+_grow_ctl_ready() {
+    dexec -u tether "$1" -- env HOME=/var/lib/tether tether node ls --json --nats-url "$2" >/dev/null 2>&1
+}
+
+_grow_terminal_serving() {
+    _gts_node=$1
+    _phase_is "$_gts_node" VOTER || return 1
+    _gts_leader=$(leader_node) || return 1
+    dexec -u tether "$_gts_leader" -- tether cluster ops show "$_gts_node" --json 2>/dev/null \
+        | jq -e '((.op.kind // "")|ascii_downcase)=="join" and ((.op.op_state // .op.state // "")|ascii_upcase)=="SERVING" and .op.terminal==true' >/dev/null 2>&1
 }
 
 # init <brk> : cut a standalone broker over to an N=1 cluster (§4.1). Mints+distributes secrets,
@@ -486,6 +522,13 @@ cmd_drill() {
     _name=${1:?drill name}; shift 2>/dev/null || true
     _script="$HERE/drills/$_name.sh"
     [ -f "$_script" ] || die "drill: no such drill '$_name' ($_script)"
+    # A drill executes the binary BAKED in the image, not vendor/tether directly. Fail closed when a
+    # caller rebuilt/staged vendor but forgot the required `remote.sh --build build`; otherwise every
+    # source-level fix is silently tested against an old product binary and produces invalid evidence.
+    _vendor_sha=$(sha256sum "$HERE/vendor/tether" 2>/dev/null | awk '{print $1}')
+    _image_sha=$(d run --rm --entrypoint sha256sum "$IMAGE" /usr/local/bin/tether 2>/dev/null | awk '{print $1}')
+    [ -n "$_vendor_sha" ] && [ "$_image_sha" = "$_vendor_sha" ] || \
+        die "drill: stale image binary (image=${_image_sha:-missing}, vendor=${_vendor_sha:-missing}); run ./remote.sh --build build before testing code changes"
     _inst="drill-$_name"
     log "drill: $_name on isolated instance '$_inst'"
     # M4: under `set -e` a RED/failed drill would abort cmd_drill BEFORE teardown → leaked instance.

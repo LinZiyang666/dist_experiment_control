@@ -28,7 +28,21 @@ node_running() { [ "$(d inspect -f '{{.State.Running}}' "$(ctr_name "$1")" 2>/de
 # Boots bare systemd (PID1) + sshd. Provisioning + unit start are driven later by the control script.
 run_node() {
     _rn_role=$1; _rn_node=$2; shift 2
+    # Internal orchestration flag: replace (rather than stack on top of) the
+    # normal /var/lib/tether named volume. Docker rejects duplicate mount
+    # destinations, and mounting only the jetstream child breaks the product's
+    # atomic move-aside during grow with EBUSY.
+    _rn_lib_mount=""
+    if [ "${1:-}" = "--sim-lib-tmpfs" ]; then
+        _rn_lib_mount=$2
+        shift 2
+    fi
     ensure_net
+    if [ -n "$_rn_lib_mount" ]; then
+        set -- --tmpfs "/var/lib/tether:size=$_rn_lib_mount" "$@"
+    else
+        set -- -v "$(vol_lib "$_rn_node"):/var/lib/tether" "$@"
+    fi
     run d run -d \
         --name "$(ctr_name "$_rn_node")" --hostname "$_rn_node" \
         --network "$(net_name)" --network-alias "$_rn_node" \
@@ -37,7 +51,6 @@ run_node() {
         --restart no \
         --label sim.instance="$INSTANCE" --label sim.role="$_rn_role" --label sim.nodeid="$_rn_node" \
         -v "$(vol_etc "$_rn_node"):/etc/tether" \
-        -v "$(vol_lib "$_rn_node"):/var/lib/tether" \
         "$@" \
         "$IMAGE" >/dev/null
 }

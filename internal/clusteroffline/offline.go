@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -29,7 +30,7 @@ import (
 )
 
 const (
-	lockFileName    = "tether.lock"
+	lockFileName    = cluster.DataDirLockFile // round-5 B3: ONE SSOT shared with the daemon's lifetime lock
 	peerDialTimeout = 1500 * time.Millisecond
 )
 
@@ -56,6 +57,11 @@ type ForceSingleOptions struct {
 	ConfirmedDead []string
 	Now           func() time.Time
 	Logger        *slog.Logger
+
+	// atomicExchangeCheck overrides the round-5 B2 capability precondition. It is UNEXPORTED and per-call
+	// (never package state — a package-level test hook is exactly the data race round-4 had to remove), so
+	// only same-package tests can set it and no production caller can weaken the gate. nil = the real probe.
+	atomicExchangeCheck func(dataDir string) error
 }
 
 // ForceSingle rewrites the on-disk raft config to {self} after enforcing the §8.4
@@ -70,7 +76,7 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 		opts.Logger = slog.Default()
 	}
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
-	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +90,25 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	if locked {
 		return nil, ErrDaemonRunning
 	}
+	exchangeCheck := opts.atomicExchangeCheck
+	if exchangeCheck == nil {
+		exchangeCheck = cluster.AtomicExchangeCapable
+	}
+	if err := exchangeCheck(opts.DataDir); err != nil {
+		return nil, err
+	}
+
+	// Round-5 B1 / round-6: identify an INTERRUPTED prior run FIRST — before the state and capability
+	// preconditions. A half-finished force-single is exactly the case whose symptoms (exit-70 crash-loop,
+	// odd on-disk state) would otherwise surface as a generic refusal that tells the operator nothing.
+	prior, err := readJournal(opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if prior != nil && prior.SelfID != opts.SelfID {
+		return nil, fmt.Errorf("clusteroffline: an interrupted force-single for a DIFFERENT node (%q) is journalled in %s — resolve it before forcing %q", prior.SelfID, opts.DataDir, opts.SelfID)
+	}
+
 	// (b) empty-state refuse.
 	exists, err := cluster.RaftStateExists(opts.DataDir)
 	if err != nil {
@@ -93,13 +118,42 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 		return nil, cluster.ErrNoExistingState
 	}
 
-	// (d) peer-reachable HARD-REFUSE (BEFORE (c) mutates).
+	// Round-5 B2: the rebuild's store swap MUST be atomic to be crash-consistent. Prove the filesystem can
+	// do it NOW — before a single byte of SQLite/Raft changes — instead of discovering it after the roster
+	// prune has already made the node un-recoverable. There is no non-atomic fallback.
+
+	// (d) peer-reachable HARD-REFUSE (BEFORE (c) mutates). RecoverCluster first restores
+	// the newest snapshot and then replays the tail, so the current SQLite projection is
+	// not sufficient: preview that exact recovery on copies and include every peer it can
+	// revive in the confirmation + liveness fence.
 	roster, err := readRoster(opts.DBPath, opts.SelfID)
 	if err != nil {
 		return nil, fmt.Errorf("clusteroffline: read roster: %w", err)
 	}
-	if err := checkPeersDead(roster, opts.ConfirmedDead); err != nil {
+	recoveredRoster, err := previewRecoveredRoster(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr)
+	if err != nil {
+		return nil, fmt.Errorf("clusteroffline: preview recovered roster: %w", err)
+	}
+	roster = mergePeers(roster, recoveredRoster)
+	// Round-6: compute the confirmation only AFTER the roster is known — a journalled confirmation is
+	// honoured ONLY for peers a prior run already pruned away, never for one still in the roster.
+	confirmed := resumeConfirmation(opts.ConfirmedDead, prior, roster)
+	if prior != nil {
+		opts.Logger.Warn("clusteroffline: resuming an INTERRUPTED force-single (forward-completing the remaining phases)",
+			"self", opts.SelfID, "phase_reached", prior.Phase, "confirmed_dead", confirmed)
+	}
+	if err := checkPeersDead(roster, confirmed); err != nil {
 		return nil, err
+	}
+
+	// The point of no return: journal BEFORE the first mutation so an interruption anywhere below is
+	// identifiable and forward-completable rather than an un-recoverable brick (round-5 B1).
+	if prior == nil {
+		if err := writeJournal(opts.DataDir, &forceSingleJournal{
+			SelfID: opts.SelfID, SelfRaftAddr: opts.SelfRaftAddr, ConfirmedDead: confirmed, Phase: phaseStarted,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// (c) reconcile + config rewrite — RecoverCluster drives the two-store replay.
@@ -113,17 +167,33 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 		return roster, fmt.Errorf("clusteroffline: recovered but failed to mark force_single_active: %w", err)
 	}
 	// G2 #12: prune the abandoned peers from cluster_nodes so the survivor's signed roster converges to
-	// {self} (clients stop failover-preferring the dead endpoints). RecoverSingleNode already rewrote the
-	// raft config to {self} above, so deleting the abandoned roster rows cannot fork quorum. Direct-SQL
-	// (the daemon is down; same post-recover raw-write durability as the marker). BEST-EFFORT: on failure
-	// the rows linger for `cluster recovery node remove <peer>` to finish — the recovery itself stands.
+	// {self}. This is now a hard step: RecoverCluster's snapshot was taken BEFORE this direct-SQL prune;
+	// leaving that snapshot in place lets a later resnapshot restore every abandoned peer.
 	if len(roster) > 0 {
 		if err := pruneRosterPeers(opts.DBPath, roster, opts.Now(), opts.Logger); err != nil {
-			opts.Logger.Warn("clusteroffline: force-single recovered but roster prune of abandoned peers failed; run `cluster recovery node remove <peer>` to finish",
-				"err", err)
+			return roster, fmt.Errorf("clusteroffline: recovered but failed to prune abandoned roster: %w", err)
 		}
 	}
-	opts.Logger.Warn("clusteroffline: force-single complete; node is now a single-voter cluster (no HA / no integrity until recover)",
+	// Rebuild the Raft store from the post-prune DB and atomically exchange it into place.
+	// Its indices start above the old durable applied_index, so the new timeline cannot
+	// be skipped by the FSM and the grow-ready snapshot contains the pruned roster + marker.
+	applied, err := readAppliedIndexPath(opts.DBPath)
+	if err != nil {
+		return roster, fmt.Errorf("clusteroffline: read recovered applied_index: %w", err)
+	}
+	if err := cluster.RebuildSingleNodeFromDB(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr, applied, opts.Logger); err != nil {
+		return roster, fmt.Errorf("clusteroffline: finalize recovered single-node raft: %w", err)
+	}
+	if err := writeJournal(opts.DataDir, &forceSingleJournal{
+		SelfID: opts.SelfID, SelfRaftAddr: opts.SelfRaftAddr, ConfirmedDead: confirmed, Phase: phaseRaftRebuilt,
+	}); err != nil {
+		return roster, err
+	}
+	// Round-5 B1: this node is NOT usable yet — the caller still has to de-cluster nats.conf to standalone,
+	// and until it does, a clustered conf at N=1 cannot form the JS meta quorum (broker exit 70). The old
+	// wording ("force-single complete") declared success one whole irreversible phase early, which is what a
+	// harness `grep -q` latched onto before SIGPIPE-killing the de-cluster. Say what is actually true.
+	opts.Logger.Warn("clusteroffline: raft/DB phases done; node is a single-voter cluster but NOT yet bootable — the NATS config must still be rewritten for standalone JetStream (the caller does this next; re-run force-single to forward-complete if interrupted)",
 		"self", opts.SelfID, "abandoned", len(roster))
 	return roster, nil
 }
@@ -162,7 +232,7 @@ func Resnapshot(opts ResnapshotOptions) error {
 		return errors.New("clusteroffline: Resnapshot requires SelfID and SelfRaftAddr")
 	}
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
-	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
 		return err
 	}
@@ -196,6 +266,19 @@ func Resnapshot(opts ResnapshotOptions) error {
 		}
 		return fmt.Errorf("clusteroffline: resnapshot is SINGLE-VOTER only but the roster has %d non-self node(s) %v "+
 			"— retire/remove them first (resnapshot rewrites the raft config to {self} and would drop peers)", len(roster), ids)
+	}
+	// The on-disk snapshot/tail can recover a different FSM than the current SQLite
+	// projection. Refuse before mutating if that exact recovery would revive a peer.
+	recoveredRoster, err := previewRecoveredRoster(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: preview recovered roster: %w", err)
+	}
+	if len(recoveredRoster) > 0 {
+		ids := make([]string, len(recoveredRoster))
+		for i, p := range recoveredRoster {
+			ids[i] = p.NodeID
+		}
+		return fmt.Errorf("clusteroffline: resnapshot is SINGLE-VOTER only but recovery would revive %d non-self node(s) %v from the Raft snapshot/log — run force-single with every peer confirmed dead before resnapshot", len(recoveredRoster), ids)
 	}
 
 	// AUDIT-WINDOW guard: the unconditional log truncation must not drop unpublished audit. v0.4.4 review
@@ -241,6 +324,100 @@ func readAuditPublishedIndex(dbPath string) (uint64, error) {
 	var v uint64
 	switch err := db.QueryRow(`SELECT CAST(value AS INTEGER) FROM cluster_meta WHERE key='audit_published_index'`).Scan(&v); err {
 	case nil:
+		return v, nil
+	case sql.ErrNoRows:
+		return 0, nil
+	default:
+		return 0, err
+	}
+}
+
+// previewRecoveredRoster runs the exact RecoverCluster path against copies of the
+// offline DB and Raft store. The current SQLite roster alone is not authoritative:
+// RecoverCluster restores the newest snapshot first and then replays its log tail,
+// either of which may revive peers that a later direct-SQL prune removed.
+func previewRecoveredRoster(dataDir, dbPath, selfID, selfRaftAddr string) ([]Peer, error) {
+	root, err := os.MkdirTemp(dataDir, ".recovery-preview-")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(root) }()
+
+	previewDB := filepath.Join(root, "tether.db")
+	if err := cluster.BackupDBFile(context.Background(), dbPath, previewDB); err != nil {
+		return nil, fmt.Errorf("copy DB: %w", err)
+	}
+	if err := cloneRegularTree(filepath.Join(dataDir, "raft"), filepath.Join(root, "raft")); err != nil {
+		return nil, fmt.Errorf("copy raft store: %w", err)
+	}
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := cluster.RecoverSingleNode(root, previewDB, selfID, selfRaftAddr, discard); err != nil {
+		return nil, err
+	}
+	return readRoster(previewDB, selfID)
+}
+
+func cloneRegularTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular raft path %q (%s)", path, info.Mode())
+		}
+		return copyFileSync(path, target)
+	})
+}
+
+func mergePeers(groups ...[]Peer) []Peer {
+	byID := make(map[string]Peer)
+	order := make([]string, 0)
+	for _, peers := range groups {
+		for _, p := range peers {
+			if _, ok := byID[p.NodeID]; !ok {
+				order = append(order, p.NodeID)
+			}
+			prev := byID[p.NodeID]
+			if p.RaftAddr == "" {
+				p.RaftAddr = prev.RaftAddr
+			}
+			if p.NatsRoute == "" {
+				p.NatsRoute = prev.NatsRoute
+			}
+			if p.TunnelAddr == "" {
+				p.TunnelAddr = prev.TunnelAddr
+			}
+			byID[p.NodeID] = p
+		}
+	}
+	out := make([]Peer, 0, len(order))
+	for _, id := range order {
+		out = append(out, byID[id])
+	}
+	return out
+}
+
+func readAppliedIndexPath(dbPath string) (uint64, error) {
+	db, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	var raw string
+	switch err := db.QueryRow(`SELECT value FROM cluster_meta WHERE key='applied_index'`).Scan(&raw); err {
+	case nil:
+		v, parseErr := strconv.ParseUint(raw, 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("corrupt applied_index %q: %w", raw, parseErr)
+		}
 		return v, nil
 	case sql.ErrNoRows:
 		return 0, nil
@@ -533,7 +710,7 @@ func Recover(opts RecoverOptions) (int, error) {
 		opts.Now = time.Now
 	}
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
-	release, err := acquireFlock(filepath.Join(opts.DataDir, lockFileName))
+	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
 		return 0, err
 	}
@@ -738,24 +915,6 @@ func wipe(dataDir, dbPath string) error {
 		}
 	}
 	return os.RemoveAll(filepath.Join(dataDir, "raft"))
-}
-
-// acquireFlock takes an exclusive, non-blocking advisory lock on path (created if
-// absent). Returns a release closure. The lock auto-releases on process exit (correct
-// for a kill-9'd holder). Bars two concurrent offline runs.
-func acquireFlock(path string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("clusteroffline: open lock %s: %w", path, err)
-	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("clusteroffline: another offline tool holds %s: %w", path, err)
-	}
-	return func() {
-		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		_ = f.Close()
-	}, nil
 }
 
 // RootAgainstNonRootDir reports the #6 hazard: an offline op running as euid==0 against a data dir

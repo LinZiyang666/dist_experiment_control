@@ -18,6 +18,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -189,11 +190,16 @@ func (b *Broker) wireClusterEarly() error {
 }
 
 func (b *Broker) loadStableTunnelCert() (*tls.Certificate, string, error) {
-	certPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelCert))
+	cert, fp, err := loadStableTunnelCertFrom(b.cfg.ClusterSecretsDir)
+	return cert, fp, err
+}
+
+func loadStableTunnelCertFrom(dir string) (*tls.Certificate, string, error) {
+	certPEM, err := os.ReadFile(filepath.Join(dir, secretTunnelCert))
 	if err != nil {
 		return nil, "", fmt.Errorf("broker: read stable tunnel cert: %w", err)
 	}
-	keyPEM, err := os.ReadFile(filepath.Join(b.cfg.ClusterSecretsDir, secretTunnelKey))
+	keyPEM, err := os.ReadFile(filepath.Join(dir, secretTunnelKey))
 	if err != nil {
 		return nil, "", fmt.Errorf("broker: read stable tunnel key: %w", err)
 	}
@@ -206,6 +212,24 @@ func (b *Broker) loadStableTunnelCert() (*tls.Certificate, string, error) {
 		return nil, "", fmt.Errorf("broker: parse stable tunnel cert leaf: %w", err)
 	}
 	return cert, tunnel.CertFingerprint(leaf), nil
+}
+
+func loadOptionalStableTunnelCert(dir string) (*tls.Certificate, bool, error) {
+	certPath := filepath.Join(dir, secretTunnelCert)
+	keyPath := filepath.Join(dir, secretTunnelKey)
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+	if errors.Is(certErr, os.ErrNotExist) && errors.Is(keyErr, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if certErr != nil || keyErr != nil {
+		return nil, false, fmt.Errorf("broker: stable tunnel certificate pair is incomplete: cert=%v key=%v", certErr, keyErr)
+	}
+	cert, _, err := loadStableTunnelCertFrom(dir)
+	if err != nil {
+		return nil, false, err
+	}
+	return cert, true, nil
 }
 
 func (b *Broker) prepareTunnelCertRotate(newFP string) (func(), error) {

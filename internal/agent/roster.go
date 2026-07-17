@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/clusterroster"
@@ -20,16 +22,14 @@ const (
 	// defaultRosterRefreshInterval is the cadence of the online roster refresh (full-jittered).
 	// 3min keeps the post-add convergence comfortably under the 5min acceptance budget.
 	defaultRosterRefreshInterval = 3 * time.Minute
+	// defaultRosterRefreshFailBackoff is the SHORT retry after a failed/empty refresh tick
+	// (for example, a leader failover), keeping one transient failure within the 5min SLA.
+	defaultRosterRefreshFailBackoff = 20 * time.Second
 	// redialAfter is how long nats.go may stay disconnected (retrying its now-dead boot pool) before
 	// the watchdog rebuilds the session on the freshest roster. > a normal reconnect, < a human's
 	// patience; the rebuild is a no-op churn-free path for a healthy agent (it only fires when stuck).
 	redialAfter = 20 * time.Second
 )
-
-// rosterRefreshFailBackoff is the SHORT retry after a failed/empty refresh tick (e.g. a leader
-// failover) so success-after-one-failure still lands < 5min (not a full interval later). A var (not
-// const) so tests can lower it.
-var rosterRefreshFailBackoff = 20 * time.Second
 
 // agentNow is the agent clock seam (cfg.Now or time.Now).
 func (a *Agent) agentNow() time.Time {
@@ -180,9 +180,9 @@ func AdoptDecision(prev RosterState, r *proto.ClusterRoster, s *proto.SeedBundle
 // adoptManifest is the daemon's single adopt path: decide via AdoptDecision, then apply to the
 // in-memory mirror (monotone re-decide under the lock for concurrent adopts) + persist. nil roster
 // (single broker) AND nil seeds → no-op (byte-equivalent register reply).
-func (a *Agent) adoptManifest(r *proto.ClusterRoster, s *proto.SeedBundle) {
+func (a *Agent) adoptManifest(r *proto.ClusterRoster, s *proto.SeedBundle) bool {
 	if r == nil && s == nil {
-		return
+		return false
 	}
 	a.rosterMu.Lock()
 	prev := RosterState{
@@ -196,11 +196,12 @@ func (a *Agent) adoptManifest(r *proto.ClusterRoster, s *proto.SeedBundle) {
 		if r != nil || s != nil {
 			a.cfg.Logger.Warn("agent: roster/seed rejected (sig / account / schema / expiry / generation)")
 		}
-		return
+		return false
 	}
 
 	a.rosterMu.Lock()
 	pinned := false
+	applied := false
 	if next.Pin != "" && a.pinAccount == "" { // first-writer-wins TOFU under the final lock
 		a.pinAccount = next.Pin
 		pinned = true
@@ -209,22 +210,25 @@ func (a *Agent) adoptManifest(r *proto.ClusterRoster, s *proto.SeedBundle) {
 		a.rosterGen = next.RosterGen
 		a.rosterURLs = next.DialURLs
 		a.cachedRoster = next.Roster
+		applied = true
 	}
 	if s != nil && next.SeedGen >= a.seedGen {
 		a.seedGen = next.SeedGen
 		a.seedURLs = next.SeedURLs
 		a.cachedSeeds = next.Seeds
+		applied = true
 	}
 	a.rosterMu.Unlock()
 	if pinned {
 		a.cfg.Logger.Info("agent: roster account pinned (TOFU)", "account_pub", next.Pin)
 	}
 	a.persistRosterCache()
+	return applied
 }
 
 // adoptRoster is the C1 roster-only entry point (boot/reconnect register + refresh). It funnels to the
 // single authority with no seed bundle — byte-behavior-identical to C1 for the roster path.
-func (a *Agent) adoptRoster(r *proto.ClusterRoster) { a.adoptManifest(r, nil) }
+func (a *Agent) adoptRoster(r *proto.ClusterRoster) bool { return a.adoptManifest(r, nil) }
 
 // manifestFetchTimeout bounds the cold-start bootstrap manifest fetch.
 const manifestFetchTimeout = 20 * time.Second
@@ -319,6 +323,13 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		case <-a.rosterRefreshNow:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 		// Single-flight: a reconnect/rebuild's own register already refreshes the roster.
 		if a.reconnectInFlight.Load() || a.rebuilding.Load() {
@@ -327,7 +338,7 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 		}
 		next := iv
 		if !a.refreshRosterOnce(ctx, nc) {
-			next = rosterRefreshFailBackoff
+			next = a.rosterRefreshFailBackoff
 		}
 		timer.Reset(jitterDur(next))
 	}
@@ -357,9 +368,89 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
 		return false
 	}
 	if resp.Roster != nil {
-		a.adoptRoster(resp.Roster)
+		a.rosterMu.Lock()
+		previous := a.cachedRoster
+		a.rosterMu.Unlock()
+		accepted := a.adoptRoster(resp.Roster)
+		// Updating only the NEXT dial pool is insufficient when this connection is still healthy
+		// at the NATS layer but its broker has entered DRAINING/RETIRING. That leaves the agent on
+		// a stale route island after the broker is removed. Trigger a single session rebuild only
+		// after the signed roster was actually accepted (verified, non-rollback and persisted).
+		if accepted && rosterRequiresReconnect(previous, resp.Roster, nc.ConnectedUrl()) {
+			a.requestRosterReconnect(nc)
+		}
 	}
 	return true // a single/non-cluster broker (nil roster) is a successful no-op, not a retry
+}
+
+// rosterRequiresReconnect is the narrow proactive-move policy: a healthy connection is rebuilt only
+// when another dialable VOTER exists and the signed roster either marks the current broker as leaving,
+// or removes a broker that the previously accepted roster identified as current. The previous-roster
+// fence prevents an unrelated DNS/route alias from looking like a removal on every refresh.
+func rosterRequiresReconnect(previous, current *proto.ClusterRoster, connectedURL string) bool {
+	cu, err := url.Parse(connectedURL)
+	if err != nil || cu.Hostname() == "" || current == nil {
+		return false
+	}
+	connectedHost := cu.Hostname()
+	knownBefore := rosterContainsHost(previous, connectedHost)
+	currentPresent := false
+	currentLeaving := false
+	otherVoter := false
+	for _, b := range current.Brokers {
+		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
+			continue
+		}
+		isCurrent := rosterBrokerMatchesHost(b, connectedHost)
+		if isCurrent {
+			currentPresent = true
+			switch b.Phase {
+			case proto.RosterPhaseDraining, proto.RosterPhaseRetiring, proto.RosterPhaseAddFailed:
+				currentLeaving = true
+			}
+			continue
+		}
+		if b.Phase == proto.RosterPhaseVoter {
+			otherVoter = true
+		}
+	}
+	return otherVoter && (currentLeaving || (knownBefore && !currentPresent))
+}
+
+func rosterContainsHost(r *proto.ClusterRoster, host string) bool {
+	if r == nil {
+		return false
+	}
+	for _, b := range r.Brokers {
+		if rosterBrokerMatchesHost(b, host) {
+			return true
+		}
+	}
+	return false
+}
+
+func rosterBrokerMatchesHost(b proto.RosterBroker, host string) bool {
+	if strings.EqualFold(host, b.PublicHost) {
+		return true
+	}
+	ru, err := url.Parse(b.NatsRoute)
+	return err == nil && ru.Hostname() != "" && strings.EqualFold(host, ru.Hostname())
+}
+
+func (a *Agent) requestRosterReconnect(nc *nats.Conn) {
+	if !a.rebuilding.CompareAndSwap(false, true) {
+		return
+	}
+	a.rebuildRequested.Store(true)
+	a.cfg.Logger.Warn("agent: current broker is leaving the signed roster; rebuilding NATS session on a voter",
+		"connected_url", nc.ConnectedUrl())
+	nc.Close()
+	a.sessCancelMu.Lock()
+	cancel := a.sessCancel
+	a.sessCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // --- C1 §D-1 L3: stuck-reconnect session-rebuild watchdog ---

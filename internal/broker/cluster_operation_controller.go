@@ -589,12 +589,30 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		if nv, err := a.node.NumVoters(); err == nil && nv > 1 {
 			_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClearForceSingle() })
 		}
-		// G4 §B (P7): converge discovery seeds on the ASYNC join path. The deprecated sync AddNode converged
-		// seeds inline and a leadership edge is a backstop, but a normal driveJoin promotion never did — so a
-		// grown broker would not appear in published seeds until the next leadership change. Best-effort +
-		// logged: seeds are advisory, so a transient failure must not block the terminal SERVING transition.
+		// G4 §B (P7): converge discovery seeds on the ASYNC join path before terminal SERVING. This is
+		// retryable state-machine work, not best-effort decoration: once the op is terminal the controller
+		// never revisits it, so swallowing a transient proposal failure leaves the endpoint stale forever.
+		// Round-5 S5-15: escalate like every other BLOCKING step in this file. recordOpError only rewrites
+		// last_error — it never changes state — so a persistent failure here pins the op at NATS_ROLLED_OUT
+		// forever (never SERVING, never BLOCKED), which is verbatim gotcha #45 and fences the whole
+		// membership plane via assertNoActiveOp. blockAfterAttempts caps at opMaxAttempts and routes to
+		// OpStateBlocked, the state `cluster ops confirm/abort` can actually act on.
 		if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
-			a.logger.Warn("cluster add: seed auto-converge failed (new voter not yet in published seeds)", "op_id", op.OpID, "err", serr)
+			a.blockAfterAttempts(op, "converge client seeds after join", serr)
+			return
+		}
+		// A cluster-add lock is safety-critical while the join is in flight, but leaving its release
+		// solely to the remote orchestrator creates a permanent serialized-fence when the final NATS
+		// reply is lost. Clear the joiner-bound marker through Raft BEFORE making the operation terminal;
+		// a crash between these steps is resumed, while a different joiner's marker is protected by
+		// PlanClearGrowActive's value predicate. Raw join approve never sets the marker, so this is an
+		// idempotent no-op for that path.
+		if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClearGrowActive(op.TargetNode)
+		}); err != nil {
+			// Round-5 S5-15: a blocking terminal gate must escalate to BLOCKED, not retry forever.
+			a.blockAfterAttempts(op, "release cluster-add grow lock", err)
+			return
 		}
 		a.clearOpAttempts(op.OpID)
 		_ = a.transition(op, cluster.OpStateServing, true, "", nil)
@@ -775,6 +793,17 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		_ = a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 			return cluster.PlanClusterDrainSet(op.TargetNode, nil)
 		})
+		// The roster row is gone and mesh convergence is proven. Make seed withdrawal part of the
+		// terminal contract; a best-effort call after/before RETIRED can fail once and is never retried,
+		// which leaves signed client discovery advertising the retired host indefinitely (#91 A3).
+		// Round-5 S5-15: escalate — an un-escalating retry here pins the retire at NATS_ROLLED_OUT forever
+		// (#45), and a wedged retire has no clean escape (the node is already RemoveServer'd and its roster
+		// row deleted, so `cluster ops abort` would mark ABORTED a retire that physically completed).
+		if err := a.deriveAndConvergeSeedsFromRoster(); err != nil {
+			a.blockAfterAttempts(op, "converge client seeds after retire", err)
+			return
+		}
+		a.clearOpAttempts(op.OpID)
 		_ = a.transition(op, cluster.OpStateRetired, true, "", nil)
 	}
 }

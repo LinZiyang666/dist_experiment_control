@@ -405,3 +405,104 @@ G-A 8 drill 名义 GREEN 后经 **Stage-C 对抗内审**（6 固定 lane reviewe
 - **R5-M7（docs）**：#29/#33 gotcha 段 + README + 本 inventory 全对齐可执行事实；撤回 240s-倒置门/固定-lag/2×-strict-GREEN/tunnel-coupled-by-design 措辞；owner 决定写入 `s3-s5-owner-decisions.md`。
 
 **判定反转**：外审比内审更狠地暴露了「非确定拓扑上的 vacuous 继续执行 + secret 日志泄露 + 假合取 + 无 owner 授权记录 + 措辞与源码/可执行事实冲突」，全部真跑修复——**这正是 mandate「暴露问题、绝不擦屁股」的落实**。逐条处置见 `s3-s5-external-review-round5.md`（本文件内的回复段）。
+
+### G-B 开发者原始 landing 快照（S6+S8，2026-07-15；已被 round-4 严格重审取代）
+
+> **非现行验收口径。** 下列“PRODUCT-RED/INCOMPLETE 非阻断、九项预期非 GREEN”的文字保留为被审查
+> 快照；round-4 已证明该策略未经 owner 授权且会放行真实缺陷。现行口径见本节末尾的“round-4 严格
+> remediation”：所有非 GREEN 默认阻断，只能显式 waiver，waiver 也不得称为 GREEN。
+
+**重大契约变更（外审 round-1/2/3 驱动）——五态 verdict 契约落地，废止「已知缺陷=harness-GREEN 连绿」。**
+G-B 是第一批在 `lib/assert.sh` **五态 verdict 契约**下写的 drill：drill 落**唯一 landing verdict**（GREEN /
+PRODUCT-RED〔signature-guarded 复现已登记缺陷——harness 按预期工作、**非绿、预期**〕/ INCOMPLETE〔`not_covered`
+覆盖缺口〕/ SETUP-RED / ASSERT-FAIL），`drill_end` 发结构化 `DRILL-VERDICT` 行，`run-drills.sh` 按 verdict
+分类 + rc 交叉校验（legacy `drill_end;exit N` → VERDICT-RC-MISMATCH blocker）。缺/空签名/缺参 fail-CLOSED。
+SSOT = `lib/assert.sh` 头注真值表 + `tests/verdict-contract-test.sh`（三壳 34 断言）+ `tests/lint-drills.sh`
+（9 drill 硬闸 0 违规、legacy 出 advisory）。**mandate 校准（用户 2026-07-15「目标是暴露问题、不是全绿」）：
+PRODUCT-RED/INCOMPLETE 是暴露-缺陷 harness 的预期产物、owner-tracked、绝不伪装成 GREEN。**
+
+**drill 在契约下的诚实预期落地（per-row disposition；非"全 GREEN"）**：
+- **`22-forcesingle-online`** → **INCOMPLETE**（或 PRODUCT-RED if #35）：ONLINE force-single dwell/refusal gates
+  + protected-mode + 全函数 Arm-0。**#35 降级 CANDIDATE**（round-3 M5）——仅 PROVEN survivor-restart（MainPID 变）
+  + dwell-never-satisfied 才 `assert_bug #35`→PRODUCT-RED，否则 `not_covered`。GATE-d/TAMED = `not_covered`。
+- **`40-drain-retire`** → **INCOMPLETE**（或 PRODUCT-RED if #31/#45）：drain 往返 + ops schema + reconcile-plan
+  refusal/zero-write + safety negatives。retire 脊 #31-intermittent（`product_red` 阻塞 / `assert_bug #45` stall /
+  converged GREEN）。OPS-ABORT/ADD-dryrun = `not_covered`。
+- **`41-shrink-to-standalone`** → **GREEN if shrink converges, else PRODUCT-RED**（#31/#45）：peer-present refuse +
+  rebind + before/after voter count + raft-replicated session 存活 oracle + JS-reset-broker-active + 3-way to-standalone。
+- **`42-rejoin-returning`** → **INCOMPLETE**：diagnose 正负 + rejoin-prepare O_EXCL + resnapshot single-voter +
+  Tier-2/machine-confirm。Arm-A journal-catch + DOC-2 + E/F/I = `not_covered`。
+- **`43-migrate-live-data`** → **INCOMPLETE**：init `--check` zero-write + `--yes`/machine-confirm 负例 + from-existing
+  cutover + **3-way rollback**（DB byte==bak + cluster-off + bootable standalone）。business-survival + E cluster-化
+  candidate = `not_covered`（bare P2 不 serve NATS，SB-43）。
+- **`90-alerts-lifecycle`** → **INCOMPLETE**：manual raise/ack/clear + 真 broker_down + quorum_lost-ack refuse；absence
+  谓词 fail-CLOSED（valid-JSON 门）。M6 disk（#39 5-min 固定）+ below_quorum/raft_lag = `not_covered`。
+- **`91-client-converge`** → **INCOMPLETE**（或 PRODUCT-RED if #46）：A1 publish + A2 grow-auto-include + C 幸存者-only。
+  **#46**（此前 #G3）= `product_red`（brk3 达 VOTER 却不进 seeds）。D cli-failover + A3 = `not_covered`。
+- **`92-js503-remote-alert`** → **INCOMPLETE**（或 PRODUCT-RED if #42）：quorum-loss READ-ONLY 自纠（`#42` `product_red`
+  if 不自纠）+ `session rm --ack-alerts` 证到达写路径（非 gate、非 connect/auth）+ 12 MiB tier-B 佐证。leg-b banner +
+  recovery = `not_covered`。
+- **`93-metrics-observability`** → **INCOMPLETE**：/metrics 真值 + /healthz&/readyz（HTTP status+body，`ready` 排除
+  `not ready`）+ webhook（raised+cleared，no-secret）+ --card/JSON。LOGJSON + --watch（需容器 PTY）+ all-down + READYZ-503
+  = `not_covered`。
+
+**台账新增/变更**（`docs/deploy-tier-gotchas.md`，与 plan §4 表零漂移）：**#45**（40/41 retire NATS_ROLLED_OUT
+收敛停滞，独立号——此前误标 "#37-family"，round-2/3 M6）· **#46**（91 seeds 漏第 3 voter，此前 #G3）· **#35 降级
+CANDIDATE**（round-3 M5，未在 sim 确定复现）· **#42** RATIFIED（有界 ~TFence 窗口，#43/#44 折入）· **#39/#36** 沿用。
+
+**§2 命令勾（臂级，G-B 消费）**：`cluster drain/retire/ops`（40）· `reconcile nats --to-standalone/--plan`（40/41）·
+`cluster recovery force-single --online / diagnose / rejoin prepare / resnapshot`（22/42）· `cluster init --from-existing`
+（43）· `alert raise/ack/clear/ls`（90）· `cluster seeds publish/show`（91）· `cluster status --remote/--card/--watch/--homes`
+（92/93）· `/metrics` `/healthz` `/readyz` + alert webhook（93）。逐命令勾入 §2 对应行、无 NULL-diff 遗漏。
+
+**收尾**：地基（`lib/assert.sh` 契约 + `run-drills.sh` 解析）+ 9 drill 迁移 + SSOT 收敛 + hermetic tests 本窗口
+一次落地；远端 fail-closed 复跑受影响 drill 后 → **停外审门**（不 commit、外审进行中不 git add）。逐条外审回复见
+`s6-s8-external-review.md` / `-round2.md` / `-round3.md` 尾部主进程回复段。
+
+### Round-4 严格单跑结果与修复状态（2026-07-16）
+
+无重试、`-j1` 的九项实跑不是全绿：22/43/92 GREEN；40/90/93 SETUP-RED；41/42/91 ASSERT-FAIL。
+其中 90 的 JS mountpoint、93 的非法 alert kind 是 fixture 缺陷；42 同时含一个假 audit oracle 和一个真实
+resnapshot/Raft 恢复缺陷。严格分诊还确认了 40 的 grow auth/catch-up fence、41 的连续 retire agent 孤岛、
+91 的 terminal-retire seeds 不收敛。修复保留原产品 oracle：不重启 agent、不删 cache、不停 retired broker、
+不手动 publish seeds、不重试 drill。独立回归覆盖 auth 重连边界、async join/retire seed terminal 契约、signed
+roster event refresh、Raft-tail peer 复活与恢复后真实权威写。
+
+**当前 release 判定仍为 Fail**：本地 contract/lint/目标单测通过不等于 deploy-tier GREEN；平台远端额度在
+2026-07-16 阻止 post-fix 重跑，因此 #47/#48/#49 与 40/41/42/90/91/93 的真栈翻转尚未得到证据。不得把
+“已实现修复”改写成“已关闭 finding”。详见 `s6-s8-external-review-round4-implementation.md`。
+
+### G-B landing（S6+S8，2026-07-17，外审 8 轮 Pass）
+
+**上一段「当前 release 判定仍为 Fail」已被后续事实推翻，此处为最终状态**（该段保留作 round-4 时点记录）：
+round-4 时缺的 deploy-tier 证据已补齐 —— 最终二进制（含全部产品修复）真栈复跑
+**`20-forcesingle-natsconf` GREEN(14) · `91-client-converge` GREEN(37)，0 FAIL**（vendor sha == 镜像 sha，
+经 `simcluster:528-531` 的 fail-closed 陈旧守卫校验）。外审 **round-8 = Pass**。
+
+**drill（9）**：`22`/`40`/`41`/`42`/`43` · `90`/`91`/`92`/`93`，全部在 `lib/assert.sh` 的**五态 verdict 契约**
+下运行（GREEN / PRODUCT-RED / INCOMPLETE / SETUP-RED / ASSERT-FAIL；`DRILL-VERDICT` 结构化行 + runner 严格
+grammar 校验 + rc 交叉校验 + **默认 fail-closed，waiver 须显式**）。契约 SSOT = `lib/assert.sh` 头注真值表；
+钉子 = `tests/verdict-contract-test.sh`（三壳）+ `tests/lint-drills.sh`（批次硬闸 0 违规）。
+
+**本批最大的教训（记入台账，供后续批次引用）**：
+1. **harness 的 oracle 可以制造假的产品故障**。drill 91 长期 ASSERT-FAIL 被判为「真实产品缺陷：seeds 不
+   收敛」——实为 drill 自己把 `force-single` 管进 `grep -q`，`grep -q` 命中 `ForceSingle` **内部日志**即退出、
+   SIGPIPE 腰斩 CLI，使其后的 nats.conf 去集群化**从未执行** → survivor exit-70 crash-loop → `seeds show`
+   连不上。三次受控实验（带/不带管道）定死因果；去掉管道后 91 GREEN(37)。**禁令已入 lint**
+   （`sigpipe-truncation`：mutating tether 命令不得管进 `grep -q`）。对照旁证：drill 20 同样管道却长期绿 ——
+   因其签名是 CLI **终末行**，彼时工作已完成。
+2. **计划外的产品手术风险极高**。S 批原定「零产品 Go diff」，外审者在 round-4 特殊 stage 修了真实 raft
+   恢复缺陷；随后的 5 轮外审在这批产品代码上连续发现：darwin 构建断裂（发布线整体产不出物）· root-run
+   recovery 把 raft/ 与锁变 root-owned → 唯一幸存 broker 永久拒启 · 目录交换绕过 bolt 锁互锁 · force-single
+   非原子无中断标记 · **锁的 chown 跟随符号链接 = 本地提权**。
+3. **修复必须接到调用点，且必须扫同类面**。多次出现「改了函数没接线」（属主修复只在
+   `AcquireDataDirLock`，五个 offline 入口仍用私有 `acquireFlock`）与「只补被点名那一处」（journal 的符号
+   链接洞刚修，同轮又在锁上原样重造）。现以**结构性守卫**钉死（`TestRound6_NoPrivateFlockHelperSurvives`
+   禁止私有 flock helper 复活）+ **调用点绑定回归**（删任一修复即精确变红，逐条 mutation 验证）。
+
+**台账新增/变更**：#45（retire NATS_ROLLED_OUT 收敛停滞，独立号）· #46（91 seeds 漏第 3 voter）·
+**#35 降级 CANDIDATE**（未在 sim 确定复现）· #42 RATIFIED（有界 TFence 窗口，#43/#44 折入）。
+
+**已知未闭合（不冒充闭合，留给后续批次）**：`InterruptedForceSingle` 无生产调用者（B1 可诊断性半成）·
+`blockAfterAttempts` 需 step-aware + `AbortOp`/`ConfirmOp` 守卫 · 原子交换预检的 EBUSY/ENOSPC 残留
+（**rename 已崩溃一致、事务尚未**）· prune→exchange 窗口需 phase-aware 跳过。

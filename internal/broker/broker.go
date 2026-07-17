@@ -29,6 +29,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
@@ -226,6 +227,11 @@ type Config struct {
 	// ClusterSecretsDir is the §15 secrets directory (cluster-ca, route leaf,
 	// tunnel-cert, broker.nk, node-ident, account.nk). Required in cluster mode.
 	ClusterSecretsDir string
+	// StableTunnelCertDir optionally supplies tunnel-cert.pem/tunnel-key.pem in SINGLE mode. When
+	// auth_callout provisioning already includes that pair, using it prevents every restart (and a
+	// cluster migration rollback) from replacing the ephemeral tunnel identity agents have pinned.
+	// Both absent preserves legacy ephemeral behavior; a partial pair is a fatal misconfiguration.
+	StableTunnelCertDir string
 
 	// NatsServerBin / NatsConfPath (C3) locate this host's nats-server binary + the live nats.conf the
 	// topology reconciler renders/swaps/reloads. Empty NatsServerBin ⇒ "nats-server" (PATH). Empty
@@ -629,6 +635,38 @@ func New(cfg Config) (*Broker, error) {
 // subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
 func (b *Broker) Run(ctx context.Context) error {
 	b.runCtx = ctx
+	// Round-5 B3: hold ${ClusterDataDir}/tether.lock for the WHOLE process lifetime. The offline recovery
+	// tools already take this exact lock, but until now nothing else did — so their only protection against
+	// a daemon reviving mid-surgery was a one-shot bolt probe taken minutes earlier, and a daemon that came
+	// back inside that window could acknowledge writes into a store the rebuild was about to delete. Taking
+	// it here makes the interlock continuous and bidirectional: a daemon refuses to start while a recovery
+	// is in flight, and a recovery refuses to start while a daemon is up. The flock dies with the process,
+	// so a crashed daemon never wedges recovery.
+	if b.cfg.ClusterDataDir != "" {
+		release, err := cluster.AcquireDataDirLock(b.cfg.ClusterDataDir)
+		if err != nil {
+			// Round-6: do NOT print "stop the previous broker" for a PERMISSION problem. A root-run recovery
+			// leaves a root-owned tether.lock, and this daemon runs as tether: the operator's broker is
+			// already stopped and the real fix is chown, not stopping anything. AcquireDataDirLock
+			// distinguishes the two; carry that distinction to the operator verbatim.
+			if errors.Is(err, cluster.ErrDataDirLockUnusable) {
+				return fmt.Errorf("broker: refusing to start — %w", err)
+			}
+			return fmt.Errorf("broker: refusing to start — %w\n"+
+				"  If an offline recovery (force-single / resnapshot / rejoin) is in progress, let it finish;\n"+
+				"  if a previous broker is still running, stop it first (systemctl stop tether-broker)", err)
+		}
+		defer release()
+	}
+	if !b.clusterMode && b.cfg.StableTunnelCertDir != "" {
+		cert, present, err := loadOptionalStableTunnelCert(b.cfg.StableTunnelCertDir)
+		if err != nil {
+			return err
+		}
+		if present {
+			b.tunnelCert = cert
+		}
+	}
 
 	// D9 cutover: in cluster mode cluster.Node owns the sole WAL DB. Construct it FIRST
 	// (it opens the merged WAL + raft), re-point reads at its read-only handle, and

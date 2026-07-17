@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
@@ -28,6 +29,12 @@ const (
 	growTriggerTimeout  = 10 * time.Second
 	growConvergeTimeout = 3 * time.Minute
 	growConvergePoll    = 3 * time.Second
+	// The former-N1 cutover restarts/reloads NATS and its auth_callout responder. A valid, already
+	// activated grow identity can pass one probe and hit a short Authorization Violation window on
+	// the very next connect. The grow is explicitly resumable, so retry this ambiguous transport edge
+	// inside the product rather than exiting and stranding the membership op/grow lock.
+	growConnectAuthRetryWindow = 30 * time.Second
+	growConnectAuthRetryPause  = time.Second
 )
 
 func newClusterAddCmd(socketPath *string) *cobra.Command {
@@ -81,7 +88,9 @@ func newClusterAddCmd(socketPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			nc, err := connectCtl(cmd, "cluster add", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			nc, err := retryClusterAddConnect(cmd.Context(), growConnectAuthRetryWindow, growConnectAuthRetryPause, func() (*nats.Conn, error) {
+				return connectCtl(cmd, "cluster add", home, natsURL, id, nats.Name(cli.CtlNameForSession(sid)))
+			})
 			if err != nil {
 				return err
 			}
@@ -128,6 +137,33 @@ func newClusterAddCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	registerYesRejector(cmd)
 	return cmd
+}
+
+// retryClusterAddConnect retries only the ambiguous auth-callout-unavailable signature produced
+// during the grow cutover. A wrong URL/TLS/network error is returned immediately; a persistently bad
+// session/PIN still returns the original permission error after the bounded window. The caller's
+// context cancels the wait. Kept as a small injected-attempt helper so its exact retry boundary is
+// independently testable without weakening the deploy-tier harness.
+func retryClusterAddConnect(ctx context.Context, window, pause time.Duration, attempt func() (*nats.Conn, error)) (*nats.Conn, error) {
+	deadline := time.Now().Add(window)
+	for {
+		nc, err := attempt()
+		if err == nil {
+			return nc, nil
+		}
+		if !strings.Contains(err.Error(), "Authorization Violation") || window <= 0 || !time.Now().Before(deadline) {
+			return nil, err
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // joinerParams bundles the joiner-local provisioning identity the orchestrator threads into the local

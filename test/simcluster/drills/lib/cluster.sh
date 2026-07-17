@@ -9,7 +9,7 @@
 #
 # retry (3rd arg, default 1) — external-review R5-M5 (attempt-accounting honesty):
 #   - retry=1 (71/73/74, which only NEED a clean N=3 as SETUP; drill 30 OWNS + pins #31 separately): the N=3 grow
-#     intermittently strands a joiner short of VOTER (~15% observed — the #31-family grow flake). Supply a clean
+#     intermittently strands a reachable learner in CATCHING_UP short of VOTER (#47). Supply a clean
 #     N=3 by NUKING + retrying the WHOLE grow ONCE. The attempt count + per-attempt grow rc are emitted as
 #     FIRST-CLASS EVIDENCE (a `GROW-ATTEMPTS: N` trailer + a per-attempt log line + a warn on each retry), so a
 #     run's "strict / single-attempt" claim is LOG-VERIFIABLE — never a silent laundering of product evidence.
@@ -36,7 +36,7 @@ grow_to_3() {
             return 0
         fi
         if [ "$_g3_try" -lt "$_g3_max" ]; then
-            warn "grow_to_3: N=3 not reached on attempt $_g3_try (intermittent #31-family grow flake — a SETUP issue; drill 30 pins #31) — NUKING + retrying the whole grow ONCE (retry=1 consumer; the attempt count is logged as first-class evidence, not laundered)"
+            warn "grow_to_3: N=3 not reached on attempt $_g3_try (intermittent #47 catch-up failure or another real grow defect) — NUKING + retrying the whole grow ONCE only for legacy retry=1 consumers; strict review drills pass retry=0"
             "$SIM" nuke >/dev/null 2>&1 || true
         fi
         _g3_try=$((_g3_try+1))

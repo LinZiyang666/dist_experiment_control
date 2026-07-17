@@ -259,6 +259,94 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   exit 的 SS 数据面在 home 变更后可靠闭合（同 #33）；让 auto-rebalance-on-return 在 return edge 可靠触发。**flip**：
   三者稳定后 74 的对应硬断言转正向 GREEN 回归。
 
+### #35 — [CANDIDATE，未在 sim 复现] online force-single 的 dwell 在 quorum-loss 期 survivor RESTART 时结构性不可达（"preferred path"仅 OFFLINE 逃生；根因 = #23 restart-bounce 族）
+
+- **状态（外审 round-3 M5 降级）**：**CANDIDATE，机理 source-cited 但尚未在 sim 确定复现**。此前把 #35 当已复现 gotcha 是过度声称——peer-kill fixture 达 22 POSITIVE（survivor 不 restart），#35 的真触发（survivor RESTART）在 22 的专属臂里**只有当一次 PROVEN 的 MainPID 变更（≠ 仅 NRestarts）叠加 dwell-never-satisfied 才判 PRODUCT-RED**；否则该 run 记 INCOMPLETE（`not_covered`），#35 保持 CANDIDATE。
+- **现象/机理**：`cluster recovery force-single --online`（`cluster_offline.go:220` 自述"the preferred path"）需连续 `forceSingleDwell=15s`（`force_single_online.go:27`）的 quorum-loss。但 quorum-loss 期若 survivor 因任何原因 `systemctl restart tether-broker`（boot 撞 `b.js==nil` EJECTED trap `broker.go:948-958` → 非零 exit `serve.go:240` → `Restart=always`/`RestartSec=2` on **tether-broker.service** `install.sh:754-755`），每 ~2s 生命 < 15s dwell，且 `newForceSingleArm()` 每 boot 归零 `leaderlessSince`（`force_single_online.go:41,46`）→ dwell 永不满足 → online force-single **结构性不可达**，只剩 OFFLINE。
+- **钉（22 专属臂，round-3 M5 硬化）**：`node_kill brk2` 后 survivor `systemctl restart tether-broker`；capture MainPID before/after——**若 MainPID 未变（restart 未生效）→ fixture 无效 → `not_covered`**（非 #35 结论）；MainPID 已变（restart 已证）且 DRY-never-WouldProceed → `assert_bug #35`（PRODUCT-RED）；MainPID 已变但 dwell 仍满足 → `not_covered`（#35 未复现，保持 CANDIDATE）。签名不再含 `socket`。**peer-kill fixture 不触发 survivor restart** → 正路径**可达**（22 POSITIVE 分支）。
+- **flip**：durable dwell（跨 restart 保 `leaderlessSince`）OR quorum-loss 上 dead-peer raft-config prune。#35 是 #23 的 manifestation-pin（plan §11-U1）。复现后翻普通 PRODUCT-RED 回归；产品修复后 `assert_bug` 见 exit0 → APPEARS-FIXED → 提 `assert_ok`。
+
+### #36 — online force-single 的 `--yes` 不走 Tier-2 rejector（与 offline 分歧；TTY 保护完好）
+
+- **现象/机理**：`runForceSingleOnline` 在 `cluster_offline.go:155-158` 早返、绕过 `:165` 的 Tier-2 `--yes` rejector → `--online --yes` 非-TTY 因 online-gate（leader contact / TTY-required）拒、**非** offline 的 `NO --yes override` 串。TTY 保护仍在（真 commit 需 typed confirm）。
+- **钉**：`22` YES-online 臂（杀前 healthy 态，签名 = online-gate 串 ≠ offline `NO --yes override`）。DOC vs gotcha，低 sev。
+- **flip**：online `--yes` 路由经 Tier-2 rejector。
+
+### #42 — quorum-loss 后 ~TFence(10s) 内 `cluster status --remote` 误报 transient + `session rm` 栽 raw store_error（有界窗口观测缺口）
+
+- **现象/机理**（Stage-C M1 订正——**非永久，是有界 ~10s 窗口**）：N=2 杀 1 voter 后 survivor 降 leadership，`LeaderContactStale` 在 `TFence=10s`（`internal/cluster/read.go:18`）+ leader-lease 后才翻 true。**窗口内**（~0-11s）：① `--remote` VERDICT = "electing a leader (transient) — re-run shortly"（误导：不可恢复却报"稍后重试"）；② `session rm` 默认（无 store-backed alert 时）栽 raw `SQLite error (store_error)`，因 `EvalDestructiveGate.QuorumLost` 走同一 TFence LIVE-probe 谓词（`alerts.go:144-163` / `d8_alerts.go:71-98`）、窗口内尚未判 quorum-lost → 不给优雅 `--ack-alerts` advisory。**TFence 后二者都自我纠正**（`--remote`→READ-ONLY/exit2 `cluster_status_nats.go:116-136`；session rm→优雅 advisory）。所以这是**短暂误导窗口**，非永久缺口。**订正**：plan §12 "推翻 §11-U3" 为**假**——§11-U3 的 exit-2 READ-ONLY 正确，只是 TFence-delayed。
+- **钉**：`92` leg-a——**fence-aware 对照**：探 on-broker socket（~1s 后翻 quorum-lost）vs `--remote`（窗口内仍 transient）→ 断二者在窗口内**不一致**（socket 已判 quorum-lost、--remote 仍 transient）；或 TFence 后断 `--remote` 自我纠正为 READ-ONLY(exit2)=GREEN。**（原 #42/#44 "永久"断法是误分类 RED、已废。）**
+- **flip**：`--remote`/destructive-gate 在窗口内即给 quorum-lost verdict（缩短或消除 TFence 误导）。#43/#44 折入本条与 #41（`--remote` remedy 与 banner 同受 `JetStreamUnavailable` gate `cluster_status_nats.go:161-168`，非独立缺陷）。
+
+### #39 — `disk_pressure` monitor interval 固定 5-min、无 operator knob（90-M6 确认）
+
+- **现象/机理**：`disk.go:23` 硬编码 5-min monitor interval，`serve.go:175-201` 从不 wire 任何 `disk_check_interval`/阈值旋钮 → disk_pressure 自动检测最慢滞后 5-min，operator 不可调。90-M6④ 的"45s 内 raise"实为从 operator `systemctl restart`（startup re-sample `disk.go:99-102`）量、非 auto-detect。
+- **钉**：`90` M6④ relabel（45s 从 bounce 量）+ 一条 no-bounce periodic leg（或 scope startup-tick，periodic hermetic）。**flip**：加 `disk_check_interval` broker.yaml/flag knob。
+
+### #45 — retire op 卡 `NATS_ROLLED_OUT`、永不达 terminal RETIRED（40/41 暴露；与 #31 grow-lock、与 plan §4 #37 mid-retire-resume 均相异）
+
+- **编号（外审 round-2 M6 / round-3 M6）**：本停滞此前误标 "#37-family"，与 **plan §4 的 #37（mid-retire-resume）语义冲突**——故给它**独立干净的 #45**（#38/#40/#41 已被候选占、#43/#44 已折入 #42，见下）。#45 = retire START 后停滞；#31 = retire START 前被 grow-lock 拒；#37(plan §4) = mid-retire-resume；三者相异。
+- **现象/机理**（41 M15）：一次 `cluster retire` 可 STALL 在 `NATS_ROLLED_OUT` 阶段（rehome/migrate 未完成）、永不收敛到 terminal RETIRED；随后下一个 retire 被 `already in flight` 拒（`cluster_operation_controller.go:33`）。
+- **钉**：`40` R-retire 要求 terminal RETIRED op_state（非仅 roster-absence；stall 则 `assert_bug #45` → PRODUCT-RED）；`41` shrink else-branch 区分二因（#31 grow-lock vs #45 stall）、`product_red` EXPOSE 本停滞。**flip**：retire op 在 rehome/migrate 完成后可靠推进到 RETIRED。
+
+### #46 — [CANDIDATE] seeds change-gated auto-publish 漏第 3 voter（91 暴露；G3 client-converge 债的 manifestation）
+
+- **现象/机理**（91-A2）：`cluster grow` 后 seeds 的 change-gated auto-publish 纳入第 2 broker（brk2 进 `seeds show` endpoints），但第 3 个 grow 后 **brk3 达 VOTER 却从不进 endpoints**（120s 内）。`seed_converge.go` 的 DeriveSeedEndpoints 为何不 derive 第 3 endpoint 待根因（SB-91）。
+- **钉**：`91` A2——`if brk3 in endpoints → GREEN`；`elif brk3 IS VOTER but not in endpoints → product_red #46`（签名 = VOTER present ∧ endpoint absent，brk2 已收敛作对照）；`else 未达 VOTER（grow flake）→ not_covered`。**flip**：第 3+ endpoint 也被 derive。
+
+### #47 — `cluster add` 可把可达 joiner 永久留在 CATCHING_UP，后续 grow 被串行锁阻断
+
+- **状态（外审 round-4，2026-07-16）**：**RATIFIED / intermittent PRODUCT defect，修复后远端待复验**。
+  当前保留的严格 40 单次日志中，brk2 invocation-1 精确到达 rc=75 start-joiner 边界；fixture 已证明
+  ctl/auth-callout ready，但 invocation-2 随即收到 `Authorization Violation`（rc=77），权威 join op 留在
+  `CATCHING_UP`（lag=21），后续 grow 被串行锁阻断。另一次较早保留运行命中独立表现：invocation-2
+  rc=69、joiner 可达但 learner/CATCHING_UP 不收敛。不得把两份日志拼成“本次等待完整 4m”。
+- **区别**：#47 是 joiner 已启动后的 Raft learner/catch-up 不收敛；#31 是 grow 已完成后
+  `cluster_grow_active` 泄漏；#45 是 retire 的 `NATS_ROLLED_OUT` 停滞。不得再用 “#31-family flake” 合并。
+- **修复边界**：产品端仅对 cutover 时 NATS 的 `Authorization Violation` 做 30s 有界重连；其他网络/TLS
+  错误不重试。join 状态机在 terminal `SERVING` 前硬收敛 seeds 并按 joiner 值谓词释放 grow lock，避免最终
+  reply 丢失留下永久 fence。严格 fixture 仍保持 retry=0，并硬断 invocation-2 rc=0、VOTER 与对应 op
+  terminal SERVING；修复后的远端结论必须以该原 oracle 重跑为准。
+- **证据**：修复前 `/tmp/s6-s8-external-round4-final-strict/40-drain-retire.log`（远端保留）；本地认证
+  重连边界与异步 join/seed 单测通过。2026-07-16 平台远端额度阻止 post-fix 重跑，故本条尚不可 CLOSED。
+
+### #48 — 连续 shrink 时 agent 可黏在已退役 broker 的 NATS 孤岛，ONLINE 行与真实命令路径分裂
+
+- **状态（外审 round-4，2026-07-16）**：**RATIFIED / release blocker**。41 先用单 seed + connz 强制
+  agt1 直连将退役的 brk2；brk2 退役后产品正确读取 leaving roster、主动 rebuild 到剩余 VOTER，connz 与真实
+  `exec` 均通过。agent 随机落到 brk3 后再执行最终 2→1：brk3 达 RETIRED、brk1 完成显式 standalone + JS
+  reset/restart，但 agt1 在完整 210s signed-roster refresh SLA 内仍直连 brk3，brk1 上真实 `exec` 无回包；数据库
+  ONLINE 不能作为替代证据。
+- **根因边界**：现有 agent 修复能处理“当前 broker 返回 leaving/removed signed roster”，却不能处理已退出
+  Raft/NATS mesh 的旧 broker 持有 stale VOTER roster、继续保持本地 client connection 的孤岛。测试没有在退役后
+  restart agent、重写 `agent.env`、删 cache 或停旧 broker；这些都会替 tether 擦屁股，明确禁止。
+- **证据**：`/tmp/s6-s8-external-round4-final-strict/41-shrink-to-standalone.log`；agent journal 仅有第一次
+  `current broker is leaving ... rebuilding`（brk2），第二次无该事件，connz 显示 brk3=1、brk1=0。
+- **flip**：退休协议在移除前可靠驱逐/迁移 client（或 agent 使用不依赖当前孤岛 broker 的权威发现通道），并
+  保持 41 的 adversarial origin、双次 connz 与真实 post-restart exec/Tier-B oracle 全部 GREEN。
+
+**修复候选（远端待复验）**：拓扑 `sys.events` 只作为唤醒提示，agent 立即走原有 account-signed、generation-
+monotone roster refresh；timer 仍作丢事件兜底。只有签名 roster 证明当前 broker leaving/removed 且另有可拨
+VOTER 时才重建 session。独立测试把周期设为 1h，证明 event 会触发 signed refresh；它不替代 41 的真实孤岛
+oracle，41 必须保持不 restart agent、不改 env/cache、不停旧 broker。
+
+### #49 — resnapshot 的 SQLite preflight 与 RecoverCluster 实际 FSM 不一致，可复活已剪 peer
+
+- **状态（外审 round-4，2026-07-16）**：**RATIFIED，产品修复已被独立 RED→GREEN 单测钉住；远端 42 待复验**。
+- **现象/机理**：`recovery resnapshot` 原先只检查当前 SQLite 为 self-only，随后 `RecoverCluster` 却先恢复旧
+  snapshot 并 replay Raft tail；旧 snapshot/tail 中的非 self peer 因而可在 preflight 后复活，同时 Raft config
+  被重写成 `{self}`。旧 force-single 也会先 snapshot、再 direct-SQL prune，留下同一枚延迟炸弹。
+- **钉**：独立测试先在 Raft tail 填入 peer、保持 SQLite self-only，旧实现真实 RED（resnapshot 接受）；修复后
+  preflight 在副本上执行同一 recovery 并拒绝。第二条测试构造旧 snapshot 含 stale peer，要求 force-single
+  计入 confirmed-dead、剪名册、以高于旧 applied_index 的 fresh `{self}` snapshot 原子换入，随后启动真实 Raft
+  并提交一条权威写，防止只看 metadata 的假绿。
+- **修复边界**：force-single 的 prune 改为 hard step；staged Raft 完整构建后用 Linux
+  `renameat2(RENAME_EXCHANGE)` 交换，避免 live `raft/` 缺失窗口。42 额外硬断 resnapshot 后名册精确 `{brk1}`，
+  并用真实 `OpTransferAudit` 制造 audit-bearing log，不再靠把 cursor 置零伪造风险。
+
+> **候选 #38/#40/#41（spike-decided，plan §4）**：#38(41 R3-recluster，default-GREEN)/#40(43 P2-agent-reconnect，default-GREEN)/#41(92 JS-503 banner 不发 on control-healthy N=1，RESERVED contingent on retire-to-N=1 spike OQ-D4-2)——各批 spike 定格。
+> **编号 reconciliation（round-2 M6 / round-3 M6）**：#37=plan §4 的 40-mid-retire-resume（**非** stall）；#45=retire NATS_ROLLED_OUT 收敛停滞（独立号，此前误标 "#37-family"）；#42=有界 `--remote` 窗口（#43/#44 折入）；#46=91 seeds 漏第 3 voter。本 ledger 与 `docs/reviews/s6-s8-plan.md §4` 表一致。
+
 ## 文档缺陷（DOC-n，不占 gotcha 号）
 
 产品**文档**缺陷单列于此（roadmap §5：批量修文档是独立小增量，S 系列只登记不顺手改）。

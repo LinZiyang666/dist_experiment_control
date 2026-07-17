@@ -82,6 +82,49 @@ func TestG3SeedShrinkConvergesDropsStale(t *testing.T) {
 	}
 }
 
+// TestG3AsyncRetireTerminalIncludesSeedConvergence pins the deploy-tier A3
+// failure: the operation controller (the production retire path) used to mark
+// RETIRED without ever invoking the helper exercised above. With no future
+// leadership edge, the signed seed bundle advertised the retired endpoint
+// forever even though the roster deletion and operation were terminal.
+func TestG3AsyncRetireTerminalIncludesSeedConvergence(t *testing.T) {
+	admin := g3AdminWithSelf(t, "self.example")
+	if _, err := admin.PublishSeeds([]string{"wss://self.example:443", "wss://retired.example:443"}, ""); err != nil {
+		t.Fatalf("PublishSeeds: %v", err)
+	}
+	_, _, gen0, _ := admin.ReadSeeds()
+	now := time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)
+	start := cluster.OpStartInput{
+		OpID: "op-retire-seeds", Kind: cluster.OpKindRetire, TargetNode: "retired",
+		InitState: cluster.OpStateNatsRolledOut, Confirmed: true, Timeline: `[{"s":"NATS_ROLLED_OUT"}]`,
+	}
+	if err := admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterOpStart(start, now)
+	}); err != nil {
+		t.Fatalf("seed retire operation: %v", err)
+	}
+	op, err := cluster.OperationByID(admin.node.RODB(), start.OpID)
+	if err != nil || op == nil {
+		t.Fatalf("read seeded operation: op=%+v err=%v", op, err)
+	}
+	admin.driveRetire(op, substrate{})
+
+	got, err := cluster.OperationByID(admin.node.RODB(), start.OpID)
+	if err != nil || got == nil || !got.Terminal || got.OpState != cluster.OpStateRetired {
+		t.Fatalf("retire did not reach terminal after seed convergence: op=%+v err=%v", got, err)
+	}
+	eps, _, gen1, err := admin.ReadSeeds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 1 || eps[0] != "wss://self.example:443" {
+		t.Fatalf("terminal RETIRED still advertises retired endpoint: %v", eps)
+	}
+	if gen1 <= gen0 {
+		t.Fatalf("terminal RETIRED did not advance seed_generation: %d -> %d", gen0, gen1)
+	}
+}
+
 func TestG3SeedHostMatchProtectsVIP(t *testing.T) {
 	admin := g3AdminWithSelf(t, "host.example")
 	// stored is an operator-curated VIP set whose host matches NO broker → the helper must be hands-off.
