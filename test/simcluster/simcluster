@@ -19,6 +19,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 : "${INSTANCE:=sim}"
 : "${IMAGE:=tether-sim:dev}"
 
+# EXT-REVIEW-B1: INSTANCE is appended to two `rm -rf` targets in cmd_nuke (secrets stash + backup vault)
+# and to every docker object name / secrets+vault path. It arrives UNVALIDATED from `--instance <name>` or
+# the environment; shell quoting stops word-splitting but NOT `..` path traversal, so a name like
+# `../../x` would let `nuke` delete outside the stash/vault root. A valid INSTANCE must match
+# `[A-Za-z0-9][A-Za-z0-9_.-]*` (leading alnum, no '/', no '..'); reject anything else BEFORE any verb
+# (incl. nuke) constructs a destructive path.
+_validate_instance() {
+    case "$1" in
+        '')                  die "instance name must not be empty" ;;
+        *[!A-Za-z0-9_.-]*)   die "invalid instance '$1': only [A-Za-z0-9_.-] allowed (no '/', no path separators)" ;;
+        *..*)                die "invalid instance '$1': '..' path-traversal component rejected" ;;
+        [!A-Za-z0-9]*)       die "invalid instance '$1': must start with an alphanumeric character" ;;
+    esac
+}
+
 # --- small helpers (tctl/sctl/leader_node/wait_phase live in lib/tether.sh) -----------------------
 
 # wait_sysd <node> : block until the container's systemd finished booting (running|degraded).
@@ -514,7 +529,12 @@ cmd_nuke() {
     for n in $(list_nodes); do [ -n "$n" ] && rm_node "$n" --vols; done
     d network rm "$(net_name)" >/dev/null 2>&1 || true
     rm -rf "${SECRETS_STASH:-$HERE/secrets}/$INSTANCE" 2>/dev/null || true
-    ok "nuked instance=$INSTANCE (containers + volumes + secrets stash)"
+    # S0-backup-vault (G-C / S7, lib/vault.sh): the vault deliberately survives `rm_node --vols` (that is
+    # the volume disaster drill 51 restores from), so `nuke` is the ONLY thing that reaps it. Without this
+    # line a bundle would leak across runs and let 51-C's "still readable after the disaster" oracle pass
+    # for the wrong reason.
+    rm -rf "${BACKUP_VAULT:-$HERE/backups}/$INSTANCE" 2>/dev/null || true
+    ok "nuked instance=$INSTANCE (containers + volumes + secrets stash + backup vault)"
 }
 
 # drill <name> : run drills/<name>.sh on an isolated throwaway --instance; print RED/GREEN.
@@ -641,6 +661,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ $# -ge 1 ] || usage
+# EXT-REVIEW-B1: single chokepoint — both `--instance` and env INSTANCE funnel here before any verb runs.
+_validate_instance "$INSTANCE"
 verb=$1; shift
 case "$verb" in
     build)         cmd_build "$@";;

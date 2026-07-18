@@ -73,8 +73,12 @@ ssh "$SERVER" "mkdir -p '$REMOTE_DIR'"
 # never exists in this source tree — so `--delete`/`--delete-excluded` would wipe it on EVERY rsync,
 # minting a fresh CA next verb and breaking a running persistent cluster's route mTLS. Protect the
 # gitignored server-only paths (mirror .gitignore) so --delete leaves them alone.
+# EXT-REVIEW-B9: `backups/` is the S0-backup-vault (lib/vault.sh) — also generated SERVER-SIDE and
+# declared "survives the volume disaster; only `nuke` reaps it". Without protecting it here, the very next
+# `remote.sh` call's `--delete` would reap it, breaking SIM_KEEP diagnostics, cross-command recovery and
+# the "only nuke reaps it" lifecycle contract. It is gitignored (like secrets/), so mirror that here.
 rsync -a --delete \
-    --filter='P /secrets/***' --filter='P /ssh_config' --filter='P *.local' \
+    --filter='P /secrets/***' --filter='P /backups/***' --filter='P /ssh_config' --filter='P *.local' \
     --exclude '.git' \
     "$here/" "$SERVER:$REMOTE_DIR/"
 

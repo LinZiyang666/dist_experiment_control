@@ -2,6 +2,10 @@
 vendor/
 # Minted secrets trees (per-node CA/route/tunnel/nkeys) — never commit private keys.
 secrets/
+# S0-backup-vault (G-C / S7): the off-cluster backup vault drills 50/51/94 pull bundles into. Lives
+# OUTSIDE `rm_node --vols` (so it survives the simulated volume disaster) but INSIDE `simcluster nuke`
+# (so it never leaks state across runs). Per-instance: backups/<instance>/. See lib/vault.sh.
+backups/
 # Local operator overrides.
 *.local
 # Generated ssh_config for `simcluster ssh <node>`.

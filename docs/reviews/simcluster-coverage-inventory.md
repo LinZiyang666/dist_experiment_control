@@ -506,3 +506,59 @@ grammar 校验 + rc 交叉校验 + **默认 fail-closed，waiver 须显式**）�
 **已知未闭合（不冒充闭合，留给后续批次）**：`InterruptedForceSingle` 无生产调用者（B1 可诊断性半成）·
 `blockAfterAttempts` 需 step-aware + `AbortOp`/`ConfirmOp` 守卫 · 原子交换预检的 EBUSY/ENOSPC 残留
 （**rename 已崩溃一致、事务尚未**）· prune→exchange 窗口需 phase-aware 跳过。
+
+---
+
+### G-C landing（S7+S9，2026-07-17）+ S1–S9 CLOSURE
+
+**drill（7）**：`50`/`51`/`52`（S7 备份·灾备·凭据轮换）· `94`/`95`/`96`/`97`（S9 混沌对账·长稳），全部在
+`lib/assert.sh` 五态 verdict 契约下运行，全部进 `tests/lint-drills.sh` 的 `BATCH` 硬闸（现 16 drill、0 违规）。
+
+**真栈 landing（与 s7-s9-plan §0.1 预期对表，`remote.sh` 全路径）**：
+- **50-backup-restore** = **PRODUCT-RED**（68 pass, 0 assert-fail）：#50 · #64（新）· DOC-27。
+- **51-full-dr** = **PRODUCT-RED**（45 pass, 0 assert-fail）：#51 + DR-STEP-LEDGER 量化（undoc=2）+ DR-completion NOT-COVERED。
+- **52-credential-rotation** = **PRODUCT-RED**（0 assert-fail）：#54 两面 · #56 · DOC-23 + 两处 NOT-COVERED。
+- **94-agent-reconcile** = **GREEN**（51 pass）：G.1 missed-exit + orphan（产品路径）+ G.5 审计 + ps LOST。
+- **95-broker-selfheal** = GREEN body：#23 判别性（clean-exit T1 / unclean-exit T2 两判别子实测通过）+ DELETING NOT-COVERED。
+- **96-mid-flight-chaos** = **PRODUCT-RED**：**#58（LIVE-CONFIRMED，外审 B2 修 oracle 后 7 次复跑一致）**——旧 `grep -c OBJ_xfer` 数 stream 存在性=假阳性，改 /jsz 数对象消息数 + 干净基线差分（baseline=1→orphan=2→重启后仍 2=未回收）；**#65（非确定性候选，外审 B10）**——D6b 逐-broker RAW artifact 显示分区少数派 stale-leader 写 6 轮里 5 轮持久（多数派可见）、1 轮回滚（退化 run），是 raft-safety 疑点、owed 产品侧根因（不记确定性 PRODUCT-RED）。分区旗舰臂 GREEN（rc=124 自证 + brk1 alive/stable + D6 多数派写读回 = 无脑裂-丢失方向）；#57/arm-B/C = NOT-COVERED（in-sim 时序/#29/DOC-28）；double-fault 臂在分区臂未完全恢复时 gate not_covered（跨臂隔离）。
+- **97-soak-cycles** = **GREEN**（41 pass）：四型注入 + fd/RSS/Threads leak oracle + panic/FK 完整性 oracle。
+
+**harness 增量**：`lib/vault.sh`（S0-备份库，per-instance host 目录、存活 rm_node --vols、随 nuke 回收）·
+`drills/lib/fault.sh`（S0-故障原语，`iptables` 静默 DROP 分区 + SIGSTOP 冻结 + 124/28 判别子）·
+`drills/lib/events.sh`（sys.events core-sub 观测，member 可读，推翻 G-A/G-B「无 reader」carve-out）·
+`drills/lib/leak.sh`（fd/RSS 泄漏 oracle）· `lib/secrets.sh` 轮换代 · `drills/lib/cluster.sh::grow_to_2` ·
+`simcluster::cmd_nuke` 接 vault · `Dockerfile` += iptables · `.gitignore` += backups/。
+
+**lint 新增 3 条结构性守卫**（G-C 开发期反复踩、已 mutation 验证）：`noshc`（harness 函数不得裹 `sh -c`）·
+`backtick-in-desc`（断言描述里反引号=命令替换）+ BATCH 含 7 个 G-C drill。
+
+**本批最大的教训（记入台账，供后续批次引用）**：
+1. **harness 的 oracle 反复制造假的产品故障**——G-B 是 SIGPIPE，G-C 是 `cluster status` 退出码当存活探针
+   （HEALTH 非 LIVENESS，DEGRADED 恒退 1，restore 后 poll 永不成功→差点把自己 bug 报成产品缺陷）。已入
+   R-LIVENESS-NOT-HEALTH。同类还有：`node ls` 字段 `nid` 非 `node_id`、audit pid 是 ULID、journal
+   `--after-cursor` 静默过滤（改 timestamp gate）、`pull` 语法、前台 exec 才造得出 missed-exit。全部实测钉住。
+2. **深水区 drill（51/52/96）须"发现钉住即 gated 收尾"**——DR/轮换的手动恢复剧本在真栈本就不完整（这正是
+   #51/#52/#54 想说的），硬跑会级联成十几个 assert-fail 掩盖真发现。正解：核心 gotcha 钉住后，依赖"恢复成功"
+   的后半段一律 gated NOT-COVERED（诚实登记"按文档不可完成"），而非 cascade。
+3. **零产品 Go diff 守住**——`go test ./cmd/tether -run TestCommandTreeInventory` 通过（零 CLI 变更）。
+
+**台账新增**：#50 · **#51（restore 不 apply cluster seam，LIVE-CONFIRMED）** · **#52（restore 不渲/不提 nats.conf，SOURCE-CONFIRMED）** · **#53（bundle 无 JetStream ⇒ DR 后 audit 全失，SOURCE-CONFIRMED）** · #54 · **#55（account.nk 轮换 auth-rejection 窗口 = #54 下游、in-sim 不可构造，候选）** · #56 · #57 · #58 · #59 · #63 · #64 · **#65（分区少数派 stale-leader 写*有时*持久，raft 安全性，非确定性候选、owed 产品侧根因）** · DOC-23 · DOC-27 · DOC-28 · [#29 续] blast-radius 扩（allocate-time frpc_failed）。
+
+**G-C-SWEEP（收官独占义务，逐行裁）**：
+- **row 54/55/56（rehome kind）**：G-A/G-B 以「无 reader」判 NOT-COVERED——**理由已被源码证伪**
+  （`permissions.go:36/:147` member 可 core-sub + `rehome_events.go:9-11` 全落 SubjSysEvents）。**结论（deploy-tier
+  不单测 rehome 事件）仍成立**，但**理由换为**：rehome/drain 事件的效果面由 71(#29 数据面)/96-C 的真流量 +
+  store-backed 告警钉住；raw event 配对不单列，因其为 operator-facing 契约而非一等 CLI reader（DOC-26 登记）。
+- **row 78 `replication_degraded`**：S5-30 owns（滚动升级窗口瞬态）；S8-90 不重复（G-B §11-U8 已裁 drop S8-90 腿）。
+- **row 123 `expose/expose rm --ack-alerts`**：G-B 指派 92(a)，G-B landing 已兑现（92 GREEN 含 ack-alerts 臂）。
+- **row 164 `cluster upgrade --notify-webhook`**：#31-blocked（upgrade-roll 受 grow-lock 阻），NOT-COVERED-tied-#31，
+  与 93 的 `alert_webhook_url`（已覆盖）是不同 webhook。
+- **broker-ops §7.4 的 JS 快照面（sqlite3 .backup / tar jetstream / nats stream backup）**：非 tether 动词，
+  NOT-COVERED（DOC-20 订正 roadmap §4.3 的「§7.4=cluster backup 同机制」事实错误）。
+- **永久 NOT-COVERED（各附源码理由，s7-s9-plan §5.1）**：97 goroutine 数（无 pprof/expvar；Threads≠goroutine）·
+  P8 24h soak parity（时长/节奏/常驻三 delta）· 94 PID-reuse 支 / agent-exit 支（结构不可造/产品从不发）·
+  restore `--raft-addr` 换 IP 动机（sim DNS 寻址）· 跨 proto flag-day（需 v1 车队基线）。
+
+**S1–S9 CLOSURE 断言**：主线 P0–P13 + B/C/D/G 系列 + S1–S9 的每一条使用者面/agent面/broker面/集群面/横切承诺/
+事件告警面，已各自归入某个 drill 或显式 NOT-COVERED（附源码理由）。**收官闸**：命令树 golden
+（`command_tree_inventory_test.go`）零 diff + `pubSysEvent`/`alert_ops` 重枚举无表外项。**无未勾且未登记的行。**

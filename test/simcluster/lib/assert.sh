@@ -225,3 +225,18 @@ drill_end() {
     else err "=== $_AS_DRILL: $_de_v (pass=$_AS_PASS product-red=$_AS_PRODUCT_RED setup-red=$_AS_SETUP assert-fail=$_AS_FAIL not-covered=$_AS_NC) ==="; fi
     return "$_de_rc"
 }
+
+# drill_install_traps <cleanup-fn> : install cancellation-safe traps.
+#
+# EXT-REVIEW-B5. The old `trap '_cleanup' EXIT INT TERM` is WRONG for INT/TERM: a POSIX signal handler
+# RETURNS to the command after the interrupted one, so a Ctrl-C mid-drill runs the cleanup and then
+# RESUMES executing kills / iptables / cert overwrites / volume disasters — and races cmd_drill's own
+# nuke. Register EXIT for the normal path; register INT/TERM handlers that clean up, DISARM the EXIT trap
+# (so cleanup never runs twice), and exit 128+signo WITHOUT resuming. Every drill must call this instead
+# of a combined `EXIT INT TERM` trap (enforced by tests/lint-drills.sh rule `combined-signal-trap`).
+drill_install_traps() {
+    _dit_fn=$1
+    trap "$_dit_fn" EXIT
+    trap "$_dit_fn; trap - EXIT; exit 130" INT
+    trap "$_dit_fn; trap - EXIT; exit 143" TERM
+}

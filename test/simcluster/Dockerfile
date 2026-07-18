@@ -15,10 +15,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus \
         openssh-server \
         python3 \
-        jq openssl iproute2 curl ca-certificates procps iputils-ping less vim-tiny \
+        jq openssl iproute2 iptables curl ca-certificates procps iputils-ping less vim-tiny \
         fuse3 libfuse2t64 python3-fusepy \
         shadowsocks-libev python3-yaml sqlite3 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+# iptables (G-C / S0-fault-primitives, s7-s9-plan §1.2-5): the netfilter instrument drills 96/97 use to
+# inject a SILENT network partition (packets DROPped, not RST) inside the target's own netns.
+# MANDATE (3)/(4): supplying a machine with standard kernel tooling is PROVISIONING (the sim's job), exactly
+# like docker/systemd/--privileged — a real Ubuntu server has iptables. It works around NO tether defect:
+# no rule exists outside an explicit injection window, every rule is removed by an unconditional trap, and
+# tether never reads netfilter. A silent partition is HARDER on tether than `docker network disconnect`
+# (which only detaches the interface -> instant EHOSTUNREACH), never easier. Verified on the sim server
+# 2026-07-17 (SB-FAULT): iptables v1.8.10 (nf_tables) works in --privileged containers; a --dport/--sport
+# DROP pair makes the peer port hang (rc=124) while an unfiltered port on the SAME peer still connects.
 # shadowsocks-libev = `ss-local` client for drill 72's real Shadowsocks egress legs (OQ-1); the SS
 # server is tether's proxy exit, stock ss-local interops (chacha20-ietf-poly1305 + evpBytesToKey MD5 +
 # HKDF-SHA1 "ss-subkey"). python3-yaml parses the /sub body (Clash YAML, application/yaml — NOT SIP008

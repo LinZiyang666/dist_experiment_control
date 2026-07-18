@@ -50,6 +50,48 @@ grow_to_3() {
     return 1
 }
 
+# grow_to_2 [agents=0] [ctl=1] : the N=2 sibling of grow_to_3 — up 2 brokers + 1 ctl (+ agents), init brk1,
+# grow brk2. Used by G-C's 50 (backup leader/follower semantics need exactly one of each) and 52.
+#
+# TWO UNCONDITIONAL FALSE-GREEN GUARDS (mirroring setup-forcesingle.sh:14-16's discipline — both must hold
+# before any drill logic runs, and neither is optional):
+#   1. JS meta cluster_size == 2. Without proving the JetStream meta group actually FORMED, a later arm
+#      that watches cluster_size drop to 1 could be observing something that was never 2 to begin with.
+#   2. leader == brk1. Drill 50's follower arms (F1/F2) are ABOUT which node is the leader; if leadership
+#      drifted to brk2 the "follower refuses" assertion becomes a coin flip that happens to pass ~half the
+#      time. 52's B5d control-source legs have the same dependency.
+# Single attempt, no retry: the drills that use this OWN their #31/#45 exposure arms, and a silent
+# nuke-and-retry would launder exactly the leftover-op state they exist to pin.
+grow_to_2() {
+    _g2_a=${1:-0}; _g2_c=${2:-1}
+    "$SIM" up --brokers 2 --agents "$_g2_a" --ctl "$_g2_c" || return 1
+    "$SIM" init brk1 || return 1
+    "$SIM" grow brk2; _g2_r=$?
+    log "grow_to_2: grow brk2 rc=$_g2_r (rc!=0 = that joiner did not reach VOTER)"
+    poll_until 90 3 "N=2 all VOTER" -- _two_voters || {
+        err "grow_to_2: N=2 not reached (single attempt, no retry — a real short grow, not laundered)"
+        return 1
+    }
+    poll_until 60 3 "JS meta cluster_size==2 (FORMED — guards every later 'it dropped to 1' claim)" -- _js_meta_size_2 || {
+        err "grow_to_2: JetStream meta group never formed at size 2 — later arms asserting a drop to 1 would be vacuous"
+        return 1
+    }
+    _g2_l=$(sim_leader) || { err "grow_to_2: no leader"; return 1; }
+    [ "$_g2_l" = brk1 ] || { err "grow_to_2: leader is $_g2_l, not brk1 — 50's follower arms and 52's control-source legs both require a pinned leader"; return 1; }
+    ok "grow_to_2: N=2 VOTER, JS meta formed (size 2), leader=brk1"
+}
+
+_two_voters() {
+    _tv2_l=$(sim_leader) || return 1
+    [ "$("$SIM" exec "$_tv2_l" -- tether cluster status --json 2>/dev/null \
+        | jq '[.nodes[]?|select(.phase=="VOTER")]|length' 2>/dev/null)" = 2 ]
+}
+
+_js_meta_size_2() {
+    "$SIM" exec brk1 -- curl -s --max-time 4 'http://127.0.0.1:8223/jsz?meta=1' 2>/dev/null \
+        | jq -e '.meta_cluster.cluster_size == 2' >/dev/null 2>&1
+}
+
 _three_voters() {
     _tv_l=$(sim_leader) || return 1
     [ "$("$SIM" exec "$_tv_l" -- tether cluster status --json 2>/dev/null \

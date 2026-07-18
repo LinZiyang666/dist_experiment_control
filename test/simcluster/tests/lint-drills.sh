@@ -10,18 +10,21 @@
 #   4. a manual counter poke `_AS_FAIL=…` / `_AS_NC=…` in a drill → must use the public API
 #   5. every drill must open with drill_begin and close with drill_end (else no verdict line is emitted)
 #
-# SCOPE. The 9 S6-S8 drills below are CONTRACT-ENFORCED: any violation is a HARD failure (exit 1). The
-# runner (run-drills.sh) additionally cross-checks every drill's verdict-line rc against its process rc, so a
+# SCOPE. The drills in BATCH below are CONTRACT-ENFORCED: any violation is a HARD failure (exit 1).
+# Every new contract-era batch MUST append its drills to BATCH — a drill absent from this list is exempt
+# from every static false-green ban above, which is the single easiest and costliest thing to forget at
+# batch landing (s7-s9-plan §7, closing gate 3). Currently: the 9 S6-S8 drills + the 7 G-C (S7+S9) drills.
+# The runner (run-drills.sh) additionally cross-checks every drill's verdict-line rc against its process rc, so a
 # LEGACY drill from an earlier batch that still uses `…; drill_end; exit N` is caught as VERDICT-RC-MISMATCH
 # at RUN time regardless of this lint. Pass --all to also print an ADVISORY report of legacy-drill debt (a
 # tracked follow-up: migrate earlier batches to the verdict contract); legacy findings never fail this lint.
 #
-# Run:  sh tests/lint-drills.sh          (hard-gate the 9 S6-S8 drills)
+# Run:  sh tests/lint-drills.sh          (hard-gate every drill in BATCH)
 #       sh tests/lint-drills.sh --all    (+ advisory legacy-debt report)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRILLS_DIR="$(cd "$HERE/../drills" && pwd)"
-BATCH="22-forcesingle-online 40-drain-retire 41-shrink-to-standalone 42-rejoin-returning 43-migrate-live-data 90-alerts-lifecycle 91-client-converge 92-js503-remote-alert 93-metrics-observability"
+BATCH="22-forcesingle-online 40-drain-retire 41-shrink-to-standalone 42-rejoin-returning 43-migrate-live-data 90-alerts-lifecycle 91-client-converge 92-js503-remote-alert 93-metrics-observability 50-backup-restore 51-full-dr 52-credential-rotation 94-agent-reconcile 95-broker-selfheal 96-mid-flight-chaos 97-soak-cycles"
 ALL=0; [ "${1:-}" = --all ] && ALL=1
 
 # strip full-line comments so the bans apply to executed code, not documentation.
@@ -47,6 +50,34 @@ scan_file() {
     # (`printf '%s' "$out" | grep -q …`) is safe and must not be flagged.
     printf '%s\n' "$_C" | grep -qE 'tether[^|]*(force-single|cluster retire|cluster add|cluster init|reconcile nats|rejoin prepare|resnapshot|cluster upgrade|node upgrade|cluster drain|rebalance)[^|]*\|[[:space:]]*grep -q' \
         && echo "sigpipe-truncation: a MUTATING tether command piped into 'grep -q' — grep's first-match exit SIGPIPEs it mid-operation (round-5 §M1); use out_matches or assert the post-condition"
+    # G-C: a HARNESS FUNCTION wrapped in `sh -c "…"`. A new shell inherits variables it was exported with
+    # and nothing else — never the sourced functions. So `sh -c "! node_exists brk1"` fails with
+    # "not found", `!` inverts the failure, and the assertion becomes PERMANENTLY TRUE: a false green no
+    # amount of running can catch. (Caught three times while writing the G-C drills; s7-s9-plan §1.4
+    # R-NOSHC. The same shape as the round-5 sigpipe rule above: a structural guard, not vigilance.)
+    # assert_* runs "$@" in the CURRENT shell, so the fix is always "define a predicate function".
+    printf '%s\n' "$_C" | grep -qE "sh -c [\"'][^\"']*(dexec|dexec_it|poll_until|node_running|node_exists|node_kill|node_start|node_stop|rm_node|ctr_name|net_name|vol_etc|vol_lib|tcp_refused|list_nodes|sim_leader|a_non_leader_voter|grow_to_[23]|dp_curl_ok_body|dp_curl_refused|dp_curl_blackholed|expose_serve_sentinel|vault_[a-z]+|fault_[a-z_]+|leak_[a-z_]+|ev_[a-z_]+|secrets_[a-z_]+|agent_provision_yaml)[[:space:]]" \
+        && echo "noshc: a HARNESS FUNCTION inside 'sh -c' — a new shell does not inherit sourced functions, so the command dies as 'not found' (and under '!' becomes permanently TRUE = false green). Define a predicate function and pass it to assert_* instead (s7-s9-plan §1.4 R-NOSHC)"
+    # G-C: `timeout N <harness-fn>` — same trap as noshc but via coreutils `timeout`, which execvp's its
+    # argument directly and never sees a sourced shell function, so it dies rc=127 "No such file or
+    # directory" and the arm fails for a reason unrelated to what it tests. (Stage-C caught this in drill
+    # 96's D4a/D4b, where it silently turned a #57/#58 PRODUCT-RED into an ASSERT-FAIL.) Push the timeout
+    # INSIDE the container in front of the real binary: `dexec … timeout N tether …`.
+    printf '%s\n' "$_C" | grep -qE '\btimeout[[:space:]]+[0-9]+[[:space:]]+(dexec|dexec_it|poll_until|node_running|node_exists|node_kill|node_start|node_stop|rm_node|ctr_name|net_name|tcp_refused|list_nodes|sim_leader|dp_curl_[a-z_]+|vault_[a-z_]+|fault_[a-z_]+|leak_[a-z_]+|ev_[a-z_]+|secrets_[a-z_]+)\b' \
+        && echo "timeout-fn: 'timeout N <harness-fn>' — coreutils timeout execvp's its argument and cannot see a sourced shell function (dies rc=127). Push the timeout INSIDE the container before the real binary (dexec … timeout N tether …)"
+    # G-C: an UNESCAPED backtick inside a double-quoted assert description is COMMAND SUBSTITUTION —
+    # the shell EXECUTES it. `assert_ok "B0a `run` is gated..."` really tries to run `run`. Prose must use
+    # single quotes (or \` if a backtick is truly wanted). Caught by `dash -n` on drill 96; plain `sh -n`
+    # accepts it, which is exactly why it needs a static rule rather than one shell's parser.
+    printf '%s\n' "$_C" | grep -qE 'assert_(ok|refuses|setup|bug|nc)[[:space:]]+"[^"]*[^\\]`' \
+        && echo "backtick-in-desc: an unescaped backtick inside a quoted assert description — the shell COMMAND-SUBSTITUTES it (it will actually run). Use single quotes in prose"
+    # EXT-REVIEW-B5: a combined `trap '<fn>' EXIT INT TERM` is WRONG for INT/TERM — a POSIX signal handler
+    # RETURNS to the next command after cleanup, so a Ctrl-C mid-drill runs cleanup then RESUMES executing
+    # kills / iptables / cert overwrites / volume disasters (and races cmd_drill's own nuke). Drills must
+    # use drill_install_traps (lib/assert.sh), which registers EXIT separately and makes INT/TERM exit
+    # 128+signo without resuming.
+    printf '%s\n' "$_C" | grep -qE "trap[[:space:]]+.[^']*.[[:space:]]+(EXIT[[:space:]]+INT|INT[[:space:]]+TERM|EXIT[[:space:]]+INT[[:space:]]+TERM)" \
+        && echo "combined-signal-trap: a single trap on EXIT+INT/TERM resumes execution after the handler returns (POSIX) — a Ctrl-C keeps running destructive steps. Use drill_install_traps <cleanup-fn> (lib/assert.sh), which exits 128+signo on INT/TERM"
     printf '%s\n' "$_C" | grep -qE '(^|[^_])drill_begin[[:space:]]' || echo "no-frame: missing drill_begin"
     printf '%s\n' "$_C" | grep -qE '(^|[^_])drill_end'             || echo "no-frame: missing drill_end (no verdict line)"
 }
@@ -54,7 +85,7 @@ scan_file() {
 is_batch() { case " $BATCH " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 HARD=0; LEGACY=0
-echo "── contract-enforced batch (S6-S8) ────────────────────────────────────────────"
+echo "── contract-enforced batch (S6-S8 + G-C) ──────────────────────────────────────"
 for name in $BATCH; do
     f="$DRILLS_DIR/$name.sh"
     [ -f "$f" ] || { echo "  MISSING  $name.sh"; HARD=$((HARD+1)); continue; }
@@ -75,5 +106,5 @@ if [ "$ALL" = 1 ]; then
 fi
 
 echo "────────────────────────────────────────────────────────────────────────────────"
-if [ "$HARD" = 0 ]; then echo "lint-drills: batch OK (9 S6-S8 drills, 0 violations)${LEGACY:+; legacy advisory findings tracked}"; exit 0
+if [ "$HARD" = 0 ]; then echo "lint-drills: batch OK ($(set -- $BATCH; echo $#) contract-enforced drills, 0 violations)${LEGACY:+; legacy advisory findings tracked}"; exit 0
 else echo "lint-drills: $HARD batch violation(s)"; exit 1; fi
