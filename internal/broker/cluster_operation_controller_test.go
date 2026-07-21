@@ -189,7 +189,7 @@ func TestG4GrowMarkerFenceAndCarveout(t *testing.T) {
 	bundleA, _ := makeJoinBundle(t, "join-A", "10.0.0.3:7400", "nonce-a")
 	bundleB, _ := makeJoinBundle(t, "join-B", "10.0.0.4:7400", "nonce-b")
 
-	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetGrowActive("join-A") }); err != nil {
+	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetGrowActive("join-A", time.Now()) }); err != nil {
 		t.Fatalf("set grow marker: %v", err)
 	}
 	if growActiveJoiner(n.RODB()) != "join-A" {

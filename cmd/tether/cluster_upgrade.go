@@ -29,7 +29,7 @@ import (
 // documented follow-ups (the roll HALTS on any refusal, never de-clusters).
 
 const (
-	upgradeTriggerTimeout = 10 * time.Second
+	upgradeTriggerTimeout  = 10 * time.Second
 	upgradeConvergeTimeout = 3 * time.Minute
 	upgradeConvergePoll    = 3 * time.Second
 )
@@ -209,13 +209,16 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 		}
 	}
 	build := func(id string, h proto.ClusterHealthResp, voter bool) clusterupgrade.Node {
-		agentNID := h.ColocatedAgentNID
-		if agentNID == "" {
-			agentNID = id
+		agentNID, presence := resolveColocatedAgent(id, h, agentRelease)
+		if presence == clusterupgrade.AgentAbsent {
+			// LOUD, never silent: the operator must be able to see why this host's verdict is
+			// broker-only. A host that DOES run an agent but under another session would show up
+			// here, and this line is how they notice.
+			_, _ = fmt.Fprintf(out, "  note: %s runs no co-located tether agent (none declared via `serve --colocated-agent-nid`, none registered under nid %q in this session) — its upgrade verdict is broker-only.\n", id, id)
 		}
 		return clusterupgrade.Node{
 			ID: id, IsLeader: h.WritableLeaderConfirmed, BrokerVer: h.ReleaseVersion,
-			AgentVer: agentRelease[agentNID], Voter: voter, CaughtUp: true,
+			AgentVer: agentRelease[agentNID], Agent: presence, Voter: voter, CaughtUp: true,
 		}
 	}
 	// External-review B1: the AUTHORITATIVE voter set is the leader's account-signed roster, NOT "who
@@ -308,6 +311,32 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 	return nodes, nil
 }
 
+// resolveColocatedAgent answers P3's three-state question for ONE broker host: which nid is its
+// co-located agent, and does it have one at all? agentRelease is keyed by every nid the session's node
+// list returned.
+//
+// The two branches are deliberately asymmetric, because the evidence is:
+//
+//   - DECLARED (`serve --colocated-agent-nid <nid>`): presence is a CONFIGURATION fact, so it holds even
+//     when that agent is currently down or absent from the node list. Such a host stays state (b) —
+//     not-at-target — and the roll HALTs loudly on it. An operator who declared an agent gets told when
+//     it cannot be upgraded; we never "helpfully" downgrade their host to broker-only.
+//
+//   - UNDECLARED: the only signal is the node_id==nid convention, so presence must be OBSERVED. The node
+//     list is the right observer — handleNodeListReq projects every node EVER registered in the session
+//     (Status ONLINE | STALE | OFFLINE), so an agent that merely stopped is still listed and still
+//     counts as PRESENT. Absence from that list therefore means "no such agent has ever registered
+//     here", i.e. state (c): the dedicated broker host.
+func resolveColocatedAgent(brokerID string, h proto.ClusterHealthResp, agentRelease map[string]string) (string, clusterupgrade.AgentPresence) {
+	if h.ColocatedAgentNID != "" {
+		return h.ColocatedAgentNID, clusterupgrade.AgentPresent
+	}
+	if _, ok := agentRelease[brokerID]; ok {
+		return brokerID, clusterupgrade.AgentPresent
+	}
+	return "", clusterupgrade.AgentAbsent
+}
+
 // fetchUpgradeRosterWithRetry pulls the signed cluster manifest, retrying a few times (A2). fetchManifest
 // OverNATS collapses every transient failure (timeout / no responder / decode) to nil, so a single blip
 // must not drop the quorum-touching roll to the fail-OPEN responder path. Returns nil only after the
@@ -347,10 +376,14 @@ func renderUpgradePlan(w interface{ Write([]byte) (int, error) }, plan clusterup
 		case clusterupgrade.StepSkip:
 			_, _ = fmt.Fprintf(w, "  SKIP    %s (already at target)\n", s.NodeID)
 		case clusterupgrade.StepUpgrade:
+			scope := ""
+			if s.BrokerOnly {
+				scope = " [broker-only — no co-located agent on this host]"
+			}
 			if s.TransferTo != "" {
-				_, _ = fmt.Fprintf(w, "  UPGRADE %s (leader — transfer to %s first)\n", s.NodeID, s.TransferTo)
+				_, _ = fmt.Fprintf(w, "  UPGRADE %s (leader — transfer to %s first)%s\n", s.NodeID, s.TransferTo, scope)
 			} else {
-				_, _ = fmt.Fprintf(w, "  UPGRADE %s\n", s.NodeID)
+				_, _ = fmt.Fprintf(w, "  UPGRADE %s%s\n", s.NodeID, scope)
 			}
 		}
 	}

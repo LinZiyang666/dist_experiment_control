@@ -171,10 +171,30 @@ assert_ok "A0e and agt2's child is RUNNING in the broker's view too" \
     poll_until 30 2 "agt2 has a RUNNING proc" -- _a0_ctrl_running
 
 # ── A1 — ps LOST. Slow by nature: StaleAfter/OfflineAfter have NO broker.yaml or flag knob (DOC-24),
-#    so the drill can only wait. LOST is derived AT READ TIME (exec.go:337-346) and never persisted.
+#    so the drill can only wait. LOST is derived AT READ TIME (exec.go:326-345) and never persisted.
 assert_ok "A1a docker kill agt1 (power-loss class: the whole container dies)" node_kill agt1
 assert_ok "A1b agt1 leaves ONLINE (heartbeat stops)" poll_until 40 3 "agt1 STALE or OFFLINE" -- _agt1_stale_or_offline
 assert_ok "A1c agt1 reaches OFFLINE" poll_until 90 3 "agt1 OFFLINE" -- _agt1_offline
+
+# ── A1d/e/f — D6: the `ps` LOST DERIVED state, now ASSERTED (was an overclaim: the header/title named
+# "ps LOST" but the drill only checked NODE status, never a proc's LOST). exec.go:326-345: a storage-RUNNING
+# proc whose OWNING NODE is OFFLINE reads back as LOST in `tether ps`; the SQLite row stays RUNNING (LOST is
+# never persisted). agt1's two exec children (seeded RUNNING in A0, PROVEN RUNNING in A0d) are still
+# storage-RUNNING and agt1 is OFFLINE now, so ps MUST derive LOST for them — while agt2's child stays
+# RUNNING because agt2 is ONLINE. Resolve the ULIDs WHILE agt1 is OFFLINE (the rows are still in the proc
+# table). This closes the RUNNING(A0d) → LOST(here) → EXITED(A2) three-state chain, so none of the three is
+# vacuous. The ULIDs are re-resolved after B0b for arm A2 (they are stable).
+LOST1=$(_ulid_of agt1 'sleep 9481'); LOST2=$(_ulid_of agt1 'sleep 9482'); LCTRL=$(_ulid_of agt2 'sleep 9483')
+[ -n "$LOST1" ] && [ -n "$LOST2" ] && [ -n "$LCTRL" ] || setup_fail "could not resolve the seeded ULIDs while agt1 is OFFLINE (needed for the ps LOST derivation — the proc rows must still be readable)"
+_a1_lost1() { [ "$(_ps_status "$LOST1")" = LOST ]; }
+_a1_lost2() { [ "$(_ps_status "$LOST2")" = LOST ]; }
+_a1_ctrl_running() { [ "$(_ps_status "$LCTRL")" = RUNNING ]; }
+assert_ok "A1d ps LOST: agt1's first exec child is DERIVED LOST now that agt1 is OFFLINE (storage-RUNNING row + OFFLINE owning node -> LOST at read time, exec.go:326-345 — NOT persisted)" \
+    poll_until 60 3 "agt1 proc #1 derives LOST in ps" -- _a1_lost1
+assert_ok "A1e ps LOST: agt1's second exec child is DERIVED LOST too" \
+    poll_until 30 3 "agt1 proc #2 derives LOST in ps" -- _a1_lost2
+assert_ok "A1f DISCRIMINATOR: agt2's child is STILL RUNNING (agt2 is ONLINE) — LOST is per-owning-node-status, not a table-wide relabel; without this the LOST above could be a blanket mislabel of every RUNNING row" \
+    _a1_ctrl_running
 
 # ══ ARM GROUP B — the ORPHAN, manufactured entirely through product paths ═══════════════════════════
 # The roadmap's original recipe (SIGSTOP the broker, then start a process) is UNREACHABLE through the

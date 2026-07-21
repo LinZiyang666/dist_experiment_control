@@ -37,7 +37,10 @@ MNT=/mnt/hung
 _cleanup_hang() {
     "$SIM" exec agt1 -- sh -c "pkill -CONT -f '[h]angfs.py' 2>/dev/null; timeout 8 umount -f -l $MNT 2>/dev/null; fusermount -u $MNT 2>/dev/null; pkill -9 -f '[h]angfs.py' 2>/dev/null; true" >/dev/null 2>&1 || true
 }
-trap '_cleanup_hang' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): the combined form resumed after the handler on INT/TERM,
+# so a Ctrl-C would un-wedge the mount and then keep driving the remaining wedge/umount steps. Same cleanup
+# fn, now via drill_install_traps (EXIT registered separately; INT/TERM exit 128+signo without resuming).
+drill_install_traps _cleanup_hang
 
 # helpers
 _hangfs_mounted(){ "$SIM" exec agt1 -- grep -q fuse.hangfs /proc/mounts; }
@@ -108,9 +111,8 @@ assert_ok "Arm3 heal: SIGCONT the daemon"  _heal
 # uninterruptible-D needs kernel nfsd + a hard mount, and observing the mode:off-WITHOUT-safe legacy hang
 # would drive an UNBOUNDED chdir/exec into the wedge — both risk wedging the agent/shared weilandserver.
 # Registered in docs/deploy-tier-gotchas.md (OQ-2). NOT force-greened; asserted from the live T/S state.
-warn "62 Arm 2 NOT-COVERED (measured): true uninterruptible-D + mode:off-without-safe legacy hang are a"
-warn "  shared-host wedge hazard; the FUSE daemon here is T/S-state kill-9-reapable (an approximation)."
-warn "  Left to dedicated hardware. Recorded as OQ-2 in docs/deploy-tier-gotchas.md."
+not_covered "62 Arm 2 (measured): true uninterruptible-D + mode:off-without-safe legacy hang" \
+    "they are a shared-host wedge hazard; the FUSE daemon here is T/S-state kill-9-reapable (an approximation). Left to dedicated hardware. Recorded as OQ-2 in docs/deploy-tier-gotchas.md." gap
 # S1-10: back this verdict with a LIVE measurement, not a self-declaring `true`. The Arm1/Arm3 discriminators
 # already proved T/S-state + statfs-blocks; here we re-measure that the wedge HEALED after the Arm3 SIGCONT
 # (statfs recovers) — i.e. the FUSE stall is SIGCONT-REVERSIBLE / reapable, which is exactly why it is an

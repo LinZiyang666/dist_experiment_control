@@ -229,6 +229,15 @@ type Agent struct {
 	procs   map[string]*procRec
 	procsMu sync.Mutex
 
+	// execChildren tracks live `tether exec` OS children by pid so an admin EVICT
+	// can reap them (#26). Unlike PTY `run` children (a.procs), a synchronous exec
+	// child is otherwise held only by the handler goroutine blocked in cmd.Wait —
+	// on a bare setsid-nohup deploy (no systemd cgroup) the daemon's self-exit
+	// then orphans the child into the host process table. Registered right after
+	// fork+exec, pruned when the synchronous handler returns.
+	execChildren   map[string]*os.Process
+	execChildrenMu sync.Mutex
+
 	// stateStore persists per-(sid, machine) data — currently the
 	// expose port_tokens table — to ~/.tether/agent/<sid>/state.json.
 	// Nil when Config.Home is empty (in-process tests).
@@ -366,6 +375,12 @@ type Agent struct {
 	// ApplyHome a non-existent session); cleared once opened. Guarded by rehomeMu.
 	deferredReplay map[int]bool
 
+	// rehomeAckTo (R8a P1) maps public port → the broker _INBOX subject an APPLIED
+	// home-ack must go to. Populated by handleHomeForwarded from the push's Reply;
+	// read by applyOneHome's success tail. Guarded by rehomeMu (same lock as the rest
+	// of the rehome state, so a push and a running loop cannot interleave).
+	rehomeAckTo map[int]string
+
 	// --- C1 agent roster auto-discovery (consume signed roster) ---
 
 	// rosterMu guards the in-memory roster mirror (pinAccount/rosterGen/rosterURLs),
@@ -410,6 +425,16 @@ type Agent struct {
 	// (a separate goroutine) can unblock heartbeatLoop to force the rebuild.
 	sessCancelMu sync.Mutex
 	sessCancel   context.CancelFunc
+
+	// avoidHostMu/avoidHost (#48) is a ONE-SHOT dial-pool exclusion set by the broker-silence
+	// escape: when the current broker goes silent (a retired-broker NATS island) the roster
+	// refresh loop rebuilds the session and stamps the silent broker's host here so connectNATS
+	// steers the FIRST reconnect onto a DIFFERENT voter instead of re-sticking to the island
+	// (nats.DontRandomize honors dial order, and the silent broker's nats-server is still
+	// accepting connections). connectNATS consumes it once; if the survivor is momentarily
+	// unreachable it falls back to the full pool (no permanent lockout).
+	avoidHostMu sync.Mutex
+	avoidHost   string
 }
 
 // sessionStateHookSetter is the OPTIONAL capability a production ExposeAdapter
@@ -438,6 +463,18 @@ type homeSessionChecker interface {
 // sets/clears it — a bare var is a data race under -race (pre-existing, surfaced by the C1 -race
 // gate). nil pointer ⇒ no hook.
 var afterRehomeWantSettledHook atomic.Pointer[func(*Agent, int)]
+
+// afterSilenceEscapeHook (#48) is a test seam fired right after the broker-silence escape closes
+// the current session and rebuilds onto a voter. It carries the host the escape decided to avoid.
+// Same race-safe atomic.Pointer pattern as afterRehomeWantSettledHook. nil ⇒ no hook.
+var afterSilenceEscapeHook atomic.Pointer[func(*Agent, string)]
+
+// fireAfterSilenceEscape invokes the test hook if installed (race-free load).
+func fireAfterSilenceEscape(a *Agent, avoidedHost string) {
+	if h := afterSilenceEscapeHook.Load(); h != nil {
+		(*h)(a, avoidedHost)
+	}
+}
 
 // fireAfterRehomeWantSettled invokes the test hook if installed (race-free load).
 func fireAfterRehomeWantSettled(a *Agent, port int) {
@@ -494,6 +531,7 @@ func New(cfg Config) (*Agent, error) {
 	a := &Agent{
 		cfg:                      cfg,
 		procs:                    map[string]*procRec{},
+		execChildren:             map[string]*os.Process{},
 		canonAllowRoots:          CanonAllowRoots(cfg.AllowRoots),
 		transferMode:             resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
 		proxy:                    &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
@@ -501,6 +539,7 @@ func New(cfg Config) (*Agent, error) {
 		rehomeRunning:            map[int]bool{},
 		rehomeSeq:                map[int]uint64{},
 		deferredReplay:           map[int]bool{},
+		rehomeAckTo:              map[int]string{},
 		rosterRefreshNow:         make(chan struct{}, 1),
 		rosterRefreshFailBackoff: defaultRosterRefreshFailBackoff,
 	}
@@ -740,6 +779,10 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 			return
 		}
 		a.cfg.Logger.Info("agent: evicted by admin", "sid", ev.SID, "nid", ev.NID)
+		// #26: reap this node's managed OS children BEFORE the daemon self-exits. On a
+		// bare setsid-nohup host there is no systemd cgroup to reap them, so an evicted
+		// agent's exec/run children would otherwise linger in the host process table.
+		a.reapManagedChildren()
 		cancelRun()
 	})
 	if err != nil {
@@ -849,6 +892,10 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		return nil, perr
 	}
 	connOpts = append(connOpts, popts...)
+	// #48: a ONE-SHOT host to skip on the FIRST dial (the just-silent island broker). Consumed
+	// here so a later rebuild for an unrelated reason is unaffected; dropped after attempt 1 so a
+	// momentarily-unreachable survivor falls back to the full pool rather than locking out forever.
+	avoid := a.takeAvoidHost()
 	backoff := a.cfg.RegisterRetryInitial
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -859,7 +906,11 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		// floor, so a (re)connect/rebuild prefers live voters and can fail over to a
 		// newly-added broker. effectiveDialURLs == cfg.NATSURL until a roster is adopted,
 		// so a non-cluster agent's dial string is byte-identical.
-		nc, err := nats.Connect(a.effectiveDialURLs(), connOpts...)
+		dial := a.effectiveDialURLs()
+		if attempt == 1 && avoid != "" {
+			dial = excludeHostFromDial(dial, avoid)
+		}
+		nc, err := nats.Connect(dial, connOpts...)
 		if err == nil {
 			if attempt > 1 {
 				a.cfg.Logger.Info("agent: NATS connect succeeded after retry",
@@ -1156,6 +1207,9 @@ func (a *Agent) applyReconciliation(ctx context.Context, resp proto.NodeRegister
 					a.cfg.Logger.Warn("agent: revoke prune state.json",
 						"err", err, "name", name)
 				}
+				// R8a P1: same reason as the expose-rm path — a revoked port must not
+				// leave its home-ack destination behind in the map.
+				a.forgetHomeAck(port)
 				a.cfg.Logger.Info("agent: revoked", "port", port, "name", name)
 			}
 		}
@@ -1319,6 +1373,12 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 				}
 			}
 			a.cfg.Logger.Info("agent: rehomed expose", "name", d.Name, "port", port, "epoch", d.Epoch)
+			// R8a P1: confirm to the broker that the DATA PLANE moved. This is the only
+			// place an ack is emitted, and it sits AFTER ApplyHome/openHomeFromState
+			// returned nil and the new home was persisted — so "acked" means "applied",
+			// never "received". The broker's home-delivery pass stops re-delivering on
+			// this signal, and drain/retire's rc semantics are decided by it.
+			a.ackHomeApplied(d)
 			if a.wantChanged(port, seq) {
 				sleep = base
 				continue // a newer directive (higher epoch OR same-epoch pin update, RF2) arrived

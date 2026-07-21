@@ -249,7 +249,17 @@ func (a *ClusterAdmin) ConfirmOp(opID string) error {
 			return err
 		}
 		if op.OpState == cluster.OpStateBlocked {
-			return a.transition(op, cluster.OpStateDrainRequested, false, "", nil)
+			// F2 (external re-review): a confirmed retry must get a FRESH convergence window. Reset
+			// catchup_deadline to 0 so boundRehomeConvergence re-stamps a new deadline on the next
+			// REHOME_EXPOSES hold — otherwise the op re-enters carrying its OLD, already-expired deadline
+			// and boundRehomeConvergence re-BLOCKs it on the very next tick, making `cluster ops confirm` a
+			// no-op. (catchup_deadline only persists alongside SetBarrier — see operation_ops.go.)
+			return a.transition(op, cluster.OpStateDrainRequested, false, "", func(in *cluster.OpTransitionInput) {
+				in.SetBarrier = true
+				in.Barrier = op.Barrier
+				in.CatchupDeadline = 0
+				in.TopoTargetGen = op.TopoTargetGen
+			})
 		}
 		return nil
 	}
@@ -296,6 +306,19 @@ const (
 	opTimelineCap    = 32              // cap the durable in-row timeline
 	opCatchupTimeout = 2 * time.Minute // join catch-up base deadline (small DBs / fresh joiners)
 	opMaxAttempts    = 5               // bounded retry of a failing side-effect before BLOCKED (C4-M8)
+	// opTopoConvergeTimeout (#45) bounds the NATS_ROLLED_OUT topology-convergence gate. Derivation: the
+	// slowest LEGITIMATE way a voter observes a new topology generation is a full nats.conf re-render plus a
+	// broker restart, and the product's own bound on that is upgradeConvergeTimeout (3 min — past it the
+	// rolling upgrade HALTs the host). 5 min gives that a comfortable margin while still turning a wedge that
+	// used to be permanent into a BLOCKED op an operator can confirm or abort. It does NOT apply to the N=1
+	// de-cluster boundary, which is carved out by design — see topoAdvance.
+	opTopoConvergeTimeout = 5 * time.Minute
+	// opRehomeConvergeTimeout (self-review high) bounds the REHOME_EXPOSES data-plane-convergence hold so a
+	// migrated expose whose agent never reconnects routes a retire to BLOCKED instead of fencing the whole
+	// membership plane forever. Generous (10 min): a NATted agent may take a while to notice + re-dial the new
+	// home, and BLOCKED is only a loud, `cluster ops confirm/abort`-actionable pause, not a failure — so err
+	// toward waiting. A genuinely dead agent still hits it and surfaces.
+	opRehomeConvergeTimeout = 10 * time.Minute
 	// #7: the fixed 2-min deadline false-BLOCKs a large/slow-but-healthy joiner whose InstallSnapshot takes
 	// longer over a WAN. Scale the persisted catch-up deadline by the command-domain DB size at a conservative
 	// transfer floor, clamped to a max window, so a big cluster gets proportionally more time without ever
@@ -318,6 +341,27 @@ type substrate struct {
 	isVoter        bool
 	numVoters      int
 	isLeaderTarget bool // the target node IS the current raft leader
+}
+
+// driveLeaderMaintenance is the per-tick leader-gated cluster maintenance the observe loop runs: resume
+// in-flight operations AND re-converge client discovery seeds. Grouping them keeps the wiring explicit
+// and unit-testable (a half-wired converge would silently leave seeds stale).
+//
+// #46 / SB-91: the per-grow seed converge (OpStateNatsRolledOut below) fires at most ONCE and is gated
+// behind topoAdvance; the ONLY other re-trigger was the leadership-ACQUIRED edge, which never re-fires on
+// a stable single-leader cluster. So the LAST-grown voter (e.g. the 3rd) could reach VOTER yet never enter
+// `seeds show` — an earlier voter is silently rescued by the NEXT grow re-deriving the full set, but the
+// final one has no successor. Re-deriving every leader tick closes the hole for grow/retire/force-single
+// uniformly: it is a cheap, idempotent no-op once converged (the seedSetEqual change-gate skips the Propose
+// so seed_generation never churns) and adds NO goroutine (it runs inline on the existing observe ticker).
+func (a *ClusterAdmin) driveLeaderMaintenance() {
+	if a == nil {
+		return
+	}
+	a.driveInFlightOperations()
+	if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
+		a.logger.Debug("cluster: periodic seed converge", "err", serr)
+	}
 }
 
 // driveInFlightOperations is the leader-gated tick: it advances every non-terminal operation by one
@@ -538,50 +582,28 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		}
 		_ = a.transition(op, cluster.OpStateCatchingUp, false, "", nil)
 	case cluster.OpStateCatchingUp:
-		// op.Barrier is guaranteed non-zero (persisted at ROSTER_COMMITTED) — the catch-up gate is real.
-		caught, err := a.caughtUpFn(op.TargetNode, op.Barrier)
-		if err != nil {
-			a.recordOpError(op, fmt.Errorf("catch-up probe: %w", err))
-			return
+		// #47 (R7b): EVERY non-advancing outcome of this state must funnel through the deadline check
+		// below — including the ones that used to `return` first. A joiner that is perfectly REACHABLE
+		// could sit in CATCHING_UP forever through two holes:
+		//
+		//   (1) a catch-up probe that ERRORS every tick returned before the deadline was ever consulted,
+		//       so the persisted deadline simply never fired;
+		//   (2) an op whose catchup_deadline is 0 (a row written before #7 persisted one, or any future
+		//       path that reaches CATCHING_UP without the ROSTER_COMMITTED capture) had no deadline at all.
+		//
+		// Either way the op stayed non-terminal, which fences the whole membership plane via
+		// assertNoActiveOp — the next `cluster add` is refused "already in flight" and the operator has no
+		// state to act on, because BLOCKED is the only state `cluster ops confirm/abort` accepts.
+		//
+		// The exit criterion is therefore absolute: leave CATCHING_UP, or terminate with an explicit error
+		// in bounded time. "It will probably converge eventually" is not an acceptable third option.
+		if a.driveCatchingUp(op, sub) {
+			return // the op actually changed state this tick
 		}
-		if caught {
-			// v0.4.2: PROMOTE the caught-up nonvoter to VOTER. AddVoter on an existing server flips
-			// its suffrage to Voter — an online config change that NOW commits because the peer is
-			// reachable AND caught up (it could not have wedged the cluster while it was a nonvoter).
-			// Idempotent; guard on isVoter so an already-promoted resume falls through. Bound retries
-			// like the staging step.
-			if !sub.isVoter {
-				raftAddr, err := a.nodeRaftAddr(op.TargetNode)
-				if err != nil {
-					a.recordOpError(op, err)
-					return
-				}
-				if !a.opStillLive(op.OpID) {
-					return // R1: aborted between the controller tick and this irreversible promotion
-				}
-				if err := a.node.AddVoter(op.TargetNode, raftAddr); err != nil {
-					a.blockAfterAttempts(op, "AddVoter (promote)", err)
-					return
-				}
-				return // wait a tick for the promotion to reflect in sub.isVoter
-			}
-			// Promote to VOTER (from CATCHING_UP; tolerate an already-VOTER resume). Heals any phase.
-			if sub.phase == phaseCatchingUp {
-				if err := a.setPhase(op.TargetNode, phaseVoter, []string{phaseCatchingUp}, ""); err != nil {
-					a.recordOpError(op, fmt.Errorf("phase->VOTER: %w", err))
-					return
-				}
-			}
-			a.toNatsRolledOut(op)
-			return
-		}
-		if op.CatchupDeadline != 0 && a.now().UnixNano() > op.CatchupDeadline {
-			_ = a.transition(op, cluster.OpStateBlocked, false, "catch-up exceeded the deadline — check the joining broker, then `cluster ops confirm <op-id>` to retry", nil)
-		}
+		a.boundCatchingUp(op)
+		return
 	case cluster.OpStateNatsRolledOut:
-		ok, reason := a.topoConvergedForOp(op, true)
-		if !ok {
-			a.recordOpError(op, errors.New(reason))
+		if !a.topoAdvance(op, sub, true) {
 			return
 		}
 		// C4-m1: clear force_single_active BEFORE the terminal transition — a kill-9 between a terminal
@@ -617,6 +639,116 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		a.clearOpAttempts(op.OpID)
 		_ = a.transition(op, cluster.OpStateServing, true, "", nil)
 	}
+}
+
+// driveCatchingUp performs ONE catch-up/promotion step. It returns true ONLY when the op's STATE actually
+// changed this tick; issuing an idempotent AddVoter is deliberately NOT counted as progress, so a promotion
+// that never reflects in the raft configuration still runs down the CATCHING_UP deadline instead of looping
+// forever (#47).
+func (a *ClusterAdmin) driveCatchingUp(op *cluster.Operation, sub substrate) bool {
+	// op.Barrier is guaranteed non-zero (persisted at ROSTER_COMMITTED) — the catch-up gate is real.
+	caught, err := a.caughtUpFn(op.TargetNode, op.Barrier)
+	if err != nil {
+		// #47: this used to `return` straight out of driveJoin, so a probe that fails EVERY tick — a
+		// permanently unreachable health endpoint on an otherwise-live joiner — skipped the deadline
+		// check forever. Now it merely declines to advance, and the caller bounds it.
+		a.recordOpError(op, fmt.Errorf("catch-up probe: %w", err))
+		return false
+	}
+	if !caught {
+		return false
+	}
+	// v0.4.2: PROMOTE the caught-up nonvoter to VOTER. AddVoter on an existing server flips
+	// its suffrage to Voter — an online config change that NOW commits because the peer is
+	// reachable AND caught up (it could not have wedged the cluster while it was a nonvoter).
+	// Idempotent; guard on isVoter so an already-promoted resume falls through. Bound retries
+	// like the staging step.
+	if !sub.isVoter {
+		raftAddr, err := a.nodeRaftAddr(op.TargetNode)
+		if err != nil {
+			a.recordOpError(op, err)
+			return false
+		}
+		if !a.opStillLive(op.OpID) {
+			return true // R1: aborted between the controller tick and this irreversible promotion
+		}
+		if err := a.node.AddVoter(op.TargetNode, raftAddr); err != nil {
+			a.blockAfterAttempts(op, "AddVoter (promote)", err)
+			return true // blockAfterAttempts owns this failure's bound; do not double-count it
+		}
+		// The promotion was ISSUED, not observed. Report "no state change" so the deadline keeps
+		// running: if the config change never reflects in sub.isVoter we would otherwise re-issue an
+		// idempotent AddVoter every tick, forever, with nothing counting it (#47).
+		return false
+	}
+	// Promote to VOTER (from CATCHING_UP; tolerate an already-VOTER resume). Heals any phase.
+	if sub.phase == phaseCatchingUp {
+		if err := a.setPhase(op.TargetNode, phaseVoter, []string{phaseCatchingUp}, ""); err != nil {
+			a.recordOpError(op, fmt.Errorf("phase->VOTER: %w", err))
+			return false
+		}
+	}
+	a.toNatsRolledOut(op)
+	return true
+}
+
+// boundCatchingUp is #47's exit criterion: a join that has not left CATCHING_UP by its persisted deadline
+// goes to BLOCKED — a LOUD, operator-actionable state that `cluster ops confirm/abort` can act on — rather
+// than staying non-terminal forever and fencing every subsequent membership operation.
+//
+// An op carrying NO deadline (catchup_deadline == 0) is not blocked: it is given one. A missing deadline is
+// a gap in the ladder, not evidence the joiner is dead, and blocking on it would false-fail a healthy join.
+// The lazy stamp costs one raft write once per such op and restores the invariant "CATCHING_UP is always
+// bounded" for rows that predate #7's capture step.
+func (a *ClusterAdmin) boundCatchingUp(op *cluster.Operation) {
+	if op.CatchupDeadline == 0 {
+		deadline := a.adaptiveCatchupDeadline()
+		_ = a.transition(op, cluster.OpStateCatchingUp, false, op.LastError, func(in *cluster.OpTransitionInput) {
+			in.SetBarrier = true
+			in.Barrier = op.Barrier
+			in.CatchupDeadline = deadline
+			in.TopoTargetGen = op.TopoTargetGen
+		})
+		return
+	}
+	if a.now().UnixNano() > op.CatchupDeadline {
+		_ = a.transition(op, cluster.OpStateBlocked, false,
+			"catch-up exceeded the deadline — check the joining broker, then `cluster ops confirm "+op.OpID+"` to retry (or `cluster ops abort "+op.OpID+"`)", nil)
+	}
+}
+
+// boundRehomeConvergence bounds the REHOME_EXPOSES data-plane wait (self-review high). The hold via
+// recordOpError is non-terminal FOREVER and never touches opAttempts, so a migrated expose whose agent
+// never reconnects would keep a retire in flight indefinitely — and assertNoActiveOp then fences every
+// subsequent join/retire, a permanent membership wedge (the #45/#47 anti-pattern the sibling gates already
+// bound). Mirror them: on FIRST entry stamp a fresh, crash-safe, replicated convergence deadline by
+// re-purposing catchup_deadline (a retire never used it for CATCHING_UP; toNatsRolledOut re-stamps it for
+// the later topology phase, so the two windows never overlap). Once the deadline passes, route to BLOCKED —
+// a loud, `cluster ops confirm/abort`-actionable state, NONZERO for `cluster retire --wait`.
+//
+// Returns (blocked, stamped): blocked ⇒ routed to BLOCKED this tick; stamped ⇒ the deadline was just written
+// (that transition already recorded the hold, so the caller must not also recordOpError). Both ⇒ the caller
+// returns without further work.
+func (a *ClusterAdmin) boundRehomeConvergence(op *cluster.Operation, holdErr error) (blocked, stamped bool) {
+	if op.CatchupDeadline == 0 {
+		deadline := a.now().Add(opRehomeConvergeTimeout).UnixNano()
+		// catchup_deadline is only persisted alongside the SetBarrier capture step (operation_ops.go),
+		// so set it and PRESERVE the current barrier + topo target (mirrors boundCatchingUp).
+		_ = a.transition(op, cluster.OpStateRehomeExposes, false, holdErr.Error(), func(in *cluster.OpTransitionInput) {
+			in.SetBarrier = true
+			in.Barrier = op.Barrier
+			in.CatchupDeadline = deadline
+			in.TopoTargetGen = op.TopoTargetGen
+		})
+		return false, true
+	}
+	if a.now().UnixNano() > op.CatchupDeadline {
+		_ = a.transition(op, cluster.OpStateBlocked, false,
+			"data plane did not converge onto the new home by the deadline — the migrated expose(s) never re-dialed the "+
+				"new broker; check the agent, then `cluster ops confirm "+op.OpID+"` to retry (or `cluster ops abort "+op.OpID+"`)", nil)
+		return true, false
+	}
+	return false, false
 }
 
 // adaptiveCatchupDeadline (#7) returns the persisted catch-up deadline scaled by the command-domain DB size:
@@ -697,8 +829,55 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		}
 		_ = a.transition(op, cluster.OpStateRehomeExposes, false, "", nil)
 	case cluster.OpStateRehomeExposes:
-		if err := a.migrateExposes(op.TargetNode); err != nil {
+		// Move any exposes still homed here (idempotent: empty on a re-drive once they are
+		// already re-pointed). The RETURN value is deliberately discarded — the gate below
+		// reads the DURABLE convergence set, because migrateExposes' list self-destructs on
+		// the second tick (see pendingRetireConvergence / CRIT-1).
+		if _, err := a.migrateExposes(op.TargetNode); err != nil {
 			a.recordOpError(op, fmt.Errorf("migrate exposes: %w", err)) // rebuild-OFF refusal surfaces here, loud
+			return
+		}
+		// R8a P1 — the retire verb's rc-semantics gate. `cluster retire` is the
+		// RESUMABLE form of drain, so instead of blocking it HOLDS in this state: the
+		// op records a last_error, the controller re-drives on the next tick, and the
+		// home-delivery pass keeps re-delivering meanwhile. It only leaves this state
+		// once every migrated expose's agent has CONFIRMED the new home — so a retire
+		// can never walk on to RemoveServer (irreversible) while the data plane is
+		// still pointing at the node being removed.
+		//
+		// CRIT-1: the gate reads the DURABLE pendingRetireConvergence(nodeID), NOT the
+		// migrateExposes return value. The latter self-destructs — its query finds rows
+		// by home_broker=nodeID, which the migrate just re-pointed, so on the SECOND tick
+		// it is empty and the old gate waved the op straight on to RemoveServer with the
+		// agent still silent. pendingRetireConvergence re-derives the un-confirmed set
+		// from current state every tick, so the hold survives across ticks.
+		//
+		// The hold is BOUNDED (self-review high): recordOpError alone is non-terminal forever and does
+		// NOT increment opAttempts, so a migrated agent that never reconnects would fence the whole
+		// membership plane indefinitely. boundRehomeConvergence stamps a crash-safe replicated deadline
+		// (re-purposing catchup_deadline, exactly as toNatsRolledOut does — retire never used CATCHING_UP)
+		// and routes a run-down retire to BLOCKED, a NONZERO terminal that `cluster retire --wait` sees and
+		// `cluster ops confirm/abort` can act on. That is the rc assertion for this verb.
+		// F3 (+ round-2 self-review): scope to exposes rehomed at or after THIS op's creation, so an
+		// UNRELATED permanently-stranded expose elsewhere (rehomed by an earlier op) cannot freeze this
+		// retire. The origin is op.CreatedAt — a FIXED point, NOT a sliding wall-clock window: this op's
+		// migrate always runs AFTER creation, so its rows never age out (even across a `cluster ops confirm`
+		// retry that restarts the convergence deadline), while a sliding window would let a still-stranded
+		// row age out BEFORE the reset deadline fires and silently complete RemoveServer (fail-open). An
+		// unparseable created_at falls back to the fleet-wide (zero) window — fail-CLOSED, never fail-open.
+		since, _ := parseClusterTime(op.CreatedAt)
+		pending, perr := a.pendingRetireConvergence(op.TargetNode, since)
+		if perr != nil {
+			a.recordOpError(op, fmt.Errorf("check data-plane convergence: %w", perr))
+			return
+		}
+		if len(pending) > 0 {
+			a.kickHomeDelivery(pending)
+			holdErr := &ErrDataPlaneNotConverged{Verb: "retire", NodeID: op.TargetNode, Pending: pending}
+			if blocked, stamped := a.boundRehomeConvergence(op, holdErr); blocked || stamped {
+				return // routed to BLOCKED, or just stamped the deadline (the stamp records the hold)
+			}
+			a.recordOpError(op, holdErr)
 			return
 		}
 		// R6: expose migration can BLOCK; re-confirm the op is live before the phase->DRAINING write.
@@ -784,9 +963,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		// Capture the topology generation the removal (mesh-leave) bumped — the NATS_ROLLED_OUT target.
 		a.toNatsRolledOut(op)
 	case cluster.OpStateNatsRolledOut:
-		ok, reason := a.topoConvergedForOp(op, false)
-		if !ok {
-			a.recordOpError(op, errors.New(reason))
+		if !a.topoAdvance(op, sub, false) {
 			return
 		}
 		// clear the drain marker; terminal RETIRED (the op row is the only record of RETIRED).
@@ -863,8 +1040,65 @@ func (a *ClusterAdmin) topoConvergedForOp(op *cluster.Operation, joining bool) (
 	return true, ""
 }
 
+// topoAdvance is #45's bounded gate. It returns true only when the op may proceed past NATS_ROLLED_OUT.
+//
+// THE DEFECT (as re-diagnosed in R6 — the earlier ledger entry blamed the wrong state)
+// -------------------------------------------------------------------------------------
+// topoConvergedForOp is fail-closed on ANY unreachable or non-reporting voter, and it had no counter, no
+// deadline and no watchdog behind it. A single voter that never reports its topology generation therefore
+// pinned the op at NATS_ROLLED_OUT indefinitely; because the op stays non-terminal, assertNoActiveOp then
+// refused the NEXT membership operation with "already in flight", and the shrink/grow spine wedged with no
+// state an operator could act on. The stall is at THIS gate — not at rehome/migrate, which is five states
+// earlier and had already committed.
+//
+// WHAT IS DELIBERATELY *NOT* FIXED (and must not be)
+// ---------------------------------------------------
+// The final retire of an N=2 cluster is an INTENTIONAL two-phase boundary, not a bug. When the leaving
+// voter is removed the survivor is alone, yet its on-disk nats.conf is still clustered — and a lone-self
+// clustered render is invalid, so the survivor cannot observe the new topology generation until the
+// operator explicitly de-clusters (`cluster reconcile --to-standalone --confirm-single`) and the live NATS
+// process proves it loaded that conf. The op MUST remain non-terminal across that boundary: going terminal
+// would declare a retire complete while the cluster is still mid-de-cluster, and BLOCKING it would fabricate
+// a failure out of a correct, documented, operator-gated wait. deploy-tier drill 41 asserts exactly this
+// shape (op_state == NATS_ROLLED_OUT && terminal != true), and after `--to-standalone` the same op reaches
+// terminal RETIRED on its own.
+//
+// So the deadline is applied to the UNBOUNDED gate only, and the N→1 de-cluster boundary is carved out by
+// its own predicate: a RETIRE whose removal left exactly one voter. A JOIN can never match it (a join at
+// NATS_ROLLED_OUT has just promoted its joiner, so there are at least two voters).
+func (a *ClusterAdmin) topoAdvance(op *cluster.Operation, sub substrate, joining bool) bool {
+	ok, reason := a.topoConvergedForOp(op, joining)
+	if ok {
+		return true
+	}
+	if !joining && sub.numVoters <= 1 {
+		// The de-cluster boundary. Record WHY we are waiting — an operator reading `cluster ops show`
+		// must see a next step, not a bare convergence complaint — and wait indefinitely, on purpose.
+		a.recordOpError(op, errors.New(reason+
+			" — this is the N=1 de-cluster boundary: the last remaining voter still has a CLUSTERED nats.conf and cannot"+
+			" observe the new topology until you run `cluster reconcile --to-standalone --confirm-single` on it."+
+			" The retire stays in flight (deliberately) until then"))
+		return false
+	}
+	if op.CatchupDeadline != 0 && a.now().UnixNano() > op.CatchupDeadline {
+		_ = a.transition(op, cluster.OpStateBlocked, false,
+			"topology convergence exceeded the deadline ("+reason+") — fix the voter, then `cluster ops confirm "+op.OpID+
+				"` to retry (or `cluster ops abort "+op.OpID+"`)", nil)
+		return false
+	}
+	a.recordOpError(op, errors.New(reason))
+	return false
+}
+
 // toNatsRolledOut transitions into NATS_ROLLED_OUT, capturing the CURRENT topology_generation as the
-// op's convergence target (the gen this op's membership change bumped). Barrier/deadline are preserved.
+// op's convergence target (the gen this op's membership change bumped).
+//
+// R7b (#45): it also (re-)stamps catchup_deadline with a FRESH topology-convergence window. The column is
+// the op's ACTIVE-PHASE deadline, not a per-state one: CATCHING_UP uses it as the catch-up window, and from
+// here on it is the topology window. Re-purposing it is what lets #45 gain a crash-safe, replicated deadline
+// with no schema migration — and nothing reads the catch-up meaning past CATCHING_UP. Deriving the window
+// from the timeline instead was rejected: recordOpError appends timeline entries carrying the SAME state
+// string, so "when did this op enter NATS_ROLLED_OUT" is not recoverable from it.
 func (a *ClusterAdmin) toNatsRolledOut(op *cluster.Operation) {
 	gen, err := cluster.TopologyGeneration(a.node.RODB())
 	if err != nil {
@@ -877,7 +1111,7 @@ func (a *ClusterAdmin) toNatsRolledOut(op *cluster.Operation) {
 	_ = a.transition(op, cluster.OpStateNatsRolledOut, false, "", func(in *cluster.OpTransitionInput) {
 		in.SetBarrier = true
 		in.Barrier = op.Barrier
-		in.CatchupDeadline = op.CatchupDeadline
+		in.CatchupDeadline = a.now().Add(opTopoConvergeTimeout).UnixNano()
 		in.TopoTargetGen = gen
 	})
 }

@@ -18,7 +18,7 @@ func TestForceSingleRound2ReviewNatsRouteURLIsProbed(t *testing.T) {
 
 	roster := []Peer{{
 		NodeID: "brk-b", RaftAddr: "127.0.0.1:1",
-		NatsRoute: "nats://" + ln.Addr().String(),
+		NatsRoute:  "nats://" + ln.Addr().String(),
 		TunnelAddr: "127.0.0.1:1",
 	}}
 	if err := CheckPeersDead(roster, []string{"brk-b"}); err == nil {

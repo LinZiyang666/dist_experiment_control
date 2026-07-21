@@ -10,13 +10,15 @@
 #    visible as a TREND in sampled counters. The journal panic/FK scan stays as a SEPARATE, orthogonal
 #    crash/integrity oracle — the two never substitute for each other.
 #
-# 2. WHY goroutines ARE NOT HERE (permanent NOT-COVERED, registered at batch level in the plan §5.1).
-#    The product exposes no pprof/expvar/goroutine gauge (`grep -rE 'pprof|expvar' cmd/ internal/` = zero
-#    hits; none of the broker's HTTP listeners serve /debug/pprof). The hermetic suites use
-#    runtime.NumGoroutine() from INSIDE the process, which a cross-process drill structurally cannot do.
-#    And `/proc/<pid>/status`'s Threads is OS threads (M), NOT goroutines (G): Go multiplexes G onto M, so
-#    10k leaked goroutines can show ZERO thread growth. Using Threads as a goroutine proxy would itself be
-#    a false-green oracle, so we do not. Threads is measured only as its own bounded quantity.
+# 2. WHY goroutines ARE NOT IN THIS /proc SAMPLER (they live in drill 97's OWN admin-runtime gate now).
+#    /proc/<pid>/status's Threads is OS threads (M), NOT goroutines (G): Go multiplexes G onto M, so 10k
+#    leaked goroutines can show ZERO thread growth. Using Threads as a goroutine proxy would itself be a
+#    false-green oracle, so this sampler measures Threads only as its own bounded quantity and NEVER as a
+#    goroutine stand-in. The goroutine count was a PERMANENT NOT-COVERED until R13 (the product exposed no
+#    goroutine gauge, and runtime.NumGoroutine() is in-process). R13 added `tether admin runtime --json`
+#    (.goroutines = runtime.NumGoroutine(), the in-process truth) over the broker-local admin socket, so
+#    drill 97 now carries a REAL cross-process goroutine leak gate (load→quiesce→floor) — see 97's header.
+#    That gate lives in the drill (it needs admin runtime + the soak's load), not in this /proc helper.
 #
 # 3. WHY THE VICTIM MUST NEVER BE THE MEASURED PROCESS. If a cycle kills the process being sampled, its fd
 #    count resets to zero every cycle and the series can never show a leak — the oracle would be

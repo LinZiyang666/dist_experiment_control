@@ -1,9 +1,13 @@
 package clusteroffline
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -78,15 +82,107 @@ func Doctor(opts DoctorOptions) []DoctorCheck {
 		checks = append(checks, DoctorCheck{"nats.conf", DoctorPass, "no include / unrecognized directive (takeover's fail-closed gate would pass)"})
 	}
 
-	// 6. DB opens read-only (the migration source must be reachable). NO schema mutation / copy.
-	if db, err := storage.OpenReadOnly("file:" + opts.DBPath); err != nil {
-		checks = append(checks, DoctorCheck{"db", DoctorFatal, fmt.Sprintf("open %s read-only: %v", opts.DBPath, err)})
+	// 6. DB opens read-only AND is a real, intact tether database (the migration source must be
+	// reachable). NO schema mutation / copy.
+	if err := DBPreflight(opts.DBPath); err != nil {
+		checks = append(checks, DoctorCheck{"db", DoctorFatal, err.Error()})
 	} else {
-		_ = db.Close()
-		checks = append(checks, DoctorCheck{"db", DoctorPass, "tether.db opens read-only (migration source reachable)"})
+		checks = append(checks, DoctorCheck{"db", DoctorPass, "tether.db opens read-only, passes quick_check, and carries a tether schema (migration source reachable)"})
 	}
 
 	return checks
+}
+
+// dbPreflightTimeout bounds every probe DBPreflight runs. The checks are local-file SQLite reads,
+// so a second is generous; the bound exists so a pathological file (a FIFO, a hung network mount)
+// can never wedge a preflight an operator runs under time pressure.
+const dbPreflightTimeout = 10 * time.Second
+
+// DBPreflight proves the DB at dbPath is a REACHABLE, INTACT tether database, read-only and without
+// mutating a byte.
+//
+// R10 P5 (#50) — "the gatekeeper was lying". This check used to be `storage.OpenReadOnly(...)` and
+// nothing else, but `OpenReadOnly` is a bare `sql.Open`, and `database/sql`'s Open is documented to
+// be LAZY: it validates the DSN, allocates a pool, and NEVER contacts the database. So every
+// pathological input below returned a nil error, `cluster doctor --offline --db <anything>` reported
+// 0 FATAL, and exited 0 — a green light for a host with no database at all. Any drill or runbook step
+// using doctor as its precondition gate was therefore gated on nothing.
+//
+// The states this must reject (all FATAL, all covered by TestDBPreflightRejectsAllFiveStates):
+//
+//	(1) the file does not exist          → os.Stat
+//	(2) the path is a DIRECTORY          → os.Stat + IsDir
+//	(3) the file is EMPTY (0 bytes)      → opens + pings + quick_check "ok"; ONLY the schema probe catches it
+//	(4) the file is TRUNCATED / garbage  → Ping
+//	(5) the file is PERMISSION-DENIED    → Ping (the lazy Open is what hid this one)
+//	(6) a CORRUPT page mid-file          → opens + pings + has a schema; ONLY quick_check catches it
+//
+// On layering — verified by mutation, because the obvious reading is wrong. Any ONE of Ping /
+// quick_check / the schema probe forces the real connection that `database/sql` skips, so deleting
+// Ping alone (or Ping+quick_check) still rejects states 1-5 and is NOT detectable from those states.
+// Each layer earns its place by the state only it catches, and by the DIAGNOSIS it gives:
+//
+//	Ping        — the only correct read of PERMISSION-DENIED. Without it that case falls through to
+//	              quick_check and is reported as "not an intact SQLite database", i.e. the operator is
+//	              told their DB is CORRUPT when it is merely unreadable. Wrong diagnosis, wrong remedy.
+//	quick_check — the ONLY layer that sees a corrupt page (state 6). Remove it and a genuinely
+//	              corrupt DB gets a clean bill of health: #50 again, one layer deeper.
+//	schema      — the ONLY layer that sees an empty file (state 3), which opens, pings and
+//	              quick_checks perfectly and is a valid, useless SQLite database.
+//
+// Exported so the same proof is available to any other offline surgery that must not proceed on an
+// unreadable DB.
+func DBPreflight(dbPath string) error {
+	if dbPath == "" {
+		return errors.New("no DB path given (--db is empty) — cannot verify the migration source")
+	}
+	st, err := os.Stat(dbPath) // Stat (not Lstat): a symlink to a real DB is fine; a dangling one errors here.
+	if err != nil {
+		return fmt.Errorf("stat %s: %v — the DB file is missing or unreadable", dbPath, err)
+	}
+	if st.IsDir() {
+		return fmt.Errorf("%s is a DIRECTORY, not a SQLite database file", dbPath)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode %s) — refusing to treat it as a SQLite database", dbPath, st.Mode())
+	}
+
+	db, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		return fmt.Errorf("open %s read-only: %v", dbPath, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbPreflightTimeout)
+	defer cancel()
+
+	// Force a real connection — this is what `database/sql`'s lazy Open never does, and skipping it
+	// is what made the pre-R10 check a no-op. (The probes below would also connect; Ping is kept
+	// because it is the layer that reports PERMISSION-DENIED as unreadable rather than as corrupt.)
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("open %s read-only: %v — the file is not a readable SQLite database (missing? permission denied? not a database?)", dbPath, err)
+	}
+	// Integrity: catches a truncated / partially-written / corrupted page image.
+	var quick string
+	if err := db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&quick); err != nil {
+		return fmt.Errorf("PRAGMA quick_check on %s: %v — the file is not an intact SQLite database", dbPath, err)
+	}
+	if quick != "ok" {
+		return fmt.Errorf("PRAGMA quick_check on %s reported %q (want \"ok\") — the database is CORRUPT", dbPath, quick)
+	}
+	// Schema: an EMPTY file is a perfectly valid, perfectly useless SQLite database — it opens, it
+	// pings, and quick_check says "ok". Only "does it carry a tether schema?" separates it from a
+	// real migration source.
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&n); err != nil {
+		return fmt.Errorf("read sqlite_master of %s: %v", dbPath, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%s opens as SQLite but has no schema_migrations table — it is EMPTY or is not a tether database "+
+			"(a fresh host has no DB until the broker has run once, or until `cluster recovery restore` installs one)", dbPath)
+	}
+	return nil
 }
 
 // DoctorSummary counts the verdicts.

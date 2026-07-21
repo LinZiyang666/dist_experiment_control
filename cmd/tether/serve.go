@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/serveconf"
@@ -49,6 +50,7 @@ func newServeCmd() *cobra.Command {
 		natsConfPath      string
 		natsServerBin     string
 		alertWebhookURL   string
+		diskCheckInterval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -122,6 +124,27 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// #58/P10: home-authoritative orphan xfer-object reap cadence (yaml-only knob, cluster
+			// section). Empty ⇒ 0 ⇒ broker.New's 5m default. Parsed here so a bad value fails the
+			// launch before storage.Open, same as the proc knobs above.
+			xferReapInterval, err := fileCfg.XferReapIntervalDuration()
+			if err != nil {
+				return err
+			}
+
+			// #39: disk-pressure monitor interval. Precedence flag > yaml > built-in default:
+			// an explicit --disk-check-interval wins; else broker.observability.disk_check_interval;
+			// else 0, which startDiskMonitor reads as "use the 5m default". Parsing the yaml here
+			// (before storage.Open) means a bad value aborts launch instead of half-creating tether.db.
+			if !cmd.Flags().Changed("disk-check-interval") {
+				yamlDisk, derr := fileCfg.DiskCheckIntervalDuration()
+				if derr != nil {
+					return derr
+				}
+				if yamlDisk != 0 {
+					diskCheckInterval = yamlDisk
+				}
+			}
 
 			// D9 C-1 (single WAL owner): in CLUSTER mode the cluster.Node opens the merged
 			// WAL DB and is the sole writable pool — serve.go must NOT call storage.Open (a
@@ -142,6 +165,12 @@ func newServeCmd() *cobra.Command {
 			if clusterMode && natsConfPath == "" && !cmd.Flags().Changed("nats-conf-path") {
 				natsConfPath = defaultNatsConfPath
 			}
+			// #27: default the C2 well-known manifest listener in cluster mode so a cluster-init'd broker
+			// is discovery serve-ready WITHOUT an explicit manifest_listen (the `cluster init` seam
+			// intentionally omits it — keying discovery on a config field the seam never writes left the
+			// listener un-bound and curl connection-REFUSED). Loopback-only + Caddy-fronted. An operator
+			// overrides the addr, or passes an explicit empty --cluster-manifest-listen to opt out.
+			manifestListen = resolveManifestListen(manifestListen, clusterMode, cmd.Flags().Changed("cluster-manifest-listen"))
 			var db *sql.DB
 			if !clusterMode {
 				db, err = storage.Open(dbPath)
@@ -186,6 +215,7 @@ func newServeCmd() *cobra.Command {
 				UpgradeURLAllowlist: allow,
 				ProcRetention:       procRetention,
 				ProcGCInterval:      procGCInterval,
+				XferReapInterval:    xferReapInterval,
 				SubHTTPAddr:         subHTTPListen,
 				SubURLBase:          subURLBase(publicHost),
 				ClusterDataDir:      clusterDataDir,
@@ -198,6 +228,7 @@ func newServeCmd() *cobra.Command {
 				NatsConfPath:        natsConfPath,
 				NatsServerBin:       natsServerBin,
 				AlertWebhookURL:     alertWebhookURL,
+				DiskCheckInterval:   diskCheckInterval,
 			}
 
 			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)
@@ -278,11 +309,24 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "address for the Prometheus /metrics + /healthz + /readyz HTTP endpoint (e.g. 127.0.0.1:9090); empty disables it (B5 OPS#1)")
-	cmd.Flags().StringVar(&manifestListen, "cluster-manifest-listen", "", "LOOPBACK address for the well-known cluster discovery manifest /.well-known/tether/cluster.json (e.g. 127.0.0.1:7480), Caddy-fronted; empty disables it; bound only in cluster mode (C2)")
+	cmd.Flags().StringVar(&manifestListen, "cluster-manifest-listen", "", "LOOPBACK address for the well-known cluster discovery manifest /.well-known/tether/cluster.json, Caddy-fronted; bound only in cluster mode where it DEFAULTS to "+defaultManifestListen+" (#27); pass an explicit empty value to opt out (C2)")
 	cmd.Flags().StringVar(&natsConfPath, "nats-conf-path", "", "live nats.conf the topology reconciler manages in cluster mode (default /etc/tether/nats.d/nats.conf; empty opts out) (C3)")
 	cmd.Flags().StringVar(&natsServerBin, "nats-server-bin", "", "nats-server binary for the topology reconciler's `-t` dry-run + `--signal reload` (default: nats-server on PATH) (C3)")
 	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
+	cmd.Flags().DurationVar(&diskCheckInterval, "disk-check-interval", 0, "how often the disk-pressure monitor samples --store-dir (H.4/#39; e.g. 5m, 30s); 0 = built-in default (5m). Overrides broker.observability.disk_check_interval")
 	return cmd
+}
+
+// resolveManifestListen applies the #27 cluster-mode default for the C2 well-known discovery manifest
+// listener. In cluster mode, an operator who left --cluster-manifest-listen unset (empty AND flag not
+// changed — which is exactly what the `cluster init` broker.yaml seam leaves, since it never writes a
+// manifest_listen key) gets the default loopback bind so discovery is serve-ready. A single-mode broker,
+// an operator-supplied addr, or an explicit empty --cluster-manifest-listen (opt out) is left as-is.
+func resolveManifestListen(cur string, clusterMode, flagChanged bool) string {
+	if clusterMode && cur == "" && !flagChanged {
+		return defaultManifestListen
+	}
+	return cur
 }
 
 // reExecBrokerInPlace (G5 #13) replaces this process image with the on-disk binary at the SAME path the

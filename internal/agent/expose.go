@@ -120,6 +120,9 @@ func (a *Agent) handleExposeRmForwarded(nc *nats.Conn, msg *nats.Msg) {
 				"err", err, "name", req.Name)
 		}
 	}
+	// R8a P1: the port is gone, so its home-ack destination is too. Without this the
+	// ack map would keep one entry per port ever pushed to, for the life of the agent.
+	a.forgetHomeAck(req.Port)
 	a.cfg.Logger.Info("agent: expose removed", "name", req.Name, "port", req.Port)
 }
 

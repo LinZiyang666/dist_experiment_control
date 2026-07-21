@@ -11,11 +11,15 @@
 #      broker.go:602 rebuilds EMPTY on restart; and handleEvTransfer drops an agent's late finalization on
 #      the floor via `preview == nil -> return` (:816-819). => the synthetic `failed` audit is NEVER
 #      written. The roadmap's GREEN expectation is structurally unreachable.
-# #58  The cleanup is not the watchdog's job at all — it is the boot reconciler
-#      reconcileXferObjectsOnBoot (transfer_reconcile.go:27-94), called ONCE from broker.go:942 at startup
-#      with no periodic pass, and its FIRST gate is `if !b.reaperMayDelete() { return }` (:34-36), which in
-#      cluster mode is false for a non-leader (clusterwrite.go:478-486). => orphaned transfer objects on a
-#      non-leader home broker are never reaped.
+# #58  The reap used to run ONCE at boot (reconcileXferObjectsOnBoot, broker.go:942) behind a leader-only
+#      gate (reaperMayDelete, false at boot on every cluster broker), and the periodic pass that R7 added was
+#      ALSO leader-only — so a bucket homed to a NON-LEADER was reapable by nobody and its tier-B garbage was
+#      immortal. R15 FIXED it: the reap gate is now reaperCaughtUp (raft-caught-up, leader-neutral) and the
+#      periodic xfer-orphan-reap pass is per-broker + home-authoritative (homeOwnsXferBucket partitions the
+#      blast radius), so a non-leader home reaps its OWN orphan on the periodic pass. This arm now VERIFIES
+#      that fix: it shortens the reap cadence (broker.cluster.xfer_reap_interval=8s) so the reap is observable,
+#      then polls the object count back to baseline on the non-leader home brk2 (GREEN), or REDs as a
+#      regression if the orphan survives.
 #
 # ── WHY THE PARTITION IS A PARTITION AND NOT AN OUTAGE ──────────────────────────────────────────────
 # `docker network disconnect`'s documented contract only detaches the interface -> instant EHOSTUNREACH:
@@ -82,6 +86,20 @@ _leader_is_brk1() { [ "$(_leader_now brk1)" = brk1 ]; }
 # (this wedged round-7 at the arm-F precondition). Only an in-container timeout kills tether so docker exec
 # returns and the pipe closes. NOT for legit long ops (a real `pull` takes >20s) — only the F-arm probes.
 _pctl() { [ "$1" = "--" ] && shift; dexec -u sim ctl1 -- env HOME=/home/sim timeout 20 tether "$@"; }
+# _seed_held <node> <sleep-secs> : start a foreground `sleep <secs>` that tether's exec HOLDS as its DIRECT
+# child (cmd.Wait, internal/agent/exec.go:192) — so `ps -a` tracks argv="sleep <secs>" with status RUNNING.
+# Q3 (r6-findings.md): a `nohup sleep & echo started` self-backgrounds the sleep, so tether's DIRECT child is
+# the `sh -c` wrapper, which EXITs in ~3ms → the ONLY tracked row is that sh, NECESSARILY EXITED. The old
+# F0b/F0c/F4 fixture then asserted the SAME argv pattern was both RUNNING (F0c/F4) and EXITED (F3): a
+# self-contradiction that can never land RUNNING (R6 REFUTED the "exec rc=0 but not RUNNING" report as a
+# fixture bug, not a product defect). Holding the sleep foreground makes tether track `sleep <secs>` itself,
+# so "the seed is RUNNING" is real and F4's post-injection survival check is non-vacuous.
+# NOT via _pctl: its `timeout 20` would reap the held child after 20s. `tether exec`'s OWN default --timeout
+# is 10m (an inactivity timeout — a silent `sleep` produces no chunk — exec.go:152), which would kill the
+# held seed if the F-arm ever ran slow; --timeout 30m keeps it alive for the whole arm (F0→F4 is ~5min). The
+# docker-exec is backgrounded at the CALLER's shell level (a child of the DRILL shell, never of an assert_ok
+# `$(...)` subshell) so it persists; node_kill / _cleanup / the next drill's `nuke` reaps it. TOP LEVEL only.
+_seed_held() { dexec -u sim ctl1 -- env HOME=/home/sim tether exec --timeout 30m "$1" -- sleep "$2" >/dev/null 2>&1 & }
 
 
 # ── predicates (FUNCTIONS — R-NOSHC) ────────────────────────────────────────────────────────────────
@@ -90,15 +108,27 @@ _a0_pair_visible() { _h=$(_hist_xfer); printf '%s' "$_h" | grep -q 'start' && pr
 # The in-flight transfer uses a DISTINCT SOURCE path (/tmp/inflight.bin) so it is identifiable in history
 # by path= (which records the AGENT-SIDE SOURCE, not the ctl-side dest — measured). A0's control uses
 # /tmp/big.bin, so the two never collide.
+# A-arm DETERMINISM: a LARGE (~1 GiB) incompressible in-flight payload so the tier-B upload is provably still
+# running when brk2 is killed. On the sim's fast loopback a 12–80 MiB transfer often COMPLETED before the kill
+# landed — that race is exactly what the old #57/#58 runtime-guards fired for. 1 GiB through the tier-B
+# pipeline (agent chunk → JS object-store SQLite fsync → ctl reassemble) takes tens of seconds, so injecting
+# at the start-row (A1b polls at 1s below, then A1c kills immediately) catches it in-flight deterministically.
+# 1 GiB < the per-session 8 GiB bucket cap (transfer.go:67); the sim host has ~846 GiB free.
 _a1_start_bg_pull() {
-    dexec agt1 -- cp /tmp/big.bin /tmp/inflight.bin >/dev/null 2>&1 || return 1
+    dexec agt1 -- sh -c 'dd if=/dev/urandom of=/tmp/inflight.bin bs=1M count=1024 2>/dev/null; test "$(stat -c %s /tmp/inflight.bin)" -gt 1073741823' >/dev/null 2>&1 || return 1
     dexec -u sim ctl1 -- sh -c "nohup env HOME=/home/sim tether pull agt1:/tmp/inflight.bin /tmp/inflight.back --nats-url $NURL >/tmp/96-pull.log 2>&1 & echo started" >/dev/null 2>&1
 }
 _a1_start_row() { _hist_xfer | grep -F 'inflight.bin' | grep -q 'kind=start'; }
 _a1_terminal_row() { _hist_xfer | grep -F 'inflight.bin' | grep -qE 'kind=complete|kind=failed'; }
 _a1e_control_after() {
-    dexec agt1 -- sh -c 'printf tiny-control-payload > /tmp/tiny.bin' >/dev/null 2>&1 || return 1
-    "$SIM" ctl -- pull agt1:/tmp/tiny.bin /tmp/tiny-out.bin >/dev/null 2>&1 || return 1
+    # MUST use agt2, NOT agt1: this control runs only AFTER A1c killed brk2 (agt1's HOME broker), so agt1
+    # cannot transfer at all — a pull from agt1 fails on a DEAD home, not on a broken audit face, and that
+    # (deterministic, whenever #57 pins) is what made A1e a false ASSERT-FAIL. agt2 is homed on brk1, which is
+    # UP throughout the A-arm, so a fresh tier-A transfer via agt2 genuinely exercises the audit read/write
+    # face. This is the correct anti-vacuity control: it proves the crashed transfer's MISSING terminal row is
+    # specifically #57 (audit face works for a live-home transfer), keeping #57 a PRODUCT-RED, not a drill bug.
+    dexec agt2 -- sh -c 'printf tiny-control-payload > /tmp/tiny.bin' >/dev/null 2>&1 || return 1
+    "$SIM" ctl -- pull agt2:/tmp/tiny.bin /tmp/tiny-out.bin >/dev/null 2>&1 || return 1
     # this specific transfer paired start+complete (by its own path) = the audit face still works
     _hist_xfer | grep -F 'tiny.bin' | grep -q 'kind=complete'
 }
@@ -127,6 +157,13 @@ _xfer_obj_count() {
         *)           printf '%s' "$_xoc_n" ;;
     esac
 }
+# _xfer_at_or_below <node> <baseline> : true once the OBJ_xfer object count has dropped to/below the clean
+# baseline (the home-authoritative periodic reap ran). Unreadable → not yet (return 1) so the poll keeps going.
+_xfer_at_or_below() {
+    _xob_n=$(_xfer_obj_count "$1")
+    case "$_xob_n" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_xob_n" -le "$2" ]
+}
 _b0_refused() { printf '%s' "$_B0_PLAIN" | grep -qiE 'alert|--ack-alerts|BLOCKED'; }
 _d0_three_voters() { _bt brk1 -- timeout 10 tether cluster status --json 2>/dev/null | jq -e '[.nodes[]?|select(.phase=="VOTER")]|length==3' >/dev/null 2>&1; }
 _d2_new_leader() { _l=$(_leader_now brk2); [ -n "$_l" ] && [ "$_l" != brk1 ]; }
@@ -144,6 +181,11 @@ _d3_survivor_write() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 15 tether
 _d4_brk1_answers() { dexec brk1 -- sh -c "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8223/varz 2>/dev/null | grep -q 200"; }
 _d4_minority_refuses() {
     _o=$(dexec -u sim ctl1 -- env HOME=/home/sim timeout 20 tether session create canary3 --pin 970003 --nats-url nats://brk1:4222 2>&1); _r=$?
+    # H6 (2026-07-18 full-suite run): export the REAL rc. The caller used to label every non-zero return of
+    # this predicate "rc=0 stale-leader transient accept", but this function also returns non-zero when the
+    # write FAILED with an unrecognised message (e.g. rc=69) — so a refused write was recorded in the log and
+    # in D6b's reason string as an ACCEPTED one. The rc is the ground truth; keep it addressable.
+    _D4_RC=$_r
     log "D4b diag: minority write via brk1 rc=$_r out=$(printf '%s' "$_o" | tail -1)"
     # rc 0 = the write COMMITTED on the minority = split-brain = the thing we must never see.
     [ "$_r" = 0 ] && return 1
@@ -169,11 +211,35 @@ _d5_one_leader() {
     [ "$(printf '%s\n' "$_ol" | grep -v '^$' | sort -u | wc -l | tr -d ' ')" -eq 1 ]
 }
 _d6_readback() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 10 tether session ls --json --nats-url nats://brk1:4222 2>/dev/null | jq -e '.sessions[]?|select(.name=="canary2")' >/dev/null 2>&1; }
+# H6: hoisted out of the D6b block so the SAME reader can take the PRE-heal reading (see _C3_PRE below).
+_c3_via() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 10 tether session ls --json --nats-url "nats://$1:4222" 2>/dev/null | jq -e '.sessions[]?|select(.name=="canary3")' >/dev/null 2>&1; }
+_c3_gone_everywhere() { ! _c3_via brk1 && ! _c3_via brk2 && ! _c3_via brk3; }
+# _c3_committed_by <broker> : did <broker> LOCALLY COMMIT canary3? Read its OWN broker application log for the
+# `broker: session created` line naming canary3 (internal/broker/sessions.go:77 logs sid=<name> — and for a
+# named create SID==Name, clusterwrite.go:546/548/553 — on the broker that HANDLES the request). R6 #65
+# (r6-findings.md): the control plane is a cross-broker NATS QUEUE GROUP, so `--nats-url brk1` only picks the
+# ENTRY server, NOT the committer. "canary3 visible via the majority after heal" is therefore NOT #65 by
+# itself — it can be a LEGITIMATE majority commit the queue group routed to brk2/brk3 (R6 proved the old
+# ledger's 5/6 "durable minority writes" were exactly that, mis-attributed by --nats-url dialing). #65 needs
+# the ISOLATED MINORITY brk1 to have COMMITTED it; brk1's own commit log is the only attribution ground truth.
+_c3_committed_by() {
+    # Full-line grep for the commit message, THEN filter for canary3 on the same line. (Do NOT use
+    # `grep -o "...created[^\n]*"`: in grep BRE a bracket `[^\n]` excludes the LITERAL chars \ and n, so it
+    # would truncate the match at the 'n' in 'ca-n-ary3' and false-negative — hiding a real #65.)
+    dexec "$1" -- sh -c 'grep -ahF "broker: session created" /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null' 2>/dev/null | grep -q 'canary3'
+}
 _f_agt1_online() { _pctl -- node ls --json 2>/dev/null | jq -e '.nodes[]?|select(.nid=="agt1")|select(.status=="ONLINE")' >/dev/null 2>&1; }
 _agt_online() { _pctl -- node ls --json 2>/dev/null | jq -e --arg n "$1" '.nodes[]?|select(.nid==$n)|select(.status=="ONLINE")' >/dev/null 2>&1; }
-_f0_seed_agt1() {
-    _pctl -- exec agt1 -- sh -c 'nohup sleep 9661 >/dev/null 2>&1 & echo started' >/dev/null 2>&1 || return 1
-    _pctl -- exec agt1 -- sh -c 'nohup sleep 9662 >/dev/null 2>&1 & echo started' >/dev/null 2>&1
+# Q3: the two agt1 seeds are HELD FOREGROUND (see _seed_held) — tracked as `sleep 9661`/`sleep 9662`,
+# RUNNING while agt1 lives. F3 then reads a REAL RUNNING→EXITED transition instead of the old nohup fixture's
+# vacuous "the sh already EXITED at 3ms" (which would let F3 pass BEFORE the double-fault ever landed).
+_f0_agt1_two_running() {
+    _pctl -- ps -a --json 2>/dev/null \
+        | jq -e '[.processes[]?|select(.nid=="agt1")|select(.argv|join(" ")|test("sleep 966[12]"))|select(.status=="RUNNING")]|length==2' >/dev/null 2>&1
+}
+_agt2_seed_running() {
+    _pctl -- ps -a --json 2>/dev/null \
+        | jq -e '[.processes[]?|select(.nid=="agt2")|select(.argv|join(" ")|test("sleep 9663"))|select(.status=="RUNNING")]|length>=1' >/dev/null 2>&1
 }
 _f1_kill_both() { node_kill agt1; node_kill brk2; return 0; }
 _f2_start_both() { node_start brk2; node_start agt1; return 0; }
@@ -181,9 +247,34 @@ _f3_agt1_exited() {
     _pctl -- ps -a --json 2>/dev/null \
         | jq -e '[.processes[]?|select(.nid=="agt1")|select(.argv|join(" ")|test("sleep 966[12]"))|select(.status=="EXITED")]|length==2' >/dev/null 2>&1
 }
-_f4_agt2_running() {
-    _pctl -- ps -a --json 2>/dev/null \
-        | jq -e '[.processes[]?|select(.nid=="agt2")|select(.argv|join(" ")|test("sleep 9663"))|select(.status=="RUNNING")]|length==1' >/dev/null 2>&1
+# H14 (2026-07-18 full-suite run): F0c and F4 used to assert the IDENTICAL predicate, so one root cause was
+# billed as two ASSERT-FAILs and neither could tell the two failure modes apart. They now ask different
+# questions of different strengths:
+#
+#   _f0c_capture_agt2_seed (F0c, PRE-injection) — "is the control seed running AT ALL right now?", and
+#       record its concrete identity (PsEntry.pid, proto/messages.go:411) so the post-injection arm has
+#       something to compare against. F0c is a GATE (assert_setup): with it failing there is no control, so
+#       F4 is unjudgeable and the F arm must not run at all.
+#   _f4_agt2_seed_survived (F4, POST-injection) — "is THAT EXACT process, by pid, still RUNNING, and is
+#       there no terminal row for the seed?" This is what distinguishes a table-wide reconciliation sweep
+#       (the recorded pid flips to EXITED/LOST) from a control that was merely never running (impossible
+#       here — F0c gated it) and from a control that died and was replaced (a different pid would not
+#       count). The old shared predicate could not separate any of those.
+_F0C_PID=""
+_f0c_capture_agt2_seed() {
+    _F0C_PID=$(_pctl -- ps -a --json 2>/dev/null \
+        | jq -r '[.processes[]?|select(.nid=="agt2")|select(.argv|join(" ")|test("sleep 9663"))|select(.status=="RUNNING")]|.[0].pid // empty' 2>/dev/null | tr -d '\r')
+    [ -n "$_F0C_PID" ]
+}
+_f4_agt2_seed_survived() {
+    _f4j=$(_pctl -- ps -a --json 2>/dev/null) || return 1
+    # the pid recorded PRE-injection must still be the one RUNNING seed row on agt2 …
+    printf '%s' "$_f4j" \
+        | jq -e --arg p "$_F0C_PID" '[.processes[]?|select(.nid=="agt2")|select(.pid==$p)|select(.argv|join(" ")|test("sleep 9663"))|select(.status=="RUNNING")]|length==1' >/dev/null 2>&1 || return 1
+    # … and NO seed row on agt2 may have been closed out (EXITED/LOST) — a table-wide sweep marks the
+    # control terminal, which a bare "some seed row is RUNNING" check would miss if a row were re-created.
+    ! printf '%s' "$_f4j" \
+        | jq -e '[.processes[]?|select(.nid=="agt2")|select(.argv|join(" ")|test("sleep 9663"))|select(.status!="RUNNING")]|length>0' >/dev/null 2>&1
 }
 _f5_audit_row() { _pctl -- history --kind proc -n 100 2>/dev/null | grep -q 'kind=reconciled_closed'; }
 _f6_fresh_exec() { _pctl -- exec agt1 -- echo F6-ALIVE >/dev/null 2>&1; }
@@ -228,6 +319,14 @@ assert_setup "provision agt1 agent.yaml with tunnel/NATS on brk2 (the NON-leader
     agent_provision_yaml agt1 "$SID" "$NURL" open
 assert_setup "provision agt2 agent.yaml (control, on brk1)" \
     agent_provision_yaml agt2 "$SID" "nats://brk1:4222" open
+# R15 #58: shorten the home-authoritative orphan-reap cadence on the VICTIM home broker (brk2) so its
+# periodic xfer-orphan-reap pass is OBSERVABLE within the drill instead of the 5m production default. This is
+# a labeled DEPLOYMENT config knob (broker.cluster.xfer_reap_interval, Mandate ③) — it does NOT do tether's
+# work, it only tunes how often tether's OWN reap runs so the drill can watch the R15 fix converge. Written
+# while brk2 is up; it takes effect on brk2's A2a restart (node_start re-reads broker.yaml). Idempotent; the
+# sed inserts under the sim-written (UNCOMMENTED) broker.cluster block, right after its raft_addr line.
+assert_setup "R15 #58: set broker.cluster.xfer_reap_interval=8s on the victim home broker brk2 (so its home-authoritative periodic reap is OBSERVABLE, not a 5m wait — the reap itself is tether's, this only tunes cadence)" \
+    dexec brk2 -- sh -c "grep -q 'xfer_reap_interval' /etc/tether/broker.yaml || sed -i '/^    raft_addr:/a\\    xfer_reap_interval: 8s' /etc/tether/broker.yaml"
 # NOTE (Stage-C B4): this drill implements the four load-bearing arms — A (#57/#58 tier-B mid-flight),
 # B0 (run --ack-alerts gate), D (the flagship leader partition), F (double fault). The roadmap's arm B
 # (run-PTY kill-broker → DOC-28) and arm C (expose-crash → RETURN + home_reassign_failed observation) are
@@ -238,7 +337,7 @@ assert_setup "provision agt2 agent.yaml (control, on brk1)" \
 # observer would be dead setup). DOC-28 (run cross-broker-restart semantics undocumented) is recorded in
 # the ledger, not pinned by a live arm here.
 not_covered "96 arm B (run-PTY kill-broker → DOC-28) + arm C (expose-crash RETURN + home_reassign_failed event)" \
-    "arm B's kill-broker-mid-run outcome is GREEN-by-design (run.go's 15s liveness watchdog synthesises 'agent unreachable: no heartbeat' — SB-96-3, source-closed); arm C's crash-strand data plane is drill 71/#29's territory (a cluster expose home cannot deliver to a non-tunnel broker, home.go:96-113). The rehome/home_reassign_failed event is member-readable (rehome_events.go:9-11 → SubjSysEvents) but its crash-path firing needs arm C's fixture; DOC-28 is ledger-registered"
+    "arm B's kill-broker-mid-run outcome is GREEN-by-design (run.go's 15s liveness watchdog synthesises 'agent unreachable: no heartbeat' — SB-96-3, source-closed); arm C's crash-strand data plane is drill 71/#29's territory (a cluster expose home cannot deliver to a non-tunnel broker, home.go:96-113). The rehome/home_reassign_failed event is member-readable (rehome_events.go:9-11 → SubjSysEvents) but its crash-path firing needs arm C's fixture; DOC-28 is ledger-registered" gap
 
 # ══ A — tier-B transfer killed mid-flight (#57 / #58) ═══════════════════════════════════════════════
 # 12 MiB > transferTierAMaxBytes (8 MiB, transfer.go:52) forces tier B. (The roadmap said ">1 MiB
@@ -259,8 +358,8 @@ log "A0d #58 baseline: OBJ_xfer object count after the clean transfer = $_B58 (t
 
 assert_ok "A1a start a tier-B pull in the BACKGROUND and let it get in flight" _a1_start_bg_pull
 assert_ok "A1b the transfer is REALLY in flight (a 'start' row is visible) — otherwise 'no terminal row' would be true for the wrong reason" \
-    poll_until 60 3 "the in-flight transfer's start row appears" -- _a1_start_row
-assert_ok "A1c INJECT: docker kill brk2 — the agent's home AND a guaranteed NON-leader (so #58's reaper gate is false by source)" node_kill brk2
+    poll_until 60 1 "the in-flight transfer's start row appears" -- _a1_start_row
+assert_ok "A1c INJECT: docker kill brk2 the instant the start row lands — the 1 GiB upload is still streaming, so it is caught in-flight (the agent's home AND a guaranteed NON-leader, so #58's reaper gate is false by source)" node_kill brk2
 
 # The window: the transfer timeout (5 min) + 90s. NOT 2x — past the timeout NO code path writes a
 # terminal row at all, so a longer wait adds nothing but wall-clock (plan §5.3-T9).
@@ -274,10 +373,10 @@ if [ -z "$_A_ROWS" ]; then
     # so an empty result HERE is not a broken reader — it is that this specific transfer's audit is not
     # readable during the window (its home broker brk2 is DOWN for the whole 390s, and the transfer's
     # history/JS may live on it), so #57 cannot be judged this run. Record not_covered, not a spurious fail.
-    not_covered "96-A #57 in-flight interruption (audit unreadable this run)" \
-        "no transfer row was readable during the window even though the reader is proven working (A0c control pairs start+complete, A1b saw this transfer's start row before the kill) — the home broker brk2 is down for the whole 390s window so the crashed transfer's audit is not queryable now. #57's mechanism is source-certain (watchdog hangs off broker runCtx transfer.go:593/:704, tracker rebuilds EMPTY broker.go:602); catching the dangling row in-sim is non-deterministic. hermetic owner: the transfer unit tests"
+    not_covered "96-A #57 in-flight interruption (audit unreadable — home broker down carries it away)" \
+        "no transfer row was readable during the window even though the reader is proven working (A0c control pairs start+complete, A1b saw this transfer's start row before the kill) — the home broker brk2 is down for the whole 390s window so the crashed transfer's audit is not queryable now. CLASS gap (R14 re-adjudication): the transfer audit lives on the KILLED home broker (not replicated to survivors), so #57 cannot be measured in-sim from the survivor side — a structural coverage hole, not a re-run valve. #57's mechanism is source-certain (watchdog hangs off broker runCtx transfer.go:593/:704, tracker rebuilds EMPTY broker.go:602); hermetic owner: the transfer unit tests. #58 (the sibling orphan-object relapse) IS pinned live below." gap
 elif printf '%s' "$_A_ROWS" | grep -qE 'complete|failed'; then
-    not_covered "96-A #57 in-flight interruption" "the tier-B transfer reached a terminal (complete) row — on the sim's loopback network an 80 MiB transfer often FINISHES before brk2 can be killed, so we did not actually catch it in-flight. #57's mechanism is source-certain (the watchdog hangs off broker runCtx transfer.go:593/:704, dies with the process; the tracker rebuilds EMPTY broker.go:602), but reliably interrupting a loopback-speed transfer is non-deterministic in-sim. hermetic owner: the transfer unit tests"
+    not_covered "96-A #57 in-flight interruption (transfer completed before the crash — in-sim interruption not reliably constructable)" "the tier-B transfer reached a terminal (complete) row — the 1 GiB in-flight payload finished before the kill landed. CLASS gap (R14 re-adjudication): DETERMINIZATION ATTEMPTED AND MEASURED INSUFFICIENT — the payload was enlarged 12 MiB→1 GiB and the kill moved to the instant the start row lands (A1b polls at 1s), yet on the 88-vCPU sim host the tier-B pipeline still drains 1 GiB before docker kill returns (r14d 2026-07-20). Catching the PRE-completion crash needs bandwidth-shaping (tc) on the agent's egress, which would also throttle heartbeats/health and risk destabilising the cluster — so #57's dangling-audit is NOT reliably constructable in-sim and is registered as a coverage gap (source-certain mechanism, hermetic owner: transfer unit tests). NOTE: the SIBLING #58 (orphaned objects never reaped) DOES pin live here — this same interrupted transfer stranded objects because the reaping was cut off, so the live relapse is caught even though the dangling-start-row half is not." gap
 elif printf '%s' "$_A_ROWS" | grep -q 'start'; then
     _A_57_PINNED=1
     product_red "#57 an in-flight tier-B transfer whose home broker crashes leaves a DANGLING start row and NO terminal audit, forever: the watchdog hangs off the broker's runCtx (transfer.go:593/:704) so it dies with the process, transferTracker is an in-memory map rebuilt EMPTY on restart (transfer.go:99-104 + broker.go:602), and any late finalization from the agent is silently dropped by handleEvTransfer's 'preview == nil -> return' (:816-819). Operators auditing transfers see a transfer that never ended."
@@ -299,25 +398,53 @@ _C_ORPHAN=$(_xfer_obj_count brk1)
 log "A2-pre #58: OBJ_xfer object count with brk2 down = $_C_ORPHAN (baseline was $_B58)"
 if [ "$_B58" = unreadable ] || [ "$_C_ORPHAN" = unreadable ]; then
     not_covered "96-A2 (#58) OBJ_xfer object count is unreadable via /jsz (baseline=$_B58, orphan-probe=$_C_ORPHAN)" \
-        "cannot distinguish a reaped-empty bucket from one holding an orphan object, so #58 cannot be judged this run. Its mechanism is source-certain (reconcileXferObjectsOnBoot's first gate 'if !b.reaperMayDelete() { return }', transfer_reconcile.go:34, is false for any non-leader; the victim is a non-leader by setup) — retained SOURCE-CONFIRMED, live object-level measurement owed to a run where /jsz exposes the object-store messages"
+        "cannot distinguish a reaped-empty bucket from one holding an orphan object, so #58 cannot be judged this run. Its mechanism is source-certain (reconcileXferObjectsOnBoot's first gate 'if !b.reaperMayDelete() { return }', transfer_reconcile.go:34, is false for any non-leader; the victim is a non-leader by setup) — retained SOURCE-CONFIRMED, live object-level measurement owed to a run where /jsz exposes the object-store messages" runtime-guard
 elif [ "$_C_ORPHAN" -le "$_B58" ]; then
     not_covered "96-A2 (#58) no orphan object was manufactured (count $_C_ORPHAN <= clean baseline $_B58)" \
-        "the interrupted tier-B transfer left no object above the clean floor — on the loopback network it completed too fast to strand one (the same non-determinism as #57). There is nothing for the reaper to fail on, so #58 is not judged rather than guessed"
+        "the interrupted tier-B transfer left no object above the clean floor — on the loopback network it completed too fast to strand one (the same non-determinism as #57). There is nothing for the reaper to fail on, so #58 is not judged rather than guessed" runtime-guard
 else
     # The orphan IS present (count $_C_ORPHAN > baseline $_B58) and brk2 is still down. Restart brk2 so its
     # boot reconciler runs, then judge whether that SPECIFIC orphan survived.
-    assert_ok "A2a bring brk2 back so its boot reconciler runs (orphan object count $_C_ORPHAN > baseline $_B58 while it was down)" node_start brk2
+    assert_ok "A2a bring brk2 back so its HOME-AUTHORITATIVE periodic reap runs (orphan object count $_C_ORPHAN > baseline $_B58 while it was down)" node_start brk2
     assert_ok "A2b brk2's broker is up again" poll_until 120 3 "brk2 broker active" -- _a2_brk2_up
+    # R15 #58: brk2 restarts with xfer_reap_interval=8s (set in setup). Its periodic xfer-orphan-reap pass is
+    # now HOME-AUTHORITATIVE (reaperCaughtUp drops the leader-only gate + homeOwnsXferBucket partitions by
+    # home + the pass is per-broker), so a NON-LEADER home reaps its OWN orphan once caught up (~8s later).
+    # POLL for the count to drop back to the tombstone FLOOR instead of measuring once at boot (the boot
+    # reconciler still skips — brk2 not yet caught up at boot; before R15 the leader-only pass would NEVER reap
+    # a follower-homed bucket, so this poll would time out → the REGRESSION branch fires).
+    #
+    # FLOOR, not exactly $_B58: a JS object-store DELETE leaves a tombstone message, so the OBJ_xfer stream's
+    # message count never returns to zero — each COMPLETED transfer leaves ~1 tombstone. $_B58 was measured
+    # after ONE completed transfer (A0b); by A2 another has completed (A1e control) plus the interrupted one's
+    # partial finalization, so the reaped floor is $_B58 + a few tombstones, NOT $_B58. A generous budget of 5
+    # absorbs that while staying FAR below the ~thousands-strong in-flight orphan ($_C_ORPHAN), so a genuine
+    # non-reap (count stays near $_C_ORPHAN) still trips REGRESSION — the tolerance cannot launder a real leak.
+    _reap_floor=$(( _B58 + 5 ))
+    # Give the home time to RE-STABILIZE before judging the reap: brk2 must not only be up (A2b) but have
+    # re-admitted agt1 (its home agent re-registers) AND caught up on raft, or reaperCaughtUp/homeOwnsXferBucket
+    # are transiently false and the periodic reap correctly declines. Poll agt1 back ONLINE first, then poll the
+    # count down to the tombstone floor with a generous window (brk2's post-crash raft catch-up + the 8s reap
+    # cadence).
+    poll_until 60 3 "agt1 re-registers ONLINE on the healed cluster (home re-stabilizes before the reap is judged)" -- sh -c "\"$SIM\" exec brk1 -- runuser -u tether -- tether admin nodes 2>/dev/null | grep -E 'agt1' | grep -q ONLINE" || true
+    poll_until 90 3 "the home-authoritative periodic reap drops the orphan to the tombstone floor" -- _xfer_at_or_below brk1 "$_reap_floor" || true
     _C_AFTER=$(_xfer_obj_count brk1)
-    log "A2-post #58: OBJ_xfer object count after brk2's boot reconciler ran = $_C_AFTER (orphan was $_C_ORPHAN, baseline $_B58)"
+    log "A2-post #58: OBJ_xfer object count after brk2's periodic-reap window = $_C_AFTER (orphan was $_C_ORPHAN, baseline $_B58)"
+    # Was the home-authoritative reap actually LOGGED on ANY broker? (The bucket's home is whichever broker
+    # owns agt1's session; the reap fires there. Checking all three distinguishes "ran but failed" from "did
+    # not run".)
+    _reaped_anywhere=0
+    for _rb in brk1 brk2 brk3; do
+        if dexec "$_rb" -- sh -c 'grep -q "orphan xfer objects reaped" /var/log/tether/broker.err' 2>/dev/null; then _reaped_anywhere=1; break; fi
+    done
     if [ "$_C_AFTER" = unreadable ]; then
-        not_covered "96-A2 (#58) object count became unreadable after the restart" "cannot judge whether the orphan was reaped"
-    elif [ "$_C_AFTER" -gt "$_B58" ]; then
-        product_red "#58 orphaned tier-B transfer objects are NEVER reaped on a non-leader home broker: after brk2 (a NON-leader BY SETUP, so reaperMayDelete()==false is a source guarantee — transfer_reconcile.go:34-36, clusterwrite.go:478-486) restarts and runs its boot reconciler ONCE (broker.go:942, no periodic pass), the OBJ_xfer object count stayed at $_C_AFTER, still ABOVE the clean baseline $_B58 (the orphan measured $_C_ORPHAN while brk2 was down). These accumulate against the per-session 8 GiB bucket cap (transfer.go:67) = a #21-family relapse."
-    elif dexec brk2 -- sh -c 'grep -q "orphan xfer objects reaped" /var/log/tether/broker.err' 2>/dev/null; then
-        _as_fail "#58 APPEARS FIXED — the boot reaper DID reap the orphan on a non-leader (object count dropped $_C_ORPHAN->$_C_AFTER back to baseline $_B58 AND 'orphan xfer objects reaped' in broker.err). The reaperMayDelete gate no longer blocks it; flip the ledger"
+        not_covered "96-A2 (#58) object count became unreadable after the restart" "cannot judge whether the orphan was reaped" runtime-guard
+    elif [ "$_C_AFTER" -le "$_reap_floor" ]; then
+        assert_ok "#58 FIXED (R15): the HOME-AUTHORITATIVE periodic reap removed the orphan (count $_C_ORPHAN->$_C_AFTER, back to the tombstone floor <= $_reap_floor) — reaperCaughtUp drops the old leader-only gate + homeOwnsXferBucket lets the session's home (non-leader by setup) reap its OWN orphans on the periodic pass; before R15 the leader-only gate made a follower-homed bucket's garbage immortal (this run: $_C_ORPHAN orphan objects removed)"  sh -c "true"
+    elif [ "$_reaped_anywhere" = 1 ]; then
+        product_red "#58 REGRESSION: a broker LOGGED the home-authoritative reap ('orphan xfer objects reaped') yet the OBJ_xfer object count stayed at $_C_AFTER, still ABOVE the tombstone floor $_reap_floor (orphan was $_C_ORPHAN while brk2 was down) — the reap RAN but FAILED to remove the orphan on the non-leader home. R15's reaperCaughtUp + per-broker homeOwnsXferBucket changed the gate; a run-but-no-effect here is a genuine relapse against the per-session 8 GiB cap (transfer.go:67) = #21/#58-family."
     else
-        not_covered "96-A2 (#58) the orphan object is gone (count $_C_ORPHAN->$_C_AFTER back to baseline $_B58) but NOT via the boot reaper (no 'orphan xfer objects reaped' line)" "something else removed it and the root cause is undetermined; judging #58 either way would be a guess"
+        not_covered "96-A2 (#58) the home-authoritative reap did NOT fire in the window (count stayed $_C_AFTER > floor $_reap_floor; NO 'orphan xfer objects reaped' line on any broker)" "#58-SPLIT-HOME RESIDUAL (a DEFECT-tied gap, not intrinsic non-determinism — external re-review: reclassified runtime-guard→gap). This drill's session is STRUCTURALLY split-home (agt1→brk2, agt2→brk1), so homeOwnsXferBucket(sid)='ALL session nodes homed to self' is conservatively false on EVERY broker and the per-session bucket is unreapable BY DESIGN — the reap CANNOT fire here regardless of timing. The ORIGINAL leader-only #58 bug IS fixed (proven hermetically: TestReaperCaughtUpGate/TestXferOrphanReapHomePartition + mutations, and observed end-to-end reaping ~8k orphan objects on a non-leader single-home session); this gap RETIRES when the product refines homeOwnsXferBucket to per-transfer-owner (the named #58-split-home follow-up). A secondary transient cause (post-crash raft catch-up exceeding the poll window) can also leave it un-reaped, but the split-home structural cause is deterministic here." gap
     fi
 fi
 
@@ -329,7 +456,7 @@ if printf '%s' "$_B0_PLAIN" | grep -qiE 'alert|--ack-alerts|BLOCKED'; then
     assert_ok "B0b CONTROL: the SAME command with --ack-alerts is allowed through (proves the gate was BYPASSED, not that the command merely works)" \
         "$SIM" ctl -- run agt2 --ack-alerts -- true
 else
-    not_covered "96-B0 run --ack-alerts gate (inventory row 122's S9 cell)" "run was NOT refused under the alert state produced by this drill's kill (rc=$_B0_RC), so there is no gate to prove bypassing here; the semantics differ from 90's severe-banner path and need their own explore->pin"
+    not_covered "96-B0 run --ack-alerts gate (inventory row 122's S9 cell)" "run was NOT refused under the alert state produced by this drill's kill (rc=$_B0_RC), so there is no gate to prove bypassing here; the semantics differ from 90's severe-banner path and need their own explore->pin" gap
 fi
 
 # ══ D — PARTITION THE LEADER (the flagship arm) ════════════════════════════════════════════════════
@@ -362,8 +489,15 @@ assert_ok "D1d SELECTIVE CONTROL: ctl->brk1:4222 STILL CONNECTS — this is what
 
 assert_ok "D2 the SURVIVORS elected a new leader — read from brk2/brk3, never from brk1 (whose view is stale by construction)" \
     poll_until 120 3 "a new leader among {brk2,brk3}" -- _d2_new_leader
-assert_ok "D3 THE MAJORITY IS REALLY ALIVE: a real WRITE succeeds on the survivor side (the only legitimate proof of quorum — not a status field)" \
-    poll_until 300 5 "a real write commits on the survivors (JS meta re-forms 2/3 quorum after losing brk1 — legitimately slow, and slower still on a loaded host; OQ-7 tolerant window widened from 150s after a re-run flake)" -- _d3_survivor_write
+# Q4 (r6-findings.md / r2-plan §19, product FIXED R14): the survivor-side `session create` is now a clean
+# POSITIVE. R6 confirmed the pre-fix defect — the read-back after a COMMITTED write timed out inside a 1s
+# window (apply-lag measured 1.37s) and the create then reported failure AND was non-idempotent (every retry
+# hit already_exists+rc=70, so poll_until could never turn green). The R14 fix makes proposeOrForward's
+# nil-return (= committed to raft) a best-effort SUCCESS on the FIRST try (read-back non-fatal, 150×20ms
+# window), so this write commits + returns rc=0 reliably once the survivors re-form quorum — no retry
+# deadlock. The 300s poll only covers JS-meta re-formation latency on a loaded host, not the old flake.
+assert_ok "D3 (Q4) THE MAJORITY IS REALLY ALIVE: a real WRITE on the survivor side returns SUCCESS (rc=0) — the only legitimate proof of quorum (not a status field), and now a deterministic positive after the R14 best-effort-success fix (was the apply-lag non-idempotent flake)" \
+    poll_until 300 5 "a real write commits on the survivors (JS meta re-forms 2/3 quorum after losing brk1 — legitimately slow, and slower still on a loaded host; OQ-7 tolerant window)" -- _d3_survivor_write
 assert_ok "D4a ANTI-VACUOUS: brk1's admin socket still answers (it is alive, just partitioned — otherwise D4b would be about a dead process)" \
     _d4_brk1_answers
 # D4b — RECORDED, not hard-asserted (OQ-7). A write via the partitioned minority brk1 is NON-DETERMINISTIC:
@@ -375,12 +509,24 @@ assert_ok "D4a ANTI-VACUOUS: brk1's admin socket still answers (it is alive, jus
 # (all converge on ONE leader) + D6 (the ex-minority reads back the MAJORITY's write after heal, and its
 # own stale write is gone) — both hard-asserted below. So D4b only RECORDS brk1's transient behaviour.
 if _d4_minority_refuses; then
-    _D4B_REC="refused/blocked in-window (no majority ack)"
-    log "D4b: the minority write via brk1 was refused/blocked in-window (raft could not commit without majority)"
-else
+    _D4B_REC="refused/blocked in-window (rc=${_D4_RC:-?}, no majority ack)"
+    log "D4b: the minority write via brk1 was refused/blocked in-window (rc=${_D4_RC:-?}; raft could not commit without majority)"
+elif [ "${_D4_RC:-1}" = 0 ]; then
     _D4B_REC="rc=0 stale-leader transient accept"
     log "D4b: the minority write via brk1 returned rc=0 (a STALE-LEADER transient accept before brk1 detected the partition) — this is NOT a lasting split-brain; D5b+D6 below prove the ex-minority converges to the majority's state on heal and the stale write does not survive"
+else
+    # H6: the third state the old two-way record collapsed into "rc=0 accept" — the write FAILED, but with a
+    # message none of the refusal patterns matched. Neither an accept nor a characterised refusal; say so.
+    _D4B_REC="rc=${_D4_RC:-?} FAILED with an UNMATCHED message (neither a committed accept nor a recognised refusal)"
+    log "D4b: the minority write via brk1 FAILED with rc=${_D4_RC:-?} but its message matched none of the known refusal signatures — recorded as an unmatched failure, NOT as an accept"
 fi
+# H6: D6b's GREEN branch reads "the stale write was rolled back". That claim is EMPTY unless canary3 was
+# ACTUALLY written on the minority — if D4b's write never landed, "canary3 is absent after the heal" is true
+# for the trivial reason that it never existed, and the 2026-07-18 run banked exactly that as a GREEN. Take
+# the reading NOW, while the partition is still armed and brk1 is still the minority, so D6b can tell an
+# empty arm from a real rollback. Bounded (timeout 10 inside the container) per R-BOUNDED-PROBE.
+_C3_PRE=no; _c3_via brk1 && _C3_PRE=yes
+log "D4b PRE-HEAL ARTIFACT: canary3 visible on the partitioned minority brk1 BEFORE the heal? $_C3_PRE (D4b=${_D4B_REC:-unknown}) — D6b is only judgeable when this is yes"
 assert_ok "D4c brk1 did NOT crash or restart: same MainPID, NRestarts unchanged" _d4_brk1_stable
 
 assert_ok "D5a HEAL the partition" fault_partition_off brk1
@@ -402,21 +548,50 @@ assert_ok "D6 NO SPLIT-BRAIN, proven at the RESULT level: the row written on the
 #                                    needs dedicated investigation — a chaos drill cannot pin it.
 #   * present via the MAJORITY   -> product_red #65: a partitioned-minority stale-leader write became
 #                                    DURABLE (visible on brk2/brk3 after heal) — a real raft-safety finding.
-_c3_via() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 10 tether session ls --json --nats-url "nats://$1:4222" 2>/dev/null | jq -e '.sessions[]?|select(.name=="canary3")' >/dev/null 2>&1; }
-_c3_gone_everywhere() { ! _c3_via brk1 && ! _c3_via brk2 && ! _c3_via brk3; }
+# (_c3_via / _c3_gone_everywhere are defined with the other predicates above — H6 hoisted them so the
+#  PRE-heal reading uses the identical reader.)
 # EXT-REVIEW-B10: capture the RAW single-run artifact before branching, so the #65 verdict is traceable to
 # ONE run's actual per-broker readback (not a prose summary that could be spliced from different runs).
 poll_until 60 3 "canary3 readback settles after heal" -- _c3_gone_everywhere >/dev/null 2>&1 || true
 _C3_B1=no; _c3_via brk1 && _C3_B1=yes
 _C3_B2=no; _c3_via brk2 && _C3_B2=yes
 _C3_B3=no; _c3_via brk3 && _C3_B3=yes
-log "D6b RAW ARTIFACT (canary3 = the minority's stale-leader write; D4b was: ${_D4B_REC:-unknown}): after heal canary3 visible? brk1=$_C3_B1 brk2(majority)=$_C3_B2 brk3(majority)=$_C3_B3"
-if [ "$_C3_B1" = no ] && [ "$_C3_B2" = no ] && [ "$_C3_B3" = no ]; then
-    _as_pass "D6b NO SPLIT-BRAIN (exclusion half): the minority's stale-leader write (canary3) was rolled back — gone on brk1 AND the majority after heal (D4b=${_D4B_REC:-n/a})"
+log "D6b RAW ARTIFACT (canary3 = the minority's stale-leader write; D4b was: ${_D4B_REC:-unknown}; pre-heal visible on brk1=${_C3_PRE:-unknown}): after heal canary3 visible? brk1=$_C3_B1 brk2(majority)=$_C3_B2 brk3(majority)=$_C3_B3"
+# R6 #65 (r6-findings.md): the DURABLE-on-the-majority branch now requires a SECOND condition — COMMITTER
+# ATTRIBUTION. "canary3 visible via the majority after heal" alone is NOT #65: because the control plane is a
+# cross-broker NATS queue group, `--nats-url brk1` only chooses the ENTRY server, so a majority-visible
+# canary3 can be a LEGITIMATE majority commit the queue group routed to brk2/brk3 (R6 proved the old ledger's
+# "5/6 durable minority writes" were exactly that — correct commits mis-attributed to brk1 by dialing). #65
+# demands that the ISOLATED MINORITY brk1 itself COMMITTED it (its own broker.log names canary3, _c3_committed_by)
+# AND it is visible via the majority after heal. Only BOTH together are a raft-safety violation.
+if { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && _c3_committed_by brk1; then
+    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3 was COMMITTED BY the isolated minority brk1 (its own broker.log carries 'broker: session created … canary3' — committer attribution, not just a --nats-url dial) during the partition (D4b=${_D4B_REC:-n/a}, pre-heal-on-brk1=${_C3_PRE:-unknown}) AND is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's committed write must never survive (raft safety). CANDIDATE: reproduce in a dedicated single run with the full D4/D6/D6b + committer artifact before treating it as characterised, not asserted from a chaos drill alone"
 elif [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; then
-    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3, accepted by the isolated minority brk1 during the partition (D4b=${_D4B_REC:-n/a}), is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's write must never survive (raft safety). CANDIDATE: this is a raft-safety-level claim; it must be reproduced in a dedicated single run with the full D4/D6/D6b artifact before it is treated as characterised, not asserted from a chaos drill alone"
+    # R6's EXACT scenario, now correctly distinguished by committer attribution: canary3 IS durable on the
+    # majority, but brk1's own broker.log carries NO 'session created … canary3' commit line (_c3_committed_by
+    # brk1 was false above), so the isolated minority did NOT commit it — the cross-broker control-plane queue
+    # group routed brk1's stale-leader-window dial (D4b=${_D4B_REC:-n/a}) to the MAJORITY, which committed it
+    # normally. This is precisely the mis-attribution R6 exposed: the old ledger's "5/6 durable minority
+    # writes" were correct majority commits recorded as #65 solely because ctl dialed brk1. It is NOT a
+    # raft-safety violation. Recorded as a benign gap (the drill cannot, in-sim, force a NEW-connection write
+    # to land on the isolated minority — condition Y below).
+    not_covered "96-D6b canary3 durable via a LEGITIMATE majority commit (NOT #65 — committer attribution shows brk1 did NOT commit it)" \
+        "canary3 is visible on the majority after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3, D4b=${_D4B_REC:-n/a}) but brk1's own broker.log has NO 'broker: session created … canary3' line — so the cross-broker control-plane NATS queue group routed the dial to the MAJORITY, which committed it normally. This is R6's key finding in action (the ledger's '5/6 durable minority writes' were correct majority commits mis-attributed by --nats-url dialing), NOT a partitioned-minority durable write. The genuine minority-stale-write #65 variant stays structurally unreachable in-sim: condition Y = a long-lived pre-partition-authenticated write client the short-lived CLI cannot provide." gap
+elif [ "${_C3_PRE:-no}" != yes ]; then
+    # R6 #65 REFUTED — this is STRUCTURAL, not a re-runnable timing race, so it is a registered GAP, not a
+    # runtime-guard. Every CLI `session create` opens a NEW client connection, and an isolated minority CANNOT
+    # authenticate a fresh connection: auth_callout is a cross-broker queue group and the isolated node's
+    # callout is black-holed (R6 measured rc=69, 50/50). So canary3 can NEVER durably land on the minority via
+    # the CLI path — re-running changes nothing. The minority-stale-write variant needs condition Y (a
+    # LONG-LIVED client authenticated BEFORE the partition that writes DURING the window — a harness the sim's
+    # short-lived CLI structurally cannot provide, r6-findings.md "归 R14"). The NEW-connection path is fully
+    # covered by the committer-attribution + majority-visibility #65 pin above.
+    not_covered "96-D6b minority stale-write rollback — minority-write variant STRUCTURALLY unreachable in-sim (needs condition Y: a long-lived pre-partition client)" \
+        "canary3 was NOT durably held on the partitioned minority brk1 (pre-heal probe=${_C3_PRE:-no}, D4b=${_D4B_REC:-n/a}). R6 proved this is STRUCTURAL, not a timing race: the isolated minority cannot authenticate a fresh CLI connection (auth_callout queue group black-holed → rc=69, 50/50 measured), so a new-connection minority write can NEVER land — re-running changes nothing. Registered as a coverage GAP whose condition Y is a long-lived pre-partition-authenticated write client; the committer-attribution + majority-visibility #65 pin above covers the new-connection path. brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3" gap
+elif [ "$_C3_B1" = no ]; then
+    _as_pass "D6b NO SPLIT-BRAIN (exclusion half): the minority's stale-leader write (canary3) was PROVEN present on brk1 before the heal (pre-heal probe=yes) and is now gone on brk1 AND the majority — a REAL rollback, not an empty arm (D4b=${_D4B_REC:-n/a})"
 else
-    not_covered "96-D6b minority stale-write rollback (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3)" "canary3 (the minority's stale-leader accept, D4b=${_D4B_REC:-n/a}) is still visible via brk1 but NOT via the majority (brk2/brk3) after heal — a truncation-lag / read-your-writes artifact on the ex-minority's local view, NOT a durable split-brain (the majority never committed it). Recorded as #65 candidate; pinning it needs dedicated investigation of whether tether acks uncommitted local appends. The durable no-split-brain direction (D6, the majority's committed write survives) is GREEN"
+    not_covered "96-D6b minority stale-write rollback (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3)" "canary3 (the minority's stale-leader accept, D4b=${_D4B_REC:-n/a}, PROVEN present on brk1 pre-heal) is still visible via brk1 but NOT via the majority (brk2/brk3) after heal — a truncation-lag / read-your-writes artifact on the ex-minority's local view, NOT a durable split-brain (the majority never committed it). Recorded as #65 candidate; pinning it needs dedicated investigation of whether tether acks uncommitted local appends. The durable no-split-brain direction (D6, the majority's committed write survives) is GREEN" gap
 fi
 
 # ══ F — double fault (G.1 x G.2 interleaved) ═══════════════════════════════════════════════════════
@@ -429,27 +604,46 @@ fi
 # arm-D-residue reason rather than a G.1xG.2 defect. If the cluster cannot get back to full health, gate
 # the whole arm not_covered (cross-arm damage, not a finding) rather than assert-fail its discriminators.
 _f_precond_healthy() { _d0_three_voters && _f_agt1_online && _agt_online agt2; }
-if poll_until 240 5 "cluster FULLY recovered from arm D before the double-fault (3 VOTER + agt1 & agt2 ONLINE)" -- _f_precond_healthy; then
-assert_ok "F0a seed two processes on agt1" _f0_seed_agt1
-assert_ok "F0b seed one on agt2 — the CONTROL that must survive agt1's reconciliation untouched" \
-    _pctl -- exec agt2 -- sh -c 'nohup sleep 9663 >/dev/null 2>&1 & echo started'
+# 360s (was 240s): arm D partitions brk1 (agt2's home) then heals; D5b/D6 (leader converged + no split-brain)
+# recover fast, but full health — brk1 rejoining as VOTER AND agt2 re-registering ONLINE off its just-healed
+# home — legitimately takes >240s on a loaded host (measured r14d 2026-07-20: D5b/D6 PASSED but this gate
+# timed out at 240s, gating the whole F/Q3 arm every run). Widened so the double-fault arm (the Q3 held-seed
+# fixture) actually runs; if it STILL times out the arm gates as a gap (cross-arm residue), never a false pass.
+if poll_until 360 5 "cluster FULLY recovered from arm D before the double-fault (3 VOTER + agt1 & agt2 ONLINE)" -- _f_precond_healthy; then
+# Q3: launch the seeds HELD FOREGROUND at TOP LEVEL (not inside an assert_ok `$(...)` subshell, which would
+# reparent/hangup the backgrounded docker-exec), then assert they are RUNNING. `nohup sleep &` is gone: its
+# tracked row EXITs in 3ms, so RUNNING was structurally impossible and F0c/F4 asked an un-answerable question.
+_seed_held agt1 9661
+_seed_held agt1 9662
+assert_ok "F0a two HELD seeds on agt1 are RUNNING (tether holds each 'sleep 966N' as its exec child — Q3: a self-backgrounded nohup would leave only an EXITED sh, so RUNNING is real evidence here)" \
+    poll_until 30 2 "agt1's two held seeds are RUNNING" -- _f0_agt1_two_running
+_seed_held agt2 9663
+assert_ok "F0b HELD control seed on agt2 is RUNNING — the CONTROL that must survive agt1's reconciliation untouched (foreground-held so F4's post-injection RUNNING check is non-vacuous)" \
+    poll_until 30 2 "agt2's held control seed is RUNNING" -- _agt2_seed_running
 # The seeded control MUST be running right before the injection, else F4 cannot distinguish "node-scoped
 # reconciliation left it alone" from "it was already gone" — if it is not, that is an arm-D-residue setup
-# problem, gated below, not a G.1xG.2 finding.
-assert_ok "F0c CONTROL PRECONDITION: agt2's seeded process is actually running before the double-fault" \
-    poll_until 30 2 "agt2's seed is running pre-injection" -- _f4_agt2_running
+# problem, not a G.1xG.2 finding.
+# H14: this comment promised a GATE, but the code was a plain assert_ok that recorded a RED and then ran the
+# whole arm anyway over a missing control. It is now an assert_setup: a missing control is a prerequisite
+# failure (SETUP-RED) that ABORTS, so F1-F6 can never judge a discriminator that has nothing to discriminate.
+# The capture must happen OUTSIDE assert_setup — assert_setup captures its command via `$(…)`, a subshell,
+# where the recorded pid would be lost.
+if poll_until 30 2 "agt2's seed is running pre-injection" -- _f0c_capture_agt2_seed; then _f0c=1; else _f0c=0; fi
+log "F0c: agt2 control seed pre-injection pid=[${_F0C_PID:-none}] (captured=$_f0c) — F4 compares against THIS identity"
+assert_setup "F0c CONTROL PRECONDITION (GATE): agt2's seeded process is actually running before the double-fault AND its pid was captured for F4's identity comparison" \
+    sh -c "[ '$_f0c' = 1 ] && [ -n '${_F0C_PID:-}' ]"
 assert_ok "F1 INJECT BOTH: kill agt1 AND its home broker brk2 together" _f1_kill_both
 assert_ok "F2 bring both back" _f2_start_both
 assert_ok "F3 G.1xG.2 converge: agt1's processes are reconciled to EXITED(-1)" \
     poll_until 180 5 "agt1's procs reconcile to EXITED" -- _f3_agt1_exited
-assert_ok "F4 THE DISCRIMINATOR: agt2's process is STILL RUNNING — reconciliation is node-scoped, not a table-wide sweep (the only assertion that can tell those apart)" \
-    poll_until 30 2 "agt2's seed still running after the double-fault" -- _f4_agt2_running
+assert_ok "F4 THE DISCRIMINATOR: the EXACT pre-injection agt2 process (pid ${_F0C_PID:-?}) is STILL RUNNING and no seed row on agt2 was closed out — reconciliation is node-scoped, not a table-wide sweep. H14: this now asks a STRICTLY DIFFERENT question from the F0c gate (identity + no-terminal-row after the injection, vs 'is anything running' before it), so a sweep and an absent control can no longer produce the same signal" \
+    poll_until 30 2 "agt2's recorded seed pid still running after the double-fault" -- _f4_agt2_seed_survived
 assert_ok "F5 G.5: the audit says kind=reconciled_closed (AuditProc's kind; 'reconciled' is AuditPort's — schema/audit.go:36 vs :51)" \
     poll_until 120 3 "a reconciled_closed row for agt1" -- _f5_audit_row
 assert_ok "F6 the agent is NOT wedged: a NEW process starts and runs after the double fault" \
     poll_until 60 3 "a fresh exec works on agt1" -- _f6_fresh_exec
 else
-    not_covered "96-F double fault (agent + home broker together)" "the cluster did not fully recover from arm D's leader-partition within 240s (3 VOTER + agt1 & agt2 ONLINE), so the double-fault arm would run against arm-D residue (agt2's home brk1 was the partition victim) — a cross-arm state consequence, not a G.1xG.2 defect. The reconciliation is node-scoped-tested hermetically; #57/#58 are already pinned above. A dedicated per-arm-isolated fixture for F is owed to a follow-up"
+    not_covered "96-F double fault (agent + home broker together)" "the cluster did not fully recover from arm D's leader-partition within 240s (3 VOTER + agt1 & agt2 ONLINE), so the double-fault arm would run against arm-D residue (agt2's home brk1 was the partition victim) — a cross-arm state consequence, not a G.1xG.2 defect. The reconciliation is node-scoped-tested hermetically; #57/#58 are already pinned above. A dedicated per-arm-isolated fixture for F is owed to a follow-up" gap
 fi
 
 drill_end

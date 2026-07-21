@@ -30,6 +30,12 @@ type Backend struct {
 	// (returns "audit_unavailable").
 	AuditTail func(ctx context.Context, sid string, n int) ([]AuditEntry, error)
 
+	// EventsTail (#30) returns the last n messages of the H.1 `events` stream, filtered to those
+	// newer than `since` (0 = no time bound) and of type `kind` ("" = all kinds), in time order
+	// (oldest → newest). Implemented by the broker against JetStream; nil = events endpoint disabled
+	// (returns "events_unavailable"). The stream is secret-free by construction of its producers.
+	EventsTail func(ctx context.Context, n int, since time.Duration, kind string) ([]AuditEntry, error)
+
 	// PubAgentEvicted broadcasts sys.events{type:agent_evicted, sid,
 	// nid} so a live agent subscribing to sys.events can self-exit
 	// within the architecture P9 "1s 内下线" budget. nil = broker
@@ -53,6 +59,13 @@ type Backend struct {
 	// reply "cluster mode not enabled". adminsock stays a leaf: the
 	// broker provides an adapter that translates to the wire types.
 	Cluster ClusterAdminBackend
+
+	// RuntimeSnapshot (R13) returns this process's live runtime introspection
+	// (goroutines/threads/fds/rss/uptime + per-reconciler last-tick) for OpRuntime.
+	// The broker builds it from runtime.NumGoroutine() + the R7 registry; adminsock
+	// stays a leaf and never imports runtime-internal state. nil → OpRuntime replies
+	// "runtime introspection unavailable" (a Backend that did not wire it).
+	RuntimeSnapshot func() *RuntimeReport
 
 	// Logger receives info/warn lines about accepts and dispatch
 	// failures; nil → discard.
@@ -253,8 +266,12 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleNodes()
 	case OpAudit:
 		return s.handleAudit(req)
+	case OpEvents:
+		return s.handleEvents(req)
 	case OpEvict:
 		return s.handleEvict(req)
+	case OpRuntime:
+		return s.handleRuntime()
 	default:
 		if clusterOps[req.Op] {
 			if s.backend.Cluster == nil {
@@ -323,6 +340,17 @@ func (s *Server) handleNodes() Response {
 	return Response{Op: OpNodes, Nodes: out, OK: true}
 }
 
+func (s *Server) handleRuntime() Response {
+	if s.backend.RuntimeSnapshot == nil {
+		return Response{Op: OpRuntime, Error: "runtime introspection unavailable", Code: CodeBadRequest}
+	}
+	rep := s.backend.RuntimeSnapshot()
+	if rep == nil {
+		return Response{Op: OpRuntime, Error: "runtime introspection unavailable", Code: CodeBadRequest}
+	}
+	return Response{Op: OpRuntime, OK: true, Runtime: rep}
+}
+
 func (s *Server) handleAudit(req Request) Response {
 	if req.SID == "" {
 		return Response{Op: OpAudit, Error: "sid required"}
@@ -340,6 +368,33 @@ func (s *Server) handleAudit(req Request) Response {
 		return Response{Op: OpAudit, Error: err.Error()}
 	}
 	return Response{Op: OpAudit, Audit: entries, OK: true}
+}
+
+func (s *Server) handleEvents(req Request) Response {
+	if req.N <= 0 {
+		req.N = 50
+	}
+	var since time.Duration
+	if req.Since != "" {
+		d, err := time.ParseDuration(req.Since)
+		if err != nil {
+			return Response{Op: OpEvents, Error: "bad since duration: " + err.Error(), Code: CodeBadRequest}
+		}
+		if d < 0 {
+			return Response{Op: OpEvents, Error: "since must not be negative", Code: CodeBadRequest}
+		}
+		since = d
+	}
+	if s.backend.EventsTail == nil {
+		return Response{Op: OpEvents, Error: "events_unavailable: broker has no JetStream"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entries, err := s.backend.EventsTail(ctx, req.N, since, req.EventKind)
+	if err != nil {
+		return Response{Op: OpEvents, Error: err.Error()}
+	}
+	return Response{Op: OpEvents, Events: entries, OK: true}
 }
 
 // rowExists reports whether the 1-column existence query returns a row (used by the

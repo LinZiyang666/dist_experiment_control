@@ -23,15 +23,53 @@
 # Slow leaks are only visible as a TREND in sampled counters. The panic/FK scan below therefore stays a
 # SEPARATE, orthogonal crash/integrity oracle; the two never substitute for each other.
 #
-# ── goroutines: PERMANENT NOT-COVERED, registered at BATCH level (plan §5.1 / §11-E) ───────────────
-# The product exposes no pprof/expvar/goroutine gauge (`grep -rE 'pprof|expvar' cmd/ internal/` = zero
-# hits). The hermetic suites call runtime.NumGoroutine() from INSIDE the process, which a cross-process
-# drill structurally cannot do. And /proc/<pid>/status's Threads is OS threads (M), NOT goroutines (G):
-# Go multiplexes G onto M, so 10k leaked goroutines can show ZERO thread growth — using Threads as a
-# goroutine proxy would itself be a false-green oracle. This gap is the roadmap's own explicit carve-out
-# and is registered in the plan's NOT-COVERED ledger, NOT via not_covered() here: 97's spine is the fd/RSS
-# oracle, and burning the suite-wide --allow-incomplete waiver on a known permanent gap would trade one
-# drill's honesty for the whole suite's (run-drills.sh:36-37's waivers are GLOBAL, not per-drill).
+# ── goroutines: NOW COVERED (R13) via `admin runtime` — the gap is RETIRED, not registered ─────────
+# Until R13 this was a PERMANENT NOT-COVERED: the product exposed no goroutine gauge, the hermetic suites
+# call runtime.NumGoroutine() from INSIDE the process (a cross-process drill cannot), and /proc Threads is
+# OS threads (M) NOT goroutines (G) — using Threads as a proxy would itself be a false-green oracle (10k
+# parked leaked goroutines add ZERO OS threads). R13 added the broker-local admin verb `tether admin
+# runtime --json`, whose `.goroutines` is runtime.NumGoroutine() — the IN-PROCESS TRUTH, reachable from a
+# cross-process drill over the root/tether-owned 0600 admin socket. So this drill now carries a REAL
+# goroutine leak gate (the GOROUTINE arm below); the plan §5.1 goroutine carve-out is retired drill-side
+# (the doc owes the same close — reported to the owner). The Threads dimension of the fd/RSS oracle stays:
+# goroutines (G) and Threads (M) are DIFFERENT quantities and neither substitutes for the other.
+#
+# ── THE GOROUTINE GATE CONTRACT (FIXED AT PLAN STAGE — never tuned at runtime; total mandate) ────────
+# Predicate: sample brk1's goroutine FLOOR before the soak (pre-load baseline), run the 6-cycle chaos soak
+# as the load, QUIESCE, then re-sample the floor; PASS iff post_floor <= pre_floor + GOR_TOL. A healthy
+# process returns to its baseline once handler goroutines return; a leak (goroutines that never exit) keeps
+# the post floor elevated by the leaked count, which ACCUMULATES across the 6 chaos cycles. brk1 is the
+# same never-victim, MainPID-guarded process the fd/RSS oracle samples, so a restart (which would reset the
+# count) invalidates the compare exactly as it does for fd/RSS. The THREE contract constants + derivations,
+# fixed HERE so no run can move them to force green:
+#   GOR_TOL          = 2*NPROC + 16   the max goroutines the quiesced floor may sit above the pre-load
+#                                     floor. DERIVATION: brk1 runs a FIXED set of long-lived goroutines
+#                                     (Run loop, the single R7a reconcile ticker, the NATS client's
+#                                     read/flush/ping, the adminsock accept loop, the http listeners). The
+#                                     only legitimate floor-to-floor variation is GC assist/mark workers
+#                                     (~GOMAXPROCS=NPROC) plus a few transient scheduler goroutines.
+#                                     Sampling the FLOOR (min over GOR_*_SAMPLES) already removes most GC
+#                                     jitter, so the residual is small; 2*NPROC+16 is that residual WIDENED
+#                                     — the same nproc-scaled shape as leak.sh's Threads high-water
+#                                     (`th0 + 2*nproc + 16`). [UNCALIBRATED] — a RED is triaged as
+#                                     jitter-or-leak FIRST; the threshold is NEVER what moves to make a run
+#                                     green. A per-cycle goroutine leak in the broker's hot paths would
+#                                     accumulate FAR past this over 6 cycles; a leak slower than the
+#                                     tolerance stays owed to the release-time deep run (SOAK_CYCLES=48),
+#                                     the same carve-out as the fd/RSS slope.
+#   GOR_PRE_SAMPLES  = 3              samples for the pre-load floor. DERIVATION: 3 gives a floor (min)
+#   GOR_POST_SAMPLES = 3              robust to a single transient spike; more only slows the drill (matches
+#                                     the mean-of-3 window leak.sh uses for fd/RSS).
+#   GOR_QUIESCE      = SOAK_SETTLE(25s) the judgment window between the last load and the post sample.
+#                                     DERIVATION: goroutine reclamation is PROMPT — a handler goroutine
+#                                     exits the instant its function returns (not on the next GC), so one
+#                                     settle window is ample for the count to fall back. Reusing SOAK_SETTLE
+#                                     keeps the quiesce identical to the per-cycle settle the fd/RSS oracle
+#                                     uses.
+# NON-VACUITY: the JUDGE is a pure integer predicate `_gor_within_tol <floor> <post>`; tests/r9d-nonvacuity
+# drives it two-sided (a within-tolerance post PASSES, a leaked post 3x the floor REDS, an empty post fails
+# closed). In-run: the SAME brk1 process is sampled pre and post, so equal floors prove NO leak while a real
+# leak would push the post floor out of tolerance — not a run that could pass whatever the product did.
 #
 # ── FALSE-GREEN RISK HEADNOTE ───────────────────────────────────────────────────────────────────────
 #  1. A loop that does nothing obviously does not leak. EVERY cycle asserts the injection really took AND
@@ -61,6 +99,12 @@ set -u
 
 : "${SOAK_CYCLES:=6}"
 : "${SOAK_SETTLE:=25}"
+# ── goroutine gate contract (see the header block; FIXED here, never tuned at runtime) ──────────────
+# GOR_TOL is nproc-derived and set just before the gate (NPROC is resolved after the loop); the two
+# sample counts + the quiesce window are the plan-fixed constants.
+: "${GOR_PRE_SAMPLES:=3}"
+: "${GOR_POST_SAMPLES:=3}"
+: "${GOR_QUIESCE:=$SOAK_SETTLE}"
 
 SID=lab
 PIN=979797
@@ -100,6 +144,26 @@ _xfer_terminal() { "$SIM" ctl -- history --kind transfer -n 100 2>/dev/null | gr
 _xfer_started() { "$SIM" ctl -- history --kind transfer -n 100 2>/dev/null | grep -qF "${_SOAK_XFER_SRC:-soak.bin}"; }
 _brk_err_clean() { ! dexec "$1" -- sh -c "grep -qE '$JOURNAL_BAD_SIG' /var/log/tether/broker.err 2>/dev/null"; }
 _agt_journal_clean() { ! dexec "$1" -- sh -c "journalctl -u tether-agent --no-pager 2>/dev/null | grep -qE '$JOURNAL_BAD_SIG'"; }
+
+# ── goroutine leak gate helpers (R13) — admin runtime .goroutines is runtime.NumGoroutine() (the
+#    IN-PROCESS TRUTH), NOT /proc Threads. Broker-local admin socket, run ON the broker as tether. ──────
+# one goroutine sample from <brk> (empty on any failure — fail-closed, never a fabricated 0).
+_gor_one() { _bt "$1" -- timeout 10 tether admin runtime --json 2>/dev/null | jq -e '.goroutines' 2>/dev/null; }
+# floor over <n> samples 3s apart: the MIN (steady-state floor rejects a transient spike). Empty if none read.
+_gor_floor() {
+    _gf_min=''; _gf_i=0
+    while [ "$_gf_i" -lt "$2" ]; do
+        _gf_v=$(_gor_one "$1")
+        if [ -n "$_gf_v" ] && [ "$_gf_v" -gt 0 ] 2>/dev/null; then
+            { [ -z "$_gf_min" ] || [ "$_gf_v" -lt "$_gf_min" ]; } && _gf_min=$_gf_v
+        fi
+        _gf_i=$((_gf_i + 1)); [ "$_gf_i" -lt "$2" ] && sleep 3
+    done
+    [ -n "$_gf_min" ] && printf '%s' "$_gf_min"
+}
+# the JUDGE (pure — no admin call, so tests/r9d-nonvacuity can drive it two-sided): the post-quiesce floor
+# ($2) must sit within GOR_TOL of the pre-load floor ($1). Fail-closed on an empty/non-numeric operand.
+_gor_within_tol() { [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$2" -le "$(( ${1} + GOR_TOL ))" ] 2>/dev/null; }
 
 
 # ── cycle predicates (FUNCTIONS — R-NOSHC) ──────────────────────────────────────────────────────────
@@ -177,6 +241,12 @@ _S_A0=$(leak_sample agt2 "$PID_A0") || setup_fail "baseline leak sample of agt2 
 leak_series_add "$SER_B" "$_S_B0"
 leak_series_add "$SER_A" "$_S_A0"
 log "97 baseline: brk1 broker pid=$PID_B0 [$(head -1 "$SER_B")] · agt2 agent pid=$PID_A0 [$(head -1 "$SER_A")] (fd threads rss_kb)"
+# GOROUTINE baseline (R13): brk1's NumGoroutine FLOOR before the soak load, via admin runtime. A missing
+# baseline is NOT fatal here — the GOROUTINE gate after the loop records not_covered rather than inventing
+# an origin (mirrors the fd/RSS fail-closed discipline: a run cannot judge a floor it never captured).
+GOR_BASE=$(_gor_floor brk1 "$GOR_PRE_SAMPLES")
+[ -n "$GOR_BASE" ] && log "97 goroutine baseline: brk1 NumGoroutine floor=$GOR_BASE over $GOR_PRE_SAMPLES samples (admin runtime .goroutines — in-process truth, not /proc Threads)" \
+    || log "97 goroutine baseline: admin runtime yielded no .goroutines at t0 — the GOROUTINE gate below will record not_covered rather than fabricate a baseline"
 
 # ── THE SOAK LOOP ───────────────────────────────────────────────────────────────────────────────────
 # Four injection types rotate (cycle % 4), exactly the four the roadmap names:
@@ -229,7 +299,7 @@ while [ "$_c" -le "$SOAK_CYCLES" ]; do
         if poll_until 60 3 "this cycle's transfer entered the product path (a start history row for $_SOAK_XFER_SRC)" -- _xfer_started; then
             _as_pass "cycle $_c/3 NON-VACUITY (transfer half): the concurrent tier-B transfer really reached the product history (start row) — not just the restart"
         else
-            not_covered "97 cycle $_c/3 transfer-concurrency half" "the broker restart took (proven above) but this cycle's tier-B transfer produced no start history row within 60s — a restart-disrupted background pull can exit before registering, so the transfer half is not observably exercised this cycle; recorded not_covered rather than claiming all four injection types self-proved"
+            not_covered "97 cycle $_c/3 transfer-concurrency half" "the broker restart took (proven above) but this cycle's tier-B transfer produced no start history row within 60s — a restart-disrupted background pull can exit before registering, so the transfer half is not observably exercised this cycle; recorded not_covered rather than claiming all four injection types self-proved" runtime-guard
         fi
         ;;
     esac
@@ -241,7 +311,7 @@ while [ "$_c" -le "$SOAK_CYCLES" ]; do
     _pb=$(leak_pid brk1 tether-broker); _pa=$(leak_pid agt2 tether-agent)
     if [ "$_pb" != "$PID_B0" ] || [ "$_pa" != "$PID_A0" ]; then
         not_covered "97 leak judgement invalid for this run: a MEASURED process restarted at cycle $_c (brk1 broker $PID_B0->$_pb, agt2 agent $PID_A0->$_pa)" \
-            "the fd/RSS series was reset, so judging it either way would be meaningless. The unexpected restart is itself the finding — triage it (NRestarts brk1=$(dexec brk1 -- systemctl show -p NRestarts --value tether-broker 2>/dev/null | tr -d '\r'))"
+            "the fd/RSS series was reset, so judging it either way would be meaningless. The unexpected restart is itself the finding — triage it (NRestarts brk1=$(dexec brk1 -- systemctl show -p NRestarts --value tether-broker 2>/dev/null | tr -d '\r'))" runtime-guard
         break
     fi
     # EXT-REVIEW-B7 (fail-closed): a failed /proc read at any cycle invalidates the series for this run —
@@ -250,7 +320,7 @@ while [ "$_c" -le "$SOAK_CYCLES" ]; do
     _S_A=$(leak_sample agt2 "$_pa"); _rca=$?
     if [ "$_rcb" != 0 ] || [ "$_rca" != 0 ]; then
         not_covered "97 leak judgement invalid: a leak sample failed to read /proc at cycle $_c (brk1 rc=$_rcb, agt2 rc=$_rca)" \
-            "a missing sample cannot be judged and must NOT be treated as a 0 0 0 (that would make a resetting series look bounded); recording not_covered instead of a meaningless bounded verdict"
+            "a missing sample cannot be judged and must NOT be treated as a 0 0 0 (that would make a resetting series look bounded); recording not_covered instead of a meaningless bounded verdict" runtime-guard
         break
     fi
     leak_series_add "$SER_B" "$_S_B"
@@ -271,11 +341,37 @@ _leak_a_ok() { [ "$_lv_a" = 0 ]; }
 
 if [ "$_lv_b" = 2 ] || [ "$_lv_a" = 2 ]; then
     not_covered "97 leak slope judgement skipped: SOAK_CYCLES=$SOAK_CYCLES gives fewer than the $LEAK_MIN_N samples the slope test needs" \
-        "with <6 samples the slope is not statistically meaningful; re-run with SOAK_CYCLES>=6 (the default). This is a parameterisation gap, not a product finding"
+        "with <6 samples the slope is not statistically meaningful; re-run with SOAK_CYCLES>=6 (the default). This is a parameterisation guard, not a product finding" runtime-guard
 else
     assert_ok "LEAK brk1's broker fd/Threads/RSS stayed bounded across $SOAK_CYCLES chaos cycles (thresholds [UNCALIBRATED], widened 4x pending the 3-run baseline — a RED here is triaged as jitter-or-leak FIRST; the threshold is never what moves to make it green)" \
         _leak_b_ok
     assert_ok "LEAK agt2's agent fd/Threads/RSS stayed bounded across $SOAK_CYCLES chaos cycles" _leak_a_ok
+fi
+
+# ── THE GOROUTINE LEAK GATE (R13) — load(soak) → quiesce → floor returns to the pre-load baseline ────
+# Contract constants are fixed in the header block. GOR_TOL is nproc-derived (same shape as leak.sh's
+# Threads high-water). The compare is only valid while brk1's MainPID is unchanged (a leader restart would
+# reset the goroutine count) — the loop's PID guard already broke with not_covered if that happened; we
+# re-check here so a break-free-but-restarted run is caught too.
+GOR_TOL=$(( 2 * NPROC + 16 ))
+_pb_now=$(leak_pid brk1 tether-broker)
+if [ "$_pb_now" != "$PID_B0" ]; then
+    not_covered "97 goroutine gate skipped: brk1's broker restarted during the soak (MainPID $PID_B0->$_pb_now)" \
+        "the goroutine FLOOR resets on a restart, so a pre/post compare is meaningless — the restart is itself the finding, triage it (same guard as the fd/RSS series)" runtime-guard
+elif [ -z "${GOR_BASE:-}" ]; then
+    not_covered "97 goroutine gate skipped: no pre-load goroutine baseline was captured at t0" \
+        "admin runtime yielded no .goroutines at baseline (socket not ready / jq miss), so there is nothing to compare the post-quiesce floor against; recorded not_covered rather than inventing a baseline" runtime-guard
+else
+    poll_until "$GOR_QUIESCE" 5 "goroutine quiesce after the soak load (let handler goroutines return before the post sample)" -- false || true
+    GOR_POST=$(_gor_floor brk1 "$GOR_POST_SAMPLES")
+    log "97 goroutine gate: pre-load floor=$GOR_BASE post-quiesce floor=${GOR_POST:-<none>} tol=$GOR_TOL (=2*NPROC[$NPROC]+16) [UNCALIBRATED]"
+    if [ -z "$GOR_POST" ]; then
+        not_covered "97 goroutine gate: no post-quiesce goroutine sample" \
+            "admin runtime yielded no .goroutines after the quiesce window, so the floor cannot be judged; recorded not_covered rather than a meaningless verdict" runtime-guard
+    else
+        assert_ok "GOROUTINE brk1's NumGoroutine floor returned to the pre-load baseline after the soak+quiesce (post $GOR_POST <= pre $GOR_BASE + tol $GOR_TOL) — a real leak would keep the post floor elevated by the accumulated leaked count; .goroutines is the in-process truth (runtime.NumGoroutine), NOT the /proc Threads proxy" \
+            _gor_within_tol "$GOR_BASE" "$GOR_POST"
+    fi
 fi
 
 # ── THE ORTHOGONAL CRASH/INTEGRITY ORACLE (never substitutes for the leak oracle, nor it for this) ──

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -68,11 +69,22 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := newRootCmd().ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		renderTerminalError(os.Stderr, err)
 		// B2 item 3: classify the terminal error into a sysexits-style code so a monitor can
 		// tell "broker unreachable" (69) from "bad arg" (64) from "permission" (77) from an
 		// unclassified tether-side fault (70). 0 still means success; only the nonzero value is
 		// now informative. (cluster status / exec / run os.Exit() before reaching here.)
 		os.Exit(classifyExit(err))
 	}
+}
+
+// renderTerminalError is the main sink's stderr print, factored out so it is testable and so a QUIET
+// error (a machine-output command's non-zero exit, e.g. `doctor --json`) does NOT append prose to a
+// stream a caller merges with stdout (`... --json 2>&1 | jq`). Quiet errors carry their failure on
+// stdout (the JSON) + the exit code; a stderr line would only corrupt the parse.
+func renderTerminalError(w io.Writer, err error) {
+	if err == nil || errorIsQuiet(err) {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "error:", err)
 }

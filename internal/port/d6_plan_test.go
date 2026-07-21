@@ -114,6 +114,47 @@ func TestD6ReassignHomeMonotonic(t *testing.T) {
 	}
 }
 
+// TestReassignHomeStampsLastRehomeAtomically (external review RESIDUAL-2): the retire/drain convergence
+// gate's F3 recency scope (internal/broker.pendingRetireConvergence) rests ENTIRELY on last_rehome_at being
+// stamped in the SAME UPDATE that bumps the epoch. A refactor that dropped the stamp would leave the row with
+// a stale/absent last_rehome_at, and the retire gate — which scopes by op.CreatedAt <= last_rehome_at — would
+// silently fail OPEN (drop this op's own still-stranded row → RemoveServer with the data plane stranded). No
+// existing test caught deleting the stamp, so pin the atomic co-stamp at the plan layer.
+func TestReassignHomeStampsLastRehomeAtomically(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "lab", "lab-1")
+	a, err := Allocate(db, "lab", "lab-1", "jupyter", 8888, 0, "SHA256:a", false, tinyBand())
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	_, cmd, err := PlanReassignHome(db, a.Port, "node-2", testRehomeTime)
+	if err != nil {
+		t.Fatalf("reassign: %v", err)
+	}
+	if len(cmd.Body) != 1 {
+		t.Fatalf("reassign must be a single atomic UPDATE, got %d statements", len(cmd.Body))
+	}
+	sql := cmd.Body[0].SQL
+	if !strings.Contains(sql, "epoch=") {
+		t.Fatalf("reassign UPDATE no longer bumps epoch: %s", sql)
+	}
+	if !strings.Contains(sql, "last_rehome_at=") {
+		t.Fatalf("reassign UPDATE no longer stamps last_rehome_at IN THE SAME UPDATE as the epoch bump — the "+
+			"retire/drain convergence gate's F3 recency scope would silently fail OPEN (RESIDUAL-2): %s", sql)
+	}
+	// And applying it persists a NON-EMPTY last_rehome_at (the F3 recency origin has something to compare).
+	if _, err := db.Exec(sql); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	var lr string
+	if err := db.QueryRow(`SELECT last_rehome_at FROM port_allocations WHERE port=?`, a.Port).Scan(&lr); err != nil {
+		t.Fatalf("read last_rehome_at: %v", err)
+	}
+	if lr == "" {
+		t.Fatal("last_rehome_at is empty after a reassign — the F3 recency origin has nothing to compare")
+	}
+}
+
 func TestD6ReassignHomeSelectsActiveReusedPort(t *testing.T) {
 	db := openDB(t)
 	seedSessionAndNode(t, db, "lab", "lab-1")

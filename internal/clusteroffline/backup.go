@@ -107,6 +107,10 @@ func OfflineBackup(opts BackupOptions) (result *BackupResult, err error) {
 
 	st, _ := os.Stat(statePath)
 	opts.Logger.Info("clusteroffline: backup complete", "bundle", opts.OutDir, "mode", mode, "self", selfID, "applied_index", m.AppliedIndex)
+	// R10 #53: the bundle is state.db-only. Say so from the library too, so a non-CLI caller (or a
+	// journald-only record of a cron backup) still carries the scope statement — see bundle_scope.go.
+	opts.Logger.Warn("clusteroffline: bundle contains the FSM state DB ONLY — JetStream (history/audit/events/in-flight transfers) is NOT included and a restore does NOT bring it back; back JetStream up separately with `nats stream backup`",
+		"bundle", opts.OutDir)
 	return &BackupResult{BundleDir: opts.OutDir, StateDBBytes: sizeOf(st), Mode: mode, SelfID: selfID, AppliedIndex: m.AppliedIndex}, nil
 }
 

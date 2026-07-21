@@ -93,11 +93,24 @@ func (b *Broker) handleProxySubRevokeCluster(sid, fp, actor, name string, msg *n
 	if b.isClusterFollower() {
 		return
 	}
+	// #30: emit proxy_keyset_changed on a REAL revoke. The single-mode path surfaces this
+	// operator-facing event (via pushCurrentKeyset), but this cluster path bumped the keyset epoch
+	// through Raft and never emitted it — so an operator watching sys.events saw create/revoke go by
+	// invisibly (drill 73's "cluster-mode revoke's ABSENT proxy_keyset_changed"). Capture the epoch
+	// across the Propose: the change-gated bump only advances when a row actually flipped
+	// ACTIVE→REVOKED, so an idempotent no-op re-revoke stays silent (matches single mode's
+	// ErrAlreadyRevoked path — no spurious event). The read-back sees the committed value because
+	// Propose applies locally before returning on the leader (same contract the create read-back uses).
+	epochBefore, _ := session.GetProxyEpoch(b.cfg.DB, sid)
 	if err := b.cl.node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
 		return proxysub.PlanRevoke(sid, name, b.cfg.Now())
 	}); err != nil {
 		b.proxyProposeErr(msg, sid, "proxy sub revoke", err)
 		return
+	}
+	if epochAfter, err := session.GetProxyEpoch(b.cfg.DB, sid); err == nil && epochAfter > epochBefore {
+		// Secret-free body ({sid} only), like every other pubSysEvent — no PSK/token ever.
+		b.pubSysEvent("proxy_keyset_changed", map[string]any{"sid": sid})
 	}
 	b.pubAuditCall(sid, fp, actor, "proxy.sub.revoke", name, true, "", msg.Reply, nil)
 	b.replyJSON(msg, proto.ProxySubRevokeResp{OK: true, Name: name})
@@ -134,6 +147,11 @@ func (b *Broker) handleProxySubCreateCluster(sid, fp, actor, name string, msg *n
 		b.replyJSON(msg, proto.ProxySubCreateResp{Code: "sub_name_taken", Name: name})
 		return
 	}
+	// #30: a confirmed create bumped the change-gated keyset epoch → surface proxy_keyset_changed,
+	// same as single mode (pushCurrentKeyset) and the sibling handleProxySetCluster (proxy_enabled/
+	// disabled). Reaching here proves the INSERT took (a duplicate no-op returned above), so the
+	// epoch definitely advanced. Body is secret-free ({sid} only) — the minted token/PSK never here.
+	b.pubSysEvent("proxy_keyset_changed", map[string]any{"sid": sid})
 	b.pubAuditCall(sid, fp, actor, "proxy.sub.create", name, true, "", msg.Reply, nil)
 	b.replyJSON(msg, proto.ProxySubCreateResp{OK: true, Name: name, SubURL: b.subURL(rawToken)})
 }

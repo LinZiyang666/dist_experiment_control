@@ -39,10 +39,25 @@ const (
 type ExitError struct {
 	Class int
 	Err   error
+	// Quiet suppresses the main sink's human-readable "error: ..." stderr line. Set by commands whose
+	// FAILURE is already carried on stdout as MACHINE output (e.g. `cluster doctor --json`, whose JSON
+	// has summary.fatal): a prose line to stderr would corrupt a caller that MERGES the streams —
+	// `... --json 2>&1 | jq` gets the JSON followed by "error: ..." and fails to parse it (the exact
+	// R11 deploy-tier failure, drill 52 B3/55c). The non-zero exit + the JSON already convey the
+	// failure, so the prose is redundant AND harmful there.
+	Quiet bool
 }
 
 func (e *ExitError) Error() string { return e.Err.Error() }
 func (e *ExitError) Unwrap() error { return e.Err }
+
+// errorIsQuiet reports whether the terminal error opted out of the main sink's "error: ..." print
+// (an *ExitError with Quiet set). Used by the main sink so a machine-output command's non-zero exit
+// does not append prose to its own stdout stream under a `2>&1` merge.
+func errorIsQuiet(err error) bool {
+	var ee *ExitError
+	return errors.As(err, &ee) && ee.Quiet
+}
 
 // usageErr/unavailErr/permErr wrap an error with an explicit class at the SOURCE (positive
 // evidence). The classifier never string-sniffs prose for a class — that would make a reworded

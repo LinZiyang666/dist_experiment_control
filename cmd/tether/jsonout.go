@@ -87,6 +87,15 @@ type adminAuditJSON struct {
 	Audit         []adminsock.AuditEntry `json:"audit"`
 }
 
+// adminEventsJSON (#30) is the `admin events --json` schema: the sys.events tail (oldest→newest),
+// each an AuditEntry (subject/seq/ts/body). Body carries the event "type" + its allow-listed scalar
+// fields — never a secret.
+type adminEventsJSON struct {
+	Schema        string                 `json:"schema"`         // "admin_events"
+	SchemaVersion int                    `json:"schema_version"` // 1
+	Events        []adminsock.AuditEntry `json:"events"`
+}
+
 type exposeJSON struct {
 	Schema        string `json:"schema"`         // "expose"
 	SchemaVersion int    `json:"schema_version"` // 1

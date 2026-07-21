@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // g3_seed_helper_test.go — G3 #1 DB-backed tests for deriveAndConvergeSeedsFromRoster on a single-node
@@ -196,6 +197,68 @@ func TestG3SeedGrowConvergesMultiBroker(t *testing.T) {
 	}
 	if gen1 <= gen0 {
 		t.Errorf("grow: seed_generation must bump once, %d -> %d", gen0, gen1)
+	}
+}
+
+// TestG3SeedThirdVoterConvergesViaLeaderMaintenance is the #46 / SB-91 regression at the helper layer.
+// It reproduces the TRIGGER gap (NOT a pure-derivation bug — DeriveSeedEndpoints handles 3 voters fine):
+// two more brokers reach VOTER in the roster WITHOUT any op re-running seed convergence (the per-grow
+// converge fires once, gated behind topoAdvance, and the only re-trigger was the leadership-acquired edge
+// that never re-fires on a stable single leader). The seeds therefore stay stale — the LAST voter has no
+// successor grow to rescue it. Then driveLeaderMaintenance (the fix, wired into the observe loop's leader
+// tick) re-converges and the 3rd voter finally enters `seeds show`; a 2nd tick is idempotent (no churn).
+func TestG3SeedThirdVoterConvergesViaLeaderMaintenance(t *testing.T) {
+	n, addr := d7SingleNode(t, "self")
+	admin := NewClusterAdmin(n, nil)
+	self := d7JoinInput(t, "self", addr)
+	self.PublicHost = "self.example"
+	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }
+	if err := admin.AddNode(self, addr, caughtUp, 5*time.Second); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if _, err := admin.PublishSeeds([]string{"wss://self.example:443"}, ""); err != nil { // host-match self → helper owns it
+		t.Fatalf("PublishSeeds: %v", err)
+	}
+
+	// brk2 + brk3 join the roster and reach VOTER — but NO converge runs (the #46 gap: the grow-op
+	// converge was skipped/no-op'd and no leadership edge fires on this stable single leader).
+	for _, b := range []struct{ id, host string }{{"b2", "b2.example"}, {"b3", "b3.example"}} {
+		in := d7JoinInput(t, b.id, "10.0.0.9:7000")
+		in.PublicHost = b.host
+		if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(in) }); err != nil {
+			t.Fatalf("upsert %s: %v", b.id, err)
+		}
+		if err := n.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanClusterNodePhase(b.id, proto.RosterPhaseVoter,
+				[]string{proto.RosterPhasePending, proto.RosterPhaseVoter}, "", time.Now().UTC())
+		}); err != nil {
+			t.Fatalf("promote %s to VOTER: %v", b.id, err)
+		}
+	}
+
+	// Bug state: with no converge trigger the seeds still advertise only self (b2 AND b3 absent).
+	eps, _, gen0, _ := admin.ReadSeeds()
+	if len(eps) != 1 || eps[0] != "wss://self.example:443" {
+		t.Fatalf("precondition: without a converge trigger seeds must still be stale, got %v", eps)
+	}
+
+	// The fix: the observe loop's per-tick leader maintenance re-converges from the roster.
+	admin.driveLeaderMaintenance()
+
+	eps, _, gen1, _ := admin.ReadSeeds()
+	joined := strings.Join(eps, ",")
+	if !strings.Contains(joined, "self.example") || !strings.Contains(joined, "b2.example") || !strings.Contains(joined, "b3.example") {
+		t.Fatalf("#46: leader maintenance must converge ALL voters including the 3rd, got %v", eps)
+	}
+	if gen1 <= gen0 {
+		t.Fatalf("#46: a real convergence must bump seed_generation once: %d -> %d", gen0, gen1)
+	}
+
+	// Idempotent: a 2nd maintenance tick on the converged set must NOT churn seed_generation (routine
+	// ticks must never force the fleet to re-adopt).
+	admin.driveLeaderMaintenance()
+	if _, _, gen2, _ := admin.ReadSeeds(); gen2 != gen1 {
+		t.Fatalf("#46: maintenance on a converged set must be a no-op, seed_generation churned: %d -> %d", gen1, gen2)
 	}
 }
 

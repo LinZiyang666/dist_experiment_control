@@ -23,7 +23,12 @@ var brokerCodeHints = map[string]string{
 	"not_a_member":                  "you're not a member of this session; ask the owner for a PIN and run `tether login -s <sid> --pin <pin>`.",
 	"session_not_found_or_deleting": "the session doesn't exist or is being deleted; check `tether session list`.",
 	"session_not_found":             "the session doesn't exist; check `tether session list`.",
-	"actor_invalid":                 "your identity is malformed; if this persists, regenerate keys with `rm -rf ~/.tether/keys/` (loses session memberships).",
+	// Q4 (docs/reviews/r6-findings.md): a session create routes through raft. It now reports success
+	// on the FIRST attempt even when the committed write is not yet locally visible, so already_exists
+	// means the name is genuinely taken. If a PRIOR create's request itself timed out (no reply), the
+	// write may still have committed — check `tether session ls` before picking a new name.
+	"already_exists": "a session with that name already exists. If an earlier `session create` request timed out with no reply, the write may still have committed — check `tether session ls`; otherwise the name is taken, pick another.",
+	"actor_invalid":  "your identity is malformed; if this persists, regenerate keys with `rm -rf ~/.tether/keys/` (loses session memberships).",
 	// Node lifecycle
 	"node_not_found":       "no agent registered under that nid in this session; check `tether ps`.",
 	"node_offline":         "the agent is OFFLINE (no recent heartbeat); start it with `tether agent --session <sid> --nid <nid>`.",
@@ -31,7 +36,7 @@ var brokerCodeHints = map[string]string{
 	"agent_malformed_resp": "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
 	// Upgrade
 	"url_not_allowed":               "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
-	"url_not_allowed_local":         "the agent's local allowlist doesn't accept that URL; check the agent's --upgrade-url-allow flag.",
+	"url_not_allowed_local":         "the agent re-checks the URL against its OWN allowlist, and that URL isn't on it; set the agent's `--upgrade-url-allow` flag or the `upgrade.url_allow` list in its agent.yaml (opening the broker's allowlist alone is not enough).",
 	"sha256_invalid":                "SHA256 must be 64 lowercase hex chars; double-check the value.",
 	"sha256_mismatch":               "the downloaded tarball's SHA256 doesn't match what you supplied; redownload and re-run.",
 	"proto_bump_requires_reinstall": "the agent's proto version differs from the broker's; this needs a full reinstall (architecture J.3), not `node upgrade`.",
@@ -86,6 +91,9 @@ var brokerCodeExitClasses = map[string]int{
 	"local_port_invalid": exitUsage, "url_not_allowed": exitUsage, "url_not_allowed_local": exitUsage,
 	"sha256_invalid": exitUsage, "sha256_mismatch": exitUsage,
 	"session_not_found": exitUsage, "session_not_found_or_deleting": exitUsage,
+	// Q4: with the same-owner idempotency exit in place, a residual already_exists is a genuine
+	// name clash by ANOTHER owner — operator-actionable (pick another name), so exit 64, not 70.
+	"already_exists": exitUsage,
 	// our bug / version skew -> internal
 	"agent_malformed_resp": exitInternal, "json_parse": exitInternal,
 	"proto_bump_requires_reinstall": exitInternal, "store_error": exitInternal,
@@ -97,7 +105,20 @@ var brokerCodeExitClasses = map[string]int{
 	"cluster_not_enabled": exitUsage, "node_unknown": exitUsage, "bad_request": exitUsage,
 	"remove_owns_resources": exitUsage, // B3 item 7: operator-actionable (drain --retire or --force)
 	"version_skew":          exitUsage, // B6 A3: reinstall the joiner on a matching release
+	// R8a P1: the control plane committed the rehome but the agents have not confirmed the new
+	// home yet. This is EX_TEMPFAIL, not a tether bug: the broker keeps re-delivering, so
+	// re-running the verb is the correct response. Crucially it is NOT 0 — `cluster drain`
+	// returning success on an unconverged data plane was the batch's headline release blocker.
+	// The literal is authored in internal/broker (codeDataplaneNotConverged); there is no
+	// compile-time link across the two packages, so TestDataplaneNotConvergedCodeIsWireStable
+	// pins it from this side.
+	dataplaneNotConvergedCode: exitTransient,
 }
+
+// dataplaneNotConvergedCode mirrors internal/broker's codeDataplaneNotConverged. Renaming
+// either side silently downgrades a terminal "not converged" signal to exit 70; the wire-
+// stability test is the only thing standing between those two literals.
+const dataplaneNotConvergedCode = "dataplane_not_converged"
 
 // brokerCodeExitClass returns the exit class for a broker code (default exitInternal=70).
 func brokerCodeExitClass(code string) int {

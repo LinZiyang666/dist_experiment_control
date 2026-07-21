@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -40,27 +39,31 @@ func TestG2ExternalReviewDataPlaneBannerNamesRequiredStandaloneFlags(t *testing.
 }
 
 // TestG2ExternalReviewColdStartDiagnosticNamesRequiredStandaloneFlags pins the same guidance in the
-// cold-start N=1 JetStream-unavailable diagnostic. This path is otherwise hard to trigger hermetically
-// because it lives inside Broker.Run after NATS/JetStream wiring; source-pin tests are already used for
-// external review contracts in this package.
+// cold-start N=1 JetStream-unavailable diagnostic. That path lives inside Broker.Run after NATS /
+// JetStream wiring and is not hermetically reachable, so the diagnostic is built by a dedicated
+// function and asserted here on the COMPOSED string.
+//
+// It was previously a source-text pin over broker.go. R10 P4 replaced the three hand-copied remedy
+// literals (this fatal, the DATA-PLANE-DEGRADED banner, `cluster recovery restore`) with the shared
+// natsconf SSOT — after which the source carries a `%s` verb and a scraping pin can no longer see the
+// flags it is meant to guarantee. Asserting the real message keeps the contract and survives the
+// refactor; a regression that drops a flag from the SSOT still turns this red (verified by mutation).
 func TestG2ExternalReviewColdStartDiagnosticNamesRequiredStandaloneFlags(t *testing.T) {
-	srcBytes, err := os.ReadFile("broker.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	src := string(srcBytes)
-	start := strings.Index(src, "broker: cluster mode requires JetStream")
-	if start < 0 {
-		t.Fatal("N=1 JetStream-unavailable diagnostic not found")
-	}
-	endRel := strings.Index(src[start:], "G2 #10")
-	if endRel < 0 {
-		t.Fatal("N=1 diagnostic boundary not found")
-	}
-	diag := src[start : start+endRel]
+	diag := n1ClusteredJetStreamFatal().Error()
 	for _, want := range []string{"tether cluster", "--server-name", "--broker-nkey"} {
 		if !strings.Contains(diag, want) {
 			t.Fatalf("cold-start N=1 diagnostic must include %s in the recovery command; got %q", want, diag)
 		}
+	}
+	// The N=1 situation is what makes the remedy correct — the message must say so, otherwise an
+	// operator on an N>=2 mesh-not-formed box would de-cluster and lose the mesh.
+	if !strings.Contains(diag, "N=1") {
+		t.Errorf("the diagnostic must scope itself to a lone voter; got %q", diag)
+	}
+	// R10 P4: it must also name the OFFLINE escape. The online verb needs a live leader to prove
+	// N=1, and this fatal fires precisely when the daemon cannot start — so pointing only at the
+	// online verb is a dead end (that dead end is the #64 finding).
+	if !strings.Contains(diag, "--manual") {
+		t.Errorf("the diagnostic must name the offline render, which is the only reachable remedy at boot; got %q", diag)
 	}
 }

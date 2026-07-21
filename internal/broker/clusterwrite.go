@@ -180,13 +180,25 @@ func (b *Broker) wireClusterEarly() error {
 		return fmt.Errorf("broker: read seeded cert_fp for self %q: %w", b.cl.node.SelfID(), err)
 	}
 	if !tunnelCertMatchesPinned(gotFP, self, b.cfg.Now()) {
-		return fmt.Errorf("broker: on-disk tunnel cert fingerprint %q matches neither the pinned "+
-			"cluster_nodes.cert_fp %q nor an unexpired cert_fp_prev %q for node %q — agents pin against those and "+
-			"would reject EVERY dial (silent data-plane outage). Restore the pinned cert or re-run "+
-			"`tether cluster rotate-tunnel-cert`", gotFP, self.CertFP, self.CertFPPrev, b.cl.node.SelfID())
+		return tunnelCertPinMismatchError(gotFP, self, b.cl.node.SelfID(), b.cfg.ClusterSecretsDir)
 	}
 	b.AttachClusterSeam(b.cl.node.SelfID(), cert)
 	return nil
+}
+
+// tunnelCertPinMismatchError composes the wireClusterEarly fail-closed error (R11 P12/DOC-23). It is
+// a named helper so the RECOVERY WORDING is unit-testable and refactor-proof. Critically, this path
+// runs BEFORE the admin socket exists (the daemon exits here), so the remedy must be a FILE-level
+// restore — it must NOT point at `tether cluster rotate-tunnel-cert`, which dials the admin socket
+// that is never up in this bricked state (the old text offered that command and dead-ended the
+// operator).
+func tunnelCertPinMismatchError(gotFP string, self *clusternodes.HomeNode, selfID, secretsDir string) error {
+	return fmt.Errorf("broker: on-disk tunnel cert fingerprint %q matches neither the pinned "+
+		"cluster_nodes.cert_fp %q nor an unexpired cert_fp_prev %q for node %q — agents pin against those and "+
+		"would reject EVERY dial (silent data-plane outage). This fail-closes BEFORE the admin socket is up, "+
+		"so the fix is a FILE-level restore, NOT a CLI command: put the PREVIOUS %s + %s back under %s (the "+
+		"pinned cert/key) so the on-disk fingerprint matches the pin again, then restart the broker",
+		gotFP, self.CertFP, self.CertFPPrev, selfID, secretTunnelCert, secretTunnelKey, secretsDir)
 }
 
 func (b *Broker) loadStableTunnelCert() (*tls.Certificate, string, error) {
@@ -313,6 +325,11 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
 		},
+		// R8a P1: the broker-owned _INBOX agents publish their APPLIED home acks to.
+		// Without it the home-delivery pass has no ACTUAL half to compare against and
+		// would degrade into an un-acked re-delivery loop, so this subscribe failing
+		// must fail cluster wiring loudly (it is in the same fail-hard list).
+		func() (*nats.Subscription, error) { return b.subscribeHomeAcks(nc) },
 		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB) },
 		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd) },
 	}
@@ -365,6 +382,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	rec := NewAlertReconciler(AlertReconcilerConfig{
 		Node: node, DB: b.cfg.DB, Propose: node.Propose, Now: b.cfg.Now, Logger: b.cfg.Logger,
 		Observe: observeAndCache, Webhook: webhookPost, LeaderID: func() string { _, id := node.LeaderWithID(); return id },
+		SelfID:           b.selfID,                              // #93/H13: distinguishes a same-node lease blip from a genuine handoff when re-baselining the webhook
 		SetJSUnavailable: func(v bool) { b.jsUnavail.Store(v) }, // G7b #20③: leader-observed sustained JS-503 → health self-report
 	})
 	b.cl.auditPub = pub
@@ -397,6 +415,12 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
 	b.cl.admin.caughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
 	b.cl.admin.streamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
+	// R8a P1: the drain/retire data-plane convergence oracle + the immediate delivery kick.
+	// WITHOUT these two the drain would go back to returning rc=0 on an unconverged data
+	// plane — TestWireClusterLateWiresHomeConvergence is the anti-half-wiring guard, and
+	// TestDrainRefusesRcZeroWhenDataPlaneStale is its behavioural mutation test.
+	b.cl.admin.homeAppliedFn = b.homeAppliedEpoch
+	b.cl.admin.homeDeliverFn = b.deliverHomeNow
 
 	// The loops run on a child ctx so the ordered shutdown can cancel + JOIN them; each
 	// signals loopDone on exit. (Run's ctx cancel also reaches this child, so a hard
@@ -485,6 +509,40 @@ func (b *Broker) reaperMayDelete() bool {
 	return b.cl.node.RaftAppliedIndex() >= b.cl.node.CommitIndex()
 }
 
+// reaperCaughtUp is the LEADER-NEUTRAL sibling of reaperMayDelete, for a reaper whose
+// blast radius is already partitioned by an independent HOME-authority gate (the xfer
+// object reaper: homeOwnsXferBucket). It requires only that this broker's RAFT-domain
+// view is current (RaftAppliedIndex >= CommitIndex) — which a caught-up FOLLOWER
+// satisfies exactly as a leader does — and drops the IsLeader() requirement.
+//
+// WHY DROPPING IsLeader() IS SAFE HERE (and why it was a BUG to keep it — #58/P10):
+// reaperMayDelete's leader requirement existed to guarantee a COMPLETE cluster view
+// before deleting from the shared JS meta. But the xfer reaper never needs a complete
+// cluster view: homeOwnsXferBucket(sid) already restricts it to buckets whose session
+// is ENTIRELY homed to THIS broker, and home is a partition (each session has exactly
+// one home). So "complete cluster view" was the wrong authority; "am I this bucket's
+// home, on a current view" is the right one. Requiring BOTH leader AND home made a
+// session homed to a NON-LEADER broker unreapable by ANY node — the leader failed
+// homeOwnsXferBucket, the home failed IsLeader — so tier-B garbage was immortal on
+// every cluster whose transfers weren't homed to the raft leader.
+//
+// The catch-up gate also closes the only split-view race the home-partition argument
+// needs: if a home reassignment X→Y is committed, X cannot both be caught up AND still
+// see itself as home — before X applies the reassignment RaftAppliedIndex < CommitIndex
+// (not caught up, no reap); after X applies it X sees home==Y (not own, no reap). So no
+// caught-up broker ever reaps a bucket that has been reassigned out from under it.
+//
+// Raft-free (L-2): only the narrow Node accessors RaftAppliedIndex/CommitIndex.
+func (b *Broker) reaperCaughtUp() bool {
+	if b.cl == nil {
+		return true
+	}
+	if b.cl.node == nil {
+		return false
+	}
+	return b.cl.node.RaftAppliedIndex() >= b.cl.node.CommitIndex()
+}
+
 // proposeOrForward routes one authoritative write through raft. Leader ⇒ run the Plan
 // locally (Propose / ProposeWithReqID for cross-retry idempotency via the 0011 ledger);
 // follower ⇒ forward the request to the leader over the D4 wire (the leader's
@@ -529,9 +587,31 @@ func (b *Broker) createSession(sid, fp, pinHash string) (*session.Session, error
 	if err := b.proposeOrForward(VerbSessionCreate, "", payload, func(db *sql.DB) (*cluster.Command, error) {
 		return session.PlanCreate(db, sid, sid, fp, pinHash, b.cfg.Now())
 	}); err != nil {
+		// NOT committed (leadership lost, forward failed) or a genuine ErrAlreadyExists (the name is
+		// already taken) — surface it. A duplicate MUST still be rejected here: the D9 cluster tests
+		// rely on it to prove the first create committed, and a same-owner retry is indistinguishable
+		// from a fresh duplicate, so idempotency cannot live on this path.
 		return nil, err
 	}
-	return b.readCommittedSession(sid)
+	// COMMITTED. proposeOrForward returns nil only after the leader APPLIED the command (leader path,
+	// Propose waits for local Apply) or the leader COMMITTED it (forward path returns on leader
+	// commit). Read the authoritative row back for the leader-baked created_at, tolerating a
+	// follower's Apply-lag (sessionReadBack*).
+	if s, err := b.readCommittedSession(sid); err == nil {
+		return s, nil
+	}
+	// Q4 (docs/reviews/r6-findings.md): the write is DURABLE (committed above) but this replica's
+	// Apply still trails past the read-back window (R6 measured 1.37s under a partition). Reporting
+	// that read-back timeout as a FAILURE was the "committed-but-reported-failed" defect: it returned
+	// rc=70, and because the leader's PlanCreate then rejected every retry with already_exists, it
+	// left `session create` structurally unable to ever go green (a poll_until loop stayed red). Since
+	// the write really committed, report SUCCESS on the FIRST attempt with a best-effort session; the
+	// authoritative created_at converges on the next read (`session ls`). This never manufactures a
+	// false success — control only reaches here after proposeOrForward committed the write to raft.
+	return &session.Session{
+		SID: sid, Name: sid, OwnerPubkeyFP: fp,
+		State: session.StateActive, CreatedAt: b.cfg.Now(),
+	}, nil
 }
 
 // allocatePort routes an expose allocation (D9 audit #6). Single mode: the direct
@@ -782,19 +862,34 @@ func (b *Broker) evictNode(sid, nid string) error {
 	})
 }
 
-// readCommittedSession reads a session back by SID after a routed write, tolerating a
-// brief follower Apply-lag: a forward returns on LEADER commit, but this replica's local
-// Apply may trail by a few ms. The leader path is immediate (Propose waits for local
-// Apply), so the loop only ever spins on a follower. Bounded so a genuine miss fails loud.
+// sessionReadBack bounds how long readCommittedSession tries to fetch a just-committed session
+// row back (for the authoritative leader-baked created_at) before giving up.
+//
+// A forward returns on the LEADER commit, but a follower's local Apply trails it. Under a real
+// partition R6 measured that apply-lag at 1.37s (drill 96 canary2, docs/reviews/r6-findings.md
+// Q4) — for which the original 1s bound (50 × 20ms) was too short. 3s (150 × 20ms) covers that
+// worst case with ~2x margin while staying safely under the 5s ctl request deadline
+// (cmd/tether/session.go), so the broker's reply still lands in time. Note this window is NOT the
+// success criterion: createSession has ALREADY confirmed the raft commit before calling this, so a
+// timeout here is NON-FATAL — createSession returns a best-effort success rather than failing.
+const (
+	sessionReadBackInterval = 20 * time.Millisecond
+	sessionReadBackAttempts = 150 // 150 × 20ms = 3s
+)
+
+// readCommittedSession reads a session back by SID after a routed write, tolerating follower
+// Apply-lag (see sessionReadBack* above). The leader path is immediate (Propose waits for local
+// Apply), so the loop only ever spins on a follower. A timeout returns an error, but the sole
+// caller (createSession) treats that as non-fatal — the write is already durably committed.
 func (b *Broker) readCommittedSession(sid string) (*session.Session, error) {
 	var last error
-	for i := 0; i < 50; i++ {
+	for i := 0; i < sessionReadBackAttempts; i++ {
 		s, err := session.Get(b.cfg.DB, sid)
 		if err == nil {
 			return s, nil
 		}
 		last = err
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(sessionReadBackInterval)
 	}
 	return nil, fmt.Errorf("broker: session %q not visible after commit (apply lag): %w", sid, last)
 }

@@ -16,10 +16,11 @@
 #      on Authorization Violation ONLY; an unreachable broker → silent retry, no such string). That message is
 #      itself auth-SPECIFIC, so B3 needs NO separate server-side discriminator (R21). NEVER assert the
 #      server-only reason `not provisioned…` on the client (§3.0).
-#  (d) evict-cleanup GAP (探索→定格, INVERTED): a leaked child = pgrep HIT = exit 0 → assert_ok (assert_bug
-#      would misread the leak as "APPEARS FIXED"). Composite oracle: daemon EXITED **and** child STILL ALIVE.
-#      Deployment-conditional (spike#3): the leak is only visible under a setsid-nohup deploy (systemd cgroup
-#      reaps the child otherwise — that reap is systemd's doing, NOT tether's).
+#  (d) evict-cleanup (#26 CLOSED R12 — now a POSITIVE regression): evict REAPS the managed child. Composite
+#      oracle: daemon EXITED **and** child GONE from the host process table. Proven on the setsid-nohup deploy
+#      (C-reap) where there is NO systemd cgroup to do it, so the reap is tether's own SIGKILL of the child's
+#      process group — AND under systemd (C-sysd-reap) where both tether and the cgroup reap. C-base-proc
+#      first proves the child WAS running (先证存在-后证消失), so neither reap check is vacuous.
 #  (e) session-rm: "the rm journey ran" is NOT phase coverage → each phase has its own RESULT oracle
 #      (history stream gone / SQLite rows gone), polled — never the rm exit code.
 #  (f) session_deleting probe: recording covered because rm ran is forbidden (inventory §1.2). After N=1
@@ -56,6 +57,10 @@ _child_alive()  { "$SIM" exec agt1 -- pgrep -f 'sleep 999999' >/dev/null 2>&1; }
 _child2_alive() { "$SIM" exec agt1 -- pgrep -f 'sleep 888888' >/dev/null 2>&1; }
 # leak oracle: daemon gone AND managed child still alive (the divergence)
 _leak_present() { _daemon_gone && _child_alive; }
+# reap oracle (#26 CLOSED R12): daemon gone AND the managed child is GONE from the host process table — the
+# evict contract now honoured. reapManagedChildren SIGKILLs the setsid-nohup child's process group on
+# agent_evicted, so on a bare (non-systemd) host there is no leak.
+_child_reaped() { _daemon_gone && ! _child_alive; }
 # session rm phase oracles
 _history_gone() { ! BADMIN audit "$SID" -n 5 >/dev/null 2>&1; }
 _sess_gone()    { ! BADMIN sessions 2>/dev/null | grep -qw "$SID"; }
@@ -136,7 +141,10 @@ assert_ok "C-base-proc managed child RUNNING (pre-injection baseline, agent-host
 # R6: also establish the BROKER-DB baseline (a managed `processes` row RUNNING) so C-brk's post-evict
 # absence check genuinely proves an FK cascade removed a row that DID exist — not a vacuous pass on a row
 # that was never inserted (the DIVERGENCE half of #26).
-assert_ok "C-base-proc-db broker `ps` shows the child RUNNING (pre-injection DB baseline for the divergence)" \
+# Lint rule `backtick-in-desc`: the prose below used unescaped backticks around ps INSIDE a double-quoted
+# description, so the shell COMMAND-SUBSTITUTED it and really ran ps (splicing its output into the desc).
+# Prose now uses single quotes. The asserted command and its judgment are unchanged.
+assert_ok "C-base-proc-db broker 'ps' shows the child RUNNING (pre-injection DB baseline for the divergence)" \
           poll_until 15 1 "sleep 999999 RUNNING in broker ps" -- sh -c "\"$SIM\" ctl -- ps -a 2>/dev/null | grep 'sleep 999999' | grep -q RUNNING"
 # active expose serving a SENTINEL body (curl-able cross-container — the data-plane baseline)
 TOKEN="SENTINEL81_$$"
@@ -164,14 +172,23 @@ assert_ok "C-brk broker DB proc+node rows GONE (FK cascade — evict contract)" 
           poll_until 15 1 "sleep 999999 row + agt1 gone from broker DB" -- sh -c "! \"$SIM\" ctl -- ps -a 2>/dev/null | grep -q 'sleep 999999' && ! \"$SIM\" exec brk1 -- runuser -u tether -- tether admin nodes 2>&1 | grep -qE 'agt1[[:space:]]'"
 assert_ok "C-exit agent daemon exited" \
           poll_until 10 1 "agt1 daemon gone" -- _daemon_gone
-assert_ok "C-GAP-proc [#26] LEAKED OS child — daemon EXITED but managed child STILL ALIVE (setsid-nohup; INVERTED assert_ok = the gap)" \
-          _leak_present
+# C-reap (#26 CLOSED R12 — flipped to a POSITIVE regression): on a bare setsid-nohup host (no systemd cgroup
+# to reap for it), evict now reaps the managed OS child. The agent receives agent_evicted, SIGKILLs each
+# managed exec child's process group (Setpgid ⇒ pgid==pid), THEN self-exits — so the child is GONE from the
+# host process table, not orphaned to PID1. C-base-proc above proved the child was RUNNING pre-evict, so this
+# is 先证存在-后证消失, not a vacuous pass.
+assert_ok "C-reap [#26 CLOSED] evict reaps the managed OS child on a setsid-nohup host: daemon EXITED and the managed child is GONE from the host process table (agent SIGKILLs the child's process group on agent_evicted; NOT relying on a systemd cgroup)" \
+          poll_until 15 1 "sleep 999999 reaped after evict" -- _child_reaped
 assert_ok "C-port public expose port CLEANED: transport CONNECTION-REFUSED (curl exit 7, NOT a 4xx/5xx leaked listener; F3) + broker port-alloc row gone (FK cascade); mechanism = tunnel drop on daemon exit" \
           poll_until 15 1 "expose port connection-refused + alloc row gone" -- _c_port_clean
-# reap the leaked child before the systemd counter-factual
+# best-effort: ensure no residue of the setsid-nohup child before the systemd variant (C-reap already
+# reaped it; this is a no-op safety net, not a compensation for a leak).
 "$SIM" exec agt1 -- pkill -f 'sleep 999999' >/dev/null 2>&1 || true
 
-# ── C-GAP-proc-sysd — counter-factual: under systemd, cgroup reaps the child (NOT tether's doing) ─────
+# ── C-sysd — second deploy variant: under a systemd unit, evict ALSO reaps the child ─────────────────
+# Pre-#26-fix this arm was a counter-factual (the cgroup masked tether's leak). Post-fix tether reaps in
+# BOTH deploys, so under systemd two mechanisms concur (the agent's own SIGKILL of the child's process group
+# + the cgroup teardown on daemon exit). The observable is unchanged and still GREEN: the child is gone.
 assert_ok "C-sysd-setup re-join agt1 under SYSTEMD unit" \
           sh -c "\"$SIM\" agent-join agt1 --session $SID --pin $PIN >/dev/null 2>&1 && \"$SIM\" exec brk1 -- runuser -u tether -- tether admin nodes 2>&1 | grep -E 'agt1[[:space:]]' | grep -q ONLINE"
 "$SIM" exec ctl1 -- env HOME=/home/sim sh -c "setsid runuser -u sim -- env HOME=/home/sim tether exec agt1 -- sleep 888888 >/dev/null 2>&1 & echo ok" >/dev/null 2>&1
@@ -179,8 +196,8 @@ assert_ok "C-sysd-base systemd-deployed managed child RUNNING" \
           poll_until 15 1 "sleep 888888 running" -- _child2_alive
 assert_ok "C-sysd-evict evict the systemd-deployed agent" \
           sh -c "\"$SIM\" exec brk1 -- runuser -u tether -- tether admin evict $SID agt1 | grep -qE 'evicted sid=lab nid=agt1.*broadcast=true'"
-assert_ok "C-GAP-proc-sysd counter-factual: systemd cgroup REAPS the child (NOT tether — proves #26 is deployment-conditional)" \
-          poll_until 12 1 "sleep 888888 reaped by cgroup" -- sh -c "! \"$SIM\" exec agt1 -- pgrep -f 'sleep 888888' >/dev/null 2>&1"
+assert_ok "C-sysd-reap [#26 CLOSED] under systemd, evict reaps the managed child too (agent SIGKILL + cgroup teardown both apply): child GONE from the host process table" \
+          poll_until 12 1 "sleep 888888 reaped after evict (systemd)" -- sh -c "! \"$SIM\" exec agt1 -- pgrep -f 'sleep 888888' >/dev/null 2>&1"
 
 # ── Arm E — session rm 3-phase + session_deleting probe (agt1 already evicted; session-level) ─────────
 ev_sub_start

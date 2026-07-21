@@ -67,8 +67,17 @@ stage_binaries() {
 if [ "$do_build" = "1" ]; then stage_binaries; fi
 [ -x "$vendor/tether" ] || { echo "[remote] no vendor/tether — run with --build first" >&2; exit 1; }
 
+# Every ssh here carries the same keepalive trio. WHY: a whole-suite `drill-all` holds one ssh open for
+# hours with long silent stretches, and we have seen the server-side runner finish and exit — every .rc
+# written — while the LOCAL ssh never returned, leaving the operator unable to tell "still running" from
+# "wedged". ServerAlive* makes the client give up after ~3min of a dead peer instead of blocking forever
+# (a NAT/conntrack idle-eviction drops the flow silently, so TCP alone never notices); ConnectTimeout
+# bounds the handshake so an unreachable sim host fails fast instead of hanging the driver up front.
+SSH_OPTS="-o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
+
 echo "[remote] rsync tree → $SERVER:$REMOTE_DIR"
-ssh "$SERVER" "mkdir -p '$REMOTE_DIR'"
+# shellcheck disable=SC2086  # SSH_OPTS is a fixed literal above and MUST word-split into separate flags
+ssh $SSH_OPTS "$SERVER" "mkdir -p '$REMOTE_DIR'"
 # B1: `secrets/` (the minted CA/account/route key stash) is generated SERVER-SIDE by lib/secrets.sh and
 # never exists in this source tree — so `--delete`/`--delete-excluded` would wipe it on EVERY rsync,
 # minting a fresh CA next verb and breaking a running persistent cluster's route mTLS. Protect the
@@ -93,5 +102,6 @@ if [ "$#" -gt 0 ]; then
     # shell syntax (injection). This preserves exact argv and is injection-safe.
     remote_cmd="cd $(printf '%q' "$REMOTE_DIR") && $entry"
     for a in "$@"; do remote_cmd="$remote_cmd $(printf '%q' "$a")"; done
-    ssh -t "$SERVER" "$remote_cmd"
+    # shellcheck disable=SC2086  # ditto — fixed literal, deliberate split; -t and $remote_cmd unchanged
+    ssh $SSH_OPTS -t "$SERVER" "$remote_cmd"
 fi

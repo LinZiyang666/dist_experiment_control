@@ -822,7 +822,7 @@ owner 查成员表找到 B 的 FP
 | broker VPS 内核沦陷 | 同上 |
 | 本地私钥文件权限弱（`0644`） | 启动时 warning，不强制 |
 | FP 枚举 / 时序攻击 | 不做恒定时间查询；FP = SHA256 输出，搜索空间 2²⁵⁶ 无意义 |
-| PIN 暴力 | 速率限制：每 IP 每分钟 ≤ 10 次尝试；不做账户锁定 |
+| PIN 暴力 | **主防线 = 记忆硬 argon2id**（每次验证 64 MiB / t=3，见 `internal/auth/pin.go`）——攻击吞吐受内存带宽约束，与速率计数无关；PIN 为 ASCII 可打印、无长度上限（`ValidPIN`），非平凡 PIN 天文级安全。**辅以**每 IP 速率限制，语义为 **per-broker**：每 broker、每 IP、每分钟 ≤ 10 次；auth_callout 用 queue-group 分发（§6.2），N-broker 集群单一 IP 的有效上限 ≈ **N×10/min**。不做账户锁定。集群一致的全局计数需在**未认证 connect 路径**上引入分布式写（raft/JS/leader RPC）——那是更差的 DoS 放大面，v1 明确不做（外审 H2 裁决；实现见 `internal/authcallout/ratelimit.go`）。 |
 
 v2+ 候选：recovery code、双 owner、tetherd 进程沙箱、mTLS 双向认证、审计签名。
 
@@ -1186,12 +1186,24 @@ O4 已定：两条流 —— 全局 `events` + per-session `history-<sid>`。
 }
 ```
 
-**消息类型**：
-- `session_created` / `session_destroyed` / `member_joined` / `pin_failed` / `rotated_pin` / `kicked`
+**消息类型**（v1 实际发出的 —— DOC-12 已按实现订正）：
+- `session_created` / `session_destroyed` / `member_joined` / `pin_failed`
 - `tetherd_restarted`
-- `agent_registered` / `agent_unregistered`
+- `agent_registered` / `agent_evicted`（I.2b 运维 `admin evict` 摘除一个节点时发；见下「命名与未实现说明」）
+- `agent_roster_stale`（agent 未跟上签名拓扑）
 - `disk_pressure`（告警）
+- 运维/数据面事件：`proxy_*`（enabled/disabled/keyset_changed/node_unready/auto_rebalanced）、`nats_topology_*`、rehome 汇总、grow-cutover、`alert_*`
 - 未来的运维指标
+
+> **命名与未实现说明（DOC-12）**：早期版本此处列过 `rotated_pin` / `kicked` / `agent_unregistered` 三个类型，
+> 但 v1 **没有任何 writer 发它们**，属于文档超前承诺，已删除：
+> - `kicked` / `rotated_pin` 对应 E.3 里 owner 的 `session kick` / `session rotate-pin` 能力，**v1 CLI 未实现这两个动词**
+>   （只有 `session create/ls/rm`）；权限层为向前兼容预留了 `.kick.req` / `.rotate-pin.req` 的 pub 许可，但无命令产生、无 broker handler 消费。
+>   运维侧摘除一个**节点**走 I.2b admin socket 的 `admin evict`，发的是 `agent_evicted`（语义是「摘除 agent 节点」而非「踢成员」），
+>   与 H.1 旧文里的 `kicked` 是**不同概念**——把代码改名成 `kicked` 会破坏 agent 对 `agent_evicted` 的订阅与既有测试，故**订正文档、保留代码名**。
+> - `agent_unregistered`：v1 **无显式注销路径**——agent 断线经心跳过期转 STALE/OFFLINE（`nodes.status`，行仍在），
+>   节点被运维摘除则发 `agent_evicted`；没有「注销」这一独立事件。
+>   这三个动词/事件若将来落地，再按各自的叶子增量补 writer + 恢复本列表项。
 
 **订阅者**：owner ctl（查询）、运维工具（ephemeral 或自建 durable）。
 

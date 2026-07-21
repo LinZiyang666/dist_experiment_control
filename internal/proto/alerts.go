@@ -6,9 +6,10 @@ package proto
 // ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
 // reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v3 (G5/G7b) adds the
 // version-skew + JS-503 + voter self-report batch (ProxyHomeCount/ProxyHomeReported/JetStreamUnavailable/
-// CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive. No consumer gates
+// CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive; v5 (R7b) adds the
+// two lock-lease expiries (UpgradeLeaseExpiry/GrowLeaseExpiry). No consumer gates
 // on this value — decoding is omitempty-additive — so it is a documentation ledger, not a compat switch.
-const ClusterHealthSchemaVersion = 4
+const ClusterHealthSchemaVersion = 5
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -72,6 +73,21 @@ type ClusterHealthResp struct {
 	// DETECT + clear a stale lock left by a prior grow whose release-lock did not confirm (the self-heal path,
 	// mirroring UpgradeLockActive). Additive omitempty → pre-G4 brokers decode false.
 	GrowLockActive bool `json:"grow_lock_active,omitempty"`
+	// UpgradeLeaseExpiry / GrowLeaseExpiry (R7b, schema v5) are the RFC3339Nano expiry instants of the two
+	// membership locks' LEASES, as committed on this broker. They exist so `tether cluster unlock` can tell
+	// an operator the difference between the two states an operator most needs distinguished:
+	//
+	//	expiry in the FUTURE  → somebody is still renewing; the lock is LIVE and ripping it out would drop
+	//	                        the mutex under a running roll/grow (--force required).
+	//	expiry in the PAST or
+	//	absent while the lock
+	//	IS held               → nobody is renewing. Absent means the lock predates leases entirely, which is
+	//	                        precisely the case that will NEVER self-heal and must be cleared by hand.
+	//
+	// Additive omitempty: a pre-R7b broker omits them → "" → the CLI reports "no lease" rather than
+	// inventing an expiry.
+	UpgradeLeaseExpiry string `json:"upgrade_lease_expiry,omitempty"`
+	GrowLeaseExpiry    string `json:"grow_lease_expiry,omitempty"`
 	// TopoApplied/TopoObserved/TopoReconcileReason (C3 §2.7) are this broker's NATS topology reconcile
 	// self-report: Applied = the generation rendered into the on-disk conf, Observed = the generation
 	// the LIVE nats-server confirmed loading (via the /varz probe). TopoReported distinguishes a C3

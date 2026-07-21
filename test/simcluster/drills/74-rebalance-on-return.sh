@@ -1,4 +1,9 @@
 #!/bin/sh
+# R14/R15 note: this drill's cascade "THIS RUN" not_covered guards were class=runtime-guard, but they are
+# NOT intrinsic-sim-timing — each fires only when a CONFIRMED #33/#34 defect reproduces (proxy home
+# distribution drift / moved-exit strand). Per roadmap §2 that makes them coverage GAPs a product fix
+# retires, not honesty valves for sim non-determinism. Reclassified runtime-guard→gap (landing-neutral,
+# same shape as drill 73's sibling gap). #33/#34 stay owned by 73/74's non-green cells.
 # 74-rebalance-on-return.sh — S4 (N=3, G7a m11 sim leg): proxy __proxy__ home rebalance. Distribution oracle = a
 # FAIL-CLOSED per-broker home COUNT from ONE validated `proxy status --json` snapshot (R5-M2 + R6-M1: rc/JSON/exactly
 # 3 DISTINCT nids/real-voter homes). Builds the LOCKED one-per-voter (1/1/1) baseline via `cluster rebalance proxy`,
@@ -11,8 +16,9 @@
 # external-review R6-M1 (round-5's measure-and-record accept-both REVERTED as a unilateral acceptance change):
 # B-dp (moved-exit data-plane closure) and C-auto (auto-rebalance-on-return EFFECT) are LOCKED acceptance criteria
 # and are HARD assertions — the drill goes RED (release-blocking) if the moved-exit data plane STRANDS or the auto
-# path does NOT fire, EXPOSING the #33-family moved-exit stranding + the auto-rebalance gap. The no-reader carve-out
-# (s3-s5-owner-decisions.md D2) covers ONLY the raw proxy_auto_rebalanced EVENT, NOT the data plane or the EFFECT.
+# path does NOT fire, EXPOSING the #33-family moved-exit stranding + the auto-rebalance gap. The old no-reader
+# carve-out (s3-s5-owner-decisions.md D2) is RETIRED: #30 added `tether admin events`, so the raw proxy_auto_rebalanced
+# EVENT is now PINNED too (C-event: exactly one, anti-flap count==1, when the auto EFFECT fires).
 # The false-success paths R6-M1 found are closed: snapshot requires 3 DISTINCT nids; dry-run/real rebalance require
 # the command rc=0; the negative control is non-vacuous (no 'single' empty-explain compare).
 #
@@ -21,8 +27,8 @@
 #    DISTINCT nids required), not a status word and not empty-list-counts-as-zero.
 #  - manual rebalance (dry-run AND real) requires the COMMAND rc=0 — a failed command can never pass on an unchanged
 #    or naturally-converged distribution (R6-M1).
-#  - moved-exit data plane (B-dp) + auto EFFECT (C-auto) are HARD — RED when they fail, never a warn/NOT-COVERED
-#    (only the raw sys.events EVENT is NOT-COVERED, no operator reader).
+#  - moved-exit data plane (B-dp) + auto EFFECT (C-auto) are HARD — RED when they fail, never a warn/NOT-COVERED.
+#    The raw proxy_auto_rebalanced sys.events EVENT is now PINNED too (C-event, via the #30 `admin events` reader).
 #  - the negative control is created + validly homed on a real broker + serving before AND after (no 'single' fallback).
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"; . "$HERE/lib/secrets.sh"
@@ -31,7 +37,12 @@ set -u
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
-trap 'ss_down ctl1 2>/dev/null; for b in brk1 brk2 brk3; do ingress_down $b 443 2>/dev/null; done' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): the combined trap resumed after the handler on INT/TERM —
+# a Ctrl-C reaped the sidecars and then kept running the broker-kill / rebalance steps below (and raced
+# cmd_drill's nuke). drill_install_traps: EXIT registered separately, INT/TERM exit 128+signo without
+# resuming. Cleanup body unchanged.
+_cleanup() { ss_down ctl1 2>/dev/null; for b in brk1 brk2 brk3; do ingress_down "$b" 443 2>/dev/null; done; }
+drill_install_traps _cleanup
 CTL() { "$SIM" ctl -- "$@"; }
 _setup_ingress_all() { ingress_trust_inject ctl1 || return 1; for b in brk1 brk2 brk3; do secrets_mint_ingress "$INSTANCE" "$b" && ingress_up "$b" 443 ingress "/sub/=127.0.0.1:8090" || return 1; done; }
 _sub_token() { CTL proxy sub create --name "$1" 2>&1 | grep -oE '/sub/[A-Za-z0-9._-]+' | head -1 | sed 's#/sub/##'; }
@@ -58,6 +69,29 @@ _ss_via_agent() {   # $1=exit nid to egress through, $2=local socks port
     ss_sub_fetch ctl1 "https://brk1/sub/$TOK_A" "/tmp/74-leg-$2.${INSTANCE:-x}.yaml" "$CA" || return 1
     ss_up ctl1 "/tmp/74-leg-$2.${INSTANCE:-x}.yaml" "$1" "$2" 2>/dev/null || return 1
     ss_curl_ok ctl1 "$2" "http://$SINK_IP:9090/" "$SINK_TOK"
+}
+# H10 (2026-07-18 full-suite run): _ss_via_agent collapses THREE structurally different failures into one
+# `return 1` — (a) the /sub fetch failed, (b) ss-local never bound its SOCKS listener, or (c) the local client
+# WAS ready and bytes still did not flow. Only (c) is a product data-plane strand. proxy.sh:51-52 says so in
+# as many words about (b): "Return 1 (a HARNESS/setup failure — callers die-gate it, NEVER count it as a
+# product black-hole)". B-dp nevertheless narrated ALL of them as the #33-family moved-exit stranding, so the
+# live run — whose ONLY failure line was `ss-local ... SOCKS listener ready` timing out — was written up as a
+# release-blocking product defect that the evidence never showed. This classifier re-runs the probe's stages
+# ONCE on the failure path and reports WHICH stage broke, so the caller can narrate the run honestly. It only
+# ever prints a classification; it never decides a verdict and never relaxes one.
+_ss_fail_stage() {   # $1=exit nid $2=local socks port → echoes harness-subfetch|harness-sslocal|product|product-late
+    _sfs_n=$1; _sfs_p=$2
+    dexec ctl1 -- pkill -f "ss-local .*-l $_sfs_p " >/dev/null 2>&1 || true
+    ss_sub_fetch ctl1 "https://brk1/sub/$TOK_A" "/tmp/74-diag-$_sfs_p.${INSTANCE:-x}.yaml" "$CA" \
+        || { echo harness-subfetch; return 0; }
+    # ss_up POLLS ss_local_ready internally, so a 0 rc here means the SOCKS listener is bound and an ss-local
+    # process is alive — exactly the precondition proxy.sh demands before a curl failure may be blamed on the exit.
+    ss_up ctl1 "/tmp/74-diag-$_sfs_p.${INSTANCE:-x}.yaml" "$_sfs_n" "$_sfs_p" 2>/dev/null \
+        || { echo harness-sslocal; return 0; }
+    # Client PROVEN ready from here on: any outcome below is about the product, not the harness. `product-late`
+    # = it flows on this terminal re-probe though it did not within the polled window (a real convergence
+    # symptom, still the product's) — deliberately NOT a harness class, so it cannot launder a strand.
+    if ss_curl_ok ctl1 "$_sfs_p" "http://$SINK_IP:9090/" "$SINK_TOK"; then echo product-late; else echo product; fi
 }
 _proxy_ready() { _n=$(CTL proxy status --json 2>/dev/null | jq '[.nodes[]?|select(.ready==true)]|length' 2>/dev/null); [ "${_n:-0}" -ge "$1" ]; }
 EXPECT_EXITS="${EXPECT_EXITS:-3}"   # 3 agent exits over 3 voters (the locked one-per-voter fixture)
@@ -113,12 +147,40 @@ _dist() { _di_snap=$(_snap_homes) || { printf 'DIST-INVALID-%s\n' "$_di_snap"; r
 _spread_ge1() { [ "$(_spread)" -ge 1 ] && [ "$(_spread)" != 99 ]; }   # skew present (and NOT the invalid-99 sentinel)
 _spread_le1() { [ "$(_spread)" -le 1 ]; }
 _spread_zero(){ [ "$(_spread)" -eq 0 ]; }   # one-per-voter (max-min==0) — the locked 1/1/1 baseline
+# H11 (2026-07-18 full-suite run): KTGT selection MUST require a READABLE home count >= 1. _count_on returns
+# -1 on an INVALID snapshot, which is correctly fail-CLOSED for the _ktgt_empty/_ktgt_loaded predicates but was
+# fail-OPEN as a RANKING key: seeded at `_kmx=-1`, a broker whose count read 0 still out-ranked the sentinel and
+# WON the selection, so the drill picked a 0-home kill target (the live run logged `Arm-C KTGT=brk3 (0 homes)`).
+# A 0-home KTGT makes _skew's whole oracle vacuous — `_ktgt_empty` ("its exits rehomed AWAY, count → 0") is
+# already TRUE on the first tick, before anything is killed. Seeding the max at 0 and refusing any non-numeric
+# (i.e. -1 / empty / garbage) count means ONLY a broker PROVEN to carry >= 1 home can become KTGT; when none
+# does, KTGT comes back empty and the caller's existing >= 1 precondition gate REDs (Arm C) or dies (Arm SKEW)
+# exactly as before. This makes the selection accurate — it relaxes no assertion.
+_pick_ktgt() {   # echoes "<count>|<broker>"; broker empty when no candidate has a readable >=1 home count
+    _pk_b=""; _pk_mx=0
+    for _pk_c in $(list_nodes broker); do
+        [ "$_pk_c" = "$(sim_leader)" ] && continue
+        # R6 FIX: brk1 = the agents' TUNNEL broker (they provision nats://brk1); killing it severs every
+        # agent's NATS control connection + breaks the whole proxy plane.
+        [ "$_pk_c" = brk1 ] && continue
+        _pk_n=$(_count_on "$_pk_c")
+        case "$_pk_n" in ''|*[!0-9]*) continue ;; esac   # unreadable snapshot (-1) / garbage → NEVER eligible
+        [ "$_pk_n" -gt "$_pk_mx" ] && { _pk_mx=$_pk_n; _pk_b=$_pk_c; }
+    done
+    printf '%s|%s\n' "$_pk_mx" "$_pk_b"
+}
 _ktgt_empty()  { [ "$(_count_on "$KTGT")" -eq 0 ]; }   # KTGT carries NO __proxy__ home (fail-closed: -1 on invalid ≠ 0)
 _ktgt_loaded() { [ "$(_count_on "$KTGT")" -gt 0 ]; }   # KTGT carries >=1 __proxy__ home
 # M6: KTGT is proxy-ELIGIBLE iff a rebalance --dry-run (a ZERO-mutation preview) PLANS a move ONTO it (the planner
 # only targets deliverable + reachable voters, proxy_rebalance.go:196). Proving KTGT is eligible makes the
 # default-off "stays empty" NON-vacuous: auto-rebalance COULD fire here if it were on, yet it does not.
-_dryrun_targets_ktgt() { "$SIM" exec "$(sim_leader)" -- runuser -u tether -- tether cluster rebalance proxy --dry-run 2>/dev/null | grep -q -- "-> $KTGT "; }
+# round-5 §M1 (lint rule `sigpipe-truncation`): capture the preview to completion instead of piping it into
+# `grep -q` — grep's first-match exit SIGPIPEs the writer mid-run. Judgment unchanged: same `-> $KTGT `
+# signature over the same output, command rc still ignored.
+_dryrun_targets_ktgt() {
+    _dt_out=$("$SIM" exec "$(sim_leader)" -- runuser -u tether -- tether cluster rebalance proxy --dry-run 2>/dev/null)
+    printf '%s\n' "$_dt_out" | grep -q -- "-> $KTGT "
+}
 # KTGT stays EMPTY across a QUIET window (6×5s = 30s) — default-off = STABLE no auto-migration, not merely "not yet".
 _ktgt_stable_empty() { _sn=0; while [ "$_sn" -lt 6 ]; do [ "$(_count_on "$KTGT")" -eq 0 ] || return 1; sleep 5; _sn=$((_sn+1)); done; }
 # _skew kills the home-HEAVIEST non-leader broker and waits for its exits to REHOME AWAY (its home count→0).
@@ -164,6 +226,19 @@ _set_auto_rebalance() {
 }
 _env_on_all() { for _b in $(list_nodes broker); do node_running "$_b" || continue; dexec "$_b" -- systemctl show tether-broker -p Environment 2>/dev/null | grep -q 'TETHER_AUTO_REBALANCE=on' || return 1; done; }
 _auto_tick() { _spread_le1; }   # NO manual verb — observe whether the auto path evens it out on its own
+# ── #30 operator event reader (admin events) ────────────────────────────────────────────────────────────
+# The H.1 `events` JetStream stream (sys.events) had NO operator reader before #30. `tether admin events` is
+# that reader, over the root-only 0600 admin socket. proxy_auto_rebalanced fires ONLY on the auto-rebalance-
+# on-return path (proxy_auto_rebalance.go:132) with planned>0 — the MANUAL `cluster rebalance proxy` verb never
+# emits it. Read on brk1 (always alive in 74 — never a KTGT; the events stream is clustered so any live-quorum
+# broker serves it). --json ⇒ ONLY machine JSON on stdout (R11), host jq parses it. Prints the event count.
+_par_count() { "$SIM" exec brk1 -- runuser -u tether -- tether admin events --kind proxy_auto_rebalanced -n 200 --json 2>/dev/null | jq '[.events[]?]|length' 2>/dev/null; }
+# the auto event LANDED: count grew past _PAR_BEFORE (the pre-C-edge baseline, which absorbs any auto fire the
+# C-setup mass-restart may have produced) — used to poll out the async publish before the exact-one assertion.
+_par_landed() { _c=$(_par_count); case "$_c" in ''|*[!0-9]*) return 1;; esac; case "${_PAR_BEFORE:-}" in ''|*[!0-9]*) return 1;; esac; [ "$_c" -gt "$_PAR_BEFORE" ]; }
+# SECRET-FREE: every proxy_auto_rebalanced body carries ONLY {v,type,ts,reason,returned,voters,planned} — node
+# ids + scalar counts, never a psk/token. jq returns true/false and never prints a body value.
+_par_secretfree() { "$SIM" exec brk1 -- runuser -u tether -- tether admin events --kind proxy_auto_rebalanced -n 200 --json 2>/dev/null | jq -e 'all(.events[]?; ((.body|keys) - ["v","type","ts","reason","returned","voters","planned"]|length)==0)' >/dev/null 2>&1; }
 # NEGATIVE-CONTROL helpers (R6-M1): the ordinary expose 'reg' must be created + validly homed on a REAL broker +
 # SERVING — no empty-explain 'single' fallback letting two missing results compare equal. Called as FUNCTIONS
 # (not sh -c) so the command-sub inherits these + the globals NEG_TOK/EXH0/_regrc.
@@ -176,6 +251,15 @@ _reg_ready()    { _rh=$(_reg_home); printf '%s' "$_rh" | grep -qE '^brk[123]$' &
 _negctrl_post() { [ "$(_reg_home)" = "${EXH0:-}" ] && [ -n "${EXH0:-}" ] && _reg_serves; }
 
 drill_begin "74-rebalance-on-return (N=3 proxy home rebalance — G7a m11 sim leg)"
+# External review H-1/M2 (ledger-crosscheck): #34 is a CONFIRMED-open defect (docs/deploy-tier-gotchas.md
+# §#34, 已证 A: control-plane home-count drift) that R15 did NOT fix. It reproduces NON-DETERMINISTICALLY, so
+# the conditional B-dp/C-auto/SKEW arms below can all pass on a run where it does not manifest — a lucky-GREEN
+# that FALSELY certifies the proxy-home subsystem as all-clear and leaves #34 with no non-GREEN owner. This
+# PERSISTENT gap (mirrors 71's persistent #29 gap) keeps 74 from ever landing a false GREEN while #34 is open:
+# it fires on EVERY path, so 74 is deterministically INCOMPLETE and #34 always has a non-GREEN owner cell. It
+# is REMOVED — 74 flips to a plain GREEN regression — the day #34 is fixed.
+not_covered "74 #34 REGISTERED-OPEN: proxy-home one-per-voter stability + auto-rebalance-on-return are NOT verified-fixed (R15 did not fix #34)" \
+    "#34 (proxy home distribution cannot stably hold one-per-voter; non-tunnel-voter proxy-eligibility unstable; auto-rebalance-on-return blocked by the #31 in-flight-op fire-gate) is CONFIRMED-open. The conditional arms in this drill catch it ONLY when it reproduces, so a non-manifesting run would otherwise report a false all-clear. Persistent gap ⇒ deterministic non-GREEN owner for #34 until the product fix lands and this line is removed." gap
 "$SIM" nuke >/dev/null 2>&1 || true
 # R5-M5: run grow_to_3 OUTSIDE assert_ok so GROW-ATTEMPTS + per-attempt grow rc are VISIBLE (assert_ok hides them on success).
 grow_to_3 3 1; _g3rc=$?
@@ -237,22 +321,16 @@ else
 fi
 if [ "$RECON" != 1 ] || [ "$RECON_FLOW" != 1 ]; then
     log "74: post-reconstruct distribution: $(_dist)"
-    warn "74 destructive arms (SKEW/RETURN/A/B/C) NOT-COVERED THIS RUN — the locked SKEW baseline (1/1/1 + every exit flowing) did NOT establish (RECON=$RECON, RECON_FLOW=$RECON_FLOW; the SKEW-reconstruct/SKEW-flow RED above). Per R7-M1/R8-M1 the destructive kill/rebalance arms are SKIPPED over an invalid/non-flowing baseline — NO misleading PASS lines over a failed foundation. The RED(s) above are the exposed #34 instability."
+    not_covered "74 destructive arms (SKEW/RETURN/A/B/C) THIS RUN" "the locked SKEW baseline (1/1/1 + every exit flowing) did NOT establish (RECON=$RECON, RECON_FLOW=$RECON_FLOW; the SKEW-reconstruct/SKEW-flow RED above). Per R7-M1/R8-M1 the destructive kill/rebalance arms are SKIPPED over an invalid/non-flowing baseline — NO misleading PASS lines over a failed foundation. The RED(s) above are the exposed #34 instability." gap
     ss_down ctl1 2>/dev/null || true
     drill_end; exit $?
 fi
 # ── Arm SKEW — kill the home-HEAVIEST non-leader broker (quorum kept 2/3) → its exits rehome AWAY ──
 # pick the heaviest so the kill demonstrably moves exits (killing a 0-home broker would make rehome vacuous).
-KTGT=""; _kmx=-1
-for b in $(list_nodes broker); do
-    [ "$b" = "$(sim_leader)" ] && continue
-    [ "$b" = brk1 ] && continue   # R6 FIX: brk1 = the agents' TUNNEL broker (they provision nats://brk1); killing
-                                  # it severs every agent's NATS control connection + breaks the whole proxy plane.
-    _kc=$(_count_on "$b"); [ "${_kc:-0}" -gt "$_kmx" ] && { _kmx=$_kc; KTGT=$b; }
-done
+_pk=$(_pick_ktgt); _kmx=${_pk%%|*}; KTGT=${_pk#*|}   # H11: readable-count-and->=1 selection (see _pick_ktgt)
 [ -n "$KTGT" ] || KTGT=brk2
 [ "$KTGT" != brk1 ] || die "74: KTGT resolved to brk1 (the agents' tunnel broker) — refusing to kill it"
-log "74: KTGT=$KTGT (home-heaviest non-leader, $_kmx homes); initial dist $(_dist)"
+log "74: KTGT=$KTGT (home-heaviest non-leader with a READABLE >=1 home count, $_kmx homes); initial dist $(_dist)"
 # self-review finding-10: die-gate the SKEW-precond — if the non-deterministic initial reconcile piled all exits on
 # the leader, every non-leader broker has 0 homes → _kmx=0 → the _skew kill would run over a 0-home KTGT and its
 # _ktgt_empty (home count→0) rehome-away oracle is trivially satisfied from the start (a vacuous destructive arm).
@@ -298,7 +376,7 @@ else
     assert_ok "B-flow-pre-snapshot the B pre-flow baseline needs a VALIDATED proxy-status snapshot (exactly $EXPECT_EXITS distinct nids, all homes real voters) — RED + fail-closed when the status is empty/partial/malformed (R9-M1: a zero-iteration enumeration must NOT leave B_PREFLOW=1)"  sh -c "false"
 fi
 if [ "$B_PREFLOW" != 1 ]; then
-    warn "74 B injection (dry-run / real rebalance / B-move / B-dp / negative control) NOT-COVERED THIS RUN — the pre-flow baseline (VALIDATED snapshot + EVERY exit flowing) did NOT establish (B_PREFLOW=0; the B-flow-pre RED(s) above). The manual rebalance is NOT run over an invalid data-plane baseline, so it cannot mutate the distribution / contaminate the ordinary-expose or Arm-C fixtures (R9-M1). The pre-flow RED is the exposure; NEG_OK stays 0."
+    not_covered "74 B injection (dry-run / real rebalance / B-move / B-dp / negative control) THIS RUN" "the pre-flow baseline (VALIDATED snapshot + EVERY exit flowing) did NOT establish (B_PREFLOW=0; the B-flow-pre RED(s) above). The manual rebalance is NOT run over an invalid data-plane baseline, so it cannot mutate the distribution / contaminate the ordinary-expose or Arm-C fixtures (R9-M1). The pre-flow RED is the exposure; NEG_OK stays 0." gap
 else
     # R10-M1: the FRESH adjacent attribution snapshot must be an EXECUTABLE gate. Capture _snap_nidhome WITHOUT a
     # pipeline — a `_snap_nidhome | tr` pipeline returns tr's rc (always 0), MASKING a failed helper (empty output).
@@ -322,10 +400,23 @@ else
         log "74: B-dp move check — exit=$DP_A oldhome=[${DP_BEFORE:-?}] newhome=[${DP_NOW:-?}] KTGT=$KTGT → valid-attributable-move=$B_MOVE"
         assert_ok "B-move a REAL exit MOVED onto $KTGT by THIS manual rebalance (exact nid $DP_A non-empty, old home ${DP_BEFORE:-?} != $KTGT, new home == $KTGT) — the attribution GATE for B-dp (R8-M1)"  sh -c "[ '$B_MOVE' = 1 ]"
         if [ "$B_MOVE" = 1 ]; then
-            assert_ok "B-dp [DATA-PLANE, HARD] an SS leg MUST flow bytes through the RECORDED moved exit $DP_A (was on $DP_BEFORE, proven flowing pre-B, now on $KTGT) within 240s — tests THAT exact nid via _ss_via_agent, not whatever is first on $KTGT (R8-M1). RED if it STRANDS = the #33-family moved-exit stranding EXPOSED as release-blocking (R6-M1)"  poll_until 240 5 "recorded moved exit $DP_A SS flows" -- _ss_via_agent "$DP_A" 1093
+            # H10: classify the TERMINAL failure stage before narrating it. A harness-side failure (no /sub, or
+            # the local ss-local client never bound its listener) means the product data plane was NEVER probed,
+            # so this run can say nothing about #33 in either direction — that is a runtime-guard gap, not a
+            # release-blocking product RED. Only a strand with the local client PROVEN READY is the #33 family.
+            if poll_until 240 5 "recorded moved exit $DP_A SS flows" -- _ss_via_agent "$DP_A" 1093; then _bdp=1; _bdps=flowed; else _bdp=0; _bdps=$(_ss_fail_stage "$DP_A" 1093); fi
             ss_down ctl1 2>/dev/null || true
+            log "74: B-dp terminal stage classification for exit $DP_A = [$_bdps] (harness-* = the /sub fetch or the LOCAL ss-local client never came up, so the product was never probed; product/product-late = the client was READY and bytes still did not flow in the window = a real #33-family strand — H10)"
+            case "$_bdps" in
+                harness-*)
+                    not_covered "74 B-dp THIS RUN" "the SS probe never REACHED the product ($_bdps): the /sub fetch or the LOCAL ss-local client failed to come up, which proxy.sh:51-52 defines as 'a HARNESS/setup failure — callers die-gate it, NEVER count it as a product black-hole'. The recorded moved exit $DP_A was therefore never actually probed, so this run evidences NOTHING about the #33-family moved-exit stranding in either direction. Narrating a drill-side client timeout as the release-blocking #33 strand (as the 2026-07-18 run did) forges a product defect out of harness debt — H10." gap
+                    ;;
+                *)
+                    assert_ok "B-dp [DATA-PLANE, HARD] an SS leg MUST flow bytes through the RECORDED moved exit $DP_A (was on $DP_BEFORE, proven flowing pre-B, now on $KTGT) within 240s — tests THAT exact nid via _ss_via_agent, not whatever is first on $KTGT (R8-M1). RED if it STRANDS with the local SS client PROVEN READY (stage=$_bdps) = the #33-family moved-exit stranding EXPOSED as release-blocking (R6-M1; the harness-vs-product split is H10)"  sh -c "[ '$_bdp' = 1 ]"
+                    ;;
+            esac
         else
-            warn "74 B-dp NOT-COVERED THIS RUN — no VALID attributable move (B-move RED above: exit=$DP_A old=[${DP_BEFORE:-?}] new=[${DP_NOW:-?}] KTGT=$KTGT). Driving the data plane without a proven move would let a different healthy exit mask a strand of the recorded moved exit (R8-M1). The B-move RED is the exposure."
+            not_covered "74 B-dp THIS RUN" "no VALID attributable move (B-move RED above: exit=$DP_A old=[${DP_BEFORE:-?}] new=[${DP_NOW:-?}] KTGT=$KTGT). Driving the data plane without a proven move would let a different healthy exit mask a strand of the recorded moved exit (R8-M1). The B-move RED is the exposure." gap
         fi
         # NEGATIVE CONTROL (R6-M1 non-vacuous + R9-M1 rc-gated): a co-homed ORDINARY expose must NOT be moved by a
         # SUCCESSFUL __proxy__-only rebalance. Created + validly homed on a real broker + SERVING before AND after; the
@@ -349,16 +440,16 @@ else
                 assert_ok "B-negctrl the co-homed ORDINARY expose reg is NOT moved by the SUCCESSFUL __proxy__-only rebalance — home STILL $EXH0 AND still SERVING (plan inv-5; RED if it moved or stopped serving)"  poll_until 15 3 "reg still homed $EXH0 + serving" -- _negctrl_post
             else
                 NEG_OK=0
-                warn "74 B-negctrl + C-negctrl NOT-COVERED THIS RUN — the negative-control rebalance FAILED (rc=$_nrc; the B-negctrl-rc RED above). An 'unchanged + serving' post-control would NOT evidence a SUCCESSFUL __proxy__ rebalance ignoring the ordinary expose (R9-M1). The rebalance-rc RED is the exposure."
+                not_covered "74 B-negctrl + C-negctrl THIS RUN" "the negative-control rebalance FAILED (rc=$_nrc; the B-negctrl-rc RED above). An 'unchanged + serving' post-control would NOT evidence a SUCCESSFUL __proxy__ rebalance ignoring the ordinary expose (R9-M1). The rebalance-rc RED is the exposure." gap
             fi
         else
             NEG_OK=0
-            warn "74 B-negctrl + C-negctrl NOT-COVERED THIS RUN — the ordinary-expose PRE-control did NOT establish (create rc=$_regrc, pre-serving=$_regpre, home=[$EXH0]; the B-negctrl-create/pre RED above). A partial/non-serving row must NOT feed the post-control (R8-M1). The pre-control RED is the exposure."
+            not_covered "74 B-negctrl + C-negctrl THIS RUN" "the ordinary-expose PRE-control did NOT establish (create rc=$_regrc, pre-serving=$_regpre, home=[$EXH0]; the B-negctrl-create/pre RED above). A partial/non-serving row must NOT feed the post-control (R8-M1). The pre-control RED is the exposure." gap
         fi
     else
         NEG_OK=0
         assert_ok "B-snapshot the FRESH attribution snapshot adjacent to the injection is VALIDATED (rc=0 + non-empty exact nid=home) — RED + fail-closed skip of the WHOLE B injection when the status is empty/partial/malformed (R10-M1: a _snap_nidhome|tr pipeline previously masked the helper rc; captured WITHOUT a pipeline now)"  sh -c "false"
-        warn "74 B injection (dry-run / real / B-move / B-dp / negative control) NOT-COVERED THIS RUN — the FRESH adjacent VALIDATED snapshot failed (empty/partial status; the B-snapshot RED above). B-dry/B-real are NOT run over an empty attribution baseline (R10-M1); NEG_OK stays 0."
+        not_covered "74 B injection (dry-run / real / B-move / B-dp / negative control) THIS RUN" "the FRESH adjacent VALIDATED snapshot failed (empty/partial status; the B-snapshot RED above). B-dry/B-real are NOT run over an empty attribution baseline (R10-M1); NEG_OK stays 0." gap
     fi
 fi
 # R7-M1: reg (created only inside a valid B injection with NEG_OK=1) is kept alive across Arm C for the __proxy__-only
@@ -374,9 +465,18 @@ if _set_auto_rebalance; then _cenv=1; else _cenv=0; C_EDGE=0; fi
 assert_ok "C-setup TETHER_AUTO_REBALANCE=on on all broker units (drop-in + daemon-reload + restart; rejoin 3-VOTER) — GATES Arm C (R8-M2)"  sh -c "[ '$_cenv' = 1 ]"
 if _env_on_all; then _cverify=1; else _cverify=0; C_EDGE=0; fi
 assert_ok "C-verify env live on every broker (systemctl show -p Environment) — GATES Arm C (R8-M2)"  sh -c "[ '$_cverify' = 1 ]"
+# H11 (2026-07-18 full-suite run): C-setup restarts EVERY broker, so the __proxy__ homes re-reconcile for tens
+# of seconds afterwards. The Arm-C distribution snapshot below used to be taken IMMEDIATELY after that restart,
+# mid-reconcile: the live run read every candidate at 0 homes and logged `Arm-C KTGT=brk3 (0 homes)`, i.e. it
+# chose the kill target from a distribution that had not settled yet. SETTLE first (_dist_stable = two reads 3s
+# apart agree) so the selection sees the real post-restart distribution. A distribution that never quiesces is
+# itself a finding, so this is a GATE on the auto edge — not a sleep, and not a softened precondition.
+if poll_until 90 3 "post-restart distribution stable" -- _dist_stable; then _csettle=1; else _csettle=0; C_EDGE=0; fi
+assert_ok "C-settle post-restart __proxy__ distribution STOPS drifting BEFORE the Arm-C KTGT snapshot (C-setup just restarted every broker; sampling mid-reconcile read all candidates at 0 homes and picked a 0-home KTGT, making _skew's rehome-away oracle vacuous — H11) — GATES the auto edge"  sh -c "[ '$_csettle' = 1 ]"
 # pick the home-heaviest non-leader non-tunnel broker; REQUIRE it carries >0 homes (C SKEW-precond, R8-M2 — the
 # round-8 retry hit KTGT=brk2 with 0 homes, so _skew's _ktgt_empty rehome-away oracle was satisfied from the start).
-KTGT=""; _kmx=-1; for b in $(list_nodes broker); do [ "$b" = "$(sim_leader)" ] && continue; [ "$b" = brk1 ] && continue; _kc=$(_count_on "$b"); [ "${_kc:-0}" -gt "$_kmx" ] && { _kmx=$_kc; KTGT=$b; }; done
+# H11: _pick_ktgt refuses an unreadable count outright, so an invalid snapshot can no longer yield a KTGT at all.
+_pk=$(_pick_ktgt); _kmx=${_pk%%|*}; KTGT=${_pk#*|}
 [ -n "$KTGT" ] || KTGT=brk2
 [ "$KTGT" != brk1 ] || die "74: Arm-C KTGT resolved to brk1 (the agents' tunnel broker) — refusing to kill it"
 log "74: Arm-C KTGT=$KTGT ($_kmx homes)"
@@ -422,6 +522,10 @@ if [ "$C_EDGE" = 1 ]; then
     log "74: C-skew-adjacent reselected KTGT=$KTGT (${_kmx2} homes) from ONE fresh validated snapshot right before the kill"
     assert_ok "C-skew-adjacent a non-leader non-tunnel broker STILL carries >=1 __proxy__ home on a VALIDATED snapshot ADJACENT to the kill (KTGT reselected=$KTGT) — R10-M1: the ~270s all-nid pre-flow loop drifts the distribution, so re-validate a NON-VACUOUS kill boundary right before _skew (else _skew kills a 0-home broker and _ktgt_empty is true from the start)"  sh -c "[ '$_cadjok' = 1 ]"
 fi
+# #30 baseline for the exact-one anti-flap event: capture the proxy_auto_rebalanced count BEFORE the Arm-C
+# skew+return edge, so any auto fire the C-setup mass-restart produced is in the baseline and the post-return
+# DELTA isolates THIS single return edge (the anti-flap "count==1" the plan wants).
+_PAR_BEFORE=$(_par_count); log "74: [#30] proxy_auto_rebalanced baseline before the Arm-C skew+return edge = ${_PAR_BEFORE:-?}"
 if [ "$C_EDGE" = 1 ]; then
     if _skew; then _cskew=1; else _cskew=0; C_EDGE=0; fi   # kill KTGT → its homes rehome AWAY (count→0)
     assert_ok "C-skew kill $KTGT → its exits rehome AWAY ($KTGT count→0) — GATES the auto edge (R8-M2)"  sh -c "[ '$_cskew' = 1 ]"
@@ -456,6 +560,18 @@ if [ "$C_EDGE" = 1 ]; then
     assert_ok "C-auto [AUTO-EFFECT, HARD] distribution AUTO-evens (spread<=1) within the locked 180s window WITHOUT the manual verb OVER A VALID skew+return edge — TETHER_AUTO_REBALANCE=on MUST auto-rebalance-on-return (locked plan §3-74 Arm C). RED if it does NOT fire = the auto-rebalance gap EXPOSED as release-blocking; likely root = the #31 lingering in-flight op closing the 'no in-flight op' fire-gate (proxy_auto_rebalance.go:57), the same op that blocks drain/upgrade (R6-M1)"  sh -c "[ '$C_AUTO' = 1 ]"
     log "74: Arm-C post-auto distribution: $(_dist)"
     if [ "$C_AUTO" = 1 ]; then
+        # #30 (closed): the plan's "exactly one proxy_auto_rebalanced (anti-flap count==1)" was carved out as
+        # UN-PINNABLE (sys.events had no operator reader). `admin events` is now that reader, so pin it: the
+        # SINGLE Arm-C return edge emitted EXACTLY ONE proxy_auto_rebalanced (a DELTA past _PAR_BEFORE — the
+        # auto EFFECT already fired above, so the event is committed; poll briefly for the async read to settle).
+        poll_until 20 2 "proxy_auto_rebalanced event lands post-auto" -- _par_landed
+        _PAR_AFTER=$(_par_count)
+        case "${_PAR_BEFORE:-}" in ''|*[!0-9]*) _PAR_BEFORE=-1;; esac
+        case "${_PAR_AFTER:-}" in ''|*[!0-9]*) _PAR_AFTER=-1;; esac
+        _par_delta=$(( _PAR_AFTER - _PAR_BEFORE ))
+        log "74: [#30] proxy_auto_rebalanced delta across the Arm-C return edge = ${_PAR_BEFORE}→${_PAR_AFTER} (=$_par_delta; anti-flap expects exactly 1)"
+        assert_ok "C-event [#30] admin events reads EXACTLY ONE proxy_auto_rebalanced for the single Arm-C return edge (anti-flap count==1; delta=$_par_delta) — #30's operator reader makes the plan's exact-one EVENT assertion PINNABLE (was carved out UN-PINNABLE: no operator read command); the auto EFFECT itself stays the HARD C-auto assertion above"  sh -c "[ '$_par_delta' = 1 ]"
+        assert_ok "C-event [#30] the proxy_auto_rebalanced payload is SECRET-FREE (body keys ⊆ {v,type,ts,reason,returned,voters,planned}; carries only node ids + scalar counts — never a psk/token)"  _par_secretfree
         # R8-M2: derive the EXACT auto-moved exit — a nid NOW on KTGT whose home in the pre-auto snapshot was != KTGT
         # — and drive the data plane through THAT recorded nid via _ss_via_agent (not _ss_via_home, the identity hole).
         C_DP_A=$(CTL proxy status --json 2>/dev/null | jq -r --arg b "$KTGT" '.nodes[]?|select(.home_broker==$b)|.nid' 2>/dev/null | head -1)
@@ -470,13 +586,13 @@ if [ "$C_EDGE" = 1 ]; then
             assert_ok "C-dp [DATA-PLANE] SS leg flows bytes through the RECORDED auto-moved exit $C_DP_A (pre-auto home $C_DP_BEFORE, proven flowing pre-kill, now on $KTGT) after the auto rebalance — tests THAT exact nid via _ss_via_agent (R8-M2/R9-M2)"  poll_until 120 5 "auto-moved exit $C_DP_A SS flows" -- _ss_via_agent "$C_DP_A" 1105
             ss_down ctl1 2>/dev/null || true
         else
-            warn "74 C-dp NOT-COVERED THIS RUN — no attributable auto move (C-move RED: exit=$C_DP_A pre-auto-home=[${C_DP_BEFORE:-?}] KTGT=$KTGT). Driving the data plane without a proven auto-move would let a different exit mask a strand (R8-M2)."
+            not_covered "74 C-dp THIS RUN" "no attributable auto move (C-move RED: exit=$C_DP_A pre-auto-home=[${C_DP_BEFORE:-?}] KTGT=$KTGT). Driving the data plane without a proven auto-move would let a different exit mask a strand (R8-M2)." gap
         fi
     else
-        warn "74 C-dp NOT-COVERED THIS RUN — the auto path did NOT fire (C-auto RED above, likely the #31 fire-gate), so there is no AUTO-moved exit to close the data plane THROUGH. Flips to GREEN the day auto-rebalance-on-return fires (R7-M1)."
+        not_covered "74 C-dp THIS RUN" "the auto path did NOT fire (C-auto RED above, likely the #31 fire-gate), so there is no AUTO-moved exit to close the data plane THROUGH. Flips to GREEN the day auto-rebalance-on-return fires (R7-M1)." gap
     fi
 else
-    warn "74 C-auto + C-dp NOT-COVERED THIS RUN — the Arm-C skew/return EDGE is INVALID (a C-setup/C-verify/C-SKEW-precond/C-ss-pre/C-skew/C-return/C-still-skewed RED above). Certifying an auto effect over an invalid edge would let _auto_tick (=_spread_le1) pass on an already-even distribution WITHOUT any automatic move (R8-M2). The prerequisite RED(s) are the exposure; C-auto/C-dp flip GREEN the day a valid edge AND a firing auto path both hold."
+    not_covered "74 C-auto + C-dp THIS RUN" "the Arm-C skew/return EDGE is INVALID (a C-setup/C-verify/C-SKEW-precond/C-ss-pre/C-skew/C-return/C-still-skewed RED above). Certifying an auto effect over an invalid edge would let _auto_tick (=_spread_le1) pass on an already-even distribution WITHOUT any automatic move (R8-M2). The prerequisite RED(s) are the exposure; C-auto/C-dp flip GREEN the day a valid edge AND a firing auto path both hold." gap
 fi
 # R7-M1 + R8-M1: the __proxy__-only NEGATIVE CONTROL across the WHOLE Arm C return transaction (kill+return+auto
 # window) — reg (homed on tunnel broker brk1, never KTGT) must NOT be moved by ANY part of Arm C whether or not the
@@ -487,5 +603,8 @@ if [ "$NEG_OK" = 1 ]; then
 fi
 "$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1   # reg served across the Arm B + Arm C negative controls; remove now
 
-warn "74 NOT-COVERED [ONLY the raw proxy_auto_rebalanced EVENT — sys.events has NO operator reader]: the plan's exact-one proxy_auto_rebalanced count==1 anti-flap EVENT assertion is UN-PINNABLE — sys.events has NO operator read command (admin = audit/evict/nodes/sessions only), so 'the event fired exactly once' cannot be READ (a TECHNICALLY-UNOBSERVABLE / review-accepted limitation — NOT an owner scope decision; s3-s5-owner-decisions.md D2, covers ONLY raw event assertions). The auto EFFECT itself (distribution auto-evens) is NOT carved out — it is the HARD C-auto assertion above (RED if it does not fire). R6-M1: the moved-exit data-plane closure (B-dp) and the auto EFFECT (C-auto) are LOCKED acceptance criteria and HARD assertions here — the drill goes RED (release-blocking) when the #33-family moved-exit stranding manifests or the auto path does not fire; that RED is the honest exposure, NOT force-greened. There is NO data-plane / auto-effect measure-and-record carve-out (round-5's was a unilateral acceptance change, reverted)."
+# #30 CLOSED: the plan's exact-one proxy_auto_rebalanced count==1 anti-flap EVENT is NO LONGER un-pinnable —
+# `tether admin events` reads sys.events, so when the auto EFFECT fires (C_AUTO=1) the C-event assertion above
+# pins it (DELTA==1 for the single return edge). When the auto path does NOT fire (the #31 fire-gate case), the
+# HARD C-auto RED / C-EDGE gap above already exposes it — there is no separate raw-event carve-out to record.
 drill_end

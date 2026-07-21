@@ -467,6 +467,57 @@ func (a *Agent) pubPtyFailed(nc *nats.Conn, pid, reason, detail string) {
 	}
 }
 
+// registerExecChild / unregisterExecChild track a live synchronous `tether exec`
+// OS child so an admin EVICT can reap it (#26). p may be nil (a start that never
+// produced a process) — recorded as a no-op guard so callers need not nil-check.
+func (a *Agent) registerExecChild(pid string, p *os.Process) {
+	if p == nil {
+		return
+	}
+	a.execChildrenMu.Lock()
+	a.execChildren[pid] = p
+	a.execChildrenMu.Unlock()
+}
+
+func (a *Agent) unregisterExecChild(pid string) {
+	a.execChildrenMu.Lock()
+	delete(a.execChildren, pid)
+	a.execChildrenMu.Unlock()
+}
+
+// reapManagedChildren SIGKILLs every process this agent still manages — the
+// synchronous `tether exec` children AND the interactive `run` PTY sessions. It
+// is the EVICT contract (#26): once the operator has evicted this node, the
+// daemon self-exits, and on a bare setsid-nohup host (no systemd cgroup) nothing
+// else would reap the managed children — they would linger in the host process
+// table. Each exec child is started Setpgid, so a single kill(-pgid) reaps the
+// child AND any subtree it forked; the PTY session kills its own Setsid group.
+// Best-effort: a child that already exited (ESRCH) is fine.
+func (a *Agent) reapManagedChildren() {
+	a.execChildrenMu.Lock()
+	execs := make([]*os.Process, 0, len(a.execChildren))
+	for _, p := range a.execChildren {
+		execs = append(execs, p)
+	}
+	a.execChildrenMu.Unlock()
+	for _, p := range execs {
+		// Setpgid => pgid == child pid; kill the whole group (child + descendants).
+		if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil {
+			_ = p.Kill() // fallback: the group is gone / never formed → target the pid directly
+		}
+	}
+
+	a.procsMu.Lock()
+	ptys := make([]*procRec, 0, len(a.procs))
+	for _, r := range a.procs {
+		ptys = append(ptys, r)
+	}
+	a.procsMu.Unlock()
+	for _, r := range ptys {
+		_ = r.sess.Signal(syscall.SIGKILL) // the PTY session signals its own Setsid process group
+	}
+}
+
 func (a *Agent) registerProc(pid string, rec *procRec) {
 	a.procsMu.Lock()
 	defer a.procsMu.Unlock()

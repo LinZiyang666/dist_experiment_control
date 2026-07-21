@@ -138,9 +138,37 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 		return fmt.Errorf("cluster drain %s: raise broker_draining: %w", nodeID, err)
 	}
 
-	// 2. migrate exposes homed here to another eligible VOTER (D6 rehome).
-	if err := a.migrateExposes(nodeID); err != nil {
+	// 2. migrate exposes homed here to another eligible VOTER (D6 rehome). The returned
+	// list is discarded — the durable gate below re-derives convergence (CRIT-1); what
+	// matters here is the raft move side effect.
+	if _, err := a.migrateExposes(nodeID); err != nil {
 		return fmt.Errorf("cluster drain %s: migrate exposes: %w", nodeID, err)
+	}
+
+	// 2b. R8a P1 — the rc-semantics gate. The raft write above changed only the
+	// CONTROL plane. Until each affected agent has re-dialed the new home, `drain`
+	// has NOT done what the operator asked, and reporting rc=0 here is precisely the
+	// lie this batch exists to remove. Block (bounded by the drain deadline) on the
+	// agents' APPLIED acks; on timeout return ErrDataPlaneNotConverged, which the
+	// adminsock layer maps to a nonzero, retry-classified exit.
+	//
+	// CRIT-1: gate on the DURABLE pendingRetireConvergence(nodeID), not migrated. On a
+	// re-run (the "re-run to keep waiting" hint) migrateExposes returns an EMPTY list
+	// because the rows already moved, and awaiting an empty list is an instant false
+	// rc=0. The durable set re-derives the still-un-confirmed exposes from current state,
+	// so a re-run keeps waiting until the data plane genuinely follows.
+	//
+	// Ordered BEFORE the phase bump and (for retire) before RemoveServer: removing a
+	// node while exposes still point at it is the very outage this gate prevents.
+	// Fleet-wide (zero time) for the SYNCHRONOUS drain: fail-CLOSED, since a recency window would fail
+	// OPEN on a slow re-run (rows aging out ⇒ false rc=0). Drain fences no membership; its over-wait is
+	// bounded by the drain deadline (F3 scoping applies to the retire OP, which does fence).
+	pending, err := a.pendingRetireConvergence(nodeID, time.Time{})
+	if err != nil {
+		return fmt.Errorf("cluster drain %s: check data-plane convergence: %w", nodeID, err)
+	}
+	if err := a.awaitHomeConvergence("drain", nodeID, pending, deadline); err != nil {
+		return err
 	}
 
 	// 3. phase VOTER -> DRAINING (the node still votes; it sheds serving load).
@@ -383,8 +411,21 @@ func (a *ClusterAdmin) RotateTunnelCert(nodeID, newFP string, window time.Durati
 	if newFP == "" {
 		return fmt.Errorf("rotate-tunnel-cert %s: --cert-fp is required", nodeID)
 	}
-	if nodeID != a.node.SelfID() {
-		return fmt.Errorf("rotate-tunnel-cert %s: rotate must run on the target broker while it is leader; transfer leadership to %s first so it can hot-swap its live tunnel certificate", nodeID, nodeID)
+	// R11 P11/#56: this is a SELF-ONLY verb (a broker hot-swaps its OWN live tunnel cert), and it needs
+	// to be leader to commit the pin update through raft. The two failure modes get DISTINCT, executable
+	// guidance — never the generic "re-run on the leader host", which is wrong for a self-only verb:
+	//   (a) wrong host        — you ran it somewhere other than the target; run it ON the target.
+	//   (b) right host, not leader — the target IS this broker but it is a follower; make it leader.
+	self := a.node.SelfID()
+	if nodeID != self {
+		return fmt.Errorf("rotate-tunnel-cert %s: must run ON the target broker %s (it hot-swaps its OWN live "+
+			"tunnel cert); you ran it on %s. Re-run it on %s — and %s must be the leader when you do (transfer "+
+			"leadership to it first if it is not: `tether cluster transfer %s`)", nodeID, nodeID, self, nodeID, nodeID, nodeID)
+	}
+	if !a.node.IsLeader() {
+		return fmt.Errorf("rotate-tunnel-cert %s: this IS the target broker, but it is a FOLLOWER — a broker can "+
+			"only hot-swap its live tunnel cert while it is the leader. Transfer leadership to it (`tether cluster "+
+			"transfer %s`), then re-run this on %s", nodeID, nodeID, nodeID)
 	}
 	if phase, ok := a.nodePhase(nodeID); !ok {
 		return fmt.Errorf("rotate-tunnel-cert %s: no such roster node", nodeID)
@@ -674,27 +715,33 @@ func (e *ErrRebuildOffExposes) Error() string {
 // FIRST (close the rows) THEN Proposes — the FSM and the reader share the one
 // SetMaxOpenConns(1) pool, so a Propose nested inside an open *sql.Rows deadlocks
 // (the D6 lesson).
-func (a *ClusterAdmin) migrateExposes(nodeID string) error {
+// It returns the exposes it actually re-pointed, with the post-Apply epoch each one
+// must now converge to. R8a: that list is the INPUT to the data-plane convergence
+// gate — "we wrote home_broker through raft" is a control-plane fact, and the whole
+// point of this batch is that a control-plane fact is not a data-plane fact.
+func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 	var rebuildOn, rebuildOff []int
 	names := map[int]string{} // B7 DOC#5: port → expose name, for the expose_rehomed event
 	sids := map[int]string{}  // Stage-C m1: port → sid, so the event can correlate to a session
+	nids := map[int]string{}  // R8a: port → nid, so the convergence gate can address the OWNING agent
 	var target string
 	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
 		rows, err := db.Query(
-			`SELECT port, rebuild_on_failure, name, sid FROM port_allocations WHERE home_broker=? AND state=?`,
+			`SELECT port, rebuild_on_failure, name, sid, nid FROM port_allocations WHERE home_broker=? AND state=?`,
 			nodeID, string(port.StateAllocated))
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var p, rebuild int
-			var name, sid string
-			if err := rows.Scan(&p, &rebuild, &name, &sid); err != nil {
+			var name, sid, nid string
+			if err := rows.Scan(&p, &rebuild, &name, &sid, &nid); err != nil {
 				_ = rows.Close()
 				return err
 			}
 			names[p] = name
 			sids[p] = sid
+			nids[p] = nid
 			if rebuild == 1 {
 				rebuildOn = append(rebuildOn, p)
 			} else {
@@ -714,14 +761,14 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 			`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND node_id != ? AND nats_server_id != '' ORDER BY node_id LIMIT 1`,
 			nodeID).Scan(&target)
 	}); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return nil, err
 	}
 	// Rebuild-OFF exposes are NEVER silently rehomed (F3): refuse + enumerate.
 	if len(rebuildOff) > 0 {
-		return &ErrRebuildOffExposes{NodeID: nodeID, Ports: rebuildOff}
+		return nil, &ErrRebuildOffExposes{NodeID: nodeID, Ports: rebuildOff}
 	}
 	if len(rebuildOn) == 0 {
-		return nil // nothing to migrate
+		return nil, nil // nothing to migrate
 	}
 	if target == "" {
 		// C6: rehome_stalled{expose,no_eligible_target} per port BEFORE returning the error (so the
@@ -732,8 +779,9 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 				"home_broker": nodeID, "reason": reasonNoEligibleTarget,
 			})
 		}
-		return ErrNoMigrationTarget
+		return nil, ErrNoMigrationTarget
 	}
+	var migrated []rehomedExpose
 	for _, p := range rebuildOn {
 		p := p
 		skipped := false
@@ -756,7 +804,7 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 				"kind": "expose", "name": names[p], "sid": sids[p], "port": p,
 				"from_broker": nodeID, "to_broker": target, "reason": classifyRehomeErr(err),
 			})
-			return fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
+			return nil, fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
 		}
 		if skipped {
 			continue // BD8/C6-EVT-5: no started/succeeded/expose_rehomed for a raced-away row
@@ -772,9 +820,118 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 		a.emitDrainEvent("expose_rehomed", map[string]any{
 			"port": p, "name": names[p], "sid": sids[p], "from_broker": nodeID, "to_broker": target,
 		})
+		migrated = append(migrated, rehomedExpose{
+			sid: sids[p], nid: nids[p], name: names[p], port: p, epoch: newEpoch, toBroker: target,
+		})
 	}
 	a.logger.Info("cluster drain: migrated rebuild-ON exposes", "node_id", nodeID, "count", len(rebuildOn), "target", target)
-	return nil
+	return migrated, nil
+}
+
+// pendingRetireConvergence is the DURABLE form of the drain/retire data-plane gate
+// (external review CRIT-1).
+//
+// migrateExposes' RETURNED list self-destructs: its query finds rows by
+// home_broker=nodeID and the migrate re-points exactly those rows, so a SECOND call
+// (a retire's next controller tick, or a drain the operator re-runs after the
+// "re-run to keep waiting" hint) returns an EMPTY list. Gating on that empty list
+// waves the op straight past the convergence check to the IRREVERSIBLE RemoveServer —
+// with the silent agent's tunnel still pinned to the node being removed — and lets a
+// re-run drain print a false rc=0. That is exactly the P1 outage this batch exists to
+// kill, reintroduced one layer down.
+//
+// This reads CURRENT replicated state each call: ALLOCATED homed exposes that have
+// already been moved OFF nodeID (home_broker != nodeID) whose owning agent has NOT
+// confirmed the row epoch (homeAppliedFn(port) < epoch). It is idempotent across ticks
+// and re-runs.
+//
+// SCOPING (external re-review F3 + round-2 self-review): rehomedSince RESTRICTS the set to
+// exposes rehomed at or after that instant (last_rehome_at, which migrateExposes stamps in
+// the same CAS that bumps the epoch). Without it the gate is FLEET-WIDE, so ONE unrelated
+// permanently-stranded expose (a prior op of another node whose agent died) would freeze
+// EVERY drain/retire. The RETIRE op passes a FIXED origin — its own op.CreatedAt — NOT a
+// sliding wall-clock window. That distinction is load-bearing: this op's migrate always runs
+// AFTER its creation, so its rows are ALWAYS >= op.CreatedAt and never age out, even across a
+// `cluster ops confirm` retry that restarts the convergence deadline; a sliding window
+// (now − Δ) drifts away from the fixed last_rehome_at and would let a still-stranded row age
+// out BEFORE the reset deadline fires, silently completing RemoveServer (a fail-open the
+// round-2 self-review caught). Unrelated old stranded rows (rehomed before this op started)
+// fall below op.CreatedAt and drop out — a permanently-stranded tenant no longer wedges
+// membership. The synchronous DRAIN passes the zero time (fleet-wide, FAIL-CLOSED): a recency
+// window would fail OPEN on a slow drain re-run (rows aging out ⇒ false rc=0, the CRIT-1
+// relapse), and drain fences no membership — its over-wait is bounded by the drain deadline.
+// Empty/unparseable last_rehome_at is always INCLUDED (fail-closed). nil homeAppliedFn / node
+// (the bare unit admin) ⇒ nothing pending, preserving the unit shape.
+func (a *ClusterAdmin) pendingRetireConvergence(nodeID string, rehomedSince time.Time) ([]rehomedExpose, error) {
+	if a.homeAppliedFn == nil || a.node == nil {
+		return nil, nil
+	}
+	type row struct {
+		r          rehomedExpose
+		lastRehome string
+	}
+	var moved []row
+	if err := a.node.BoundedStaleRead(func(db *sql.DB) error {
+		rows, err := db.Query(
+			`SELECT sid, nid, name, port, epoch, home_broker, last_rehome_at FROM port_allocations
+			  WHERE state=? AND home_broker != '' AND home_broker != ? ORDER BY port`,
+			string(port.StateAllocated), nodeID)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var m row
+			if err := rows.Scan(&m.r.sid, &m.r.nid, &m.r.name, &m.r.port, &m.r.epoch, &m.r.toBroker, &m.lastRehome); err != nil {
+				return err
+			}
+			moved = append(moved, m)
+		}
+		return rows.Err()
+	}); err != nil {
+		return nil, err
+	}
+	// Filter to the UNCONFIRMED (and, when a window is given, RECENTLY-rehomed) subset AFTER
+	// the rows are closed (the D6 SetMaxOpenConns(1) discipline).
+	var pending []rehomedExpose
+	for _, m := range moved {
+		if a.homeAppliedFn(m.r.port) >= m.r.epoch {
+			continue
+		}
+		if !rehomedSince.IsZero() && !rehomedRecently(m.lastRehome, rehomedSince) {
+			continue // an old stranded row unrelated to THIS operation
+		}
+		pending = append(pending, m.r)
+	}
+	return pending, nil
+}
+
+// clusterTimeLayout is the layout of a cluster.LitTime value (= time.Time.String()),
+// which is how both port_allocations.last_rehome_at and cluster_operations.created_at
+// are stored. Parsing it round-trips exactly (verified: fractional + non-fractional + UTC).
+const clusterTimeLayout = "2006-01-02 15:04:05.999999999 -0700 MST"
+
+// parseClusterTime parses a cluster.LitTime string; ok=false on empty/malformed.
+func parseClusterTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(clusterTimeLayout, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// rehomedRecently reports whether a port_allocations.last_rehome_at is at or after
+// `since`. An empty or unparseable stamp is treated as RECENT (fail-closed: never drop a
+// possibly-relevant row from the convergence gate on a formatting quirk).
+func rehomedRecently(lastRehomeAt string, since time.Time) bool {
+	t, ok := parseClusterTime(lastRehomeAt)
+	if !ok {
+		return true
+	}
+	return !t.Before(since)
 }
 
 // emitDrainEvent fires a leader-side drain observability event (nil emitter ⇒ no-op).

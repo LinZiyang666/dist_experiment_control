@@ -18,9 +18,10 @@
 #     the tunnel). So a proxy is #29-IMMUNE at steady state; PROMPT crash-rehome data-plane recovery is NOT-COVERED
 #     — Arm REHOME observes the gap (data plane black-holes at rehomed+ready) + measures the recovery lag.
 # Readable control-plane oracles: proxy status --cluster view, /sub http_code, quorum-loss freeze (/sub keeps
-# vending 200 WHILE a control write is fenced). #30 (cluster-mode `sub revoke` emits no proxy_keyset_changed)
-# NOT-COVERED — sys.events has NO operator reader (admin=audit/evict/nodes/sessions only); revoke is pinned by
-# its /sub 404 data effect. proxy_node_unready/proxy_no_ready_nodes/proxy_partial likewise NOT-COVERED (no reader).
+# vending 200 WHILE a control write is fenced). #30 CLOSED: a7b88cb made the cluster-mode `sub revoke` REALLY
+# emit proxy_keyset_changed and #30 added the operator reader `tether admin events` — the REVOKE arm now reads
+# the event back (DELTA past the sub-create baseline, secret-free) ON TOP OF its /sub 404 data effect.
+# proxy_node_unready/proxy_no_ready_nodes/proxy_partial remain NOT-COVERED (no reader for those kinds yet).
 #
 # FALSE-GREEN GUARDS:
 #  - SS egress asserts BYTES through the exit (ss-local → agent exit → curl an RFC1918 sink returns the sentinel),
@@ -41,7 +42,12 @@ set -u
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
-trap 'ss_down ctl1 2>/dev/null; for b in brk1 brk2 brk3; do ingress_down $b 443 2>/dev/null; done' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): the combined trap resumed after the handler on INT/TERM —
+# a Ctrl-C reaped the sidecars and then kept running the broker-kill / black-hole steps below (and raced
+# cmd_drill's nuke). drill_install_traps: EXIT registered separately, INT/TERM exit 128+signo without
+# resuming. Cleanup body unchanged.
+_cleanup() { ss_down ctl1 2>/dev/null; for b in brk1 brk2 brk3; do ingress_down "$b" 443 2>/dev/null; done; }
+drill_install_traps _cleanup
 CTL() { "$SIM" ctl -- "$@"; }
 
 _setup_ingress_all() { ingress_trust_inject ctl1 || return 1; for b in brk1 brk2 brk3; do secrets_mint_ingress "$INSTANCE" "$b" && ingress_up "$b" 443 ingress "/sub/=127.0.0.1:8090" || return 1; done; }
@@ -51,6 +57,24 @@ _sub_http()     { "$SIM" exec "$1" -- curl -s -o /dev/null -w '%{http_code}' --m
 _home_of()      { CTL proxy status --json 2>/dev/null | jq -r --arg n "$1" '.nodes[]?|select(.nid==$n)|.home_broker // "none"' 2>/dev/null; }
 _agent_ready()  { [ "$(CTL proxy status --json 2>/dev/null | jq -r --arg n "$1" '.nodes[]?|select(.nid==$n)|.ready' 2>/dev/null)" = true ]; }
 _homes_line()   { CTL proxy status --json 2>/dev/null | jq -r '.nodes[]?|"\(.nid)=\(.home_broker // "none")/rdy=\(.ready)"' 2>/dev/null | tr '\n' ' '; }
+# ── #30 operator event reader (admin events) ────────────────────────────────────────────────────────────
+# The H.1 `events` JetStream stream (sys.events) had NO operator reader before #30: a MEMBER could NATS-
+# SUBSCRIBE, but the OPERATOR (root on the broker host, no member cred) could not. `tether admin events` is
+# that reader, over the same root-only 0600 admin socket. Read on brk1 (always alive in 73; the events stream
+# is clustered so any live-quorum broker serves it). --json ⇒ ONLY machine JSON on stdout (R11), host jq parses it.
+_admin_events_brk1() { "$SIM" exec brk1 -- runuser -u tether -- tether admin events "$@" 2>/dev/null; }
+# count of proxy_keyset_changed events carrying sid=lab (empty/non-numeric on a jq/reader miss → callers RED).
+_pkc_count() { _admin_events_brk1 --kind proxy_keyset_changed -n 200 --json | jq '[.events[]?|select(.body.sid=="lab")]|length' 2>/dev/null; }
+# reader ANCHOR: the operator reader ALREADY reads the earlier alice+carol sub-create proxy_keyset_changed
+# events (cluster-mode create emits it too, proxy_cluster_wire.go:154) — >=2 for sid=lab proves the reader WORKS
+# in this drill before we pin the revoke's delta, and guarantees both create emits are in the pre-revoke baseline.
+_pkc_two() { _c=$(_pkc_count); case "$_c" in ''|*[!0-9]*) return 1;; esac; [ "$_c" -ge 2 ]; }
+# revoke landed: the sid=lab count GREW past the pre-revoke baseline _PKC_BEFORE (a DELTA, so it pins the REVOKE's
+# emit — a7b88cb — not the create emits already counted in the baseline).
+_pkc_grew() { _c=$(_pkc_count); case "$_c" in ''|*[!0-9]*) return 1;; esac; case "${_PKC_BEFORE:-}" in ''|*[!0-9]*) return 1;; esac; [ "$_c" -gt "$_PKC_BEFORE" ]; }
+# SECRET-FREE: every matching event body carries ONLY {v,type,ts,sid} (proxy events never a psk/token). jq
+# returns true/false and never PRINTS a body value, so the check itself leaks nothing. Requires >=1 event (non-vacuous).
+_pkc_secretfree() { _admin_events_brk1 --kind proxy_keyset_changed -n 200 --json | jq -e '([.events[]?|select(.body.sid=="lab")]|length>=1) and all(.events[]?; ((.body|keys) - ["v","type","ts","sid"]|length)==0)' >/dev/null 2>&1; }
 # CV: cluster view has the CLUSTER line + per-agent HOME/REASON, member-readable, no leaked secret.
 _cv() {
     _o=$(CTL proxy status --cluster 2>&1) || return 1
@@ -229,9 +253,28 @@ ss_down ctl1
 _ss_egress "$NT_A" 1081; _r33base=$?
 assert_ok "REHOME-baseline SS leg via $NT_A (home=$NT_HB) flows bytes pre-kill (live destructive baseline; the SAME verified-ready client observes the crash black-hole below — anti-vacuity)"  sh -c "exit $_r33base"
 [ "$_r33base" -eq 0 ] || die "73: REHOME pre-kill SS baseline via $NT_A did NOT flow in 240s — refusing the destructive kill over a dead baseline (M1 fail-fast; self-review finding-8)"
-# live-target guard: the kill target must still run AND still home NT_A (else the kill is vacuous).
-assert_ok "REHOME-precond $NT_HB still runs AND still homes $NT_A (live destructive target)"  sh -c "\"$SIM\" exec $NT_HB -- true >/dev/null 2>&1 && [ \"\$(\"$SIM\" ctl -- proxy status --json 2>/dev/null | jq -r --arg n '$NT_A' '.nodes[]?|select(.nid==\$n)|.home_broker // \"none\"')\" = '$NT_HB' ]"
-_still_homed_on "$NT_A" "$NT_HB" || die "73: REHOME target $NT_HB no longer homes $NT_A pre-kill — vacuous kill; refusing"
+# ── live-target guard (REWRITTEN R9-D item 2) ──────────────────────────────────────────────────────────────────
+# It used to be ONE compound assert_ok followed by `|| die`. When the home DRIFTED off the constructed target —
+# which is literally what #34 IS — that shape produced: an ASSERT-FAIL on a line described as a "live destructive
+# target" check, plus a SETUP-RED from the die, and the whole drill reported as a broken FOUNDATION. The product
+# defect that caused it was named nowhere. Two independent facts, attributed separately:
+#   • the target CONTAINER is still running — an infra fact; a hard assert either way.
+#   • the target still HOMES the exit      — when it does not, that is #34's distribution drift, recorded as a
+#     signature-carrying PRODUCT-RED against its owner. The REHOME arm is then SKIPPED entirely: killing a broker
+#     that no longer hosts the exit is a vacuous kill, and every #33 statement built on it would be describing a
+#     broker that hosted nothing (exactly the H10-class misattribution the full-suite review called out).
+_np_running=0; node_running "$NT_HB" && _np_running=1
+_np_home=$(_home_of "$NT_A")
+log "73: REHOME-precond snapshot — target=$NT_HB running=$_np_running ; $NT_A home=[${_np_home:-none}] ; homes: $(_homes_line)"
+assert_ok "REHOME-precond-live the kill target $NT_HB is still RUNNING (killing an already-dead container is a vacuous injection)"  sh -c "[ '$_np_running' = 1 ]"
+REHOME_OK=0
+if [ "$_np_running" = 1 ] && [ "$_np_home" = "$NT_HB" ]; then
+    REHOME_OK=1
+    assert_ok "REHOME-precond-home $NT_HB STILL homes $NT_A at kill time — the 1/1/1 spread constructed by 'cluster rebalance proxy' HELD long enough to be used (a KEPT invariant, and the causal precondition of every #33 claim below)"  sh -c "[ '$_np_home' = '$NT_HB' ]"
+else
+    product_red "#34 proxy home distribution does not STAY put (owner: R8 product side; docs/deploy-tier-gotchas.md:231) — the spread this drill CONSTRUCTED with 'cluster rebalance proxy' had already drifted by kill time: $NT_A is homed on [${_np_home:-none}], not the constructed $NT_HB. Same signature the 2026-07-18 full-suite run recorded (a constructed 1/1/1 collapsing back onto one broker after a disturbance). Operationally: proxy HA capacity spread is not durable — an operator must re-run 'cluster rebalance proxy' after every disturbance or the spread is decorative"
+fi
+if [ "$REHOME_OK" = 1 ]; then
 _t_kill=$(date +%s)
 assert_ok "REHOME kill $NT_A's home broker $NT_HB (non-leader; quorum kept 2/3 so the rehome raft-write can commit)"  node_kill "$NT_HB"
 # #33-a (DETERMINISTIC + CAUSAL): the crash severs the tunnel to the dead home → the SAME client that flowed +
@@ -262,13 +305,37 @@ fi
 ss_down ctl1
 assert_ok "REHOME [#33] crash-rehome DATA-plane auto-recovery MEASURED = $_33auto (control rehomed+ready ≈ $((_t_ready-_t_kill))s after the crash; STRANDED ⇒ the #33 gap, which the QUORUM arm below proves the manual 'proxy off; proxy on' heal recovers) — recorded per-run, never pre-judged or die-masked"  sh -c "[ '$_33auto' = AUTO-RECOVERED ] || [ '$_33auto' = STRANDED ]"
 log "73: #33 TRACE from the $NT_HB crash at t0: control rehomed+ready ≈ $((_t_ready-_t_kill))s ; data-plane auto-recovery = $_33auto (probe ended ≈ $((_t_flow-_t_kill))s)"
+else
+    # R9-D: #34 drift skipped the whole REHOME arm. Two things must still be true for the rest of the drill to
+    # mean anything, and NEITHER may borrow the REHOME arm's language:
+    #   (1) the #33 measurement is genuinely uncovered THIS RUN — recorded, not silently absent;
+    #   (2) the QUORUM arm below still needs 2 of 3 brokers down to lose committable quorum, and $NT_HB is the
+    #       one it excludes from its K2 pick. So $NT_HB is killed anyway, as PURE PROVISIONING carrying NO #33
+    #       claim (labelled as such, and issued through assert_setup so a failed kill aborts instead of quietly
+    #       letting the QUORUM arm run at 2/3 while calling itself a quorum-loss proof).
+    ss_down ctl1
+    not_covered "73 Arm REHOME (#33 crash-rehome control-plane + data-plane measurement) THIS RUN" "the constructed home drifted before the kill (#34, recorded PRODUCT-RED above), so $NT_HB no longer hosts $NT_A. Killing it would be a vacuous injection and every #33 statement downstream — black-hole, control rehome, auto-recovery latency — would be describing a broker that hosted nothing. The drill declines to manufacture a #33 verdict on top of a #34 failure; re-run for the #33 measurement, or fix #34 to make the spread durable." gap
+    assert_setup "REHOME-skip [env] kill $NT_HB as PURE QUORUM-arm PROVISIONING (2 of 3 brokers must be down before the quorum-loss separation below; this kill asserts NOTHING about #33 — see the NOT-COVERED above)"  node_kill "$NT_HB"
+    _33auto=SKIPPED-NO-VALID-TARGET
+fi
 
 # ── Arm REVOKE — carol sub revoke → /sub 404 (data effect) WHILE alice stays 200; #30 event NOT-COVERED ──
 TOK_C=$(_sub_token carol)
 assert_ok "REVOKE carol minted + /sub 200 before revoke"  sh -c "[ -n '$TOK_C' ] && [ \"\$(\"$SIM\" exec brk1 -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8090/sub/$TOK_C)\" = 200 ]"
+# #30 ANCHOR + baseline (non-vacuity): the operator reader already reads the alice+carol sub-create
+# proxy_keyset_changed events. Poll until BOTH have landed (>=2) so the post-revoke DELTA is attributable to
+# the REVOKE alone, then freeze the baseline.
+assert_ok "REVOKE-event [#30] anchor: the operator reader (admin events) reads the earlier sub-create proxy_keyset_changed events (>=2 for sid=lab) — proves the reader WORKS in this drill before pinning the revoke's delta (non-vacuity)"  poll_until 20 2 ">=2 sub-create proxy_keyset_changed readable" -- _pkc_two
+_PKC_BEFORE=$(_pkc_count); log "73: [#30] proxy_keyset_changed(sid=lab) baseline before revoke = ${_PKC_BEFORE:-?} (alice+carol sub-create emits)"
 assert_ok "REVOKE proxy sub revoke carol"  "$SIM" ctl -- proxy sub revoke carol
 assert_ok "REVOKE-effect carol /sub → 404 WHILE alice /sub still 200 (precise, not a blanket outage)"  poll_until 15 2 "carol 404 ∧ alice 200" -- sh -c "[ \"\$(\"$SIM\" exec brk1 -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8090/sub/$TOK_C)\" = 404 ] && [ \"\$(\"$SIM\" exec brk1 -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8090/sub/$TOK_A)\" = 200 ]"
-warn "73 NOT-COVERED [#30]: cluster-mode revoke's ABSENT proxy_keyset_changed — sys.events has no operator reader. #30 stays a code-confirmed gap; data effect pinned above."
+# #30 CLOSED: a7b88cb made the CLUSTER-MODE revoke REALLY emit proxy_keyset_changed (the single-mode path
+# already did via pushCurrentKeyset), and #30 added the operator reader (the events stream had no NATS-less
+# operator reader). The old NOT-COVERED[gap] "sys.events has no operator reader" is retired — assert the
+# revoke's event is now READABLE: the sid=lab count GREW past the baseline (DELTA pins the REVOKE's emit, not
+# the sub-create emits already counted), and the payload is secret-free.
+assert_ok "REVOKE-event [#30] admin events reads the CLUSTER-MODE revoke's proxy_keyset_changed: the sid=lab count grew past the pre-revoke baseline ${_PKC_BEFORE:-?} (DELTA pins the revoke's emit a7b88cb, not the sub-create emits) — operator reader over the root admin socket, no NATS member cred (closes the old #30 no-reader gap)"  poll_until 20 2 "proxy_keyset_changed count grows across the revoke" -- _pkc_grew
+assert_ok "REVOKE-event [#30] the proxy_keyset_changed payload is SECRET-FREE (body keys ⊆ {v,type,ts,sid}; the reader relays only sid — never a psk/token/PSK material)"  _pkc_secretfree
 
 # ── Arm QUORUM — DATA-PLANE separation (M7/M1, R-CONTROLSRC): under quorum loss a dead-homed exit's SS leg
 #    BLACK-HOLES (data plane dead) WHILE a survivor(leader)-homed exit's SS leg STILL FLOWS and /sub still vends
@@ -341,10 +408,10 @@ if [ "$_qld" -eq 0 ] && [ "$_qls" -eq 0 ]; then
         assert_ok "Q-freeze [corrob] a control WRITE is FENCED (proxy sub create does NOT mint under quorum loss)"  _write_fenced
         [ "$_bh" = 1 ] || warn "73 Q-DIAGNOSIS: the dead-homed leg via $DEAD_A (vended server=$_dsrv == home $DEAD_HB, Q-xcheck PASSED) did NOT black-hole within 15s though $DEAD_HB is DOWN — since the endpoints AGREE this is NOT stale rendering / status attribution; it is either a tunnel that outlived its killed home or a slow teardown. The SEPARATION assertion above is RED (the causal gate), NOT a false PASS."
     else
-        warn "73 Q ENDPOINT MISMATCH (R7-M3 exposed defect): the dead-homed exit $DEAD_A's /sub-VENDED server=[$_dsrv] does NOT equal its control-plane home_broker=$DEAD_HB — the control plane and the data plane DISAGREE on where the exit lives (stale /sub rendering OR status-attribution drift). This mismatch IS the exposed defect (Q-xcheck FAILED above = the RED). REFUSING the destructive kill of $DEAD_HB: it would prove nothing since the leg vends via $_dsrv, not $DEAD_HB — a vacuous kill over a mismatched endpoint. The QUORUM separation proof is NOT-COVERED THIS RUN (gated by the mismatch); no contradictory 'endpoints matched' claim is made."
+        not_covered "73 QUORUM separation proof THIS RUN — Q ENDPOINT MISMATCH (R7-M3 exposed defect)" "the dead-homed exit $DEAD_A's /sub-VENDED server=[$_dsrv] does NOT equal its control-plane home_broker=$DEAD_HB — the control plane and the data plane DISAGREE on where the exit lives (stale /sub rendering OR status-attribution drift). This mismatch IS the exposed defect (Q-xcheck FAILED above = the RED). REFUSING the destructive kill of $DEAD_HB: it would prove nothing since the leg vends via $_dsrv, not $DEAD_HB — a vacuous kill over a mismatched endpoint. The QUORUM separation proof is gated by the mismatch; no contradictory 'endpoints matched' claim is made." gap
     fi
 else
-    warn "73 QUORUM data-plane separation NOT-COVERED THIS RUN: a rebalance-MOVED dead-homed exit ($DEAD_A on $DEAD_HB) did not render+serve pre-kill within 240s (dead-leg flowed=$([ "$_qld" -eq 0 ] && echo yes || echo NO), survivor flowed=$([ "$_qls" -eq 0 ] && echo yes || echo NO)) — the SAME moved-exit intermittency #33 measures (a proxy exit MOVED onto a non-tunnel broker sometimes strands). Refusing a vacuous destructive Q-kill over a dead baseline (finding-8); NOT a die — the drill completes. Re-run for the separation proof, or fix moved-exit rendering to make it deterministic."
+    not_covered "73 QUORUM data-plane separation THIS RUN" "a rebalance-MOVED dead-homed exit ($DEAD_A on $DEAD_HB) did not render+serve pre-kill within 240s (dead-leg flowed=$([ "$_qld" -eq 0 ] && echo yes || echo NO), survivor flowed=$([ "$_qls" -eq 0 ] && echo yes || echo NO)) — the SAME moved-exit intermittency #33/#34 measures (a proxy exit MOVED onto a non-tunnel broker sometimes strands). Refusing a vacuous destructive Q-kill over a dead baseline (finding-8); NOT a die — the drill completes. CLASS gap (R14 re-adjudication): the stranding is a CONFIRMED product defect (#33/#34) reproducing, not intrinsic sim non-determinism — this hole is debt owned by #33/#34 and turns GREEN when moved-exit rendering is made deterministic in the product, so it is a gap, not a re-run-and-it-lands runtime-guard (matching line 381's sibling gap)." gap
 fi
 ss_down ctl1
 

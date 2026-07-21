@@ -119,7 +119,7 @@ func TestUpgradeTriggerTamperedFieldRefused(t *testing.T) {
 	var routed []adminsock.Request
 	b := newTriggerTestBroker("brk-a", seed, triggerNow, &routed)
 	req := &proto.ClusterUpgradeReq{Op: "reload", TargetNode: "brk-a", ToVersion: "v2", IssuedAt: triggerNow.Format(time.RFC3339)}
-	signUpgradeReq(t, seed, req) // stamps req.Sig over ToVersion=v2
+	signUpgradeReq(t, seed, req)  // stamps req.Sig over ToVersion=v2
 	req.ToVersion = "v3-TAMPERED" // mutate AFTER signing; keep the old Sig
 	data, _ := json.Marshal(req)
 	resp := b.handleUpgradeTrigger(data, triggerNow)

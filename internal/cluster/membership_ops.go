@@ -387,18 +387,34 @@ func PlanClearForceSingle() (*Command, error) {
 // down one + restarting one"). A marker (not an operation) so it never self-blocks the roll's own reloads.
 const MetaKeyUpgradeActive = "cluster_upgrade_active"
 
-// PlanSetUpgradeActive / PlanClearUpgradeActive UPSERT/DELETE the roll-lock marker (mirrors force-single).
+// PlanSetUpgradeActive / PlanClearUpgradeActive acquire/DELETE the roll-lock marker (mirrors force-single).
+//
+// R7b: acquiring also stamps the lock's LEASE (cluster_upgrade_lease) in the SAME command, i.e. the same
+// FSM transaction. Marker-without-lease must be reachable ONLY as "acquired by a pre-R7b broker" — if a
+// crash could interleave the two writes, a brand-new lock could land in the fail-closed never-expires
+// bucket and reintroduce the exact permanent fence this batch removes.
+//
+// External review H1: the acquire is CONDITIONAL on no grow marker being held (grow and upgrade are ONE
+// mutual-exclusion domain). The leader's preflight read cannot make check-then-write atomic — two
+// concurrent callbacks can both pass the read before either commits — so the mutex is enforced HERE, at
+// the replicated write: Raft serializes the two commands and the second one's guard sees the first's
+// marker and no-ops. The caller read-backs the marker after Propose and refuses on a no-op acquire.
 func PlanSetUpgradeActive(now time.Time) (*Command, error) {
-	keyLit := MustLitText(MetaKeyUpgradeActive)
 	valLit := MustLitText(now.UTC().Format(time.RFC3339Nano))
-	return NewCommand(OpClusterMetaSet, Stmt(
-		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
-			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+	guard := `NOT ` + growMarkerExists()
+	stmts := markerAcquireStmts(MetaKeyUpgradeActive, valLit, guard)
+	stmts = append(stmts, leaseAcquireStmts(MetaKeyUpgradeLease, now.Add(LockLeaseTTL), guard)...)
+	return NewCommand(OpClusterMetaSet, stmts...), nil
 }
 
 func PlanClearUpgradeActive() (*Command, error) {
 	keyLit := MustLitText(MetaKeyUpgradeActive)
-	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit)), nil
+	return NewCommand(OpClusterMetaClear,
+		Stmt(`DELETE FROM cluster_meta WHERE key=`+keyLit),
+		// Guarded on the marker being gone — see leaseClearStmt. For the upgrade lock the marker DELETE is
+		// unconditional, so this always fires; the guard keeps the two lock shapes textually identical.
+		leaseClearStmt(MetaKeyUpgradeLease, MetaKeyUpgradeActive),
+	), nil
 }
 
 // MetaKeyGrowActive is the cluster_meta key a `cluster add` grow sets for its whole duration (G4 §B). Its
@@ -408,13 +424,28 @@ func PlanClearUpgradeActive() (*Command, error) {
 // operation) so it never self-blocks the grow's own OpKindJoin op (see the driveInFlightOperations carve-out).
 const MetaKeyGrowActive = "cluster_grow_active"
 
-// PlanSetGrowActive UPSERTs the grow marker with the joiner id as the value (mirrors force-single/upgrade).
-func PlanSetGrowActive(joinerID string) (*Command, error) {
-	keyLit := MustLitText(MetaKeyGrowActive)
-	valLit := MustLitText(joinerID)
-	return NewCommand(OpClusterMetaSet, Stmt(
-		`INSERT INTO cluster_meta(key, value) VALUES(`+keyLit+`, `+valLit+`) `+
-			`ON CONFLICT(key) DO UPDATE SET value = excluded.value`)), nil
+// PlanSetGrowActive acquires the grow marker with the joiner id as the value (mirrors force-single/upgrade),
+// and (R7b) stamps the lock's LEASE in the same command/transaction — see PlanSetUpgradeActive on why the
+// two writes must be atomic.
+//
+// External review H1: the acquire is CONDITIONAL on (a) no upgrade marker held AND (b) no grow marker held
+// by a DIFFERENT joiner. (a) enforces the grow⇄upgrade mutex at the replicated layer; (b) closes the same
+// check-then-write race for grow-vs-grow (two `cluster add`s of different joiners both passing the leader's
+// preflight). Idempotent for THIS joiner (resume). The caller read-backs growActiveJoiner after Propose and
+// refuses on a no-op acquire.
+func PlanSetGrowActive(joinerID string, now time.Time) (*Command, error) {
+	valLit, err := LitText(joinerID)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: grow-lock acquire: literal: %w", err)
+	}
+	otherGrow, err := growMarkerHeldByOther(joinerID)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: grow-lock acquire: literal: %w", err)
+	}
+	guard := `NOT ` + upgradeMarkerExists() + ` AND NOT ` + otherGrow
+	stmts := markerAcquireStmts(MetaKeyGrowActive, valLit, guard)
+	stmts = append(stmts, leaseAcquireStmts(MetaKeyGrowLease, now.Add(LockLeaseTTL), guard)...)
+	return NewCommand(OpClusterMetaSet, stmts...), nil
 }
 
 // PlanClearGrowActive DELETEs the grow marker (release). External review M1: when joinerID is non-empty the
@@ -426,9 +457,21 @@ func PlanClearGrowActive(joinerID string) (*Command, error) {
 	keyLit := MustLitText(MetaKeyGrowActive)
 	where := `key=` + keyLit
 	if joinerID != "" {
-		where += ` AND value=` + MustLitText(joinerID)
+		lit, err := LitText(joinerID)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: grow-lock release: literal: %w", err)
+		}
+		where += ` AND value=` + lit
 	}
-	return NewCommand(OpClusterMetaClear, Stmt(`DELETE FROM cluster_meta WHERE `+where)), nil
+	return NewCommand(OpClusterMetaClear,
+		Stmt(`DELETE FROM cluster_meta WHERE `+where),
+		// R7b: the lease dies with its marker — but ONLY if the marker actually went away. When the
+		// value predicate above no-ops (this release belongs to a DIFFERENT joiner), the guard inside
+		// leaseClearStmt no-ops too, so joiner B's live lease survives joiner A's release. Without that
+		// guard, a same-transaction unconditional lease DELETE would leave B's marker leaseless and the
+		// reaper would treat it as pre-R7b (never expire) — silently re-creating the permanent fence.
+		leaseClearStmt(MetaKeyGrowLease, MetaKeyGrowActive),
+	), nil
 }
 
 // MetaKeyForceSingleEpoch is the cluster_meta key holding the per-recovery epoch token. The

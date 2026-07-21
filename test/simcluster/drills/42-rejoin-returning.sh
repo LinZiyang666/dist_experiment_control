@@ -148,8 +148,19 @@ assert_ok "E fresh DB/raft contain exactly the manifest self identity (not the o
 # A real transfer commits OpTransferAudit entries after force-single's recovery snapshot. Merely setting
 # audit_published_index below raw LastIndex is NOT sufficient: config/noop/checkpoint records carry no
 # re-derivable audit, and treating those as a loss window would manufacture a false RED.
-assert_setup "I create real post-force-single transfer-audit Raft entries" \
-    sh -c "$SIM exec ctl1 -- sh -c 'head -c 4096 /dev/urandom > /tmp/pre-resnapshot.bin' && $SIM ctl -- push /tmp/pre-resnapshot.bin agt1:/tmp/pre-resnapshot.bin"
+assert_setup "I stage the transfer-audit payload on ctl1" \
+    "$SIM" exec ctl1 -- sh -c 'head -c 4096 /dev/urandom > /tmp/pre-resnapshot.bin'
+# H8 (2026-07-18 full-suite run): this fixture's push used to run WITHOUT --ack-alerts and was BLOCKED
+# (rc=70) by the client-synth severe gate — the force-single above leaves force_single_active active, and
+# gateDestructive (cmd/tether/d8_alerts.go:71) covers push/pull/run/expose/session rm. That is the DESIGN,
+# not a defect, so the repair is to feed the fixture the override — and to PIN the gate itself rather than
+# quietly route around it. The negative runs FIRST and is side-effect-free (the gate returns before any
+# transfer starts), so it cannot disturb the audit window the positive below is building.
+assert_refuses "I GATE: the same push WITHOUT --ack-alerts is BLOCKED by the force_single_active severe gate (gateDestructive, d8_alerts.go:71 — a KEPT design guard, not a defect; this is why the fixture below must pass the override)" \
+    "force_single_active|--ack-alerts|BLOCKED: this command needs a healthy broker cluster" \
+    "$SIM" ctl -- push /tmp/pre-resnapshot.bin agt1:/tmp/pre-resnapshot-blocked.bin
+assert_setup "I create real post-force-single transfer-audit Raft entries (--ack-alerts overrides the force_single_active gate the assertion above pins)" \
+    "$SIM" ctl -- push --ack-alerts /tmp/pre-resnapshot.bin agt1:/tmp/pre-resnapshot.bin
 assert_setup "G stop lone brk1 before offline resnapshot" "$SIM" exec brk1 -- systemctl stop tether-broker
 # Fault injection is limited to the documented publisher cursor. The preceding real transfer proves the
 # scanned tail contains audit-bearing OpTransferAudit records; this is not a raw-index surrogate.
@@ -176,19 +187,59 @@ APPROVE_LOG="/tmp/s6s8-42-approve-$$.log"
 dexec -u tether brk1 -- tether cluster join approve "$BUNDLE" --wait --timeout 5m >"$APPROVE_LOG" 2>&1 &
 APPROVE_PID=$!
 sleep 3
-assert_setup "F cluster add resumes the pre-approved returning-node op and performs mesh/start orchestration" "$SIM" grow brk2
+# ── R9-D: the re-grow is a PRODUCT outcome, not a fixture step ─────────────────────────────────────────
+# H8's `--ack-alerts` fix moved this drill's failure point from assertion 27 to 37, which finally let the
+# whole rejoin/resnapshot spine (audit window, --accept-audit-loss, no stale-peer resurrection, identity
+# manifest) execute — all of it now GREEN. The one thing still failing is HERE, and the pre-R9-D shape made
+# it un-attributable in two separate ways:
+#   • `assert_setup … "$SIM" grow brk2` captured the output and printed only `tail -3`, so the 2026-07-18
+#     run's entire evidence was "want exit 0, got 1" plus three lines of an unrelated JSON dump. The grow
+#     therefore runs OUTSIDE the assertion now (the R5-M5 pattern grow_to_3 already uses), with its full
+#     output echoed as first-class log lines before anything is judged.
+#   • SETUP-RED says "the drill's own fixture broke". A returning node that cannot rejoin is a statement
+#     about TETHER — the fixture (force-single, rejoin prepare, init --from-manifest, resnapshot) all
+#     succeeded, and every one of those steps is asserted GREEN above. So the outcome is classified: a
+#     known defect signature lands PRODUCT-RED against its owner, anything else is an honest ASSERT-FAIL,
+#     and the downstream arms are recorded as uncovered instead of being run over a node that never joined.
+_F_OUT=$("$SIM" grow brk2 2>&1); _F_GROWRC=$?
+printf '%s\n' "$_F_OUT" | sed 's/^/  F-grow| /' >&2
+log "42: F re-grow of the returning brk2 → rc=$_F_GROWRC"
 wait "$APPROVE_PID"; APPROVE_RC=$?
+if [ "$_F_GROWRC" = 0 ]; then
+    assert_ok "F [REJOIN TERMINUS] the returning node RE-GROWS into the cluster: 'cluster add' resumed the pre-approved join op and completed the mesh/start orchestration (rc=0). This is the terminus of the whole recovery journey — force-single, rejoin prepare, init --from-manifest, resnapshot are all worthless if the node cannot come back"  sh -c "[ '$_F_GROWRC' = 0 ]"
+# CLASSIFY force-single FIRST (R15 fix): #GROW-ONTO-FORCE-SINGLE is the ROOT and CATCHING_UP is its
+# DOWNSTREAM symptom — a force-single'd survivor leaves its JetStream clustered-lone-voter 503, so the
+# returning joiner crash-loops (broker.go:1063 n1ClusteredJetStreamFatal), never meshes, and therefore
+# NEVER becomes reachable+caught-up; the leader's catch-up probe simply never gets a reply and the op
+# sits at CATCHING_UP as a side effect. Both signatures land in one grow-status dump, so ordering the
+# CATCHING_UP branch first (the old bug) mis-attributed this to #47 by grep-order — the #47 message even
+# claimed a "REACHABLE joiner" while the very same dump showed brk2 reachable:false. #47's AddVoter/isVoter
+# branch is UPSTREAM-blocked here and is not actually exercised by this fixture until the force-single root
+# is fixed.
+elif printf '%s' "$_F_OUT" | grep -qiE 'force.single|FORCE-SINGLE|force_single_active'; then
+    product_red "#GROW-ONTO-FORCE-SINGLE (owner: R9 product side; the deploy-tier finding this arm exists to surface) — every documented recovery step SUCCEEDED (force-single, rejoin prepare with dump+manifest, init --from-manifest, resnapshot with --accept-audit-loss, brk1 leader again) and yet the re-grow of the returning node FAILED with a force-single signature (rc=$_F_GROWRC): the survivor's JetStream was left clustered-lone-voter (503), so the returning joiner crash-loops on n1ClusteredJetStreamFatal, never meshes, and stalls the op at CATCHING_UP. A survivor that can never be grown back out of force-single means the documented escape hatch is one-way: the cluster stays permanently N=1 with no redundancy. Full 'cluster add' output logged verbatim above"
+elif printf '%s' "$_F_OUT" | grep -qiE 'CATCHING_UP|catch_up_stalled|did not reach VOTER'; then
+    # Only a GENUINE #47 now: reached here means NO force-single signature is present, i.e. the survivor
+    # was healthy and the returning node was admitted + REACHABLE but still never promoted to VOTER.
+    product_red "#47 (owner: R9 product side) — the returning brk2 was admitted but never converged to VOTER: 'cluster add' left a REACHABLE joiner in CATCHING_UP (rc=$_F_GROWRC) with NO force-single root present. docs/deploy-tier-gotchas.md:521 — the subsequent grow is then blocked by the serialization lock. R7b bounded the CATCHING_UP state and R9 added the controller-loop tests, but the deploy-tier verifier for the AddVoter/isVoter branch is this drill (R9 risk 2 named it explicitly: that branch is unreachable in a hermetic single-node raft)"
+else
+    assert_ok "F [REJOIN TERMINUS] the returning node must RE-GROW into the cluster — it did not (rc=$_F_GROWRC), and the failure matches NEITHER the #47 CATCHING_UP signature NOR a force-single one. Undocumented: surfaced rather than laundered into a known defect (full 'cluster add' output logged verbatim above)"  sh -c "false"
+fi
 if [ "$APPROVE_RC" = 0 ] && grep -qiE 'reached (SERVING|RETIRED)|operation .* reached' "$APPROVE_LOG"; then
     _as_pass "F genuine cluster join approve <bundle> --wait reached SERVING while cluster add orchestrated the returning node"
 else
     _as_fail "F join approve --wait did not reach SERVING (rc=$APPROVE_RC)" "$(tail -5 "$APPROVE_LOG" 2>/dev/null)"
 fi
-assert_ok "F returning brk2 is a reachable VOTER in the authoritative roster" \
-    sh -c "$SIM status --json 2>/dev/null | jq -e '.nodes[]?|select(.node_id==\"brk2\" and .phase==\"VOTER\" and .reachable==true)' >/dev/null"
-assert_setup "F seed a real tier-A workload after rejoin" "$SIM" exec ctl1 -- sh -c 'head -c 65536 /dev/urandom > /tmp/rejoin.bin'
-assert_ok "F post-rejoin real workload transfers through the surviving session/agent" "$SIM" ctl -- push /tmp/rejoin.bin agt1:/tmp/rejoin.bin
-assert_ok "F post-rejoin workload bytes are exact on agt1" sh -c \
-    "[ \"\$($SIM exec ctl1 -- sha256sum /tmp/rejoin.bin | awk '{print \$1}')\" = \"\$($SIM exec agt1 -- sha256sum /tmp/rejoin.bin | awk '{print \$1}')\" ]"
+if [ "$_F_GROWRC" = 0 ]; then
+    assert_ok "F returning brk2 is a reachable VOTER in the authoritative roster" \
+        sh -c "$SIM status --json 2>/dev/null | jq -e '.nodes[]?|select(.node_id==\"brk2\" and .phase==\"VOTER\" and .reachable==true)' >/dev/null"
+    assert_setup "F seed a real tier-A workload after rejoin" "$SIM" exec ctl1 -- sh -c 'head -c 65536 /dev/urandom > /tmp/rejoin.bin'
+    assert_ok "F post-rejoin real workload transfers through the surviving session/agent" "$SIM" ctl -- push /tmp/rejoin.bin agt1:/tmp/rejoin.bin
+    assert_ok "F post-rejoin workload bytes are exact on agt1" sh -c \
+        "[ \"\$($SIM exec ctl1 -- sha256sum /tmp/rejoin.bin | awk '{print \$1}')\" = \"\$($SIM exec agt1 -- sha256sum /tmp/rejoin.bin | awk '{print \$1}')\" ]"
+else
+    not_covered "42 F post-rejoin VOTER + tier-A workload round-trip THIS RUN" "the returning node never rejoined (the RED / PRODUCT-RED above). Asserting 'brk2 is a reachable VOTER' or pushing a workload 'after rejoin' over a cluster the node never re-entered would judge a state the drill never reached — and a push that happened to succeed through the surviving N=1 broker would read as a post-rejoin success it is not." gap
+fi
 
 # ── J Tier-2 --yes negatives (rejoin-prepare + resnapshot; both quorum-affecting, no --yes override) ─
 assert_refuses "J rejoin prepare --yes rejected (Tier-2, never-escapable)" \

@@ -42,6 +42,6 @@ func TestRootAgainstNonRootDir(t *testing.T) {
 func TestWarnRootDataDirOwnerBestEffort(t *testing.T) {
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	warnRootDataDirOwner(filepath.Join(t.TempDir(), "does-not-exist"), discard) // stat fails → no-op
-	warnRootDataDirOwner(t.TempDir(), nil)                                       // nil logger → no-op
-	warnRootDataDirOwner(t.TempDir(), discard)                                   // existing dir → no panic
+	warnRootDataDirOwner(t.TempDir(), nil)                                      // nil logger → no-op
+	warnRootDataDirOwner(t.TempDir(), discard)                                  // existing dir → no panic
 }

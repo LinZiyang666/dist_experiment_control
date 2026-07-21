@@ -126,7 +126,7 @@ func newClusterAddCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&secretsDir, "secrets-dir", "/etc/tether/secrets", "§15 secrets dir")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "/var/lib/tether", "the joiner's broker data dir (raft/ bootstrapped here)")
 	cmd.Flags().StringVar(&dbPath, "db", "/var/lib/tether/tether.db", "the joiner's tether.db")
-	cmd.Flags().StringVar(&configPath, "config", "/etc/tether/broker.yaml", "the joiner's broker.yaml (the init step applies + this verifies the broker.cluster seam here)")
+	cmd.Flags().StringVar(&configPath, "config", defaultBrokerConfigPath, "the joiner's broker.yaml (the init step applies + this verifies the broker.cluster seam here)")
 	cmd.Flags().BoolVar(&resetFormerJS, "reset-former-js", false, "acknowledge resetting a NON-EMPTY former-N1 JetStream store (history/audit loss; the store is MOVED aside, not deleted)")
 	cmd.Flags().BoolVar(&preserveJSData, "preserve-js-data", false, "acknowledge the former-N1 JS reset, keeping the moved-aside store (jetstream.grow-bak.<epoch>) to restore by hand; auto backup→restore is not implemented in v1")
 	cmd.Flags().IntVar(&autoConfirmCatchup, "auto-confirm-catchup", 0, "for unattended runs, auto-confirm a BLOCKED catch-up op up to N times (default 0 = surface it to the operator)")

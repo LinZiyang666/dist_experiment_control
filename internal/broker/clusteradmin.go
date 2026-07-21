@@ -76,6 +76,23 @@ type ClusterAdmin struct {
 	caughtUpFn     func(nodeID string, barrier uint64) (bool, error)
 	streamsReadyFn func(nodeID string) (bool, error)
 
+	// homeAppliedFn / homeDeliverFn (R8a P1), when set (wireClusterLate), are the
+	// broker's data-plane convergence oracle and its immediate-delivery kick.
+	//
+	// homeAppliedFn(port) returns the highest home epoch the AGENT confirmed it
+	// APPLIED — not "we published it", not "the row says so". That distinction is
+	// the entire rc-semantics contract: a drain that re-pointed home_broker through
+	// raft but whose agent has not re-dialed the new home is NOT done, and must not
+	// return rc=0.
+	//
+	// nil ⇒ the convergence wait is SKIPPED (the many unit paths in this package
+	// construct a bare ClusterAdmin with no broker behind it). That nil-skip is the
+	// classic half-wiring trap this project has already been bitten by twice, so it
+	// is guarded from both ends: TestWireClusterLateWiresHomeConvergence pins the
+	// wiring, and TestDrainRefusesRcZeroWhenDataPlaneStale pins the behaviour.
+	homeAppliedFn func(publicPort int) int64
+	homeDeliverFn func(sid, nid string)
+
 	// opAttempts (C4-M8) is the leader-local bounded-retry counter for an operation's failing
 	// side-effect (keyed by op_id) → BLOCKED after opMaxAttempts. Reset on a leadership change (the new
 	// leader re-counts from 0).

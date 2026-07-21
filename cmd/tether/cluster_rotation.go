@@ -85,8 +85,11 @@ func printCredentialRotationGuide(w io.Writer, node, secretsDir, confPath string
 	p("     surviving voter's route-cert.pem/route-key.pem with YOUR PKI.\n")
 	p("  2. Distribute the new 0600 files to EACH surviving voter's secrets dir over YOUR OWN channel\n")
 	p("     (scp/ssh). tether NEVER copies private keys for you (rejection #2).\n")
-	p("  3. On each voter: `tether cluster reconcile nats` (or `reconcile nats --manual`) so the\n")
-	p("     auth_callout issuer matches the new PUBLIC account key, then rolling-restart the broker.\n")
+	p("  3. Rolling-RESTART each voter's broker so it re-renders nats.conf from the NEW account.nk: the\n")
+	p("     auth_callout issuer is rendered from the seed the process loads AT STARTUP, so swapping\n")
+	p("     account.nk on disk is INERT until restart (#54). `reconcile nats --all --wait` does NOT\n")
+	p("     re-render from the new seed — run it AFTER the restart to CONFIRM (it fails-closed if the\n")
+	p("     on-disk issuer still disagrees with the rendered one).\n")
 	p("  See docs/cluster-runbook.md §2.1 for the verbatim commands.\n\n")
 
 	p("STEP B — tunnel-cert  (OPTIONAL defense-in-depth, online; does NOT mitigate %s's compromise):\n", node)

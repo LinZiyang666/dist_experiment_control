@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -33,8 +34,167 @@ with read+write access to the socket file (mode 0600 — typically the
 	root.AddCommand(newAdminSessionsCmd(&socketPath))
 	root.AddCommand(newAdminNodesCmd(&socketPath))
 	root.AddCommand(newAdminAuditCmd(&socketPath))
+	root.AddCommand(newAdminEventsCmd(&socketPath))
 	root.AddCommand(newAdminEvictCmd(&socketPath))
+	root.AddCommand(newAdminRuntimeCmd(&socketPath))
 	return root
+}
+
+// newAdminEventsCmd (#30) tails the broker's H.1 `events` stream — the operator's reader for
+// sys.events. Members can subscribe to sys.events over NATS; the operator (root on the broker host)
+// uses this admin-socket verb instead, and gets HISTORY (the stream is persisted 30d/1GiB) plus
+// kind/time filters. There is deliberately no --follow: the admin socket is one-shot by design
+// (protocol.go), and the operator need is a point-in-time "what did the cluster just emit"; re-run
+// with --since for a fresh window (broker-ops.md documents a poll-loop for a live tail).
+func newAdminEventsCmd(socketPath *string) *cobra.Command {
+	var (
+		n      int
+		since  time.Duration
+		kind   string
+		asJSON bool
+	)
+	cmd := &cobra.Command{
+		Use:   "events",
+		Short: "Tail the broker's operational sys.events (topology/rehome/proxy/session/disk kinds)",
+		Long: `Read the H.1 'events' JetStream stream — the operator-facing sys.events feed
+(session_created/destroyed, member_joined, agent_registered/evicted,
+agent_roster_stale, disk_pressure, tetherd_restarted, and the operational
+proxy_*/nats_topology_*/rehome/grow-cutover kinds). Reaches the broker over the
+same root-only 0600 admin socket as 'admin runtime'/'alert raise'. The payloads
+are secret-free by construction (never a PSK/token). Filter with --kind and
+--since; -n bounds how many most-recent matching events to return.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			req := adminsock.Request{Op: adminsock.OpEvents, N: n, EventKind: kind}
+			if since > 0 {
+				req.Since = since.String()
+			}
+			resp, err := callAdmin(*socketPath, req)
+			if err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+			}
+			if asJSON {
+				// R11 discipline: on success ONLY the machine JSON reaches stdout; the error paths
+				// above return to main() (stderr), so `admin events --json 2>&1 | jq` stays clean.
+				return emitJSON(cmd.OutOrStdout(), adminEventsJSON{Schema: "admin_events", SchemaVersion: 1, Events: normSlice(resp.Events)})
+			}
+			return renderAdminEvents(cmd, resp.Events)
+		},
+	}
+	cmd.Flags().IntVarP(&n, "n", "n", 50, "number of most-recent (matching) events to tail")
+	cmd.Flags().DurationVar(&since, "since", 0, "only events newer than this (e.g. 1h, 30m); 0 = no time bound")
+	cmd.Flags().StringVar(&kind, "kind", "", "only events of this type (e.g. proxy_keyset_changed); empty = all kinds")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
+	return cmd
+}
+
+// renderAdminEvents prints the human table for `admin events`: TIME, TYPE, then the raw body JSON so
+// the operator can inspect kind-specific fields without the CLI mirroring every event shape.
+func renderAdminEvents(cmd *cobra.Command, events []adminsock.AuditEntry) error {
+	if len(events) == 0 {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no events)")
+		return nil
+	}
+	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "TIME\tTYPE\tFIELDS")
+	for _, e := range events {
+		kind, _ := e.Body["type"].(string)
+		if kind == "" {
+			kind = "-"
+		}
+		body, _ := json.Marshal(e.Body)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Ts.Format(time.RFC3339), kind, string(body))
+	}
+	return tw.Flush()
+}
+
+func newAdminRuntimeCmd(socketPath *string) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "runtime",
+		Short: "Show this broker's live process runtime (goroutines/threads/fds/rss/uptime + reconciler last-tick)",
+		Long: `Runtime introspection for the LIVE broker daemon (R13). Reports the in-process
+goroutine count (runtime.NumGoroutine — the real value, NOT the OS thread count,
+which does not move when parked goroutines leak), the OS thread count, open fd
+count, resident-set size, process uptime, and each periodic reconciler's last
+tick. Diagnose a goroutine/fd leak by polling this and watching a count climb;
+diagnose a stalled reconciler by watching its last_tick stop advancing.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpRuntime})
+			if err != nil {
+				return err
+			}
+			if resp.Error != "" {
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+			}
+			rep := resp.Runtime
+			if rep == nil {
+				return fmt.Errorf("broker: runtime reply missing")
+			}
+			if asJSON {
+				// R11 discipline: on success ONLY the machine JSON reaches stdout (the failure
+				// paths above return errors that main() prints to stderr and emit nothing here),
+				// so `admin runtime --json 2>&1 | jq` never sees prose mixed into the JSON stream.
+				return emitJSON(cmd.OutOrStdout(), rep)
+			}
+			return renderAdminRuntime(cmd, rep)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
+	return cmd
+}
+
+// renderAdminRuntime prints the human table for `admin runtime`. -1 counts (a platform where
+// /proc/self is unreadable) render as "n/a" so an operator never mistakes an unmeasurable value
+// for a real zero.
+func renderAdminRuntime(cmd *cobra.Command, rep *adminsock.RuntimeReport) error {
+	w := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(w, "goroutines : %d\n", rep.Goroutines)
+	_, _ = fmt.Fprintf(w, "threads    : %d\n", rep.Threads)
+	_, _ = fmt.Fprintf(w, "open_fds   : %s\n", intOrNA(rep.OpenFDs))
+	_, _ = fmt.Fprintf(w, "rss        : %s\n", rssHuman(rep.RSSBytes))
+	_, _ = fmt.Fprintf(w, "uptime     : %s\n", time.Duration(rep.UptimeSeconds*float64(time.Second)).Round(time.Second))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "\nRECONCILER\tINTERVAL\tLEADER_ONLY\tLAST_TICK\tRUNS\tSKIPS\tLAST_ERR")
+	now := time.Now()
+	for _, r := range rep.Reconcilers {
+		last := "never"
+		if !r.LastTick.IsZero() {
+			last = humaneAge(now.Sub(r.LastTick)) + " ago"
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%d\t%d\t%s\n",
+			r.Name, time.Duration(r.IntervalMS)*time.Millisecond, r.LeaderOnly, last, r.Runs, r.Skips, dashIfEmptyAdmin(r.LastErr))
+	}
+	if len(rep.Reconcilers) == 0 {
+		_, _ = fmt.Fprintln(tw, "(no reconcilers registered)")
+	}
+	return tw.Flush()
+}
+
+func intOrNA(n int) string {
+	if n < 0 {
+		return "n/a"
+	}
+	return strconv.Itoa(n)
+}
+
+func dashIfEmptyAdmin(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// rssHuman renders a byte count as a compact MiB string; -1 → "n/a".
+func rssHuman(b int64) string {
+	if b < 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f MiB", float64(b)/(1024*1024))
 }
 
 func newAdminSessionsCmd(socketPath *string) *cobra.Command {
@@ -206,8 +366,24 @@ denied at next CONNECT (no longer provisioned).`,
 	return cmd
 }
 
-func callAdmin(socketPath string, req adminsock.Request) (*adminsock.Response, error) {
-	c := &adminsock.Client{Path: socketPath}
+// adminCallTimeout picks the admin-socket client read timeout for an op. Most admin ops reply promptly,
+// so they take the client's 5s default (returned as 0). The SYNCHRONOUS `cluster drain` is the exception
+// (external review M-6): it BLOCKS on the broker up to drainNotice (~30s) awaiting data-plane convergence,
+// and a 5s client deadline would fire FIRST — surfacing that convergence wait as a bare socket timeout
+// (exit 69, "broker unreachable") instead of the intended dataplane_not_converged (exit 75, retry-later).
+// 60s clears drainNotice with margin for the convergence poll + the reply; `cluster retire` needs no bump
+// because it starts a resumable op and returns immediately (its wait is a separate client-side poll).
+func adminCallTimeout(op string) time.Duration {
+	if op == adminsock.OpClusterDrain {
+		return 60 * time.Second
+	}
+	return 0 // adminsock.Client default (5s)
+}
+
+// callAdmin is a var seam so tests can drive the admin CLI commands without a live socket (e.g. the
+// R11 2>&1-cleanliness test for `admin runtime --json`). Production always uses the real client.
+var callAdmin = func(socketPath string, req adminsock.Request) (*adminsock.Response, error) {
+	c := &adminsock.Client{Path: socketPath, Timeout: adminCallTimeout(req.Op)}
 	resp, err := c.Call(req)
 	if err != nil {
 		// Transport failure (socket missing / broker down / EOF) = service unavailable (69),

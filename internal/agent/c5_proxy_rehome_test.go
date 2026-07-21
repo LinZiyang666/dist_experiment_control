@@ -74,6 +74,54 @@ func TestC5ProxyBoundReflectsTunnelLiveness(t *testing.T) {
 	}
 }
 
+// #33 (R8a): a SUCCESSFUL rehome must RESTORE ProxyBound.
+//
+// This is the assertion this file was missing. TestC5ProxyBoundReflectsTunnelLiveness above
+// pins the two notifyState edges (drop clears, redial restores) but never covered the third
+// writer of a live tunnel: ApplyHome. The rehome success branch updated homeAddr/homeEpoch and
+// nothing else, and ApplyHome→OpenHome never calls notifyState — so after a home broker died
+// (drop edge wrote proxyTunnelUp=false) and the rehome to the survivor SUCCEEDED, the flag
+// stayed false over a tunnel that was demonstrably up.
+//
+// The observable damage was inverted and therefore looked non-deterministic: a FLAPPING tunnel
+// self-healed (its redial edge fires notifyState(true)) while a STABLE rehomed one never did —
+// its heartbeats reported proxy_ready=false forever, and after proxyRehomeDwell bad reads the
+// broker's reaper minted a fresh port+token and stranded the data plane.
+func TestC5ProxyRehomeSuccessRestoresProxyBound(t *testing.T) {
+	adapter := newFakeHomeAdapter(func(int, int64, int) error { return nil }) // ApplyHome succeeds
+	a := newC5ProxyAgent(t, adapter)
+
+	// Serving, tunnel live.
+	a.applyProxyDirective(context.Background(), nil, c5FullDirective(14000, 1))
+	if a.proxy == nil || a.proxy.srv == nil {
+		t.Fatal("server should be running after a full enable")
+	}
+	a.onTunnelSessionState(14000, true)
+	if !a.proxyBound() {
+		t.Fatal("serving + tunnel up → ProxyBound must be true")
+	}
+
+	// The home broker dies: the supervisor's drop edge clears tunnel liveness.
+	a.onTunnelSessionState(14000, false)
+	if a.proxyBound() {
+		t.Fatal("a tunnel drop must clear ProxyBound")
+	}
+
+	// The rehome to the surviving broker SUCCEEDS: ApplyHome returns nil AND HasSession is true.
+	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: ssproxy.Cipher,
+		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "cccccccccccccccc"}}, Epoch: 1,
+		Home: &proto.HomeDirective{PublicPort: 14000, BrokerAddr: "home-2", Epoch: 2, CertPins: proto.CertPins{Current: "pin2"}},
+	})
+	if a.proxy.homeEpoch != 2 || a.proxy.homeAddr != "home-2" {
+		t.Fatalf("rehome did not take: homeAddr=%q homeEpoch=%d want (home-2, 2)", a.proxy.homeAddr, a.proxy.homeEpoch)
+	}
+	if !a.proxyBound() {
+		t.Fatal("#33: a SUCCESSFUL rehome proved a live tunnel but left ProxyBound false — " +
+			"every heartbeat now reports proxy_ready=false and the broker's reaper will strand this expose")
+	}
+}
+
 // N1: a rehome directive minted for a DIFFERENT (prior) allocation port must be ignored — its
 // higher per-allocation epoch must not fence the current epoch-0 home.
 func TestC5ProxyRehomeScopedByPort(t *testing.T) {

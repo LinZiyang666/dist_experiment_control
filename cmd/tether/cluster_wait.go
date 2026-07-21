@@ -115,3 +115,68 @@ func waitForConverge(cmd *cobra.Command, socketPath, node string, pred func(*adm
 
 // nowFunc is time.Now, indirected so a test can drive the timeout deterministically.
 var nowFunc = time.Now
+
+// settleDefaultInterval is the poll gap for `cluster status --settle`. Each fetch already blocks up
+// to ~observePollWindow (2s) via the live health scatter-gather, so a 1s gap between polls paces the
+// loop without adding meaningful latency to detecting a settle.
+const settleDefaultInterval = 1 * time.Second
+
+// settleClusterStatus (D3) is the OPT-IN debounce for `cluster status`. A voter restart produces a
+// REAL, brief DEGRADED (exit 1) window — the restarting voter is genuinely unreachable / catching up
+// for a few seconds, so the instantaneous exit code honestly flaps 0→1→0. The default one-shot
+// reports that transient faithfully (it is real; masking it by default would be dishonest). --settle
+// lets a MONITOR say "give a benign restart up to <dur> to clear before you trust a DEGRADED verdict":
+//
+//   - HEALTHY_HA (0) at any poll        → return immediately (the transient cleared / never happened).
+//   - QUORUM_LOST (2) / FORCE_SINGLE (3) → return immediately. These are NEVER benign restart blips;
+//     debouncing them into "transient" would hide a real outage — exactly what D3 warns against.
+//   - DEGRADED (1)                       → keep polling until it clears OR the window elapses. If it is
+//     STILL DEGRADED after <dur>, the degradation is SUSTAINED, not a restart blip: return exit 1
+//     honestly. A permanently NOT-HA (N=2) cluster therefore waits the full window then still exits 1.
+//
+// It renders only the FINAL report; the caller owns render + os.Exit(rep.ExitCode). Testable via the
+// fetchClusterStatusReport + nowFunc seams.
+func settleClusterStatus(cmd *cobra.Command, socketPath string, settle, interval time.Duration) (*adminsock.ClusterStatusReport, error) {
+	if interval <= 0 {
+		interval = settleDefaultInterval
+	}
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	deadline := nowFunc().Add(settle)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var lastRep *adminsock.ClusterStatusReport
+	var lastErr error
+	for {
+		rep, err := fetchClusterStatusReport(socketPath)
+		if err == nil {
+			lastRep, lastErr = rep, nil
+			// A terminal (non-transient) verdict surfaces at once; a DEGRADED verdict may be a
+			// restart blip, so fall through to the deadline check and keep polling.
+			if rep.ExitCode != 1 {
+				return rep, nil
+			}
+		} else {
+			// A transient socket error mid-settle (mid-election, momentary unbind) is retried; a
+			// monitor asked us to wait out benign blips, and a dropped frame is one.
+			lastErr = err
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "settle: %v (retrying)\n", err)
+		}
+		if !nowFunc().Before(deadline) {
+			// Window elapsed. A DEGRADED that never cleared is a SUSTAINED degradation — return it so
+			// the caller exits 1 honestly. If every poll errored, surface the last transport error.
+			if lastRep != nil {
+				return lastRep, nil
+			}
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			if lastRep != nil {
+				return lastRep, nil
+			}
+			return nil, &ExitError{Class: exitTransient, Err: fmt.Errorf("cluster status --settle: interrupted before the health verdict settled")}
+		case <-ticker.C:
+		}
+	}
+}

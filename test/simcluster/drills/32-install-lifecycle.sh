@@ -31,7 +31,12 @@ F=fresh32
 # other (the 2nd replaced the 1st), so an early failure after artifact_up leaked the artifact container. Both
 # artifact_down and the fresh-container reap now run on ANY exit path (the §8.4 sim topology is reaped by
 # cmd_drill's finalizer nuke).
-trap 'artifact_down 2>/dev/null; rm_node "$F" --vols 2>/dev/null' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): the combined `EXIT INT TERM` form still RESUMED after the
+# handler on a Ctrl-C — cleanup would run and the drill would then keep going through the §8.4 stop/binary-swap
+# steps. drill_install_traps keeps the single EXIT registration (the R5-M4 fix above) and additionally exits
+# 128+signo on INT/TERM without resuming. Cleanup body unchanged.
+_cleanup() { artifact_down 2>/dev/null; rm_node "$F" --vols 2>/dev/null; }
+drill_install_traps _cleanup
 IN()    { dexec "$F" -- "$@"; }
 INSIM() { dexec -u sim "$F" -- env HOME=/home/sim "$@"; }
 _systemd_up() { IN systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded|starting'; }

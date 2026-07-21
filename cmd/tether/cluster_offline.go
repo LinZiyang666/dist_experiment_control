@@ -33,6 +33,16 @@ const (
 	// root-owned (the root-run caddy reads /etc/tether/Caddyfile — a tether-owned /etc/tether would be
 	// a tether->root privesc). SSOT for the default across init / reconcile / retire / preflight / serve.
 	defaultNatsConfPath = "/etc/tether/nats.d/nats.conf"
+	// defaultBrokerConfigPath is the broker.yaml `install.sh` writes. SSOT for every command that
+	// applies/verifies the broker.cluster seam (init / add / recovery restore — R10 P2).
+	defaultBrokerConfigPath = "/etc/tether/broker.yaml"
+	// defaultManifestListen is the LOOPBACK address the C2 well-known cluster discovery manifest
+	// (/.well-known/tether/cluster.json) binds to in cluster mode when broker.yaml / --cluster-manifest-listen
+	// leave it unset (#27). Loopback-only + Caddy-fronted (the manifest is unauthenticated but
+	// account-SIGNED, discovery-only, zero secrets). A cluster-init'd broker is therefore discovery
+	// serve-ready by default without an extra config key; an operator can override the addr or pass an
+	// explicit empty value to opt out.
+	defaultManifestListen = "127.0.0.1:7480"
 )
 
 // readSelfIdentity reads this survivor's server_name (nats_server_id) + bus nkey (bus_nkey_pub) from its
@@ -153,6 +163,14 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			// ONLINE: the preferred path — recover via the running broker's admin socket WITHOUT stopping
 			// it (no second outage). --dry-run is a zero-mutation drill runnable on a HEALTHY cluster.
 			if online {
+				// #36 (docs/reviews/r6-findings.md): the ONLINE path must reject an unattended --yes at
+				// the SAME Tier-2 gate the OFFLINE path uses below. force-single is split-brain-capable
+				// and has NO unattended override in ANY mode; before this the online arm skipped the
+				// rejector, diverging from offline. The TTY-typed node_id confirm inside
+				// runForceSingleOnline stays intact (the online arm is still hands-on).
+				if err := rejectedUnattendedYes(cmd, "force-single", selfID); err != nil {
+					return err
+				}
 				socket, _ := cmd.Flags().GetString("socket")
 				return runForceSingleOnline(cmd, socket, selfID, confirmDead, dryRun)
 			}

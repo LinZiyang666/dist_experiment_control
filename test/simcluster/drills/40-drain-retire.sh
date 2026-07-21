@@ -29,8 +29,27 @@ _is_voter()    { "$SIM" status --json 2>/dev/null | jq -e --arg n "$1" '.nodes[]
 # Never pin operation reads to a leader variable across the injected leadership
 # transfer. The mid-retire leader can be the target itself; after it transfers
 # leadership and is removed, its local admin socket/DB is necessarily stale.
+# H7 (2026-07-18 full-suite run): ONE leader criterion for the whole mid-retire window, and a fallback that
+# never interrogates a dead container. drills/lib/cluster.sh's sim_leader falls back to `exec brk1` when the
+# authoritative `$SIM status --json` view is momentarily unavailable — but the injected kill below can be
+# brk1 itself, so that fallback queries a DEAD node, returns empty, and manufactured a spurious
+# `SETUP-FAIL resolve new mid-retire leader` while a replacement leader genuinely existed. Ask the
+# authoritative view first (cmd_status already fails closed unless is_leader_view==true), then every LIVE
+# broker in turn. $1 (optional) = a node that must NOT be reported (the just-killed one); "" = no exclusion.
+_live_leader() {
+    _ll_x=${1:-}
+    _ll_v=$("$SIM" status --json 2>/dev/null | jq -r '.leader_id // empty' 2>/dev/null | head -1)
+    if [ -n "$_ll_v" ] && [ "$_ll_v" != "$_ll_x" ]; then printf '%s' "$_ll_v"; return 0; fi
+    for _ll_b in $(list_nodes broker); do
+        [ "$_ll_b" = "$_ll_x" ] && continue
+        node_running "$_ll_b" || continue
+        _ll_v=$(dexec -u tether "$_ll_b" -- tether cluster status --json 2>/dev/null | jq -r '.leader_id // empty' 2>/dev/null | head -1)
+        [ -n "$_ll_v" ] && [ "$_ll_v" != "$_ll_x" ] && { printf '%s' "$_ll_v"; return 0; }
+    done
+    return 1
+}
 _op_show_json() {
-    _osj_ldr=$(sim_leader) || return 1
+    _osj_ldr=$(_live_leader) || return 1
     dexec -u tether "$_osj_ldr" -- tether cluster ops show "$1" --json
 }
 # schema helpers (call A + jq DIRECTLY — never dexec inside sh -c). Diag-verified: ops ls --json =
@@ -216,11 +235,21 @@ elif printf '%s' "$RET_OUT" | grep -qiE 'watch: .*cluster ops show|retir|removed
     if poll_until 45 2 "$T retire reaches a stable pre-removal cursor" -- _retire_pre_remove "$T"; then
         _as_pass "R-resume: captured a durable pre-RAFT_REMOVED retire cursor"
         node_kill "$OLD_LDR"
-        if poll_until 45 2 "new leader after mid-retire kill" -- sh -c "n=\$($SIM status --json 2>/dev/null | jq -r '.leader_id // empty'); test -n \"\$n\" && test \"\$n\" != '$OLD_LDR'"; then
-            LDR=$(sim_leader) || setup_fail "resolve new mid-retire leader"
+        # H7: the DETECTION gate and the RESOLUTION must be the SAME criterion. The old code polled
+        # `$SIM status --json | .leader_id != OLD_LDR` and then resolved with sim_leader (a different
+        # projection plus a brk1-hardcoded fallback), so any disagreement between the two — including the
+        # brk1-is-the-corpse case — aborted a HEALTHY failover as SETUP-FAIL. Retry the resolution itself
+        # (~46s, matching the old gate's 45s) over LIVE nodes only; a genuine non-failover still REDs below.
+        NEW_LDR=""; _nl_i=0
+        while [ "$_nl_i" -lt 23 ]; do
+            NEW_LDR=$(_live_leader "$OLD_LDR") && [ -n "$NEW_LDR" ] && break
+            NEW_LDR=""; _nl_i=$((_nl_i+1)); sleep 2
+        done
+        if [ -n "$NEW_LDR" ]; then
+            LDR=$NEW_LDR
             _as_pass "R-resume: leadership moved from $OLD_LDR to $LDR while the retire op remained in flight"
         else
-            _as_fail "R-resume: no replacement leader after killing $OLD_LDR"
+            _as_fail "R-resume: no replacement leader after killing $OLD_LDR (single criterion, retried ~46s across every LIVE broker)"
         fi
         node_start "$OLD_LDR"
         assert_setup "R-resume: old leader returns before irreversible removal" poll_until 60 3 "$OLD_LDR reachable VOTER" -- _is_voter "$OLD_LDR"

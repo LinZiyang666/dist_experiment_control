@@ -1,10 +1,12 @@
 tether	flags:
 tether admin	flags: --socket
 tether admin audit	flags: --json --n --socket
+tether admin events	flags: --json --kind --n --since --socket
 tether admin evict	flags: --socket
 tether admin nodes	flags: --json --socket
+tether admin runtime	flags: --json --socket
 tether admin sessions	flags: --json --socket
-tether agent	flags: --install-user-service --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall
+tether agent	flags: --install-user-service --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall --upgrade-url-allow
 tether agent config	flags:
 tether agent config refresh	flags: --once --session
 tether agent doctor	flags: --session
@@ -50,18 +52,19 @@ tether cluster recovery node remove	flags: --confirm-node-id --force --manual --
 tether cluster recovery rejoin	flags: --socket
 tether cluster recovery rejoin prepare	flags: --data-dir --db --dump-divergent --emit-manifest --guided --secrets-dir --self-id --socket --yes(hidden)
 tether cluster recovery resnapshot	flags: --accept-audit-loss --confirm-node-id --data-dir --db --raft-addr --self-id --socket --yes(hidden)
-tether cluster recovery restore	flags: --confirm-node-id --data-dir --db --raft-addr --secrets-dir --socket --yes(hidden)
+tether cluster recovery restore	flags: --config --confirm-node-id --data-dir --db --nats-conf --raft-addr --secrets-dir --socket --yes(hidden)
 tether cluster remove [hidden]	flags: --confirm-node-id --force --manual --socket --yes(hidden)
-tether cluster restore [hidden]	flags: --confirm-node-id --data-dir --db --raft-addr --secrets-dir --socket --yes(hidden)
+tether cluster restore [hidden]	flags: --config --confirm-node-id --data-dir --db --nats-conf --raft-addr --secrets-dir --socket --yes(hidden)
 tether cluster retire	flags: --compromised --require-credential-rotation --secrets-dir --socket --timeout --wait
 tether cluster rotate-tunnel-cert	flags: --cert-fp --socket
 tether cluster seeds	flags: --socket
 tether cluster seeds publish	flags: --bootstrap --endpoint --sid --socket
 tether cluster seeds show	flags: --home --nats-url --remote --socket
 tether cluster set-raft-addr	flags: --allow-loopback --route --socket
-tether cluster status	flags: --card --db --home --homes --json --nats-url --offline --remote --socket --watch
+tether cluster status	flags: --card --db --home --homes --json --nats-url --offline --remote --settle --socket --watch
 tether cluster takeover-natsconf [hidden]	flags: --account-issuer --allow-partial-mesh --broker-nkey --cluster-listen --conf --json --nats-server --peer --plan --route-url --secrets-dir --server-name --skip-dry-run --socket
 tether cluster transfer-leader	flags: --socket --timeout --wait
+tether cluster unlock	flags: --account-seed --dry-run --force --grow --home --nats-url --socket --upgrade
 tether cluster upgrade	flags: --account-seed --ack-writefence --backup-taken --dry-run --expect-sha256 --home --nats-url --notify-webhook --socket --to-version
 tether completion	flags:
 tether completion bash	flags: --no-descriptions
@@ -91,7 +94,7 @@ tether ps	flags: --all --home --json --nats-url
 tether pull	flags: --ack-alerts --force --home --nats-url --timeout
 tether push	flags: --ack-alerts --force --home --nats-url --timeout
 tether run	flags: --ack-alerts --cwd --home --nats-url --safe
-tether serve	flags: --admin-socket --alert-webhook-url --auth-callout-seeds-dir --cluster-data-dir --cluster-manifest-listen --cluster-raft-addr --cluster-secrets-dir --colocated-agent-nid --config --db --log-json --log-level --metrics-listen --nats-conf-path --nats-server-bin --nats-url --public-host --store-dir --sub-http-listen --tunnel-addr --tunnel-public-host --upgrade-url-allow
+tether serve	flags: --admin-socket --alert-webhook-url --auth-callout-seeds-dir --cluster-data-dir --cluster-manifest-listen --cluster-raft-addr --cluster-secrets-dir --colocated-agent-nid --config --db --disk-check-interval --log-json --log-level --metrics-listen --nats-conf-path --nats-server-bin --nats-url --public-host --store-dir --sub-http-listen --tunnel-addr --tunnel-public-host --upgrade-url-allow
 tether session	flags: --home --nats-url
 tether session create	flags: --home --nats-url --pin
 tether session ls	flags: --home --json --nats-url

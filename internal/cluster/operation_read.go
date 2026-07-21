@@ -87,6 +87,24 @@ func ActiveOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
 	return o, nil
 }
 
+// LatestOperationForTarget returns the most recently updated operation for a node —
+// terminal or not — or nil when the node has never had one. ActiveOperationForTarget
+// answers "is something in flight"; this answers "what happened last", which is what
+// the R7 grow-lock reaper needs to tell a FINISHED grow (terminal row ⇒ the lock's
+// holder is gone) from a grow that has not created its operation yet (no row at all ⇒
+// the acquire-lock window, hands off).
+func LatestOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
+	row := ro.QueryRow(`SELECT `+opSelectCols+` FROM cluster_operations WHERE target_node = ? ORDER BY updated_at DESC, op_id LIMIT 1`, target)
+	o, err := scanOperation(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cluster: latest operation for %q: %w", target, err)
+	}
+	return o, nil
+}
+
 // OperationByID returns one operation by its op_id (= plan-id), or nil if absent.
 func OperationByID(ro *sql.DB, opID string) (*Operation, error) {
 	row := ro.QueryRow(`SELECT `+opSelectCols+` FROM cluster_operations WHERE op_id = ?`, opID)

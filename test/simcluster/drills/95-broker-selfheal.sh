@@ -77,7 +77,21 @@ _t2_history_ok()   { _th=$("$SIM" ctl -- history -n 50 2>&1); [ $? = 0 ] && [ -n
 # absence, fail-closed: the reader must be proven alive first (D2b/T2h are the paired positive controls).
 _t2_agent_undisturbed() { ! _agent_jafter agt1 "$CURA" 'agent: re-registered after reconnect'; }
 _t3_agent_works()  { "$SIM" ctl -- exec agt1 -- echo T3E-ALIVE >/dev/null 2>&1; }
-_d_raft_ok()       { _bt brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id=="brk1"' >/dev/null 2>&1; }
+# 95-D CORRECTED PREDICATE (R6 adjudication → R13). The OLD body hard-pinned .leader_id=="brk1" — but by
+# arm D, T1a (SIGTERM brk1) + T2a (SIGKILL brk1) have felled brk1's broker TWICE, and at N=2 leadership can
+# legitimately settle on brk2. The old pin then FAILED for a reason UNRELATED to what arm D tests (DELETING
+# boot-resume), manufacturing a FALSE not_covered (r6-findings: "95-D REFUTED — 谓词过严"). Correct
+# semantics: raft has a STABLE leader (some voter leads AND that identity is unchanged across two spaced
+# reads) — NOT that it is brk1. Stability distinguishes "a leader exists this instant" from "raft settled";
+# .leader_id is read as a string (jq // empty), never pinned to an identity. Proven able to go RED by the
+# D-NEG arm below (a no-leader input and a churning-leader input must BOTH fail) + tests/r9d-nonvacuity.
+_d_leader_via()    { _bt "$1" -- tether cluster status --json 2>/dev/null | jq -r '.leader_id // empty' 2>/dev/null; }
+_d_raft_ok()       {
+    _drl1=$(_d_leader_via brk1); [ -n "$_drl1" ] || return 1
+    sleep 2
+    _drl2=$(_d_leader_via brk1); [ -n "$_drl2" ] || return 1
+    [ "$_drl1" = "$_drl2" ]
+}
 _d_core_ok()       { "$SIM" ctl -- node ls --json >/dev/null 2>&1; }
 _d_state_is_deleting() {
     _ds=$(dexec brk1 -- sqlite3 -readonly /var/lib/tether/tether.db "select state from sessions where name='doomed'" 2>/dev/null | tr -d '\r')
@@ -217,6 +231,19 @@ assert_ok "EV the tetherd_restarted event was emitted and is readable by a membe
 # hermetic (test/p7/audit_e2e_test.go:323) writes session.Tombstone straight into SQLite; the deploy tier
 # MUST NOT copy that — in cluster mode `sessions` is replicated state and an out-of-raft write forks
 # leader/follower content (broker.go:1130-1136 spells the mechanism out).
+# ── D-NEG (R13) — the tightened _d_raft_ok MUST be able to go RED, or the precondition poll below is a
+#    permanently-true oracle (the OLD brk1-pin was a FALSE gap; a green means nothing unless the predicate
+#    can red). Drive the REAL stability logic with a subshell-local shadowed reader (never leaks into the
+#    real poll): (i) NO leader visible and (ii) a CHURNING leader (two different ids across the two spaced
+#    reads) must BOTH make _d_raft_ok fail. Deterministic + hermetic — zero cluster disruption. Mirrored in
+#    tests/r9d-nonvacuity.sh.
+_d_neg_no_leader() { ( _d_leader_via() { printf ''; }; _d_raft_ok ); }
+_d_neg_churn()     { ( _CH="$1"; _d_leader_via() { if [ -f "$_CH" ]; then rm -f "$_CH"; printf brk2; else : >"$_CH"; printf brk1; fi; }; _d_raft_ok ); }
+_d_neg1_ok()       { ! _d_neg_no_leader; }
+_d_neg2_ok()       { ! _d_neg_churn "/tmp/95-dneg-churn.$$"; }
+assert_ok "D-neg1 the tightened _d_raft_ok returns FALSE when NO leader is visible (existence half can RED — the predicate is not permanently true)" _d_neg1_ok
+assert_ok "D-neg2 the tightened _d_raft_ok returns FALSE when the leader CHURNS across the two spaced reads (stability half can RED — a mere this-instant leader is rejected, and the OLD 'must be brk1' semantics is gone)" _d_neg2_ok
+
 assert_ok "D0 create a session to doom" "$SIM" ctl -- session create doomed --pin 969696
 assert_ok "D0b switch the ctl back to $SID (R-CTX: session create ACTIVATES the new session, and a ctl left on a session we are about to destroy fails every later call with an Authorization Violation)" \
     dexec -u sim ctl1 -- env HOME=/home/sim tether login -s "$SID" --pin "$PIN" --nats-url "$NURL"
@@ -226,18 +253,34 @@ assert_ok "D1 stop ONLY brk2's nats-server (kills the JS meta quorum; brk2's tet
 # The DELETING recipe needs raft to stay healthy while ONLY JS meta is down. If stopping brk2's nats
 # instead cost raft its leader (N=2 is fragile), the recipe's premise does not hold on the real stack —
 # record 95-D as NOT-COVERED rather than asserting a precondition we could not establish.
-if ! poll_until 30 3 "raft stays healthy (brk1 leads) with only JS down" -- _d_raft_ok \
+if ! poll_until 30 3 "raft stays healthy (a STABLE leader — any voter, not pinned to brk1) with only JS down" -- _d_raft_ok \
    || ! poll_until 30 3 "core NATS still serves" -- _d_core_ok; then
     dexec brk2 -- systemctl start nats-server >/dev/null 2>&1 || true
     not_covered "95-D DELETING boot resume: could not decouple raft from JS at N=2" \
-        "stopping brk2's nats-server to kill only the JS meta quorum also disturbed raft (N=2 raft + JS share fate here), so the middle DELETING state cannot be established on the real stack. cluster mode forbids the hermetic recipe of writing sessions rows outside raft (broker.go:1130-1136). hermetic owner: test/p7/audit_e2e_test.go:323"
+        "stopping brk2's nats-server to kill only the JS meta quorum also disturbed raft (N=2 raft + JS share fate here) — raft has no STABLE leader (checked without pinning brk1, the R6-corrected predicate), so the middle DELETING state cannot be established on the real stack. cluster mode forbids the hermetic recipe of writing sessions rows outside raft (broker.go:1130-1136). hermetic owner: test/p7/audit_e2e_test.go:323" gap
     drill_end; exit "$?"
 fi
-_D_RM=$("$SIM" ctl -- session rm doomed --yes 2>&1); _D_RM_RC=$?
+# R13: `session rm` takes NO --yes flag (only --ack-alerts; session.go:210) — the old `--yes` failed with
+# `unknown flag: --yes` (rc=70) so the tombstone never even started and the row stayed ACTIVE, which the
+# tightened _d_raft_ok above finally let us SEE (the old brk1-pin aborted the arm before D3 ever ran). We
+# do NOT assert rc=0 here: with JS meta down the finalize legitimately errors while the raft tombstone
+# still commits, so it is _d_state_is_deleting (a direct SQLite read) that decides the path, not this rc.
+_D_RM=$("$SIM" ctl -- session rm doomed 2>&1); _D_RM_RC=$?
 log "D3 session rm doomed: rc=$_D_RM_RC out=$(printf '%s' "$_D_RM" | tail -1)"
 if _d_state_is_deleting; then
     _as_pass "D3 the session is parked in DELETING (the tombstone committed through raft; the JS-side finalize could not complete) — the middle state is PROVEN, so the resume oracle below cannot be vacuous"
     assert_ok "D4 restore brk2's nats-server so JS can form again" dexec brk2 -- systemctl start nats-server
+    # R13: the boot resumer (reconcileHistoryStreamsOnBoot, broker.go:1023-1038) is a ONE-SHOT gated on a
+    # 1-second js.AccountInfo probe at boot with NO periodic retry — if JS meta has not re-formed within
+    # that 1s window when brk1 restarts, the DELETING resume is SILENTLY SKIPPED and the row stays until the
+    # NEXT restart. So let JS meta actually re-form after D4 BEFORE restarting brk1 in D5 (the resumer's own
+    # documented precondition: "Called once from Run after JS is confirmed available"), or D6b would be
+    # testing our restart timing racing JS re-election, not the resumer. A JS-backed history read proves JS
+    # meta is back (its AccountInfo boot probe is lighter, so a working stream read implies the probe passes).
+    # NOT papering over: this establishes the resumer's contractual precondition; the resilience nuance
+    # (one-shot, 1s probe, no retry) is reported separately as a bounded observation, not masked.
+    assert_ok "D4b JS meta re-formed after restoring brk2's nats (a JS-backed history read works again) — the boot resumer's documented precondition (broker.go:1023-1038); without it D5's 1s boot probe races JS re-election and the resume is silently skipped" \
+        poll_until 90 3 "JS-backed history read works again after brk2 nats restore" -- _t2_history_ok
     assert_ok "D5 restart brk1's broker — the boot resumer must finish the interrupted delete (audit.go:161 / sessions.go:161,180)" \
         dexec brk1 -- sh -c 'systemctl reset-failed tether-broker 2>/dev/null; systemctl restart tether-broker'
     assert_ok "D6a the broker is live again" poll_until 120 3 "brk1 live after the resume restart" -- _broker_live
@@ -249,7 +292,7 @@ if _d_state_is_deleting; then
 else
     dexec brk2 -- systemctl start nats-server >/dev/null 2>&1 || true
     not_covered "95-D DELETING boot resume: could not park a session in DELETING on the real stack (session rm rc=$_D_RM_RC; the JS-meta-down window did not leave the row in DELETING)" \
-        "raft and JS quorum did not decouple as modelled at N=2; cluster mode forbids the hermetic recipe of writing sessions rows outside raft (broker.go:1130-1136's fork mechanism). hermetic owner: test/p7/audit_e2e_test.go:323"
+        "raft and JS quorum did not decouple as modelled at N=2; cluster mode forbids the hermetic recipe of writing sessions rows outside raft (broker.go:1130-1136's fork mechanism). hermetic owner: test/p7/audit_e2e_test.go:323" gap
 fi
 
 drill_end

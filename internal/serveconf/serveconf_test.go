@@ -53,6 +53,40 @@ broker:
 	}
 }
 
+// TestXferReapIntervalDuration (#58/P10) pins the new home-authoritative orphan-reap cadence knob:
+// a valid sub-minute value parses (the whole point — a drill / operator can shorten it below the
+// proc-GC 1m floor to OBSERVE the reap), empty means "broker default", and a sub-second value is
+// rejected at Load so a bad config fails the launch instead of churning the JS API.
+func TestXferReapIntervalDuration(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+broker:
+  cluster:
+    xfer_reap_interval: 8s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := cfg.XferReapIntervalDuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 8*time.Second {
+		t.Errorf("xfer_reap_interval: want 8s got %v", d)
+	}
+
+	empty, err := Load(writeConfig(t, `broker: {}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := empty.XferReapIntervalDuration(); got != 0 {
+		t.Errorf("empty xfer_reap_interval should be zero (broker default), got %v", got)
+	}
+
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_reap_interval: 200ms\n")); err == nil {
+		t.Error("Load: sub-second xfer_reap_interval silently accepted (should reject at launch)")
+	}
+}
+
 func TestProcRetentionDuration_EmptyMeansZero(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `broker: {}`))
 	if err != nil {
@@ -124,5 +158,58 @@ broker:
     proc_gc_interval: 30s
 `)); err == nil {
 		t.Errorf("Load: sub-minute proc_gc_interval silently accepted")
+	}
+}
+
+// --- #39 disk_check_interval knob ---
+
+func TestDiskCheckIntervalDuration_Parses(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+broker:
+  observability:
+    disk_check_interval: 2m
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := cfg.DiskCheckIntervalDuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 2*time.Minute {
+		t.Errorf("disk_check_interval: want 2m got %v", d)
+	}
+}
+
+func TestDiskCheckIntervalDuration_EmptyMeansZero(t *testing.T) {
+	// Empty ⇒ 0 so serve.go/broker fall back to the built-in 5m default (default preserved).
+	cfg := &Config{}
+	d, err := cfg.DiskCheckIntervalDuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 0 {
+		t.Errorf("empty disk_check_interval should be zero (broker picks 5m default), got %v", d)
+	}
+}
+
+func TestDiskCheckIntervalDuration_RejectsSubSecondAndInvalid(t *testing.T) {
+	// Sub-second: a negative/zero would panic time.NewTicker; a sub-second poll is statfs churn.
+	if _, err := (&Config{Broker: BrokerSection{Obs: ObsSection{DiskCheckInterval: "500ms"}}}).DiskCheckIntervalDuration(); err == nil {
+		t.Errorf("accessor: sub-second disk_check_interval silently accepted")
+	}
+	if _, err := (&Config{Broker: BrokerSection{Obs: ObsSection{DiskCheckInterval: "-5m"}}}).DiskCheckIntervalDuration(); err == nil {
+		t.Errorf("accessor: negative disk_check_interval silently accepted")
+	}
+	if _, err := (&Config{Broker: BrokerSection{Obs: ObsSection{DiskCheckInterval: "nonsense"}}}).DiskCheckIntervalDuration(); err == nil {
+		t.Errorf("accessor: unparseable disk_check_interval silently accepted")
+	}
+	// Load() must run the validator so a bad value aborts startup BEFORE storage.Open.
+	if _, err := Load(writeConfig(t, `
+broker:
+  observability:
+    disk_check_interval: 500ms
+`)); err == nil {
+		t.Errorf("Load: sub-second disk_check_interval silently accepted")
 	}
 }

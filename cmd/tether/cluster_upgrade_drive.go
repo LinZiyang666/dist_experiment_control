@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusterupgrade"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
@@ -29,6 +30,16 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	// completion — a HALT/cancel deliberately LEAVES it held so membership stays blocked while the cluster
 	// sits in a partial-roll state; a re-run (forward OR rollback) re-acquires (UPSERT) and eventually
 	// releases, so the lock self-heals via the documented "fix and re-run" recovery.
+	//
+	// R7b: the lock is now LEASED. The paragraph above described a lock that a HALT left held forever —
+	// "fix and re-run" is only a self-heal while `plan.Upgrades() > 0`, and back then an agentless host had
+	// AtTarget structurally false, so the `plan.Upgrades() == 0` self-heal branch was UNREACHABLE there.
+	// (P3 has since fixed the root cause: an agentless host now reaches AtTarget on the broker alone, so
+	// that branch is reachable again. The lease remains the general answer — it covers every HALT, not just
+	// this one.) A HALT used to fence join/retire permanently. The lease closes that: this process keeps
+	// renewing for as long as it is driving, and when it stops (HALT, kill -9, snapped SSH) the reaper
+	// on the leader releases the lock
+	// within one reap interval after LockLeaseTTL. `tether cluster unlock` is the impatient operator's out.
 	{
 		leader, lerr := currentLeader(ctx, nc, actor)
 		if lerr != nil {
@@ -42,6 +53,12 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 			return haltUpgrade(webhook, leader, fmt.Errorf("acquire upgrade lock refused: %s %s", lresp.Code, lresp.Error))
 		}
 	}
+	// Renew for the whole roll. defer Stop() covers EVERY exit below — each `return haltUpgrade(...)` is a
+	// path on which the operator walks away and the lock must decay on its own.
+	keeper := startLockKeeper(ctx, "upgrade", upgradeLeaseRenewInterval,
+		func(rctx context.Context) (bool, error) { return renewUpgradeLease(rctx, nc, actor, seed) }, out)
+	defer keeper.Stop()
+
 	canaryChecked := false
 	for _, s := range plan.Steps {
 		if s.Kind != clusterupgrade.StepUpgrade {
@@ -80,7 +97,14 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 		// Stage-C B1: a WHOLE-HOST upgrade needs the co-located AGENT re-exec'd too (the broker daemon is
 		// only half the host). Do this even when the broker was AlreadyAtVersion (its agent may be stale);
 		// skip only when the agent is ALREADY at target (idempotent — re-run does not re-restart agents).
-		if av, ok := agentVersionOf(ctx, nc, actor, sid, s.NodeID); ok && av == toVersion {
+		//
+		// P3: unless this host HAS no agent. The decision is the PLAN's (Step.BrokerOnly), not re-derived
+		// here, so the executor can never disagree with what the operator was shown. Re-deriving it live
+		// would also let a mid-roll registration flap silently flip a host between whole-host and
+		// broker-only halfway through its own step.
+		if s.BrokerOnly {
+			_, _ = fmt.Fprintf(out, "  (no co-located agent on %s — broker-only host, nothing else to re-exec)\n", s.NodeID)
+		} else if av, ok := agentVersionOf(ctx, nc, actor, sid, s.NodeID); ok && av == toVersion {
 			_, _ = fmt.Fprintf(out, "  (agent already at %s)\n", toVersion)
 		} else {
 			_, _ = fmt.Fprintf(out, "→ re-exec %s's co-located agent into %s\n", s.NodeID, toVersion)
@@ -95,7 +119,11 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 				return haltUpgrade(webhook, s.NodeID, err)
 			}
 		}
-		_, _ = fmt.Fprintf(out, "  ✓ %s (broker+agent) at %s\n", s.NodeID, toVersion)
+		scope := "broker+agent"
+		if s.BrokerOnly {
+			scope = "broker-only host"
+		}
+		_, _ = fmt.Fprintf(out, "  ✓ %s (%s) at %s\n", s.NodeID, scope, toVersion)
 		notifyUpgrade(webhook, "host_done", map[string]any{"node": s.NodeID, "version": toVersion})
 		if !canaryChecked {
 			canaryChecked = true
@@ -104,11 +132,70 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 			}
 		}
 	}
+	// R8a P1 — the upgrade verb's rc-semantics gate. Every host now reports the target
+	// version, which is a CONTROL-plane fact. A rolling upgrade restarts brokers
+	// underneath live reverse tunnels, so it can finish with an expose whose agent never
+	// re-confirmed its home — the data plane down while the roll prints success. Ask the
+	// LEADER for the agent-confirmed verdict before declaring completion, holding the roll
+	// lock throughout (the keeper is still renewing), and refuse rc=0 if it does not come.
+	//
+	// This mirrors the keeper.Lost() precedent immediately below: "every host reached the
+	// target" has never been sufficient for rc=0 in this function.
+	if err := waitHomesConverged(ctx, nc, actor, seed, out); err != nil {
+		keeper.Stop()
+		releaseUpgradeLock(ctx, nc, actor, seed, out)
+		notifyUpgrade(webhook, "halt", map[string]any{"to_version": toVersion, "error": err.Error()})
+		return err
+	}
+	// R7b: stop renewing BEFORE releasing. Not for safety (a renewal cannot re-create a released lock — its
+	// statements are gated on the marker existing), but so the release is never racing a renewal that would
+	// otherwise land microseconds after it and make the log confusing to read.
+	keeper.Stop()
 	// External-review B2: clean completion → release the cluster-scoped roll lock so membership resumes.
 	releaseUpgradeLock(ctx, nc, actor, seed, out)
+	// R7b: a roll that lost its lock partway through was NOT serialized against other membership changes,
+	// even though every host reached the target. That is not an rc=0 outcome.
+	if keeper.Lost() {
+		notifyUpgrade(webhook, "halt", map[string]any{"to_version": toVersion, "error": "upgrade lock lost mid-roll"})
+		return keeper.LostErr("cluster upgrade rolled every host but LOST its roll lock partway through")
+	}
 	_, _ = fmt.Fprintln(out, "rolling upgrade complete.")
 	notifyUpgrade(webhook, "complete", map[string]any{"to_version": toVersion})
 	return nil
+}
+
+// upgradeLeaseRenewInterval / growLeaseRenewInterval are vars, not consts, ONLY so hermetic tests can
+// compress the 5-minute production cadence into microseconds. Production never reassigns them; both are
+// cluster.LockLeaseRenewInterval, whose derivation lives in internal/cluster/lock_lease.go.
+var (
+	upgradeLeaseRenewInterval = cluster.LockLeaseRenewInterval
+	growLeaseRenewInterval    = cluster.LockLeaseRenewInterval
+)
+
+// renewUpgradeLease pushes the roll lock's lease forward by one TTL.
+//
+// The leader is re-resolved on EVERY call, deliberately: `cluster upgrade` moves leadership off each host
+// it rolls, so a leader cached at acquire time is wrong for most of the roll, and every renewal after the
+// first transfer would fail — letting the lease expire under a live roll, which is the corruption this
+// whole mechanism exists to avoid.
+func renewUpgradeLease(ctx context.Context, nc *nats.Conn, actor string, seed []byte) (bool, error) {
+	leader, err := currentLeader(ctx, nc, actor)
+	if err != nil {
+		return true, fmt.Errorf("resolve leader: %w", err) // transient: still ours as far as we know
+	}
+	resp, err := sendUpgradeTrigger(ctx, nc, actor, seed, &proto.ClusterUpgradeReq{Op: "renew-lock", TargetNode: leader})
+	switch {
+	case err != nil:
+		return true, err
+	case resp == nil:
+		return true, fmt.Errorf("no reply from leader %s", leader)
+	case resp.OK:
+		return true, nil
+	case resp.Code == clusterLockNotHeldCode:
+		return false, nil // TERMINAL
+	default:
+		return true, fmt.Errorf("%s %s", resp.Code, resp.Error)
+	}
 }
 
 // releaseUpgradeLock best-effort clears the B2 cluster-scoped roll lock via the current leader. Failure is
@@ -264,6 +351,58 @@ func canaryCommandVerCheck(ctx context.Context, nc *nats.Conn, actor, canary str
 }
 
 // pollUntil re-checks pred every upgradeConvergePoll until it holds or the deadline passes.
+// upgradeHomesConvergedOp mirrors internal/broker's upgradeOpHomesConverged. ClusterUpgradeReq.Op
+// is a free-form string, so the two literals have no compile-time link — renaming one side would
+// make this gate silently answer "unknown op" forever, i.e. turn the assertion off without any
+// build/test/lint failure. TestUpgradeHomesConvergedOpIsWireStable pins the pair.
+const upgradeHomesConvergedOp = "homes-converged"
+
+// homesConvergeTimeout bounds the roll-tail data-plane wait. The broker re-delivers home
+// directives on its own reconcile cadence, so this is "how long the operator's command is willing
+// to stand and watch", not a correctness bound: on timeout the roll exits NONZERO and re-running
+// (or `cluster status --homes`) picks the convergence back up.
+const homesConvergeTimeout = 2 * time.Minute
+
+// waitHomesConverged asks the CURRENT leader whether every homed expose's agent has re-confirmed
+// its home, retrying while the answer is "not converged" or "not leader" (a leadership change
+// mid-roll is routine — the roll transfers leadership on purpose).
+func waitHomesConverged(ctx context.Context, nc *nats.Conn, actor string, seed []byte, out io.Writer) error {
+	_, _ = fmt.Fprintln(out, "→ verifying the data plane re-converged onto its homes")
+	deadline := time.Now().Add(homesConvergeTimeout)
+	var last string
+	for {
+		leader, lerr := currentLeader(ctx, nc, actor)
+		if lerr == nil && leader != "" {
+			resp, err := sendUpgradeTriggerOnce(ctx, nc, actor, seed, &proto.ClusterUpgradeReq{
+				Op: upgradeHomesConvergedOp, TargetNode: leader,
+			})
+			switch {
+			case err != nil:
+				last = err.Error()
+			case resp.OK:
+				_, _ = fmt.Fprintln(out, "  ✓ every homed expose confirmed by its agent")
+				return nil
+			default:
+				last = resp.Code + ": " + resp.Error
+			}
+		} else if lerr != nil {
+			last = lerr.Error()
+		}
+		if time.Now().After(deadline) {
+			// EX_TEMPFAIL, not EX_SOFTWARE: the brokers keep re-delivering, so "run it
+			// again" is the correct operator response — but it is emphatically not rc=0.
+			return &ExitError{Class: exitTransient, Err: fmt.Errorf(
+				"cluster upgrade: every host reached the target version but the DATA PLANE has not re-converged onto its homes within %s (%s)"+
+					" — the roll is NOT complete; re-run, or inspect `tether cluster status --homes`", homesConvergeTimeout, last)}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(upgradeConvergePoll):
+		}
+	}
+}
+
 func pollUntil(ctx context.Context, timeout time.Duration, pred func() bool, timeoutMsg string) error {
 	deadline := time.Now().Add(timeout)
 	for {

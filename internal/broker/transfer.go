@@ -64,7 +64,7 @@ const transferMaxBytes = 2 * 1024 * 1024 * 1024
 const (
 	xferEventsHistoryReserve = 2 * 1024 * 1024 * 1024 // events(1 GiB)+history(1 GiB) — the other JS reservations
 	xferBucketFloor          = 256 * 1024 * 1024      // smallest useful per-session tier-B ceiling
-	xferBucketCap            = 8 * 1024 * 1024 * 1024  // legacy ceiling (large-disk brokers unchanged)
+	xferBucketCap            = 8 * 1024 * 1024 * 1024 // legacy ceiling (large-disk brokers unchanged)
 )
 
 // transferTrackerMaxEntries caps the in-memory tracker map so a fast
@@ -600,6 +600,22 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		TransferID: req.TransferID, Path: req.Path,
 		Size: req.Size, SHA256: req.SHA256, Tier: req.Tier, Bucket: req.Bucket,
 	})
+
+	// R7a ORDERING GUARD (do not remove — it is load-bearing for the PERIODIC orphan reaper).
+	// The reaper (#58) used to run once at boot; it now runs on every reconcile sweep, so "delete objects
+	// this broker has no tracker entry for" changed from a one-shot cleanup into a loop. What keeps that
+	// loop from eating a live upload is an ORDERING FACT: the tracker entry is put() above, BEFORE the
+	// prepare reaches the agent, and the agent is the only writer of objects — so no object can exist
+	// during the unprotected window. That fact was a convention enforced by nothing. Moving this forward
+	// above the put(), or adding a path that writes an object before registering, would silently turn the
+	// reaper into a data-loss loop. So the convention is now a PRECONDITION: refuse to forward a prepare
+	// the tracker does not already know about, rather than trust that nobody reorders these lines.
+	if b.transfers.get(entry.transferID) == nil {
+		b.replyPushErr(msg, "internal_error",
+			"transfer prepare would be forwarded to the agent before its tracker entry exists — "+
+				"the periodic orphan reaper could delete the upload mid-flight (R7a ordering guard)")
+		return
+	}
 
 	// Forward to agent, preserving ctl's reply inbox so the agent's
 	// PushPrepareResp goes straight back to ctl (broker stays out of

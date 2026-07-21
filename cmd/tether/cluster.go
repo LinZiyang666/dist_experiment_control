@@ -63,6 +63,7 @@ STOPPED and operate directly on disk (see the runbook in docs/).`,
 	addGrouped(newClusterRebalanceCmd(&socketPath), "online") // C-rebalance: rebalance proxy (spread __proxy__ homes)
 	addGrouped(newClusterUpgradeCmd(), "online")              // G5 #13/#14: rolling broker-daemon upgrade
 	addGrouped(newClusterAddCmd(&socketPath), "online")       // G4 §B: grow orchestration (joiner-local + leader-over-NATS)
+	addGrouped(newClusterUnlockCmd(), "online")               // R7b: clear a stale roll/grow lock without waiting out its lease TTL
 	addGrouped(newClusterPinCmd(), "client")                  // cli-failover: pin a cluster from an OOB discovery invite
 	addGrouped(newClusterInviteCmd(), "client")               // cli-failover: mint an OOB discovery invite
 	addGrouped(newClusterInitCmd(), "migrate")
@@ -117,11 +118,20 @@ func hiddenDebugCmd(c *cobra.Command) *cobra.Command {
 func newClusterStatusCmd(socketPath *string) *cobra.Command {
 	var asJSON, offline, remote, homes bool
 	var dbPath, natsURL, home string
-	var watch time.Duration
+	var watch, settle time.Duration
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show cluster health (exit 0=HEALTHY-HA 1=DEGRADED 2=read-only/quorum-lost 3=force-single)",
+		Long: "Show cluster health with the §17 exit-code contract (0=HEALTHY-HA, 1=DEGRADED, 2=read-only/\n" +
+			"quorum-lost, 3=force-single). The exit code is INSTANTANEOUS: a voter restart legitimately\n" +
+			"produces a brief DEGRADED (exit 1) window of a few seconds while that voter is unreachable /\n" +
+			"catching up, so a monitor polling continuously will see 0→1→0. That transient is REAL (reduced\n" +
+			"redundancy), not a bug — see docs/cluster-runbook.md 'cluster status exit-code semantics'. Use\n" +
+			"--settle to debounce a benign restart: it waits up to the given duration for a DEGRADED verdict\n" +
+			"to clear before trusting it (a genuinely quorum-lost/force-single cluster still exits at once;\n" +
+			"a sustained DEGRADED still exits 1 after the window).",
 		Example: "  tether cluster status                 # operator table (on a broker host)\n" +
+			"  tether cluster status --settle 30s    # debounce a benign voter-restart transient (cron/monitor)\n" +
 			"  tether cluster status --watch 5s      # repaint every 5s (Ctrl-C to exit)\n" +
 			"  tether cluster status --remote        # user summary over NATS (from a laptop, no socket)\n" +
 			"  tether cluster status --offline --db /var/lib/tether/tether.db   # disk roster (daemon stopped)",
@@ -148,6 +158,20 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 			if watch > 0 {
 				return watchClusterStatus(cmd, *socketPath, asJSON, watch)
 			}
+			// D3: --settle debounces a benign voter-restart DEGRADED transient (opt-in; default off ⇒
+			// the instantaneous verdict below). It renders the SETTLED report and exits with its code.
+			if settle > 0 {
+				rep, perr := settleClusterStatus(cmd, *socketPath, settle, 0)
+				if perr != nil {
+					return perr
+				}
+				renderClusterStatusReport(cmd, rep, asJSON)
+				os.Exit(rep.ExitCode) // §17 exit-code contract for cron/monitoring
+				return nil
+			}
+			if settle < 0 {
+				return usageErr("--settle must be non-negative")
+			}
 			rep, perr := fetchClusterStatusReport(*socketPath)
 			if perr != nil {
 				return perr
@@ -162,6 +186,7 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&offline, "offline", false, "broker-local offline view (reads the on-disk roster; pass --db)")
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "tether.db path (for --offline)")
 	cmd.Flags().DurationVar(&watch, "watch", 0, "repaint the status every interval (≥2s; Ctrl-C to exit); 0 = one-shot (B5 OPS#5)")
+	cmd.Flags().DurationVar(&settle, "settle", 0, "D3: debounce a benign voter-restart DEGRADED transient — wait up to this long for a DEGRADED(exit 1) verdict to clear before trusting it (0 = off, report the instantaneous verdict; quorum-lost/force-single still exit immediately)")
 	// B1: ctl-over-NATS user view — no broker host / admin socket needed. Returns a user
 	// summary (reachability + leader pointer), NOT the operator table or escape hatches.
 	cmd.Flags().BoolVar(&remote, "remote", false, "query cluster health over NATS as a ctl (no broker admin socket; returns a user summary; exit 0/2/3 only, never 1/DEGRADED)")
@@ -174,11 +199,19 @@ func newClusterStatusCmd(socketPath *string) *cobra.Command {
 	// remote laptop watch-looping the member broadcast amplifies ACL traffic for little value.
 	cmd.MarkFlagsMutuallyExclusive("offline", "watch")
 	cmd.MarkFlagsMutuallyExclusive("remote", "watch")
+	// --settle is a debounced ONE-SHOT socket probe: it makes no sense with the disk snapshot
+	// (--offline), the interactive repaint (--watch), the descriptive homes view (no exit contract),
+	// or the ctl-over-NATS user view (which never returns DEGRADED/exit 1, so there is nothing to
+	// debounce).
+	cmd.MarkFlagsMutuallyExclusive("offline", "settle")
+	cmd.MarkFlagsMutuallyExclusive("watch", "settle")
+	cmd.MarkFlagsMutuallyExclusive("remote", "settle")
 	cmd.Flags().BoolVar(&homes, "homes", false, "C6: aggregate every expose + proxy home/epoch/ready_reason (one descriptive view; no exit-code contract)")
 	cmd.MarkFlagsMutuallyExclusive("homes", "offline")
 	// G7b #16: --homes + --remote is now ALLOWED (the over-NATS home-count aggregate). The other
 	// homes combinations stay mutually exclusive (offline = disk snapshot, watch = socket repaint).
 	cmd.MarkFlagsMutuallyExclusive("homes", "watch")
+	cmd.MarkFlagsMutuallyExclusive("homes", "settle") // homes is a descriptive view with no exit-code to debounce
 	// doctor is an alias for status (the diagnostic framing).
 	return cmd
 }
@@ -861,7 +894,7 @@ func newClusterInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&check, "check", false, "dry-run: run the read-only doctor preflight and exit WITHOUT mutating")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "alias of --check")
 	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "unattended confirm (#5): must equal --self-id AND match $"+machineConfirmEnv+" (no TTY; for `cluster add`)")
-	cmd.Flags().StringVar(&configPath, "config", "/etc/tether/broker.yaml", "broker.yaml to auto-apply the cluster seam into (#5; empty = only print it)")
+	cmd.Flags().StringVar(&configPath, "config", defaultBrokerConfigPath, "broker.yaml to auto-apply the cluster seam into (#5; empty = only print it)")
 	registerYesRejector(cmd)
 	return cmd
 }

@@ -163,3 +163,33 @@ func TestRunFailureMessageMapsKnownReasons(t *testing.T) {
 type errStub string
 
 func (e errStub) Error() string { return string(e) }
+
+// TestDataplaneNotConvergedCodeIsWireStable is the pin both sides' comments promise
+// and that neither side actually had.
+//
+// `dataplane_not_converged` is authored in internal/broker (codeDataplaneNotConverged)
+// and re-declared here (dataplaneNotConvergedCode). The two packages have no
+// compile-time link — cmd/tether must not import internal/broker — so a rename on
+// either side compiles, tests, and lints perfectly clean while silently reclassifying
+// the code from exit 75 (EX_TEMPFAIL, retry-later) to the default exit 70 (internal
+// error). That downgrade would strip the meaning from R8a's headline fix: `cluster
+// drain` refusing rc=0 on an unconverged data plane.
+//
+// The literal is asserted directly rather than compared to the broker constant,
+// because importing it is exactly the dependency that does not exist.
+func TestDataplaneNotConvergedCodeIsWireStable(t *testing.T) {
+	const wire = "dataplane_not_converged"
+	if dataplaneNotConvergedCode != wire {
+		t.Fatalf("dataplaneNotConvergedCode = %q, want %q — internal/broker emits the latter "+
+			"(codeDataplaneNotConverged); a mismatch silently reclassifies an unconverged drain "+
+			"from exit 75 to exit 70", dataplaneNotConvergedCode, wire)
+	}
+	if got := brokerCodeExitClass(wire); got != exitTransient {
+		t.Fatalf("brokerCodeExitClass(%q) = %d, want %d (EX_TEMPFAIL). Above all it must not be 0: "+
+			"a drain that committed the control-plane write but whose data plane never followed "+
+			"MUST NOT report success.", wire, got, exitTransient)
+	}
+	if exitTransient == 0 {
+		t.Fatal("exitTransient must be nonzero")
+	}
+}

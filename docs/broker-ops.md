@@ -120,6 +120,10 @@ broker:
   storage:
     db: /var/lib/tether/tether.db      # SQLite 文件
     js_store: /var/lib/tether/jetstream # JetStream store dir
+  observability:                       # 可选；缺省 = info/text/无 metrics/无 webhook
+    # metrics_listen: 127.0.0.1:9090   # Prometheus /metrics + /healthz + /readyz（空 = 关）
+    # alert_webhook_url: https://...   # 每次 committed 告警 raise/clear POST（仅集群，空 = 关）
+    # disk_check_interval: 5m          # 磁盘监控采样间隔（#39；默认 5m；flag --disk-check-interval 优先）
   upgrade:
     url_allow:                         # `tether node upgrade` 白名单（可选）
       - https://github.com/LinZiyang666/dist_experiment_control/releases/
@@ -403,7 +407,9 @@ sudo tether admin --socket /var/run/tether/admin.sock nodes
 tether admin sessions                       # 全部 session
 tether admin nodes                          # 全部节点（含心跳年龄、proto、release）
 tether admin audit <sid> [-n 50]            # 审计尾部 N 条
+tether admin events [-n 50] [--since 1h] [--kind proxy_keyset_changed] [--json]  # sys.events 运维事件流
 tether admin evict <sid> <nid>              # 强制踢
+tether admin runtime [--json]               # 本进程 runtime 自省（goroutines/threads/fds/rss/uptime + reconciler last-tick）
 ```
 
 各子命令含义：
@@ -413,7 +419,25 @@ tether admin evict <sid> <nid>              # 强制踢
 | `admin sessions` | 列出 broker SQLite 里**全部** session（不区分 owner / member），含 ACTIVE / DELETING 状态、owner 指纹、创建时间。 | 排查"用户说看不见 session"、确认 tombstone 是否完成、容量盘点。 |
 | `admin nodes` | 列出**全部**已注册 agent，含 sid、nid、当前状态（ONLINE/OFFLINE/STALE）、心跳年龄、proto 版本、release 版本。 | 排查 OFFLINE 节点、版本审计、找到要 evict 的目标。 |
 | `admin audit <sid>` | 直接从 JetStream `history-<sid>` stream 读最近 N 条审计 entry（不走 ctl 的 NATS path）。 | NATS 鉴权坏了 / owner 失联但需要查历史 / 合规导出。 |
+| `admin events` | 读 broker 的 H.1 `events` 流（**运维契约事件流** sys.events）：`session_created`/`session_destroyed`、`member_joined`、`agent_registered`/`agent_evicted`、`agent_roster_stale`、`disk_pressure`、`tetherd_restarted`，以及拓扑/迁移类 `proxy_*`（含 `proxy_keyset_changed`）/`nats_topology_*`/`home_reassign_*`/`grow_cutover_*`。**member 能 subscribe sys.events，但 operator（broker 主机 root、无 NATS 成员凭据）此前没有任何读命令**——这个动词就是那个 reader，走同一 root-only 0600 admin socket。读的是**持久化流**（保留 30d/1GiB），故 `--since` 能翻历史、`--kind` 能只看某类。载荷**永不含 secret**（生产者手搭 allow-list 标量 map）。 | "集群刚发了哪些拓扑/告警/迁移事件"、排查 rehome/proxy 变更、disk_pressure 复盘、离线取证。 |
 | `admin evict <sid> <nid>` | 强制把指定 (sid, nid) 从 broker 移除：删 `agent_provisioning` 行 + `nodes` 行 + 广播 `sys.events{type:agent_evicted}`。 | agent 失控 / 机器换主 / nkey 泄漏要立即吊销。 |
+| `admin runtime` | 读**活着的 broker 进程自身**的 runtime：`goroutines`（`runtime.NumGoroutine()` 进程内真值）、`threads`（OS 线程/M 数）、`open_fds`、`rss`、`uptime`，以及每个周期 reconciler 的 `last_tick`。**只读本进程 + R7 注册表**，不碰 DB / raft / leadership，单机与集群、leader 与 follower 都能答。 | 诊断**活 broker 上的 goroutine / fd 泄漏**（隔一段时间连采两次、看计数是否单调爬升）；诊断**卡死的 reconciler**（某 pass 的 `last_tick` 不再前进）。现网车队出过泄漏/崩溃事故、而此前生产二进制**零自省面**——这个动词就是补它。 |
+
+> **为什么用 `goroutines` 不用 `/proc/<pid>/status` 的 `Threads`**：`Threads` 是 OS 线程数（M），10k 个泄漏的 goroutine 若都 park 住，**线程数纹丝不动**——拿 `Threads` 当 goroutine 代理会在进程漏 goroutine 时报一个平坦的假计数。两者从各自来源分别上报，正是为了让运维看到它们背离。
+>
+> **为什么不引入 pprof**：`admin runtime` 返回计数即足以定位泄漏（连采看爬升），且已被 root-only 的 0600 admin socket 网住。常驻 `net/http/pprof` 端点会额外引入攻击面（heap / goroutine-stack dump + CPU-profile DoS，暴露远超计数）与体积；深度栈级取证是**罕见、刻意、离线**的动作，不该做成常驻 HTTP 面。故：走 admin socket 返回计数，不上 pprof。
+>
+> **`--json`**：稳定 schema（`schema:"admin_runtime"` + `schema_version:1`）供监控采集。成功时**只有** JSON 落 stdout，失败只落 stderr + 非零退出——`admin runtime --json 2>&1 | jq` 不会被散文污染。
+
+> **`admin events` 为什么走 admin socket 而不是 NATS sub**：sys.events 的读者有两类——**member** 用 NATS 订阅（数据面成员信任层）、**operator** 用 admin socket（root-only 0600，与 `admin runtime`/`alert raise` 同层）。operator 在 broker 主机上通常没有 NATS 成员凭据，admin socket 才是它的信任面；且 `events` 是**持久化流**，admin socket 读它能给出**历史**（`--since` 翻过去、`--kind` 过滤），裸 NATS sub 只能拿到**订阅之后**的 live 事件。
+>
+> **为什么没有 `--follow`**：admin socket 刻意是"一次请求一次响应"的非流式协议（见 `internal/adminsock`），而 operator 的需求是**时点读**"集群刚发了哪些事件"。要 live tail 就 poll：
+> ```bash
+> while :; do sudo -u tether tether admin events --since 5s --json | jq -c '.events[]'; sleep 5; done
+> ```
+> 真要连续订阅可用一个 member 身份 `nats sub tether.v2.sys.events`（但那是 member 面、非 operator 面）。
+>
+> **`--json`**：稳定 schema（`schema:"admin_events"` + `schema_version:1`）；成功只落 JSON、失败只落 stderr——`admin events --json 2>&1 | jq` 干净。**载荷无 secret**：所有 sys.events 由生产者手搭 allow-list 标量 map（`sid`/`nid`/`type`/`ready`/`capable` 等），从不夹带 PSK/token；reader 原样转发、不新增字段。
 
 子命令参数：
 
@@ -421,8 +445,13 @@ tether admin evict <sid> <nid>              # 强制踢
 |---|---|---|---|
 | `admin audit` | `<sid>` | (必填) | 要读取审计流的 session id |
 | `admin audit` | `--n, -n` | `50` | 读取最近 N 条 |
+| `admin events` | `--n, -n` | `50` | 返回最近 N 条（过滤后）事件 |
+| `admin events` | `--since` | `0`（无时间界） | 只看 now 往前该时长内的事件（如 `1h`/`30m`） |
+| `admin events` | `--kind` | `""`（全部） | 只看该 type 的事件（如 `proxy_keyset_changed`/`disk_pressure`/`nats_topology_reload`） |
+| `admin events` | `--json` | `false` | 输出稳定机器 JSON（默认人类表格） |
 | `admin evict` | `<sid>` | (必填) | 目标 session id |
 | `admin evict` | `<nid>` | (必填) | 要强制踢出的 agent node id |
+| `admin runtime` | `--json` | `false` | 输出稳定机器 JSON（默认人类表格） |
 
 `evict` 行为（架构 P9 / I.2b）：
 1. 删 `agent_provisioning` 行 + `nodes` 行；
@@ -466,6 +495,12 @@ JetStream store 占用超过磁盘 80% 时 broker 会发出 `sys.events{type:dis
    /usr/local/bin/nats stream rm history-<sid>
    ```
 4. 或扩盘 / 调整 `jsstream.MaxBytesPerSession`（重新部署）。
+
+**采样间隔（可配，#39）**：磁盘监控**默认每 5 min** 采样一次 `--store-dir` 占用。
+运维可用 `broker.observability.disk_check_interval`（Go duration，如 `5m`/`30s`/`1h`）
+或等价 flag `--disk-check-interval` 覆盖，优先级 **flag > broker.yaml > 内建默认（5m）**。
+空/`0` = 保持 5m 默认。低于 `1s` 的值在启动时被拒（子秒采样纯属 statfs 空转）。
+调短用于填盘演练或需要更快 `disk_pressure` 反应的场景；调长用于极大盘 / 极慢存储降开销。
 
 ### 7.3 admin socket 权限
 
@@ -519,6 +554,20 @@ append 的标准写法。
 - NATS 连接数：`/usr/local/bin/nats server check connections`；
 - JetStream 磁盘：`df` 阈值 80%；
 - `journalctl -u tether-broker | grep -E '(disk_pressure|store_error|panic)'`。
+
+**进程 runtime 自省（goroutine / fd 泄漏 · 卡死 reconciler）**：`tether admin runtime`
+（详见 §5.20）读活 broker 进程自身的 `goroutines`（`runtime.NumGoroutine()` 真值）、
+`threads`、`open_fds`、`rss`、`uptime` + 每个 reconciler 的 `last_tick`。诊断法：
+- **goroutine / fd 泄漏**：隔几分钟连采两次 `admin runtime --json`，`goroutines` 或
+  `open_fds` **单调爬升**即泄漏迹象（现网车队出过此类事故；用 `NumGoroutine` 真值而非
+  `Threads` 代理——park 住的泄漏 goroutine 不涨线程数）。
+  ```bash
+  sudo -u tether tether admin runtime --json | jq '{goroutines, open_fds, rss_bytes}'
+  ```
+- **卡死 reconciler**：某个 pass 的 `last_tick` 停在过去不再前进 = 该周期对账停摆。
+  ```bash
+  sudo -u tether tether admin runtime --json | jq '.reconcilers[] | {name, last_tick, runs, last_err}'
+  ```
 
 > 网络文件系统（NFS/CIFS/…）挂死时 run/exec 卡住的**使用者侧**自救（`agent.yaml remote_fs`、
 > `tether exec/run --safe`、`remote_fs_*` 错误码）见 [`usage.md`](usage.md) §7.7。

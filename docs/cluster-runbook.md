@@ -208,6 +208,16 @@ you must **type the node_id to confirm** — `--yes` is never accepted. Retire i
 > clear manual:brk-b`. `severe` is banner-only — it does NOT block writes (only
 > `quorum_lost` / `force_single_active` hard-gate destructive ops).
 
+> **Agents on the retired broker fail over on their own (#48).** Retire does not disconnect
+> clients, and a retired broker stops answering while its nats-server keeps the TCP connection
+> alive — so an agent that was connected to it cannot be reached by the surviving cluster to be
+> told to move. The agent detects the sustained silence on its periodic roster refresh and, when
+> its cached roster still names another dialable voter, rebuilds its NATS session onto a surviving
+> voter (avoiding the retired host on the first re-dial). This is automatic and bounded — **do NOT
+> restart the agent, edit `agent.env`, or delete its cache** to "unstick" it; those hide the path
+> that must work on its own. Confirm with `tether ps` (the node returns ONLINE via a surviving
+> broker) rather than reading a single broker's local view.
+
 ### 2.1 Retire is a topology change, NOT a trust revocation (account.nk / CA rotation)
 
 A retired node's roster + raft membership are removed immediately, but its
@@ -244,16 +254,25 @@ trusted$ #   SAN-bearing leaves as a working reference.
 #    channel (scp, never committed; 0600). Update /etc/tether/secrets/{account.nk,cluster-ca.pem}
 #    and the corresponding route-cert.pem/route-key.pem leaf files on each node.
 
-# 4. Re-render nats.conf across the cluster (`tether cluster reconcile nats --all --wait`),
-#    then rolling-restart NATS + the broker so both NATS route auth and broker auth_callout
-#    load the new secrets. Old JWTs signed by the old account key expire within their TTL;
-#    the new CA rejects the retired node's old route cert immediately.
+# 4. Rolling-RESTART NATS + the broker on each node so both NATS route auth and broker
+#    auth_callout load the new secrets. The RESTART is what re-renders nats.conf with the
+#    NEW auth_callout issuer: the per-broker topology reconciler renders from the seed the
+#    process loaded AT STARTUP (internal/broker/topology_reconcile.go), NOT by re-reading
+#    account.nk on the fly — so swapping account.nk on disk is INERT until the broker restarts.
+#    (#54) `reconcile nats --all --wait` does NOT re-render from the new on-disk seed; it now
+#    FAILS-CLOSED (non-zero) if it detects the on-disk account.nk disagrees with the rendered
+#    issuer, so it is a VERIFY step, not the re-render step — run it AFTER the restart to confirm.
+# 5. Confirm convergence: `tether cluster reconcile nats --all --wait` (exits non-zero and
+#    names the skew if any broker's on-disk issuer still disagrees with its rendered nats.conf).
+#    Old JWTs signed by the old account key expire within their TTL; the new CA rejects the
+#    retired node's old route cert immediately.
 ```
 
-After `cluster retire`, immediately run `tether cluster reconcile nats --all --wait`
-so the retired node's NATS route/user grants are removed from generated
-configuration. **Retire is not considered safe against a compromised node until
-this re-render/restart and the key/CA rotation above are done.**
+After `cluster retire`, immediately rolling-restart the survivors and then run
+`tether cluster reconcile nats --all --wait` so the retired node's NATS route/user
+grants are removed from generated configuration and the new issuer is confirmed
+converged. **Retire is not considered safe against a compromised node until this
+restart/re-render/verify and the key/CA rotation above are done.**
 
 ### 2.2 De-cluster the LONE survivor back to standalone JetStream (v0.4.2 shrink)
 
@@ -300,6 +319,42 @@ recovers IN-PROCESS on the RUNNING survivor broker via its admin socket (no seco
 be drilled with `--dry-run` on a healthy cluster). The OFFLINE disk-surgery path stays the floor for a
 broker that cannot start. After it lands you at N=1 (`force_single_active`), routine cluster ops work
 again (quorum-of-1), though destructive DATA ops stay hard-gated until you regrow to HA (N≥3).
+
+### 2.4 `cluster status` exit-code semantics — the stable contract + the voter-restart transient (D3)
+
+`cluster status` exits with a **§17 health code**, and the code is **instantaneous**: it reflects the
+cluster's state *at the moment you polled*, on purpose.
+
+| exit | health | meaning |
+|---|---|---|
+| **0** | `HEALTHY_HA` | quorum intact, every voter reachable + caught up, streams at target replicas |
+| **1** | `DEGRADED` | writable but redundancy is reduced — a voter is unreachable / catching up / lagging, a stream is below target, a node is mid-join/drain/retire, roster↔raft inconsistent, or this node's disk<10% / ports≥90% |
+| **2** | `QUORUM_LOST` | read-only (this broker sees no leader) — needs force-single after confirming peers dead |
+| **3** | `FORCE_SINGLE` | running single-node with no integrity — recover as peers return |
+
+**The voter-restart transient is REAL, not a bug.** When a voter restarts (a rolling upgrade, a
+`systemctl restart`, a crash-recovery), it is genuinely unreachable and then catching up for a few
+seconds. During that window redundancy IS reduced, so `cluster status` **correctly** flips
+`0 → 1(DEGRADED) → 0` — a monitor polling continuously will see the exit code "jitter" for a few
+seconds. The bound on the window is the observe/convergence time: the leader's health poll re-runs
+every ~5 s and marks a voter reachable again once it answers and its applied-index catches up (below
+the §17 lag threshold). A brief exit-1 after a voter restart is therefore **expected and honest** —
+masking it by default would hide a real (if short) drop in redundancy.
+
+**If you want to debounce a benign restart** (so a cron/monitor does not alert on the blip), use the
+opt-in `--settle`:
+
+```bash
+# Wait up to 30s for a DEGRADED verdict to CLEAR before trusting it. Exit 0 if it clears; exit 1 if
+# the degradation is SUSTAINED past the window (a real problem, not a restart blip). QUORUM_LOST(2)
+# and FORCE_SINGLE(3) still return IMMEDIATELY — those are never benign restart transients.
+tether cluster status --settle 30s
+```
+
+`--settle` is **off by default** (the default one-shot reports the instantaneous verdict, transient
+and all). It only ever waits out a `DEGRADED(1)` window; a permanently NOT-HA cluster (e.g. N=2) still
+exits 1 after the full window, and a real quorum loss / force-single surfaces at once. It is a
+debounce, never a mask.
 
 ## 3. Quorum loss — the force-single escape hatch
 
@@ -532,6 +587,30 @@ tether cluster backup --offline --out /var/backups/tether-$(date +%F) \
 Take backups on a schedule + before any destructive op (drain/retire/remove/force-single). A
 single backup off ANY node is the whole committed state — you do **not** need one per node.
 
+> ⚠ **BUNDLE SCOPE — the bundle is the FSM state DB ONLY. JetStream is NOT in it.**
+> Both backup paths (online and offline) produce exactly the same scope, and both now print this
+> warning on completion. The bundle carries the roster, ports, sessions, alerts and the applied
+> cursor. It does **not** carry per-session history (`history-<sid>`, which is what `tether history`
+> and the incident-export forensic bundle read), the events stream, or in-flight `OBJ_xfer`
+> transfers — those live in the **nats-server JetStream store**, which no tether backup reads.
+> Restoring a bundle brings the control plane back with **EMPTY history/audit**, and restore resets
+> the audit re-derive cursor to 0, so nothing backfills it.
+>
+> To have a recoverable history/audit, back JetStream up **separately, next to every bundle**:
+>
+> ```bash
+> # alongside EVERY `cluster backup`, on the same node:
+> mkdir -p /var/backups/js-$(date +%F)
+> for s in $(nats stream ls -n); do
+>     nats stream backup "$s" "/var/backups/js-$(date +%F)/$s"
+> done
+> ```
+>
+> (This is the same `nats stream backup`/`restore` pair §1 step 3a uses to preserve audit/history
+> across the first grow. tether deliberately does not reimplement it: a bundle that contained
+> JetStream would have to talk to a LIVE nats-server, which `backup --offline` — whose whole premise
+> is a stopped daemon — cannot do, so the offline and online bundles would silently differ in scope.)
+
 ### 5.1 Restore (OFFLINE, IRREVERSIBLE)
 
 Use restore to rebuild a destroyed node, or to roll the whole cluster back to a known-good
@@ -547,14 +626,55 @@ systemctl stop tether-broker
 #    irreversible + identity-affecting). The bundle's identity must match this host's secrets.
 #    Restore is RE-RUNNABLE after a kill-9: it marks restore_in_progress and the daemon REFUSES to
 #    start until restore completes — do NOT start the daemon mid-restore; just re-run the line.
+#
+#    --config is REQUIRED for the host to boot (it defaults to /etc/tether/broker.yaml, so you
+#    normally do not type it). A restored DB is cluster-seeded, and `install.sh` ships broker.yaml
+#    with the whole `cluster:` block COMMENTED OUT — so without the seam the daemon FATALs at boot
+#    with "refusing to silently downgrade a cluster DB to single mode ... broker.cluster.data_dir".
+#    restore applies the seam for you and FAILS NONZERO if it cannot.
 tether cluster recovery restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a \
-    --secrets-dir /etc/tether/secrets
-# 3. Start the daemon. It comes up as a single-voter cluster (NO HA until you re-grow).
+    --secrets-dir /etc/tether/secrets \
+    --config /etc/tether/broker.yaml --nats-conf /etc/tether/nats.d/nats.conf
+#    The command prints the ordered next steps (3-5 below) with every argument substituted for THIS
+#    host — prefer the printed lines over the generic ones here.
+
+# 3. FIX nats.conf BEFORE starting the daemon. Restore prunes the roster to a SINGLE voter but does
+#    NOT touch nats.conf; if the conf still has a `cluster{}` block, the lone node can never reach
+#    the clustered JetStream meta quorum and tether-broker CRASH-LOOPS at boot. Render this node's
+#    standalone conf — NO --peer means `Standalone: len(peers)==1`, which is what N=1 requires.
+#    (The ONLINE verb `reconcile nats --to-standalone` proves N=1 from a live LEADER view and is
+#    therefore unreachable here: the daemon is stopped and cannot be started.)
+tether cluster reconcile nats --manual --conf /etc/tether/nats.d/nats.conf \
+    --secrets-dir /etc/tether/secrets --server-name brk-a \
+    --route-url nats://<this-host>:6222 \
+    --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
+systemctl restart nats-server
+
+# 4. Start the daemon. It comes up as a single-voter cluster (NO HA until you re-grow).
 systemctl start tether-broker
 tether cluster status            # exit 1 DEGRADED (N=1, no redundancy) until re-grown; roster = {self}
                                  # (NOT exit 3 — restore is not force-single; it clears that marker)
-# 4. Re-grow to N>=3 with the §1 join flow (`cluster join prepare` / `join approve`),
+# 5. Re-grow to N>=3 with the §1 join flow (`cluster join prepare` / `join approve`),
 #    re-rendering nats.conf with `tether cluster reconcile nats --all --wait`.
+```
+
+> ⚠ **History and audit do NOT come back.** The bundle is state.db-only (see the scope warning in
+> §5 above), so the restored node has an EMPTY JetStream: no `history-<sid>`, no events stream, no
+> forensic incident bundle — and the audit re-derive cursor is reset to 0, so nothing backfills.
+> `cluster recovery restore` prints this on completion. If you took a JetStream backup alongside the
+> bundle, restore it **after** step 3 (nats-server must be up on the final standalone conf):
+>
+> ```bash
+> for d in /var/backups/js-2026-06-24/*; do nats stream restore "$(basename "$d")" "$d"; done
+> ```
+
+The `--config` seam restore writes sets **five** fields under `broker.cluster` — `data_dir`,
+`raft_addr`, `secrets_dir`, `nats_conf_path`, `nats_server_bin`. All five matter: `serve` keys
+cluster mode on **`data_dir`**, so a partial seam boots the host in SINGLE mode and lands on the
+same boot FATAL. Verify it before starting the daemon:
+
+```bash
+grep -A6 '^  cluster:' /etc/tether/broker.yaml    # all five keys present + uncommented
 ```
 
 The restore **resets the applied cursor to 0** and **prunes the old peers from the roster** so
@@ -565,13 +685,53 @@ fingerprint** (== the manifest's `self_cert_fp` == the bundle's self-row `cert_f
 
 ### 5.2 Full-cluster disaster recovery (all nodes lost)
 
+Every node is gone, so there is no survivor to take the online path — this is the fully offline
+sequence, in order. It is executable as written; substitute the bracketed values for your node.
+
 ```bash
-# 1. On a FRESH box, restore this node's secrets dir from your secret store.
-# 2. cluster recovery restore the latest bundle (§5.1) with --confirm-node-id <the original node_id>.
-# 3. Start the daemon (single voter N=1), then re-grow to N>=3 with the §1 join flow
-#    (`cluster join prepare` on each new node, `join approve <bundle> --wait` on the leader).
-# 4. Agents reconnect + re-pin; exposes re-home onto the live broker automatically (D6).
+# 1. On a FRESH box, install tether and restore this node's secrets dir from your secret store.
+#    The live tunnel cert in that dir is the un-forgeable provenance anchor: a restore onto a
+#    different node's secrets is REFUSED.
+systemctl stop tether-broker            # a stock install may have started it; restore is OFFLINE
+
+# 2. Restore the latest bundle. --config applies the broker.cluster seam (WITHOUT it the fresh box
+#    FATALs at boot: the restored DB is cluster-seeded, but install.sh ships broker.yaml with the
+#    `cluster:` block commented out, so broker.cluster.data_dir is unset).
+#    --raft-addr is the fresh-host escape: pass it when THIS box's IP differs from the dead one's.
+tether cluster recovery restore /var/backups/tether-2026-06-24 \
+    --confirm-node-id brk-a --secrets-dir /etc/tether/secrets \
+    --data-dir /var/lib/tether --db /var/lib/tether/tether.db \
+    --config /etc/tether/broker.yaml --nats-conf /etc/tether/nats.d/nats.conf \
+    --raft-addr <this-box-ip>:7400
+#    Restore prints the remaining steps with every argument already substituted for THIS host.
+#    Confirm the seam landed (all FIVE keys, uncommented) before going on:
+grep -A6 '^  cluster:' /etc/tether/broker.yaml
+
+# 3. Render this node's nats.conf as a LONE VOTER, BEFORE the daemon is started. A fresh box has no
+#    conf (or a stock standalone one); a rebuilt box may still carry the dead cluster's `cluster{}`
+#    block, which would crash-loop the broker. NO --peer => standalone JetStream, which N=1 requires.
+tether cluster reconcile nats --manual --conf /etc/tether/nats.d/nats.conf \
+    --secrets-dir /etc/tether/secrets --server-name brk-a \
+    --route-url nats://<this-box-ip>:6222 \
+    --account-issuer <account-public-nkey> --broker-nkey <broker-public-nkey>
+systemctl restart nats-server
+nats --server localhost:4222 stream ls   # must RETURN (not hang) — proves JS is up standalone
+
+# 4. Start the daemon (single voter N=1).
+systemctl start tether-broker
+tether cluster status                    # exit 1 DEGRADED (N=1, no redundancy) is EXPECTED here
+
+# 5. Re-grow to N>=3 with the §1 join flow (`cluster join prepare` on each new node,
+#    `join approve <bundle> --wait` on the leader), then re-render the whole cluster's conf:
+#    `tether cluster reconcile nats --all --wait`. Note §1 step 3a: THIS node is the "former N=1"
+#    node — do NOT plain-restart it into the mesh.
+# 6. Agents reconnect + re-pin; exposes re-home onto the live broker automatically (D6).
 ```
+
+> ⚠ **What you did NOT get back:** history, audit and the forensic incident bundle. The bundle is
+> state.db-only; see the scope warning in §5. If you have a matching JetStream backup, restore it
+> after step 3 (`nats stream restore`, as in §5.1). If you do not, that data is gone — the control
+> plane is recovered, the transcripts are not.
 
 ### 5.3 Identity-only manifest replay (recover → re-init)
 

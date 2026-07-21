@@ -32,9 +32,9 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/LinZiyang666/tether/internal/jsstream"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
-	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -211,6 +211,45 @@ type Config struct {
 	// short intervals (broker.New imposes no minimum).
 	ProcGCInterval time.Duration
 
+	// XferReapInterval is how often the R7 registry re-runs the orphan
+	// xfer-object reaper. Defaults to 5 min.
+	//
+	// Before R7 this reaper ran EXACTLY ONCE, in Run's JetStream-probe block —
+	// and its gate is structurally false at that point on every cluster-mode
+	// broker (raft catch-up is not yet established), so on a cluster the one run
+	// it got was always skipped and there was never a second (#58/P10). R15
+	// closed the second half of the same bug: the pass is now a per-broker,
+	// catch-up-gated, HOME-authoritative reap (reaperCaughtUp + homeOwnsXferBucket)
+	// rather than leader-only — a session homed to a follower was otherwise
+	// unreapable by ANY node, so the pass ran forever and reaped nothing on it.
+	XferReapInterval time.Duration
+
+	// GrowLockReapInterval is how often the R7 registry checks for a
+	// cluster_grow_active marker whose grow has already finished (#31 — the
+	// CLI's lock release is best-effort, so a dropped release used to block
+	// every subsequent grow/retire/upgrade forever). Defaults to 30s.
+	GrowLockReapInterval time.Duration
+
+	// UpgradeLockReapInterval (R7b) is how often the registry checks whether the
+	// cluster_upgrade_active roll lock's LEASE has expired — i.e. whether the
+	// `cluster upgrade` orchestrator that took it has stopped renewing. Defaults
+	// to 30s (the grow lock's cadence). The reap cadence is deliberately three
+	// orders of magnitude finer than the lease TTL: it controls only how promptly
+	// an already-dead lock is noticed, never how long a live one survives.
+	UpgradeLockReapInterval time.Duration
+
+	// HomeDeliverInterval (R8a) is how often the registry re-delivers home
+	// directives to agents whose CONFIRMED-applied home epoch is behind the
+	// allocation's. Defaults to 5s.
+	//
+	// This is the cadence the batch's one-vote-veto invariant is measured against:
+	// with the agent completely silent (no reconnect, no restart, no command), a
+	// drain's rehome must reach the data plane within a BOUNDED time, and this
+	// interval IS that bound (times the number of retries a failing rehome needs).
+	// It is deliberately short: the register-reply path it backstops used to have
+	// an unbounded delivery latency ("the next reconnect", i.e. possibly never).
+	HomeDeliverInterval time.Duration
+
 	// --- D9 cluster cutover surface (all zero ⇒ single mode, byte-equivalent) ---
 
 	// ClusterDataDir is the raft sub-tree parent (raft/raft.db + raft/snapshots),
@@ -344,6 +383,32 @@ type Broker struct {
 	// receiver-finalization signal arrives or the watchdog fires.
 	// file-transfer-plan §Object bucket lifecycle.
 	transfers *transferTracker
+
+	// xferReapMinAge is the grace below which a freshly-modified OBJ_xfer object is never reaped
+	// (external review M-3). Defaulted to xferReapMinObjectAge in New; left 0 on a zero-value test
+	// Broker so the reap-logic unit tests keep their prompt-reap semantics, and set explicitly by the
+	// M-3 mutation test that proves a fresh object is shielded.
+	xferReapMinAge time.Duration
+
+	// reconcilers (R7) is the periodic-reconciliation registry that drives
+	// every convergence pass from Run's single ticker. Wired in Run just
+	// before the loop; nil before Run. See reconcile_registry.go for the
+	// one-vote-veto invariant every registered pass must satisfy.
+	reconcilers *reconcileRegistry
+
+	// bootAt (R13) is the instant Run started (from the injectable clock), the base for the
+	// OpRuntime uptime. Written ONCE at the top of Run, before the admin socket's accept goroutine
+	// exists, so the admin-goroutine read in runtimeSnapshot is race-free by the goroutine-start
+	// happens-before edge. Zero before Run ⇒ uptime reported as 0.
+	bootAt time.Time
+
+	// homeDeliveryState (R8a) is the ACTIVE home-directive delivery bookkeeping:
+	// which public port the agent has CONFIRMED applied, and the per-node
+	// re-delivery backoff. Leader-local convergence cache (not replicated),
+	// created lazily so the many zero-value Broker literals in this package's
+	// tests keep working. See home_delivery.go.
+	homeDeliveryState *homeDeliveryState
+	homeDeliveryOnce  sync.Once
 
 	// proxyGen is this broker incarnation's P13 ordering generation, stamped onto
 	// every ProxyDirective. It is persisted (proxy_meta) and can be ESCALATED at
@@ -597,10 +662,23 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.ProcGCInterval == 0 {
 		cfg.ProcGCInterval = 5 * time.Minute
 	}
+	if cfg.XferReapInterval == 0 {
+		cfg.XferReapInterval = 5 * time.Minute
+	}
+	if cfg.GrowLockReapInterval == 0 {
+		cfg.GrowLockReapInterval = 30 * time.Second
+	}
+	if cfg.UpgradeLockReapInterval == 0 {
+		cfg.UpgradeLockReapInterval = 30 * time.Second
+	}
+	if cfg.HomeDeliverInterval == 0 {
+		cfg.HomeDeliverInterval = 5 * time.Second
+	}
 	b := &Broker{
-		cfg:         cfg,
-		transfers:   newTransferTracker(),
-		clusterMode: clusterMode,
+		cfg:            cfg,
+		transfers:      newTransferTracker(),
+		clusterMode:    clusterMode,
+		xferReapMinAge: xferReapMinObjectAge, // M-3: production shields fresh in-flight objects
 	}
 
 	// proxyGen (round-3/4/5) is this broker incarnation's ordering generation: a
@@ -627,6 +705,26 @@ func New(cfg Config) (*Broker, error) {
 	return b, nil
 }
 
+// n1ClusteredJetStreamFatal is the cold-start diagnostic for a LONE voter whose nats.conf still
+// carries a `cluster{}` block: a single node can never reach the clustered JetStream meta quorum, so
+// JS never comes up and the broker crash-loops with no self-recovery.
+//
+// R10 P4: the remedy literal is the shared natsconf SSOT — the same sentence the DATA-PLANE-DEGRADED
+// status banner and `cluster recovery restore`'s completion text emit. Those were three hand-copied
+// copies, which is how the late one gets fixed and the early one rots.
+//
+// Extracted from Broker.Run so the guidance can be asserted at RUNTIME (the path itself lives after
+// NATS/JetStream wiring and is not hermetically reachable). It used to be pinned by scraping this
+// file's source text, which only worked while the remedy was a literal — a source pin cannot see
+// through a format verb. Asserting the composed string is both stronger and refactor-proof.
+func n1ClusteredJetStreamFatal() error {
+	return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 "+
+		"node — a single node cannot form the clustered JetStream meta quorum. The nats.conf almost "+
+		"certainly still has a `cluster{}` block: de-cluster it to standalone JS with `%s` %s; %s. "+
+		"(Or, if mid-grow, finish the grow / remove the half-added peer.) N=1 MUST run standalone JetStream",
+		natsconf.DeClusterRemedyCmd, natsconf.DeClusterRemedyArgHint, natsconf.DeClusterRemedyOfflineNote)
+}
+
 // Run connects to NATS, installs subscriptions, runs the reconcile ticker,
 // and blocks until ctx is canceled. The NATS connection is drained on exit.
 //
@@ -635,6 +733,15 @@ func New(cfg Config) (*Broker, error) {
 // subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
 func (b *Broker) Run(ctx context.Context) error {
 	b.runCtx = ctx
+	// R13: stamp the process boot instant for the OpRuntime uptime BEFORE anything spawns a
+	// goroutine that could read it (the admin socket's accept loop, below). Written once here, read
+	// in runtimeSnapshot from the admin goroutine — race-free via the goroutine-start ordering. Guard
+	// nil Now: a few tests drive Run on a bare Broker literal that refuses early (e.g. the data-dir
+	// lock interlock) and never reaches broker.New's Now default; they never serve the admin socket,
+	// so bootAt staying zero (uptime 0) is correct there.
+	if b.cfg.Now != nil {
+		b.bootAt = b.cfg.Now()
+	}
 	// Round-5 B3: hold ${ClusterDataDir}/tether.lock for the WHOLE process lifetime. The offline recovery
 	// tools already take this exact lock, but until now nothing else did — so their only protection against
 	// a daemon reviving mid-surgery was a one-shot bolt probe taken minutes earlier, and a daemon that came
@@ -939,7 +1046,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 			// file-transfer-plan §Object bucket lifecycle G.2 —
 			// reap leftover OBJ_xfer-* streams from a previous crash.
-			if n, err := b.reconcileXferObjectsOnBoot(ctx); err != nil {
+			if n, err := b.reconcileXferObjects(ctx); err != nil {
 				b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", err)
 			} else if n > 0 {
 				b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
@@ -962,13 +1069,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			// standalone) vs. the N>=2 mesh-not-formed case.
 			voters, verr := b.cl.node.NumVoters()
 			if verr == nil && voters <= 1 {
-				return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 " +
-					"node — a single node cannot form the clustered JetStream meta quorum. The nats.conf almost " +
-					"certainly still has a `cluster{}` block: de-cluster it to standalone JS with " +
-					"`tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> " +
-					"--broker-nkey <self-bus-nkey>` (server-name = the conf's server_name; broker-nkey = the bus nkey " +
-					"from the broker.nk seed in secrets_dir or cluster_nodes.bus_nkey_pub, NOT broker.yaml; or, if " +
-					"mid-grow, finish the grow / remove the half-added peer). N=1 MUST run standalone JetStream")
+				return n1ClusteredJetStreamFatal()
 			}
 			// G2 #10: voters>=2 but no JetStream at boot is the force-single-EJECTED trap — this node's
 			// on-disk raft config still lists {this, peer(s)} (voters>=2), but a survivor may have
@@ -1023,6 +1124,13 @@ func (b *Broker) Run(ctx context.Context) error {
 	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
 	b.startDiskMonitor(ctx)
 
+	// R7: build the reconciliation registry and register the standing passes HERE — before the
+	// admin socket's accept goroutine exists — so runtimeSnapshot's cross-goroutine read of
+	// b.reconcilers is race-free (the goroutine-start happens-before edge publishes the fully
+	// populated registry). start()/granularity()/the driving ticker stay below, next to the loop.
+	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
+	b.registerCoreReconcilePasses()
+
 	// P9 / I.2b — local admin socket. No-op when path empty (the
 	// in-process tests that don't exercise admin leave it unset).
 	if b.cfg.AdminSocketPath != "" {
@@ -1031,7 +1139,11 @@ func (b *Broker) Run(ctx context.Context) error {
 			Now:             b.cfg.Now,
 			Logger:          b.cfg.Logger,
 			AuditTail:       b.adminAuditTail,
+			EventsTail:      b.adminEventsTail, // #30: operator reader for the H.1 sys.events stream
 			PubAgentEvicted: b.pubAgentEvicted,
+			// R13: process self-introspection (goroutines/threads/fds/rss/uptime + reconciler
+			// last-tick) for `tether admin runtime`. Works in single AND cluster mode.
+			RuntimeSnapshot: b.runtimeSnapshot,
 		}
 		// D9: in cluster mode the `tether cluster *` admin verbs are served by the
 		// ClusterAdmin orchestrator (D7); nil in single mode ⇒ "cluster mode not enabled".
@@ -1093,11 +1205,32 @@ func (b *Broker) Run(ctx context.Context) error {
 		"offline_after", b.cfg.OfflineAfter,
 	)
 
-	ticker := time.NewTicker(b.cfg.ReconcileInterval)
-	defer ticker.Stop()
+	// R7: every periodic duty now lives in the reconciliation registry rather
+	// than in hand-rolled ticker arms. The four bodies that used to be inlined
+	// here are registered VERBATIM (reconcile_passes.go) and keep their exact
+	// cadence, leadership gate and effects — see the fake-clock equivalence
+	// proof in reconcile_registry_test.go. The two tickers collapse into one
+	// driving ticker at the shortest registered interval; per-pass anchored
+	// deadlines reproduce what the dedicated tickers did.
+	//
+	// Replacing two long-lived tickers with one (and adding zero goroutines) is
+	// deliberate: the registry is driven by this loop's clock and owns no
+	// timers, so it stays invisible to the repo's NumGoroutine/fd leak gate.
+	//
+	// The registry itself and its passes were created above (before the admin socket) so the
+	// OpRuntime last-tick read is race-free; here we only anchor the schedule at boot.
+	b.reconcilers.start(b.cfg.Now())
 
-	gcTicker := time.NewTicker(b.cfg.ProcGCInterval)
-	defer gcTicker.Stop()
+	// granularity() is 0 only if nothing registered, which registerCoreReconcilePasses
+	// makes impossible — but time.NewTicker(0) panics, and a wiring mistake must not
+	// take the broker down with a runtime panic. Fall back to the reconcile interval.
+	granularity := b.reconcilers.granularity()
+	if granularity <= 0 {
+		b.cfg.Logger.Warn("broker: no reconcile passes registered; falling back to the reconcile interval")
+		granularity = b.cfg.ReconcileInterval
+	}
+	ticker := time.NewTicker(granularity)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -1105,42 +1238,7 @@ func (b *Broker) Run(ctx context.Context) error {
 			b.cfg.Logger.Info("broker: shutting down")
 			return ctx.Err()
 		case <-ticker.C:
-			now := b.cfg.Now()
-			n, err := node.ReconcileStates(b.livenessDB(), now,
-				b.cfg.StaleAfter, b.cfg.OfflineAfter)
-			if err != nil {
-				b.cfg.Logger.Warn("broker: reconcile failed", "err", err)
-			} else if n > 0 {
-				b.cfg.Logger.Info("broker: state transitions", "count", n)
-			}
-			// D9 round-1 MAJOR: the OFFLINE-node port-revocation scan is a leader-local
-			// DECISION (like proc GC) — in cluster mode run it only on the leader, so N
-			// followers don't each re-scan + forward the same (idempotent but wasteful)
-			// PlanRevoke every tick. ReconcileStates above is per-broker-local liveness
-			// (livenessDB), so it stays on every broker. Single mode unchanged.
-			if !b.clusterMode || b.cl.node.IsLeader() {
-				if revoked := b.reconcilePorts(now); revoked > 0 {
-					b.cfg.Logger.Info("broker: port revocations", "count", revoked)
-				}
-			}
-			if closed := b.reconcileTunnelSessions(); closed > 0 {
-				b.cfg.Logger.Info("broker: stale tunnel proxies closed", "count", closed)
-			}
-		case <-gcTicker.C:
-			// In cluster mode processes is replicated state, so deleting rows outside raft
-			// can fork leader/follower SQLite contents. Keep retention GC single-node only
-			// until it has a replicated command.
-			if b.clusterMode {
-				continue
-			}
-			cutoff := b.cfg.Now().Add(-b.cfg.ProcRetention)
-			n, err := proc.GCExited(b.livenessDB(), cutoff)
-			if err != nil {
-				b.cfg.Logger.Warn("broker: proc gc", "err", err)
-			} else if n > 0 {
-				b.cfg.Logger.Info("broker: proc gc",
-					"deleted", n, "cutoff", cutoff)
-			}
+			b.reconcilers.runDue(ctx, b.cfg.Now())
 		}
 	}
 }

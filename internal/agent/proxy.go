@@ -152,6 +152,23 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 			} else {
 				p.homeAddr, p.homeEpoch = d.Home.BrokerAddr, d.Home.Epoch
 				a.persistProxyHomeLocked(p)
+				// #33 (R8a): RESTORE the tunnel-liveness flag. This branch has just
+				// PROVEN a live tunnel — ApplyHome returned nil AND HasSession(port) is
+				// true — yet before this line it never touched proxyTunnelUp, whose only
+				// writers are the supervisor's drop/redial edges (agent.go notifyState)
+				// and the proxy start/teardown paths. ApplyHome→OpenHome never calls
+				// notifyState, so after a crash-rehome the flag stayed stuck at the
+				// `false` the drop edge wrote, while the new tunnel was actually up.
+				//
+				// The consequence was the reported non-determinism, with a perverse
+				// inversion: a FLAPPING tunnel self-heals (its redial edge fires
+				// notifyState(true)) while a STABLE rehomed one never does. ProxyBound
+				// stayed false ⇒ every heartbeat wrote proxy_ready=false, racing the ACK
+				// path's true, and after proxyRehomeDwell bad reads the broker's reaper
+				// minted a fresh port+token and stranded the data plane. `proxy off;
+				// proxy on` worked only because it takes the token path — which is
+				// exactly the manual workaround operators had found.
+				a.proxyTunnelUp.Store(true)
 				a.cfg.Logger.Info("agent: proxy rehomed", "home", d.Home.BrokerAddr, "home_epoch", d.Home.Epoch)
 			}
 		}

@@ -158,33 +158,84 @@ assert_ok "Q4c the private key the symlink pointed at is byte-identical (the REA
 assert_ok "Q6 incident export --since smoke" \
     _bt brk1 -- tether cluster recovery incident export --since 24h --out /tmp/inc-since.json
 
-# ── R — cluster doctor --offline (R2 is the control source that makes R3 meaningful) ────────────────
+# ── R — cluster doctor --offline: THE PRECONDITION GATE, proved two-sided (#50 FLIPPED, R10 P5) ──────
 # doctor MUST run as tether: as root it would bypass preflight.go:78-85's real os.Open readability check.
 assert_ok "R1 doctor --offline is green on a healthy node (as User=tether — root would bypass the real open() check)" \
     _bt brk1 -- tether cluster doctor --offline --secrets-dir /etc/tether/secrets --db /var/lib/tether/tether.db --conf /etc/tether/nats.d/nats.conf
-assert_refuses "R2 doctor --offline --conf <nonexistent> FAILS (proves doctor CAN go red — R3's control source)" \
+assert_refuses "R2 doctor --offline --conf <nonexistent> FAILS (the CONF cell's control source — that cell always did a real read)" \
     "no such file|read .*nats.conf|FATAL" \
     _bt brk1 -- tether cluster doctor --offline --secrets-dir /etc/tether/secrets --db /var/lib/tether/tether.db --conf /nonexistent/nats.conf
 
-# R3 — #50. INVERTED: the command SUCCEEDING is the defect. R-EXHAUST: four states, never an `else`.
-# Mechanism: doctor.go:82-87 -> storage.OpenReadOnly -> storage.go:105-111 is a bare sql.Open, which is
-# LAZY and never Pings, so a nonexistent path reports PASS. cluster_natsconf.go:520-523 only usageErr's
-# when fatal>0. Contrast R2 (the conf check does a real read and fails) — that is why R2 must pass first.
-_doc_missing_db() {
-    _bt brk1 -- tether cluster doctor --offline --secrets-dir /etc/tether/secrets \
-        --db /nonexistent/nope.db --conf /etc/tether/nats.d/nats.conf --json 2>&1
+# R3 — #50, FLIPPED (R10 P5). This arm used to be INVERTED: `doctor --offline --db <nonexistent>` exited 0
+# with `.summary.fatal == 0`, so the SUCCESS was the defect and the arm was `assert_ok` + a bare
+# product_red. The self-check arm ("#50 APPEARS FIXED — promote R3 to assert_refuses") has now fired for
+# real: DBPreflight (internal/clusteroffline/doctor.go) replaced the bare lazy `storage.OpenReadOnly`
+# with Stat + Ping + PRAGMA quick_check + a schema probe.
+#
+# THE FLIP IS A REWRITTEN PREDICATE, NOT A RENAMED KEYWORD. The old oracle asked one question ("did it
+# exit 0?"). Turning that single question into a single `assert_refuses` would be a strictly WEAKER test
+# than the one it replaces was as an inverted pin, because ANY failure — a typo in --secrets-dir, a
+# leader drift, a broken binary — would satisfy it. So the flip enumerates the SIX pathological states
+# the product documents itself as rejecting, each as a SEPARATE bad input carrying its OWN signature.
+# One "it went red" arm would still pass with five of the six layers deleted; six signature-anchored arms
+# cannot. R1 (a HEALTHY db is green) is the positive control that stops the six from passing vacuously —
+# without it, a doctor that FATALs on everything would look perfect here.
+#
+# R-EXHAUST holds in a new form: the four-state explore is gone because the state space is no longer
+# "does it go red?" (unknown) but "which layer catches which input?" (documented + testable).
+_doc_db()  { _bt brk1 -- tether cluster doctor --offline --secrets-dir /etc/tether/secrets --db "$1" --conf /etc/tether/nats.d/nats.conf; }
+# The db CELL specifically must be FATAL — the exact inverse of #50's evidence (`.summary.fatal == 0`
+# while the db cell said PASS). Asserting only `summary.fatal >= 1` would be satisfied by ANY other cell
+# going red, which is how a "the gate works now" claim gets forged.
+_doc_db_cell_fatal() {
+    _bt brk1 -- tether cluster doctor --offline --secrets-dir /etc/tether/secrets --db "$1" \
+        --conf /etc/tether/nats.d/nats.conf --json 2>/dev/null \
+        | jq -e '(.summary.fatal>=1) and ([.checks[]?|select(.name=="db")|select(.status=="FATAL")]|length==1)' >/dev/null 2>&1
 }
-_R3_OUT=$(_doc_missing_db); _R3_RC=$?
-_R3_FATAL=$(printf '%s' "$_R3_OUT" | jq -r '.summary.fatal // empty' 2>/dev/null)
-if [ "$_R3_RC" = 0 ] && [ "${_R3_FATAL:-}" = 0 ]; then
-    product_red "#50 cluster doctor --offline --db /nonexistent/nope.db reports 0 fatal and exits 0 (storage.OpenReadOnly is a lazy sql.Open that never Pings — doctor.go:82-87 + storage.go:105-111); the 'migration source is reachable' preflight promise is structurally false. Control source R2 proves doctor CAN go red."
-elif [ "$_R3_RC" != 0 ]; then
-    _as_fail "#50 APPEARS FIXED — doctor now rejects a nonexistent --db (rc=$_R3_RC); promote R3 to assert_refuses and flip the ledger"
-elif [ -z "${_R3_FATAL:-}" ]; then
-    _as_fail "#50 UNJUDGEABLE — doctor --json produced no .summary.fatal (rc=$_R3_RC); the oracle's shape assumption is wrong, triage before judging"
-else
-    _as_fail "#50 UNJUDGEABLE — doctor exited 0 but reported fatal=$_R3_FATAL; unclassified state, refusing to judge"
-fi
+# exit 64 (usageErr, cluster_natsconf.go's renderDoctor) — the class a calling script branches on. A bare
+# "non-zero" would also accept a panic or a 127.
+_doc_db_rc64() { _doc_db "$1" >/dev/null 2>&1; _drc=$?; [ "$_drc" = 64 ]; }
+# Stage the six inputs. perm.db is deliberately root-owned 0600 so the tether user CANNOT read it — that
+# is the state the lazy sql.Open hid best (it reported a PASS on a file it never opened). The corruption
+# overwrites pages 2-3 and leaves page 1 (header + sqlite_master) intact, so the file still OPENS, still
+# PINGS and still HAS a schema: quick_check is the only layer that can see it.
+_stage_bad_dbs() {
+    dexec brk1 -- sh -c '
+        set -e
+        rm -rf /tmp/nvdb; mkdir -p /tmp/nvdb/adir
+        [ "$(stat -c %s /var/lib/tether/tether.db)" -ge 65536 ] || { echo "live tether.db too small to corrupt meaningfully" >&2; exit 1; }
+        : > /tmp/nvdb/empty.db
+        head -c 512 /var/lib/tether/tether.db > /tmp/nvdb/trunc.db
+        cp /var/lib/tether/tether.db /tmp/nvdb/perm.db
+        cp /var/lib/tether/tether.db /tmp/nvdb/corrupt.db
+        dd if=/dev/urandom of=/tmp/nvdb/corrupt.db bs=4096 seek=1 count=2 conv=notrunc status=none
+        chown -R tether:tether /tmp/nvdb
+        chown root:root /tmp/nvdb/perm.db
+        chmod 600 /tmp/nvdb/perm.db
+    '
+}
+assert_ok "R3-prep stage the six pathological --db inputs (missing / dir / empty / truncated / unreadable / corrupt-page)" \
+    _stage_bad_dbs
+assert_refuses "R3a #50 state 1/6 — a NONEXISTENT --db is FATAL (this is #50's own literal reproducer, which used to exit 0)" \
+    "the DB file is missing or unreadable" _doc_db /nonexistent/nope.db
+assert_ok "R3a-rc the #50 reproducer exits 64 (usage), not 0 — the class a calling script branches on" \
+    _doc_db_rc64 /nonexistent/nope.db
+assert_ok "R3a-cell the DB CELL is the one reporting FATAL (summary.fatal>=1 alone would be satisfied by ANY other cell going red)" \
+    _doc_db_cell_fatal /nonexistent/nope.db
+assert_refuses "R3b #50 state 2/6 — a DIRECTORY passed as --db is FATAL (os.Stat + IsDir)" \
+    "is a DIRECTORY, not a SQLite database file" _doc_db /tmp/nvdb/adir
+assert_refuses "R3c #50 state 3/6 — an EMPTY (0-byte) file is FATAL: it opens, pings and quick_checks perfectly, so ONLY the schema probe can see it" \
+    "no schema_migrations table" _doc_db /tmp/nvdb/empty.db
+assert_refuses "R3d #50 state 4/6 — a TRUNCATED db is FATAL" \
+    "not a readable SQLite database|not an intact SQLite database|CORRUPT" _doc_db /tmp/nvdb/trunc.db
+assert_refuses "R3e #50 state 5/6 — a PERMISSION-DENIED db is FATAL and is diagnosed as UNREADABLE, not as corrupt (the layer the lazy sql.Open hid best)" \
+    "not a readable SQLite database" _doc_db /tmp/nvdb/perm.db
+assert_refuses "R3f #50 state 6/6 — a CORRUPT PAGE is FATAL: the file opens, pings and carries a schema, so quick_check is the only layer that can catch it" \
+    "CORRUPT|not an intact SQLite database" _doc_db /tmp/nvdb/corrupt.db
+# The anti-vacuity twin of the six: the SAME predicate, the SAME command, the HEALTHY db => green. Without
+# it "doctor rejects six bad inputs" is equally true of a doctor that rejects everything.
+assert_ok "R3g ANTI-VACUITY: the identical probe against the LIVE tether.db is green — the six reds above discriminate, they are not a doctor that FATALs on everything" \
+    _doc_db /var/lib/tether/tether.db
 
 # ── C — the runbook's own literal example (DOC-27) ──────────────────────────────────────────────────
 # R-SUPPLY-ORDER: this arm runs BEFORE the vault appears as [env]. It shows what tether cannot do
@@ -202,9 +253,25 @@ else
 fi
 
 # ── D — the authoritative leader bundle ─────────────────────────────────────────────────────────────
-assert_ok "D backup on the LEADER (the freshest committed state)" \
-    out_matches 'online backup complete: .*self=brk1, source=leader' \
-    _bt brk1 -- tether cluster backup --out "$BK_DIR"
+# ONE invocation, captured once; every D signature is asserted against THAT output (a mutating command
+# must never be re-run per signature). The predicates are FUNCTIONS — `sh -c` would not see $_D_CAP.
+_D_CAP=$(_bt brk1 -- tether cluster backup --out "$BK_DIR" 2>&1); _D_RC=$?
+_d_rc_ok()    { [ "$_D_RC" = 0 ]; }
+_d_leader()   { printf '%s' "$_D_CAP" | grep -qE 'online backup complete: .*self=brk1, source=leader'; }
+# #53-silence (R10, CLOSED): the bundle has ALWAYS been state.db-only; what was unacceptable was that
+# neither end said so, so an operator formed the belief "I have a backup" at exactly the moment the
+# product knew it was handing them a control-plane-only one. Three independent clauses, because a
+# single `grep BUNDLE` would still pass if the warning were reduced to a bare header with no content
+# and no remedy: it must NAME the missing scope AND give the runnable alternative.
+_d_scope_warned() {
+    printf '%s' "$_D_CAP" | grep -qF 'BUNDLE SCOPE' &&
+    printf '%s' "$_D_CAP" | grep -qF 'JetStream is NOT in it' &&
+    printf '%s' "$_D_CAP" | grep -qF 'nats stream backup'
+}
+assert_ok "D backup on the LEADER (the freshest committed state)" _d_rc_ok
+assert_ok "D-sig it self-reports as a LEADER-sourced online bundle" _d_leader
+assert_ok "D-#53-silence the BACKUP end warns UNMISSABLY about the bundle's scope: it names 'BUNDLE SCOPE', says JetStream is NOT in it, and prints the runnable \`nats stream backup\` alternative (a bare header with no content and no remedy would satisfy a one-clause grep — this one cannot)" \
+    _d_scope_warned
 assert_ok "D2 [env, S0-backup-vault] pull the bundle off the box (= an operator scp-ing it away)" \
     vault_pull brk1 "$BK_DIR" "$BK_NAME"
 assert_ok "D3 manifest names brk1 as a LEADER-sourced bundle over a 2-node roster" \
@@ -337,35 +404,114 @@ assert_ok "M1c repair the manifest from the vault for the real restore" \
 # assert_ok runs "$@" in the CURRENT shell, so a function sees both the variable and the harness.
 _j2_pruned()   { printf '%s' "$_J2_CAP" | grep -qE 'restore complete: node brk1 is now a single-voter cluster \(pruned 1 stale peers; bundle applied_index [0-9]+ reset to 0\)'; }
 _j2_preserved(){ printf '%s' "$_J2_CAP" | grep -qE 'prior DB preserved at: '; }
-_j2_next()     { printf '%s' "$_J2_CAP" | grep -q 'NEXT: start tether-broker'; }
 _j2_rc_ok()    { [ "$_J2_RC" = 0 ]; }
+# R10 P4: the completion text is now an ORDERED, copy-paste-ready list, not the single
+# "NEXT: start tether-broker, then cluster join approve" line that made #64 possible. The old predicate
+# (`grep 'NEXT: start tether-broker'`) is DELETED rather than loosened: keeping it would silently pass on
+# a product that had regressed all the way back to the one-liner.
+_j2_next()     { printf '%s' "$_J2_CAP" | grep -qF 'NEXT (run in order):'; }
+# #53-silence, restore end. Same three-clause shape as D-#53-silence: name the loss, name the cursor
+# reset (the reason nothing backfills), and give the runnable inverse of the backup remedy.
+_j2_history_warned() {
+    printf '%s' "$_J2_CAP" | grep -qF 'HISTORY/AUDIT NOT RESTORED' &&
+    printf '%s' "$_J2_CAP" | grep -qF 'does NOT backfill' &&
+    printf '%s' "$_J2_CAP" | grep -qF 'nats stream restore'
+}
+# R10 P2: restore now carries --config (default /etc/tether/broker.yaml) and applies the broker.cluster
+# seam. On THIS box the seam already exists and matches (the sim provisioned it as root when the cluster
+# was built — /etc/tether is root-owned by install.sh and the drill never chowns it), so the observable
+# is the IDEMPOTENT branch. Asserting it is what proves --config is WIRED rather than merely declared:
+# a flag that is parsed and dropped would print nothing here.
+_j2_seam_idempotent() { printf '%s' "$_J2_CAP" | grep -qE 'broker\.cluster seam (already present and correct|applied) in|broker\.cluster seam applied to'; }
 
 _J2_CAP=$(_pty brk1 brk1 -- tether cluster recovery restore "$BK_DIR" --confirm-node-id brk1 --secrets-dir /etc/tether/secrets 2>&1); _J2_RC=$?
 assert_ok "J2 restore succeeds via a real typed confirm (the CONTROL SOURCE for I1/I2/I3/I4/M1 — 'it always refuses' is not evidence a gate exists)" _j2_rc_ok
 assert_ok "J2b restore pruned the stale peer + reset the cursor (the ONLY stdout evidence the prune ran)" _j2_pruned
 assert_ok "J2c restore preserved the prior DB and printed where"                                          _j2_preserved
-assert_ok "J2d restore printed the NEXT step (start the daemon, then re-grow)"                            _j2_next
+assert_ok "J2d restore printed the ORDERED next-step list (R10 P4 replaced the single 'NEXT: start tether-broker' line that #64 was made of)" _j2_next
+assert_ok "J2e (#53-silence) the RESTORE end warns that history/audit did NOT come back, says the re-derive cursor does NOT backfill, and prints the runnable \`nats stream restore\` inverse" \
+    _j2_history_warned
+assert_ok "J2f (P2) restore REPORTED on the broker.cluster seam via --config (default /etc/tether/broker.yaml) — here the idempotent branch, since the seam was provisioned when the cluster was built. A --config that was parsed and dropped would print nothing at all" \
+    _j2_seam_idempotent
+# The seam's FIVE fields, read off disk rather than believed from stdout. `serve` keys cluster mode on
+# data_dir alone, so a partial seam boots the host in SINGLE mode and lands on the same boot FATAL the
+# seam exists to prevent — which is why "the seam is present" is not the assertion; "all five" is.
+_seam_five_fields() {
+    _sf=$("$SIM" exec brk1 -- sed -n '/^  cluster:/,/^  [a-z_]*:/p' /etc/tether/broker.yaml 2>/dev/null)
+    for _k in data_dir raft_addr secrets_dir nats_conf_path nats_server_bin; do
+        printf '%s' "$_sf" | grep -qE "^[[:space:]]+$_k:[[:space:]]*[^[:space:]#]" || return 1
+    done
+    return 0
+}
+assert_ok "J2g the broker.cluster seam carries ALL FIVE fields on disk (data_dir/raft_addr/secrets_dir/nats_conf_path/nats_server_bin) — serve keys cluster mode on data_dir alone, so a PARTIAL seam boots SINGLE mode and hits the very FATAL the seam prevents" \
+    _seam_five_fields
 
-# ── K — start + the degraded single-voter status ────────────────────────────────────────────────────
-# ── K — start, and the CLUSTERED-CONF finding (#64) ─────────────────────────────────────────────────
-# `recovery restore` prunes the roster to a LONE VOTER but leaves nats.conf's `cluster{}` block exactly
-# as it was, and its completion text says only "NEXT: start tether-broker, then cluster join approve".
-# The operator follows that verbatim and the broker CRASH-LOOPS, because a lone node cannot form a
-# clustered JetStream meta quorum. The product's own error even names the missing step:
-#   "cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 node … The nats.conf almost
-#    certainly still has a `cluster{}` block: de-cluster it to standalone JS with `tether cluster
-#    reconcile nats --to-standalone --confirm-single …`"
-# So the product KNOWS the remedy at crash time but restore never told the operator up front.
+# ── K — start, and the CLUSTERED-CONF finding (#64), NOW FLIPPED TO A POSITIVE ──────────────────────
+# WHAT #64 WAS. `recovery restore` prunes the roster to a LONE VOTER but leaves nats.conf's `cluster{}`
+# block exactly as it was, and its completion text said only "NEXT: start tether-broker, then cluster
+# join approve". The operator followed that verbatim and the broker CRASH-LOOPED, because a lone node
+# cannot form a clustered JetStream meta quorum. The product's own boot error named the missing step —
+# so it KNEW the remedy at crash time and had simply never said it up front. The defect was the SILENCE,
+# and this arm's self-check ("#64 does not reproduce … flip the ledger") existed to catch the fix.
 #
-# Measured 2026-07-17: it self-heals in ~7-10s after ~4 crash-loops (the in-broker reconciler converges
-# the conf to standalone, G2's #20 fix). That BOUNDEDNESS is asserted, not assumed — an unbounded claim
-# would repeat #42/#43's misclassification (a bounded transient reported as a permanent break).
-_restart_ts=$(date +%s)
-# Stage-C minor 10: reset-failed before starting — #64's crash-loop could hit StartLimitBurst=5/10s and
-# leave the broker `failed` (no self-heal), turning the expected PRODUCT-RED into an ASSERT-FAIL.
+# WHAT IT IS NOW (R10 P4). printRestoreNextSteps inspects nats.conf and, when it is CLUSTERED, leads
+# with the de-cluster step and states outright that tether-broker will REFUSE to start without it. The
+# flip is therefore NOT "assert_bug → assert_ok on the same command": the command being judged has
+# CHANGED, from "start the daemon and watch it die" to "did restore say, in advance, the thing it used
+# to only say at crash time — and was it right?". Two independent halves, because either alone is
+# forgeable: a warning nobody can execute is theatre, and an executable line that predicts the wrong
+# failure is worse than silence.
+#
+# THIS DRILL DELIBERATELY DOES NOT FOLLOW THE ADVICE. Arm L3 needs brk1's JetStream to re-form against
+# brk2's surviving replica, which de-clustering brk1's conf would destroy — and 50's disaster is a
+# lib-volume wipe, not a total loss. Following the printed steps IN ORDER is drill 51's property (the
+# real DR). What 50 owns is: the advice EXISTS, is RUNNABLE, and CORRECTLY PREDICTS what happens when
+# it is skipped.
+#
+# ── K-#64 POSITIVE HALF 1 — the ADVICE, read off the restore completion text (deterministic) ────────
+# _J2_CAP is the completion text of the real restore above. /etc/tether survived the lib-volume wipe, so
+# nats.conf is still the CLUSTERED conf the cluster was built with ⇒ printRestoreNextSteps must take its
+# `case clustered:` branch: lead with the de-cluster step and state the broker will REFUSE to start
+# without it. Three clauses, because a bare "de-cluster" mention is forgeable — the value is that it
+# NAMES the consequence (refuse to start) and orders it FIRST.
+_k64_advice_leads_decluster() {
+    printf '%s' "$_J2_CAP" | grep -qF 'NEXT (run in order):' &&
+    printf '%s' "$_J2_CAP" | grep -qiE 'is CLUSTERED, but this node is now a LONE VOTER' &&
+    printf '%s' "$_J2_CAP" | grep -qiE 'tether-broker will REFUSE to start'
+}
+# HALF 1b — the printed remedy is RUNNABLE, not a placeholder. /etc/tether/secrets survived, so
+# readClusterPublicIdentities derives REAL public nkeys (account issuer A…, broker nkey U…) rather than
+# the `<account-public-nkey>` / `<broker-public-nkey>` stand-ins it prints when the keys are unreadable.
+# An advice line no operator can paste is theatre; this is the clause that catches that.
+_k64_remedy_runnable() {
+    printf '%s' "$_J2_CAP" | grep -qE 'tether cluster reconcile nats --manual --conf ' &&
+    printf '%s' "$_J2_CAP" | grep -qE -- '--account-issuer A[A-Z2-7]{20,}' &&
+    printf '%s' "$_J2_CAP" | grep -qE -- '--broker-nkey U[A-Z2-7]{20,}' &&
+    ! printf '%s' "$_J2_CAP" | grep -qF '<account-public-nkey>'
+}
+assert_ok "K-#64a the restore completion text LEADS with the de-cluster step and states the broker will REFUSE to start without it — the advance warning #64 said was owed (it used to appear only in the boot FATAL, at crash time)" \
+    _k64_advice_leads_decluster
+assert_ok "K-#64b that de-cluster remedy is COPY-PASTE-RUNNABLE: real substituted nkeys (--account-issuer A… / --broker-nkey U…), not the <…> placeholders it prints when secrets are unreadable" \
+    _k64_remedy_runnable
+
+# ── K-#64 POSITIVE HALF 2 — the PREDICTION was ACCURATE (reality, signature-guarded) ────────────────
+# We DELIBERATELY skip the advice (L3 needs brk1's JS to re-form off brk2's replica; see the header). So
+# the broker must first hit exactly the refusal the advice PREDICTED, before the surviving peer lets the
+# clustered JS meta re-form (~4 crash-loops, ~73s, measured). This closes the loop that the advice is not
+# just present but TRUE: a warning that predicts a failure which never happens would be noise.
+# Stage-C minor 10: reset-failed before starting — the crash-loop could hit StartLimitBurst=5/10s and
+# leave the broker `failed` (no self-heal). Kept: the honest self-heal window is what the prediction
+# rides on.
 dexec brk1 -- sh -c 'systemctl reset-failed tether-broker 2>/dev/null; systemctl start nats-server tether-broker' >/dev/null 2>&1 || true
+# Sample broker.err DURING the crash-loop window for the predicted refusal. A large tail so a line
+# written early in the loop is still present after recovery scrolls success on top. Non-vacuous: a broker
+# that came up clean (no refusal ever logged) makes this FALSE — which would mean the advice predicted a
+# failure that did not occur.
+_k64_predicted_refusal() { _berr brk1 400 | grep -qF 'cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 node'; }
+_K64_PREDICTED=0
+if poll_until 90 3 "brk1 logs the lone-N=1 refusal the advice predicted (skipping de-cluster on purpose)" -- _k64_predicted_refusal; then _K64_PREDICTED=1; fi
 _K_READY=0
-if poll_until 120 3 "brk1 broker becomes reachable after the restore" -- _broker_ready; then _K_READY=1; fi
+if poll_until 120 3 "brk1 broker becomes reachable (self-heals off brk2's surviving JS replica)" -- _broker_ready; then _K_READY=1; fi
 _k_ready() { [ "$_K_READY" = 1 ]; }
 
 # Diagnostics run at TOP LEVEL, never inside the asserted command: assert_ok captures stderr into _AS_OUT
@@ -378,41 +524,40 @@ if [ "$_K_READY" = 0 ]; then
     err "K2 diag 4 — the cluster seam in broker.yaml:"; dexec brk1 -- sh -c 'grep -A4 "^  cluster:" /etc/tether/broker.yaml 2>/dev/null | head -6' >&2 || true
     err "K2 diag 5 — what restore left on disk:"; dexec brk1 -- sh -c 'ls -la /var/lib/tether/ 2>&1 | head -10' >&2 || true
 fi
-assert_ok "K1+K2 the broker becomes reachable after the restore" _k_ready
-
-# #64 — the finding itself. INVERTED-ish: we are pinning that the documented path CRASH-LOOPS first.
-# R-EXHAUST: four states, no `else` fallback that could invent a gotcha out of an unread log.
-_K_ERR=$(_berr brk1 60)
-_k_declustered_now() { ! dexec brk1 -- grep -qE '^cluster[[:space:]]*\{' /etc/tether/nats.d/nats.conf; }
-if printf '%s' "$_K_ERR" | grep -qF 'cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 node'; then
-    product_red "#64 \'recovery restore\' prunes the roster to a LONE VOTER but leaves nats.conf's cluster{} block in place and never mentions it: its completion text says only 'NEXT: start tether-broker, then cluster join approve' (cluster_backup.go:115-119), so an operator following the documented path gets a CRASH-LOOPING broker. The product's own startup error names the exact missing step ('de-cluster it to standalone JS with tether cluster reconcile nats --to-standalone --confirm-single …'), which proves restore could have said so up front. Same family as #52 (restore renders no nats.conf) but observable WITHOUT a fresh box — it is the roster-prune half. Measured: ~4 crash-loops before the in-broker reconciler converges it."
-    # BOUNDEDNESS is asserted (K1+K2 already proved the broker DID become reachable), but the RECOVERY
-    # MECHANISM is only RECORDED — because the first cut of this arm asserted the wrong one.
-    # Measured 2026-07-17: the broker recovered ~73s after start while nats.conf was STILL clustered. So
-    # it was NOT an in-broker reconciler de-clustering the conf (drill 20's #20 path): brk2's nats-server
-    # is still alive in this topology, so the clustered JS meta simply re-formed across the two
-    # nats-servers even though tether's raft roster is now {brk1} alone. That distinction matters: in a
-    # REAL total-loss disaster there is no surviving peer to re-form with — which is drill 51's territory,
-    # not something 50 may claim either way.
-    if _k_declustered_now; then
-        log "#64 recovery mechanism: nats.conf WAS de-clustered to standalone (the in-broker reconciler converged it, #20's fix path)"
-    else
-        log "#64 recovery mechanism: nats.conf is STILL clustered — the broker recovered because the surviving peer's nats-server let the clustered JS meta re-form, NOT because anything de-clustered the conf. A real total-loss DR has no such peer (drill 51 owns that case)."
-    fi
+assert_ok "K1+K2 the broker becomes reachable after the restore (bounded self-heal off brk2's replica — NOT a de-cluster; a real total loss has no such peer, which is drill 51's territory)" _k_ready
+# The prediction check. Signature-guarded so a run where brk2's replica re-forms the JS meta before the
+# refusal is ever flushed to broker.err is recorded as an honest timing miss (runtime-guard), never as a
+# false GREEN and never as a false RED against the advice.
+if [ "$_K64_PREDICTED" = 1 ]; then
+    _as_pass "K-#64c the advice's PREDICTION held: brk1 did hit the lone-N=1 JetStream refusal when the de-cluster step was skipped — the warning is not just present, it is TRUE"
 elif [ "$_K_READY" = 1 ]; then
-    _as_pass "#64 does not reproduce: the broker came up after the restore with no lone-N=1 JetStream refusal in broker.err — restore now leaves a serviceable conf. Re-triage #64/#52 and flip the ledger"
+    not_covered "50-K-#64c the predicted lone-N=1 refusal was not observed in broker.err this run" "the broker became reachable (self-heal off brk2's replica) but the refusal line was not captured in the crash-loop window — brk2's JS meta may have re-formed before the refusal was flushed. The ADVICE halves (K-#64a/b) are asserted deterministically above; this reality-tie is timing-dependent on the surviving peer" runtime-guard
 else
-    _as_fail "#64 UNJUDGEABLE — the broker never became reachable AND broker.err carries no lone-N=1 JetStream signature. Triage before judging (see the K2 diagnostics above)"
+    _as_fail "K-#64c UNJUDGEABLE — the broker never became reachable AND the predicted refusal was never logged. Triage before judging (see the K2 diagnostics above)"
 fi
 
 assert_ok "K3 status is DEGRADED / NOT-HA with exactly ONE voter and NO force_single (exit 1 alone has no discriminating power)" \
     sh -c "\"$SIM\" exec brk1 -- sh -c 'runuser -u tether -- tether cluster status --json' | jq -e '.health==\"DEGRADED\" and (.health_label|test(\"NOT-HA\")) and ([.nodes[]?|select(.phase==\"VOTER\")]|length==1) and (.force_single_active != true)' >/dev/null"
 
-# ── L — IDENTITY: the bundle restored the backup MOMENT, not an empty or wrong DB ───────────────────
-# L1+L2 are ONE read and ONE jq: evaluating them separately would let `session ls` erroring count as
-# "Z is absent" (the positive and negative halves must stand or fall together).
-assert_ok "L1+L2 IDENTITY: X (lab, pre-backup) is present AND Z (zed, post-backup) is absent — one read, one evaluation" \
-    sh -c "\"$SIM\" ctl -- session ls --json 2>/dev/null | jq -e '([.sessions[]?|select(.name==\"lab\")]|length==1) and ([.sessions[]?|select(.name==\"zed\")]|length==0)' >/dev/null"
+# ── L — IDENTITY: the bundle restored a VALID DB and the surviving peer re-converged its own state ──
+# CORRECTED (R15, drill self-contradiction): the first cut asserted "zed (post-backup) is ABSENT" — a
+# BACKUP-MOMENT ROLLBACK. That invariant is WRONG for THIS drill's scenario, and the drill's own L3
+# comment below already says so: this is a PARTIAL loss (brk1's lib volume wiped while brk2 stays up) and
+# the drill DELIBERATELY does NOT de-cluster (K header), precisely so brk1 self-heals by RE-CLUSTERING with
+# brk2. Once it does, brk2 re-replicates every row it holds — including zed, which was committed after the
+# backup — back onto brk1 (~73s crash-loop + up to 120s, both already awaited by K1+K2 above). So the
+# CORRECT post-restore identity set here is {lab, zed}: lab proves the bundle restored real content, zed
+# proves the surviving peer's post-backup data was NOT lost to the partial DR. The backup-MOMENT rollback
+# (a post-backup session ABSENT) is a TOTAL-loss invariant with NO surviving peer — it belongs to drill 51,
+# exactly as L3 designates. L1+L2 stay ONE read and ONE jq so a `session ls` error can't count as a pass.
+# POLLED, not one-shot (R15 fix): the surviving-peer re-convergence (brk2's replica re-forms the raft group
+# with the restored brk1 and re-replicates zed) is timing-VARIABLE — under deploy-tier load the self-heal can
+# still be completing when the shell reaches here, so a single read races it and reads zed still-absent. Poll
+# for the STABLE re-converged identity {lab, zed}; each iteration is one read + one jq eval so a `session ls`
+# error can never count as a pass. This asserts the same invariant (partial-loss re-convergence) robustly.
+_id_reconverged() { "$SIM" ctl -- session ls --json 2>/dev/null | jq -e '([.sessions[]?|select(.name=="lab")]|length==1) and ([.sessions[]?|select(.name=="zed")]|length==1)' >/dev/null 2>&1; }
+assert_ok "L1+L2 IDENTITY: X (lab, pre-backup) is present AND Z (zed, post-backup) RE-CONVERGED from the surviving peer (POLLED — re-convergence is timing-variable under load)" \
+    poll_until 90 3 "lab present AND zed re-converged from the surviving peer" -- _id_reconverged
 # L3: absence is only evidence if the reader itself is proven alive. rc=0 + non-empty + L1's positive
 # control must all hold before the `! grep` means anything.
 # L3 — WHAT ACTUALLY HAPPENS TO HISTORY HERE, measured rather than assumed.
@@ -430,7 +575,7 @@ _L3_READER_UP=0
 if poll_until 180 3 "the history reader is alive again after #64's crash-loop" -- _l3_reader_alive; then _L3_READER_UP=1; fi
 _L3_OUT=$("$SIM" ctl -- history -n 50 2>&1); _L3_RC=$?
 if [ "$_L3_READER_UP" = 0 ] || [ "$_L3_RC" != 0 ] || [ -z "$_L3_OUT" ]; then
-    not_covered "50-L3 history survival via the replica" "the JS-backed history reader did not recover within 180s after #64's ~73s crash-loop (the history-<sid> stream reforms via brk2's replica on its own schedule) — an in-sim reader-recovery timing issue, not a product finding. #50/#64/DOC-27 (the drill's findings) are pinned above; history replication itself is covered by drill 10's R=3 stream proof"
+    not_covered "50-L3 history survival via the replica" "the JS-backed history reader did not recover within 180s after #64's ~73s crash-loop (the history-<sid> stream reforms via brk2's replica on its own schedule) — an in-sim reader-recovery timing issue, not a product finding. #50/#64/DOC-27 (the drill's findings) are pinned above; history replication itself is covered by drill 10's R=3 stream proof" runtime-guard
 elif printf '%s' "$_L3_OUT" | grep -q 'BACKUP-HISTORY-SENTINEL'; then
     _as_pass "L3 history SURVIVED the lib-volume wipe — correctly, via brk2's JetStream replica of history-$SID, NOT via the bundle (which carries state.db only, backup.go:87). The 'a bundle contains no JetStream' claim needs a total loss with no surviving replica: that is drill 51 arm J's property (#53), and asserting it here would be a false RED against restore"
 else

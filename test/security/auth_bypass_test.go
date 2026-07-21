@@ -196,18 +196,17 @@ func TestAgentProvEvictedAllowsNewBinding(t *testing.T) {
 
 // === C.21 PIN brute force defense documentation ==========================
 
-// TestPINBruteForceNoAccountLockoutCurrentBehavior: the auth_callout
-// handler does NOT impose any rate-limit / lockout per (sid, fp) on
-// failed PIN attempts. After 100 wrong PINs in a row, the 101st with
-// the CORRECT pin still succeeds. This is the documented v1
-// behavior — auth-rate-limiting was deferred (P-future).
+// TestPINBruteForceNoLockout5Tries: the session.JoinWithPIN PRIMITIVE imposes no
+// per-(sid, fp) lockout — it is a pure verify-and-insert. That is intentional:
+// the E.6 brute-force defense lives one layer UP, in the auth_callout handler,
+// as a PER-CLIENT-IP rate limit (P7/#25 — see internal/authcallout/ratelimit.go
+// + the ≤10/IP/min gate proven in internal/authcallout/ratelimit_test.go and the
+// real-callout end-to-end test/p3.TestPINRateLimitEndToEndRealCallout). This test
+// pins that the join primitive itself stays lockout-free (the rate limit is not
+// smeared into the storage layer), so 5 wrong + 1 right still lets the right PIN
+// through at THIS layer.
 //
-// FINDING (medium): no PIN-attempt rate limit; an attacker with
-// knowledge of (sid, nid) can brute-force a 4-digit PIN at ~1
-// CONNECT/sec for the next ~3 hours.
-//
-// We don't actually run 100 argon2 verifies (would take ~20s); we
-// run 5 wrong + 1 right and assert the right PIN still works.
+// We don't run 100 argon2 verifies (would take ~20s); 5 wrong + 1 right suffices.
 func TestPINBruteForceNoLockout5Tries(t *testing.T) {
 	db := openDB(t)
 	_, ownerFP := freshUserPub(t)

@@ -81,6 +81,10 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 			ForceSingleActive:  forceSingleActive(db),
 			UpgradeLockActive:  upgradeActive(db),          // External-review round2 B1: expose the roll lock for stale-lock self-heal
 			GrowLockActive:     growActiveJoiner(db) != "", // G4 §B: expose the grow lock for stale-lock self-heal (cluster add)
+			// R7b: expose each lock's LEASE expiry so `cluster unlock` can refuse to rip a LIVE lock out
+			// from under a renewing holder, and can name the never-self-healing "no lease at all" case.
+			UpgradeLeaseExpiry: leaseExpiryString(db, cluster.MetaKeyUpgradeLease),
+			GrowLeaseExpiry:    leaseExpiryString(db, cluster.MetaKeyGrowLease),
 			NodeID:             node.SelfID(),
 			ReleaseVersion:     proto.ReleaseVersion, // B6 OPS#4: live self-reported version
 			ProtoVer:           proto.ProtoVersion,
@@ -235,4 +239,16 @@ func growActiveJoiner(db *sql.DB) string {
 		return ""
 	}
 	return joiner
+}
+
+// leaseExpiryString (R7b) renders a lock lease's expiry for the health reply, or "" when the lock carries
+// no lease (a pre-R7b acquire) or the row is unreadable. Deliberately NOT an error: the health probe must
+// answer even on a broker whose lease row is malformed, and "" is the honest, fail-closed answer — the
+// reaper declines to expire exactly the same cases.
+func leaseExpiryString(db *sql.DB, key string) string {
+	exp, err := cluster.LeaseExpiry(db, key)
+	if err != nil {
+		return ""
+	}
+	return exp.UTC().Format(time.RFC3339Nano)
 }

@@ -18,8 +18,9 @@
 #  (f) refresh "converged" only from exit 0 with a stale roster_gen → C1 asserts roster_gen strictly grew.
 #  (g) doctor "all green" only from treating a FATAL as WARN → the FATAL variant (T2) asserts exit 77.
 #  (h) "no residue" loudly claimed while agent.yaml WAS written → T2 pins the EXACT residue reality.
-#  (i) manifest leg "serve-ready" only because the sim hand-started manifest_listen → assert default-OFF
-#      FIRST (gotcha #27) THEN enable.
+#  (i) manifest leg "serve-ready" only because curl always returns non-000 → the #27-CLOSED bound check is
+#      gated by a control curl to a genuinely-unbound port (must be 000), so the bound assertion cannot pass
+#      vacuously. #27 is now serve-ready by DEFAULT after init (no operator manifest_listen step).
 set -u
 . "$HERE/lib/log.sh"
 . "$HERE/lib/docker.sh"
@@ -35,14 +36,26 @@ CTL()   { "$SIM" ctl -- "$@"; }
 AJOIN() { "$SIM" exec agt1 -- runuser -u sim -- env HOME=/home/sim tether "$@"; }
 BROK()  { "$SIM" exec brk1 -- runuser -u tether -- tether "$@"; }
 # R10: reap the same-netns ingress sidecars on ANY exit BEFORE cmd_nuke removes their netns-owner broker.
-trap 'ingress_down brk1 443 2>/dev/null; ingress_down brk1 8444 2>/dev/null' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): a POSIX INT/TERM handler RETURNS to the next command, so
+# the combined trap reaped the sidecars and then RESUMED the join/forgery steps below. drill_install_traps
+# registers EXIT on its own and exits 128+signo on INT/TERM. Cleanup body unchanged.
+_cleanup() { ingress_down brk1 443 2>/dev/null; ingress_down brk1 8444 2>/dev/null; }
+drill_install_traps _cleanup
 
 _agt1_online() { CTL node ls 2>/dev/null | grep -qE "^agt1[[:space:]]+.*ONLINE"; }
-# manifest default-off probe: no listener bound → curl http_code 000 (couldn't connect). After enable it is
-# 200 or 503 (bound). This cleanly distinguishes "no listener" from "listener returns an HTTP error".
+# manifest listener probe: no listener bound → curl http_code 000 (couldn't connect); a bound listener is
+# 200 or 503. This cleanly distinguishes "no listener" from "listener returns an HTTP error".
 _manifest_refused() {
     _code=$("$SIM" exec brk1 -- curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:7480/.well-known/tether/cluster.json 2>/dev/null)
     [ "$_code" = "000" ]
+}
+# #27 CLOSED (R12): after cluster init the listener is bound BY DEFAULT ⇒ curl answers (code != 000).
+_manifest_bound() { ! _manifest_refused; }
+# non-恒真 control: a port nothing listens on MUST still yield curl 000 — proves the 000-detection actually
+# discriminates a refused connection, so _manifest_bound's pass is not a vacuous "curl always returns non-000".
+_unbound_port_refused() {
+    _c=$("$SIM" exec brk1 -- curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:39999/.well-known/tether/cluster.json 2>/dev/null)
+    [ "$_c" = "000" ]
 }
 # drill-local predicates that call the ingress.sh / CTL / AJOIN functions (assert_ok runs these in a
 # command-sub subshell that INHERITS the functions — unlike `sh -c "…func…"`).
@@ -97,16 +110,22 @@ drill_begin "82-agent-onboarding-invite (N=2 + fresh agent: C2 onboarding + S0-i
 # agt1 = the fresh agent that joins via invite; agt2 = a fresh container kept CA-UN-injected (I-NEG-CA negative).
 assert_ok "up 2 brokers + 2 fresh agents + 1 ctl"  "$SIM" up --brokers 2 --agents 2 --ctl 1
 assert_ok "init brk1 (standalone → N=1 cluster)"   "$SIM" init brk1
-# R15: leader-health floor so SETUP-27's `000` is provably the unbound manifest port, not a crashed broker.
-assert_ok "N=1 leader floor (leader=brk1) — attributes SETUP-27's 000 to the manifest port, not a dead broker" \
+# R15: leader-health floor so the broker is provably ALIVE — a crashed broker would ALSO refuse curl (000),
+# so SETUP-27's BOUND check (and the control port's 000) are attributable to the listener state, not a dead
+# broker. This is the health precondition under which the #27-CLOSED default-bind is asserted.
+assert_ok "N=1 leader floor (leader=brk1) — broker alive, so the #27 bound/refused checks reflect the manifest listener, not a dead broker" \
           sh -c "\"$SIM\" exec brk1 -- sh -c 'tether cluster status --json' | jq -e '.leader_id==\"brk1\"' >/dev/null"
-# ── gotcha #27: C2 well-known discovery is NOT serve-ready after bare init (manifest_listen omitted) ──
-assert_ok "SETUP-27 [#27] bare init: well-known manifest listener NOT bound (curl → connection refused)" \
-          _manifest_refused
-# labeled operator step: enable manifest_listen (the workaround the gap forces)
-assert_ok "SETUP-enable ingress_enable_manifest brk1 (labeled operator step; gotcha #27 workaround)" \
-          ingress_enable_manifest brk1
+# ── #27 CLOSED (R12): C2 well-known discovery is now serve-ready after cluster init BY DEFAULT ─────────
+# resolveManifestListen defaults manifest_listen to 127.0.0.1:7480 in cluster mode, so a bare `cluster init`
+# (the sim's broker.yaml seam writes the cluster: block but NOT manifest_listen — mirroring the real seam)
+# binds the listener with NO operator step. The old inverted "listener NOT bound" gap + its ingress_enable_
+# manifest workaround are RETIRED; the listener being bound after init is now a plain GREEN regression.
+assert_ok "SETUP-27-control a genuinely-unbound port yields curl 000 (proves the connection-refused oracle discriminates — the bound check below is not a vacuous 'curl always returns non-000')" \
+          _unbound_port_refused
+assert_ok "SETUP-27 [#27 CLOSED] after cluster init the well-known manifest listener is BOUND by default (curl to 127.0.0.1:7480 answers, NOT connection-refused) — no operator manifest_listen step required" \
+          poll_until 30 2 "manifest listener bound after init" -- _manifest_bound
 # S0-ingress bring-up: mint leaf, start same-netns TLS front, inject CA into agt1 trust store
+# (the loopback manifest listener the front routes to is already bound by the #27 default above).
 assert_ok "SETUP-ingress mint ingress leaf for brk1"    secrets_mint_ingress "$INSTANCE" brk1
 assert_ok "SETUP-ingress start same-netns HTTPS front on brk1:443" ingress_up brk1
 assert_ok "SETUP-ingress inject instance CA into agt1 trust store" ingress_trust_inject agt1
@@ -202,11 +221,11 @@ if "$SIM" exec agt1 -- loginctl enable-linger sim >/dev/null 2>&1 && \
         assert_ok "U3 user-unit enable --now → same agent back ONLINE" \
                   poll_until 30 2 "agt1 ONLINE via user-unit" -- _agt1_online
     else
-        warn "U3 NOT-COVERED-in-sim: systemctl --user not viable in this container (measured)"
+        not_covered "U3 (in-sim)" "systemctl --user not viable in this container (measured)" gap
     fi
     assert_ok "U4 --uninstall removes the user unit"  _u4
 else
-    warn "U1-U4 NOT-COVERED-in-sim: container has no systemd --user manager / linger (measured — usage §6.1 path left to real machines)"
+    not_covered "U1-U4 (in-sim)" "container has no systemd --user manager / linger (measured — usage §6.1 path left to real machines)" gap
 fi
 
 # cleanup: kill any backgrounded ingress sidecars + join daemons (trap nuke also reaps by label)

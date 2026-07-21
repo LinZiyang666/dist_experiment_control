@@ -29,10 +29,15 @@ import (
 // through publishAudit so it lands in the `events` JetStream stream
 // when JS is available; falls back to core publish otherwise.
 //
-// kind values per architecture H.1: session_created /
-// session_destroyed / member_joined / pin_failed / rotated_pin /
-// kicked / tetherd_restarted / agent_registered /
-// agent_unregistered / disk_pressure.
+// kind values ACTUALLY emitted (architecture H.1): session_created /
+// session_destroyed / member_joined / pin_failed / tetherd_restarted /
+// agent_registered / agent_evicted / agent_roster_stale / disk_pressure,
+// plus the operational proxy_* / nats_topology_* / rehome / grow-cutover
+// kinds. DOC-12: architecture H.1 previously listed `rotated_pin`, `kicked`
+// and `agent_unregistered`, which have NO producer in v1 — `session
+// kick`/`rotate-pin` are not implemented, and node removal emits
+// `agent_evicted` (I.2b operator eviction), not `kicked`. H.1 was corrected
+// to match this; do not re-add those three unless the producing verbs land.
 func (b *Broker) pubSysEvent(kind string, fields map[string]any) {
 	if fields == nil {
 		fields = map[string]any{}

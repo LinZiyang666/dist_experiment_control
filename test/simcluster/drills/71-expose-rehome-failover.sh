@@ -18,25 +18,52 @@
 #     UNCHANGED, until the home RETURNS and the agent re-tunnels (same port / same epoch). rebuild-ON and
 #     rebuild-OFF behave IDENTICALLY on a crash (both strand) — the rebuild distinction is DRAIN-only (NOT-COVERED).
 #
-# HOW B / E / G / F (DRAIN-MIGRATE etc.) ARE HANDLED — an EXPLICIT FAILING GATE, not a self-authored NOT-COVERED
+# ── R9-D (2026-07-19): ARM B IS NO LONGER A "RED-EXPOSING WALL" — IT IS P1's DEPLOY-TIER VERIFIER ──────────────
+# R8 landed two distinct changes that this drill had not caught up with, and BOTH are judged here, separately:
+#
+#   (a) rc SEMANTICS. `cluster drain` used to write port_allocations.home_broker through raft, tell nobody, and
+#       print "drain <node> ok". It now refuses rc=0 while the data plane is behind: exit 75 (EX_TEMPFAIL) with
+#       codeDataplaneNotConverged ("the control plane committed the rehome but N expose(s) have NOT confirmed
+#       the new home yet"). That exit is CORRECT BEHAVIOUR, not a refusal and not a transport failure — the
+#       rehome IS committed and the broker keeps re-delivering. The pre-R9-D drill classified it as
+#       "refused for an UNEXPECTED reason" and went RED on the product's own fix.
+#   (b) DELIVERY no longer depends on the agent reconnecting. The home directive is an ACTIVE push that the
+#       broker RE-DELIVERS on a reconcile pass until the agent publishes an APPLIED ack (agent/home_push.go).
+#       Before R8 the only carrier was the register reply, so a healthy, quiet agent could never learn its
+#       expose had moved — the tunnel stayed pinned to the drained broker forever. That is P1.
+#
+# So arm B is now a POSITIVE assertion with three independent oracles, in increasing order of what they prove:
+#   B-cmd     — the rc is honest (rc=0, or rc=75 with the EXACT authored dataplane_not_converged string).
+#   B-migrate — the TERMINAL data-plane state: the expose is homed on a SURVIVOR voter and that broker's public
+#               port returns the sentinel over the real tunnel. Never an intermediate "a directive was
+#               published" artifact — a published directive that nobody applied is precisely the P1 bug.
+#   B-silent  — the P1 PREMISE: it got there while agt1 NEITHER restarted NOR re-registered/rebuilt its NATS
+#               session. Without this, one incidental reconnect would make the drill pass in BOTH the fixed
+#               and the unfixed world (R8's hermetic test buys the same guarantee with a fake agent that is
+#               structurally incapable of speaking; deploy-tier buys it by counting the agent's own journal).
+#
+# HOW E / G / F (the remaining drain arms) ARE HANDLED — an EXPLICIT FAILING GATE, not a self-authored NOT-COVERED
 # (external-review R6-M2; round-5's owner-decisions.md D1 was a developer-authored authority the reviewer could not
-# verify — removed). The locked drain-migrate (arm B) is now a HARD assertion: agt→brk3 + a rebuild-ON expose is
-# established, then `cluster drain brk3` MUST migrate it to a survivor voter that SERVES. It goes RED when blocked,
-# EXPOSING the walls (this is the owner's "缺陷登记" register-as-defect intent + the reviewer's requirement):
+# verify — removed). The rebuild-OFF drain refusal (arm E) stays a HARD assert_refuses. The walls the pre-R9-D
+# header listed were:
 #   (1) homeForExpose does NOT deliver a non-tunnel home (un-homed fallback, above) — expose --on-broker a-non-leader
 #       from a leader-tunneled agent NEVER serves (empirically, 180s×2);
 #   (2) the ONLY way to home an expose on a non-leader is to tunnel the AGENT there, and agent-tunnel-to-a-non-leader
 #       is INTERMITTENT (the FIXTURE gate hard-asserts + RED-exposes this; the reviewer's own solo1b hit it as 71 RED);
-#   (3) even when the fixture establishes, `cluster drain brk3` is REFUSED by a lingering grow op (NATS_ROLLED_OUT,
-#       the #31 grow-op family) until an operator runs `cluster ops abort`.
-# So arm B goes RED (release-blocking), and E/G/F (which need a SUCCESSFUL drain as their precondition) are blocked
-# by the SAME walls — the drill exposes them as gaps rather than declaring the deliverable complete. The FIXTURE
+#   (3) even when the fixture establishes, `cluster drain brk3` can be REFUSED by a lingering grow op
+#       (NATS_ROLLED_OUT, the #31 grow-op family). R7a fixed #31's release-failure shape and R7b put the marker
+#       under a lease+TTL with `cluster unlock` as the operator's out, so this is no longer the EXPECTED outcome
+#       — but if it still fences the drain, arm B records it as a signature-guarded PRODUCT-RED against #31 and
+#       declines to judge a migration that never ran (a command that did not execute proves nothing either way).
+# G/F (which need a SUCCESSFUL drain of a NON-leader-homed expose as their precondition) remain gaps. The FIXTURE
 # assertion is also HARD (RED if agt→brk3 never establishes) so a non-establishing fixture is never a silent GREEN.
 # Draining the AGENT's-tunnel broker = draining the LEADER (whose failover admin-path is a separate follow-up S9).
 #
-# EVENT ORACLES → READABLE SUBSTITUTES: home_reassign_*/broker_down_rehome_summary sys.events have NO operator
-# reader; oracles bind to expose explain --json (epoch/moved/rebuild), curl-through (sentinel / exit-7), and
-# `cluster status` reachability (proves the leader SAW the crash). Raw events stay NOT-COVERED (no reader).
+# EVENT ORACLES → READABLE SUBSTITUTES + the #30 raw reader: oracles bind to expose explain --json (epoch/moved/
+# rebuild), curl-through (sentinel / exit-7), and `cluster status` reachability (proves the leader SAW the crash).
+# #30 ADDED the operator reader `tether admin events`, so Arm B now ALSO reads the drain's expose_rehomed sys.event
+# back (on top of the data-plane migrate). broker_down_rehome_summary/rehome_stalled fire only from the crash /
+# no-eligible-target fixtures G/F own (still gaps), so they are not read here.
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/cluster.sh"; . "$HERE/drills/lib/dataplane.sh"
@@ -69,6 +96,38 @@ _all_live_voters_refuse() {
 _epoch_moved_unchanged() {   # $1=name $2=expected-epoch — epoch unchanged AND not moved (NO rehome happened)
     [ "$(_ex_epoch "$1")" = "$2" ] && [ "$(_ex "$1" | jq -r '.moved // false' 2>/dev/null)" = false ]
 }
+# ── R9-D arm-B oracles ────────────────────────────────────────────────────────────────────────────────────────
+# _drain_dataplane_pending <rc> <captured-output> : the EXACT R8 rc semantics. BOTH halves are required —
+#   • rc == 75 (exitcode.go:33 exitTransient; error_hints.go maps codeDataplaneNotConverged to it), and
+#   • the authored sentence from ErrDataPlaneNotConverged.Error() (home_convergence.go:73).
+# Matching only the string would accept any exit code (including a hypothetical rc=0 that merely PRINTED it);
+# matching only rc=75 would accept every other transient (catch_up_stalled, quorum blips) as if it were this one.
+_drain_dataplane_pending() {
+    [ "${1:-}" = 75 ] || return 1
+    printf '%s' "${2:-}" | grep -qE 'the control plane committed the rehome but .* have NOT confirmed'
+}
+# _agt_journal_count <agent> <since> <ere> : how many lines in the agent's OWN journal window match <ere>.
+# Prints a number, or NOTHING when the journal is unreadable — callers treat empty as FAIL, never as zero.
+_agt_journal_count() {
+    dexec "$1" -- sh -c "journalctl -u tether-agent --since='$2' --no-pager 2>/dev/null | grep -cE '$3'" 2>/dev/null
+}
+_agt_mainpid() { "$SIM" exec "$1" -- systemctl show tether-agent -p MainPID --value 2>/dev/null; }
+# _agt_silent_since <agent> <since> : the P1 PREMISE. Over the drain window the agent
+#   (i)  DID receive + apply at least one ACTIVE home directive  ("home directives pushed" / "home applied-ack",
+#        agent/home_push.go:64,95), and
+#   (ii) did NOT re-establish its session even once ("re-registered after reconnect" proxy.go:503, "registered"
+#        agent.go:665 — which fires on EVERY register incl. a restart's first one — or either rebuild line).
+# (i) is NOT the claim; it is the ANTI-VACUITY GUARD. A missing/empty/unreadable journal would otherwise make
+# (ii)'s "zero reconnects" trivially true, which is exactly the permanently-true-oracle family this suite keeps
+# getting bitten by. The CLAIM the drill makes about the product is B-migrate (the terminal data plane); this
+# predicate only certifies that the claim was earned WITHOUT a reconnect carrying the directive.
+_agt_silent_since() {
+    _ass_push=$(_agt_journal_count "$1" "$2" 'agent: home directives pushed|agent: home applied-ack')
+    _ass_reg=$(_agt_journal_count "$1" "$2" 'agent: re-registered after reconnect|agent: registered|rebuilding NATS session|rebuilding session')
+    log "71: agt-journal window since '$2' on $1 — active home-delivery lines=[${_ass_push:-UNREADABLE}] re-register/rebuild lines=[${_ass_reg:-UNREADABLE}]"
+    [ -n "${_ass_push:-}" ] && [ "$_ass_push" -ge 1 ] 2>/dev/null || return 1
+    [ -n "${_ass_reg:-}" ] && [ "$_ass_reg" -eq 0 ] 2>/dev/null
+}
 # R6-M2: the locked drain-migrate (arm B) — an expose migrated OFF <old-home> to a survivor voter that SERVES.
 _drain_migrated() {   # $1=expose-name $2=old-home
     _dm_h=$(_ex "$1" | jq -r '.home_broker // empty' 2>/dev/null)
@@ -76,8 +135,53 @@ _drain_migrated() {   # $1=expose-name $2=old-home
     _dm_p=$(_ex_port "$1"); [ -n "$_dm_p" ] || return 1
     dp_curl_ok_body ctl1 "http://$_dm_h:$_dm_p/" "$TOK"
 }
+# H9 (2026-07-18 full-suite run): a failed B-migrate used to leave NO terminal evidence, so the report could
+# not separate the two very different failures _drain_migrated collapses into one `return 1`:
+#   (a) the control plane never moved the expose at all — home_broker is STILL the drained brk3; or
+#   (b) the control plane DID move it (home_broker changed) but the data plane never followed the move.
+# Those have different owners (the drain/rehome write path vs the P1-family "raft written, data plane never
+# executes" gap), and telling them apart needs exactly two facts: the TERMINAL `expose explain --json`, and
+# whether the OLD home is still the one answering. Both are captured here, on the failure path only.
+_b_migrate_forensics() {   # $1=expose-name $2=old-home
+    log "71: B-migrate FAILED — TERMINAL expose explain $1 --json (does .home_broker still say $2? then the drain never rehomed it at all) →"
+    "$SIM" ctl -- expose explain "$1" --json 2>&1 | sed 's/^/[b-migrate explain] /'
+    _bmf_h=$(_ex "$1" | jq -r '.home_broker // "none"' 2>/dev/null)
+    _bmf_p=$(_ex_port "$1")
+    log "71: B-migrate FAILED — terminal home_broker=[${_bmf_h:-?}] public_port=[${_bmf_p:-?}] old_home=$2"
+    _bmf_out=$(dexec ctl1 -- curl -sS -m 6 -o /dev/null -w 'http=%{http_code}' "http://$2:${_bmf_p:-0}/" 2>&1); _bmf_rc=$?
+    log "71: B-migrate FAILED — curl against the OLD home $2:${_bmf_p:-?} → rc=$_bmf_rc out=[$_bmf_out] (rc=7 refused / rc=28 timeout = the old home stopped serving; a 200 here means the expose never left $2)"
+    if [ -n "$_bmf_h" ] && [ "$_bmf_h" != "$2" ] && [ "$_bmf_h" != none ]; then
+        _bmf_new=$(dexec ctl1 -- curl -sS -m 6 -o /dev/null -w 'http=%{http_code}' "http://$_bmf_h:${_bmf_p:-0}/" 2>&1); _bmf_nrc=$?
+        log "71: B-migrate FAILED — the home DID change to $_bmf_h; curl against the NEW home $_bmf_h:${_bmf_p:-?} → rc=$_bmf_nrc out=[$_bmf_new] (a failure here = control plane moved it, data plane did not follow)"
+    else
+        log "71: B-migrate FAILED — the home did NOT change (still [${_bmf_h:-?}]): this is a control-plane non-rehome, NOT a data-plane strand"
+    fi
+}
+# ── #30 operator event reader (admin events) ────────────────────────────────────────────────────────────
+# The H.1 `events` JetStream stream (sys.events) had NO operator reader before #30: home_reassign_*/expose_rehomed/
+# broker_down_rehome_summary were member-SUBSCRIBE only. `tether admin events` is that reader, over the root-only
+# 0600 admin socket. Read on the leader $LDR0 (always alive — never the crash/drain victim brk3; the events stream
+# is clustered so any live-quorum broker serves it). --json ⇒ ONLY machine JSON on stdout (R11), host jq parses it.
+# reader ANCHOR: the operator reader reads a KNOWN-fired, non-rehome event (agent_registered for sid=lab/nid=agt1,
+# broker.go:1341) — proves the reader WORKS in this drill before we pin the drain's rehome kind (non-vacuity).
+_reader_reads_agent_registered() {
+    _c=$(dexec -u tether "$LDR0" -- tether admin events --kind agent_registered -n 200 --json 2>/dev/null | jq '[.events[]?|select(.body.sid=="lab" and .body.nid=="agt1")]|length' 2>/dev/null)
+    case "$_c" in ''|*[!0-9]*) return 1;; esac; [ "$_c" -ge 1 ]
+}
+# target: the Arm-B drain's expose_rehomed for wstrand OFF brk3 is READABLE (clusterdrain.go:806 emits it on a
+# committed migrate; body {port,name,sid,from_broker,to_broker}). from_broker=brk3 (the drained home), name=wstrand.
+_reader_reads_expose_rehomed() {
+    dexec -u tether "$LDR0" -- tether admin events --kind expose_rehomed -n 200 --json 2>/dev/null \
+        | jq -e '[.events[]?|select(.body.name=="wstrand" and .body.from_broker=="brk3" and .body.sid=="lab")]|length>=1' >/dev/null 2>&1
+}
+# SECRET-FREE: every expose_rehomed body carries ONLY {v,type,ts,port,name,sid,from_broker,to_broker} — topology
+# fields, never a token/psk. jq returns true/false and never prints a body value. Requires >=1 wstrand event (non-vacuous).
+_expose_rehomed_secretfree() {
+    dexec -u tether "$LDR0" -- tether admin events --kind expose_rehomed -n 200 --json 2>/dev/null \
+        | jq -e '([.events[]?|select(.body.name=="wstrand")]|length>=1) and all(.events[]?; ((.body|keys) - ["v","type","ts","port","name","sid","from_broker","to_broker"]|length)==0)' >/dev/null 2>&1
+}
 
-drill_begin "71-expose-rehome-failover (N=3 — cluster-expose CRASH-STRAND/RETURN #29; drain-migrate = HARD RED gate)"
+drill_begin "71-expose-rehome-failover (N=3 — cluster-expose CRASH-STRAND/RETURN #29; drain-migrate = P1/R8's deploy-tier verifier)"
 "$SIM" nuke >/dev/null 2>&1 || true
 # R5-M5: run grow_to_3 OUTSIDE assert_ok so its FIRST-CLASS evidence (GROW-ATTEMPTS trailer + per-attempt grow rc
 # + any retry warning) is VISIBLE in the log (assert_ok captures + hides stdout/stderr on success), then assert the rc.
@@ -158,38 +262,82 @@ if [ "$FIXTURE" = 1 ]; then
             && log "71: Arm E DIAGNOSTIC — the drain was intercepted by the #31 lingering in-flight op (rc=$_AS_RC, NATS_ROLLED_OUT) BEFORE reaching the rebuild-OFF check; the EXACT refusal is unreachable behind #31 (that IS the assert_refuses RED above, R8-M3), not a false pass"
         dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3 --abort >/dev/null 2>&1 || true
     else
-        warn "71 Arm E NOT-COVERED THIS RUN — a post-return recovery FAILED (C-recover=$_crec, D-recover=$_drec; the RED assertion(s) above): the rebuild-off fixture is not both-live, so a drain would run over a non-live fixture while claiming both exposes are live. Arm E is GATED (R8-M3); the recover RED(s) above are the exposure."
+        not_covered "71 Arm E THIS RUN" "a post-return recovery FAILED (C-recover=$_crec, D-recover=$_drec; the RED assertion(s) above): the rebuild-off fixture is not both-live, so a drain would run over a non-live fixture while claiming both exposes are live. Arm E is GATED (R8-M3); the recover RED(s) above are the exposure. CLASS gap (R14 re-adjudication): this hole exists BECAUSE the #29-family recovery is not yet reliable, not a sim-timing valve — it turns GREEN when the product recovers the fixture, so it is debt owned by #29, not a re-run-and-it-lands runtime-guard." gap
     fi
     CTL expose rm agt1 --name wnr >/dev/null 2>&1   # E done — remove wnr; keep wstrand (rebuild-ON) live for the B journey
 
-    # ── Arm B [DRAIN-MIGRATE] (R6-M2 + R7-M2) — GATED on the rebuild-ON wstrand recovery (R9-M3): B's fixture IS
-    #    wstrand; if it did NOT recover after return (_crec=0), the drain would run over a non-live fixture and could
-    #    describe a bogus migration/serving. Gate on _crec (wnr already removed, so _drec is not needed here); else B
-    #    NOT-COVERED without issuing the drain, preserving the C-recover RED. Check the drain COMMAND outcome directly
-    #    (rc + signature), SPLIT from the migration oracle — a #31 refusal is the credible product block; a wrong
-    #    refusal / transport failure is a DIFFERENT (undocumented) RED; a successful drain runs the migration oracle. ──
+    # ── Arm B [DRAIN-MIGRATE — the P1 / R8 deploy-tier verifier] (R6-M2 + R7-M2, REWRITTEN R9-D) ────────────────
+    #    GATED on the rebuild-ON wstrand recovery (R9-M3): B's fixture IS wstrand; if it did NOT recover after
+    #    return (_crec=0), the drain would run over a non-live fixture and could describe a bogus migration.
+    #    The drain COMMAND outcome (rc + signature) is judged SEPARATELY from the DATA-PLANE outcome, because
+    #    R8 deliberately made them different questions — see the R9-D block in the header. ──
     if [ "$_crec" = 1 ]; then
-        _dm_out=$(dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3 --now 2>&1); _dmrc=$?
+        # R9-D: NO `--now`. `--now` collapses the convergence deadline to `now` (clusterstatus.go:776-779), so
+        # the R8 gate is structurally unable to observe an ack and rc=75 becomes the ONLY reachable outcome —
+        # the drill would be measuring its own flag rather than the product. Dropping it hands the gate its
+        # designed 30s drain-notice budget, which makes the rc oracle genuinely TWO-SIDED (rc=0 is reachable).
+        AGT_PID0=$(_agt_mainpid agt1)
+        BSINCE=$(dexec agt1 -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        [ -n "$BSINCE" ] || BSINCE="-10 min"
+        log "71: Arm B pre-drain — agt1 tether-agent MainPID=[${AGT_PID0:-?}] journal window opens at [$BSINCE]"
+        _dm_out=$(dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3 2>&1); _dmrc=$?
         log "71: Arm B cluster drain brk3 rc=$_dmrc out=[$(printf '%s' "$_dm_out" | tr '\n' '|' | head -c 300)]"
-        if [ "$_dmrc" = 0 ]; then
-            assert_ok "B-cmd cluster drain brk3 command SUCCEEDED (rc=0) — the drain-migrate path is reachable this run"  sh -c "true"
-            assert_ok "B-migrate [DRAIN-MIGRATE] wstrand migrates to a survivor voter + SERVES within 180s (the locked rehome-via-drain, plan §2-71 B; RED if the moved expose strands)"  poll_until 180 6 "wstrand migrates off brk3 + serves" -- _drain_migrated wstrand brk3
+        if [ "$_dmrc" = 0 ] || _drain_dataplane_pending "$_dmrc" "$_dm_out"; then
+            if [ "$_dmrc" = 0 ]; then
+                assert_ok "B-cmd [R8 rc] cluster drain brk3 returned rc=0 — under R8 that is a STRONG claim, not a bare exit: DrainNode only reaches its rc=0 tail once awaitHomeConvergence has seen every migrated expose's agent ACK the new home epoch (home_convergence.go:122-142). The pre-R8 rc=0 (raft written, nobody told) is the exact lie this arm exists to catch"  sh -c "[ '$_dmrc' = 0 ]"
+            else
+                assert_ok "B-cmd [R8 rc] cluster drain brk3 returned the DOCUMENTED rc=75 dataplane_not_converged with its authored signature — CORRECT behaviour, NOT a refusal and NOT a transport failure: the rehome IS committed and the broker keeps re-delivering, so the CLI declines to report success the data plane has not earned yet. Pre-R9-D this drill classified the product's own P1 fix as 'a wrong refusal' and went RED on it"  _drain_dataplane_pending "$_dmrc" "$_dm_out"
+            fi
+            # H9: capture the poll OUTCOME first, emit the terminal forensics on the failure path, THEN judge.
+            # The forensics MUST run here and not later: the `cluster drain --abort` a few lines below mutates
+            # the very state (home_broker / which broker serves) the evidence is about, so a post-abort capture
+            # would describe the rollback rather than the failure. The judgment is byte-for-byte the same one
+            # (RED unless the expose migrated off brk3 AND served) — assert_ok simply no longer runs the poll.
+            if poll_until 240 6 "wstrand migrates off brk3 + serves on a survivor" -- _drain_migrated wstrand brk3; then _bmig=1; else _bmig=0; fi
+            [ "$_bmig" = 1 ] || _b_migrate_forensics wstrand brk3
+            assert_ok "B-migrate [P1 TERMINAL STATE — the core of this drill] wstrand is homed on a SURVIVOR voter AND that broker's public port returns the exact sentinel over the real tunnel, within 240s of the drain. This is the END state, never an intermediate 'a home directive was published' artifact — a directive nobody applied IS the P1 bug. RED here means the control plane moved the row and the data plane never followed; the terminal explain + old/new-home curl forensics logged above say WHICH of the two it was (H9)"  sh -c "[ '$_bmig' = 1 ]"
+            AGT_PID1=$(_agt_mainpid agt1)
+            assert_ok "B-noreexec agt1's tether-agent MainPID is UNCHANGED across the drain (was [${AGT_PID0:-?}], now [${AGT_PID1:-?}]) — the rehome was NOT carried by an agent restart, whose boot register would have delivered the new home the pre-R8 way"  sh -c "[ -n '${AGT_PID0:-}' ] && [ '${AGT_PID0:-x}' = '${AGT_PID1:-y}' ]"
+            if [ "$_bmig" = 1 ]; then
+                assert_ok "B-silent [P1 PREMISE] the migration above was delivered while agt1 stayed SILENT: its own journal for the drain window contains >=1 ACTIVE home-delivery line (home directives pushed / home applied-ack) and ZERO re-register/rebuild lines. Without this, one incidental NATS reconnect would let B-migrate pass in BOTH the fixed and the unfixed world — the reconnect, not the R8 push, would have carried the directive"  _agt_silent_since agt1 "$BSINCE"
+                # #30 CLOSED: home_reassign_*/expose_rehomed sys.events had no operator reader — `admin events` is now
+                # that reader. B-migrate just PROVED wstrand migrated OFF brk3 on the DATA plane, so the drain also
+                # committed + emitted expose_rehomed (clusterdrain.go:806); assert the operator can now READ it back.
+                assert_ok "B-event [#30] anchor: the operator reader (admin events) reads a KNOWN-fired non-rehome event (agent_registered sid=lab/nid=agt1) — proves the reader WORKS in this drill before pinning the rehome kind (non-vacuity)"  _reader_reads_agent_registered
+                assert_ok "B-event [#30] admin events reads the drain's expose_rehomed for wstrand OFF brk3 (from_broker=brk3, name=wstrand, sid=lab) — the migration B-migrate just proved on the data plane ALSO surfaces as an operator-readable rehome event; #30 added this reader (was NOT-COVERED: raw sys.events had no operator reader)"  poll_until 20 2 "expose_rehomed for wstrand readable" -- _reader_reads_expose_rehomed
+                assert_ok "B-event [#30] the expose_rehomed payload is SECRET-FREE (body keys ⊆ {v,type,ts,port,name,sid,from_broker,to_broker}; the reader relays only topology fields — never a token/psk)"  _expose_rehomed_secretfree
+            else
+                not_covered "71 B-silent [P1 premise] THIS RUN" "B-migrate is RED (the expose never reached a survivor that serves), so there is no delivery whose silence could be certified. Judging the premise over a migration that did not happen would attach a verdict to nothing. The B-migrate RED above is the exposure. CLASS gap (R14): tied to the #29-family migration not landing — debt that a fix retires, not intrinsic sim non-determinism." gap
+            fi
+            if [ "$_dmrc" != 0 ]; then
+                # The rc=75 message DOCUMENTS a remedy: "re-run to keep waiting (the broker keeps re-delivering)".
+                # Assert the remedy actually TERMINATES. NB this deliberately does NOT claim to re-prove
+                # convergence (by now nothing is homed on brk3, so the re-run's migrate set is empty): what it
+                # pins is that the documented operator loop ends in a completed drain instead of looping forever.
+                assert_ok "B-rerun [R8 remedy] the re-run the rc=75 message tells the operator to do reaches rc=0 (the documented loop TERMINATES; it does not tell operators to retry something that can never succeed)"  dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3
+                assert_ok "B-rerun-effect brk3 is actually in phase DRAINING after that rc=0 (the terminal control-plane state the exit code claims), read back from the leader's roster — not inferred from the exit code alone"  poll_until 30 3 "brk3 DRAINING" -- _phase_is brk3 DRAINING
+            fi
         elif printf '%s' "$_dm_out" | grep -qiE 'in flight|NATS_ROLLED_OUT|membership operation'; then
-            assert_ok "B-cmd cluster drain brk3 is REFUSED by the documented #31 lingering in-flight op (rc=$_dmrc, signature 'NATS_ROLLED_OUT/in flight') — the credible product block, split from the migration oracle (a wrong-refusal/transport failure would NOT match this signature; R7-M2)"  sh -c "true"
-            assert_ok "B-migrate [DRAIN-MIGRATE] the locked rehome-via-drain (wstrand migrates to a survivor + serves) is UNREACHABLE — RED (release-blocking): the drain was refused by #31 above, so the migration NEVER happens (R6-M2/R7-M2)"  sh -c "false"
+            product_red "#31 acquire-lock window (owner: R7b lease+TTL / 'cluster unlock') — cluster drain brk3 was FENCED by a lingering in-flight membership op (rc=$_dmrc, signature NATS_ROLLED_OUT/in-flight/membership-operation). R7a fixed the release-failure shape and R7b put the marker under a 15m lease with an explicit operator clear, so this is no longer the expected steady state; reproducing it here is the registered defect surfacing, not a new one"
+            not_covered "71 Arm B [P1 drain-migrate + the R8 rc semantics] THIS RUN" "the drain COMMAND never executed — it was fenced by the #31 in-flight membership op recorded PRODUCT-RED above. Nothing about the rehome data plane can be judged from a command that did not run, and inventing a migration failure for it would attribute a #31 fence to P1. The PRODUCT-RED is the exposure; re-run once membership is unfenced (tether cluster unlock) to reach the P1 verifier." gap
         else
-            assert_ok "B-cmd cluster drain brk3 refused for an UNEXPECTED reason (rc=$_dmrc, NOT the #31 signature: [$(printf '%s' "$_dm_out" | tr '\n' '|' | head -c 120)]) — a wrong refusal / transport failure; RED for an undocumented reason (R7-M2)"  sh -c "false"
-            assert_ok "B-migrate [DRAIN-MIGRATE] UNREACHABLE — RED (release-blocking): the drain failed (undocumented) so the migration never happens (R7-M2)"  sh -c "false"
+            assert_ok "B-cmd cluster drain brk3 failed for an UNDOCUMENTED reason (rc=$_dmrc, matching NEITHER the R8 dataplane_not_converged signature NOR the #31 in-flight fence: [$(printf '%s' "$_dm_out" | tr '\n' '|' | head -c 160)]) — a wrong refusal / transport failure; the false-green guard trips rather than laundering an unknown failure into one of the two known ones"  sh -c "false"
+            assert_ok "B-migrate [P1 TERMINAL STATE] UNREACHABLE — the drain failed for an undocumented reason above, so the migration never happens (RED, release-blocking)"  sh -c "false"
         fi
         dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3 --abort >/dev/null 2>&1 || true
     else
-        warn "71 Arm B [DRAIN-MIGRATE] NOT-COVERED THIS RUN — the rebuild-ON wstrand did NOT recover after return (C-recover RED, _crec=0): B's OWN fixture is not proven live, so the drain is NOT issued (running it could describe a bogus migration/serving over a dead fixture — R9-M3). The C-recover RED is the exposure."
+        not_covered "71 Arm B [DRAIN-MIGRATE] THIS RUN" "the rebuild-ON wstrand did NOT recover after return (C-recover RED, _crec=0): B's OWN fixture is not proven live, so the drain is NOT issued (running it could describe a bogus migration/serving over a dead fixture — R9-M3). The C-recover RED is the exposure. CLASS gap (R14): the #29-family recovery not landing is a persistent product hole, not a re-runnable sim-timing valve — GREEN when the fixture recovers." gap
     fi
     CTL expose rm agt1 --name wstrand >/dev/null 2>&1
 else
-    warn "71 crash-strand core + drain arms NOT-COVERED THIS RUN — the FIXTURE assertion above is RED (R6-M2): agt→brk3 + a brk3-homed expose did NOT establish within 200s (agent_rejected:frpc_failed — the intermittent agent-tunnel-to-non-leader gap, itself the #29-family unreliability). The crash + drain arms are not run over a non-established fixture (a misleading result); the RED FIXTURE assertion exposes the gap so the drill is NOT silently GREEN."
+    not_covered "71 crash-strand core + drain arms THIS RUN" "the FIXTURE assertion above is RED (R6-M2): agt→brk3 + a brk3-homed expose did NOT establish within 200s (agent_rejected:frpc_failed — the intermittent agent-tunnel-to-non-leader gap, itself the #29-family unreliability). The crash + drain arms are not run over a non-established fixture (a misleading result); the RED FIXTURE assertion exposes the gap so the drill is NOT silently GREEN. CLASS gap (R14): #29 is an OPEN defect, so this is registered debt owned by #29 (it disappears when #29 lands), not an intrinsic sim-timing runtime-guard." gap
 fi
 
 # ── Arms G / F (stickiness, rehome_stalled) — need a SUCCESSFUL drain as precondition; blocked by the same walls ──
-warn "71 NOT-COVERED [G/F only — Arm E is now DIRECTLY EXECUTED above (R7-M2)]: the home-return stickiness arm (G) and rehome_stalled{no_eligible_target} (F) need a SUCCESSFUL cluster drain of a non-leader-homed expose as their precondition — blocked by the same #29/#31 walls Arm B RED-exposes. Arm E (rebuild-OFF drain refusal) is NO LONGER grouped here — it is executed above with assert_refuses (rc≠0 + exact 'will NOT be auto-migrated' signature; if #31 intercepts it REDs as unreachable). COVERAGE (R8-M3 correction): the rebuild-OFF drain refusal IS hermetic-tested — test/d7/integration_test.go testD7DrainRefusesRebuildOff asserts errors.As ErrRebuildOffExposes + the enumerated refused port + the home NOT silently changed; Arm E here ADDS CLI / real-stack / #31-interaction coverage, it is NOT the only coverage (the round-7 'no _test.go references' claim was a scoping error — that grep searched only internal/, missing test/d7/). What deploy-tier drill 71 uniquely covers is the rebuild-ON drain-MIGRATE end-to-end DATA PLANE (expose actually migrates to a survivor + serves over the real tunnel) — D7's DrainRetireFollower no-ops migrateExposes (no exposes homed), so that data-plane path is NOT hermetic-tested. home_reassign_*/broker_down_rehome_summary/expose_rehomed/rehome_stalled RAW sys.events have NO operator reader (raw-event only, s3-s5-owner-decisions.md D2). The CRASH-STRAND + RETURN + rebuild-OFF-crash halves of #29 ARE pinned above; the DRAIN-MIGRATE (B) + rebuild-OFF-drain-refusal (E) are RED-exposed (unreachable behind #29/#31), not declared complete."
+not_covered "71 [G/F only — Arm E is now DIRECTLY EXECUTED above (R7-M2)]: the home-return stickiness arm (G) and rehome_stalled{no_eligible_target} (F)" \
+    "G (home-return stickiness) needs a drained-then-RETURNED home and F (rehome_stalled{no_eligible_target}) needs an N=1-eligible topology; neither is constructed by this drill, so both stay registered gaps rather than being folded into arm B. Arm E (rebuild-OFF drain refusal) is NOT grouped here — it is executed above with assert_refuses (rc!=0 + exact 'will NOT be auto-migrated' signature). Arm B is NO LONGER grouped here either: since R8 it is a POSITIVE assertion (P1's deploy-tier verifier), not a RED-exposed wall. COVERAGE (R8-M3 correction): the rebuild-OFF drain refusal IS hermetic-tested — test/d7/integration_test.go testD7DrainRefusesRebuildOff asserts errors.As ErrRebuildOffExposes + the enumerated refused port + the home NOT silently changed; Arm E here ADDS CLI / real-stack / #31-interaction coverage, it is NOT the only coverage (the round-7 'no _test.go references' claim was a scoping error — that grep searched only internal/, missing test/d7/). What deploy-tier drill 71 uniquely covers is the rebuild-ON drain-MIGRATE end-to-end DATA PLANE over the REAL tunnel, with the agent proven silent — D7's DrainRetireFollower no-ops migrateExposes (no exposes homed) and R8's own invariant test proves the same claim hermetically against a fake agent, so the real-stack half is drill 71's alone." gap
+# #30 CLOSED: the home_reassign_*/expose_rehomed RAW sys.events no longer lack an operator reader — `tether admin
+# events` added it, and Arm B above reads the drain's expose_rehomed back (anchored on agent_registered, secret-free)
+# whenever the rebuild-ON migrate lands (_bmig=1). The remaining raw-event kinds (broker_down_rehome_summary /
+# rehome_stalled) fire only from the crash / no-eligible-target fixtures that G/F own above (still gaps), not Arm B.
 drill_end

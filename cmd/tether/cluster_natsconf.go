@@ -472,6 +472,10 @@ func newClusterDoctorCmd() *cobra.Command {
 			checks := clusteroffline.Doctor(clusteroffline.DoctorOptions{
 				SecretsDir: secretsDir, DBPath: dbPath, ConfPath: confPath, RaftAddr: raftAddr, NatsRoute: natsRoute,
 			})
+			// R11 P6/#54 facet 2: the syntax/perms checks above never noticed that a rotated
+			// account.nk/broker.nk no longer matches the issuer rendered into nats.conf. Cross-check
+			// the on-disk seeds against the live conf so an auth_callout skew is FATAL, not invisible.
+			checks = append(checks, clusterAuthIssuerSkewChecks(secretsDir, confPath)...)
 			return renderDoctor(cmd, append(prefix, checks...), asJSON)
 		},
 	}
@@ -518,6 +522,15 @@ func renderDoctor(cmd *cobra.Command, checks []clusteroffline.DoctorCheck, asJSO
 		_, _ = fmt.Fprintf(out, "\ndoctor: %d pass, %d advisory, %d fatal\n", pass, advisory, fatal)
 	}
 	if fatal > 0 {
+		if asJSON {
+			// R11 deploy-tier fix (drill 52 B3/55c): in --json mode the JSON on stdout already carries
+			// summary.fatal, so exit non-zero QUIETLY — do NOT let the main sink append an "error: ..."
+			// line to stderr. A caller that merges the streams (`cluster doctor --json 2>&1 | jq`) would
+			// otherwise get the JSON followed by prose and fail to parse it (jq: parse error), so a
+			// correctly-detected FATAL would be invisible to the machine consumer.
+			return &ExitError{Class: exitUsage, Quiet: true,
+				Err: fmt.Errorf("cluster doctor: %d FATAL check(s)", fatal)}
+		}
 		return usageErr("cluster doctor: %d FATAL check(s) — fix them before `cluster init`", fatal)
 	}
 	return nil

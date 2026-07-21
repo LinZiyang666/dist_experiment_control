@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,6 +38,22 @@ type agentYAML struct {
 	FileTransfer fileTransferConfig `yaml:"file_transfer"`
 	Proxy        proxyConfig        `yaml:"proxy"`
 	RemoteFS     remoteFSConfig     `yaml:"remote_fs"`
+	// Upgrade (#28) is the agent's own upgrade policy. The agent has ALWAYS re-checked the download
+	// URL against a local allowlist (architecture J.4 § 安全约束 — belt and braces behind the broker's
+	// gate), but until now that allowlist was a hardcoded constant with no operator input: an operator
+	// self-hosting release artifacts could open the broker's allowlist and still be refused
+	// url_not_allowed_local by every agent, with nothing to change. Both the error hint and the manual
+	// pointed at "the agent's --upgrade-url-allow flag", which did not exist.
+	Upgrade agentUpgradeConfig `yaml:"upgrade,omitempty"`
+}
+
+// agentUpgradeConfig is the agent.yaml `upgrade:` block. It mirrors the broker's
+// `broker.upgrade.url_allow` (cmd/tether/serve.go) so the two roles are configured the same way.
+type agentUpgradeConfig struct {
+	// URLAllow narrows/replaces the built-in agent allowlist. Absent/empty ⇒ the agent keeps its
+	// built-in default (this project's GitHub releases prefix), preserving the pre-#28 behaviour
+	// exactly for every existing install.
+	URLAllow []string `yaml:"url_allow,omitempty"`
 }
 
 // remoteFSConfig controls hung-network-filesystem-safe spawn for exec/run
@@ -65,6 +82,81 @@ func parseOptDuration(s, field string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: must not be negative: %q", field, s)
 	}
 	return d, nil
+}
+
+// resolveAgentUpgradeAllow applies #28's precedence for the agent's local upgrade-URL allowlist:
+//
+//	explicit --upgrade-url-allow  >  agent.yaml `upgrade.url_allow`  >  the agent's built-in default
+//
+// This is the same shape `tether serve` already uses for the broker's copy of the same setting. An empty
+// result is NOT "deny everything": internal/agent falls back to defaultAgentURLAllowlist, so every
+// pre-#28 install keeps its exact behaviour.
+//
+// Entries are validated, because the failure mode of a typo here is silent and confusing: urlAllowed is
+// a plain strings.HasPrefix test, so "githib.com/…" or a bare hostname simply never matches, and the
+// operator sees url_not_allowed_local for a URL they believe they allowed. Fail at startup instead.
+func resolveAgentUpgradeAllow(cmd *cobra.Command, flagVal, yamlVal []string) ([]string, error) {
+	allow := flagVal
+	if !cmd.Flags().Changed("upgrade-url-allow") {
+		allow = yamlVal
+	}
+	for _, p := range allow {
+		if !strings.HasPrefix(p, "https://") && !strings.HasPrefix(p, "http://") {
+			return nil, fmt.Errorf("upgrade URL allowlist entry %q is not a URL prefix — entries must begin with "+
+				"https:// (or http://). The allowlist is matched by prefix, so a non-URL entry can never match a "+
+				"download URL: it would silently DISABLE upgrades rather than permit them. "+
+				"Set it via --upgrade-url-allow or the `upgrade.url_allow` list in agent.yaml", p)
+		}
+	}
+	return allow, nil
+}
+
+// agentDaemonInputs is everything the daemon's config fold needs that is not on the cobra command.
+type agentDaemonInputs struct {
+	Home, SID, NID, PIN, NATSURL string
+	YAML                         agentYAML
+	UpgradeURLAllowFlag          []string
+	Logger                       *slog.Logger
+}
+
+// agentDaemonConfig folds flags + agent.yaml into the daemon's agent.Config. Every value-resolution rule
+// for `tether agent` lives here so it can be asserted directly; RunE does IO and lifecycle only.
+//
+// It runs BEFORE any identity/NATS work, so a malformed setting is a startup error the operator sees at
+// once rather than a mysterious refusal much later (e.g. url_not_allowed_local at upgrade time).
+func agentDaemonConfig(cmd *cobra.Command, in agentDaemonInputs) (agent.Config, error) {
+	probeTO, err := parseOptDuration(in.YAML.RemoteFS.ProbeTimeout, "remote_fs.probe_timeout")
+	if err != nil {
+		return agent.Config{}, err
+	}
+	spawnTO, err := parseOptDuration(in.YAML.RemoteFS.SpawnTimeout, "remote_fs.spawn_timeout")
+	if err != nil {
+		return agent.Config{}, err
+	}
+	upgradeAllow, err := resolveAgentUpgradeAllow(cmd, in.UpgradeURLAllowFlag, in.YAML.Upgrade.URLAllow)
+	if err != nil {
+		return agent.Config{}, usageErr("%v", err)
+	}
+	return agent.Config{
+		NATSURL:      in.NATSURL,
+		SID:          in.SID,
+		NID:          in.NID,
+		PIN:          in.PIN,
+		Home:         in.Home,
+		Logger:       in.Logger,
+		AccountPub:   in.YAML.AccountPub,   // C2: OOB account-pub pin (disables TOFU)
+		BootstrapURL: in.YAML.BootstrapURL, // C2: cold-start manifest URL
+
+		AllowRoots:                    in.YAML.FileTransfer.AllowRoots,
+		RootsConfigured:               in.YAML.FileTransfer.AllowRoots != nil,
+		ProxyAllowPrivateDestinations: in.YAML.Proxy.AllowPrivateDestinations,
+		RemoteFSMode:                  in.YAML.RemoteFS.Mode,
+		RemoteFSSafeDir:               in.YAML.RemoteFS.SafeDir,
+		RemoteFSProbeTimeout:          probeTO,
+		RemoteFSSpawnTimeout:          spawnTO,
+		RemoteFSWedgeCeiling:          in.YAML.RemoteFS.WedgeCeiling,
+		UpgradeURLAllowlist:           upgradeAllow, // #28
+	}, nil
 }
 
 // proxyConfig is the agent-side P13 proxy block (round-7 F5). The documented
@@ -156,6 +248,7 @@ func newAgentCmd() *cobra.Command {
 		nid                string
 		pin                string
 		tunnelAddr         string
+		upgradeURLAllow    []string
 		installUserService bool
 		uninstall          bool
 		logLevel           string
@@ -202,38 +295,20 @@ func newAgentCmd() *cobra.Command {
 				return fmt.Errorf("--nid is required (set on CLI or in agent.yaml)")
 			}
 
-			probeTO, err := parseOptDuration(ay.RemoteFS.ProbeTimeout, "remote_fs.probe_timeout")
-			if err != nil {
-				return err
-			}
-			spawnTO, err := parseOptDuration(ay.RemoteFS.SpawnTimeout, "remote_fs.spawn_timeout")
-			if err != nil {
-				return err
-			}
-
 			logger, err := newLogger(logLevel, logJSON)
 			if err != nil {
 				return err
 			}
 
-			cfg := agent.Config{
-				NATSURL:      natsURL,
-				SID:          sid,
-				NID:          nid,
-				PIN:          pin,
-				Home:         home,
-				Logger:       logger,
-				AccountPub:   ay.AccountPub,   // C2: OOB account-pub pin (disables TOFU)
-				BootstrapURL: ay.BootstrapURL, // C2: cold-start manifest URL
-
-				AllowRoots:                    ay.FileTransfer.AllowRoots,
-				RootsConfigured:               ay.FileTransfer.AllowRoots != nil,
-				ProxyAllowPrivateDestinations: ay.Proxy.AllowPrivateDestinations,
-				RemoteFSMode:                  ay.RemoteFS.Mode,
-				RemoteFSSafeDir:               ay.RemoteFS.SafeDir,
-				RemoteFSProbeTimeout:          probeTO,
-				RemoteFSSpawnTimeout:          spawnTO,
-				RemoteFSWedgeCeiling:          ay.RemoteFS.WedgeCeiling,
+			// The FLAGS+YAML → agent.Config fold lives in one testable function (see #28's wiring
+			// tests): assembling it inline here made it impossible to assert that a resolved setting
+			// actually reaches the daemon, which is precisely how a flag ends up parsed-then-discarded.
+			cfg, err := agentDaemonConfig(cmd, agentDaemonInputs{
+				Home: home, SID: sid, NID: nid, PIN: pin, NATSURL: natsURL,
+				YAML: ay, UpgradeURLAllowFlag: upgradeURLAllow, Logger: logger,
+			})
+			if err != nil {
+				return err
 			}
 
 			// TETHER_DEV_NO_AUTH (CLI-side env, see internal/cli.DevNoAuthEnv):
@@ -287,6 +362,10 @@ func newAgentCmd() *cobra.Command {
 	cmd.Flags().StringVar(&pin, "pin", "", "session PIN, required only on first connect (binds (sid,nid) to this agent's nkey)")
 	cmd.Flags().StringVar(&tunnelAddr, "tunnel-addr", "127.0.0.1:7000",
 		"broker reverse-TCP tunnel control address (host:port); empty to disable data plane")
+	cmd.Flags().StringSliceVar(&upgradeURLAllow, "upgrade-url-allow", nil,
+		"URL prefixes this agent will accept for `tether node upgrade` downloads (architecture J.4; the agent re-checks "+
+			"independently of the broker). Overrides `upgrade.url_allow` in agent.yaml; unset on both = the built-in "+
+			"tether releases prefix")
 	cmd.Flags().BoolVar(&installUserService, "install-user-service", false,
 		"write ~/.config/systemd/user/tether-agent@<sid>.service and exit (does NOT start)")
 	cmd.Flags().BoolVar(&uninstall, "uninstall", false,

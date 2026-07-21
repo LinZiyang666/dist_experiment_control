@@ -85,13 +85,20 @@ assert_refuses "GATE-a healthy REAL arm refuses (quorum_not_lost / leader contac
 assert_refuses "YES-off: offline --yes rejected (Tier-2, NO --yes override)" \
     "NO --yes override|cannot run unattended" \
     dexec -u tether brk1 -- sh -c "tether cluster recovery force-single --self-id brk1 --confirm-peers-dead brk2 --yes 2>&1"
-# YES-online (#36 candidate): the ONLINE path with --yes is NOT routed through the offline Tier-2 rejector —
-# on a healthy cluster it refuses via the online quorum_not_lost gate ("leader contact"), NEVER the offline
-# "NO --yes override" string. The distinct refusal string (vs YES-off above) IS the #36 finding: online
-# force-single's --yes handling diverges from offline's Tier-2 rejection (cluster_offline.go:155-158 early
-# return skips the :165 rejector). TTY protection stays intact (a real commit still needs the typed confirm).
-assert_refuses "YES-online (#36): online --yes refuses via the online gate (leader contact), NOT offline 'NO --yes override'" \
-    "leader contact|quorum-loss escape|requires an interactive terminal" \
+# YES-online (#36 FLIPPED — product fixed R14): the ONLINE path's --yes is now routed through the SAME
+# Tier-2 rejector the offline path uses. `newClusterForceSingleCmd`'s `if online` branch calls
+# rejectedUnattendedYes(cmd, "force-single", selfID) BEFORE runForceSingleOnline (cluster_offline.go:165-173)
+# — the earlier :155-158 early-return that skipped the :165 rejector is gone. So --online --yes now refuses
+# with the offline-identical `cannot run unattended … NO --yes override` (exit 64), IN FRONT of the admin
+# socket, exactly like YES-off above. #36's offline/online divergence is CLOSED. TTY-typed confirm stays
+# intact (a real commit still needs the typed node_id).
+# NON-VACUITY: this signature is the OPPOSITE of the pre-fix one. Pre-fix, --online --yes reached the online
+# quorum_not_lost gate and printed "leader contact" (never "NO --yes override"); reverting the R14 rejector
+# degrades it to a bare admin-socket dial error (measured, R14 mutation `WithoutYesReachesSocket`). Either
+# regression prints NEITHER "NO --yes override" nor "cannot run unattended" ⇒ this assert_refuses REDs
+# ("refused, but NOT for /sig/"). It can only pass on the FIXED product.
+assert_refuses "YES-online (#36 FLIPPED, R14): online --yes is Tier-2-rejected IDENTICALLY to offline ('NO --yes override' / 'cannot run unattended'), not the old online-gate divergence" \
+    "NO --yes override|cannot run unattended" \
     dexec -u tether brk1 -- sh -c "tether cluster recovery force-single --online --self-id brk1 --confirm-peers-dead brk2 --yes 2>&1"
 
 # ── ARM-0: DIAGNOSIS SPIKE — kill the peer (REAL Restart=always unit NEVER masked) ──────────────────
@@ -128,7 +135,7 @@ positive|tamed)
     if [ "$BRANCH" = tamed ]; then
         warn "Arm-0 TAMED: brk1 restarted (NRestarts $NR0→$NR1) but the dwell still satisfied — a container-timing artifact. Falling through to the positive path."
         not_covered "Arm-0 uninterrupted-dwell production-fidelity (TAMED: the survivor restarted but the dwell still satisfied — a container-timing artifact)" \
-            "the positive commit path IS exercised below, but the production-real uninterrupted-dwell (no survivor bounce) was not reproduced this run — a container-timing artifact (SB-22 follow-up)"
+            "the positive commit path IS exercised below, but the production-real uninterrupted-dwell (no survivor bounce) was not reproduced this run — a container-timing artifact (SB-22 follow-up)" runtime-guard
     fi
     # GATE-d: exercise the single-shot and TTL gates on the real socket before the destructive commit.
     ARM1=$(_admin_json '{"op":"cluster_force_single_arm","node_id":"brk1","confirm_peers_dead":["brk2"]}')

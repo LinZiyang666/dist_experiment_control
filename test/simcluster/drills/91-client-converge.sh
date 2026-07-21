@@ -47,21 +47,19 @@ assert_ok "A2 grow brk2 → seeds show AUTO-includes brk2 (NO manual publish) wi
 assert_ok "A2 seed_generation ADVANCED past $GEN0 after grow (change-gated auto-publish)" \
     sh -c "[ \"\$($SIM exec $LDR -- tether cluster seeds show 2>/dev/null | sed -n 's/^seed_generation: *//p' | head -1)\" != '$GEN0' ]"
 assert_setup "A2 grow brk3 reaches VOTER" "$SIM" grow brk3
-# gate on brk3 actually reaching VOTER first (a grow flake ≠ an auto-converge failure), then poll seeds ≤120s.
-poll_until 90 4 "brk3 reaches VOTER" -- sh -c "$SIM status --json 2>/dev/null | jq -e '.nodes[]?|select(.node_id==\"brk3\" and .phase==\"VOTER\")' >/dev/null" || warn "A2: brk3 did not reach VOTER (grow flake — auto-converge can't include a non-voter)"
-# measure-and-record: brk2 auto-converged into seeds (arm above) but brk3 consistently does not within 120s.
-# If brk3 IS a VOTER yet never appears in `seeds show`, that is a REAL candidate G3 auto-converge gap (the
-# change-gated auto-publish includes the 2nd broker but not the 3rd) — EXPOSE it, do not just extend the timeout.
-if poll_until 120 5 "brk3 in endpoints" -- _ep_has "brk3"; then
-    _as_pass "A2 grow brk3 → seeds show AUTO-includes brk3 (NO manual publish, change-gated auto-publish)"
-elif "$SIM" status --json 2>/dev/null | jq -e '.nodes[]?|select(.node_id=="brk3" and .phase=="VOTER")' >/dev/null 2>&1; then
-    # brk3 IS a VOTER but never appeared in `seeds show` within 120s, while brk2 DID — a REAL G3 auto-converge
-    # defect (the change-gated auto-publish includes the 2nd broker but not the 3rd), reproduced this run and
-    # signature-matched (VOTER present, endpoint absent) → PRODUCT-RED, not a silent NOT-COVERED-GREEN.
-    product_red "#46 seeds auto-converge OMITS the 3rd voter [#46] — brk3 reached VOTER but never appeared in 'seeds show' endpoints within 120s while brk2 DID; the change-gated auto-publish includes the 2nd broker but not the 3rd (seed_converge.go root-cause SB-91)"
+# #46 CLOSED (R12 — flip): the machinery hypothesis (DeriveSeedEndpoints "drops the 3rd") was REFUTED — it
+# handled 3 voters all along. The real fix is the TRIGGER: the leader now re-converges seeds every observe
+# tick (seedSetEqual change-gate), so the LAST voter no longer starves waiting for a non-existent next grow.
+# Gate on brk3 reaching VOTER first — a grow flake is genuine non-determinism → runtime-guard, NOT a #46
+# judgment; once brk3 IS a VOTER the periodic re-converge MUST pull it into `seeds show` within bounded time.
+# Non-恒真: A1 (brk1) + A2 (brk2) above already assert those endpoints are PRESENT, so `_ep_has` reads real
+# data — a still-absent brk3 would exhaust the poll and RED this assertion.
+if poll_until 90 4 "brk3 reaches VOTER" -- sh -c "$SIM status --json 2>/dev/null | jq -e '.nodes[]?|select(.node_id==\"brk3\" and .phase==\"VOTER\")' >/dev/null"; then
+    assert_ok "A2 grow brk3 → seeds show AUTO-includes brk3 within 120s (#46 CLOSED — leader periodic re-converge; NO manual publish)" \
+        poll_until 120 5 "brk3 in endpoints" -- _ep_has "brk3"
 else
     not_covered "A2 grow brk3 → seeds auto-include (brk3 never reached VOTER this run — grow flake)" \
-        "auto-converge cannot include a non-voter; the G3 auto-converge assertion for the 3rd broker was not exercisable this run (grow flake, not a G3 gap)"
+        "auto-converge cannot include a non-voter; the 3rd-voter converge assertion was not exercisable this run (grow flake, not a #46 gap)" runtime-guard
 fi
 
 # ── D cli broker auto-failover + trust-anchor negative ──────────────────────────────────────

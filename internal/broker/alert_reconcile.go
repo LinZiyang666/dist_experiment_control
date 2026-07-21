@@ -47,6 +47,11 @@ type AlertReconcilerConfig struct {
 	Webhook func(WebhookEvent)
 	// LeaderID returns the current leader's node id (stamped into the webhook body).
 	LeaderID func() string
+	// SelfID is this broker's node id. Used ONLY to tell a genuine leadership HANDOFF (LeaderID
+	// is some OTHER node) apart from a same-node lease blip (LeaderID is us or empty) when deciding
+	// whether to discard the webhook baseline — see ReconcileAlertsOnce (#93/H13). Empty ⇒ the
+	// conservative old behavior (always re-baseline on any leadership loss).
+	SelfID string
 	// SetJSUnavailable (G7b #20③), when non-nil, is called with the leader's SUSTAINED JetStream-503
 	// verdict: true once Observe has failed with the 10008 signature for >= jsDownThreshold, false on
 	// the first positive observation OR when this node is no longer leader. nil disables JS-503 signalling.
@@ -62,9 +67,10 @@ type AlertReconcilerConfig struct {
 type AlertReconciler struct {
 	cfg AlertReconcilerConfig
 	// webhook committed-delta state (leader-local, single-goroutine — no lock needed): the
-	// committed ACTIVE set observed on the PREVIOUS leader pass. webhookSeeded is reset whenever
-	// this node is not leader, so on (re)gaining leadership the first pass establishes a baseline
-	// WITHOUT firing (else a new leader would re-POST every already-active alert).
+	// committed ACTIVE set observed on the PREVIOUS leader pass. webhookSeeded is reset on a
+	// GENUINE handoff to another node (so the returning leader re-baselines WITHOUT re-POSTing
+	// every already-active alert) but PRESERVED across a same-node lease blip (#93/H13 — else a
+	// transition committed during the blip would be absorbed into the re-seed and dropped forever).
 	prevActive    map[string]bool
 	webhookSeeded bool
 	// jsDownSince (G7b #20③) is the leader-local wall-clock of the FIRST JS-503 in the current run of
@@ -174,7 +180,20 @@ func cloneKeySet(m map[string]bool) map[string]bool {
 func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 	now := r.cfg.Now()
 	if !r.cfg.Node.IsLeader() || r.cfg.Node.LeaderContactStale(now) {
-		r.webhookSeeded = false // lost leadership → re-baseline on the next leader pass (no re-fire)
+		// #93/H13: only DISCARD the webhook baseline on a GENUINE handoff to ANOTHER node — that
+		// node's reconciler now owns (and fires) the committed deltas, so re-firing them on our
+		// return would duplicate. A SAME-NODE lease blip (a sub-second raft step-down/re-elect with
+		// no other leader, common when a saturated host starves the raft lease past
+		// LeaderLeaseTimeout) must NOT discard: a transition committed during the blip was fired by
+		// nobody, and re-seeding would absorb it into the baseline and DROP it forever. Preserving the
+		// baseline across a blip re-fires the missed delta on our return; the only cost is a possible
+		// DUPLICATE webhook on a genuine handoff-and-back, which the dedup_key makes idempotent —
+		// strictly better than a silent drop. Empty SelfID / nil LeaderID ⇒ conservative old reset.
+		if r.cfg.SelfID == "" || r.cfg.LeaderID == nil {
+			r.webhookSeeded = false
+		} else if lid := r.cfg.LeaderID(); lid != "" && lid != r.cfg.SelfID {
+			r.webhookSeeded = false // a different node is leader now — it owns the deltas
+		}
 		// G7b #20③: a demoted leader drops its JS-503 state so it never answers a stale-true self-report.
 		r.jsDownSince = time.Time{}
 		if r.cfg.SetJSUnavailable != nil {

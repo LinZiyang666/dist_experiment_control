@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -31,6 +33,16 @@ const upgradeTriggerCodeUnauthorized = "unauthorized"
 // not wired yet (a broker that just re-exec'd has its health responder up before clusterAdminHandle is
 // set). The orchestrator retries it, so a startup window is a brief wait rather than a roll HALT.
 const upgradeTriggerCodeNotReady = "cluster_not_ready"
+
+// upgradeTriggerCodeLockNotHeld (R7b) tells a lease renewer the roll lock is gone. TERMINAL for the
+// renewer: a renewal is structurally incapable of re-creating a released lock.
+const upgradeTriggerCodeLockNotHeld = "lock_not_held"
+
+// upgradeOpHomesConverged (R8a P1) is the roll-tail data-plane verdict op. The literal is
+// shared with cmd/tether/cluster_upgrade_drive.go (both ends author it independently — the
+// ClusterUpgradeReq.Op field is a free-form string); TestUpgradeHomesConvergedOpIsWireStable
+// pins the pair so a rename on one side cannot silently turn the gate into a no-op.
+const upgradeOpHomesConverged = "homes-converged"
 
 // setClusterAdminHandle stores the admin-dispatch func under the lock (the trigger responder reads it from
 // another goroutine). External-review M1.
@@ -130,7 +142,16 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		fwd, _ := json.Marshal(&proto.UpgradeForwardedReq{ReExecOnly: true, SHA256: req.ExpectSHA256})
 		reply, err := nc.Request(proto.SubjCmdForwarded(req.SID, agentNID, "upgrade"), fwd, b.cfg.UpgradeForwardTimeout())
 		if err != nil {
-			return &proto.ClusterUpgradeResp{Code: "agent_no_responders", Error: err.Error()}
+			// P3: name the agentless case explicitly. A dedicated broker host (no
+			// `serve --colocated-agent-nid`, no agent registered under node_id==nid) has no agent leg,
+			// and a current ctl marks its step BROKER-ONLY and never sends this op. Reaching here means
+			// either a genuinely unreachable agent, or a ctl too old to make that distinction — for
+			// which "upgrade the ctl, or re-run the roll from a current one" is the actual fix, not
+			// "go find the agent".
+			return &proto.ClusterUpgradeResp{Code: "agent_no_responders", Error: err.Error() +
+				" (no agent answered for nid " + agentNID + " on broker host " + b.selfID +
+				"; if this host deliberately runs NO co-located agent, a current `tether cluster upgrade`" +
+				" plans it broker-only and does not send this request at all)"}
 		}
 		var ar proto.UpgradeForwardedResp
 		if json.Unmarshal(reply.Data, &ar) != nil {
@@ -138,6 +159,27 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		}
 		if !ar.OK {
 			return &proto.ClusterUpgradeResp{Code: "agent_rejected:" + ar.Code, Error: ar.Error}
+		}
+		return &proto.ClusterUpgradeResp{OK: true}
+	case upgradeOpHomesConverged:
+		// R8a P1: the `cluster upgrade` verb's rc-semantics probe. The orchestrator asks
+		// the LEADER, at the tail of a roll, whether every homed expose's agent has
+		// CONFIRMED its home — i.e. whether the data plane actually came back after the
+		// brokers were restarted underneath it. Not-converged is a NONZERO outcome for
+		// the roll, exactly as keeper.Lost() already is.
+		if b.cl == nil || b.cl.node == nil || !b.cl.node.IsLeader() {
+			// Only the leader accumulates applied acks (the delivery pass is leaderOnly),
+			// so a follower must not render a verdict — it would always say "unconverged".
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeNotLeader, Error: "not leader; ask the leader for the data-plane verdict"}
+		}
+		pending, err := b.homesUnconverged()
+		if err != nil {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeStoreError, Error: err.Error()}
+		}
+		if len(pending) > 0 {
+			return &proto.ClusterUpgradeResp{Code: codeDataplaneNotConverged,
+				Error: "the roll finished on every host but " + strconv.Itoa(len(pending)) +
+					" expose(s) have not re-confirmed their home: " + strings.Join(pending, ", ")}
 		}
 		return &proto.ClusterUpgradeResp{OK: true}
 	case "acquire-lock":
@@ -162,6 +204,35 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		}
 		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetUpgradeActive(b.cfg.Now()) }); err != nil {
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeNotLeader, Error: "acquire upgrade lock (run against the leader): " + err.Error()}
+		}
+		// H1: the acquire is a CONDITIONAL replicated mutex (PlanSetUpgradeActive no-ops if a grow marker is
+		// held). Read the marker back after apply — a no-op means a `cluster add` grow won the race between our
+		// preflight read and our commit, so we must NOT report a lock we do not hold. Refuse and let the operator
+		// retry rather than run a roll lockless alongside a grow.
+		if !upgradeActive(b.cl.node.RODB()) {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest,
+				Error: "a concurrent `cluster add` grow acquired the membership lock first — let it finish, then retry the rolling upgrade"}
+		}
+		return &proto.ClusterUpgradeResp{OK: true}
+	case "renew-lock":
+		// R7b (P3): the roll lock is now LEASED. driveUpgrade keeps a renewer alive for the whole roll; a
+		// HALT (or a killed ctl) stops the renewals and the broker-side reconcile pass expires the lock.
+		//
+		// This is the fix for a lock that was previously UNRELEASABLE. releaseUpgradeLock runs only on clean
+		// completion, and the sole self-heal lives inside `plan.Upgrades() == 0` — a branch an agentless host
+		// can never reach, because AtTarget is structurally false there. A HALT therefore fenced join/retire
+		// permanently. The renewal can only REFRESH, never CREATE (PlanRenewUpgradeLease is gated on the
+		// marker still existing), so a late renewal cannot resurrect a released lock.
+		if b.cl == nil || b.cl.node == nil {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeClusterNotEnabled, Error: "cluster not enabled"}
+		}
+		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanRenewUpgradeLease(b.cfg.Now())
+		}); err != nil {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeNotLeader, Error: "renew upgrade lock (run against the leader): " + err.Error()}
+		}
+		if !upgradeActive(b.cl.node.RODB()) {
+			return &proto.ClusterUpgradeResp{Code: upgradeTriggerCodeLockNotHeld, Error: "the upgrade lock is no longer held"}
 		}
 		return &proto.ClusterUpgradeResp{OK: true}
 	case "release-lock":

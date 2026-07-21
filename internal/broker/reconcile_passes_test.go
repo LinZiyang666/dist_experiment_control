@@ -1,0 +1,1240 @@
+package broker
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"errors"
+	"sort"
+	"strings"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+// reconcile_passes_test.go (R7a) — the per-pass contract.
+//
+// Two obligations are discharged here.
+//
+// 1. EFFECT EQUIVALENCE. The cadence half of the rewrite is proven in
+//    reconcile_registry_test.go under a fake clock; this file proves the other
+//    half — that a registry sweep leaves the database in the byte-identical
+//    state the pre-R7 inline loop body would have. The pre-R7 bodies are
+//    reproduced verbatim below as ORACLES and run against a parallel fixture.
+//
+// 2. THE THREE IDEMPOTENCE TESTS, for every registered pass:
+//      (a) once converged, N consecutive ticks produce ZERO further side effects;
+//      (b) after an external change, the next tick re-converges;
+//      (c) two brokers driving the same state produce exactly ONE write.
+//
+//    (a) is the one that matters most. Periodizing an action that was previously
+//    one-shot is only safe if the converged state is a fixed point; if it is
+//    not, R7 does not fix a bug, it schedules one every 30 seconds.
+
+const (
+	passStale   = 30 * time.Second
+	passOffline = 90 * time.Second
+)
+
+var passEpoch = time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
+
+// --------------------------------------------------------------------------
+// fixtures
+// --------------------------------------------------------------------------
+
+func passTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// seedLivenessFixture installs one session and three nodes whose last heartbeat
+// ages straddle both thresholds: fresh (ONLINE), stale (STALE), ancient
+// (OFFLINE). All three rows start mislabeled ONLINE so a reconcile pass has real
+// work to do on its first tick and none on the second.
+func seedLivenessFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('lab','lab','o','p','ACTIVE',?)`, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		nid string
+		age time.Duration
+	}{
+		{"fresh", 1 * time.Second},
+		{"stale", 45 * time.Second},
+		{"gone", 10 * time.Minute},
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(
+			`INSERT INTO nodes(nid,sid,status,registered_at,last_heartbeat_at) VALUES(?,'lab','ONLINE',?,?)`,
+			r.nid, passEpoch, passEpoch.Add(-r.age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func nodeStatuses(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT nid, status FROM nodes ORDER BY nid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var nid, st string
+		if err := rows.Scan(&nid, &st); err != nil {
+			t.Fatal(err)
+		}
+		out[nid] = st
+	}
+	return out
+}
+
+// passBroker builds a NATS-free, single-mode broker driven by a fake clock.
+// publishOnConn/publishAudit degrade to a logged warning without a connection,
+// which is exactly the pre-R7 behavior on a disconnected broker, so the DB
+// effects under test are unaffected.
+func passBroker(t *testing.T, db *sql.DB, clk *fakeClock) *Broker {
+	t.Helper()
+	b := &Broker{transfers: newTransferTracker()}
+	b.cfg = Config{
+		DB:                   db,
+		Logger:               silentLogger(),
+		Now:                  clk.Now,
+		ReconcileInterval:    time.Second,
+		StaleAfter:           passStale,
+		OfflineAfter:         passOffline,
+		ProcRetention:        time.Hour,
+		ProcGCInterval:       5 * time.Minute,
+		XferReapInterval:     5 * time.Minute,
+		GrowLockReapInterval: 30 * time.Second,
+		// R7b: registering a pass with a zero interval is a wiring PANIC by design, so a fixture that
+		// forgets a new pass's interval fails loudly rather than silently dropping the pass.
+		UpgradeLockReapInterval: 30 * time.Second,
+		HomeDeliverInterval:     5 * time.Second, // R8a P1 home-delivery pass
+	}
+	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
+	b.registerCoreReconcilePasses()
+	b.reconcilers.start(clk.Now())
+	return b
+}
+
+// passBrokerFollower is passBroker with the registry's leadership gate wired
+// FALSE. It models "this broker is a cluster follower" at the only layer that
+// matters for the leader-only contract — the registry gate — without faking a
+// clusterMode broker that has no raft runtime (which would simply nil-panic in
+// livenessDB, proving nothing).
+func passBrokerFollower(t *testing.T, db *sql.DB, clk *fakeClock) *Broker {
+	t.Helper()
+	b := passBroker(t, db, clk)
+	b.reconcilers = newReconcileRegistry(b.cfg.Logger, func() bool { return false })
+	b.registerCoreReconcilePasses()
+	b.reconcilers.start(clk.Now())
+	return b
+}
+
+// runPass drives exactly one named pass, bypassing the schedule. Scheduling is
+// proven separately; these tests are about what a pass DOES.
+func runPass(t *testing.T, b *Broker, name string, now time.Time) error {
+	t.Helper()
+	for _, p := range b.reconcilers.passes {
+		if p.name == name {
+			return p.fn(context.Background(), now)
+		}
+	}
+	t.Fatalf("no registered pass named %q", name)
+	return nil
+}
+
+// --------------------------------------------------------------------------
+// 1. EFFECT EQUIVALENCE with the pre-R7 inline loop bodies
+// --------------------------------------------------------------------------
+
+// legacyReconcileTickOracle is the pre-R7 `case <-ticker.C:` body, verbatim.
+// It is the ORACLE, not a helper: it must never be refactored to share code
+// with the registry passes, because then it would stop being independent
+// evidence and start being a tautology.
+func legacyReconcileTickOracle(b *Broker, now time.Time) {
+	n, err := node.ReconcileStates(b.livenessDB(), now, b.cfg.StaleAfter, b.cfg.OfflineAfter)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: reconcile failed", "err", err)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: state transitions", "count", n)
+	}
+	if !b.clusterMode || b.cl.node.IsLeader() {
+		if revoked := b.reconcilePorts(now); revoked > 0 {
+			b.cfg.Logger.Info("broker: port revocations", "count", revoked)
+		}
+	}
+	if closed := b.reconcileTunnelSessions(); closed > 0 {
+		b.cfg.Logger.Info("broker: stale tunnel proxies closed", "count", closed)
+	}
+}
+
+// legacyGCTickOracle is the pre-R7 `case <-gcTicker.C:` body, verbatim.
+func legacyGCTickOracle(b *Broker, now time.Time) {
+	if b.clusterMode {
+		return
+	}
+	cutoff := now.Add(-b.cfg.ProcRetention)
+	n, err := proc.GCExited(b.livenessDB(), cutoff)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: proc gc", "err", err)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: proc gc", "deleted", n, "cutoff", cutoff)
+	}
+}
+
+// TestReconcilePassEffectsMatchLegacy runs the pre-R7 oracle and the R7 registry
+// against two independently-seeded but identical fixtures for 20 ticks, and
+// requires the resulting database state to be identical at every step.
+//
+// Twenty ticks rather than one, because a single tick would not distinguish "the
+// same effect" from "the same FIRST effect": several of these passes are
+// convergent, so their second tick is a no-op regardless of whether the first
+// one was faithful.
+func TestReconcilePassEffectsMatchLegacy(t *testing.T) {
+	clkLegacy := newFakeClock(passEpoch)
+	clkRegistry := newFakeClock(passEpoch)
+
+	dbLegacy := passTestDB(t)
+	dbRegistry := passTestDB(t)
+	seedLivenessFixture(t, dbLegacy)
+	seedLivenessFixture(t, dbRegistry)
+	seedPortFixture(t, dbLegacy)
+	seedPortFixture(t, dbRegistry)
+	seedProcFixture(t, dbLegacy)
+	seedProcFixture(t, dbRegistry)
+
+	bLegacy := passBroker(t, dbLegacy, clkLegacy)
+	bRegistry := passBroker(t, dbRegistry, clkRegistry)
+
+	for tick := 1; tick <= 20; tick++ {
+		nowL := clkLegacy.advance(time.Second)
+		legacyReconcileTickOracle(bLegacy, nowL)
+		legacyGCTickOracle(bLegacy, nowL)
+
+		nowR := clkRegistry.advance(time.Second)
+		for _, name := range []string{"node-states", "ports", "tunnel-sessions", "proc-gc"} {
+			if err := runPass(t, bRegistry, name, nowR); err != nil {
+				t.Fatalf("tick %d: pass %s returned %v; the pre-R7 bodies never returned an error, so returning one here changes cadence via backoff", tick, name, err)
+			}
+		}
+
+		if got, want := nodeStatuses(t, dbRegistry), nodeStatuses(t, dbLegacy); !sameStringMap(got, want) {
+			t.Fatalf("tick %d: node states diverged\n registry=%v\n  legacy=%v", tick, got, want)
+		}
+		if got, want := portStates(t, dbRegistry), portStates(t, dbLegacy); !sameStringMap(got, want) {
+			t.Fatalf("tick %d: port allocation states diverged\n registry=%v\n  legacy=%v", tick, got, want)
+		}
+		if got, want := procPIDs(t, dbRegistry), procPIDs(t, dbLegacy); !sameStringMap(got, want) {
+			t.Fatalf("tick %d: processes diverged\n registry=%v\n  legacy=%v", tick, got, want)
+		}
+	}
+
+	// Sanity: the fixture must have actually exercised the passes. An
+	// equivalence proof over two no-ops proves nothing.
+	if st := nodeStatuses(t, dbRegistry); st["gone"] != "OFFLINE" || st["stale"] != "STALE" || st["fresh"] != "ONLINE" {
+		t.Fatalf("fixture never converged — the equivalence run was vacuous: %v", st)
+	}
+}
+
+func sameStringMap(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// --------------------------------------------------------------------------
+// 2a. pass: node-states
+// --------------------------------------------------------------------------
+
+func TestPassNodeStatesIdempotence(t *testing.T) {
+	// (a) converged ⇒ zero side effects on 3 consecutive ticks.
+	t.Run("converged is a fixed point", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedLivenessFixture(t, db)
+		b := passBroker(t, db, clk)
+
+		if err := runPass(t, b, "node-states", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		converged := nodeStatuses(t, db)
+
+		for i := 0; i < 3; i++ {
+			// Time does NOT advance: the converged state must be stable under
+			// re-evaluation, independent of any clock movement.
+			if err := runPass(t, b, "node-states", clk.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if got := nodeStatuses(t, db); !sameStringMap(got, converged) {
+				t.Fatalf("tick %d mutated a converged fixture: %v -> %v", i+1, converged, got)
+			}
+		}
+	})
+
+	// (b) external drift ⇒ re-converges.
+	t.Run("re-converges after external drift", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedLivenessFixture(t, db)
+		b := passBroker(t, db, clk)
+		if err := runPass(t, b, "node-states", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if nodeStatuses(t, db)["gone"] != "OFFLINE" {
+			t.Fatal("precondition: 'gone' must have converged to OFFLINE")
+		}
+
+		// Something outside the loop flips it back — a stale write, a restored
+		// backup, an operator. The pass must not need an event to notice.
+		if _, err := db.Exec(`UPDATE nodes SET status='ONLINE' WHERE nid='gone'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := runPass(t, b, "node-states", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if got := nodeStatuses(t, db)["gone"]; got != "OFFLINE" {
+			t.Fatalf("pass did not re-converge after external drift: 'gone' is %q, want OFFLINE", got)
+		}
+	})
+
+	// (c) two brokers ⇒ no duplicate writes.
+	//
+	// node-states is per-broker-local by design (each broker reconciles the
+	// agents homed to it, reading its own livenessDB), so the meaningful
+	// statement is that concurrent evaluation converges to the same fixed point
+	// without corrupting rows — which is what the shared-DB race below asserts.
+	t.Run("concurrent brokers converge without corruption", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedLivenessFixture(t, db)
+		b1 := passBroker(t, db, clk)
+		b2 := passBroker(t, db, clk)
+
+		var wg sync.WaitGroup
+		for _, b := range []*Broker{b1, b2} {
+			wg.Add(1)
+			go func(b *Broker) {
+				defer wg.Done()
+				for i := 0; i < 25; i++ {
+					_ = runPass(t, b, "node-states", clk.Now())
+				}
+			}(b)
+		}
+		wg.Wait()
+
+		st := nodeStatuses(t, db)
+		if st["fresh"] != "ONLINE" || st["stale"] != "STALE" || st["gone"] != "OFFLINE" {
+			t.Fatalf("concurrent reconcilers left a non-converged state: %v", st)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// 2b. pass: ports (the LEADER-ONLY shape)
+// --------------------------------------------------------------------------
+
+func seedPortFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	// The node must exist and be long-OFFLINE for the revoke scan to see it.
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('ports','ports','o','p','ACTIVE',?)`, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at,last_heartbeat_at) VALUES('dead','ports','OFFLINE',?,?)`,
+		passEpoch, passEpoch.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at,last_heartbeat_at) VALUES('live','ports','ONLINE',?,?)`,
+		passEpoch, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	ins := `INSERT INTO port_allocations(port,sid,nid,name,local_port,token_hash,state,created_by_fp,created_at) VALUES(?,'ports',?,?,?,?,'ALLOCATED','fp',?)`
+	if _, err := db.Exec(ins, 20001, "dead", "svc-dead", 8080, "hash-dead", passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ins, 20002, "live", "svc-live", 8081, "hash-live", passEpoch); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func portStates(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT port, state FROM port_allocations ORDER BY port`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var p int
+		var st string
+		if err := rows.Scan(&p, &st); err != nil {
+			t.Fatal(err)
+		}
+		out[fmt.Sprint(p)] = st
+	}
+	return out
+}
+
+func TestPassPortsIdempotence(t *testing.T) {
+	t.Run("converged is a fixed point", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedPortFixture(t, db)
+		b := passBroker(t, db, clk)
+
+		if err := runPass(t, b, "ports", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		converged := portStates(t, db)
+		if converged["20001"] != "REVOKED" || converged["20002"] != "ALLOCATED" {
+			t.Fatalf("precondition: the OFFLINE node's port must be revoked and the live one left alone: %v", converged)
+		}
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "ports", clk.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if got := portStates(t, db); !sameStringMap(got, converged) {
+				t.Fatalf("tick %d mutated a converged fixture: %v -> %v", i+1, converged, got)
+			}
+		}
+	})
+
+	t.Run("re-converges after a new allocation goes stale", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedPortFixture(t, db)
+		b := passBroker(t, db, clk)
+		if err := runPass(t, b, "ports", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+
+		// The live node dies while the broker was not looking. No event fires;
+		// only the periodic pass can notice.
+		if _, err := db.Exec(`UPDATE nodes SET status='OFFLINE', last_heartbeat_at=? WHERE nid='live'`, passEpoch.Add(-24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := runPass(t, b, "ports", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if got := portStates(t, db)["20002"]; got != "REVOKED" {
+			t.Fatalf("pass did not re-converge: port 20002 is %q, want REVOKED", got)
+		}
+	})
+
+	// (c) The leader-only gate is what makes "two brokers, one write" TRUE for
+	// this pass, and it is enforced by the registry rather than by the pass. A
+	// follower must never even invoke it.
+	t.Run("a follower never runs the pass", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedPortFixture(t, db)
+
+		follower := passBrokerFollower(t, db, clk)
+
+		for i := 0; i < 5; i++ {
+			follower.reconcilers.runDue(context.Background(), clk.advance(time.Second))
+		}
+		if got := portStates(t, db)["20001"]; got != "ALLOCATED" {
+			t.Fatalf("a follower revoked a port: 20001 is %q — the leader-only gate is not being enforced", got)
+		}
+		for _, s := range follower.reconcilers.status() {
+			if s.Name == "ports" && s.Runs != 0 {
+				t.Fatalf("leader-only pass 'ports' ran %d times on a follower", s.Runs)
+			}
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// 2c. pass: tunnel-sessions
+// --------------------------------------------------------------------------
+
+func TestPassTunnelSessionsIdempotence(t *testing.T) {
+	clk := newFakeClock(passEpoch)
+	db := passTestDB(t)
+	b := passBroker(t, db, clk)
+
+	// (a) With no tunnel server installed (the overwhelmingly common shape:
+	// TunnelControlAddr unset) the pass must be a total no-op, forever.
+	for i := 0; i < 3; i++ {
+		if err := runPass(t, b, "tunnel-sessions", clk.Now()); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+	if n := b.reconcileTunnelSessions(); n != 0 {
+		t.Fatalf("reconcileTunnelSessions closed %d proxies with no tunnel server installed", n)
+	}
+
+	// (b)/(c) The pass only ever closes fds owned by THIS process, so a second
+	// broker cannot double-close another's listener; and its "drift" input is
+	// the local session table, re-read every tick. Both are structural, and are
+	// asserted at the registry level: the pass is per-broker (never leader-
+	// gated) so every broker keeps reaping its own fds even as leadership moves.
+	for _, s := range b.reconcilers.status() {
+		if s.Name == "tunnel-sessions" && s.LeaderOnly {
+			t.Fatal("tunnel-sessions must NOT be leader-only: it reaps this process's own listener fds, and a follower that stopped reaping would leak them until it happened to win an election")
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// 2d. pass: proc-gc (the DIFFERENT-CADENCE shape)
+// --------------------------------------------------------------------------
+
+func seedProcFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('gc','gc','o','p','ACTIVE',?)`, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at,last_heartbeat_at) VALUES('n1','gc','ONLINE',?,?)`, passEpoch, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(pid string, endedAgo time.Duration) {
+		p := proc.Process{PID: pid, SID: "gc", NID: "n1", Argv: []string{"x"}, StartedAt: passEpoch.Add(-endedAgo - time.Minute)}
+		if err := proc.Insert(db, p); err != nil {
+			t.Fatal(err)
+		}
+		if err := proc.MarkExited(db, pid, 0, passEpoch.Add(-endedAgo)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("old-1", 3*time.Hour) // past the 1h retention ⇒ collectable
+	mk("old-2", 2*time.Hour) // past retention ⇒ collectable
+	mk("recent", time.Minute)
+}
+
+func procPIDs(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT pid, status FROM processes ORDER BY pid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var pid, st string
+		if err := rows.Scan(&pid, &st); err != nil {
+			t.Fatal(err)
+		}
+		out[pid] = st
+	}
+	return out
+}
+
+func TestPassProcGCIdempotence(t *testing.T) {
+	t.Run("converged is a fixed point", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedProcFixture(t, db)
+		b := passBroker(t, db, clk)
+
+		if err := runPass(t, b, "proc-gc", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		converged := procPIDs(t, db)
+		if _, still := converged["old-1"]; still {
+			t.Fatalf("precondition: retention-expired rows must be collected: %v", converged)
+		}
+		if _, kept := converged["recent"]; !kept {
+			t.Fatalf("proc-gc collected a row inside the retention window: %v", converged)
+		}
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "proc-gc", clk.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if got := procPIDs(t, db); !sameStringMap(got, converged) {
+				t.Fatalf("tick %d mutated a converged fixture: %v -> %v", i+1, converged, got)
+			}
+		}
+	})
+
+	t.Run("re-converges as rows age past retention", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedProcFixture(t, db)
+		b := passBroker(t, db, clk)
+		if err := runPass(t, b, "proc-gc", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, kept := procPIDs(t, db)["recent"]; !kept {
+			t.Fatal("precondition: 'recent' must survive the first sweep")
+		}
+		// Two hours pass. The row is now retention-expired; no event announces
+		// that — only the periodic pass can act on the passage of time.
+		if err := runPass(t, b, "proc-gc", clk.advance(2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, kept := procPIDs(t, db)["recent"]; kept {
+			t.Fatal("proc-gc did not re-converge once 'recent' aged past retention")
+		}
+	})
+
+	// (c) In cluster mode `processes` is replicated, so deleting rows outside
+	// raft would fork leader/follower SQLite contents. The pass must remain a
+	// hard no-op there — this is the "two brokers must not both write" property
+	// for proc-gc, and it is enforced by a MODE gate, not a leadership gate
+	// (a leader deleting replicated rows outside raft is just as wrong).
+	t.Run("cluster mode is a hard no-op", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedProcFixture(t, db)
+		b := passBroker(t, db, clk)
+		before := procPIDs(t, db)
+		b.clusterMode = true
+
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "proc-gc", clk.advance(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := procPIDs(t, db); !sameStringMap(got, before) {
+			t.Fatalf("proc-gc deleted replicated rows outside raft in cluster mode: %v -> %v", before, got)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// 2e. pass: grow-lock (#31) — the third-shape sample
+// --------------------------------------------------------------------------
+
+func setGrowMarker(t *testing.T, db *sql.DB, joiner string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO cluster_meta(key,value) VALUES('cluster_grow_active',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, joiner); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertOp(t *testing.T, db *sql.DB, opID, target, state string, terminal bool, updated time.Time) {
+	t.Helper()
+	term := 0
+	if terminal {
+		term = 1
+	}
+	if _, err := db.Exec(
+		`INSERT INTO cluster_operations(op_id,kind,target_node,op_state,terminal,created_at,updated_at) VALUES(?,'join',?,?,?,?,?)`,
+		opID, target, state, term, updated, updated); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func noVoters(string) (bool, error) { return false, nil }
+
+// TestGrowLockDecision is the #31 truth table. Every row is a state the cluster
+// can actually be in; the two that clear the marker are exactly the two the
+// product already treats as "grow complete", and the two that do NOT are the
+// ones where clearing would rip the serialization mutex out from under a live
+// grow.
+func TestGrowLockDecision(t *testing.T) {
+	cases := []struct {
+		name      string
+		setup     func(t *testing.T, db *sql.DB)
+		isVoter   func(string) (bool, error)
+		wantClear bool
+		why       string
+	}{
+		{
+			name:      "no marker",
+			setup:     func(*testing.T, *sql.DB) {},
+			isVoter:   noVoters,
+			wantClear: false,
+			why:       "nothing is held — the converged state must be a total no-op, or the pass writes every tick forever",
+		},
+		{
+			name: "marker + live op",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+				insertOp(t, db, "op-1", "brk-b", "CATCHING_UP", false, passEpoch)
+			},
+			isVoter:   noVoters,
+			wantClear: false,
+			why:       "a grow IS in flight; clearing here would let a concurrent retire/upgrade slip past the mutex mid-grow",
+		},
+		{
+			name: "marker + terminal op",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+				insertOp(t, db, "op-1", "brk-b", "SERVING", true, passEpoch)
+			},
+			isVoter:   noVoters,
+			wantClear: true,
+			why:       "#31 proper: the grow finished and the CLI's best-effort release was lost — this is the leak",
+		},
+		{
+			name: "marker + failed terminal op",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+				insertOp(t, db, "op-1", "brk-b", "FAILED", true, passEpoch)
+			},
+			isVoter:   noVoters,
+			wantClear: true,
+			why:       "an ABORTED/FAILED grow is just as over as a successful one; leaving membership fenced after a failure is the worse outcome",
+		},
+		{
+			name: "marker + no op at all + not a voter",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+			},
+			isVoter:   noVoters,
+			wantClear: false,
+			why:       "the acquire-lock window: `cluster add` holds the marker before its op exists. Without a lease there is nothing to expire, so R7a's fail-closed behavior must survive R7b verbatim (TestGrowLockLeaseExpiry covers the leased case)",
+		},
+		{
+			name: "marker + no op + already a voter",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+			},
+			isVoter:   func(id string) (bool, error) { return id == "brk-b", nil },
+			wantClear: true,
+			why:       "the CLI's own P0 shortcut — a VOTER with no live join op is a completed grow whose op row was pruned",
+		},
+		{
+			name: "marker + terminal op for a DIFFERENT node",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+				insertOp(t, db, "op-1", "brk-c", "SERVING", true, passEpoch)
+			},
+			isVoter:   noVoters,
+			wantClear: false,
+			why:       "another node's finished grow says nothing about this marker's holder",
+		},
+		{
+			name: "marker + newer live op supersedes an older terminal one",
+			setup: func(t *testing.T, db *sql.DB) {
+				setGrowMarker(t, db, "brk-b")
+				insertOp(t, db, "op-old", "brk-b", "FAILED", true, passEpoch.Add(-time.Hour))
+				insertOp(t, db, "op-new", "brk-b", "CATCHING_UP", false, passEpoch)
+			},
+			isVoter:   noVoters,
+			wantClear: false,
+			why:       "a RETRY after a failed grow: an old terminal row must never authorize clearing the retry's live lock",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := passTestDB(t)
+			tc.setup(t, db)
+			joiner, clear, err := growLockDecision(db, tc.isVoter, passEpoch)
+			if err != nil {
+				t.Fatalf("decision returned %v", err)
+			}
+			if clear != tc.wantClear {
+				t.Fatalf("clear=%v, want %v (joiner=%q)\nwhy: %s", clear, tc.wantClear, joiner, tc.why)
+			}
+		})
+	}
+}
+
+func TestPassGrowLockIdempotence(t *testing.T) {
+	// (a) converged ⇒ zero side effects. The pass's "write" is a raft Propose;
+	// with no marker set the decision must never reach it, on any tick.
+	t.Run("converged is a fixed point", func(t *testing.T) {
+		db := passTestDB(t)
+		for i := 0; i < 3; i++ {
+			joiner, clear, err := growLockDecision(db, noVoters, passEpoch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if clear || joiner != "" {
+				t.Fatalf("tick %d proposed a write against a converged cluster (joiner=%q clear=%v)", i+1, joiner, clear)
+			}
+		}
+	})
+
+	// Also a fixed point once a grow is legitimately in flight: 3 ticks, no write.
+	t.Run("in-flight grow is a fixed point", func(t *testing.T) {
+		db := passTestDB(t)
+		setGrowMarker(t, db, "brk-b")
+		insertOp(t, db, "op-1", "brk-b", "CATCHING_UP", false, passEpoch)
+		for i := 0; i < 3; i++ {
+			if _, clear, err := growLockDecision(db, noVoters, passEpoch); err != nil || clear {
+				t.Fatalf("tick %d would have cleared a LIVE grow's lock (err=%v)", i+1, err)
+			}
+		}
+	})
+
+	// (b) drift ⇒ re-converges. The op reaches a terminal state while the CLI's
+	// release is lost; the very next tick must decide to clear.
+	t.Run("re-converges when a release is lost", func(t *testing.T) {
+		db := passTestDB(t)
+		setGrowMarker(t, db, "brk-b")
+		insertOp(t, db, "op-1", "brk-b", "CATCHING_UP", false, passEpoch)
+		if _, clear, _ := growLockDecision(db, noVoters, passEpoch); clear {
+			t.Fatal("precondition: a live grow must not be cleared")
+		}
+		if _, err := db.Exec(`UPDATE cluster_operations SET op_state='SERVING', terminal=1 WHERE op_id='op-1'`); err != nil {
+			t.Fatal(err)
+		}
+		joiner, clear, err := growLockDecision(db, noVoters, passEpoch)
+		if err != nil || !clear || joiner != "brk-b" {
+			t.Fatalf("pass did not notice the finished grow: joiner=%q clear=%v err=%v", joiner, clear, err)
+		}
+
+		// And once the clear lands, it is a fixed point again — the pass must
+		// not re-propose a DELETE against an already-empty key every 30s.
+		if _, err := db.Exec(`DELETE FROM cluster_meta WHERE key='cluster_grow_active'`); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			if _, clear, _ := growLockDecision(db, noVoters, passEpoch); clear {
+				t.Fatalf("tick %d re-proposed a clear against an already-released lock", i+1)
+			}
+		}
+	})
+
+	// (c) two brokers ⇒ one write. Structural: the pass is leader-only, and the
+	// clear goes through raft, so a follower neither evaluates nor proposes.
+	t.Run("a follower neither evaluates nor proposes", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		follower := passBrokerFollower(t, db, clk)
+
+		for i := 0; i < 10; i++ {
+			follower.reconcilers.runDue(context.Background(), clk.advance(30*time.Second))
+		}
+		for _, s := range follower.reconcilers.status() {
+			if s.Name != "grow-lock" {
+				continue
+			}
+			if s.Runs != 0 {
+				t.Fatalf("grow-lock ran %d times on a follower — two brokers would race the same replicated clear", s.Runs)
+			}
+			if s.Skips == 0 {
+				t.Fatal("grow-lock never even came due on a follower — it must be scheduled and gated, not unscheduled")
+			}
+		}
+	})
+
+	// The pass must be inert on a single-mode broker: there is no grow lock
+	// without a cluster, and a nil raft node must never be dereferenced.
+	t.Run("single mode is inert", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		b := passBroker(t, db, clk)
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "grow-lock", clk.Now()); err != nil {
+				t.Fatalf("single-mode grow-lock returned %v", err)
+			}
+		}
+	})
+}
+
+// TestGrowLockClearIsValueBound pins that the clear the pass proposes is the
+// SAME joiner-bound plan the CLI's release-lock trigger uses. An unconditional
+// DELETE would let a stale reaper wipe a DIFFERENT joiner's live marker — the
+// exact failure external review M1 hardened the CLI path against.
+func TestGrowLockClearIsValueBound(t *testing.T) {
+	cmd, err := cluster.PlanClearGrowActive("brk-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// R7b: the clear is now TWO statements in one FSM transaction — the value-bound marker DELETE, then
+	// the lease DELETE guarded on the marker having actually gone (see leaseClearStmt).
+	if len(cmd.Body) != 2 {
+		t.Fatalf("expected the marker clear + its guarded lease clear, got %d statements", len(cmd.Body))
+	}
+	stmt := cmd.Body[0].SQL
+	if !strings.Contains(stmt, "brk-b") {
+		t.Fatalf("the reaper's clear must be bound to the joiner value (an unconditional DELETE could wipe a DIFFERENT grow's live marker); rendered: %s", stmt)
+	}
+
+	// And a real fixture proves the binding actually holds: a marker owned by
+	// brk-c must survive a clear aimed at brk-b.
+	db := passTestDB(t)
+	setGrowMarker(t, db, "brk-c")
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatal(err)
+	}
+	if got := growActiveJoiner(db); got != "brk-c" {
+		t.Fatalf("a clear for brk-b wiped brk-c's marker (now %q) — the serialization mutex is not value-bound", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// 2f. pass: xfer-orphan-reap (#58/P10)
+// --------------------------------------------------------------------------
+
+// TestPassXferOrphanReapIdempotence covers the shapes reachable without a live
+// JetStream; the JetStream-backed behavior is exercised in
+// TestXferOrphanReapPeriodicSafety.
+func TestPassXferOrphanReapIdempotence(t *testing.T) {
+	// (a) Without JetStream the pass must be a total no-op on every tick — this
+	// is the default single-mode dev/test shape, and a pass that errored here
+	// would put itself into permanent backoff for no reason.
+	t.Run("no JetStream is a fixed point", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		b := passBroker(t, db, clk)
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "xfer-orphan-reap", clk.Now()); err != nil {
+				t.Fatalf("tick %d: %v", i+1, err)
+			}
+		}
+	})
+
+	// (c) #58/P10 FIX: the reaper is PER-BROKER, not leader-only. A session homed to a
+	// NON-LEADER broker must be reapable by that broker — the leader fails
+	// homeOwnsXferBucket for it, so a leader-only reaper never collects it and its tier-B
+	// garbage is immortal (the exact #58 leak). So a follower's registry MUST invoke the
+	// pass. Safety no longer comes from leader-exclusivity but from two gates the pass
+	// applies internally: reaperCaughtUp (a not-caught-up broker reaps nothing) and
+	// homeOwnsXferBucket (a broker only ever touches buckets whose session is entirely
+	// homed to itself — home is a partition, so no two brokers touch the same bucket; the
+	// data-loss protection is proven in TestXferOrphanReapHomePartition).
+	t.Run("the reaper is per-broker, not leader-only (#58/P10)", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		follower := passBrokerFollower(t, db, clk)
+
+		for i := 0; i < 4; i++ {
+			follower.reconcilers.runDue(context.Background(), clk.advance(5*time.Minute))
+		}
+		ran := false
+		for _, s := range follower.reconcilers.status() {
+			if s.Name == "xfer-orphan-reap" {
+				if s.LeaderOnly {
+					t.Fatal("#58/P10 regression: xfer-orphan-reap is leader-only again — a session homed to a follower would never be reaped, so its tier-B objects leak forever")
+				}
+				ran = s.Runs > 0
+			}
+		}
+		if !ran {
+			t.Fatal("#58/P10 regression: the reaper never ran on a follower — a non-leader home would leak tier-B objects forever")
+		}
+		// Safety layer 1 (catch-up): a cluster-mode broker with no wired raft node is NOT
+		// caught up and must delete nothing — its empty/stale view would misclassify live
+		// cluster-wide objects as orphan.
+		if (&Broker{cl: &clusterRuntime{}}).reaperCaughtUp() {
+			t.Fatal("reaperCaughtUp must be false on a cluster broker with no raft node (not caught up)")
+		}
+	})
+
+	// The #58 regression itself, stated as a property: the reaper is REGISTERED,
+	// so it can run again after boot. Before R7 its only call site was inside
+	// Run's JetStream probe, behind a gate that is false at that moment on every
+	// cluster-mode broker — one skipped call and never another.
+	t.Run("the reaper is periodic, not boot-only", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		b := passBroker(t, db, clk)
+		found := false
+		for _, s := range b.reconcilers.status() {
+			if s.Name == "xfer-orphan-reap" {
+				found = true
+				if s.Interval <= 0 {
+					t.Fatal("orphan reaper registered without a cadence")
+				}
+			}
+		}
+		if !found {
+			t.Fatal("#58/P10 regression: the orphan xfer reaper is not registered as a periodic pass, so it can only ever run at boot")
+		}
+	})
+}
+
+// TestXferOrphanReapLiveTransferGuard is the safety argument for periodizing a
+// DELETE, asserted rather than merely reasoned.
+//
+// The reaper skips any bucket named in transfers.activeOBJStreams(). The tracker
+// entry — with its bucket already populated — is inserted BEFORE the prepare is
+// forwarded to the agent, i.e. before any object can exist. So a live transfer's
+// bucket is excluded for the whole of its life. This test pins that exclusion,
+// because if it ever regresses, R7 converts a harmless boot-time sweep into a
+// process that deletes in-flight tier-B payloads every five minutes.
+func TestXferOrphanReapLiveTransferGuard(t *testing.T) {
+	tr := newTransferTracker()
+	if code := tr.put(&transferEntry{transferID: "t1", sid: "lab", bucket: "xfer-lab"}); code != "" {
+		t.Fatalf("put: %s", code)
+	}
+	active := tr.activeOBJStreams()
+	if _, ok := active["OBJ_xfer-lab"]; !ok {
+		t.Fatalf("a live transfer's bucket must appear in the reaper's exclusion set, got %v", active)
+	}
+
+	// And once it finishes, the bucket stops being protected — otherwise the
+	// reaper could never collect anything and #58 would be "fixed" into a no-op.
+	tr.remove("t1")
+	if _, ok := tr.activeOBJStreams()["OBJ_xfer-lab"]; ok {
+		t.Fatal("a completed transfer must leave the exclusion set, or the reaper can never collect")
+	}
+}
+
+// TestXferOrphanReapPeriodicSafety is the R-a risk test, run against a REAL
+// JetStream: it proves that turning a boot-only DELETE into a five-minute loop
+// collects garbage without ever touching live work.
+//
+// This is the single most dangerous change in R7a. A boot-only reaper that
+// wrongly deletes costs one restart's worth of data; the same reaper on a timer
+// costs it 288 times a day. So the test asserts both directions on the same
+// bucket, across consecutive ticks:
+//
+//	orphan object      ⇒ collected on the first tick, and the state is then a
+//	                     fixed point (ticks 2 and 3 change nothing);
+//	in-flight object   ⇒ survives every tick for as long as the tracker holds it.
+func TestXferOrphanReapPeriodicSafety(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	clk := newFakeClock(passEpoch)
+	db := passTestDB(t)
+	b := passBroker(t, db, clk)
+	b.js = js
+	b.nc.Store(nc)
+
+	ctx := context.Background()
+	mkBucket := func(sid string) jetstream.ObjectStore {
+		t.Helper()
+		os, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "xfer-" + sid})
+		if err != nil {
+			t.Fatalf("create bucket %s: %v", sid, err)
+		}
+		return os
+	}
+	put := func(os jetstream.ObjectStore, name string) {
+		t.Helper()
+		if _, err := os.PutBytes(ctx, name, []byte("payload")); err != nil {
+			t.Fatalf("put %s: %v", name, err)
+		}
+	}
+	names := func(os jetstream.ObjectStore) []string {
+		t.Helper()
+		objs, err := os.List(ctx)
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			return nil
+		}
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		var out []string
+		for _, o := range objs {
+			if !o.Deleted {
+				out = append(out, o.Name)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	orphanStore := mkBucket("orphan-sess")
+	put(orphanStore, "leftover-1")
+	put(orphanStore, "leftover-2")
+
+	liveStore := mkBucket("live-sess")
+	put(liveStore, "in-flight-1")
+	// Register the transfer EXACTLY as the push/pull prepare handlers do: the
+	// entry carries its bucket and is in the tracker for the whole transfer.
+	if code := b.transfers.put(&transferEntry{transferID: "t-live", sid: "live-sess", bucket: "xfer-live-sess"}); code != "" {
+		t.Fatalf("tracker put: %s", code)
+	}
+
+	// --- tick 1: collect the orphans, spare the live transfer ---
+	if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if got := names(orphanStore); len(got) != 0 {
+		t.Fatalf("tick 1 left orphan objects behind: %v (this is the #58/P10 leak)", got)
+	}
+	if got := names(liveStore); len(got) != 1 || got[0] != "in-flight-1" {
+		t.Fatalf("tick 1 DELETED AN IN-FLIGHT TRANSFER'S OBJECT: %v — periodizing the reaper is unsafe", got)
+	}
+
+	// --- ticks 2 and 3: converged state is a fixed point ---
+	for tick := 2; tick <= 3; tick++ {
+		if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
+			t.Fatalf("tick %d: %v", tick, err)
+		}
+		if got := names(orphanStore); len(got) != 0 {
+			t.Fatalf("tick %d: converged bucket changed: %v", tick, got)
+		}
+		if got := names(liveStore); len(got) != 1 {
+			t.Fatalf("tick %d deleted the in-flight object: %v", tick, got)
+		}
+	}
+
+	// --- drift: the transfer finishes and its object becomes collectable ---
+	b.transfers.remove("t-live")
+	if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
+		t.Fatalf("post-completion tick: %v", err)
+	}
+	if got := names(liveStore); len(got) != 0 {
+		t.Fatalf("the reaper never collects once the transfer completes: %v — #58 would be 'fixed' into a permanent no-op", got)
+	}
+}
+
+// TestXferReapShieldsFreshObjects (external review M-3) proves the ModTime grace: with a positive
+// xferReapMinAge a freshly-written object is NOT reaped even though the tracker has NO in-flight entry
+// for it (the snapshot-staleness / mid-transfer-rehome race that could otherwise tear out an object that
+// is mid-upload), and IS reaped once the grace is disabled. Production sets the grace in broker.New; a
+// zero-value broker leaves it 0, which is why the reap-logic tests above keep their prompt-reap semantics.
+func TestXferReapShieldsFreshObjects(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+
+	b := &Broker{transfers: newTransferTracker()}
+	b.cfg = Config{DB: passTestDB(t), Logger: silentLogger(), Now: time.Now}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = time.Hour // production shields fresh in-flight objects
+
+	os, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "xfer-fresh-sess"})
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	if _, err := os.PutBytes(ctx, "just-uploaded", []byte("payload")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	liveCount := func() int {
+		t.Helper()
+		objs, lerr := os.List(ctx)
+		if errors.Is(lerr, jetstream.ErrNoObjectsFound) {
+			return 0
+		}
+		if lerr != nil {
+			t.Fatalf("list: %v", lerr)
+		}
+		n := 0
+		for _, o := range objs {
+			if !o.Deleted {
+				n++
+			}
+		}
+		return n
+	}
+
+	// No tracker entry ⇒ the bucket LOOKS orphan — but the object is FRESH, so the grace must spare it.
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reap (shielded): %v", err)
+	}
+	if n := liveCount(); n != 1 {
+		t.Fatalf("a fresh object was reaped despite the M-3 grace: %d live objects", n)
+	}
+
+	// Disable the grace (a zero-value/legacy broker, or a genuinely aged object) ⇒ the orphan IS reaped.
+	b.xferReapMinAge = 0
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reap (grace off): %v", err)
+	}
+	if n := liveCount(); n != 0 {
+		t.Fatalf("with the grace disabled the orphan must be reaped; %d live objects remain", n)
+	}
+}
+
+// TestXferOrphanReapHomePartition (#58/P10) is the NEW safety argument that REPLACES
+// leader-exclusivity: a broker reaps ONLY buckets whose session is entirely homed to itself.
+// This is what makes "every caught-up broker runs the reaper" safe — home is a partition, so
+// no two brokers ever touch the same bucket. Two homed sessions with orphan objects in both;
+// the node-A broker collects its own (sess-A) and leaves node-B's bucket (sess-B) untouched.
+//
+// It is also the data-loss guard: reverting the homeOwnsXferBucket gate would let this broker
+// wipe node-B's objects (a follower's live in-flight transfer that node-A's empty tracker
+// cannot see). The complementary #58 claim — that a NON-LEADER home may reap at all (the
+// reaperMayDelete→reaperCaughtUp change) — needs a real non-leader raft node and is verified
+// at the deploy tier (drill 96); here selfID is set with b.cl nil, so reaperCaughtUp is true.
+func TestXferOrphanReapHomePartition(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	clk := newFakeClock(passEpoch)
+	db := passTestDB(t)
+	b := passBroker(t, db, clk)
+	b.selfID = "node-A" // non-empty ⇒ homeOwnsXferBucket takes its REAL query path
+	b.js = js
+	b.nc.Store(nc)
+
+	// sess-A is homed HERE (node-A); sess-B is homed to node-B (a different broker).
+	seedHomedNode(t, db, "sess-A", "a-1", "srv-A", "node-A")
+	seedHomedNode(t, db, "sess-B", "b-1", "srv-B", "node-B")
+
+	ctx := context.Background()
+	mkOrphan := func(sid string) jetstream.ObjectStore {
+		t.Helper()
+		os, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "xfer-" + sid})
+		if err != nil {
+			t.Fatalf("create bucket %s: %v", sid, err)
+		}
+		if _, err := os.PutBytes(ctx, "orphan-"+sid, []byte("payload")); err != nil {
+			t.Fatalf("put %s: %v", sid, err)
+		}
+		return os
+	}
+	live := func(os jetstream.ObjectStore) int {
+		t.Helper()
+		objs, err := os.List(ctx)
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			return 0
+		}
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		n := 0
+		for _, o := range objs {
+			if !o.Deleted {
+				n++
+			}
+		}
+		return n
+	}
+
+	osA := mkOrphan("sess-A")
+	osB := mkOrphan("sess-B")
+
+	if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
+		t.Fatalf("reap tick: %v", err)
+	}
+
+	if n := live(osA); n != 0 {
+		t.Fatalf("node-A did not reap its OWN home's orphan (sess-A): %d left — the #58/P10 leak", n)
+	}
+	if n := live(osB); n != 1 {
+		t.Fatalf("node-A reaped sess-B, homed to node-B (%d objects survived, want 1) — home partition violated: a broker wiped another home's bucket (DATA LOSS)", n)
+	}
+}

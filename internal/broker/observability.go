@@ -260,9 +260,10 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 			wasLeader = isLeader
 			// C4: drive in-flight operations one idempotent step per tick (leader-gated inside). This is
 			// the resume mechanism — a kill-9/leadership-change leaves a non-terminal op that the new
-			// leader picks up + drives to terminal by re-deriving from the substrate.
+			// leader picks up + drives to terminal by re-deriving from the substrate. It also re-converges
+			// client discovery seeds each tick (#46) — see driveLeaderMaintenance.
 			if isLeader && b.cl.admin != nil {
-				b.cl.admin.driveInFlightOperations()
+				b.cl.admin.driveLeaderMaintenance()
 			}
 			// C5: the leader-gated proxy data-plane reaper (allocation + home-down rehome).
 			if isLeader {

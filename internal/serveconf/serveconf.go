@@ -42,6 +42,11 @@ type ObsSection struct {
 	LogJSON         bool   `yaml:"log_json"`          // structured JSON logs
 	MetricsListen   string `yaml:"metrics_listen"`    // Prometheus /metrics addr; empty disables
 	AlertWebhookURL string `yaml:"alert_webhook_url"` // B6 OPS#2 alert webhook (http/https); empty disables
+
+	// DiskCheckInterval (#39 / R13) is how often the H.4 disk-pressure monitor samples
+	// StoreDir usage. Accepts Go time.Duration syntax ("5m", "30s", "1h"). Empty → broker
+	// default (5m). Values below 1s are rejected at Load() — see DiskCheckIntervalDuration.
+	DiskCheckInterval string `yaml:"disk_check_interval"`
 }
 
 // ClusterSection mirrors broker.cluster — the D9 cutover surface. It carries
@@ -77,6 +82,12 @@ type ClusterSection struct {
 	// self-reported in ClusterHealthResp so `node ls --brokers` correlates the broker daemon's version
 	// with its agent's RELEASE. Empty ⇒ the CLI assumes node_id==nid (labelled "(assumed)").
 	ColocatedAgentNID string `yaml:"colocated_agent_nid"`
+	// XferReapInterval (#58/P10) is how often the home-authoritative orphan tier-B xfer-object reaper
+	// runs (reconcile_passes.go xfer-orphan-reap). Empty ⇒ broker default (5m), which is fine for
+	// production (orphans are not urgent). Exposed so a deploy-tier drill / a bucket-cap-sensitive
+	// operator can shorten it and OBSERVE the reap without a five-minute wait. Go duration syntax; a
+	// sub-second value is rejected at Load (pure JS-API churn).
+	XferReapInterval string `yaml:"xfer_reap_interval"`
 }
 
 // UpgradeSection mirrors broker.upgrade — the architecture J.4
@@ -155,7 +166,32 @@ func Load(path string) (*Config, error) {
 	if _, err := cfg.ProcGCIntervalDuration(); err != nil {
 		return nil, err
 	}
+	if _, err := cfg.DiskCheckIntervalDuration(); err != nil {
+		return nil, err
+	}
+	if _, err := cfg.XferReapIntervalDuration(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// XferReapIntervalDuration parses broker.cluster.xfer_reap_interval (#58/P10). Returns (0, nil) when
+// unset (caller falls back to broker.New's 5m default). Values under 1 second are rejected — a
+// sub-second reap is pure ListStreams/object-list churn against the JS API for no operator benefit,
+// and a non-positive value would make the registry's anchored deadline math meaningless.
+func (c *Config) XferReapIntervalDuration() (time.Duration, error) {
+	if c.Broker.Cluster.XferReapInterval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Broker.Cluster.XferReapInterval)
+	if err != nil {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_reap_interval: %w", err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_reap_interval %q "+
+			"< 1s (refusing a sub-second orphan-object reap)", d)
+	}
+	return d, nil
 }
 
 // ProcRetentionDuration parses broker.storage.proc_retention. Returns
@@ -196,6 +232,26 @@ func (c *Config) ProcGCIntervalDuration() (time.Duration, error) {
 	if d < time.Minute {
 		return 0, fmt.Errorf("serveconf: broker.storage.proc_gc_interval %q "+
 			"< 1m (refusing sub-minute GC)", d)
+	}
+	return d, nil
+}
+
+// DiskCheckIntervalDuration parses broker.observability.disk_check_interval (#39 / R13). Returns
+// (0, nil) when unset (caller falls back to the broker's built-in 5m default). Values under 1
+// second are rejected — a sub-second disk poll is pure statfs churn for no operator benefit, and a
+// negative/zero value would make time.NewTicker panic in the monitor. This is the yaml half of the
+// operator knob; --disk-check-interval is the flag half, and takes precedence in serve.go.
+func (c *Config) DiskCheckIntervalDuration() (time.Duration, error) {
+	if c.Broker.Obs.DiskCheckInterval == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Broker.Obs.DiskCheckInterval)
+	if err != nil {
+		return 0, fmt.Errorf("serveconf: broker.observability.disk_check_interval: %w", err)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("serveconf: broker.observability.disk_check_interval %q "+
+			"< 1s (refusing a sub-second disk poll)", d)
 	}
 	return d, nil
 }

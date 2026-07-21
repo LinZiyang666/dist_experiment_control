@@ -76,7 +76,11 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 		}
 		if liveOp == "" {
 			_, _ = fmt.Fprintf(out, "  %s is already a VOTER with no live join op — grow complete\n", jp.Joiner)
-			releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out)
+			// R7 (#31): a failed release leaves membership fenced — that is NOT a rc=0 outcome.
+			if rerr := releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out); rerr != nil {
+				notifyGrow(webhook, "halt", map[string]any{"phase": "release-lock", "joiner": jp.Joiner, "error": rerr.Error()})
+				return rerr
+			}
 			notifyGrow(webhook, "complete", map[string]any{"joiner": jp.Joiner, "already": true})
 			return nil
 		}
@@ -89,6 +93,21 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	} else if !resp.OK {
 		return haltAdd(webhook, "acquire-lock", jp.Joiner, fmt.Errorf("%s %s", resp.Code, resp.Error))
 	}
+
+	// R7b (#31): the ACQUIRE-LOCK WINDOW. From here until P4 creates the join operation row there is no
+	// operation for the broker-side reconciler to read, so a HALT at P2 (init) or P3 (verify-seam) used to
+	// leave cluster_grow_active set with literally nothing in the cluster that could ever judge it — R7a's
+	// identifying pass is blind here by construction. The lease is what makes this window judgeable: while
+	// this process lives it keeps saying so, and when it stops the marker decays on its own.
+	//
+	// The renewal is JOINER-BOUND, so it can only ever extend THIS grow's lock, never another's.
+	//
+	// defer Stop() covers every HALT return below — those are precisely the abandonment paths.
+	keeper := startLockKeeper(ctx, "grow", growLeaseRenewInterval,
+		func(rctx context.Context) (bool, error) {
+			return renewGrowLease(rctx, nc, actor, accountSeed, jp.Joiner)
+		}, out)
+	defer keeper.Stop()
 
 	// P2 LOCAL OFFLINE INIT: bootstrap raft/ + apply the broker.yaml seam. Skip if raft/ already present.
 	if !dirExists(jp.DataDir + "/raft") {
@@ -188,11 +207,46 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 		_, _ = fmt.Fprintf(out, "  ⚠ rebalance-proxy did not confirm (non-fatal; run `cluster rebalance proxy` later)\n")
 	}
 
-	// P9 RELEASE LOCK on clean completion. A failure only leaves membership blocked; a re-run re-releases.
-	releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out)
+	// P9 RELEASE LOCK on clean completion. R7 (#31): retried with backoff, and a failure is FATAL to the exit
+	// code — the grow itself succeeded, but the cluster is left with membership fenced, so reporting success
+	// would hand automation a green light over a blocked control plane.
+	keeper.Stop() // stop renewing before releasing (see driveUpgrade — ordering is for log clarity, not safety)
+	if rerr := releaseGrowLock(ctx, nc, actor, accountSeed, jp.Joiner, out); rerr != nil {
+		notifyGrow(webhook, "halt", map[string]any{"phase": "release-lock", "joiner": jp.Joiner, "error": rerr.Error()})
+		return rerr
+	}
+	// R7b: a grow that lost its lock partway through ran unserialized against other membership changes.
+	// The joiner may well be SERVING, but the safety property the lock exists to provide was not held.
+	if keeper.Lost() {
+		notifyGrow(webhook, "halt", map[string]any{"phase": "lease", "joiner": jp.Joiner, "error": "grow lock lost mid-grow"})
+		return keeper.LostErr("cluster add completed the grow but LOST its grow lock partway through")
+	}
 	_, _ = fmt.Fprintln(out, "cluster add complete.")
 	notifyGrow(webhook, "complete", map[string]any{"joiner": jp.Joiner})
 	return nil
+}
+
+// renewGrowLease pushes THIS joiner's grow-lock lease forward by one TTL. Like the upgrade renewal it
+// re-resolves the leader every call: a grow can outlive several elections, and a cached leader would make
+// every renewal after the first one fail.
+func renewGrowLease(ctx context.Context, nc *nats.Conn, actor string, seed []byte, joiner string) (bool, error) {
+	leader, err := currentLeader(ctx, nc, actor)
+	if err != nil {
+		return true, fmt.Errorf("resolve leader: %w", err) // transient: still ours as far as we know
+	}
+	resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "renew-lock", TargetNode: leader, JoinerNode: joiner})
+	switch {
+	case err != nil:
+		return true, err
+	case resp == nil:
+		return true, fmt.Errorf("no reply from leader %s", leader)
+	case resp.OK:
+		return true, nil
+	case resp.Code == clusterLockNotHeldCode:
+		return false, nil // TERMINAL
+	default:
+		return true, fmt.Errorf("%s %s", resp.Code, resp.Error)
+	}
 }
 
 // --- phase helpers -------------------------------------------------------------------------------------
@@ -496,20 +550,70 @@ func stableCutoverRefusal(resp *proto.ClusterGrowResp, err error) bool {
 	return err == nil && resp != nil && !resp.OK && !resp.AlreadyDone
 }
 
-// releaseGrowLock best-effort clears THIS joiner's grow marker via the leader (mirrors releaseUpgradeLock).
+// growLockReleaseAttempts / growLockReleaseBackoff bound the release retry. Four attempts spanning ~7s cover
+// the transient shapes that actually cause a dropped release — a leadership change mid-grow, a lost NATS
+// reply — without turning a genuinely unreachable leader into a multi-minute hang.
+const growLockReleaseAttempts = 4
+
+// growLockReleaseBackoff is a var, not a const, ONLY so the hermetic retry test can
+// compress ~7s of real backoff into microseconds. Production never reassigns it.
+var growLockReleaseBackoff = 1 * time.Second
+
+// releaseGrowLock clears THIS joiner's grow marker via the leader (mirrors releaseUpgradeLock), retrying with
+// backoff, and REPORTS FAILURE to its caller.
+//
 // External review M1: the release is JOINER-BOUND — it carries JoinerNode, and the leader clears the marker
 // ONLY if its value is this joiner. So a completed/aborted re-run of `cluster add <joinerA>` can never wipe a
 // DIFFERENT grow's in-flight marker (<joinerB>), which would drop the strict-serialize mutex mid-grow and let a
 // concurrent join/retire/upgrade slip in (breaking the Q7 safety model).
-func releaseGrowLock(ctx context.Context, nc *nats.Conn, actor string, seed []byte, joiner string, out interface{ Write([]byte) (int, error) }) {
-	leader, err := currentLeader(ctx, nc, actor)
-	if err != nil {
-		_, _ = fmt.Fprintf(out, "  ⚠ WARNING: could not resolve the leader to release the grow lock: %v — cluster_grow_active stays set, so `cluster join`/`cluster retire` stay BLOCKED. Re-run `tether cluster add` with --account-seed to clear it.\n", err)
-		return
+//
+// R7 (#31): this used to be fire-and-forget — one attempt, a warning on stderr, and `cluster add` exited 0
+// regardless. Two things were wrong with that. First, no retry: the overwhelmingly common cause of a failed
+// release is a transient (an election, a dropped reply), and a second attempt a second later almost always
+// succeeds. Second, and worse, exit 0: a caller that succeeds here has left the cluster's membership control
+// plane FENCED — every later grow/retire/upgrade is refused — and reported success while doing so. Automation
+// downstream of `cluster add` cannot distinguish that from a clean grow, which is precisely the failure shape
+// the R7 exit criterion "the CLI must not return rc=0 when convergence has not been reached" exists to kill.
+//
+// The broker-side grow-lock reconciliation pass (reconcile_grow_lock.go) will clear the marker on its own
+// within GrowLockReapInterval, so this is no longer an unrecoverable state — but it is still NOT converged at
+// the moment this process exits, and the exit code must say so.
+func releaseGrowLock(ctx context.Context, nc *nats.Conn, actor string, seed []byte, joiner string, out interface{ Write([]byte) (int, error) }) error {
+	var last error
+	for attempt := 1; attempt <= growLockReleaseAttempts; attempt++ {
+		if attempt > 1 {
+			delay := growLockReleaseBackoff << uint(attempt-2)
+			select {
+			case <-ctx.Done():
+				last = ctx.Err()
+				goto failed
+			case <-time.After(delay):
+			}
+			_, _ = fmt.Fprintf(out, "  … retrying grow lock release (attempt %d/%d)\n", attempt, growLockReleaseAttempts)
+		}
+		leader, err := currentLeader(ctx, nc, actor)
+		if err != nil {
+			last = fmt.Errorf("could not resolve the leader: %w", err)
+			continue
+		}
+		resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "release-lock", TargetNode: leader, JoinerNode: joiner})
+		switch {
+		case err != nil:
+			last = err
+		case resp == nil:
+			last = fmt.Errorf("no reply from leader %s", leader)
+		case !resp.OK:
+			last = fmt.Errorf("%s %s", resp.Code, resp.Error)
+		default:
+			return nil
+		}
 	}
-	if resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "release-lock", TargetNode: leader, JoinerNode: joiner}); err != nil || resp == nil || !resp.OK {
-		_, _ = fmt.Fprintf(out, "  ⚠ WARNING: grow lock release did NOT confirm — cluster_grow_active stays set; `cluster join`/`cluster retire` stay BLOCKED. Re-run `tether cluster add` with --account-seed to clear it.\n")
-	}
+failed:
+	return unavailErr("cluster add: the grow of %s completed but its lock release did NOT confirm after %d attempts (%v) — "+
+		"cluster_grow_active is still set, so `cluster join`/`cluster retire`/`cluster upgrade` stay BLOCKED. The leader's "+
+		"grow-lock reconciler clears a finished grow's marker on its own within ~30s; verify with `tether cluster status`, "+
+		"or re-run `tether cluster add %s` with --account-seed to clear it now",
+		joiner, growLockReleaseAttempts, last, joiner)
 }
 
 // --- cluster-health readers ----------------------------------------------------------------------------

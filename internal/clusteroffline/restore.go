@@ -56,6 +56,14 @@ type RestoreResult struct {
 	BundleAppliedIdx uint64 // the bundle's committed cursor (reset to 0 in the installed DB)
 	PrunedPeers      int64  // non-self roster rows removed for a clean single-voter origin
 	PreRestoreBackup string // External-review F4: the unique path the prior live DB was preserved at ("" if none)
+	// RaftAddr is the address the fresh single voter was actually bootstrapped at — the bundle's
+	// raft_addr, or --raft-addr when a fresh-host restore overrode it. R10 P2: the CLI needs it to
+	// write a CORRECT broker.cluster seam into broker.yaml (a seam carrying the dead box's address
+	// would boot a broker that binds nothing reachable).
+	RaftAddr string
+	// NatsRoute is the restored node's own NATS route URL (from the bundle manifest). R10 P4: the
+	// completion text renders a copy-paste-ready `reconcile nats --manual` line, which requires it.
+	NatsRoute string
 }
 
 // RestoreFromBackup installs a cluster backup bundle as a fresh single-voter cluster.
@@ -210,7 +218,10 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 
 	opts.Logger.Warn("clusteroffline: restore complete; node is a single-voter cluster — re-grow with `cluster join prepare`/`cluster join approve`",
 		"self", m.SelfID, "bundle_applied_index", m.AppliedIndex, "pruned_peers", pruned, "pre_restore_backup", preBak)
-	return &RestoreResult{SelfID: m.SelfID, BundleAppliedIdx: m.AppliedIndex, PrunedPeers: pruned, PreRestoreBackup: preBak}, nil
+	return &RestoreResult{
+		SelfID: m.SelfID, BundleAppliedIdx: m.AppliedIndex, PrunedPeers: pruned,
+		PreRestoreBackup: preBak, RaftAddr: effectiveRaftAddr, NatsRoute: m.NatsRoute,
+	}, nil
 }
 
 // restoreProvenanceGate enforces the 4-layer identity gate (all FATAL, pre-mutation).
@@ -328,6 +339,25 @@ func normalizeRestoreStaging(stagePath, selfID, raftAddr string) (int64, error) 
 	// never GC against the fresh log — drop them (the dedup window is meaningless post-rebootstrap).
 	if _, err := tx.Exec(`DELETE FROM cluster_reqid_ledger`); err != nil {
 		return 0, fmt.Errorf("clusteroffline: clear reqid ledger: %w", err)
+	}
+	// R15 (#31/#45/#51): a DR restore rebuilds a CLEAN single-voter origin — by definition NO
+	// grow/retire/upgrade is in flight. But a bundle captured WHILE one was running carries its
+	// membership-control residue: the grow/upgrade markers, their lease rows, and any non-terminal
+	// cluster_operations (e.g. a retire pinned at NATS_ROLLED_OUT). None can legitimately resume
+	// against the fresh log (roster is pruned to {self} above, raft is re-bootstrapped), yet each one
+	// FENCES the very first re-grow — growActiveJoiner()/upgradeActive() refuse it, and assertNoActiveOp
+	// rejects it as "already in flight". The reconcile passes cannot rescue this: a marker with no lease
+	// row fail-closes (LeaseExpired returns false, never clears), and topoAdvance's numVoters<=1 boundary
+	// permanently disables the stalled-retire deadline at N=1, so the op is neither terminal nor
+	// operator-actionable BLOCKED. So — exactly like the reqid ledger and force_single_active above —
+	// this stale old-cluster state must be dropped in THIS normalize txn. Only NON-terminal ops are
+	// cleared: they are the rows that fence a new op; terminal rows are inert history and are left.
+	if _, err := tx.Exec(`DELETE FROM cluster_meta WHERE key IN
+		('cluster_grow_active','cluster_grow_lease','cluster_upgrade_active','cluster_upgrade_lease')`); err != nil {
+		return 0, fmt.Errorf("clusteroffline: clear stale grow/upgrade locks: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM cluster_operations WHERE terminal = 0`); err != nil {
+		return 0, fmt.Errorf("clusteroffline: clear non-terminal operation residue: %w", err)
 	}
 	// Audit DI-MAJOR-2: stamp a restore_in_progress marker. It rides the install into the live DB; the
 	// daemon's assertClusterDBConsistent FATALs while it is set, so a SIGKILL between install and the

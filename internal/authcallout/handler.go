@@ -27,6 +27,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agentprov"
@@ -82,6 +83,19 @@ type Handler struct {
 	// in D3). Transparent follower→leader forwarding is D4.
 	JoinMemberWrite     func(sid, fp, pin string, now time.Time) error
 	ProvisionAgentWrite func(sid, nid, fp, pin string, now time.Time) error
+
+	// pinLimiter (P7/#25) throttles PIN-bootstrap brute force per client IP
+	// (architecture E.6). Created once on first use; shared across every callout
+	// this broker answers. See ratelimit.go for the trust-boundary rationale.
+	limiterOnce sync.Once
+	limiter     *pinRateLimiter
+}
+
+// pinLimiterFor returns the process-wide (per-broker) PIN rate limiter, creating
+// it exactly once. Race-safe: Handle may be invoked concurrently.
+func (h *Handler) pinLimiterFor() *pinRateLimiter {
+	h.limiterOnce.Do(func() { h.limiter = newPinRateLimiter() })
+	return h.limiter
 }
 
 // ErrNotLeader is the transient deny a clustered write seam returns when this
@@ -94,6 +108,13 @@ var ErrNotLeader = errors.New("not_leader: cluster write must go to the leader (
 // contact (> T_fence) and must fail closed (§3.2/§6.2). Retriable once contact
 // is restored.
 var ErrFenced = errors.New("fenced: node lost leader contact (retriable)")
+
+// ErrPINRateLimited is the deny returned when a client IP has exceeded the E.6
+// PIN-attempt budget (≤10 failed attempts / IP / minute). It is REFUSED even
+// with a correct PIN — the whole point is to shut a brute-force source out of
+// the PIN oracle. Retriable once the source's bucket refills. It never touches a
+// legitimate already-provisioned reconnect (those skip the PIN path entirely).
+var ErrPINRateLimited = errors.New("rate_limited: too many PIN attempts from your network address; retry shortly")
 
 const defaultJWTTTL = 24 * time.Hour
 
@@ -157,19 +178,24 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		return h.deny(req, "fingerprint: "+err.Error())
 	}
 
+	// clientIP is the TCP peer address nats-server stamped onto the request; it
+	// keys the E.6 per-IP PIN-brute-force throttle. Client-controlled fields
+	// (nkey / name / token) are NOT trusted for this — see ratelimit.go.
+	clientIP := req.ClientInformation.Host
+
 	role, sid, nid := parseRole(req.ConnectOptions.Name)
 	switch role {
 	case roleCtlUnactivated:
 		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey))
 	case roleCtlActivated:
-		if err := h.ensureMember(sid, fp, req.ConnectOptions.Token); err != nil {
+		if err := h.ensureMember(sid, fp, req.ConnectOptions.Token, clientIP); err != nil {
 			h.Logger.Info("authcallout: ctl deny", "actor", clientNkey, "sid", sid, "err", err)
 			return h.deny(req, err.Error())
 		}
 		h.Logger.Info("authcallout: ctl allow", "actor", clientNkey, "sid", sid)
 		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid))
 	case roleAgent:
-		if err := h.ensureAgentProvisioned(sid, nid, clientNkey, fp, req.ConnectOptions.Token); err != nil {
+		if err := h.ensureAgentProvisioned(sid, nid, clientNkey, fp, req.ConnectOptions.Token, clientIP); err != nil {
 			h.Logger.Info("authcallout: agent deny",
 				"actor", clientNkey, "sid", sid, "nid", nid, "err", err)
 			return h.deny(req, err.Error())
@@ -232,7 +258,7 @@ func parseRole(name string) (role, string, string) {
 //
 // Architecture K.1 — agent identity is per-machine, per-session, bound
 // once at install/provision time and remembered by the broker thereafter.
-func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) error {
+func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin, clientIP string) error {
 	if err := proto.ValidateSID(sid); err != nil {
 		return fmt.Errorf("sid: %w", err)
 	}
@@ -273,6 +299,13 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 	if pin == "" {
 		return fmt.Errorf("agent (sid=%q, nid=%q) not provisioned; first connect must supply --pin", sid, nid)
 	}
+	// E.6 PIN brute-force throttle: a source over its per-IP budget is refused
+	// BEFORE the Argon2 verify, so even a correct PIN is rejected while the source
+	// is shut out (that is the point — deny the brute-forcer the oracle).
+	if h.pinRateLimited(clientIP) {
+		h.Logger.Warn("authcallout: agent PIN attempt rate-limited", "sid", sid, "nid", nid, "ip", clientIP)
+		return ErrPINRateLimited
+	}
 	// PIN-bootstrap WRITE: route through the cluster FSM (leader-only) when wired,
 	// else the direct local mutator (production default in D3).
 	provision := h.ProvisionAgentWrite
@@ -294,6 +327,7 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 	case errors.Is(err, agentprov.ErrSessionDeleting):
 		return fmt.Errorf("session %q is being deleted", sid)
 	case errors.Is(err, agentprov.ErrInvalidPIN):
+		h.recordPINFailure(clientIP) // E.6: only a genuine Argon2 reject counts toward the budget
 		h.emit("pin_failed", map[string]any{"sid": sid, "nid": nid, "fp": fp, "role": "agent"})
 		return fmt.Errorf("invalid PIN")
 	case errors.Is(err, agentprov.ErrAlreadyProvisioned):
@@ -306,7 +340,7 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin string) e
 	}
 }
 
-func (h *Handler) ensureMember(sid, fp, pin string) error {
+func (h *Handler) ensureMember(sid, fp, pin, clientIP string) error {
 	if err := proto.ValidateSID(sid); err != nil {
 		return err
 	}
@@ -332,6 +366,12 @@ func (h *Handler) ensureMember(sid, fp, pin string) error {
 	if pin == "" {
 		return fmt.Errorf("not a member of session %q", sid)
 	}
+	// E.6 PIN brute-force throttle: refuse a source over its per-IP budget BEFORE
+	// the Argon2 verify (a correct PIN is refused too — the source is shut out).
+	if h.pinRateLimited(clientIP) {
+		h.Logger.Warn("authcallout: ctl PIN attempt rate-limited", "sid", sid, "ip", clientIP)
+		return ErrPINRateLimited
+	}
 	// PIN-bootstrap WRITE: route through the cluster FSM (leader-only) when wired,
 	// else the direct local mutator (production default in D3).
 	join := h.JoinMemberWrite
@@ -345,6 +385,7 @@ func (h *Handler) ensureMember(sid, fp, pin string) error {
 			return ErrNotLeader // transient — never false-allow (D3-R3)
 		}
 		if errors.Is(err, session.ErrInvalidPIN) {
+			h.recordPINFailure(clientIP) // E.6: only a genuine Argon2 reject counts toward the budget
 			h.emit("pin_failed", map[string]any{"sid": sid, "fp": fp, "role": "ctl"})
 			return fmt.Errorf("invalid PIN for session %q", sid)
 		}
@@ -352,6 +393,27 @@ func (h *Handler) ensureMember(sid, fp, pin string) error {
 	}
 	h.emit("member_joined", map[string]any{"sid": sid, "fp": fp, "via": "pin", "role": "ctl"})
 	return nil
+}
+
+// pinRateLimited reports whether clientIP is currently over its E.6 PIN-attempt
+// budget. An empty IP (nats-server did not stamp a peer address — not something
+// a client can force) fails OPEN: we would rather never throttle real joiners on
+// a missing address than collapse the whole fleet into one shared bucket. The
+// realistic brute-force path always carries a real peer IP.
+func (h *Handler) pinRateLimited(clientIP string) bool {
+	if clientIP == "" {
+		return false
+	}
+	return h.pinLimiterFor().blocked(clientIP, h.Now())
+}
+
+// recordPINFailure charges one unit of clientIP's E.6 budget for a genuine
+// Argon2 reject. No-op on an empty IP (see pinRateLimited).
+func (h *Handler) recordPINFailure(clientIP string) {
+	if clientIP == "" {
+		return
+	}
+	h.pinLimiterFor().recordFailure(clientIP, h.Now())
 }
 
 // emit safely calls EmitEvent if it's wired. Keeps caller code from

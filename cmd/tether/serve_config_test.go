@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/spf13/cobra"
 )
 
@@ -146,5 +150,91 @@ func TestPickFlagOrYamlPrecedence(t *testing.T) {
 	}
 	if got := pickFlagOrYaml(cmd, "opt", "flag-val", "yaml-val"); got != "flag-val" {
 		t.Errorf("explicit flag: got %q want flag-val", got)
+	}
+}
+
+// TestDiskCheckIntervalFlagDefault pins the #39 knob's serve surface: the flag exists, is a
+// duration, and DEFAULTS to 0 — which serve.go/startDiskMonitor read as "use the built-in 5m
+// default". A regression that changed the default here (e.g. to 5m) would break the flag>yaml>default
+// precedence (the yaml would never be consulted because Changed()==false but the value wouldn't be 0).
+func TestDiskCheckIntervalFlagDefault(t *testing.T) {
+	f := newServeCmd().Flags().Lookup("disk-check-interval")
+	if f == nil {
+		t.Fatal("serve: --disk-check-interval flag missing")
+	}
+	if f.Value.Type() != "duration" {
+		t.Errorf("--disk-check-interval type = %q, want duration", f.Value.Type())
+	}
+	if f.DefValue != "0s" {
+		t.Errorf("--disk-check-interval default = %q, want 0s (0 ⇒ built-in 5m default)", f.DefValue)
+	}
+}
+
+// TestResolveManifestListen pins the #27 cluster-mode default for the C2 well-known
+// discovery manifest listener: an operator who leaves --cluster-manifest-listen unset
+// in cluster mode (exactly what the `cluster init` broker.yaml seam leaves — it never
+// writes a manifest_listen key) gets the default loopback bind so discovery is
+// serve-ready. Single mode, an explicit addr, and an explicit empty opt-out are
+// all left untouched.
+func TestResolveManifestListen(t *testing.T) {
+	cases := []struct {
+		name        string
+		cur         string
+		clusterMode bool
+		flagChanged bool
+		want        string
+	}{
+		{"cluster + unset -> default (the #27 fix)", "", true, false, defaultManifestListen},
+		{"single mode + unset -> stays empty (disabled)", "", false, false, ""},
+		{"cluster + explicit addr wins", "127.0.0.1:9999", true, true, "127.0.0.1:9999"},
+		{"cluster + explicit empty flag -> opt out stays empty", "", true, true, ""},
+		{"cluster + yaml addr (not changed) preserved", "127.0.0.1:7000", true, false, "127.0.0.1:7000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveManifestListen(tc.cur, tc.clusterMode, tc.flagChanged); got != tc.want {
+				t.Errorf("resolveManifestListen(%q,%v,%v) = %q, want %q", tc.cur, tc.clusterMode, tc.flagChanged, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultManifestListenBindsAndIsReachable proves the #27 default addr is a valid
+// loopback that actually BINDS and ACCEPTS connections (curl-reachable, not connection
+// refused) — the whole point of defaulting it. It serves a 503 (no manifest yet), which
+// is a served HTTP response, i.e. the listener is bound (a refused connection would be a
+// transport error instead).
+func TestDefaultManifestListenBindsAndIsReachable(t *testing.T) {
+	ln, err := clustermanifest.Bind(defaultManifestListen)
+	if err != nil {
+		t.Skipf("default manifest addr %s not bindable in this environment (port busy?): %v", defaultManifestListen, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- clustermanifest.ServeListener(ctx, ln, func() ([]byte, bool) { return nil, false }) }()
+
+	url := "http://" + defaultManifestListen + clustermanifest.ManifestPath
+	var resp *http.Response
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err = http.Get(url)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("default manifest listener not reachable at %s: %v", url, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("bound manifest listener: got status %d, want 503 (no manifest yet)", resp.StatusCode)
+	}
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manifest server did not exit on ctx cancel")
 	}
 }

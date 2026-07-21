@@ -26,7 +26,11 @@ set -u
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
-trap 'ss_down ctl1 2>/dev/null; ingress_down brk1 443 2>/dev/null' EXIT INT TERM
+# EXT-REVIEW-B5 (lint rule `combined-signal-trap`): a POSIX INT/TERM handler RETURNS to the next command, so
+# the old combined trap tore the SS/ingress sidecars down and then RESUMED the drill's revoke/token steps.
+# drill_install_traps registers EXIT on its own and exits 128+signo on INT/TERM. Cleanup body unchanged.
+_cleanup() { ss_down ctl1 2>/dev/null; ingress_down brk1 443 2>/dev/null; }
+drill_install_traps _cleanup
 CTL() { "$SIM" ctl -- "$@"; }
 
 # ── drill-local predicates (assert_ok runs these in a command-sub that INHERITS functions; NOT `sh -c`) ──

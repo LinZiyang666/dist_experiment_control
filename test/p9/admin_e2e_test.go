@@ -8,11 +8,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -170,6 +174,89 @@ func TestAdminSocketPermissions(t *testing.T) {
 	if mode := parent.Mode().Perm(); mode != 0o700 {
 		t.Errorf("socket parent dir mode: got %o want 0700", mode)
 	}
+}
+
+// TestAdminRuntimeEndToEnd (R13) is the anti-"half-wired" proof for the runtime introspection verb:
+// it boots a REAL broker (Run wires backend.RuntimeSnapshot = b.runtimeSnapshot and the real R7
+// registry), then drives OpRuntime over the REAL admin socket and asserts (a) live process numbers,
+// (b) the core reconcilers are present — proving the registry is actually reachable, and (c) a
+// reconciler's last-tick ADVANCES across two calls — proving the value flows from the running
+// registry through the socket, not from a stub or a one-shot snapshot.
+func TestAdminRuntimeEndToEnd(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	socketPath := adminSocketPath(t)
+	defer startBrokerWithAdmin(t, url, db, socketPath)()
+
+	c := &adminsock.Client{Path: socketPath, Timeout: time.Second}
+	resp, err := c.Call(adminsock.Request{Op: adminsock.OpRuntime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("runtime: %s", resp.Error)
+	}
+	rep := resp.Runtime
+	if rep == nil {
+		t.Fatal("nil runtime report — the broker Run did not wire RuntimeSnapshot (half-wired)")
+	}
+	// Live values. This test shares the process with the in-proc broker, so runtime.NumGoroutine()
+	// is directly comparable (± scheduling jitter).
+	if rep.Goroutines < 2 {
+		t.Errorf("goroutines=%d, want a live count", rep.Goroutines)
+	}
+	if live := runtime.NumGoroutine(); absI(rep.Goroutines-live) > 50 {
+		t.Errorf("goroutines=%d far from in-process NumGoroutine=%d", rep.Goroutines, live)
+	}
+	if rep.Threads < 1 {
+		t.Errorf("threads=%d, want >=1", rep.Threads)
+	}
+	if rep.OpenFDs < 1 {
+		t.Errorf("open_fds=%d, want >=1 on linux", rep.OpenFDs)
+	}
+	if rep.RSSBytes < 1 {
+		t.Errorf("rss=%d, want >0", rep.RSSBytes)
+	}
+	if rep.UptimeSeconds <= 0 {
+		t.Errorf("uptime=%v, want >0", rep.UptimeSeconds)
+	}
+	// The REAL registry is reachable: the standing core passes appear.
+	firstTick := map[string]time.Time{}
+	for _, r := range rep.Reconcilers {
+		firstTick[r.Name] = r.LastTick
+	}
+	for _, want := range []string{"node-states", "ports", "tunnel-sessions", "home-delivery"} {
+		if _, ok := firstTick[want]; !ok {
+			t.Errorf("reconciler %q missing (%+v) — the R7 registry is not wired to OpRuntime", want, rep.Reconcilers)
+		}
+	}
+	// last-tick is LIVE: node-states fires every ReconcileInterval (50ms in this harness). Poll until
+	// its LastTick advances past the first observation.
+	deadline := time.Now().Add(3 * time.Second)
+	advanced := false
+	for time.Now().Before(deadline) && !advanced {
+		r2, e := c.Call(adminsock.Request{Op: adminsock.OpRuntime})
+		if e == nil && r2.Runtime != nil {
+			for _, rr := range r2.Runtime.Reconcilers {
+				if rr.Name == "node-states" && rr.LastTick.After(firstTick["node-states"]) {
+					advanced = true
+				}
+			}
+		}
+		if !advanced {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if !advanced {
+		t.Errorf("node-states LastTick never advanced past %v — last-tick is not live through the socket", firstTick["node-states"])
+	}
+}
+
+func absI(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // TestAdminSocketStaleSocketReclaim: a stale socket file from a
@@ -452,6 +539,108 @@ func TestAdminEvictTriggersAgentShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Errorf("agent did not shut down within 1s of admin evict")
+	}
+}
+
+// TestAdminEvictReapsManagedExecChild is the #26 regression: an evicted agent must REAP its managed OS
+// children, not merely self-exit. On a bare setsid-nohup deploy (no systemd cgroup) a leaked child lingers
+// in the HOST process table after the daemon exits. This drives a REAL managed exec (a sleep that records
+// its own pid), evicts, and asserts the child pid is GONE from the host process table — the exit-assertion
+// distinction of NOT just trusting the admin call's rc.
+func TestAdminEvictReapsManagedExecChild(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	_, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	socketPath := adminSocketPath(t)
+
+	defer startBrokerWithAdmin(t, url, db, socketPath)()
+
+	a, err := agent.New(agent.Config{
+		NATSURL:           url,
+		SID:               "lab",
+		NID:               "lab-1",
+		Logger:            silentLog(),
+		HeartbeatInterval: 100 * time.Millisecond,
+		RegisterTimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	testharness.WaitNodeOnline(t, db, "lab", "lab-1", 3*time.Second)
+
+	// A managed exec whose child records its own pid then `exec sleep` (the recorded pid IS the surviving
+	// process). Publish straight onto the agent's forwarded-command subscription (what the broker forwards).
+	dir, err := os.MkdirTemp("", "evictchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	pidFile := filepath.Join(dir, "child.pid")
+
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+	body, _ := json.Marshal(proto.ExecReq{Argv: []string{"sh", "-c", "echo $$ > " + pidFile + "; exec sleep 120"}})
+	if err := nc.PublishMsg(&nats.Msg{
+		Subject: proto.SubjCmdForwarded("lab", "lab-1", "exec"),
+		Reply:   nats.NewInbox(),
+		Data:    body,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	childPID := 0
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, rerr := os.ReadFile(pidFile); rerr == nil {
+			if p, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && p > 0 {
+				childPID = p
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if childPID == 0 {
+		t.Fatal("managed exec child never recorded its pid (did the forwarded exec dispatch?)")
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("baseline: managed child pid %d must be alive BEFORE evict, got %v", childPID, err)
+	}
+
+	c := &adminsock.Client{Path: socketPath}
+	resp, err := c.Call(adminsock.Request{Op: adminsock.OpEvict, SID: "lab", NID: "lab-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error != "" || resp.Evict == nil || !resp.Evict.BroadcastedEvicted {
+		t.Fatalf("evict did not broadcast: %+v err=%v", resp.Evict, err)
+	}
+
+	// #26: the managed child must DISAPPEAR from the host process table (ESRCH), not just have the daemon
+	// exit. SIGKILL delivery + the parent's reap are async, so poll.
+	gone := false
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); errors.Is(err, syscall.ESRCH) {
+			gone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gone {
+		// Best-effort cleanup so a failing run doesn't leak the sleep.
+		_ = syscall.Kill(-childPID, syscall.SIGKILL)
+		t.Fatalf("#26: managed exec child pid %d STILL present in the host process table after evict (leaked)", childPID)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("agent did not shut down after evict")
 	}
 }
 

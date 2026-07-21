@@ -27,6 +27,50 @@ import (
 
 const webhookQueueCap = 64
 
+// webhookSchemaName / webhookSchemaVersion identify the on-the-wire alert webhook contract. A consumer
+// keys off (schema, schema_version) to authenticate the payload shape and reject a forged / wrong-version
+// body. Bump webhookSchemaVersion on ANY incompatible field change.
+const (
+	webhookSchemaName    = "tether_alert_webhook"
+	webhookSchemaVersion = 1
+)
+
+// webhookPayload is the EXACT on-the-wire JSON contract POSTed for each alert transition. It is the single
+// serialization SSOT (was an ad-hoc map[string]any). SECURITY INVARIANT: every field is a fixed, public,
+// whitelisted key carrying only cluster topology (the same fields `cluster status` / `alert ls` render) —
+// it MUST NEVER carry a secret (no PIN, nkey, seed, token, cert, account key, password). b6_webhook_test
+// pins the key set to exactly this whitelist + a no-secret scan, and proves an adversarial alert string
+// cannot smuggle extra keys (JSON-injection safe).
+type webhookPayload struct {
+	Schema        string `json:"schema"`
+	SchemaVersion int    `json:"schema_version"`
+	Transition    string `json:"transition"` // "raised" | "cleared"
+	Kind          string `json:"kind"`
+	Severity      string `json:"severity"`
+	DedupKey      string `json:"dedup_key"`
+	Message       string `json:"message"`
+	Node          string `json:"node,omitempty"` // omitted when empty (cluster-wide alert)
+	ClusterLeader string `json:"cluster_leader"`
+	Ts            string `json:"ts"`
+}
+
+// webhookPayloadFor builds the wire payload from an alert transition. Stamps the schema identity so the
+// receiver can verify shape + version.
+func webhookPayloadFor(ev WebhookEvent) webhookPayload {
+	return webhookPayload{
+		Schema:        webhookSchemaName,
+		SchemaVersion: webhookSchemaVersion,
+		Transition:    ev.Transition,
+		Kind:          ev.Kind,
+		Severity:      ev.Severity,
+		DedupKey:      ev.DedupKey,
+		Message:       ev.Message,
+		Node:          ev.Node,
+		ClusterLeader: ev.ClusterLeader,
+		Ts:            ev.Ts,
+	}
+}
+
 // WebhookEvent is one alert transition to POST.
 type WebhookEvent struct {
 	Transition    string // "raised" | "cleared"
@@ -122,21 +166,7 @@ func (p *webhookPoster) Run(ctx context.Context) {
 }
 
 func (p *webhookPoster) deliver(ctx context.Context, ev WebhookEvent) {
-	body := map[string]any{
-		"schema":         "tether_alert_webhook",
-		"schema_version": 1,
-		"transition":     ev.Transition,
-		"kind":           ev.Kind,
-		"severity":       ev.Severity,
-		"dedup_key":      ev.DedupKey,
-		"message":        ev.Message,
-		"cluster_leader": ev.ClusterLeader,
-		"ts":             ev.Ts,
-	}
-	if ev.Node != "" {
-		body["node"] = ev.Node
-	}
-	buf, err := json.Marshal(body)
+	buf, err := json.Marshal(webhookPayloadFor(ev))
 	if err != nil {
 		p.logger.Warn("alert webhook: marshal", "err", err)
 		return

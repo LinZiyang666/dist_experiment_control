@@ -48,6 +48,17 @@ assert_verdict() {
 # field <line> <key> : extract a key=value field from a verdict line.
 field() { printf '%s\n' "$1" | sed -n "s/.* $2=\\([^ ]*\\).*/\\1/p"; }
 
+# Self-guard (external review M2 negative control): prove the recorder/helper names this file calls
+# actually EXIST. The die() frame gate was silently dead because it called ok/bad — names that don't
+# exist here — so `grep && ok || bad` ran a command-not-found on every line and FAILS never moved. A
+# missing helper must abort LOUDLY (exit 2, distinct from a normal 1-FAILED), never no-op into ALL PASS.
+for _fn in pass fail field run_drill_body; do
+    command -v "$_fn" >/dev/null 2>&1 || {
+        printf 'FATAL: verdict-contract helper %s is undefined — the gate would silently no-op\n' "$_fn" >&2
+        exit 2
+    }
+done
+
 echo "── lib/assert.sh verdict contract ──────────────────────────────────────────────"
 
 # 1. GREEN — every assertion a kept invariant.
@@ -87,21 +98,21 @@ assert_verdict "SETUP-RED setup_fail abort" \
 
 # 8. INCOMPLETE — a recorded coverage gap.
 assert_verdict "INCOMPLETE not_covered" \
-    'drill_begin "t-inc"; assert_ok "one real pass" true; not_covered "some cell" "not exercisable in-sim this run"' \
+    'drill_begin "t-inc"; assert_ok "one real pass" true; not_covered "some cell" "not exercisable in-sim this run" gap' \
     INCOMPLETE 4
 
 # ── PRECEDENCE ──────────────────────────────────────────────────────────────────
 # 9. ASSERT-FAIL beats everything.
 assert_verdict "precedence ASSERT-FAIL>all" \
-    'drill_begin "t-p1"; assert_ok "break" false; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"; not_covered "g" "r"' \
+    'drill_begin "t-p1"; assert_ok "break" false; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"; not_covered "g" "r" gap' \
     ASSERT-FAIL 1
 # 10. SETUP-RED beats PRODUCT-RED + INCOMPLETE (setup_fail aborts, so seed PRODUCT-RED first).
 assert_verdict "precedence SETUP-RED>PRODUCT-RED" \
-    'drill_begin "t-p2"; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"; not_covered "g" "r"; setup_fail "late prereq"' \
+    'drill_begin "t-p2"; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"; not_covered "g" "r" gap; setup_fail "late prereq"' \
     SETUP-RED 2
 # 11. PRODUCT-RED beats INCOMPLETE.
 assert_verdict "precedence PRODUCT-RED>INCOMPLETE" \
-    'drill_begin "t-p3"; not_covered "g" "r"; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"' \
+    'drill_begin "t-p3"; not_covered "g" "r" gap; assert_bug "d" "#1" "x" sh -c "echo x>&2;exit 1"' \
     PRODUCT-RED 3
 
 # ── FAIL-CLOSED harness misuse (round-3 M1/m1): NEVER a false GREEN, ALWAYS a verdict ──
@@ -129,6 +140,23 @@ assert_verdict "misuse: assert_ok empty command" \
 assert_verdict "misuse: not_covered missing reason" \
     'drill_begin "t-m6"; not_covered "gap with no reason"' \
     SETUP-RED 2
+# 17b. not_covered with desc+reason but NO class → SETUP-RED (an untriageable gap is misuse; batch E).
+assert_verdict "misuse: not_covered missing class" \
+    'drill_begin "t-m8"; not_covered "gap" "a real reason"' \
+    SETUP-RED 2
+# 17c. not_covered with an EMPTY class → SETUP-RED (must not fall through to a nameless gap).
+assert_verdict "misuse: not_covered empty class" \
+    'drill_begin "t-m9"; not_covered "gap" "a real reason" ""' \
+    SETUP-RED 2
+# 17d. not_covered with an OUT-OF-ENUM class → SETUP-RED, and it must NOT have bumped not_covered.
+assert_verdict "misuse: not_covered bogus class" \
+    'drill_begin "t-m10"; not_covered "gap" "a real reason" flaky' \
+    SETUP-RED 2
+_out=$(run_drill_body 'drill_begin "t-m10b"; not_covered "gap" "a real reason" flaky')
+_line=$(printf '%s\n' "$_out" | grep '^DRILL-VERDICT ' | tail -1)
+{ [ "$(field "$_line" not_covered)" = 0 ] && [ "$(field "$_line" nc_gap)" = 0 ] && [ "$(field "$_line" nc_guard)" = 0 ]; } \
+    && pass "misuse: a bogus class is rejected, never counted as a gap" \
+    || fail "misuse: bogus class leaked into the not_covered counters ($_line)"
 # 18. A misuse that would otherwise be GREEN must land SETUP-RED (proves misuse is not swallowed).
 assert_verdict "misuse poisons an otherwise-GREEN drill" \
     'drill_begin "t-m7"; assert_ok "real pass" true; assert_refuses "d" "" sh -c "exit 1"' \
@@ -136,17 +164,70 @@ assert_verdict "misuse poisons an otherwise-GREEN drill" \
 
 # ── grammar: the verdict line fields are all present + numeric ──
 echo "── verdict-line grammar ────────────────────────────────────────────────────────"
-_out=$(run_drill_body 'drill_begin "t-grammar"; assert_ok "a" true; assert_ok "b" true; not_covered "g" "r"')
+_out=$(run_drill_body 'drill_begin "t-grammar"; assert_ok "a" true; assert_ok "b" true; not_covered "g" "r" gap')
 _line=$(printf '%s\n' "$_out" | grep '^DRILL-VERDICT ' | tail -1)
-if printf '%s\n' "$_line" | grep -qE '^DRILL-VERDICT verdict=[A-Z-]+ rc=[0-9]+ assert_fail=[0-9]+ setup_red=[0-9]+ product_red=[0-9]+ not_covered=[0-9]+ pass=[0-9]+ -- '; then
+# R1: die() must be FRAME-AWARE. lib/log.sh's die is `err; exit 1`; 38 call sites across six drills used it
+# as a mid-drill refusal guard, exiting WITHOUT a verdict line so the runner reported INFRA-ABORT — measured
+# on drill 73, which had already recorded a real assert_fail and still got relabelled as "the harness broke".
+_t=$(mktemp -d)
+printf '. "$1/lib/log.sh"\n. "$1/lib/assert.sh"\ndrill_begin "die-frame"\ndie "mid-drill refusal"\n' > "$_t/d.sh"
+# External review H-3/M2: these two checks called `ok`/`bad` — helpers that DO NOT EXIST in this
+# file (it defines pass/fail; the names were copied from poll-reentrancy-test.sh). `grep && ok || bad`
+# then ran `ok`/`bad`, both exiting 127 (command-not-found) on EVERY run, so FAILS never moved and the
+# die() frame-aware regression gate — R1's headline deliverable — was silently dead (a reviewer proved a
+# reverted die() still `ALL PASS`ed). Fixed to pass/fail; the checks are now a live regression gate.
+_out=$(INSTANCE=drill-x sh "$_t/d.sh" "$HERE/.." 2>&1)
+if printf '%s\n' "$_out" | grep -q 'DRILL-VERDICT verdict=SETUP-RED'; then
+    pass "die() inside a frame lands SETUP-RED WITH a verdict line (no INFRA-ABORT)"
+else
+    fail "die() inside a frame emitted no SETUP-RED verdict line: $_out"
+fi
+# and it must NOT hijack die() outside a frame (lib helpers sourced by simcluster itself rely on plain abort)
+printf '. "$1/lib/log.sh"\n. "$1/lib/assert.sh"\ndie "outside frame"\n' > "$_t/e.sh"
+_out=$(INSTANCE=drill-x sh "$_t/e.sh" "$HERE/.." 2>&1)
+if printf '%s\n' "$_out" | grep -q 'DRILL-VERDICT'; then
+    fail "die() outside a frame wrongly emitted a verdict line"
+else
+    pass "die() outside a frame keeps plain abort semantics (non-vacuity control)"
+fi
+rm -rf "$_t"
+
+if printf '%s\n' "$_line" | grep -qE '^DRILL-VERDICT verdict=[A-Z-]+ rc=[0-9]+ assert_fail=[0-9]+ setup_red=[0-9]+ product_red=[0-9]+ not_covered=[0-9]+ nc_gap=[0-9]+ nc_guard=[0-9]+ pass=[0-9]+ -- '; then
     pass "grammar: all machine fields present + numeric"
 else
     fail "grammar: line does not match the contract: $_line"
 fi
 [ "$(field "$_line" pass)" = 2 ] && pass "grammar: pass=2 counted" || fail "grammar: pass count wrong ($_line)"
 [ "$(field "$_line" not_covered)" = 1 ] && pass "grammar: not_covered=1 counted" || fail "grammar: not_covered count wrong ($_line)"
+# The two class fields were APPENDED after not_covered: older field names/order are untouched, and the
+# classes must always sum back to the parent counter (a drifting split would silently under-report debt).
+[ "$(field "$_line" nc_gap)" = 1 ] && pass "grammar: nc_gap=1 counted" || fail "grammar: nc_gap wrong ($_line)"
+[ "$(field "$_line" nc_guard)" = 0 ] && pass "grammar: nc_guard=0 counted" || fail "grammar: nc_guard wrong ($_line)"
 # a drill name WITH SPACES must survive after the ` -- ` sentinel:
 printf '%s\n' "$_line" | grep -q ' -- t-grammar$' && pass "grammar: free-text name after -- sentinel" || fail "grammar: name sentinel broken ($_line)"
+
+# ── not_covered CLASSES (batch E) ───────────────────────────────────────────────
+echo "── not_covered classes (gap vs runtime-guard) ──────────────────────────────────"
+# A runtime-guard gets NO green back door: it still lands INCOMPLETE, exactly like a gap.
+assert_verdict "INCOMPLETE not_covered runtime-guard (no green back door)" \
+    'drill_begin "t-rg"; assert_ok "one real pass" true; not_covered "arm" "the fixture did not land this run" runtime-guard' \
+    INCOMPLETE 4
+# Mixed classes: nc_gap + nc_guard must sum to not_covered and be attributed to the right buckets.
+_out=$(run_drill_body 'drill_begin "t-mix"; not_covered "a" "r" gap; not_covered "b" "r" runtime-guard; not_covered "c" "r" gap')
+_line=$(printf '%s\n' "$_out" | grep '^DRILL-VERDICT ' | tail -1)
+{ [ "$(field "$_line" not_covered)" = 3 ] && [ "$(field "$_line" nc_gap)" = 2 ] && [ "$(field "$_line" nc_guard)" = 1 ]; } \
+    && pass "classes: nc_gap=2 + nc_guard=1 sum to not_covered=3" \
+    || fail "classes: split does not reconcile with not_covered ($_line)"
+# The human NOT-COVERED line must carry the class so a log reader can triage without re-parsing.
+printf '%s\n' "$_out" | grep -q 'NOT-COVERED\[gap\]' && printf '%s\n' "$_out" | grep -q 'NOT-COVERED\[runtime-guard\]' \
+    && pass "classes: the NOT-COVERED log line names its class" \
+    || fail "classes: NOT-COVERED log line lost its class tag"
+# drill_begin must RESET the class counters, or a second frame inherits the first frame's debt.
+_out=$(run_drill_body 'drill_begin "t-r1"; not_covered "a" "r" gap; not_covered "b" "r" runtime-guard; drill_begin "t-r2"; assert_ok "clean" true')
+_line=$(printf '%s\n' "$_out" | grep '^DRILL-VERDICT ' | tail -1)
+{ [ "$(field "$_line" nc_gap)" = 0 ] && [ "$(field "$_line" nc_guard)" = 0 ]; } \
+    && pass "classes: drill_begin resets nc_gap/nc_guard" \
+    || fail "classes: class counters leaked across drill_begin ($_line)"
 
 # ── run-drills.sh END-TO-END: build a synthetic drill tree + a fake simcluster, run the REAL runner, and
 # assert its classify-by-verdict + blocker exit code (round-3 B1 + 疑惑-4). Needs bash (the runner uses
@@ -159,19 +240,19 @@ if command -v bash >/dev/null 2>&1; then
     mkd() {
         af=0; sr=0; pr=0; nc=0
         case "$2" in ASSERT-FAIL) af=1 ;; SETUP-RED) sr=1 ;; PRODUCT-RED) pr=1 ;; INCOMPLETE) nc=1 ;; esac
-        printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=%s rc=%s assert_fail=%s setup_red=%s product_red=%s not_covered=%s pass=1 -- %s\\n" >&2\nexit %s\n' \
+        printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=%s rc=%s assert_fail=%s setup_red=%s product_red=%s not_covered=%s nc_gap=0 nc_guard=0 pass=1 -- %s\\n" >&2\nexit %s\n' \
             "$2" "$3" "$af" "$sr" "$pr" "$nc" "$1" "$3" > "$RT/drills/$1.sh"
     }
     mkd g GREEN 0; mkd p PRODUCT-RED 3; mkd i INCOMPLETE 4; mkd s SETUP-RED 2; mkd a ASSERT-FAIL 1
     printf '#!/bin/sh\necho "boom crash" >&2\nexit 1\n' > "$RT/drills/z.sh"   # INFRA-ABORT: no verdict line
     # a LEGACY drill: emits a GREEN verdict line (rc=0) but process exits 1 → CONTRACT-ERROR.
-    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 pass=1 -- legacy\\n" >&2\nexit 1\n' > "$RT/drills/m.sh"
+    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=1 -- legacy\\n" >&2\nexit 1\n' > "$RT/drills/m.sh"
     # Adversarial contracts: missing field, duplicate/conflicting line, and counter/verdict contradiction.
-    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN assert_fail=0 setup_red=0 product_red=0 not_covered=0 pass=1 -- missing-rc\\n" >&2\nexit 0\n' > "$RT/drills/bad-missing.sh"
-    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=ASSERT-FAIL rc=1 assert_fail=1 setup_red=0 product_red=0 not_covered=0 pass=0 -- dup\\n" >&2\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 pass=1 -- dup\\n" >&2\nexit 0\n' > "$RT/drills/bad-dup.sh"
-    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=1 setup_red=0 product_red=0 not_covered=0 pass=1 -- bad-counter\\n" >&2\nexit 0\n' > "$RT/drills/bad-counter.sh"
+    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN assert_fail=0 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=1 -- missing-rc\\n" >&2\nexit 0\n' > "$RT/drills/bad-missing.sh"
+    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=ASSERT-FAIL rc=1 assert_fail=1 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=0 -- dup\\n" >&2\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=1 -- dup\\n" >&2\nexit 0\n' > "$RT/drills/bad-dup.sh"
+    printf '#!/bin/sh\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=1 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=1 -- bad-counter\\n" >&2\nexit 0\n' > "$RT/drills/bad-counter.sh"
     # Contract contradiction plus an infra-looking string must never be retried/laundered.
-    printf '#!/bin/sh\necho "container not running" >&2\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 pass=1 -- mismatch-flake\\n" >&2\nexit 1\n' > "$RT/drills/bad-retry.sh"
+    printf '#!/bin/sh\necho "container not running" >&2\nprintf "DRILL-VERDICT verdict=GREEN rc=0 assert_fail=0 setup_red=0 product_red=0 not_covered=0 nc_gap=0 nc_guard=0 pass=1 -- mismatch-flake\\n" >&2\nexit 1\n' > "$RT/drills/bad-retry.sh"
     # (1) all six matched drills → 5 blockers by default (PRODUCT/INCOMPLETE included).
     bash "$RT/run-drills.sh" --skip-preflight --no-retry --logdir "$RT/l1" g p i s a z >/dev/null 2>&1
     [ "$?" = 5 ] && pass "runner e2e: 6 mixed drills → exit 5 (all non-GREEN block by default)" || fail "runner e2e: mixed exit != 5"

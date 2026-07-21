@@ -87,8 +87,44 @@ func (b *Broker) handleGrowTrigger(data []byte, now time.Time) *proto.ClusterGro
 				}
 			}
 		}
-		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetGrowActive(req.JoinerNode) }); err != nil {
+		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetGrowActive(req.JoinerNode, b.cfg.Now()) }); err != nil {
 			return &proto.ClusterGrowResp{Code: adminsock.CodeNotLeader, Error: "acquire grow lock (run against the leader): " + err.Error()}
+		}
+		// H1: the acquire is a CONDITIONAL replicated mutex (PlanSetGrowActive no-ops if an upgrade marker or a
+		// DIFFERENT joiner's grow marker is held). Read the marker back after apply — if it is not owned by THIS
+		// joiner, an upgrade roll or a racing grow won between our preflight and our commit, so we must not report
+		// a lock we do not hold.
+		if growActiveJoiner(b.cl.node.RODB()) != req.JoinerNode {
+			return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest,
+				Error: "a concurrent `cluster upgrade` roll or another `cluster add` grow acquired the membership lock first — retry after it completes"}
+		}
+		return &proto.ClusterGrowResp{OK: true}
+
+	case "renew-lock":
+		// R7b: the grow lock is now LEASED. `cluster add` keeps a renewer alive for the whole grow; when the
+		// orchestrator dies (a HALT at P2/P3 — the acquire-lock window R7a could not judge, because the join
+		// operation row does not exist yet) the renewals stop and the reconcile pass expires the lock.
+		//
+		// The renewal is JOINER-BOUND and can only REFRESH, never CREATE: PlanRenewGrowLease's statements are
+		// gated on cluster_grow_active still being held by THIS joiner. So a keeper goroutine that outlives its
+		// release by one tick cannot re-fence membership, and a keeper for joiner A cannot extend joiner B's lock.
+		if b.cl == nil || b.cl.node == nil {
+			return &proto.ClusterGrowResp{Code: adminsock.CodeClusterNotEnabled, Error: "cluster not enabled"}
+		}
+		if req.JoinerNode == "" {
+			return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "renew-lock requires a joiner"}
+		}
+		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanRenewGrowLease(req.JoinerNode, b.cfg.Now())
+		}); err != nil {
+			return &proto.ClusterGrowResp{Code: adminsock.CodeNotLeader, Error: "renew grow lock (run against the leader): " + err.Error()}
+		}
+		// Read back the COMMITTED marker: a renewal that landed on a lock this joiner no longer owns is a
+		// no-op at the SQL level, and reporting OK for it would let a stale keeper believe it still holds a
+		// lock it does not. Tell it the truth so it stops.
+		if j := growActiveJoiner(b.cl.node.RODB()); j != req.JoinerNode {
+			return &proto.ClusterGrowResp{Code: growTriggerCodeLockNotHeld,
+				Error: "the grow lock is no longer held by " + req.JoinerNode + " (holder=" + j + ")"}
 		}
 		return &proto.ClusterGrowResp{OK: true}
 
@@ -200,4 +236,8 @@ func meshPeerTriples(db *sql.DB) ([]string, error) {
 const (
 	growTriggerCodeUnauthorized = "unauthorized"
 	growTriggerCodeNotReady     = "cluster_not_ready"
+	// growTriggerCodeLockNotHeld (R7b) tells a lease renewer that the lock it believes it holds is gone
+	// (released, expired, or taken over). It is TERMINAL for the renewer — retrying cannot re-acquire,
+	// because a renewal is structurally incapable of creating a lock.
+	growTriggerCodeLockNotHeld = "lock_not_held"
 )

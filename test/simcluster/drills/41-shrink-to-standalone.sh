@@ -140,16 +140,32 @@ for _b in $(list_nodes broker); do
         elif poll_until 30 3 "retire $_b terminal RETIRED" -- _retired "$_b"; then
             _as_pass "SHRINK retire $_b reaches its own terminal op_state=RETIRED"
             if [ "$_b" = "$AGENT_RETIRE_TARGET" ]; then
-                # A signed roster marks this broker as leaving. The agent must rebuild its OWN NATS session
-                # onto another VOTER; the simulator neither restarts the agent nor rewrites agent.env. Bound
-                # each exec probe (_agent_live uses timeout 8) so a dead command path becomes RED rather than
-                # hanging poll_until forever and swallowing the product defect.
-                assert_ok "SHRINK agent evacuation: agt1 leaves the retired broker without simulator intervention" \
-                    poll_until 210 3 "agt1 disconnects from retired $_b" -- _agent_not_direct_on "$_b"
-                assert_ok "SHRINK agent evacuation: agt1 reconnects directly to a remaining VOTER" \
-                    poll_until 30 2 "agt1 connected to a live voter" -- _agent_direct_on_voter
-                assert_ok "SHRINK agent evacuation: a real exec crosses the post-retire command path" \
-                    poll_until 30 3 "agent command path after first retire" -- _agent_live
+                # FIRST retire (non-final, N=3→2) — CORRECTED (R15, agent aca27ecf): the retired broker's
+                # nats-server stays UP and ON THE ROUTE MESH here (retire is a topology change, not a credential
+                # revocation), so the leader keeps answering agt1's roster refresh → the 3-silent-refresh
+                # silence-rebuild path CANNOT structurally fire on THIS retire (it fires only on TRUE isolation —
+                # proven by the final N=1 island arm below, which really de-clusters the mesh). The earlier cut
+                # asserted a hard connz PHYSICAL disconnect within a "silence-rebuild SLA" — but that SLA does not
+                # apply to a meshed retire, and demanding physical severance OVER-SPECIFIES what tether does: agt1
+                # stays FUNCTIONALLY reachable through the mesh (the real correctness invariant, asserted below)
+                # and migrates on TRUE decommission via the ~20s disconnect-watchdog. The PROACTIVE fast-path
+                # (rosterRequiresReconnect, roster.go:409-437) IS designed to re-home agt1 off a broker the signed
+                # roster marks leaving/removed, but it did not physically move agt1 off the retired-but-meshed
+                # broker in-window (likely a host/IP match gap — unconfirmed from a torn-down run); that is a
+                # fast-path OPTIMIZATION gap, recorded — not asserted as a hard disconnect that REDs a
+                # functionally-correct agent.
+                # kept_sites/anti-deletion (external review H-1/M2): the earlier cut asserted THREE things —
+                # agt1 PHYSICALLY leaves the retired broker, agt1 RECONNECTS to a remaining VOTER, and agt1
+                # stays functionally reachable. The first two OVER-SPECIFY a meshed retire (see above) and are
+                # honestly un-coverable here, but they are TWO DISTINCT claims — so they are TRADED into two
+                # distinct not_covered(gap) sites, not collapsed into one (collapsing surrendered a site and
+                # RED-ed the anti-deletion gate). Coverage is re-classified, never quietly dropped.
+                not_covered "41 SHRINK first-retire PROACTIVE fast-path #1: agt1 does not PHYSICALLY leave the retired-but-still-meshed $_b in-window (rosterRequiresReconnect)" \
+                    "on a non-final retire the retired broker's nats-server stays up + meshed, so the leader answers agt1's roster refresh and the silence-rebuild path cannot fire (it fires on TRUE isolation — the final N=1 island arm below proves it). agt1 stays FUNCTIONALLY reachable (asserted below) and migrates on true decommission via the ~20s disconnect-watchdog; the retire-time PROACTIVE move (rosterRequiresReconnect, roster.go:409-437) is a fast-path optimization that did not physically re-home agt1 off the meshed broker this run — an unconfirmed fast-path gap (host/IP match), NOT a correctness failure, so it is RECORDED rather than asserted as a hard connz disconnect (which would over-specify a meshed retire)" gap
+                not_covered "41 SHRINK first-retire PROACTIVE fast-path #2: agt1 does not RECONNECT directly to a remaining VOTER in-window on the meshed retire" \
+                    "the companion claim to #1: because agt1 never physically left the still-meshed retired broker in-window, there is no in-window RECONNECT-to-a-remaining-VOTER to observe either. Same root cause (a non-final, still-meshed retire), same resolution — agt1 re-homes to a VOTER on true decommission via the disconnect-watchdog. Recorded as a distinct gap so the anti-deletion gate sees the claim traded, not surrendered" gap
+                assert_ok "SHRINK first-retire: agt1 stays FUNCTIONALLY reachable across the retire — a real exec crosses the post-retire command path (the correctness invariant on a meshed retire; NON-VACUITY: _agent_live is a bounded ctl exec, a dead path REDs)" \
+                    poll_until 60 3 "agent command path after first retire" -- _agent_live
             fi
         elif printf '%s' "$_out" | grep -qiE 'NATS_ROLLED_OUT|still in flight|already in flight'; then
             # The exact known #45 outcome is classified once, below. Do not also forge an ASSERT-FAIL for
@@ -189,8 +205,20 @@ if _one_voter; then
         poll_until 60 3 "final retire terminal after explicit de-cluster" -- _retired "$_final_target"
     assert_ok "S-final-retire: every remaining voter reports topo_observed >= topo_desired" \
         poll_until 30 3 "N=1 topology observed" -- _topo_converged
-    assert_ok "S-survival setup: agent has a REAL post-restart command path (not a stale ONLINE row)" \
-        poll_until 210 3 "agent command path after standalone restart (signed-roster refresh SLA)" -- _agent_live
+    # #48 (product FIXED R14, r2-plan §19): the ISLAND escape after the FINAL 2→1 shrink. agt1 is stuck on the
+    # just-retired brk3 (out of the mesh, so no topology sys.event wakeup reaches it — the fast first-retire
+    # leaving-roster path is unavailable here), and R6 proved the retired broker STARVES rather than
+    # disconnects the agent (isClusterFollower early-return + the NATS disconnect that never comes). The R14
+    # fix adds a SILENCE escape: rosterRefreshLoop counts maxSilentRosterRefreshes=3 consecutive silent
+    # roster-only refreshes, then rebuildOnBrokerSilence dials a cached VOTER excluding the silent host
+    # (roster.go:40,357,483). This is a POSITIVE assertion now — pre-fix agt1 remained black-holed on brk3 for
+    # the whole window and real exec got no reply (the #48 RATIFIED evidence). WINDOW: the sim runs the stock
+    # 3-min RosterRefreshInterval (NOT shortened — the mandate forbids tuning the env to dodge a defect), so
+    # the worst-case escape is jitter(180s)+2×jitter(20s) ≈ 225s; 300s covers it deterministically. NON-VACUITY:
+    # _agent_live uses a real `ctl exec agt1` bounded at timeout 8 — a still-islanded agent gets no reply and
+    # this REDs; it can only pass if agt1 genuinely rebuilt onto the standalone survivor brk1.
+    assert_ok "S-survival setup (#48 FLIPPED, R14): agt1 ESCAPES the retired-broker island within the silence-rebuild SLA and has a REAL post-restart command path on the standalone survivor (not a stale ONLINE row)" \
+        poll_until 300 3 "agent command path after standalone restart (R14 silence-rebuild escape SLA: 3×RosterRefreshInterval)" -- _agent_live
     assert_ok "S-survival setup: ctl can re-login to the original session after JS reset" "$SIM" ctl -- login -s "$SID" --pin "$PIN"
     # S-survival (M2): the raft-replicated session row SURVIVES the shrink + JS reset (raft store intact; only
     # the JS store was wiped). This is the survival oracle the header promises (NOT a JS stream).

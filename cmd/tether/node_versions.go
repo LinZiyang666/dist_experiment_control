@@ -22,14 +22,17 @@ type brokerDaemon struct {
 }
 
 // brokerVersionRow is one whole-host dual-version verdict.
+// JSON keys are snake_case (schema node_ls_brokers v2) — matching proto.NodeListEntry and every other
+// --json payload in this package. v1 emitted the bare Go field names (PascalCase); renaming the keys is
+// a breaking change, hence the schema_version bump below.
 type brokerVersionRow struct {
-	NodeID      string // broker cluster node_id
-	AgentNID    string // its co-located agent nid
-	Assumed     bool   // AgentNID came from the node_id==nid convention (a pre-G5 broker), not self-declared
-	BrokerVer   string // broker daemon release ("?" if unreported)
-	AgentVer    string // co-located agent release ("?" if the agent is absent from the node list)
-	Skew        bool   // broker and agent releases differ → whole-host upgrade is INCOMPLETE
-	WholeHostAt bool   // both == target (the single #19 "done" criterion); only meaningful when target != ""
+	NodeID      string `json:"node_id"`       // broker cluster node_id
+	AgentNID    string `json:"agent_nid"`     // its co-located agent nid
+	Assumed     bool   `json:"assumed"`       // AgentNID came from the node_id==nid convention (a pre-G5 broker), not self-declared
+	BrokerVer   string `json:"broker_ver"`    // broker daemon release ("?" if unreported)
+	AgentVer    string `json:"agent_ver"`     // co-located agent release ("?" if the agent is absent from the node list)
+	Skew        bool   `json:"skew"`          // broker and agent releases differ → whole-host upgrade is INCOMPLETE
+	WholeHostAt bool   `json:"whole_host_at"` // both == target (the single #19 "done" criterion); only meaningful when target != ""
 }
 
 // correlateBrokerVersions joins broker daemons (nodeID → {brokerVer, colocatedAgentNID}) with agent
@@ -97,7 +100,7 @@ func renderNodeLsBrokers(cmd *cobra.Command, nc *nats.Conn, actor string, nodes 
 			Schema        string             `json:"schema"`
 			SchemaVersion int                `json:"schema_version"`
 			Brokers       []brokerVersionRow `json:"brokers"`
-		}{Schema: "node_ls_brokers", SchemaVersion: 1, Brokers: rows})
+		}{Schema: "node_ls_brokers", SchemaVersion: 2, Brokers: rows})
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "BROKER\tAGENT_NID\tBROKER_VER\tAGENT_VER\tSKEW")

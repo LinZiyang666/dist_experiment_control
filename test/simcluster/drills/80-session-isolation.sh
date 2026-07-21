@@ -17,9 +17,13 @@
 #      Violation`, NEVER `Permissions Violation`).
 #  (c) `not_owner` is a CONNECT-deny in disguise → not_owner is an APP-LAYER code only reachable AFTER a
 #      successful member CONNECT (a non-member hits `Authorization Violation` first) + a member positive control.
-#  (d) the PIN rate-limit probe: the 11th same-IP correct-PIN join SUCCEEDING is the RECORDED DEFECT
-#      (assert_ok, INVERTED — §E.6 unimplemented, gotcha #25). If a maintainer sees it FAIL (11th refused) a
-#      limiter landed → FLIP to assert_refuses.
+#  (d) the PIN rate-limit probe (#25 CLOSED R12 — now a POSITIVE regression): after a same-IP wrong-PIN
+#      STORM the 11th same-IP CORRECT-PIN join is REFUSED at CONNECT (assert_refuses). A correct credential
+#      rejected can ONLY be the per-IP §E.6 limiter, and the broker log (_rl_logged) is the server-side
+#      discriminator. False-green guards: E-pos (under-threshold correct PIN succeeds — the limiter does not
+#      fire spuriously) + R-2ndsrc (a DIFFERENT source IP still joins while ctl1 is throttled — per-IP scope,
+#      not a global outage). If a maintainer sees R-11th SUCCEED while _rl_logged is silent, the limiter
+#      regressed (#25 re-opened).
 #  (e) a sys.events oracle catches a STALE setup event → the background core sub starts AFTER setup; only
 #      W's post-sub join is asserted; the capture file is fresh; Arm R runs AFTER the sub is killed (E-clean).
 #  (f) `member_joined`: the owner's own `login` does NOT emit it (already a member → fp-reconnect path,
@@ -54,10 +58,15 @@ ev_stop()  { "$SIM" exec ctl1 -- pkill -f 'sys.events' >/dev/null 2>&1 || true; 
 # single-line JSON (audit.go:36-48). Ordering (ev_stop before Arm R) keeps the capture to W's two events.
 _ev_pinfailed() { "$SIM" exec ctl1 -- sh -c "grep '\"type\":\"pin_failed\"' $EVCAP | grep '\"sid\":\"lab\"' | grep -q '\"role\":\"ctl\"'"; }
 _ev_joined()    { "$SIM" exec ctl1 -- sh -c "grep '\"type\":\"member_joined\"' $EVCAP | grep '\"via\":\"pin\"' | grep -q '\"sid\":\"lab\"'"; }
-# F1 (+ R2 residual): count the pin_failed events (the §E.6 counter's real trigger) with sid+role BOUND on
-# the same JSON line — ≥10 proves the 10 wrong-PIN attempts all reached the Argon2-failure path for lab/ctl
-# (were countable), not pre-blocked by some other refusal.
-_ev_pinfailed_ge10() { _c=$("$SIM" exec ctl1 -- sh -c "grep '\"type\":\"pin_failed\"' $EVCAP | grep '\"sid\":\"lab\"' | grep -c '\"role\":\"ctl\"'" 2>/dev/null); [ "${_c:-0}" -ge 10 ]; }
+# R12 (#25 CLOSED — flip helpers). _rl_logged: the SERVER-SIDE rate-limit signature. nats-server hides the
+# callout reason behind a client-generic Authorization Violation, so the proof that a refusal was the §E.6
+# limiter (not some unrelated auth fault) is the broker's OWN warning line
+# (`authcallout: {ctl,agent} PIN attempt rate-limited`), read from the broker journal / broker.err.
+_rl_logged() { "$SIM" exec brk1 -- sh -c "journalctl -u tether-broker --no-pager 2>/dev/null | grep -qiE 'PIN attempt rate-limited' || grep -qiE 'PIN attempt rate-limited' /var/log/tether/broker.err 2>/dev/null"; }
+# _r_second_source: a CORRECT-PIN member join from a DIFFERENT source IP (agt1's container = a distinct TCP
+# peer ⇒ a distinct client_info.host bucket). It must STILL succeed while ctl1 is throttled — proving the
+# §E.6 throttle is per-IP (no collateral lockout of an innocent joiner), not a global refusal.
+_r_second_source() { "$SIM" exec agt1 -- runuser -u sim -- env HOME=/home/sim TETHER_HOME=/home/sim/.tether-src2 tether login -s "$SID_A" --pin "$PIN_A" --broker "$NURL" >/dev/null 2>&1; }
 
 # drill-local predicates (call the ident.sh functions; assert_ok runs these in a command-sub subshell that
 # INHERITS the functions — unlike `sh -c "CTLH …"`, which spawns a fresh shell without them).
@@ -156,28 +165,46 @@ assert_ok      "E-joined: member_joined sys.event captured (sid=lab, via=pin; W 
                poll_until 15 1 "member_joined event for lab via pin" -- _ev_joined
 ev_stop   # E-clean: BEFORE Arm R (so Arm R never pollutes the E-arm capture)
 
-# ── Arm R — PIN rate-limit black-box probe (探索→定格 预期-gotcha #25; INVERTED: success = the gap) ─────
-# EXTERNAL-REVIEW F1: the §E.6 limiter counts on the Argon2 FAILURE branch (architecture §E.2: 失败 → 拒绝 +
-# pin_failed + 按 E.6 计数); the threat is WRONG-PIN brute force. So the probe must fire WRONG PINs (the
-# countable trigger), prove they reached the real auth path (pin_failed events), then show the SAME source's
-# next CORRECT-PIN attempt STILL SUCCEEDS — a working ≤10/IP/min limiter would BLOCK the source after 10
-# failures, refusing even the correct 11th. Its success = limiter ABSENT (#25). (Models the hermetic
-# TestPINBruteForceNoLockout5Tries at deploy tier: N wrong + 1 correct-still-succeeds.)
-ev_sub_start   # fresh capture (truncates $EVCAP) to COUNT the 10 pin_failed events
-assert_ok "R-sub: fresh sys.events observer for the pin_failed count"  poll_until 15 1 "sub live" -- ev_ready
-RF=0; i=1; while [ "$i" -le 10 ]; do
+# ── Arm R — per-IP PIN rate limit (#25 CLOSED R12 — flipped to a POSITIVE regression) ────────────────────
+# architecture §E.2/§E.6: a failed (Argon2-reject) PIN attempt counts toward a per-IP budget (burst 10 /
+# refill 10/min); once a source exhausts it, EVERY further attempt from that IP — a correct PIN included — is
+# refused BEFORE the Argon2 verify (deny the brute-forcer the oracle). authcallout/ratelimit.go implements it
+# keyed on client_info.host (the TCP peer IP nats-server stamps; unspoofable at the callout layer). So the
+# probe: (1) a same-IP WRONG-PIN storm exhausts ctl1's budget, (2) the SAME source's next CORRECT-PIN join is
+# now REFUSED at CONNECT (the flip — a correct credential rejected is the limiter, not a bad PIN), guarded by
+# the broker's own rate-limit log line and by a different-IP control that still succeeds.
+ev_sub_start   # fresh capture (truncates $EVCAP): confirm the storm actually reached the Argon2 path
+assert_ok "R-sub: fresh sys.events observer live"  poll_until 15 1 "sub live" -- ev_ready
+# STORM: 18 same-IP WRONG-PIN attempts from ctl1. burst=10 ⇒ once the budget empties, later attempts are
+# refused by the LIMITER (before Argon2). Sizing: 18 sequential attempts drain past the refill accrued during
+# the (~30-40s) storm, so the bucket is at 0 by the end and the source is shut out.
+RF=0; i=1; while [ "$i" -le 18 ]; do
     CTLH "rf$i" login -s "$SID_A" --pin 111111 --broker "$NURL" >/dev/null 2>&1 || RF=$((RF+1)); i=$((i+1))
 done
-# (a) all 10 same-IP WRONG-PIN attempts were REFUSED (reached the real auth path = countable §E.6 attempts).
-assert_ok "R-fails: all 10 same-IP WRONG-PIN attempts REFUSED (reached the Argon2-failure = countable path)"  sh -c "[ $RF -eq 10 ]"
-# (b) BIND them to the limiter's real trigger: ≥10 pin_failed sys.events for lab/ctl captured.
-assert_ok "R-pinfailed: ≥10 pin_failed sys.events captured (the §E.6 counter's trigger fired 10× — not pre-blocked)" \
-    poll_until 15 1 "10 pin_failed events" -- _ev_pinfailed_ge10
-ev_stop
-# (c) THE inverted probe: after 10 same-IP failures, the 11th same-IP CORRECT-PIN attempt STILL SUCCEEDS —
-# a ≤10/IP/min limiter would have blocked this source. Success = the recorded gap #25.
-assert_ok "R-11th: after 10 same-IP wrong-PIN failures, the 11th same-IP CORRECT-PIN join STILL SUCCEEDS — PIN rate-limit ABSENT (§E.6 unimplemented; #25; FLIP to assert_refuses <rate-limit-sig> when the per-IP limiter lands)" \
+# THE FLIP: IMMEDIATELY (before the 6s refill hands back a token) the SAME-source CORRECT PIN is REFUSED at
+# CONNECT. Fired as the very next command (no ev_stop/poll between) so the block window has not lapsed. A
+# correct credential rejected can ONLY be the per-IP §E.6 limiter (E-pos above proved a correct PIN joins
+# under threshold), surfaced client-side as the generic auth_callout rejection.
+assert_refuses "R-11th [#25 CLOSED] after $RF same-IP wrong-PIN attempts, the 11th same-IP CORRECT-PIN join is REFUSED at CONNECT — the per-IP PIN rate limit now shuts the source out (a correct PIN would otherwise join, so this refusal is the limiter, not a bad credential)" \
+    "auth_callout rejected|Authorization Violation" \
     CTLH rok login -s "$SID_A" --pin "$PIN_A" --broker "$NURL"
+ev_stop
+# (a) every storm attempt was refused (each an Argon2 reject OR a rate-limit refusal — a correct PIN would
+# have joined, so a universal refusal proves the source was denied throughout).
+assert_ok "R-fails: all $RF same-IP storm attempts were refused (wrong PIN or rate-limited)"  sh -c "[ $RF -eq 18 ]"
+# (b) the storm reached the real Argon2-failure path (≥1 pin_failed sys.event for lab/ctl) — so R-11th's
+# refusal is a genuine post-budget block, not the storm bouncing off some connect-level wall.
+assert_ok "R-pinfailed: the wrong-PIN storm reached the Argon2-failure path (pin_failed captured — the §E.6 counter's real trigger)" \
+    poll_until 15 1 "pin_failed event for lab/ctl" -- _ev_pinfailed
+# (c) SERVER-SIDE rate-limit signature: the broker's own log records the §E.6 limiter engaging for this
+# source — the discriminator that R-11th is the LIMITER, behind nats-server's client-generic reason.
+assert_ok "R-ratelimit-sig [#25]: broker log shows the per-IP PIN rate limit fired ('… PIN attempt rate-limited')" \
+    poll_until 15 1 "rate-limit line in broker log" -- _rl_logged
+# (d) NON-恒真 / per-IP scope: a CORRECT-PIN join from a DIFFERENT source IP (agt1's container) still
+# succeeds while ctl1 is throttled — the throttle is per-IP, not a global outage (no innocent-joiner
+# collateral). Robust of the block-window timing (agt1's IP has zero failures, so it is never blocked).
+assert_ok "R-2ndsrc: a correct-PIN join from a DIFFERENT source IP still succeeds while ctl1 is throttled (per-IP scope, no collateral lockout)" \
+    _r_second_source
 
 # ── Arm TS — TETHER_SESSION dual-shell no-crosstalk ──────────────────────────────────────────────────
 assert_ok      "TS-lab: shell pinned to lab sees agt1, NOT agt2"                 _ts_lab

@@ -24,8 +24,25 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRILLS_DIR="$(cd "$HERE/../drills" && pwd)"
-BATCH="22-forcesingle-online 40-drain-retire 41-shrink-to-standalone 42-rejoin-returning 43-migrate-live-data 90-alerts-lifecycle 91-client-converge 92-js503-remote-alert 93-metrics-observability 50-backup-restore 51-full-dr 52-credential-rotation 94-agent-reconcile 95-broker-selfheal 96-mid-flight-chaos 97-soak-cycles"
+# R1: BATCH is now EVERY drill. It used to be a hand-maintained list of 16, which left 21/37 exempt from
+# every false-green ban below — and the exemption is exactly where H1 (a jq path that matched nothing, so
+# one assertion could never pass and its twin was permanently vacuous) and H13 (a broken jq in drill 93)
+# survived. A per-batch opt-in list cannot be the gate for a suite whose whole job is catching false greens.
+BATCH="$(cd "$DRILLS_DIR" && for f in *.sh; do printf '%s ' "${f%.sh}"; done)"
 ALL=0; [ "${1:-}" = --all ] && ALL=1
+
+# PENDING <drill> <rule> — a violation that is REAL, ACKNOWLEDGED, and OWNED BY A NAMED LATER BATCH.
+# It prints loudly and is NOT counted as a hard failure, but it is NOT an exemption either: the owning
+# batch's exit criteria include emptying its rows here, and a PENDING row for a rule/drill pair that no
+# longer violates is itself a hard failure (a stale carve-out is how allowlists rot into waivers).
+#
+# The ONLY current entries are `bare-not-covered`: converting those 24 `warn "…NOT-COVERED"` notes into
+# real not_covered() calls IS batch R2 (docs/allgreen-remediation-roadmap.md §4). Fixing them here would
+# merge R2 into R1 and skip R2's requirement that every newly-red cell be pre-enumerated with an owner.
+PENDING=""   # R2 emptied it: all 24 bare-not-covered sites are now real not_covered() calls.
+
+is_pending() { printf '%s\n' "$PENDING" | grep -q "^$1:$2:"; }
+pending_owner() { printf '%s\n' "$PENDING" | grep "^$1:$2:" | cut -d: -f3; }
 
 # strip full-line comments so the bans apply to executed code, not documentation.
 code() { grep -vE '^[[:space:]]*#' "$1"; }
@@ -78,6 +95,19 @@ scan_file() {
     # 128+signo without resuming.
     printf '%s\n' "$_C" | grep -qE "trap[[:space:]]+.[^']*.[[:space:]]+(EXIT[[:space:]]+INT|INT[[:space:]]+TERM|EXIT[[:space:]]+INT[[:space:]]+TERM)" \
         && echo "combined-signal-trap: a single trap on EXIT+INT/TERM resumes execution after the handler returns (POSIX) — a Ctrl-C keeps running destructive steps. Use drill_install_traps <cleanup-fn> (lib/assert.sh), which exits 128+signo on INT/TERM"
+    # R1: an INVERTED block asserts "the defect reproduced" by a POSITIVE predicate (assert_ok on a command
+    # that SHOULD have failed). That is a legitimate repo idiom — but only when it is PAIRED with a
+    # product_red/assert_bug in the same block, so the reproduction still lands non-GREEN. Unpaired, the
+    # drill reports GREEN while a registered defect is live: exactly how #25/#26/#27 sat inside three
+    # "green" drills (80/81/82). lib/assert.sh:169 already exposes a bare product_red recorder, so pairing
+    # costs one line and there is no excuse for the unpaired form.
+    # R1/H12: an EMPTY grep needle matches every line, so `grep -qE ''` is a permanently-true oracle. Same
+    # family as H1 (a jq path that matches nothing is permanently FALSE, and its negation permanently true).
+    # A static rule can catch the empty needle; it CANNOT catch a well-formed-but-wrong jq path — that is
+    # what the non-vacuity proof requirement exists for (roadmap §3 gate C: every changed/new assertion must
+    # be shown to go RED against a deliberately bad input).
+    printf '%s\n' "$_C" | grep -qE "grep -[qEo]*[[:space:]]+(\"\"|'')" \
+        && echo "empty-needle: grep with an EMPTY pattern matches everything — a permanently-true oracle"
     printf '%s\n' "$_C" | grep -qE '(^|[^_])drill_begin[[:space:]]' || echo "no-frame: missing drill_begin"
     printf '%s\n' "$_C" | grep -qE '(^|[^_])drill_end'             || echo "no-frame: missing drill_end (no verdict line)"
 }
@@ -90,8 +120,30 @@ for name in $BATCH; do
     f="$DRILLS_DIR/$name.sh"
     [ -f "$f" ] || { echo "  MISSING  $name.sh"; HARD=$((HARD+1)); continue; }
     out=$(scan_file "$f")
-    if [ -n "$out" ]; then printf '%s\n' "$out" | while IFS= read -r v; do echo "  VIOLATION $name: $v"; done; HARD=$((HARD+$(printf '%s\n' "$out" | grep -c .)));
+    if [ -n "$out" ]; then
+        # Split the findings into PENDING (acknowledged, owned by a named later batch) and HARD.
+        _hard_n=0
+        printf '%s\n' "$out" | while IFS= read -r v; do
+            _rule=${v%%:*}
+            if is_pending "$name" "$_rule"; then echo "  PENDING   $name: $_rule (owner: $(pending_owner "$name" "$_rule")) — $v"
+            else echo "  VIOLATION $name: $v"; fi
+        done
+        _hard_n=$(printf '%s\n' "$out" | while IFS= read -r v; do
+            _rule=${v%%:*}; is_pending "$name" "$_rule" || echo x
+        done | grep -c .)
+        HARD=$((HARD+_hard_n))
+        [ "$_hard_n" = 0 ] && echo "  ok   $name (all findings PENDING)"
     else echo "  ok   $name"; fi
+done
+
+# A PENDING row whose violation no longer exists is a STALE carve-out — the mechanism by which an
+# allowlist rots into a permanent waiver. Fail hard so the owning batch has to delete its rows.
+printf '%s\n' "$PENDING" | while IFS= read -r _row; do
+    [ -n "$_row" ] || continue
+    _pd=${_row%%:*}; _rest=${_row#*:}; _pr=${_rest%%:*}
+    if [ -f "$DRILLS_DIR/$_pd.sh" ] && ! scan_file "$DRILLS_DIR/$_pd.sh" | grep -q "^$_pr:"; then
+        echo "  STALE-PENDING $_pd: rule '$_pr' no longer fires — delete this PENDING row"
+    fi
 done
 
 if [ "$ALL" = 1 ]; then

@@ -27,13 +27,23 @@ setup_forcesingle_n2
 assert_ok "docker-kill brk2 (provably dead)" \
     sh -c "docker kill sim-$INST-brk2 >/dev/null 2>&1"
 
+# round-5 §M1 (lint rule `sigpipe-truncation`): the de-cluster run must NOT be piped straight into `grep -q`
+# — grep exits at its first match and SIGPIPEs the writer, killing the multi-step recovery MID-OPERATION.
+# That is the exact drill-91 failure this very drill asserts the fix for: the run was cut off BEFORE its
+# nats.conf de-cluster step. Capture to completion, then match the SAME signature over the captured output.
+# Judgment is unchanged: tool rc still ignored, still `de-clustered to standalone` over its combined output.
+_fs20() {
+    _fs_out=$("$SIM" exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- \
+        tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 2>&1)
+    printf '%s\n' "$_fs_out" | grep -q 'de-clustered to standalone'
+}
+
 # OFFLINE force-single on brk1: stop the daemon so the offline tool can take the disk, then run it as the
 # data-dir owner (tether) — pty-fed typed confirm. The #20 fix AUTO-de-clusters nats.conf to standalone
 # + prunes brk2, printing "de-clustered to standalone".
 assert_ok "stop brk1 broker daemon (an operator stop — #23 Restart=always does NOT revive it)" \
     sh -c "$SIM exec brk1 -- systemctl stop tether-broker"
-assert_ok "offline force-single brk1 auto-de-clusters + prunes (prints 'de-clustered to standalone')" \
-    sh -c "$SIM exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 2>&1 | grep -q 'de-clustered to standalone'"
+assert_ok "offline force-single brk1 auto-de-clusters + prunes (prints 'de-clustered to standalone')"  _fs20
 
 # #20 FIX: the survivor's nats.conf is now STANDALONE (cluster{} block dropped) — the auto-de-cluster.
 assert_ok "#20 FIXED: nats.conf auto-de-clustered to STANDALONE (no cluster{} block)" \

@@ -29,11 +29,21 @@ setup_forcesingle_n2
 assert_ok "docker-kill brk2 (provably dead)" \
     sh -c "docker kill sim-$INST-brk2 >/dev/null 2>&1"
 
+# round-5 §M1 (lint rule `sigpipe-truncation`): the offline recovery run must NOT be piped straight into
+# `grep -q` — grep exits at its first match and SIGPIPEs the writer, which can kill a multi-step recovery
+# MID-OPERATION (proven on drill 91: the run died before its nats.conf step and the drill blamed the
+# product). Capture the run to completion first, then match the SAME signature over the captured output.
+# Judgment is unchanged: still the tool's rc ignored, still `single-voter cluster` over its combined output.
+_fs12() {
+    _fs_out=$("$SIM" exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- \
+        tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 2>&1)
+    printf '%s\n' "$_fs_out" | grep -q 'single-voter cluster'
+}
+
 # OFFLINE force-single on brk1 (reliable — no online dwell/leadership race). #12: it AUTO-PRUNES brk2.
 assert_ok "stop brk1 broker daemon (an operator stop — #23 Restart=always does NOT revive it)" \
     sh -c "$SIM exec brk1 -- systemctl stop tether-broker"
-assert_ok "offline force-single brk1 (auto-prunes the abandoned brk2)" \
-    sh -c "$SIM exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 2>&1 | grep -q 'single-voter cluster'"
+assert_ok "offline force-single brk1 (auto-prunes the abandoned brk2)"  _fs12
 assert_ok "restart nats-server + broker (provisioning)" \
     sh -c "$SIM exec brk1 -- sh -c 'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.\$(date +%s) 2>/dev/null; systemctl restart nats-server; systemctl start tether-broker'"
 sleep 6

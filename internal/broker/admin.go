@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/jsstream"
@@ -31,6 +32,9 @@ func (b *Broker) adminAuditTail(ctx context.Context, sid string, n int) ([]admin
 	}
 	if n <= 0 {
 		n = 50
+	}
+	if n > adminTailMaxN {
+		n = adminTailMaxN // L1: clamp an operator typo (`-n 999999999`) before it sizes a slice / a seq range
 	}
 
 	streamName := jsstream.HistoryStreamName(sid)
@@ -78,6 +82,101 @@ func (b *Broker) adminAuditTail(ctx context.Context, sid string, n int) ([]admin
 	// Defensive: stream order is monotonic by sequence, but if a
 	// gap-skip reordered anything, sort by seq so the operator
 	// sees a clean tail.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, nil
+}
+
+// eventsMaxScan bounds how many messages adminEventsTail walks backward through the `events`
+// stream when a filter (--kind/--since) is set. sys.events are operational (topology/rehome/
+// proxy/session-lifecycle/disk) — low-frequency, not per-request — so 5000 covers a lot of
+// history; the cap is a safety valve against a pathological high-volume stream, not the norm.
+const eventsMaxScan = 5000
+
+// adminTailMaxN clamps the operator-supplied -n on the admin audit/events tails at the
+// server trust boundary (external review L1). The Unix socket is root/operator-only, so
+// this is not a remote exploit, but a typo like `-n 999999999` would otherwise size a
+// slice (and, for audit, a seq range) to that value and can OOM the live broker. The
+// scans are already bounded to eventsMaxScan, so a larger request buys nothing.
+const adminTailMaxN = eventsMaxScan
+
+// adminEventsTail is the EventsTail hook (#30): the last n messages of the H.1 `events` stream,
+// oldest → newest, each decoded into AuditEntry, optionally filtered to type==kind and to messages
+// newer than now-since. Returns "events_unavailable" when JetStream isn't wired or the stream
+// doesn't exist yet.
+//
+// Same Info()+GetMsg-backwards strategy as adminAuditTail (no OrderedConsumer state to clean up).
+// With a filter we walk backward COLLECTING up to n matches (so `--kind proxy_keyset_changed`
+// returns the most recent n of THAT kind, not "the matches among the last n"), stopping at the
+// since cutoff, at FirstSeq, or after eventsMaxScan messages. The events stream is secret-free by
+// construction of its producers (rehome_events.go: hand-built allow-listed scalar maps); this
+// reader adds no field, so it cannot introduce one.
+func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration, kind string) ([]adminsock.AuditEntry, error) {
+	if b.js == nil {
+		return nil, fmt.Errorf("events_unavailable: broker has no JetStream")
+	}
+	if n <= 0 {
+		n = 50
+	}
+	if n > adminTailMaxN {
+		n = adminTailMaxN // L1: clamp before `make([]…, 0, n)` — an operator typo must not size the alloc
+	}
+
+	stream, err := b.js.Stream(ctx, jsstream.EventsStreamName)
+	if err != nil {
+		return nil, fmt.Errorf("events_unavailable: %w", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("events_unavailable: stream info: %w", err)
+	}
+	last := info.State.LastSeq
+	first := info.State.FirstSeq
+	if last == 0 || last < first {
+		return nil, nil
+	}
+
+	var cutoff time.Time
+	if since > 0 {
+		cutoff = b.cfg.Now().Add(-since)
+	}
+
+	out := make([]adminsock.AuditEntry, 0, n)
+	scanned := 0
+	for seq := last; seq >= first; seq-- {
+		if scanned >= eventsMaxScan {
+			break
+		}
+		scanned++
+		raw, err := stream.GetMsg(ctx, seq)
+		if err != nil {
+			// Retention/compaction can drop a message between the Info() range and GetMsg.
+			// Skip and keep going — the admin tail is best-effort (mirrors adminAuditTail).
+			continue
+		}
+		// The stream is time-ordered by sequence, so once we cross below the cutoff every
+		// earlier message is older too — stop the backward walk.
+		if !cutoff.IsZero() && raw.Time.Before(cutoff) {
+			break
+		}
+		var body map[string]any
+		_ = json.Unmarshal(raw.Data, &body)
+		if kind != "" {
+			t, _ := body["type"].(string)
+			if t != kind {
+				continue
+			}
+		}
+		out = append(out, adminsock.AuditEntry{
+			Subject: raw.Subject,
+			Seq:     seq,
+			Ts:      raw.Time,
+			Body:    body,
+		})
+		if len(out) >= n {
+			break
+		}
+	}
+	// We collected newest → oldest; present oldest → newest like adminAuditTail.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
 }

@@ -25,6 +25,14 @@ func clusterCodeFor(err error) string {
 	if err == nil {
 		return ""
 	}
+	// R8a P1: classify by TYPE, not by prose. The data-plane gate is the one signal
+	// an operator script must be able to distinguish from a real failure ("re-run,
+	// it is still converging" vs "this drain is broken"), so it must not depend on
+	// a reworded message the way the string cases below do.
+	var dp *ErrDataPlaneNotConverged
+	if errors.As(err, &dp) {
+		return codeDataplaneNotConverged
+	}
 	s := err.Error()
 	switch {
 	case strings.Contains(s, "catch_up_stalled"):
@@ -351,7 +359,10 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			rep.Banner += " "
 		}
 		if jsClusteredForceSingle {
-			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE — nats.conf is still clustered after force-single (file transfers / history / audit return 503). De-cluster it: `tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> --broker-nkey <self-bus-nkey>` (server-name = the conf's server_name; broker-nkey = the bus nkey from the broker.nk seed in secrets_dir or cluster_nodes.bus_nkey_pub, NOT broker.yaml), then restart nats-server."
+			// R10 P4: the remedy literal is the shared natsconf SSOT (also emitted by the N=1 boot
+			// FATAL and by `cluster recovery restore`'s completion text — three copies used to drift).
+			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE — nats.conf is still clustered after force-single (file transfers / history / audit return 503). De-cluster it: `" +
+				natsconf.DeClusterRemedyCmd + "` " + natsconf.DeClusterRemedyArgHint + ", then restart nats-server."
 		} else {
 			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE (sustained 503) — file transfers / history / audit are failing. Check `tether cluster status`, nats-server, and JetStream meta quorum."
 		}
@@ -645,6 +656,18 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 	if req.Op == adminsock.OpBrokerUpgradeReload {
 		return b.handleBrokerUpgradeReload(req)
 	}
+	// R11 P11/#56: rotate-tunnel-cert is a SELF-ONLY verb — a broker can only hot-swap its OWN live
+	// tunnel cert, and only while it is leader. It must BYPASS the generic mutating-verb leader-redirect
+	// below: that redirect ("re-run on the leader host") is wrong guidance here — sending the operator to
+	// brk1 to rotate brk2 still fails, because the TARGET must BE the leader, not merely be reached from
+	// it. Dispatch it before the gate so RotateTunnelCert can give the correct "transfer leadership to
+	// the target first" guidance directly (it distinguishes wrong-host from right-host-but-not-leader).
+	if req.Op == adminsock.OpClusterRotateCrt {
+		if err := b.admin.RotateTunnelCert(req.NodeID, req.CertFP, certRotationWindow); err != nil {
+			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
+		}
+		return adminsock.Response{Op: req.Op, OK: true}
+	}
 	// Mutating verbs are leader-local (§8.1, NO forwarding): fail fast naming the leader.
 	if !b.admin.node.IsLeader() {
 		_, leaderID := b.admin.node.LeaderWithID()
@@ -699,11 +722,6 @@ func (b *clusterAdminBackend) HandleCluster(req adminsock.Request) adminsock.Res
 			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
 		}
 		return adminsock.Response{Op: req.Op, OK: true, OpID: req.OpID}
-	case adminsock.OpClusterRotateCrt:
-		if err := b.admin.RotateTunnelCert(req.NodeID, req.CertFP, certRotationWindow); err != nil {
-			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}
-		}
-		return adminsock.Response{Op: req.Op, OK: true}
 	case adminsock.OpClusterSetRaftAddr:
 		if err := b.admin.SetRaftAddr(req.NodeID, req.Host, req.AllowLoopback); err != nil {
 			return adminsock.Response{Op: req.Op, Error: err.Error(), Code: clusterCodeFor(err)}

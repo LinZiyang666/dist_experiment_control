@@ -27,6 +27,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 > `assert_bug` 语义相反，见 §0.2 注〕钉住，附 flip 条件）。三条均经**活体 server spike 实测**（2026-07-11）。
 
 ### #25 — PIN CONNECT 无 per-IP 限速（架构 §E.6 承诺未实现）
+
+> ****CLOSED（2026-07-19，R12/P7）**：per-IP PIN 限速已实现（`authcallout/ratelimit.go`，token bucket burst=10 refill=10/min，本地 in-memory 无分布式状态无新依赖）。错误 PIN 分支计数、超 10/IP/min 后连正确 PIN 也拒。`client_info.host` 由 nats-server 填、callout 层不可伪造；共享 NAT 是有意接受的 v1 权衡（宁误伤不留 PIN oracle）。本地 auth_callout e2e 真跑通（`test/p3` 12 错 PIN 后正确 PIN 被拒）。**
 - **现象**：单源 IP 可在任一 60s 窗口内**无限次** PIN 首连尝试，无任何节流。`architecture.md:825` §E.6「未处理
   的威胁」表承诺「PIN 暴力：速率限制：每 IP 每分钟 ≤ 10 次尝试」，且 E.2 流（`architecture.md:754`）明确**在
   失败（Argon2 校验失败）分支** `拒绝 connection + 写 pin_failed + 按 E.6 速率限制计数`——即限速器的触发是**错误
@@ -46,6 +48,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   （**second-source-IP 控 in-window 成** + **window-reset 后原源恢复成**）成 GREEN 回归。
 
 ### #26 — evict 不清理 agent 的 managed OS 子进程（部署条件式；公网口随隧道掉线被清）
+
+> ****CLOSED（2026-07-19，R12）**：evict 现在 agent 侧收割 managed 子进程——exec children 起 `Setpgid` 并登记，`agent_evicted` 事件到达后 SIGKILL 整个进程组（含 PTY run 会话）。仅 evict 触发，正常 restart/upgrade 保留子进程供 G.1 reconcile。变异验证：去掉收割 → 宿主进程表仍有该 pid。**
 - **现象**：`admin evict <sid> <nid>` 删 `agent_provisioning` + `nodes` 行（FK cascade 移
   `processes`/`port_allocations` 行），broker DB 视图里 proc/port **都没了**，但 agent 主机上**真实运行的
   managed OS 子进程**（如 `tether run`/`tether exec` 起的进程）与 broker DB 视图 **DIVERGE**。活体 spike
@@ -68,6 +72,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   C-GAP-proc 翻断「子进程被收」。
 
 ### #27 — C2 well-known discovery 在 `cluster init` 后不 serve-ready（`manifest_listen` 被 seam 省略 + 未文档化）
+
+> ****CLOSED（2026-07-19，R12）**：`manifest_listen` 在 cluster 模式下默认 `127.0.0.1:7480`（照 `nats_conf_path` 同款默认），init 后 discovery listener 已 bound、curl 可达。**
 - **现象**：bare `cluster init` / `cluster add` 后 broker **不 bind** well-known manifest listener，C2
   bootstrap-URL onboarding 腿默认**死**（curl `http://127.0.0.1:7480/.well-known/tether/cluster.json` →
   connection refused，实测 `82` SETUP-27）；operator 必须**手加** `manifest_listen` 才 serve-ready，而
@@ -92,7 +98,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 > 被三重叠加墙挡即 RED 暴露为 release-blocking，非自证的 owner-decision NOT-COVERED，R6-M2）。旧「home-binding 永久死 / ≥1/4 探针 /
 > 2× isolated GREEN（round-1..3）/ 必须-tunnel-coupled-by-design（round-4）」框架均已撤回（R5-M3）。
 
-### #28 — agent 侧升级 URL 白名单硬编码、不可 operator 配置（DOC-3 是并发文档缺陷）
+### #28 — agent 侧升级 URL 白名单硬编码、不可 operator 配置（DOC-3 是并发文档缺陷）· ✅ FIXED (R15, 2026-07-20)
+> **状态：已修复**。产品加了 agent 侧可配白名单：`cmd/tether/agent.go` `resolveAgentUpgradeAllow`（优先级 `--upgrade-url-allow` flag > agent.yaml `upgrade.url_allow` > 内建默认），`internal/agent/upgrade.go:76` 消费 `Config.UpgradeURLAllowlist`；`agent_upgrade_allow_test.go` 证半接线闭合（daemon→resolver→agent.Config）。DOC-3 的错误 hint 也随之成真。drill 31 已翻（`_allow_artifact_agent` 配 agent 白名单后：CONFIGURED URL 越过 agent 门、卡在 `sha256_mismatch`；OFF-allowlist URL 仍 `url_not_allowed_local`=白名单仍强制）。drill 落 INCOMPLETE（保留 success-re-exec 的诚实 not_covered，归专属 success drill），#28 缺陷本身 CLOSED。下文为历史记录。
 - **现象**：broker 放行（`broker.upgrade.url_allow`）的自托管镜像 URL，被 **agent 本地白名单**拒
   `url_not_allowed_local`——即使 broker 已 whitelist、agent 能 fetch+trust 该 URL、agent ONLINE+owner。
   自托管/私有 release 镜像升级在 agent 侧不可达。
@@ -261,6 +268,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 ### #35 — [CANDIDATE，未在 sim 复现] online force-single 的 dwell 在 quorum-loss 期 survivor RESTART 时结构性不可达（"preferred path"仅 OFFLINE 逃生；根因 = #23 restart-bounce 族）
 
+> **R6 定案（2026-07-19）：REFUTED as stated** —— trap 仅开机路径（已跑的 survivor 不重入）；`observeLeadership` 不受 leader 门控故 dwell 可满足；`install.sh:777-778` 保留 `StartLimitBurst=5` ⇒ 崩溃循环 ~10s 即停。drill 22 于 07-18 GREEN（未复现）。只剩条件句成立、措辞降级，不占发布闸。
+
 - **状态（外审 round-3 M5 降级）**：**CANDIDATE，机理 source-cited 但尚未在 sim 确定复现**。此前把 #35 当已复现 gotcha 是过度声称——peer-kill fixture 达 22 POSITIVE（survivor 不 restart），#35 的真触发（survivor RESTART）在 22 的专属臂里**只有当一次 PROVEN 的 MainPID 变更（≠ 仅 NRestarts）叠加 dwell-never-satisfied 才判 PRODUCT-RED**；否则该 run 记 INCOMPLETE（`not_covered`），#35 保持 CANDIDATE。
 - **现象/机理**：`cluster recovery force-single --online`（`cluster_offline.go:220` 自述"the preferred path"）需连续 `forceSingleDwell=15s`（`force_single_online.go:27`）的 quorum-loss。但 quorum-loss 期若 survivor 因任何原因 `systemctl restart tether-broker`（boot 撞 `b.js==nil` EJECTED trap `broker.go:948-958` → 非零 exit `serve.go:240` → `Restart=always`/`RestartSec=2` on **tether-broker.service** `install.sh:754-755`），每 ~2s 生命 < 15s dwell，且 `newForceSingleArm()` 每 boot 归零 `leaderlessSince`（`force_single_online.go:41,46`）→ dwell 永不满足 → online force-single **结构性不可达**，只剩 OFFLINE。
 - **钉（22 专属臂，round-3 M5 硬化）**：`node_kill brk2` 后 survivor `systemctl restart tether-broker`；capture MainPID before/after——**若 MainPID 未变（restart 未生效）→ fixture 无效 → `not_covered`**（非 #35 结论）；MainPID 已变（restart 已证）且 DRY-never-WouldProceed → `assert_bug #35`（PRODUCT-RED）；MainPID 已变但 dwell 仍满足 → `not_covered`（#35 未复现，保持 CANDIDATE）。签名不再含 `socket`。**peer-kill fixture 不触发 survivor restart** → 正路径**可达**（22 POSITIVE 分支）。
@@ -268,9 +277,17 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 ### #36 — online force-single 的 `--yes` 不走 Tier-2 rejector（与 offline 分歧；TTY 保护完好）
 
+> ****CLOSED（2026-07-20，R14）**：online force-single 的 `--yes` 现在与 offline 一致走 Tier-2 rejector（`cluster_offline.go:171` 的 `rejectedUnattendedYes` 在 admin socket 之前）⇒ `--online --yes` 被拒 exit 64。drill 22 翻正为 `assert_refuses`，GREEN。**
+
 - **现象/机理**：`runForceSingleOnline` 在 `cluster_offline.go:155-158` 早返、绕过 `:165` 的 Tier-2 `--yes` rejector → `--online --yes` 非-TTY 因 online-gate（leader contact / TTY-required）拒、**非** offline 的 `NO --yes override` 串。TTY 保护仍在（真 commit 需 typed confirm）。
 - **钉**：`22` YES-online 臂（杀前 healthy 态，签名 = online-gate 串 ≠ offline `NO --yes override`）。DOC vs gotcha，低 sev。
 - **flip**：online `--yes` 路由经 Tier-2 rejector。
+- **产品修复（R14，2026-07-19）**：`newClusterForceSingleCmd` 的 `if online` 分支现在**先**调
+  `rejectedUnattendedYes(cmd, "force-single", selfID)`，再进 `runForceSingleOnline`——与 offline 分支同一个 Tier-2
+  gate。故 `force-single --online --yes` 现返 offline 一致的 `cannot run unattended … NO --yes override`（exit 64），
+  **在触到 admin socket 之前**。TTY-typed node_id confirm（`confirmTypedNodeID(..., false, "")`）原样保留。
+  测试 `TestOnlineForceSingleRejectsUnattendedYes`（+ `WithoutYesReachesSocket` 反向守卫）；变异（去掉 rejector）
+  实测退化成 socket dial error。**drill 22 YES-online 臂签名待主进程翻正**（现应断 offline 同串）。
 
 ### #42 — quorum-loss 后 ~TFence(10s) 内 `cluster status --remote` 误报 transient + `session rm` 栽 raw store_error（有界窗口观测缺口）
 
@@ -279,6 +296,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **flip**：`--remote`/destructive-gate 在窗口内即给 quorum-lost verdict（缩短或消除 TFence 误导）。#43/#44 折入本条与 #41（`--remote` remedy 与 banner 同受 `JetStreamUnavailable` gate `cluster_status_nats.go:161-168`，非独立缺陷）。
 
 ### #39 — `disk_pressure` monitor interval 固定 5-min、无 operator knob（90-M6 确认）
+
+> **CLOSED（2026-07-19，R13）**：disk_pressure 间隔加了 operator 旋钮——`broker.observability.disk_check_interval`（yaml）+ `--disk-check-interval`（flag），优先级 flag>yaml>内建 5m 默认，亚秒/负值 Load 时拒。默认保持 5m。drill 覆盖 owner=R13（drill 90 待翻正为正向回归）。
 
 - **现象/机理**：`disk.go:23` 硬编码 5-min monitor interval，`serve.go:175-201` 从不 wire 任何 `disk_check_interval`/阈值旋钮 → disk_pressure 自动检测最慢滞后 5-min，operator 不可调。90-M6④ 的"45s 内 raise"实为从 operator `systemctl restart`（startup re-sample `disk.go:99-102`）量、非 auto-detect。
 - **钉**：`90` M6④ relabel（45s 从 bounce 量）+ 一条 no-bounce periodic leg（或 scope startup-tick，periodic hermetic）。**flip**：加 `disk_check_interval` broker.yaml/flag knob。
@@ -289,7 +308,9 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **现象/机理**（41 M15）：一次 `cluster retire` 可 STALL 在 `NATS_ROLLED_OUT` 阶段（rehome/migrate 未完成）、永不收敛到 terminal RETIRED；随后下一个 retire 被 `already in flight` 拒（`cluster_operation_controller.go:33`）。
 - **钉**：`40` R-retire 要求 terminal RETIRED op_state（非仅 roster-absence；stall 则 `assert_bug #45` → PRODUCT-RED）；`41` shrink else-branch 区分二因（#31 grow-lock vs #45 stall）、`product_red` EXPOSE 本停滞。**flip**：retire op 在 rehome/migrate 完成后可靠推进到 RETIRED。
 
-### #46 — [CANDIDATE] seeds change-gated auto-publish 漏第 3 voter（91 暴露；G3 client-converge 债的 manifestation）
+### #46 —  seeds change-gated auto-publish 漏第 3 voter（91 暴露；G3 client-converge 债的 manifestation） — **CONFIRMED（drill 91 product_red 钉住，owner R12）**
+
+> ****CLOSED（2026-07-19，R12）**——**台账机理假说被推翻**：`DeriveSeedEndpoints` 本就正确处理 3 voter，真缺陷在**触发架构**（per-grow converge 只在 leadership-acquired 边沿重触发，稳定单 leader 集群永不再触发 ⇒ 最后一个 voter brk3 无后继 grow）。修：leader 每 observe tick 用 `seedSetEqual` change-gate 幂等 re-converge。**又一次「证据真、归因错」。****
 
 - **现象/机理**（91-A2）：`cluster grow` 后 seeds 的 change-gated auto-publish 纳入第 2 broker（brk2 进 `seeds show` endpoints），但第 3 个 grow 后 **brk3 达 VOTER 却从不进 endpoints**（120s 内）。`seed_converge.go` 的 DeriveSeedEndpoints 为何不 derive 第 3 endpoint 待根因（SB-91）。
 - **钉**：`91` A2——`if brk3 in endpoints → GREEN`；`elif brk3 IS VOTER but not in endpoints → product_red #46`（签名 = VOTER present ∧ endpoint absent，brk2 已收敛作对照）；`else 未达 VOTER（grow flake）→ not_covered`。**flip**：第 3+ endpoint 也被 derive。
@@ -318,6 +339,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 
 ### #51 — `recovery restore` 结构上不能 apply broker.yaml cluster seam ⇒ fresh DR box 上「start the daemon」必 FATAL
+
+> ****CLOSED（2026-07-19，R10/P2）**：`recovery restore` 加 `--config`，落地即调 `applyClusterSeam` 写全五字段（含 `nats_conf_path`）。drill 51 F-b8 实测：seam 五字段齐全、无效键 `nats_route` 消除、fresh box 不再 boot FATAL。** 详见 `docs/reviews/r2-plan.md` §15。
 - **状态**：**LIVE-CONFIRMED（2026-07-17，drill 51 臂 G1）**。
 - **现象**：全灭 DR 后在 fresh box 上 restore 成功 → 照 runbook §5.2 step 3 启动 broker → FATAL
   `broker.cluster.data_dir is unset ... refusing to silently downgrade a cluster DB to single mode`。
@@ -327,6 +350,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **钉住它的**：drill 51 臂 **G1**（`assert_bug`，签名 `data_dir is unset|refusing to silently downgrade`）+ DR-STEP-LEDGER 计入。
 
 ### #52 — `recovery restore` 既不渲染也不提示 nats.conf ⇒ fresh box 的 stock conf 无 auth_callout、broker 服务不了
+
+> ****部分 CLOSED（2026-07-19，R10/P4）**：*silence 半* CLOSED——restore 完成文案印出有序 `reconcile nats --manual` 下一步，drill 51 G-nats **逐字执行 restore 自己印的命令**跑通。*auto-render 半*（restore 自动渲 nats.conf）降为已文档化的手工步骤，owner 决定 close vs. reduce-to-note。** 详见 `docs/reviews/r2-plan.md` §15。
 - **状态**：**SOURCE-CONFIRMED**（静态源码事实：restore 无 `--config`、完成文案不提 nats.conf；`assert_bug "#52"`
   的直证 auth/nkey 签名分支本轮**未触发**——broker 在真实栈上根本没起来（seam 不完整 = #51/#52 自身运维后果），
   故经 **DR-completion NOT-COVERED** 门 + DR-STEP-LEDGER（undoc=2）捕获，而非直接 auth 签名；直证签名 owed to a
@@ -336,6 +361,24 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   authorization/auth_callout（`install.sh:690-704`），cluster 模式 auth_callout 自动 ON（`serve.go:203-218`）。
 - **钉住它的**：drill 51 臂 **G2**（三出口探索→定格；抓到 auth/nkey 硬墙 → `product_red`，seam 不完整 → 记 DR-completion NOT-COVERED）+ DR-STEP-LEDGER 计入（undoc=2）。
 
+### #53 — **已拆分（2026-07-19，R10）**：`#53-silence` **CLOSED** / `#53-scope` **WONTFIX-BY-DESIGN**
+
+> **拆分理由（主进程批准）**：原条目把两件事捆在一起——「**丢**」与「**不说**」。R10 只能、也只应修后者。
+>
+> - **`#53-silence`（静默）→ CLOSED**：backup 与 restore **两端都明确告警**
+>   （`BUNDLE SCOPE` / `HISTORY/AUDIT NOT RESTORED`），runbook §5 亦补上。变异验证：抽掉任一端的告警，
+>   对应测试即红。**「静默丢 history/audit」这条底线已达成。**
+> - **`#53-scope`（bundle 不含 JetStream）→ WONTFIX-BY-DESIGN**：把 JetStream 拉进 bundle 会**强迫
+>   `backup --offline`（其前提正是「守护进程已停」）去跟一个活的 nats-server 说话**，从而让 offline 与 online
+>   两种 bundle **在范围上悄悄不同**——**那正是 #53 本身所属的那一类谎言**。故保持 bundle 为 state.db-only。
+>
+> **⚠ 对 drill 的后果（必须同批处理）**：`51-full-dr.sh:409` 的「已修」判据写的是
+> *「灾前 history 行在 DR 后幸存；bundle 现已携带 JetStream 状态」* ——按 (b) 方案它**永远不会成立**，
+> 会让 #53 永久报 PRODUCT-RED。drill 侧须改判为：**两端告警存在 = `#53-silence` GREEN**，
+> 而 history 不可回填改记为 `#53-scope` 的**已登记设计边界**（`not_covered` class=gap 或正向断言「告警确实出现」）。
+
+<details><summary>原条目（已拆分，存档）</summary>
+
 ### #53 — backup bundle 不含 JetStream ⇒ 全灭 DR 后 history/audit 全失且从不告警
 - **状态**：**SOURCE-CONFIRMED**（静态源码事实：bundle 只含 `state.db`、restore 归零 `audit_published_index`；
   `product_red "#53"` 的 live-reader 分支本轮**未跑**——它坐落在 tail（G3/H/H2/J），而 tail 被 **DR-completion
@@ -343,6 +386,9 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **机理**：bundle 只含 `state.db`（`backup.go:87`），`audit_published_index` restore 时重置为 0（`restore.go:317`），
   raft 从 index 1 重 bootstrap ⇒ 无可回填。runbook §5 从不告知 bundle 不含 JS（DOC-19）。
 - **钉住它的**：drill 51 臂 **J**（history rc≠0/无流 → `product_red`/DOC-19；有行 → 撤销）。
+
+
+</details>
 
 ### #57 — 在飞 tier-B 传输的 home broker crash 后终态 audit 永不写（悬空 start 行）
 - **状态**：源码确证；96 分区件已验证可注入（rc=124 静默丢包实测通）。
@@ -364,13 +410,16 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **钉住它的（3 次复跑一致）**：drill 96 臂 A2——`baseline=1 → brk2 宕时 orphan=2（>1）→ brk2 重启 boot-reconciler 跑后仍=2`
   ⇒ 未回收 = product_red。签名守卫：仅当 `orphan-probe > baseline ∧ post-restart > baseline` 才钉；读不出对象数 → not_covered。
 
-### #59 — 被分区少数派 broker 无法「只读存活」（候选）
+### #59 — ~~被分区少数派 broker 无法「只读存活」~~ → **REFUTED（R6 定案，2026-07-19）**
+> 只读存活是**设计态**、有名字：`proxyStateFrozenReadonly`（"control writes refused, but /sub KEEPS vending"，`proxy_cluster.go:43-45`）；`read.go:14-17` 明写 fence 存在正是为了「quorum-lost 节点继续供本地读而非砖化（§6.2）」。R6 的 Q2 实测（`MainPID` 稳定 / `/varz` 200 / `fenced` 拒绝）逐点吻合该契约、落在台账自己的 GREEN 分支。`broker.go:956-985` 是 `Run` 的**冷启动**序列、不在任何循环里——把它当稳态机理是又一次「把 X 当成 Y」。**不占发布闸。** 详见 `docs/reviews/r6-findings.md`。
 - **状态**：候选，96 旗舰分区臂探索→定格。
 - **机理**：`broker.go:956-985`（注释 :976-978 明说给的是 ranked differential、never a hard assertion ⇒
   不预设必崩）；总函数三分支（POSITIVE=MainPID 稳/NRestarts 不增 → GREEN；crash-loop → #59；否则 not_covered）。
   复现 = #35 CANDIDATE 的分区触发器首证。
 
 ### #50 — `cluster doctor --offline --db <不存在的路径>` 报 `0 fatal` 且 exit 0（「迁移源可达」预检承诺结构性为假）
+
+> ****CLOSED（2026-07-19，R10/P5）**：`OpenReadOnly` 后加 `Ping()`+`PRAGMA quick_check`；db 格失败计入 fatal、exit 64。**六态**（不存在/空/截断/目录/权限拒绝/损坏页）drill 50 R3 臂逐一 `assert_refuses` 实测变红，对照 live DB 仍绿。** 详见 `docs/reviews/r2-plan.md` §15。
 - **状态**：**LIVE-CONFIRMED（2026-07-17，drill 50 首跑即复现）**。
 - **现象**：`tether cluster doctor --offline --secrets-dir … --db /nonexistent/nope.db --conf …` **exit 0**、
   `--json` 的 `.summary.fatal == 0`、db 那格报 PASS。运维据此认为「备份/迁移源可达」，实际那个路径根本不存在。
@@ -383,6 +432,27 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **钉住它的**：`drills/50-backup-restore.sh` 臂 **R3**（**INVERTED**：命令 exit 0 **就是**缺陷 ⇒ 用
   `assert_ok`+`product_red` 而非 `assert_bug`——后者会把 exit 0 判成 APPEARS-FIXED → ASSERT-FAIL = verdict 误分类）。
   四态穷举（R-EXHAUST），R2 是其「doctor 能红」的对照源。**FLIP**：产品修好后 R3 翻 `assert_refuses`。
+
+### #65 — ~~[CANDIDATE] 分区少数派的 stale-leader 写有时变持久~~ → **REFUTED（2026-07-19，R6 定案批）**
+
+> **本条已证伪，不是产品缺陷，不占发布闸。** 详见 `docs/reviews/r6-findings.md`。
+>
+> **旧记录「6 轮中 5 次持久」的成因 = 归属错误，不在 raft 层**：控制面 RPC 是**跨全部 broker 的
+> NATS queue group**，`--nats-url` 只决定 ctl 连哪台**入口服务器**，**不决定哪台 broker 处理请求**。
+> 10 轮判定组 × 5 窗口点 = 50 次少数派写尝试，支③ **0 次**（solo 与并发两档一致）：
+> - broker 提交日志显示所有 rc=0 的写**全由 brk2/brk3 提交，brk1 提交数 0**；
+>   **分区之前**经 `--nats-url nats://brk1:4222` 建的记录**也是** brk3/brk2 提交的。
+> - 分区期直读三台 SQLite：`brk1=no, brk2=yes, brk3=yes` —— 与「少数派本地有、多数派没有」的预测**正好相反**。
+> - 50/50 次钉在 brk1 的尝试全部 rc=69，brk1 分区后**再无任何 `authcallout:` 行**
+>   ⇒ 被隔离的少数派**无法认证新客户端连接**，结构上不可能接受写。
+> ⇒ 台账那 5 次「持久」是 **5 次正确的多数派提交**。
+>
+> **残留（归 R14，非本条）**：本实验每次都是**新建连接**，故只证伪了 #65 原文场景；
+> **分区前已认证的长连接**在窗口内写入的路径未被触及（CLI 短生命周期，结构上跑不到），需条件 Y = 长连接写入客户端。
+> **另**：drill 96 的 D6b 判别子**即便修好 H6 后仍不能判定 #65**——缺「提交者归属」这一环，
+> 只要 ctl 够得到多数派就会把**合法写**记成 #65 候选。须改为「提交者归属 + 分区期多数派可见性」双条件。
+
+<details><summary>原条目（已证伪，存档）</summary>
 
 ### #65 — [CANDIDATE / 非确定性] 分区少数派的 stale-leader 写**有时**变持久（raft 安全性，需产品侧根因确证）
 - **状态**：**CANDIDATE — 非确定性复现（外审 B10 后 6 次 fresh-instance 复跑取地面真相）**。此前记 LIVE-CONFIRMED 是
@@ -411,7 +481,42 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   只负责暴露 + 用 signature-guarded product_red 钉住，不负责归因。**
 - **钉住它的**：drill 96 臂 **D6b**（多数派可见性判别子；signature-guarded product_red）。
 
+
+</details>
+
+### Q4 — 分区中 `session create` 写**已提交**却报失败 + 非幂等（R6 CONFIRMED-DEFECT，机理①；产品批）— **产品修复 R14（2026-07-19）**
+
+- **现象（R6 实测，drill 96 canary2）**：分区中经存活 follower 写 `session create canary2`，14 次全非零，**第 1 次**就是落地时刻：
+  `rc=70 elapsed=1.37s error: session create failed: broker: session "canary2" not visible after commit (apply lag)`；
+  而经另一 broker `session ls --json` 读得回 `state=ACTIVE`。
+- **机理**：`internal/broker/clusterwrite.go` 的 `readCommittedSession` 原 50×20ms=**1s** 上限不够——forward 在 **leader commit**
+  返回、follower 本地 Apply 滞后（实测 1.37s）⇒ read-back 超时报「committed-but-reported-failed」。**复合缺陷**：`session create`
+  **非幂等**——首超时后每次重试 leader 的 `PlanCreate` 存在性复查返 `already_exists`+rc=70 ⇒ `poll_until` **结构上永远转不了绿**；
+  `error_hints.go` 无 `already_exists` 条目。
+- **产品修复（R14）——为何不用 owner-fp 幂等**：初版对 `ErrAlreadyExists` 走「同 owner ⇒ 视作本次创建返成功」的幂等出口，
+  被 `make e2e` 的 `test/d9`（`SessionCreateRoutesThroughRaft`/`TwoBrokerJoinReplicates`）打回——那两条**同 actor 连做两次
+  create**、以「第二次被拒」证明第一次已 commit 到复制 FSM。**一次超时重试与一次全新同名 create 在 broker 侧字节无别**
+  （无跨进程幂等 token），故任何让「同 owner 第二次 create」成功的方案都**必然**破坏该 D9 契约。改走正确得多的一招：
+  - **(核心) read-back 超时非致命 ⇒ 首次即报成功**：`proposeOrForward` 返 nil **就已经意味着写 commit 到 raft**（leader 路径
+    Propose 等本地 Apply；forward 路径在 leader commit 返回）。故 `createSession` 先试 read-back 取权威 `created_at`；**超时不再当
+    失败**，而是**返 best-effort success**（`{SID,OwnerFP,State=ACTIVE,CreatedAt=now}`，权威 created_at 下次 `session ls` 收敛）。
+    ⇒ 首次尝试即 rc=0，**根本不进重试循环**，`already_exists` 死结不复存在。**绝不造假成功**——只有 `proposeOrForward` 已
+    commit 才走到这条。**重名（任何 owner）仍返 `already_exists`**，D9 契约原样保留。
+  - **(a) 放宽 read-back 窗口**：`sessionReadBackAttempts` 50→**150**（3s）——覆盖 R6 的 1.37s apply-lag，常态仍取到权威行；
+    3s 之内落在 5s ctl deadline 内，broker 回包来得及；超过则走 best-effort。
+  - **(c) 补 hint**：`error_hints.go` 加 `already_exists`（若上次 create 请求本身超时无回包，写仍可能已 commit ⇒ `session ls` 确认）
+    + exit class 64（真冲突=取名冲突、运维可动，非 tether bug 的 70）。
+- **改的是 raft 写路径**：`-race` 全绿；success 只在 commit 已确立后返，不引入假成功。
+- **测试**：`TestSessionCreateSucceedsAndDuplicateStillRejected`（钉住 D9 依赖的重名拒绝契约）· `TestSessionCreateReportsSuccessWhen
+  CommittedButNotYetVisible`（把 broker 读 DB 指向另一空 DB、FSM commit 到 node 自身 DB ⇒ read-back 超时但写真在 ⇒ 断言返成功
+  且 `n.RODB()` 确有该行=非假成功）· `TestSessionReadBackWindowCoversMeasuredApplyLag`。变异（去 best-effort）实测复现 R6 的
+  `not visible after commit (apply lag)`。
+- **单模式不变**：`session create` 单模式仍走原子 `session.Create`、重名仍 `already_exists`（无 read-back、无此失败模式）。
+- **drill 96 D3/D6 侧翻正待主进程**（首次即成功后 poll_until 应转绿）。
+
 ### #64 — `recovery restore` 剪到单 voter 却不去集群化 nats.conf、也从不提示 ⇒ 照文档做必 crash-loop
+
+> ****CLOSED（2026-07-19，R10/P4）**：完成文案改为**领以 de-cluster 步骤**并点名「REFUSE to start」，复用 `clusterstatus.go` 的 remedy SSOT、带真实 nkey。drill 50 K 臂翻正为正向断言，实测通过。** 详见 `docs/reviews/r2-plan.md` §15。
 - **状态**：**LIVE-CONFIRMED（2026-07-17，drill 50 臂 K，稳定复现）**。
 - **现象**：N=2 集群上 `recovery restore` 成功（`pruned 1 stale peers`）→ 照它自己印的 NEXT
   （`NEXT: start tether-broker, then cluster join approve`）启动 → broker **crash-loop ~4 轮**，broker.err：
@@ -436,39 +541,83 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 
 ### #54 — account.nk / CA 轮换无产品级 re-render 与 verify；`reconcile nats --all --wait` 报 false all-clear；`doctor` 对 skew 失明
-- **状态**：**facet 2 LIVE-CONFIRMED（2026-07-17，drill 52 臂 B3）**；facet 1（reconcile false all-clear）实测中（B2 迭代）。
-- **facet 2 现象**：换了 account.nk（issuer 源）后、broker 未重启前，on-disk account.nk 与 nats.conf 渲染的
-  auth_callout issuer 已 skew，但 `cluster doctor --offline` 仍报 **0 fatal、零 skew 提示**。
-- **机理**：auth_callout seeds 在 `serve.go:203-218` **启动时一次性加载**，`reconcile nats` 是 pure polling
-  （`cluster_reconcile.go:78` 自陈「It NEVER bumps a generation」）⇒ 不重启 broker 永不换 issuer。唯一能打印
-  该 skew 的 note（`cluster_secrets.go:46-47`）只挂在 rotation guide 与 `init --from-existing` 上 ⇒ 运行中集群
-  无任何动词可查。
-- **钉住它的**：drill 52 臂 **B3**（R-INVERTED；doctor 报绿于已知 skew 态 = product_red）+ **B2**（facet 1，
-  实测中）。**FLIP**：产品加运行中 skew 检查 / reconcile 真 re-render。
 
-### #55 — [候选] account.nk 轮换的 auth-rejection 窗口（fresh-CA route-leaf 拒）在 sim 结构上不可构造 ⇒ #54 的下游后果
-- **状态**：候选（drill 52 臂 B4–B7/B5d **not_covered**；**非 in-sim 可复现窗口**，是 #54 的下游、owed to staging）。
-- **机理**：B5d 的前置态是「brk1 的 conf issuer==NEW 而 brk2 仍以 OLD-key 应答」的 skew 窗口——但 **#54** 正是
-  「运行中集群的 issuer **永不**变 NEW」（reconcile 纯 polling、`cluster_reconcile.go:78` + `serve.go:203-218`
-  一次性 seed）。故 NEW-issuer skew 窗口 live 无法构造，#55 的拒绝窗口没有可复现的 in-sim 态——它是 #54 的
-  下游后果，**不是可单独测的窗口**。完整轮换需带外重签车队凭据 + 协调滚动重启（staging）。
-- **钉住它的**：drill 52 `not_covered "52 B4-B7 + B5d (live-rotation completion + #55 auth-rejection window)"`
-  （源码级 not_covered 理由，非「owed to staging」的口头搪塞）。**FLIP**：产品给 account.nk 轮换一个原子
-  switch-over 动词（使 NEW-issuer 态可协调构造）后，#55 窗口方可在 sim 复现。
+> **R11 修复（2026-07-19）**：doctor 接 `readClusterPublicIdentities`，issuer skew 计入 **FATAL**；`reconcile nats` 检出 skew **非零退出**（不再 false all-clear）。runbook §2.1 订正：reconcile 是 restart **之后**的 fail-closed VERIFY 步，不 re-render。**#55 一并解决**（重启即换 issuer，故 #55「不可构造」前提为假、无需新动词）。CLOSED。
+- **状态**：**产品侧 FIXED（R11 P6，2026-07-19）**——facet 1 + facet 2 均已修，drill 52 臂 B2/B3 待主进程翻正为回归。
+- **facet 2 现象（已修）**：换了 account.nk（issuer 源）后、broker 未重启前，on-disk account.nk 与 nats.conf 渲染的
+  auth_callout issuer 已 skew，但 `cluster doctor --offline` 曾报 **0 fatal、零 skew 提示**。
+- **机理**：auth_callout seeds 在**启动时一次性加载**（topology 对账从**进程启动 seed** 渲染，非按需重读
+  account.nk），`reconcile nats` 是 pure polling（`cluster_reconcile.go:78` 自陈「It NEVER bumps a generation」）
+  ⇒ 不重启 broker 永不换 issuer。唯一能打印该 skew 的 note 只挂在 rotation guide 与 `init --from-existing` 上
+  ⇒ 运行中集群曾无任何动词可查。
+- **修法（R11 P6）**：
+  - **facet 2**：`cluster doctor` 的 check 列表接上 `readClusterPublicIdentities` 的结构化 skew 信号
+    （`cmd/tether/cluster_secrets.go` 新增 `IssuerSkew/BrokerSkew` + `clusterAuthIssuerSkewChecks`）——on-disk
+    account.nk/broker.nk 与渲染的 auth_callout issuer/nkey 不符即 **FATAL**（`auth-issuer-skew` /
+    `auth-broker-nkey-skew`）。测试 `TestClusterDoctorReportsIssuerSkew`（端到端命令 + 变异对照）。
+  - **facet 1**：`runReconcileNatsAuto` 在打印 converged 前后做同一 skew 交叉核对，检出即**非零退出**
+    （`clusterAuthIssuerSkewError`），不再打印 false all-clear。测试 `TestReconcileNatsFailsClosedOnIssuerSkew`。
+  - runbook §2.1 + `cluster_rotation.go` 轮换指引同步订正：reconcile 不 re-render，RESTART 才 re-render；
+    reconcile 现为 VERIFY 步（fail-closed on skew），须在 restart 之后跑。
+  - **deploy-tier 复现暴露的第二个产品 bug（drill 52 B3/55c，hermetic 漏掉）**：facet 2 的**检测**在真实栈上
+    是对的（reconcile B2 用同一 `readClusterPublicIdentities` 已 fail-closed），但 `cluster doctor --json` 在检出
+    FATAL 后，`main.go` 会往 **stderr** 打一行 `error: ...`；drill 用 `... --json 2>&1 | jq` 抓取 ⇒ JSON 尾部被
+    prose 污染 ⇒ `jq: parse error` ⇒ 谓词失败（55b 收敛态无 FATAL、nil error、JSON 干净故 PASS——正是这一半掩盖
+    了它）。**修**：`ExitError` 加 `Quiet` 位；`renderDoctor` 在 `--json` + FATAL 时返回 quiet 非零，`main.go` 经
+    `renderTerminalError` 对 quiet error 不打 stderr（JSON 的 `summary.fatal` + 退出码已足够传达失败）。测试
+    `TestClusterDoctorJSONStreamStaysParseableOnFatal`（真复现 `2>&1` 合流 + 双向变异）。**教训**：hermetic 只测了
+    cmd 自身的 out/err，从没合流过 `main.go` 的 stderr 打印——机器输出命令的 `2>&1` 洁净度必须在合流后测。
+- **钉住它的**：drill 52 臂 **B3 + 55c**（doctor FATAL auth-issuer-skew，`2>&1|jq` 可解析）+ **B2**（facet 1）——
+  **deploy-tier r11e 实测 B2/B3/55a/55b/55c 全 PASS**（pass 57→59）。
 
-### #56 — `rotate-tunnel-cert` 的循环建议（follower→leader→follower 死循环）
-- **状态**：**LIVE-CONFIRMED（2026-07-17，drill 52 臂 A4）**。
-- **现象**：在 follower 上跑 `rotate-tunnel-cert <target>` → 报「not the leader — re-run on the leader host: brk1」；
-  运维照做、在 leader(brk1) 上对同一 target 跑 → 报「transfer leadership to **brk2** first」。**两条建议互相指向对方，
-  运维被来回踢、永远到不了正确状态**（真实要求「target 必须 BE leader」从没在一处说清）。
-- **机理**：`clusterstatus.go:649-657` + `cluster.go:625` 给 leader-redirect vs `clusterdrain.go:386-388` 给
-  self-only 拒绝，两条路径各说各的。
-- **钉住它的**：drill 52 臂 **A4**（成对断言：follower 得 redirect ∧ leader 对同 target 得 self-only 拒）。
+### #55 — account.nk 轮换的 auth-rejection skew 窗口 ⇒ 与 #54 合并 → **CLOSED（R11，随 #54 一并修复）**
+> R6 定案：**可构造**（重启一台 broker 即在 20s 内换 issuer），非「结构性不可构造」⇒ 原「加原子 switch-over 动词」的 (a) 裁决作废。真实问题（skew 无人可见 + reconcile false all-clear）已并入 #54，由 R11 修复。
+- **状态**：**前提被 R6 证伪、真实问题并入 #54（R11 P6 已修可见性）**。**不加原子 switch-over 动词**（总纲 §2 原
+  裁决据 R6 撤销）。
+- **R6 定案**：原前提「运行中集群的 issuer **永不**变 NEW」为假——`topology_reconcile.go:233` 喂的
+  `AccountIssuer` 由**本进程启动 seed** 实时导出，`natsreconcile/reconcile.go:157` 按**纯内容比对**换、不受
+  generation 门控 ⇒ **带新 seed 重启一台 broker，nats.conf 20s 内就变 NEW issuer**，只重启一台即构造出 #55 的
+  确切 skew。且因 auth_callout 是**跨 broker 队列组**，后果**比 per-broker skew 更糟**：两台上都出现 ~1/N 的
+  授权违规掷硬币。
+- **结论**：#55 的真实缺陷不是「不可构造」而是「运行中集群的 issuer skew 无人可见、且 reconcile 报 false
+  all-clear」——即 **#54**。R11 P6 已给 doctor + reconcile 加上 skew 可见性/fail-closed（见 #54）。**不新增动词**：
+  一个原子 switch-over 动词对「重启即换 issuer」的现实是多余的（铁律④：drill 越省事越可疑）。
+- **钉住它的**：随 #54 的 drill 52 臂 B* 一并翻正；#55 不再作为独立 not_covered。
 
-### #63 — [CANDIDATE] rotate-tunnel-cert 在线轮换后车队不自发 re-pin（52-A7 探测）
-- **状态**：候选，drill 52 臂 A7 探索→定格（自发 45s + 分区强制 redial 90s 双窗口均不 re-pin 才钉）。
-- **机理**：`rotate-tunnel-cert` 只 hot-swap 服务端 cert（`clusterwrite.go:247-250`），既有连接不受影响；若车队非重启不能 re-pin，则文档化的在线轮换不可用如所述。
-- **钉住它的**：drill 52 臂 A7（两段式：先看自发重拨，不自发则 `fault_partition_on agt1 7000` 强制 redial，连 redial 也不 re-pin 才 product_red）。
+### #56 — `rotate-tunnel-cert` 的 follower 侧误导指引（**UX 误导，非流程死锁** — R6 收窄）
+
+> **R11 收窄（2026-07-19）**：R6 已核实**不是死锁**——产品在 `RotateTunnelCert` 同一处就给了可执行出路（transfer leadership 后再做）。真实缺陷是 follower 侧走了 `clusterstatus.go:649-657` 的**通用** mutating-verb leader-redirect、对这个 **self-only 动词**给了错指引。R11 已修：self-only 动词旁路通用 redirect，直接指向「target 须 BE leader」。**「死循环」措辞降为「UX 误导」。CLOSED。**
+- **状态**：**产品侧 FIXED（R11 P11，2026-07-19）**。**「死循环」措辞按 R6 收窄为 UX 误导**——`clusterdrain.go` 的
+  `RotateTunnelCert` 在同一处**完整表述了真实要求并给出可执行出路**（transfer leadership 后再做），**不存在死锁**：
+  照它做一次即可脱困。
+- **现象（已修）**：在 follower 上跑 `rotate-tunnel-cert <self>` → 曾报「not leader — re-run on the leader host」；
+  运维照做、在 leader 上对同一 target 跑 → 报「transfer leadership to <target> first」。第一条是**错指引**：去
+  leader 对 follower 做仍会失败，因为真实要求是「**target 必须 BE leader**」。
+- **机理**：follower 侧走的是 `clusterstatus.go` 的**通用** mutating-verb leader-redirect，对这个 **self-only 动词**
+  给了错指引。
+- **修法（R11 P11）**：为 self-only 动词 `OpClusterRotateCrt` **旁路通用 leader-redirect**（在 leader 门之前 dispatch，
+  与 force-single/broker-reload 同列），直接进 `RotateTunnelCert`；后者现区分**错主机**（nodeID≠self：run ON the
+  target）与**对主机但非 leader**（nodeID==self ∧ !IsLeader：transfer leadership to it），两者都指向「target 须 BE
+  leader」、绝不再说「re-run on the leader host」。测试 `TestRotateCertOnFollowerGivesSelfOnlyGuidance` +
+  对照 `TestGenericMutatingVerbStillRedirectsOnFollower`（drain 仍走通用 redirect，证明旁路是 self-only 专属）。
+- **钉住它的**：drill 52 臂 **A4**（成对断言）——产品已修，主进程翻正为 GREEN 回归 + 收窄 drill 文案里的「死循环」措辞。
+
+### #63 — rotate-tunnel-cert 在线轮换后 re-pin（R6 REFUTED：车队确实 re-pin；机理已在 R11 立源、残留归 R14）
+
+> **R11 归因（2026-07-19）**：re-pin 真实路径已从源码立住——`rotate-tunnel-cert` 更新 roster `cert_fp` 但不 bump epoch，载体是**完整 register 回包**（`homeForRegister` 从 roster 实时读 pins），任何 NATS 重连/boot 触发 ⇒ 解释 R6 的 3/3 实跑。**残留→R14**：R8 的 active push 按 epoch 判收敛，裸 cert 轮换不改 epoch ⇒ 静默 agent 不被推送；已用 `TestActivePushIsBlindToBareCertRotation` 钉在代码里。CLOSED（残留 R14）。
+- **状态**：**REFUTED（R6 3/3 实跑，后果被证伪）**——车队在线轮换后**确实 re-pin**。R11 从源码立住机理并加测试；
+  一条 active-push 残留归 **R14**。
+- **R6 定案**：三份保留日志 A7d 全 PASS，含承重双边沿（rc=124 黑洞过 30s yamux keepalive 杀旧会话 → 新会话对轮换后
+  证书吐出精确 sentinel）。
+- **机理（R11 从源码立住）**：`rotate-tunnel-cert` 更新 roster 的 `cert_fp` 但**不 bump expose epoch**。真实 re-pin
+  载体是**完整 register 回包**：`homeForRegister` 从 roster **实时读** cert pins，故轮换后**下一次完整 register**
+  即携带新 pin（同 epoch），agent 经 `ApplyHome` **原地**更新 `sess.certPins`（`TestD6ReviewSameEpochPinUpdateQueuedDuringLoop`
+  钉住 agent 半边）。该 register 在任何 NATS 重连/boot 时发生 ⇒ 在线轮换在实践中 re-pin，正是 R6 所见。
+  测试 `TestRotatedCertPinRidesTheRegisterReply`（投递载体携带轮换后 pin、epoch 不变）。
+- **残留 → R14**：R8 的 **active home-delivery push** 不覆盖「静默 agent 的裸 cert 轮换」——其收敛判据
+  `homeAssignmentApplied` **按 epoch 判**，轮换不改 epoch ⇒ pass 视作已收敛、不推送。闭合需给 applied-ack 带上
+  pin 指纹（wire 变更）以让 pass 检出 pin skew，超出 R11 身份/凭据面范围。`TestActivePushIsBlindToBareCertRotation`
+  把该残留**钉在代码里**（若未来 pass 变 pin-aware，该测试翻红、强制复议本残留）。
 
 ### DOC-28 — `docs/usage.md` 未定义 `run` 会话跨 broker 重启的语义
 - **状态**：登记（drill 96 臂 B 的 NOT-COVERED 理由，源码 SB-96-3 已闭合行为面）。
@@ -476,11 +625,17 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **修法**：usage 补一句说明 run 跨 broker 重启 = liveness watchdog 优雅终止（可用 `TETHER_RUN_LIVENESS_TIMEOUT` 调）。
 
 ### DOC-23 — 砖化态下 `rotate-tunnel-cert` 的补救提示不可达
-- **状态**：**LIVE-CONFIRMED（2026-07-17，drill 52 臂 A8）**。
-- **现象**：tunnel cert pin-mismatch 使 broker 拒启（fail-closed，正确）；错误串的第二条补救「re-run
-  `tether cluster rotate-tunnel-cert`」在该态**不可达**——`wireClusterEarly` 在 `broker.go:691` 返错即退，
-  admin socket 要到 `:1060` 才建，命令连不上。唯一出路是手动恢复旧 cert 文件。
-- **钉住它的**：drill 52 臂 **A8**（砖化态跑该命令 → assert_refuses「no such file|connection refused」）。
+
+> **R11 修复（2026-07-19）**：pin-mismatch 文案去掉指向连不上的 `rotate-tunnel-cert`，改为 FILE-level 恢复（还原 tunnel-cert.pem/tunnel-key.pem 再重启）。CLOSED。
+- **状态**：**产品侧 FIXED（R11 P12，2026-07-19）**——错误文案已改为可达的 FILE-level 恢复。
+- **现象（已修）**：tunnel cert pin-mismatch 使 broker 拒启（fail-closed，正确）；旧错误串的第二条补救「re-run
+  `tether cluster rotate-tunnel-cert`」在该态**不可达**——`wireClusterEarly`（`clusterwrite.go`）在 admin socket
+  建立**之前**返错即退，命令连不上。
+- **修法（R11 P12）**：pin-mismatch 错误串（`tunnelCertPinMismatchError`）**去掉指向 `rotate-tunnel-cert` 的补救**，
+  改为明确的**文件级恢复**：把 `<secrets>/tunnel-cert.pem` + `tunnel-key.pem` 还原成 pinned 的那对、再重启。
+  测试 `TestTunnelCertPinMismatchErrorPointsAtFileRestore`（断言不再提 rotate-tunnel-cert、且指明还原文件+重启）。
+- **钉住它的**：drill 52 臂 **A8**（砖化态跑该命令 → assert_refuses「no such file|connection refused」）——产品已修，
+  drill 可另加断言：错误文案指向文件恢复而非该命令。
 
 ### DOC-27 — runbook §5:524 的 `cluster backup --out /var/backups/…` 示例在 stock 装机上跑不了
 - **状态**：**LIVE-CONFIRMED（2026-07-17，drill 50 臂 C）**。
@@ -512,6 +667,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 ### #48 — 连续 shrink 时 agent 可黏在已退役 broker 的 NATS 孤岛，ONLINE 行与真实命令路径分裂
 
+> ****CLOSED（2026-07-20，R14）**：R6 机理订正（被饿着非投毒）落地——agent 侧 `rosterRefreshLoop` 数连续静默刷新，持续静默 + 缓存 roster 仍有可拨 voter ⇒ `rebuildOnBrokerSilence`（roster.go:473）关闭静默连接、重建到幸存者。复用 R8 的 rebuild-onto-voter 机制、只加静默触发器。drill 41 翻正为正向回归（窗口 210→300s 适配 stock 3-min SLA），GREEN。**
+
 - **状态（外审 round-4，2026-07-16）**：**RATIFIED / release blocker**。41 先用单 seed + connz 强制
   agt1 直连将退役的 brk2；brk2 退役后产品正确读取 leaving roster、主动 rebuild 到剩余 VOTER，connz 与真实
   `exec` 均通过。agent 随机落到 brk3 后再执行最终 2→1：brk3 达 RETIRED、brk1 完成显式 standalone + JS
@@ -529,6 +686,35 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 monotone roster refresh；timer 仍作丢事件兜底。只有签名 roster 证明当前 broker leaving/removed 且另有可拨
 VOTER 时才重建 session。独立测试把周期设为 1h，证明 event 会触发 signed refresh；它不替代 41 的真实孤岛
 oracle，41 必须保持不 restart agent、不改 env/cache、不停旧 broker。
+
+- **R6 机理订正（2026-07-19，必读）**：机理是「**被饿着**」不是「被投毒」——退役 broker 的 `handleRegister`
+  在 `isClusterFollower` 门（在 `RosterRefreshOnly` 分支**之上**）早返 + `ShutdownOnRemove` 默认 true ⇒ 它
+  **什么都不答**，并非供 stale VOTER roster。上面「旧 broker 持有 stale VOTER roster」这半是被 R6 证伪的。
+  「DB 显示 ONLINE」本身是**归属错误**（`nodes.status` per-broker 本地存活、从不复制 ⇒ ONLINE 恰证明应答来自
+  那台退役 broker 自己）。
+- **产品修复（R14，2026-07-19）**：走 flip 的**后半**——「agent 使用不依赖当前孤岛 broker 的权威发现通道」。
+  R8 的 broker→agent 主动投递**不可复用**（孤岛 agent 在退役 broker 的 NATS 上、幸存集群够不到它）；可复用的是
+  R8 期新增的 **agent 侧 rebuild-onto-voter 机制**（`requestRosterReconnect`）。新增：`rosterRefreshLoop` 计
+  **连续静默**次数（`maxSilentRosterRefreshes=3`），达阈且 `hasOtherDialableVoter`（缓存 roster 里另有可拨 VOTER）
+  为真时，`rebuildOnBrokerSilence` 把当前(静默)broker 的 host 标为一次性 `avoidHost` 并触发 rebuild——`connectNATS`
+  首拨据 `nats.DontRandomize` 排除该 host、落到幸存 VOTER（幸存瞬时不可达则回退全池，无永久锁死）。既有
+  `rosterRequiresReconnect`（拉得回新 roster 才发火）在孤岛下永不发火，这条正是补它的缺。测试
+  `TestBrokerSilenceEscapesToVoter`（真 NATS，broker 建连后转静默 ⇒ agent 逃到 voter）+ 三条单测；变异（关静默
+  触发）实测 agent 6s 内不逃、复现孤岛。**drill 41 真实孤岛 oracle 待主进程复验**（不 restart agent / 不改
+  env/cache / 不停旧 broker）。
+
+### #49 — ~~resnapshot 的 SQLite preflight 与 RecoverCluster 实际 FSM 不一致~~ → **CLOSED / ALREADY-FIXED（2026-07-19）**
+
+> **已修复并复验，不再占发布闸。**
+> **R6 定案（源码级）**：`internal/clusteroffline/offline.go:270-282` 现已跑 `previewRecoveredRoster`
+> ——在**副本 DB + 克隆 raft 树**上真跑一次 recovery，若该 recovery 会复活 peer 则**拒绝**；
+> force-single 的 prune 是硬步骤（`:169-176`）；staged swap 用 `unix.Renameat2(RENAME_EXCHANGE)`
+> （`exchangedir_linux.go:26`，能力先证后变更、无 fallback）。已有 RED→GREEN 单测
+> （`s6_s8_resnapshot_external_review_test.go:25,74`）。**无源码级缺口残留。**
+> **R9 复验（deploy-tier）**：drill 42 的 rejoin/resnapshot 主干**首次端到端执行并全绿**（42 条断言），
+> 其中「resnapshot 不复活陈旧 peer」一条实测通过。
+
+<details><summary>原条目（已闭合，存档）</summary>
 
 ### #49 — resnapshot 的 SQLite preflight 与 RecoverCluster 实际 FSM 不一致，可复活已剪 peer
 
@@ -656,3 +842,5 @@ oracle，41 必须保持不 restart agent、不改 env/cache、不停旧 broker�
   FUSE daemon 是 **T/S 态、kill-9 可收割**的**近似**（drill 的 D-判别子实测钉住），把它等同真-D 即
   Mandate-① false-GREEN。**留给专用硬件/隔离宿主**，不在共享 sim 宿主上跑。remote_fs 的判定逻辑本身
   hermetic-密（`internal/spawnsafe` 单测），此处部署增量 = 真 FUSE 挂载 + 真 bootHangable 扫描 + 真有界 statfs。
+
+</details>

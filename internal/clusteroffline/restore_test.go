@@ -136,6 +136,109 @@ func TestRestoreResetsAppliedIndexAndPrunesRoster(t *testing.T) {
 	assertRaftBootstrapped(t, dataDir)
 }
 
+// TestRestoreClearsStaleGrowUpgradeAndOpResidue (#31/#45/#51, R15) proves that
+// normalizeRestoreStaging drops the membership-control residue a bundle carries when it was
+// captured mid-grow/mid-retire/mid-upgrade: the grow/upgrade markers, their lease rows, and any
+// NON-terminal cluster_operations row. Without this, a DR restore to a "clean" N=1 origin still
+// FENCES the very first re-grow (assertNoActiveOp / growActiveJoiner refuse it), which is the
+// 51-full-dr §5.2-step-3b block. Reverting either DELETE in restore.go makes this test go RED.
+// A TERMINAL op row is inert history and MUST survive — asserted too, so the fix cannot overreach
+// into wiping the whole operation log.
+func TestRestoreClearsStaleGrowUpgradeAndOpResidue(t *testing.T) {
+	root := t.TempDir()
+	secretsDir := filepath.Join(root, "secrets")
+	fp := writeSecrets(t, secretsDir)
+	selfID := "node-A"
+
+	srcDir := filepath.Join(root, "src")
+	if err := os.MkdirAll(srcDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	srcDB := filepath.Join(srcDir, "tether.db")
+	db, err := storage.OpenWAL("file:" + srcDB)
+	if err != nil {
+		t.Fatalf("open src db: %v", err)
+	}
+	// self row — cert_fp MUST equal the live tunnel fp or restore refuses (provenance anchor).
+	if _, err := db.Exec(
+		`INSERT INTO cluster_nodes
+		 (node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at,join_nonce,join_sig)
+		 VALUES(?,?,?,?,?,?,?,?,?,'VOTER','2026-06-24 00:00:00 +0000 UTC',?,?)`,
+		selfID, "broker-A", "Ident-A", selfID, "10.0.0.1:7400", "nats://10.0.0.1:6222",
+		"10.0.0.1:7443", "a.example", fp, "NONCE-A", "SIG-A",
+	); err != nil {
+		t.Fatalf("insert self: %v", err)
+	}
+	for _, kv := range [][2]string{
+		{"self_node_id", selfID}, {"applied_index", "9000"},
+		// the residue a mid-membership-op backup carries:
+		{"cluster_grow_active", "node-Z"}, {"cluster_grow_lease", "1700000000"},
+		{"cluster_upgrade_active", "1"}, {"cluster_upgrade_lease", "1700000000"},
+	} {
+		if _, err := db.Exec(`INSERT INTO cluster_meta(key,value) VALUES(?,?)`, kv[0], kv[1]); err != nil {
+			t.Fatalf("seed meta %s: %v", kv[0], err)
+		}
+	}
+	insertOp := func(opID, target, state string, terminal int) {
+		if _, err := db.Exec(
+			`INSERT INTO cluster_operations(op_id,kind,target_node,op_state,terminal,created_at,updated_at)
+			 VALUES(?,?,?,?,?,'2026-06-24 00:00:00 +0000 UTC','2026-06-24 00:00:00 +0000 UTC')`,
+			opID, "retire", target, state, terminal,
+		); err != nil {
+			t.Fatalf("seed op %s: %v", opID, err)
+		}
+	}
+	insertOp("op-stalled", "node-Z", "NATS_ROLLED_OUT", 0) // the #45 stalled-retire fence
+	insertOp("op-history", "node-Y", "RETIRED", 1)         // inert terminal history — must survive
+	_ = db.Close()
+
+	bundleDir := filepath.Join(root, "bundle")
+	if _, err := clusteroffline.OfflineBackup(clusteroffline.BackupOptions{
+		DataDir: srcDir, DBPath: srcDB, SecretsDir: secretsDir, OutDir: bundleDir,
+		Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}); err != nil {
+		t.Fatalf("OfflineBackup: %v", err)
+	}
+
+	dataDir, dbPath := freshTarget(t)
+	if _, err := clusteroffline.RestoreFromBackup(clusteroffline.RestoreOptions{
+		BundleDir: bundleDir, DataDir: dataDir, DBPath: dbPath, SecretsDir: secretsDir,
+		ConfirmNodeID: selfID, Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}); err != nil {
+		t.Fatalf("RestoreFromBackup: %v", err)
+	}
+
+	ro, err := storage.OpenReadOnly("file:" + dbPath)
+	if err != nil {
+		t.Fatalf("open installed: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+
+	for _, key := range []string{"cluster_grow_active", "cluster_grow_lease", "cluster_upgrade_active", "cluster_upgrade_lease"} {
+		var n int
+		if err := ro.QueryRow(`SELECT COUNT(*) FROM cluster_meta WHERE key=?`, key).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", key, err)
+		}
+		if n != 0 {
+			t.Fatalf("restore left stale membership lock %q — it fences the first re-grow (#31/#45/#51)", key)
+		}
+	}
+	var nonTerminal int
+	if err := ro.QueryRow(`SELECT COUNT(*) FROM cluster_operations WHERE terminal = 0`).Scan(&nonTerminal); err != nil {
+		t.Fatalf("count non-terminal ops: %v", err)
+	}
+	if nonTerminal != 0 {
+		t.Fatalf("restore left %d non-terminal operation(s) — a stalled retire pins 'already in flight' forever (#45/#51)", nonTerminal)
+	}
+	var history int
+	if err := ro.QueryRow(`SELECT COUNT(*) FROM cluster_operations WHERE op_id='op-history'`).Scan(&history); err != nil {
+		t.Fatalf("count history op: %v", err)
+	}
+	if history != 1 {
+		t.Fatal("restore wiped a TERMINAL operation row — the fix overreached; terminal ops are inert history and must survive")
+	}
+}
+
 // assertRaftBootstrapped opens the raft stores and asserts a config exists.
 func assertRaftBootstrapped(t *testing.T, dataDir string) {
 	t.Helper()

@@ -133,7 +133,7 @@ func TestG7DefaultProxyStatusReadyGatedOnHomeHealth(t *testing.T) {
 }
 
 // TestG7DefaultProxyStatusSingleModeByteIdentical: with clusterMode off (single broker) there is no home
-// concept — home_broker is '' and the entry stays byte-identical to pre-G7a (publicHostFor()).
+// concept — home_broker is ” and the entry stays byte-identical to pre-G7a (publicHostFor()).
 func TestG7DefaultProxyStatusSingleModeByteIdentical(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), PublicHost: "solo.example"}, selfID: ""}

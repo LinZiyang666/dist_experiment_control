@@ -21,6 +21,29 @@ const (
 	OpAudit    = "audit"
 	OpEvict    = "evict"
 
+	// OpRuntime (R13) is a broker-LOCAL process-introspection read: the live
+	// goroutine count (runtime.NumGoroutine — the in-process TRUTH, never the OS
+	// thread count as a proxy), OS thread count, open fd count, resident-set size,
+	// process uptime, and each periodic reconciler's last-tick. It reads only this
+	// process's own runtime + the R7 reconcile registry — no DB, no raft, no
+	// leadership — so it answers in BOTH single and cluster mode and on a follower.
+	// Its purpose is diagnosing a goroutine/fd leak or a stalled reconciler on a
+	// LIVE broker (the fleet has had leak/crash incidents), which is why it is a
+	// normal operator verb over the same root-only admin socket, NOT a build-tag /
+	// env / hidden path (that would be a test backdoor, roadmap §2 T2).
+	OpRuntime = "runtime"
+
+	// OpEvents (#30) is a broker-LOCAL read of the H.1 `events` JetStream stream — the
+	// operator-facing sys.events feed (session_created/destroyed, member_joined, agent_registered/
+	// evicted, agent_roster_stale, disk_pressure, tetherd_restarted, plus the operational proxy_* /
+	// nats_topology_* / rehome / grow-cutover kinds). Members can SUBSCRIBE to sys.events over NATS,
+	// but the OPERATOR (root on the broker host, no NATS member credential) had no reader: this verb
+	// is that reader, on the same root-only 0600 admin socket as OpRuntime/OpAudit/the alert verbs.
+	// It tails the PERSISTED stream (so `--since`/history works, not just a live sub), filters by
+	// kind, and NEVER carries a secret — the events stream payloads are hand-built allow-listed scalar
+	// maps (rehome_events.go), so the reader relays only what the producers already keep secret-free.
+	OpEvents = "events"
+
 	// D7 §8.1 cluster admin verbs. They are routed to Backend.Cluster (a
 	// ClusterAdminBackend); when that is nil (production until the D9 cutover) the
 	// server replies "cluster mode not enabled". A non-leader broker replies with
@@ -152,7 +175,11 @@ type Request struct {
 
 	// Audit args
 	SID string `json:"sid,omitempty"` // also used by Evict
-	N   int    `json:"n,omitempty"`   // audit tail count
+	N   int    `json:"n,omitempty"`   // audit / events tail count
+
+	// #30 OpEvents filter: return only sys.events whose "type" equals EventKind ("" = all kinds).
+	// The time window reuses the existing Since field (a Go duration string, e.g. "1h").
+	EventKind string `json:"event_kind,omitempty"`
 
 	// Evict args
 	NID string `json:"nid,omitempty"`
@@ -253,7 +280,15 @@ type Response struct {
 	Nodes    []NodeEntry    `json:"nodes,omitempty"`
 	Audit    []AuditEntry   `json:"audit,omitempty"`
 
+	// Events (#30 OpEvents) is the tail of the H.1 `events` stream, oldest→newest. It reuses
+	// AuditEntry (subject/seq/ts/body) — an events message is the same decoded-JS shape; body carries
+	// the event "type" + its allow-listed scalar fields.
+	Events []AuditEntry `json:"events,omitempty"`
+
 	Evict *EvictResult `json:"evict,omitempty"`
+
+	// Runtime (R13) is the OpRuntime process-introspection snapshot.
+	Runtime *RuntimeReport `json:"runtime,omitempty"`
 
 	// Alert (B4) reports what an operator alert raise/clear did: the resolved dedup_key
 	// (so the CLI can echo the exact `alert clear <key>` command) and whether the raise
@@ -294,6 +329,53 @@ type Response struct {
 	SeedGeneration uint64   `json:"seed_generation,omitempty"`
 	SeedEndpoints  []string `json:"seed_endpoints,omitempty"`
 	SeedBootstrap  string   `json:"seed_bootstrap,omitempty"`
+}
+
+// RuntimeReport (R13) is the OpRuntime process-introspection snapshot. Every field is measured
+// FROM THIS PROCESS at request time — there are no cached/long-lived objects behind it (the verb
+// exists to catch leaks, so it must not itself hold a goroutine, timer, or growing buffer).
+//
+// Goroutines is runtime.NumGoroutine(): the number of live goroutines the Go scheduler is tracking
+// RIGHT NOW. That is the ONLY correct signal for a goroutine leak. Threads is a SEPARATE, distinct
+// measurement (the OS thread / M count) and MUST NOT be read as a goroutine proxy: 10k leaked
+// goroutines that are all parked add ZERO OS threads, so "/proc/<pid>/status Threads" would report
+// a flat count while the process bleeds goroutines. The two are reported side by side precisely so
+// an operator can see they diverge.
+type RuntimeReport struct {
+	Schema        string `json:"schema"`         // "admin_runtime" — machine-dispatch discriminator
+	SchemaVersion int    `json:"schema_version"` // B2 (schema, schema_version) contract; v1
+
+	// Goroutines is runtime.NumGoroutine() — the in-process count of live goroutines. A steadily
+	// climbing value across polls is the goroutine-leak signal the fleet's incidents needed.
+	Goroutines int `json:"goroutines"`
+	// Threads is the OS thread (M) count from the runtime's threadcreate profile. It is NOT a
+	// goroutine proxy (see the type doc) — it is here so leaks in the two domains can be told apart.
+	Threads int `json:"threads"`
+	// OpenFDs is the number of open file descriptors (Linux /proc/self/fd). -1 = not measurable on
+	// this platform (v1 ships Linux-only; architecture I.5). fd growth is the OTHER standard leak.
+	OpenFDs int `json:"open_fds"`
+	// RSSBytes is the resident-set size in bytes (Linux /proc/self/statm). -1 = not measurable.
+	RSSBytes int64 `json:"rss_bytes"`
+	// UptimeSeconds is wall time since the broker's Run started (from the injectable clock).
+	UptimeSeconds float64 `json:"uptime_seconds"`
+
+	// Reconcilers is one entry per registered R7 periodic reconciliation pass, carrying the
+	// last-tick the registry recorded. A pass whose LastTick stops advancing while the process is
+	// up is a stalled reconciler — the other class of live-broker fault this verb surfaces.
+	Reconcilers []ReconcilerTick `json:"reconcilers"`
+}
+
+// ReconcilerTick is one R7 reconcile pass's observability row, projected from the registry's
+// status snapshot (R13 consumes the lastTick the registry has recorded since R7a; it does not
+// change the scheduler).
+type ReconcilerTick struct {
+	Name       string    `json:"name"`
+	IntervalMS int64     `json:"interval_ms"`
+	LeaderOnly bool      `json:"leader_only"`
+	LastTick   time.Time `json:"last_tick"` // last INVOCATION of the pass fn; zero == never invoked
+	Runs       uint64    `json:"runs"`
+	Skips      uint64    `json:"skips"` // came due but gated off by leaderOnly (never invoked)
+	LastErr    string    `json:"last_err,omitempty"`
 }
 
 // ClusterOpEntry is one membership operation, DERIVED from a cluster_nodes row (B7 DOC#2). Kind is

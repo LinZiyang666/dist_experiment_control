@@ -61,7 +61,7 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 				}
 				return runNatsconfTakeover(cmd, &f)
 			}
-			return runReconcileNatsAuto(cmd, f.takeoverSocket, wait, timeout)
+			return runReconcileNatsAuto(cmd, f.takeoverSocket, f.secretsDir, f.confPath, wait, timeout)
 		},
 	}
 	bindNatsconfTakeoverFlags(cmd, &f)
@@ -77,7 +77,21 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 // runReconcileNatsAuto blocks (when wait) until every voter's observed topology generation reaches the
 // desired one. It NEVER bumps a generation (a raft write + a spurious DEGRADED flap) — the reconcilers
 // converge on their own; this just polls the authoritative status.
-func runReconcileNatsAuto(cmd *cobra.Command, socket string, wait bool, timeout time.Duration) error {
+//
+// R11 P6/#54 facet 1: topology-generation convergence is NOT the whole story. A rotated account.nk
+// (or broker.nk) whose new identity has not been re-rendered into nats.conf is an auth_callout skew
+// this poll is structurally blind to — the topology generation can be perfectly converged while the
+// on-disk issuer disagrees with the rendered one. The rotation runbook (§2.1) names THIS command as
+// its re-render verb, so a "converged" print here was a false all-clear on the exact command an
+// operator runs to VERIFY a credential rotation. It now fails-closed on that skew (BEFORE and AFTER
+// the topology poll) instead of printing converged.
+func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath string, wait bool, timeout time.Duration) error {
+	// Fail-closed on a local auth_callout identity skew regardless of --wait: even the non-wait
+	// message below ("converges automatically") is a form of all-clear an operator must not get on a
+	// rotated-but-not-re-rendered issuer.
+	if err := clusterAuthIssuerSkewError(secretsDir, confPath); err != nil {
+		return err
+	}
 	if !wait {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
 			"each broker's topology reconciler converges automatically (≤5s after a membership change); pass --wait to block until converged.")
@@ -96,6 +110,12 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket string, wait bool, timeout 
 		}
 		laggards := topoLaggards(rep)
 		if len(laggards) == 0 {
+			// Topology generation converged — but re-check the issuer skew before declaring
+			// all-clear (the seed could have been rotated during the wait). A skew here is a
+			// non-zero exit, not a "converged" print.
+			if err := clusterAuthIssuerSkewError(secretsDir, confPath); err != nil {
+				return err
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all voters converged to topology generation %d.\n", rep.TopoDesired)
 			return nil
 		}

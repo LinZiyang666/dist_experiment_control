@@ -29,6 +29,15 @@ const (
 	// the watchdog rebuilds the session on the freshest roster. > a normal reconnect, < a human's
 	// patience; the rebuild is a no-op churn-free path for a healthy agent (it only fires when stuck).
 	redialAfter = 20 * time.Second
+	// maxSilentRosterRefreshes (#48) is how many CONSECUTIVE failed roster-only refreshes on an
+	// otherwise-healthy NATS connection mark the current broker as a SILENT retired-broker island.
+	// A retired broker answers nothing (its register handler early-returns on isClusterFollower) yet
+	// the NATS connection to its still-running nats-server never drops — so neither the "current
+	// broker is leaving" roster edge (it needs a reply) nor the disconnect-armed redial watchdog can
+	// ever fire, and the agent starves. After this many misses (≈ N × failBackoff of silence) the
+	// agent rebuilds onto a known voter instead. 3 tolerates a transient miss / one leader failover
+	// (each retried on failBackoff) before concluding the broker is gone.
+	maxSilentRosterRefreshes = 3
 )
 
 // agentNow is the agent clock seam (cfg.Now or time.Now).
@@ -318,6 +327,7 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 	}
 	timer := time.NewTimer(jitterDur(iv))
 	defer timer.Stop()
+	silent := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -337,7 +347,16 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 			continue
 		}
 		next := iv
-		if !a.refreshRosterOnce(ctx, nc) {
+		if a.refreshRosterOnce(ctx, nc) {
+			silent = 0
+		} else {
+			silent++
+			// #48: sustained silence on a healthy connection == a retired-broker island. If the
+			// cached roster still knows another dialable voter, rebuild onto it (excluding the
+			// silent broker from the immediate dial) instead of polling the island forever.
+			if silent >= maxSilentRosterRefreshes && a.rebuildOnBrokerSilence(nc) {
+				return
+			}
 			next = a.rosterRefreshFailBackoff
 		}
 		timer.Reset(jitterDur(next))
@@ -438,12 +457,19 @@ func rosterBrokerMatchesHost(b proto.RosterBroker, host string) bool {
 }
 
 func (a *Agent) requestRosterReconnect(nc *nats.Conn) {
+	a.rebuildOntoVoter(nc, "agent: current broker is leaving the signed roster; rebuilding NATS session on a voter")
+}
+
+// rebuildOntoVoter tears the current session down so the Run loop re-dials the freshest pool. It
+// single-flights via `rebuilding` (returns false if a rebuild is already in flight); the shared
+// body for both the roster-says-leaving path (requestRosterReconnect) and the broker-silence path
+// (rebuildOnBrokerSilence). reason is logged.
+func (a *Agent) rebuildOntoVoter(nc *nats.Conn, reason string) bool {
 	if !a.rebuilding.CompareAndSwap(false, true) {
-		return
+		return false
 	}
 	a.rebuildRequested.Store(true)
-	a.cfg.Logger.Warn("agent: current broker is leaving the signed roster; rebuilding NATS session on a voter",
-		"connected_url", nc.ConnectedUrl())
+	a.cfg.Logger.Warn(reason, "connected_url", nc.ConnectedUrl())
 	nc.Close()
 	a.sessCancelMu.Lock()
 	cancel := a.sessCancel
@@ -451,6 +477,92 @@ func (a *Agent) requestRosterReconnect(nc *nats.Conn) {
 	if cancel != nil {
 		cancel()
 	}
+	return true
+}
+
+// rebuildOnBrokerSilence (#48) fires when the current broker has gone silent. It only acts when the
+// cached roster still names ANOTHER dialable voter to fail over to — else the disconnect-armed
+// redial watchdog (all brokers truly gone) or the seed floor is the right recovery, and churning
+// here would be pointless. It stamps the silent broker's host as a one-shot dial exclusion so the
+// rebuild lands on the survivor rather than re-sticking to the island. Returns true iff it rebuilt.
+func (a *Agent) rebuildOnBrokerSilence(nc *nats.Conn) bool {
+	cu, err := url.Parse(nc.ConnectedUrl())
+	if err != nil || cu.Hostname() == "" {
+		return false
+	}
+	host := cu.Hostname()
+	if !a.hasOtherDialableVoter(host) {
+		return false
+	}
+	a.setAvoidHost(host)
+	if !a.rebuildOntoVoter(nc, "agent: current broker went silent (no roster reply — retired-broker island); rebuilding onto a known voter") {
+		return false // a rebuild is already in flight; the avoid hint is consumed next connect
+	}
+	fireAfterSilenceEscape(a, host)
+	return true
+}
+
+// hasOtherDialableVoter reports whether the cached signed roster names a VOTER on a host other than
+// connectedHost that is actually dialable (not loopback/unspecified). Read-only over the in-memory
+// mirror. It gates the #48 silence rebuild: with no survivor to move to, staying put is correct.
+func (a *Agent) hasOtherDialableVoter(connectedHost string) bool {
+	a.rosterMu.Lock()
+	r := a.cachedRoster
+	a.rosterMu.Unlock()
+	if r == nil {
+		return false
+	}
+	for _, b := range r.Brokers {
+		if b.Phase != proto.RosterPhaseVoter {
+			continue
+		}
+		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
+			continue
+		}
+		if strings.EqualFold(b.PublicHost, connectedHost) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// setAvoidHost / takeAvoidHost carry the one-shot dial exclusion (#48) from the silence-rebuild
+// decision to the next connectNATS. takeAvoidHost clears it so it applies to exactly one dial.
+func (a *Agent) setAvoidHost(host string) {
+	a.avoidHostMu.Lock()
+	a.avoidHost = host
+	a.avoidHostMu.Unlock()
+}
+
+func (a *Agent) takeAvoidHost() string {
+	a.avoidHostMu.Lock()
+	defer a.avoidHostMu.Unlock()
+	h := a.avoidHost
+	a.avoidHost = ""
+	return h
+}
+
+// excludeHostFromDial drops every comma-separated dial URL whose host equals `host` (the just-silent
+// island broker). If the filter would strand the agent (empty result), it returns the input
+// unchanged — never trade a stuck-on-island for a stuck-on-nothing.
+func excludeHostFromDial(csv, host string) string {
+	if csv == "" || host == "" {
+		return csv
+	}
+	parts := strings.Split(csv, ",")
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		u, err := url.Parse(strings.TrimSpace(p))
+		if err == nil && u.Hostname() != "" && strings.EqualFold(u.Hostname(), host) {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if len(kept) == 0 {
+		return csv
+	}
+	return strings.Join(kept, ",")
 }
 
 // --- C1 §D-1 L3: stuck-reconnect session-rebuild watchdog ---

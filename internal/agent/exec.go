@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proc"
@@ -81,6 +82,12 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 			defer a.proxyHandlerWG.Done()
 			a.handleProxyKeysForwarded(nc, msg, seq)
 		}()
+	case "home":
+		// R8a P1: the broker's ACTIVE home-directive push. Before it existed, home
+		// changes reached this agent ONLY on the register reply — i.e. only when THIS
+		// agent happened to reconnect — so a `cluster drain` on a healthy, silent agent
+		// never reached the data plane at all.
+		go a.handleHomeForwarded(nc, msg)
 	case "upgrade":
 		go a.handleUpgradeForwarded(nc, msg)
 	case "push":
@@ -120,7 +127,7 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 	a.replyChunk(nc, msg.Reply, proto.ExecChunk{Kind: "started", PID: pid})
 	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
 
-	exitCode, err := a.runChild(nc, msg.Reply, &req)
+	exitCode, err := a.runChild(nc, msg.Reply, pid, &req)
 	a.pubProcExit(nc, pid, exitCode)
 
 	if err != nil {
@@ -138,7 +145,7 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 // and returns the exit code. A non-nil error is returned ONLY for setup
 // failures (pipe / Start), not for child exit codes — those are the
 // returned exitCode value and the caller pubs an "exit" chunk.
-func (a *Agent) runChild(nc *nats.Conn, replyTo string, req *proto.ExecReq) (int, error) {
+func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq) (int, error) {
 	cmd, decision, err := a.buildExecCmd(req)
 	if err != nil {
 		// Hung-fs fail-fast (remote_fs_unhealthy / _unsafe_cwd / _not_found).
@@ -182,6 +189,13 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo string, req *proto.ExecReq) (int
 	} else if err := cmd.Start(); err != nil {
 		return -1, err
 	}
+
+	// #26: track the live child so an admin EVICT can reap it (setsid-nohup deploys
+	// have no cgroup to do it when the daemon self-exits). Pruned when this
+	// synchronous handler returns (cmd.Wait below), whether the child exits on its
+	// own or is SIGKILLed by reapManagedChildren.
+	a.registerExecChild(pid, cmd.Process)
+	defer a.unregisterExecChild(pid)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -329,6 +343,7 @@ func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision,
 		if len(req.Env) > 0 {
 			cmd.Env = envSliceFromMap(req.Env)
 		}
+		setExecProcGroup(cmd)
 		return cmd, d, nil
 	}
 	// Active: ALWAYS &exec.Cmd{Path,Args} (bypass the hanging LookPath). Args[0]
@@ -348,7 +363,20 @@ func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision,
 			cmd.Env = envSliceFromMap(req.Env)
 		}
 	}
+	setExecProcGroup(cmd)
 	return cmd, d, nil
+}
+
+// setExecProcGroup puts the exec child in its OWN process group (Setpgid) so an
+// admin EVICT can reap the child AND any subtree it forks with one kill(-pgid)
+// (#26 reapManagedChildren) — a bare setsid-nohup agent host has no systemd
+// cgroup to do it. pgid == child pid once started. It does not detach a
+// controlling terminal (exec is non-PTY), so output streaming is unchanged.
+func setExecProcGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 }
 
 // execBaseEnv is the env an exec child would otherwise run with: the override

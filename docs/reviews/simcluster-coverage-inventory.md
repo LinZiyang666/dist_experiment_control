@@ -140,13 +140,15 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `agent doctor` | — | `--session` | S2-82 | |
 | `admin sessions/nodes/evict` | — | — | S2-81 | socket 属主语义 |
 | `admin audit <sid>` | — | `-n` | S2-81 | |
+| `admin events` | — | `-n/--since/--kind` | **#30 新增；drill 覆盖 owner = 71/73/74 D2**（"raw sys.events have no operator reader"） | operator 读 H.1 `events` 流的 sys.events（session/member/agent/disk/`proxy_*`/`nats_topology_*`/rehome/grow-cutover 各 kind）。走 root-only 0600 admin socket（与 `admin runtime`/`alert raise` 同信任层），读**持久化流**故支持 `--since` 历史 + `--kind` 过滤；**无 `--follow`**（admin socket 一次性设计，运维需求是时点读；live tail 用 poll-loop，见 broker-ops）。载荷**恒无 secret**（生产者手搭 allow-list 标量 map，reader 原样转发）。cluster-mode `proxy sub create/revoke` 现补发 `proxy_keyset_changed`（此前只 bump epoch 不发事件） |
 | `serve` | — | `--config/--db/--admin-socket/--nats-url`（部署 seam 例外）`/--nats-conf-path/--nats-server-bin/--auth-callout-seeds-dir/--sub-http-listen/--cluster-manifest-listen/--metrics-listen/--alert-webhook-url/--log-level/--log-json/--upgrade-url-allow/--cluster-data-dir/--cluster-raft-addr/--cluster-secrets-dir/--colocated-agent-nid/--tunnel-addr/--tunnel-public-host/--store-dir/--public-host` | 既有组建 + S8-93（metrics/webhook/log-json）+ S4/S2（两 loopback listener）+ S5-30（colocated）+ 既有 13/doctor（nats-conf-path/nats-server-bin seam） | 两 listener 的 loopback fail-closed 是 S0-ingress 的产品边界断言 |
 
 ### 2.2 `cluster` 面（root persistent flag：`--socket`）
 
 | command path | Hidden | 行为 flag（排除规则外全列） | 归属 | 断言或理由 |
 |---|---|---|---|---|
-| `cluster status` | — | `--card/--homes/--watch/--remote/--offline/--db` | 既有 00/10 + S8-92/93 | exit taxonomy 分立断言 |
+| `cluster status` | — | `--card/--homes/--watch/--remote/--offline/--db/`**`--settle`**（R13/D3 新增） | 既有 00/10 + S8-92/93 | exit taxonomy 分立断言。**`--settle <dur>`（R13）**：仅去抖 DEGRADED(1) 的 voter-restart 瞬态；持续降级仍 exit 1；QUORUM_LOST(2)/FORCE_SINGLE(3) **绝不去抖**、立即返回。owner=R13 drill（93/D3） |
+| `admin runtime` | — | `--json` | **R13 新增；owner=R13 drill（97）** | 97 结构性缺口的 (a) 解：返回 `goroutines(NumGoroutine 进程内真值)/threads/open_fds/rss/uptime/各 reconciler last_tick`。root-only 0600 admin socket，**禁 pprof**（计数即够、socket 已门控）。drill 97 用它做 goroutine 泄漏门（注入负载→quiesce→回落基线±tol） |
 | `cluster drain <id>` | — | `--now/--abort` + **Hidden `--retire`**（REMOVED-redirect：报错导向 `cluster retire`） | S6-40 | 40 顺带 redirect 报错断言 |
 | `cluster retire <id>` | — | `--wait/--timeout/--secrets-dir/--compromised/--require-credential-rotation` | S6-40 + S7-52 | C7 轮换臂 |
 | `cluster transfer-leader <id>` | — | `--wait/--timeout` | 既有 10 | |
@@ -154,6 +156,7 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `cluster set-raft-addr <host:port>` | — | `--route/--allow-loopback` | S6-41（rebind 臂） | |
 | `cluster backup` | — | `--out/--offline/--db/--data-dir/--secrets-dir/--allow-stale-follower` | S7-50 | follower 默认拒成对臂 |
 | `cluster ops ls/show/confirm/abort` | — | — | S6-40 | confirm/abort 由 BLOCKED/STALLED 态驱动 |
+| `cluster unlock` | — | `--upgrade/--grow/--force/--dry-run` | **R7b 新增；drill 覆盖 owner = R9**（30 需断言「stale-lock 清除动词被实际调用且锁确已释放」） | R7b 产物：升级/grow 锁改 lease+TTL 后，运维需要一个**不必等 TTL 到期**的出路。默认**拒绝清除仍在续约的 lease**，`--force` 才越过；清除后**再探一次**确认，仅在确认已清才 rc=0 |
 | `cluster apply` | — | `--file` | S6-40 顺带 | 仅 plan、零执行断言 |
 | `cluster seeds publish` | — | `--bootstrap/--endpoint/--sid` | S2-82（首次）+ S8-91 | |
 | `cluster seeds show` | — | `--remote` | S8-91/92 | |
@@ -172,7 +175,7 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `cluster recovery force-single` | — | `--online/--dry-run/--guided/--self-id/--self-addr/--confirm-peers-dead/--data-dir/--db/--nats-conf/--nats-server` + Hidden `--yes` | 既有 12/20（OFFLINE）+ S6-22（ONLINE + 拒绝门五臂 + `--guided`→42 顺带） | `--nats-conf/--nats-server` 决定 OFFLINE 去集群化写哪份 conf/用哪个 binary 做 fail-closed 校验——12/20 隐式走默认，显式/错值负例 plan 定 |
 | `cluster recovery resnapshot` | — | `--self-id/--raft-addr/--data-dir/--db/--confirm-node-id/**--accept-audit-loss**` + Hidden `--yes` | S6-42（变体） | **`--accept-audit-loss` 是显式数据损失开关**：42 两臂——有未发布 audit 且不带 → 拒；带 → 截断继续（探索→定格钉真实语义） |
 | `cluster recovery rejoin prepare` | — | `--self-id/--dump-divergent/--emit-manifest/--guided/--data-dir/--db/--secrets-dir` + Hidden `--yes` | S6-42 | |
-| `cluster recovery restore <bundle>` | — | `--confirm-node-id`（**provenance 锚，typed-confirm**）`/--data-dir/--db/--raft-addr/--secrets-dir` + Hidden `--yes` | S7-50/51 + S9-94（orphan 造法） | **never-escapable（R5-F2）**：`confirmTypedNodeID(machineEscapable=false)`——50 三断言：① `--confirm-node-id` 与 manifest/provenance 不符 → 拒；② `--yes` 必拒；③ **flag+`$TETHER_CONFIRM_NODE_ID` 同时正确、非交互执行仍拒**（`TestRestoreNeverEscapableEndToEnd` 的真栈版）。`--raft-addr` = fresh-host IP 变化的恢复逃生 → S7-51 的 DR 臂 |
+| `cluster recovery restore <bundle>` | — | `--confirm-node-id`（**provenance 锚，typed-confirm**）`/--data-dir/--db/--raft-addr/--secrets-dir/`**`--config`**（R10 新增） + Hidden `--yes` | S7-50/51 + S9-94（orphan 造法） | **never-escapable（R5-F2）**：`confirmTypedNodeID(machineEscapable=false)`——50 三断言：① `--confirm-node-id` 与 manifest/provenance 不符 → 拒；② `--yes` 必拒；③ **flag+`$TETHER_CONFIRM_NODE_ID` 同时正确、非交互执行仍拒**（`TestRestoreNeverEscapableEndToEnd` 的真栈版）。`--raft-addr` = fresh-host IP 变化的恢复逃生 → S7-51 的 DR 臂。**`--config`（R10/P2 新增）**：restore 此前**结构上不可能**写 broker.yaml 的 cluster seam（flag 集里根本没有 config），而 `install.sh` 把 `cluster:` 整段注释掉 ⇒ fresh DR box 启动必 FATAL `data_dir is unset`。加 `--config` 后落地即调现成的 `applyClusterSeam`（自带 fail-closed 的 decode 回读校验）。**drill 覆盖 owner = R10 的 drill 侧**：51 的 DR 尾段须**从订正后的 runbook §5.2 逐字执行**并断言 seam 五字段齐全（含 `nats_conf_path`） |
 | `cluster recovery incident export` | — | `--since/--out/--sid/--force` | S7-50 顺带 | `--force` 翻转 O_EXCL 防覆盖——50 顺带负例（不带 --force 时目标已存在 → 拒） |
 | `cluster recovery node remove <id>` | — | `--manual/--force/--confirm-node-id` + Hidden `--yes` | 既有 12（--manual 路径）；`--force`（孤儿化语义）+ machine-confirm 负例 → S6-40 的 ops 臂顺带 | ghost passthrough hermetic |
 | `cluster force-single`/`recover`/`restore`/`export-incident`/`remove`（顶层旧拼写） | **Hidden** ×5（`deprecatedClusterAlias`，同构 RunE + stderr 警告） | 同各本体 | NOT-COVERED | 与 recovery 本体共享 RunE（安全门字节保留）；一 release 后删 |
