@@ -420,13 +420,16 @@ type homeDeliveryTarget struct{ sid, nid string }
 // exists for), and a publish to a truly absent node is a no-op on the wire. Filtering
 // on a liveness column would re-introduce a peer-event precondition through the back
 // door.
-func (b *Broker) homeDeliveryTargets() ([]homeDeliveryTarget, map[int]struct{}, error) {
+// It also returns the live set of (sid|nid) KEYS (== the dedup keys), so the pass can prune the
+// attempts map for nodes that no longer own any homed expose (N-9). Returning the SAME `seen` map the
+// dedup uses keeps the prune key definitionally identical to the enumeration key — no drift.
+func (b *Broker) homeDeliveryTargets() ([]homeDeliveryTarget, map[int]struct{}, map[string]struct{}, error) {
 	rows, err := b.cfg.DB.Query(
 		`SELECT DISTINCT sid, nid, port FROM port_allocations
 		  WHERE state='ALLOCATED' AND home_broker != ''
 		  ORDER BY sid, nid, port`)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var targets []homeDeliveryTarget
@@ -436,7 +439,7 @@ func (b *Broker) homeDeliveryTargets() ([]homeDeliveryTarget, map[int]struct{}, 
 		var sid, nid string
 		var p int
 		if err := rows.Scan(&sid, &nid, &p); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		live[p] = struct{}{}
 		k := sid + "|" + nid
@@ -445,7 +448,7 @@ func (b *Broker) homeDeliveryTargets() ([]homeDeliveryTarget, map[int]struct{}, 
 			targets = append(targets, homeDeliveryTarget{sid: sid, nid: nid})
 		}
 	}
-	return targets, live, rows.Err()
+	return targets, live, seen, rows.Err()
 }
 
 // homeAssignmentFingerprint renders the EXPECTED assignment into a stable string.
@@ -549,12 +552,13 @@ func (b *Broker) reconcileHomeDelivery(_ context.Context, now time.Time) error {
 	if nc == nil {
 		return nil
 	}
-	targets, live, err := b.homeDeliveryTargets()
+	targets, live, liveKeys, err := b.homeDeliveryTargets()
 	if err != nil {
 		return fmt.Errorf("home-delivery: enumerate targets: %w", err)
 	}
 	b.pruneHomeApplied(live)
 	b.pruneHomeOutstanding(now)
+	b.pruneHomeAttempts(liveKeys)
 	for _, t := range targets {
 		ha := b.homeForRegister(t.sid, t.nid, proto.NodeRegisterReq{})
 		if ha == nil || len(ha.Directives) == 0 {
@@ -585,6 +589,26 @@ func (b *Broker) pruneHomeApplied(live map[int]struct{}) {
 	for p := range hd.applied {
 		if _, ok := live[p]; !ok {
 			delete(hd.applied, p)
+		}
+	}
+}
+
+// pruneHomeAttempts (N-9) drops backoff entries for (sid,nid) pairs that no longer own any ALLOCATED
+// homed expose. Without it, a node whose expose is released / whose node is removed while it was NOT
+// yet converged leaks its attempts entry forever: homeDeliveryReset (the only delete) fires only for a
+// still-ENUMERATED, converged target, and a departed node is never enumerated again. That is a slow map
+// leak the NumGoroutine/fd gate structurally cannot see. Keyed by the SAME sid+"|"+nid the targets
+// enumeration dedups on (liveKeys == the pass's `seen` set), so a still-live target — including one
+// merely sitting in backoff this tick — is always in the set and keeps its earned backoff untouched. A
+// live-set prune (not a TTL on nextAt) is exact: a TTL would evict a live node parked in max backoff
+// during a long agent outage and reset the backoff the storm-control depends on.
+func (b *Broker) pruneHomeAttempts(liveKeys map[string]struct{}) {
+	hd := b.homeDelivery()
+	hd.mu.Lock()
+	defer hd.mu.Unlock()
+	for k := range hd.attempts {
+		if _, ok := liveKeys[k]; !ok {
+			delete(hd.attempts, k)
 		}
 	}
 }

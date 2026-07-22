@@ -85,10 +85,27 @@ func (b *Broker) reconcileUpgradeLock(_ context.Context, now time.Time) error {
 		return nil
 	}
 	// External review M-2: reap only when this leader has APPLIED everything committed. A leader that
-	// just won an election (e.g. mid rolling-upgrade) can trail the log by several entries; deciding to
+	// just won an election (e.g. mid rolling-upgrade) can trail the log by MANY entries; deciding to
 	// reap off that stale view could read an EXPIRED lease that a renewal has already refreshed on the
 	// committed-but-not-yet-applied tail, and tear out a LIVE roll lock — re-admitting the concurrent
-	// join/retire the lock exists to fence. reaperCaughtUp gates the decision on applied>=commit.
+	// join/retire the lock exists to fence. reaperCaughtUp() closes the large-replay case: a just-elected
+	// leader replaying a long committed tail has RaftAppliedIndex < CommitIndex (the FSM dispatch channel
+	// backpressures), so the gate holds off until the bulk of the tail has drained.
+	//
+	// RESIDUAL (external re-review lock-reap, RECORDED — a bounded Barrier was rejected): raft's
+	// RaftAppliedIndex advances when a committed batch is ENQUEUED to the FSM (fsmMutateCh, depth 128 ×
+	// MaxAppendEntries 64 ≈ 8192 entries), NOT when Apply RETURNS. So ANY committed tail below that
+	// dispatch-channel capacity — a lease renewal and up to thousands of siblings — passes the gate at
+	// dispatch while its SQLite apply is still draining (µs–ms), letting upgradeLockDecision read the
+	// stale pre-renewal RODB; only a >capacity replay or a wedged FSM produces a sustained
+	// RaftAppliedIndex < CommitIndex. A raft Barrier before the clear WOULD close it, but raft's
+	// Barrier(timeout) only bounds the ENQUEUE — Barrier().Error() then blocks until applied with NO
+	// deadline, so on a wedged/islanded FSM it hangs the reconcile goroutine (strictly worse than this
+	// residual). The window is one 30s-tick vs a µs–ms drain and is already backstopped (leader-only pass
+	// + the clear Propose needs a fresh quorum + the orchestrator's keeper latch), so per
+	// security-pragmatism it stays recorded, not closed. A hermetic behavioral test is rejected as
+	// disproportionate (it would need a wedged FSM + thousands of blocked proposer goroutines to flood
+	// >128 batches), not impossible; TestMembershipLockReapsGateOnCatchUp source-pins the gate on both files.
 	if !b.reaperCaughtUp() {
 		return nil
 	}

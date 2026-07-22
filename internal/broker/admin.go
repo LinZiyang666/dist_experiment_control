@@ -110,9 +110,16 @@ const adminTailMaxN = eventsMaxScan
 // since cutoff, at FirstSeq, or after eventsMaxScan messages. The events stream is secret-free by
 // construction of its producers (rehome_events.go: hand-built allow-listed scalar maps); this
 // reader adds no field, so it cannot introduce one.
-func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration, kind string) ([]adminsock.AuditEntry, error) {
+// The returned bool is TRUNCATED (external review N-5): true when the walk stopped EARLY — at the
+// eventsMaxScan cap, or because the request ctx deadline/cancel fired mid-scan — so older matching
+// messages were NOT examined and the tail is a partial answer, not a complete one. It is deliberately
+// false for the two COMPLETE stops (the --since cutoff and collecting n matches): those return every
+// message the request asked for. Callers surface it so an operator is never handed a silently-partial
+// tail. Truncation is NOT an error (a partial answer with a marker beats breaking every busy-stream
+// script), so err stays nil in the truncated case.
+func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration, kind string) ([]adminsock.AuditEntry, bool, error) {
 	if b.js == nil {
-		return nil, fmt.Errorf("events_unavailable: broker has no JetStream")
+		return nil, false, fmt.Errorf("events_unavailable: broker has no JetStream")
 	}
 	if n <= 0 {
 		n = 50
@@ -123,16 +130,16 @@ func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration
 
 	stream, err := b.js.Stream(ctx, jsstream.EventsStreamName)
 	if err != nil {
-		return nil, fmt.Errorf("events_unavailable: %w", err)
+		return nil, false, fmt.Errorf("events_unavailable: %w", err)
 	}
 	info, err := stream.Info(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("events_unavailable: stream info: %w", err)
+		return nil, false, fmt.Errorf("events_unavailable: stream info: %w", err)
 	}
 	last := info.State.LastSeq
 	first := info.State.FirstSeq
 	if last == 0 || last < first {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var cutoff time.Time
@@ -142,19 +149,33 @@ func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration
 
 	out := make([]adminsock.AuditEntry, 0, n)
 	scanned := 0
+	truncated := false
 	for seq := last; seq >= first; seq-- {
 		if scanned >= eventsMaxScan {
+			truncated = true // hit the scan cap before a natural stop — older messages were never examined
 			break
 		}
 		scanned++
 		raw, err := stream.GetMsg(ctx, seq)
 		if err != nil {
-			// Retention/compaction can drop a message between the Info() range and GetMsg.
-			// Skip and keep going — the admin tail is best-effort (mirrors adminAuditTail).
+			if ctx.Err() != nil {
+				// The request deadline/cancel fired MID-scan (a pre-cancelled ctx instead errors earlier at
+				// js.Stream/Info and never reaches this loop): every remaining GetMsg would fail too, so stop
+				// rather than burn the scan budget, and report the tail as PARTIAL instead of the silent
+				// partial the old unconditional `continue` produced. NOTE: this mid-scan branch has no
+				// hermetic unit test — a pre-cancelled ctx is caught at Stream/Info (the only structurally
+				// buildable fixture), and a genuine mid-loop cancel is timing-fragile against embedded JS;
+				// recorded as infeasible-as-specced (release-readiness-followups-plan §3 C1), like the A2 case.
+				truncated = true
+				break
+			}
+			// Benign retention/compaction gap between the Info() range and this GetMsg — skip and keep
+			// going (the admin tail is best-effort; mirrors adminAuditTail).
 			continue
 		}
 		// The stream is time-ordered by sequence, so once we cross below the cutoff every
-		// earlier message is older too — stop the backward walk.
+		// earlier message is older too — stop the backward walk. This is a COMPLETE stop (we
+		// returned every message inside the --since window), not truncation.
 		if !cutoff.IsZero() && raw.Time.Before(cutoff) {
 			break
 		}
@@ -173,12 +194,12 @@ func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration
 			Body:    body,
 		})
 		if len(out) >= n {
-			break
+			break // COMPLETE: collected the n most-recent matches the request asked for.
 		}
 	}
 	// We collected newest → oldest; present oldest → newest like adminAuditTail.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out, nil
+	return out, truncated, nil
 }
 
 // pubAgentEvicted is the PubAgentEvicted hook for the admin

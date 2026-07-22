@@ -744,6 +744,7 @@ func newClusterInitCmd() *cobra.Command {
 		dryRun        bool
 		confirmNodeID string // G4 #5: machine-escape confirm (with $TETHER_CONFIRM_NODE_ID) for unattended grow
 		configPath    string // G4 #5: broker.yaml to auto-apply the cluster seam into (was print-only)
+		natsConfPath  string // N-4c: the nats.conf path recorded into the seam + used for the doctor/identity cross-check
 	)
 	cmd := &cobra.Command{
 		Use:     "init --from-existing",
@@ -768,7 +769,7 @@ func newClusterInitCmd() *cobra.Command {
 			// must not demand --name/--node-ident-pub/--tunnel-addr/--public-host the real run needs.
 			if check || dryRun {
 				checks := clusteroffline.Doctor(clusteroffline.DoctorOptions{
-					SecretsDir: secretsDir, DBPath: dbPath, ConfPath: defaultNatsConfPath, RaftAddr: raftAddr, NatsRoute: natsRoute,
+					SecretsDir: secretsDir, DBPath: dbPath, ConfPath: natsConfPath, RaftAddr: raftAddr, NatsRoute: natsRoute,
 				})
 				return renderDoctor(cmd, checks, false)
 			}
@@ -829,7 +830,7 @@ func newClusterInitCmd() *cobra.Command {
 			// already present. This lets `cluster add` (and a manual init) leave a serve-ready broker.yaml.
 			seamApplied := false
 			if configPath != "" {
-				applied, aerr := applyClusterSeam(configPath, dataDir, raftAddr, secretsDir)
+				applied, aerr := applyClusterSeam(configPath, dataDir, raftAddr, secretsDir, natsConfPath)
 				if aerr != nil {
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: could not auto-apply the broker.yaml cluster seam (%v) — set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} by hand\n", aerr)
 				}
@@ -845,7 +846,7 @@ func newClusterInitCmd() *cobra.Command {
 			// B3 item 1: substitute the REAL account/broker PUBLIC nkeys (cross-checked against
 			// nats.conf) so step 1 is copy-paste-ready. Fail-closed: an unresolved/mismatched value
 			// stays a <placeholder> + a NOTE — this print is POST-success and never fails the cmd.
-			ids := readClusterPublicIdentities(secretsDir, defaultNatsConfPath)
+			ids := readClusterPublicIdentities(secretsDir, natsConfPath)
 			acctTok := orPlaceholder(ids.AccountIssuer, "<account-public-nkey>")
 			brkTok := orPlaceholder(ids.BrokerNkey, "<broker-public-nkey>")
 			out := cmd.OutOrStdout()
@@ -855,9 +856,12 @@ func newClusterInitCmd() *cobra.Command {
 			}
 			_, _ = fmt.Fprintf(out, "cluster init --from-existing complete — %s is now a single-voter cluster (data_dir %s).%s\n", selfID, dataDir, fillHint)
 			_, _ = fmt.Fprintln(out, "NEXT (run in order):")
-			_, _ = fmt.Fprintf(out, "  1. tether cluster reconcile nats --manual --secrets-dir %s --server-name %s --route-url %s --account-issuer %s --broker-nkey %s\n",
-				secretsDir, selfID, routeURL, acctTok, brkTok)
-			if ids.AccountIssuer != "" && ids.BrokerNkey != "" {
+			_, _ = fmt.Fprintf(out, "  1. tether cluster reconcile nats --manual --conf %s --secrets-dir %s --server-name %s --route-url %s --account-issuer %s --broker-nkey %s\n",
+				natsConfPath, secretsDir, selfID, routeURL, acctTok, brkTok)
+			// N-3: only claim "verified against nats.conf" when the cross-check actually RAN. On a stock
+			// pre-cutover conf (no auth_callout issuer yet) the issuer is UNVERIFIED — printing "verified"
+			// there was an outright false claim; the ids.Note (UNVERIFIED sentence) is printed instead.
+			if ids.AccountIssuer != "" && ids.BrokerNkey != "" && !ids.IssuerUnverified {
 				_, _ = fmt.Fprintln(out, "     # account-issuer auto-read from this host's secrets + verified against nats.conf")
 				_, _ = fmt.Fprintln(out, "     # (broker-nkey verified too on a single-user conf; otherwise read from broker.nk)")
 			}
@@ -869,7 +873,7 @@ func newClusterInitCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(out, "  3. ✓ broker.cluster seam auto-applied to %s (#5)\n", configPath)
 			} else {
 				_, _ = fmt.Fprintln(out, "  3. set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path} in broker.yaml")
-				_, _ = fmt.Fprintln(out, "     # nats_conf_path: /etc/tether/nats.d/nats.conf  (the reconciler's conf; #22 — set it explicitly so a future binary upgrade can't repoint it)")
+				_, _ = fmt.Fprintf(out, "     # nats_conf_path: %s  (the reconciler's conf; #22 — set it explicitly so a future binary upgrade can't repoint it)\n", natsConfPath)
 			}
 			_, _ = fmt.Fprintln(out, "  4. systemctl start tether-broker                       # starts in cluster mode (N=1)")
 			_, _ = fmt.Fprintln(out, "  5. reinstall ALL agents on v2, then `tether cluster join prepare`/`approve` to grow to N>=3")
@@ -895,6 +899,7 @@ func newClusterInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "alias of --check")
 	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "unattended confirm (#5): must equal --self-id AND match $"+machineConfirmEnv+" (no TTY; for `cluster add`)")
 	cmd.Flags().StringVar(&configPath, "config", defaultBrokerConfigPath, "broker.yaml to auto-apply the cluster seam into (#5; empty = only print it)")
+	cmd.Flags().StringVar(&natsConfPath, "nats-conf", defaultNatsConfPath, "nats.conf path recorded into the broker.cluster seam + used for the --check doctor preflight and the printed-identity cross-check (N-4c)")
 	registerYesRejector(cmd)
 	return cmd
 }
@@ -910,7 +915,13 @@ func newClusterInitCmd() *cobra.Command {
 // misjudge as clustered and stall. Inserting right after the `broker:` line is placement-independent, and the
 // write is FAIL-CLOSED VERIFIED: the result must decode back with broker.cluster.raft_addr set, else this
 // returns an error so the caller never proceeds on a config that will boot single-mode.
-func applyClusterSeam(configPath, dataDir, raftAddr, secretsDir string) (bool, error) {
+func applyClusterSeam(configPath, dataDir, raftAddr, secretsDir, natsConfPath string) (bool, error) {
+	// N-4c: the seam records the ACTUAL nats.conf path this deploy uses (the reconciler reads it), not
+	// a hardcoded default. An empty path is a caller bug — fail loud rather than silently substituting a
+	// default that would drift from a --nats-conf-customized deployment.
+	if natsConfPath == "" {
+		return false, fmt.Errorf("applyClusterSeam: natsConfPath must not be empty (pass --nats-conf or the default)")
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -927,16 +938,16 @@ func applyClusterSeam(configPath, dataDir, raftAddr, secretsDir string) (bool, e
 	if existing, lerr := serveconf.Load(configPath); lerr == nil {
 		ec := existing.Broker.Cluster
 		if ec.RaftAddr != "" || ec.DataDir != "" || ec.SecretsDir != "" || ec.NatsConfPath != "" {
-			if ec.RaftAddr == raftAddr && ec.DataDir == dataDir && ec.SecretsDir == secretsDir && ec.NatsConfPath == defaultNatsConfPath {
+			if ec.RaftAddr == raftAddr && ec.DataDir == dataDir && ec.SecretsDir == secretsDir && ec.NatsConfPath == natsConfPath {
 				return false, nil // complete + matching (idempotent)
 			}
 			return false, fmt.Errorf("broker.yaml %s already has a broker.cluster seam that is stale/incomplete for this node "+
 				"(have raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q; want raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q) — "+
-				"fix or remove it, then re-run", configPath, ec.RaftAddr, ec.DataDir, ec.SecretsDir, ec.NatsConfPath, raftAddr, dataDir, secretsDir, defaultNatsConfPath)
+				"fix or remove it, then re-run", configPath, ec.RaftAddr, ec.DataDir, ec.SecretsDir, ec.NatsConfPath, raftAddr, dataDir, secretsDir, natsConfPath)
 		}
 	}
 	seam := fmt.Sprintf("  cluster:\n    data_dir: %s\n    raft_addr: %s\n    secrets_dir: %s\n    nats_conf_path: %s\n    nats_server_bin: nats-server",
-		dataDir, raftAddr, secretsDir, defaultNatsConfPath)
+		dataDir, raftAddr, secretsDir, natsConfPath)
 	lines := strings.Split(string(data), "\n")
 	out := make([]string, 0, len(lines)+7)
 	inserted := false

@@ -35,6 +35,17 @@ type clusterPublicIdentities struct {
 	// doctor` and `reconcile nats` consume these to fail-closed instead of printing a false all-clear.
 	IssuerSkew bool
 	BrokerSkew bool
+
+	// IssuerUnverified (external review N-3) is true when account.nk was readable and SUBSTITUTED but
+	// could NOT be cross-checked against the live nats.conf auth_callout issuer — the conf was unreadable
+	// (Preflight error) OR carries no auth_callout issuer yet (a stock pre-cutover conf, which install.sh
+	// writes with no authorization{} block). This is the ABSENCE of evidence, not evidence of a skew
+	// (IssuerSkew is a positive DISAGREE), so it is surfaced LOUD-but-advisory, never a hard refuse: a
+	// refuse would break `cluster init` on a stock conf and the restore fresh-box printer, both of which
+	// legitimately hit this state. The security fix is that "no skew detected" is no longer conflated with
+	// "skew CHECK ran and passed" — a caller that only reads IssuerSkew used to print a false all-clear.
+	IssuerUnverified       bool
+	IssuerUnverifiedReason string
 }
 
 // readClusterPublicIdentities derives the account-issuer + broker-nkey PUBLIC keys from the secrets
@@ -47,8 +58,11 @@ func readClusterPublicIdentities(secretsDir, confPath string) clusterPublicIdent
 	brk := derivePublicKey(filepath.Join(secretsDir, "broker.nk"), nkeys.IsValidPublicUserKey)
 
 	confIssuer, confBroker := "", ""
+	var confErr error
 	if own, err := natsconf.Preflight(confPath); err == nil {
 		confIssuer, confBroker = own.AuthIdentity()
+	} else {
+		confErr = err
 	}
 
 	var notes []string
@@ -59,7 +73,19 @@ func readClusterPublicIdentities(secretsDir, confPath string) clusterPublicIdent
 		notes = append(notes, "account.nk disagrees with nats.conf auth_callout issuer")
 		out.IssuerSkew = true
 	default:
+		// account.nk is readable → substitute it. But if we could NOT read an issuer out of the conf
+		// (N-3), the skew CHECK did not run — record that loudly instead of silently implying a clean
+		// verification. The value is still substituted (it IS this host's own seed, needed by the
+		// init/restore printers precisely when no conf exists), just flagged UNVERIFIED.
 		out.AccountIssuer = acct
+		if confIssuer == "" {
+			out.IssuerUnverified = true
+			if confErr != nil {
+				out.IssuerUnverifiedReason = fmt.Sprintf("nats.conf %s not readable/parsable (%v)", confPath, confErr)
+			} else {
+				out.IssuerUnverifiedReason = "nats.conf has no auth_callout issuer rendered yet (pre-cutover conf)"
+			}
+		}
 	}
 	// NOTE: AuthIdentity() returns confBroker=="" unless the conf's authorization{users} block has
 	// exactly ONE user (a single-user install.sh conf). For a grown multi-user conf the cross-check
@@ -77,6 +103,17 @@ func readClusterPublicIdentities(secretsDir, confPath string) clusterPublicIdent
 	if len(notes) > 0 {
 		out.Note = "# NOTE: " + strings.Join(notes, "; ") +
 			" — NOT auto-substituted; reconcile (rotated a key without re-rendering nats.conf?) before running takeover."
+	}
+	// N-3: the unverified case SUBSTITUTES the value, so it must NOT share the "NOT auto-substituted"
+	// wording above — append a separate sentence (a fresh box with no conf hits this on its mainline).
+	if out.IssuerUnverified {
+		unv := "# NOTE: account-issuer substituted from secrets but UNVERIFIED — " + out.IssuerUnverifiedReason +
+			"; skew detection did not run (this is not proof of a match). Verify with `tether cluster doctor` once the conf is rendered."
+		if out.Note == "" {
+			out.Note = unv
+		} else {
+			out.Note += "\n     " + unv
+		}
 	}
 	return out
 }
@@ -110,7 +147,29 @@ func clusterAuthIssuerSkewChecks(secretsDir, confPath string) []clusteroffline.D
 	if ids.BrokerSkew {
 		out = append(out, clusteroffline.DoctorCheck{Name: "auth-broker-nkey-skew", Status: clusteroffline.DoctorFatal, Detail: authBrokerNkeySkewDetail})
 	}
+	// N-3: an ADVISORY (not FATAL) when account.nk was substituted but the conf cross-check could not
+	// run. FATAL would fail doctor on a stock pre-init box on its mainline path; ADVISORY makes the
+	// skipped verification VISIBLE without breaking the fresh-box / init flow. Deliberately asymmetric
+	// with clusterAuthIssuerSkewError (which stays skew-only, a hard error): a KNOWN mismatch must
+	// fail-closed, an ABSENT check must be loud-but-non-fatal. There is deliberately no broker-nkey
+	// "unverified" — a multi-user conf normally yields confBroker=="", so it would be a permanent false alarm.
+	if ids.IssuerUnverified {
+		out = append(out, clusteroffline.DoctorCheck{Name: "auth-issuer-unverified", Status: clusteroffline.DoctorAdvisory,
+			Detail: "auth_callout issuer cross-check SKIPPED: " + ids.IssuerUnverifiedReason + " — skew detection did not run; this is not proof of a match"})
+	}
 	return out
+}
+
+// clusterIssuerUnverifiedReason returns a non-empty reason string when the account issuer was
+// substituted UNVERIFIED (N-3) — i.e. the skew CHECK could not run — so `reconcile nats` can WARN that
+// its convergence report does not confirm the rendered issuer, instead of a silent false all-clear. It
+// is separate from clusterAuthIssuerSkewError (kept skew-only so its callers/tests are unchanged).
+func clusterIssuerUnverifiedReason(secretsDir, confPath string) string {
+	ids := readClusterPublicIdentities(secretsDir, confPath)
+	if ids.IssuerUnverified {
+		return ids.IssuerUnverifiedReason
+	}
+	return ""
 }
 
 // clusterAuthIssuerSkewError returns a non-nil error naming every auth_callout identity skew, or nil

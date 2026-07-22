@@ -40,11 +40,17 @@ func TestReaperCaughtUpGate(t *testing.T) {
 }
 
 // TestMembershipLockReapsGateOnCatchUp (external review M-2): the grow/upgrade lock reapers must gate on
-// reaperCaughtUp, exactly like the xfer reaper. Without it a freshly-elected leader trailing the log could
-// read a stale EXPIRED lease that a renewal already refreshed on the un-applied tail and tear out a LIVE
-// membership lock, re-admitting the concurrent join/retire the lock exists to fence. A caught-up follower
-// with applied<commit cannot be built hermetically (d7SingleNode always bootstraps leader+caught-up), so
-// this pins the gate from source; its behaviour is proven by TestReaperCaughtUpGate's accessor comparison.
+// reaperCaughtUp, so a freshly-elected leader replaying a long committed tail (RaftAppliedIndex <
+// CommitIndex under FSM dispatch backpressure) does NOT reap a live membership lock off a stale view.
+//
+// This is a SOURCE-PIN, deliberately. A fully behavioral lagging-leader test is INFEASIBLE-AS-SPECCED:
+// (1) the hermetic fixtures always bootstrap caught-up; and (2) the residual reaperCaughtUp does NOT
+// cover — a SINGLE committed-but-unapplied renewal in the µs–ms SQLite-apply window (RaftAppliedIndex
+// advances at FSM DISPATCH, not Apply-return) — cannot be closed by a raft Barrier before the clear,
+// because Barrier().Error() has no apply deadline and would HANG the reconcile goroutine on a wedged
+// FSM (verified: it blocks indefinitely). That narrower window is a recorded, backstopped residual (see
+// reconcile_upgrade_lock.go), not a testable behavior here. The accessor-level positive path is proven
+// at the cluster layer (TestRaftAppliedIndexCatchesUpToCommitOnLeader / Node.CaughtUp tests).
 func TestMembershipLockReapsGateOnCatchUp(t *testing.T) {
 	for _, f := range []string{"reconcile_upgrade_lock.go", "reconcile_grow_lock.go"} {
 		src := readRepoFile(t, f)

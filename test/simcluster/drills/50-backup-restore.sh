@@ -59,7 +59,7 @@ set -u
 SID=lab
 PIN=505050
 NURL="nats://brk1:4222"
-BK_DIR=/var/lib/tether/bk-50-leader        # install.sh:491 makes /var/lib/tether tether-owned 0750
+BK_DIR=/var/lib/tether/bk-50-leader        # install.sh:500 makes /var/lib/tether tether-owned 0750
 BK_NAME=leader-1
 
 # _bt <node> -- <tether args...> : run tether as User=tether on <node> (broker-ops #6).
@@ -237,19 +237,22 @@ assert_refuses "R3f #50 state 6/6 — a CORRUPT PAGE is FATAL: the file opens, p
 assert_ok "R3g ANTI-VACUITY: the identical probe against the LIVE tether.db is green — the six reds above discriminate, they are not a doctor that FATALs on everything" \
     _doc_db /var/lib/tether/tether.db
 
-# ── C — the runbook's own literal example (DOC-27) ──────────────────────────────────────────────────
-# R-SUPPLY-ORDER: this arm runs BEFORE the vault appears as [env]. It shows what tether cannot do
-# unaided, so the supply that follows masks no gap.
-_C_OUT=$(dexec -u tether brk1 -- sh -c 'tether cluster backup --out /var/backups/tether-$(date +%F)-$$' 2>&1); _C_RC=$?
-# Stage-C minor 3: signature-guard DOC-27 — only pin it when the failure is the EXPECTED parent-dir/perm
-# one, not any non-zero exit (a leader drift / transient / auth error must not be mislabelled DOC-27).
-if [ "$_C_RC" != 0 ] && printf '%s' "$_C_OUT" | grep -qiE 'prepare bundle parent|store_error|permission denied|mkdir|must not exist'; then
-    product_red "DOC-27 runbook §5 line 524's literal example \'cluster backup --out /var/backups/tether-\$(date +%F)\' does not run on a stock install: /var/backups is not created by install.sh (:491 only makes LIB_DIR/LOG_DIR), so MkdirAll fails inside the daemon and the operator gets a store_error. Captured: $(printf '%s' "$_C_OUT" | tail -1)"
-elif [ "$_C_RC" != 0 ]; then
-    _as_fail "DOC-27 UNJUDGEABLE — the backup example failed but not for the parent-dir/perm reason (rc=$_C_RC): $(printf '%s' "$_C_OUT" | tail -1). Triage before pinning DOC-27"
+# ── C — the runbook's own literal ONLINE-backup example (DOC-27 CLOSED, positive regression) ─────────
+# R-SUPPLY-ORDER: this arm runs BEFORE the vault appears as [env]. DOC-27 is now CLOSED — the runbook §5
+# ONLINE-backup example uses /var/lib/tether/backups, which install.sh makes tether-owned (:500 LIB_DIR),
+# so the daemon (User=tether) CAN write it. This arm is the POSITIVE regression that KEEPS it closed: the
+# CORRECTED example must run verbatim on a stock install; a parent-dir/perm failure is a REGRESSION.
+_C_OUT=$(dexec -u tether brk1 -- sh -c 'tether cluster backup --out /var/lib/tether/backups/tether-$(date +%F)-$$' 2>&1); _C_RC=$?
+_c_backup_runs()   { [ "$_C_RC" = 0 ]; }
+_c_perm_signature() { printf '%s' "$_C_OUT" | grep -qiE 'prepare bundle parent|store_error|permission denied|mkdir|must not exist'; }
+# Stage-C minor 3: signature-guard — only pin a REGRESSION on the EXPECTED parent-dir/perm failure, not
+# any non-zero exit (a leader drift / transient / auth error must not be mislabelled DOC-27).
+if _c_backup_runs; then
+    assert_ok "DOC-27 CLOSED: the runbook §5 ONLINE-backup literal example (--out /var/lib/tether/backups/tether-\$(date +%F)) runs as User=tether on a stock install — install.sh makes LIB_DIR tether-owned, so the daemon's MkdirAll of the backup leaf succeeds" _c_backup_runs
+elif _c_perm_signature; then
+    product_red "DOC-27 REGRESSION: the CORRECTED runbook §5 example \'cluster backup --out /var/lib/tether/backups/tether-\$(date +%F)\' is unrunnable again on a stock install (parent-dir/perm failure) — the doc fix regressed. Captured: $(printf '%s' "$_C_OUT" | tail -1)"
 else
-    ok "C runbook §5:524's literal example SUCCEEDED — DOC-27 does not hold; record and drop it"
-    _as_pass "C runbook literal backup example works as documented"
+    _as_fail "DOC-27 UNJUDGEABLE — the corrected backup example failed but not for the parent-dir/perm reason (rc=$_C_RC): $(printf '%s' "$_C_OUT" | tail -1). Triage before pinning DOC-27"
 fi
 
 # ── D — the authoritative leader bundle ─────────────────────────────────────────────────────────────

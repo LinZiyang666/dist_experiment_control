@@ -13,8 +13,10 @@ import (
 	"strings"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
@@ -1090,6 +1092,234 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 	}
 	if got := names(liveStore); len(got) != 0 {
 		t.Fatalf("the reaper never collects once the transfer completes: %v — #58 would be 'fixed' into a permanent no-op", got)
+	}
+}
+
+// putXferOrphan creates the OBJ_xfer-<bucket> object store and writes one orphan object into it (no
+// tracker entry), so the reap pass sees a bucket with accumulating garbage.
+func putXferOrphan(t *testing.T, ctx context.Context, js jetstream.JetStream, bucket, name string) {
+	t.Helper()
+	store, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: bucket})
+	if err != nil {
+		t.Fatalf("create object store %s: %v", bucket, err)
+	}
+	if _, err := store.PutBytes(ctx, name, []byte("orphan")); err != nil {
+		t.Fatalf("put %s/%s: %v", bucket, name, err)
+	}
+}
+
+// TestXferUnreapableBucketCounter (external review N-6) proves the reap pass counts ONLY the buckets no
+// broker can ever reap that actually hold aged garbage: a split-home session and a zero-node session
+// count; a single-home-elsewhere session (a peer reaps it — the noise guard) and a split-home but EMPTY
+// bucket (no disk risk — the aged guard) do NOT. It is a gauge (Store, not Add) and changes no reaping.
+func TestXferUnreapableBucketCounter(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
+	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = 0 // any non-deleted object is "aged garbage" for this test
+
+	// split-home (node-A + node-B) with an orphan → COUNTS.
+	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
+	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	// single-home elsewhere with an orphan → NOT counted (node-B reaps it — noise guard).
+	seedHomedNode(t, db, "elsewhere", "e1", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-elsewhere", "obj")
+	// zero-node session bucket with an orphan → COUNTS.
+	putXferOrphan(t, ctx, js, "xfer-zero", "obj")
+	// split-home but EMPTY bucket → NOT counted (no aged garbage — aged guard).
+	seedHomedNode(t, db, "splitempty", "se1", "srv-A", "node-A")
+	seedHomedNode(t, db, "splitempty", "se2", "srv-B", "node-B")
+	if _, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "xfer-splitempty"}); err != nil {
+		t.Fatalf("create empty store: %v", err)
+	}
+
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects: %v", err)
+	}
+	if got := b.xferUnreapableBuckets.Load(); got != 2 {
+		t.Fatalf("unreapable buckets = %d, want 2 (split + zero; elsewhere and split-empty must NOT count)", got)
+	}
+
+	// A SECOND pass must re-publish the SAME gauge, not accumulate — it is a gauge (Store), not a
+	// counter (Add). Mutation Store→Add would give 4 here and this reds.
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects (2nd pass): %v", err)
+	}
+	if got := b.xferUnreapableBuckets.Load(); got != 2 {
+		t.Fatalf("2nd pass unreapable buckets = %d, want still 2 (gauge Store, not counter Add)", got)
+	}
+
+	// HEAL the split-home session: drop its node-B binding so it becomes single-home to self (node-A).
+	// homeOwnsXferBucket now owns it → it reaps (no longer orphaned-everywhere), so the gauge must FALL to
+	// 1 (only the zero-node bucket remains). A gauge that never dropped (or Add) would fail here.
+	if _, err := db.Exec(`DELETE FROM nodes WHERE sid='split' AND nid='sp2'`); err != nil {
+		t.Fatalf("heal split session: %v", err)
+	}
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects (post-heal): %v", err)
+	}
+	if got := b.xferUnreapableBuckets.Load(); got != 1 {
+		t.Fatalf("post-heal unreapable buckets = %d, want 1 (split healed to single-home → reapable; only zero-node remains)", got)
+	}
+}
+
+// TestXferUnreapableBucketSkipsFreshObjects (external review N-6) proves the aged-object guard: a
+// split-home bucket whose only object is FRESH (within the grace) is NOT counted — the gauge tracks
+// accumulating garbage, not transient in-flight objects.
+func TestXferUnreapableBucketSkipsFreshObjects(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
+	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = time.Hour // shield fresh objects (real wall-clock ModTime)
+
+	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
+	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-split", "just-uploaded") // written now → inside the 1h grace
+
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects: %v", err)
+	}
+	if got := b.xferUnreapableBuckets.Load(); got != 0 {
+		t.Fatalf("a fresh-only split-home bucket must NOT count as unreapable garbage, got %d", got)
+	}
+}
+
+// TestAdminEventsTailTruncatesAtScanCap (external review N-5) proves adminEventsTail reports TRUNCATED
+// when the eventsMaxScan cap is hit before a natural stop: a --kind that matches NONE of the newest
+// eventsMaxScan messages exhausts the scan budget and returns a partial (empty) tail with truncated=true
+// — never a silent "(no events)". The control (a --kind that matches immediately, satisfying n) is a
+// COMPLETE stop → truncated=false. Mutation: drop `truncated=true` on the scan-cap break → this reds.
+func TestAdminEventsTailTruncatesAtScanCap(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	if err := jsstream.EnsureEventsStream(ctx, js, 1); err != nil {
+		t.Fatalf("ensure events stream: %v", err)
+	}
+
+	b := &Broker{}
+	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
+	b.js = js
+	b.nc.Store(nc)
+
+	total := eventsMaxScan + 10
+	body := []byte(`{"type":"noise"}`)
+	for i := 0; i < total; i++ {
+		if err := nc.Publish(proto.SubjSysEvents, body); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	stream, err := js.Stream(ctx, jsstream.EventsStreamName)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		info, ierr := stream.Info(ctx)
+		if ierr != nil {
+			t.Fatalf("info: %v", ierr)
+		}
+		if info.State.Msgs >= uint64(total) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("events stream never captured %d msgs (got %d)", total, info.State.Msgs)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A --kind matching NONE forces the walk to the eventsMaxScan cap → truncated.
+	entries, truncated, err := b.adminEventsTail(ctx, 1, 0, "rare")
+	if err != nil {
+		t.Fatalf("adminEventsTail(rare): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 matches for kind=rare, got %d", len(entries))
+	}
+	if !truncated {
+		t.Fatal("hitting the eventsMaxScan cap with no match must report truncated=true (N-5)")
+	}
+
+	// Control: a --kind matching the newest message satisfies n immediately → COMPLETE, not truncated.
+	entries, truncated, err = b.adminEventsTail(ctx, 1, 0, "noise")
+	if err != nil {
+		t.Fatalf("adminEventsTail(noise): %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 match for kind=noise n=1, got %d", len(entries))
+	}
+	if truncated {
+		t.Fatal("collecting the requested n matches is a COMPLETE stop — truncated must be false")
+	}
+}
+
+// TestXferReapGraceIsWiredInProduction (external review M-3, wiring pin) proves broker.New actually
+// wires the fresh-object shield to a POSITIVE grace. TestXferReapShieldsFreshObjects (below) hand-sets
+// the value on a zero-value Broker, so it can NOT catch a regression that drops the wiring in New — a
+// zero grace disables the shield and an in-flight object becomes reapable mid-upload. The >0 assert is
+// load-bearing and MUST come first: it goes red under BOTH mutations — dropping `xferReapMinAge:
+// xferReapMinObjectAge` from New (zero value) AND zeroing the const xferReapMinObjectAge. An
+// equality-only assert would stay GREEN under the zeroed const (both sides 0). New does not dial NATS
+// (it validates + sets defaults + one single-mode proxy-gen DB write), so a garbage URL suffices.
+func TestXferReapGraceIsWiredInProduction(t *testing.T) {
+	db := openDBWithSession(t, "lab")
+	b, err := New(Config{NATSURL: "nats://127.0.0.1:1", DB: db, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if b.xferReapMinAge <= 0 {
+		t.Fatalf("broker.New must wire a POSITIVE xferReapMinAge (the M-3 fresh-object shield); got %v", b.xferReapMinAge)
+	}
+	if b.xferReapMinAge != xferReapMinObjectAge {
+		t.Fatalf("broker.New wired xferReapMinAge=%v, want the M-3 const xferReapMinObjectAge=%v", b.xferReapMinAge, xferReapMinObjectAge)
 	}
 }
 

@@ -87,6 +87,47 @@ broker:
 	}
 }
 
+// TestReapIntervalUpperBound (external review N-5) pins the upper clamp on the three interval knobs: a
+// value like 10000h passes the sub-second/sub-minute floor yet SILENTLY DISABLES the reaper/monitor
+// (immortal garbage / no disk-pressure). Each knob must reject > 24h, accept exactly 24h (the boundary),
+// and reject just past it — and the rejection must fire at Load(), not only at the accessor.
+func TestReapIntervalUpperBound(t *testing.T) {
+	xfer := func(v string) *Config {
+		return &Config{Broker: BrokerSection{Cluster: ClusterSection{XferReapInterval: v}}}
+	}
+	disk := func(v string) *Config { return &Config{Broker: BrokerSection{Obs: ObsSection{DiskCheckInterval: v}}} }
+	gc := func(v string) *Config {
+		return &Config{Broker: BrokerSection{Storage: StorageSection{ProcGCInterval: v}}}
+	}
+
+	cases := []struct {
+		name  string
+		over  func() (time.Duration, error)
+		atMax func() (time.Duration, error)
+		just  func() (time.Duration, error)
+	}{
+		{"xfer_reap_interval", xfer("10000h").XferReapIntervalDuration, xfer("24h").XferReapIntervalDuration, xfer("24h1s").XferReapIntervalDuration},
+		{"disk_check_interval", disk("10000h").DiskCheckIntervalDuration, disk("24h").DiskCheckIntervalDuration, disk("24h1s").DiskCheckIntervalDuration},
+		{"proc_gc_interval", gc("10000h").ProcGCIntervalDuration, gc("24h").ProcGCIntervalDuration, gc("24h1s").ProcGCIntervalDuration},
+	}
+	for _, c := range cases {
+		if _, err := c.over(); err == nil {
+			t.Errorf("%s: 10000h must be rejected (silently-disabled reaper), got nil error", c.name)
+		}
+		if d, err := c.atMax(); err != nil || d != 24*time.Hour {
+			t.Errorf("%s: exactly 24h must be accepted (boundary), got d=%v err=%v", c.name, d, err)
+		}
+		if _, err := c.just(); err == nil {
+			t.Errorf("%s: 24h1s must be rejected (just over the bound), got nil error", c.name)
+		}
+	}
+
+	// Load()-level: an over-bound value must fail the launch, not just the accessor.
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_reap_interval: 10000h\n")); err == nil {
+		t.Error("Load: over-24h xfer_reap_interval silently accepted (should reject at launch)")
+	}
+}
+
 func TestProcRetentionDuration_EmptyMeansZero(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `broker: {}`))
 	if err != nil {

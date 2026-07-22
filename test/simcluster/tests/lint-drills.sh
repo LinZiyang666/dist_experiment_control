@@ -95,12 +95,19 @@ scan_file() {
     # 128+signo without resuming.
     printf '%s\n' "$_C" | grep -qE "trap[[:space:]]+.[^']*.[[:space:]]+(EXIT[[:space:]]+INT|INT[[:space:]]+TERM|EXIT[[:space:]]+INT[[:space:]]+TERM)" \
         && echo "combined-signal-trap: a single trap on EXIT+INT/TERM resumes execution after the handler returns (POSIX) — a Ctrl-C keeps running destructive steps. Use drill_install_traps <cleanup-fn> (lib/assert.sh), which exits 128+signo on INT/TERM"
-    # R1: an INVERTED block asserts "the defect reproduced" by a POSITIVE predicate (assert_ok on a command
-    # that SHOULD have failed). That is a legitimate repo idiom — but only when it is PAIRED with a
-    # product_red/assert_bug in the same block, so the reproduction still lands non-GREEN. Unpaired, the
-    # drill reports GREEN while a registered defect is live: exactly how #25/#26/#27 sat inside three
-    # "green" drills (80/81/82). lib/assert.sh:169 already exposes a bare product_red recorder, so pairing
-    # costs one line and there is no excuse for the unpaired form.
+    # GATE D (INVERTED same-block pairing) — WITHDRAWN, deliberately NOT implemented (external review M-5,
+    # release-readiness-followups §6.4). An INVERTED block asserts "the defect reproduced" by a POSITIVE
+    # predicate (assert_ok on a command that SHOULD have failed); to still land non-GREEN it must be PAIRED
+    # with a product_red/assert_bug in the SAME block. Enforcing that pairing is not decidable by the 13
+    # line-global grep gates here — it needs block-scoped parsing (awk/state) — and ANY implementable proxy
+    # keys on the word "INVERTED" in COMMENTS, i.e. a prose-triggered lint: rename the comment and the gate
+    # goes blind; mention INVERTED in an unrelated note and it false-fires. That is the exact failure mode
+    # kept-sites' comment-stripping (code() above) exists to avoid, and this repo already WROTE, MEASURED,
+    # and WITHDREW such a static sibling (ledger-crosscheck.sh header: 10 hits, 3 real). Replacement, by half:
+    #   REGISTERED defect sitting in a GREEN drill  -> tests/ledger-crosscheck.sh (executing, fail-closed).
+    #   UNREGISTERED inverted false-green           -> NOT statically checkable; owned by the Stage-C
+    #     non-vacuity requirement (roadmap §3 gate C: every changed/new assertion proven RED against a bad
+    #     input). Accepted residual risk, recorded here so nobody re-invents this prose-keyed gate.
     # R1/H12: an EMPTY grep needle matches every line, so `grep -qE ''` is a permanently-true oracle. Same
     # family as H1 (a jq path that matches nothing is permanently FALSE, and its negation permanently true).
     # A static rule can catch the empty needle; it CANNOT catch a well-formed-but-wrong jq path — that is

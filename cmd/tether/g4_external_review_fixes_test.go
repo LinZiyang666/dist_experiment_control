@@ -44,7 +44,7 @@ func TestVerifyClusterSeam(t *testing.T) {
 	if err := os.WriteFile(seamed, []byte("broker:\n  domain: x\nstorage:\n  scratch: /tmp\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := applyClusterSeam(seamed, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets"); err != nil {
+	if _, err := applyClusterSeam(seamed, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets", defaultNatsConfPath); err != nil {
 		t.Fatalf("apply seam: %v", err)
 	}
 	if err := verifyClusterSeam(seamed, "brk-a:7400", "/var/lib/tether", "/etc/tether/secrets", "/etc/tether/nats.d/nats.conf"); err != nil {
@@ -105,7 +105,7 @@ func TestApplyClusterSeam_RejectsMismatchedExistingSeam(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte("broker:\n  cluster:\n    raft_addr: stale:7400\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	applied, err := applyClusterSeam(cfg, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets")
+	applied, err := applyClusterSeam(cfg, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets", defaultNatsConfPath)
 	if err == nil {
 		t.Fatal("applyClusterSeam must reject an existing seam whose raft_addr != this node's --raft-addr")
 	}
@@ -121,7 +121,7 @@ func TestApplyClusterSeam_RejectsMismatchedExistingSeam(t *testing.T) {
 	if err := os.WriteFile(partial, []byte("broker:\n  cluster:\n    raft_addr: brk2:7400\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if applied, err := applyClusterSeam(partial, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets"); err == nil || applied {
+	if applied, err := applyClusterSeam(partial, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets", defaultNatsConfPath); err == nil || applied {
 		t.Errorf("a partial existing seam (missing data_dir) must hard-error, not be idempotent; got applied=%v err=%v", applied, err)
 	}
 	// Only a COMPLETE matching seam stays idempotent (no double-append, no error).
@@ -129,7 +129,7 @@ func TestApplyClusterSeam_RejectsMismatchedExistingSeam(t *testing.T) {
 	if err := os.WriteFile(match, []byte("broker:\n  cluster:\n    data_dir: /var/lib/tether\n    raft_addr: brk2:7400\n    secrets_dir: /etc/tether/secrets\n    nats_conf_path: /etc/tether/nats.d/nats.conf\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if applied, err := applyClusterSeam(match, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets"); err != nil || applied {
+	if applied, err := applyClusterSeam(match, "/var/lib/tether", "brk2:7400", "/etc/tether/secrets", defaultNatsConfPath); err != nil || applied {
 		t.Errorf("a complete matching seam must be idempotent (applied=false, err=nil), got applied=%v err=%v", applied, err)
 	}
 }

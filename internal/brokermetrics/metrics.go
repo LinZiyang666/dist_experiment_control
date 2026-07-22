@@ -48,6 +48,11 @@ type Snapshot struct {
 	// StreamsTarget==0 means "not observed this scrape" → both gauges are omitted.
 	StreamsActual int
 	StreamsTarget int
+	// XferUnreapableBuckets (external review N-6) is the reap pass's count of OBJ_xfer buckets that hold
+	// aged orphan objects yet are home-owned by no broker (split-home / zero-node session) → immortal
+	// garbage (the racknerd small-disk-fill class). Cluster-mode gauge; always emitted (emit 0) so a
+	// scraper can alert on it rising. Observability only — it never means the reaper deletes them.
+	XferUnreapableBuckets int
 }
 
 // Render writes the Prometheus text exposition for s. Every gauge that applies is ALWAYS present
@@ -68,6 +73,7 @@ func Render(w io.Writer, s Snapshot) {
 	g("tether_broker_applied_index", "This broker's command-domain applied index.", int64(s.AppliedIndex))
 	g("tether_broker_commit_index", "This broker's raft commit index.", int64(s.CommitIndex))
 	g("tether_broker_force_single", "1 if the force_single_active escape-hatch marker is set, else 0.", b2i(s.ForceSingle))
+	g("tether_broker_xfer_unreapable_buckets", "Number of xfer buckets holding aged orphan objects that no broker's home-gated reaper will ever delete (split-home / zero-node session; N-6).", int64(s.XferUnreapableBuckets))
 	// B6 OPS#4: JS stream replica posture (actual<target ⇒ replication degraded). Omitted when
 	// not observed this scrape (StreamsTarget==0) — a faked 0 would read as a degraded cluster.
 	if s.StreamsTarget > 0 {

@@ -36,7 +36,9 @@ set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SIM_ROOT="$(cd "$HERE/.." && pwd)"
-DRILLS="$SIM_ROOT/drills"
+# DRILLS defaults to the real suite; overridable via env ONLY so the N-7 self-test (kept-sites-selftest.sh)
+# can point it at a scratch fixture. Production callers never set it.
+DRILLS="${DRILLS:-$SIM_ROOT/drills}"
 
 # count_sites <file> : emit the kept-site count for one drill.
 #
@@ -53,6 +55,13 @@ count_sites() {
         /^[ \t]*#/ { next }                       # whole-line comment: never a call site
         {
             line = $0
+            # QUOTE MASK (N-7): erase quoted-string CONTENTS before separator-splitting, so ; & | ( ) { }
+            # inside a description/prose string can never open a phantom command position. \047 is octal for
+            # a single quote (a bare single-quote char is impossible inside this single-quoted awk program,
+            # hence the octal escape). The double-quote arm handles a backslash-escaped quote inside a span.
+            # Verified: identical per-drill counts on all 37 drills vs the quote-unaware tokenizer (any
+            # future divergence = a real miscount to investigate).
+            gsub(/\047[^\047]*\047|"(\\.|[^"\\])*"/, "Q", line)
             gsub(/[;&|(){}]/, "\n", line)         # every separator opens a new command position
             m = split(line, part, "\n")
             for (i = 1; i <= m; i++) {

@@ -268,6 +268,11 @@ func startJoinerHint(joiner string) string {
 
 // runSelfInit shells out to THIS binary's `cluster init --from-existing` (reusing the exact tested migration +
 // seam-apply path) with the machine-escape confirm so no TTY is needed.
+//
+// N-4c (record-only): this does NOT pass --nats-conf, so a grown joiner's seam records the DEFAULT
+// nats_conf_path. Threading a custom conf path through join bundles / joinerParams is deliberate scope
+// creep for a flow that only targets stock installs; a custom-conf-path deployment growing via `cluster
+// add` gets the default-path seam (harmless on stock installs, where the path IS the default).
 func runSelfInit(cmd *cobra.Command, jp joinerParams) error {
 	self, err := os.Executable()
 	if err != nil {

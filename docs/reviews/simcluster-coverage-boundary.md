@@ -67,4 +67,5 @@
 
 - **30 · (b)** N=2 write-fence NEGATIVE 控制（证 write-probe 能在 raft 写真停时转 RED）——可构造（刻意 stall raft 写）。positive 已覆盖；negative 控制为 nice-to-have。
 - **71 · G/F** home-return stickiness（需 drained-then-RETURNED home）+ `rehome_stalled{no_eligible_target}`（需 N=1-eligible 拓扑）——可构造的 topology fixture，本 drill 未构造。
+- **H2 · N≥3 分布式 PIN 限速 drill — DEFERRED（v2 验收）**（外审 codex H2 / claude N-2）。v1 的 PIN 限速**明确是 per-broker best-effort**（architecture §E.6 已改正为诚实语义：N-broker 集群 ≈ N×10/min 的猜测预算，argon2id 是主防线）；集群一致的全局计数须在**未认证 connect 路径**上引入分布式写，是更差的 DoS 放大面，v1 不做。因此**不存在**要构造的 drill——一个"故意不存在的语义"的 drill 是虚构，不建。**若/当** cluster-consistent 限速在 v2 落地，这条 N≥3 分布 callout drill 即成其验收门（现 drill 80 的 N=1 GREEN 只证 N=1 拒绝、不据以推断多-broker 行为）。无 tsv 行（无 drill 存在）。
 - 以上均**非结构性**：列此以证"未遗漏"，最终构造与否由 roadmap 定；在构造前保持 INCOMPLETE/gap 如实呈现，绝不当作已覆盖。

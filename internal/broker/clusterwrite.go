@@ -490,8 +490,7 @@ func (b *Broker) livenessDB() *sql.DB {
 // streams/buckets. In single mode (b.cl == nil) the local DB is the authority — always true. In
 // cluster mode only a CAUGHT-UP LEADER has a local view that reflects the true cluster state; a fresh
 // joiner / not-yet-caught-up follower would classify every cluster-wide stream as orphan and wipe live
-// history + in-flight tier-B buckets (audit G — CRITICAL data loss). Raft-free (L-2): only the narrow
-// Node accessors IsLeader/RaftAppliedIndex/CommitIndex.
+// history + in-flight tier-B buckets (audit G — CRITICAL data loss).
 //
 // Caught-up is measured in the RAFT domain (RaftAppliedIndex vs CommitIndex), NOT the command domain.
 // The SQLite command cursor AppliedIndex never advances on the leader-election LogNoop (or config
@@ -499,6 +498,15 @@ func (b *Broker) livenessDB() *sql.DB {
 // against CommitIndex is cross-domain and structurally never true, which silently disabled this gate on
 // every cluster-mode boot (v0.4.4 review G-reaper-gate). RaftAppliedIndex advances on the noop too, so a
 // caught-up leader reads RaftAppliedIndex == CommitIndex.
+//
+// External re-review (lock-reap-F2): the catch-up test is Node.CaughtUp(), which additionally
+// requires CommitIndex()>0 — a bare RaftAppliedIndex()>=CommitIndex() is VACUOUSLY true on a
+// never-elected node AND on a snapshot-carrying restart (applied=snapshot, volatile commit=0),
+// which would let a pre-first-commit boot view classify orphans. The IsLeader() gate already
+// blocks a booting non-leader, but the boot orphan reap runs from Run's boot path, so the
+// commit>0 bound is a belt-and-suspenders that also matches the cluster-layer positive test.
+//
+// Raft-free (L-2): only the narrow Node accessors IsLeader/CaughtUp.
 func (b *Broker) reaperMayDelete() bool {
 	if b.cl == nil {
 		return true
@@ -506,7 +514,7 @@ func (b *Broker) reaperMayDelete() bool {
 	if b.cl.node == nil || !b.cl.node.IsLeader() {
 		return false
 	}
-	return b.cl.node.RaftAppliedIndex() >= b.cl.node.CommitIndex()
+	return b.cl.node.CaughtUp()
 }
 
 // reaperCaughtUp is the LEADER-NEUTRAL sibling of reaperMayDelete, for a reaper whose
@@ -526,13 +534,19 @@ func (b *Broker) reaperMayDelete() bool {
 // homeOwnsXferBucket, the home failed IsLeader — so tier-B garbage was immortal on
 // every cluster whose transfers weren't homed to the raft leader.
 //
-// The catch-up gate also closes the only split-view race the home-partition argument
-// needs: if a home reassignment X→Y is committed, X cannot both be caught up AND still
-// see itself as home — before X applies the reassignment RaftAppliedIndex < CommitIndex
-// (not caught up, no reap); after X applies it X sees home==Y (not own, no reap). So no
-// caught-up broker ever reaps a bucket that has been reassigned out from under it.
+// The catch-up gate also closes the split-view race the home-partition argument needs, on
+// a LIVE commit view: if a home reassignment X→Y is committed, X cannot both be caught up
+// AND still see itself as home — before X applies the reassignment RaftAppliedIndex <
+// CommitIndex (not caught up, no reap); after X applies it X sees home==Y (not own, no
+// reap). CAVEAT (external re-review, CaughtUp HONEST LIMIT #2): on an ISLANDED X whose
+// CommitIndex froze BEFORE the reassignment was learned, applied catches that frozen
+// ceiling and CaughtUp() reads true on a stale view. The reap's destructive action is the
+// write-path backstop there: a JS object delete fails once X's colocated JS meta loses
+// quorum, so a stale-view reap cannot actually delete a live bucket. The commit>0 conjunct
+// (see Node.CaughtUp) additionally suppresses the pre-first-commit boot/snapshot-restart
+// window that a bare applied>=commit made vacuously true.
 //
-// Raft-free (L-2): only the narrow Node accessors RaftAppliedIndex/CommitIndex.
+// Raft-free (L-2): only the narrow Node accessor CaughtUp.
 func (b *Broker) reaperCaughtUp() bool {
 	if b.cl == nil {
 		return true
@@ -540,7 +554,7 @@ func (b *Broker) reaperCaughtUp() bool {
 	if b.cl.node == nil {
 		return false
 	}
-	return b.cl.node.RaftAppliedIndex() >= b.cl.node.CommitIndex()
+	return b.cl.node.CaughtUp()
 }
 
 // proposeOrForward routes one authoritative write through raft. Leader ⇒ run the Plan

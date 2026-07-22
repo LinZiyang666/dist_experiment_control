@@ -284,6 +284,11 @@ type Response struct {
 	// AuditEntry (subject/seq/ts/body) — an events message is the same decoded-JS shape; body carries
 	// the event "type" + its allow-listed scalar fields.
 	Events []AuditEntry `json:"events,omitempty"`
+	// Truncated (#30 / external review N-5) is set when an OpEvents tail stopped EARLY — at the
+	// eventsMaxScan cap or a request-deadline mid-scan — so older matching messages were NOT examined
+	// and the tail is partial. Additive + omitempty: an old CLI ignores it, an old broker never sets
+	// it, so both directions degrade to today's behavior. Not a schema-version bump.
+	Truncated bool `json:"truncated,omitempty"`
 
 	Evict *EvictResult `json:"evict,omitempty"`
 
@@ -337,8 +342,9 @@ type Response struct {
 //
 // Goroutines is runtime.NumGoroutine(): the number of live goroutines the Go scheduler is tracking
 // RIGHT NOW. That is the ONLY correct signal for a goroutine leak. Threads is a SEPARATE, distinct
-// measurement (the OS thread / M count) and MUST NOT be read as a goroutine proxy: 10k leaked
-// goroutines that are all parked add ZERO OS threads, so "/proc/<pid>/status Threads" would report
+// measurement (the runtime's threadcreate profile: OS threads / M EVER created, MONOTONE — it never
+// falls as threads exit, so it is a high-water mark, not a live count) and MUST NOT be read as a
+// goroutine proxy: 10k leaked goroutines that are all parked add ZERO OS threads, so it would report
 // a flat count while the process bleeds goroutines. The two are reported side by side precisely so
 // an operator can see they diverge.
 type RuntimeReport struct {
@@ -348,7 +354,8 @@ type RuntimeReport struct {
 	// Goroutines is runtime.NumGoroutine() — the in-process count of live goroutines. A steadily
 	// climbing value across polls is the goroutine-leak signal the fleet's incidents needed.
 	Goroutines int `json:"goroutines"`
-	// Threads is the OS thread (M) count from the runtime's threadcreate profile. It is NOT a
+	// Threads is the runtime's threadcreate profile count: OS threads (M) EVER created — MONOTONE, it
+	// never decreases as threads exit, so it is a high-water mark, not a live thread count. It is NOT a
 	// goroutine proxy (see the type doc) — it is here so leaks in the two domains can be told apart.
 	Threads int `json:"threads"`
 	// OpenFDs is the number of open file descriptors (Linux /proc/self/fd). -1 = not measurable on

@@ -152,9 +152,10 @@ func (b *Broker) reconcileGrowLock(_ context.Context, now time.Time) error {
 		return nil
 	}
 	// External review M-2: reap only when this leader has APPLIED everything committed (see the sibling
-	// comment in reconcileUpgradeLock). A freshly-elected leader trailing the log could read a stale
-	// EXPIRED grow lease that a renewal already refreshed, and tear out a live grow lock — re-admitting a
-	// concurrent membership change. reaperCaughtUp gates the decision on applied>=commit.
+	// comment in reconcileUpgradeLock, incl. the recorded dispatch-vs-apply residual and why a Barrier
+	// was rejected). reaperCaughtUp() closes the large-replay case (a just-elected leader trailing a long
+	// committed tail has RaftAppliedIndex < CommitIndex); the single-committed-but-unapplied-renewal
+	// window is a recorded, backstopped residual.
 	if !b.reaperCaughtUp() {
 		return nil
 	}

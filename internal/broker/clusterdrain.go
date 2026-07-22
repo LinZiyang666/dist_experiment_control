@@ -862,6 +862,22 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 // relapse), and drain fences no membership — its over-wait is bounded by the drain deadline.
 // Empty/unparseable last_rehome_at is always INCLUDED (fail-closed). nil homeAppliedFn / node
 // (the bare unit admin) ⇒ nothing pending, preserving the unit shape.
+//
+// RESIDUAL-1 (external review round-3 §1 — RECORDED, deliberately unclosed): a purely theoretical
+// fail-open survives the fixed origin. If a NEW leader's wall clock is rolled BACK by more than the
+// create→migrate elapsed time (an NTP-level >10-15s cross-leader step, inside a window that is
+// normally seconds wide), this op's row can stamp last_rehome_at < op.CreatedAt and age out of the
+// window → a still-stranded expose is dropped from the gate and RemoveServer completes (fail-open).
+// The followups' own optional "tidy-it-up" idea — subtract a clockSkewTolerance from op.CreatedAt — is DECLINED,
+// not merely deferred: a lower origin re-admits EVERY unconfirmed row rehomed within
+// (CreatedAt−tolerance, CreatedAt), which is exactly the unrelated-stranded-row membership wedge the
+// fixed origin exists to eliminate. Back-to-back retires within one tolerance window (a realistic
+// fleet reshuffle) would then spuriously hold the second retire on the first's corpse row and route
+// it to BLOCKED — real operator friction traded for an incomplete fix (a rollback > tolerance still
+// fails open) of a theoretical bug. Per security-pragmatism (docs/architecture safety stance) and the
+// reviewer's ruling, the fixed origin — strictly better than the discarded sliding wall-clock window —
+// stays as-is and the residual is recorded here. TestPendingRetireConvergenceRecencyWindow pins the
+// fixed-origin-vs-sliding-window distinction that makes this the safe choice.
 func (a *ClusterAdmin) pendingRetireConvergence(nodeID string, rehomedSince time.Time) ([]rehomedExpose, error) {
 	if a.homeAppliedFn == nil || a.node == nil {
 		return nil, nil

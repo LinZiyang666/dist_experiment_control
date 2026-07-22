@@ -19,7 +19,7 @@ func TestRenderSingleModeHonest(t *testing.T) {
 	if !strings.Contains(out, "tether_broker_alerts_active 2") {
 		t.Errorf("alerts_active must be present in single mode:\n%s", out)
 	}
-	for _, forbidden := range []string{"is_leader", "voters", "applied_index", "peer_applied_lag"} {
+	for _, forbidden := range []string{"is_leader", "voters", "applied_index", "peer_applied_lag", "xfer_unreapable"} {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("single mode must NOT emit cluster gauge %q:\n%s", forbidden, out)
 		}
@@ -33,6 +33,7 @@ func TestRenderClusterEveryGaugePresentAndEscaped(t *testing.T) {
 	Render(&sb, Snapshot{
 		ClusterMode: true, IsLeader: true, Voters: 3, QuorumMargin: 1,
 		AppliedIndex: 100, CommitIndex: 100, ForceSingle: false, AlertsActive: 0,
+		XferUnreapableBuckets: 2,
 		Peers: []PeerSnap{
 			{NodeID: `brk"b`, AppliedLag: 5, Reachable: true},
 			{NodeID: "brk-c", AppliedLag: 0, Reachable: false},
@@ -43,6 +44,7 @@ func TestRenderClusterEveryGaugePresentAndEscaped(t *testing.T) {
 		"tether_broker_is_leader 1", "tether_broker_voters 3", "tether_broker_quorum_margin 1",
 		"tether_broker_applied_index 100", "tether_broker_commit_index 100",
 		"tether_broker_force_single 0", "tether_broker_alerts_active 0",
+		"tether_broker_xfer_unreapable_buckets 2",         // N-6: always-present cluster gauge, value flows from the snapshot
 		`tether_broker_peer_applied_lag{node="brk\"b"} 5`, // escaped quote
 		`tether_broker_peer_reachable{node="brk-c"} 0`,
 	} {

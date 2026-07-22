@@ -30,9 +30,9 @@ func newClusterBackupCmd(socketPath *string) *cobra.Command {
 		Use:   "backup --out <dir>",
 		Short: "Write a { state.db, manifest.json } backup bundle (online via the broker leader, or --offline on a stopped daemon)",
 		Example: "  # online (daemon running; runs on the LEADER for the freshest committed state):\n" +
-			"  tether cluster backup --out /var/backups/tether-$(date +%F)\n" +
+			"  tether cluster backup --out /var/lib/tether/backups/tether-$(date +%F)   # then copy the bundle OFF-node\n" +
 			"  # offline (daemon STOPPED):\n" +
-			"  tether cluster backup --offline --out /var/backups/tether --db /var/lib/tether/tether.db --secrets-dir /etc/tether/secrets",
+			"  tether cluster backup --offline --out /var/lib/tether/backups/tether --db /var/lib/tether/tether.db --secrets-dir /etc/tether/secrets",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if out == "" {
@@ -89,7 +89,7 @@ func newClusterRestoreCmd() *cobra.Command {
 		Use:   "restore <bundle> --confirm-node-id <id>",
 		Short: "Restore a backup bundle as a fresh single-voter cluster (OFFLINE, daemon STOPPED, IRREVERSIBLE)",
 		Example: "  systemctl stop tether-broker\n" +
-			"  tether cluster recovery restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a --secrets-dir /etc/tether/secrets",
+			"  tether cluster recovery restore /var/lib/tether/backups/tether-2026-06-24 --confirm-node-id brk-a --secrets-dir /etc/tether/secrets",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			bundle := args[0]
@@ -133,7 +133,7 @@ func newClusterRestoreCmd() *cobra.Command {
 			// runbook was structurally impossible to execute, because restore had no --config at all
 			// and `install.sh` ships broker.yaml with the whole `cluster:` block commented out.
 			// Same helper (and same fail-closed decode-back verification) the `cluster init` path uses.
-			seamApplied, seamErr := applyRestoreClusterSeam(cmd, configPath, dataDir, res.RaftAddr, secretsDir)
+			seamApplied, seamErr := applyRestoreClusterSeam(cmd, configPath, dataDir, res.RaftAddr, secretsDir, natsConfPath)
 
 			// R10 P4 (#64) + #53: the next steps the product already knew and only ever said AFTER the
 			// crash / never at all. M1: gate step 3 on whether the seam was ACTUALLY applied — a
@@ -158,7 +158,7 @@ func newClusterRestoreCmd() *cobra.Command {
 	cmd.Flags().StringVar(&confirmNodeID, "confirm-node-id", "", "the node_id this bundle is for (must match the manifest)")
 	cmd.Flags().StringVar(&raftAddr, "raft-addr", "", "override the bundle's raft addr (host:7400) for a FRESH-HOST restore where this box's IP changed (default: the bundle's address)")
 	cmd.Flags().StringVar(&configPath, "config", defaultBrokerConfigPath, "broker.yaml to apply the broker.cluster seam into (P2; a restored host without it FATALs at boot — pass \"\" only to write it by hand)")
-	cmd.Flags().StringVar(&natsConfPath, "nats-conf", defaultNatsConfPath, "nats.conf inspected to choose the correct NEXT step (clustered => de-cluster; fresh/standalone => render this lone voter's conf)")
+	cmd.Flags().StringVar(&natsConfPath, "nats-conf", defaultNatsConfPath, "nats.conf inspected to choose the correct NEXT step (clustered => de-cluster; fresh/standalone => render this lone voter's conf) AND recorded into the broker.cluster seam's nats_conf_path (N-4c)")
 	registerYesRejector(cmd)
 	return cmd
 }
@@ -180,7 +180,7 @@ func newClusterRestoreCmd() *cobra.Command {
 // (applied=false, err=nil), and a hard failure (err!=nil). The old single-error return
 // conflated the opt-out with success, so the NEXT-steps renderer printed "✓ seam is in
 // — start the daemon" for a restore that had explicitly NOT installed it.
-func applyRestoreClusterSeam(cmd *cobra.Command, configPath, dataDir, raftAddr, secretsDir string) (bool, error) {
+func applyRestoreClusterSeam(cmd *cobra.Command, configPath, dataDir, raftAddr, secretsDir, natsConfPath string) (bool, error) {
 	if configPath == "" {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 			"note: --config \"\" — the broker.cluster seam was NOT applied. Set broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path,nats_server_bin} in broker.yaml by hand before starting tether-broker, or it will refuse to start.\n")
@@ -192,7 +192,7 @@ func applyRestoreClusterSeam(cmd *cobra.Command, configPath, dataDir, raftAddr, 
 				"  The restored DB is cluster-seeded, so tether-broker will REFUSE to start until broker.cluster is set.\n"+
 				"  Point --config at this host's broker.yaml and re-run (restore is idempotent), or set the seam by hand", configPath, err)}
 	}
-	applied, err := applyClusterSeam(configPath, dataDir, raftAddr, secretsDir)
+	applied, err := applyClusterSeam(configPath, dataDir, raftAddr, secretsDir, natsConfPath)
 	if err != nil {
 		return false, &ExitError{Class: exitInternal, Err: fmt.Errorf(
 			"restore: the DB was restored but the broker.cluster seam could NOT be applied to %s: %w.\n"+
@@ -200,7 +200,7 @@ func applyRestoreClusterSeam(cmd *cobra.Command, configPath, dataDir, raftAddr, 
 	}
 	if applied {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "broker.cluster seam applied to %s (data_dir=%s raft_addr=%s secrets_dir=%s nats_conf_path=%s).\n",
-			configPath, dataDir, raftAddr, secretsDir, defaultNatsConfPath)
+			configPath, dataDir, raftAddr, secretsDir, natsConfPath)
 	} else {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "broker.cluster seam already present and correct in %s (raft_addr=%s).\n", configPath, raftAddr)
 	}
@@ -241,9 +241,12 @@ func printRestoreNextSteps(cmd *cobra.Command, res *clusteroffline.RestoreResult
 
 	clustered := false
 	confReadable := false
-	if own, perr := natsconf.Preflight(natsConfPath); perr == nil {
+	var perr error
+	if own, e := natsconf.Preflight(natsConfPath); e == nil {
 		confReadable = true
 		clustered = own.IsClusteredJetStream()
+	} else {
+		perr = e
 	}
 
 	_, _ = fmt.Fprintln(out, "NEXT (run in order):")
@@ -255,7 +258,25 @@ func printRestoreNextSteps(cmd *cobra.Command, res *clusteroffline.RestoreResult
 		_, _ = fmt.Fprintf(out, "  1. %s is standalone — render THIS node's lone-voter cluster conf (auth_callout + cluster ACL,\n"+
 			"     standalone JetStream) before starting the daemon:\n", natsConfPath)
 	default:
-		_, _ = fmt.Fprintf(out, "  1. %s is missing/unreadable (a fresh DR box) — render THIS node's lone-voter conf before starting the daemon:\n", natsConfPath)
+		// N-4b: the render command below reads the EXISTING conf (listen addr + JetStream store_dir) and
+		// fails at natsconf.Preflight if the file is absent, so a bare `reconcile nats --manual --conf
+		// <missing>` cannot run on the box it targets. Distinguish exists-but-unreadable from truly
+		// missing, and for the fresh box print the honest prerequisite step — WITH the install.sh-clobber
+		// warning (install.sh unconditionally overwrites broker.yaml + nats.conf, destroying the seam this
+		// restore just applied).
+		if _, serr := os.Stat(natsConfPath); serr == nil {
+			_, _ = fmt.Fprintf(out, "  1. %s exists but cannot be taken over as-is (%v).\n"+
+				"     Fix or replace it FIRST (e.g. restore it from your config backup), THEN render this node's lone-voter conf:\n",
+				natsConfPath, perr)
+		} else {
+			_, _ = fmt.Fprintf(out, "  1. %s is MISSING (a fresh DR box). The render below reads the existing conf (listen addr,\n"+
+				"     JetStream store_dir), so it CANNOT run yet. FIRST create the base conf:\n"+
+				"       a. restore it from your config backup, or write the minimal stock conf (host/port +\n"+
+				"          jetstream.store_dir + websocket — the one scripts/install.sh renders).\n"+
+				"          Do NOT re-run install.sh now: it OVERWRITES broker.yaml AND nats.conf and removes the\n"+
+				"          broker.cluster seam this restore just applied.\n"+
+				"       b. THEN render this node's lone-voter conf:\n", natsConfPath)
+		}
 	}
 	_, _ = fmt.Fprintf(out, "     tether cluster reconcile nats --manual --conf %s --secrets-dir %s --server-name %s --route-url %s --account-issuer %s --broker-nkey %s\n",
 		natsConfPath, secretsDir, res.SelfID, routeURL, acctTok, brkTok)

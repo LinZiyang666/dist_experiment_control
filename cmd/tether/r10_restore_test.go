@@ -223,7 +223,9 @@ func TestRestoreAppliesTheClusterSeamAndTheHostBootsClustered(t *testing.T) {
 		{"data_dir", c.DataDir, b.dataDir},
 		{"raft_addr", c.RaftAddr, b.raftAddr},
 		{"secrets_dir", c.SecretsDir, b.secretsDir},
-		{"nats_conf_path", c.NatsConfPath, defaultNatsConfPath},
+		// N-4c: the seam now records the ACTUAL --nats-conf the restore was given (b.natsConf), not the
+		// hardcoded default — that is the whole fix (a custom-conf deploy no longer drifts to the default).
+		{"nats_conf_path", c.NatsConfPath, b.natsConf},
 	} {
 		if f.got != f.want {
 			t.Errorf("seam field %s = %q, want %q", f.name, f.got, f.want)
@@ -338,7 +340,7 @@ jetstream { store_dir: "/var/lib/nats/js" }
 		wantWhy string // the situation-specific DIAGNOSIS
 	}{
 		{"A-clustered-conf", clusteredConf, "is CLUSTERED"},
-		{"B-fresh-box-no-conf", "", "missing/unreadable"},
+		{"B-fresh-box-no-conf", "", "is MISSING"}, // N-4b: fresh box is now diagnosed as MISSING (honest 2-step)
 		{"B-stock-standalone-conf", standaloneConf, "is standalone"},
 	}
 	for _, tc := range cases {
@@ -395,6 +397,53 @@ jetstream { store_dir: "/var/lib/nats/js" }
 				}
 			}
 		})
+	}
+}
+
+// TestRestoreNextStepsFreshBoxIsAnHonestTwoStep (external review N-4b) proves the fresh-box remediation
+// no longer prints a command that cannot run: a genuinely-missing conf is diagnosed as MISSING with an
+// explicit "create the base conf FIRST" step and the install.sh-clobber warning. The premise is real —
+// the render command it points at reads the conf via Preflight, which fails on a missing file.
+func TestRestoreNextStepsFreshBoxIsAnHonestTwoStep(t *testing.T) {
+	b := newDRBox(t)
+	// b.natsConf is never created → a fresh DR box.
+	stdout, _, err := b.runRestore(t)
+	if err != nil {
+		t.Fatalf("restore: %v\n%s", err, stdout)
+	}
+	for _, want := range []string{
+		"is MISSING",
+		"CANNOT run yet",
+		"FIRST create the base conf",
+		"Do NOT re-run install.sh now",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("fresh-box next-steps must be an honest two-step; missing %q\n%s", want, stdout)
+		}
+	}
+	// Premise: the render command reads the conf via natsconf.Preflight, which fails on a missing file —
+	// so "create the base conf FIRST" is necessary, not gratuitous (this is exactly the N-4b bug).
+	if _, e := natsconf.Preflight(b.natsConf); e == nil {
+		t.Fatal("premise broken: a missing conf must fail Preflight (else the fresh-box two-step would be unnecessary)")
+	}
+}
+
+// TestRestoreNextStepsDistinguishBrokenConfFromMissing (external review N-4b) proves a conf that EXISTS
+// but is Preflight-refused (an `include` directive) is diagnosed as exists-but-unreadable, not "MISSING".
+func TestRestoreNextStepsDistinguishBrokenConfFromMissing(t *testing.T) {
+	b := newDRBox(t)
+	if err := os.WriteFile(b.natsConf, []byte("include \"other.conf\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := b.runRestore(t)
+	if err != nil {
+		t.Fatalf("restore: %v\n%s", err, stdout)
+	}
+	if !strings.Contains(stdout, "exists but cannot be taken over as-is") {
+		t.Errorf("a Preflight-refused conf must be diagnosed as exists-but-unreadable:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "is MISSING") {
+		t.Errorf("an existing (broken) conf must not be reported as MISSING:\n%s", stdout)
 	}
 }
 

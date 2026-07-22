@@ -53,8 +53,9 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	// audit G: a not-caught-up node's empty in-memory tracker would treat live cluster-wide objects as
-	// orphan. reaperCaughtUp requires this broker's raft-domain view to be current (RaftAppliedIndex >=
-	// CommitIndex) — a caught-up FOLLOWER as much as a leader. It deliberately does NOT require leadership:
+	// orphan. reaperCaughtUp requires this broker's raft-domain view to be current (Node.CaughtUp:
+	// synced-with-a-leader-once CommitIndex>0 AND RaftAppliedIndex >= CommitIndex) — a caught-up FOLLOWER
+	// as much as a leader. It deliberately does NOT require leadership:
 	// the per-bucket homeOwnsXferBucket gate below already partitions the blast radius to buckets whose
 	// session is entirely homed HERE, so "am I this bucket's home, on a current view" is the correct
 	// authority — not "am I the leader". Requiring leader AND home is exactly the #58/P10 bug: a session
@@ -67,6 +68,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 	}
 	infos := b.js.ListStreams(ctx)
 	deleted := 0
+	unreapable := 0 // N-6: buckets no broker can ever reap that hold aged garbage (observability only)
 	for info := range infos.Info() {
 		name := info.Config.Name
 		if !strings.HasPrefix(name, "OBJ_xfer-") {
@@ -78,6 +80,19 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		// object. Inert in production (selfID==""): homeOwnsXferBucket is always true.
 		sid := strings.TrimPrefix(name, "OBJ_xfer-")
 		if !b.homeOwnsXferBucket(sid) {
+			// N-6: a bucket NO broker can ever reap (split-home / zero-node session) that actually holds
+			// AGED orphan garbage is the racknerd small-disk-fill class — count it for the gauge + warn so
+			// an operator sees it before the disk fills. Observability ONLY: the reaper deletes nothing
+			// extra here (that would be #58's per-transfer-owner product fix), and this never softens the
+			// #58 ledger status. Counting every non-home skip would be ~always nonzero on a healthy
+			// cluster (each bucket is non-home on N-1 brokers), so the orphaned-EVERYWHERE + aged-objects
+			// predicate is what makes the number mean something. Cluster mode only (selfID!="").
+			if b.selfID != "" && b.xferBucketOrphanedEverywhere(sid) && b.xferBucketHasAgedObjects(ctx, name) {
+				unreapable++
+				b.cfg.Logger.Warn("broker: xfer bucket unreapable by ANY broker (split-home or zero-node session) "+
+					"holds aged orphan objects that will accumulate — the #58 per-transfer-owner refinement retires this",
+					"bucket", name, "sid", sid)
+			}
 			continue
 		}
 		// M-3: re-read the in-flight set PER BUCKET rather than snapshotting it once at sweep start.
@@ -126,5 +141,34 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		b.cfg.Logger.Info("broker: orphan xfer objects reaped",
 			"bucket", bucket, "deleted_so_far", deleted)
 	}
+	// N-6: publish the latest unreapable-bucket count for the /metrics gauge + status. Store (not Add):
+	// it is a gauge that must fall back to 0 once topology heals the split-home / zero-node condition.
+	b.xferUnreapableBuckets.Store(int64(unreapable))
 	return deleted, infos.Err()
+}
+
+// xferBucketHasAgedObjects reports whether the OBJ_xfer bucket `name` holds at least one non-deleted
+// object past the reap grace — i.e. real accumulating garbage, not an empty or all-fresh bucket. Used
+// ONLY to keep the N-6 unreapable-bucket gauge meaningful (an empty split-home bucket is no disk risk).
+// A missing bucket / empty list / transient error is "no aged objects" (fail-quiet: the gauge must not
+// over-count on a read blip).
+func (b *Broker) xferBucketHasAgedObjects(ctx context.Context, name string) bool {
+	bucket := strings.TrimPrefix(name, "OBJ_")
+	store, err := b.js.ObjectStore(ctx, bucket)
+	if err != nil {
+		return false
+	}
+	objs, err := store.List(ctx)
+	if err != nil {
+		return false // ErrNoObjectsFound (empty) or a transient error — not counted
+	}
+	for _, obj := range objs {
+		if obj.Deleted {
+			continue
+		}
+		if b.xferReapMinAge <= 0 || obj.ModTime.IsZero() || b.now().Sub(obj.ModTime) >= b.xferReapMinAge {
+			return true
+		}
+	}
+	return false
 }

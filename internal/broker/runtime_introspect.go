@@ -17,10 +17,12 @@ package broker
 //
 // WHY NumGoroutine AND NOT /proc Threads
 // --------------------------------------
-// Goroutines is runtime.NumGoroutine() — the Go scheduler's live count. The OS thread count
-// (Threads) is a genuinely different quantity: 10k parked leaked goroutines add ZERO OS threads, so
-// using Threads as a goroutine proxy would report a flat count while the process bleeds goroutines.
-// Both are reported, from their own sources, so they can be seen to diverge.
+// Goroutines is runtime.NumGoroutine() — the Go scheduler's live count. Threads is a genuinely
+// different quantity and is NOT a goroutine proxy: 10k parked leaked goroutines add ZERO OS threads,
+// so using it as one would report a flat count while the process bleeds goroutines. Note Threads here
+// is the runtime's threadcreate profile — a CUMULATIVE count of OS threads (M) EVER created, MONOTONE:
+// it never falls as threads exit, so it is a high-water mark, not a live thread count. A climbing value
+// signals thread churn. Both are reported, from their own sources, so they can be seen to diverge.
 
 import (
 	"bufio"
@@ -42,7 +44,7 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 		Schema:        "admin_runtime",
 		SchemaVersion: 1,
 		Goroutines:    runtime.NumGoroutine(),               // in-process TRUTH, never the Threads proxy
-		Threads:       pprof.Lookup("threadcreate").Count(), // OS thread (M) count — a DIFFERENT quantity
+		Threads:       pprof.Lookup("threadcreate").Count(), // OS threads (M) EVER created — monotone, never falls
 		OpenFDs:       openFDCount(),                        // -1 if not measurable (non-Linux)
 		RSSBytes:      residentSetBytes(),                   // -1 if not measurable (non-Linux)
 	}

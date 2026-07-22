@@ -21,14 +21,18 @@ func TestDispatchEventsWiresBackend(t *testing.T) {
 	var gotN int
 	var gotSince time.Duration
 	var gotKind string
-	sOK := New("/unused", Backend{EventsTail: func(_ context.Context, n int, since time.Duration, kind string) ([]AuditEntry, error) {
+	sOK := New("/unused", Backend{EventsTail: func(_ context.Context, n int, since time.Duration, kind string) ([]AuditEntry, bool, error) {
 		gotN, gotSince, gotKind = n, since, kind
-		return []AuditEntry{{Subject: "tether.v2.sys.events", Seq: 9, Body: map[string]any{"type": kind}}}, nil
+		return []AuditEntry{{Subject: "tether.v2.sys.events", Seq: 9, Body: map[string]any{"type": kind}}}, true, nil
 	}})
 
 	resp := sOK.dispatch(Request{Op: OpEvents, Since: "90m", EventKind: "disk_pressure"})
 	if !resp.OK || resp.Error != "" || len(resp.Events) != 1 {
 		t.Fatalf("wired hook: got %+v", resp)
+	}
+	// N-5: the truncated flag from the hook must propagate onto the Response envelope.
+	if !resp.Truncated {
+		t.Errorf("EventsTail truncated=true must propagate to Response.Truncated, got %+v", resp)
 	}
 	if gotN != 50 {
 		t.Errorf("N should default to 50, got %d", gotN)
@@ -46,9 +50,9 @@ func TestDispatchEventsWiresBackend(t *testing.T) {
 
 func TestDispatchEventsRejectsBadSince(t *testing.T) {
 	called := false
-	s := New("/unused", Backend{EventsTail: func(context.Context, int, time.Duration, string) ([]AuditEntry, error) {
+	s := New("/unused", Backend{EventsTail: func(context.Context, int, time.Duration, string) ([]AuditEntry, bool, error) {
 		called = true
-		return nil, nil
+		return nil, false, nil
 	}})
 	resp := s.dispatch(Request{Op: OpEvents, Since: "junk"})
 	if resp.OK || resp.Code != CodeBadRequest {

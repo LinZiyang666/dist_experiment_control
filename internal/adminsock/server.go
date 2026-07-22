@@ -34,7 +34,7 @@ type Backend struct {
 	// newer than `since` (0 = no time bound) and of type `kind` ("" = all kinds), in time order
 	// (oldest → newest). Implemented by the broker against JetStream; nil = events endpoint disabled
 	// (returns "events_unavailable"). The stream is secret-free by construction of its producers.
-	EventsTail func(ctx context.Context, n int, since time.Duration, kind string) ([]AuditEntry, error)
+	EventsTail func(ctx context.Context, n int, since time.Duration, kind string) ([]AuditEntry, bool, error)
 
 	// PubAgentEvicted broadcasts sys.events{type:agent_evicted, sid,
 	// nid} so a live agent subscribing to sys.events can self-exit
@@ -390,11 +390,11 @@ func (s *Server) handleEvents(req Request) Response {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	entries, err := s.backend.EventsTail(ctx, req.N, since, req.EventKind)
+	entries, truncated, err := s.backend.EventsTail(ctx, req.N, since, req.EventKind)
 	if err != nil {
 		return Response{Op: OpEvents, Error: err.Error()}
 	}
-	return Response{Op: OpEvents, Events: entries, OK: true}
+	return Response{Op: OpEvents, Events: entries, Truncated: truncated, OK: true}
 }
 
 // rowExists reports whether the 1-column existence query returns a row (used by the

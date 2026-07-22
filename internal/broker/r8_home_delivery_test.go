@@ -209,6 +209,72 @@ func rehomeRow(t *testing.T, b *Broker, port int, newHome string, newEpoch int64
 	}
 }
 
+// TestHomeDeliveryPrunesAttemptsForDepartedTargets (external review N-9) proves the pass prunes the
+// attempts backoff map for (sid,nid) pairs that no longer own any homed expose, WITHOUT touching a
+// still-live target's earned backoff. The leak this closes: a non-converged node whose expose is
+// released is never enumerated again, so homeDeliveryReset (the only other delete) never fires and its
+// attempts entry lives forever — a slow map leak the NumGoroutine/fd gate cannot see.
+func TestHomeDeliveryPrunesAttemptsForDepartedTargets(t *testing.T) {
+	url := startNATS(t)
+	b, _ := homeDeliveryBroker(t, url, "brk-a")
+	seedClusterNode(t, b, "brk-a", "brk-a", "brk-a:7000", "fpA", "VOTER")
+	seedClusterNode(t, b, "brk-b", "brk-b", "brk-b:7000", "fpB", "VOTER")
+	seedHomedExpose(t, b, "lab", "lab-1", "svc", 14000, "th", "brk-b", 2)
+
+	// One pass at t0: the live, un-converged target earns a real attempts entry (pushed, no ack).
+	t0 := time.Now()
+	if err := b.reconcileHomeDelivery(context.Background(), t0); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	hd := b.homeDelivery()
+	hd.mu.Lock()
+	live, hasLive := hd.attempts["lab|lab-1"]
+	var liveBackoff time.Duration
+	if hasLive {
+		liveBackoff = live.backoff
+	}
+	// Inject a ghost: a (sid,nid) that earned a backoff and then had its expose released — the leak shape.
+	hd.attempts["gone|gone"] = &homeDeliveryAttempt{want: "stale", nextAt: t0.Add(time.Hour), backoff: time.Minute}
+	hd.mu.Unlock()
+	if !hasLive {
+		t.Fatal("the live un-converged target must have earned an attempts entry after one pass")
+	}
+
+	// Second pass at the SAME t0: the live target is NOT due (nextAt is in the future), so it must be
+	// preserved with its backoff intact; the ghost — no longer a live key — must be pruned.
+	if err := b.reconcileHomeDelivery(context.Background(), t0); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	hd.mu.Lock()
+	_, ghostStill := hd.attempts["gone|gone"]
+	stillLive, liveStill := hd.attempts["lab|lab-1"]
+	hd.mu.Unlock()
+	if ghostStill {
+		t.Fatal("a departed (sid,nid) attempts entry must be pruned by the pass (N-9)")
+	}
+	if !liveStill {
+		t.Fatal("a still-live target's attempts entry must NOT be pruned")
+	}
+	if stillLive.backoff != liveBackoff {
+		t.Fatalf("prune must not disturb a live target's earned backoff: was %v now %v", liveBackoff, stillLive.backoff)
+	}
+
+	// Now RELEASE the live target's expose (a real drain / expose-rm) so it leaves the target set, then
+	// run a pass: its entry — un-converged and no longer enumerated — must be pruned too.
+	if _, err := b.cfg.DB.Exec(`DELETE FROM port_allocations WHERE port=?`, 14000); err != nil {
+		t.Fatalf("release expose: %v", err)
+	}
+	if err := b.reconcileHomeDelivery(context.Background(), t0.Add(time.Hour)); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	hd.mu.Lock()
+	_, orphanStill := hd.attempts["lab|lab-1"]
+	hd.mu.Unlock()
+	if orphanStill {
+		t.Fatal("an un-converged target whose expose was released must have its attempts entry pruned (N-9 leak)")
+	}
+}
+
 // TestHomeDeliveryFollowsADrainWithASilentAgent is THE exit assertion of R8a.
 //
 // The agent connects once and then does NOTHING: no register, no heartbeat, no

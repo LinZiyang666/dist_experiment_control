@@ -175,10 +175,20 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// maxReapInterval is the upper bound (external review N-5) shared by the periodic-reaper / monitor
+// interval knobs. Their floor duty is "garbage / disk pressure must not be immortal"; a value like
+// 10000h passes the sub-second floor check yet SILENTLY DISABLES the reaper (the racknerd small-disk
+// fill was exactly an immortal-garbage incident). One run per day bounds worst-case garbage lifetime
+// to ~1 day; any legitimate slow-reap motive (JS-API churn on a big cluster) is satisfied far below
+// this. The clamp catches "silently disabled", not taste — it is deliberately generous.
+const maxReapInterval = 24 * time.Hour
+
 // XferReapIntervalDuration parses broker.cluster.xfer_reap_interval (#58/P10). Returns (0, nil) when
 // unset (caller falls back to broker.New's 5m default). Values under 1 second are rejected — a
 // sub-second reap is pure ListStreams/object-list churn against the JS API for no operator benefit,
-// and a non-positive value would make the registry's anchored deadline math meaningless.
+// and a non-positive value would make the registry's anchored deadline math meaningless. Values over
+// maxReapInterval (24h) are ALSO rejected (N-5): an effectively-disabled reaper lets orphan tier-B
+// objects fill the disk; there is no "off" setting.
 func (c *Config) XferReapIntervalDuration() (time.Duration, error) {
 	if c.Broker.Cluster.XferReapInterval == "" {
 		return 0, nil
@@ -190,6 +200,11 @@ func (c *Config) XferReapIntervalDuration() (time.Duration, error) {
 	if d < time.Second {
 		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_reap_interval %q "+
 			"< 1s (refusing a sub-second orphan-object reap)", d)
+	}
+	if d > maxReapInterval {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_reap_interval %q "+
+			"> 24h (an effectively-disabled reaper lets orphan tier-B objects fill the disk — the reap must "+
+			"run at least daily; there is no 'off' setting, unset means the built-in 5m default)", d)
 	}
 	return d, nil
 }
@@ -233,6 +248,10 @@ func (c *Config) ProcGCIntervalDuration() (time.Duration, error) {
 		return 0, fmt.Errorf("serveconf: broker.storage.proc_gc_interval %q "+
 			"< 1m (refusing sub-minute GC)", d)
 	}
+	if d > maxReapInterval {
+		return 0, fmt.Errorf("serveconf: broker.storage.proc_gc_interval %q "+
+			"> 24h (an effectively-disabled GC lets EXITED proc rows grow unbounded — it must run at least daily)", d)
+	}
 	return d, nil
 }
 
@@ -252,6 +271,11 @@ func (c *Config) DiskCheckIntervalDuration() (time.Duration, error) {
 	if d < time.Second {
 		return 0, fmt.Errorf("serveconf: broker.observability.disk_check_interval %q "+
 			"< 1s (refusing a sub-second disk poll)", d)
+	}
+	if d > maxReapInterval {
+		return 0, fmt.Errorf("serveconf: broker.observability.disk_check_interval %q "+
+			"> 24h (an effectively-disabled disk monitor cannot raise disk_pressure before the disk fills — "+
+			"it must run at least daily)", d)
 	}
 	return d, nil
 }

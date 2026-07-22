@@ -75,6 +75,11 @@ func newClusterRetireCmd(socketPath *string) *cobra.Command {
 							"  durable not-safe surface is MISSING — `cluster status` / `alert ls` will NOT reflect this node.\n"+
 							"  Manually raise it (or re-run after a leader is elected); do NOT treat %s as rotated until you do.\n", raiseErr, node)
 				}
+				// N-4c-adjacent (record-only, external review L-3): the printed credential-rotation guide
+				// still hardcodes the DEFAULT nats.conf path — on a custom-conf deployment the operator
+				// would re-render the wrong file if they copy it verbatim. Like runSelfInit / online-doctor,
+				// this is a stock-install-only flow; threading a custom --nats-conf through retire is out of
+				// this batch's scope (a leaf follow-up), recorded here rather than silently left.
 				printCredentialRotationGuide(cmd.OutOrStdout(), node, secretsDir, defaultNatsConfPath, raiseErr == nil /* alert actually raised */)
 				printNotSafeBanner(cmd.ErrOrStderr(), node)
 				if wait {

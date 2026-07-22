@@ -109,3 +109,49 @@ func (b *Broker) homeOwnsXferBucket(sid string) bool {
 	}
 	return true
 }
+
+// xferBucketOrphanedEverywhere reports whether NO broker can EVER reap the OBJ_xfer-<sid> bucket:
+// the session has zero bound nodes, or its bound nodes resolve to no single common home (an unresolved
+// node, or two distinct homes = a split-home session). Since homeOwnsXferBucket requires self to be the
+// home of EVERY bound node, in each of those cases it returns false on EVERY broker and the bucket is
+// immortal (the #58 split-home residual / racknerd small-disk-fill class). A bucket whose bound nodes
+// all share ONE home elsewhere is NOT orphaned-everywhere — that broker will reap it. Read-only, used
+// only for the N-6 unreapable-bucket gauge; callers gate on cluster mode (selfID!=""). Same collect-
+// then-close discipline as homeOwnsXferBucket (SetMaxOpenConns(1)). A read error returns false —
+// observability must not fabricate a defect it cannot confirm.
+func (b *Broker) xferBucketOrphanedEverywhere(sid string) bool {
+	rows, err := b.cfg.DB.Query(`SELECT nid FROM nodes WHERE sid=?`, sid)
+	if err != nil {
+		return false
+	}
+	var nids []string
+	for rows.Next() {
+		var nid string
+		if err := rows.Scan(&nid); err != nil {
+			_ = rows.Close()
+			return false
+		}
+		nids = append(nids, nid)
+	}
+	cerr := rows.Err()
+	_ = rows.Close()
+	if cerr != nil {
+		return false
+	}
+	if len(nids) == 0 {
+		return true // zero-node session bucket: no broker is its home, ever
+	}
+	commonHome := ""
+	for _, nid := range nids {
+		home := b.resolveHomeForAgent(sid, nid)
+		if home == nil {
+			return true // an unresolved node: homeOwnsXferBucket fails on every broker
+		}
+		if commonHome == "" {
+			commonHome = home.NodeID
+		} else if home.NodeID != commonHome {
+			return true // split home: no single broker owns all bound nodes
+		}
+	}
+	return false // all bound nodes share one home — that broker will reap this bucket
+}

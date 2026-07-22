@@ -49,6 +49,7 @@ func (b *Broker) metricsSnapshot() brokermetrics.Snapshot {
 	}
 	s.CommitIndex = n.CommitIndex()
 	s.ForceSingle = forceSingleActive(b.cfg.DB)
+	s.XferUnreapableBuckets = int(b.xferUnreapableBuckets.Load()) // N-6: latest reap-pass gauge (any broker)
 	// m2 (Stage-C): the cached per-peer observe is leader-era data — a DEMOTED leader would serve
 	// frozen peer gauges next to is_leader 0. Emit peer series ONLY while leader (a follower honestly
 	// shows no peer observation, matching the package's omit-don't-fabricate stance).

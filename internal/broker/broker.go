@@ -481,6 +481,17 @@ type Broker struct {
 	// responder reads it into ClusterHealthResp.JetStreamUnavailable (cross-goroutine → atomic).
 	jsUnavail atomic.Bool
 
+	// xferUnreapableBuckets (external review N-6) is the LAST xfer-reap pass's count of OBJ_xfer
+	// buckets that hold aged orphan objects yet are home-owned by NO broker (a split-home or zero-node
+	// session), so nothing will EVER reap them — the racknerd small-disk-fill class. A GAUGE, not a
+	// counter: topology healing (rehome/evict) legitimately drops it back to 0. Cross-goroutine (the
+	// reap pass writes, the /metrics + status responders read) → atomic. It is only refreshed when the
+	// reap pass actually SCANS: on a gated pass (js==nil, or not reaperCaughtUp) the value is left STALE
+	// rather than fabricated — `admin runtime` last_tick is the wedge detector, matching the package's
+	// omit-don't-fabricate stance. Pure observability: the reaper's delete behavior is unchanged, and this
+	// must NEVER be cited to soften #58 / drill 96 (only the per-transfer-owner refinement retires the gap).
+	xferUnreapableBuckets atomic.Int64
+
 	// reExecRequested (G5 #13) is set by RequestReExec so serve.go, AFTER Run's ordered shutdown returns,
 	// re-execs the (freshly-staged) on-disk binary in place (PID-preserving; immune to the #23 clean-exit
 	// trap). reloadTrigger is the run-context cancel serve.go injects so RequestReExec unwinds Run through

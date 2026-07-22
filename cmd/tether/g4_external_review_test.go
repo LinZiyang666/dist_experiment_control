@@ -16,7 +16,7 @@ func TestExternalReviewApplyClusterSeamDoesNotAttachWhenBrokerIsNotLast(t *testi
 		t.Fatal(err)
 	}
 
-	applied, err := applyClusterSeam(cfg, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets")
+	applied, err := applyClusterSeam(cfg, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets", defaultNatsConfPath)
 	if err != nil || !applied {
 		t.Fatalf("expected seam append attempt: applied=%v err=%v", applied, err)
 	}

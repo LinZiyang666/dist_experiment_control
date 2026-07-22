@@ -183,19 +183,91 @@ _start_write_probe() {
     # this survived unnoticed for as long as the drill had no agent-side oracle to expose it.
     dexec ctl1 -- install -o sim -g sim -m 0755 -d "/home/sim/probe-$1" >/dev/null 2>&1 || return 1
     dexec ctl1 -- sh -c "nohup sh -c \"i=0; while [ \\\$i -lt 1200 ]; do runuser -u sim -- env HOME=/home/sim/probe-$1 tether session create $1wp\\\$i --pin 111111 --nats-url nats://brk1:4222 >>/tmp/wp-$1.log 2>&1 && echo WROTE-$1wp\\\$i >>/tmp/wp-$1.log || echo WRITEFAIL >>/tmp/wp-$1.log; i=\\\$((i+1)); sleep 0.3; done\" >/dev/null 2>&1 & echo ok" >/dev/null 2>&1
+    # D2: start the observation-only scene watcher for this phase's window (snapshots the cluster at the
+    # FIRST failure-signature hit so the HALT-window question can be adjudicated from a preserved scene).
+    _start_scene_watcher "$1"
 }
 # _ctl_session_intact : the ctl's ACTIVE session is still the drill's own. A guard, not a decoration: every
 # agent-side oracle below is session-scoped, and the failure mode above was silent (empty node list ⇒ "?"),
 # so it is asserted explicitly rather than trusted.
 _ctl_session_intact() { [ "$(dexec -u sim ctl1 -- sh -c 'cat /home/sim/.tether/current_session 2>/dev/null')" = "$SID" ]; }
-_stop_write_probe() { dexec ctl1 -- pkill -f "session create $1wp" >/dev/null 2>&1 || true; }
+# The write-probe failure signatures — shared by _probe_clean and the scene watcher so they can never drift.
+_scene_sigs='not_leader|503|no.responder|unavailable|no servers|WRITEFAIL'
+# _start_scene_watcher (D2 / release-readiness-followups §6.1) — a HOST-side, OBSERVATION-ONLY background
+# loop that snapshots the cluster the INSTANT the write-probe first logs a failure signature, so the
+# undecided drill-30 HALT-window question (real write-availability defect vs parallel-sweep infra artifact
+# vs over-strict predicate) can be adjudicated from a preserved scene rather than the END state SIM_KEEP=1
+# leaves. It adds ZERO assert sites, never writes into /tmp/wp-*.log (cannot forge WROTE/WRITEFAIL), and a
+# mid-roll `cluster status` that itself fails is EVIDENCE, not an error (captured best-effort with || true).
+_start_scene_watcher() {
+    _tag=$1
+    rm -f "/tmp/wp-$_tag.scene" "/tmp/wp-$_tag.scene-done" 2>/dev/null || true
+    # CRITICAL: DETACH the subshell's stdin/stdout/stderr. _start_write_probe runs under assert_ok, whose
+    # _as_capture wraps it in a $(...) command substitution — that substitution blocks until EOF on the
+    # pipe, and a backgrounded subshell that INHERITS the pipe's write end (and loops until a roll that
+    # only starts AFTER this returns) would wedge the drill at "start probe" on EVERY run. `</dev/null
+    # >/dev/null 2>&1` frees the pipe so the capture returns promptly; the scene is written to its own file.
+    # The loop is BOUNDED (~20min = 2400×0.5s > the roll's worst case) so an aborted drill cannot leak an
+    # immortal host-side dexec loop even if _stop_scene_watcher never runs.
+    _ldr="${LDR:-brk1}"
+    (
+        _n=0
+        while [ ! -f "/tmp/wp-$_tag.scene-done" ] && [ "$_n" -lt 2400 ]; do
+            _n=$((_n + 1))
+            _hit=$(dexec ctl1 -- grep -m1 -inE "$_scene_sigs" "/tmp/wp-$_tag.log" 2>/dev/null || true)
+            if [ -n "$_hit" ]; then
+                {
+                    echo "=== SCENE @ $(date -u +%Y-%m-%dT%H:%M:%SZ) tag=$_tag ==="
+                    echo "first failure-signature line: $_hit"
+                    for _b in brk1 brk2 brk3; do
+                        echo "--- $_b cluster status (leader at start = $_ldr) ---"
+                        dexec -u tether "$_b" -- tether cluster status 2>&1 | head -24 || true
+                        echo "--- $_b systemctl show (MainPID / ExecMainStartTimestamp) ---"
+                        dexec "$_b" -- systemctl show tether-broker -p MainPID,ExecMainStartTimestamp 2>&1 || true
+                        echo "--- $_b journalctl -u tether-broker (last 80) ---"
+                        dexec "$_b" -- journalctl -u tether-broker -n 80 --no-pager 2>&1 || true
+                    done
+                } > "/tmp/wp-$_tag.scene" 2>&1
+                : > "/tmp/wp-$_tag.scene-done"
+                break
+            fi
+            sleep 0.5
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    echo $! > "/tmp/wp-$_tag.watcher.pid"
+}
+_stop_scene_watcher() {
+    if [ -f "/tmp/wp-$1.watcher.pid" ]; then
+        kill "$(cat "/tmp/wp-$1.watcher.pid")" 2>/dev/null || true
+        rm -f "/tmp/wp-$1.watcher.pid" 2>/dev/null || true
+    fi
+}
+# _replay_scene surfaces the captured failure-instant scene into the drill output (like _dump_roll_log for
+# the roll): SIM_KEEP=1 only preserves the END state, so without this the failure instant is lost.
+_replay_scene() {
+    if [ -s "/tmp/wp-$1.scene" ]; then
+        warn "30: write-probe[$1] saw a failure signature — replaying the captured FIRST-HIT scene:"
+        while IFS= read -r _sl; do log "30: scene[$1]| $_sl"; done < "/tmp/wp-$1.scene"
+        warn "30: ---- end scene[$1] ----"
+    fi
+}
+_stop_write_probe() {
+    dexec ctl1 -- pkill -f "session create $1wp" >/dev/null 2>&1 || true
+    _stop_scene_watcher "$1"
+}
 _probe_clean() {
     _stop_write_probe "$1"
     # non-vacuity guard (Stage-C mandate-2/pin-1): the probe must have ACTUALLY committed writes — else a
     # silent/never-run probe grep-MISSES the failure markers and false-greens (grep -q on an empty/missing file
     # exits 1/2, the leading ! flips both to PASS). Require ≥1 WROTE-* committed line first.
     dexec ctl1 -- grep -qE "^WROTE-$1wp[0-9]" "/tmp/wp-$1.log" 2>/dev/null || { warn "30: probe[$1] VACUOUS — /tmp/wp-$1.log has no committed session-create; a zero-not_leader here is meaningless"; return 1; }
-    ! dexec ctl1 -- grep -qiE 'not_leader|503|no.responder|unavailable|no servers|WRITEFAIL' "/tmp/wp-$1.log" 2>/dev/null
+    # NOTE: the scene replay is NOT done here — _probe_clean runs UNDER assert_ok's _as_capture ($(...)),
+    # which swallows all but the last few lines. The drill body calls _replay_scene AFTER the CONTINUITY
+    # assert (uncaptured, like _dump_roll_log), so the full multi-line scene reaches the transcript.
+    if dexec ctl1 -- grep -qiE "$_scene_sigs" "/tmp/wp-$1.log" 2>/dev/null; then
+        return 1
+    fi
+    return 0
 }
 # _do_roll RETURNS the roll's exit code (it used to be discarded, so a roll that failed for a reason other
 # than #31 was indistinguishable from a clean one). /tmp/roll.log is the ONLY record of why a roll failed —
@@ -353,6 +425,7 @@ if [ "$HALTED_ON_AGENT" = 1 ]; then
     assert_ok "PHASE-1 SKEW $FIRSTHOP now reports skew=true — broker at $NEXTVER, its co-located agent still at $VCUR. This is #19's whole-host verdict doing its job: the host is NOT done, and the operator is told so by name"  _field_is "$FIRSTHOP" skew true
     assert_ok "PHASE-1 SKEW $FIRSTHOP is NOT whole-host-at-target (the half-upgraded host must not read as done on either version)"  _not_whole_host_at "$FIRSTHOP" "$NEXTVER"
     assert_ok "PHASE-1 CONTINUITY the raft write-probe saw NO not_leader / 503 / no-responders ACROSS the failed roll — a HALT must leave a SAFE partial state, i.e. writable, not a wedged cluster"  _probe_clean p1
+    _replay_scene p1   # uncaptured: surface the full first-hit scene into the transcript if one was captured
 
     # ── THE WAY OUT: `tether cluster unlock` (R7b; drill coverage owner = R9) ──
     assert_ok "UNLOCK-precond the HALTed roll LEFT the roll lock HELD (cluster_upgrade_drive.go deliberately does not release on HALT, so membership stays fenced while the cluster sits half-rolled)"  _upgrade_lock_held
@@ -385,6 +458,7 @@ if [ "$HALTED_ON_AGENT" = 1 ]; then
     assert_ok "PHASE-2 [re-exec] tether-broker MainPID UNCHANGED across BOTH rolls (syscall.Exec in place, not a kill/restart) — brk1=$MP1 brk2=$MP2 brk3=$MP3" \
               sh -c "[ \"\$(\"$SIM\" exec brk1 -- systemctl show tether-broker -p MainPID --value)\" = '$MP1' ] && [ \"\$(\"$SIM\" exec brk2 -- systemctl show tether-broker -p MainPID --value)\" = '$MP2' ] && [ \"\$(\"$SIM\" exec brk3 -- systemctl show tether-broker -p MainPID --value)\" = '$MP3' ]"
     assert_ok "PHASE-2 CONTINUITY the write-probe saw NO not_leader / 503 / no-responders across the completing roll (M1, independent phase-2 window — it cannot pass on phase-1's samples)"  _probe_clean p2
+    _replay_scene p2   # uncaptured: surface the full first-hit scene into the transcript if one was captured
 else
     _stop_write_probe p1
     not_covered "30 the G5 roll MECHANISM (per-hop advance, whole-host dual-version, skew, cluster unlock recovery, PID-preserving re-exec, write continuity) THIS RUN" "PHASE-1 did not produce the P3 (b)-state HALT it constructs (see the RED / PRODUCT-RED above and the verbatim roll.log). Every assertion in the block below depends on the roll having stopped exactly where the fixture aimed it; running them anyway would attribute an unrelated failure's partial state to the G5 mechanism." gap

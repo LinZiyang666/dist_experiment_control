@@ -433,6 +433,16 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   `assert_ok`+`product_red` 而非 `assert_bug`——后者会把 exit 0 判成 APPEARS-FIXED → ASSERT-FAIL = verdict 误分类）。
   四态穷举（R-EXHAUST），R2 是其「doctor 能红」的对照源。**FLIP**：产品修好后 R3 翻 `assert_refuses`。
 
+### #66 — 滚动升级 phase-2（leader 自身 reload）有一个有界的 leader-hop 写不可用窗口
+
+- **状态**：**LIVE-CONFIRMED（2026-07-21，drill 30 臂 PHASE-2 CONTINUITY，scene 实证）**。deploy-tier 定案实验（`release-readiness-followups.md §6.1` 的「30 HALT 窗定案」）：serial ×2 + -j3 ×1 = **1 次 fire / 2 次 clean（间歇）**。
+- **现象**：`30-rolling-upgrade.sh` 的 phase-2 写探针（`ctl1` 每 0.3s 一发 `session create` = 一次 raft 写）在**完成滚动**（含 leader 主机自身 reload）期间**偶尔**记到 `WRITEFAIL`。scene（本会话 serial #1 首次命中即抓）显示失败瞬间：leader **已从 brk1 转到 brk2**（发生 leader 换届）、三 broker 全 VOTER / LAG=0 / STREAMS 3/3 / TOPO 收敛✓ / 全可达——**集群健康、已重收敛，不是 wedged、不是 IO 停滞、不是 no_responders**。
+- **机理（scene 定案，非预判）**：roll 是 leader-last，leader 主机用 PID-preserving `syscall.Exec` 原地 re-exec；但 raft 节点随之重启、in-memory raft 态丢失并从盘重读 ⇒ leader lease 过期 ⇒ 重选举（brk1→brk2）。这 ~亚秒窗口内一发 `session create` 无 leader 可达即返非零（`WRITEFAIL`）。**CLI 命令级不自动重试**（architecture C.3：`run/exec/session.* 超时即失败、由发起方决定重试`），所以恰落在该窗口的写就暴露为失败。**间歇**：探针 0.3s 节拍是否恰好命中亚秒重选窗决定命中与否；serial 也会 fire（**非并行专属**——`-j3` 并未明显放大，本次 -j3 反而 clean）。
+- **#66 只是 roll-窗口写 blip 的一种确证形态，不排他**（外审 M-1 收窄，2026-07-21）：主进程登记时的证据是 **1 个 phase-2 换届 scene**（样本量 serial×2+-j3×1），据此写下的「phase-1 CONTINUITY 恒 clean」是超出证据的过强概括。外审独立 serial 复跑的**样本 #4 已证伪它**：一次 **PHASE-1 CONTINUITY 命中**，scene 显示命中瞬间 **leader 未换届（brk1 保持 leader、HEALTHY-HA、view authoritative）、roll 期无 systemd 重启（MainPID-UNCHANGED 亦 PASS）**——**不符合 #66 的 leader-hop 机理**（无重选举换届），失败签名行未存档故形态**未定性**（更接近 branch-3 暂态/no-responder 类或一个未定型形态，不硬归）。所以：#66 = phase-2 leader-hop 命中的确证缺陷（其换届 scene 是真证据）；phase-1 命中是**另一种未定性形态**，不属 #66，watcher 常驻正为继续自捕这类样本以待定因（样本 #4 即其自捕能力的实证）。
+- **不是什么**：#66 本身不是 branch-3 的 host IO-contention infra-flake（其 scene 集群健康、有明确 leader 换届）。
+- **候选修**（产品，留后续 phase）：在 CLI 的 raft-write 路径（`session create` 等）加**有界 not_leader/no-responder 重试**以骑过 leader-hop 窗；或显式把「滚动升级 leader-hop 有界写窗口」文档化为可接受语义。二者皆非本 phase 范围。
+- **钉住它的**：`drills/30-rolling-upgrade.sh` 的 **PHASE-2 CONTINUITY** 断言（谓词**保持严格**，不放宽 grep——mandate：真相由本 gotcha + tsv owner 承载，不由弱化谓词掩盖）+ **scene-capture watcher**（观测-only，命中瞬间抓 leader/status/journal，已 committed 为常驻取证器）。间歇命中时 drill 落 ASSERT-FAIL（否则 INCOMPLETE，仅 b/c 两结构 gap）；该 ASSERT-FAIL 现**可归因 #66**，非无主 flake。
+
 ### #65 — ~~[CANDIDATE] 分区少数派的 stale-leader 写有时变持久~~ → **REFUTED（2026-07-19，R6 定案批）**
 
 > **本条已证伪，不是产品缺陷，不占发布闸。** 详见 `docs/reviews/r6-findings.md`。
@@ -638,7 +648,7 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   drill 可另加断言：错误文案指向文件恢复而非该命令。
 
 ### DOC-27 — runbook §5:524 的 `cluster backup --out /var/backups/…` 示例在 stock 装机上跑不了
-- **状态**：**LIVE-CONFIRMED（2026-07-17，drill 50 臂 C）**。
+- **状态**：**CLOSED（2026-07-21）**——runbook §5（9 处）+ `cmd/tether/cluster_backup.go` 的 `--help` 示例改用 `/var/lib/tether/backups/…`（install.sh 已建 `LIB_DIR` 且 tether 可写）+ 加 off-node caveat；drill 50 臂 C 翻为正向回归，**deploy-tier 实测 drill-50 GREEN（pass=87，0 gaps）on weilandserver**、`DOC-27 CLOSED …runs as User=tether` 断言 PASS。tsv row 50 已同步 GREEN。下文为历史立项记录（原 LIVE-CONFIRMED 2026-07-17，drill 50 臂 C）。
 - **现象**：逐字照抄 runbook `:524` 的示例 → 失败。**实测真串**（非预判）：
   `error: cluster backup: create bundle dir "/var/backups/tether-2026-07-17-799" (must not exist): mkdir /var/backups/tether-2026-07-17-799: permission denied`
 - **机理**：`install.sh:491` 只 `install -d -o tether -g tether` 建 `LIB_DIR`/`LOG_DIR`；**`/var/backups` 从未被建**
@@ -646,8 +656,13 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   **实测推翻**：真正撞的是 `create bundle dir … permission denied`，故原 gotcha 立项降为 DOC。）
 - **怎么修**：文档改用 `/var/lib/tether/backups/…`（install.sh 已建且 tether 可写），或 install.sh 建 `/var/backups/tether`
   并 chown tether，或让 backup 的报错直接给出可执行的补救命令。
-- **钉住它的**：`drills/50-backup-restore.sh` 臂 **C**（分支式：失败 → `product_red` + 抓真串；成功 → 记录并撤销本条）。
+- **钉住它的**：`drills/50-backup-restore.sh` 臂 **C**。
   本臂同时是 **R-SUPPLY-ORDER** 的前置证据：它先证明「不供给备份库时 tether 做不到什么」，S0-备份库才作为 `[env]` 出场。
+- **修复轨迹（2026-07-21，两阶段）**：runbook §5（9 处）+ `cmd/tether/cluster_backup.go` 的 `--help` 示例订正为
+  `/var/lib/tether/backups/…`（install.sh 已建 `LIB_DIR` 且 tether 可写）并加 off-node caveat；臂 C 翻为**正向回归**——
+  成功=`assert_ok "DOC-27 …runs as User=tether"`、意外 perm 失败=`product_red "DOC-27 REGRESSION"`、其它=`_as_fail`。
+  第一阶段落地时 weilandserver 一度不可达（no route）、tsv row 50 暂留 PRODUCT-RED；**同日晚些时候 weilandserver 恢复，
+  `./remote.sh drill 50` 独立复跑 GREEN（pass=87，0 gaps）后已翻结**——本条状态行 CLOSED、tsv row 50 转 GREEN（见顶部状态行；已无「drill 码期望绿 vs tsv 期望红」的待验证差）。保留本段仅为演进轨迹，不含现在时的 OPEN/PRODUCT-RED 断言。
 
 ### #47 — `cluster add` 可把可达 joiner 永久留在 CATCHING_UP，后续 grow 被串行锁阻断
 

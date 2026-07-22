@@ -113,6 +113,44 @@ func (n *Node) LogLastIndex() (uint64, error)  { return n.store.LastIndex() }
 // instead (v0.4.4 review G-reaper-gate). Stays in internal/cluster so internal/broker keeps L-2 raft-free.
 func (n *Node) RaftAppliedIndex() uint64 { return n.raft.Load().AppliedIndex() }
 
+// CaughtUp reports whether this node's raft-domain view is current enough to make a
+// destructive decision (orphan/lock reap) from local state. It is the SSOT the broker's
+// reaperMayDelete/reaperCaughtUp both call, so the tested predicate and the shipped one
+// can never drift (v0.4.4 review G-reaper-gate + external re-review lock-reap-F2).
+//
+// Two conjuncts:
+//   - commit > 0: this node has synced with a leader at least once. Without it,
+//     applied >= commit is VACUOUSLY true in two real windows — a never-elected node
+//     (both cursors 0) AND a snapshot-carrying RESTART (restoreSnapshot sets applied to
+//     the snapshot index while the volatile CommitIndex is still 0 until the first
+//     post-restart commit is learned, so applied=S >= commit=0 passes on the common
+//     production restart path). The bound suppresses only that pre-first-commit instant.
+//   - RaftAppliedIndex() >= commit: raft's own cursor has reached the commit ceiling.
+//
+// HONEST LIMIT #1 (dispatch vs apply): RaftAppliedIndex advances when a committed batch
+// is ENQUEUED to the FSM (fsmMutateCh), NOT when fsm.Apply returns — so a committed entry
+// that is dispatched-but-not-yet-applied to SQLite still reads caught-up. This closes the
+// LARGE-replay case (a just-elected leader replaying a long tail backpressures the dispatch
+// channel, so applied < commit) but NOT a single committed-but-unapplied entry in the µs–ms
+// apply window. That narrower residual is RECORDED, not closed: the membership-lock reaps
+// document it (reconcile_upgrade_lock.go — a raft Barrier was rejected because Barrier().Error()
+// has no apply deadline and would hang the reconcile goroutine on a wedged FSM); the xfer/orphan
+// reaps tolerate it (home partition + ModTime grace + JS-delete-fails-without-quorum).
+//
+// HONEST LIMIT #2 (islanded follower): an islanded node's CommitIndex FROZE at a positive
+// value and its applied catches that frozen ceiling, so CaughtUp() still returns true on a
+// stale view. That case is fenced by the WRITE path, not this predicate: a Propose from a
+// quorum-less node cannot commit, and a JS delete fails once the colocated JS meta loses
+// quorum. See TestCaughtUpIslandedFollowerFrozenCommitResidual (an executable honesty pin).
+//
+// Read commit first, then applied: applied advancing between the two reads only yields a
+// correct true; the reverse can only yield a fail-closed false. Raft-free of NATS; stays
+// in internal/cluster so internal/broker keeps L-2 raft-free.
+func (n *Node) CaughtUp() bool {
+	commit := n.CommitIndex()
+	return commit > 0 && n.RaftAppliedIndex() >= commit
+}
+
 // CommittedCommandAt decodes the *Command at a committed raft index, reading the local
 // raft log via the SAME unexported decodeCommand the FSM uses (identical poison /
 // version verdicts). Pure read — no apply, no DB mutation. Typed sentinels let the

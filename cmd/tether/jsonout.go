@@ -94,6 +94,9 @@ type adminEventsJSON struct {
 	Schema        string                 `json:"schema"`         // "admin_events"
 	SchemaVersion int                    `json:"schema_version"` // 1
 	Events        []adminsock.AuditEntry `json:"events"`
+	// Truncated (N-5) is true when the tail stopped early (scan cap / request deadline) so older
+	// matching events were not examined. Always present in the machine schema; additive, no version bump.
+	Truncated bool `json:"truncated"`
 }
 
 type exposeJSON struct {

@@ -44,6 +44,14 @@ DQ=$(printf '\042')
 # One state-machine pass. Tracking heredoc state (rather than grepping for backticks globally) is
 # what makes the rule precise: a backtick in ordinary script comments outside a heredoc is harmless,
 # and a `<<` appearing INSIDE a body must not be mistaken for a new opener.
+#
+# KNOWN LIMITATION (N-7, record-only — accepted, NOT fixed): the opener detector is not quote-aware. A
+# `<<` inside a QUOTED string or a left-shift expression can be misread as a heredoc opener, and the
+# opener's own quote (`<<'EOF'` — semantic) cannot be told apart from an ENCLOSING quote without
+# position-aware quote tracking. Both drift directions are LOUD, not silent, so a fix is disproportionate
+# for one vendored file: a spurious opener either hits the never-terminated VIOLATION at EOF, or marks a
+# real body "quoted ⇒ inert, not scanned" and prints a visible `skip` row (never a false GREEN that hides
+# a command substitution). If install.sh ever grows a `<<`-bearing string this must be revisited.
 OUT=$(awk -v sq="$SQ" -v dq="$DQ" '
     # --- inside a heredoc: look for the terminator, and scan the body if it is shell-active ---
     in_hd {

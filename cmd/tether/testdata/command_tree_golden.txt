@@ -24,7 +24,7 @@ tether cluster doctor	flags: --conf --db --json --nats-route --offline --raft-ad
 tether cluster drain	flags: --abort --now --retire(hidden) --socket
 tether cluster export-incident [hidden]	flags: --force --out --sid --since --socket
 tether cluster force-single [hidden]	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --self-addr --self-id --socket --yes(hidden)
-tether cluster init	flags: --check --config --confirm-node-id --data-dir --db --dry-run --from-existing --from-manifest --name --nats-route --node-ident-pub --public-host --raft-addr --secrets-dir --self-id --socket --tunnel-addr --yes(hidden)
+tether cluster init	flags: --check --config --confirm-node-id --data-dir --db --dry-run --from-existing --from-manifest --name --nats-conf --nats-route --node-ident-pub --public-host --raft-addr --secrets-dir --self-id --socket --tunnel-addr --yes(hidden)
 tether cluster invite	flags: --account-pub --bootstrap --seed --socket
 tether cluster join	flags: --socket
 tether cluster join approve	flags: --socket --timeout --wait

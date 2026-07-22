@@ -450,6 +450,13 @@ func newClusterDoctorCmd() *cobra.Command {
 			if !offline {
 				rep, err := fetchClusterStatusReport(socketPath)
 				if err == nil && rep != nil {
+					// TODO(n3-online-doctor): the ONLINE branch does NOT run clusterAuthIssuerSkewChecks
+					// (they only run in the offline/fallback branch below), so a rotated-but-not-re-rendered
+					// or unverified issuer is invisible to `cluster doctor` on a LIVE cluster — the mode a
+					// rotated cluster actually runs in. RECORDED, not fixed this phase (external review N-3
+					// adjacent): appending the checks here would emit a permanent ADVISORY on every custom-
+					// conf online doctor unless --conf is passed (a noise regression); the proper fix reads
+					// the conf path from the running broker's config. See release-readiness-followups-plan §2.
 					return renderDoctor(cmd, clusterDoctorOnline(rep), asJSON)
 				}
 				// Stage-C M5 + External-review F7: do NOT silently fall through to a green offline

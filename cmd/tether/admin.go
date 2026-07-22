@@ -79,9 +79,9 @@ are secret-free by construction (never a PSK/token). Filter with --kind and
 			if asJSON {
 				// R11 discipline: on success ONLY the machine JSON reaches stdout; the error paths
 				// above return to main() (stderr), so `admin events --json 2>&1 | jq` stays clean.
-				return emitJSON(cmd.OutOrStdout(), adminEventsJSON{Schema: "admin_events", SchemaVersion: 1, Events: normSlice(resp.Events)})
+				return emitJSON(cmd.OutOrStdout(), adminEventsJSON{Schema: "admin_events", SchemaVersion: 1, Events: normSlice(resp.Events), Truncated: resp.Truncated})
 			}
-			return renderAdminEvents(cmd, resp.Events)
+			return renderAdminEvents(cmd, resp.Events, resp.Truncated)
 		},
 	}
 	cmd.Flags().IntVarP(&n, "n", "n", 50, "number of most-recent (matching) events to tail")
@@ -93,12 +93,20 @@ are secret-free by construction (never a PSK/token). Filter with --kind and
 
 // renderAdminEvents prints the human table for `admin events`: TIME, TYPE, then the raw body JSON so
 // the operator can inspect kind-specific fields without the CLI mirroring every event shape.
-func renderAdminEvents(cmd *cobra.Command, events []adminsock.AuditEntry) error {
+func renderAdminEvents(cmd *cobra.Command, events []adminsock.AuditEntry, truncated bool) error {
+	out := cmd.OutOrStdout()
 	if len(events) == 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no events)")
+		if truncated {
+			// A truncated EMPTY tail is not "no events" — the scan cap or request deadline was hit
+			// before any match was found. Say so, so the operator narrows the query instead of
+			// concluding the stream is empty (N-5).
+			_, _ = fmt.Fprintln(out, "(no events returned — results truncated at the scan cap or request deadline; narrow with --since/--kind)")
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "(no events)")
 		return nil
 	}
-	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "TIME\tTYPE\tFIELDS")
 	for _, e := range events {
 		kind, _ := e.Body["type"].(string)
@@ -108,7 +116,16 @@ func renderAdminEvents(cmd *cobra.Command, events []adminsock.AuditEntry) error 
 		body, _ := json.Marshal(e.Body)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Ts.Format(time.RFC3339), kind, string(body))
 	}
-	return tw.Flush()
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if truncated {
+		// N-5: never hand back a silently-partial tail. This is result metadata on stdout, not an error.
+		// %d is the number RETURNED; older messages beyond it were NOT examined (scan cap or deadline).
+		_, _ = fmt.Fprintf(out, "(results truncated: showing the newest %d matching events; older messages "+
+			"were NOT examined — the scan cap or request deadline was hit. Narrow with --since/--kind)\n", len(events))
+	}
+	return nil
 }
 
 func newAdminRuntimeCmd(socketPath *string) *cobra.Command {

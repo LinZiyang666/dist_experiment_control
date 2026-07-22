@@ -26,7 +26,7 @@ R15 修复了 r15a 全套整合暴露的**一切可安全修复**的缺陷（各
 - **50**（backup-restore）：drill **自相矛盾**已修——L1+L2 IDENTITY 一次性 read 断言 zed absent，但 drill 故意保 brk2 存活+不 de-cluster → self-heal re-cluster 把 zed 复制回来（正确行为，L3 注释自陈）。改断言为「lab present AND zed re-converged」（partial-loss 正确不变量），backup-moment 回滚归 total-loss drill 51。**与产品无关**（诊断确认我的 restore DELETE 不碰 sessions 表）。
 - **#28**（drill 31）：`assert_bug` 翻正向——配 agent 白名单后 CONFIGURED URL 越过 agent 门卡 `sha256_mismatch`；OFF-allowlist URL 仍 `url_not_allowed_local`（白名单仍强制、非空性负控）；F3 config-abort 改用 agent-denied URL。drill 落 **INCOMPLETE**（保留 success-re-exec 的诚实 not_covered，归专属 success drill；#28 缺陷本身 CLOSED）。
 - **#30**（drill 71/73/74）：用新 `admin events` operator reader 把 raw sys.event gap 翻成真断言（73=proxy_keyset_changed delta；74=proxy_auto_rebalanced exact-one；71=expose_rehomed）——各带非空性锚（先证 reader 能读到已知事件）+ secret-free 断言，retire 旧 gap。**96 保持 gap**（arm C home_reassign_failed 需未构造的 crash fixture，硬造=禁止）。
-- **#58**（drill 96）：观测更新——配短 `xfer_reap_interval` + poll 等 home-authoritative 周期 reap + 翻已有的 APPEARS-FIXED 分支为 GREEN。*(re-run #2 验证中)*
+- **#58**（drill 96）：观测更新——配短 `xfer_reap_interval` + poll 等 home-authoritative 周期 reap + 翻已有的 APPEARS-FIXED 分支为 GREEN。*(re-run #2 验证中)* **[已验证 r15v4：single-home A2 8186→2；split-home 残留 = defect-tied gap，见 §8 更新]**
 - **42/51 归因更正**：见 §3。
 
 ## 3. 深层缺陷诚实披露：grow-onto-RECOVERED-broker 缺陷族（42+51）
@@ -62,7 +62,7 @@ R15 修复了 r15a 全套整合暴露的**一切可安全修复**的缺陷（各
 | 73 | **GREEN** | **#30 wiring ✓✓**（proxy_keyset_changed） | — |
 | 74 | **GREEN** | **#30 wiring ✓✓**（proxy_auto_rebalanced） | — |
 | 93 | ASSERT-FAIL | webhook 计时竞态（产品修复改善未根治） | r15v5 重分类→INCOMPLETE(runtime-guard) |
-| 96 | PRODUCT-RED | **#58 实测生效**（8186→2 孤儿在非-leader 被回收）；drill 断言 tombstone-floor 太严误判 | r15v5 A2 修复→GREEN |
+| 96 | PRODUCT-RED | **#58 实测生效**（8186→2 孤儿在非-leader 被回收）；drill 断言 tombstone-floor 太严误判 | r15v5 A2 修复→GREEN　**[更新：落地 = PRODUCT-RED，nc_gap=5 nc_guard=0；#57 是当前红因，#58-split-home 计入 nc_gap]** |
 
 **关键实证**：#58 修复**真的工作**——r15v4 的 96 A2 显示 OBJ_xfer 从 **8186→2**（非-leader brk2 的 home-authoritative 周期 reap 移除了 8186 个孤儿 chunk，只剩 2 个 JS delete-tombstone）。drill 原断言要求回到精确 baseline=1，误判 REGRESSION；已修为 tombstone-floor 容忍（budget 5，8186>>6 保非空性）。
 
@@ -91,14 +91,14 @@ r15v4(有效运行)+ r15w1/w2(服务器重启后 -j2 复跑)确认，除 grow-on
 
 - **#57 transfer-audit durability**(96 arm A)：in-flight tier-B transfer 的 home broker 崩溃时，start 行 dangling、永无 terminal audit（watchdog 挂在 broker runCtx 死于进程 transfer.go:593/:704；tracker 是内存 map、重启 rebuilt empty；late finalization 被 handleEvTransfer `preview==nil→return` :816-819 静默丢）。**报告已 pre-classify 为 source-certain + hermetic-owned**；drill 96 在 in-flight 被 pre-completion 抓到时正确 pin PRODUCT-RED。修复=transfer 审计持久化/重启对账（写 synthetic interrupted-terminal 行）——真 transfer-durability 改动，归 follow-up/R16-family。
 
-- **#58 split-home 残留**(96 arm A2)：`homeOwnsXferBucket(sid)` 保守要求「session 全部节点 homed 到同一 broker」；drill 的 session 含 agt1(home brk2)+agt2(home brk1) split-home → 无 broker 拥有 per-session bucket → 不回收。**#58 的 single-home 修复已证**（hermetic + r15v4 的 8190→少数）；split-home 是保守残留，修复=把 homeOwnsXferBucket 细化为 per-transfer-owner，归 follow-up。R15 已把 drill 从**假 REGRESSION** 改成诚实 runtime-guard（时序/split-home，非 leak；non-vacuity：真 leak 时 count 停在 orphan 级、reap-log 存在则仍 REGRESSION）。
+- **#58 split-home 残留**(96 arm A2)：`homeOwnsXferBucket(sid)` 保守要求「session 全部节点 homed 到同一 broker」；drill 的 session 含 agt1(home brk2)+agt2(home brk1) split-home → 无 broker 拥有 per-session bucket → 不回收。**#58 的 single-home 修复已证**（hermetic + r15v4 的 8190→少数）；split-home 是保守残留，修复=把 homeOwnsXferBucket 细化为 per-transfer-owner，归 follow-up。R15 已把 drill 从**假 REGRESSION** 改成诚实 runtime-guard（时序/split-home，非 leak；non-vacuity：真 leak 时 count 停在 orphan 级、reap-log 存在则仍 REGRESSION）。 **[POST-EXTERNAL-REVIEW 2026-07-21：#58-split-home 由 runtime-guard 重分类为 DEFECT-tied gap，server 实测 nc_guard=0；split-home 成因是确定性结构性缺陷（非 re-run 可恢复的非确定性），随 per-transfer-owner 细化退役。drill 代码 96-mid-flight-chaos.sh:447 已如实标 gap；tsv 台账同步。]**
 
 **更新的诚实总账**：R15 未达 37/37。真深层缺陷（disclosed，待 follow-up/R16）：grow-onto-recovered(42/51)、#57(transfer audit)、#58-split-home。已修+验证：#28/#30/#58-single-home/restore-residue/93/50/41。结构性：30-bc/62/82/51-H1a/96-#65/93-#42/50-history。
 
 ## 9. 全套 r15full(-j3, 37 drills, 2026-07-20)的三点补充
 
 1. **grow-onto-recovered 深层缺陷比 §3 更广**：全套中 **22-forcesingle-online(C-grow N=2)、82-agent-onboarding(C1-grow N=2)** 也 ASSERT-FAIL 于 "grow brk2 (N=2) failed"——与 42/51 同根（grow-to-N=2-after-recovery/force-single 的 clustered-JS meta 形成死锁）。**深层缺陷影响任何在恢复/force-single 后 grow-to-N=2 的 drill**（22/42/51/82），且间歇（22/82 曾 GREEN=该 deadlock 是 clustered-JS-1→2 的间歇脆弱）。**更强化 R16 的必要性**。
-2. **重 clustered-JS/raft drill 在并行 sweep 下 flake**（CLAUDE.md 已记：make e2e 故意串行、"并行会饿死 routed JS server not ready"）：全套 -j3 使 30(roll-continuity 见瞬态 not_leader)等重 drill 的 verdict **不可靠**——它们的**可靠 verdict 须来自 serial/-j1~2 运行**（run-drills.sh CAVEAT：并行 grow-timing timeout 须单跑）。R15-affected 的可靠 verdict 来自 r15v4/w1/w2(-j2)。**外审门交接前，重 drill 的最终 G-证据须 serial/-j2 复跑**。
+2. **重 clustered-JS/raft drill 在并行 sweep 下 flake**（CLAUDE.md 已记：make e2e 故意串行、"并行会饿死 routed JS server not ready"）：全套 -j3 使 30(roll-continuity 见瞬态 not_leader)等重 drill 的 verdict **不可靠**——它们的**可靠 verdict 须来自 serial/-j1~2 运行**（run-drills.sh CAVEAT：并行 grow-timing timeout 须单跑）。R15-affected 的可靠 verdict 来自 r15v4/w1/w2(-j2)。**外审门交接前，重 drill 的最终 G-证据须 serial/-j2 复跑**。 **[D2 定案 2026-07-21（release-readiness-followups §6.1）：30 的 roll-continuity 瞬态**不是**纯并行 sweep 假象——scene-capture 实证它在 SERIAL 也间歇 fire。已确证一种形态 = phase-2 **leader-hop 写可用性窗口 #66**（leader 自身 reload→raft 重启→重选举 brk1→brk2，恰落该亚秒窗的 `session create` 失败；CLI 不自动重试 C.3；scene 显示失败瞬间集群健康已重收敛=非 infra）。**但归因不排他（外审 M-1 收窄）**：外审独立 serial 复跑的样本 #4 是一次 **phase-1 命中、leader 未换届、集群健康**——不属 #66 机理、形态未定性（签名行未存档）。故 30 的间歇 ASSERT-FAIL 是 roll-窗口 band：phase-2 换届=#66，phase-1 命中待定因（watcher 自捕）。谓词保持严格，verdict 维持 INCOMPLETE。]**
 3. **50 的 zed-reconverge 断言修为 POLL**：我 §2 的 50 修复原用 one-shot read，在 -j3 负载下 self-heal re-convergence 未完成即读 → 假 FAIL；已改 `poll_until 90s`（等 {lab,zed} 稳定 re-converge，每轮一读一评、reader 错不算 pass）。
 
 **全套净读**：affected drill 全是**预期 verdict**（31/41/71 INCOMPLETE、42/51 PRODUCT-RED、73/74 曾 GREEN）=**无 cross-regression**；light drill 全 GREEN；重/时序 drill 的非绿为(a)grow-onto-recovered 深层缺陷(22/42/51/82，disclosed)或(b)并行-sweep flake(30/50-已修)——须 serial 复跑定最终 G-证据。

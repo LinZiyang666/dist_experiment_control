@@ -27,6 +27,36 @@ func seedHomedNode(t *testing.T, db *sql.DB, sid, nid, natsServer, nodeID string
 	}
 }
 
+// TestXferBucketOrphanedEverywhere (external review N-6) pins the noise-guard predicate behind the
+// unreapable-bucket gauge: only a bucket NO broker can ever reap (split-home OR zero-node session)
+// is "orphaned everywhere". A single-home session — to self OR to a peer — is reapable by exactly one
+// broker and must NOT count (else the gauge is ~always nonzero on a healthy N-broker cluster).
+func TestXferBucketOrphanedEverywhere(t *testing.T) {
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}, selfID: "node-A"}
+
+	seedHomedNode(t, db, "self", "s1", "srv-A", "node-A")
+	if b.xferBucketOrphanedEverywhere("self") {
+		t.Fatal("single-home-to-self is reapable by self — not orphaned everywhere")
+	}
+	seedHomedNode(t, db, "else", "e1", "srv-B", "node-B")
+	if b.xferBucketOrphanedEverywhere("else") {
+		t.Fatal("single-home-elsewhere is reapable by that broker — not orphaned everywhere (the noise guard)")
+	}
+	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
+	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
+	if !b.xferBucketOrphanedEverywhere("split") {
+		t.Fatal("a split-home session is unreapable by every broker — orphaned everywhere")
+	}
+	if !b.xferBucketOrphanedEverywhere("ghost-no-nodes") {
+		t.Fatal("a zero-node session bucket is unreapable by every broker — orphaned everywhere")
+	}
+}
+
 // TestD8TransferHomeGateClustered (review m3): the clustered home gate — the load-bearing
 // anti-fan-out mechanism — proceeds ONLY on the agent's home broker; a non-home or an
 // unresolved (no binding) target is silently refused.

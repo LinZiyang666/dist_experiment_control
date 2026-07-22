@@ -92,7 +92,20 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 	if err := clusterAuthIssuerSkewError(secretsDir, confPath); err != nil {
 		return err
 	}
+	// N-3: a KNOWN skew fails closed above; when the issuer could not be CROSS-CHECKED at all (conf
+	// unreadable / no auth_callout issuer rendered yet), never print a bare all-clear — WARN that the
+	// convergence report does not confirm the rendered issuer matches account.nk. Computed ONCE: the
+	// conf's readability is static across the --wait loop, so this avoids the repeated nkey-derive +
+	// Preflight of re-reading it per all-clear branch (external review N-3 nit).
+	unverifiedReason := clusterIssuerUnverifiedReason(secretsDir, confPath)
+	warnIssuerUnverified := func() {
+		if unverifiedReason != "" {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: auth_callout issuer verification SKIPPED (%s) — convergence below "+
+				"does not confirm the rendered issuer matches this host's account.nk; pass --conf <path> or run `tether cluster doctor`.\n", unverifiedReason)
+		}
+	}
 	if !wait {
+		warnIssuerUnverified()
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
 			"each broker's topology reconciler converges automatically (≤5s after a membership change); pass --wait to block until converged.")
 		return nil
@@ -105,6 +118,9 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 		}
 		// C3-m11: nothing is being managed yet → there is no convergence to wait for.
 		if rep.TopoDesired == 0 {
+			// L-2 (external review): this is the THIRD all-clear form under --wait; like the other two it
+			// must not print a bare all-clear when the issuer could not be cross-checked.
+			warnIssuerUnverified()
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no topology generation is being managed yet (nothing to converge).")
 			return nil
 		}
@@ -115,6 +131,14 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			// non-zero exit, not a "converged" print.
 			if err := clusterAuthIssuerSkewError(secretsDir, confPath); err != nil {
 				return err
+			}
+			// N-3: keep the leading "all voters converged" substring (drills grep it), but append the
+			// SKIPPED qualifier + a stderr warning when the issuer could not be cross-checked, so the
+			// converged print is never read as "issuer verified".
+			if unverifiedReason != "" {
+				warnIssuerUnverified()
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all voters converged to topology generation %d (issuer verification SKIPPED — see warning above).\n", rep.TopoDesired)
+				return nil
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all voters converged to topology generation %d.\n", rep.TopoDesired)
 			return nil

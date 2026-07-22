@@ -144,9 +144,9 @@ former-N1$ sudo systemctl start nats-server           # joins the mesh with a FR
 #     TO PRESERVE audit/history across the first grow (data-preserving alternative): while the
 #     node is STILL standalone (JS serving), snapshot every stream, then restore after the meta
 #     forms (restores at R=1; reconcile then raises to target R):
-#       former-N1$ for s in $(nats stream ls -n); do nats stream backup "$s" "/var/backups/js/$s"; done
+#       former-N1$ for s in $(nats stream ls -n); do nats stream backup "$s" "/var/lib/tether/backups/js/$s"; done
 #       former-N1$  ... stop / rm -rf jetstream / start clustered (above) ...
-#       former-N1$ for d in /var/backups/js/*; do nats stream restore "$(basename "$d")" "$d"; done
+#       former-N1$ for d in /var/lib/tether/backups/js/*; do nats stream restore "$(basename "$d")" "$d"; done
 
 # 3b. VERIFY the JetStream meta formed (the failure mode is a SILENT JS problem, so check it,
 #     not just raft): `nats --server <broker> stream ls` must RETURN (not hang) on each broker.
@@ -576,16 +576,21 @@ single voter. The bundle is **not a credential**: a restore *requires* the node'
 
 ```bash
 # ONLINE backup (daemon running; any node, leader OR follower — read-only, no raft write):
-tether cluster backup --out /var/backups/tether-$(date +%F)
+tether cluster backup --out /var/lib/tether/backups/tether-$(date +%F)
 
 # OFFLINE backup (daemon STOPPED):
 systemctl stop tether-broker
-tether cluster backup --offline --out /var/backups/tether-$(date +%F) \
+tether cluster backup --offline --out /var/lib/tether/backups/tether-$(date +%F) \
     --db /var/lib/tether/tether.db --secrets-dir /etc/tether/secrets
 ```
 
 Take backups on a schedule + before any destructive op (drain/retire/remove/force-single). A
 single backup off ANY node is the whole committed state — you do **not** need one per node.
+
+> ⚠ **Copy the bundle OFF-node immediately.** `/var/lib/tether/backups/` lives on the data volume
+> (the daemon runs as `User=tether`, which cannot write `/var/backups`), so a backup left there dies
+> WITH the disk it is meant to recover — the §7 disaster flow assumes the bundle survives the disk.
+> `scp`/`rsync` each bundle to off-host storage as soon as it is written.
 
 > ⚠ **BUNDLE SCOPE — the bundle is the FSM state DB ONLY. JetStream is NOT in it.**
 > Both backup paths (online and offline) produce exactly the same scope, and both now print this
@@ -600,9 +605,9 @@ single backup off ANY node is the whole committed state — you do **not** need 
 >
 > ```bash
 > # alongside EVERY `cluster backup`, on the same node:
-> mkdir -p /var/backups/js-$(date +%F)
+> mkdir -p /var/lib/tether/backups/js-$(date +%F)
 > for s in $(nats stream ls -n); do
->     nats stream backup "$s" "/var/backups/js-$(date +%F)/$s"
+>     nats stream backup "$s" "/var/lib/tether/backups/js-$(date +%F)/$s"
 > done
 > ```
 >
@@ -632,7 +637,7 @@ systemctl stop tether-broker
 #    with the whole `cluster:` block COMMENTED OUT — so without the seam the daemon FATALs at boot
 #    with "refusing to silently downgrade a cluster DB to single mode ... broker.cluster.data_dir".
 #    restore applies the seam for you and FAILS NONZERO if it cannot.
-tether cluster recovery restore /var/backups/tether-2026-06-24 --confirm-node-id brk-a \
+tether cluster recovery restore /var/lib/tether/backups/tether-2026-06-24 --confirm-node-id brk-a \
     --secrets-dir /etc/tether/secrets \
     --config /etc/tether/broker.yaml --nats-conf /etc/tether/nats.d/nats.conf
 #    The command prints the ordered next steps (3-5 below) with every argument substituted for THIS
@@ -665,7 +670,7 @@ tether cluster status            # exit 1 DEGRADED (N=1, no redundancy) until re
 > bundle, restore it **after** step 3 (nats-server must be up on the final standalone conf):
 >
 > ```bash
-> for d in /var/backups/js-2026-06-24/*; do nats stream restore "$(basename "$d")" "$d"; done
+> for d in /var/lib/tether/backups/js-2026-06-24/*; do nats stream restore "$(basename "$d")" "$d"; done
 > ```
 
 The `--config` seam restore writes sets **five** fields under `broker.cluster` — `data_dir`,
@@ -698,7 +703,7 @@ systemctl stop tether-broker            # a stock install may have started it; r
 #    FATALs at boot: the restored DB is cluster-seeded, but install.sh ships broker.yaml with the
 #    `cluster:` block commented out, so broker.cluster.data_dir is unset).
 #    --raft-addr is the fresh-host escape: pass it when THIS box's IP differs from the dead one's.
-tether cluster recovery restore /var/backups/tether-2026-06-24 \
+tether cluster recovery restore /var/lib/tether/backups/tether-2026-06-24 \
     --confirm-node-id brk-a --secrets-dir /etc/tether/secrets \
     --data-dir /var/lib/tether --db /var/lib/tether/tether.db \
     --config /etc/tether/broker.yaml --nats-conf /etc/tether/nats.d/nats.conf \
