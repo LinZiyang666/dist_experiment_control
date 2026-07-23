@@ -87,6 +87,42 @@ broker:
 	}
 }
 
+// TestXferCrossHomeReapAgeDuration (R16 #58 Lane C) pins the leader cross-home GC age-floor knob.
+//
+// EXTERNAL REVIEW F2: this test used to assert that 8s PARSES — i.e. it pinned the unsafe behaviour as
+// correct. The production schema must only let an operator RAISE the floor: in a split-home session the
+// leader cannot see a transfer still live on another home, so any floor below the tier-B watchdog lets
+// it delete an in-use object. Empty still means the broker's derived default.
+func TestXferCrossHomeReapAgeDuration(t *testing.T) {
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_cross_home_reap_age: 8s\n")); err == nil {
+		t.Fatal("8s must be REJECTED: it is far below the tier-B watchdog, so the leader could reap an " +
+			"object still live on another home (external review F2)")
+	}
+	cfg, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_cross_home_reap_age: 30m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, err := cfg.XferCrossHomeReapAgeDuration(); err != nil || d != 30*time.Minute {
+		t.Fatalf("raising the floor must be allowed: want 30m got %v (err %v)", d, err)
+	}
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_cross_home_reap_age: 14m59s\n")); err == nil {
+		t.Fatalf("anything below the %s safe floor must be rejected", MinXferCrossHomeReapAge)
+	}
+	empty, err := Load(writeConfig(t, `broker: {}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := empty.XferCrossHomeReapAgeDuration(); got != 0 {
+		t.Errorf("empty xfer_cross_home_reap_age should be zero (broker default), got %v", got)
+	}
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_cross_home_reap_age: 200ms\n")); err == nil {
+		t.Error("Load: sub-second xfer_cross_home_reap_age accepted (a near-zero floor could tear out a live peer transfer)")
+	}
+	if _, err := Load(writeConfig(t, "broker:\n  cluster:\n    xfer_cross_home_reap_age: 25h\n")); err == nil {
+		t.Error("Load: >24h xfer_cross_home_reap_age accepted (an effectively-disabled floor immortalizes split-home garbage)")
+	}
+}
+
 // TestReapIntervalUpperBound (external review N-5) pins the upper clamp on the three interval knobs: a
 // value like 10000h passes the sub-second/sub-minute floor yet SILENTLY DISABLES the reaper/monitor
 // (immortal garbage / no disk-pressure). Each knob must reject > 24h, accept exactly 24h (the boundary),

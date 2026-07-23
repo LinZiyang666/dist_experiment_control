@@ -84,6 +84,23 @@ var brokerCodeExitClasses = map[string]int{
 	// Mega-audit MAJ-7: C5 proxy quorum-loss is a designed self-healing transient (the leader heals on
 	// re-election) — map to 75 so a monitor retries instead of treating it as a tether bug (70).
 	"proxy_disabled_no_quorum": exitTransient, "proxy_frozen_readonly": exitTransient,
+	// G67 #67: tier-B object-store provisioning could not complete because JetStream did not accept
+	// the request (a broker restart, a leader election, or a cluster grow in flight). The broker has
+	// already retried it a bounded number of times and classified it; 75 tells a monitor to retry
+	// rather than treat a transient stall as a tether bug. `bucket_create_failed` deliberately stays
+	// unmapped (70): it is the PERMANENT half of the same split.
+	"jetstream_not_ready": exitTransient,
+	// G67 (internal review M5): these two are PERMANENT and operator-actionable, so they must be
+	// TERMINAL (64) rather than the unclassified 70 that docs/usage.md §9.13 tells automation to
+	// retry with backoff. tier_b_store_too_small = give this broker more disk;
+	// jetstream_unavailable = this broker has no JetStream at all (a config/boot state).
+	// bucket_create_failed deliberately stays 70: it is the genuinely UNCLASSIFIED remainder.
+	"tier_b_store_too_small": exitUsage, "jetstream_unavailable": exitUsage,
+	// A restarting broker is the most retriable condition there is (internal review, adopted).
+	"broker_restarting": exitTransient,
+	// G67: both are already worded "retry shortly" by the broker (internal/broker/transfer.go) yet
+	// landed on the unclassified 70. Same path, same self-healing shape.
+	"too_many_in_flight": exitTransient, "transfer_id_in_flight": exitTransient,
 	"ha_policy_invalid": exitUsage,
 	// operator-action-required (NOT blind-retry) -> usage
 	"node_offline": exitUsage, "node_not_found": exitUsage, "port_exhausted": exitUsage,

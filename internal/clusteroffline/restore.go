@@ -209,9 +209,23 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		return nil, fmt.Errorf("clusteroffline: bootstrap restored single voter: %w", err)
 	}
 
-	// Audit DI-MAJOR-2: clear restore_in_progress ONLY now (raft bootstrapped) — the DB is now a
-	// complete, startable single-voter cluster. A crash before this point leaves the marker set →
-	// the daemon refuses to start until restore is re-run.
+	// R16 (#GROW-ONTO-RECOVERED): make the restored single voter GROW-READY. A restore DIRECT-installs
+	// the bundle's cluster_nodes/state rows that no raft-log entry created (exactly like `cluster init
+	// --from-existing`); without a snapshot a fresh joiner grown onto this survivor replays the log from
+	// index 1 onto its un-seeded DB and FK-fail-stops / becomes a hollow voter — the pc732 keystone, and
+	// drill 51's remaining root (the re-grow stalls at NATS_ROLLED_OUT). Mirror init.go:242:
+	// BootstrapSingleNode then GrowReadySnapshot so FirstIndex>1 and a joiner installs the snapshot.
+	// The D5 audit-window guard is trivially satisfied here — normalizeRestoreStaging reset
+	// audit_published_index=0 and the bundle carries no JetStream, so the 1-entry bootstrap log holds no
+	// unpublished audit ops for RecoverCluster's unconditional DeleteRange to drop.
+	if err := cluster.GrowReadySnapshot(opts.DataDir, opts.DBPath, m.SelfID, effectiveRaftAddr, opts.Logger); err != nil {
+		return nil, fmt.Errorf("clusteroffline: grow-ready snapshot after restore: %w", err)
+	}
+
+	// Audit DI-MAJOR-2: clear restore_in_progress ONLY now (raft bootstrapped AND grow-ready) — the DB is
+	// now a complete, startable, grow-ready single-voter cluster. A crash before this point (incl. between
+	// bootstrap and the grow-ready snapshot) leaves the marker set → the daemon refuses to start until
+	// restore is re-run, which forward-completes.
 	if err := clearRestoreInProgress(opts.DBPath); err != nil {
 		return nil, fmt.Errorf("clusteroffline: clear restore_in_progress: %w", err)
 	}

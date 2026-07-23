@@ -326,6 +326,29 @@ func reqIDSeenTx(tx *sql.Tx, reqID string) (bool, error) {
 	return true, nil
 }
 
+// ReqIDCommitted reports whether req_id already stands in the REPLICATED dedup ledger, i.e. whether a
+// command carrying it has already been committed. Read-only, safe on any node's RO handle.
+//
+// External RE-REVIEW F1: recovery uses it to DETECT a prior commit instead of blindly re-emitting a
+// staged terminal. The FSM would dedup the replay anyway (Apply skips a seen ReqID), but detecting it
+// here means the guarantee does not depend on reaching that layer, costs no raft round trip, and is
+// visible to a test that stubs the forward. Retention is ~1M raft indices (months), far longer than the
+// 2-minute JetStream Duplicates window, so a broker that was down for hours still detects the commit.
+func ReqIDCommitted(db *sql.DB, reqID string) (bool, error) {
+	if db == nil || reqID == "" {
+		return false, nil
+	}
+	var one int
+	err := db.QueryRow(`SELECT 1 FROM cluster_reqid_ledger WHERE req_id = ?`, reqID).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("cluster: reqid ledger lookup: %w", err)
+	}
+	return true, nil
+}
+
 // insertReqIDTx records a NEW req_id at raft index. The PRIMARY KEY is the
 // dedup-uniqueness backstop: a duplicate INSERT here is a programming bug (the
 // dedup branch should have caught it) and surfaces as an error → fail-stop.

@@ -87,7 +87,7 @@ func TestExternalToStandaloneFailsClosedWithoutLiveN1Proof(t *testing.T) {
 		confPath: conf, serverName: "solo", takeoverSocket: "/unavailable",
 		plan: true, skipDryRun: true,
 	}
-	if err := runReconcileToStandalone(externalStandaloneCmd(), f, true); err == nil {
+	if err := runReconcileToStandalone(externalStandaloneCmd(), f, true, false); err == nil {
 		t.Fatal("--to-standalone must fail closed when live N=1 cannot be proved")
 	}
 }
@@ -107,7 +107,7 @@ func TestExternalToStandaloneRefusesMissingStoreDir(t *testing.T) {
 		confPath: conf, serverName: "solo", takeoverSocket: "/unused",
 		plan: true, skipDryRun: true,
 	}
-	err := runReconcileToStandalone(externalStandaloneCmd(), f, true)
+	err := runReconcileToStandalone(externalStandaloneCmd(), f, true, false)
 	if err == nil || !strings.Contains(err.Error(), "store_dir") {
 		t.Fatalf("--to-standalone must refuse JetStream-without-store_dir, got %v", err)
 	}
@@ -154,7 +154,7 @@ func TestExternalToStandaloneRequiresCompleteLeaderN1Proof(t *testing.T) {
 				confPath: conf, serverName: "solo", takeoverSocket: "/unused",
 				plan: true, skipDryRun: true,
 			}
-			if err := runReconcileToStandalone(externalStandaloneCmd(), f, true); err == nil {
+			if err := runReconcileToStandalone(externalStandaloneCmd(), f, true, false); err == nil {
 				t.Fatal("--to-standalone accepted a non-authoritative/incomplete N=1 report")
 			}
 		})

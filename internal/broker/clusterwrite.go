@@ -37,6 +37,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ctlQueueGroup is the shared NATS queue group the ctl-command + event subscriptions join
@@ -415,6 +416,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
 	b.cl.admin.caughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
 	b.cl.admin.streamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
+	b.cl.admin.jsPlaceableFn = b.clusterJSPlaceable   // G69 (#67 sub-face 4): join terminal placement gate
 	// R8a P1: the drain/retire data-plane convergence oracle + the immediate delivery kick.
 	// WITHOUT these two the drain would go back to returning rc=0 on an unconverged data
 	// plane — TestWireClusterLateWiresHomeConvergence is the anti-half-wiring guard, and
@@ -469,6 +471,105 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 		return false, err
 	}
 	return rep.AllAtTarget(), nil
+}
+
+// clusterJSPlaceProbeTimeout bounds the join-side placement probe. It is hygiene, not protection: the
+// same inline tick already embeds a 2s healthPoll and an unbounded ObserveReplicas (topoConvergedForOp
+// -> StatusReport -> streamObserve), so this cap does not keep the observe loop responsive and must not
+// be described as if it did.
+const clusterJSPlaceProbeTimeout = 3 * time.Second
+
+// jsPlaceableFrom is #67 sub-face 4's predicate in PURE form, split out so it is testable without a
+// broker or a JetStream connection.
+//
+// It has NO error return by design: every uncertainty folds into (false, detail). A seam that could
+// return an error would let a probe that fails every tick take a path that skips the caller's deadline
+// check — the precise shape of the hole that made gotcha #45 wedge the membership plane.
+func jsPlaceableFrom(target int, st jsstream.StreamReplicaState, obsErr error) (bool, string) {
+	if target <= 1 {
+		// N=1 / force-single: there is nothing to place. Semantic, not an optimisation — a single-replica
+		// asset needs no meta placement at all.
+		return true, ""
+	}
+	if obsErr != nil {
+		// G-11: the detail string is recorded via recordOpError, which is change-gated on the RENDERED
+		// message — so folding the raw error in verbatim makes a JS meta election (which alternates
+		// "context deadline exceeded" / "nats: no responders available") commit a raft write EVERY tick
+		// and evict the join ladder's history at opTimelineCap. Classify into a STABLE category here and
+		// leave the raw error to the logger.
+		return false, "events stream not observable yet (" + jsObsCategory(obsErr) + ")"
+	}
+	if st.Configured < target {
+		return false, fmt.Sprintf("events stream is configured at %d/%d replicas (the replica raise has not landed)",
+			st.Configured, target)
+	}
+	if st.Assigned < target {
+		return false, fmt.Sprintf("the JS meta has assigned %d/%d peers to the events stream",
+			st.Assigned, target)
+	}
+	return true, ""
+}
+
+// jsObsCategory collapses an observation error into a small, STABLE set of words so the gate's detail
+// string does not churn tick-to-tick (see the G-11 note above). The raw error still reaches the log.
+func jsObsCategory(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the JetStream API did not answer in time"
+	case errors.Is(err, nats.ErrNoResponders):
+		return "no JetStream responder"
+	case errors.Is(err, jetstream.ErrStreamNotFound):
+		return "the events stream does not exist yet"
+	default:
+		return "unavailable"
+	}
+}
+
+// clusterJSPlaceable is the JOIN-side placement gate: can the JS meta host a NEW asset at the CURRENT
+// target replica factor? Evidence is the canonical `events` stream, which ReconcileOnce raises FIRST and
+// UNCONDITIONALLY on every pass, so it is always the first thing the meta had to place.
+//
+// It is deliberately NOT clusterStreamsReady (retire's predicate). That one asks a DATA-SAFETY question
+// — "has every stream, including every multi-GiB OBJ_xfer bucket, CAUGHT UP" — and audit.go records in
+// the product's own words that a lingering under-target OBJ_xfer blocks that gate forever. Making a grow
+// wait for a full byte copy would be a false-block of a healthy cluster. Join asks a PLACEMENT-CAPABILITY
+// question, and assignment answers it.
+//
+// SCOPE, stated honestly: ReplicasFor caps at 3, so a 3->4 grow leaves target=3 and the events stream
+// TYPICALLY already has 3 assigned peers — none of them necessarily the joiner — so this returns true on
+// the first tick. ("Typically" is deliberate: that is a steady-state assumption, not an invariant.) The
+// gate covers target-INCREASING grows (1->2, 2->3), which is where #67 was measured. It does NOT prove
+// the meta placed anything ON THE JOINER.
+func (b *Broker) clusterJSPlaceable() (bool, string) {
+	nv, err := b.cl.node.NumVoters()
+	if err != nil {
+		return false, "count voters: " + err.Error()
+	}
+	target := jsstream.ReplicasFor(nv)
+	if target <= 1 {
+		return true, "" // no JS call at all
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), clusterJSPlaceProbeTimeout)
+	defer cancel()
+	// Cheap gate first: the events stream's CONFIGURED/ASSIGNED counts. It costs 2 round trips and
+	// rejects the common "the replica raise has not landed yet" case without touching the meta.
+	st, oerr := jsstream.CollectStreamState(ctx, b.js, jsstream.EventsStreamName, target)
+	if ok, detail := jsPlaceableFrom(target, st, oerr); !ok {
+		return false, detail
+	}
+	// EXTERNAL REVIEW F3: then MEASURE, do not infer. The counts above are a proxy for "a new R=N asset
+	// is creatable", and the review showed a proxy can be satisfied by state that says nothing about
+	// now — tether never peer-removes, so a retired member lingers in the assignment list. The canary is
+	// an EMPTY stream created at the target factor and immediately deleted: it asks the meta the exact
+	// question the CLI's contract promises an answer to, and because it carries no data it introduces
+	// none of the byte-copy wait that gating on catch-up would.
+	if err := jsstream.ProbeMetaCanPlace(ctx, b.js, target, b.cfg.Logger); err != nil {
+		return false, "the JS meta refused to assign an empty memory-backed canary at the target replica " +
+			"factor (this measures META ASSIGNMENT, not disk budget for file/object stores): " + err.Error()
+	}
+	return true, ""
 }
 
 // livenessDB returns the handle for LIVENESS-column writes (last_heartbeat_at, status)

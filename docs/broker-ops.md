@@ -124,6 +124,14 @@ broker:
     # metrics_listen: 127.0.0.1:9090   # Prometheus /metrics + /healthz + /readyz（空 = 关）
     # alert_webhook_url: https://...   # 每次 committed 告警 raise/clear POST（仅集群，空 = 关）
     # disk_check_interval: 5m          # 磁盘监控采样间隔（#39；默认 5m；flag --disk-check-interval 优先）
+    # --- broker.cluster.* 的 xfer 回收节奏（仅 cluster 模式；生产通常全部留空用内建默认）---
+    # xfer_reap_interval: 5m           # #58/P10：home 权威的 orphan tier-B 对象回收周期（默认 5m；<1s 或 >24h 在 Load 期拒绝）
+    # xfer_cross_home_reap_age: 15m    # R16 #58：LEADER 跨-home GC 的年龄下限（**只能调高，不能调低**；
+    #                                   # 外审 F2：低于 tier-B 看门狗的下限会让 leader 删掉另一 home 上
+    #                                   # 仍在用的对象——leader 看不见别人的 tracker）。回收「没有任何 home 能回收」的
+    #                                  # split-home / 零节点会话 bucket。默认派生自 3×tier-B 超时(=15m)——比 per-home
+    #                                  # grace 长，护住另一 home 上仍在飞的传输（跨节点时钟偏斜留余量）。**没有生产调参
+    #                                  # 场景**，暴露它只为 deploy-tier drill 压缩排程；<1s 或 >24h 在 Load 期拒绝。
   upgrade:
     url_allow:                         # `tether node upgrade` 白名单（可选）
       - https://github.com/LinZiyang666/dist_experiment_control/releases/

@@ -285,15 +285,16 @@ standalone:
 # ONLY when exactly ONE voter remains (retire the rest FIRST). De-clustering with live peers tears the
 # route mesh, so --confirm-single is mandatory and a FULL restart is required (dropping cluster{} is
 # NOT SIGHUP-reloadable).
-lone$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self> --broker-nkey <self-bus-nkey>
+lone$ sudo tether cluster reconcile nats --to-standalone --confirm-single --reset-js --server-name <self> --broker-nkey <self-bus-nkey>
 # (--broker-nkey = this broker's bus nkey — derive from the broker.nk seed in secrets_dir, or read
 #  cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A multi-broker conf lists every peer's nkey so
 #  --to-standalone cannot auto-pick self's — pass it explicitly. A single-broker conf auto-reads it.)
-lone$ sudo systemctl restart nats-server      # FULL restart loads the standalone conf
-# ⚠ clustered-JS → standalone-JS does NOT migrate in place — RESET the JS store (the command prints
-#   the exact rm -rf). DATA IMPACT: drops ALL JetStream audit/history (history-<sid>, events, in-flight
-#   OBJ_xfer — drain first; `nats stream backup`/`restore` to preserve). Mirror of grow §1 step 3a.
-lone$ sudo systemctl stop nats-server && sudo rm -rf /var/lib/tether/jetstream && sudo systemctl start nats-server
+# ⚠ clustered-JS → standalone-JS does NOT migrate in place. R16: --reset-js MOVES the clustered JS store
+#   ASIDE (jetstream.standalone-bak.<ts>, NEVER deleted) BEFORE swapping the conf — so a non-empty store
+#   refuses WITHOUT --reset-js (a clean re-run, conf untouched), and there is no manual `rm -rf` step.
+#   DATA IMPACT: drops ALL JetStream audit/history (history-<sid>, events, in-flight OBJ_xfer) from the
+#   LIVE store — `nats stream backup` first to preserve it, or restore from the moved-aside dir by hand.
+lone$ sudo systemctl restart nats-server      # FULL restart loads the standalone conf + the fresh empty store
 ```
 
 Lands at "N=1 single-voter cluster, standalone JS" — the supported post-init shape. (Fully EXITING
@@ -407,11 +408,20 @@ survivor$ sudo tether cluster status --offline --db /var/lib/tether/tether.db
 #    HARD-REFUSES if any of them still accepts a TCP connection on :7400 (alive ->
 #    split-brain), if there is no existing raft state, or if the daemon still holds
 #    the store. You must TYPE this node's id to confirm — no --yes.
+#    R16: pass --reset-js. De-clustering the conf is not enough — NATS cannot migrate a clustered JS store
+#    in place, so a standalone nats booted over it serves 503 (the racknerd incident). --reset-js MOVES the
+#    store to jetstream.force-single-bak.<epoch> (NEVER deleted; restore by hand or `nats stream restore`)
+#    as part of the recovery. WITHOUT it a data-bearing store is REFUSED loudly: the recovery is journalled,
+#    so you simply re-run the same command with --reset-js and it forward-completes.
+#    ⚠ DATA IMPACT: moves ALL JetStream audit/history (history-<sid>, events, in-flight OBJ_xfer) aside.
 survivor$ sudo tether cluster recovery force-single \
             --self-id <this-node-id> --self-addr <this-host:7400> \
-            --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2>
+            --confirm-peers-dead <dead-node-id-1>,<dead-node-id-2> --reset-js
 
-# 4. Bring the daemon back. It runs as a single voter (NO HA / NO integrity until recovered).
+# 4. A FULL nats-server restart is REQUIRED (the conf was de-clustered — NOT SIGHUP-reloadable — and the JS
+#    store was reset), THEN bring the daemon back. It runs as a single voter (NO HA / NO integrity until
+#    recovered). Starting the broker before nats reloads the standalone conf lands you in a 503.
+survivor$ sudo systemctl restart nats-server
 survivor$ sudo systemctl unmask tether-broker && sudo systemctl start tether-broker
 ```
 
@@ -429,20 +439,23 @@ history, audit) needs one more step, and the abandoned peers must leave the clie
 force-single wedges JetStream at `503` (no quorum-of-2) — *silently*, since the alert path itself rides
 JetStream. `cluster status` now raises a **DATA-PLANE DEGRADED** banner when this is the case.
 
-- **OFFLINE force-single already fixed it**: it re-renders the survivor's nats.conf to standalone
-  JetStream BEFORE you restart the broker (§3.1 step 3 prints "nats.conf de-clustered to standalone").
-  Just RESET the JS store as warned (it prints the `mv jetstream …` guidance) before the restart.
+- **OFFLINE force-single fixes BOTH halves (R16)**: it re-renders the survivor's nats.conf to standalone
+  JetStream AND, with `--reset-js`, moves the clustered JS store aside itself (§3.1 step 3) — there is no
+  hand-rolled `mv`/`rm -rf` step any more. A data-bearing store WITHOUT `--reset-js` is refused loudly and
+  the journalled re-run forward-completes. A FULL `systemctl restart nats-server` is still required.
 - **ONLINE force-single leaves the daemon running** and does NOT restart nats-server (that would blip the
-  shared core-NATS control plane). De-cluster it explicitly, then restart ONLY nats-server:
+  shared core-NATS control plane). De-cluster it explicitly — `--reset-js` moves the clustered store aside
+  in the same command (R16) — then restart ONLY nats-server:
 
   ```
-  survivor$ sudo tether cluster reconcile nats --to-standalone --confirm-single --server-name <self> --broker-nkey <self-bus-nkey>
+  survivor$ sudo tether cluster reconcile nats --to-standalone --confirm-single --reset-js --server-name <self> --broker-nkey <self-bus-nkey>
   # (--broker-nkey is this broker's bus nkey — derive from the broker.nk seed in secrets_dir, or read
   #  cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A still-clustered conf lists every peer's nkey
   #  so --to-standalone cannot auto-pick self's — pass it explicitly)
-  # detached so stopping nats-server does not cut the ctl channel mid-command:
-  survivor$ sudo systemd-run --collect --unit tether-nats-restart \
-              sh -c 'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.clustered-bak.$(date +%s); systemctl restart nats-server'
+  # --reset-js moves the store to jetstream.standalone-bak.<ts> BEFORE swapping the conf, so a refusal
+  # leaves the conf untouched and re-runnable. Then restart nats detached (stopping it would cut the ctl
+  # channel mid-command):
+  survivor$ sudo systemd-run --collect --unit tether-nats-restart sh -c 'systemctl restart nats-server'
   ```
 
   The abandoned peers are already pruned (below), so the N=1 voter tally passes and `--to-standalone`

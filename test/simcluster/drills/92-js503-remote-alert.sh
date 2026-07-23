@@ -127,11 +127,31 @@ fi
 # Recovery: operator to-standalone + JS reset → tier-B works. explore→pin: tier-B recovery is timing/state
 # fragile after a force-single (b-TERMINUS RED'd exit 70 first pass — could be an incomplete recovery or a
 # real gap). Drive the documented recovery + RECORD the outcome (measure-and-record, don't hard-fail here).
-assert_ok "leg-b recovery: reconcile nats --to-standalone succeeds" \
-    "$SIM" exec brk1 -- runuser -u tether -- tether cluster reconcile nats --to-standalone --confirm-single \
-        --server-name brk1 --account-issuer "$(secrets_account_pub "$INSTANCE")" --broker-nkey "$(secrets_broker_pub "$INSTANCE" brk1)"
-assert_ok "leg-b recovery: JS reset and service restart both succeed" \
-    "$SIM" exec brk1 -- sh -eu -c 'systemctl stop tether-broker nats-server; test -d /var/lib/tether/jetstream; mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.$(date +%s); systemctl start nats-server tether-broker; test "$(systemctl is-active nats-server)" = active; test "$(systemctl is-active tether-broker)" = active'
+# R16 A4 + G67: the JS-store reset is now the PRODUCT's job. `--to-standalone --reset-js` swaps the
+# conf AND moves the clustered store aside in ONE verb, so this drill's hand-rolled
+# `mv /var/lib/tether/jetstream ...` is retired — it was a Mandate-2 concealment of exactly the gap
+# A4 closed, and after A4 it was also BROKEN: the bare --to-standalone now REFUSES on a data-bearing
+# store, so the conf was never swapped, and the hand-mv then restarted a lone voter onto a still
+# CLUSTERED conf => n1ClusteredJetStreamFatal => the auth responder never came up and every later
+# assertion cascaded. (Found by G67's regression sweep; 92 was not re-run during R16.)
+#
+# The guard rail itself is PINNED first: a data-bearing store must refuse WITHOUT the flag, and the
+# refusal must name the flag and the data impact. Asserting only the happy path would let a future
+# change silently drop the acknowledgement gate on a destructive operation.
+_recon_args="--confirm-single --server-name brk1 --account-issuer $(secrets_account_pub "$INSTANCE") --broker-nkey $(secrets_broker_pub "$INSTANCE" brk1)"
+assert_ok "leg-b recovery GUARD precondition: the conf is STILL clustered (the already-standalone refusal also mentions --reset-js, so without this the guard could pass for the wrong reason)" \
+    "$SIM" exec brk1 -- sh -c "grep -qE '^cluster' /etc/tether/nats.d/nats.conf"
+assert_refuses "leg-b recovery GUARD: bare --to-standalone REFUSES on a data-bearing JS store and names --reset-js + the data impact (R16 A4 acknowledgement gate)" \
+    "NON-EMPTY|refusing to reset it without acknowledgement" \
+    "$SIM" exec brk1 -- sh -c "runuser -u tether -- tether cluster reconcile nats --to-standalone $_recon_args 2>&1"
+assert_ok "leg-b recovery: reconcile nats --to-standalone --reset-js succeeds (ONE product verb: conf swap + store move-aside; no hand-rolled mv)" \
+    "$SIM" exec brk1 -- sh -c "runuser -u tether -- tether cluster reconcile nats --to-standalone --reset-js $_recon_args"
+assert_ok "leg-b recovery: the product MOVED the store aside (never deleted) — a standalone-bak.* is on disk" \
+    "$SIM" exec brk1 -- sh -c 'ls -d /var/lib/tether/jetstream.standalone-bak.* >/dev/null 2>&1'
+# Only the SERVICE restart remains sim-side (legitimate per Mandate 3): the product tells the operator
+# to restart nats-server so the standalone conf + fresh store take effect.
+assert_ok "leg-b recovery: service restart (the step the product tells the operator to run)" \
+    "$SIM" exec brk1 -- sh -eu -c 'systemctl stop tether-broker; systemctl restart nats-server; systemctl start tether-broker'
 assert_ok "leg-b recovery: ctl re-login succeeds after broker auth responder is ready" \
     poll_until 60 3 "ctl auth responder ready" -- "$SIM" ctl -- login -s "$SID" --pin "$PIN"
 assert_ok "leg-b recovery: --remote banner clears on the recovered control plane" \

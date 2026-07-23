@@ -803,6 +803,26 @@ type PushPrepareReq struct {
 // PushPrepareResp — agent pub on the push.req reply inbox. For tier A
 // this means "file is on disk + SHA verified + renamed into place"; for
 // tier B it means "I validated Path + ready for you to Put".
+//
+// Code taxonomy for the tier-B provisioning refusals (G67 / gotcha #67). These two are the
+// TRANSIENT/PERMANENT split of what used to be a single terminal code, and the distinction is the
+// whole point — do not collapse them again:
+//
+//	jetstream_not_ready   TRANSIENT. The broker could not provision the per-session object store
+//	                      because JetStream did not accept the request (a broker restart, a leader
+//	                      election, or a cluster grow in flight). The broker has ALREADY retried a
+//	                      bounded number of times before replying. Retrying the command shortly is
+//	                      the correct operator response; ctl maps it to exit 75.
+//	bucket_create_failed  PERMANENT. Provisioning failed for a reason retrying cannot fix (the JS
+//	                      store is too small for the tier-B floor, replicas>1 on a non-clustered
+//	                      node, ...). Its text deliberately carries NO retry vocabulary.
+//	jetstream_unavailable This broker has no JetStream client at all — a configuration/boot state,
+//	                      not a stall. Distinct from jetstream_not_ready, which means JetStream
+//	                      exists but would not serve this request right now.
+//
+// Adding jetstream_not_ready is purely ADDITIVE: Code is a free-form string, the struct is
+// unchanged, and ProtoVersion does NOT move. An older ctl prints an unknown code through its
+// default branch exactly as it always did.
 type PushPrepareResp struct {
 	OK    bool   `json:"ok"`
 	Tier  string `json:"tier,omitempty"` // echoed for paranoia

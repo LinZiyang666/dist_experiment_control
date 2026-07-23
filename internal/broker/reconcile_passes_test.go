@@ -1112,6 +1112,143 @@ func putXferOrphan(t *testing.T, ctx context.Context, js jetstream.JetStream, bu
 // broker can ever reap that actually hold aged garbage: a split-home session and a zero-node session
 // count; a single-home-elsewhere session (a peer reaps it — the noise guard) and a split-home but EMPTY
 // bucket (no disk risk — the aged guard) do NOT. It is a gauge (Store, not Add) and changes no reaping.
+// TestXferCrossHomeReapAgeDerivation pins the #58 Lane C cross-home GC age floor to 3× the tier-B timeout
+// so the safety margin (a transfer still live on another home terminates within one tier-B timeout) cannot
+// silently drift when a future tier edits the timeout.
+func TestXferCrossHomeReapAgeDerivation(t *testing.T) {
+	if xferCrossHomeReapAge != 3*transferTimeoutTierB {
+		t.Fatalf("xferCrossHomeReapAge must stay 3×transferTimeoutTierB (got %s, want 3×%s) — the cross-home GC "+
+			"floor's cross-node/clock-skew margin depends on this relation", xferCrossHomeReapAge, transferTimeoutTierB)
+	}
+	// minor-7: the cross-home floor must ALWAYS exceed the per-home grace — a future tier edit that inverts
+	// this would make cross-home reap MORE aggressive than home reap (tearing out a peer-home's live object).
+	if xferCrossHomeReapAge <= xferReapMinObjectAge {
+		t.Fatalf("xferCrossHomeReapAge (%s) must exceed the per-home grace xferReapMinObjectAge (%s)",
+			xferCrossHomeReapAge, xferReapMinObjectAge)
+	}
+}
+
+// TestXferCrossHomeGCSkipsBusyBucket pins M6: the leader must NEVER cross-home GC a split-home bucket for
+// which it holds a LIVE tracker entry (its own in-flight transfer), even under a 1ns floor.
+func TestXferCrossHomeGCSkipsBusyBucket(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
+	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now, XferCrossHomeReapAge: time.Nanosecond}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = 0
+
+	// split-home session (node-A + node-B), leader holds a LIVE tracker entry for its bucket.
+	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
+	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	if code := b.transfers.put(&transferEntry{transferID: "obj", sid: "split", nid: "sp1", verb: "pull", tier: "b", bucket: "xfer-split", startedAt: time.Now()}); code != "" {
+		t.Fatalf("put live: %s", code)
+	}
+
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects: %v", err)
+	}
+	store, err := js.ObjectStore(ctx, "xfer-split")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	if _, err := store.GetInfo(ctx, "obj"); err != nil {
+		t.Fatalf("the leader must NOT cross-home GC a bucket it holds a LIVE tracker entry for (M6): %v", err)
+	}
+}
+
+// TestXferCrossHomeGCReapsSplitHome is the #58 Lane C fix pin: the caught-up LEADER reaps the AGED orphan
+// objects of a split-home / zero-node bucket no single home can reap, and the unreapable gauge falls to 0.
+// A single-home-ELSEWHERE bucket is left for its own home to reap (not orphaned-everywhere).
+func TestXferCrossHomeGCReapsSplitHome(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
+	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now, XferCrossHomeReapAge: time.Nanosecond}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = 0 // any non-deleted object is aged garbage for the gauge
+
+	// split-home (node-A + node-B) orphan → the LEADER cross-home GCs it.
+	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
+	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	// zero-node session orphan → cross-home GC'd.
+	putXferOrphan(t, ctx, js, "xfer-zero", "obj")
+	// single-home ELSEWHERE (node-B) orphan → NOT orphaned-everywhere → left for node-B, NOT GC'd here.
+	seedHomedNode(t, db, "elsewhere", "e1", "srv-B", "node-B")
+	putXferOrphan(t, ctx, js, "xfer-elsewhere", "obj")
+
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects: %v", err)
+	}
+
+	xferObjCount := func(bucket string) int {
+		store, err := js.ObjectStore(ctx, bucket)
+		if err != nil {
+			return -1
+		}
+		objs, err := store.List(ctx)
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			return 0
+		}
+		if err != nil {
+			t.Fatalf("list %s: %v", bucket, err)
+		}
+		n := 0
+		for _, o := range objs {
+			if !o.Deleted {
+				n++
+			}
+		}
+		return n
+	}
+	if got := xferObjCount("xfer-split"); got != 0 {
+		t.Fatalf("split-home bucket must be cross-home GC'd by the leader, still has %d objects", got)
+	}
+	if got := xferObjCount("xfer-zero"); got != 0 {
+		t.Fatalf("zero-node bucket must be cross-home GC'd by the leader, still has %d objects", got)
+	}
+	if got := xferObjCount("xfer-elsewhere"); got != 1 {
+		t.Fatalf("a single-home-elsewhere bucket must be LEFT for its own home (node-B), got %d objects (must not cross-home GC)", got)
+	}
+	if got := b.xferUnreapableBuckets.Load(); got != 0 {
+		t.Fatalf("after the leader cross-home GC the unreapable gauge must fall to 0 (the #58-fixed signal), got %d", got)
+	}
+}
+
 func TestXferUnreapableBucketCounter(t *testing.T) {
 	url := testharness.StartJSNATS(t)
 	nc, err := nats.Connect(url)

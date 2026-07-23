@@ -170,6 +170,21 @@ func (b *Broker) registerCoreReconcilePasses() {
 		return nil
 	})
 
+	// #57 Lane B: finalize-on-recovery. On the same cadence, close any DANGLING in-flight-transfer start
+	// row whose HOME broker crashed mid-flight (the durable ledger file outlived the process but no terminal
+	// was written). Runs after Run's late-wiring attaches the cluster audit sink, so the synthetic terminal
+	// routes through leader Apply and its content-reqID dedups. Shares the reap cadence (no new goroutine).
+	r.register("xfer-inflight-finalize", b.cfg.XferReapInterval, false, func(ctx context.Context, _ time.Time) error {
+		n, err := b.finalizeStrandedXfers(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			b.cfg.Logger.Info("broker: finalized stranded in-flight transfers after a home restart", "count", n)
+		}
+		return nil
+	})
+
 	// --- #31: stale grow-lock reaper (the THIRD SHAPE: leader-only + backoff) ---
 	//
 	// Registered here; the pass body and its convergence predicate live in

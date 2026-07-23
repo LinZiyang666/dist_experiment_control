@@ -224,6 +224,12 @@ type Config struct {
 	// unreapable by ANY node, so the pass ran forever and reaped nothing on it.
 	XferReapInterval time.Duration
 
+	// XferCrossHomeReapAge (R16 #58 Lane C) is the age floor for the leader-driven cross-home GC of a
+	// split-home / zero-node OBJ_xfer bucket no single home broker can reap. Defaults to xferCrossHomeReapAge
+	// (3× the tier-B timeout). Exposed so a deploy-tier drill can compress it and OBSERVE the GC without a
+	// multi-minute wait; production has no operator tuning story (the default is derived, never hand-set).
+	XferCrossHomeReapAge time.Duration
+
 	// GrowLockReapInterval is how often the R7 registry checks for a
 	// cluster_grow_active marker whose grow has already finished (#31 — the
 	// CLI's lock release is best-effort, so a dropped release used to block
@@ -462,8 +468,16 @@ type Broker struct {
 	// emitTransferAudit falls through to the byte-identical best-effort pubAuditTransfer.
 	// transferAuditWG tracks the async forward goroutines so the ordered shutdown (and the
 	// leak gate) can drain them (WaitTransferAudit).
-	transferAuditSink func(schema.AuditTransfer)
-	transferAuditWG   sync.WaitGroup
+	// onCommitted (external review F1) is invoked ONLY after the record is durably COMMITTED. It is
+	// how a terminal path drops the #57 in-flight ledger without ever deleting the evidence before the
+	// audit it is evidence for exists. nil = the caller has nothing to release.
+	transferAuditSink func(rec schema.AuditTransfer, onCommitted func())
+	// transferAuditForwardSync (R16 #57) is the SYNCHRONOUS, error-returning forward core (same fwd.Forward
+	// the async sink wraps). The #57 finalize-on-recovery pass uses it so it can DELETE the durable ledger
+	// ONLY on a confirmed commit — a fire-and-forget emit would destroy the evidence in the leaderless
+	// post-crash window (exactly #57's flagship case). Nil in single mode (finalizer never runs there).
+	transferAuditForwardSync func(payload []byte) error
+	transferAuditWG          sync.WaitGroup
 	// transferAuditDraining (D9 round-1 MAJOR): once the ordered shutdown sets it, new audit
 	// emits forward SYNCHRONOUSLY in the NATS handler instead of spawning a tracked goroutine
 	// — so a transfer event arriving in the shutdown window is drained within nc.Drain's
@@ -675,6 +689,9 @@ func New(cfg Config) (*Broker, error) {
 	}
 	if cfg.XferReapInterval == 0 {
 		cfg.XferReapInterval = 5 * time.Minute
+	}
+	if cfg.XferCrossHomeReapAge == 0 {
+		cfg.XferCrossHomeReapAge = xferCrossHomeReapAge
 	}
 	if cfg.GrowLockReapInterval == 0 {
 		cfg.GrowLockReapInterval = 30 * time.Second
@@ -1186,6 +1203,24 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 		defer func() { _ = b.admin.Close() }()
 		b.cfg.Logger.Info("broker: admin socket ready", "path", b.cfg.AdminSocketPath)
+	}
+
+	// R16 #57 (minor-2): eagerly finalize any transfer stranded by a PRIOR crash, so a broker that crash-loops
+	// faster than XferReapInterval still closes dangling start rows (the periodic pass is anchored at
+	// start+interval). M1 makes it safe when leaderless — the ledger is deleted only on a CONFIRMED commit.
+	//
+	// PLACEMENT IS LOAD-BEARING: this walks a ledger and, per stranded transfer, forwards to the leader with a
+	// bounded retry (~500ms each when leaderless). It MUST run AFTER the admin socket is serving. Running it
+	// earlier delays the socket, and the socket IS the joiner-readiness signal `tether cluster add` polls
+	// (joinerBrokerUpLocal → OpClusterStatus): a joiner restarted mid-grow that is merely still finalizing
+	// would be misread as "not up in cluster mode" and the grow would HALT at the start-joiner boundary.
+	// Observed on the deploy tier (drill 42 returning-node re-grow) when this ran before the socket.
+	if b.clusterMode {
+		if n, ferr := b.finalizeStrandedXfers(ctx); ferr != nil {
+			b.cfg.Logger.Warn("broker: eager stranded-transfer finalize on boot", "err", ferr)
+		} else if n > 0 {
+			b.cfg.Logger.Info("broker: eagerly finalized stranded in-flight transfers on boot (#57)", "count", n)
+		}
 	}
 
 	// G.2 step ① — recompute node states from persisted

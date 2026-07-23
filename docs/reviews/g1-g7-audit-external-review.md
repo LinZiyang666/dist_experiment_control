@@ -71,9 +71,25 @@ Blocked:
 
 这是**基础设施**问题（`kex_exchange_identification: Connection closed`），非代码缺陷；我这侧同样够不到时无法代跑。A1（唯一触碰 cutover 部署面的改动）是**防御性**的——happy-path 行为不变（真 cutover：nats 仍跑旧 standalone=reachable→照 SIGKILL 复活），仅新增"健康 clustered 不被瞬时探测错误误弹 / down 时不盲发 SIGKILL"。hermetic `TestCutoverRestartDecision` + 既有 grow 套件覆盖决策逻辑。**待 weilandserver SSH 恢复后跑一次 `drill 10-grow-to-3`/`11-grow-gaps` 作为 release-gate**（happy-path 应保持 GREEN）。
 
-### Residual-risk 2 — A11 移除了首次 AccountInfo 失败的"意外第二次机会"　【ACKNOWLEDGED · 接受】
+### Residual-risk 2 — A11 移除了首次 AccountInfo 失败的"意外第二次机会"　【~~ACKNOWLEDGED · 接受~~ → **本条当初的接受理由含一处事实错误；已由 G67 更正**】
 
-属实。旧的两次 `AccountInfo` 是**意外冗余**（准入一次 + 建桶一次），非有意重试；A11 合并成一次。瞬时 JS-meta 失败现在会让该次 push 准入干净失败（`bucket_create_failed`），而非碰运气第二次成功——这是可接受的：客户端本就对整次 push 重试，且一次失败比"准入过了但建桶用了另一个 ceiling"的不一致更安全。不阻塞发布；记入 release 监控。
+> **更正（2026-07-22，G67 / gotcha #67）。** 下面原文里"**客户端本就对整次 push 重试**"这句**是错的**——
+> 树内从来不存在任何客户端重试：`runPush` / `runPull` 拿到拒绝即 `return err`（`cmd/tether/transfer.go`），
+> `--timeout` 只是单次 RPC 的 deadline（默认 10 分钟），不是重试预算。也就是说本条当初被接受时，
+> 依据的是一个**不成立的兜底假设**。
+>
+> 后果在 R16 部署层验证期间显形：`drills/42-rejoin-returning` 复跑 3 的 setup 挂在
+> `code=bucket_create_failed create_bucket: context deadline exceeded`，而**一次朴素重试即成功**；
+> 专用 drill `67-transient-js-refusal` 已把它做成确定性复现。真正的机理比"少了一次机会"更糟：
+> 合并后的**单次** `AccountInfo` 与 `CreateObjectStore` **共用同一个 5s deadline**，而
+> `jsStoreCeiling` **吞掉** AccountInfo 的错误回退 statfs——所以一次停住的 sizing 探测不报任何错，
+> 只是静默吃光预算，承重的 create **连一次尝试都拿不到**（RED-first 测得剩余 **-4.25 ms**）。
+>
+> **不是要推翻 A11 的合并**（合并本身正确，两次 AccountInfo 确属意外冗余），而是要记下：
+> 「上游还有兜底」这类前提，**必须在树内验证过才能作为接受理由**。G67 的修复是给 sizing 与 create
+> **各自独立的 deadline** + 有界分类重试 + 把瞬时态与永久态分成两个码，详见 `docs/reviews/g67-plan.md`。
+
+~~属实。旧的两次 `AccountInfo` 是**意外冗余**（准入一次 + 建桶一次），非有意重试；A11 合并成一次。瞬时 JS-meta 失败现在会让该次 push 准入干净失败（`bucket_create_failed`），而非碰运气第二次成功——这是可接受的：客户端本就对整次 push 重试，且一次失败比"准入过了但建桶用了另一个 ceiling"的不一致更安全。不阻塞发布；记入 release 监控。~~
 
 ### Residual-risk 3 — C3 sentinel-only no-op 返回可能不存在的 backup 路径　【FIXED】
 

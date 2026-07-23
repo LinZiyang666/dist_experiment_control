@@ -80,18 +80,40 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		// object. Inert in production (selfID==""): homeOwnsXferBucket is always true.
 		sid := strings.TrimPrefix(name, "OBJ_xfer-")
 		if !b.homeOwnsXferBucket(sid) {
-			// N-6: a bucket NO broker can ever reap (split-home / zero-node session) that actually holds
-			// AGED orphan garbage is the racknerd small-disk-fill class — count it for the gauge + warn so
-			// an operator sees it before the disk fills. Observability ONLY: the reaper deletes nothing
-			// extra here (that would be #58's per-transfer-owner product fix), and this never softens the
-			// #58 ledger status. Counting every non-home skip would be ~always nonzero on a healthy
-			// cluster (each bucket is non-home on N-1 brokers), so the orphaned-EVERYWHERE + aged-objects
-			// predicate is what makes the number mean something. Cluster mode only (selfID!="").
-			if b.selfID != "" && b.xferBucketOrphanedEverywhere(sid) && b.xferBucketHasAgedObjects(ctx, name) {
-				unreapable++
-				b.cfg.Logger.Warn("broker: xfer bucket unreapable by ANY broker (split-home or zero-node session) "+
-					"holds aged orphan objects that will accumulate — the #58 per-transfer-owner refinement retires this",
-					"bucket", name, "sid", sid)
+			// R16 #58 Lane C: a bucket NO home can reap (split-home / zero-node session — homeOwnsXferBucket
+			// is false on EVERY broker) is the racknerd small-disk-fill class. The caught-up LEADER performs a
+			// cross-home GC of its AGED orphan objects: ONE broker (the leader) does it so no two race, only
+			// when orphaned-EVERYWHERE (no home owns the whole session), and with a LONGER age floor than the
+			// per-home grace (a transfer still live on ANOTHER home must never be torn out across clock skew).
+			// A follower cannot GC (leader-only) but still counts the gauge so accumulation stays visible.
+			// Cluster mode only (selfID!=""); in production single-broker mode homeOwnsXferBucket is always true.
+			if b.selfID != "" && b.xferBucketOrphanedEverywhere(sid) {
+				// M6: NEVER cross-home GC a bucket with a LIVE local tracker entry — a split-home session where
+				// the leader itself homes one node and holds an in-flight transfer. Its live object must not be
+				// torn out even under a compressed cross-home floor (the drill sets ≥1s). A busy bucket is live
+				// work, not accumulating garbage → skip the GC AND the gauge (tracker key == the OBJ_xfer-<sid> name).
+				if _, busy := b.transfers.activeOBJStreams()[name]; busy {
+					continue
+				}
+				// The caught-up LEADER GCs objects past the LONGER cross-home floor (only the leader, so no two
+				// brokers race; the longer floor protects a transfer still live on another home across clock skew).
+				if b.reaperMayDelete() {
+					if reaped := b.reapBucketObjects(ctx, name, b.crossHomeReapAge()); reaped > 0 {
+						deleted += reaped
+						b.cfg.Logger.Info("broker: cross-home GC reaped aged orphan xfer objects (split-home/zero-node bucket)",
+							"bucket", name, "sid", sid, "deleted", reaped)
+					}
+				}
+				// Gauge (N-6b): any bucket STILL holding aged garbage (per the per-home grace) AFTER the GC is
+				// accumulating disk risk — a follower (leader-only GC), or objects not yet past the longer
+				// cross-home floor. Computed independently of the GC so the number stays honest; it falls to 0
+				// once the leader reaps everything past the floor (the drill-observable #58-fixed signal).
+				if b.xferBucketHasAgedObjects(ctx, name) {
+					unreapable++
+					b.cfg.Logger.Warn("broker: xfer bucket unreapable by any HOME (split-home or zero-node session) holds "+
+						"aged orphan objects — the leader's cross-home GC (#58) reclaims those past the cross-home age floor",
+						"bucket", name, "sid", sid)
+				}
 			}
 			continue
 		}
@@ -102,49 +124,65 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		if _, busy := b.transfers.activeOBJStreams()[name]; busy {
 			continue
 		}
-		bucket := strings.TrimPrefix(name, "OBJ_")
-		store, err := b.js.ObjectStore(ctx, bucket)
-		if err != nil {
-			b.cfg.Logger.Warn("broker: open xfer bucket for reconcile",
-				"bucket", bucket, "err", err)
-			continue
+		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge)
+		deleted += reaped
+		if reaped > 0 {
+			b.cfg.Logger.Info("broker: orphan xfer objects reaped",
+				"bucket", name, "deleted_so_far", deleted)
 		}
-		objs, err := store.List(ctx)
-		if err != nil {
-			// Empty bucket → ErrNoObjectsFound; not an error.
-			if errors.Is(err, jetstream.ErrNoObjectsFound) {
-				continue
-			}
-			b.cfg.Logger.Warn("broker: list xfer objects for reconcile",
-				"bucket", bucket, "err", err)
-			continue
-		}
-		for _, obj := range objs {
-			if obj.Deleted {
-				continue
-			}
-			// M-3: never reap a FRESH object. The per-bucket busy re-read above closes most of the
-			// snapshot race, but an object created between that check and this Delete — or one a
-			// mid-transfer rehome left on a broker whose tracker no longer tracks it — must not be
-			// torn out mid-upload. A genuinely orphan object ages past the grace and is reaped later.
-			if b.xferReapMinAge > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < b.xferReapMinAge {
-				continue
-			}
-			if err := store.Delete(ctx, obj.Name); err != nil &&
-				!errors.Is(err, jetstream.ErrObjectNotFound) {
-				b.cfg.Logger.Warn("broker: orphan xfer object delete",
-					"bucket", bucket, "name", obj.Name, "err", err)
-				continue
-			}
-			deleted++
-		}
-		b.cfg.Logger.Info("broker: orphan xfer objects reaped",
-			"bucket", bucket, "deleted_so_far", deleted)
 	}
 	// N-6: publish the latest unreapable-bucket count for the /metrics gauge + status. Store (not Add):
 	// it is a gauge that must fall back to 0 once topology heals the split-home / zero-node condition.
 	b.xferUnreapableBuckets.Store(int64(unreapable))
 	return deleted, infos.Err()
+}
+
+// reapBucketObjects deletes every non-deleted object in the OBJ_xfer bucket `name` older than minAge and
+// returns the count deleted. Shared by the home-owned reap (per-home grace b.xferReapMinAge) and the #58
+// leader cross-home GC (the longer crossHomeReapAge). minAge<=0 reaps everything (the zero-value test
+// broker's prompt-reap semantics).
+func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration) (deleted int) {
+	bucket := strings.TrimPrefix(name, "OBJ_")
+	store, err := b.js.ObjectStore(ctx, bucket)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: open xfer bucket for reconcile", "bucket", bucket, "err", err)
+		return 0
+	}
+	objs, err := store.List(ctx)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoObjectsFound) { // empty bucket — not an error
+			return 0
+		}
+		b.cfg.Logger.Warn("broker: list xfer objects for reconcile", "bucket", bucket, "err", err)
+		return 0
+	}
+	for _, obj := range objs {
+		if obj.Deleted {
+			continue
+		}
+		// Never reap a FRESH object: the per-bucket busy re-read closes most of the snapshot race, but an
+		// object created between that check and this Delete — or one a mid-transfer rehome left on a broker
+		// whose tracker no longer tracks it — must not be torn out mid-upload. It ages past the grace and is
+		// reaped later. The cross-home GC uses a longer floor so a peer-home's live transfer is never torn out.
+		if minAge > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < minAge {
+			continue
+		}
+		if err := store.Delete(ctx, obj.Name); err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {
+			b.cfg.Logger.Warn("broker: orphan xfer object delete", "bucket", bucket, "name", obj.Name, "err", err)
+			continue
+		}
+		deleted++
+	}
+	return deleted
+}
+
+// crossHomeReapAge is the effective age floor for the #58 leader cross-home GC — the serveconf override when
+// set (a deploy-tier drill compresses it), else the derived xferCrossHomeReapAge default.
+func (b *Broker) crossHomeReapAge() time.Duration {
+	if b.cfg.XferCrossHomeReapAge > 0 {
+		return b.cfg.XferCrossHomeReapAge
+	}
+	return xferCrossHomeReapAge
 }
 
 // xferBucketHasAgedObjects reports whether the OBJ_xfer bucket `name` holds at least one non-deleted

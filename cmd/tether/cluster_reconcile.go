@@ -31,7 +31,7 @@ func newClusterReconcileCmd(socketPath *string) *cobra.Command {
 
 func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 	var f natsconfTakeoverFlags
-	var manual, all, wait, toStandalone, confirmSingle bool
+	var manual, all, wait, toStandalone, confirmSingle, resetJS bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "nats",
@@ -49,11 +49,16 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 			"      --peer brk-a,nats://10.0.0.1:6222,U… --peer brk-b,nats://10.0.0.2:6222,U…",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --confirm-single / --reset-js are meaningful ONLY with --to-standalone; silently ignoring them
+			// on the auto/manual paths would leave an operator believing a destructive intent took effect.
+			if !toStandalone && (confirmSingle || resetJS) {
+				return usageErr("reconcile nats: --confirm-single / --reset-js are only valid with --to-standalone")
+			}
 			if toStandalone {
 				if all || wait || manual {
 					return usageErr("reconcile nats: --to-standalone cannot be combined with --all/--wait/--manual")
 				}
-				return runReconcileToStandalone(cmd, &f, confirmSingle)
+				return runReconcileToStandalone(cmd, &f, confirmSingle, resetJS)
 			}
 			if manual {
 				if all || wait {
@@ -71,6 +76,7 @@ func newClusterReconcileNatsCmd(socketPath *string) *cobra.Command {
 	cmd.Flags().DurationVar(&timeout, "timeout", 60*time.Second, "with --wait: give up after this long, exit non-zero naming the laggard(s)")
 	cmd.Flags().BoolVar(&toStandalone, "to-standalone", false, "SHRINK: re-render this lone survivor's nats.conf WITHOUT the cluster{} block (standalone JetStream). The FINAL N=1 de-cluster step; requires --confirm-single + a full nats-server restart")
 	cmd.Flags().BoolVar(&confirmSingle, "confirm-single", false, "with --to-standalone: assert this is the SINGLE remaining voter (`cluster retire` to N=1 first — de-clustering with live peers tears the route mesh)")
+	cmd.Flags().BoolVar(&resetJS, "reset-js", false, "with --to-standalone: acknowledge resetting a NON-EMPTY clustered JetStream store to standalone (history/audit loss; MOVED aside to <store>.standalone-bak.<ts>, NEVER deleted) — NATS cannot migrate a clustered JS store in place")
 	return cmd
 }
 

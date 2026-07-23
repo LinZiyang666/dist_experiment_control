@@ -159,10 +159,17 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 		return gerr
 	}
 
-	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
-	tier, _, err := chooseTier(st.Size(), caps)
+	// G67 #67 face B: the probe RESULT is classified, never silently zero-valued. A failed probe used
+	// to fall back to proto.CapsResp{} — JetStreamReady=false, MaxPayload=0 — which made "the probe
+	// failed" indistinguishable from "the broker has no JetStream", and the CLI then asserted the
+	// latter with advice the broker never gave.
+	probe := probeCapsClassified(cmd.Context(), nc, id.PublicKey, sid, 3*time.Second)
+	tier, _, err := chooseTier(st.Size(), probe, nc.MaxPayload())
 	if err != nil {
 		return err
+	}
+	if note := probe.warning(); note != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "tether push: %s\n", note)
 	}
 
 	transferID := newTransferID()
@@ -208,7 +215,7 @@ func pushTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier A): parse: %w", err)
 	}
 	if !pr.OK {
-		return fmt.Errorf("push (tier A) refused: code=%s %s", pr.Code, pr.Error)
+		return transferRefusalErr(pr.Code, "push (tier A) refused: code=%s %s", pr.Code, pr.Error)
 	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "tether push: OK (tier A)")
 	return nil
@@ -251,7 +258,7 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B prepare): parse: %w", err)
 	}
 	if !pr.OK {
-		return fmt.Errorf("push (tier B) refused at prepare: code=%s %s", pr.Code, pr.Error)
+		return transferRefusalErr(pr.Code, "push (tier B) refused at prepare: code=%s %s", pr.Code, pr.Error)
 	}
 
 	// Step 2: ObjectStore.Put into the per-session bucket xfer-<sid>,
@@ -312,7 +319,7 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 		return fmt.Errorf("push (tier B commit): parse: %w", err)
 	}
 	if !cr.OK {
-		return fmt.Errorf("push (tier B) commit refused: code=%s %s", cr.Code, cr.Error)
+		return transferRefusalErr(cr.Code, "push (tier B) commit refused: code=%s %s", cr.Code, cr.Error)
 	}
 
 	// Wait for ev.transfer.<id>.{complete,failed}. If subscription was
@@ -325,7 +332,10 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 			var ev proto.TransferEvent
 			if json.Unmarshal(msg.Data, &ev) == nil {
 				if ev.Kind == "failed" {
-					return fmt.Errorf("push (tier B) failed: code=%s %s", ev.Code, ev.Error)
+					// G67 m14: the SIXTH refusal site (plan §2 IN item 5 counts six). This one reports
+					// the transfer's TERMINAL outcome rather than a prepare-time refusal, so it is the
+					// one place a failure code arrives after the data plane already ran.
+					return transferRefusalErr(ev.Code, "push (tier B) failed: code=%s %s", ev.Code, ev.Error)
 				}
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 					"tether push: OK (tier B, %d bytes, %dms)\n", ev.Bytes, ev.DurationMs)
@@ -420,13 +430,13 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 		return gerr
 	}
 
-	caps, _ := probeCaps(nc, id.PublicKey, sid, 3*time.Second)
-	maxInline := int64(cliTierAMaxBytes)
-	if caps.MaxPayload > 0 {
-		half := caps.MaxPayload/2 - 1024
-		if half > 0 && half < maxInline {
-			maxInline = half
-		}
+	// G67: same classified probe + the SHARED ceiling helper (the duplicated arithmetic that used to
+	// live here silently WIDENED the inline budget to the 8 MiB default whenever the probe failed,
+	// because a zero-value CapsResp has MaxPayload=0 and the old code only clamped when it was > 0).
+	probe := probeCapsClassified(cmd.Context(), nc, id.PublicKey, sid, 3*time.Second)
+	maxInline := tierAInlineCeiling(nc.MaxPayload(), probe)
+	if note := probe.warning(); note != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "tether pull: %s\n", note)
 	}
 
 	transferID := newTransferID()
@@ -461,7 +471,7 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 				Code: pr.Code, Error: pr.Error,
 			}, 3*time.Second)
 		}
-		return fmt.Errorf("pull refused: code=%s %s", pr.Code, pr.Error)
+		return transferRefusalErr(pr.Code, "pull refused: code=%s %s", pr.Code, pr.Error)
 	}
 
 	if pr.Tier == "a" {
@@ -611,7 +621,7 @@ func sendFinalize(nc *nats.Conn, actor, sid, transferID string, fin proto.Transf
 	}
 	var fr proto.TransferFinalizeResp
 	if json.Unmarshal(resp.Data, &fr) == nil && !fr.OK {
-		return fmt.Errorf("finalize refused: code=%s %s", fr.Code, fr.Error)
+		return transferRefusalErr(fr.Code, "finalize refused: code=%s %s", fr.Code, fr.Error)
 	}
 	return nil
 }
@@ -705,15 +715,17 @@ func parseRemoteSpec(s string) (remoteSpec, error) {
 	return remoteSpec{Node: nid, Path: path}, nil
 }
 
-// probeCaps issues `ctrl.by.<actor>.s.<sid>.caps.req` and returns the
-// broker's reported capabilities. Used by chooseTier so we don't shoot
-// a tier-B request at a broker without JetStream, or a tier-A request
-// that exceeds the server max_payload. timeout is small (caps is a
-// pre-flight; failing the probe simply means we fall back to
-// conservative defaults).
-func probeCaps(nc *nats.Conn, actor, sid string, timeout time.Duration) (proto.CapsResp, error) {
+// probeCapsCtx issues `ctrl.by.<actor>.s.<sid>.caps.req` and returns the broker's reported
+// capabilities. Used by chooseTier so we don't shoot a tier-B request at a broker without JetStream,
+// or a tier-A request that exceeds the server max_payload.
+//
+// #67 face B: its ERROR IS LOAD-BEARING and callers must not discard it. Failing this probe means we
+// learned NOTHING; it does not mean the broker has no JetStream. Go through probeCapsClassified,
+// which encodes that distinction in the type. The parent context makes Ctrl-C interrupt the probe
+// instead of waiting out its timeout.
+func probeCapsCtx(parent context.Context, nc *nats.Conn, actor, sid string, timeout time.Duration) (proto.CapsResp, error) {
 	body, _ := json.Marshal(proto.CapsReq{})
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	subj := proto.SubjCtrlCaps(actor, sid)
 	msg, err := nc.RequestWithContext(ctx, subj, body)
@@ -727,41 +739,129 @@ func probeCaps(nc *nats.Conn, actor, sid string, timeout time.Duration) (proto.C
 	return resp, nil
 }
 
-// chooseTier decides tier A vs B for a given file size + caps probe
-// result. The plan's rules (file-transfer-plan §Tier selection):
+// capsStatus classifies what a caps probe actually established. #67 face B existed because these
+// three collapsed into one zero-value CapsResp, making "no answer" indistinguishable from
+// "authoritatively: no JetStream".
+type capsStatus int
+
+const (
+	capsUndetermined capsStatus = iota // transport or parse failure — NO usable answer
+	capsRefused                        // the broker answered but declined (OK=false)
+	capsOK                             // authoritative
+)
+
+type capsProbe struct {
+	Status capsStatus
+	Resp   proto.CapsResp
+	Err    error
+}
+
+// warning returns the stderr note for a probe that produced no authoritative answer, or "" when the
+// answer was authoritative. It is a WARNING, never an error: the broker is one RPC away and is the
+// single adjudicator of whether tier B can be served.
+func (p capsProbe) warning() string {
+	switch p.Status {
+	case capsUndetermined:
+		return fmt.Sprintf("warning: could not read broker capabilities (%v); proceeding and letting the broker decide", p.Err)
+	case capsRefused:
+		return fmt.Sprintf("warning: the broker declined to report its capabilities (%s); that says nothing about JetStream, so proceeding and letting the broker decide", p.Resp.Code)
+	default:
+		return ""
+	}
+}
+
+// probeCapsClassified runs the caps probe and CLASSIFIES the outcome instead of discarding the error.
+// It deliberately does NOT retry: once a failed probe means "let the broker decide", a retry buys
+// nothing but latency on every transfer.
+func probeCapsClassified(ctx context.Context, nc *nats.Conn, actor, sid string, timeout time.Duration) capsProbe {
+	return classifyCapsResp(probeCapsCtx(ctx, nc, actor, sid, timeout))
+}
+
+// classifyCapsResp is the pure half of the probe, split out so the three-way classification is
+// directly testable. Internal review B1: with it folded into the RPC wrapper, flipping the
+// `!resp.OK` arm to capsOK left every Go test green — and that flip alone reinstates #67 face B,
+// because a broker that merely DECLINED to answer (`not_a_member`) would be treated as authoritative
+// and chooseTier would refuse with a permanent capability claim the broker never made.
+func classifyCapsResp(resp proto.CapsResp, err error) capsProbe {
+	switch {
+	case err != nil:
+		return capsProbe{Status: capsUndetermined, Err: err}
+	case !resp.OK:
+		return capsProbe{Status: capsRefused, Resp: resp}
+	default:
+		return capsProbe{Status: capsOK, Resp: resp}
+	}
+}
+
+// tierAInlineCeiling clamps the inline (tier-A) budget by EVERY measurement actually available and
+// NEVER by one that is missing.
 //
-//   - size > 2 GiB: refused outright before we get here.
-//   - size > 8 MiB: tier B.
-//   - size > caps.MaxPayload * 0.5: tier B (give NATS some headroom
-//     for framing + headers).
-//   - else: tier A.
+// #67 face B, second half: the old code clamped only `if caps.MaxPayload > 0`, so a zero-value
+// CapsResp from a FAILED probe silently RAISED the ceiling back to the 8 MiB design default and moved
+// the tier-A/B boundary without telling anyone. nc.MaxPayload() is ground truth for what THIS client
+// may publish and is populated from server INFO on any connected conn, so it is always available;
+// the broker's own caps.MaxPayload is honoured only when the probe was authoritative.
+func tierAInlineCeiling(connMaxPayload int64, probe capsProbe) int64 {
+	ceiling := int64(cliTierAMaxBytes)
+	clamp := func(p int64) {
+		if p <= 0 {
+			return
+		}
+		if half := p/2 - 1024; half > 0 && half < ceiling {
+			ceiling = half
+		}
+	}
+	clamp(connMaxPayload)
+	if probe.Status == capsOK {
+		clamp(probe.Resp.MaxPayload)
+	}
+	return ceiling
+}
+
+// chooseTier decides tier A vs B for a given file size and a CLASSIFIED caps probe.
 //
-// If caps.JetStreamReady=false, tier B isn't an option:
-//   - size > 8 MiB: refuse with `jetstream_unavailable` so the user
-//     gets a clean error instead of a cryptic mid-Put failure.
+//   - size <= the inline ceiling            -> tier A. A failed probe must never block a tier-A
+//     transfer, so this is decided first.
+//   - authoritative + JetStream ready       -> tier B.
+//   - authoritative + JetStream NOT ready   -> refuse. This is the ONLY case where the broker really
+//     told us tier B cannot be served, so it is the only case entitled to say so.
+//   - no authoritative answer               -> tier B, with a stderr warning. The broker adjudicates
+//     (handlePushReq refuses with real prose if it has no JetStream). Refusing locally would mean
+//     inventing a second claim — which is exactly what #67 was.
 //
-// Returns ("a"|"b", maxInline, err). maxInline is what we pass into
-// PullPrepareReq.MaxInline for symmetric agent-side decision.
-func chooseTier(size int64, caps proto.CapsResp) (string, int64, error) {
+// Returns ("a"|"b", maxInline, err).
+func chooseTier(size int64, probe capsProbe, connMaxPayload int64) (string, int64, error) {
 	if size > cliMaxBytes {
 		return "", 0, fmt.Errorf("too_large: file size %d > %d (use `tether expose` + rsync)", size, cliMaxBytes)
 	}
-	maxInline := int64(cliTierAMaxBytes)
-	if caps.MaxPayload > 0 {
-		// Leave 1 KiB headroom for proto framing + base64.
-		half := caps.MaxPayload/2 - 1024
-		if half > 0 && half < maxInline {
-			maxInline = half
-		}
-	}
+	maxInline := tierAInlineCeiling(connMaxPayload, probe)
 	if size <= maxInline {
 		return "a", maxInline, nil
 	}
-	if !caps.JetStreamReady {
-		return "", maxInline, fmt.Errorf("jetstream_unavailable: broker has no JetStream so tier-B (>%d bytes) cannot be served; either bump nats max_payload >= %d or use `tether expose` + rsync",
-			maxInline, size*2+2048)
+	if probe.Status == capsOK && !probe.Resp.JetStreamReady {
+		// The max_payload clause is offered ONLY when raising it would actually help — i.e. when the
+		// file could travel inline. For a file above the 8 MiB tier-A design ceiling it never can,
+		// and offering it (as the pre-#67 message did unconditionally) is misdirection.
+		if size <= cliTierAMaxBytes {
+			return "", maxInline, usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B cannot be served, and this %d-byte file does not fit the current tier-A inline budget of %d bytes. Raise the broker's nats max_payload to at least %d bytes so this file travels inline as tier A, enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
+				size, maxInline, size*2+2048)
+		}
+		return "", maxInline, usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B (files larger than %d bytes) cannot be served. Enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
+			maxInline)
 	}
 	return "b", maxInline, nil
+}
+
+// transferRefusalErr attaches an EXIT CLASS to a transfer refusal WITHOUT touching its text.
+//
+// G67 step 6. The transfer refusals deliberately do NOT go through brokerErrorMessage: that renders
+// `<verb> failed: <msg> (<code>)`, dropping the literal `code=<X>` token that drills/61-transfer-edges
+// greps for (it is GREEN and must stay so), and it also DISCARDS the raw broker error whenever a hint
+// exists. So the message is formatted exactly as before and only the class is added — the class is
+// what turns `jetstream_not_ready` into exit 75 (retry me) instead of the unclassified 70 (tether
+// bug). Codes with no mapping keep 70, which is the pre-G67 behaviour for every one of them.
+func transferRefusalErr(code, format string, args ...any) error {
+	return &ExitError{Class: brokerCodeExitClass(code), Err: fmt.Errorf(format, args...)}
 }
 
 // newTransferID makes a 16-hex random id. Not a ULID (we don't need

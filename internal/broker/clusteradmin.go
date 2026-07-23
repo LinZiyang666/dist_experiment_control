@@ -75,6 +75,18 @@ type ClusterAdmin struct {
 	// readiness probes the operation controller drives (same funcs AddNode/DrainNode take as params).
 	caughtUpFn     func(nodeID string, barrier uint64) (bool, error)
 	streamsReadyFn func(nodeID string) (bool, error)
+	// jsPlaceableFn (G69 / #67 sub-face 4) answers "can the JetStream meta place a NEW asset at the
+	// CURRENT target replica factor?" — the question the join terminal gate never asked, which is why
+	// `cluster add` could return rc=0 at a moment when the first CreateObjectStore(Replicas: N) still
+	// failed. It returns no error: EVERY uncertainty folds into (false, detail) so no caller can have a
+	// path that returns before the deadline check. nil ⇒ PLACEABLE (the house nil-skip contract; dozens
+	// of unit paths build a bare ClusterAdmin), which is exactly why the wiring carries a source pin.
+	//
+	// CONTRACT (internal review G-19): it MUST NOT panic and MUST bound itself. It is called INLINE on
+	// the observe loop, and there is no recover() anywhere in internal/broker — a panicking or blocking
+	// implementation takes the whole leader-maintenance loop down with it. The 3s cap lives in the
+	// production implementation, not here, so any other implementation owes its own bound.
+	jsPlaceableFn func() (bool, string)
 
 	// homeAppliedFn / homeDeliverFn (R8a P1), when set (wireClusterLate), are the
 	// broker's data-plane convergence oracle and its immediate-delivery kick.

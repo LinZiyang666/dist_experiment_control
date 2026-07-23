@@ -362,7 +362,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			// R10 P4: the remedy literal is the shared natsconf SSOT (also emitted by the N=1 boot
 			// FATAL and by `cluster recovery restore`'s completion text — three copies used to drift).
 			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE — nats.conf is still clustered after force-single (file transfers / history / audit return 503). De-cluster it: `" +
-				natsconf.DeClusterRemedyCmd + "` " + natsconf.DeClusterRemedyArgHint + ", then restart nats-server."
+				natsconf.DeClusterRemedyCmd + "` " + natsconf.DeClusterRemedyArgHint + ", then restart nats-server. " + natsconf.DeClusterRemedyResetJSNote
 		} else {
 			rep.Banner += "DATA-PLANE DEGRADED: JetStream is UNAVAILABLE (sustained 503) — file transfers / history / audit are failing. Check `tether cluster status`, nats-server, and JetStream meta quorum."
 		}

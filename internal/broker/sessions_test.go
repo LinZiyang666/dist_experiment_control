@@ -31,6 +31,23 @@ func runBrokerForSessions(t *testing.T) (*nats.Conn, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// waitNATSReady proves the earlier node-register subscription is live, but Broker.Run registers
+	// handlers sequentially and the session subscriptions may not exist yet. Probe the exact create
+	// face with invalid JSON (no DB mutation) so callers cannot race into nats.ErrNoResponders.
+	readyActor := freshUserActor(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err = nc.Request(proto.SubjCtrlSessionCreate(readyActor), []byte("not-json"), 200*time.Millisecond)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			nc.Close()
+			cancel()
+			t.Fatalf("session broker subscriptions not ready: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	stop := func() {
 		nc.Close()
@@ -164,7 +181,10 @@ func TestHandleSessionListReturnsOnlyMine(t *testing.T) {
 		}
 	}
 
-	msg, _ := nc.Request(proto.SubjCtrlSessionList(a), []byte("{}"), 2*time.Second)
+	msg, err := nc.Request(proto.SubjCtrlSessionList(a), []byte("{}"), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var resp proto.SessionListResp
 	_ = json.Unmarshal(msg.Data, &resp)
 	if len(resp.Sessions) != 1 || resp.Sessions[0].SID != "alpha" {

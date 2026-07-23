@@ -34,15 +34,13 @@ _rejoin_diag() {
     printf '%s' "$_rj" | grep -qi 'recovery rejoin prepare' && printf '%s' "$_rj" | grep -qiE 'EJECTED|raft config still lists peer'
 }
 _reset_after_force_single() {
-    # Keep the reset strict, but leave enough evidence to distinguish a missing
-    # JS store from a NATS/broker startup failure. assert_ok otherwise prints only
-    # the command's final three lines and the remote shell used to be silent.
+    # R16 A3: the JS-store reset is now the PRODUCT's job (force-single --reset-js moved it aside above). The
+    # only step left here is the sim-side SERVICE restart the product tells the operator to run (systemctl is
+    # legitimately sim-side per Mandate ③): a FULL nats-server restart to load the standalone conf + the fresh
+    # store, then start the broker. NO hand-rolled mv/rm — that concealment is retired.
     "$SIM" exec brk1 -- sh -eu -c '
         trap '\''rc=$?; printf "reset failed rc=%s nats=%s broker=%s js=%s\n" "$rc" "$(systemctl is-active nats-server 2>/dev/null || true)" "$(systemctl is-active tether-broker 2>/dev/null || true)" "$(test -d /var/lib/tether/jetstream && echo present || echo missing)"; tail -n 2 /var/log/tether/nats.err /var/log/tether/broker.err 2>/dev/null || true; exit "$rc"'\'' 0
-        systemctl stop nats-server
-        test -d /var/lib/tether/jetstream
-        mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.$(date +%s)
-        systemctl start nats-server
+        systemctl restart nats-server
         systemctl start tether-broker
         test "$(systemctl is-active nats-server)" = active
         test "$(systemctl is-active tether-broker)" = active
@@ -92,11 +90,18 @@ assert_refuses "H resnapshot refuses unless the on-disk roster is SINGLE-VOTER" 
 # that made drill 91 brick its survivor and blame the product. grep -q exits at ForceSingle's INTERNAL
 # "…single-voter cluster" log line (emitted BEFORE the CLI's nats.conf de-cluster) and SIGPIPEs tether.
 # Run to completion (rc-checked), then assert the REAL #20 post-condition on the file.
-assert_ok "OFFLINE force-single brk1 → lone N=1 survivor (prunes dead brk2; runs to completion, rc=0)" \
-    "$SIM" exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2
+# R16 A3: --reset-js makes force-single MOVE the survivor's clustered JS store aside as a PRODUCT step
+# (jetstream.force-single-bak.<epoch>, never deleted) — retiring the drill's old hand-rolled `mv` compensation
+# (a Mandate-④ concealment). Without --reset-js the command now REFUSES a non-empty clustered store (loud gate).
+assert_ok "OFFLINE force-single --reset-js brk1 → lone N=1 survivor (prunes dead brk2; de-clusters conf AND moves the clustered JS store aside; runs to completion, rc=0)" \
+    "$SIM" exec brk1 -- runuser -u tether -- python3 /opt/sim/pty-confirm.py brk1 -- tether cluster recovery force-single --self-id brk1 --self-addr brk1:7400 --confirm-peers-dead brk2 --reset-js
 assert_ok "OFFLINE force-single de-clustered nats.conf to standalone (#20 post-condition on the FILE, not a log line)" \
     sh -c "! $SIM exec brk1 -- grep -qE '^cluster[[:space:]]*\\{' /etc/tether/nats.d/nats.conf"
-assert_ok "OFFLINE force-single operator reset succeeds and both services return active" \
+# R16 A3 file-postcondition: the product (not the drill) moved the clustered JS store aside. This is the
+# assertion that pins the sim `mv` compensation is GONE — force-single itself reset the store.
+assert_ok "OFFLINE force-single --reset-js MOVED the clustered JS store aside itself (jetstream.force-single-bak.* present — the product verb, not the sim's old mv)" \
+    sh -c "$SIM exec brk1 -- sh -c 'ls -d /var/lib/tether/jetstream.force-single-bak.* >/dev/null 2>&1'"
+assert_ok "OFFLINE force-single: the operator's systemctl restart loads the standalone conf + fresh store; both services return active (systemctl stays sim-side per Mandate ③; the JS reset was the product's job)" \
     _reset_after_force_single
 sleep 5
 

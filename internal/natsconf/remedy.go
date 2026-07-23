@@ -30,4 +30,18 @@ const (
 	// manual takeover renders `Standalone: len(peers)==1`, so passing NO --peer emits exactly the
 	// standalone-JetStream conf a lone voter needs, without touching the admin socket.
 	DeClusterRemedyOfflineNote = "with the daemon STOPPED the online verb cannot prove N=1 — use the offline render instead: `tether cluster reconcile nats --manual` with NO --peer emits a STANDALONE (no cluster{}) conf"
+
+	// DeClusterRemedyResetJSNote closes an R16 divergence this file's own doc comment predicted.
+	// R16 (A4) added an ACKNOWLEDGEMENT GATE: --to-standalone now REFUSES when the JetStream store is
+	// data-bearing, because swapping a clustered conf under a live clustered store strands it, and
+	// resetting it drops audit/history. The grow-cutover remedy was updated to say --reset-js; THIS
+	// one was not — so the DATA-PLANE-DEGRADED banner, which fires exactly when JetStream has been
+	// serving and is therefore exactly when the store IS data-bearing, told the operator to run a
+	// command that would refuse. (Caught on the deploy tier by drill 92 during G67, because 92 was
+	// not re-run inside R16.)
+	//
+	// The refusal is a guard rail, not a dead end — it names the flag, the data impact, and the
+	// `nats stream backup` escape — so the command above is left UNCHANGED (advising an unconditional
+	// data-dropping flag in a banner would be worse). This note just removes the surprise.
+	DeClusterRemedyResetJSNote = "if this node's JetStream store still holds data the command above will REFUSE and tell you to add `--reset-js`, which MOVES the store aside (never deletes) and drops live audit/history — run `nats stream backup` first if you need it"
 )

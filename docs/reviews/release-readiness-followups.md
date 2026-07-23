@@ -40,7 +40,10 @@
 | 外审阻塞层（发布级缺陷） | ✅ 全闭合，两位外审三轮 Pass，"可放行" |
 | 头号目标 CRIT-1/P1 | ✅ 真闭合 + hermetic + live 双验证 |
 | 代码质量（经得起对抗测试、非快乐测试） | ✅ 达标 |
-| **grow-onto-recovered 深层缺陷** | ⚠️ **开放**（见 §3）——是否阻塞取决于目标场景 |
+| **grow-onto-recovered 深层缺陷** | ✅ **R16 已修**（2026-07-22，deploy-tier 复验：drill 51 `I re-grow to N=2 succeeded`、drill 42 GREEN）；**停在外审门**，未 commit |
+| **#57 / #58 传输深层项** | ✅ **R16 已修 + hermetic 钉**；deploy-tier 证明仍欠（drill 96 的 1 GiB 上传总在 kill 前完成）⇒ 台账保持 OPEN |
+| **#67 瞬时 tier-B 拒绝**（R16 验证期间新发现） | ✅ **G67 已修 face A/B**；`#67` 整条仍 OPEN（face B 无 deploy-tier oracle + 4 条 sub-face）。**停在同一道外审门** |
+| **#68 remedy SSOT 分裂**（G67 回归清扫发现） | ✅ **已修**（R16 A4 更新了一处补救文案、漏了 SSOT ⇒ JS-503 横幅让运维跑一条必被拒的命令） |
 | 发版机制（tag/产物/车队） | ❌ 未执行（见 §4） |
 | macOS 门 | ❌ 未跑（见 §5） |
 | Follow-up 技术债 | ◻ 开放但不阻塞（见 §6） |
@@ -51,7 +54,11 @@
 
 - **是什么**：force-single 恢复（或某 broker 崩溃恢复成 survivor）后，**再扩容回 N=2** 时，clustered-JetStream 的 meta 从 1→2 形成期**死锁**。真实生产事故同型（racknerd/pc732，见 `project_racknerd_forcesingle_js_incident` / `project_cluster_ha_realmachine_test` memory）。
 - **影响面**：drill **42 / 51 / 22 / 82**（本批 deploy-tier 里 42=PRODUCT-RED、51=PRODUCT-RED 即此族）。
-- **状态**：已在外审中**诚实披露为深层 PRODUCT-RED**，**不在本 allgreen 批次范围**，留给专属 **R16**（HA 关键路径，值得单独 plan→实现→内审→外审，不 rush）。
+- **状态（2026-07-22 更新）**：**R16 已完成 plan→实现→内审（Fable 5, 13 agent）→ deploy-tier 复验**，现停在**外审门**（未 commit）。
+  根因不是 #31/#45/#51 那类残留（R15 已闭），而是 `restore.go` 引导单 voter 后**从未取 `GrowReadySnapshot`**（`init.go` 会取），
+  于是 fresh joiner 重放一条不含 direct-install 行的日志 → FK/hollow。修复 = A2c。
+  另有 A1（returning joiner 的陈旧 JS store 在 grow P5 移置）与两处由部署层逼出的修复（start-joiner 就绪检查改有界轮询、
+  #57 boot finalize 移到 admin socket 之后）。**决策树以下内容已过时**——恢复后 re-grow 的死锁已不再触发。
 - **决策树**：
   - 目标部署**不涉及"恢复后再扩容"**（单 broker / 稳定 N≥3 不重扩）→ **可直接发版**，本缺陷不触发。
   - 目标部署**会做恢复后 re-grow**（HA 运维演练/车队重组）→ **建议先做 R16 再发**，否则用户会踩死锁。
@@ -131,6 +138,20 @@
   - `project_racknerd_forcesingle_js_incident` / `project_cluster_ha_realmachine_test`（grow-onto-recovered 生产事故）
   - `project_live_fleet_v2_ops` / `project_release_lines_v1_v2`（现网车队/发版线）
   - `feedback_commit_authorship`（无 AI 署名）/ `feedback_main_only_no_branches`（直提 main）
+
+---
+
+## 7bis. 2026-07-22 状态快照（R16 + G67 双增量同树）
+
+- 工作树 **44 改 + 17 新，未 add 未 commit**，两个增量**共用同一道外审门**。
+- 硬闸（干净树重测）：`make test` 0 FAIL · `make lint` 0 issues · `make e2e` ok 647s · simcluster hermetic ALL PASS。
+- 外审清单：`docs/reviews/r16-external-review-tasklist.md`（末尾 §G 段覆盖 G67）。
+- **仍未做、且属于我的只有一条**：`#67` **sub-face 4** —— `cluster add` 在 JS meta 尚不能放置 R=N 资产时就宣告成功，
+  于是「grow 完立刻传文件」在负载下仍会被拒一次（G67 只让这次拒绝变诚实、可重试，**没有**消除它）。
+  修法要在 `cluster_operation_controller.go` 的 `topoAdvance`（NATS_ROLLED_OUT → SERVING 那道门）加 JS-meta 就绪条件——
+  **正是 gotcha #45 的形状**（fail-closed 门 + 不可靠信号曾把 op 永久钉住并 wedge 整个成员变更面），
+  因此值得独立 plan→实现→内审，不宜顺手打补丁。
+- **另外两项结构上不是主进程能做的**：§4 发版机制（tag/goreleaser/车队，需决策+执行）、§5 macOS 门（需用户的 mac）。
 
 ---
 

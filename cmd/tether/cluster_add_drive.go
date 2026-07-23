@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/nats-io/nats.go"
@@ -173,6 +175,16 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 		if err := renderJoinerClusteredConf(cmd, nc, actor, accountSeed, leader, jp, out); err != nil {
 			return haltAdd(webhook, "render-joiner-conf", jp.Joiner, err)
 		}
+		// R16 A1: reset the JOINER's OWN stale JetStream store BEFORE it boots clustered. A RETURNING node
+		// (rejoin-prepare wiped raft/+tether.db but NOT the JS store) carries a dead-epoch clustered JS meta;
+		// booting the freshly-rendered clustered conf onto it wedges the 1->2 JS-meta formation and the joiner
+		// crash-loops on the lone-clustered fatal (n1ClusteredJetStreamFatal), stalling the op at CATCHING_UP
+		// (drill 42 #GROW-ONTO-FORCE-SINGLE). A FRESH joiner's store is empty → no-op (drills 10/11). Non-empty
+		// (data-bearing) → operator-gated move-aside (never delete). Backup-dir-first idempotent (keyed on opID)
+		// so a resume after the move never double-moves the fresh clustered store.
+		if err := resetJoinerJSStore(out, jp, opID); err != nil {
+			return haltAdd(webhook, "reset-joiner-js", jp.Joiner, err)
+		}
 	}
 	if votersBefore == 1 {
 		if former := formerSoleVoter(nc, actor, jp.Joiner); former != "" {
@@ -187,7 +199,7 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	// systemctl). Liveness is on the joiner's LOCAL admin socket (we run ON the joiner; its nats health is
 	// unreachable over NATS until the mesh forms). HALT with the resume hint if not up yet — its conf is now
 	// clustered, so provisioning's start brings it up meshed.
-	if !joinerBrokerUpLocal(socketPath) {
+	if !awaitJoinerBrokerUpLocal(ctx, socketPath, jp.Joiner, out) {
 		_, _ = fmt.Fprint(out, startJoinerHint(jp.Joiner))
 		notifyGrow(webhook, "paused_start_joiner", map[string]any{"joiner": jp.Joiner})
 		return &ExitError{Class: exitTransient, Err: fmt.Errorf("RESUME: start the joiner's daemons, then re-run `tether cluster add %s`", jp.Joiner)}
@@ -658,6 +670,43 @@ func joinerBrokerUpLocal(socketPath string) bool {
 	return err == nil && adminStatusIsClustered(resp)
 }
 
+// joinerBootGrace bounds how long the start-joiner boundary waits for a joiner whose daemons provisioning has
+// ALREADY started. It is not a guess at "how slow is slow": it covers the two REAL transients a just-restarted
+// joiner goes through — the broker serving its admin socket at the END of Run (after the cluster backend wires),
+// and, during a grow specifically, a short crash-restart cycle while its clustered JetStream still has no quorum
+// (the former-N1's nats is meshing) and the broker fail-stops on the lone-clustered-JS guard until systemd's
+// Restart=always brings it back. Both resolve in seconds; a minute is generous without hiding a real failure.
+const joinerBootGrace = 60 * time.Second
+
+// awaitJoinerBrokerUpLocal polls joinerBrokerUpLocal for a bounded window instead of probing ONCE.
+//
+// A one-shot probe is wrong at exactly this boundary. Provisioning has just restarted the joiner's nats +
+// broker, so "not up in cluster mode" right now is far more often "still coming up" than "misconfigured" —
+// and the one-shot HALT told the operator to start daemons that were already running, then aborted a grow
+// whose joiner became healthy seconds later. Observed on the deploy tier: drill 42's returning-node re-grow
+// failed this way in 3 of 4 runs (invocation 2, rc=75) while brk2 was mid boot/crash-restart, even though the
+// grow itself was correct — the former-N1 had already been cut over and was sitting clustered-alone waiting.
+// Polling turns that transient back into what it is; a joiner that is genuinely single-mode or truly not
+// started still fails the whole window and gets the same actionable HALT.
+func awaitJoinerBrokerUpLocal(ctx context.Context, socketPath, joiner string, out interface{ Write([]byte) (int, error) }) bool {
+	if joinerBrokerUpLocal(socketPath) {
+		return true
+	}
+	_, _ = fmt.Fprintf(out, "  … waiting up to %s for %s's broker to serve cluster status (provisioning just restarted it)\n", joinerBootGrace, joiner)
+	deadline := time.Now().Add(joinerBootGrace)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(2 * time.Second):
+		}
+		if joinerBrokerUpLocal(socketPath) {
+			return true
+		}
+	}
+	return false
+}
+
 // adminStatusIsClustered reports whether an OpClusterStatus reply proves the broker is up AND running in CLUSTER
 // mode. A SINGLE-mode broker answers the socket too, but with OK=false / Cluster=nil / Code=cluster_not_enabled;
 // accepting any reply misjudged it as clustered (external review B1).
@@ -720,6 +769,54 @@ func renderJoinerClusteredConf(cmd *cobra.Command, nc *nats.Conn, actor string, 
 	c.Stderr = &stderr
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("reconcile nats --manual: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// resetJoinerJSStore moves aside the JOINER's own JetStream store before it boots clustered (R16 A1). A
+// returning node's dead-epoch clustered JS meta would otherwise wedge the 1->2 meta and crash-loop the
+// joiner (n1ClusteredJetStreamFatal). Discovery: preflight the joiner's freshly-rendered nats.conf for its
+// JS store dir. A non-empty store is operator-gated (--reset-former-js / --preserve-js-data); an empty
+// store (a fresh joiner) is a no-op. The move is backup-dir-first idempotent (keyed on the op id).
+func resetJoinerJSStore(out interface{ Write([]byte) (int, error) }, jp joinerParams, opID string) error {
+	own, err := natsconf.Preflight(defaultNatsConfPath)
+	if err != nil {
+		// minor-1: fail CLOSED. The render step just rewrote the joiner's clustered conf, so a preflight
+		// failure here is abnormal — surfacing it (rather than silently disarming the drill-42 fix) matches
+		// the m4 fail-closed posture in MoveAsideJSStore one layer down.
+		return fmt.Errorf("preflight the joiner's nats.conf to resolve its JS store: %w", err)
+	}
+	storeDir := own.JSStoreDir()
+	// M3: only a DATA-BEARING store (a returning node's stale streams/clustered meta) needs resetting. A
+	// truly-fresh joiner's store is absent, empty, or only the structural skeleton a booted JS nats lays
+	// down — treat it as a no-op so a fresh grow (drills 10/11) is byte-equivalent (no backup, no sentinel,
+	// no spurious "moved aside" line, no false residue evidence) and never a false data-loss HALT.
+	hasData, hasErr := natsconf.JSStoreHasData(storeDir)
+	if hasErr != nil {
+		// F4: an unreadable store is DATA-BEARING by contract — proceeding as if it were empty is what
+		// re-opens the grow wedge. Surface it instead of silently skipping the reset.
+		return fmt.Errorf("cannot determine whether the joiner's JetStream store holds data: %w", hasErr)
+	}
+	if storeDir == "" || !hasData {
+		return nil
+	}
+	// The op id is the STABLE per-grow epoch (set at P4, always non-empty by P5). Fail LOUD rather than mint
+	// a fixed collision-prone "grow-bak.join" that a second grow would treat as a same-epoch no-op.
+	if opID == "" {
+		return fmt.Errorf("reset joiner JS store: no op id (grow epoch) in hand — refusing a fixed-name backup that a later grow could collide with")
+	}
+	backup := storeDir + ".grow-bak." + opID
+	sentinel := filepath.Join(jp.DataDir, ".grow-joiner-reset-"+opID+".done")
+	moved, err := natsconf.MoveAsideJSStore(storeDir, backup, sentinel, jp.ResetFormerJS || jp.PreserveJSData)
+	if err != nil {
+		// Widen the refusal to name the JOINER end of the grow + the exact re-run (M2 stable-refusal).
+		return fmt.Errorf("the JOINER %s carries a pre-existing JetStream store that must be reset before it can "+
+			"boot clustered — %w\n  re-run `tether cluster add %s … --reset-former-js` (or --preserve-js-data): "+
+			"the flags move ANY pre-existing JS store on EITHER end of the grow aside (grow-bak, NEVER deleted)",
+			jp.Joiner, err, jp.Joiner)
+	}
+	if moved != "" {
+		_, _ = fmt.Fprintf(out, "→ reset joiner %s JetStream store (moved aside to %s; a returning node's stale clustered meta would wedge the grow)\n", jp.Joiner, moved)
 	}
 	return nil
 }

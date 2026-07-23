@@ -908,8 +908,11 @@ ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload
 据此选档；agent 也会复算一次（防止操作员把 broker 的 `max_payload` 调
 小了 ctl 不知道）。
 
-**tier A 实际上限**为 `min(8 MiB, broker.max_payload/2 - 1 KiB)`（源码
-`cliTierAMaxBytes = 8*1024*1024`，再与 broker `caps.MaxPayload/2 - 1024` 取小）。
+**tier A 实际上限**为 `min(8 MiB, ctl_conn.max_payload/2 - 1 KiB, broker_caps.max_payload/2 - 1 KiB)`
+（源码 `cliTierAMaxBytes = 8*1024*1024`，再与**每一个已知**测量取小）。G67 / #67：
+**探测失败绝不会放宽这个上限**——早先的实现只在 `caps.MaxPayload > 0` 时才收紧，于是一次失败的
+caps 探测（零值 `CapsResp`）会把上限悄悄抬回 8 MiB 默认值、无声挪动 tier-A/B 分界；现在缺失的测量
+一律忽略，`nc.MaxPayload()` 这一项在任何已连接的连接上都可得。
 NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让 tier A 跑满
 8 MiB，broker 的 NATS `max_payload` 必须 ≥ 16 MiB（broker.yaml 之外的 nats.conf
 配置）。超过此阈值的请求由 ctl 自动升 tier B。
@@ -917,7 +920,10 @@ NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让
 **先决条件**：
 
 1. broker 必须已开 JetStream（用 tarball install 写出的 nats.conf 缺省即开）；
-   否则 tier-B 会以 `jetstream_unavailable` 拒掉；
+   否则 tier-B 会以 `jetstream_unavailable` 拒掉（**永久态**）。注意与 `jetstream_not_ready`
+   区分：后者是**瞬时**的（broker 重启 / 选主 / grow 进行中），稍后重试即可；
+   caps 探测本身失败时 ctl **不再**自行断言 broker 没有 JetStream，而是照常发起请求、
+   由 broker 裁决（探测失败会在 stderr 打一条 warning）；
 2. push/pull **默认开放**（无需配置）：不配 `file_transfer.allow_roots` 时，
    远端路径可达 agent 用户能访问的**任意绝对路径**（与 `run`/`exec` 同等触达）。
    `allow_roots` 是**可选收紧**；显式 `allow_roots: []`（空列表）则**禁用**
@@ -999,7 +1005,9 @@ broker 永远是 single audit writer。
 | `sha_mismatch` / `size_mismatch` | 接收端在提交目标文件前发现 SHA-256 / 字节数不符 |
 | `path_race` | 校验后父目录或文件 inode 被并发替换，操作已拒绝 |
 | `too_large` | 文件 > 2 GiB |
-| `jetstream_unavailable` | tier-B 但 broker 没开 JetStream |
+| `jetstream_unavailable` | **永久配置态**：该 broker 根本没有 JetStream 客户端（nats.conf 里禁用了，或 broker 启动时那次一次性 JetStream 探测失败——broker 不会重探，重启即重探）。重试无用 |
+| `jetstream_not_ready` | **瞬时态**（G67 / #67）：JetStream 在，但此刻不受理该请求——broker 重启、选主、或 grow 正在进行。broker **已经**有界重试过若干次才回这个码；**稍后重跑同一条命令**即可，退出码 75。持续不消失则 `tether cluster status` |
+| `bucket_create_failed` | **永久态**：tier-B 对象存储无法建立且重试无用（JS store 小于 tier-B 下限、非集群节点上 replicas>1 等）。文案刻意不含任何"重试"字样 |
 | `node_offline` / `not_a_member` | 目标节点离线 / 调用者不是 session 成员 |
 | `not_owner_or_creator` | finalize 阶段 actor 跟 transfer 创建者不一致（防伪造） |
 
@@ -1303,7 +1311,8 @@ rsync -av --progress big-dataset/ rsync@broker:14001/...
 - `tether push` 报 `transfer_disabled` → agent.yaml 里 `file_transfer.allow_roots: []`（显式关闭）；删掉该键即恢复开放；
 - `path_outside_roots` → 配了 `allow_roots` 收紧，远端绝对路径不在任一前缀下；
 - `dst_exists` → 远端已有同名文件，加 `--force` 覆盖；
-- `jetstream_unavailable` → broker 没开 JetStream，tier B 走不了；
+- `jetstream_unavailable` → 该 broker 没有 JetStream 客户端（禁用了，或启动时的一次性探测失败；重启 broker 会重探）——**永久态**，重试无用；
+- `jetstream_not_ready` → **瞬时态**：JetStream 在但此刻不受理（broker 重启 / 选主 / grow 进行中），broker 已有界重试过；**稍后重跑同一条命令**，持续则 `tether cluster status`；
 - 详细 audit：`tether history --kind transfer -n 20`。
 
 ---

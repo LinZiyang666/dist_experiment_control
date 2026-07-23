@@ -131,6 +131,12 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// R16 #58 Lane C: the leader cross-home GC age floor (empty ⇒ 0 ⇒ broker.New's derived 3×tier-B
+			// default). A deploy-tier drill compresses it to observe the GC; production leaves it unset.
+			xferCrossHomeReapAge, err := fileCfg.XferCrossHomeReapAgeDuration()
+			if err != nil {
+				return err
+			}
 
 			// #39: disk-pressure monitor interval. Precedence flag > yaml > built-in default:
 			// an explicit --disk-check-interval wins; else broker.observability.disk_check_interval;
@@ -202,33 +208,34 @@ func newServeCmd() *cobra.Command {
 			}
 
 			cfg := broker.Config{
-				NATSURL:             natsURL,
-				DB:                  db,
-				Logger:              logger,
-				PublicHost:          publicHost,
-				TunnelControlAddr:   tunnelCtrlAddr,
-				TunnelPublicHost:    tunnelPublicHost,
-				StoreDir:            storeDir,
-				AdminSocketPath:     adminSocket,
-				PortBandLow:         bandLow,
-				PortBandHigh:        bandHigh,
-				UpgradeURLAllowlist: allow,
-				ProcRetention:       procRetention,
-				ProcGCInterval:      procGCInterval,
-				XferReapInterval:    xferReapInterval,
-				SubHTTPAddr:         subHTTPListen,
-				SubURLBase:          subURLBase(publicHost),
-				ClusterDataDir:      clusterDataDir,
-				ClusterRaftAddr:     clusterRaftAddr,
-				ClusterSecretsDir:   clusterSecrets,
-				ColocatedAgentNID:   colocatedAgentNID,
-				DBPath:              dbPath,
-				MetricsAddr:         metricsListen,
-				ManifestAddr:        manifestListen,
-				NatsConfPath:        natsConfPath,
-				NatsServerBin:       natsServerBin,
-				AlertWebhookURL:     alertWebhookURL,
-				DiskCheckInterval:   diskCheckInterval,
+				NATSURL:              natsURL,
+				DB:                   db,
+				Logger:               logger,
+				PublicHost:           publicHost,
+				TunnelControlAddr:    tunnelCtrlAddr,
+				TunnelPublicHost:     tunnelPublicHost,
+				StoreDir:             storeDir,
+				AdminSocketPath:      adminSocket,
+				PortBandLow:          bandLow,
+				PortBandHigh:         bandHigh,
+				UpgradeURLAllowlist:  allow,
+				ProcRetention:        procRetention,
+				ProcGCInterval:       procGCInterval,
+				XferReapInterval:     xferReapInterval,
+				XferCrossHomeReapAge: xferCrossHomeReapAge,
+				SubHTTPAddr:          subHTTPListen,
+				SubURLBase:           subURLBase(publicHost),
+				ClusterDataDir:       clusterDataDir,
+				ClusterRaftAddr:      clusterRaftAddr,
+				ClusterSecretsDir:    clusterSecrets,
+				ColocatedAgentNID:    colocatedAgentNID,
+				DBPath:               dbPath,
+				MetricsAddr:          metricsListen,
+				ManifestAddr:         manifestListen,
+				NatsConfPath:         natsConfPath,
+				NatsServerBin:        natsServerBin,
+				AlertWebhookURL:      alertWebhookURL,
+				DiskCheckInterval:    diskCheckInterval,
 			}
 
 			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)

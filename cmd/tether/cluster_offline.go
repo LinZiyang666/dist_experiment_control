@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -141,7 +142,7 @@ func newClusterForceSingleCmd() *cobra.Command {
 	var dataDir, dbPath, selfID, selfAddr, natsConf, natsServerBin string
 	var confirmDead []string
 	var guided bool
-	var online, dryRun bool
+	var online, dryRun, resetJS bool
 	cmd := &cobra.Command{
 		Use:   "force-single",
 		Short: "DANGER (split-brain risk): force this node to a lone single-voter cluster — quorum-loss escape hatch only; daemon STOPPED; type node_id to confirm",
@@ -210,7 +211,8 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			// clustered conf would exit 70 (clustered JS cannot form quorum-of-2 at N=1). already-standalone
 			// is a no-op, so this is always safe to run.
 			declustered := "; nats.conf de-clustered to standalone"
-			if storeDir, changed, derr := deClusterStandaloneConf(natsConf, natsServerBin, selfID, dbPath); derr != nil {
+			storeDir, changed, derr := deClusterStandaloneConf(natsConf, natsServerBin, selfID, dbPath)
+			if derr != nil {
 				// Round-5 B1: this is NOT a warning. The raft/DB phases are already committed and
 				// irreversible; without this de-cluster the broker cannot start at all (clustered JS
 				// cannot form a quorum at N=1 -> exit 70 crash-loop). Returning nil here reported SUCCESS
@@ -221,12 +223,26 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 					"  The recovery is JOURNALLED - re-run this exact force-single command to forward-complete it\n"+
 					"  (the peers you already confirmed dead are recorded, so you need not re-list them),\n"+
 					"  or de-cluster %s by hand (drop the cluster{} block) and re-run to finish", natsConf, derr, natsConf)
-			} else if changed {
-				warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
-			} else {
-				// already standalone (e.g. a hand-de-clustered survivor) — a proven byte no-op: NO destructive
-				// JS-store reset warning, no false "de-clustered" claim (plan §4 铁律).
+			}
+			if !changed {
+				// already standalone (e.g. a hand-de-clustered survivor) — a proven byte no-op: no false
+				// "de-clustered" claim (plan §4 铁律). The JS store may STILL be clustered, so the reset below
+				// runs regardless.
 				declustered = "; nats.conf already standalone (no change)"
+			}
+			// R16 A3 (#20 completion): reset the survivor's clustered JS store to standalone — dropping the
+			// cluster{} block is NOT enough (NATS does not migrate a clustered JS store in place, so a standalone
+			// nats boots onto a stale clustered meta = 503). Runs whenever a force-single is finishing (a
+			// hand-de-clustered survivor still carries a clustered store) and BEFORE the journal is cleared so a
+			// crash forward-completes. Gated by --reset-js (non-empty store = history/audit loss); the backup name
+			// uses the journal's per-incident epoch so a resume is backup-dir-first idempotent. Retires the old
+			// `rm -rf` advisory (warnClusteredJSShrink).
+			jsEpoch, jeerr := clusteroffline.ForceSingleJSResetEpoch(dataDir)
+			if jeerr != nil {
+				return fmt.Errorf("force-single: read JS-reset epoch from the journal: %w", jeerr)
+			}
+			if err := resetForceSingleJSStore(cmd, storeDir, dataDir, jsEpoch, resetJS); err != nil {
+				return err
 			}
 			// Round-5 B1: the node is bootable again ONLY now - the first moment the sequence is truly
 			// complete - so this is the only place the recovery journal may be cleared.
@@ -235,7 +251,9 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"force-single complete: %q is now a single-voter cluster (%d nodes abandoned)%s.\n"+
-					"RESET the JS store as warned (if any), then systemctl unmask tether-broker && systemctl start tether-broker, then recover the others.\n",
+					"A FULL `systemctl restart nats-server` is REQUIRED (the conf was de-clustered — NOT SIGHUP-reloadable —\n"+
+					"and the JS store was reset), THEN `systemctl unmask tether-broker && systemctl start tether-broker`,\n"+
+					"then recover the others. (Starting the broker before nats reloads the standalone conf ⇒ 503.)\n",
 				selfID, len(abandoned), declustered)
 			return nil
 		},
@@ -250,8 +268,37 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "with --online: a zero-mutation drill (evaluate the gates + report) runnable on a HEALTHY cluster")
 	cmd.Flags().StringVar(&natsConf, "nats-conf", defaultNatsConfPath, "nats.conf to de-cluster to standalone after an OFFLINE force-single (#20)")
 	cmd.Flags().StringVar(&natsServerBin, "nats-server", "nats-server", "nats-server binary for the de-cluster -t dry-run validation")
+	cmd.Flags().BoolVar(&resetJS, "reset-js", false, "acknowledge resetting a NON-EMPTY clustered JetStream store to standalone (history/audit loss; the store is MOVED aside to jetstream.force-single-bak.<epoch>, NEVER deleted) — completes the shrink so the survivor serves JS at N=1 (#20)")
 	registerYesRejector(cmd)
 	return cmd
+}
+
+// resetForceSingleJSStore moves the survivor's clustered JetStream store aside to standalone (R16 A3),
+// gated by --reset-js for a non-empty (data-bearing) store. It is the product replacement for the old
+// `rm -rf` advisory: MOVE-aside, never delete. The backup path uses the force-single journal's per-incident
+// epoch so a resume reuses the same name (backup-dir-first idempotent). storeDir "" (no jetstream store_dir
+// in the conf) and an already-empty/absent store are no-ops.
+func resetForceSingleJSStore(cmd *cobra.Command, storeDir, dataDir, epoch string, resetJS bool) error {
+	if storeDir == "" {
+		return nil // no explicit JS store_dir in nats.conf — nothing to reset
+	}
+	if epoch == "" {
+		epoch = "unknown"
+	}
+	backup := storeDir + ".force-single-bak." + epoch
+	sentinel := filepath.Join(dataDir, ".force-single-js-reset."+epoch+".done")
+	moved, err := natsconf.MoveAsideJSStore(storeDir, backup, sentinel, resetJS)
+	if err != nil {
+		return fmt.Errorf("force-single: the survivor's clustered JetStream store must be reset to standalone before "+
+			"the broker can serve JS at N=1 — %w\n"+
+			"  re-run this exact force-single command with --reset-js (the peers you confirmed dead are journalled).\n"+
+			"  ⚠ DATA IMPACT: moves ALL JetStream audit/history (history-<sid> incl. the forensic incident bundle, the\n"+
+			"  events stream, in-flight OBJ_xfer) aside to %s — NEVER deleted; to PRESERVE it live, `nats stream backup` first", err, backup)
+	}
+	if moved != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "→ reset clustered JS store to standalone (moved aside to %s; NEVER deleted — restore by hand or `nats stream restore`). A FULL `systemctl restart nats-server` is REQUIRED next.\n", moved)
+	}
+	return nil
 }
 
 // runForceSingleOnline drives the online force-single arm->confirm->commit flow over the broker's admin
@@ -316,7 +363,8 @@ func runForceSingleOnline(cmd *cobra.Command, socket, selfID string, confirmDead
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n"+
 			"NEXT — the DATA plane (JetStream: file transfers / history / audit) stays 503 until you de-cluster this survivor's nats.conf:\n"+
-			"  tether cluster reconcile nats --to-standalone --confirm-single --server-name <self-server-name> --broker-nkey <self-bus-nkey>\n"+
+			"  "+natsconf.DeClusterRemedyCmd+"\n"+
+			"  "+natsconf.DeClusterRemedyResetJSNote+"\n"+
 			"  (server-name is this broker's nats_server_id — the conf's server_name: line; broker-nkey is its bus nkey — derive it from the broker.nk seed in secrets_dir, or read cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A multi-broker conf can't auto-pick self's nkey)\n"+
 			"then a FULL `systemctl restart nats-server` (the abandoned peers are already pruned, so the N=1 proof now passes). `cluster status` shows a DATA-PLANE-DEGRADED banner until you do.\n",
 		selfID, abandoned)

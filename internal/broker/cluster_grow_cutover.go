@@ -53,21 +53,42 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "no nats.conf path configured — cannot cut over"}
 	}
 
-	// Stage A: live already clustered → done. A1: TOLERANT probe — a transient monitor error must not fall
-	// through to a spurious SIGKILL of a healthy clustered broker (mesh-cutover is re-invoked on any grow
-	// resume, so a re-run against an already-cutover broker + one probe blip could otherwise bounce it).
-	if clustered, _ := b.probeNatsClusteredTolerant(); clustered {
-		return &proto.ClusterGrowResp{OK: true, AlreadyDone: true}
-	}
-
 	own, err := natsconf.Preflight(confPath)
 	if err != nil {
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "preflight live conf: " + err.Error()}
 	}
+	// A1: TOLERANT probe — a transient monitor error must not fall through to a spurious SIGKILL of a healthy
+	// clustered broker (mesh-cutover is re-invoked on any grow resume).
+	liveClustered, _ := b.probeNatsClusteredTolerant()
+	confClustered := own.IsClusteredJetStream()
+
+	// R16 A5-min: a survivor that is CLUSTERED but whose clustered state PREDATES this grow (online
+	// force-single / restore left it clustered — a stale single-node/dead-peer meta) must NEVER be silently
+	// classified AlreadyDone/restart-only: NATS cannot absorb a joiner into a stale meta, so the 1->2 meta
+	// wedges (drills 42/51 root; racknerd incident). The durable evidence that a grow cutover RESET this
+	// store is a grow-bak.<epoch> backup (M3). A NORMAL grow enters this cutover STANDALONE and only reaches
+	// "clustered" AFTER moving the store aside, so a clustered survivor whose store was NEVER grow-reset is
+	// recovered residue. Refuse LOUDLY with the de-cluster remedy rather than wedge the grow. (The full
+	// auto-reset + /jsz meta-health verdict is a deferred follow-up; loud-refuse is the safe minimum — no
+	// drill depends on in-cutover auto-reset here, and the refusal routes to a SAFE de-cluster+reset+re-grow.)
+	if (liveClustered || confClustered) && !b.growCutoverThisEpochEvidence(own.JSStoreDir(), req.GrowEpoch) {
+		b.cfg.Logger.Error("grow cutover: survivor is CLUSTERED but no grow ever reset its JS store — recovered clustered residue; a stale single-node meta cannot absorb the joiner, so refusing rather than wedging the 1->2 meta",
+			"remedy", "tether cluster reconcile nats --to-standalone --confirm-single --reset-js, then re-run cluster add")
+		b.pubSysEvent("grow_cutover_clustered_residue", map[string]any{
+			"remedy": "reconcile nats --to-standalone --confirm-single --reset-js",
+		})
+		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest,
+			Error: "refusing cutover: this broker is CLUSTERED but the grow never reset its JetStream store — it is recovered clustered residue (a stale single-node/dead-peer JS meta that cannot absorb the joiner, so the 1->2 meta would wedge). De-cluster + reset it to standalone first: `tether cluster reconcile nats --to-standalone --confirm-single --reset-js`, then re-run `cluster add`."}
+	}
+
+	// Stage A: live already clustered (with grow-reset evidence) → done.
+	if liveClustered {
+		return &proto.ClusterGrowResp{OK: true, AlreadyDone: true}
+	}
 
 	// Stage B: conf already clustered on disk but nats not live-clustered → a prior apply landed and the
 	// revival failed/was interrupted. Re-SIGKILL + verify only (do NOT re-move the store — it is already reset).
-	if own.IsClusteredJetStream() {
+	if confClustered {
 		return b.restartAndVerifyClustered()
 	}
 
@@ -117,6 +138,9 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 	if merr != nil {
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: merr.Error()}
 	}
+	// M2: durably mark THIS epoch's cutover as run — even if the store was absent (no backup created) — so a
+	// later resume (A5-min) is not falsely refused as recovered residue.
+	b.markGrowCutoverEpoch(req.GrowEpoch)
 
 	// Apply the clustered conf (atomic swap, .bak kept). nats has NOT reloaded it yet — the SIGKILL+revive does.
 	if aerr := natsconf.Apply(confPath, merged); aerr != nil {
@@ -252,7 +276,10 @@ func (b *Broker) renderClusteredCutoverConf(own *natsconf.Ownership) (string, er
 // moveAsideJetStreamStore renames the standalone JS store to <store>.grow-bak.<epoch> (NEVER deletes) so the
 // broker boots clustered with a fresh empty store, and recreates the empty store dir. Gated: a NON-EMPTY
 // (data-bearing) store refuses without ResetAck (loud, operator-gated — plan §3 Q3). Idempotent per epoch via
-// a sentinel, so a retry after the move does not double-move a freshly-clustered store. Returns the backup path.
+// a backup-dir-first check + sentinel, so a retry after the move does not double-move a freshly-clustered
+// store. Returns the backup path. R16 A0: the delicate move-aside logic (M3 backup-dir-first, m4 fail-closed
+// ReadDir, non-empty→refuse, EACCES→loud chown hint) now lives ONCE in natsconf.MoveAsideJSStore, shared with
+// the grow joiner reset (A1), offline force-single (A3), and reconcile-nats --to-standalone (A4).
 func (b *Broker) moveAsideJetStreamStore(storeDir, epoch string, ack bool) (string, error) {
 	if storeDir == "" {
 		return "", nil // no explicit store dir — nothing to move (render already refused an implicit one)
@@ -262,43 +289,45 @@ func (b *Broker) moveAsideJetStreamStore(storeDir, epoch string, ack bool) (stri
 	}
 	backup := storeDir + ".grow-bak." + epoch
 	sentinel := filepath.Join(b.cfg.ClusterDataDir, ".grow-cutover-"+epoch+".done")
-	// M3: the DURABLE evidence of the move is the backup dir itself — check it FIRST. The sentinel is written
-	// last (after the irreversible rename+recreate) and can be lost to a crash/kill/OOM in that window; keying
-	// idempotency on it alone wedged a resume with ENOTEMPTY (rename of the recreated-empty store over the
-	// data-bearing backup). If the backup already exists, this epoch's move already happened → no-op.
-	if _, berr := os.Stat(backup); berr == nil {
-		return backup, nil // already moved this grow epoch (durable backup present) — idempotent no-op; C3: still report the restore hint
+	return natsconf.MoveAsideJSStore(storeDir, backup, sentinel, ack)
+}
+
+// growCutoverThisEpochEvidence reports whether THIS grow epoch's cutover already handled the survivor — the
+// durable proof (A5-min) that a clustered survivor is a freshly-reset grow store rather than recovered
+// clustered residue that predates the grow (M2). It is EPOCH-SPECIFIC: keying on ANY historical grow-bak.*
+// (backups are never pruned, and MoveAsideJSStore renames even an empty store, so every ex-joiner/ex-former-N1
+// carries one forever) would silently DISARM the guard and absorb real racknerd-class residue as AlreadyDone.
+// Two evidence forms: (a) the per-epoch sentinel .grow-cutover-<epoch>.done, written even on the absent-store
+// path so a legit grow onto an empty-store survivor is not falsely refused on resume; (b) the <store>.grow-bak.<epoch>
+// backup. No epoch, or a read miss, is NO evidence → refuse loudly (never silently absorb; plan §8.2).
+func (b *Broker) growCutoverThisEpochEvidence(storeDir, epoch string) bool {
+	if epoch == "" {
+		return false // no epoch to key on → cannot prove THIS grow handled it → treat as residue (refuse loudly)
 	}
-	if _, serr := os.Stat(sentinel); serr == nil {
-		// Sentinel present but the backup dir is GONE (the Stat above failed) — the move happened yet the
-		// operator has since moved/removed the backup. Idempotent no-op; return "" (external review F1-doubt:
-		// do NOT hand back a computed path to a directory that no longer exists as the restore hint).
-		return "", nil
-	}
-	if fi, serr := os.Stat(storeDir); serr != nil || !fi.IsDir() {
-		return "", nil // no store dir on disk yet — nothing to reset
-	}
-	// m4: fail CLOSED on a ReadDir error — a store we cannot enumerate must be treated as POTENTIALLY
-	// data-bearing (require the operator ack), never silently as empty (a gate whose job is to fail loud).
-	entries, rerr := os.ReadDir(storeDir)
-	if (rerr != nil || len(entries) > 0) && !ack {
-		reason := "is NON-EMPTY (data-bearing)"
-		if rerr != nil {
-			reason = "could not be enumerated (" + rerr.Error() + ") — treating it as data-bearing"
+	if b.cfg.ClusterDataDir != "" {
+		if _, err := os.Stat(filepath.Join(b.cfg.ClusterDataDir, ".grow-cutover-"+epoch+".done")); err == nil {
+			return true
 		}
-		return "", fmt.Errorf("former-N1 JetStream store %q %s — refusing to reset it without acknowledgement; "+
-			"re-run `cluster add` with --reset-former-js OR --preserve-js-data (both move the store aside to %s; it is NEVER deleted, and you can restore it by hand)", storeDir, reason, backup)
 	}
-	if err := os.Rename(storeDir, backup); err != nil {
-		return "", fmt.Errorf("move JS store aside: %w", err)
+	if storeDir != "" {
+		if _, err := os.Stat(storeDir + ".grow-bak." + epoch); err == nil {
+			return true
+		}
 	}
-	if err := os.MkdirAll(storeDir, 0o700); err != nil {
-		return backup, fmt.Errorf("recreate empty JS store dir: %w", err)
+	return false
+}
+
+// markGrowCutoverEpoch writes the per-epoch cutover sentinel so a resume is not falsely refused as residue,
+// even when the store was absent (MoveAsideJSStore writes the sentinel only when it actually moves something).
+func (b *Broker) markGrowCutoverEpoch(epoch string) {
+	if epoch == "" || b.cfg.ClusterDataDir == "" {
+		return
 	}
-	if werr := os.WriteFile(sentinel, []byte(b.cfg.Now().UTC().Format(time.RFC3339Nano)+" backup="+backup+"\n"), 0o600); werr != nil {
-		b.cfg.Logger.Warn("grow cutover: could not write move-aside sentinel (harmless — the backup dir is the durable idempotency guard)", "err", werr)
+	sentinel := filepath.Join(b.cfg.ClusterDataDir, ".grow-cutover-"+epoch+".done")
+	if _, err := os.Stat(sentinel); err == nil {
+		return
 	}
-	return backup, nil
+	_ = os.WriteFile(sentinel, []byte("grow-cutover epoch="+epoch+"\n"), 0o600)
 }
 
 // hardRestartNatsServer SIGKILLs the local nats-server via nats-server's own signal resolver

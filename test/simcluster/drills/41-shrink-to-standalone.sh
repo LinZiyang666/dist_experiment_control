@@ -38,11 +38,18 @@ _agent_direct_on_voter() {
     return 1
 }
 _no_cluster_block() { ! "$SIM" exec "$LDR" -- grep -qE '^cluster' /etc/tether/nats.d/nats.conf; }
-_tostandalone() {
-    A reconcile nats --to-standalone --confirm-single --server-name "$LDR" \
-        --account-issuer "$(secrets_account_pub "$INSTANCE")" \
-        --broker-nkey "$(secrets_broker_pub "$INSTANCE" "$LDR")"
+# EXTERNAL REVIEW F7: the precondition used to run `sh -c "! _no_cluster_block"`. A shell function is not
+# exported to a child shell, so the child hit command-not-found (127) and the leading `!` turned that into
+# rc=0 — the anti-vacuity guard was itself PERMANENTLY VACUOUS. assert_ok takes a function directly.
+_still_clustered() { "$SIM" exec "$LDR" -- grep -qE '^cluster' /etc/tether/nats.d/nats.conf; }
+# R16 A4: --to-standalone REFUSES on a data-bearing JS store without --reset-js, and --reset-js makes
+# the store move-aside part of the SAME product verb (conf swap + move, one command). _tostandalone_bare
+# is kept so the acknowledgement gate itself is pinned before the happy path.
+_tostandalone_args() {
+    printf '%s' "--confirm-single --server-name $LDR --account-issuer $(secrets_account_pub "$INSTANCE") --broker-nkey $(secrets_broker_pub "$INSTANCE" "$LDR")"
 }
+_tostandalone_bare() { A reconcile nats --to-standalone $(_tostandalone_args) 2>&1; }
+_tostandalone()      { A reconcile nats --to-standalone --reset-js $(_tostandalone_args); }
 _rebind()       { A set-raft-addr "$LDR:7400" --route "nats://$LDR:6222" 2>&1 | grep -qiE 'raft advertise address|rebound|reconcile nats|updated|in place'; }
 # retire a node (pty typed-confirm) and print its output (caller branches on #31-blocked vs op-started).
 # --timeout 3m: a #31-stuck retire stalls in NATS_ROLLED_OUT; cap the wait so the NOT-COVERED-blocked
@@ -192,13 +199,23 @@ if _one_voter; then
     assert_ok "SHRINK: reached EXACTLY 1 voter ($LDR) via cluster retire (#31 released this run)" _one_voter
     assert_ok "SHRINK: final membership operation is explicitly captured for the N=1 de-cluster boundary" test -n "$_final_target"
     # to-standalone now ALLOWED (1 voter): de-clusters the conf + prints the JS-reset requirement.
-    assert_ok "S-tostandalone: reconcile --to-standalone --confirm-single de-clusters the conf" _tostandalone
+    # G69 sweep (#68 family, THIRD call site): R16's A4 added an ACKNOWLEDGEMENT GATE — --to-standalone
+    # REFUSES on a data-bearing JetStream store — and the deploy tier had three call sites of that verb,
+    # of which R16 updated one (drill 42), G67 a second (drill 92) and this is the third. Pin the gate
+    # itself BEFORE the happy path: asserting only the happy path would let a future change silently drop
+    # the acknowledgement on a destructive operation.
+    assert_ok "S-tostandalone GUARD precondition: the conf is STILL clustered (else the already-standalone refusal — which also mentions --reset-js — would bank this guard for the wrong reason and the de-cluster arm would go green without de-clustering)" \
+        _still_clustered
+assert_refuses "S-tostandalone GUARD: bare --to-standalone REFUSES on a data-bearing JS store and names --reset-js + the data impact (R16 A4)" \
+        "NON-EMPTY|refusing to reset it without acknowledgement" _tostandalone_bare
+    assert_ok "S-tostandalone: reconcile --to-standalone --reset-js de-clusters the conf AND moves the clustered JS store aside (ONE product verb; the hand-rolled mv is retired)" _tostandalone
     assert_ok "S-tostandalone: nats.conf has NO cluster{} block (real de-cluster)" _no_cluster_block
-    # S-jsreset [operator per runbook §2.2]: the JS-store reset is a runbook-mandated operator step. Run the
-    # reset, THEN hard-assert the broker actually came back active (M2: the old trailing `; true` masked a
-    # failed reset — a false GREEN). No `; true`.
-    assert_ok "S-jsreset [operator per runbook §2.2]: stop services, move the JS store, restart both services" \
-        "$SIM" exec "$LDR" -- sh -eu -c 'systemctl stop tether-broker nats-server; test -d /var/lib/tether/jetstream; mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.$(date +%s); systemctl start nats-server; systemctl start tether-broker; test "$(systemctl is-active nats-server)" = active; test "$(systemctl is-active tether-broker)" = active'
+    assert_ok "S-tostandalone: the PRODUCT moved the store aside (never deleted) — a standalone-bak.* is on disk" \
+        "$SIM" exec "$LDR" -- sh -c 'ls -d /var/lib/tether/jetstream.standalone-bak.* >/dev/null 2>&1'
+    # Only the SERVICE restart remains sim-side (legitimate per Mandate 3): the product tells the operator
+    # to restart so the standalone conf + fresh store take effect.
+    assert_ok "S-jsreset [operator per runbook §2.2]: restart the services the product told the operator to restart" \
+        "$SIM" exec "$LDR" -- sh -eu -c 'systemctl stop tether-broker; systemctl restart nats-server; systemctl start tether-broker; test "$(systemctl is-active nats-server)" = active'
     assert_ok "S-jsreset [operator per runbook §2.2]: tether-broker is ACTIVE again after the JS-store reset + restart" \
         poll_until 30 3 "broker active post-reset" -- sh -c "[ \"\$($SIM exec $LDR -- systemctl is-active tether-broker 2>/dev/null | tr -d '\r')\" = active ]"
     assert_ok "S-final-retire: only after live standalone NATS loads, the final op reaches terminal RETIRED" \

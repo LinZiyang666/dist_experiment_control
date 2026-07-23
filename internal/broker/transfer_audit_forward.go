@@ -46,10 +46,18 @@ func (b *Broker) AttachTransferAuditSink(fwd *Forwarder) {
 // ErrForwardNotLeader is retried (the derived reqID dedups a double-commit), a permanent error
 // returns at once, and the loop ALWAYS terminates (bounded attempts×backoff) — not a leak.
 func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error) {
-	runForward := func(payload []byte, rec schema.AuditTransfer) {
+	// R16 #57: expose the SYNCHRONOUS forward so finalizeStrandedXfers can confirm a commit before deleting
+	// the durable ledger (a fire-and-forget emit would lose the evidence in the leaderless post-crash window).
+	b.transferAuditForwardSync = forward
+	runForward := func(payload []byte, rec schema.AuditTransfer, onCommitted func()) {
 		for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
 			ferr := forward(payload)
 			if ferr == nil {
+				// External review F1: the record is now COMMITTED — this, not "the goroutine started",
+				// is when a terminal path may drop its #57 in-flight ledger.
+				if onCommitted != nil {
+					onCommitted()
+				}
 				return
 			}
 			if !errors.Is(ferr, cluster.ErrForwardNotLeader) {
@@ -62,7 +70,7 @@ func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error)
 		b.cfg.Logger.Warn("d8: transfer audit forward gave up after retries (best-effort)",
 			"tid", rec.TransferID, "kind", rec.Kind)
 	}
-	b.transferAuditSink = func(rec schema.AuditTransfer) {
+	b.transferAuditSink = func(rec schema.AuditTransfer, onCommitted func()) {
 		payload, err := json.Marshal(rec)
 		if err != nil {
 			return
@@ -80,14 +88,14 @@ func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error)
 		b.transferAuditMu.Lock()
 		if b.transferAuditDraining.Load() {
 			b.transferAuditMu.Unlock()
-			runForward(payload, rec)
+			runForward(payload, rec, onCommitted)
 			return
 		}
 		b.transferAuditWG.Add(1)
 		b.transferAuditMu.Unlock()
 		go func() {
 			defer b.transferAuditWG.Done()
-			runForward(payload, rec)
+			runForward(payload, rec, onCommitted)
 		}()
 	}
 }

@@ -89,6 +89,57 @@ func freshTarget(t *testing.T) (dataDir, dbPath string) {
 	return dataDir, filepath.Join(dataDir, "tether.db")
 }
 
+// TestRestoreLeavesGrowReadySnapshot is the R16 STEP-0 adjudication pin for drill 51
+// (#GROW-ONTO-RECOVERED). A DR-restored survivor is grown back to N=2 by adding a FRESH joiner.
+// Like `cluster init --from-existing` (TestD9GrowReadySnapshotAtInit), restore DIRECT-installs the
+// bundle's DB rows that no raft-log entry created; without a grow-ready snapshot a fresh joiner
+// replays the restored leader's log from index 1 onto its un-seeded DB and FK-fail-stops / becomes a
+// hollow voter — the SAME keystone the init path fixes with cluster.GrowReadySnapshot, but which
+// restore.go (BootstrapSingleNode only, no snapshot) was never given. That is drill 51's remaining
+// root once the #31/#45/#51 stale-op fence (already closed in normalizeRestoreStaging) is excluded:
+// the re-grow cannot converge and stalls at NATS_ROLLED_OUT / "already in flight".
+//
+// RED before R16 (restore takes no snapshot); GREEN after A2 adds cluster.GrowReadySnapshot.
+func TestRestoreLeavesGrowReadySnapshot(t *testing.T) {
+	bundleDir, secretsDir, selfID := buildClusterBundle(t)
+	dataDir, dbPath := freshTarget(t)
+
+	if _, err := clusteroffline.RestoreFromBackup(clusteroffline.RestoreOptions{
+		BundleDir: bundleDir, DataDir: dataDir, DBPath: dbPath, SecretsDir: secretsDir,
+		ConfirmNodeID: selfID, Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+	}); err != nil {
+		t.Fatalf("RestoreFromBackup: %v", err)
+	}
+
+	// KEYSTONE (mirror TestD9GrowReadySnapshotAtInit): restore must leave a raft snapshot carrying the
+	// installed DB so a fresh joiner installs it (InstallSnapshot -> fsm.Restore) instead of replaying
+	// the log from index 1 onto an un-seeded DB and FK-crashing.
+	exists, idx, _, err := cluster.RaftSnapshotMeta(dataDir)
+	if err != nil {
+		t.Fatalf("RaftSnapshotMeta: %v", err)
+	}
+	if !exists {
+		t.Fatal("R16 (#GROW-ONTO-RECOVERED): restore left NO raft snapshot — a fresh joiner growing onto the " +
+			"restored survivor replays the log onto an un-seeded DB and FK-fail-stops (the pc732 keystone). " +
+			"RestoreFromBackup must call cluster.GrowReadySnapshot after BootstrapSingleNode (mirror init.go:242).")
+	}
+	if idx < 1 {
+		t.Fatalf("grow-ready snapshot index = %d, want >= 1 (must sit at/after bootstrap config@1 so a joiner "+
+			"whose nextIndex decays to 1 receives InstallSnapshot, not the truncated log)", idx)
+	}
+	// COMPACTION is the load-bearing half: a snapshot file without a compacted log is the v0.4.3 no-op
+	// (raft.Snapshot won't compact a log shorter than TrailingLogs=10240 -> FirstIndex stays 1 -> the
+	// leader ships the LOG -> joiner replays -> FK crash). GrowReadySnapshot's raft.RecoverCluster does
+	// an UNCONDITIONAL DeleteRange, so the offline log is empty (RaftLastIndex==0).
+	if last, lerr := cluster.RaftLastIndex(dataDir); lerr != nil {
+		t.Fatalf("RaftLastIndex: %v", lerr)
+	} else if last != 0 {
+		t.Fatalf("grow-ready log NOT compacted after restore: RaftLastIndex=%d, want 0 — restore wrote a snapshot "+
+			"but left the log un-truncated (the v0.4.3 no-op class); a joiner would replay the log, not "+
+			"InstallSnapshot. GrowReadySnapshot must DeleteRange the log via raft.RecoverCluster.", last)
+	}
+}
+
 func TestRestoreResetsAppliedIndexAndPrunesRoster(t *testing.T) {
 	bundleDir, secretsDir, selfID := buildClusterBundle(t)
 	dataDir, dbPath := freshTarget(t)

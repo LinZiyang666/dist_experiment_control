@@ -236,6 +236,16 @@ func (f *fsm) restoreFrom(rc io.ReadCloser) error {
 		}
 	}
 
+	// R16 B1: restore_in_progress is a SOURCE-NODE-LOCAL recovery flag (the daemon FATALs on it until
+	// `recovery restore` completes) — it must NEVER ride a snapshot to ANOTHER node, exactly like
+	// self_node_id above. A grow-ready snapshot is taken (correctly) BEFORE the source clears the marker
+	// (restore.go's fail-closed crash-window), so the snapshot DB carries restore_in_progress='1'. A fresh
+	// joiner that InstallSnapshots it would then FATAL (assertNoInterruptedRestore) on its NEXT restart on a
+	// restore it never ran. Strip it on every install — the source's own live DB already clears it separately.
+	if _, err := f.db.Exec(`DELETE FROM cluster_meta WHERE key='restore_in_progress'`); err != nil {
+		return fmt.Errorf("cluster: restore strip restore_in_progress: %w", err)
+	}
+
 	// 5. Liveness baseline reset (§3.5 D1 amendment).
 	if err := RebuildLiveness(f.db); err != nil {
 		return err

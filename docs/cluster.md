@@ -114,7 +114,7 @@ quorum-loss 的离线逃生。
 | 命令 | 作用 | 有效规模 / 语义 |
 |---|---|---|
 | `cluster set-raft-addr <host:port> [--route nats://h:p] [--allow-loopback]` | **在线**重绑本 broker 的 raft（+可选 NATS route）advertise 地址（AddVoter 原地改、非 force-single 的 wipe）；N=1 loopback→公网的 grow 前置 | 任意 N，**仅自身**（改 follower 须先 `transfer-leader` 过去）；leader-only；保护模式下拒绝 |
-| `cluster reconcile nats --to-standalone --confirm-single --server-name <self>` | **降级末步**：把 lone 幸存者的 nats.conf 重渲染成无 cluster{} 的 standalone（之后 JS reset + 全量重启 nats-server） | **仅 N=1**（先 `retire` 到单 voter）；拒已 standalone |
+| `cluster reconcile nats --to-standalone --confirm-single --reset-js --server-name <self>` | **降级末步**：把 lone 幸存者的 nats.conf 重渲染成无 cluster{} 的 standalone；**R16 `--reset-js` 同时把 clustered JS store 移置**（`jetstream.standalone-bak.<ts>`，只移不删，且在换 conf **之前**做，故拒绝时 conf 原样可重跑），之后全量重启 nats-server | **仅 N=1**（先 `retire` 到单 voter）；拒已 standalone |
 
 **完整 grow / shrink 演练 + 保护模式语义见 `docs/cluster-runbook.md` §1.0(grow 前置 rebind)、§2.2(de-cluster 降级)、§2.3(命令语义表 + 边界情形)。** 要点:
 - **有多台却要降级**:先 `cluster retire` 逐台降到 N=1,再 `reconcile nats --to-standalone`(有 peer 时硬拒)。
@@ -205,6 +205,7 @@ mesh。新增或退役 broker 后，要跑 `cluster reconcile nats --all --wait`
 | `cluster rotate-tunnel-cert` | `--cert-fp` | (必填) | 新稳定 tunnel cert 指纹；DB pin 更新后当前/previous pin 进入旋转窗口 |
 | `cluster recovery force-single` | `--online` | false | **首选**：经 RUNNING broker 的 admin socket 在线恢复，**不停 daemon、不制造第二次停机**；socket 不可达（broker 真死）才回落 OFFLINE 磁盘路径 |
 | `cluster recovery force-single` | `--dry-run` | false | 配合 `--online`：零改动演练（评估 gate + 打印 peer 探测），可在**健康集群**上跑，用来排练命令与核对 peer 列表 |
+| `cluster recovery force-single` | `--reset-js` | false | **R16**：确认把幸存者的 clustered JS store 移置为 standalone（`jetstream.force-single-bak.<epoch>`，**只移不删**）。只 de-cluster conf 不够——NATS 不能就地迁移 clustered JS store，standalone nats 起在其上会 503（racknerd 事故）。**非空 store 不带此 flag 会被大声拒绝**；恢复是 journalled 的，原样加 `--reset-js` 重跑即 forward-complete。⚠ 移走全部 JS audit/history |
 | `cluster recovery force-single` | `--data-dir` | `/var/lib/tether` | broker data dir；**OFFLINE 路径用**，daemon 必须停止 |
 | `cluster recovery force-single` | `--db` | `/var/lib/tether/tether.db` | 本机 DB 路径（OFFLINE 路径用） |
 | `cluster recovery force-single` | `--self-id` | (必填) | 当前幸存节点 id；命令会要求人工输入它确认。`--online` 下该值会发给 broker 校验（与 socket 所属节点不符即拒，防误指错节点） |

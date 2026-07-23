@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
@@ -8,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/LinZiyang666/tether/internal/natscluster"
@@ -85,29 +88,8 @@ func warnStandaloneJSGrow(w io.Writer, storeDir string) {
 		storeDir)
 }
 
-// warnClusteredJSShrink is the REVERSE of warnStandaloneJSGrow (v0.4.2 shrink): de-clustering the
-// lone survivor to standalone drops the cluster{} block, so the clustered JS meta — which needs a
-// quorum-of-2 a lone node can never reach — must be RESET to standalone. NATS does not migrate
-// clustered JS back to standalone in place. Same data-impact warning as the grow direction.
-func warnClusteredJSShrink(w io.Writer, storeDir string) {
-	if storeDir == "" {
-		storeDir = "<jetstream store_dir from nats.conf>"
-	}
-	// review suggestion: shell-quote the store_dir in the copy-paste `rm -rf` — a path with spaces or
-	// shell metacharacters would otherwise mis-delete or inject. Single-quote with embedded-quote escape.
-	quoted := "'" + strings.ReplaceAll(storeDir, "'", `'\''`) + "'"
-	_, _ = fmt.Fprintf(w,
-		"\n⚠ CLUSTERED-JS → STANDALONE-JS on THIS node (shrinking to N=1): a lone node can never reach\n"+
-			"  the clustered JS meta quorum-of-2, so the cluster{} block is dropped and the clustered JS\n"+
-			"  store must be RESET to standalone — NATS does not migrate clustered JS back in place.\n"+
-			"  After the FULL restart that loads this standalone conf, RESET the JS store:\n"+
-			"      sudo systemctl stop nats-server && sudo rm -rf %s && sudo systemctl start nats-server\n"+
-			"  ⚠ DATA IMPACT: drops ALL JetStream audit/history (history-<sid> incl. the forensic incident\n"+
-			"  bundle, the events stream, in-flight OBJ_xfer — drain those first). The re-derive cursor\n"+
-			"  survives the wipe, so it does NOT backfill. To PRESERVE it: `nats stream backup` before /\n"+
-			"  `restore` after. See cluster-runbook.md §2.2 (shrink / de-cluster).\n",
-		quoted)
-}
+// R16 A4: warnClusteredJSShrink (the old `rm -rf` advisory for the clustered→standalone shrink) is RETIRED
+// — `reconcile nats --to-standalone --reset-js` now MOVES the store aside (never deletes) as a product step.
 
 // runReconcileToStandalone is the v0.4.2 SHRINK de-cluster step: re-render the lone survivor's
 // nats.conf WITHOUT the cluster{} block (standalone JetStream), validate it, swap it, and surface
@@ -115,13 +97,37 @@ func warnClusteredJSShrink(w io.Writer, storeDir string) {
 // while peers remain would tear the route mesh, so the operator must `cluster retire` down to a
 // single voter first and assert it via --confirm-single. A FULL nats-server restart is required
 // afterwards (dropping cluster{} is not SIGHUP-reloadable).
-func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, confirmSingle bool) error {
+func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, confirmSingle, resetJS bool) error {
 	own, err := natsconf.Preflight(f.confPath)
 	if err != nil {
 		return err
 	}
 	if !own.IsClusteredJetStream() {
-		return fmt.Errorf("reconcile nats --to-standalone: %q is already standalone (no cluster{} block) — nothing to de-cluster", f.confPath)
+		// M4: an already-standalone CONF can still sit over a clustered JS STORE (a pre-R16 / hand-de-clustered
+		// host — racknerd-legacy — or a crash after the conf swap but before the store move). With --reset-js,
+		// forward-complete JUST the gated store move (the conf is already standalone → skip render/apply; there
+		// is no route mesh to tear, so the F2 N=1 gate below is moot for a store-only reset). Without --reset-js,
+		// the old refusal, but now naming the remedy so R16's own guidance never dead-ends.
+		if resetJS {
+			storeDir := own.JSStoreDir()
+			if storeDir == "" {
+				return fmt.Errorf("reconcile nats --to-standalone --reset-js: %q is standalone but declares no JetStream store_dir — nothing to reset", f.confPath)
+			}
+			moved, mErr := natsconf.MoveAsideJSStore(storeDir, storeDir+".standalone-bak."+nowStampUTC(), "", true /*acked*/)
+			if mErr != nil {
+				return fmt.Errorf("reconcile nats --to-standalone --reset-js: %w", mErr)
+			}
+			if moved != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"conf already standalone; the clustered JS store was reset to standalone (moved aside to %s — NEVER deleted). "+
+						"A FULL `systemctl restart nats-server` is REQUIRED so nats boots on the fresh store.\n", moved)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "conf already standalone and the JS store is already empty — nothing to reset.\n")
+			}
+			return nil
+		}
+		return fmt.Errorf("reconcile nats --to-standalone: %q is already standalone (no cluster{} block) — nothing to de-cluster "+
+			"(pass --reset-js if the clustered JS store still needs resetting to standalone)", f.confPath)
 	}
 	if !confirmSingle {
 		return fmt.Errorf("reconcile nats --to-standalone: de-clustering is the FINAL N=1 step — `cluster retire` down to a SINGLE voter first, then re-run with --confirm-single (de-clustering with live peers would tear the route mesh)")
@@ -211,13 +217,32 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 			dry = e.Error()
 		}
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "--to-standalone plan: would render a STANDALONE (no cluster{}) conf for %s; nats-server -t: %s\n", serverName, dry)
-		warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
+		// R16 A4 preview: the clustered JS store must be reset to standalone (NATS does not migrate it in
+		// place). Name --reset-js, never the old rm -rf advisory.
+		if resetJS {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  --reset-js: would MOVE the clustered JS store %q aside to <store>.standalone-bak.<ts> (NEVER deleted) so the standalone nats boots on a fresh store.\n", storeDir)
+		} else {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  NOTE: the clustered JS store %q must be reset to standalone — re-run WITHOUT --plan and WITH --reset-js to MOVE it aside (never deleted). `nats stream backup` first to preserve it live.\n", storeDir)
+		}
 		return nil
 	}
 	if f.skipDryRun {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "WARNING: --skip-dry-run set — swapping nats.conf WITHOUT `nats-server -t` validation")
 	} else if err := natsconf.DryRun(f.natsServerBin, merged); err != nil {
 		return err
+	}
+	// R16 A4: reset the clustered JS store to standalone (move-aside, never delete) BEFORE swapping the conf
+	// — a refusal (non-empty store without --reset-js) then leaves the conf UNTOUCHED (a clean, re-runnable
+	// refusal), never a standalone conf stranded over a clustered store the "already standalone" guard would
+	// refuse to fix on re-run. Retires the old `rm -rf` advisory. Not journalled (--to-standalone is a single
+	// online op); a crash between this move and the Apply below re-runs cleanly (conf still clustered).
+	jsBackup := storeDir + ".standalone-bak." + nowStampUTC()
+	moved, mErr := natsconf.MoveAsideJSStore(storeDir, jsBackup, "", resetJS)
+	if mErr != nil {
+		return fmt.Errorf("reconcile nats --to-standalone: the clustered JS store must be reset to standalone before the "+
+			"conf is swapped — %w\n"+
+			"  re-run with --reset-js (moves %q aside, NEVER deleted; `nats stream backup` first to preserve it live).\n"+
+			"  ⚠ DATA IMPACT: drops ALL JetStream audit/history (history-<sid>, events, in-flight OBJ_xfer) from the live store", mErr, jsBackup)
 	}
 	if err := natsconf.Apply(f.confPath, merged); err != nil {
 		return err
@@ -231,11 +256,33 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	} else if post.JSStoreDir() != storeDir {
 		return fmt.Errorf("reconcile nats --to-standalone: applied conf store_dir %q != source %q (refusing to move the JS store)", post.JSStoreDir(), storeDir)
 	}
-	warnClusteredJSShrink(cmd.ErrOrStderr(), storeDir)
-	_, _ = fmt.Fprintln(cmd.OutOrStdout(),
+	jsNote := ""
+	if moved != "" {
+		jsNote = fmt.Sprintf(" The clustered JS store was reset to standalone (moved aside to %s — NEVER deleted; restore by hand or `nats stream restore`).", moved)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 		"nats.conf de-clustered to STANDALONE (pristine .bak kept). A FULL `systemctl restart nats-server` "+
-			"is REQUIRED — dropping the cluster{} block is NOT SIGHUP-reloadable — then RESET the JS store as warned above.")
+			"is REQUIRED — dropping the cluster{} block is NOT SIGHUP-reloadable.%s\n", jsNote)
 	return nil
+}
+
+// nowStampUTC is a compact UTC timestamp for move-aside backup dir names (jetstream.*-bak.<ts>).
+// nowStampUTC mints the per-attempt idempotency key embedded in a move-aside backup path.
+//
+// EXTERNAL REVIEW F5: it used to be second-precision, and MoveAsideJSStore treats an existing backup
+// path as proof that THIS exact move already happened. Two attempts inside the same second therefore
+// shared a key — and that is a reachable sequence, not a theoretical one: the first move succeeds, the
+// Apply that follows fails, the still-running nats-server writes into the recreated store, and a retry
+// within the same second matches the old backup and SKIPS the now-live data. Nanoseconds plus a random
+// suffix make the key unique per attempt, so a retry always mints a distinct identity.
+func nowStampUTC() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Randomness is a collision belt-and-braces on top of nanoseconds; a failure must not break the
+		// operation, and nanosecond precision alone already separates two sequential attempts.
+		return time.Now().UTC().Format("20060102-150405.000000000")
+	}
+	return time.Now().UTC().Format("20060102-150405.000000000") + "-" + hex.EncodeToString(b[:])
 }
 
 func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {

@@ -52,6 +52,15 @@ const (
 	transferTierAMaxBytes = 8 * 1024 * 1024
 )
 
+// xferCrossHomeReapAge (R16 #58 Lane C) is the age floor for the LEADER-driven cross-home GC of a
+// split-home / zero-node OBJ_xfer bucket that no single home broker can reap (homeOwnsXferBucket is false
+// on every broker). It is deliberately LONGER than the per-home grace (xferReapMinObjectAge, 2m): the
+// leader deletes another home's objects here, and it sees their ModTime across nodes with clock skew, so a
+// transfer still live on ANOTHER broker's home must never be torn out. Derived from transferTimeoutTierB (a
+// live tier-B transfer terminates by its watchdog within one tier-B timeout) with a 3× margin; pinned by a
+// test so the relation cannot silently drift. A deploy-tier drill compresses it via the serveconf seam.
+const xferCrossHomeReapAge = 3 * transferTimeoutTierB
+
 // transferMaxBytes is the GLOBAL hard upper bound for one tier-B transfer (2 GiB). On a small-disk
 // broker the per-session bucket ceiling (xferBucketMaxBytes, G6 #21) can be LOWER, and the push
 // admission gate rejects at min(transferMaxBytes, that bucket ceiling).
@@ -219,6 +228,11 @@ func (b *Broker) xferBucketMaxBytes(ctx context.Context) (int64, error) {
 	return xferMaxBytesForCeiling(b.jsStoreCeiling(ctx))
 }
 
+// errXferStoreTooSmall marks the G6 #21 sizing refusal as a PERMANENT condition: a disk that cannot
+// hold the tier-B floor is not a stall, so the #67 bounded provisioning retry must make ZERO create
+// attempts against it. Wrapped (never re-worded) by xferMaxBytesForCeiling.
+var errXferStoreTooSmall = errors.New("js store too small for tier-B")
+
 // xferMaxBytesForCeiling is the pure disk-aware clamp (G6 #21), split out for testing. ceiling<=0
 // (unknown) ⇒ the legacy cap. Otherwise a fraction of what's left after the events/history reservation,
 // clamped to [floor, min(cap, avail)]; too small for the floor ⇒ refuse (never MaxBytes<=0, which nats
@@ -229,7 +243,13 @@ func xferMaxBytesForCeiling(ceiling int64) (int64, error) {
 	}
 	avail := ceiling - xferEventsHistoryReserve
 	if avail < xferBucketFloor {
-		return 0, fmt.Errorf("js store too small for tier-B: ceiling=%d bytes, need >= %d (events+history %d + floor %d)",
+		// G67: wrapped in a SENTINEL so the #67 provisioning path can prove this refusal is
+		// PERMANENT via errors.Is rather than by matching prose. The rendered text is byte-identical
+		// to what it was before the sentinel was introduced. Without a structural handle, the
+		// "permanent set" tests would pass with the entire permanent branch deleted, because the
+		// classifier's default is already permanent.
+		return 0, fmt.Errorf("%w: ceiling=%d bytes, need >= %d (events+history %d + floor %d)",
+			errXferStoreTooSmall,
 			ceiling, int64(xferEventsHistoryReserve)+int64(xferBucketFloor), int64(xferEventsHistoryReserve), int64(xferBucketFloor))
 	}
 	maxBytes := avail / 4 * 3 // 0.75 of what's left, integer-safe
@@ -244,23 +264,6 @@ func xferMaxBytesForCeiling(ceiling int64) (int64, error) {
 		maxBytes = hi
 	}
 	return maxBytes, nil
-}
-
-// ensureXferBucket creates (or raise-reconciles) the per-session OBJ_xfer object store. Its MaxBytes is
-// DISK-AWARE (xferBucketMaxBytes, G6 #21) — previously a hardcoded 8 GiB that denied tier-B on small-disk
-// brokers. Per-transfer ObjectMeta caps individual objects via the chunked-message TTL on the underlying
-// stream.
-//
-// v0.2.2 change: previously each transfer got its own bucket
-// `xfer-<sid>-<id>`, but NATS perm wildcards can't address that
-// (no partial-token wildcards), so JWTs couldn't allow per-bucket
-// access. Per-session buckets allow a single literal perm entry.
-func (b *Broker) ensureXferBucket(ctx context.Context, sid string, targetReplicas int) (string, error) {
-	if b.js == nil {
-		return "", fmt.Errorf("jetstream_unavailable")
-	}
-	maxBytes, err := b.xferBucketMaxBytes(ctx)
-	return b.ensureXferBucketSized(ctx, sid, targetReplicas, maxBytes, err)
 }
 
 // ensureXferBucketSized is ensureXferBucket with a PRE-COMPUTED disk-aware ceiling (A11): the tier-B push
@@ -423,7 +426,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 		default:
 			code = "timeout"
 		}
-		b.emitTransferAudit(schema.AuditTransfer{
+		b.emitTerminalTransferAudit(schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 			Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 			ActorNkey: ent.actor, ActorFp: ent.actorFP,
@@ -431,9 +434,10 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			Bucket: ent.bucket, DurationMs: msSince(ent.startedAt, b.cfg.Now()),
 			Code:  code,
 			Error: fmt.Sprintf("broker watchdog: no %s finalization within %s", ent.verb, d),
-		})
+		}, ent.transferID)
 		_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
 		b.transfers.remove(ent.transferID)
+		// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 		b.cfg.Logger.Warn("broker: transfer watchdog fired",
 			"transfer_id", ent.transferID, "verb", ent.verb, "tier", ent.tier,
 			"code", code)
@@ -475,11 +479,69 @@ func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
 // (OpTransferAudit, re-derivable §9/§6.3) so any new leader re-derives committed-but-
 // unpublished transfer audit after a leader death (cutover=D9).
 func (b *Broker) emitTransferAudit(rec schema.AuditTransfer) {
+	b.emitTransferAuditWithCommit(rec, nil)
+}
+
+// emitTransferAuditWithCommit is emitTransferAudit plus a COMMIT callback: onCommitted runs only after
+// the record is durably committed (cluster mode: the raft forward returned nil; single mode: the core
+// publish is the record). It never runs on a give-up.
+func (b *Broker) emitTransferAuditWithCommit(rec schema.AuditTransfer, onCommitted func()) {
 	if b.transferAuditSink != nil {
-		b.transferAuditSink(rec)
+		b.transferAuditSink(rec, onCommitted)
 		return
 	}
 	b.pubAuditTransfer(rec)
+	if onCommitted != nil {
+		onCommitted()
+	}
+}
+
+// emitTerminalTransferAudit is the ONE way a TERMINAL transfer audit is written, and the only place
+// allowed to drop the #57 durable in-flight ledger.
+//
+// EXTERNAL REVIEW F1 (Blocker). The four terminal paths used to emit the audit and then delete the
+// ledger on the next line — but in cluster mode emitTransferAudit hands the record to a goroutine and
+// returns immediately (transfer_audit_forward.go: "never block the NATS handler"), so "the audit was
+// emitted" is not "the audit was committed". A broker exiting in that window left the ledger already
+// deleted and the terminal never committed: recovery had no evidence to read and the audit kept a
+// start row with no terminal forever — verbatim the #57 shape R16 exists to remove.
+//
+// R16's own recovery finalizer already had this right (commitSyntheticTransferTerminal, then delete).
+// This applies the SAME invariant to the common paths. If the forward gives up, the ledger SURVIVES and
+// the recovery finalizer synthesizes a terminal on the next boot — the outcome #57 was built for.
+//
+// The reviewer also noted the previous pin (TestXferInflightTerminalDropsLedger) used a no-op sink and
+// therefore froze the WRONG order as green; it now drives a blocking sink.
+func (b *Broker) emitTerminalTransferAudit(rec schema.AuditTransfer, transferID string) {
+	// RE-REVIEW F1: STAGE the decided terminal into the ledger BEFORE forwarding it. The first fix only
+	// delayed the unlink until after the commit, which left the symmetric window open — a process killed
+	// after the commit but before the unlink came back to a START-ONLY ledger, and recovery then GUESSED
+	// a `failed/home_broker_restart` row that can never dedup against the real terminal (the reqID hashes
+	// the whole record), so the audit claimed the transfer both completed and failed.
+	//
+	// Staging first makes recovery a REPLAY of the same bytes instead of a guess: identical record ⇒
+	// identical reqID ⇒ the replicated dedup ledger collapses it. Both windows are now closed by one
+	// invariant: the ledger holds the exact row that must exist, until that row is known to exist.
+	staged, applicable := b.stageXferInflightTerminal(transferID, rec)
+	// ROUND-4 RE-REVIEW: what makes suppression safe is that RECOVERY STILL HOLDS THIS EXACT TERMINAL —
+	// and that is now a property of the staging attempt itself, not a guess about the past. Staging falls
+	// back to a sibling outbox directory, so "unstaged" no longer means "the primary directory hiccuped";
+	// it means the whole data directory refused BOTH writes. Earlier rounds tried to answer this with an
+	// in-memory "the start ledger was written once" bit, which is a claim about a write that may since
+	// have been undone — the data directory can be replaced, unmounted or wiped while the process runs.
+	// A durability decision must not rest on a bit that outlives the thing it describes.
+	if applicable && !staged {
+		// Nothing anywhere will hold this outcome, so the two remaining options are: forward it and risk
+		// recovery synthesizing a contradictory row from a surviving start record, or stay silent and
+		// lose the transfer's ONLY terminal outright. Silence is worse: a contradiction is visible and
+		// repairable, a transfer that never reported an outcome is not — nothing in the audit trail even
+		// says it should be there. Forward, and make the durability failure loud.
+		b.cfg.Logger.Error("broker: terminal staging failed in BOTH the xfer-inflight ledger and the fallback "+
+			"outbox — forwarding the terminal best-effort, because suppressing it would lose this transfer's "+
+			"only terminal outright",
+			"transfer_id", transferID, "kind", rec.Kind)
+	}
+	b.emitTransferAuditWithCommit(rec, func() { b.removeXferInflight(transferID) })
 }
 
 // handlePushReq is the broker entry for `tether push`. It runs the
@@ -544,25 +606,21 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	// scoping happens via ObjectKey = TransferID.
 	if req.Tier == "b" {
 		if b.js == nil {
-			b.replyPushErr(msg, "jetstream_unavailable", "")
+			b.replyPushErr(msg, "jetstream_unavailable", xferNoJetStreamMsg)
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		// G6 #21 + A11: compute the disk-aware ceiling ONCE and reuse it for BOTH the size-admission check
-		// and the bucket sizing — ensureXferBucket used to recompute it, costing a second AccountInfo
-		// round-trip per push. On a small-disk broker the per-session ceiling can be BELOW the global 2 GiB
-		// per-transfer cap; reject at ADMISSION rather than accept-then-fail with an opaque 10047 mid-stream.
-		// A sizing error (disk too small for tier-B) is surfaced as bucket_create_failed, exactly as before.
-		maxBytes, sizeErr := b.xferBucketMaxBytes(ctx)
-		if sizeErr == nil && req.Size > maxBytes {
-			cancel()
-			b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > per-session tier-B ceiling %d on this broker (small disk)", req.Size, maxBytes))
+		// G6 #21 + A11: the disk-aware ceiling is computed ONCE and reused for BOTH the size-admission
+		// check and the bucket sizing. G67: sizing and create no longer share a deadline, and a
+		// TRANSIENT create failure is retried a bounded number of times and reported as retriable —
+		// see provisionXferBucket. Runs BEFORE transfers.put(); do not move it after.
+		bucket, tooLarge, perr := b.provisionXferBucket(b.runCtx, sid, req.Size)
+		if tooLarge != nil {
+			b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > per-session tier-B ceiling %d on this broker (small disk)", req.Size, tooLarge.MaxBytes))
 			return
 		}
-		bucket, err := b.ensureXferBucketSized(ctx, sid, b.xferTargetReplicas(), maxBytes, sizeErr)
-		cancel()
-		if err != nil {
-			b.replyPushErr(msg, "bucket_create_failed", err.Error())
+		if perr != nil {
+			code, text := xferProvisionRefusal(perr)
+			b.replyPushErr(msg, code, text)
 			return
 		}
 		req.Bucket = bucket
@@ -590,6 +648,9 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
 		return
 	}
+	// #57 Lane B: persist the durable in-flight ledger BEFORE forwarding, so a home crash between here and a
+	// terminal is recovered into a synthetic terminal audit (not a dangling start row).
+	b.writeXferInflight(entry)
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
 	// Audit start (plan §Audit "start written from broker-accepted prepare").
@@ -675,13 +736,17 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	// it iff Size > MaxInline; otherwise nothing is written and the
 	// bucket stays untouched. Per-transfer cleanup deletes only the
 	// object (deleteXferObject), never the bucket.
+	// G67: same provisioning seam as the push path — separate deadlines for the best-effort sizing
+	// probe and the load-bearing create, plus a bounded classified retry, so a transient JetStream
+	// stall is reported as retriable instead of terminal. Pull passes size 0: the agent decides
+	// tier A vs B itself, so there is no admission size to check here (tooLarge is unreachable).
 	bucket := ""
 	if b.js != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		bucket, err = b.ensureXferBucket(ctx, sid, b.xferTargetReplicas())
-		cancel()
-		if err != nil {
-			b.replyPullErr(msg, "bucket_create_failed", err.Error())
+		var perr *xferProvisionErr
+		bucket, _, perr = b.provisionXferBucket(b.runCtx, sid, 0)
+		if perr != nil {
+			code, text := xferProvisionRefusal(perr)
+			b.replyPullErr(msg, code, text)
 			return
 		}
 	}
@@ -717,6 +782,8 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
 		return
 	}
+	// #57 Lane B: durable in-flight ledger BEFORE forwarding (see handlePushReq).
+	b.writeXferInflight(entry)
 	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
 
 	b.emitTransferAudit(schema.AuditTransfer{
@@ -858,12 +925,13 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 		rec.Code = ev.Code
 		rec.Error = ev.Error
 	}
-	b.emitTransferAudit(rec)
+	b.emitTerminalTransferAudit(rec, entry.transferID)
 	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()
 	}
 	b.transfers.remove(transferID)
+	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 	b.cfg.Logger.Info("broker: ev.transfer handled",
 		"transfer_id", transferID, "kind", kind, "verb", entry.verb)
 }
@@ -877,19 +945,20 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 	if !claimed || ent == nil {
 		return
 	}
-	b.emitTransferAudit(schema.AuditTransfer{
+	b.emitTerminalTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 		Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 		ActorNkey: ent.actor, ActorFp: ent.actorFP,
 		TransferID: ent.transferID, Path: ent.path,
 		Tier: ent.tier, Bucket: ent.bucket,
 		Code: code, Error: errMsg,
-	})
+	}, ent.transferID)
 	_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
 	if ent.cancel != nil {
 		ent.cancel()
 	}
 	b.transfers.remove(ent.transferID)
+	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 }
 
 // transferGate runs the standard precondition trio used by every
@@ -1123,12 +1192,13 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		rec.Code = fin.Code
 		rec.Error = fin.Error
 	}
-	b.emitTransferAudit(rec)
+	b.emitTerminalTransferAudit(rec, entry.transferID)
 	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
 	if entry.cancel != nil {
 		entry.cancel()
 	}
 	b.transfers.remove(transferID)
+	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 
 	b.replyFinalize(msg, proto.TransferFinalizeResp{OK: true})
 	b.cfg.Logger.Info("broker: pull finalize handled",

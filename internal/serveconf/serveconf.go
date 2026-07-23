@@ -88,6 +88,12 @@ type ClusterSection struct {
 	// operator can shorten it and OBSERVE the reap without a five-minute wait. Go duration syntax; a
 	// sub-second value is rejected at Load (pure JS-API churn).
 	XferReapInterval string `yaml:"xfer_reap_interval"`
+	// XferCrossHomeReapAge (R16 #58 Lane C) is the age floor for the LEADER-driven cross-home GC of a
+	// split-home / zero-node OBJ_xfer bucket no single home can reap. Empty ⇒ broker default (3× the tier-B
+	// timeout = 15m), which is right for production (a longer floor protects a transfer still live on another
+	// home across clock skew). Exposed ONLY so a deploy-tier drill can compress it and OBSERVE the GC without
+	// a multi-minute wait; there is no production tuning story. Go duration syntax; sub-second is rejected.
+	XferCrossHomeReapAge string `yaml:"xfer_cross_home_reap_age"`
 }
 
 // UpgradeSection mirrors broker.upgrade — the architecture J.4
@@ -172,6 +178,9 @@ func Load(path string) (*Config, error) {
 	if _, err := cfg.XferReapIntervalDuration(); err != nil {
 		return nil, err
 	}
+	if _, err := cfg.XferCrossHomeReapAgeDuration(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -205,6 +214,44 @@ func (c *Config) XferReapIntervalDuration() (time.Duration, error) {
 		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_reap_interval %q "+
 			"> 24h (an effectively-disabled reaper lets orphan tier-B objects fill the disk — the reap must "+
 			"run at least daily; there is no 'off' setting, unset means the built-in 5m default)", d)
+	}
+	return d, nil
+}
+
+// MinXferCrossHomeReapAge is the SAFE FLOOR for the cross-home GC age (external review F2): 3x the
+// tier-B transfer timeout, i.e. the same value broker.New derives when the knob is unset. It is
+// duplicated here rather than imported because internal/serveconf must not depend on internal/broker;
+// a test pins the two against each other.
+const MinXferCrossHomeReapAge = 15 * time.Minute
+
+// XferCrossHomeReapAgeDuration parses broker.cluster.xfer_cross_home_reap_age (R16 #58 Lane C). Returns
+// (0, nil) when unset (caller falls back to broker.New's derived 3×tier-B default). Sub-second is rejected
+// (a near-zero floor would let the leader tear out a transfer still live on another home); the upper clamp
+// (maxReapInterval, 24h) forbids an effectively-disabled floor that would immortalize split-home garbage.
+func (c *Config) XferCrossHomeReapAgeDuration() (time.Duration, error) {
+	if c.Broker.Cluster.XferCrossHomeReapAge == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Broker.Cluster.XferCrossHomeReapAge)
+	if err != nil {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_cross_home_reap_age: %w", err)
+	}
+	// EXTERNAL REVIEW F2: this used to accept anything >= 1s, which let a production YAML set the
+	// cross-home GC floor BELOW the tier-B watchdog. In a split-home session no broker owns the whole
+	// bucket and the leader only excludes its OWN local tracker — it cannot see a transfer still live on
+	// another home — so a 5s floor lets the leader delete another home's in-use object minutes before
+	// that transfer's own 5-minute watchdog would end it. The knob may now only RAISE the floor above
+	// the derived safe default; it can never lower it. (Drill-side time compression must construct
+	// broker.Config directly rather than go through the production schema.)
+	if d < MinXferCrossHomeReapAge {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_cross_home_reap_age %q is below the safe "+
+			"floor %s (3x the tier-B transfer timeout). A shorter floor lets the leader reap an object "+
+			"that is still live on ANOTHER home, which no broker-local tracker can see. This knob may "+
+			"only RAISE the floor; unset means the built-in derived default", d, MinXferCrossHomeReapAge)
+	}
+	if d > maxReapInterval {
+		return 0, fmt.Errorf("serveconf: broker.cluster.xfer_cross_home_reap_age %q "+
+			"> 24h (an effectively-disabled floor would immortalize split-home garbage; unset means the built-in 3×tier-B default)", d)
 	}
 	return d, nil
 }

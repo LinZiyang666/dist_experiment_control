@@ -48,6 +48,22 @@ type forceSingleJournal struct {
 	SelfRaftAddr  string   `json:"self_raft_addr"`
 	ConfirmedDead []string `json:"confirmed_dead"`
 	Phase         string   `json:"phase"`
+	// JSResetEpoch (R16 A3) is a per-incident stable timestamp minted when the raft rebuild lands. The CLI
+	// names the JS-store move-aside backup (jetstream.force-single-bak.<epoch>) with it so a resume reuses
+	// the SAME backup path → backup-dir-first idempotent. Cleared with the journal at completion, so a later
+	// incident mints a fresh epoch (a fixed name would unsafely no-op a second incident's clustered store).
+	JSResetEpoch string `json:"js_reset_epoch,omitempty"`
+}
+
+// ForceSingleJSResetEpoch returns the per-incident JS-reset epoch recorded in an in-flight force-single
+// journal (R16 A3), or "" if there is no journal (nothing in flight). The CLI uses it to name the survivor
+// JS-store move-aside backup stably across resumes.
+func ForceSingleJSResetEpoch(dataDir string) (string, error) {
+	j, err := readJournal(dataDir)
+	if err != nil || j == nil {
+		return "", err
+	}
+	return j.JSResetEpoch, nil
 }
 
 func journalPath(dataDir string) string { return filepath.Join(dataDir, journalFileName) }

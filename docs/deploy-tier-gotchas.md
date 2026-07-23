@@ -391,6 +391,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 </details>
 
 ### #57 — 在飞 tier-B 传输的 home broker crash 后终态 audit 永不写（悬空 start 行）
+
+- **R16 状态（2026-07-22）：产品修复已落地，deploy-tier 证明仍欠 —— 本条保持 OPEN。** Lane B 实现「finalize-on-recovery」：在 `<ClusterDataDir>/xfer-inflight/<hash>.json` 落一份 node-local 持久 in-flight 账（put() 后、转发前写，四条 terminal 路径各自删），重启后的周期 pass 对「超过 tier 超时+slack 且无活 tracker 条目」的账目补发一条**确定性**终态（`Kind=failed, Code=home_broker_restart, Ts=startedAt+timeout`），其内容寻址 reqID 使任何重发在复制 ledger 去重。内审 M1 修正了致命一点：终态**确认提交后**才删账目，leaderless 时保留并下轮重试（否则恰在 #57 的旗舰窗口把证据也毁掉）。hermetic 钉：`TestXferInflightFinalizeOnRecovery` / `...RetainsLedgerWhenUncommittable` / `...DedupReqIDStable`。**未闭合的原因**：drill 96 的 1 GiB tier-B 上传这次仍在 docker kill 前抵达终态（本条自身记录的 in-sim 中断不可构造 gap），故悬空 start 行从未在部署层产生，补发路径未获实测演示。
 - **状态**：源码确证；96 分区件已验证可注入（rc=124 静默丢包实测通）。
 - **机理**：watchdog 挂 broker runCtx（`transfer.go:593`/`:704`）随进程死；`transferTracker` 内存 map
   （`:99-104`）重启 `newTransferTracker()`（`broker.go:602`）为空；`handleEvTransfer` 对迟到 finalization
@@ -398,6 +400,8 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **钉住它的**：drill 96 臂 A（R-EXHAUST 四态；`start` 悬空无终态 → product_red）。
 
 ### #58 — cluster 模式非-leader home broker 重启后 orphan xfer object 永不回收
+
+- **R16 状态（2026-07-22）：产品修复已落地，deploy-tier 证明仍欠 —— 本条保持 OPEN。** Lane C 实现 leader 跨-home GC：`homeOwnsXferBucket` 为假且 `xferBucketOrphanedEverywhere` 为真（split-home / 零节点会话，即**没有任何 home 能回收**的 bucket）时，由 caught-up **LEADER**（唯一，避免多 broker 竞争）回收年龄超过`xferCrossHomeReapAge`（派生自 3×tier-B 超时=15m，比 per-home grace 长，护住另一 home 上仍在飞的传输，跨节点时钟偏斜留足余量）的对象；内审 M6 补回 busy-bucket 合取（leader 自己持活 tracker 条目的 bucket 绝不 GC）。新增 serveconf seam `xfer_cross_home_reap_age` —— **外审 F2 后已收窄为生产安全旋钮：只能调高、不能低于 15m**（3× tier-B）。低于该下限会让 leader 删掉另一 home 上仍在用的对象，而 leader 看不见别人的 tracker。**因此它不再是 drill 的压缩接缝**；drill 96 的 #58 臂已改为无条件 `not_covered`（结构上不可在窗口内观察），**没有为此在产品里保留测试后门**。hermetic 钉：`TestXferCrossHomeGCReapsSplitHome` / `TestXferCrossHomeGCSkipsBusyBucket` / `TestXferCrossHomeReapAgeDerivation` / `TestXferUnreapableBucketCounter`。**未闭合的原因**：drill 96 本次未产生 orphan 集（峰值 2 ≤ tombstone floor 6，同 #57 的中断 gap），GC 无物可收；R16 因此给该臂加了**非空过闸**——峰值不超过 floor 时记 not_covered，绝不把「计数本就在 floor」当作 FIXED 空过。
 - **状态**：**LIVE-CONFIRMED（外审 B2 修 oracle 后 3 次 fresh-instance 复跑一致）**。victim 固定非-leader ⇒
   `reaperMayDelete()==false` 源码保证、非 race。
 - **机理**：`reconcileXferObjectsOnBoot`（`transfer_reconcile.go:27-94`）仅 `broker.go:942` 启动时调一次、
@@ -409,6 +413,174 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   deleteXferObject 回收，floor）→ 打断后 orphan 计数须 **> 基线** 才判（先证 orphan 存在再判是否被 reap）。
 - **钉住它的（3 次复跑一致）**：drill 96 臂 A2——`baseline=1 → brk2 宕时 orphan=2（>1）→ brk2 重启 boot-reconciler 跑后仍=2`
   ⇒ 未回收 = product_red。签名守卫：仅当 `orphan-probe > baseline ∧ post-restart > baseline` 才钉；读不出对象数 → not_covered。
+
+### #67 — 瞬时 JetStream 不可用被 tier-B push 当作**永久能力缺失**上报（零重试 + 错误指引）
+
+- **状态（2026-07-22，G67）：拆分登记。`#67-A` 产品修复已落地并经 deploy-tier 复验；`#67-B` CLI 侧已修但
+  **无 drill 级 oracle**，保持 OPEN；另登记三条 open sub-face。** 发现于 R16 部署层验证（drill 42 复跑 3），
+  非 R16 回归——`git diff` 证明 R16 对 `internal/broker/transfer.go` 的改动全在 bucket-create **之后**，
+  缺陷存在于已发布的 v0.4.7。修复方案见 `docs/reviews/g67-plan.md`（11 agent 对抗性 workflow 起草、主进程逐条验证定稿）。
+- **缺陷说的到底是什么（勿扩大）**：quorum 缺失期间**拒绝** tier-B push 本身**不算错**——R=2 资产那时确实写不了。
+  错的是**告诉运维的话**：拒绝文案**不含任何「瞬时、稍后重试」线索**，而同一条 push 几秒后零操作即成功；
+  最坏那张面孔更断言了一个 broker 从未报告过的**永久能力缺失**并给出与故障无关的建议。
+  **tether 在同一条路径上本就有这套词汇**（`transfer %s rejected (%s); retry shortly`）却不用；
+  而 broker 自己的 reconcile 循环同一时刻正把同一状况**正确地当作瞬时**并每 ~100ms 重试
+  （`d5: replica reconcile … 503 err_code=10008`）——**可重试通道存在，用户面 push 够不到**。
+
+#### `#67-A` — broker 侧共享 deadline + 单次尝试　→　**FIXED（G67）**
+
+- **机理（已由 RED-first 测试坐实）**：`handlePushReq`/`handlePullReq` 把**两次独立 JetStream 往返**
+  （`xferBucketMaxBytes`→`jsStoreCeiling`→`AccountInfo`，与 `CreateObjectStore`）塞进**同一个 5s ctx、各一次**。
+  而 `jsStoreCeiling` **吞掉** AccountInfo 的错误回退 statfs ⇒ 停住的 sizing 探测**不报错、只静默吃光预算**。
+  `TestSizingStallDoesNotConsumeCreateBudget` 对修复前代码测得：承重的 create 拿到的 ctx 剩余 **-4.25 ms**
+  ——**它连一次尝试都没得到**。这解释了为何实测 ~57 ms 的建桶会产出 5s deadline 错误（≈100× 余量）。
+- **修复**：`internal/broker/xfer_provision.go` 新增 `provisionXferBucket`——sizing 独立 1.5s deadline；
+  create 每次尝试独立 2.5s、最多 3 次、总墙钟 8s、`±25%` 抖动退避；分类由**独立的**
+  `jsstream.IsTransientProvisionErr` 负责（**`IsMetaGroupNotReady` 一个字节没动**，它喂的是 reconcile 的
+  永久循环，放宽会把永久错配拖成几天静默）。永久分类**恰好一次尝试**即返回。
+  新增瞬时码 `jetstream_not_ready`（纯增量，`ProtoVersion` 不变）；`bucket_create_failed` 文案**逐字节不变**
+  且**不含**任何重试词，两者不可混淆。nil-JS 拒绝从**空串**改为同时点名两种成因的真文案。
+- **预算为何压紧**：`.push.req`/`.pull.req` 在 `isBroadcastClusterSubject` 里、走普通 `nc.Subscribe`，
+  handler 直接作为 nats.go 异步回调注册**无 goroutine 包装** ⇒ **全 broker 的 push 串行在一条投递 goroutine 上**。
+  in-handler 最坏 ≈9.5s（今日 5s 的 1.9×），仍远小于 `transferTimeoutTierA=30s`。
+- **hermetic 钉**：`TestSizingStallDoesNotConsumeCreateBudget`（RED→GREEN 的根因裁决）、
+  `TestPushHandlerRepliesTransientCodeOnStall`（**接线**——把 handler 还原即精确变红成
+  `bucket_create_failed: create_bucket: context deadline exceeded`，突变检查实测过）、
+  `TestXferProvisionRefusalDistinguishesTransientFromPermanent`（**双向**）、
+  `TestXferProvisionPermanentMakesExactlyOneAttempt`、`...RetriesTransientWithinBudget`、
+  `...SucceedsOnRetry`、`...SizingRefusalMakesZeroAttempts`、`TestIsTransientProvisionErr`、
+  `TestIsMetaGroupNotReadyDeliberatelyNotWidened`。
+- **deploy-tier oracle**：`drills/67-transient-js-refusal` 翻为 **GREEN 回归**——注入后的拒绝必须
+  ① 带 `code=jetstream_not_ready`、② 含重试指引、③ **不**含 `broker has no JetStream`/`bump nats max_payload`，
+  ④ **非空过牙齿**：brk1 的 `broker.err` 里必须读到 `tier-B bucket provisioning retried|gave up`
+  ——**证明有界重试真的跑过，而不是只把文案改漂亮**。
+  **内审更正**：这颗牙齿是 `not_covered` 而非 `_as_fail`，所以删掉重试循环是把 `nc_gap` 从 1 顶到 2、**不是**把 drill 打红；
+  因此健康运行的 **nc_gap 基线=1**（face B）已写进 tsv，跑出 2 就意味着重试没在跑。先前台账说它「变红」是**说过头了**。
+  该牙齿**刻意不接受** `gave up` 那一行：它在**永久单次尝试**时同样会打，用它当牙齿等于把重试循环删掉也能过。
+- **deploy-tier 实测（2026-07-22，weilandserver）**：面 A 臂 **GREEN**，实际拒绝为
+  `code=jetstream_not_ready tier-B object store could not be provisioned after 3 attempt(s) over 8s:
+  create_bucket: context deadline exceeded — … usually transient …`，恢复 peer 后同一条 push 零操作成功。
+  修复前同一注入下是 `code=bucket_create_failed create_bucket: context deadline exceeded`，无任何重试线索。
+- **跑这次复验又抓出两个 drill 自身的 bug（留痕）**：① 断言写成 `sh -c "… \$_G67_OUT …"`——子 shell **不继承**
+  该变量，于是三条断言实际在测**空串**，产出**两个假 FAIL + 一个空过 PASS**；已全部改走函数。
+  ② 第一版非空过牙齿接受 `retried|gave up`（见上）。**两处都是"测试自己坏了"，不是产品问题——但如果不查清，
+  第一条会被误读成"修复没生效"，第三条会被误读成"已验证不含误导文案"。**
+
+#### 覆盖缺口（drill 自报，verdict 因此是 INCOMPLETE 而非 GREEN）
+
+drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B 未被本 drill 覆盖。
+若不记，这个 drill 会报出一个干净的 GREEN，从而**暗示 #67 整条已闭**——那正是 ledger-crosscheck 存在的理由所指的
+假完整形态。
+
+#### `#67-B` — client 侧吞掉 caps 探测错误、据零值编造永久断言　→　代码已修，**但保持 OPEN（无 drill oracle）**
+
+- **机理**：`cmd/tether/transfer.go` 的 `caps, _ := probeCaps(...)`（push 与 pull 两处）**丢弃错误**，
+  `probeCaps` 失败即返回零值 `CapsResp{}` ⇒ `JetStreamReady=false` 且 `MaxPayload=0`；而 `handleCapsReq`
+  对 `not_a_member`/`session_not_found_or_deleting`/`store_error`/`actor_invalid` 也回 `OK:false`+零值
+  ⇒ **四种状态坍缩成同一字节模式**。`chooseTier` 据此编造出永久断言。broker **从未**这么说过：
+  `JetStreamReady` 取自**静态** `b.js != nil`，与临时 503 无关。`MaxPayload=0` 还顺带把 tier-A/B 分界悄悄抬回 8 MiB 默认值。
+- **修复**：引入带类型的 `capsProbe{capsUndetermined|capsRefused|capsOK}`；**非权威**答案一律**乐观走 tier-B
+  并在 stderr 打 warning，交由 broker 裁决**（权威答案就在一次 RPC 之外，本地拒绝等于再编造一个断言）；
+  只有 `capsOK && !JetStreamReady` 才拒绝，且 `max_payload` 建议**仅在提高它确实能让文件走 inline 时**才出现。
+  `tierAInlineCeiling` 对**每一个已知**测量取小、**绝不因测量缺失而放宽**。两条误导字面量已从 CLI 路径删除。
+  钉：`TestChooseTierNeverInventsACapabilityClaim`、`TestTierAInlineCeilingNeverWidenedByAMissingMeasurement`、
+  `TestCapsProbeWarningsAreHonest`。
+- **为何仍 OPEN**：面 B 只有**一次人工探针**复现（SIGSTOP 冻结 peer），而 SIGSTOP 因会毒化 brk1 的 route I/O
+  已被弃用；clean-stop 注入**不复现**它。**没有 drill 级 oracle ⇒ 不允许标 CLOSED。**
+
+#### 残留限制（G67 **没有**声称修掉的东西 —— 实测数据在此，勿在验收时误读）
+
+- **G67 的契约是「诚实 + 可重试」，不是「第一次必成」。** 有界重试的墙钟预算是 **8s**（受 head-of-line
+  blocking 反向约束，见上），超过它仍会拒——只是现在拒得诚实：`code=jetstream_not_ready` + 「稍后重试同一条命令」。
+- **实测（2026-07-22，weilandserver）**：
+  - **空载**部署层：grow 后**第一次** tier-B push **1.66s 成功、零重试**（`provisioning gave up` 计数 0）
+    ⇒ 常态下 8s 预算绰绰有余。
+  - **多 drill 并发**（一台机上 6–9 个 clustered-JS 集群）：3 次尝试跨 8s **全部超时** ⇒ 该负载下
+    post-grow 的 meta 窗口 **> 8s**，运维需要按提示重试一次。
+- **更深的正解在 grow 侧、不在 push 侧**：`cluster add` 在 JS meta 尚不能放置资产时就报成功。真正消除
+  「grow 完立刻传文件会失败」应当是**让 grow 不要过早宣告成功**，而不是让 push 无限等。**本增量不做**，登记为
+  sub-face 4。
+- **因此 drill 断言形状也改了**（`drills/lib/setup-forcesingle.sh` 的 baseline 与 drill 67 的 CONTROL(before)）：
+  契约断言为「要么一次成功，**要么**被 `jetstream_not_ready` 拒且**紧接着的重试成功**」。
+  **这不是放水**——修复前的**终态** `bucket_create_failed` 仍然硬失败；只有产品**明确文档化并指示**的那条路径被接受；
+  且若瞬时拒绝之后的重试**也**失败，记 product_red（说明文档化的补救根本不work）。
+
+#### open sub-faces（本增量明确未做，登记以免遗忘）
+
+1. **broker 的 JetStream 探测是一次性的**：`b.js` 由启动时一次 1s `AccountInfo` 确定，失败后**永不重探**
+   ⇒ 忙主机上探测超时会让该 broker 一直拒绝 tier-B 直到重启。懒重探是正解，但 `b.js` 是被大量点直接读的
+   裸字段，需 `atomic.Value`/`RWMutex` 改造 + 独立 `-race`，不进本增量；已改为拒绝文案**同时点名两种成因**。
+2. **签名 (ii)** `push (tier B prepare): context deadline exceeded`（rc=75）的根在 `transferHomeGate`
+   对未解析 home 的静默，属集群路由议题。
+3. **面 B 的 drill oracle 缺失**（见上）。
+4. **`cluster add` 过早宣告成功** —— **G69：产品修复已落地（hermetic 钉 P1–P10），deploy-tier 证明仍欠。**
+   grow 返回时 JS meta 可能尚不能放置 R=N 资产，于是「grow 完立刻传文件」在负载下会撞上一次瞬时拒绝。
+   G69 在 join 终态门加了一个合取项：`events` 流的 `Configured` 与 `Assigned` 都达到目标副本数才进 SERVING；
+   到期则**降级推进**（绝不 BLOCK）并在 op timeline 留 `WITHOUT proving JetStream placement`。
+   **为什么仍欠证明（内审 G-3 更正了主进程的说法）**：drill 67 那条 sub-face-4 gap **不是无条件的**——
+   它只在「首推失败 ∧ 重试成功」时触发，而**空载主机产生不了这个前提**（实测空载 1.66s、零重试）。
+   更要命的是 tsv 里记录的**修复前**基线本来就是 `nc_gap=1 pass=17`，所以「修复后 nc_gap=1」与修复前
+   **逐字节相同、零判别力**。主进程一度把它当作验收证据，**那是把巧合当证据**。
+   现已改为**正向** oracle（grow 后断言任何 op timeline 里都**没有** `WITHOUT proving` 降级条目），
+   它每次运行都可判、不依赖负载。
+   **饱和实测（2026-07-22，7 路并发 = 当初产生原始失败的同一 regime）**：drill 67 两条判据**均成立**——
+   正向 oracle PASS（grow 真的证明了放置、未降级），且 sub-face-4 gap **未触发**（首推不再需要文档化重试）；
+   同批的 grow 家族 10/11/42/92 全 GREEN，这同时也是 `jsGateExpiryReserve` 那个 BLOCKER 修复在真实压力下的证据。
+   **限度（勿读过头）**：这是**单臂**证据，不是差分——跑修复前那一臂需要在 51 改+20 新的未提交树上做 stash 构建，
+   风险不对等，故未做。所以它证明「修复在原始失败的负载下成立」，**不能排除**「这次恰好没触发」。
+- **同一次饱和跑暴露的残留（如实登记，非吸收）**：drill 12 的共享 fixture 命中 `#67 residual` 护栏——
+  首推被判瞬时拒绝后，**紧接着那一次重试也失败**。即 **G69 收窄了 post-grow 窗口但在极端负载下没有关闭它**。
+  产品文案承诺的是「retry the same command **shortly**. If it **persists**, …」——一个**短窗口**而非「一次必成」，
+  所以 fixture 原先断言「恰好一次重试成功」是**相对产品自己的承诺过度规定**，已改为**有界多次**（5 次 / ~25s）
+  并保留原有牙齿（窗口内始终不成功仍记 product_red），且把成功时的**尝试次数打进日志**，使恶化表现为数字而非静默通过。
+- **两次七路饱和跑的实数据（这就是"收窄但未完全关闭"的量化依据）**：
+  | 跑次 | 首推一次成功的 fixture | 需要重试的 | 结果 |
+  |---|---|---|---|
+  | 第 1 次 | 2/3 | drill 12（首推被拒 **且紧接的那次重试也失败**） | PRODUCT-RED（护栏正确触发） |
+  | 第 2 次 | **3/3**（12/42/92 全部 first attempt） | 0 | 7 drill 全部回到期望值，0 product_red |
+  ⇒ 残留是**间歇性**的：G69 把 post-grow 窗口收窄到「多数情况下首推即成」，但在极端并发下**仍可能**需要
+  产品文案所说的那个短重试窗口。**未声称已关闭。**
+   **已获得可计数的 owner**（内审 M-honesty）：drill 67 的 CONTROL(before) 在「首推被判瞬时 + 重试成功」时记一条
+   `not_covered … sub-face 4` gap。此前该分支只 `log`，导致 DRILL-VERDICT 与「一次成功」**逐字节相同**——
+   于是最初发现 #67 的那个探测器（drill 42 复跑 3 挂在这条 baseline）变得**不可达**，而成因仍未修。
+
+### #68 — R16 A4 的 `--reset-js` 确认门只更新了一半 remedy ⇒ JS-503 横幅让运维跑一条必被拒的命令
+
+- **状态：✅ FIXED（G67 修产品侧；G69 补完部署层的第三个调用点）。**
+- **⚠ 范围更正（G69，2026-07-22）——本条最初被我记小了。** 我当初把它写成「漏了一处 SSOT 副本」。
+  真实形状是：**R16 A4 改变了 `reconcile nats --to-standalone` 这个动词的契约**（数据面 JS store 上必须
+  带 `--reset-js`），而部署层有**三个**调用点，R16 只更新了其中一个（drill 42）：
+  | # | 调用点 | 谁发现 | 怎么发现的 |
+  |---|---|---|---|
+  | 1 | `drills/42-rejoin-returning` | R16 自己 | R16 期间跑过 |
+  | 2 | `drills/92-js503-remote-alert` | **G67 回归清扫** | R16 期间**没重跑** 92 |
+  | 3 | `drills/41-shrink-to-standalone` | **G69 验收跑** | R16 与 G67 **都没重跑** 41 |
+  | 4 | `internal/natsconf/remedy.go` 的 SSOT（JS-503 横幅） | **G67 内审** | 横幅让运维跑一条必被拒的命令 |
+  | 5 | `cmd/tether/cluster_offline.go`（online force-single 完成文案，**手抄字面量**）+ `cluster_operation_controller.go` 的 N=1 边界下一步文案 | **G69 内审（G-7）** | 手抄字面量**结构上绕过了** SSOT 的 pin——SSOT 化本身正是为防这个而做的，却漏了这两处 |
+  **同一个缺陷被独立发现了五次。** 第 5 处尤其讽刺：`remedy.go` 的文档注释开宗明义写着「三份手抄副本迟早烂掉一份」，
+  而它自己的 SSOT 化并没有收编所有副本，于是**留下的手抄件正好绕过了为它设的 pin**。
+  **教训（比缺陷本身更重要）**：改变一个动词的契约时，只更新「手头正在跑的那个 drill」是不够的——
+  必须**全局扫所有调用点，包括产品自己打印给运维的文案**。我在修 92 时只扫了 drills 目录，没扫产品侧的
+  手抄字面量；G69 内审才把第 4/5 处翻出来。**"改契约 ⇒ 扫调用点"必须包含：drills、lib、docs/runbook、
+  以及产品里所有会把该命令打印给人看的地方**——尤其是**没走 SSOT 的手抄件**，因为 SSOT 的 pin 看不见它们。三个 drill 里有两个还各自留着一份**手工 `mv` JS store** 的 Mandate-② 遮掩，
+  A4 之后它们不仅多余而且是**坏的**（拒绝 ⇒ conf 没换 ⇒ 手工挪走 store ⇒ 孤 voter 带 clustered conf 启动
+  ⇒ `n1ClusteredJetStreamFatal` ⇒ 后续断言连锁失败）。三处现已统一改为**一条产品动词**
+  `--to-standalone --reset-js`，并**先钉住确认门本身**（不带 flag 必须拒绝且点名 flag 与数据影响）。
+- **机理**：R16 A4 给 `reconcile nats --to-standalone` 加了**确认门**：JS store 有数据时**拒绝**，要求 `--reset-js`。
+  R16 更新了 grow-cutover 那处 remedy（`cluster_grow_cutover.go` 明写 `--reset-js`），却**没更新 SSOT**
+  `internal/natsconf/remedy.go` 的 `DeClusterRemedyCmd`。而该 SSOT 正是 **DATA-PLANE-DEGRADED / JetStream
+  UNAVAILABLE 横幅**的补救文案——那个横幅**恰恰**在 JetStream 一直在服务、因而 store **必然有数据**时才亮。
+  于是：横幅让你跑 X，X 必拒。`remedy.go` 自己的文档注释早写了「三份手抄副本迟早烂掉一份」——这次烂的就是它预言的那份。
+- **连锁**：drill 92 的恢复腿因此整条塌掉——`--to-standalone` 被拒 ⇒ conf 没换 ⇒ 而 drill 又用**手工 `mv`**
+  把 store 挪走并重启 ⇒ 孤 voter 带着 **clustered conf** 启动 ⇒ `n1ClusteredJetStreamFatal` ⇒ auth responder
+  起不来 ⇒ ctl re-login / terminus / REMOTE-homes 连挂 4 条。**表面 4 个失败，根只有 1 个。**
+- **修复**：新增 `DeClusterRemedyResetJSNote` 并接入横幅。**命令本身不动**——在横幅里无条件推荐一个会丢
+  audit/history 的破坏性 flag 更糟；拒绝本身是**护栏而非死路**（它已点名 flag、数据影响、以及先 `nats stream backup`）。
+  这条 note 只是消除意外。
+- **同时退役 drill 92 的遮掩**：第 134 行的手工 `mv /var/lib/tether/jetstream …` 是 Mandate-② 违规
+  （R16 刚在 drill 42 里退役过同一形态），且 A4 之后它还是**坏的**。改为一条产品动词
+  `--to-standalone --reset-js`（conf 交换 + store 移置一步到位），并**先钉住护栏**：不带 flag 必须拒绝且
+  文案点名 `--reset-js` 与数据影响——只断言 happy path 会让日后有人悄悄摘掉破坏性操作的确认门。
 
 ### #59 — ~~被分区少数派 broker 无法「只读存活」~~ → **REFUTED（R6 定案，2026-07-19）**
 > 只读存活是**设计态**、有名字：`proxyStateFrozenReadonly`（"control writes refused, but /sub KEEPS vending"，`proxy_cluster.go:43-45`）；`read.go:14-17` 明写 fence 存在正是为了「quorum-lost 节点继续供本地读而非砖化（§6.2）」。R6 的 Q2 实测（`MainPID` 稳定 / `/varz` 200 / `fenced` 拒绝）逐点吻合该契约、落在台账自己的 GREEN 分支。`broker.go:956-985` 是 `Run` 的**冷启动**序列、不在任何循环里——把它当稳态机理是又一次「把 X 当成 Y」。**不占发布闸。** 详见 `docs/reviews/r6-findings.md`。
@@ -666,7 +838,16 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 ### #47 — `cluster add` 可把可达 joiner 永久留在 CATCHING_UP，后续 grow 被串行锁阻断
 
-- **状态（外审 round-4，2026-07-16）**：**RATIFIED / intermittent PRODUCT defect，修复后远端待复验**。
+- **状态：✅ CLOSED / FIXED（R16，2026-07-22 deploy-tier 复验）** —— 本条此前唯一未闭合的原因是「修复后远端
+  待复验」（2026-07-16 额度受限）。R16 在 weilandserver 用本条自己规定的 oracle 重跑 `drills/42-rejoin-returning`
+  并取得 **verdict=GREEN（pass=48, assert_fail=0, product_red=0, not_covered=0）**：`cluster add` invocation-2
+  **rc=0**、`✓ brk2 is now a VOTER`、权威 join op 达 **terminal SERVING**、`cluster add complete.`——即本条
+  "修复后的远端结论必须以该原 oracle 重跑为准" 的三项硬断全部满足，fixture 仍是 retry=0 的严格版。
+  R16 另外补了两处使该 oracle 可稳定达成的产品修复（见 42 行 tsv 证据）：A1 把 **returning joiner 自身**
+  的 dead-epoch clustered JS store 在 grow P5 移置（rejoin-prepare 只擦 raft/+tether.db、不擦 JS store，
+  joiner 因而 fail-stop 于 n1ClusteredJetStreamFatal），以及把 start-joiner 就绪检查从**一次性探测**改为
+  **有界轮询**（一次性探测会撞上 joiner 重启后的正常启动窗口，把正确的 grow 判成失败）。
+- **原状态（外审 round-4，2026-07-16，保留作轨迹）**：**RATIFIED / intermittent PRODUCT defect，修复后远端待复验**。
   当前保留的严格 40 单次日志中，brk2 invocation-1 精确到达 rc=75 start-joiner 边界；fixture 已证明
   ctl/auth-callout ready，但 invocation-2 随即收到 `Authorization Violation`（rc=77），权威 join op 留在
   `CATCHING_UP`（lag=21），后续 grow 被串行锁阻断。另一次较早保留运行命中独立表现：invocation-2

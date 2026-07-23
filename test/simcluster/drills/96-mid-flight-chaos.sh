@@ -327,6 +327,32 @@ assert_setup "provision agt2 agent.yaml (control, on brk1)" \
 # sed inserts under the sim-written (UNCOMMENTED) broker.cluster block, right after its raft_addr line.
 assert_setup "R15 #58: set broker.cluster.xfer_reap_interval=8s on the victim home broker brk2 (so its home-authoritative periodic reap is OBSERVABLE, not a 5m wait — the reap itself is tether's, this only tunes cadence)" \
     dexec brk2 -- sh -c "grep -q 'xfer_reap_interval' /etc/tether/broker.yaml || sed -i '/^    raft_addr:/a\\    xfer_reap_interval: 8s' /etc/tether/broker.yaml"
+# R16 #58 Lane C: this session is STRUCTURALLY split-home, so no HOME can reap it — the fix is a
+# LEADER-driven cross-home GC. Only the CADENCE (xfer_reap_interval) is compressed here.
+#
+# EXTERNAL REVIEW F2 (2026-07-23): the AGE FLOOR (xfer_cross_home_reap_age) is no longer compressible.
+# It used to be settable to 5s through the production YAML, and the reviewer showed that is unsafe for
+# real deployments: in a split-home session the leader only excludes its OWN local tracker, so it cannot
+# see a transfer still live on ANOTHER home, and a floor below the tier-B watchdog lets it delete an
+# in-use object. The schema now only permits RAISING the floor above the derived 3x tier-B default.
+#
+# The honest consequence, recorded rather than worked around: with a 15m floor the cross-home GC cannot
+# be observed inside a drill window at all, so this arm can no longer prove the reap. That is a coverage
+# LOSS traded for production safety — the Mandate forbids re-opening a test-only backdoor in the product
+# to buy it back. #58 therefore stays OPEN with its deploy-tier proof owed, now for a STRUCTURAL reason.
+not_covered "#58 cross-home GC reap (deploy-tier observation)" \
+    "the age floor is no longer compressible from the production YAML (external review F2 clamped it to >= 3x the tier-B timeout, because a lower floor lets the leader delete an object still live on another home). With a 15m floor the reap cannot occur inside a drill window, so this arm cannot observe it. Re-opening a test-only seam in the product to make it observable is exactly what F2 forbids; the honest options are a drill that waits >15m or a hermetic pin (which exists: TestXferCrossHomeGCReapsSplitHome)" gap
+assert_setup "R16 #58: set broker.cluster.xfer_reap_interval=8s on the LEADER brk1 (CADENCE only — the age floor is no longer compressible, see above)" \
+    dexec brk1 -- sh -c "grep -q 'xfer_reap_interval' /etc/tether/broker.yaml || sed -i '/^    raft_addr:/a\\    xfer_reap_interval: 8s' /etc/tether/broker.yaml"
+assert_setup "R16 #58: restart brk1 so it loads the cross-home GC knobs" \
+    dexec brk1 -- systemctl restart tether-broker
+# Restarting brk1 hands leadership away (raft re-elects while it is down). The cross-home GC is LEADER-ONLY,
+# so the compressed knobs must sit on the node that IS the leader — re-establish the arm's precondition after
+# the restart, exactly as the setup did before it.
+assert_setup "R16 #58: brk1 is the leader again after the knob-loading restart (the cross-home GC is leader-only, so the compressed knobs must be on the LEADER)" \
+    _ensure_leader_brk1
+assert_setup "R16 #58: PRECONDITION re-verified — leader is brk1 (post-restart)" \
+    sh -c "$SIM status --json 2>/dev/null | jq -e '.leader_id==\"brk1\"' >/dev/null"
 # NOTE (Stage-C B4): this drill implements the four load-bearing arms — A (#57/#58 tier-B mid-flight),
 # B0 (run --ack-alerts gate), D (the flagship leader partition), F (double fault). The roadmap's arm B
 # (run-PTY kill-broker → DOC-28) and arm C (expose-crash → RETURN + home_reassign_failed observation) are
@@ -378,8 +404,28 @@ if [ -z "$_A_ROWS" ]; then
 elif printf '%s' "$_A_ROWS" | grep -qE 'complete|failed'; then
     not_covered "96-A #57 in-flight interruption (transfer completed before the crash — in-sim interruption not reliably constructable)" "the tier-B transfer reached a terminal (complete) row — the 1 GiB in-flight payload finished before the kill landed. CLASS gap (R14 re-adjudication): DETERMINIZATION ATTEMPTED AND MEASURED INSUFFICIENT — the payload was enlarged 12 MiB→1 GiB and the kill moved to the instant the start row lands (A1b polls at 1s), yet on the 88-vCPU sim host the tier-B pipeline still drains 1 GiB before docker kill returns (r14d 2026-07-20). Catching the PRE-completion crash needs bandwidth-shaping (tc) on the agent's egress, which would also throttle heartbeats/health and risk destabilising the cluster — so #57's dangling-audit is NOT reliably constructable in-sim and is registered as a coverage gap (source-certain mechanism, hermetic owner: transfer unit tests). NOTE: the SIBLING #58 (orphaned objects never reaped) DOES pin live here — this same interrupted transfer stranded objects because the reaping was cut off, so the live relapse is caught even though the dangling-start-row half is not." gap
 elif printf '%s' "$_A_ROWS" | grep -q 'start'; then
+    # ROUND-3 R3-F3: this used to declare #57 "forever" HERE — while brk2 (the crashed home) is still DOWN
+    # and the finalize-on-recovery pass has therefore had NO opportunity to run. That verdict measured the
+    # crash, not the product's recovery, so it could neither certify nor refute the R16/G67 fix. Bring the
+    # home back FIRST, give the recovery pass its window, and only then judge.
+    assert_ok "A1f-pre bring brk2 back so the finalize-on-recovery pass can run BEFORE #57 is judged (R3-F3: the old verdict fired while the home was still down)" node_start brk2
+    assert_ok "A1f-pre brk2's broker is active again (recovery cannot run on a dead broker)" \
+        poll_until 120 3 "brk2 broker active" -- _a2_brk2_up
+    _a57_try=0
+    while [ "$_a57_try" -lt 30 ]; do
+        _a57_try=$((_a57_try+1))
+        _A_ROWS=$(_pctl -- history --kind transfer -n 200 2>/dev/null | grep -F 'inflight.bin' || true)
+        printf '%s' "$_A_ROWS" | grep -qE 'complete|failed' && break
+        sleep 6
+    done
+    log "96-A #57 post-recovery poll: $_a57_try attempt(s); rows: $(printf '%s' "$_A_ROWS" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-200)"
+    if printf '%s' "$_A_ROWS" | grep -qE 'complete|failed'; then
+        _as_pass "#57 FIXED: after the home broker came back, the finalize-on-recovery pass wrote a TERMINAL for the interrupted transfer (no dangling start)"
+        _A_57_PINNED=0
+    else
     _A_57_PINNED=1
     product_red "#57 an in-flight tier-B transfer whose home broker crashes leaves a DANGLING start row and NO terminal audit, forever: the watchdog hangs off the broker's runCtx (transfer.go:593/:704) so it dies with the process, transferTracker is an in-memory map rebuilt EMPTY on restart (transfer.go:99-104 + broker.go:602), and any late finalization from the agent is silently dropped by handleEvTransfer's 'preview == nil -> return' (:816-819). Operators auditing transfers see a transfer that never ended."
+    fi
 else
     _as_fail "#57 UNJUDGEABLE — rows exist for the in-flight transfer but match neither start nor a terminal kind; triage before judging"
 fi
@@ -433,18 +479,35 @@ else
     # Was the home-authoritative reap actually LOGGED on ANY broker? (The bucket's home is whichever broker
     # owns agt1's session; the reap fires there. Checking all three distinguishes "ran but failed" from "did
     # not run".)
+    # R16: accept EITHER reap signature — the home-authoritative periodic reap (R15) OR the LEADER cross-home
+    # GC (R16 Lane C, the only thing that can reclaim a STRUCTURALLY split-home bucket no home owns).
     _reaped_anywhere=0
     for _rb in brk1 brk2 brk3; do
-        if dexec "$_rb" -- sh -c 'grep -q "orphan xfer objects reaped" /var/log/tether/broker.err' 2>/dev/null; then _reaped_anywhere=1; break; fi
+        if dexec "$_rb" -- sh -c 'grep -qE "orphan xfer objects reaped|cross-home GC reaped aged orphan xfer objects" /var/log/tether/broker.err' 2>/dev/null; then _reaped_anywhere=1; break; fi
     done
     if [ "$_C_AFTER" = unreadable ]; then
         not_covered "96-A2 (#58) object count became unreadable after the restart" "cannot judge whether the orphan was reaped" runtime-guard
-    elif [ "$_C_AFTER" -le "$_reap_floor" ]; then
-        assert_ok "#58 FIXED (R15): the HOME-AUTHORITATIVE periodic reap removed the orphan (count $_C_ORPHAN->$_C_AFTER, back to the tombstone floor <= $_reap_floor) — reaperCaughtUp drops the old leader-only gate + homeOwnsXferBucket lets the session's home (non-leader by setup) reap its OWN orphans on the periodic pass; before R15 the leader-only gate made a follower-homed bucket's garbage immortal (this run: $_C_ORPHAN orphan objects removed)"  sh -c "true"
-    elif [ "$_reaped_anywhere" = 1 ]; then
-        product_red "#58 REGRESSION: a broker LOGGED the home-authoritative reap ('orphan xfer objects reaped') yet the OBJ_xfer object count stayed at $_C_AFTER, still ABOVE the tombstone floor $_reap_floor (orphan was $_C_ORPHAN while brk2 was down) — the reap RAN but FAILED to remove the orphan on the non-leader home. R15's reaperCaughtUp + per-broker homeOwnsXferBucket changed the gate; a run-but-no-effect here is a genuine relapse against the per-session 8 GiB cap (transfer.go:67) = #21/#58-family."
+    elif [ "$_C_ORPHAN" -le "$_reap_floor" ]; then
+        # NON-VACUITY GATE (R16): "the count is at the floor" only means the reap WORKED if there was a real
+        # orphan set to reclaim. When the A-arm's 1 GiB tier-B transfer completes before the docker kill (the
+        # same in-sim interruption gap #57 records), the peak count never rises above the floor and the FIXED
+        # branch below would PASS having reclaimed nothing. Record that as uncovered instead of banking a
+        # vacuous green — the reap/GC is pinned hermetically; this arm only claims it when it truly ran.
+        not_covered "96-A2 (#58) the A-arm produced NO orphan set this run (peak orphan count $_C_ORPHAN <= tombstone floor $_reap_floor), so neither the home-authoritative reap nor the R16 leader cross-home GC had anything to reclaim" "IN-SIM INTERRUPTION GAP (same root as 96-A/#57): the tier-B upload reached a terminal before the kill landed, so no in-flight chunks were stranded. A 'count is at the floor' PASS here would be VACUOUS — it would assert the reap works on a run where no reap was needed. The #58 mechanisms are pinned hermetically (TestXferCrossHomeGCReapsSplitHome / TestXferCrossHomeGCSkipsBusyBucket / TestXferUnreapableBucketCounter + the derivation pin); this arm claims them ONLY on a run that actually strands objects." gap
     else
-        not_covered "96-A2 (#58) the home-authoritative reap did NOT fire in the window (count stayed $_C_AFTER > floor $_reap_floor; NO 'orphan xfer objects reaped' line on any broker)" "#58-SPLIT-HOME RESIDUAL (a DEFECT-tied gap, not intrinsic non-determinism — external re-review: reclassified runtime-guard→gap). This drill's session is STRUCTURALLY split-home (agt1→brk2, agt2→brk1), so homeOwnsXferBucket(sid)='ALL session nodes homed to self' is conservatively false on EVERY broker and the per-session bucket is unreapable BY DESIGN — the reap CANNOT fire here regardless of timing. The ORIGINAL leader-only #58 bug IS fixed (proven hermetically: TestReaperCaughtUpGate/TestXferOrphanReapHomePartition + mutations, and observed end-to-end reaping ~8k orphan objects on a non-leader single-home session); this gap RETIRES when the product refines homeOwnsXferBucket to per-transfer-owner (the named #58-split-home follow-up). A secondary transient cause (post-crash raft catch-up exceeding the poll window) can also leave it un-reaped, but the split-home structural cause is deterministic here." gap
+        # ROUND-3 R3-F3: the FIXED / REGRESSION / SPLIT-HOME judges that used to live here are GONE, not
+        # relocated. They all rested on a compressed 5s `xfer_cross_home_reap_age`, which external review
+        # F2 made UNLOADABLE: the production schema now refuses anything below the 15m safe floor, because
+        # a shorter floor lets the leader delete an object still live on ANOTHER home. With a 15m floor no
+        # reap can occur inside this drill's window, so any verdict here would be judging an event that
+        # cannot happen — and the previous revision kept those branches while ALSO pre-recording a gap,
+        # which is how the reply and the diff came apart.
+        # ROUND-4 R4-F3: and NO gap is recorded here either. The gap is STRUCTURAL — it holds for every
+        # run of this drill regardless of which branch the A-arm takes — so it is registered exactly once,
+        # unconditionally, in the A-arm setup section above. Booking
+        # it a second time here made the coverage count depend on whether this branch was reached, which
+        # is precisely the accounting a structural gap must not have.
+        :
     fi
 fi
 

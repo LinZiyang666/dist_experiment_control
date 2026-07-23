@@ -23,7 +23,7 @@ tether cluster backup	flags: --allow-stale-follower --data-dir --db --offline --
 tether cluster doctor	flags: --conf --db --json --nats-route --offline --raft-addr --secrets-dir --socket
 tether cluster drain	flags: --abort --now --retire(hidden) --socket
 tether cluster export-incident [hidden]	flags: --force --out --sid --since --socket
-tether cluster force-single [hidden]	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --self-addr --self-id --socket --yes(hidden)
+tether cluster force-single [hidden]	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --reset-js --self-addr --self-id --socket --yes(hidden)
 tether cluster init	flags: --check --config --confirm-node-id --data-dir --db --dry-run --from-existing --from-manifest --name --nats-conf --nats-route --node-ident-pub --public-host --raft-addr --secrets-dir --self-id --socket --tunnel-addr --yes(hidden)
 tether cluster invite	flags: --account-pub --bootstrap --seed --socket
 tether cluster join	flags: --socket
@@ -40,11 +40,11 @@ tether cluster pin	flags: --force --home --socket
 tether cluster rebalance	flags: --socket
 tether cluster rebalance proxy	flags: --dry-run --socket
 tether cluster reconcile	flags: --socket
-tether cluster reconcile nats	flags: --account-issuer --all --allow-partial-mesh --broker-nkey --cluster-listen --conf --confirm-single --json --manual --nats-server --peer --plan --route-url --secrets-dir --server-name --skip-dry-run --socket --timeout --to-standalone --wait
+tether cluster reconcile nats	flags: --account-issuer --all --allow-partial-mesh --broker-nkey --cluster-listen --conf --confirm-single --json --manual --nats-server --peer --plan --reset-js --route-url --secrets-dir --server-name --skip-dry-run --socket --timeout --to-standalone --wait
 tether cluster recover [hidden]	flags: --data-dir --db --dump-divergent --emit-manifest --guided --secrets-dir --self-id --socket --yes(hidden)
 tether cluster recovery	flags: --socket
 tether cluster recovery diagnose	flags: --db --offline --self-id --socket
-tether cluster recovery force-single	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --self-addr --self-id --socket --yes(hidden)
+tether cluster recovery force-single	flags: --confirm-peers-dead --data-dir --db --dry-run --guided --nats-conf --nats-server --online --reset-js --self-addr --self-id --socket --yes(hidden)
 tether cluster recovery incident	flags: --socket
 tether cluster recovery incident export	flags: --force --out --sid --since --socket
 tether cluster recovery node	flags: --socket

@@ -470,7 +470,8 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 		{Name: "ports", Interval: time.Second, LeaderOnly: true},
 		{Name: "tunnel-sessions", Interval: time.Second, LeaderOnly: false},
 		{Name: "proc-gc", Interval: 5 * time.Minute, LeaderOnly: false},
-		{Name: "xfer-orphan-reap", Interval: 5 * time.Minute, LeaderOnly: false}, // #58/P10: home-authoritative, per-broker (see reaperCaughtUp+homeOwnsXferBucket)
+		{Name: "xfer-orphan-reap", Interval: 5 * time.Minute, LeaderOnly: false},       // #58/P10: home-authoritative, per-broker (see reaperCaughtUp+homeOwnsXferBucket)
+		{Name: "xfer-inflight-finalize", Interval: 5 * time.Minute, LeaderOnly: false}, // R16 #57: finalize-on-recovery for stranded in-flight transfers (shares the reap cadence)
 		{Name: "grow-lock", Interval: 30 * time.Second, LeaderOnly: true},
 		{Name: "upgrade-lock", Interval: 30 * time.Second, LeaderOnly: true},
 		// R8a P1: leader-only — it re-delivers what the leader's homeForRegister computes

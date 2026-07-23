@@ -36,6 +36,17 @@ func TestG2ExternalReviewDataPlaneBannerNamesRequiredStandaloneFlags(t *testing.
 			t.Fatalf("DATA-PLANE DEGRADED banner must include %s in the recovery command; got %q", want, rep.Banner)
 		}
 	}
+	// G67 / gotcha #68 (internal review M4: the fix shipped with no anti-regression pin at either tier).
+	// R16's A4 added an ACKNOWLEDGEMENT GATE — --to-standalone REFUSES on a data-bearing JetStream
+	// store — and updated the grow-cutover remedy while missing this SSOT. This banner fires exactly
+	// when JetStream HAS been serving, i.e. exactly when the store IS data-bearing, so without the note
+	// it tells the operator to run a command that will refuse. Deliberately NOT asserted on the
+	// cold-start sibling below: that path returns from Broker.Run before the admin socket exists, so
+	// the online verb is unreachable there and already names the --manual offline escape instead.
+	if !strings.Contains(rep.Banner, "--reset-js") {
+		t.Fatalf("DATA-PLANE DEGRADED banner must warn that a data-bearing JetStream store makes the "+
+			"remedy REFUSE without --reset-js (gotcha #68); got %q", rep.Banner)
+	}
 }
 
 // TestG2ExternalReviewColdStartDiagnosticNamesRequiredStandaloneFlags pins the same guidance in the

@@ -606,6 +606,18 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		if !a.topoAdvance(op, sub, true) {
 			return
 		}
+		// G69 (#67 sub-face 4): topology convergence proves the rendered nats.conf rolled out and the
+		// live process loaded it. A loaded conf is NOT a placeable JetStream meta — so `cluster add`
+		// used to return rc=0 at a moment when the first CreateObjectStore(Replicas: N) could still
+		// fail, which the deploy tier measured as "grow, then push, intermittently refused".
+		//
+		// Placed HERE, not inside topoAdvance: that function is shared with retire and carries the
+		// deliberate N=1 de-cluster carve-out. And placed BEFORE the two Propose-bearing steps below,
+		// so waiting costs zero raft writes and cannot release the grow lock while still waiting.
+		jsAdvance, jsDegrade := a.jsPlacementAdvance(op)
+		if !jsAdvance {
+			return
+		}
 		// C4-m1: clear force_single_active BEFORE the terminal transition — a kill-9 between a terminal
 		// SERVING and a later clear would strand a stale FORCE_SINGLE marker (the op is never revisited).
 		if nv, err := a.node.NumVoters(); err == nil && nv > 1 {
@@ -637,6 +649,10 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 			return
 		}
 		a.clearOpAttempts(op.OpID)
+		if jsDegrade != nil {
+			// Splice the unproven-placement record into the TERMINAL write only (see jsPlacementAdvance).
+			op.Timeline = appendTimeline(op.Timeline, *jsDegrade)
+		}
 		_ = a.transition(op, cluster.OpStateServing, true, "", nil)
 	}
 }
@@ -1040,6 +1056,88 @@ func (a *ClusterAdmin) topoConvergedForOp(op *cluster.Operation, joining bool) (
 	return true, ""
 }
 
+// jsGateExpiryReserve makes the JS conjunct degrade to terminal SERVING STRICTLY BEFORE topoAdvance's
+// own expiry branch can fire (internal review G-1, a BLOCKER I shipped and did not see).
+//
+// The conjunct in isolation can never hold an op past the deadline. The LADDER can. Because holding the
+// op alive at NATS_ROLLED_OUT keeps topoAdvance — which is fail-CLOSED and whose expiry branch is
+// OpStateBlocked — re-evaluated on every one of those ticks, and it runs FIRST. Pre-G69 a join went
+// terminal on the first tick topology converged and was thereafter immune; G69 exposed it for the whole
+// residual window. The exposure is CORRELATED, not exotic: topoConvergedForOp needs each voter's
+// TopoReported, which is set only when that node answered THAT tick's health scatter-gather
+// (clusterstatus.go), and the saturated host that makes the JS meta slow to place is the same host that
+// drops a health reply. The result would be OpStateBlocked -> blockedConfirmDecision(0,0,false) reports
+// budget-exhausted on the FIRST poll -> `cluster add` exits non-zero with the WRONG causal string and
+// assertNoActiveOp fences the membership plane. That is verbatim the outcome plan §0.3 rejected.
+//
+// Two observe ticks is the minimum that guarantees the degrade tick precedes the expiry tick; 30s is
+// the comfortable value and still leaves the total NATS_ROLLED_OUT dwell unchanged.
+const jsGateExpiryReserve = 30 * time.Second
+
+// jsPlacementAdvance is the JOIN-ONLY second conjunct of the terminal gate (G69 / #67 sub-face 4).
+//
+// It is a BOUNDED WAIT, not a fail-closed gate, and that distinction is the whole #45 argument. Gotcha
+// #45 was: fail-closed gate + unreliable signal + no bound ⇒ the op pinned non-terminal at
+// NATS_ROLLED_OUT ⇒ assertNoActiveOp refused the NEXT membership operation ⇒ the grow/shrink spine
+// wedged with no state `cluster ops confirm/abort` could act on. Here the EXPIRY OUTCOME IS ADVANCE:
+// there exists no input that holds THIS CONJUNCT past op.CatchupDeadline.
+//
+// That claim is scoped to the conjunct ON PURPOSE. It was first written as a claim about the whole
+// ladder, and that was FALSE — see jsGateExpiryReserve, which is what makes the composed gate's expiry
+// outcome ADVANCE too. A zero deadline (legacy or hand-seeded rows) is treated as expired and advances.
+//
+// Escalating to OpStateBlocked instead was considered and REJECTED on source evidence:
+// --auto-confirm-catchup defaults to 0, so blockedConfirmDecision(0,0,false) reports budget-exhausted
+// on the FIRST blocked poll — `cluster add` would exit non-zero immediately with the wrong causal
+// string ("the joiner is not catching up"), the op would stay non-terminal, and the membership plane
+// would be fenced until a human confirmed. Nothing about the pre-fix state is data-unsafe: the grow
+// physically completed, and the push failure it causes is honest and retryable since G67.
+//
+// The cost of advancing, stated plainly: on expiry we ship a SERVING we could not prove — which is
+// EXACTLY today's behaviour, plus a durable timeline entry naming why.
+func (a *ClusterAdmin) jsPlacementAdvance(op *cluster.Operation) (bool, *opTimelineEntry) {
+	if a.jsPlaceableFn == nil {
+		return true, nil // unwired (bare admin in unit paths) ⇒ today's behaviour; wiring has a source pin
+	}
+	ok, detail := a.jsPlaceableFn()
+	if ok {
+		return true, nil
+	}
+	if op.CatchupDeadline == 0 || a.now().UnixNano() > op.CatchupDeadline-int64(jsGateExpiryReserve) {
+		// RETURN the degrade entry; do not record it here. Two review findings converge on this shape:
+		//
+		//  1. transition() rebuilds the timeline from the IN-MEMORY op.Timeline, so a recordOpError here
+		//     would be ERASED by the very next transition (which still holds the stale value).
+		//  2. Mutating op.Timeline in place is no better: THREE steps still stand between this point and
+		//     the terminal transition, and any of them can route to blockAfterAttempts -> recordOpError,
+		//     which would then bake "declared SERVING …" into a NON-terminal, NON-SERVING write — once
+		//     per tick, because blockAfterAttempts embeds an attempt counter so the change-gate never
+		//     suppresses it. An operator or drill grepping that string would conclude a degraded SERVING
+		//     shipped on an op whose terminal state is BLOCKED.
+		//
+		// So the entry is spliced into the TERMINAL transition and nowhere else: one raft write, no
+		// speculative record, no duplicates.
+		// G-12: the degrade is on the wire via `cluster ops show --json`, but `cluster add` returns nil on
+		// SERVING and the human `cluster ops show` never renders the timeline — so the operator whose next
+		// push is refused has no pointer to it. A Warn is the cheapest honest signal that adds no wire face.
+		a.logger.Warn("cluster: join declared SERVING without proving JetStream placement",
+			"op_id", op.OpID, "target", op.TargetNode, "detail", detail)
+		return true, &opTimelineEntry{
+			S: cluster.OpStateServing, T: a.now().UTC().Format(time.RFC3339),
+			E: "declared SERVING WITHOUT proving JetStream placement (" + detail +
+				") — the first tier-B transfer after this grow may be refused as transient " +
+				"(`jetstream_not_ready`) and need one retry",
+		}
+	}
+	// ROUND-4 R4-F3/疑惑 3: say what was actually measured. The canary is memory-backed, so it proves the
+	// META can ASSIGN a new asset at the target factor — not that a file/object-backed stream would find
+	// the disk budget to be created. Promising the latter here would be a contract the gate cannot keep.
+	a.recordOpError(op, errors.New("waiting for the JetStream meta to be able to ASSIGN a new stream at the "+
+		"target replica factor (measured with an empty memory-backed canary; it does not check disk budget "+
+		"for file/object stores): "+detail))
+	return false, nil
+}
+
 // topoAdvance is #45's bounded gate. It returns true only when the op may proceed past NATS_ROLLED_OUT.
 //
 // THE DEFECT (as re-diagnosed in R6 — the earlier ledger entry blamed the wrong state)
@@ -1076,7 +1174,9 @@ func (a *ClusterAdmin) topoAdvance(op *cluster.Operation, sub substrate, joining
 		// must see a next step, not a bare convergence complaint — and wait indefinitely, on purpose.
 		a.recordOpError(op, errors.New(reason+
 			" — this is the N=1 de-cluster boundary: the last remaining voter still has a CLUSTERED nats.conf and cannot"+
-			" observe the new topology until you run `cluster reconcile --to-standalone --confirm-single` on it."+
+			" observe the new topology until you run `cluster reconcile --to-standalone --confirm-single` on it"+
+			" (add `--reset-js` if that node's JetStream store still holds data — it will otherwise REFUSE;"+
+			" the flag MOVES the store aside, never deletes, and drops live audit/history)."+
 			" The retire stays in flight (deliberately) until then"))
 		return false
 	}

@@ -61,6 +61,59 @@ type StreamReplicaState struct {
 	Target int
 	Actual int
 	Ready  bool
+	// Assigned / Configured (G69, #67 sub-face 4) are ADDITIVE and do not participate in Ready. They
+	// answer a different question from Actual: "did the META manage to place this many peers", not
+	// "have this many peers caught up". The join terminal gate needs the former — a peer that has been
+	// assigned but is still copying bytes has ALREADY proven the meta could place an R=N group, which
+	// is all a NEW (empty) asset needs.
+	Assigned   int // peers the JS meta has assigned to the raft group (Current NOT required)
+	Configured int // the stream's configured Replicas (the raise may not have landed yet)
+}
+
+// AssignedReplicas computes how many peers the JS META has ASSIGNED to a stream's raft group and are
+// still PRESENT (G69, #67 sub-face 4): 1 (this replica) + every non-nil, non-Offline peer in
+// Cluster.Replicas.
+//
+// What is deliberately NOT filtered is `Current`. A peer that has been assigned and is still copying
+// bytes is real placement evidence, and requiring catch-up would make every grow wait for a full byte
+// copy (the events stream alone is capped at 1 GiB) — a false-block of a healthy grow over a slow route.
+//
+// What IS filtered is `Offline`, and that was external review F3: tether never issues a JS peer-remove,
+// so a member retired in a 3->2 shrink stays listed forever. Counting it let a later 2->3 regrow satisfy
+// "Assigned >= target" on the FIRST tick from a corpse, and the join gate then declared the meta able to
+// place a new R=N asset while the new joiner had not joined the meta group at all.
+//
+// It still does NOT prove anything about a SPECIFIC peer (e.g. the joiner), so this is only a cheap
+// PRE-GATE: the join gate's authoritative evidence is the DIRECT measurement, ProbeMetaCanPlace, which
+// actually creates an empty R=N canary stream and deletes it again (round-4 R4-F4: that canary has
+// LANDED — this comment used to describe it as an outstanding suggestion, which read as a still-open gap
+// long after it was closed). What remains genuinely open is registered in docs/reviews/g69-plan.md §7:
+// the `3->2 (no JS peer-remove) ->3` real-machine differential, and the fact that a MemoryStorage canary
+// measures meta placement but not whether a new File/ObjectStore asset has the disk budget to be created.
+func AssignedReplicas(info *jetstream.StreamInfo) int {
+	if info == nil {
+		return 0
+	}
+	if info.Cluster == nil {
+		return 1 // non-clustered: this replica is the whole group
+	}
+	n := 1 // self
+	for _, p := range info.Cluster.Replicas {
+		// EXTERNAL REVIEW F3: nil and OFFLINE peers must not count. tether never issues a JS
+		// peer-remove, so a member retired in a 3->2 shrink stays listed forever; counting it let a
+		// later 2->3 regrow satisfy the target on the FIRST tick from a corpse, and the join gate
+		// declared "the meta can place a new R=N asset" while the new joiner had not joined the meta
+		// group at all — the exact post-grow window the gate exists to measure.
+		//
+		// Note what is deliberately NOT excluded: !Current. A peer that has been ASSIGNED and is still
+		// copying bytes is real placement evidence, and requiring catch-up would make every grow wait
+		// for a full byte copy (events alone is capped at 1 GiB). Assigned AND PRESENT is the contract.
+		if p == nil || p.Offline {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // ActualReplicas computes the number of CAUGHT-UP replicas of a stream from its live

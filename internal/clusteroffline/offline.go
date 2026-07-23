@@ -184,8 +184,15 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	if err := cluster.RebuildSingleNodeFromDB(opts.DataDir, opts.DBPath, opts.SelfID, opts.SelfRaftAddr, applied, opts.Logger); err != nil {
 		return roster, fmt.Errorf("clusteroffline: finalize recovered single-node raft: %w", err)
 	}
+	// R16 A3: mint a per-incident JS-reset epoch (stable across resumes — reuse the prior journal's if this
+	// is a forward-completion) so the CLI's survivor JS-store move-aside backup name is idempotent.
+	jsEpoch := opts.Now().UTC().Format("20060102-150405.000000000")
+	if prior != nil && prior.JSResetEpoch != "" {
+		jsEpoch = prior.JSResetEpoch
+	}
 	if err := writeJournal(opts.DataDir, &forceSingleJournal{
 		SelfID: opts.SelfID, SelfRaftAddr: opts.SelfRaftAddr, ConfirmedDead: confirmed, Phase: phaseRaftRebuilt,
+		JSResetEpoch: jsEpoch,
 	}); err != nil {
 		return roster, err
 	}
