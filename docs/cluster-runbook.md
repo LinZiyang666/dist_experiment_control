@@ -804,3 +804,36 @@ Notes:
   releases that add NO migration are freely roll-back-able.
 - Watch `cluster status` STREAMS (actual/target) between steps: a node restart transiently drops a
   JS replica; wait for `replication_degraded` to clear (actual==target) before upgrading the next.
+
+### 6.1 Membership is wedged: a stale roll lock / grow lock
+
+`cluster upgrade` takes a cluster-scoped **roll lock** and `cluster add` takes a **grow lock**. While
+either is held, `join` / `retire` / `upgrade` are all REFUSED — that is a real mutex (it also freezes
+the leader's in-flight membership ops), not an entry-gate nicety, so two membership changes can never
+interleave and knock out quorum.
+
+**First: usually you just wait.** Both locks carry a LEASE that their orchestrator renews while it
+runs, so an abandoned lock releases itself in about **15 minutes**. And a re-run of `cluster upgrade`
+with the same `--to-version` clears a stale lock it left behind on its own (it prints
+`cleared a stale upgrade lock`). Reach for the verb below only when waiting is not good enough:
+
+- you KNOW the operation is dead and will not sit out a deliberately conservative timer, or
+- the lock was taken by a broker released BEFORE leases existed — it carries no lease and therefore
+  never expires at all.
+
+```bash
+# Report + clear anything already abandoned (no selector ⇒ BOTH locks)
+tether cluster unlock --dry-run                  # see what it would do first
+tether cluster unlock --account-seed /etc/tether/secrets/account.nk
+
+# Only one of them
+tether cluster unlock --upgrade --account-seed <path>
+tether cluster unlock --grow    --account-seed <path>
+```
+
+- A lock whose lease is **still being renewed** is REFUSED by default: clearing it would pull the mutex
+  out from under a RUNNING orchestrator and let a second membership change interleave with it.
+- `--force` overrides that refusal. Before using it, prove the other orchestrator is gone — its process
+  exited, its terminal is closed, and `tether cluster ops ls` shows no in-flight op. Forcing a lock that
+  someone is still renewing is how you get two concurrent membership changes.
+- `--account-seed` is required for the signed request (same trust anchor as `cluster upgrade`).

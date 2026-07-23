@@ -303,6 +303,63 @@ tether cluster upgrade --to-version v0.5.0 \
 - **远程可观测(#16)**:`tether cluster status --homes --remote`(经 NATS 看各 broker 的代理 home 分布聚合,无需 SSH 上 broker)、`tether cluster seeds show --remote`(经 NATS 看签名 seed bundle);`cluster status --remote` 在 force-single 下 **exit 3**(监控可按退出码抓紧急态)。
 - **JetStream 持续 503 告警(#20③)**:某 broker 的 JetStream 持续不可用(如 force-single 后 nats.conf 滞留 clustered、meta 无 quorum,返 503)时,`tether cluster status --remote` 会打出**响亮的 `DATA-PLANE DEGRADED — JetStream UNAVAILABLE` 告警**(此前只有 socket 端 banner、`--remote` 看不到)——杜绝"JS 静默烂数天无人察觉"的运维盲区。JS 恢复(首次成功观测)即自动清除。
 
+### 5.6.12 OOB 发现与信任锚：`tether cluster invite` / `tether cluster pin`
+
+ctl 要在 broker 挂掉时**自动切到幸存者**，必须先知道两件事：这个集群的 **account_pub（信任锚）** 和至少一个
+**可拨号端点**。这两样只能经**带外（OOB）**交付——ctl **绝不**在 HTTP/NATS 上做 TOFU（trust-on-first-use）。
+`invite` 铸令牌、`pin` 收令牌，是这条链路的两端。
+
+```bash
+# broker 运维侧：铸一张 invite（--account-pub 必填；--seed 与 --bootstrap 至少给一个）
+tether cluster invite --account-pub AB... --seed wss://broker2:443
+# → tether-invite:v1?pin=AB...&seed=wss%3A%2F%2Fbroker2%3A443
+
+# 使用者侧：先设主 broker，再 pin
+tether login --broker wss://broker1:443 -s lab
+tether cluster pin 'tether-invite:v1?pin=AB...&seed=wss://broker2:443'
+```
+
+- **两层端点**：`--seed` 是 **tier-1 冷启动地板**（client-dialable 端点，`nats://` / `tls://` / `wss://`）；
+  `--bootstrap` 是 **tier-2** 的 well-known HTTPS manifest URL，供自动发现。给一个即可，两个都给更稳。
+- **invite 不含任何 secret**（`pin=` 是 account **公钥**，无 PIN、无 seed 材料、无私钥），所以风险**不是泄露、
+  而是被替换**：令牌**未签名**，完整性完全由交付通道承担。攻击者若能改写你交付的令牌，就能把受害者 ctl
+  pin 到**他自己的**信任锚上。因此必须走**可信 OOB 通道**（当面 / 已认证的 IM / 内部工单），
+  与今天手抄 `broker_url` + `account_pub` 同级。
+- **先 `login --broker` 再 `pin`**：failover 需要知道你的**主** broker_url，pin 只提供"备选 + 信任锚"。
+- **first-write-wins**：重复 pin **同一个** account_pub 是幂等的；pin **另一个** account_pub 意味着换集群，
+  必须 `--force`，并会**重置本地名册缓存**。
+- **durable 自定义/IP 端点放这里，不要混进 broker 托管的签名 seeds**——原因见 §5.6.9（混合集会被静默重建抹除）。
+
+### 5.6.13 解除陈旧成员锁 `tether cluster unlock`
+
+`cluster upgrade` 会取一把 **roll lock**、`cluster add` 会取一把 **grow lock**；任一锁在手期间，
+**join / retire / upgrade 全部被拒**（这是防止两次成员变更交错击穿 quorum 的真互斥，不是入口摆设）。
+
+两把锁都带 **lease**，编排器运行时持续续租，所以**被遗弃的锁会在约 15 分钟内自行释放**——
+大多数情况下**什么都不用做，等就行**。这条命令只为两种等不起的情况存在：
+
+1. 运维**已确认**那次操作确实死了，不想干等保守定时器；
+2. 锁是**旧版本 broker**（lease 机制之前）留下的——它**不带 lease，因此永远不会过期**。
+
+```bash
+# 报告并清除"已经被遗弃"的锁（不加选择器 = 两把锁都处理）
+tether cluster unlock
+
+# 只处理 roll lock
+tether cluster unlock --upgrade --account-seed /etc/tether/secrets/account.nk
+
+# ⚠ 危险：强行拔掉一把"仍在被续租"的锁
+tether cluster unlock --grow --force --account-seed <path>
+```
+
+- **默认拒绝清除活锁**：只要 lease 仍在被续租，命令就**拒绝**——因为那会把互斥体从一个**正在运行**的编排器脚下抽走，
+  让第二次成员变更与它交错。`--force` 才会覆盖这条保护。
+- **用 `--force` 前先自证**：确认另一个编排器**确实没了**（进程已退、终端已关、`tether cluster ops ls` 里没有在飞 op）。
+- **不带选择器 = 两把都清**：想"把成员变更解卡"的运维不必先搞清楚是哪个动词留下的锁。
+- **`--dry-run`** 先看它打算做什么；**`--account-seed`** 是签名所需（与 `cluster upgrade` 同一信任锚）。
+- **多数时候你不需要它**：`cluster upgrade` 自身在**重跑**时会探测并清除自己留下的残留锁（见 §5.6.10），
+  这条命令是那条自愈路径够不到时的兜底。
+
 ### 5.7 `tether alert`（cluster alerts）
 
 ```
