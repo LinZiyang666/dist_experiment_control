@@ -160,7 +160,7 @@ positive|tamed)
     assert_ok "POS commit: online force-single (pty-fed typed confirm) succeeds in-process" sh -c "
       out=\$($SIM exec brk1 -- python3 /opt/sim/pty-confirm.py brk1 -- $FS_ONLINE 2>&1); echo \"\$out\" | grep -qiE 'single-voter cluster|writable WITHOUT a broker restart|force.single'"
     assert_ok "POS PRIMARY oracle: the PREVIOUSLY-REFUSED set-raft-addr now SUCCEEDS (raft writable at quorum-of-1)" \
-        poll_until 20 3 "set-raft-addr succeeds" -- _sra_ok
+        poll_until_fixed 20 3 "set-raft-addr succeeds" -- _sra_ok
     assert_ok "POS in-process discriminator: brk1 MainPID UNCHANGED across the commit (== $PID0, no restart)" \
         sh -c "[ \"\$($SIM exec brk1 -- systemctl show tether-broker -p MainPID --value | tr -d '\r')\" = '$PID0' ]"
     assert_ok "POS force_single_active banner: cluster status exits 3 / reports force-single" \

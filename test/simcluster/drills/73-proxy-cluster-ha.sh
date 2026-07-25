@@ -220,7 +220,7 @@ _ldr0=$(sim_leader) || die "73: SS no leader"
 # home exists), with a diagnostic deadline — NOT a blind fixed-time assumption. If eligibility never reaches >=2,
 # die LOUD (a measured brk2/brk3 proxy-eligibility-recovery gap), never a silent construction timeout.
 poll_until 240 5 ">=2 proxy-eligible voters (brk2/brk3 proxy-home eligibility recovered post-grow)" -- _ge2_proxy_eligible || die "73: fewer than 2 proxy-eligible voters after 240s — brk2/brk3 proxy-home eligibility did NOT recover (a MEASURED setup gap; the drill refuses to guess); construction of a non-tunnel exit is impossible"
-assert_ok "SS-construct rebalance until >=1 exit homes OFF the tunnel/leader broker brk1 (now that >=2 voters are proxy-eligible, the spread is achievable; M1/R3-M1)"  poll_until 90 5 ">=1 exit off brk1" -- _construct_nontunnel
+assert_ok "SS-construct rebalance until >=1 exit homes OFF the tunnel/leader broker brk1 (now that >=2 voters are proxy-eligible, the spread is achievable; M1/R3-M1)"  poll_until_fixed 90 5 ">=1 exit off brk1" -- _construct_nontunnel
 NT=$(_pick_nontunnel "$_ldr0") || die "73: SS no NON-LEADER non-tunnel exit after construct (homes: $(_homes_line); leader=$_ldr0) — topology construction FAILED (or a leader-election anomaly moved the leader off brk1 so the only off-brk1 exit sits on the leader — a setup flake, not a product defect; re-run), #29-immunity is unprovable this run"
 NT_A=${NT% *}; NT_HB=${NT#* }
 [ -n "$NT_A" ] && [ -n "$NT_HB" ] || die "73: SS empty NT_A='$NT_A' / NT_HB='$NT_HB' after pick"
@@ -362,7 +362,7 @@ K2=""; for b in $(list_nodes broker); do [ "$b" != "$LDR" ] && [ "$b" != "$NT_HB
 # exits on brk1 (resolveHomeForAgent maps by nats_server = the agents' tunnel broker brk1), so the rebalance must
 # move one onto K2 — which needs K2 to be proxy-ELIGIBLE again (its §17 reachable re-observe after the REHOME
 # reconfiguration can lag ~150s). Poll (rebalancing each tick) up to 240s so K2's eligibility reliably recovers.
-assert_ok "Q-construct rebalance until BOTH leader $LDR and K2 $K2 each home >=1 exit (DETERMINISTIC 1+1 over the 2 live voters — both baselines fresh+healthy after the heal; survivor NOT optional; waits out K2's post-reconfiguration proxy-eligibility)"  poll_until 240 5 "leader+K2 both homed" -- _qconstruct
+assert_ok "Q-construct rebalance until BOTH leader $LDR and K2 $K2 each home >=1 exit (DETERMINISTIC 1+1 over the 2 live voters — both baselines fresh+healthy after the heal; survivor NOT optional; waits out K2's post-reconfiguration proxy-eligibility)"  poll_until_fixed 240 5 "leader+K2 both homed" -- _qconstruct
 DEAD_A=$(_agent_homed_on "$K2"); DEAD_HB=$K2
 SURV_A=$(_agent_homed_on "$LDR")
 # fail-fast BEFORE any destructive injection (M1): both control sources MUST exist and MUST be distinct.

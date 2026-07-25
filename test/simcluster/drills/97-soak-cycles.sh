@@ -229,7 +229,7 @@ assert_setup "seed a 12 MiB payload on agt1 for the transfer-concurrency cycles 
 
 # ── WARM-UP, then t0. Sampling at boot would catch lazy init and manufacture a false RED. ───────────
 assert_setup "warm-up: real business traffic before the baseline (t0 at boot would catch lazy init and false-RED)" _biz_ok
-poll_until "$SOAK_SETTLE" 5 "steady state before the baseline sample" -- false || true
+poll_until_fixed "$SOAK_SETTLE" 5 "steady state before the baseline sample" -- false || true
 
 PID_B0=$(leak_pid brk1 tether-broker); PID_A0=$(leak_pid agt2 tether-agent)
 [ -n "$PID_B0" ] && [ "$PID_B0" != 0 ] || setup_fail "could not resolve brk1's broker MainPID for the leak baseline"
@@ -304,7 +304,7 @@ while [ "$_c" -le "$SOAK_CYCLES" ]; do
         ;;
     esac
 
-    poll_until "$SOAK_SETTLE" 5 "steady state before sampling cycle $_c" -- false || true
+    poll_until_fixed "$SOAK_SETTLE" 5 "steady state before sampling cycle $_c" -- false || true
 
     # PID GENERATION GUARD — the measured processes must never have been restarted, or the series is
     # reset and the leak judgement is invalid for this run.
@@ -362,7 +362,7 @@ elif [ -z "${GOR_BASE:-}" ]; then
     not_covered "97 goroutine gate skipped: no pre-load goroutine baseline was captured at t0" \
         "admin runtime yielded no .goroutines at baseline (socket not ready / jq miss), so there is nothing to compare the post-quiesce floor against; recorded not_covered rather than inventing a baseline" runtime-guard
 else
-    poll_until "$GOR_QUIESCE" 5 "goroutine quiesce after the soak load (let handler goroutines return before the post sample)" -- false || true
+    poll_until_fixed "$GOR_QUIESCE" 5 "goroutine quiesce after the soak load (let handler goroutines return before the post sample)" -- false || true
     GOR_POST=$(_gor_floor brk1 "$GOR_POST_SAMPLES")
     log "97 goroutine gate: pre-load floor=$GOR_BASE post-quiesce floor=${GOR_POST:-<none>} tol=$GOR_TOL (=2*NPROC[$NPROC]+16) [UNCALIBRATED]"
     if [ -z "$GOR_POST" ]; then

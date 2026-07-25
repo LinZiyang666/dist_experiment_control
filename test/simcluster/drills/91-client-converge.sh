@@ -135,16 +135,24 @@ assert_setup "C stop survivor broker for offline recovery" "$SIM" exec "$SURV" -
 # ran, and the survivor crash-looped exit 70 forever while the drill blamed the product for "seeds not
 # converging". Run it to COMPLETION (no pipe, rc-checked), then assert the REAL post-conditions.
 # shellcheck disable=SC2086
-assert_setup "C offline force-single commits with every non-self peer explicitly confirmed dead (runs to completion, rc=0)" \
-    "$SIM" exec "$SURV" -- runuser -u tether -- python3 /opt/sim/pty-confirm.py "$SURV" -- tether cluster recovery force-single --self-id "$SURV" --self-addr "$SURV:7400" $_confirm
+# D1b (simcluster-accel): c6b9c9e requires --reset-js to move a non-empty clustered JS store aside so the
+# lone survivor can serve JS at N=1 (correct, journalled behaviour — see drill 20's _fs20 note and §2.2).
+# The bare verb was the SIXTH unswept call site; pass --reset-js exactly as the GREEN drill 42 does.
+assert_setup "C offline force-single --reset-js commits with every non-self peer explicitly confirmed dead (runs to completion, rc=0)" \
+    "$SIM" exec "$SURV" -- runuser -u tether -- python3 /opt/sim/pty-confirm.py "$SURV" -- tether cluster recovery force-single --self-id "$SURV" --self-addr "$SURV:7400" $_confirm --reset-js
 # The load-bearing post-condition (#20): OFFLINE force-single MUST leave nats.conf standalone. A clustered
 # conf at N=1 can never form the JS meta quorum → the broker fail-closes exit 70 → an un-recoverable brick
 # (force-single refuses to re-run once the peers are pruned, and `reconcile nats --to-standalone` needs the
 # very broker that cannot start). Assert the FILE, not a log string.
 assert_ok "C force-single de-clustered nats.conf to standalone (no cluster{} block — #20 post-condition, not a log line)" \
     sh -c "! $SIM exec $SURV -- grep -qE '^cluster[[:space:]]*\\{' /etc/tether/nats.d/nats.conf"
-assert_setup "C reset JetStream and restart both standalone services" "$SIM" exec "$SURV" -- sh -c \
-    'mv /var/lib/tether/jetstream /var/lib/tether/jetstream.bak.$(date +%s) 2>/dev/null || true; systemctl restart nats-server; systemctl start tether-broker; systemctl is-active --quiet nats-server tether-broker'
+# Internal review round-2 MINOR-1: assert the PRODUCT (force-single --reset-js) moved the store aside, and
+# DELETE the hand-rolled `mv` (a vestigial Mandate-④ concealment that would mask a --reset-js regression
+# returning rc=0 without moving a data-bearing store). Mirrors drill 42; the systemctl restart stays sim-side.
+assert_ok "C force-single --reset-js MOVED the clustered JS store aside ITSELF (jetstream.force-single-bak.* present)" \
+    sh -c "$SIM exec $SURV -- sh -c 'ls -d /var/lib/tether/jetstream.force-single-bak.* >/dev/null 2>&1'"
+assert_setup "C restart both standalone services (the JS reset was the product's job above)" "$SIM" exec "$SURV" -- sh -c \
+    'systemctl restart nats-server; systemctl start tether-broker; systemctl is-active --quiet nats-server tether-broker'
 # Round-5 §M1: `is-active` immediately after `systemctl start` races the failure — a broker that boots and
 # then exit-70s is still "activating" at that instant, so the crash-loop leaked downstream and resurfaced as
 # a misleading "seeds do not converge". Gate on a SETTLED survivor: NRestarts stops climbing AND the admin

@@ -55,7 +55,11 @@ assert_ok "streams at R=3 (stream_actual==stream_target==3)" \
 # clustered JS meta corroboration (the R=3 stream assertion above already PROVES a 3-node meta — you
 # cannot replicate a stream to R=3 without one; this /jsz check is a lenient cross-check, tolerant of the
 # leader's own replicas-list shape which varies by which node answers).
-assert_ok "clustered JS meta present (≥3-node)"  sh -c "for i in \$(seq 1 6); do $SIM exec $LDR -- sh -c 'curl -s \"localhost:8223/jsz?meta=1\"' 2>/dev/null | jq -e '.meta_cluster!=null and (.meta_cluster.cluster_size>=3 or (.meta_cluster.replicas|length>=2))' >/dev/null && exit 0; sleep 3; done; exit 1"
+# H3 (simcluster-accel): was a hand-rolled `for i in seq…; do check; sleep 3; done` — an open-coded poll
+# that escaped the M3 POLL-WAIT accounting and the fast-start grid. Same first-success semantics, now a
+# real poll_until: instrumented, and a quick-resolving meta is caught in ~1s instead of a 3s grid step.
+_js_meta_ge3() { $SIM exec "$LDR" -- sh -c 'curl -s "localhost:8223/jsz?meta=1"' 2>/dev/null | jq -e '.meta_cluster!=null and (.meta_cluster.cluster_size>=3 or (.meta_cluster.replicas|length>=2))' >/dev/null 2>&1; }
+assert_ok "clustered JS meta present (≥3-node)"  poll_until 18 3 "clustered JS meta ≥3-node" -- _js_meta_ge3
 
 # M8 (OQ-6 cheap hollow-voter parity — the fidelity crux, minus the deferred InstallSnapshot-forcing arm):
 # a fresh joiner replaying a migrated leader's log is the FK-panic / hollow-voter bug class (32b28e9). The
@@ -76,8 +80,9 @@ CUR=$("$SIM" status --json 2>/dev/null | jq -r '.leader_id // empty'); [ -n "$CU
 TGT=""; for b in brk1 brk2 brk3; do [ "$b" != "$CUR" ] && TGT=$b && break; done
 assert_ok "transfer leadership $CUR→$TGT (--wait, run on the current leader)" \
     "$SIM" exec "$CUR" -- tether cluster transfer-leader "$TGT" --wait
+_status_leader_view_is() { [ "$("$SIM" status --json 2>/dev/null | jq -r 'select(.is_leader_view==true).leader_id' 2>/dev/null)" = "$1" ]; }
 assert_ok "status --json is the AUTHORITATIVE leader view after the move (is_leader_view=true, leader=$TGT)" \
-    sh -c "for i in \$(seq 1 8); do [ \"\$($SIM status --json 2>/dev/null | jq -r 'select(.is_leader_view==true).leader_id' 2>/dev/null)\" = $TGT ] && exit 0; sleep 3; done; exit 1"
+    poll_until 24 3 "status --json reports the new leader $TGT as authoritative" -- _status_leader_view_is "$TGT"
 LDR=$TGT   # leadership moved — the follower-kill below picks a follower relative to the NEW leader
 
 # --- follower-LOSS HA proof (M9): kill a NON-leader follower's WHOLE CONTAINER (≠ the ctl's brk1). This
@@ -90,12 +95,17 @@ log "HA proof: leader=$LDR, killing follower CONTAINER=$F"
 assert_ok "docker-kill follower $F (raft node drops → quorum 2/3)"  sh -c "docker kill sim-\${INSTANCE}-$F >/dev/null"
 # generous poll windows: after a raft node drops the survivors re-confirm leadership + the JS/roster
 # re-stabilizes over several seconds before node ls serves again.
-assert_ok "survivors still elect a leader at quorum 2/3"  sh -c "for i in \$(seq 1 12); do $SIM exec brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id!=null' >/dev/null && exit 0; sleep 3; done; exit 1"
-assert_ok "control plane alive: node ls still lists agt1"  sh -c "for i in \$(seq 1 12); do $SIM ctl -- node ls 2>/dev/null | grep -q agt1 && exit 0; sleep 3; done; exit 1"
+_has_leader()  { $SIM exec brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id!=null' >/dev/null 2>&1; }
+_nodels_agt1() { $SIM ctl -- node ls 2>/dev/null | grep -q agt1; }
+assert_ok "survivors still elect a leader at quorum 2/3"  poll_until 36 3 "leader re-elected at quorum 2/3" -- _has_leader
+assert_ok "control plane alive: node ls still lists agt1"  poll_until 36 3 "node ls still lists agt1" -- _nodels_agt1
 # F2 (external review): a WRITE must still COMMIT at quorum 2/3, not just reads. `session create` is a
 # raft-replicated write (propose → commit); its success proves write-forwarding/propose still commits with
 # one voter gone — the read checks above would pass even if writes were wedged.
+# EFFECTFUL (a raft write per tick) → poll_until_fixed keeps the deliberate spacing; it retries only on
+# FAILURE and exits on the first commit, so the fixed cadence just bounds how often a write is proposed.
+_ha_write_commits() { $SIM ctl -- session create ha-write-proof --pin "$PIN" >/dev/null 2>&1; }
 assert_ok "control-plane WRITE commits at quorum 2/3 (session create via raft)" \
-    sh -c "for i in \$(seq 1 10); do $SIM ctl -- session create ha-write-proof --pin $PIN >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1"
+    poll_until_fixed 30 3 "a raft write commits at quorum 2/3" -- _ha_write_commits
 
 drill_end

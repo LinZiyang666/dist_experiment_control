@@ -236,7 +236,7 @@ echo "── run-drills.sh end-to-end (real runner, synthetic drills) ───�
 if command -v bash >/dev/null 2>&1; then
     RT=$(mktemp -d); mkdir -p "$RT/drills"
     ln -sf "$SIM_ROOT/run-drills.sh" "$RT/run-drills.sh"
-    printf '#!/bin/sh\n[ "$1" = drill ] || exit 9\nexec sh "$(dirname "$0")/drills/$2.sh"\n' > "$RT/simcluster"; chmod +x "$RT/simcluster"
+    printf '#!/bin/sh\n[ "$1" = check-image ] && exit 0\n[ "$1" = drill ] || exit 9\nexec sh "$(dirname "$0")/drills/$2.sh"\n' > "$RT/simcluster"; chmod +x "$RT/simcluster"
     mkd() {
         af=0; sr=0; pr=0; nc=0
         case "$2" in ASSERT-FAIL) af=1 ;; SETUP-RED) sr=1 ;; PRODUCT-RED) pr=1 ;; INCOMPLETE) nc=1 ;; esac
@@ -284,6 +284,71 @@ if command -v bash >/dev/null 2>&1; then
 else
     echo "  (skipped — no bash; runner needs arrays)"
 fi
+
+
+# ── M1 flight recorder: capture must NEVER be able to change a verdict ──────────────────────────────
+# The recorder writes host telemetry and full command output at every non-green assertion. That is a new
+# side effect on the failure path, i.e. exactly where a bug would be most expensive: a drill that reds
+# for a REAL reason must not have its verdict, rc, or verdict line altered by the act of recording it.
+echo "── M1 flight recorder ──────────────────────────────────────────────────────────"
+EV="${TMPDIR:-/tmp}/vct-ev.$$"
+rm -rf "$EV"; mkdir -p "$EV"
+
+# (1) The record is actually written, carries the FULL output, and reports the first-failure ordinal.
+#     "FULL" is the point: the console keeps tail -3, which is what truncated drill 20's --reset-js
+#     refusal and drill 52's `error: not leader` out of existence on 2026-07-23.
+#     Internal review MA11: the first draft grepped the WHOLE evidence file for the needle, which also
+#     appears in the `argv:` echo — so reverting the body to tail -3 still passed. The assertion now
+#     extracts the `--- stdout+stderr` BLOCK (argv lives outside it) and requires the FIRST output line,
+#     which a tail -3 of a 5-line output would drop, to be present IN THE BLOCK.
+out=$(SIM_EVIDENCE_DIR="$EV" run_drill_body '
+    drill_begin "m1-evidence"
+    assert_ok "a green one first" true
+    assert_ok "the failing one" sh -c "printf \"HEAD-NEEDLE\nL2\nL3\nL4\nL5\n\"; exit 3"
+')
+evline=$(printf '%s\n' "$out" | grep '^DRILL-EVIDENCE ' | tail -1)
+evfile=$(printf '%s\n' "$evline" | sed -n 's/^DRILL-EVIDENCE file=\([^ ]*\) .*/\1/p')
+evord=$(printf '%s\n' "$evline" | sed -n 's/.*first_fail_ord=\([0-9]*\).*/\1/p')
+block=""
+[ -s "$evfile" ] && block=$(awk '/^--- stdout\+stderr/{f=1;next} /^--- end ---/{f=0} f' "$evfile")
+if [ -z "$evline" ]; then fail "M1: no DRILL-EVIDENCE line emitted on a failing drill"
+elif [ ! -s "$evfile" ]; then fail "M1: DRILL-EVIDENCE names $evfile but it is empty/absent"
+elif ! printf '%s\n' "$block" | grep -q '^HEAD-NEEDLE$'; then fail "M1: the FIRST output line is absent from the stdout block — a tail would drop it (vacuity check)"
+elif ! printf '%s\n' "$block" | grep -q '^L5$'; then fail "M1: the LAST output line is absent from the stdout block"
+elif ! grep -q '^rc:   3' "$evfile"; then fail "M1: evidence file did not record the command rc"
+elif ! grep -q '^argv: ' "$evfile"; then fail "M1: evidence file did not record argv"
+elif [ "$evord" != 2 ]; then fail "M1: first_fail_ord=$evord, want 2 (one PASS then one FAIL)"
+else pass "M1: full output block (head AND tail) + rc + argv + first_fail_ord=2 recorded"
+fi
+# Non-vacuity control: the console really is still truncated, so (1) is testing something.
+printf '%s\n' "$out" | grep -q 'HEAD-NEEDLE' \
+    && fail "M1 control: the CONSOLE printed line 1 — tail -3 is gone, so the evidence test proves nothing" \
+    || pass "M1 control: console still truncates (evidence file is the only full copy)"
+
+# (2) An UNWRITABLE evidence dir must leave the verdict line BYTE-IDENTICAL. This is the whole safety
+#     claim: a broken/read-only/full recorder degrades to silence, never to a changed or missing verdict.
+body='drill_begin "m1-unwritable"
+    assert_ok "fails" false
+    setup_note_unused=1'
+good=$(SIM_EVIDENCE_DIR="$EV/ok2"  run_drill_body "$body" | grep '^DRILL-VERDICT ')
+bad=$(SIM_EVIDENCE_DIR=/proc/self/no/such/place run_drill_body "$body" | grep '^DRILL-VERDICT ')
+if [ -z "$good" ] || [ -z "$bad" ]; then fail "M1: missing verdict line in the writable/unwritable comparison"
+elif [ "$good" != "$bad" ]; then fail "M1: unwritable evidence dir CHANGED the verdict line:
+       writable:   $good
+       unwritable: $bad"
+else pass "M1: unwritable evidence dir → byte-identical verdict line"
+fi
+# …and it must not emit a DRILL-EVIDENCE line it cannot back with a file.
+SIM_EVIDENCE_DIR=/proc/self/no/such/place run_drill_body "$body" | grep -q '^DRILL-EVIDENCE ' \
+    && fail "M1: announced DRILL-EVIDENCE with no file behind it" \
+    || pass "M1: no DRILL-EVIDENCE line when nothing could be written"
+
+# (3) A GREEN drill writes nothing at all — zero cost, and no file to mislead an operator.
+out=$(SIM_EVIDENCE_DIR="$EV/g" run_drill_body 'drill_begin "m1-green"; assert_ok "ok" true')
+{ printf '%s\n' "$out" | grep -q '^DRILL-EVIDENCE '; } \
+    && fail "M1: a GREEN drill produced an evidence line" \
+    || pass "M1: GREEN drills produce no evidence record"
+rm -rf "$EV"
 
 echo "────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAILS" = 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILED"; exit 1; fi

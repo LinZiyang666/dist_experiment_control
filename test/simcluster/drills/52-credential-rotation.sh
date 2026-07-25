@@ -551,6 +551,10 @@ assert_ok "D2c the refusal had ZERO side effects: no NEW removal (retire/drain) 
 
 # D-spine — single attempt, branch on the real output (#31 is intermittent; never hardcode either outcome).
 _D_OUT=$(_pty brk1 brk2 -- tether cluster retire brk2 --compromised --require-credential-rotation 2>&1); _D_RC=$?
+# Emit the retire outcome as a CAUSE diagnostic (external review re-review Major 1: band signatures match
+# `[simcluster]`/`[warn]` cause lines, not the assertion title). The #69 band keys on the `not leader`
+# cause that appears here, so a retire failure for a DIFFERENT reason (a different tail) is NOT #69.
+log "52 D-spine: retire --compromised --require-credential-rotation rc=$_D_RC outcome: $(printf '%s' "$_D_OUT" | tail -1)"
 if printf '%s' "$_D_OUT" | grep -qiE 'grow of .* is in progress|already in flight'; then
     product_red "#31 the leaked \'cluster add\' grow lock BLOCKS the C7 guided rotation spine — and it does so AFTER the operator has already been made to type the node id (cluster_retire.go:50's callAdmin runs after :47's typed confirm), which is a new facet of #31's blast radius. Captured: $(printf '%s' "$_D_OUT" | tail -1)"
     not_covered "52 D4-D8: the C7 guided-rotation alert lifecycle (guide + severe manual:credrot alert raise -> read from ctl -> clear)" "the retire op could not be created: blocked by the #31 grow-lock leak, exactly as it blocks drills 40/41. Not clearing it by inventing a workaround: G-B proved even the canonical clear does not work (ledger:186-198)" gap

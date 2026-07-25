@@ -209,7 +209,7 @@ _rebalance_tick() {
     "$SIM" exec "$(sim_leader)" -- runuser -u tether -- tether cluster rebalance proxy >/dev/null 2>&1 || return 1
     _spread_le1
 }
-_rebalance_real() { poll_until 180 6 "distribution evens (spread<=1) once the returned voter is proxy-eligible" -- _rebalance_tick; }
+_rebalance_real() { poll_until_fixed 180 6 "distribution evens (spread<=1) once the returned voter is proxy-eligible" -- _rebalance_tick; }
 # RETURN the killed broker: restart its container → it rejoins as a VOTER. Exits do NOT auto-move back to it
 # (no auto-rebalance by default) — so the cluster is back to 3 voters but the distribution stays SKEWED (KTGT=0
 # homes) until a manual `cluster rebalance proxy`. This is what makes the spread<=1 target reachable (rebalance
@@ -288,14 +288,14 @@ TOK_A=$(_sub_token alice); [ -n "$TOK_A" ] || die "74: could not mint a sub toke
 _nat=$(_dist); _natsp=$(_spread)
 log "74: NATURAL initial __proxy__ distribution (before any rebalance) = [$_nat] spread=$_natsp $([ "$_natsp" = 0 ] && echo '(happened to be one-per-voter this run)' || echo '(NOT one-per-voter — tether initial reconcile piles; the locked 1/1/1 is CONSTRUCTED below, R5-M2)')"
 poll_until 240 5 ">=3 proxy-eligible voters (all 3 recovered post-grow)" -- _ge3_eligible || die "74: fewer than 3 proxy-eligible voters after 240s — cannot construct the locked one-per-voter baseline (a MEASURED setup gap)"
-assert_ok "SETUP-111 construct one-per-voter via cluster rebalance proxy (spread==0 — the locked 1/1/1 baseline; the non-deterministic initial reconcile can pile exits, so this is CONSTRUCTED not assumed)"  poll_until 120 5 "spread==0 (1/1/1)" -- _construct_111
+assert_ok "SETUP-111 construct one-per-voter via cluster rebalance proxy (spread==0 — the locked 1/1/1 baseline; the non-deterministic initial reconcile can pile exits, so this is CONSTRUCTED not assumed)"  poll_until_fixed 120 5 "spread==0 (1/1/1)" -- _construct_111
 _three_voters || die "74: not 3 voters after 1/1/1 construct"
 log "74: 1/1/1 baseline distribution: $(_dist)"
 # R6 finding: the proxy distribution DRIFTS back to piling on the tunnel broker — non-tunnel voters' (brk2/brk3)
 # proxy-home-eligibility is UNSTABLE (gain it → get an exit → lose it → the exit re-piles on brk1). RE-CONSTRUCT
 # 1/1/1 RIGHT before the destructive skew so KTGT is picked from a fresh balanced distribution; RED if it cannot be
 # re-balanced (the #34 eligibility instability is total this run).
-if poll_until 120 5 "re-1/1/1 before skew" -- _construct_111; then RECON=1; else RECON=0; fi
+if poll_until_fixed 120 5 "re-1/1/1 before skew" -- _construct_111; then RECON=1; else RECON=0; fi
 assert_ok "SKEW-reconstruct re-build 1/1/1 (spread==0, rc-checked rebalance) right before the destructive skew — RED if the proxy distribution can't be re-balanced (the #34 non-tunnel-voter proxy-eligibility instability). GATES the destructive arms (R7-M1: a failed foundation must NOT flow into misleading destructive PASS lines)"  sh -c "[ '$RECON' = 1 ]"
 # R8-M1: the locked SKEW baseline is "one-per-voter PLUS every exit flowing" — reconstruction re-establishes the
 # 1/1/1 DISTRIBUTION but can REMAP which exit is on each voter, so re-PROVE every exit's data plane flows ADJACENT to
@@ -356,7 +356,7 @@ assert_ok "A default-off: $KTGT stays at 0 homes across a 30s quiet window (STAB
 # ── Arm B — manual cluster rebalance proxy (dry-run zero-change + real evens + exits move BACK onto KTGT) ──
 # settle first: the post-return rehome reconcile must quiesce, else a natural drift would masquerade as a
 # dry-run side effect (and hide a genuine dry-run defect if there is one).
-assert_ok "B-settle post-return proxy distribution stops drifting before measuring dry-run"  poll_until 45 3 "distribution stable" -- _dist_stable
+assert_ok "B-settle post-return proxy distribution stops drifting before measuring dry-run"  poll_until_fixed 45 3 "distribution stable" -- _dist_stable
 BEFORE=$(_dist)
 # R9-M1: prove EVERY exit (per-nid, over a VALIDATED snapshot) flows IMMEDIATELY before the move, and place the
 # COMPLETE B injection (dry-run + real rebalance + effect/no-none + move-attribution + B-dp + negative control) BEHIND
@@ -471,7 +471,7 @@ assert_ok "C-verify env live on every broker (systemctl show -p Environment) —
 # chose the kill target from a distribution that had not settled yet. SETTLE first (_dist_stable = two reads 3s
 # apart agree) so the selection sees the real post-restart distribution. A distribution that never quiesces is
 # itself a finding, so this is a GATE on the auto edge — not a sleep, and not a softened precondition.
-if poll_until 90 3 "post-restart distribution stable" -- _dist_stable; then _csettle=1; else _csettle=0; C_EDGE=0; fi
+if poll_until_fixed 90 3 "post-restart distribution stable" -- _dist_stable; then _csettle=1; else _csettle=0; C_EDGE=0; fi
 assert_ok "C-settle post-restart __proxy__ distribution STOPS drifting BEFORE the Arm-C KTGT snapshot (C-setup just restarted every broker; sampling mid-reconcile read all candidates at 0 homes and picked a 0-home KTGT, making _skew's rehome-away oracle vacuous — H11) — GATES the auto edge"  sh -c "[ '$_csettle' = 1 ]"
 # pick the home-heaviest non-leader non-tunnel broker; REQUIRE it carries >0 homes (C SKEW-precond, R8-M2 — the
 # round-8 retry hit KTGT=brk2 with 0 homes, so _skew's _ktgt_empty rehome-away oracle was satisfied from the start).
@@ -496,9 +496,22 @@ log "74: Arm-C pre-skew homes (VALIDATED)=[$C_BEFORE_HOMES]"
 if [ "$C_EDGE" = 1 ] && [ -n "$C_PRE_NIDS" ]; then
     _cpre=1; _cpport=1102
     for _cnid in $C_PRE_NIDS; do
-        if poll_until 90 4 "C pre-kill SS flows via $_cnid" -- _ss_via_agent "$_cnid" "$_cpport"; then _cf=1; else _cf=0; _cpre=0; fi
-        assert_ok "C-ss-pre exit $_cnid flows bytes over the POST-RESTART baseline before the C kill (per-nid SEQUENTIAL probe, ALL exits over a VALIDATED snapshot, ~90s each — R9-M2; not just the first on KTGT, since auto may return a different nid; the C-skew-adjacent reselect re-validates a non-vacuous kill boundary right before _skew) — GATES the auto edge"  sh -c "[ '$_cf' = 1 ]"
+        # Internal review round-2 MAJOR-2: classify the failure stage exactly as the sibling B-dp arm
+        # (407-415) does. _ss_via_agent collapses three failure modes into one `return 1` (H10, 73-95):
+        # /sub fetch failed and ss-local never bound are HARNESS/setup failures; only a strand with the
+        # local client PROVEN READY is the #34 family. Without this split a harness bind flake reds with
+        # the "C-ss-pre exit … flows bytes" description and is absorbed by the #34 band as a CONFIRMED
+        # product reproduction — a flake dressed as a known defect, the very habit this increment kills.
+        if poll_until 90 4 "C pre-kill SS flows via $_cnid" -- _ss_via_agent "$_cnid" "$_cpport"; then _cf=1; _cfs=flowed; else _cf=0; _cpre=0; _cfs=$(_ss_fail_stage "$_cnid" "$_cpport"); fi
         ss_down ctl1 2>/dev/null || true
+        case "$_cfs" in
+            harness-*)
+                not_covered "74 C-ss-pre THIS RUN via $_cnid" "the SS probe never REACHED the product ($_cfs): the /sub fetch or the LOCAL ss-local client failed to come up (proxy.sh:51-52 = a HARNESS/setup failure, NEVER a product black-hole). The pre-kill baseline for $_cnid was therefore never actually probed, so this run cannot attribute a C-ss-pre strand to #34 — mirroring B-dp's H10 split. The auto edge is gated off (C_EDGE=0 via _cpre=0)." gap
+                ;;
+            *)
+                assert_ok "C-ss-pre exit $_cnid flows bytes over the POST-RESTART baseline before the C kill (per-nid SEQUENTIAL probe, ALL exits over a VALIDATED snapshot, ~90s each — R9-M2; the harness-vs-product split is H10, stage=$_cfs) — GATES the auto edge"  sh -c "[ '$_cf' = 1 ]"
+                ;;
+        esac
         _cpport=$((_cpport+1))
     done
 else

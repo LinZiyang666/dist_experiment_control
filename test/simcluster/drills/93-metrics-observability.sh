@@ -163,7 +163,7 @@ assert_setup "READYZ-503: abort drain" dexec -u tether "$LDR" -- tether cluster 
 # is unchanged; this only establishes the delta mechanism's stable-leadership precondition.
 _wh_leader_stable() { _wl1=$(sim_leader 2>/dev/null); [ -n "$_wl1" ] || return 1; sleep 3; _wl2=$(sim_leader 2>/dev/null); [ -n "$_wl2" ] && [ "$_wl1" = "$_wl2" ]; }
 assert_ok "WEBHOOK precondition: STABLE cluster leadership before the delta-timing-sensitive webhook arm (the reconciler re-seeds + fires NOTHING on any leadership move — alert_reconcile.go:120-123,177 — which intermittently swallowed the raise delta)" \
-    poll_until 90 3 "stable leadership before the webhook arm" -- _wh_leader_stable
+    poll_until_fixed 90 3 "stable leadership before the webhook arm" -- _wh_leader_stable
 LDR=$(sim_leader); FOLL=$(a_non_leader_voter)
 log "WEBHOOK: re-captured stable leader LDR=$LDR follower FOLL=$FOLL (the webhook body stamps cluster_leader = LDR; the oracle pins it)"
 # The first leader-side reconcile pass intentionally seeds the active-set baseline and emits no delta.

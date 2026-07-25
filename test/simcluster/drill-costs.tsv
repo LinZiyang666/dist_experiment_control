@@ -1,0 +1,54 @@
+# drill-costs.tsv — measured per-drill wall cost, used ONLY for launch ORDERING (V1).
+#
+# WHY. run-drills.sh launched drills in LEXICOGRAPHIC order. On 2026-07-23 that put the single longest
+# drill (96-mid-flight-chaos, 22.2 min) at position 37 of 38, starting at minute 25 of a 47.4-minute
+# sweep. Longest-processing-time-first drops the wall to max(sum/j, longest) with no change to what any
+# drill does: wall 47.4 -> ~32.5 min at -j 6 (= max(sum/j, p_max) = max(195.1/6, 22.3)), purely from
+# the order things start in — ~15 min recovered from the alphabetical tail.
+#
+# THIS FILE CANNOT AFFECT A VERDICT. It is consulted for sort order only. A stale or wrong cost can
+# mis-order a sweep; it can never mis-judge one. A drill ABSENT from this table sorts FIRST at maximum
+# cost, so a newly added drill can never silently become the straggler that sets the wall.
+#
+# Costs are p50 seconds. Re-seed from a sweep's rollup.tsv duration_s column (run-drills.sh records it).
+# Source: full sweep -j 6, weilandserver, 2026-07-23 10:02-10:49, image built from c6b9c9e.
+#
+# drill	p50_secs	class	note
+96-mid-flight-chaos	1337	long	-
+67-transient-js-refusal	777	long	-
+90-alerts-lifecycle	775	long	-
+74-rebalance-on-return	653	long	-
+41-shrink-to-standalone	572	long	-
+97-soak-cycles	568	long	-
+40-drain-retire	565	long	-
+22-forcesingle-online	477	medium	-
+51-full-dr	467	medium	-
+71-expose-rehome-failover	428	medium	-
+73-proxy-cluster-ha	419	medium	-
+93-metrics-observability	392	medium	-
+30-rolling-upgrade	378	medium	-
+91-client-converge	376	medium	-
+42-rejoin-returning	344	medium	-
+10-grow-to-3	305	medium	-
+92-js503-remote-alert	291	medium	-
+95-broker-selfheal	274	medium	-
+13-inbroker-reconcile-perm	266	medium	-
+52-credential-rotation	234	medium	-
+50-backup-restore	227	medium	-
+82-agent-onboarding-invite	196	medium	-
+20-forcesingle-natsconf	186	medium	-
+12-ghost-voter	174	short	-
+11-grow-gaps	152	short	-
+94-agent-reconcile	133	short	-
+72-proxy-subscription	108	short	-
+61-transfer-edges	88	short	-
+81-admin-evict-session-rm	69	short	-
+60-user-journey	69	short	-
+32-install-lifecycle	65	short	-
+80-session-isolation	62	short	-
+31-node-upgrade-fleet	62	short	-
+62-remote-fs-safe	52	short	-
+70-expose-journey	47	short	-
+43-migrate-live-data	46	short	-
+00-skeleton	38	short	-
+21-smalldisk-tierb	32	short	-

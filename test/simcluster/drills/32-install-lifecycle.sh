@@ -197,7 +197,7 @@ assert_ok "84-session lab + ctl login (owner)"  "$SIM" session lab --pin 135790
 # expose serving IS the gate that agt1's tunnel is up (an un-provisioned agent would fail 84-baseline).
 assert_ok "84-agent-join agt1 (onboards + tunnel to brk1)"  "$SIM" agent-join agt1 --session lab --pin 135790
 TOK84=$(expose_serve_sentinel agt1 8080); [ -n "$TOK84" ] || die "32-§8.4: agt1 sentinel empty"
-assert_ok "84-baseline expose biz on brk1 serves the sentinel (business DATA plane LIVE pre-upgrade)"  poll_until 30 2 "biz serves" -- _mkbiz biz
+assert_ok "84-baseline expose biz on brk1 serves the sentinel (business DATA plane LIVE pre-upgrade)"  poll_until_fixed 30 2 "biz serves" -- _mkbiz biz
 PB84=$(_biz_port biz); MP84_0=$(_mainpid84); V84_0=$(_ver84)
 log "32-§8.4: pre-upgrade brk1 running-version=[$V84_0] MainPID=$MP84_0 biz-port=$PB84 ; staged tether-next=$NEXTVER"
 assert_ok "84-pre-version brk1 runs v-cur (NOT $NEXTVER yet — anti-vacuity for the flip below)"  sh -c "[ \"$V84_0\" != '$NEXTVER' ]"
@@ -212,7 +212,7 @@ assert_ok "84-start systemctl start tether-broker (the NEW binary boots + runs G
 
 # G.2 convergence — real business read-write recovers ON THE NEW BINARY (the #20 data-plane oracle, not a field):
 assert_ok "84-converge-persist original expose biz serves the sentinel AGAIN on brk1:$PB84 (agent re-registered + state PERSISTED across the swap — G.2 reconcile; real tunneled bytes)"  poll_until 90 3 "biz recovers" -- _biz_serves biz
-assert_ok "84-converge-write a NEW expose biz2 created POST-upgrade serves the sentinel (control-plane WRITE + data plane BOTH work on the new binary — real read-write, not a health field)"  poll_until 60 3 "biz2 serves" -- _mkbiz biz2
+assert_ok "84-converge-write a NEW expose biz2 created POST-upgrade serves the sentinel (control-plane WRITE + data plane BOTH work on the new binary — real read-write, not a health field)"  poll_until_fixed 60 3 "biz2 serves" -- _mkbiz biz2
 assert_ok "84-version-flip brk1 running (self-reported) version flipped v-cur→$NEXTVER via cluster status .release_version (a 'no upgrade happened' run would leave it on v-cur — the false-green guard the plan mandates)"  poll_until 60 3 "brk1 self-reports $NEXTVER" -- _ver84_is_next
 assert_ok "84-pid-changed tether-broker MainPID CHANGED across §8.4 (a real systemctl stop/start swap, NOT drill 30's syscall.Exec in-place re-exec — version-flip ∧ PID-changed TOGETHER prove a genuine swap happened)"  sh -c "[ \"\$(\"$SIM\" exec brk1 -- systemctl show tether-broker -p MainPID --value)\" != '$MP84_0' ]"
 

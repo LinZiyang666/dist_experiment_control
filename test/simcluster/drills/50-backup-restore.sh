@@ -578,7 +578,12 @@ _L3_READER_UP=0
 if poll_until 180 3 "the history reader is alive again after #64's crash-loop" -- _l3_reader_alive; then _L3_READER_UP=1; fi
 _L3_OUT=$("$SIM" ctl -- history -n 50 2>&1); _L3_RC=$?
 if [ "$_L3_READER_UP" = 0 ] || [ "$_L3_RC" != 0 ] || [ -z "$_L3_OUT" ]; then
-    not_covered "50-L3 history survival via the replica" "the JS-backed history reader did not recover within 180s after #64's ~73s crash-loop (the history-<sid> stream reforms via brk2's replica on its own schedule) — an in-sim reader-recovery timing issue, not a product finding. #50/#64/DOC-27 (the drill's findings) are pinned above; history replication itself is covered by drill 10's R=3 stream proof" runtime-guard
+    # Enriched under -j6 (external re-review Major 3): carry the reader's ACTUAL rc + last error so the
+    # evidence self-describes the observed state (rc=77 = JetStream not yet available while brk2's
+    # history-<sid> replica may still be re-forming). Do not assert a root the artifact does not prove:
+    # the corrected-tree concurrent run failed in setup before reaching L3, so its later solo GREEN is
+    # broad load-sensitivity evidence, not a paired reproduction of this exact recovery miss.
+    not_covered "50-L3 history survival via the replica" "the JS-backed history reader did not recover within 180s after #64's ~73s crash-loop (reader_up=$_L3_READER_UP rc=$_L3_RC last='$(printf '%s' "$_L3_OUT" | tail -1 | cut -c1-160)'); the history-<sid> stream re-forms via brk2's replica on its own schedule. This run establishes a reader-recovery timing miss, not its cause; preserve it as a first-class runtime guard until a paired concurrent/solo L3 reproduction distinguishes host contention from a product recovery defect. #50/#64/DOC-27 are pinned above; history replication itself is covered by drill 10's R=3 stream proof" runtime-guard
 elif printf '%s' "$_L3_OUT" | grep -q 'BACKUP-HISTORY-SENTINEL'; then
     _as_pass "L3 history SURVIVED the lib-volume wipe — correctly, via brk2's JetStream replica of history-$SID, NOT via the bundle (which carries state.db only, backup.go:87). The 'a bundle contains no JetStream' claim needs a total loss with no surviving replica: that is drill 51 arm J's property (#53), and asserting it here would be a false RED against restore"
 else

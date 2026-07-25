@@ -1040,3 +1040,48 @@ oracle，41 必须保持不 restart agent、不改 env/cache、不停旧 broker�
   hermetic-密（`internal/spawnsafe` 单测），此处部署增量 = 真 FUSE 挂载 + 真 bootHangable 扫描 + 真有界 statfs。
 
 </details>
+
+### #69 — `retire --compromised --require-credential-rotation` 不跟随 leader，把 `not leader` 直接抛给运维
+
+- **状态：🔴 OPEN（候选产品 UX 缺陷；simcluster-accel D3 于 -j6/-j12 并发下暴露）。**
+- **现象**：并发/换届期间对**非 leader** broker 发 `tether cluster retire --compromised
+  --require-credential-rotation`，CLI 返回 `error: not leader`（rc=77），要求运维自己去找 leader 重发。
+  drill 52 D-spine 两轮 -j6 + 一轮 -j12 均复现此签名（`D-spine UNJUDGEABLE — retire --compromised
+  --require-credential-rotation failed for an unclassified reason (rc=77): error: not leader`）。
+- **归因**：M4 判为 LOAD-SENSITIVE——单 leader 稳定（solo）时永不触发，独跑转 GREEN。所以不是回归，是并发暴露的
+  产品行为：这条破坏性运维动词没有透明地路由到 leader、也没有 retry-with-redirect。
+- **产品修复方向（交产品增量，不在 simcluster-accel 范围）**：`retire --compromised` 应跟随 leader 或在
+  `not leader` 时带重定向重试，而不是把 leader-hunting 甩给运维。**禁止在 drill 侧对产品动词加重试循环**
+  （Mandate ②）——simcluster 的职责是暴露+钉住，不是代劳。
+- **部署层钉住**：drill 52 以签名绑定 band `ASSERT-FAIL@#69@sig:retire-not-leader` 记录，红时归 MATCH-BAND
+  （仍阻断、已归因），签名变了则回落 DEVIATION。
+
+### #70 — grow_to_3（N=3 HA 形成）在高 -j 并发下时序不稳（DELIBERATELY NOT banded）
+
+- **状态：🟡 OPEN（已知 sim/product 并发时序特性；simcluster-accel B1/D2 于 -j6 暴露）。**
+- **现象**：`grow_to_3` 的 N=3 集群形成是 SINGLE no-retry 尝试（drill 30 owns #31，故不得靠重试洗掉一次
+  grow 失败）。-j6 满并发时，多个 drill 同时 grow 会饿死 raft VOTER 晋升，`grow_to_3` 偶发 RED（drill 30
+  run-1、drill 96 run-2 均命中签名 `grow_to_3 (N=3 HA …`）。独跑/低 -j 时 grow 顺利完成。
+- **归因**：M4 判为 LOAD-SENSITIVE（独跑转 GREEN/INCOMPLETE 的预期态）。这是 README「CAVEAT (grow-
+  concurrency)」+ OQ-8 记录的 grow-并发 flake，不是 lever 引入的回归。
+- **⚠ 为何 DELIBERATELY NOT banded**：真 grow 回归也会失败在**同一个 `grow_to_3` 断言**上——签名无法把
+  flake 与回归区分开。给它签名绑定 band 会让**真 grow 回归被当成已知 flake 吞掉**（正是 simcluster-accel
+  round-2 MAJOR-2 的洗白类）。所以它**故意保持 first-class DEVIATION**，由 M4 每次判 LOAD-SENSITIVE、运维
+  独跑复核。代价是 -j6 的偏离集因此不稳定（30/96 时红时不红）。
+- **真正的修复方向（另一增量）**：OQ-8 的 two-wave split——grow-heavy drills 走低 -j（serial/-j2），其余
+  走高 -j。那能消除 grow flake 并让偏离集稳定，但属独立的调度增量、需自己的评审与验证。
+
+### #71 — drill 96 于 -j6 的 heal 后 brk1 canary3 commit-success 行（OPEN，边界时序未定根）
+
+- **状态：🔴 OPEN。** 旧归档在 heal 后看到 brk1 自己的 `broker: session created … canary3`，但修正树
+  两次 `-j6` 没有复现同一世界：到达 D 臂的 solo run 是 pre-heal=no、post-heal 也无 brk1 行，走的是已知的
+  “queue group 路由到多数派”分支。因此新运行只能证明**本次**没有少数派提交，不能解释旧归档。
+- **已增加的证据**：drill 96 在 partition 仍 armed 时记录 `_C3_COMMIT_PREHEAL`。若为 `yes`，brk1 的请求
+  handler 在与多数派完全隔离时从 committed create 返回，仍直接触发 `#65` PRODUCT-RED；这是强证据。
+- **为何 `no` 不能关闭旧现象**：pre-heal grep 与随后 `iptables -F` 不是原子边界。若该行在 snapshot 后、
+  heal 前落盘，它仍可能是真少数派安全问题；若在 heal 后落盘，则可能是恢复 quorum 后的合法延迟完成。没有
+  product 时间戳/边界 artifact 时，两者不能区分。源码说明“少数派按设计不能 commit”是预期不变量，不是对
+  一次违反该不变量的实测归因。
+- **处置**：不 band；pre-heal `yes` 保持 PRODUCT-RED，pre-heal `no` + post-heal `yes` 保持
+  `NOT-COVERED[gap] #71 AMBIGUOUS`，直到专用复现提供可与 heal 边界排序的 product artifact。结构不可达的
+  长连接 condition Y 仍是相关覆盖缺口。

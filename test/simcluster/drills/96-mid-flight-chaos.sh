@@ -214,9 +214,11 @@ _d6_readback() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 10 tether sessi
 # H6: hoisted out of the D6b block so the SAME reader can take the PRE-heal reading (see _C3_PRE below).
 _c3_via() { dexec -u sim ctl1 -- env HOME=/home/sim timeout 10 tether session ls --json --nats-url "nats://$1:4222" 2>/dev/null | jq -e '.sessions[]?|select(.name=="canary3")' >/dev/null 2>&1; }
 _c3_gone_everywhere() { ! _c3_via brk1 && ! _c3_via brk2 && ! _c3_via brk3; }
-# _c3_committed_by <broker> : did <broker> LOCALLY COMMIT canary3? Read its OWN broker application log for the
-# `broker: session created` line naming canary3 (internal/broker/sessions.go:77 logs sid=<name> — and for a
-# named create SID==Name, clusterwrite.go:546/548/553 — on the broker that HANDLES the request). R6 #65
+# _c3_committed_by <broker> : did <broker>'s request handler return from a committed create for canary3?
+# Read its OWN broker application log for `broker: session created` (sessions.go:77 emits only after
+# createSession succeeds). This is a commit-success witness on the broker that HANDLES the request, not
+# necessarily the raft leader that proposed it; under a complete route+raft partition, however, brk1 cannot
+# obtain such success from the majority, so seeing the line while isolation is proven is a #65 candidate. R6 #65
 # (r6-findings.md): the control plane is a cross-broker NATS QUEUE GROUP, so `--nats-url brk1` only picks the
 # ENTRY server, NOT the committer. "canary3 visible via the majority after heal" is therefore NOT #65 by
 # itself — it can be a LEGITIMATE majority commit the queue group routed to brk2/brk3 (R6 proved the old
@@ -592,6 +594,29 @@ _C3_PRE=no; _c3_via brk1 && _C3_PRE=yes
 log "D4b PRE-HEAL ARTIFACT: canary3 visible on the partitioned minority brk1 BEFORE the heal? $_C3_PRE (D4b=${_D4B_REC:-unknown}) — D6b is only judgeable when this is yes"
 assert_ok "D4c brk1 did NOT crash or restart: same MainPID, NRestarts unchanged" _d4_brk1_stable
 
+# #71 PRE-HEAL COMMITTER SNAPSHOT (added after the -j6 PRODUCT-RED the external re-review flagged).
+# The post-heal committer grep (_c3_committed_by brk1 at D6b) CANNOT distinguish two very different worlds:
+#   (a) a genuine raft-safety violation — brk1 COMMITTED canary3 WHILE ISOLATED (minority split-brain), or
+#   (b) a LEGITIMATE delayed majority commit — the D4b propose that the CLI reported as failed (rc!=0)
+#       actually committed AFTER the heal, once quorum returned (clusterwrite.go:718-729, the Q4
+#       "committed-but-reported-failed" path), and brk1 — rejoined as a normal group member — then wrote
+#       the same `broker: session created … canary3` line. That is NOT a split-brain.
+# A pre-heal YES is decisive: take the committer reading while the partition is STILL ARMED and brk1 is
+# STILL the isolated minority. `_c3_committed_by` is a
+# `dexec` local file read (grep on brk1's broker.log) — the DROP only blackholes ports 6222/7400, not the
+# docker exec channel — so it runs correctly under the partition. If brk1's log ALREADY names canary3 here,
+# the minority returned from a committed write while isolated = a real #65.
+#
+# A pre-heal NO is NOT by itself decisive for a line first observed after heal: there is an unavoidable
+# interval between this snapshot and the iptables flush. A line may be appended during that interval (real
+# #65) or after quorum returns (legitimate delayed completion). Without a timestamp/boundary marker from
+# the product log, the old #71 world remains ambiguous and must stay a first-class gap, not be declared
+# benign. The corrected-tree run happened to have NO brk1 line even after heal, so it did not reproduce
+# that world.
+_C3_COMMIT_PREHEAL=no; _c3_committed_by brk1 && _C3_COMMIT_PREHEAL=yes
+_C3_COMMIT_PREHEAL_LINE=$(dexec brk1 -- sh -c 'grep -ahF "broker: session created" /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null | grep canary3' 2>/dev/null | tail -1)
+log "D4b COMMITTER SNAPSHOT (pre-heal, partition STILL ARMED): brk1's OWN broker.log names canary3 while ISOLATED? $_C3_COMMIT_PREHEAL${_C3_COMMIT_PREHEAL_LINE:+ [line: $_C3_COMMIT_PREHEAL_LINE]} — yes = a genuine raft-safety violation candidate (#65); no = absent at this snapshot only (a line first seen after heal remains #71-ambiguous across the snapshot→heal boundary)"
+
 assert_ok "D5a HEAL the partition" fault_partition_off brk1
 assert_ok "D5b all three nodes converge on ONE leader (sort -u == 1)" \
     poll_until 180 5 "all three report the same leader" -- _d5_one_leader
@@ -627,8 +652,15 @@ log "D6b RAW ARTIFACT (canary3 = the minority's stale-leader write; D4b was: ${_
 # "5/6 durable minority writes" were exactly that — correct commits mis-attributed to brk1 by dialing). #65
 # demands that the ISOLATED MINORITY brk1 itself COMMITTED it (its own broker.log names canary3, _c3_committed_by)
 # AND it is visible via the majority after heal. Only BOTH together are a raft-safety violation.
-if { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && _c3_committed_by brk1; then
-    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3 was COMMITTED BY the isolated minority brk1 (its own broker.log carries 'broker: session created … canary3' — committer attribution, not just a --nats-url dial) during the partition (D4b=${_D4B_REC:-n/a}, pre-heal-on-brk1=${_C3_PRE:-unknown}) AND is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's committed write must never survive (raft safety). CANDIDATE: reproduce in a dedicated single run with the full D4/D6/D6b + committer artifact before treating it as characterised, not asserted from a chaos drill alone"
+if { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && [ "$_C3_COMMIT_PREHEAL" = yes ]; then
+    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3 was COMMITTED BY the isolated minority brk1 WHILE STILL PARTITIONED (the pre-heal committer artifact — brk1's own broker.log named canary3 BEFORE D5a healed the partition${_C3_COMMIT_PREHEAL_LINE:+: $_C3_COMMIT_PREHEAL_LINE} — is committer attribution taken during isolation, not just a --nats-url dial and not a post-heal delayed commit) during the partition (D4b=${_D4B_REC:-n/a}, pre-heal-on-brk1=${_C3_PRE:-unknown}) AND is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's committed write must never survive (raft safety). CANDIDATE: reproduce in a dedicated single run with the full D4/D6/D6b + pre-heal committer artifact before treating it as characterised, not asserted from a chaos drill alone"
+elif { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && _c3_committed_by brk1; then
+    # #71 remains OPEN. The line was absent at the pre-heal snapshot and present when observed after heal,
+    # but the snapshot and iptables flush are not atomic. The line could have landed in that boundary window
+    # (real #65) or after quorum returned (legitimate delayed completion). The corrected-tree acceptance run
+    # did NOT exercise this branch — it had no brk1 line even post-heal — so it cannot root the old archive.
+    not_covered "96-D6b #71 AMBIGUOUS: brk1's canary3 commit-success line first observed after the pre-heal snapshot" \
+        "canary3 is visible on the majority after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3, D4b=${_D4B_REC:-n/a}) and brk1's own broker.log names it now, while the last pre-heal snapshot was NO. The snapshot→iptables-flush boundary is not atomic: this may be a genuine isolated-minority commit in that interval (#65) or a legitimate completion after quorum returned. Keeping #71 OPEN and this run INCOMPLETE; do not call it a benign Q4 delayed commit without a product timestamp/boundary artifact." gap
 elif [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; then
     # R6's EXACT scenario, now correctly distinguished by committer attribution: canary3 IS durable on the
     # majority, but brk1's own broker.log carries NO 'session created … canary3' commit line (_c3_committed_by

@@ -66,8 +66,13 @@ cmd_build() {
     ok "image $IMAGE built"
 }
 
-# provision + boot a single node (used by `up`).
-_bring_up_node() {
+# V4 (simcluster-accel): bring-up is split into two phases so `cmd_up` can run all nodes CONCURRENTLY
+# instead of serially. On a 3-broker + agent + ctl drill the serial path paid ~5× the per-node cost
+# (docker run + wait_sysd + install.sh provisioning) back to back; parallelizing collapses that to ~1×.
+# No tether state is pre-staged and the end state is byte-identical — only the host-side orchestration
+# changes. _start_node just launches the container; _provision_node does the wait + install.sh, with the
+# retry-once diagnostic preserved so an interleaved provision hiccup is still handled.
+_start_node() {
     _role=$1; _node=$2; shift 2
     if node_exists "$_node"; then
         node_running "$_node" || run d start "$(ctr_name "$_node")" >/dev/null
@@ -75,6 +80,9 @@ _bring_up_node() {
         log "starting $_role node $_node"
         run_node "$_role" "$_node" "$@"
     fi
+}
+_provision_node() {
+    _role=$1; _node=$2
     wait_sysd "$_node"
     # sshd for `ssh sim-<node>` (real-ops debug path).
     sctl "$_node" enable --now ssh >/dev/null 2>&1 || true
@@ -84,6 +92,9 @@ _bring_up_node() {
     dexec "$_node" -- /opt/sim/provision-node.sh "$_role" "$_node" "$_node" \
         || { warn "provision $_node hiccupped — retrying once"; sleep 2; dexec "$_node" -- /opt/sim/provision-node.sh "$_role" "$_node" "$_node"; }
 }
+# (A serial _start_node → _provision_node wrapper lived here; V4 rewired cmd_up to call the two phases
+# directly and no caller remained — grow provisions its joiner inline — so it was deleted rather than
+# left as dead code with a false "kept for grow" rationale. Internal review round-2 MINOR-4.)
 
 cmd_up() {
     _brokers=1; _agents=0; _ctl=0; _capstore=""
@@ -102,10 +113,68 @@ cmd_up() {
     # parent still gives deterministic statfs and consumes no host-global loop devices (§9 OQ-5).
     _brk_extra=""
     [ -n "$_capstore" ] && _brk_extra="--sim-lib-tmpfs $_capstore"
-    # shellcheck disable=SC2086
-    _i=1; while [ "$_i" -le "$_brokers" ]; do _bring_up_node broker "brk$_i" $_brk_extra; _i=$((_i+1)); done
-    _i=1; while [ "$_i" -le "$_agents" ];  do _bring_up_node agent  "agt$_i"; _i=$((_i+1)); done
-    _i=1; while [ "$_i" -le "$_ctl" ];     do _bring_up_node ctl    "ctl$_i"; _i=$((_i+1)); done
+    # V4: PHASE 1 — launch every container first (docker run -d returns immediately). shellcheck disable=SC2086
+    _i=1; while [ "$_i" -le "$_brokers" ]; do _start_node broker "brk$_i" $_brk_extra; _i=$((_i+1)); done
+    _i=1; while [ "$_i" -le "$_agents" ];  do _start_node agent  "agt$_i"; _i=$((_i+1)); done
+    _i=1; while [ "$_i" -le "$_ctl" ];     do _start_node ctl    "ctl$_i"; _i=$((_i+1)); done
+    # V4: PHASE 2 — provision every node CONCURRENTLY (wait_sysd + install.sh), each into its own log so
+    # the retry-once diagnostic survives interleaving, then fail `up` if ANY node failed (a leaked
+    # half-provisioned cluster is worse than a slow one).
+    # SET -E SAFETY: _provision_node's wait_sysd calls die (exit) on a systemd-never-came-up. In a
+    # BACKGROUND job that exit skips a trailing `echo $? >rc`, leaving NO rc file — which a glob-based
+    # check would silently skip, turning a dead node into a green `up`. The if/else captures the rc
+    # unconditionally (set -e is suspended in an if-condition), and the check below iterates the EXPECTED
+    # node list so a MISSING rc is itself a failure.
+    # External review Low 8: a PREDICTABLE $$-based path lets a same-host actor pre-create it, and no trap
+    # meant an interrupt leaked the dir. Use mktemp -d (unpredictable, 0700 by default) + a trap that
+    # removes it on any exit of this function's phase.
+    _up_tmp=$(mktemp -d "${TMPDIR:-/tmp}/simup.XXXXXX") || die "up: mktemp failed"
+    case "$_up_tmp" in /tmp/simup.*|"${TMPDIR:-/tmp}"/simup.*) ;; *) die "up: refusing suspicious temp dir '$_up_tmp'" ;; esac
+    # Re-review Low 7 + final review: on a signal, terminate each provisioner's FULL process tree (not only
+    # its wrapper shell), reap it, clean up, and exit with a signal-derived status. Killing only `_prov_bg`
+    # orphans wait_sysd/docker/provision-node.sh, which can keep changing a container after `up` returned.
+    _up_signal_tree() {
+        local _ust_sig="$1" _ust_root="$2" _ust_child
+        [ -n "$_ust_root" ] || return 0
+        if [ -r "/proc/$_ust_root/task/$_ust_root/children" ]; then
+            for _ust_child in $(cat "/proc/$_ust_root/task/$_ust_root/children" 2>/dev/null); do
+                _up_signal_tree "$_ust_sig" "$_ust_child"
+            done
+        fi
+        kill "-$_ust_sig" "$_ust_root" 2>/dev/null || true
+    }
+    _up_on_signal() {
+        local _uos_name="$1" _uos_rc="$2" _uos_pid
+        for _uos_pid in ${_up_pids:-}; do _up_signal_tree TERM "$_uos_pid"; done
+        /bin/sleep 1
+        for _uos_pid in ${_up_pids:-}; do
+            kill -0 "$_uos_pid" 2>/dev/null && _up_signal_tree KILL "$_uos_pid"
+            wait "$_uos_pid" 2>/dev/null || true
+        done
+        rm -rf "$_up_tmp" 2>/dev/null
+        warn "up: interrupted by SIG$_uos_name; provisioning children reaped"
+        exit "$_uos_rc"
+    }
+    trap 'rm -rf "$_up_tmp" 2>/dev/null' EXIT
+    trap '_up_on_signal INT 130' INT
+    trap '_up_on_signal TERM 143' TERM
+    _up_nodes=""; _up_pids=""
+    _prov_bg() {
+        if ( _provision_node "$1" "$2" ) >"$_up_tmp/$2.log" 2>&1; then _pb_rc=0; else _pb_rc=$?; fi
+        echo "$_pb_rc" >"$_up_tmp/$2.rc"
+    }
+    _i=1; while [ "$_i" -le "$_brokers" ]; do _prov_bg broker "brk$_i" & _up_pids="$_up_pids $!"; _up_nodes="$_up_nodes brk$_i"; _i=$((_i+1)); done
+    _i=1; while [ "$_i" -le "$_agents" ];  do _prov_bg agent  "agt$_i" & _up_pids="$_up_pids $!"; _up_nodes="$_up_nodes agt$_i"; _i=$((_i+1)); done
+    _i=1; while [ "$_i" -le "$_ctl" ];     do _prov_bg ctl    "ctl$_i" & _up_pids="$_up_pids $!"; _up_nodes="$_up_nodes ctl$_i"; _i=$((_i+1)); done
+    wait
+    _up_rc=0
+    for _n in $_up_nodes; do
+        cat "$_up_tmp/$_n.log" >&2 2>/dev/null || true
+        [ "$(cat "$_up_tmp/$_n.rc" 2>/dev/null || echo MISSING)" = 0 ] || { err "up: provisioning FAILED on $_n"; _up_rc=1; }
+    done
+    rm -rf "$_up_tmp"
+    trap - EXIT INT TERM
+    [ "$_up_rc" = 0 ] || die "up: one or more nodes failed to provision (see per-node output above)"
     ok "up: $_brokers broker(s), $_agents agent(s), $_ctl ctl (instance=$INSTANCE, image=$IMAGE)"
     log "next: ./simcluster init brk1   (standalone → N=1 cluster)"
 }
@@ -538,17 +607,30 @@ cmd_nuke() {
 }
 
 # drill <name> : run drills/<name>.sh on an isolated throwaway --instance; print RED/GREEN.
-cmd_drill() {
-    _name=${1:?drill name}; shift 2>/dev/null || true
-    _script="$HERE/drills/$_name.sh"
-    [ -f "$_script" ] || die "drill: no such drill '$_name' ($_script)"
-    # A drill executes the binary BAKED in the image, not vendor/tether directly. Fail closed when a
-    # caller rebuilt/staged vendor but forgot the required `remote.sh --build build`; otherwise every
-    # source-level fix is silently tested against an old product binary and produces invalid evidence.
+# check_image_or_die: the baked image binary must match the staged vendor binary, else every drill runs
+# against a stale product and produces invalid evidence. Factored out of cmd_drill so run-drills.sh can
+# run it ONCE per sweep (V6) via the `check-image` subcommand.
+check_image_or_die() {
     _vendor_sha=$(sha256sum "$HERE/vendor/tether" 2>/dev/null | awk '{print $1}')
     _image_sha=$(d run --rm --entrypoint sha256sum "$IMAGE" /usr/local/bin/tether 2>/dev/null | awk '{print $1}')
     [ -n "$_vendor_sha" ] && [ "$_image_sha" = "$_vendor_sha" ] || \
         die "drill: stale image binary (image=${_image_sha:-missing}, vendor=${_vendor_sha:-missing}); run ./remote.sh --build build before testing code changes"
+}
+
+cmd_drill() {
+    _name=${1:?drill name}; shift 2>/dev/null || true
+    # External review re-review Medium 4: the V6 `--image-prechecked <vendor-sha>` bypass was FORGEABLE —
+    # the vendor sha is public workspace state (`sha256sum vendor/tether`), so any caller could compute it
+    # and skip the stale-image guard. There is no CHEAP unforgeable attestation (independently verifying
+    # the IMAGE sha requires the container start V6 removed), so the bypass is REMOVED: every drill runs
+    # check_image_or_die. A stray `--image-prechecked` argument is now silently ignored (still parsed off so
+    # it does not reach the drill). run-drills.sh keeps its once-per-sweep check as a FAST early abort, but
+    # correctness no longer depends on trusting a forgeable flag. (V6's launch-storm optimization is
+    # reverted; the per-drill image check is cheap relative to the drill itself.)
+    case "${1:-}" in --image-prechecked) shift 2 2>/dev/null || shift ;; esac
+    _script="$HERE/drills/$_name.sh"
+    [ -f "$_script" ] || die "drill: no such drill '$_name' ($_script)"
+    check_image_or_die
     _inst="drill-$_name"
     log "drill: $_name on isolated instance '$_inst'"
     # M4: under `set -e` a RED/failed drill would abort cmd_drill BEFORE teardown → leaked instance.
@@ -681,6 +763,7 @@ case "$verb" in
     logs)          cmd_logs "$@";;
     nats-conf)     cmd_natsconf "$@";;
     drill)         cmd_drill "$@";;
+    check-image)   check_image_or_die; ok "image binary matches staged vendor/tether";;
     down)          cmd_down "$@";;
     nuke)          cmd_nuke "$@";;
     doctor)        cmd_doctor "$@";;

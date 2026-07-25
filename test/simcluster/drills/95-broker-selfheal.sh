@@ -164,7 +164,7 @@ assert_ok "T1g FUNCTION really recovered: the data plane serves the exact sentin
 assert_ok "T1h no start-limit was hit (install.sh:752-753 deliberately leaves StartLimitBurst=5/10s on — a leftover would kill a later arm and get blamed on the product)" _t1_no_startlimit
 
 # ══ T2 — kill -9 (G.2's crash-recovery direction) ═══════════════════════════════════════════════════
-poll_until 20 5 "spacing the restart arms so StartLimitBurst=5/10s cannot bite" -- false || true
+poll_until_fixed 20 5 "spacing the restart arms so StartLimitBurst=5/10s cannot bite" -- false || true
 PID1=$(_mainpid brk1); NR1=$(_nrestarts brk1); RD1=$(_ready_count brk1)
 CURB2=$(_jcursor_b brk1); CURA=$(_acursor agt1)
 assert_ok "T2a SIGKILL MainPID $PID1 (unclean — the OTHER exit semantics)" dexec brk1 -- kill -9 "$PID1"
@@ -188,7 +188,7 @@ assert_ok "T2h POSITIVE CONTROL for T2g (without it, T2g would be a vacuous PASS
     poll_until 60 3 "agt1 ONLINE after the crash" -- _agt1_online
 
 # ══ T3 — restart nats-server: #23's full chain ═════════════════════════════════════════════════════
-poll_until 20 5 "spacing the restart arms" -- false || true
+poll_until_fixed 20 5 "spacing the restart arms" -- false || true
 PID2=$(_mainpid brk1); NR2=$(_nrestarts brk1); RD2=$(_ready_count brk1)
 CURA2=$(_acursor agt1)
 assert_ok "T3a restart nats-server underneath the broker" dexec brk1 -- systemctl restart nats-server

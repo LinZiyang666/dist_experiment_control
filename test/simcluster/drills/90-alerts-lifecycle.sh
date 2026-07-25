@@ -53,13 +53,26 @@ _lag_observed() {
     "$SIM" status --json 2>/dev/null | jq -e --arg n "$1" \
         '.nodes[]? | select(.node_id==$n and .reachable==true and (.applied_lag // 0)>64)' >/dev/null 2>&1
 }
+# V5 (simcluster-accel): the 72 real `tether alert` invocations are preserved VERBATIM — the ONLY change
+# is that the 36-iteration loop now runs INSIDE the container in a single `dexec … sh -c` instead of 72
+# separate docker-exec round-trips. The product path is byte-identical (same binary, same args, same
+# order, same LDR broker); only the ~71 container attach/detach round-trips are removed. `runuser -u
+# tether` reproduces the `dexec -u tether` privilege drop. A non-zero from any tether call aborts the
+# in-container loop (set -e) and surfaces as a non-zero dexec, exactly as the per-call `|| return 1` did.
 _write_raft_gap() {
-    _i=1
-    while [ "$_i" -le 36 ]; do
-        dexec -u tether "$LDR" -- tether alert raise --kind manual --severity info --message "lag-fixture-$_i" >/dev/null || return 1
-        dexec -u tether "$LDR" -- tether alert clear manual >/dev/null || return 1
-        _i=$((_i+1))
-    done
+    # >/dev/null only (NOT 2>&1): the old per-call form dropped stdout but PRESERVED stderr, and this runs
+    # via assert_setup whose _as_capture reads _AS_OUT=$("$@" 2>&1). tether is a cobra CLI that writes
+    # errors to stderr, so a trailing 2>&1 here would discard the failing `tether alert` line and the M1
+    # flight recorder would fall to its EMPTY note — a fresh attribution regression on a formerly-visible
+    # predicate (internal review round-2 MINOR-2). Keep stderr for the recorder; each in-loop tether
+    # already drops its own stdout.
+    dexec "$LDR" -- runuser -u tether -- sh -ec '
+        i=1
+        while [ "$i" -le 36 ]; do
+            tether alert raise --kind manual --severity info --message "lag-fixture-$i" >/dev/null
+            tether alert clear manual >/dev/null
+            i=$((i+1))
+        done' >/dev/null || return 1
 }
 
 drill_begin "S8-90 alerts lifecycle: manual raise/ack/clear + broker_down + quorum_lost-ack refuse (N=3 GREEN)"

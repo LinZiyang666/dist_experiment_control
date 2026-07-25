@@ -153,7 +153,7 @@ assert_ok "leg-b recovery: the product MOVED the store aside (never deleted) —
 assert_ok "leg-b recovery: service restart (the step the product tells the operator to run)" \
     "$SIM" exec brk1 -- sh -eu -c 'systemctl stop tether-broker; systemctl restart nats-server; systemctl start tether-broker'
 assert_ok "leg-b recovery: ctl re-login succeeds after broker auth responder is ready" \
-    poll_until 60 3 "ctl auth responder ready" -- "$SIM" ctl -- login -s "$SID" --pin "$PIN"
+    poll_until_fixed 60 3 "ctl auth responder ready" -- "$SIM" ctl -- login -s "$SID" --pin "$PIN"
 assert_ok "leg-b recovery: --remote banner clears on the recovered control plane" \
     poll_until 60 4 "JS-503 banner clears" -- sh -c "! $SIM ctl -- cluster status --remote 2>&1 | grep -qiE 'DATA-PLANE DEGRADED|JetStream UNAVAILABLE'"
 # M1: recovery terminus uses a >8 MiB payload (real tier-B) and asserts the push stdout reports tier=b.

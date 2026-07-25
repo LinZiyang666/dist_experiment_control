@@ -181,7 +181,7 @@ assert_ok "C1-grow grow brk2 (N=2)"                "$SIM" grow brk2
 # R3: poll past the 30s manifest re-sign throttle (as M1/M2 do) — a single-shot refresh can read the stale
 # pre-grow gen if it lands <30s after the last manifest touch → spurious false-RED. Gen is monotone.
 assert_ok "C1 agent roster converges: roster_gen strictly grew after grow (polled past 30s throttle)" \
-          poll_until 45 3 "roster_gen grew past $G1" -- sh -c "G2=\$(\"$SIM\" exec agt1 -- runuser -u sim -- env HOME=/home/sim tether agent config refresh --once --session $SID 2>&1 | grep -oE 'roster_gen=[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n \"\$G2\" ] && [ -n \"$G1\" ] && [ \"\$G2\" -gt \"$G1\" ]"
+          poll_until_fixed 45 3 "roster_gen grew past $G1" -- sh -c "G2=\$(\"$SIM\" exec agt1 -- runuser -u sim -- env HOME=/home/sim tether agent config refresh --once --session $SID 2>&1 | grep -oE 'roster_gen=[0-9]+' | grep -oE '[0-9]+' | head -1); [ -n \"\$G2\" ] && [ -n \"$G1\" ] && [ \"\$G2\" -gt \"$G1\" ]"
 
 # ── Arm T — trust-anchor negatives (isolated TETHER_HOME; never pollute J's good agent.yaml) ─────────
 # ($REAL captured in setup.) Mint a valid-but-foreign account pub for the forged invite.

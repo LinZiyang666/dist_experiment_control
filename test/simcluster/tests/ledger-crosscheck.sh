@@ -49,9 +49,13 @@ open_ids() {
     for i in $all; do printf '%s\n' "$cls" | grep -qx -- "$i" || printf '%s\n' "$i"; done
 }
 
-# owners: every non-GREEN row of the verdict ledger contributes its owner field (col 3, may list several).
+# owners: every non-GREEN row of the verdict ledger contributes its owner field (may list several).
+# The owner column moved 3 -> 5 when expected-verdicts.tsv was split into a strict machine table plus
+# expected-verdicts-log.md (the prose ledger). Rows are now selected by "not a comment, exactly 6
+# fields" rather than by line number, so adding or removing header comments cannot silently drop rows —
+# which would have made this gate report every defect as UNOWNED, or worse, none at all.
 owned_ids() {
-    awk -F'\t' 'NR>2 && $2!="GREEN" {print $3}' "$VERDICTS" \
+    awk -F'\t' '!/^#/ && NF==6 && $2!="GREEN" {print $5}' "$VERDICTS" \
         | tr ' /,+' '\n\n\n\n' | grep -oE '#[0-9]+|DOC-[0-9]+' | sort -u
 }
 

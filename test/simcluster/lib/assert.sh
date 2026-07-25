@@ -107,14 +107,187 @@ _AS_NC_GUARD=0      # …of which class=runtime-guard (honest guards; must not F
 _AS_SETUP=0         # setup / prerequisite / misuse failures → SETUP-RED
 _AS_PRODUCT_RED=0   # signature-guarded known-defect reproductions → PRODUCT-RED
 
-_as_pass()        { _AS_PASS=$((_AS_PASS+1)); ok   "PASS  $1"; }
-_as_fail()        { _AS_FAIL=$((_AS_FAIL+1)); err  "FAIL  $1"; [ -n "${2:-}" ] && printf '        %s\n' "$2" >&2; }
-_as_product_red() { _AS_PRODUCT_RED=$((_AS_PRODUCT_RED+1)); err "PRODUCT-RED  $1"; }
-_as_setup_red()   { _AS_SETUP=$((_AS_SETUP+1)); err "SETUP-RED  $1"; }
+# ── THE FLIGHT RECORDER (M1) ────────────────────────────────────────────────────────────────────────
+# Every non-green assertion writes a full evidence record to $SIM_EVIDENCE_DIR/<drill>.evidence.
+#
+# WHY. On 2026-07-23 five drills deviated from their recorded expectation. Attributing them cost an
+# evening of solo re-runs, because the console keeps only `tail -3` of the failing command's output —
+# and for drills 20/91 the three lines kept were the DATA-IMPACT warning, while the line that actually
+# named the cause ("re-run this exact force-single command with --reset-js") was truncated away. The
+# same truncation hid drill 52's `error: not leader`. The fix is not more re-runs: it is to record, at
+# the moment of failure and on the FIRST run, everything a human would go back for.
+#
+# THREE RULES, all load-bearing:
+#   1. CAPTURE NEVER CHANGES A VERDICT. No counter is touched, no rc is propagated, every probe is
+#      bounded by `timeout` and swallowed with `|| true`. If $SIM_EVIDENCE_DIR is unwritable the drill
+#      must emit a BYTE-IDENTICAL verdict line — pinned by tests/verdict-contract-test.sh.
+#   2. THE CONSOLE IS UNCHANGED. `tail -3` still governs what a human sees scrolling past; the full
+#      output goes to the file. Widening the console would bury the signal it exists to show.
+#   3. IT IS APPENDED, NEVER GRAFTED ONTO THE CONTRACT. drill_end emits one extra DRILL-EVIDENCE line.
+#      The DRILL-VERDICT grammar is untouched — three parsers depend on it.
+_AS_ORD=0                # assertion ordinal within this drill (every assertion, pass or not)
+_AS_FIRST_FAIL_ORD=0     # ordinal of the FIRST non-green assertion — the one worth reading first
+_AS_EV_HOST_DONE=0       # host-level probes run once per drill, not once per failure
+
+# The evidence filename MUST agree with what run-drills.sh's deviation report opens, which is keyed on the
+# drill FILENAME ($d), not the free-text drill_begin title. Internal review B1: naming it from $_AS_DRILL
+# (the title — "#20/#12 OFFLINE force-single …") produced a file the reader never found for ANY of the 38
+# drills, so the report silently fell back to `tail -5` of the .log — the exact truncation M1 exists to
+# kill. run_one exports SIM_DRILL_ID (the filename); prefer it, and fall back to the sanitized title only
+# for the hermetic tests, which run drill bodies directly and resolve the path from the emitted
+# DRILL-EVIDENCE line rather than by guessing it.
+_as_ev_file() {
+    _ev_dir="${SIM_EVIDENCE_DIR:-${TMPDIR:-/tmp}}"
+    if [ -n "${SIM_DRILL_ID:-}" ]; then
+        printf '%s/%s.evidence' "$_ev_dir" "$SIM_DRILL_ID"
+    else
+        printf '%s/%s.evidence' "$_ev_dir" "$(printf '%s' "${_AS_DRILL:-drill}" | tr -cs 'A-Za-z0-9._-' '-')"
+    fi
+}
+
+# _as_redact : mask secret-bearing values on stdin (external review Medium 6). Covers `--pin V`,
+# `--pin=V`, `--token/--secret/--password V`, `PIN=V`/`TOKEN=`/`PASSWORD=` env forms, and the pty-confirm
+# 6-digit PINs. Best-effort — it protects the common shapes the drills actually use, not an exhaustive
+# scanner. Runs under `LC_ALL=C` for portable sed.
+_as_redact() {
+    LC_ALL=C sed -E \
+        -e 's/(--(pin|token|secret|password|pass)[= ])[^ ]+/\1<REDACTED>/g' \
+        -e 's/((PIN|TOKEN|SECRET|PASSWORD|PASS)=)[^ ]+/\1<REDACTED>/g' \
+        -e 's/([?&](pin|token|secret|password|pass)=)[^ &]+/\1<REDACTED>/g' \
+        2>/dev/null || cat
+}
+
+# Render argv without losing argument boundaries and redact secrets BEFORE the string is persisted. `$*`
+# cannot represent boundaries: an argument `--pin "two words"` becomes indistinguishable from two public
+# arguments, so a later regex either leaks `words` or must erase the rest of the command. This formatter
+# walks the original argv, masks the value following a secret flag (including spaces/quotes/newlines), and
+# then emits shell-readable single-quoted fields. URI/KEY=value forms are redacted per argument as well.
+_as_quote_arg() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_./:@%+=,-]*)
+            printf "'"
+            printf '%s' "$1" | sed "s/'/'\\\\''/g"
+            printf "'"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+_as_format_argv() {
+    _afa_need_secret=0
+    _afa_sep=""
+    for _afa_arg in "$@"; do
+        if [ "$_afa_need_secret" = 1 ]; then
+            _afa_safe="<REDACTED>"
+            _afa_need_secret=0
+        else
+            case "$_afa_arg" in
+                --pin|--token|--secret|--password|--pass)
+                    _afa_safe="$_afa_arg"
+                    _afa_need_secret=1
+                    ;;
+                --pin=*|--token=*|--secret=*|--password=*|--pass=*|\
+                PIN=*|TOKEN=*|SECRET=*|PASSWORD=*|PASS=*|\
+                pin=*|token=*|secret=*|password=*|pass=*)
+                    _afa_safe="${_afa_arg%%=*}=<REDACTED>"
+                    ;;
+                *\?pin=*|*\&pin=*|*\?token=*|*\&token=*|*\?secret=*|*\&secret=*|\
+                *\?password=*|*\&password=*|*\?pass=*|*\&pass=*)
+                    # sed is line-oriented; a query value containing a newline would otherwise leak its
+                    # continuation. Mask the whole URI argument rather than pretend we can preserve its
+                    # other query fields safely without a real URI parser.
+                    _afa_safe="<REDACTED-URI>"
+                    ;;
+                *) _afa_safe=$(printf '%s' "$_afa_arg" | _as_redact) ;;
+            esac
+        fi
+        printf '%s' "$_afa_sep"
+        _as_quote_arg "$_afa_safe"
+        _afa_sep=" "
+    done
+}
+
+# _as_evidence <kind> <desc> : append one record. Best effort, always returns 0.
+_as_evidence() {
+    _ev_kind=$1; _ev_desc=$2
+    _ev_f=$(_as_ev_file)
+    _ev_dir=${_ev_f%/*}
+    [ -d "$_ev_dir" ] || mkdir -p "$_ev_dir" 2>/dev/null || return 0
+    { : >>"$_ev_f"; } 2>/dev/null || return 0     # unwritable target: give up SILENTLY, never fail a drill
+    [ "$_AS_FIRST_FAIL_ORD" = 0 ] && _AS_FIRST_FAIL_ORD=$_AS_ORD
+    {
+        printf '\n=== %s ord=%s kind=%s drill=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" "$_AS_ORD" "$_ev_kind" "${_AS_DRILL:-drill}"
+        printf 'desc: %s\n' "$_ev_desc"
+        # argv/rc/took belong to the captured command and are valid ONLY when the capture is this
+        # ordinal's (MA1) — otherwise they are the previous, passing command's, which is worse than blank.
+        if [ "${_AS_CAP_ORD:-0}" = "$_AS_ORD" ]; then
+            # External review Medium 6: REDACT secret-bearing values before persisting. argv/output carry
+            # session PINs, invite tokens, and confirm values; $LOGDIR is now 0700, but redaction is
+            # defence-in-depth so an archived/copied evidence file is not a credential dump.
+            [ -n "${_AS_ARGV:-}" ] && printf 'argv: %s\n' "$(printf '%s' "$_AS_ARGV" | _as_redact)"
+            [ -n "${_AS_RC:-}" ]   && printf 'rc:   %s\n' "$_AS_RC"
+            [ -n "${_AS_MS:-}" ]   && printf 'took: %s ms\n' "$_AS_MS"
+        fi
+        # THE FULL output — this is the whole point; the console's tail -3 is what lost drill 20's cause.
+        # Internal review MA1: only emit the captured block when the capture belongs to THIS ordinal.
+        # _as_capture stamps _AS_CAP_ORD with the ordinal it is about to feed; a non-capturing red
+        # (a bare product_red, setup_fail, not_covered) leaves the PREVIOUS capture in the variables, so
+        # without this guard a PRODUCT-RED after a passing assert_ok would record "rc: 0" and the earlier,
+        # unrelated command's output. When the stamp does not match, fall through to the EMPTY note.
+        if [ -n "${_AS_OUT:-}" ] && [ "${_AS_CAP_ORD:-0}" = "$_AS_ORD" ]; then
+            printf -- '--- stdout+stderr (FULL, %s line(s)) ---\n' "$(printf '%s\n' "$_AS_OUT" | wc -l | tr -d ' ')"
+            printf '%s\n' "$_AS_OUT" | _as_redact      # Medium 6: mask secrets in the persisted output
+            printf -- '--- end ---\n'
+        elif [ "${_AS_CAP_ORD:-0}" != "$_AS_ORD" ]; then
+            printf -- '--- stdout+stderr: NOT CAPTURED for this assertion ---\n'
+            printf 'NOTE: this red was recorded by a non-capturing path (product_red / setup_fail /\n'
+            printf '      not_covered) that ran no command through the harness, so there is no argv/rc/\n'
+            printf '      output to show. The evidence, if any, is in the console log around this ordinal.\n'
+            printf -- '--- end ---\n'
+        elif [ -n "${_AS_ARGV:-}" ]; then
+            # NOT a harmless blank. A predicate that captures its command's output into a local variable,
+            # greps it, and discards it leaves _AS_OUT EMPTY — so this recorder, and the console, and the
+            # deviation report all have nothing to show but "(want exit 0, got 1)". That is precisely how
+            # drill 20's `--reset-js` refusal became invisible on 2026-07-23 while drill 91, which let the
+            # same refusal reach the harness, printed it. Say so out loud instead of leaving a silent gap:
+            # the blindness is a DRILL defect, and an operator staring at an empty record must be told
+            # where to look rather than left to conclude the command said nothing.
+            printf -- '--- stdout+stderr: EMPTY ---\n'
+            printf 'NOTE: the failing predicate produced no output for the harness to record. If it is a\n'
+            printf '      function that does `v=$(cmd 2>&1); printf %%s "$v" | grep -q ...`, the evidence was\n'
+            printf '      swallowed INSIDE the drill, not truncated here — make it re-emit $v on failure.\n'
+            printf -- '--- end ---\n'
+        fi
+        if [ "$_AS_EV_HOST_DONE" = 0 ]; then
+            _AS_EV_HOST_DONE=1
+            printf -- '--- host at first failure ---\n'
+            printf 'loadavg: %s\n' "$(timeout 10 cat /proc/loadavg 2>/dev/null || true)"
+            # fsync latency is the ONE coupling docker does not isolate. On this host the p50 is
+            # DEVICE-BOUND at ~6.4 ms whether idle or loaded (a consumer NVMe's flush cost); only the tail
+            # (p90/p99) widens under contention. Recording it AT the failure is what lets a later
+            # disposition say "this red happened on a loaded disk" with evidence rather than a hunch.
+            # Internal review MA4: the previous parser printed dd's LAST TWO fields — the THROUGHPUT pair
+            # ("683 kB/s"), under a name that says milliseconds. Parse the SECONDS field (the value before
+            # the standalone "s" token) and convert to ms.
+            printf 'fsync_4k_ms: %s\n' "$(timeout 10 sh -c 'LC_ALL=C dd if=/dev/zero of="'"$_ev_dir"'/.fsprobe.$$" bs=4096 count=1 conv=fdatasync 2>&1 | awk "/copied/{gsub(/,/,\" \"); for(i=1;i<=NF;i++) if(\$i==\"s\"){printf \"%.3f\", \$(i-1)*1000; exit}}"; rm -f "'"$_ev_dir"'/.fsprobe.$$"' 2>/dev/null || true)"
+            printf 'disk_free: %s\n' "$(timeout 10 df -Pk "$_ev_dir" 2>/dev/null | awk 'NR==2{print $4" KiB free on "$1}' || true)"
+            printf 'containers:\n%s\n' "$(timeout 10 docker ps --filter "label=sim.instance=${INSTANCE:-}" --format '  {{.Names}} {{.Status}}' 2>/dev/null || true)"
+        fi
+    } >>"$_ev_f" 2>/dev/null || true
+    return 0
+}
+
+_as_pass()        { _AS_ORD=$((_AS_ORD+1)); _AS_PASS=$((_AS_PASS+1)); ok   "PASS  $1"; }
+_as_fail()        { _AS_ORD=$((_AS_ORD+1)); _AS_FAIL=$((_AS_FAIL+1)); err  "FAIL  $1"; [ -n "${2:-}" ] && printf '        %s\n' "$2" >&2; _as_evidence ASSERT-FAIL "$1"; }
+_as_product_red() { _AS_ORD=$((_AS_ORD+1)); _AS_PRODUCT_RED=$((_AS_PRODUCT_RED+1)); err "PRODUCT-RED  $1"; _as_evidence PRODUCT-RED "$1"; }
+# Console label is SETUP-FAIL, matching assert_setup/setup_fail and the archived logs — the deviation
+# report and attribution greps anchor on `^\[err \] (FAIL|SETUP-FAIL|…)`, so a SETUP-RED string here would
+# make every SETUP-RED first-failure invisible to them. The evidence-record KIND stays SETUP-RED.
+_as_setup_red()   { _AS_ORD=$((_AS_ORD+1)); _AS_SETUP=$((_AS_SETUP+1)); err "SETUP-FAIL  $1"; _as_evidence SETUP-RED "$1"; }
 
 # Harness-misuse recorder: a SETUP-RED that does NOT abort (the caller returns 0 so the drill continues to
 # drill_end and still emits a verdict line). Used by the arg validators below.
-_as_misuse() { _AS_SETUP=$((_AS_SETUP+1)); err "HARNESS-ERROR  $1"; }
+_as_misuse() { _AS_ORD=$((_AS_ORD+1)); _AS_SETUP=$((_AS_SETUP+1)); err "HARNESS-ERROR  $1"; _as_evidence HARNESS-ERROR "$1"; }
 
 # _as_argcount <need> <have> <api-ctx> : true iff have>=need; else records misuse. Checked BEFORE any
 # positional param is read, so `set -u` never trips on a missing $2/$3.
@@ -129,7 +302,32 @@ _as_nonempty() {
     _as_misuse "$1 — required argument is empty (would fail-open / forge a false verdict)"; return 1
 }
 
-_as_capture() { _AS_OUT=$("$@" 2>&1); _AS_RC=$?; return 0; }
+# Milliseconds since the epoch. `date +%s%N` is GNU/Linux (the only platform drills run on — they are
+# docker containers); the fallback keeps this from exploding into a syntax error anywhere else, at the
+# cost of second granularity. Timing is DIAGNOSTIC ONLY and never gates a verdict.
+_as_now_ms() {
+    _nm=$(date +%s%N 2>/dev/null) || _nm=""
+    case "$_nm" in
+        ''|*[!0-9]*|*N*) printf '%s000' "$(date +%s)" ;;
+        *) printf '%s' "$(( _nm / 1000000 ))" ;;
+    esac
+}
+
+# _as_capture records the FULL output, the rc, the argv and the wall time of the command under test.
+# argv + elapsed exist for the flight recorder: "which command, and was it slow?" is the first pair of
+# questions any attribution asks, and neither was recoverable from a drill log before M1.
+_as_capture() {
+    _AS_ARGV=$(_as_format_argv "$@")
+    # Stamp the ordinal this capture is FOR (the next assertion to be recorded). _as_evidence emits the
+    # argv/rc/output block only when this equals the ordinal being recorded, so a later non-capturing red
+    # cannot inherit this command's data (MA1). The +1 is because _as_pass/_as_fail increment _AS_ORD
+    # AFTER capture, so this capture belongs to the upcoming ordinal.
+    _AS_CAP_ORD=$((_AS_ORD+1))
+    _as_t0=$(_as_now_ms)
+    _AS_OUT=$("$@" 2>&1); _AS_RC=$?
+    _AS_MS=$(( $(_as_now_ms) - _as_t0 ))
+    return 0
+}
 
 assert_ok() {
     _as_argcount 2 "$#" "assert_ok <desc> <cmd...>" || return 0
@@ -229,6 +427,11 @@ not_covered() {
         runtime-guard) _AS_NC_GUARD=$((_AS_NC_GUARD+1)) ;;
         *) _as_misuse "not_covered <class> — must be exactly 'gap' or 'runtime-guard', got '$3' (an untriageable gap would corrupt the end-of-programme debt count)"; return 0 ;;
     esac
+    # The ordinal counts every assertion-shaped event so "first_fail_ord=N" locates the failure in the
+    # drill's own PASS/NOT-COVERED sequence. A coverage gap is deliberately NOT given an evidence record:
+    # it is a declared hole, not a failure, and recording host telemetry for it would dilute the file
+    # that exists to explain reds.
+    _AS_ORD=$((_AS_ORD+1))
     _AS_NC=$((_AS_NC+1)); err "NOT-COVERED[$3]  $1 — $2"
 }
 
@@ -241,14 +444,20 @@ assert_setup() {
     _as_nonempty "assert_setup <cmd> (first word)" "${1:-}" || return 0
     _as_capture "$@"
     if [ "$_AS_RC" = 0 ]; then _as_pass "setup: $_as_desc"; return 0; fi
-    _AS_SETUP=$((_AS_SETUP+1)); err "SETUP-FAIL  $_as_desc (want exit 0, got $_AS_RC)"
+    # Internal review B2: this used to bump _AS_SETUP inline and never record evidence, so the flight
+    # recorder was BLIND on every SETUP-RED — including drills 30 and 91, the two SETUP-RED deviations M1
+    # was built to attribute. Route through _as_setup_red, which advances the ordinal and writes the
+    # evidence record (the capture above means its argv/rc/output are this ordinal's, MA1-clean).
+    _as_setup_red "$_as_desc (want exit 0, got $_AS_RC)"
     printf '        %s\n' "$(printf '%s' "$_AS_OUT" | tail -3)" >&2
     drill_end; exit "$?"
 }
 
 # setup_fail "<desc>" — record a SETUP-RED and ABORT via drill_end. For `X=$(cmd) || setup_fail "…"` guards
 # where the value is captured (so it cannot be wrapped as assert_setup). Emits a SETUP-RED verdict line.
-setup_fail() { _AS_SETUP=$((_AS_SETUP+1)); err "SETUP-FAIL  ${1:-unspecified prerequisite}"; drill_end; exit "$?"; }
+# B2: also routes through _as_setup_red so the abort is recorded. There is no captured command here, so
+# the evidence record correctly shows the NOT-CAPTURED note rather than a stale prior command (MA1).
+setup_fail() { _as_setup_red "${1:-unspecified prerequisite}"; drill_end; exit "$?"; }
 
 # R1: MAKE THE VERDICT CONTRACT TOTAL. The header above claims "a well-formed drill ALWAYS emits a verdict
 # line". That claim was FALSE: lib/log.sh's die() is `err "$*"; exit 1`, and 38 call sites across six drills
@@ -277,6 +486,8 @@ drill_begin() {
     esac
     _AS_DRILL="${1:-drill}"; _AS_PASS=0; _AS_FAIL=0; _AS_NC=0; _AS_SETUP=0; _AS_PRODUCT_RED=0
     _AS_NC_GAP=0; _AS_NC_GUARD=0
+    _AS_ORD=0; _AS_FIRST_FAIL_ORD=0; _AS_EV_HOST_DONE=0
+    _AS_ARGV=""; _AS_RC=""; _AS_MS=""; _AS_OUT=""
     _AS_FRAME_OPEN=1          # R1: arms the contract-total die() below
     log "=== drill: $_AS_DRILL ==="
 }
@@ -291,6 +502,21 @@ drill_end() {
     # the SSOT verdict line the runner + hermetic tests parse (machine fields first, free-text name last):
     printf 'DRILL-VERDICT verdict=%s rc=%s assert_fail=%s setup_red=%s product_red=%s not_covered=%s nc_gap=%s nc_guard=%s pass=%s -- %s\n' \
         "$_de_v" "$_de_rc" "$_AS_FAIL" "$_AS_SETUP" "$_AS_PRODUCT_RED" "$_AS_NC" "$_AS_NC_GAP" "$_AS_NC_GUARD" "$_AS_PASS" "$_AS_DRILL" >&2
+    # M1: an APPENDED line, deliberately NOT part of the DRILL-VERDICT grammar (three parsers pin that
+    # line and a sixth field would break all of them). Emitted only when a record was actually written,
+    # so an unwritable evidence dir leaves the drill's output byte-identical to the pre-M1 form.
+    if [ "${_AS_FIRST_FAIL_ORD:-0}" != 0 ] && [ -s "$(_as_ev_file)" ]; then
+        printf 'DRILL-EVIDENCE file=%s first_fail_ord=%s\n' "$(_as_ev_file)" "$_AS_FIRST_FAIL_ORD" >&2
+    fi
+    # M3: how much of this drill was spent waiting on the cluster, as opposed to doing anything. Also an
+    # appended line, for the same reason as DRILL-EVIDENCE: the DRILL-VERDICT grammar is parsed in three
+    # places and must not grow fields.
+    if command -v poll_wait_total >/dev/null 2>&1; then
+        # "direct" because it covers only top-level poll_until calls, not those nested inside an assert
+        # predicate's subshell (see poll_wait_total's LIMIT note). Naming it honestly stops a later phase
+        # from tuning against it as if it were the complete wait budget.
+        printf 'DRILL-POLL-WAIT direct_total=%ss\n' "$(poll_wait_total)" >&2
+    fi
     if [ "$_de_v" = GREEN ]; then ok "=== $_AS_DRILL: GREEN ($_AS_PASS assertions, 0 gaps) ==="
     else err "=== $_AS_DRILL: $_de_v (pass=$_AS_PASS product-red=$_AS_PRODUCT_RED setup-red=$_AS_SETUP assert-fail=$_AS_FAIL not-covered=$_AS_NC [gap=$_AS_NC_GAP guard=$_AS_NC_GUARD]) ==="; fi
     return "$_de_rc"
