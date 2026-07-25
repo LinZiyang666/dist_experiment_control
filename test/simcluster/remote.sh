@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# remote.sh — WSL-side driver: build the static tether binary + stage vendor binaries, rsync the
+# remote.sh — external-driver script: build the static tether binary + stage vendor binaries, rsync the
 # whole test/simcluster/ tree to the Ubuntu sim server, then run `simcluster` there over ssh.
-# The server has no Go toolchain, so the tether/nats/nk binaries are all produced on WSL (amd64,
+# Use this only when you are NOT on weilandserver (on the server itself call ./simcluster directly).
+# The tether/nats/nk binaries are produced on the driver box (amd64,
 # matching the server) and shipped. NOT a Makefile target (keeps sim-* off the release-gate build).
 #
 # Usage: ./remote.sh [--build] <simcluster subcommand + args...>
@@ -14,57 +15,29 @@ REMOTE_DIR="${SIM_REMOTE_DIR:-/home/weiland/dist_experiment_control/test/simclus
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
-# M10: single-source the nats-server pin from the REAL installer (never a hardcoded literal that can
-# silently drift from what the fleet runs — the tool's whole justification).
-NATS_VERSION="v$(grep -oE 'NATS_SERVER_VERSION[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' "$repo/scripts/install.sh" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-[ "$NATS_VERSION" != "v" ] || { echo "[remote] could not read NATS_SERVER_VERSION from install.sh" >&2; exit 1; }
-vendor="$here/vendor"
+# M10: the nats-server pin is single-sourced from the REAL installer (never a hardcoded literal that
+# can silently drift from what the fleet runs). That logic — and the whole vendor build — lives in
+# lib/stage.sh so this driver and local.sh cannot diverge.
+export SIM_REPO="$repo"
+export SIM_VENDOR="$here/vendor"
+export SIM_TAG="remote"
+# shellcheck source=lib/stage.sh
+. "$here/lib/stage.sh"
+vendor="$SIM_VENDOR"
 mkdir -p "$vendor"
+
+# On the sim host itself this driver would rsync the machine onto itself and ssh into localhost —
+# pointless and confusing. Point the operator at the on-host driver instead.
+if sim_is_sim_host && [ "${SIM_ALLOW_SELF_RSYNC:-0}" != "1" ]; then
+    echo "[remote] this machine IS the sim host — use ./local.sh ${*:-status} instead" >&2
+    echo "[remote] (override with SIM_ALLOW_SELF_RSYNC=1 if you really mean to rsync onto self)" >&2
+    exit 2
+fi
 
 do_build=0
 if [ "${1:-}" = "--build" ]; then do_build=1; shift; fi
 
-stage_binaries() {
-    echo "[remote] building static tether (CGO_ENABLED=0 amd64)…"
-    ( cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build VERSION="${SIM_VERSION:-v0.0.0-simcluster}" )
-    cp "$repo/bin/tether" "$vendor/tether"
-
-    # S5 / s3-s5-plan §1.E: a SECOND build with ONLY the version string bumped → vendor/tether-next, the
-    # staged "new" binary drills 30/31 upgrade to. SAME source / proto / commandVersion / schema (g5
-    # rolling-safety hard precondition — a real proto/command delta is an incompatible reinstall, not a
-    # rolling upgrade). artifact.sh serves it with a host-computed SHA256SUMS; 30 stages it per-host, 31
-    # serves it as the self-hosted mirror the agent allow-list (#28) refuses. Version-string-only delta is
-    # enough to drive `node ls --brokers` skew, whole-host readback, and PID-preserving re-exec.
-    echo "[remote] building tether-next (VERSION=${SIM_VERSION_NEXT:-v0.0.0-simcluster-next}, same source)…"
-    ( cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 make build VERSION="${SIM_VERSION_NEXT:-v0.0.0-simcluster-next}" )
-    cp "$repo/bin/tether" "$vendor/tether-next"
-
-    # nats-server pinned to the production install.sh version (NOT go.mod's embedded newer one).
-    if [ ! -x "$vendor/nats-server" ] || ! "$vendor/nats-server" --version 2>/dev/null | grep -q "${NATS_VERSION#v}"; then
-        echo "[remote] fetching nats-server $NATS_VERSION…"
-        tmp="$(mktemp -d)"
-        curl -fsSL -o "$tmp/n.tgz" \
-          "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
-        tar xzf "$tmp/n.tgz" -C "$tmp"
-        cp "$tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" "$vendor/nats-server"
-        rm -rf "$tmp"
-    fi
-
-    # nats + nk CLIs (host build == amd64 == server). Cached.
-    if [ ! -x "$vendor/nats" ]; then
-        echo "[remote] go install nats CLI…"
-        GOBIN="$vendor" go install github.com/nats-io/natscli/nats@latest
-    fi
-    if [ ! -x "$vendor/nk" ]; then
-        echo "[remote] go install nk…"
-        GOBIN="$vendor" go install github.com/nats-io/nkeys/nk@latest
-    fi
-
-    cp "$repo/scripts/install.sh" "$vendor/install.sh"
-    echo "[remote] vendor staged: $(cd "$vendor" && ls -1 | tr '\n' ' ')"
-}
-
-if [ "$do_build" = "1" ]; then stage_binaries; fi
+if [ "$do_build" = "1" ]; then sim_stage_binaries; fi
 [ -x "$vendor/tether" ] || { echo "[remote] no vendor/tether — run with --build first" >&2; exit 1; }
 
 # Every ssh here carries the same keepalive trio. WHY: a whole-suite `drill-all` holds one ssh open for

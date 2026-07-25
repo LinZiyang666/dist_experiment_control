@@ -51,15 +51,21 @@ It is bound by the following, without exception:
 
 ## Architecture
 
-Two layers — a **driver on your WSL dev box** and a **brain on the sim server** — because the server has
-no Go toolchain and WSL's docker+systemd is awkward:
+**The primary home is `weilandserver` itself** — it is both the main development box and the sim host,
+so the normal path is to work in the checkout on that machine and drive `./simcluster` directly. Check
+where you are first: `hostname` is `weilandserver` (note `/etc/hostname` says `weiland_server`), or
+`hostname -I` contains `192.168.1.150`.
+
+`remote.sh` remains for the *optional* case of driving from a different box (build elsewhere, rsync in,
+ssh-run). On `weilandserver` itself, skip it — it would rsync the machine onto itself.
 
 ```
-  WSL dev box                          dedicated Ubuntu server
-  -----------                          -----------------------
-  remote.sh  ──build tether────────>   docker build the image
-             ──stage vendor/ + rsync>  (nats-server / nats / nk / install.sh)
-             ──ssh: run simcluster──>   simcluster orchestrates N containers.
+  on weilandserver (normal)            from another box (optional, remote.sh)
+  -------------------------            --------------------------------------
+  ./simcluster <verb>  ────────────>   build tether ──> stage vendor/ ──> rsync
+                                       ──ssh: run simcluster on the server──>
+
+     simcluster orchestrates N containers.
 
      each container = one node (brk1, brk2, brk3, agt1, ctl1, …) on a docker
      bridge where container-name == hostname == node_id:
@@ -86,7 +92,9 @@ no Go toolchain and WSL's docker+systemd is awkward:
 
 | File | Runs where | Job |
 |---|---|---|
-| `remote.sh` | **your WSL** | The driver you actually type. Compiles `tether` + stages `vendor/` binaries (server has no Go) + rsyncs the tree + ssh-runs `simcluster` on the server. |
+| `local.sh` | **`weilandserver` (normal)** | The on-host driver. Same vendor staging as `remote.sh`, minus rsync/ssh — builds in place and execs `./simcluster`. Refuses to run off-host (escape hatch: `SIM_ALLOW_ANY_HOST=1`). |
+| `lib/stage.sh` | both drivers | Shared vendor staging (tether + tether-next + pinned `nats-server` + `nats`/`nk` + `install.sh`) and the `sim_is_sim_host` probe, so the two drivers cannot drift. |
+| `remote.sh` | **an external driver box (optional)** | Only needed when you are *not* on `weilandserver`. Compiles `tether` + stages `vendor/` binaries + rsyncs the tree + ssh-runs `simcluster` on the server. On the server itself, call `./simcluster` directly. |
 | `simcluster` | server | The brain: ~19 verbs. Orchestrates docker + in-container `systemctl` + the real `tether` CLI. |
 | `lib/log.sh` | server | logging + `poll_until` (wait-for-condition, never a fixed sleep) |
 | `lib/docker.sh` | server | docker primitives (`dexec`, `ctr_name`, `run_node`, hostname addressing) |
@@ -107,15 +115,18 @@ re-run `remote.sh`. The baked files (`Dockerfile`, `image/*`, the vendored binar
 
 ## Server
 
-Runs on a dedicated Ubuntu host (see `docs/devices-ops.local.md §6` for the credentials). Requirements:
-Linux with cgroup v2 + Docker (systemd-in-docker needs `--privileged --cgroupns=host`). The `tether`,
-`nats-server` (pinned to the `install.sh` version), `nats`, and `nk` binaries are built/staged on the WSL
-dev box (the server has no Go) and rsync'd over; see `remote.sh`.
+Runs on `weilandserver`, the main development box (see `docs/devices-ops.local.md §6`). Requirements:
+Linux with cgroup v2 + Docker (systemd-in-docker needs `--privileged --cgroupns=host`), plus a Go
+toolchain to build `tether` in place. The `nats-server` (pinned to the `install.sh` version), `nats`
+and `nk` binaries live in `vendor/` and are staged by `./simcluster build`. When driving from an
+external box instead, `remote.sh` builds and rsyncs them over.
 
 ## Quickstart
 
 ```sh
-# from the WSL dev box (builds tether + stages vendor binaries + rsyncs the tree + runs on the server):
+# On weilandserver:      ./local.sh  [--build] <verb>     (builds in place, no rsync/ssh)
+# From another box:      ./remote.sh [--build] <verb>     (builds + rsyncs + ssh, shown below)
+# The two take identical verbs; each refuses to run in the other's situation.
 ./remote.sh --build build                       # build the tether-sim image (once, or after a code change)
 ./remote.sh up --brokers 3 --agents 1 --ctl 1   # boot + provision (does not cluster)
 ./remote.sh init brk1                            # standalone → N=1 cluster
@@ -134,7 +145,8 @@ the server after an rsync; edit files locally and re-run. Baked files (`Dockerfi
 
 ## Walkthrough (what each step does + how to debug)
 
-The Quickstart, explained. Everything is typed on your WSL box; `remote.sh` ships it to the server.
+The Quickstart, explained. On `weilandserver` these are `./simcluster <verb>`; from an external box
+`remote.sh` wraps each one with a build + rsync first.
 
 1. `remote.sh --build build` — compile `tether`, fetch/cache `nats-server` (pinned to install.sh's
    version), stage `vendor/`, rsync the tree, and `docker build` the image on the server. Run once, and

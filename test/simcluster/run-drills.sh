@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-drills.sh — run the WHOLE simcluster drill suite in parallel. Runs ON THE SIM SERVER (needs
-# docker + ./simcluster). Drive it from the WSL box with `./remote.sh drill-all [opts]`, or run it
+# docker + ./simcluster). On weilandserver run it directly; from an external box use `./remote.sh drill-all [opts]`, or run it
 # directly on the server from test/simcluster/.
 #
 # WHY THE SUITE WOULDN'T PARALLELIZE (root cause, established 2026-07-09)
@@ -25,7 +25,7 @@
 #   if it can), then runs everything concurrently. -j / --stagger remain available for small hosts, and a
 #   post-pass re-runs any residual infra flake.
 #
-# USAGE (from test/simcluster/ on the server, or `./remote.sh drill-all …` from WSL)
+# USAGE (from test/simcluster/ on the server, or `./remote.sh drill-all …` from an external driver box)
 #   ./run-drills.sh                          # ALL drills, full parallelism (preflight guards inotify)
 #   ./run-drills.sh -j 3                      # cap at 3 concurrent drills (smaller host)
 #   ./run-drills.sh --stagger 15             # 15s between launches (default 0 — not needed post-fix)
@@ -355,7 +355,7 @@ if [ -t 1 ]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[
 
 # Every drill is bounded by --drill-timeout. WHY: a drill that wedges (an unbounded poll_until is the
 # usual way) used to hang the WHOLE sweep — `wait` never returns, the summary is never printed, and the
-# ssh driver on WSL just sits there looking dead. `timeout` turns that unbounded hang into a bounded,
+# ssh driver on the external box just sits there looking dead. `timeout` turns that unbounded hang into a bounded,
 # self-explaining INFRA-ABORT. `-k 30` matters as much as the ceiling itself: without it a child that
 # ignores TERM would re-introduce exactly the hang we are trying to kill.
 # The elapsed check exists because `-k` changes the reported status: a TERM-ignoring drill is SIGKILLed

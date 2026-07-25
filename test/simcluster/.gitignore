@@ -1,4 +1,4 @@
-# Baked binaries + install.sh are rsync'd from the WSL dev box at build time, never committed.
+# Baked binaries + install.sh are staged into vendor/ at build time, never committed.
 vendor/
 # Minted secrets trees (per-node CA/route/tunnel/nkeys) — never commit private keys.
 secrets/

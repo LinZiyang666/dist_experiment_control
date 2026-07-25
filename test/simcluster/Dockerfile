@@ -2,7 +2,7 @@
 # Real systemd (PID1) + real sshd + real out-of-process nats-server + the real tether binary,
 # so the sim exercises the cross-process / on-disk / nats.conf-drift / install-path bug class
 # the hermetic Go suites cannot reach. Build context = test/simcluster/. Binaries + install.sh
-# are rsync'd into vendor/ from the WSL dev box (server has no Go); see remote.sh.
+# live in vendor/ (staged by ./simcluster build on the server, or rsync'd in by remote.sh).
 #
 # Confirmed run flags (server PID1 smoke, 2026-07-04): --privileged --cgroupns=host
 #   -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock --stop-signal SIGRTMIN+3
@@ -46,7 +46,7 @@ RUN mkdir -p /run/sshd \
     && echo 'sim:sim' | chpasswd \
     && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Baked binaries (rsync'd into vendor/ from WSL): production-pinned nats-server v2.10.22 (NOT go.mod's
+# Baked binaries (from vendor/): production-pinned nats-server v2.10.22 (NOT go.mod's
 # embedded v2.14.0 — running what the fleet runs is the tool's justification), the tether binary, and
 # the nats/nk CLIs. install.sh is the REAL production installer (reused, never forked).
 COPY vendor/tether       /usr/local/bin/tether
