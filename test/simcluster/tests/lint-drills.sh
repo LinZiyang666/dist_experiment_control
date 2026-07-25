@@ -37,7 +37,7 @@ ALL=0; [ "${1:-}" = --all ] && ALL=1
 # longer violates is itself a hard failure (a stale carve-out is how allowlists rot into waivers).
 #
 # The ONLY current entries are `bare-not-covered`: converting those 24 `warn "…NOT-COVERED"` notes into
-# real not_covered() calls IS batch R2 (docs/allgreen-remediation-roadmap.md §4). Fixing them here would
+# real not_covered() calls IS batch R2 (docs/reviews/allgreen-remediation-roadmap.md §4). Fixing them here would
 # merge R2 into R1 and skip R2's requirement that every newly-red cell be pre-enumerated with an owner.
 PENDING=""   # R2 emptied it: all 24 bare-not-covered sites are now real not_covered() calls.
 

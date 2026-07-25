@@ -123,7 +123,7 @@ outcomes as an initial-delivery/replication race unless stronger evidence rules 
 
 ### R2-M5 — drill 72 does not test the mandated in-flight revoke semantics or port reclamation (Major)
 
-The roadmap (`docs/simcluster-coverage-roadmap.md:399-401`) and locked plan
+The roadmap (`docs/reviews/simcluster-coverage-roadmap.md:399-401`) and locked plan
 (`docs/reviews/s3-s5-plan.md:173-185`) require two persistent streams: revoke must force-close alice's
 already-established stream while bob's established stream continues, separately deny alice's cached-PSK new
 connection, and OFF must reclaim `__proxy__` ports.

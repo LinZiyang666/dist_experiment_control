@@ -1,7 +1,7 @@
 # Fail — allgreen / simcluster 整治工程（R1–R15）外部审查
 
 > 审查者：claude（外部审查者，与主进程无关）。范围：**暂存区全部文件**（`git diff --cached`，177 文件 / +22005/-1104）。
-> 输入索引（**不信任其结论**）：`docs/allgreen-remediation-roadmap.md`、`docs/reviews/r{1,2,6,15}-*.md`、`expected-verdicts.tsv`、`simcluster-full-suite-run-2026-07-18*.md`。
+> 输入索引（**不信任其结论**）：`docs/reviews/allgreen-remediation-roadmap.md`、`docs/reviews/r{1,2,6,15}-*.md`、`expected-verdicts.tsv`、`simcluster-full-suite-run-2026-07-18*.md`。
 > 方法：多专家对抗性并行审查（10 lane，均 ≥ Opus 4.8）→ 主审对每条高危 finding **逐行代码复核 / 本地实测 / deploy-tier live 复跑**独立坐实。
 > `codex` 前缀报告与未跟踪测试文件按用户指示忽略（仅记录其对硬闸的影响，见 §4）。
 >

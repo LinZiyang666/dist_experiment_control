@@ -2,7 +2,7 @@
 
 Date: 2026-07-10
 
-Review target: `docs/simcluster-coverage-roadmap.md` (rev2)
+Review target: `docs/reviews/simcluster-coverage-roadmap.md` (rev2)
 
 Review role: independent external reviewer. `simcluster-coverage-roadmap-review.md` was used only as
 an index of claims; none of its conclusions were accepted without re-reading the roadmap, governing

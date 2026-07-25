@@ -1,6 +1,6 @@
 # 模拟集群测试补完 — 总纲 Roadmap（S1–S9）
 
-Date: 2026-07-10（rev7；本文件后移至 `docs/`，审查史/清单附录仍在 `docs/reviews/`）。修订史：
+Date: 2026-07-10（rev7；本文件与审查史/清单附录同在 `docs/reviews/`）。修订史：
 rev2 = 61 条内审 findings 裁决（`docs/reviews/simcluster-coverage-roadmap-review.md`）；
 rev3/rev4/rev5 = 外审 round1（11 findings + 4 doubts）/round2（8 findings + 3 questions）/round3
 （2 Major + 1 Minor）/round4（1 Major + 2 Minor）逐轮全采纳，逐条回复见各轮

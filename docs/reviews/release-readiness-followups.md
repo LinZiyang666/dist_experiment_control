@@ -2,7 +2,7 @@
 
 > 日期：2026-07-21 · 当前 main HEAD：`55b1451`（"fix(cluster): close external-review release blockers + simcluster all-green remediation"，已 push）
 > 用途：新 session 接手用。本文件自包含——记录**已达标的部分**、**发布就绪的分层判定**、**发版前需你决策/我来做的事**、以及**逐项 follow-up 技术债**（含文件位置、严重度、外审 finding 号、怎么做）。
-> 关联真相源：外审报告 `docs/reviews/{claude,codex}-allgreen-external-review.md`（含一/二/三轮 + 逐条举证回复）；remediation 总纲 `docs/allgreen-remediation-roadmap.md`。
+> 关联真相源：外审报告 `docs/reviews/{claude,codex}-allgreen-external-review.md`（含一/二/三轮 + 逐条举证回复）；remediation 总纲 `docs/reviews/allgreen-remediation-roadmap.md`。
 
 ---
 
@@ -124,7 +124,7 @@
 - **外审报告**（含一/二/三轮 + 逐条举证回复、顶部最新结论指引）：
   - `docs/reviews/claude-allgreen-external-review.md`
   - `docs/reviews/codex-allgreen-external-review.md`
-- **remediation 总纲**：`docs/allgreen-remediation-roadmap.md`
+- **remediation 总纲**：`docs/reviews/allgreen-remediation-roadmap.md`
 - **本次 commit**：`55b1451`（189 files，作者 LinZiyang666、无 AI 署名）
 - **本批新增的关键回归测试**（防未来 revert）：
   - `internal/broker/r8_home_delivery_test.go`：`TestPendingRetireConvergenceIsDurable`（CRIT-1 durable）、`TestRetireRehomeHoldIsBoundedToBlocked`（bound→BLOCKED + F2 confirm 重窗）、`TestHomeDeliveryConvergesEveryPortOfAMultiExposeAgent`（多-port 收敛）、`TestHomeAckPerDirectiveTokenRejectsSiblingForgery`（SR-8 跨-session 伪造被拒，变异实证）、`TestPendingRetireConvergenceRecencyWindow`（F3 固定 origin 不龄出 vs 滑动窗 fail-open 对比）、`TestDrainConsultsTheDurableConvergenceGate` + `TestRetireConsultsTheConvergenceGate`（drain/retire 双 source-pin）

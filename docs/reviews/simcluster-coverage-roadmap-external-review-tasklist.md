@@ -1,7 +1,7 @@
 # Simcluster Coverage Roadmap External Review Tasklist
 
 Scope: external review of the current unstaged/untracked roadmap stage. The product artifact under
-review is `docs/simcluster-coverage-roadmap.md`; the internal review is an index of claims,
+review is `docs/reviews/simcluster-coverage-roadmap.md`; the internal review is an index of claims,
 not trusted evidence. This is a roadmap-only stage: review may add review artifacts and run
 independent checks, but must not implement S1-S9 or product fixes.
 

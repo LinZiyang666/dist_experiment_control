@@ -1,6 +1,6 @@
 # R2 plan — 记账诚实化（定稿）
 
-Date: 2026-07-19 · 总纲：`docs/allgreen-remediation-roadmap.md` §4-R2 · 前置：R1 已收口
+Date: 2026-07-19 · 总纲：`docs/reviews/allgreen-remediation-roadmap.md` §4-R2 · 前置：R1 已收口
 基线：`test/simcluster/expected-verdicts.tsv`（24 稳定 GREEN / 9 稳定非绿 / 4 不稳定）
 
 > **本批是全工程唯一被允许扩大红区的批。** 代价是：**扩大的每一格必须在实现前逐格枚举**，

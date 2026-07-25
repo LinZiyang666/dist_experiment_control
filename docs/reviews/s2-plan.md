@@ -1,7 +1,7 @@
 # S2 Plan — session · 多租户安全 · admin · agent onboarding（C1/C2）
 
 Date: 2026-07-11. Batch: **S2**（S 系列第二批）. Flow: CLAUDE.md §3（3 阶段 7 步）.
-Status: **主进程定稿**（Stage A step 2）. Roadmap 总纲：`docs/simcluster-coverage-roadmap.md` §3-S2；
+Status: **主进程定稿**（Stage A step 2）. Roadmap 总纲：`docs/reviews/simcluster-coverage-roadmap.md` §3-S2；
 无遗漏闸清单：`docs/reviews/simcluster-coverage-inventory.md`；质量尺模板：`docs/reviews/s1-plan.md`.
 
 > 草拟法：本 plan 由 Stage A 对抗草拟工作流（5 drafter〔80/81/82/S0-隧道/S0-ingress〕→ 5 对抗 critic

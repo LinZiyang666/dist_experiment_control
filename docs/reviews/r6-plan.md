@@ -1,6 +1,6 @@
 # R6 plan — 定案实验批（定稿）
 
-Date: 2026-07-19 · 总纲：`docs/allgreen-remediation-roadmap.md` §4-R6 · 前置：R5
+Date: 2026-07-19 · 总纲：`docs/reviews/allgreen-remediation-roadmap.md` §4-R6 · 前置：R5
 **本批铁律：只取证，不改实现。** 出口硬断言 `git diff --stat internal/ cmd/ scripts/` 为空
 （唯一例外：纯观测的日志补强，须论证不改变任何控制流，且走独立提交、ledger 比对在观测改动之前的构建上做）。
 

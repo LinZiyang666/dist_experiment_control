@@ -1,7 +1,7 @@
 # S1 Plan — 用户平面核心旅程（+ S 系列工艺底座）
 
 Date: 2026-07-10. Batch: **S1**（S 系列首开批）. Flow: CLAUDE.md §3（3 阶段 7 步）.
-Status: **主进程定稿**（Stage A step 2）. Roadmap 总纲：`docs/simcluster-coverage-roadmap.md` §3-S1；
+Status: **主进程定稿**（Stage A step 2）. Roadmap 总纲：`docs/reviews/simcluster-coverage-roadmap.md` §3-S1；
 无遗漏闸清单：`docs/reviews/simcluster-coverage-inventory.md`.
 
 > 草拟法：本 plan 由 Stage A 对抗草拟工作流（4 视角 drafter → 4 对抗 critic → 1 synth，全部

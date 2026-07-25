@@ -4,7 +4,7 @@
 
 Reviewer role: external reviewer. Scope:
 `docs/distributed-broker-architecture.md`（暂存区外、未跟踪文件），并对照
-`docs/distributed-broker-requirements.md` 与既有三轮内审报告
+`docs/reviews/distributed-broker-requirements.md` 与既有三轮内审报告
 `docs/reviews/dist-broker-arch-review*.md`。
 
 本轮不重新展开三轮内审已收口的问题；重点审查这份文档是否已经可以作为
@@ -108,7 +108,7 @@ ctl/NATS 视图 vs broker 本机 offline 视图，并分别定义数据源、退
 - `docs/distributed-broker-architecture.md:355`
 
 这会直接生成错误 migration 和错误 CLI/API。并且需求文档原本要求 ack 按身份生效
-（`docs/distributed-broker-requirements.md:180`）；如果架构决定降级为集群级 ack，
+（`docs/reviews/distributed-broker-requirements.md:180`）；如果架构决定降级为集群级 ack，
 必须在 §16 偏离登记里显式列出。
 
 ### F6 - Medium: “实现精度残留”里仍包含必须先定的架构契约
@@ -140,7 +140,7 @@ catch-up 安全与快照语义。若外审要签“架构已 settled”，这些
 
 ```text
 docs/distributed-broker-architecture.md
-docs/distributed-broker-requirements.md
+docs/reviews/distributed-broker-requirements.md
 docs/reviews/dist-broker-arch-review.md
 docs/reviews/dist-broker-arch-review-round2.md
 docs/reviews/dist-broker-arch-review-round3.md

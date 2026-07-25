@@ -339,7 +339,7 @@ Two disjoint halves. The `lib/assert.sh` half (`:51-149`) drives the real produc
 ### S5-22 · MODERATE · Gotcha-ledger integrity — REDs fired against unregistered numbers, signature-free attributions, and missing pins
 *(lane: mandate-ssot R1-2, R1-3, R1-4, R1-7, R1-8, R1-9, R1-10 — merged; all CONFIRMED, most DOWNGRADEd to MODERATE by their verifiers)*
 
-`docs/deploy-tier-gotchas.md:14` mandates the template *"每条模板：现象 / 机理(file:line) / 怎么自动化或修 / 钉住它的 drill + 签名"*, and `docs/simcluster-coverage-roadmap.md:49-51` §0.2 mandates "登记 gotcha（#25+）→ 用 assert_bug 签名钉成 RED". Seven live violations:
+`docs/deploy-tier-gotchas.md:14` mandates the template *"每条模板：现象 / 机理(file:line) / 怎么自动化或修 / 钉住它的 drill + 签名"*, and `docs/reviews/simcluster-coverage-roadmap.md:49-51` §0.2 mandates "登记 gotcha（#25+）→ 用 assert_bug 签名钉成 RED". Seven live violations:
 
 | # | Site | Defect |
 |---|---|---|

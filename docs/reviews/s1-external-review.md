@@ -43,7 +43,7 @@ snapshot 语义，则应删除“re-login 取最新快照”的错误 coverage �
 
 ### MAJOR-3 — 强制内审留档缺失，S1 的 Stage C 审计链不可复核
 
-`CLAUDE.md:36-38` 和 roadmap `docs/simcluster-coverage-roadmap.md:14-15` 要求实现后先做对抗内审、形成
+`CLAUDE.md:36-38` 和 roadmap `docs/reviews/simcluster-coverage-roadmap.md:14-15` 要求实现后先做对抗内审、形成
 `docs/reviews/s<N>-review.md`，再进入外审。当前 `docs/reviews/` 只有 `s1-plan.md`，没有 `s1-review.md` 或任何
 round 报告；但 plan、README、inventory 和实现注释已经引用 `S1-02`、`S1-04`、`S1-08`、`S1-12` 等“内审
 订正”。外部审查无法知道完整 finding 集、主进程逐条采纳/驳回裁决、哪些新增测试来自内审，也无法验证
@@ -55,7 +55,7 @@ Workflow 模型/数量约束。
 ### MINOR-1 — roadmap 的 S0 状态 SSOT 与已落地文件直接矛盾
 
 roadmap 明文规定 S0 项“落地后在本表状态列登记，后续批据此判定已就绪”
-（`docs/simcluster-coverage-roadmap.md:194-199`），但同文件 `:209-210` 仍把 S0-pty 标为“未落地”、把
+（`docs/reviews/simcluster-coverage-roadmap.md:194-199`），但同文件 `:209-210` 仍把 S0-pty 标为“未落地”、把
 S0-台账除旧 inventory 外标为“其余未落地”；文件头 `:11` 仍称整个 roadmap“未开工”。与此同时本次已经
 提交 `pty-run.py`、gotcha ledger、README 重构、永久 command-tree gate，并在 inventory 写成 landing。
 这会让 S9 或下一首开判断重复实现/错误依赖。应更新 S0 两行（含落地批与待填 commit），并把总体状态改成
@@ -181,7 +181,7 @@ source SHA-256` PASS；`E4c recover round-trip sha256 == source` PASS。61 GREEN
 
 ## MINOR-1 — roadmap S0 状态矛盾 → 采纳
 
-**采纳。** `docs/simcluster-coverage-roadmap.md`：文件头 Status 改「S1 已落地（外审整改中，commit 待填）、S2–S9
+**采纳。** `docs/reviews/simcluster-coverage-roadmap.md`：文件头 Status 改「S1 已落地（外审整改中，commit 待填）、S2–S9
 未开工」；**S0-pty** 状态列 → 已落地（S1；`image/pty-run.py` 烘焙进镜像；commit 待填）；**S0-台账** 状态列 →
 已落地（S1；gotcha ledger + README 编号族/drill 表重构 + 提交入仓命令树 golden gate；commit 待填）。
 

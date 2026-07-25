@@ -1,6 +1,6 @@
 # R1 plan — 仪器地基（定稿）
 
-Date: 2026-07-18 · 总纲：`docs/allgreen-remediation-roadmap.md` §4-R1 + §3 仪器契约
+Date: 2026-07-18 · 总纲：`docs/reviews/allgreen-remediation-roadmap.md` §4-R1 + §3 仪器契约
 对抗草拟来源：`docs/reviews/allgreen-roadmap-synthesis.md`（4 视角 + 4 对抗评审 + 综合，主进程定稿）
 
 > **本批铁律：零产品逻辑改动。** 出口硬断言 `git diff --stat internal/ cmd/ scripts/` 为空。

@@ -1,7 +1,7 @@
 # S6–S8 (G-B) external review tasklist
 
 Scope: independently review every unstaged/untracked change in the S6+S8 deploy-tier batch against
-`CLAUDE.md`, the simcluster Mandate, `docs/simcluster-coverage-roadmap.md`, the architecture/operations
+`CLAUDE.md`, the simcluster Mandate, `docs/reviews/simcluster-coverage-roadmap.md`, the architecture/operations
 contracts and the finalized S6–S8 plan. The internal review is a lead index only, never evidence.
 Review the final worktree, add only independent review tests/artifacts, and stage every file at handoff.
 

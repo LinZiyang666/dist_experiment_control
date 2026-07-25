@@ -87,7 +87,7 @@ INCOMPLETE=rc1、GREEN=rc0；组合优先级和 `_AS_PRODUCT_RED` 的 `drill_beg
 
 - `assert.sh:1-13` 仍写 RED/GREEN harness、已知 bug 命中后“drill stays green”。
 - `test/simcluster/README.md:95` 仍写 bug 会因文档化原因 “passes”。
-- `docs/simcluster-coverage-roadmap.md:853-858` 明确规定已知缺陷运行是整体 harness-GREEN，属于“连绿”。
+- `docs/reviews/simcluster-coverage-roadmap.md:853-858` 明确规定已知缺陷运行是整体 harness-GREEN，属于“连绿”。
 - README drill 表仍把 `31-node-upgrade-fleet` 标为 GREEN。
 
 回复称“是否允许 release 由 owner 决定”，但代码当前无 owner disposition，行为是无条件阻断。PRODUCT-RED
@@ -189,7 +189,7 @@ owner-tracked、不 fail suite**；suite 退出码 = count(ASSERT-FAIL)+count(SE
 
 ### M2（round-3，= round-2 M1，PRODUCT-RED 语义同步）— 采纳，CLOSED
 
-- 库内 PRODUCT-RED/rc3 已实现（本轮确认）；本轮补齐**全套门禁语义同步**：runner 有 PRODUCT-RED 独立分栏 + owner disposition（非 blocking、非「all green」）；`assert.sh` 头注删「reproduced bug drill stays green」、写入五态契约 + owner 策略；`README.md` 删「bug passes」措辞、加五态 verdict legend + owner 表；`docs/simcluster-coverage-roadmap.md` **废止「已知缺陷=harness-GREEN 连绿」纪律**、改五态契约；README drill 表把 `31-node-upgrade-fleet` 从 GREEN 改 **PRODUCT-RED**（其 assert_bug 复现 #28）。
+- 库内 PRODUCT-RED/rc3 已实现（本轮确认）；本轮补齐**全套门禁语义同步**：runner 有 PRODUCT-RED 独立分栏 + owner disposition（非 blocking、非「all green」）；`assert.sh` 头注删「reproduced bug drill stays green」、写入五态契约 + owner 策略；`README.md` 删「bug passes」措辞、加五态 verdict legend + owner 表；`docs/reviews/simcluster-coverage-roadmap.md` **废止「已知缺陷=harness-GREEN 连绿」纪律**、改五态契约；README drill 表把 `31-node-upgrade-fleet` 从 GREEN 改 **PRODUCT-RED**（其 assert_bug 复现 #28）。
 
 ### m1（round-3，五 verdict 名 vs「四态」）— 采纳，CLOSED
 
