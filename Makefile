@@ -36,11 +36,25 @@ test:
 e2e:
 	go test -count=1 -tags e2e_matrix -timeout 20m -v ./test/e2e/...
 
+# The version is enforced, not just recorded. golangci-lint bundles its own
+# staticcheck, so a different version silently changes WHICH checks run: 2.12
+# added SA1019 for parser.ParseDir (deprecated in Go 1.25) and reports an issue
+# on code that 2.5.0 passes. Without this gate, `make lint` is green on one
+# machine and red on another with the same commit, and whoever has the newer
+# binary ends up "fixing" code to satisfy a check the repo never adopted.
+# Fail closed and point at `make tools`, which installs exactly $(GOLANGCI_VERSION).
 lint:
 	@GOPATH_BIN="$$(go env GOPATH)/bin/golangci-lint"; \
 	  if [ -x "$$GOPATH_BIN" ]; then LINT="$$GOPATH_BIN"; \
 	  else LINT="$$(command -v golangci-lint 2>/dev/null)"; fi; \
 	  test -n "$$LINT" && test -x "$$LINT" || { echo "error: golangci-lint not found. Run: make tools"; exit 1; }; \
+	  WANT="$$(printf '%s' '$(GOLANGCI_VERSION)' | sed 's/^v//')"; \
+	  HAVE="$$("$$LINT" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"; \
+	  if [ "$$HAVE" != "$$WANT" ]; then \
+	    echo "error: golangci-lint $$HAVE found at $$LINT, but this repo pins $$WANT."; \
+	    echo "       Lint results are not comparable across versions. Run: make tools"; \
+	    exit 1; \
+	  fi; \
 	  "$$LINT" run
 
 # Build golangci-lint from source with the LOCAL Go toolchain (Go 1.25) via the
