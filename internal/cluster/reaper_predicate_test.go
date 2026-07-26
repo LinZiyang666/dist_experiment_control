@@ -26,9 +26,9 @@ func TestCaughtUpRequiresFirstLeaderSync(t *testing.T) {
 		Transport:          trans,
 		Logger:             quietLogger(),
 		ApplyTimeout:       30 * time.Second,
-		HeartbeatTimeout:   50 * time.Millisecond,
-		ElectionTimeout:    50 * time.Millisecond,
-		LeaderLeaseTimeout: 25 * time.Millisecond,
+		HeartbeatTimeout:   MultinodeHeartbeatTimeout,
+		ElectionTimeout:    MultinodeElectionTimeout,
+		LeaderLeaseTimeout: MultinodeLeaderLeaseTimeout,
 		BootstrapPeers: []raft.Server{
 			{Suffrage: raft.Voter, ID: "solo-of-two", Address: "solo-of-two"},
 			{Suffrage: raft.Voter, ID: "phantom-peer", Address: "phantom-unreachable"},

@@ -74,7 +74,7 @@ func freePort(t *testing.T) int {
 }
 
 // startRoutedJS brings up an n-server clustered-JetStream NATS mesh. Under the full
-// `make e2e` suite (now including D9's clustered matrix) the embedded servers occasionally
+// `make e2e-parallel` suite (now including D9's clustered matrix) the embedded servers occasionally
 // fail to become ready / mesh / form the JS meta-group within their windows due to host
 // load — a documented flake (CLAUDE.md §e2e). Rather than chase ever-longer timeouts, it
 // RETRIES the whole bring-up on a fresh port set (a transient startup starvation clears on
@@ -267,8 +267,8 @@ func startCluster5(t *testing.T, n int) *cluster5 {
 		nd, err := cluster.New(cluster.Config{
 			LocalID: raft.ServerID(fmt.Sprintf("d5-%d", i)), DataDir: dir, DBPath: dbPaths[i],
 			Transport: trans[i], BootstrapPeers: peers,
-			HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-			LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+			HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 		})
 		if err != nil {
 			t.Fatalf("node %d: %v", i, err)

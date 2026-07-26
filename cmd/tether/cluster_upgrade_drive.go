@@ -403,23 +403,6 @@ func waitHomesConverged(ctx context.Context, nc *nats.Conn, actor string, seed [
 	}
 }
 
-func pollUntil(ctx context.Context, timeout time.Duration, pred func() bool, timeoutMsg string) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if pred() {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return unavailErr("%s", timeoutMsg)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(upgradeConvergePoll):
-		}
-	}
-}
-
 // notifyUpgrade POSTs a best-effort JSON milestone to the webhook (no-op if empty). Failures are ignored
 // — the roll's correctness never depends on the webhook.
 func notifyUpgrade(webhook, event string, fields map[string]any) {

@@ -118,8 +118,8 @@ func newRaftNode(t *testing.T, ca *routeCA, id, dir string, peers []raft.Server)
 	n, err := cluster.New(cluster.Config{
 		LocalID: raft.ServerID(id), DataDir: dir, DBPath: filepath.Join(dir, "state.db"),
 		Transport: tr, BootstrapPeers: peers,
-		HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-		LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+		HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New %s: %v", id, err)
@@ -192,8 +192,8 @@ func TestD3HandlerRealNodeFenceLive(t *testing.T) {
 		n, err := cluster.New(cluster.Config{
 			LocalID: raft.ServerID(ids[i]), DataDir: dirs[i], DBPath: filepath.Join(dirs[i], "state.db"),
 			Transport: trans[i], BootstrapPeers: peers,
-			HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-			LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+			HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 		})
 		if err != nil {
 			t.Fatalf("New %s: %v", ids[i], err)

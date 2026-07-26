@@ -426,7 +426,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 		default:
 			code = "timeout"
 		}
-		b.emitTerminalTransferAudit(schema.AuditTransfer{
+		b.finalizeTransfer(ent, schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 			Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 			ActorNkey: ent.actor, ActorFp: ent.actorFP,
@@ -434,10 +434,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			Bucket: ent.bucket, DurationMs: msSince(ent.startedAt, b.cfg.Now()),
 			Code:  code,
 			Error: fmt.Sprintf("broker watchdog: no %s finalization within %s", ent.verb, d),
-		}, ent.transferID)
-		_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
-		b.transfers.remove(ent.transferID)
-		// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
+		}, false) // false: the watchdog owns entry.cancel; calling it here is a no-op
 		b.cfg.Logger.Warn("broker: transfer watchdog fired",
 			"transfer_id", ent.transferID, "verb", ent.verb, "tier", ent.tier,
 			"code", code)
@@ -945,16 +942,39 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 	if !claimed || ent == nil {
 		return
 	}
-	b.emitTerminalTransferAudit(schema.AuditTransfer{
+	b.finalizeTransfer(ent, schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 		Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
 		ActorNkey: ent.actor, ActorFp: ent.actorFP,
 		TransferID: ent.transferID, Path: ent.path,
 		Tier: ent.tier, Bucket: ent.bucket,
 		Code: code, Error: errMsg,
-	}, ent.transferID)
+	}, true)
+}
+
+// finalizeTransfer performs the terminal disposal shared by the watchdog and
+// the failure path: emit the terminal audit, delete the staged object, then drop
+// the tracker entry.
+//
+// cancelEntry is EXPLICIT rather than inferred. The watchdog must pass false —
+// it IS the owner of entry.cancel, and calling it there would be a no-op (the
+// only thing that ctx guards is the watchdog's own select, and the object delete
+// on this path deliberately uses context.Background()). Making the difference a
+// named argument is the point: the previous shape had the two paths written out
+// separately, and the ONLY record of why one of them omits cancel() was the
+// absence of a line.
+//
+// Batch-A A10 deliberately does NOT fold in two other sites that look similar:
+//   - transfer.go's rec-building blocks assemble an audit record, they are not
+//     terminal disposal;
+//   - xfer_inflight.go's stranded-transfer recovery must NOT delete the ledger
+//     unless the synthetic terminal was durably COMMITTED (the #57 M1
+//     invariant) — its delete is conditional where these two are unconditional,
+//     so merging them would invert the guarantee.
+func (b *Broker) finalizeTransfer(ent *transferEntry, rec schema.AuditTransfer, cancelEntry bool) {
+	b.emitTerminalTransferAudit(rec, ent.transferID)
 	_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
-	if ent.cancel != nil {
+	if cancelEntry && ent.cancel != nil {
 		ent.cancel()
 	}
 	b.transfers.remove(ent.transferID)
@@ -966,16 +986,29 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 // (used for finalize.req / caps.req which don't carry a nid in their
 // subject). Returns "" on accept, else the response Code.
 func (b *Broker) transferGate(sid, fp, nid string) string {
+	// Batch-A review M13: A2 established that a store_error's SQLite detail
+	// belongs in the broker log rather than on the wire — but the detail was
+	// simply dropped here, so it went NOWHERE. "Only in the log" was a claim
+	// about a log line that did not exist; the operator lost the one string that
+	// says whether the DB is locked, corrupt, or missing a table.
+	logStore := func(op string, err error) string {
+		if b.cfg.Logger != nil {
+			b.cfg.Logger.Warn("broker: transfer gate storage error",
+				"op", op, "sid", sid, "nid", nid, "err", err)
+		}
+		return "store_error"
+	}
+
 	active, err := session.IsActive(b.cfg.DB, sid)
 	if err != nil {
-		return "store_error"
+		return logStore("session.IsActive", err)
 	}
 	if !active {
 		return "session_not_found_or_deleting"
 	}
 	member, err := session.IsMember(b.cfg.DB, sid, fp)
 	if err != nil {
-		return "store_error"
+		return logStore("session.IsMember", err)
 	}
 	if !member {
 		return "not_a_member"
@@ -988,7 +1021,7 @@ func (b *Broker) transferGate(sid, fp, nid string) string {
 		return "node_not_found"
 	}
 	if err != nil {
-		return "store_error"
+		return logStore("node.LookupStatus", err)
 	}
 	if status != node.StateOnline {
 		return "node_offline"
@@ -1045,22 +1078,16 @@ func (b *Broker) handleCapsReq(msg *nats.Msg) {
 		b.replyJSON(msg, proto.CapsResp{Code: "actor_invalid", Error: err.Error()})
 		return
 	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyJSON(msg, proto.CapsResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !active {
-		b.replyJSON(msg, proto.CapsResp{Code: "session_not_found_or_deleting"})
-		return
-	}
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyJSON(msg, proto.CapsResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !member {
-		b.replyJSON(msg, proto.CapsResp{Code: "not_a_member"})
+	// Batch-A A2: this used to inline transferGate's first two checks. The
+	// helper lives 60 lines up and its doc comment already named this handler
+	// ("used for finalize.req / caps.req"), so the copy was pure drift risk.
+	//
+	// The inline copy also put err.Error() — raw SQLite text: db path, table
+	// and constraint names — on the wire to any session member. transferGate
+	// returns the code alone, and that is the behaviour we want: store_error
+	// detail belongs in the broker log, not in a reply to a non-owner.
+	if code := b.transferGate(sid, fp, ""); code != "" {
+		b.replyJSON(msg, proto.CapsResp{Code: code})
 		return
 	}
 

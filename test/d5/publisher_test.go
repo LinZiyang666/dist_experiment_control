@@ -68,7 +68,7 @@ func TestD5PostElectionSweep(t *testing.T) {
 	ni := c.waitLeaderExcept(t, li)
 
 	// The NEW leader sweeps the replicated entry. Under the heavy concurrent -race
-	// load of `make e2e`, the election settle + the JS publish/propagation can exceed
+	// load of `make e2e-parallel`, the election settle + the JS publish/propagation can exceed
 	// a tight single-shot window, so RETRY the (idempotent, dedup-id-keyed → no
 	// double-publish) sweep until the records land or a generous deadline. This is the
 	// same flake class the D5 stream-placement retry already addresses.

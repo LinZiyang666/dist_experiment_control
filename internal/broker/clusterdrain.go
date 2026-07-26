@@ -17,7 +17,8 @@ import (
 // clusterdrain.go — D7 §8.3 drain / retire orchestration (build-and-prove; part of
 // the guard-excluded ClusterAdmin mechanism). Reuses D6 rehome (port.PlanReassignHome)
 // to migrate exposes off the draining node and D5 AllAtTarget (via the injected
-// streamsReady probe) to gate retire.
+// streamsReady probe) to gate retire — that half moved to StartRetireOperation
+// in batch-A A13; what remains here is drain only.
 
 // QuorumProjection is the §8.3 "after this op" fault-tolerance summary shown before
 // a drain/retire. FaultTolerance==0 means the cluster goes read-only on the next
@@ -56,10 +57,6 @@ func (e *ErrQuorumConfirmRequired) Error() string {
 		e.Proj.Voters, e.Proj.Quorum)
 }
 
-// ErrStreamsNotAtTarget refuses a retire while the node still holds stream replicas
-// below target (data not yet redundant elsewhere; §8.3 AllAtTarget guard).
-var ErrStreamsNotAtTarget = errors.New("cluster retire: this node's streams are not yet at target replicas (data not redundant) — refusing retire")
-
 // ErrNoMigrationTarget is returned when exposes are homed on the draining node but no
 // other eligible VOTER exists to receive them.
 var ErrNoMigrationTarget = errors.New("cluster drain: exposes are homed here but no other eligible VOTER exists to migrate them to")
@@ -74,15 +71,40 @@ func (e *ErrLeadershipTransferred) Error() string {
 	return fmt.Sprintf("cluster drain %s: it was the leader — leadership transferred off it; re-run `cluster drain %s` on the new leader", e.NodeID, e.NodeID)
 }
 
-// DrainNode drains (and optionally retires) nodeID (§8.3). streamsReady is the D5
-// AllAtTarget probe (retire only; nil => treated as ready, for the no-JS unit path).
+// DrainNode drains nodeID (§8.3).
+//
+// Batch-A A13 removed the retire half: it did RemoveServer + a roster delete
+// with none of StartRetireOperation's protections. The `retire` parameter is
+// kept so the 8 call sites and the adminsock shape are unchanged, but passing
+// true is now an error naming `tether cluster retire`. streamsReady is likewise
+// vestigial — the D5 AllAtTarget gate it fed lives on the operation path.
 // confirmed is the operator's typed F==0 confirmation.
 //
-// Order: quorum-projection guard -> AllAtTarget (retire) -> raise broker_draining ->
-// migrate exposes (D6 rehome) -> transfer-leader if self is leader -> phase
-// VOTER->DRAINING -> (retire) RETIRING -> RemoveServer -> ClusterNodeRemove -> clear
-// the drain marker. Each step's failure leaves a status-visible stuck phase.
+// Order: quorum-projection guard -> raise broker_draining -> migrate exposes
+// (D6 rehome) -> transfer-leader if self is leader -> phase VOTER->DRAINING.
+// Each step's failure leaves a status-visible stuck phase. The steps that
+// followed (RETIRING -> RemoveServer -> ClusterNodeRemove -> clear marker) are
+// now driven by the retire operation, not from here.
 func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline time.Time, streamsReady func() (bool, error)) error {
+	// Batch-A A13: the synchronous retire is gone.
+	//
+	// It performed RemoveServer plus a roster row delete — an IRREVERSIBLE raft
+	// membership change — with none of the protections StartRetireOperation
+	// has: no opStillLive TOCTOU recheck, no replicable deadline (it carried the
+	// caller's wall clock, so a broker restart lost it), no BLOCKED escape
+	// hatch, no resume. cmd/tether hardcoded Retire:false, so no released CLI
+	// ever reached it, and handleDrain now refuses the field on the socket too —
+	// which left this body reachable only from tests, while still being the most
+	// destructive code path in the package.
+	//
+	// The parameter is kept so the 8 call sites and the adminsock shape stay
+	// unchanged; passing true is now an error that names the supported verb.
+	if retire {
+		return fmt.Errorf("cluster drain %s: --retire is no longer supported here; use `tether cluster retire %s` "+
+			"(the recoverable operation: crash-resumable deadline, BLOCKED escape hatch, TOCTOU-safe membership change)",
+			nodeID, nodeID)
+	}
+	_ = streamsReady // retained for signature compatibility; only the retire path consumed it
 	// C4: refuse a raw drain/retire when an operation already owns this node's membership.
 	if err := a.assertNoActiveOp(nodeID); err != nil {
 		return err
@@ -91,7 +113,7 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	if err != nil {
 		return fmt.Errorf("cluster drain %s: count voters: %w", nodeID, err)
 	}
-	proj := ProjectQuorum(voters, retire)
+	proj := ProjectQuorum(voters, false) // retire is refused above; this is the drain-only projection
 	if retire && proj.Voters < 1 {
 		// Retiring the last/only voter destroys the cluster (unrecoverable except via
 		// force-single). HARD-refuse — no typed confirm bypasses this (review m4).
@@ -121,16 +143,6 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	if err := a.requireClusterNode(nodeID); err != nil {
 		return fmt.Errorf("cluster drain %s: %w", nodeID, err)
 	}
-	if retire && streamsReady != nil {
-		ready, err := streamsReady()
-		if err != nil {
-			return fmt.Errorf("cluster retire %s: stream readiness: %w", nodeID, err)
-		}
-		if !ready {
-			return ErrStreamsNotAtTarget
-		}
-	}
-
 	// 1. raise broker_draining with the deadline (nodeID is a follower; we are leader).
 	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterDrainSet(nodeID, &deadline)
@@ -174,33 +186,6 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	// 3. phase VOTER -> DRAINING (the node still votes; it sheds serving load).
 	if err := a.setPhase(nodeID, phaseDraining, []string{phaseVoter}, ""); err != nil {
 		return fmt.Errorf("cluster drain %s: phase->DRAINING: %w", nodeID, err)
-	}
-	if !retire {
-		return nil
-	}
-
-	// 5. retire: §8.1 removal ORDER — roster RETIRING -> raft RemoveServer -> roster delete.
-	if err := a.setPhase(nodeID, phaseRetiring, []string{phaseDraining}, ""); err != nil {
-		return fmt.Errorf("cluster retire %s: phase->RETIRING: %w", nodeID, err)
-	}
-	if err := a.node.RemoveServer(nodeID); err != nil {
-		return fmt.Errorf("cluster retire %s: raft RemoveServer (roster stuck at RETIRING, status shows next step): %w", nodeID, err)
-	}
-	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterNodeRemove(nodeID, a.now())
-	}); err != nil {
-		return fmt.Errorf("cluster retire %s: roster delete: %w", nodeID, err)
-	}
-	// Clear the drain marker (the node is gone).
-	if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterDrainSet(nodeID, nil)
-	}); err != nil {
-		a.logger.Warn("cluster retire: clear broker_draining marker failed", "node_id", nodeID, "err", err)
-	}
-	// G3 #1: the retired node's roster row is DELETEd (PlanClusterNodeRemove above), so converge the
-	// published seeds to drop its now-dead client endpoint. Best-effort — never fail a completed retire.
-	if err := a.deriveAndConvergeSeedsFromRoster(); err != nil {
-		a.logger.Warn("cluster retire: seed auto-converge failed (retired node's endpoint lingers in published seeds)", "node_id", nodeID, "err", err)
 	}
 	return nil
 }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tokenhash"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/spf13/cobra"
@@ -873,8 +874,12 @@ func newTransferID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// hexSHA256 wraps the canonical sha256.Sum256+hex.EncodeToString pair.
-func hexSHA256(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
+// hexSHA256 hashes file content for the transfer sha256 check.
+//
+// Batch-A A11: its doc used to call itself "the canonical" pair while three
+// other byte-identical copies existed elsewhere, none of them aware of it or of
+// each other. It now delegates to internal/tokenhash, which is the actual
+// single implementation. Note this call site hashes FILE CONTENT, not a bearer
+// token — same function, different namespace, so it must not be assumed to move
+// in lockstep with the token hashes if that scheme ever changes.
+func hexSHA256(b []byte) string { return tokenhash.SumBytes(b) }

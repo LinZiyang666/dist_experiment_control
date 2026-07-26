@@ -193,6 +193,7 @@ func (b *Broker) buildClusterRuntime() (*clusterRuntime, error) {
 		return nil, fmt.Errorf("broker: secrets preflight: %w", fatal)
 	}
 	node, err := cluster.NewProduction(cluster.ProductionConfig{
+		Logger:       b.cfg.Logger, // batch-A review M1: without this the raft log bridge is a no-op
 		LocalID:      selfID,
 		DataDir:      b.cfg.ClusterDataDir,
 		DBPath:       b.cfg.DBPath,

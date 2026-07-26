@@ -199,8 +199,13 @@ type CertPins struct {
 // (onNATSReconnect → re-register → homeForRegister directives → applyHomeDirectives);
 // the home broker dying takes its co-located nats-server with it, so the agent's
 // NATS connection bounces and that path fires. This type is defined here so the
-// v2 wire is stable when D7 wires the backup; a guard test asserts it has no live
-// publisher so a half-wiring is caught (review A5 M5).
+// v2 wire is stable when D7 wires the backup. TestRehomeDirectiveHasNoLivePublisher
+// asserts it has no live publisher, so a half-wiring is caught (review A5 M5).
+//
+// Batch-A A4: that sentence was written in the present tense while no such test
+// existed anywhere in the repo. A promised guard is worse than an admitted gap —
+// a reviewer reads it and stops checking. The test now exists; if you delete it,
+// delete this sentence with it.
 type RehomeDirective struct {
 	HomeDirective
 }

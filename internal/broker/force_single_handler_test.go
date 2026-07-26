@@ -31,9 +31,9 @@ func fsTestBackend(t *testing.T, selfID, peerID, peerRaftAddr string) (*clusterA
 		DBPath:             filepath.Join(dir, "state.db"),
 		Transport:          trans,
 		ApplyTimeout:       30 * time.Second,
-		HeartbeatTimeout:   50 * time.Millisecond,
-		ElectionTimeout:    50 * time.Millisecond,
-		LeaderLeaseTimeout: 25 * time.Millisecond,
+		HeartbeatTimeout:   cluster.MultinodeHeartbeatTimeout,
+		ElectionTimeout:    cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 		// inmem rebuild bound to selfID so the recovered {self} config (raft_addr == selfID) elects.
 		TransportFactory: func() (raft.Transport, error) {
 			_, tr := raft.NewInmemTransport(raft.ServerAddress(selfID))

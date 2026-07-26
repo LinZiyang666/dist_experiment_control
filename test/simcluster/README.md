@@ -43,7 +43,7 @@ It is bound by the following, without exception:
 
 - A **dev tool**, not the product. **Zero changes to the `tether` binary**; it orchestrates the *real*
   `tether` CLI + `docker` + in-container `systemctl`, exactly as an operator would.
-- **NOT part of `make test` / `make e2e`.** No Go `_test.go` here, no build tag — `go test ./...` never
+- **NOT part of `make test` / `make e2e-parallel`.** No Go `_test.go` here, no build tag — `go test ./...` never
   sees it. It is a separate, slower, deploy-tier gate you run before a release touches production.
 - It complements — does not replace — the fast hermetic suites. The `d*_integration` suites run raft
   in-process with an embedded NATS; this runs the *real* out-of-process stack. It **replaces** "SSH to the

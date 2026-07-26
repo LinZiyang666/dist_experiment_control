@@ -783,15 +783,40 @@ func (b *clusterAdminBackend) handleDrain(req adminsock.Request) adminsock.Respo
 		}
 		return adminsock.Response{Op: req.Op, OK: true}
 	}
+	// Batch-A A13: refuse the synchronous retire path outright.
+	//
+	// cmd/tether/cluster.go hardcodes Retire:false, so no released CLI reaches
+	// this; but the socket still accepted retire:true, and that branch performs
+	// RemoveServer + a roster row delete — an IRREVERSIBLE raft membership
+	// change — WITHOUT the protections the recoverable path has: no opStillLive
+	// TOCTOU recheck, no replicable deadline (it carries the caller's wall
+	// clock, so a broker restart loses it), no BLOCKED escape hatch, and no
+	// resume. It is one hand-written socket request away from being reachable.
+	//
+	// `cluster retire` (OpClusterRetire) drives the same outcome through the
+	// operation controller, which has all four. There is no reason to keep a
+	// second, unprotected way to do the most destructive thing this API can do.
+	//
+	// For an older CLI that did send retire:true this is an improvement: it used
+	// to silently take the unprotected path.
+	//
+	// Cross-version behaviour change. Review F-18: this used to point at "the
+	// release note", which does not exist — the increment is not released yet,
+	// and naming a document that is not there is the same false-reference habit
+	// A4 set out to remove. The note is drafted under A13 in
+	// docs/reviews/batch-a-progress.md and must ship with the release carrying
+	// this commit.
+	if req.Retire {
+		return adminsock.Response{Op: req.Op, Code: adminsock.CodeBadRequest,
+			Error: "cluster drain --retire is no longer served on this socket: it performed an irreversible " +
+				"raft membership change with no crash-resumable deadline and no BLOCKED escape hatch. " +
+				"Use `tether cluster retire <node>` (the recoverable operation) instead."}
+	}
 	deadline := b.admin.now().Add(b.drainNotice)
 	if req.Now {
 		deadline = b.admin.now()
 	}
-	var ready func() (bool, error)
-	if req.Retire && b.streamsReady != nil {
-		ready = func() (bool, error) { return b.streamsReady(req.NodeID) }
-	}
-	err := b.admin.DrainNode(req.NodeID, req.Retire, req.Confirmed, deadline, ready)
+	err := b.admin.DrainNode(req.NodeID, false, req.Confirmed, deadline, nil)
 	var qc *ErrQuorumConfirmRequired
 	if errors.As(err, &qc) {
 		return adminsock.Response{Op: req.Op, QuorumProj: &adminsock.QuorumProjection{

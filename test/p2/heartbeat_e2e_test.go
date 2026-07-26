@@ -36,7 +36,7 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	// Wide STALE window (200ms → 3s) so the matrix-load CPU
 	// pressure can't make the test fly past STALE and observe
 	// only OFFLINE. Audit shard 05: original 200/600 was 400ms
-	// wide; under `make e2e` parallel loadgen one tick of
+	// wide; under `make e2e-parallel` parallel loadgen one tick of
 	// scheduling jitter could miss it. The total test deadline
 	// is still bounded by the per-phase 2s waitForState calls.
 	bCfg := broker.Config{

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -443,6 +444,26 @@ func loadAuthCalloutSeeds(dir string) (*broker.AuthCalloutConfig, error) {
 	accountSeed, err := readPrivateSeedFile(dir, "account.nk")
 	if err != nil {
 		return nil, err
+	}
+	// Batch-A A6: reject a wrong-KIND seed here, at startup.
+	//
+	// A user seed (SU…) parses fine through nkeys.FromSeed, so
+	// broker.installAuthCallout accepted it and the broker came up healthy —
+	// then signed every user JWT with a wrong-kind issuer and nats-server
+	// rejected every client at auth_callout. The failure presented as "the
+	// service is up but nobody can connect", with nothing in the broker log
+	// pointing at account.nk.
+	//
+	// auth.LoadAccountSigner is exactly this check (it derives the public key
+	// and requires the A prefix) and has existed since P1 — test/p1's risk test
+	// even asserts the guard exists. It was simply never wired into the
+	// production path. We discard the signer: this is a validation call only,
+	// and the signing path is deliberately left byte-for-byte unchanged
+	// (routing it through IssueUserJWT would drop uc.Audience, which
+	// nats-server uses to place the connection in an account).
+	if _, err := auth.LoadAccountSigner(accountSeed); err != nil {
+		return nil, fmt.Errorf("%s/account.nk: %w — auth_callout needs an ACCOUNT seed (SA…); "+
+			"a user seed parses but makes every client fail authentication with a wrong-kind issuer", dir, err)
 	}
 	return &broker.AuthCalloutConfig{
 		BrokerNkeySeed: brokerSeed,

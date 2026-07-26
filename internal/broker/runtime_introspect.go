@@ -29,6 +29,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -64,6 +65,39 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 				Runs:       st.Runs,
 				Skips:      st.Skips,
 				LastErr:    st.LastErr,
+			})
+		}
+	}
+	// Batch-A A5: the four cluster loops (audit-publisher / reconciler / observe /
+	// topology-reconcile, plus the optional alert-webhook) were entirely
+	// unobservable — nothing reported whether the topology reconciler had ticked
+	// in the last minute or had died quietly on its first iteration. They ride
+	// the same ReconcilerTick shape as the registry entries, tagged so the two
+	// sources stay distinguishable.
+	if b.cl != nil && b.cl.loops != nil {
+		// Sorted: a map range gives a different order every call, so two
+		// export-incident bundles taken seconds apart would diff for no reason
+		// (external review, gate quality #4).
+		snap := b.cl.loops.Snapshot()
+		names := make([]string, 0, len(snap))
+		for name := range snap {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			st := snap[name]
+			// Batch-A review M8/F-03: these rows are NOT ReconcilerTick rows in
+			// the sense adminsock/protocol.go documents — there LastTick failing
+			// to advance means "stalled", and a loop row's LastTick never
+			// advances by construction. Emitting them into the same array
+			// produced 4-5 permanent false "stalled" entries in
+			// `admin runtime --json` and every export-incident bundle.
+			//
+			// They are reported under their own key instead, carrying only what is
+			// actually observable: the start time.
+			rep.ClusterLoops = append(rep.ClusterLoops, adminsock.ClusterLoopInfo{
+				Name:      name,
+				StartedAt: st.StartedAt,
 			})
 		}
 	}

@@ -21,7 +21,7 @@ tether expose --name web --local-port 3000
   and the operator runbook [`docs/cluster-runbook.md`](docs/cluster-runbook.md)
 
 Built with `CGO_ENABLED=0` (static binary), Go 1.25. `make build` / `make test` /
-`make e2e` / `make lint`.
+`make e2e-parallel` / `make lint`.
 
 > **Release lines:** the `main` branch is on **proto v2** (the distributed-broker HA epic)
 > and is **not** wire-compatible with the deployed proto-v1 fleet. v1 patches branch from

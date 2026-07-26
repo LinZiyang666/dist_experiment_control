@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -167,11 +168,11 @@ func newClusterJoinApproveCmd(socketPath *string) *cobra.Command {
 // waitForOp polls `cluster ops` for the op_id until it is terminal (done = exit 0; failed/aborted =
 // loud non-zero) or the timeout (exit 75 transient). Reuses the cluster status socket round-trip.
 func waitForOp(cmd *cobra.Command, socketPath, opID string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
+	var lastState string
+	err := pollUntilStep(cmd.Context(), 2*time.Second, time.Now().Add(timeout), func() (bool, error) {
 		resp, err := callAdmin(socketPath, adminsock.Request{Op: adminsock.OpClusterOps, OpsNode: opID})
 		if err != nil {
-			return err
+			return false, err
 		}
 		var op *adminsock.ClusterOpEntry
 		for i := range resp.Ops {
@@ -180,22 +181,24 @@ func waitForOp(cmd *cobra.Command, socketPath, opID string, timeout time.Duratio
 			}
 		}
 		if op == nil {
-			return fmt.Errorf("operation %s not found", opID)
+			return false, fmt.Errorf("operation %s not found", opID)
 		}
+		lastState = op.OpState
 		if op.Terminal {
 			if op.State == "done" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "operation %s reached %s.\n", opID, op.OpState)
-				return nil
+				return true, nil
 			}
-			return &ExitError{Class: exitInternal, Err: fmt.Errorf("operation %s ended %s: %s", opID, op.OpState, op.LastError)}
+			return false, &ExitError{Class: exitInternal, Err: fmt.Errorf("operation %s ended %s: %s", opID, op.OpState, op.LastError)}
 		}
 		// C4-M7: a BLOCKED op needs operator action — do NOT hang to the timeout; surface it promptly.
 		if op.State == "stalled" {
-			return &ExitError{Class: exitTransient, Err: fmt.Errorf("operation %s is BLOCKED (%s): %s — `cluster ops confirm %s` to proceed, or `cluster ops abort %s`", opID, op.OpState, op.LastError, opID, opID)}
+			return false, &ExitError{Class: exitTransient, Err: fmt.Errorf("operation %s is BLOCKED (%s): %s — `cluster ops confirm %s` to proceed, or `cluster ops abort %s`", opID, op.OpState, op.LastError, opID, opID)}
 		}
-		if time.Now().After(deadline) {
-			return &ExitError{Class: exitTransient, Err: fmt.Errorf("operation %s still in flight (%s) after %s — `cluster ops show %s`", opID, op.OpState, timeout, opID)}
-		}
-		time.Sleep(2 * time.Second)
+		return false, nil
+	})
+	if errors.Is(err, errPollDeadline) {
+		return &ExitError{Class: exitTransient, Err: fmt.Errorf("operation %s still in flight (%s) after %s — `cluster ops show %s`", opID, lastState, timeout, opID)}
 	}
+	return err
 }

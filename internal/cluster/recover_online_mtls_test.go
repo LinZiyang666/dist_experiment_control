@@ -34,9 +34,9 @@ func TestRecoverToSelfOnlineRealMTLSTransportRebuild(t *testing.T) {
 		DataDir:            dir,
 		DBPath:             filepath.Join(dir, "state.db"),
 		Transport:          tr0,
-		HeartbeatTimeout:   150 * time.Millisecond,
-		ElectionTimeout:    150 * time.Millisecond,
-		LeaderLeaseTimeout: 75 * time.Millisecond,
+		HeartbeatTimeout:   MultinodeHeartbeatTimeout,
+		ElectionTimeout:    MultinodeElectionTimeout,
+		LeaderLeaseTimeout: MultinodeLeaderLeaseTimeout,
 		ApplyTimeout:       5 * time.Second,
 		// The online-recover seam rebuilds a REAL mTLS transport on the same bind addr — exactly what
 		// NewProduction wires, so this test covers the production rebuild, not an inmem stand-in.

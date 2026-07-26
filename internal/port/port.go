@@ -32,14 +32,14 @@ package port
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/tokenhash"
 )
 
 // PortBandLow / PortBandHigh bound the public port range. Defaults
@@ -398,9 +398,26 @@ func updateAllocationState(db *sql.DB, a Allocation, next State, label string, n
 	return nil
 }
 
-// Revoke transitions ALLOCATED → REVOKED. Same shape as Free but used
-// by the broker reconciler when the owning node has been OFFLINE long
-// enough (architecture D.4 / F.3, default 15min). Idempotent.
+// Revoke transitions ALLOCATED → REVOKED by PORT NUMBER ALONE, and is
+// idempotent (re-revoking an already-REVOKED port returns nil).
+//
+// DO NOT USE IT IN PRODUCTION CODE. Use RevokeAllocation.
+//
+// Batch-A A4. This function's doc used to claim it was "used by the broker
+// reconciler when the owning node has been OFFLINE long enough". That was
+// false, and dangerously so: the reconciler uses RevokeAllocation, whose
+// WHERE clause carries the full row identity precisely so that "a delayed
+// revoke cannot affect a later allocation that reused the same port". Matching
+// on `port=?` alone IS that race — this function is the pre-fix version, and
+// its doc was still recruiting new callers into re-introducing a bug that only
+// ever shows up in production.
+//
+// It survives for exactly one reason: test/cluster/equiv_test.go:422 uses it as
+// the single-node arm of the single-vs-cluster equivalence check (the cluster
+// arm runs PlanRevoke + cluster.ExecCommand, and the test asserts both produce
+// the same logicalHash). Its idempotence is load-bearing there and in
+// port_test.go:180/232/342/370, so it is NOT interchangeable with
+// RevokeAllocation, which returns ErrNotFound instead.
 func Revoke(db *sql.DB, port int, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE port_allocations
@@ -467,10 +484,10 @@ func ListAllocatedForOfflineNodes(db *sql.DB, now time.Time, threshold time.Dura
 // from a frpc-supplied token without re-implementing the hash choice.
 func HashToken(rawToken string) string { return hashToken(rawToken) }
 
-func hashToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
-}
+// hashToken delegates to the shared scheme (batch-A A11); the local copy was
+// one of four byte-identical implementations that had to stay in lockstep with
+// no compiler help.
+func hashToken(raw string) string { return tokenhash.Sum(raw) }
 
 // translateInsertErr maps a failed ALLOCATED-row INSERT to the right
 // caller-facing error, encoding the P12 D-2 gate.

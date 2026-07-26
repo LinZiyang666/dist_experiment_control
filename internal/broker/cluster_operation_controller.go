@@ -366,6 +366,33 @@ func (a *ClusterAdmin) driveLeaderMaintenance() {
 
 // driveInFlightOperations is the leader-gated tick: it advances every non-terminal operation by one
 // idempotent step. Called from the observe loop (leader-edge + each tick). A non-leader is a no-op.
+// streamsReady wraps the injected readiness probe with a fail-closed default.
+// A nil probe means "we cannot observe replication", which for an irreversible
+// membership change must read as NOT ready — never as ready, and never as a
+// panic that takes the whole controller tick down.
+func (a *ClusterAdmin) streamsReady(nodeID string) (bool, error) {
+	if a.streamsReadyFn == nil {
+		return false, fmt.Errorf("stream readiness probe not wired (refusing to treat unverifiable replication as at-target)")
+	}
+	return a.streamsReadyFn(nodeID)
+}
+
+// DriveOperationsForTest runs one idempotent step of the in-flight operation
+// controller, the same step the observe loop takes each tick.
+//
+// External review B5: the D7 matrix lost its real three-node retire success
+// path when A13 removed the synchronous DrainNode(retire=true) route. The
+// replacement has to drive the recoverable operation instead, but test/d7 is an
+// EXTERNAL test package and the controller step is unexported — so the suite
+// could only assert the refusal, and the end-to-end proof (leadership,
+// catch-up, RemoveServer, roster order) disappeared from the release matrix
+// while the test name still claimed to provide it.
+//
+// This follows the existing *ForTest convention in this package
+// (ClusterAdminForTest, ClusterStateForTest, ...): production never calls it,
+// and it exposes no state the caller could not already reach.
+func (a *ClusterAdmin) DriveOperationsForTest() { a.driveInFlightOperations() }
+
 func (a *ClusterAdmin) driveInFlightOperations() {
 	if a == nil || a.node == nil || !a.node.IsLeader() {
 		return
@@ -908,7 +935,14 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		}
 		_ = a.transition(op, cluster.OpStateStreamsAtTarget, false, "", nil)
 	case cluster.OpStateStreamsAtTarget:
-		ready, err := a.streamsReadyFn(op.TargetNode)
+		// External review B5: this dereferenced streamsReadyFn unconditionally.
+		// It is injected by wireClusterLate, so any ClusterAdmin built outside the
+		// full production wiring — every direct NewClusterAdmin, including the
+		// harnesses that drive real multi-node retires — panicked here instead of
+		// refusing. A nil readiness probe must FAIL CLOSED (unknown replication is
+		// not "at target"): retire removes a voter, and doing that on an
+		// unverifiable stream posture is the one outcome this gate exists to stop.
+		ready, err := a.streamsReady(op.TargetNode)
 		if err != nil {
 			a.recordOpError(op, fmt.Errorf("stream readiness: %w", err))
 			return
@@ -945,7 +979,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		if sub.isVoter && !a.retireGatePasses(op, sub) {
 			return
 		}
-		if ready, err := a.streamsReadyFn(op.TargetNode); err != nil || !ready {
+		if ready, err := a.streamsReady(op.TargetNode); err != nil || !ready {
 			a.recordOpError(op, errors.New("streams regressed below target before removal — holding"))
 			return
 		}

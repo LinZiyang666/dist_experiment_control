@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -32,11 +33,16 @@ type d7Cluster struct {
 	nodes   []*cluster.Node
 	dataDir []string
 	dbPath  []string
-	admin   *broker.ClusterAdmin // leader's orchestrator (node 0)
+	admin   *broker.ClusterAdmin // bootstrap orchestrator; addNodeRetry rebinds to the current leader
 }
 
 // startD7Cluster bootstraps node 0 as a single voter and brings up n-1 EMPTY-state
 // nodes connected over inmem transports, ready for dynamic AddVoter.
+//
+// The harness uses the production Multinode timing constants directly. Earlier
+// 60/60/30ms and 300/300/150ms fixtures manufactured elections under -race and
+// full load; aliases were also removed so the timing guard can detect drift.
+
 func startD7Cluster(t *testing.T, n int) *d7Cluster {
 	t.Helper()
 	c := &d7Cluster{ids: make([]string, n), nodes: make([]*cluster.Node, n), dataDir: make([]string, n), dbPath: make([]string, n)}
@@ -62,7 +68,8 @@ func startD7Cluster(t *testing.T, n int) *d7Cluster {
 		cfg := cluster.Config{
 			LocalID: raft.ServerID(c.ids[i]), DataDir: c.dataDir[i], DBPath: c.dbPath[i],
 			Transport: trans[i], ApplyTimeout: 5 * time.Second,
-			HeartbeatTimeout: 60 * time.Millisecond, ElectionTimeout: 60 * time.Millisecond, LeaderLeaseTimeout: 30 * time.Millisecond,
+			HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 		}
 		if i == 0 {
 			cfg.BootstrapPeers = []raft.Server{{Suffrage: raft.Voter, ID: raft.ServerID(c.ids[0]), Address: addrs[0]}}
@@ -80,8 +87,26 @@ func startD7Cluster(t *testing.T, n int) *d7Cluster {
 			}
 		}
 	})
+	// External review M4: WaitForLeader only proves a leader EXISTS. c.admin is
+	// bound to nodes[0], so every seed AddNode fails with "node is not the
+	// leader" if leadership landed elsewhere or moved during startup — which is
+	// what made ForgedSigPoisonSkipsOnFollower flake inside the loaded e2e run
+	// while passing when d7 ran alone. addNodeRetry cannot recover from it: it
+	// retries the same non-leader node.
+	//
+	// Wait for nodes[0] to hold leadership ITSELF, which is the invariant the
+	// harness actually depends on.
 	if err := c.nodes[0].WaitForLeader(3 * time.Second); err != nil {
 		t.Fatalf("node 0 leadership: %v", err)
+	}
+	selfLead := time.Now().Add(5 * time.Second)
+	for !c.nodes[0].IsLeader() {
+		if time.Now().After(selfLead) {
+			t.Fatalf("node 0 did not become leader within 5s (a leader exists elsewhere); " +
+				"the harness binds ClusterAdmin to node 0, so every seed AddNode would fail " +
+				"with \"not the leader\"")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	c.admin = broker.NewClusterAdmin(c.nodes[0], nil)
 	return c
@@ -336,7 +361,7 @@ func testD7AddNeverCatchesUp(t *testing.T) {
 
 // d7TransientAddErr reports whether an AddNode error is a TRANSIENT raft leadership change
 // (the orchestrator's phase Propose raced an election) — safe to retry, since the two-phase
-// membership change is idempotent. Only fires under full make e2e -race contention.
+// membership change is idempotent. Only fires under full make e2e-parallel -race contention.
 func d7TransientAddErr(err error) bool {
 	if err == nil {
 		return false
@@ -349,19 +374,171 @@ func d7TransientAddErr(err error) bool {
 }
 
 // addNodeRetry seeds a cluster member, retrying a TRANSIENT raft leadership change (the
-// orchestrator phase Propose racing an election under full make e2e -race contention). The
+// orchestrator phase Propose racing an election under full make e2e-parallel -race contention). The
 // two-phase membership change is idempotent, so a re-run converges. Used by every SEED site;
 // the ghost/half-state drills that ASSERT an error call AddNode directly.
+// addNodeRetry retries a transient AddNode, waiting for nodes[0] to REGAIN
+// leadership before each attempt.
+//
+// External review M4: this used to retry 6 times at a fixed 300ms with no
+// leadership check, so a leadership blip during the seed phase burned all six
+// attempts re-sending to a node that was still not the leader. That is what
+// failed inside the loaded 18-minute e2e run while passing when d7 ran alone,
+// and it got worse under -race, where elections take longer relative to the
+// fixed budget. Budget is now wall-clock and each retry waits for the invariant
+// the harness depends on (c.admin is bound to nodes[0]) to hold again.
 func (c *d7Cluster) addNodeRetry(in cluster.ClusterNodeUpsertInput, raftAddr string, caughtUp func(uint64) (bool, error), maxWait time.Duration) error {
+	deadline := time.Now().Add(30 * time.Second)
 	var err error
-	for attempt := 0; attempt < 6; attempt++ {
-		err = c.admin.AddNode(in, raftAddr, caughtUp, maxWait)
+	for {
+		// Wait against the REMAINING budget rather than a fresh fixed slice.
+		// Under a loaded e2e run leadership can move away and take longer than
+		// any one attempt's share to come back; a per-attempt 5s made the helper
+		// give up while the overall budget still had 15s left.
+		// External review R5 / M4, THIRD iteration — and the first one that stops
+		// fighting raft. The previous two both kept the harness's assumption that
+		// nodes[0] holds leadership and tried ever harder to restore it: wait
+		// longer, then actively transfer leadership back. Under load that lost 58
+		// transfer attempts in 29.7s, because a voter that just won an election has
+		// no reason to hand it back, and every attempt raced the next commit.
+		//
+		// The assumption itself was the defect. AddNode has to run ON the leader;
+		// it does not have to run on nodes[0]. So bind the orchestrator to whoever
+		// currently holds leadership instead of demanding leadership come to us.
+		// See docs/testing-standards.md T3: re-establish the premise, do not force
+		// the world to match a stale observation.
+		admin, lerr := c.adminForLeader(time.Until(deadline))
+		if lerr != nil {
+			if err != nil {
+				return fmt.Errorf("%w (last AddNode error: %v)", lerr, err)
+			}
+			return lerr
+		}
+		err = admin.AddNode(in, raftAddr, caughtUp, maxWait)
 		if err == nil || !d7TransientAddErr(err) {
 			return err
 		}
-		time.Sleep(300 * time.Millisecond)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("AddNode still transient after 30s: %w", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	return err
+}
+
+// adminForLeader returns an orchestrator bound to whichever node currently holds
+// leadership, waiting up to d for one to exist.
+//
+// This replaces "make nodes[0] the leader again" with "talk to the leader". The
+// harness only ever needed AN orchestrator on THE leader; that it happened to be
+// nodes[0] was an incidental property of bootstrap, not a requirement, and
+// enforcing it under load is what produced the 58-transfer-attempt failure.
+func (c *d7Cluster) adminForLeader(d time.Duration) (*broker.ClusterAdmin, error) {
+	if d < 2*time.Second {
+		d = 2 * time.Second
+	}
+	deadline := time.Now().Add(d)
+	for {
+		for i, n := range c.nodes {
+			if n != nil && n.IsLeader() {
+				if i == 0 {
+					return c.admin, nil
+				}
+				return broker.NewClusterAdmin(n, nil), nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("no node held leadership within %s", d)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// ensureSelfLeader restores the invariant the harness is built on: c.admin is
+// bound to nodes[0], so nodes[0] must be the leader.
+//
+// External review M4, second iteration. Waiting alone is not enough — the
+// failure was never "the election is slow". Under a loaded e2e run a commit can
+// lose leadership mid-flight ("leadership lost while committing log") and raft
+// hands it to another voter, which has no reason to give it back. nodes[0] then
+// stays a follower forever and every retry, however patient, re-sends to the
+// wrong node. The observed wait was 29.7s against a 30s budget: not a race that
+// more time would win.
+//
+// So: wait briefly, and if leadership went elsewhere, ASK the current leader to
+// transfer it back before retrying.
+func (c *d7Cluster) ensureSelfLeader(d time.Duration) error {
+	if d < 2*time.Second {
+		d = 2 * time.Second
+	}
+	deadline := time.Now().Add(d)
+	// Poll-and-nudge until the budget runs out. A single transfer attempt was
+	// not enough: right after "leadership lost while committing log" there is
+	// often NO leader at all for a moment, so the one attempt finds nothing to
+	// ask and the remaining wait is passive. Re-checking means we catch the new
+	// leader as soon as the election settles.
+	for attempt := 0; ; attempt++ {
+		if err := c.waitSelfLeader(500 * time.Millisecond); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node 0 did not hold leadership within %s after %d transfer attempt(s); "+
+				"ClusterAdmin is bound to it (leadership moved under load — external review M4)", d, attempt)
+		}
+		c.nudgeLeadershipHome()
+	}
+}
+
+// nudgeLeadershipHome asks whichever node in OUR configuration currently holds
+// leadership to hand it back to nodes[0]. Best-effort and idempotent.
+func (c *d7Cluster) nudgeLeadershipHome() {
+	for i := 1; i < len(c.nodes); i++ {
+		if c.nodes[i] == nil || !c.nodes[i].IsLeader() {
+			continue
+		}
+		// Only a node that shares OUR raft configuration is holding OUR
+		// leadership. startD7Cluster brings up n raft instances but bootstraps
+		// only nodes[0]; the rest are un-joined singletons that legitimately
+		// lead their own one-node configuration. Asking one of those to transfer
+		// leadership to d7-a fails with "not in the raft configuration" — which
+		// is not a symptom of anything, just the wrong node to ask.
+		if !c.sharesConfigWithSelf(i) {
+			continue
+		}
+		_ = broker.NewClusterAdmin(c.nodes[i], nil).TransferLeaderTo(c.ids[0])
+		return
+	}
+}
+
+// sharesConfigWithSelf reports whether nodes[i] is in the same raft
+// configuration as nodes[0] — i.e. whether its leadership is ours to reclaim.
+func (c *d7Cluster) sharesConfigWithSelf(i int) bool {
+	cfg, err := c.nodes[i].RaftConfiguration()
+	if err != nil {
+		return false
+	}
+	for _, srv := range cfg {
+		if srv.NodeID == c.ids[0] {
+			return true
+		}
+	}
+	return false
+}
+
+// waitSelfLeader blocks until nodes[0] holds leadership itself.
+func (c *d7Cluster) waitSelfLeader(d time.Duration) error {
+	deadline := time.Now().Add(d)
+	if d <= 0 {
+		d = time.Second
+		deadline = time.Now().Add(d)
+	}
+	for !c.nodes[0].IsLeader() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node 0 did not hold leadership within %s; ClusterAdmin is bound to it "+
+				"(leadership moved under load — see external review M4)", d)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil
 }
 
 // testD7ForceSingleRecover: kill a 3-node cluster, force-single a survivor (peers
@@ -429,7 +606,8 @@ func testD7ForceSingleRecover(t *testing.T) {
 	nd, err := cluster.New(cluster.Config{
 		LocalID: raft.ServerID(c.ids[survivorIdx]), DataDir: c.dataDir[survivorIdx], DBPath: c.dbPath[survivorIdx],
 		Transport: tr, ApplyTimeout: 5 * time.Second,
-		HeartbeatTimeout: 60 * time.Millisecond, ElectionTimeout: 60 * time.Millisecond, LeaderLeaseTimeout: 30 * time.Millisecond,
+		HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 	})
 	if err != nil {
 		t.Fatalf("restart survivor: %v", err)
@@ -513,9 +691,19 @@ func testD7ReconcileMultiNode(t *testing.T) {
 	}
 }
 
-// testD7DrainRetireFollower (review M4): drain+retire a FOLLOWER end-to-end on a real
-// 3-node cluster — it must leave the raft config AND the roster (the §8.1 removal
-// order), with no half-state.
+// testD7DrainRetireFollower (review M4 / external-review B5): retire a FOLLOWER
+// end-to-end on a real 3-node cluster through the OPERATION path — it must leave
+// both the raft configuration and the roster (the §8.1 removal order), with no
+// half-state.
+//
+// Batch-A A13 deleted the synchronous DrainNode(retire=true) route this used to
+// drive: it performed RemoveServer plus a roster delete with no crash-resumable
+// deadline, no BLOCKED escape hatch and no TOCTOU recheck, and no released CLI
+// could reach it. External review B5 caught the replacement being a refusal
+// assertion only — which left the release matrix with NO end-to-end proof that
+// retire works, while this function's name still promised one. Both halves are
+// asserted now: the dead route stays refused, and the live route is driven to
+// completion.
 func testD7DrainRetireFollower(t *testing.T) {
 	c := startD7Cluster(t, 3)
 	for i := 1; i < 3; i++ {
@@ -527,25 +715,119 @@ func testD7DrainRetireFollower(t *testing.T) {
 			t.Fatalf("seed AddNode %d: %v", i, err)
 		}
 	}
-	// Retire a FOLLOWER (node 2; node 0 is leader). F after = N=2 (retire 3->2), F==0,
-	// so confirmed=true is required. No exposes homed here -> migrateExposes no-ops.
-	if err := c.admin.DrainNode(c.ids[2], true, true, time.Now(), func() (bool, error) { return true, nil }); err != nil {
-		t.Fatalf("drain --retire follower: %v", err)
+
+	// Half 1: the removed synchronous route must stay refused, and the refusal
+	// must name the supported verb (a bare "no" gets worked around).
+	if err := c.admin.DrainNode(c.ids[2], true, true, time.Now(), func() (bool, error) { return true, nil }); err == nil {
+		t.Fatal("DrainNode still accepts --retire: the unprotected irreversible path is reachable again")
+	} else if !strings.Contains(err.Error(), "cluster retire") {
+		t.Fatalf("refusal must name the supported verb, got %v", err)
 	}
-	// Gone from the roster (RETIRING -> ClusterNodeRemove) and from raft config.
-	if _, ok := readPhase(t, c.nodes[0], c.ids[2]); ok {
-		t.Fatal("retired follower still in the roster")
+
+	// Half 2: the live route. F after = N=2 (retire 3->2), F==0, so confirmed=true
+	// is required. No exposes homed here -> migrateExposes no-ops.
+	//
+	// The readiness probe must be supplied explicitly: without it the gate fails
+	// closed (external review B5), which is correct for production but would hang
+	// this harness — there is no JetStream behind these raft-only nodes.
+	c.admin.SetStreamsReadyProbe(func(string) (bool, error) { return true, nil })
+
+	opID, err := c.admin.StartRetireOperation(c.ids[2], true)
+	if err != nil {
+		t.Fatalf("StartRetireOperation: %v", err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	if opID == "" {
+		t.Fatal("StartRetireOperation returned an empty op id")
+	}
+
+	// Drive it the way the observe loop does, until the OPERATION is terminal.
+	//
+	// Waiting on the roster row alone is not enough: the row is deleted several
+	// steps before the op finishes (NATS_ROLLED_OUT still follows), and stopping
+	// there would assert a membership change whose operation record is still
+	// in flight — the precise half-state this test is supposed to rule out.
+	// Drive to NATS_ROLLED_OUT, which is where every IRREVERSIBLE step has
+	// completed: RemoveServer has run and the roster row is deleted (§8.1 order).
+	//
+	// It does not run to terminal RETIRED here, and that is a property of the
+	// harness, not of the product: the last hop gates on C3 topology convergence,
+	// which requires every voter to report a topology generation. These are
+	// raft-only nodes with no topology reconciler, so no voter ever reports one.
+	// Faking that report would make the test assert a convergence that did not
+	// happen — the whole class of defect this batch has been cleaning up. What is
+	// asserted instead is everything that CANNOT be undone, which is what the
+	// membership-change safety argument rests on. The RETIRED transition itself
+	// carries no membership mutation (drain-marker clear + seed convergence) and
+	// is covered by the controller unit suite.
+	deadline := time.Now().Add(30 * time.Second)
+	var op *cluster.Operation
 	for {
-		if nv, _ := c.nodes[0].NumVoters(); nv == 2 {
+		// The controller only advances an operation on the leader. A retire
+		// TRANSFERS leadership as one of its steps (LEADER_TRANSFERRED), so
+		// driving blindly on nodes[0] stalls there — which is what the parallel
+		// e2e run surfaced. Reclaim leadership each turn before driving.
+		if lerr := c.ensureSelfLeader(5 * time.Second); lerr != nil && time.Now().After(deadline) {
+			t.Fatalf("retire op %s: %v", opID, lerr)
+		}
+		c.admin.DriveOperationsForTest()
+		var oerr error
+		op, oerr = cluster.OperationByID(c.nodes[0].RODB(), opID)
+		if oerr != nil {
+			t.Fatalf("OperationByID(%s): %v", opID, oerr)
+		}
+		if op != nil && (op.Terminal || op.OpState == cluster.OpStateNatsRolledOut) {
 			break
 		}
 		if time.Now().After(deadline) {
+			state := "<missing>"
+			if op != nil {
+				state = op.OpState
+			}
+			ph, _ := readPhase(t, c.nodes[0], c.ids[2])
+			t.Fatalf("retire op %s stalled within 30s (op=%q, roster phase=%q)", opID, state, ph)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if op.OpState == cluster.OpStateRetireFailed {
+		t.Fatalf("retire op %s ended in RETIRE_FAILED: %s", opID, op.LastError)
+	}
+
+	// The roster row must be gone (the §8.1 order's last durable step).
+	if ph, ok := readPhase(t, c.nodes[0], c.ids[2]); ok {
+		t.Errorf("retired follower still in the roster (phase=%q) after the op reached %q",
+			ph, op.OpState)
+	}
+
+	// Gone from raft configuration too, and in the right order: the roster delete
+	// above is the LAST step, so by now RemoveServer must already have happened.
+	voterDeadline := time.Now().Add(10 * time.Second)
+	for {
+		nv, verr := c.nodes[0].NumVoters()
+		if verr == nil && nv == 2 {
+			break
+		}
+		if time.Now().After(voterDeadline) {
 			nv, _ := c.nodes[0].NumVoters()
 			t.Fatalf("retired follower still a raft voter: NumVoters=%d, want 2", nv)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// No half-state: the op must not have blocked or errored on its way here.
+	if op.LastError != "" {
+		t.Errorf("retire op %s reached %q carrying last_error=%q; the membership change completed but "+
+			"the operation did not run clean", opID, op.OpState, op.LastError)
+	}
+
+	// And the record survives for the operator: a completed removal whose op row
+	// vanished leaves nothing to audit afterwards.
+	final, ferr := cluster.OperationByID(c.nodes[0].RODB(), opID)
+	if ferr != nil {
+		t.Fatalf("OperationByID(%s): %v", opID, ferr)
+	}
+	if final == nil {
+		t.Errorf("retire op %s vanished; its terminal state is the operator's only record that the "+
+			"removal completed", opID)
 	}
 }
 

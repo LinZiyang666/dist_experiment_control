@@ -540,8 +540,8 @@ func startSoloRaftLeader(t *testing.T) (*cluster.Node, string) {
 	dbPath := filepath.Join(dir, "state.db")
 	nd, err := cluster.New(cluster.Config{
 		LocalID: raft.ServerID("solo"), DataDir: dir, DBPath: dbPath, Transport: tr,
-		HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-		LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+		HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("solo node: %v", err)

@@ -194,7 +194,7 @@ git clone https://github.com/LinZiyang666/dist_experiment_control.git
 cd dist_experiment_control
 make build                 # 输出 ./bin/tether
 make test                  # 单元 + 包内测试，~30s
-make e2e                   # 端到端矩阵，~80s（嵌入式 nats-server）
+make e2e-parallel          # 完整端到端矩阵；44 核开发机约 3 分钟，小型 CI 会自动降并行度
 ```
 
 要求 `Go 1.25+`（由 `nats-io/jwt/v2 ≥ v2.8.1` 锁定），`CGO_ENABLED=0` 静态
@@ -1513,7 +1513,7 @@ language version 1.23 is lower than the targeted Go version 1.25
 
 ⇒ 用了 v1.x 的 golangci-lint。`make tools` 装好 v2.5.0 即可。
 
-### 9.12 `make e2e` 挂起或 OOM
+### 9.12 `make e2e-parallel` 挂起或 OOM
 
 - 矩阵串行跑全 P1-P10，单跑 70-90s。CI 资源紧张时 `test/p5
   TestRunExitCodePropagates` 可能因 attach_timeout 偶发抖动 —— 单跑
@@ -1540,6 +1540,21 @@ language version 1.23 is lower than the targeted Go version 1.25
 - `exec` / `run` **透传远端进程退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器；判别靠"你跑的是哪个命令"，不是值。所以"77=权限"仅限 broker-RPC 命令。
 
 **健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。
+
+> **batch-A A1 订正**：此前有 **62 个** broker/agent 错误码**没有** exit class 归类，因而全部落 `70`——
+> 也就是被上面这条规则指示"退避重试"。其中包括物理上不可能靠重试成功的（`too_large` 超 2 GiB 硬上限、
+> `self_path`、`verb_mismatch`、`pid_unknown`），以及 **force-single 的全部拒绝码**
+> （`peer_alive` = 一个"已确认死亡"的 broker 竟回应了探测、`quorum_not_lost`、`arm_expired`）——
+> 后者意味着自动化会反复重试一个**因为对端还活着而被正确拒绝**的 force-single。
+>
+> 62 个码现已逐个归类（77×2 / 75×10 / 64×42 / 70×8）——其中 8 个经判断确属我方 bug、
+> **仍归 70 但现在是显式声明**（"判过"与"没人看过"因此可区分），所以**退出码真正发生变化的是 54 个**。
+> 由 `cmd/tether/error_code_coverage_test.go`
+> 的守门测试防止再次漏归。**wire 上的码字符串一个字节未改**，只改了进程退出码，
+> 现网混版本 broker/agent/ctl 无感。
+>
+> 仍留在 `70` 的是**经判断确实无法分类**的兜底分支（如 `io_error`：磁盘满与瞬时 EIO 落进同一分支，
+> 无从区分）。它们在守门测试里带**书面理由**登记，而不是继续隐式落到 default。
 
 ### 9.14 机器 JSON 接口（`--json`）
 
@@ -1666,7 +1681,7 @@ TETHER_DEV_NO_AUTH=1 ./bin/tether agent \
 
 ```bash
 make test            # 单元 + 包内测试，~30s
-make e2e             # P1-P10 完整 e2e，~80s（embedded nats-server，无外部依赖）
+make e2e-parallel    # P1-P10 完整 e2e；44 核开发机约 3 分钟，小型 CI 自动降并行度
 make lint            # golangci-lint v2.5.0
 ```
 

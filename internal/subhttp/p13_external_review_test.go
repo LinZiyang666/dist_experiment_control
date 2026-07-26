@@ -1,7 +1,6 @@
 package subhttp
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +12,15 @@ import (
 )
 
 func TestExternalReviewServeRejectsNonLoopbackAddress(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	err := Serve(ctx, "0.0.0.0:0", Config{DB: newDB(t)})
+	// Batch-A A4 retargeted this from Serve() to Bind(). Serve was a two-line
+	// wrapper (Bind + ServeListener) with no production caller — this test was
+	// its only user — and the loopback refusal it guards happens inside Bind.
+	// Testing Bind directly keeps the guarantee while removing the dead wrapper;
+	// it is also strictly more precise, since it can no longer pass for the
+	// wrong reason (e.g. ServeListener failing first).
+	ln, err := Bind("0.0.0.0:0")
 	if err == nil {
+		_ = ln.Close()
 		t.Fatal("subscription HTTP accepted a non-loopback listener")
 	}
 }

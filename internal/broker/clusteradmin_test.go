@@ -34,9 +34,9 @@ func d7SingleNode(t *testing.T, id string) (*cluster.Node, string) {
 		DBPath:             filepath.Join(dir, "state.db"),
 		Transport:          trans,
 		ApplyTimeout:       30 * time.Second,
-		HeartbeatTimeout:   50 * time.Millisecond,
-		ElectionTimeout:    50 * time.Millisecond,
-		LeaderLeaseTimeout: 25 * time.Millisecond,
+		HeartbeatTimeout:   cluster.MultinodeHeartbeatTimeout,
+		ElectionTimeout:    cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 	})
 	if err != nil {
 		t.Fatalf("new node: %v", err)

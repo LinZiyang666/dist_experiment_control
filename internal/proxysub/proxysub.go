@@ -11,14 +11,14 @@ package proxysub
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/tokenhash"
 
 	"github.com/oklog/ulid/v2"
 
@@ -201,11 +201,11 @@ func LookupSIDByTokenHash(db *sql.DB, tokenHash string) (string, error) {
 	return sid, nil
 }
 
-// HashToken returns SHA256(rawToken) hex-encoded (same scheme as port tokens).
-func HashToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
-}
+// HashToken returns SHA256(rawToken) hex-encoded. Batch-A A11: this was the
+// THIRD independent copy of the scheme — written after an earlier audit decided
+// a comment was enough — and its own comment ("same scheme as port tokens") did
+// not know a second copy already existed. It now delegates.
+func HashToken(raw string) string { return tokenhash.Sum(raw) }
 
 func genSecret(n int) (string, error) {
 	b := make([]byte, n)

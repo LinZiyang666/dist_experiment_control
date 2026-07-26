@@ -25,8 +25,8 @@ func TestReviewCIHasNightlyE2EMatrix(t *testing.T) {
 	if !strings.Contains(workflow, "schedule:") {
 		t.Fatal("P11 requires CI nightly e2e runs, but .github/workflows/ci.yml has no schedule trigger")
 	}
-	if !strings.Contains(workflow, "make e2e") {
-		t.Fatal("P11 requires P2-P10 e2e matrix in CI, but .github/workflows/ci.yml never runs make e2e")
+	if !strings.Contains(workflow, "make e2e-parallel") {
+		t.Fatal("P11 requires P2-P10 e2e matrix in CI, but .github/workflows/ci.yml never runs make e2e-parallel")
 	}
 }
 

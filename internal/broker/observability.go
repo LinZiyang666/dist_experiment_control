@@ -249,6 +249,18 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 				b.cl.fsArm.observeLeadership(b.cl.node.LeaderContactStale(now), now)
 			}
 			isLeader := b.cl != nil && b.cl.node != nil && b.cl.node.IsLeader()
+			// Batch-A A15: the two leadership edges are the anchor of any
+			// post-incident raft read — without them the raft library's own
+			// lines have nothing to be correlated against, and "the write timed
+			// out right after leadership moved" is unreconstructable. Two lines
+			// per election is not a volume concern.
+			if isLeader != wasLeader {
+				what := "lost"
+				if isLeader {
+					what = "acquired"
+				}
+				b.cfg.Logger.Info("broker: raft leadership "+what, "component", "cluster", "is_leader", isLeader)
+			}
 			if isLeader && !wasLeader && b.cl.admin != nil {
 				if err := b.cl.admin.ReconcileMembershipOnLeadership(); err != nil {
 					b.cfg.Logger.Warn("broker: membership reconciliation on leadership", "err", err)

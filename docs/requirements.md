@@ -1,7 +1,15 @@
 # 分布式节点控制系统 — 需求文档
 
-> **HISTORICAL — 这是 v1 设计开始之前的需求草稿。**
-> **当前 v1 实现以 `docs/architecture.md` 为权威；本文件保留以记录设计起点。**
+> **文档权威链**（与 `CLAUDE.md §1` 同一表）：本文是 **WHAT** 层——产品要做什么、不做什么，是**需求**的唯一真相。
+> 它**不描述当前实现**：v2 / 集群面当前如何实现见 `docs/distributed-broker-architecture.md`
+> 与 `docs/deploy-tier-gotchas.md`（HOW·当前）；当初为什么这么选见 `docs/architecture.md` §A–§K（HOW·历史，
+> 取舍论证有效、标识符已过时）。历史层从不覆盖当前层。
+
+
+> **v1 范围裁剪记录**（外审 R6 订正：此处原写作"本文是 v1 之前的历史草稿、当前以
+> `architecture.md` 为权威"，与上方权威链直接矛盾——一个读者按上表读到"需求唯一真相"，
+> 按下表读到"以 architecture 为准"。**以上表为准**：本文是需求层的真相，下面列的是
+> v1 当初没做的部分，是**范围记录**，不是权威转让。）
 >
 > 不在 v1 范围（已挪到 v2 或显式 deferred）：
 > - **`push` / `pull` / 文件传输**（本文 §5、§7、§9 多次出现）—— v1 不实现；
@@ -11,7 +19,9 @@
 >
 > 当前 v1 的实际命令面以 `tether --help` + architecture I.1/I.2 章为准。
 
-> **文档定位**：系统的**需求规约（what）**，供实现参考。决策过程请看 `logs/log.md`（历史决策日志，冻结）。架构细节请看 `docs/architecture.md`（待产出）。
+> **文档定位**：系统的**需求规约（what）**，供实现参考。决策过程请看 `logs/log.md`（历史决策日志，冻结）。
+> 架构细节：当前实现见 `docs/distributed-broker-architecture.md`，历史取舍见 `docs/architecture.md`
+> （原文写作"待产出"，那是本文起草时的状态，早已不成立）。
 
 ---
 
@@ -190,8 +200,16 @@
 | `ctl session switch <name>` | 切换当前活跃 session | member+ |
 | `ctl session current` | 显示当前 session | member+ |
 | `ctl session rm <name>` | 删除 session（**交互确认**） | **owner-only** |
-| `ctl session kick <pubkey-or-fp>` | 将某身份从 allowed_pubkeys 移除 | **owner-only** |
-| `ctl session rotate-pin` | 生成新 PIN（已加入的 pubkey 不受影响） | **owner-only** |
+| ~~`ctl session kick <pubkey-or-fp>`~~ | 将某身份从 allowed_pubkeys 移除 | **未实现**（见下方 banner） |
+| ~~`ctl session rotate-pin`~~ | 生成新 PIN（已加入的 pubkey 不受影响） | **未实现**（见下方 banner） |
+
+> **⚠ 未实现（batch-A A7 订正）**：`session kick` 与 `session rotate-pin` **从未实现**。
+> 全仓 `members` 表只有一处 DELETE（session 硬删的级联），`pin_hash` 有 **零处** UPDATE。
+> architecture H.1 已由 DOC-12 订正，`internal/broker/audit.go:36-39` 也记录了同一事实，
+> 但本文件此前仍将两者列为已交付能力——**规格与 ACL 同时撒谎，比诚实的缺口危险得多**：
+> 它让读者以为吊销能力已存在。A7 已同步移除对应的 NATS 授权
+> （`session.<sid>.kick.req` / `rotate-pin.req`），并加了双向对账测试防止再次漂移。
+> 撤销/PIN 轮换若要落地，需作为新的叶子增量重新设计。
 
 **不做**：默认 / 自动创建的 session；未 login 状态下除 `session list/create/login` 外所有命令均拒绝。
 

@@ -89,9 +89,9 @@ func fastMultinodeCfg(id raft.ServerID, dir string, tr raft.Transport, peers []r
 		Transport:          tr,
 		BootstrapPeers:     peers,
 		Logger:             quietLogger(),
-		HeartbeatTimeout:   150 * time.Millisecond,
-		ElectionTimeout:    150 * time.Millisecond,
-		LeaderLeaseTimeout: 75 * time.Millisecond,
+		HeartbeatTimeout:   MultinodeHeartbeatTimeout,
+		ElectionTimeout:    MultinodeElectionTimeout,
+		LeaderLeaseTimeout: MultinodeLeaderLeaseTimeout,
 		ApplyTimeout:       5 * time.Second,
 	}
 }
@@ -179,8 +179,8 @@ func TestD3TransportShutdownReapsListenerNoLeak(t *testing.T) {
 		n, err := New(Config{
 			LocalID: raft.ServerID(fmt.Sprintf("churn-%d", i)), DataDir: dir,
 			DBPath: filepath.Join(dir, "state.db"), Transport: tr, Logger: quietLogger(),
-			HeartbeatTimeout: 100 * time.Millisecond, ElectionTimeout: 100 * time.Millisecond,
-			LeaderLeaseTimeout: 50 * time.Millisecond,
+			HeartbeatTimeout: MultinodeHeartbeatTimeout, ElectionTimeout: MultinodeElectionTimeout,
+			LeaderLeaseTimeout: MultinodeLeaderLeaseTimeout,
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -495,8 +495,14 @@ func TestD3FailingNewReapsTransportNoLeak(t *testing.T) {
 			t.Fatalf("transport: %v", err)
 		}
 		dir := t.TempDir()
-		// LeaderLeaseTimeout (2s) > HeartbeatTimeout (1s) => raft.ValidateConfig
-		// rejects inside BootstrapCluster, so New fails AFTER the transport is built.
+		// DELIBERATELY INVALID, and exempt from TestRaftTimingsUseProductionConstants
+		// for that reason: LeaderLeaseTimeout (2s) > HeartbeatTimeout (1s) makes
+		// raft.ValidateConfig reject inside BootstrapCluster, so New fails AFTER the
+		// transport is built — which is the whole point, this test checks the
+		// transport is still reaped on that failure path. Production constants are a
+		// VALID ordering, so using them here makes New succeed and the test asserts
+		// nothing. (A batch that replaced every hardcoded timing did exactly that,
+		// and this test caught it — see docs/testing-standards.md T2's exception.)
 		n, err := New(Config{
 			LocalID: raft.ServerID(fmt.Sprintf("failnew-%d", i)), DataDir: dir,
 			DBPath: filepath.Join(dir, "state.db"), Transport: tr, Logger: quietLogger(),

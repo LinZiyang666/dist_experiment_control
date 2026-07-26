@@ -157,6 +157,14 @@ func NewClusterAdmin(node *cluster.Node, logger *slog.Logger) *ClusterAdmin {
 // SetCapacityProbes injects the B5 OPS#9 self-row capacity config (store dir for the disk
 // statfs + the port band for ports_used/total). Called once after construction by the production
 // broker; left unset in tests that don't exercise capacity (fields stay absent — honest).
+// SetStreamsReadyProbe injects the JetStream replica-readiness probe the retire
+// operation gates on. Production wires it in wireClusterLate; multi-node test
+// harnesses that drive a real retire must supply one, because the gate fails
+// closed without it (external review B5).
+func (a *ClusterAdmin) SetStreamsReadyProbe(fn func(nodeID string) (bool, error)) {
+	a.streamsReadyFn = fn
+}
+
 func (a *ClusterAdmin) SetCapacityProbes(storeDir string, bandLow, bandHigh int) {
 	a.storeDir = storeDir
 	a.portBandLow = bandLow

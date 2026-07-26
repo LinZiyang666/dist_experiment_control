@@ -241,7 +241,7 @@ func TestProxyFalseOnlineRecoversAfterTunnelDrop(t *testing.T) {
 	// (1) the dead exit is dropped from /sub, not advertised: proxy_ready clears.
 	// (This is the reliable Defect-B signal; the public-port unbind is corroborating
 	// but transient — the agent self-heals within one backoff, so we don't race it.)
-	// 15s (was 5s): under the full make e2e matrix this -race subprocess runs after every
+	// 15s (was 5s): under the full make e2e-parallel matrix this -race subprocess runs after every
 	// other heavy matrix, so tunnel-drop detection + /sub re-advertise is slower; the assertion
 	// is "eventually clears" (it clears in ~0.5s in isolation), so the extra headroom only
 	// prevents a load-induced false Defect-B regression.

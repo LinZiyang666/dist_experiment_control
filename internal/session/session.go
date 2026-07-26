@@ -293,8 +293,18 @@ func GetProxyEpoch(db *sql.DB, sid string) (int64, error) {
 	return e, err
 }
 
-// BumpProxyEpoch increments and returns the session's keyset epoch (used after
-// enable / sub create / sub revoke so agents detect a changed key set).
+// BumpProxyEpoch increments and returns the session's keyset epoch.
+//
+// NOT USED IN PRODUCTION — see SetProxyEnabledAndBumpEpoch, which does the flip
+// and the bump in ONE transaction (round-6 F6). This one is the non-atomic
+// predecessor and is kept only because tests drive the epoch directly.
+//
+// Batch-A A4: its doc used to read "used after enable / sub create / sub
+// revoke", describing a production role it no longer has. That is the same
+// shape as port.Revoke's doc (see internal/port/port.go): a superseded
+// function whose comment still recruits callers back onto the pre-fix path —
+// here, one that can leave the switch and the epoch disagreeing if the second
+// statement fails.
 func BumpProxyEpoch(db *sql.DB, sid string) (int64, error) {
 	if _, err := db.Exec(`UPDATE sessions SET proxy_epoch=proxy_epoch+1 WHERE sid=?`, sid); err != nil {
 		return 0, fmt.Errorf("session: bump proxy_epoch: %w", err)

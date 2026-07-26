@@ -41,9 +41,17 @@ func PermissionsForUnactivated(actor string) jwt.Permissions {
 
 // PermissionsForActivatedMember returns permissions for a CLI that has
 // activated session sid as either owner or member. Owner-only operations
-// (session rm / kick / rotate-pin) are pub-allowed at the NATS layer for
-// every member; tetherd performs the owner check on the application side
-// and replies admin_denied for non-owners (see architecture B.2 note).
+// (session rm) are pub-allowed at the NATS layer for every member; tetherd
+// performs the owner check on the application side (see architecture B.2 note).
+//
+// Batch-A A4: this doc used to say the same of `kick` / `rotate-pin` and to
+// promise that tetherd "replies admin_denied for non-owners". Both halves are
+// false — those two verbs have NO handler at all, so nothing can reply
+// anything. internal/broker/audit.go:36-39 already records the same finding
+// ("session kick/rotate-pin are not implemented"); this doc had not caught up.
+// A7 then removed the grants themselves, and TestACLGrantsHaveSubscribers now
+// reconciles this template against the broker's live subscription table in both
+// directions so the pair cannot drift apart again.
 //
 // JetStream API permissions are scoped to this session's `history-<sid>`
 // stream only. Members need to publish to `$JS.API.STREAM.INFO.<stream>`,
@@ -86,11 +94,24 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ls.req",
 			subjectPrefix + ".ctrl.by." + actor + ".alert.ack.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rm.req",
-			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".kick.req",
-			subjectPrefix + ".ctrl.by." + actor + ".session." + sid + ".rotate-pin.req",
+			// Batch-A A7 removed three grants here whose verbs do not exist:
+			// session.<sid>.kick.req, session.<sid>.rotate-pin.req and
+			// s.<sid>.node.*.tag.req. No broker ever subscribed to any of them
+			// (TestACLGrantsHaveSubscribers now reconciles both directions), and
+			// there is no pin rotation anywhere in the repo — `pin_hash` has zero
+			// UPDATE sites.
+			//
+			// The risk was never the unused strings. It was that the next person
+			// to implement node tagging would find both the subject AND the grant
+			// already in place, read that as "the design was done", and inherit an
+			// authorisation nobody reviewed for the feature they were building.
+			//
+			// Reversible: grants live in issued user JWTs (24h TTL), so this
+			// converges as clients re-authenticate and a revert converges back the
+			// same way. These subjects match no JetStream stream filter, so an
+			// unsubscribed publish was dropped by core NATS, never persisted.
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".ps.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.list.req",
-			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".node.*.tag.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".caps.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".transfer.*.finalize.req",
 			// P13 proxy subscription control (owner-only enforced at the

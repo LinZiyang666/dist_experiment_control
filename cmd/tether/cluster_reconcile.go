@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -116,11 +117,15 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			"each broker's topology reconciler converges automatically (≤5s after a membership change); pass --wait to block until converged.")
 		return nil
 	}
-	deadline := time.Now().Add(timeout)
-	for {
+	var lastLaggards []string
+	// Batch-A A3: this used to be a bare `time.Sleep` loop that never read
+	// cmd.Context() (so Ctrl-C did nothing) and whose timeout returned a plain
+	// error — exit 70, i.e. "a tether bug, retry it" per docs/usage.md §9.13.
+	// A wait that ran out is EX_TEMPFAIL like every other one.
+	perr := pollUntilStep(cmd.Context(), 2*time.Second, time.Now().Add(timeout), func() (bool, error) {
 		rep, err := fetchClusterStatusReport(socket)
 		if err != nil {
-			return err
+			return false, err
 		}
 		// C3-m11: nothing is being managed yet → there is no convergence to wait for.
 		if rep.TopoDesired == 0 {
@@ -128,7 +133,7 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			// must not print a bare all-clear when the issuer could not be cross-checked.
 			warnIssuerUnverified()
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no topology generation is being managed yet (nothing to converge).")
-			return nil
+			return true, nil
 		}
 		laggards := topoLaggards(rep)
 		if len(laggards) == 0 {
@@ -136,7 +141,7 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			// all-clear (the seed could have been rotated during the wait). A skew here is a
 			// non-zero exit, not a "converged" print.
 			if err := clusterAuthIssuerSkewError(secretsDir, confPath); err != nil {
-				return err
+				return false, err
 			}
 			// N-3: keep the leading "all voters converged" substring (drills grep it), but append the
 			// SKIPPED qualifier + a stderr warning when the issuer could not be cross-checked, so the
@@ -144,16 +149,19 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			if unverifiedReason != "" {
 				warnIssuerUnverified()
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all voters converged to topology generation %d (issuer verification SKIPPED — see warning above).\n", rep.TopoDesired)
-				return nil
+				return true, nil
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all voters converged to topology generation %d.\n", rep.TopoDesired)
-			return nil
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("reconcile nats: timed out after %s; not converged: %s", timeout, strings.Join(laggards, ", "))
-		}
-		time.Sleep(2 * time.Second)
+		lastLaggards = laggards
+		return false, nil
+	})
+	if errors.Is(perr, errPollDeadline) {
+		return &ExitError{Class: exitTransient, Err: fmt.Errorf(
+			"reconcile nats: timed out after %s; not converged: %s", timeout, strings.Join(lastLaggards, ", "))}
 	}
+	return perr
 }
 
 // topoLaggards returns the voters not yet converged to the desired generation — INCLUDING unreachable

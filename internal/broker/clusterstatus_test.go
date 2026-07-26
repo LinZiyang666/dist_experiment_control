@@ -128,10 +128,12 @@ func TestD7DrainConfirmGateF0(t *testing.T) {
 func TestD7RetireLastVoterHardRefused(t *testing.T) {
 	n, _ := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
-	// Retiring the only voter is hard-refused even WITH confirmation (review m4).
+	// Batch-A A13: the synchronous retire path is gone; DrainNode refuses the
+	// flag and names the recoverable operation. The last-voter guard itself now
+	// lives in StartRetireOperation, which is the only way to retire at all.
 	err := admin.DrainNode("single-1", true, true, time.Now(), nil)
-	if err == nil || !strings.Contains(err.Error(), "cannot retire the last voter") {
-		t.Fatalf("retire of the last voter must be hard-refused, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cluster retire") {
+		t.Fatalf("drain --retire must be refused and must name `cluster retire`, got %v", err)
 	}
 }
 

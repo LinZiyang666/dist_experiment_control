@@ -2,6 +2,7 @@ package broker
 
 import (
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"sort"
 	"strings"
 	"time"
@@ -52,7 +53,12 @@ type rehomedExpose struct {
 // no compile-time link available across those packages, so
 // TestDataplaneNotConvergedCodeIsWireStable (cmd/tether) pins the literal from the
 // other end.
-const codeDataplaneNotConverged = "dataplane_not_converged"
+// codeDataplaneNotConverged aliases the proto SSOT. Batch-A review F-17: A1
+// added proto.CodeDataplaneNotConverged as a THIRD independent declaration of
+// this literal instead of collapsing the two that existed — plan decision D4
+// promised the opposite ("pinned on both sides, stronger than today"). Aliasing
+// makes the compiler enforce what the doc claimed.
+const codeDataplaneNotConverged = proto.CodeDataplaneNotConverged
 
 // ErrDataPlaneNotConverged is returned when the affected agents have not confirmed
 // the new home within the operator's deadline. It names every port still behind, so

@@ -46,7 +46,11 @@ func TransferRecordReqID(rec schema.AuditTransfer) (string, error) {
 }
 
 // PlanTransferAudit renders OpTransferAudit for one audit record: EMPTY Body (no DB
-// mutation), Aux = the record, ReqID = TransferReqID(rec). The Ts monotonic reading is
+// mutation), Aux = the record, ReqID = TransferRecordReqID(rec) — the CONTENT-addressed
+// key. Batch-A A4: this line used to name TransferReqID, the COARSE (transferID, kind)
+// key. That misreads as "dedup is per-transfer-and-kind", which would let a reviewer
+// accept a re-emit that must in fact be distinguished by content — the #57
+// finalize-on-recovery design rests on the content key. The Ts monotonic reading is
 // stripped (rec.Ts.Round(0)) so the replayed JSON is byte-identical to the live
 // pubAuditTransfer payload (time.Time.MarshalJSON already drops the monotonic part; this
 // is the same defensive strip proc.PlanReconcileBatch applies). rec.Kind must be one of

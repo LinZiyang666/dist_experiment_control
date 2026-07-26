@@ -224,8 +224,8 @@ func startD8Cluster(t *testing.T, n int) *d8cluster {
 		nd, err := cluster.New(cluster.Config{
 			LocalID: raft.ServerID(fmt.Sprintf("d8-%d", i)), DataDir: dir, DBPath: dbPath,
 			Transport: trans[i], BootstrapPeers: peers,
-			HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-			LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+			HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 		})
 		if err != nil {
 			t.Fatalf("node %d: %v", i, err)

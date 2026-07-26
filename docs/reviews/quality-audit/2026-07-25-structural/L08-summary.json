@@ -1,0 +1,222 @@
+{
+  "lane": "deadcode-unused",
+  "reportPath": "docs/reviews/quality-audit/2026-07-25-structural/L08-deadcode-unused.md",
+  "verdict": "minor-debt",
+  "headline": "死代码不是 tether 臃肿的原因——68,328 行生产代码里 RTA 不可达仅 51 函数 / 392 行（0.57%，逐位复现），36 个 internal 包只有 1 个不进发布二进制，0 处注释掉的代码；真正的债不在体量，而在约 10 个「已被取代或从未接线、却带着声称自己在生产路径上的 godoc」的幸存符号，它们合计不到 300 行但每条都能让下一个人做出错误决定。",
+  "bloatScore": 2,
+  "scopeLines": 68328,
+  "findings": [
+    {
+      "severity": "high",
+      "title": "internal/auth 整套 AccountSigner 从未接线，它要守的 account-key-kind 校验生产路径上真的不存在",
+      "evidence": [
+        "internal/auth/jwt.go:11-13 (godoc 声称 \"tetherd holds exactly one and uses it from inside its auth_callout response handler\")",
+        "internal/auth/jwt.go:22 LoadAccountSigner — go/packages 引用计数 prod=0 test=8（jwt_test.go ×6 + test/p1/foundation_risk_test.go ×2），deadcode RTA 亦列为 unreachable",
+        "internal/broker/authcallout.go:70 (生产直接 nkeys.FromSeed，无 kind 校验)",
+        "cmd/tether/serve.go:438 loadAuthCalloutSeeds (只读文件，不校验 key kind)",
+        "internal/authcallout/handler.go:427-448 (*Handler).allow — 与 IssueUserJWT 同构但缺 nkeys.IsValidPublicUserKey 前置校验，对照 internal/auth/jwt.go:49",
+        "test/p1/foundation_risk_test.go:35 正在断言这条不存在的生产校验"
+      ],
+      "whyItBlocksEvolution": "运维在 /etc/tether/account.nk 放错 seed（如误拷 user seed），broker 正常启动、installAuthCallout 成功，然后每个客户端在 auth_callout 阶段被 NATS 静默拒绝——本该 boot 时一行错误挡掉的配置错误变成「服务起来了但没人能连」的现网事故；而 risk test 的存在让 review 者误以为这条路已守住。",
+      "recommendation": "不要删，要接线：loadAuthCalloutSeeds 里把 accountSeed 过一遍 auth.LoadAccountSigner（丢弃 signer 只取校验），并把 handler.allow 的 uc.Encode 换成 signer.IssueUserJWT，消掉 JWT 签发的第二份实现。",
+      "estLinesRemovable": 0,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "high",
+      "title": "port.Revoke / PlanRevoke 是被 race-safe 版本取代的旧孪生，godoc 却声称 broker reconciler 在用它",
+      "evidence": [
+        "internal/port/port.go:401-428 Revoke — godoc \"used by the broker reconciler when the owning node has been OFFLINE long enough\"；引用计数 prod=0 test=6",
+        "internal/port/plan.go:73-77 PlanRevoke — 引用计数 prod=0 test=3",
+        "internal/port/port.go:374-378 RevokeAllocation（生产真实使用）← internal/broker/clusterwrite.go:897",
+        "internal/port/plan.go:41-44 PlanRevokeAllocation ← internal/broker/clusterwrite.go:906 + internal/broker/cluster_forward.go:618",
+        "test/cluster/equiv_test.go:415-438 single/cluster 等价性证明覆盖的是产品不走的 port-keyed 路径"
+      ],
+      "whyItBlocksEvolution": "仓库里并排放着两个同义 API，一个安全一个有已知 port-reuse race，而有 race 的那个的 godoc 声称自己是 reconciler 在用的那个。下一个加 revoke 路径的人照 godoc 选 port.Revoke，会把「别人的 expose 被莫名撤销」这类只在现网出现、测试抓不到的 bug 引回来。",
+      "recommendation": "删 Revoke + PlanRevoke，测试调用点改到 *Allocation 版本。注意两点：(a) planPortStateChange 仍被 PlanFree 用，不能一起删；(b) Revoke 是幂等的（RowsAffected==0 时回查 port 存在则返回 nil），RevokeAllocation 直接返回 ErrNotFound——port_test.go:180/232/342/370 依赖前者语义，替换需逐点确认而非 sed 全替。",
+      "estLinesRemovable": 33,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "high",
+      "title": "[核验新增] session.BumpProxyEpoch 是与 F2 同构的被取代孪生：godoc 声称 enable/sub create/sub revoke 在用，生产零调用",
+      "evidence": [
+        "internal/session/session.go:297-303 BumpProxyEpoch — godoc \"used after enable / sub create / sub revoke so agents detect a changed key set\"",
+        "go/packages 引用计数 prod=0 test=10（internal/broker/p13_external_review_round2_test.go 等）；deadcode RTA 亦列为 unreachable",
+        "internal/session/session.go:308 SetProxyEnabledAndBumpEpoch — 生产实际使用的事务化替代品"
+      ],
+      "whyItBlocksEvolution": "与 F2 完全同一形状：旧的非事务版本活着、godoc 指着它、新的事务版本才是生产路径。下一个加 proxy keyset 变更点的人选中它，就绕过了 round-6 F6 那条「epoch bump 失败必须回滚 enable 开关」的原子性约束——而 tunnelTokenLookup 把该开关当授权边界。",
+      "recommendation": "删 BumpProxyEpoch，测试改用 SetProxyEnabledAndBumpEpoch；若某些测试确需裸 bump，加 Deprecated 标注说明生产走事务版本。",
+      "estLinesRemovable": 7,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "medium",
+      "title": "4 条 wire subject 无 publisher/subscriber 却仍在 JWT permission 模板里被授权",
+      "evidence": [
+        "internal/proto/subjects.go:10 SubjVersionAnnounce — 字面串 ctrl.version.announce 全仓只出现在 internal/auth/permissions.go:35/136/227 与该定义处",
+        "internal/proto/subjects.go:74 SubjNodeUnregister — 授权在 permissions.go:170/250；git log -S \"SubjNodeUnregister(\" 显示最后一个生产调用者在 55b1451 被移除",
+        "internal/proto/subjects.go:82 SubjEvNodeState — internal/broker/broker.go:960-1013 订阅表无 .ev.node.*.state",
+        "internal/proto/subjects.go:203 SubjPtyReady — 授权在 permissions.go:140/174；真实 ready 是 msg.Reply 上的 RunChunk kind（internal/agent/run.go:130-132 → cmd/tether/run.go:152），非独立 subject",
+        "internal/broker/audit.go:37 自陈 agent_unregistered \"have NO producer in v1\""
+      ],
+      "whyItBlocksEvolution": "permissions.go 是产品的授权边界，是安全审查唯一要看的那张表。表里 4 条无消费者的 subject 让安全审查面大于真实协议面；任何被授权的 ctl/agent 现在可以往 ctrl.version.announce 无限 publish（无 rate limit、无 schema 校验），将来给它加 subscriber 的人继承的是一个从未被有意设计过的授权。",
+      "recommendation": "从 5 个 permission 模板里摘掉这 7 行授权（35/136/227、170/250、140/174），并删 4 个 builder；若 unregister 是有意保留的未来能力，在 architecture.md 登记为「保留未接线」并保留 subject 但撤授权（least-privilege）。注意：SubjClusterWildcard 不属于本条（见下）。",
+      "estLinesRemovable": 21,
+      "changeRisk": "medium",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "medium",
+      "title": "三份逐字节相同的 hashToken；上一轮决定「用注释解决」后长出了第三份",
+      "evidence": [
+        "internal/port/port.go:470-473 hashToken",
+        "internal/tunnel/tunnel.go:1274-1277 hashToken — godoc 引用 \"Audit shard 06 F10 — flagged as low, resolved by comment, not extraction\"",
+        "internal/proxysub/proxysub.go:205-208 HashToken — godoc 只写 \"same scheme as port tokens\"，不知道第二份存在",
+        "三份函数体一字不差：sum := sha256.Sum256([]byte(raw)); return hex.EncodeToString(sum[:])"
+      ],
+      "whyItBlocksEvolution": "三处是同一个安全决策（raw bearer token 的存储/查表表示）的三个副本，必须永远一致。加 pepper 这类合理加固若漏改一处，后果不是编译错误也不是测试失败，而是静默 fail-closed 的全网故障（每个 agent 的 tunnel REGISTER 被拒），且错误信息指向 token 分发而非 hash 实现。上一轮「用注释固定重复」的处理方式已被证伪——重复繁殖了，且每份新副本的注释只知道自己那一份。",
+      "recommendation": "提叶子包 internal/tokenhash（仅 crypto/sha256 + encoding/hex，约 10 行），三处 import 它；tunnel 的 dep-graph-leaf 诉求依然成立因为 tokenhash 本身就是 leaf。",
+      "estLinesRemovable": 8,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "medium",
+      "title": "schema 里三个审计字段的注释声称会被填，生产从不填；上一轮刚修过同一 struct 的同类问题",
+      "evidence": [
+        "internal/schema/audit.go:24 AuditCall.ActorName — 唯一构造点 internal/broker/exec.go:428-435 不设",
+        "internal/schema/audit.go:45 AuditProc.DurationMs — internal/broker/exec.go:446-457 的 exit 分支只设 RC，任何分支都不设 DurationMs",
+        "internal/schema/audit.go:61 AuditPort.ActorNkey — internal/broker/expose.go:523-527 签名只有 actorFP，写的是 ActorFp",
+        "三个字段引用计数均 prod=0 test=1（仅 internal/schema/audit_test.go）",
+        "internal/broker/exec.go:419-422 记录着上一轮 03 F2 修复同 struct 的 ReqID/Target"
+      ],
+      "whyItBlocksEvolution": "schema 包自称 append-only contract，写进 JetStream history-<sid> 后必须永远可解码。消费者照 struct 写解码逻辑，然后发现 duration_ms 永远 nil、actor_nkey 永远空。同一缺陷类型在同一文件复发，说明「schema 字段 ↔ 构造点」之间没有任何机械约束。",
+      "recommendation": "填上而非删（删已发布字段要 bump AuditSchemaVersion）：pubAuditProc 加 startedAt 参数在 exit 分支算 DurationMs，pubAuditPort 加 actorNkey 参数；ActorName 若无来源则删。另在 audit_test.go 加「每个字段至少被一个生产构造点写过」的反射断言，钉死复发路径。",
+      "estLinesRemovable": 0,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "medium",
+      "title": "ExposeReq / ExposeRmReq / UpgradeReq 的 ActorFP 声明了一条 broker 从不执行的安全契约",
+      "evidence": [
+        "internal/proto/messages.go:577-579 / :670 / :715-717 — 注释 \"broker-stamped at forward time; same convention as ExecReq.ActorFP. ctl-supplied value is discarded\"",
+        "internal/broker/expose.go:277 与 internal/broker/upgrade.go:115 stamp 的是 *ForwardedReq，不是请求类型",
+        "对照真做 in-place stamp 的 internal/broker/exec.go:97 req.ActorFP = fp",
+        "三个字段引用计数 prod=0（仅 internal/proto/proto_invariants_test.go 等形状测试）"
+      ],
+      "whyItBlocksEvolution": "\"ctl-supplied value is discarded\" 是一条安全语义宣称（ctl 无法伪造 actor 身份）。今天是空的，但下一个给 expose 加「记录发起人」的人读到这行注释会直接用 req.ActorFP——拿到的是 ctl 自填、未经 broker 覆盖的值，即可伪造的 actor 身份进了审计记录。ExecReq 的同名字段在同文件相隔 200 行、措辞逐字相同、实现却不同。",
+      "recommendation": "让 broker 在 expose / expose-rm / upgrade handler 里也做 in-place stamp（与 exec/run/transfer 对齐，各 1 行），把三条约定收敛成一条。字段是 omitempty，完全 additive。",
+      "estLinesRemovable": 0,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "medium",
+      "title": "[核验新增] 51 条不可达函数里另有 5 处「误导性 godoc / 死构造器 / 仅测试可达簇」原报告未点名，其中最大的一簇约 40 行",
+      "evidence": [
+        "internal/broker/cluster_forward.go:309-380 ReconcileReqID + rcKey + writeSeg — 3 函数、约 40 行的仅测试可达簇（ReconcileReqID prod=0 test=11，后两者只被它调），大于原报告 F9 表里任何一条",
+        "internal/spawnsafe/spawnsafe.go:885-891 Policy.IsPathDead — godoc \"Exposed for the agent-liveness guard (Component I): the agent checks its own Home before a blocking state.json read\"，引用计数 0",
+        "internal/spawnsafe/spawnsafe.go:876 Policy.SafeDir（prod=0 test=8）与 :909 Policy.RunStart（prod=0 test=5，是生产在用的 RunStartWithCleanup 的 1 行孪生）",
+        "internal/broker/proxy.go:676-678 Broker.repairProxyEpoch — godoc 自陈 \"kept for direct callers / tests\"，正是 F8 点名要杀的 internal 包「为调用者保留」措辞",
+        "internal/broker/proxy_auto_rebalance.go:40 newAutoRebalanceArm — 死构造器，同文件 tick() 注释自陈 \"zero-value arm (a Broker struct field) is usable without newAutoRebalanceArm\""
+      ],
+      "whyItBlocksEvolution": "本报告自己总结的规律是「问题不在体量，在于活下来的死符号在误导人」，但 F1–F5 的取样偏向最小的叶子，漏掉了最大的仅测试可达簇和 3 处带假生产用途声明的 godoc。真实数量比 F1–F5 列出的多约一半。下一轮清理若以 F9 那张零引用表为清单，会系统性地漏掉这一类。",
+      "recommendation": "以「51 条 deadcode RTA 输出 × 逐条读 godoc」为清单重扫一遍，而不是以零引用表为清单。这 5 处按其形状分别归入 F2（BumpProxyEpoch 类）、F8（kept-for 措辞类）、F11（仅测试可达类）处理。",
+      "estLinesRemovable": 75,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "low",
+      "title": "clusterspec.NodeSpec 的 4 个 yaml 字段解析后被丢弃，而生成的命令行恰好缺的就是这几个值",
+      "evidence": [
+        "internal/clusterspec/spec.go:28-35 NodeSpec 的 RaftAddr / NatsRoute / TunnelAddr / CertFP — 引用计数全部为 0（含测试、含全部 build tag）",
+        "internal/clusterspec/spec.go:89-160 Diff() 是唯一消费者，只读 NodeID 与 Desired",
+        "internal/clusterspec/spec.go:111 生成的 Verb 串仍带字面 \"…\"，需要的正是这 4 个值"
+      ],
+      "whyItBlocksEvolution": "tether cluster apply 的整个价值主张是「把 roster.yaml 翻译成运维要敲的命令」。运维认真填了 raft_addr，工具解析了、扔掉了，最后打印一条带字面 … 的命令让运维再去别处翻一遍。这个命令的核心用途只完成了一半，而从 struct 定义 / yaml / 文档上都看不出来。",
+      "recommendation": "把这 4 个值插进 Diff 生成的 Sprintf（改 1 处）；若 join prepare 的真实参数形状不是这 4 个，就把 yaml schema 改成真实形状。绝不能留「解析了、丢弃了、还在文档里」。",
+      "estLinesRemovable": 0,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "low",
+      "title": "internal/ 包给「不可能存在的外部调用者」保留 back-compat / convenience API",
+      "evidence": [
+        "internal/subhttp/subhttp.go:147-150 LiveProxyNodes — godoc \"kept exported for back-compat\"，引用计数 0",
+        "internal/subhttp/subhttp.go:304-317 Serve — godoc \"Retained for callers/tests that want the combined form\"，prod=0 test=1（internal/subhttp/p13_external_review_test.go:19）；生产走 Bind + ServeListener（internal/broker/broker.go:886-895）"
+      ],
+      "whyItBlocksEvolution": "internal/ 是 Go 的封闭世界，编译器保证仓库外没有 import 者，所以「back-compat」在 internal 包里语义上不可能成立。这两个符号会永远活着，因为注释给了它们存在理由，下一次清理 subhttp 的人看到「kept for back-compat」就会跳过。",
+      "recommendation": "删这两个函数，测试改用 Bind + ServeListener；并把判据写进 review checklist：internal/ 包不存在 back-compat 义务，任何以外部兼容为由保留的 internal 符号都应被质疑（同一措辞在 internal/broker/proxy.go:676 也有一例）。",
+      "estLinesRemovable": 13,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "low",
+      "title": "约 30 个真·零引用叶子符号，其中 3 条带着积极的误导性文本",
+      "evidence": [
+        "抽查 14 个符号引用计数全部为 0（go/packages，Tests:true + 全部 8 个 build tag）：internal/session/session.go:51-57 Member、internal/proto/messages.go:204 RehomeDirective、internal/natsconf/preflight.go:209 Ownership.ServerName、internal/spawnsafe/spawnsafe.go:888 Policy.IsPathDead、internal/agent/transfer.go:571 IsPathValidationError、internal/agent/ssproxy/server.go:284 Server.LocalPort、internal/xferaudit/plan.go:30 TransferReqID、internal/subhttp/subhttp.go:148 LiveProxyNodes、internal/proto/messages.go:1077 ProxySubListReq、internal/proto/cluster_grow.go:11 ClusterGrowSchemaVersion、internal/adminsock/protocol.go:127 CodeAlreadyVoter、internal/serveconf/serveconf.go:112-113 WssListen/WSInternal、internal/agent/state.go:63 ProxyState.CertPins",
+        "internal/proto/messages.go:202-203 声称 \"a guard test asserts it has no live publisher so a half-wiring is caught (review A5 M5)\" — 该 guard test 不存在：grep -rn RehomeDirective --include=*.go 全仓 3 个命中全在 messages.go 自身",
+        "internal/serveconf/serveconf.go:112-113 被 scripts/install.sh:547-548 写入 broker.yaml、被 docs/broker-ops.md:112-113 文档化，但 Go 侧解析后从不读 —— 一个静默无效的配置旋钮"
+      ],
+      "whyItBlocksEvolution": "单条都是 nit，合起来的问题是其中 3 条带着积极的误导性文本（\"legacy coarse key\" 暗示还有非 legacy 用途、\"kept for back-compat\" 暗示有外部调用者、\"a guard test asserts…\" 暗示有安全网）。ClusterGrowSchemaVersion 尤其值得注意：定义了 wire schema 版本却从未 stamp 进 ClusterGrowReq，意味着 ClusterGrowReq 在线上没有版本判别位。",
+      "recommendation": "逐条删。三条特殊处理：ClusterGrowSchemaVersion 不要删要 stamp（additive，不动 ProtoVersion）；RehomeDirective 删掉 godoc 里那句假保证或真把 guard test 写出来；serveconf 两个字段删 Go 字段并决定 install.sh 是否继续写这两个 key（写则在 yaml 里标 informational only）。",
+      "estLinesRemovable": 70,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "low",
+      "title": "proc.ulidLower + bytePos 用 24 行手写实现了 strings.ToLower 一行的事，同仓另一处已经这么写了",
+      "evidence": [
+        "internal/proc/proc.go:62-77 ulidLower（手写 Crockford base32 大写→小写查表）+ :79-86 bytePos（手写 strings.IndexByte，只被 ulidLower 用）",
+        "internal/proxysub/proxysub.go:218-220 newSubID() — 同样需求，实现是 return strings.ToLower(ulid.Make().String())，1 行",
+        "等价性可证：ulid.String() 用 Crockford 大写表 0123456789ABCDEFGHJKMNPQRSTVWXYZ，ToLower 后逐字符等于 proc.go:63 的 enc 常量"
+      ],
+      "whyItBlocksEvolution": "影响很小（PID 生成不在热路径），真正成本是阅读成本：读 internal/proc 的人会停下来想「为什么不能用 strings.ToLower？是不是有 Unicode 陷阱？」——答案是没有陷阱，只是先写的那份没想到。",
+      "recommendation": "ulidLower 改为 strings.ToLower(u.String())，删 bytePos，保留 proc_test.go 里针对映射表的测试作为等价性回归。",
+      "estLinesRemovable": 23,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    },
+    {
+      "severity": "low",
+      "title": "86 个只被测试引用的生产声明——大部分是外部测试树的合理架构税，但 internal/cli 里有 26 行测试替身住在生产文件",
+      "evidence": [
+        "internal/cli/completion_transport.go:290-315 NewTestNATSTransport + stub transport（约 26 行），prod=0 test=1（test/cli_e2e/completion_test.go:35）",
+        "internal/cli/completion.go:151-156 ClearCompletionCacheForTest — prod=0 test=31，分布在 internal/cli/completion_test.go（17 处，包内）与 test/cli_e2e/completion_test.go（14 处，外部测试树）",
+        "internal/broker 的 5 个 *ForTest 方法（clusterwrite.go:125 / cutover.go:214/223/233 / home.go:42）全部 prod=0，被 test/d9 与 test/d6 使用",
+        "8 个测试可观测性计数器如 internal/cluster/node.go:422 Node.DedupCount（5 test refs）、internal/spawnsafe/spawnsafe.go:976 Policy.WedgedCount（9 test refs）"
+      ],
+      "whyItBlocksEvolution": "*ForTest 这一组不是债，是 test/pN 外部测试树布局的必然代价（跨包测试拿不到 export_test.go 可见性），应如实记为架构取舍。真正的债是 internal/cli 那 26 行测试替身住在生产文件里：读 completion_transport.go 的人会以为这个包有两种 transport 实现要维护，362 行里有 26 行（7%）是测试脚手架。",
+      "recommendation": "把 NewTestNATSTransport + stub 搬进 test/cli_e2e/（Transport 是导出接口，外部包可自行实现）：生产减 26 行。8 个计数器与 5 个 *ForTest 保留，建议统一加 // test-observability accessor 标记。**注意：ClearCompletionCacheForTest 不能搬进 internal/cli/export_test.go**——它同时被外部测试树 test/cli_e2e 使用，export_test.go 只对包内测试二进制可见，照做会编译失败。",
+      "estLinesRemovable": 26,
+      "changeRisk": "low",
+      "touchesWireOrInvariant": false
+    }
+  ],
+  "counterEvidence": [
+    "死代码率极低且逐位可复现：deadcode RTA（v0.42.0，入口 ./cmd/...）独立重跑得到 51 个 unreachable func、按 FuncDecl 起止行求和恰为 392 行 = 生产代码的 0.57%。同体量 Go 服务这个数字通常在 3–8%。",
+    "36 个 internal 包里 35 个真的进了发布二进制：go list -deps ./cmd/tether 与 go list ./internal/... 的差集只有 internal/testharness 一个。没有「为将来准备的空包」，没有「实验后忘了删的包」——对一个走了 P0→P11 + 十几个 post-1.0 增量的项目，这个纪律罕见。",
+    "internal/testharness（239 行、7 个函数）被 15 个测试包引用，替代方案是 15 份拷贝；它作为不进主二进制的独立包存在是唯一正确做法，不是债。",
+    "生产代码里 0 处注释掉的代码块：grep -rnE '^\\s*//\\s*(if |for |return |go |defer |switch )' 在生产文件命中 59 处，抽样全部是以这些词开头的英文散文注释。长期演进项目里几乎没见过。",
+    "只有 2 个空方法体（精确复核），都是合法接口实现：internal/cli/completion_transport.go:314 noopTransport.Close 与 internal/cluster/snapshot.go:73 fsmSnapshot.Release。没有「待实现」的空壳。",
+    "386 处 _ = f()（精确复核）全部是有意的 errcheck 消音，抽样未发现吞掉业务错误。",
+    "接口没有被滥用：AST 扫描报出的 28 个「零引用方法」全部是真接口实现（raft.FSM / raft.SnapshotSink / raft.StreamLayer / error / io.Reader / cluster.Applier / agent.ExposeAdapter / cli.Transport 等），且有 var _ Applier = …（internal/cluster/membership_ops.go:168）等 4 处编译期接口断言钉死契约。",
+    "「故意不接线」和「忘了删」被明确区分并写下了理由：internal/proto/messages.go:192-203 用 12 行说明 RehomeDirective 为何暂无 publisher；internal/clusterupgrade/plan.go:24-27 的 AgentUnknown 引用计数确为 0 但是 iota 零值且 fail-closed 语义是载荷，删掉会静默改变后续枚举值；internal/cluster/fsm.go:80-89 有 10 行 INVARIANT 注释禁止给 applied* 结果类型加 Error() 方法并记录了曾经的事故。一个能写下「为什么这段代码看起来该删但不能删」的仓库，比一个没有死代码的仓库更难得。",
+    "上一轮 06-deadcode-drift.md 的 13 条里 11 条真的闭合了（internal/frpmgr 悬空指针没了、lands in P<N> 相位标签全仓 0 命中、var _ = errors.New 占位符删了），说明 audit → 修复的闭环在这个项目里有效。",
+    "internal/proto 的 wire 面很克制：2,042 行承载 3 个角色 × ~40 个动词的完整协议，死掉的消息类型只有 2 个单行。同类项目常见的「每个版本留一份旧 message 类型」这里一份都没有。"
+  ],
+  "essentialVsAccidental": {
+    "essentialPct": 97,
+    "reasoning": "本 lane 能确证的偶然复杂度约 868 行 / 1.27%（RTA 不可达 392 + internal/testharness 239 + 零引用类型常量字段 ~45 + 语义重复实现 ~160 + 生产文件里的测试脚手架 32），去重后约 750 行 / 1.1%；加上核验阶段补出的 5 处漏报（约 75 行）为 ~825 行 / 1.2%。但这个桶里真正「直接删掉即可」的只有约 260 行——其余是 internal/testharness（239 行，报告自己论证过是正确抽象，不该删）与 auth.AccountSigner（95 行，建议是接线而非删）。另有约 1.8% 是灰色地带：86 个测试专用声明中「结构上被迫导出」的部分（*ForTest、外部测试树可见性代价），换掉它的代价远大于收益，应算作已付清的合理架构税。剩下的 ~97% 是活代码：从 main 可达、有生产调用者、承担真实职责。这 97% 是否「本质」取决于问题域（NAT 穿透 + Raft HA + auth_callout + 文件传输 + PTY + 隧道数据面 + 集群生命周期七个子系统），不在本 lane 的证据范围内，由 concurrency / broker-decomposition 等 lane 回答——本 lane 只能说：它们不是死的。"
+  },
+  "verificationNote": "本 JSON 由独立补位 agent 在核验后重写（原 lane agent 写完 567 行报告后、返回摘要前上下文耗尽崩溃，结论未经核验也未进入综合阶段）。核验手段：离线重编 deadcode@v0.42.0 + 自写 go/packages 引用计数器（Tests:true + 全部 8 个 build tag，并修正了 pkg [pkg.test] 变体导致的 types.Object 身份漏计陷阱），未跑任何测试、未改任何实现代码。结果：(1) 所有可精确复现的硬数字逐位命中——生产 68,328 行、51 个 unreachable func、392 行、2 个空方法体、386 处 _ = f()、仅 internal/testharness 在二进制闭包外，原报告没有幻觉；(2) 11 条 finding 中 9 条完整 upheld；(3) F3 的第 5 行 DOWNGRADED——proto.SubjClusterWildcard 不是未用常量，它被 internal/auth/permissions_test.go:246-247 用作 proto SSOT ↔ ACL 字面量的 drift guard，按原建议「删常量即可」会删掉活的守护断言；(4) F11 的一条具体建议 REFUTED——ClearCompletionCacheForTest 同时被 internal/cli/completion_test.go（包内 17 处）与 test/cli_e2e/completion_test.go（外部 14 处）使用，搬进 export_test.go 会让 test/cli_e2e 编译失败，而原报告在同一条 finding 里刚正确陈述过这条可见性规则；(5) 数字订正：internal 包 36 个（非 35）、internal/testharness 239 行（非 189）、internal/auth/jwt.go 92 行（非 95）、port.Revoke 位于 port.go:401-428（非 399-425）且净删 ~33 行（非 28）、F3 授权行 7 行（非 6）、偶然复杂度合计 818→868 行、可删估计 ~700→~750 行；(6) 最实质的补充是漏报——51 条不可达清单里另有 5 处符合本报告自身头号主题的符号未进 F1–F11，其中 session.BumpProxyEpoch 与 F2 同级（被取代的孪生 + godoc 声称生产在用），internal/broker/cluster_forward.go:309-380 的 ReconcileReqID+rcKey+writeSeg 是约 40 行的仅测试可达簇、大于 F9 表里任何一条。净判断（死代码不是臃肿原因、bloatScore 2/10、minor-debt）经复核成立，未变。"
+}

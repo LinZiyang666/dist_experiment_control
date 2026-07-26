@@ -4,6 +4,29 @@
 >
 > 术语与北极星请参见 `docs/requirements.md` §2、§3。本文只谈"如何实现"。
 
+> ## ⚠ 阅读须知（batch-A A8 加，外审 M3 补齐权威链，**先读这段再读下文**）
+>
+> **文档权威链**（与 `CLAUDE.md §1` 同一表）：本文是 **HOW·历史** 层。
+> 需求看 `docs/requirements.md`（WHAT）；v2 / 集群面**当前**如何实现看
+> `docs/distributed-broker-architecture.md` + `docs/deploy-tier-gotchas.md`（HOW·当前）。
+> **本文从不覆盖当前层。**
+>
+> **§A–§K 是 proto v1 / 单 broker 时代的历史基线，不是当前实现的尺。** 实测：
+>
+> | 文中写的 | 代码实际 |
+> |---|---|
+> | `tether.v1`（**70 处**） | `proto.ProtoVersion = 2`，subject 前缀是 `tether.v2` |
+> | frp / frpc / frps（**72 处**） | `go.mod` 里**没有 frp 依赖**；数据面是自研 `internal/tunnel`（yamux + mTLS） |
+> | Part II 的待办清单 | 已完成，属历史记录 |
+>
+> **v2 / 集群面的绑定契约在这两份，它们才是当前的尺：**
+> - `docs/distributed-broker-architecture.md` —— 分布式 broker、raft、home 归属、reconcile
+> - `docs/deploy-tier-gotchas.md` —— 真实部署下已知会踩的坑（hermetic 测试结构上到不了的那类）
+>
+> 为什么保留而不重写：§A–§K 里的**取舍论证**仍然有效（为什么选 NATS、为什么控制面/数据面分离、
+> 为什么 auth_callout），那是重写会丢失的部分。失效的只是**标识符与拓扑细节**。
+> 一把 40% 给出相反读数的尺，比没有尺更糟 —— 所以此处标注，而不是让读者自己踩。
+
 ---
 
 ## A. 部署拓扑
@@ -1551,7 +1574,7 @@ type AuditCall struct {
 
 ### I.5 构建与发布
 
-- **Makefile**：`make build` → `./bin/tether`（单二进制）；`make test`；`make e2e`；`make release` 触发 goreleaser。
+- **Makefile**：`make build` → `./bin/tether`（单二进制）；`make test`；`make e2e-parallel`；`make release` 触发 goreleaser。
 - **单条** `CGO_ENABLED=0 go build -ldflags "-X main.version=$V -X github.com/<org>/tether/internal/proto.ReleaseVersion=$V" ./cmd/tether` 出全部功能。
 - 静态链接（`CGO_ENABLED=0`）保证无权限机器可直接放置运行（见 K）。
 - **goreleaser** 负责多平台交叉编译（`linux/amd64`、`linux/arm64` 首发；`darwin/*` 可选），输出 `tether_<ver>_<os>_<arch>.tar.gz`（内含单一 `tether` 二进制）+ `install.sh` + `SHA256SUMS`。

@@ -6,9 +6,9 @@
 // subprocess-invoke each phase package, so:
 //
 //   - one entry point: `go test -tags e2e_matrix ./test/e2e/...`
-//     runs everything (or `make e2e` via the Makefile target);
+//     runs everything (or `make e2e-parallel` via the Makefile target);
 //   - the per-phase packages stay intact for fast iteration
-//     (`go test ./test/p7/...` is much shorter than `make e2e`);
+//     (`go test ./test/p7/...` is much shorter than `make e2e-parallel`);
 //   - a hang or long e2e in one phase doesn't drag the others —
 //     each subtest is its own subprocess with its own timeout;
 //   - failures bubble up with the phase name in t.Run output, so
@@ -29,14 +29,72 @@ import (
 	"time"
 )
 
-// NOTE on speed (2026-06): parallelizing the matrices was tried + measured and REVERTED. The
-// heavy clustered-JetStream matrices (D5/D8) starve their embedded-JS meta-group formation
-// ("routed JS server not ready") whenever a concurrent heavy -race matrix shares the machine —
-// even at -parallel 2 with GOMAXPROCS capped (D8 flaked at 2-way, D5 at 4-way). The matrix
-// runtime is dominated by these timing-sensitive suites, so meaningful parallelism reintroduces
-// exactly the contention flakes this phase hardened. Serial is the right release-gate posture.
-// For fast LOCAL iteration run the ONE suite you touched, e.g. `go test ./test/p8/...` or
-// `go test -tags d8_integration -race ./test/d8/`, not the whole e2e.
+// NOTE on speed — CORRECTED 2026-07 (the 2026-06 note below was an attribution error).
+//
+// The original note said parallelism "was tried + measured and REVERTED" because D5/D8 starve
+// their embedded-JS meta-group formation ("routed JS server not ready") when a concurrent matrix
+// shares the machine, flaking at -parallel 2 (D8) and 4 (D5). The FLAKES were real. The cause
+// was not resource starvation:
+//
+//   - a full serial e2e run leaves this host 97.5% CPU-idle, disks at 0% util, 196 GB RAM free;
+//   - what -parallel changes is SCHEDULING, not supply. GOMAXPROCS bounds how many threads run,
+//     never WHERE they run, so two test processes still interleave across both sockets — and
+//     cross-NUMA access here costs 2.1x local (distance 21 vs 10). Lock-heavy raft/JS handshakes
+//     with hard deadlines are precisely the workload that notices.
+//
+// With each matrix pinned to an exclusive set of whole physical cores on ONE NUMA node
+// (test/e2e/parallel, `make e2e-parallel`), measured on this 44-core box:
+//
+//   serial                                  18m21s
+//   strict fallback + 8-way shards, auto     2m54s   ~6.4x, 99 units, ALL PASS,
+//                                                    coverage self-check 15/15
+//
+// An earlier version of this table read 2m22s / 7.9x. It was wrong, and how it was
+// wrong is the useful part: test/e2e/parallel required a "Matrix" name suffix on
+// its run-whole fallback, and TestAllPhases keeps its exec.Command in runPhase() —
+// a different function — so it parsed to nothing, matched no suffix, and was
+// dropped. Every one of those runs skipped all 11 phase suites and finished fast
+// and green. TestAllPhases takes 1m49s on its own; that is most of the difference
+// between the two numbers. The fallback no longer name-filters, and the runner now
+// refuses to start unless every top-level test here has a unit.
+//
+// The per-package split being SLOWER is the useful measurement: `go test ./a/... ./b/...`
+// already runs its packages concurrently, so splitting them re-implements what the
+// toolchain does and adds process overhead. The real ceiling was inside one package —
+// internal/broker is 4m37s of D4's 4m45s, because Go runs tests within a package
+// serially (496 tests at 0.7 cores of real CPU; the rest is waiting). Sharding by test
+// NAME moves it: each shard is its own process, which is safer than adding t.Parallel()
+// since nothing is shared and per-test globals stay per-process.
+//
+// D8 passed at 28s/36s and D5 at 4m50s/4m44s — the two suites the note said could not tolerate
+// 2-way and 4-way.
+//
+// The matrices that flaked under the parallel runner turned out to share ONE defect, and calling
+// it "the d7 harness" (as this note first did) understated it by a factor of seventeen: every
+// raft-driving suite in the repo had invented its own timings — 50ms, 60ms, 80ms, 100ms, 150ms,
+// with one 25ms leader lease — against a production heartbeat of 1000ms and a lease of 500ms.
+// d7 was simply the first one caught. All 17 sites now reference
+// cluster.Multinode{Heartbeat,Election,LeaderLease}Timeout, and
+// test/determinism.TestRaftTimingsUseProductionConstants fails the build if a new one appears.
+//
+// The mechanism, using d7 as the example: it drove raft with a 60ms heartbeat timeout while the
+// suite is required to run under -race, which slows memory access 5-10x. A GC pause was enough to unseat
+// the leader mid-AddNode. It was first raised to 300ms, which took d7 from ~1/7 failures to 6/6
+// green serially and 30/30 across two full parallel rounds; external review M4 then pointed out
+// that 300ms is still a third of production's MultinodeHeartbeatTimeout, i.e. a harness tuned to
+// the edge of what -race allows rather than to what production actually does, so it now matches
+// production at 1000ms. Runtime is unchanged either way — the timeout bounds failure detection,
+// not the happy path. Running the matrices concurrently is what made this frequent enough to
+// diagnose at all; three earlier attempts had each treated a symptom (wait longer, re-elect,
+// transfer leadership back) without asking why leadership kept moving.
+//
+// This is the same shape as simcluster's "drills must run serially", which was believed for a
+// long time and turned out to be fs.inotify.max_user_instances exhaustion.
+//
+// `make e2e-parallel` IS the gate (CLAUDE.md §5). Running this whole matrix serially is
+// forbidden: it was the gate for years and caught none of the four defect classes a loaded
+// parallel run exposed. Use this file's suites individually (`go test ./test/pX/...`) only to
+// isolate something the parallel run already flagged.
 
 // phaseTimeout caps each subprocess. test/p3 is the slow one
 // (~22s for the full auth_callout matrix); 90s gives 4× headroom.
@@ -58,9 +116,11 @@ func TestAllPhases(t *testing.T) {
 	// C.5.1, 3s deadline) is contention-sensitive: with 10 phase
 	// subprocesses each spawning embedded NATS + multiple
 	// goroutines per test, attach_timeout fires under load and
-	// `make e2e` flakes. P11 is a release gate — repeatability
-	// beats wall-clock. Sequential is ~80s on this box, still
-	// well inside any nightly budget.
+	// attach_timeout fires. Repeatability beats wall-clock HERE,
+	// inside one matrix: the parallelism that matters is between
+	// matrices, and test/e2e/parallel provides it — this unit is
+	// scheduled onto a wide worker precisely so its serial phases
+	// each get enough machine. Sequential is ~80s on this box.
 	for _, phase := range allPhases {
 		t.Run(phase, func(t *testing.T) {
 			runPhase(t, phase)
@@ -74,7 +134,7 @@ func TestAllPhases(t *testing.T) {
 // in test/cli_e2e (a `make test` hard gate); the phase matrix is otherwise a
 // `./test/pN` runner and transfer is a post-1.0 feature increment, so rather
 // than mint a fake phase this subprocess re-runs just the open/off-switch
-// cases here. A silent re-disable of the open default thus fails `make e2e`
+// cases here. A silent re-disable of the open default thus fails `make e2e-parallel`
 // too, not only `make test`.
 func TestTransferDefaultsMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -97,7 +157,7 @@ func TestTransferDefaultsMatrix(t *testing.T) {
 // phase it re-runs the feature's hermetic suites as a subprocess (under -race,
 // since the spawn watchdog + sticky/self-healing probe are concurrency
 // surfaces): a regression in PATH sanitization, the abandon/ceiling watchdog,
-// the broker Safe round-trip, or Component I thus fails `make e2e` too, not just
+// the broker Safe round-trip, or Component I thus fails `make e2e-parallel` too, not just
 // `make test`.
 // TestProxyDialMatrix runs the post-1.0 proxy-aware-dial leaf under -race, like
 // the other leaf matrices (the dialer is invoked concurrently on reconnect, so
@@ -126,7 +186,7 @@ func TestProxyDialMatrix(t *testing.T) {
 // needs its OWN budget well beyond the 90s phase cap and must NOT go through the
 // no-race allPhases runPhase. A regression in the same-txn applied_index
 // invariant, the idempotent re-apply, the online-backup snapshot/restore, or the
-// WAL-concurrency path thus fails `make e2e` too, not only `make test`.
+// WAL-concurrency path thus fails `make e2e-parallel` too, not only `make test`.
 func TestD1Matrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
@@ -367,7 +427,7 @@ func TestRemoteFSMatrix(t *testing.T) {
 // -race: a regression in the reconnect loop (DENY-terminal taxonomy, transient
 // retry, ctx-cancel, no-leak / no-double-owner), the broker token-lookup
 // transient split (Fix C), the repairProxy not-ready suppression (Fix D), or
-// the agent readiness hook (Fix B) thus fails `make e2e` too, not only `make test`.
+// the agent readiness hook (Fix B) thus fails `make e2e-parallel` too, not only `make test`.
 func TestProxyTunnelReconnectMatrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
@@ -405,7 +465,7 @@ func runPhase(t *testing.T, phase string) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
 
-	// -count=1 disables go's test cache so each `make e2e` run is
+	// -count=1 disables go's test cache so each `make e2e-parallel` run is
 	// a real exercise, not a cached PASS replay (architecture
 	// P11 acceptance: "CI 夜跑稳定 ≥ 7 天" — we want each night
 	// to actually re-run, not stamp the same cached pass).

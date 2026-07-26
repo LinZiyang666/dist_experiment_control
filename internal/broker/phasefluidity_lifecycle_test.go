@@ -24,7 +24,7 @@ func pfRestartableNode(t *testing.T, id, dir string, bootstrap bool) *cluster.No
 	cfg := cluster.Config{
 		LocalID: raft.ServerID(id), DataDir: dir, DBPath: filepath.Join(dir, "state.db"),
 		Transport: trans, ApplyTimeout: 30 * time.Second,
-		HeartbeatTimeout: 50 * time.Millisecond, ElectionTimeout: 50 * time.Millisecond, LeaderLeaseTimeout: 25 * time.Millisecond,
+		HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout, LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 	}
 	if bootstrap {
 		cfg.BootstrapPeers = []raft.Server{{Suffrage: raft.Voter, ID: raft.ServerID(id), Address: addr}}

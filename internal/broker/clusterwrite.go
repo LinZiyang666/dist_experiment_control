@@ -95,12 +95,18 @@ type clusterRuntime struct {
 	subs []*nats.Subscription
 	// auditPub + alertRec are the leader-gated loops; they poll IsLeader() so the
 	// goroutine count is constant across leadership flaps.
-	auditPub *AuditPublisher
+	// auditPub is written once by wireClusterLate and read afterwards by, among
+	// others, the /metrics HTTP goroutine (metrics_wire.go). Batch-A review M6:
+	// that read was unsynchronised against the write — a real data race with a
+	// seconds-wide window (wireClusterLate does JetStream probing and several
+	// reconciles between broker start and this assignment), which a 15s scrape
+	// interval can land inside. atomic.Pointer keeps the read lock-free.
+	auditPub atomic.Pointer[AuditPublisher]
 	alertRec *AlertReconciler
 	// cancel stops the leader-gated loops (a child of Run's ctx); loopDone receives one
 	// signal per loop on exit so the ordered shutdown can JOIN them (not guess via defer).
-	cancel   func()
-	loopDone chan struct{}
+	cancel func()
+	loops  *loopSet
 	// admin is the D7 membership orchestrator wired into the adminsock cluster backend;
 	// kept here so the d9_integration harness can drive `cluster add` (AddNode) directly.
 	admin *ClusterAdmin
@@ -154,12 +160,8 @@ func (b *Broker) clusterShutdownOrdered() {
 	if b.cl.cancel != nil {
 		b.cl.cancel()
 	}
-	for i := 0; i < cap(b.cl.loopDone); i++ {
-		select {
-		case <-b.cl.loopDone:
-		case <-time.After(10 * time.Second):
-			b.cfg.Logger.Warn("broker: cluster loop did not exit within 10s of shutdown")
-		}
+	if b.cl.loops != nil {
+		b.cl.loops.Join(10*time.Second, b.cfg.Logger)
 	}
 	// 3. Unsubscribe the responders (stop accepting new forwarded writes / RPCs).
 	for _, s := range b.cl.subs {
@@ -386,7 +388,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		SelfID:           b.selfID,                              // #93/H13: distinguishes a same-node lease blip from a genuine handoff when re-baselining the webhook
 		SetJSUnavailable: func(v bool) { b.jsUnavail.Store(v) }, // G7b #20③: leader-observed sustained JS-503 → health self-report
 	})
-	b.cl.auditPub = pub
+	b.cl.auditPub.Store(pub)
 	b.cl.alertRec = rec
 	// D7 membership orchestrator — constructed in cluster mode regardless of the admin
 	// socket (the adminsock backend, wired later in Run, uses it iff the socket is set).
@@ -429,21 +431,19 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// shutdown still stops them.)
 	loopCtx, cancel := context.WithCancel(ctx)
 	b.cl.cancel = cancel
-	// Base 3 (pub/rec/observe) + 1 for the C3 topology reconciler (always started in cluster mode,
-	// even when inert) + 1 when a webhook poster joins the ordered shutdown.
-	loopCount := 4
-	if poster != nil {
-		loopCount = 5
-	}
-	b.cl.loopDone = make(chan struct{}, loopCount)
-	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); pub.Run(loopCtx) }()
-	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); rec.Run(loopCtx) }()
+	// Batch-A A5: the set counts itself. The previous hand-maintained
+	// loopCount (4, or 5 with a webhook poster) had no test and no link to the
+	// `go` statements below it; undercounting it would let the ordered shutdown
+	// proceed to nc.Drain while a loop was still publishing.
+	b.cl.loops = newLoopSet()
+	b.cl.loops.Go(loopCtx, "audit-publisher", pub.Run)
+	b.cl.loops.Go(loopCtx, "reconciler", rec.Run)
 	// D9 §17 step 10b: the leader-gated observability poll (broker_down / raft_lag).
-	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); b.runObserveLoop(loopCtx) }()
+	b.cl.loops.Go(loopCtx, "observe", b.runObserveLoop)
 	// C3: the per-broker (NOT leader-gated) NATS topology reconcile loop.
-	go func() { defer func() { b.cl.loopDone <- struct{}{} }(); b.runTopologyReconcileLoop(loopCtx) }()
+	b.cl.loops.Go(loopCtx, "topology-reconcile", b.runTopologyReconcileLoop)
 	if poster != nil {
-		go func() { defer func() { b.cl.loopDone <- struct{}{} }(); poster.Run(loopCtx) }()
+		b.cl.loops.Go(loopCtx, "alert-webhook", poster.Run)
 	}
 	return nil
 }
@@ -466,7 +466,13 @@ func (b *Broker) clusterCaughtUp(nodeID string, barrier uint64) (bool, error) {
 // fail-closed — an incomplete observation reports NOT ready). nodeID is unused (the predicate
 // is cluster-wide: a stream below target means retiring ANY node risks losing a replica).
 func (b *Broker) clusterStreamsReady(string) (bool, error) {
-	rep, err := b.cl.auditPub.ObserveReplicas(context.Background())
+	ap := b.cl.auditPub.Load()
+	if ap == nil {
+		// Fail-closed, consistent with AllAtTarget's own contract: an
+		// unobservable cluster is NOT ready.
+		return false, fmt.Errorf("broker: audit publisher not wired yet")
+	}
+	rep, err := ap.ObserveReplicas(context.Background())
 	if err != nil {
 		return false, err
 	}

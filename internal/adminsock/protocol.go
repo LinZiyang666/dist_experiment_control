@@ -370,11 +370,33 @@ type RuntimeReport struct {
 	// last-tick the registry recorded. A pass whose LastTick stops advancing while the process is
 	// up is a stalled reconciler — the other class of live-broker fault this verb surfaces.
 	Reconcilers []ReconcilerTick `json:"reconcilers"`
+	// ClusterLoops (batch-A A5, corrected by review M8) lists the long-running
+	// cluster loops with their start time only — see ClusterLoopInfo for why they
+	// are NOT folded into Reconcilers. omitempty: absent in single mode, so no
+	// schema_version bump (docs/usage.md §9.14 bump policy).
+	ClusterLoops []ClusterLoopInfo `json:"cluster_loops,omitempty"`
 }
 
 // ReconcilerTick is one R7 reconcile pass's observability row, projected from the registry's
 // status snapshot (R13 consumes the lastTick the registry has recorded since R7a; it does not
 // change the scheduler).
+// ClusterLoopInfo describes one long-running cluster loop (audit publisher,
+// reconciler, observe, topology reconcile, alert webhook).
+//
+// Batch-A review M8: these were briefly reported as ReconcilerTick rows, but the
+// contract on that type is that a LastTick which stops advancing means the pass
+// is STALLED — and a loop row's LastTick cannot advance, because the set only
+// observes the loop's start. Four permanent false "stalled" rows in every
+// `admin runtime --json` and every export-incident bundle is a worse outcome
+// than not reporting the loops at all.
+//
+// So they get their own key with only the field that is actually knowable. Per-iteration
+// liveness arrives when B7 moves these loops onto the reconciler registry.
+type ClusterLoopInfo struct {
+	Name      string    `json:"name"`
+	StartedAt time.Time `json:"started_at"`
+}
+
 type ReconcilerTick struct {
 	Name       string    `json:"name"`
 	IntervalMS int64     `json:"interval_ms"`

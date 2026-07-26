@@ -275,7 +275,11 @@ func raftConfig(cfg Config) *raft.Config {
 	c.ElectionTimeout = orDur(cfg.ElectionTimeout, 200*time.Millisecond)
 	c.LeaderLeaseTimeout = orDur(cfg.LeaderLeaseTimeout, 200*time.Millisecond)
 	c.CommitTimeout = orDur(cfg.CommitTimeout, 20*time.Millisecond)
-	c.LogOutput = io.Discard // D1: discard raft's internal chatter; D3 wires logging
+	// Batch-A A15: raft's own logging, finally wired (the D3 the old comment
+	// promised). WARN+ only, deduplicated per raftLogDedupWindow, so the volume
+	// is bounded regardless of how many unreachable peers the configuration
+	// holds. DEBUG/INFO ride --log-level debug.
+	c.Logger = NewRaftLogger(cfg.Logger, cfg.Logger != nil && cfg.Logger.Enabled(context.Background(), slog.LevelDebug))
 	// SQLite is the durable apply authority (§3.7): on restart it already holds
 	// the committed state, and raft re-applies the log idempotently (the FSM
 	// self-skips index <= applied_index). So do NOT let raft roll SQLite back to a

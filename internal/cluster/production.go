@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -38,6 +39,14 @@ type ProductionConfig struct {
 	// LeafCertPath / LeafKeyPath: this node's cluster-CA-signed route leaf + key.
 	LeafCertPath string
 	LeafKeyPath  string
+	// Logger backs both the FSM's own logging and the raft library bridge
+	// (raftlog.go). Batch-A review M1: this field did not exist, so every
+	// production Node was built with a nil Logger and raftLogBridge.emit
+	// returned on its first line — the raft logging A15 claimed to have "finally
+	// wired" was, on the only path that actually runs in production, a black
+	// hole. nil is still tolerated (tests construct Config directly), but the
+	// daemon must pass one.
+	Logger *slog.Logger
 }
 
 // NewProduction builds the mTLS transport and the cluster Node for the D9 daemon. The
@@ -75,6 +84,7 @@ func NewProduction(cfg ProductionConfig) (*Node, error) {
 
 	n, err := New(Config{
 		LocalID:            raft.ServerID(cfg.LocalID),
+		Logger:             cfg.Logger,
 		DataDir:            cfg.DataDir,
 		DBPath:             cfg.DBPath,
 		Transport:          trans,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"strings"
 )
 
@@ -21,8 +22,8 @@ var brokerCodeHints = map[string]string{
 	"not_owner":                     "only the session owner can do this; ask the owner to run it.",
 	"not_owner_or_creator":          "only the session owner or the resource creator can do this.",
 	"not_a_member":                  "you're not a member of this session; ask the owner for a PIN and run `tether login -s <sid> --pin <pin>`.",
-	"session_not_found_or_deleting": "the session doesn't exist or is being deleted; check `tether session list`.",
-	"session_not_found":             "the session doesn't exist; check `tether session list`.",
+	"session_not_found_or_deleting": "the session doesn't exist or is being deleted; check `tether session ls`.",
+	"session_not_found":             "the session doesn't exist; check `tether session ls`.",
 	// Q4 (docs/reviews/r6-findings.md): a session create routes through raft. It now reports success
 	// on the FIRST attempt even when the committed write is not yet locally visible, so already_exists
 	// means the name is genuinely taken. If a PRIOR create's request itself timed out (no reply), the
@@ -113,7 +114,14 @@ var brokerCodeExitClasses = map[string]int{
 	"already_exists": exitUsage,
 	// our bug / version skew -> internal
 	"agent_malformed_resp": exitInternal, "json_parse": exitInternal,
-	"proto_bump_requires_reinstall": exitInternal, "store_error": exitInternal,
+	"store_error": exitInternal,
+	// External review M1: proto_bump_requires_reinstall was exitInternal(70)
+	// while proto_mismatch — the same refusal, same remedy — was 64. docs/usage.md
+	// says both need a full reinstall, and §9.13 tells automation that 70 is
+	// retryable. So the code whose own hint says "this needs a full reinstall,
+	// not `node upgrade`" was the one instructing monitors to retry it forever.
+	// Two names for one operator action get one class.
+	"proto_bump_requires_reinstall": exitUsage,
 	// adminsock cluster codes (Item 4 sets these on the wire; the CLI maps them here)
 	"not_leader": exitNoPerm, "already_voter": exitUsage, "not_a_voter": exitUsage,
 	"catch_up_stalled": exitTransient, "quorum_confirm_required": exitUsage, "nonce_used": exitUsage,
@@ -130,12 +138,106 @@ var brokerCodeExitClasses = map[string]int{
 	// compile-time link across the two packages, so TestDataplaneNotConvergedCodeIsWireStable
 	// pins it from this side.
 	dataplaneNotConvergedCode: exitTransient,
+
+	// ---------------------------------------------------------------------
+	// Batch-A A1. Everything below was previously UNMAPPED, i.e. it exited 70
+	// — and docs/usage.md §9.13 tells automation to retry 70 with backoff. So
+	// `too_large` (a file over the hard 2 GiB ceiling) was instructing monitors
+	// to retry forever, recomputing a full-file SHA-256 each round. These are
+	// classified by the same taxonomy as the block above: permission -> 77,
+	// self-healing transient -> 75, operator-action-required -> 64, our bug or
+	// version skew -> 70. Codes whose class is genuinely NOT KNOWN are left
+	// unmapped on purpose and recorded in unclassifiedCodeAllowlist (see
+	// error_code_coverage_test.go) rather than being guessed at.
+
+	// permission / security boundary -> 77
+	// path_outside_roots is a REFUSAL, not a usage slip: the path resolved
+	// outside every configured allow_root. Same shape as not_owner.
+	"path_outside_roots": exitNoPerm,
+
+	// positively self-healing transients -> 75
+	"attach_timeout":          exitTransient, // PTY attach did not land in time; the next attempt usually does
+	"path_race":               exitTransient, // the path changed under us mid-check; re-resolving is the fix
+	"forward_failed":          exitTransient, // broker->broker forward failed; the caller re-runs the verb
+	"broker_forward_failed":   exitTransient,
+	"cluster_not_ready":       exitTransient, // the cluster is still converging
+	"remote_fs_unhealthy":     exitTransient, // spawnsafe: the path lives on a wedged mount; heals when the mount does
+	"remote_fs_spawn_timeout": exitTransient, // spawnsafe: the bounded stat gave up; the slot is released on fs recovery
+	"too_many_wedged_spawns":  exitTransient, // spawnsafe: slot exhaustion, self-clearing (spawnsafe.go:812-814)
+
+	// operator-action-required (a human must change something) -> 64
+	"name_required":         exitUsage,
+	"name_reserved":         exitUsage,
+	"not_found":             exitUsage, // the target does not exist; retrying cannot make it appear
+	"on_broker_single_mode": exitUsage, // this verb needs a cluster; the broker is single-mode
+	"on_broker_unknown":     exitUsage,
+	"already_deleting":      exitUsage, // terminal state, not a race to wait out
+	"already_revoked":       exitUsage,
+	"sub_name_invalid":      exitUsage,
+	"sub_name_taken":        exitUsage,
+	"sub_not_found":         exitUsage,
+	"argv_required":         exitUsage,
+	"pid_required":          exitUsage,
+	"pid_unknown":           exitUsage, // that PID is not tracked; a retry will not find it
+	"path_not_absolute":     exitUsage,
+	"path_not_found":        exitUsage,
+	"path_parent_missing":   exitUsage,
+	"not_a_regular_file":    exitUsage,
+	"dst_exists":            exitUsage,
+	"transfer_disabled":     exitUsage, // a config state; the operator must enable transfers
+	"tier_invalid":          exitUsage,
+	"too_large":             exitUsage, // over the hard size ceiling — physically cannot succeed on retry
+	"size_mismatch":         exitUsage,
+	"sha_mismatch":          exitUsage,
+	"bucket_unknown":        exitUsage,
+	"install_failed":        exitUsage, // read the agent log; blind retry re-runs the same failing install
+	"self_path":             exitUsage, // refusing to overwrite our own running binary
+	"sha256_required":       exitUsage,
+	"frpc_failed":           exitUsage, // the data-plane helper failed to start; needs a human
+	"nid_mismatch":          exitUsage, // this agent is configured for a different node id
+	"proto_mismatch":        exitUsage, // reinstall the peer at a matching release (see CLAUDE.md §5)
+	"request_invalid":       exitUsage,
+	"rejected":              exitUsage, // kill refused by policy/state; the reason string says which
+	"lock_not_held":         exitUsage, // grow lock lost — cluster_grow_trigger.go:124 wants the keeper to STOP
+	"remote_fs_unsafe_cwd":  exitUsage,
+	"remote_fs_not_found":   exitUsage,
+	"verb_mismatch":         exitUsage,
+	"transfer_unknown":      exitUsage, // no such transfer id; it will not appear on retry
+
+	// permission -> 77 (second entry; grouped with path_outside_roots above)
+	"unauthorized": exitNoPerm, // the grow trigger's account-signature check refused this caller
+
+	// The online force-single anti-split-brain gates (adminsock.Code*). These
+	// were the most dangerous unmapped codes in the repo: force-single is the
+	// operation that can END a cluster, every one of its refusals used to exit
+	// 70, and §9.13 tells automation that 70 is retryable — i.e. "keep retrying
+	// the force-single we refused because the other broker is still ALIVE".
+	// All five are decisions a human must act on; none self-heals.
+	"peer_alive":           exitUsage, // a confirmed-dead peer answered a probe — the refusal is the point
+	"quorum_not_lost":      exitUsage, // quorum is intact; force-single is not the right tool
+	"force_single_refused": exitUsage,
+	"arm_expired":          exitUsage, // the arming window closed; re-arm deliberately, do not auto-retry
+	"is_leader":            exitUsage, // transfer leadership off this broker first (reexec.go:58)
+
+	// our bug / version skew -> 70 (stated explicitly, so "we judged this" is
+	// distinguishable from "nobody looked")
+	"actor_invalid":          exitInternal, // a well-formed ctl cannot produce this
+	"subject_malformed":      exitInternal,
+	"marshal":                exitInternal,
+	"internal_error":         exitInternal,
+	"state_write_failed":     exitInternal,
+	"signal_failed":          exitInternal,
+	"cutover_revival_failed": exitInternal,
+	"free_failed":            exitInternal,
 }
 
-// dataplaneNotConvergedCode mirrors internal/broker's codeDataplaneNotConverged. Renaming
-// either side silently downgrades a terminal "not converged" signal to exit 70; the wire-
-// stability test is the only thing standing between those two literals.
-const dataplaneNotConvergedCode = "dataplane_not_converged"
+// dataplaneNotConvergedCode aliases the proto SSOT, which internal/broker also
+// aliases. Batch-A review F-17: these were two independent string literals kept
+// in sync only by a test, and A1 made it three. Now the compiler holds them
+// together and TestDataplaneNotConvergedCodeIsWireStable pins the VALUE against
+// a literal written into the test file — which is the assertion that still
+// matters, since renaming is free but changing the bytes is a wire break.
+const dataplaneNotConvergedCode = proto.CodeDataplaneNotConverged
 
 // brokerCodeExitClass returns the exit class for a broker code (default exitInternal=70).
 func brokerCodeExitClass(code string) int {
@@ -213,10 +315,29 @@ var runFailureReasons = map[string]string{
 }
 
 func runFailureMessage(reason string) error {
-	if hint := runFailureReasons[reason]; hint != "" {
-		return fmt.Errorf("run failed: %s (%s)", hint, reason)
+	// Batch-A A1 Step 4. The broker sends RunChunk.Reason as either "<code>" or
+	// "<code>: <detail>" (internal/broker/run.go builds the latter with
+	// `"store_error: " + err.Error()`). This function only ever looked up the
+	// WHOLE string, so every reason carrying a detail missed both the hint table
+	// and the exit-class table and came out as a bare 70 — which
+	// docs/usage.md §9.13 tells automation to retry.
+	//
+	// execFailureMessage already split on the colon; run did not. Same wire
+	// shape, two different readers. The split is done here rather than by
+	// changing RunChunk: adding a Code field would be a wire change, and batch A
+	// is explicitly zero-wire.
+	code := reason
+	if i := strings.IndexByte(reason, ':'); i >= 0 {
+		code = strings.TrimSpace(reason[:i])
 	}
-	return fmt.Errorf("run rejected by agent (%s)", reason)
+	class := brokerCodeExitClass(code)
+	if hint := runFailureReasons[code]; hint != "" {
+		return &ExitError{Class: class, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
+	}
+	if hint := brokerCodeHints[code]; hint != "" {
+		return &ExitError{Class: class, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
+	}
+	return &ExitError{Class: class, Err: fmt.Errorf("run rejected by agent (%s)", reason)}
 }
 
 // execFailureMessage wraps an exec error-chunk string, appending the operator

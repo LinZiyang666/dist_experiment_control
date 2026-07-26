@@ -374,7 +374,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   **非幂等**——首超时后每次重试 leader 的 `PlanCreate` 存在性复查返 `already_exists`+rc=70 ⇒ `poll_until` **结构上永远转不了绿**；
   `error_hints.go` 无 `already_exists` 条目。
 - **产品修复（R14）——为何不用 owner-fp 幂等**：初版对 `ErrAlreadyExists` 走「同 owner ⇒ 视作本次创建返成功」的幂等出口，
-  被 `make e2e` 的 `test/d9`（`SessionCreateRoutesThroughRaft`/`TwoBrokerJoinReplicates`）打回——那两条**同 actor 连做两次
+  被 `make e2e-parallel` 的 `test/d9`（`SessionCreateRoutesThroughRaft`/`TwoBrokerJoinReplicates`）打回——那两条**同 actor 连做两次
   create**、以「第二次被拒」证明第一次已 commit 到复制 FSM。**一次超时重试与一次全新同名 create 在 broker 侧字节无别**
   （无跨进程幂等 token），故任何让「同 owner 第二次 create」成功的方案都**必然**破坏该 D9 契约。改走正确得多的一招：
   - **(核心) read-back 超时非致命 ⇒ 首次即报成功**：`proposeOrForward` 返 nil **就已经意味着写 commit 到 raft**（leader 路径

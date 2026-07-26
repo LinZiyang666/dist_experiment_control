@@ -74,7 +74,7 @@ func newHomeBroker(t *testing.T, db *sql.DB, nodeID string) *homeBrokerInst {
 	b.AttachClusterSeam(nodeID, cert)
 
 	// Retry the listen-port bind: freePort is a TOCTOU allocator (listen :0 -> close ->
-	// reuse), so under the heavy concurrent `make e2e` -race load the chosen port can be
+	// reuse), so under the heavy concurrent `make e2e-parallel` -race load the chosen port can be
 	// grabbed by another listener before Start binds it. Retry with a fresh port a few
 	// times rather than flaking the whole suite.
 	var addr string
@@ -215,7 +215,7 @@ func waitEcho(t *testing.T, publicPort int, msg string, timeout time.Duration) {
 
 // seedAndOpenHome seeds a homed expose on a fresh public port and opens it via the
 // agent, RETRYING with a new port if the broker's public-port bind loses the freePort
-// TOCTOU race ("public_port_bind_failed") under the concurrent `make e2e` -race load.
+// TOCTOU race ("public_port_bind_failed") under the concurrent `make e2e-parallel` -race load.
 // Returns the public port that succeeded. Use it for the HAPPY-path opens (the
 // expect-failure tests assert specific errors and must not retry).
 func seedAndOpenHome(t *testing.T, db *sql.DB, cli *tunnel.Client, sid, nid, name string, localPort int, token, homeNodeID, homeAddr string, epoch int64, pins proto.CertPins) int {

@@ -242,7 +242,7 @@ func TestG67SizingTimeoutCannotMoveTheAdmissionDecision(t *testing.T) {
 	// The invariant is that the sizing deadline cannot move the ADMISSION DECISION — not that two live
 	// disk readings are bit-identical. The first version of this test demanded exact equality of two
 	// statfs results taken milliseconds apart; free space moves under a concurrent test suite, so it was
-	// structurally flaky and reddened the shared `make e2e` gate twice (internal review G-9, which the
+	// structurally flaky and reddened the shared `make e2e-parallel` gate twice (internal review G-9, which the
 	// main process read and did not act on until it bit). Compare the DERIVED ceiling within a tolerance
 	// and, decisively, the admission verdict itself.
 	if fast <= 0 || starved <= 0 {

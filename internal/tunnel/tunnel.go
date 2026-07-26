@@ -43,9 +43,7 @@ package tunnel
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +56,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tokenhash"
 	"github.com/hashicorp/yamux"
 )
 
@@ -353,9 +352,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// abort the install — so an already-authorized REGISTER can't resurrect the
 	// public listener after OFF returned, whether OFF closed by port or by sid.
 	s.mu.Lock()
-	gen := s.killGen[port]
-	sessGen := s.killGenSession[sid]
-	allocGen := s.killGenAllocation[fenceKey]
+	snap := s.fenceSnapLocked(port, sid, fenceKey)
 	// round-6 F4: mark this REGISTER in-flight for sid so ForgetSession can't
 	// prune the session tombstone (and lose the fence) while we're paused
 	// between snapshot and install. Decremented when the handler returns.
@@ -402,7 +399,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// loses under load. The post-yamux re-check stays as the authoritative
 	// install-time fence for the residual snapshot→install window.
 	s.mu.Lock()
-	fenced := s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen || s.killGenAllocation[fenceKey] != allocGen
+	fenced := s.closed || s.fenceChangedLocked(snap, port, sid, fenceKey)
 	s.mu.Unlock()
 	if fenced {
 		_ = publicLn.Close()
@@ -438,7 +435,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		cancel:     cancel,
 	}
 	s.mu.Lock()
-	if s.closed || s.killGen[port] != gen || s.killGenSession[sid] != sessGen || s.killGenAllocation[fenceKey] != allocGen {
+	if s.closed || s.fenceChangedLocked(snap, port, sid, fenceKey) {
 		// Server shutting down, OR a CloseProxy(port)/CloseSession(sid) fired
 		// during our handshake (round-2/round-5 F1). Either way don't install —
 		// roll back the per-conn state so we don't leak the public port or
@@ -632,6 +629,48 @@ func (s *Server) ForgetSession(sid string) {
 	for _, sess := range victims {
 		closeServerSession(sess)
 	}
+}
+
+// fenceSnap is the set of kill generations a REGISTER handler captured before
+// it started installing. Comparing the whole struct is what makes the fence
+// total: adding a fourth dimension means adding a field here, and every
+// comparison site picks it up automatically.
+//
+// Batch-A A9. This replaced a snapshot of three locals plus TWO hand-written
+// `||` chains that repeated the same three comparisons verbatim. The three
+// dimensions did not arrive together — killGen[port] came from round-2 F1,
+// killGenSession[sid] from round-5 F1, killGenAllocation[fenceKey] from
+// round-6 F4 — i.e. three consecutive external reviews each found the fence
+// incomplete in a new direction.
+//
+// A fourth is entirely plausible (per-nid, for multi-home). Under the old shape
+// that meant editing three places, and OMITTING one of the two chains COMPILES
+// CLEANLY. The consequence of that silent miss is not a crash: an exit that was
+// already killed gets resurrected by a REGISTER racing the kill, and re-binds
+// the public port. A data-plane hole, in precisely the spot three reviews in a
+// row already had to patch.
+type fenceSnap struct {
+	port  int64
+	sess  int64
+	alloc int64
+}
+
+// fenceSnapLocked captures the current fence. Caller holds s.mu.
+func (s *Server) fenceSnapLocked(port int, sid string, fenceKey sessionFenceKey) fenceSnap {
+	return fenceSnap{
+		port:  s.killGen[port],
+		sess:  s.killGenSession[sid],
+		alloc: s.killGenAllocation[fenceKey],
+	}
+}
+
+// fenceChangedLocked reports whether any fence dimension moved since snap.
+// Caller holds s.mu.
+//
+// s.closed is deliberately NOT folded in: it is server lifecycle, not a fence
+// dimension, and call sites read better spelling out `s.closed || changed`.
+func (s *Server) fenceChangedLocked(snap fenceSnap, port int, sid string, fenceKey sessionFenceKey) bool {
+	return s.fenceSnapLocked(port, sid, fenceKey) != snap
 }
 
 // maybePruneSessionLocked deletes a forgotten session's kill-gen bookkeeping
@@ -1271,7 +1310,6 @@ func parseRegisterLine(line string) (sid, nid string, port int, token string, ep
 // dep-graph leaf: importing port would pull SQLite into the wire
 // layer with no real benefit. Audit shard 06 F10 — flagged as low,
 // resolved by comment, not extraction.
-func hashToken(raw string) string {
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
-}
+// hashToken delegates to the shared scheme (batch-A A11). tokenhash imports
+// stdlib only, so tunnel stays a dependency-graph leaf.
+func hashToken(raw string) string { return tokenhash.Sum(raw) }

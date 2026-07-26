@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -72,8 +73,27 @@ func newReconnectHarness(t *testing.T, logger *slog.Logger) *reconnectHarness {
 		func(p int) (int, error) { return localPort, nil }, logger)
 	cli.SetBackoffForTest(10*time.Millisecond, 80*time.Millisecond)
 	cli.Start(srvCtx)
-	if err := cli.Open(publicPort, localPort, rawToken); err != nil {
-		t.Fatalf("client.Open: %v", err)
+	// findFreePort is a TOCTOU probe: it binds, reads the port, closes, and hands
+	// back a number that anything on the machine may claim before we do. With one
+	// test at a time that is a theoretical race; with 20 parallel workers it is a
+	// regular one, and it surfaced as a REGISTER denied with public_port_bind_failed
+	// while the harness was still being built — i.e. as a "tunnel reconnect is
+	// broken" failure that had nothing to do with reconnection.
+	//
+	// Retrying with a fresh port is the fix rather than widening a timeout: losing
+	// the port is not something waiting resolves. See docs/testing-standards.md T5.
+	var openErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if openErr = cli.Open(publicPort, localPort, rawToken); openErr == nil {
+			break
+		}
+		if !strings.Contains(openErr.Error(), "public_port_bind_failed") {
+			t.Fatalf("client.Open: %v", openErr)
+		}
+		publicPort = findFreePort(t)
+	}
+	if openErr != nil {
+		t.Fatalf("client.Open: port kept being taken between probe and use: %v", openErr)
 	}
 	return &reconnectHarness{
 		srv: srv, cli: cli, publicPort: publicPort, localPort: localPort,

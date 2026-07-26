@@ -13,39 +13,21 @@ package subhttp
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/LinZiyang666/tether/internal/httplisten"
 	"github.com/LinZiyang666/tether/internal/proxysub"
 	"github.com/LinZiyang666/tether/internal/session"
 )
 
 // maxTokenLen bounds the path segment we hash (defense against absurd inputs).
 const maxTokenLen = 256
-
-// requireLoopback rejects any listen address whose host is not loopback.
-func requireLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("subhttp: invalid listen address %q: %w", addr, err)
-	}
-	if host == "localhost" {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("subhttp: listen address %q must be loopback (127.0.0.1, ::1, or localhost) — Caddy fronts /sub/* on :443; a non-loopback bind would expose token/PSK vending over plaintext HTTP", addr)
-	}
-	return nil
-}
 
 // Config wires the handler to its read-only dependencies.
 type Config struct {
@@ -144,7 +126,14 @@ type ProxyNode struct {
 	Host string
 }
 
-// LiveProxyNodes is the single-mode (P13) exit-node query, kept exported for back-compat.
+// LiveProxyNodes is the single-mode (P13) exit-node query.
+//
+// Batch-A A4: its doc used to end "kept exported for back-compat". internal/
+// is a closed world — the compiler proves there are no callers outside this
+// module — so "back-compat" cannot mean anything here, and the phrase was
+// discouraging removal of something with zero callers. It is retained (rather
+// than deleted) only because ClusterMode's doc at :56 refers to it by name to
+// explain the single-mode/cluster-mode split.
 func LiveProxyNodes(db *sql.DB, sid string) ([]ProxyNode, error) {
 	return liveProxyNodes(db, sid, false)
 }
@@ -274,44 +263,11 @@ func renderClash(sid, publicHost, cipher, psk string, nodes []ProxyNode) ([]byte
 // port fails the broker start instead of leaving a healthy-looking broker with
 // no subscription endpoint.
 func Bind(addr string) (net.Listener, error) {
-	if err := requireLoopback(addr); err != nil {
-		return nil, err
-	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("subhttp: listen %q: %w", addr, err)
-	}
-	return ln, nil
+	// requireLoopback=true: /sub is unauthenticated and Caddy-fronted.
+	return httplisten.Bind("subhttp", addr, true)
 }
 
 // ServeListener serves /sub on an already-bound listener until ctx is canceled.
 func ServeListener(ctx context.Context, ln net.Listener, cfg Config) error {
-	srv := &http.Server{
-		Handler:           Handler(cfg),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	context.AfterFunc(ctx, func() {
-		shCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shCtx)
-	})
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("subhttp: serve: %w", err)
-	}
-	return nil
-}
-
-// Serve binds and serves in one call (validation is synchronous; an invalid
-// address returns before any goroutine). Returns immediately (nil) when addr
-// is empty (feature disabled). Retained for callers/tests that want the
-// combined form.
-func Serve(ctx context.Context, addr string, cfg Config) error {
-	if addr == "" {
-		return nil
-	}
-	ln, err := Bind(addr)
-	if err != nil {
-		return err
-	}
-	return ServeListener(ctx, ln, cfg)
+	return httplisten.Serve(ctx, ln, Handler(cfg), "subhttp")
 }

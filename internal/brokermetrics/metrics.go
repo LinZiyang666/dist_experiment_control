@@ -13,14 +13,13 @@ package brokermetrics
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/httplisten"
 	"io"
 	"net"
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 )
 
 // PeerSnap is one voter's observed health (up to ~5s stale — sourced from the leader's cached
@@ -53,6 +52,16 @@ type Snapshot struct {
 	// garbage (the racknerd small-disk-fill class). Cluster-mode gauge; always emitted (emit 0) so a
 	// scraper can alert on it rising. Observability only — it never means the reaper deletes them.
 	XferUnreapableBuckets int
+
+	// Batch-A A15: the audit pipeline's three loss counters. They existed on
+	// AuditPublisher and were read by nobody — so when `tether history` showed a
+	// hole, there was no way to tell "nothing happened then" from "the audit was
+	// truncated and we dropped it". A gap you cannot distinguish from silence is
+	// not an observability nicety; it decides whether an incident is
+	// investigable.
+	AuditTruncationLoss    int64
+	AuditLagExceeded       int64
+	AuditDeletedStreamLoss int64
 }
 
 // Render writes the Prometheus text exposition for s. Every gauge that applies is ALWAYS present
@@ -61,6 +70,14 @@ type Snapshot struct {
 func Render(w io.Writer, s Snapshot) {
 	g := func(name, help string, v int64) {
 		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", name, help, name, name, v)
+	}
+	// c renders a monotonically-increasing counter. Batch-A review m5: the three
+	// audit-loss series below were introduced with the `_total` suffix — the
+	// Prometheus counter convention — but rendered through g as gauges. A scraper
+	// reading TYPE gauge will not apply rate()/increase() correctly to them.
+	// Purely additive series, so fixing the type now costs nothing.
+	c := func(name, help string, v int64) {
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
 	}
 	g("tether_broker_cluster_mode", "1 if this broker runs in clustered HA mode, else 0.", b2i(s.ClusterMode))
 	g("tether_broker_alerts_active", "Number of ACTIVE cluster alerts.", int64(s.AlertsActive))
@@ -73,6 +90,9 @@ func Render(w io.Writer, s Snapshot) {
 	g("tether_broker_applied_index", "This broker's command-domain applied index.", int64(s.AppliedIndex))
 	g("tether_broker_commit_index", "This broker's raft commit index.", int64(s.CommitIndex))
 	g("tether_broker_force_single", "1 if the force_single_active escape-hatch marker is set, else 0.", b2i(s.ForceSingle))
+	c("tether_broker_audit_truncation_loss_total", "Audit records dropped because the history stream was truncated ahead of the publisher (A15).", s.AuditTruncationLoss)
+	c("tether_broker_audit_lag_exceeded_total", "Times the audit publisher exceeded its lag budget (A15).", s.AuditLagExceeded)
+	c("tether_broker_audit_deleted_stream_loss_total", "Audit records dropped because their target stream had been deleted (A15).", s.AuditDeletedStreamLoss)
 	g("tether_broker_xfer_unreapable_buckets", "Number of xfer buckets holding aged orphan objects that no broker's home-gated reaper will ever delete (split-home / zero-node session; N-6).", int64(s.XferUnreapableBuckets))
 	// B6 OPS#4: JS stream replica posture (actual<target ⇒ replication degraded). Omitted when
 	// not observed this scrape (StreamsTarget==0) — a faked 0 would read as a degraded cluster.
@@ -112,11 +132,10 @@ func escapeLabel(s string) string {
 // caller propagates a bind error from broker startup so an occupied port fails the broker rather
 // than leaving a healthy broker with a dead metrics port.
 func Bind(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("brokermetrics: listen %q: %w", addr, err)
-	}
-	return ln, nil
+	// requireLoopback=false ON PURPOSE: /metrics is meant to be scraped from a
+	// private interface. It is the one surface of the three that may leave
+	// loopback — TestHTTPSurfaceLoopbackPolicy pins that asymmetry.
+	return httplisten.Bind("brokermetrics", addr, false)
 }
 
 // ServeListener serves /metrics, /healthz, /readyz on ln until ctx is canceled. snap is a
@@ -125,16 +144,7 @@ func Bind(addr string) (net.Listener, error) {
 // process); /healthz is a constant 200 once the listener is up (it never snapshots, so it stays up
 // regardless).
 func ServeListener(ctx context.Context, ln net.Listener, snap func() Snapshot, ready func() (bool, string)) error {
-	srv := &http.Server{Handler: Handler(snap, ready), ReadHeaderTimeout: 5 * time.Second}
-	context.AfterFunc(ctx, func() {
-		shCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shCtx)
-	})
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("brokermetrics: serve: %w", err)
-	}
-	return nil
+	return httplisten.Serve(ctx, ln, Handler(snap, ready), "brokermetrics")
 }
 
 // Handler builds the /metrics + /healthz + /readyz mux (extracted so it is httptest-able).

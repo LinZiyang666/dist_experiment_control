@@ -18,6 +18,22 @@ func (b *Broker) metricsSnapshot() brokermetrics.Snapshot {
 	if keys, err := cluster.ActiveAlertKeys(b.cfg.DB); err == nil {
 		s.AlertsActive = len(keys)
 	}
+	// Batch-A A15: surface the audit pipeline's loss counters.
+	//
+	// Review F-04 corrected the original comment here, which claimed this
+	// placement let single-mode brokers benefit too. It does not: b.cl is nil
+	// outside cluster mode, so this block is unreachable there. The publisher
+	// itself only exists in cluster mode. Placing the read above the
+	// cluster-mode early return buys nothing today and is kept only because it
+	// costs nothing and stays correct if the publisher is ever wired for single
+	// mode.
+	if b.cl != nil {
+		if ap := b.cl.auditPub.Load(); ap != nil {
+			s.AuditTruncationLoss = int64(ap.TruncationLossCount())
+			s.AuditLagExceeded = int64(ap.LagExceededCount())
+			s.AuditDeletedStreamLoss = int64(ap.DeletedStreamLossCount())
+		}
+	}
 	if !b.clusterMode || b.cl == nil || b.cl.node == nil {
 		return s
 	}

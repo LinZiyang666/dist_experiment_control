@@ -49,9 +49,9 @@ func rotate2NodeFollower(t *testing.T) (fb *clusterAdminBackend, followerID, lea
 			DBPath:             filepath.Join(dir, "state.db"),
 			Transport:          transports[i],
 			BootstrapPeers:     servers,
-			HeartbeatTimeout:   50 * time.Millisecond,
-			ElectionTimeout:    50 * time.Millisecond,
-			LeaderLeaseTimeout: 25 * time.Millisecond,
+			HeartbeatTimeout:   cluster.MultinodeHeartbeatTimeout,
+			ElectionTimeout:    cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 			ApplyTimeout:       5 * time.Second,
 		})
 		if err != nil {

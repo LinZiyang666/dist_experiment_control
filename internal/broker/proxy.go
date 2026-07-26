@@ -670,9 +670,16 @@ func (b *Broker) pushCurrentKeyset(nc *nats.Conn, sid string, epoch int64) {
 // directive re-pushed — covering BOTH a dropped keyset push (switch on) AND a
 // dropped OFF (switch off but the agent is still serving, agentEpoch>0). This
 // makes `proxy off` a convergent kill switch, not a one-shot nudge.
-// repairProxyEpoch is the epoch-only entry point (kept for direct callers /
-// tests); it treats the agent generation as 0 (always mismatched) so any ON
-// node it's invoked for is re-pushed.
+// repairProxyEpoch is the epoch-only entry point: it treats the agent
+// generation as 0 (always mismatched) so any ON node it is invoked for is
+// re-pushed. Its only callers are p13_external_review_test.go and
+// p13_external_review_round2_test.go — production always goes through
+// repairProxy with a real generation.
+//
+// Batch-A A4: "kept for direct callers / tests" overstated this. internal/ is
+// a closed world, so "direct callers" cannot mean anything outside the module,
+// and there are none inside it either; naming the two tests is both true and
+// actionable — if they go, so does this.
 func (b *Broker) repairProxyEpoch(sid, nid string, agentEpoch int64) {
 	b.repairProxy(sid, nid, 0, agentEpoch)
 }

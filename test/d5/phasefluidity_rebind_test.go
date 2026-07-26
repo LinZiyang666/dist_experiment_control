@@ -56,8 +56,8 @@ func TestPhaseFluidityMTLSRebind(t *testing.T) {
 	nd, err := cluster.New(cluster.Config{
 		LocalID: "pf-mtls", DataDir: dir, DBPath: filepath.Join(dir, "state.db"), Transport: tr,
 		BootstrapPeers:   []raft.Server{{Suffrage: raft.Voter, ID: "pf-mtls", Address: tr.LocalAddr()}},
-		HeartbeatTimeout: 150 * time.Millisecond, ElectionTimeout: 150 * time.Millisecond,
-		LeaderLeaseTimeout: 75 * time.Millisecond, ApplyTimeout: 5 * time.Second,
+		HeartbeatTimeout: cluster.MultinodeHeartbeatTimeout, ElectionTimeout: cluster.MultinodeElectionTimeout,
+		LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout, ApplyTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("mtls node: %v", err)

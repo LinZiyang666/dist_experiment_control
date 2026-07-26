@@ -18,7 +18,8 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 	}{
 		{"not_owner", "session owner"},
 		{"not_a_member", "tether login"},
-		{"session_not_found_or_deleting", "session list"},
+		// A8: `session list` is not a real verb — it printed help and exited 0.
+		{"session_not_found_or_deleting", "session ls"},
 		{"node_offline", "tether agent --session"},
 		{"node_not_found", "tether ps"},
 		{"agent_no_responders", "agent isn't reachable"},
@@ -191,5 +192,51 @@ func TestDataplaneNotConvergedCodeIsWireStable(t *testing.T) {
 	}
 	if exitTransient == 0 {
 		t.Fatal("exitTransient must be nonzero")
+	}
+}
+
+// TestRunFailureMessageSplitsCodeFromDetail is batch-A A1 Step 4.
+//
+// internal/broker/run.go builds RunChunk.Reason as `"<code>: " + err.Error()`
+// in 33 places. runFailureMessage used to look up the whole string, so none of
+// those matched a hint or an exit class and every one of them exited 70 — the
+// class docs/usage.md §9.13 tells automation to retry with backoff. A member
+// hitting `not_a_member` was told to keep retrying.
+func TestRunFailureMessageSplitsCodeFromDetail(t *testing.T) {
+	tests := []struct {
+		reason    string
+		wantClass int
+		wantIn    string
+	}{
+		// bare code, already worked before
+		{"not_a_member", exitNoPerm, "not_a_member"},
+		// code + detail: the shape that used to fall through to 70
+		{"not_a_member: fp 0xdead not in session", exitNoPerm, "not_a_member"},
+		{"store_error: database is locked", exitInternal, "store_error"},
+		{"node_offline: last heartbeat 5m ago", exitUsage, "node_offline"},
+		{"actor_invalid: bad nkey", exitInternal, "actor_invalid"},
+		// unknown code still classifies as internal, and keeps the raw text
+		{"something_unheard_of: detail", exitInternal, "something_unheard_of"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.reason, func(t *testing.T) {
+			err := runFailureMessage(tc.reason)
+			var ee *ExitError
+			if !errors.As(err, &ee) {
+				t.Fatalf("runFailureMessage returned %T, not *ExitError — it would fall through to 70", err)
+			}
+			if ee.Class != tc.wantClass {
+				t.Errorf("reason %q exited %d, want %d", tc.reason, ee.Class, tc.wantClass)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("message %q lost the raw code %q; logs and bug reports grep for it",
+					err.Error(), tc.wantIn)
+			}
+			// The full reason (code AND detail) must survive into the message —
+			// dropping the detail would trade one usability problem for another.
+			if !strings.Contains(err.Error(), tc.reason) {
+				t.Errorf("message %q dropped the detail from %q", err.Error(), tc.reason)
+			}
+		})
 	}
 }

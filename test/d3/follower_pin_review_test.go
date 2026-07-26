@@ -48,9 +48,9 @@ func TestD3FollowerPINWriteStaleReplicaReturnsNotLeader_Review(t *testing.T) {
 			DBPath:             filepath.Join(dirs[i], "state.db"),
 			Transport:          trans[i],
 			BootstrapPeers:     servers,
-			HeartbeatTimeout:   80 * time.Millisecond,
-			ElectionTimeout:    80 * time.Millisecond,
-			LeaderLeaseTimeout: 40 * time.Millisecond,
+			HeartbeatTimeout:   cluster.MultinodeHeartbeatTimeout,
+			ElectionTimeout:    cluster.MultinodeElectionTimeout,
+			LeaderLeaseTimeout: cluster.MultinodeLeaderLeaseTimeout,
 			ApplyTimeout:       2 * time.Second,
 		})
 		if err != nil {
@@ -66,28 +66,61 @@ func TestD3FollowerPINWriteStaleReplicaReturnsNotLeader_Review(t *testing.T) {
 		}
 	})
 
-	leaderIdx := -1
-	if !waitForCond(5*time.Second, func() bool {
-		for i, n := range nodes {
-			if n.IsLeader() {
-				leaderIdx = i
-				return true
+	// The assertion below is only meaningful while the node we poke is genuinely a
+	// FOLLOWER. Observing leadership and then acting on that observation is a
+	// race: leadership can move in between, and then Propose runs on the real
+	// leader, which legitimately executes the business plan and reports
+	// ErrSessionMissing (the seed only wrote the other node's DB). That is
+	// precisely the symptom this test saw under a 20-worker parallel load.
+	//
+	// The fix is to re-establish the premise, NOT to relax the assertion: the
+	// contract under test ("a follower PIN write is a transient not_leader deny")
+	// is unchanged, it simply cannot be evaluated on a node that is no longer a
+	// follower. Leadership is therefore confirmed immediately before AND after the
+	// call, and the whole observe-then-act sequence is retried when it moved.
+	// A test that instead accepted ErrSessionMissing "because leadership may have
+	// changed" would assert nothing at all.
+	var err error
+	const attempts = 5
+	for attempt := 1; ; attempt++ {
+		leaderIdx := -1
+		if !waitForCond(10*time.Second, func() bool {
+			for i, n := range nodes {
+				if n.IsLeader() {
+					leaderIdx = i
+					return true
+				}
 			}
+			return false
+		}) {
+			t.Fatal("no leader elected")
 		}
-		return false
-	}) {
-		t.Fatal("no leader elected")
+		followerIdx := 1 - leaderIdx
+
+		// Model a bounded-stale follower: the leader already has the session, but this
+		// follower has not applied that session row yet.
+		seedSession(t, filepath.Join(dirs[leaderIdx], "state.db"), "lab", "test-pin")
+		_, fp := freshClient(t)
+
+		if nodes[followerIdx].IsLeader() {
+			if attempt == attempts {
+				t.Fatalf("leadership kept moving across %d attempts; cannot establish a stable follower", attempts)
+			}
+			continue
+		}
+		err = nodes[followerIdx].Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return agentprov.PlanProvisionWithPIN(db, "lab", "lab-1", fp, "test-pin", auth.VerifyPIN, time.Now())
+		})
+		if nodes[followerIdx].IsLeader() {
+			// It became the leader while we were proposing, so whatever came back
+			// says nothing about follower behaviour. Not a pass, not a failure.
+			if attempt == attempts {
+				t.Fatalf("target became leader mid-Propose on all %d attempts", attempts)
+			}
+			continue
+		}
+		break
 	}
-	followerIdx := 1 - leaderIdx
-
-	// Model a bounded-stale follower: the leader already has the session, but this
-	// follower has not applied that session row yet.
-	seedSession(t, filepath.Join(dirs[leaderIdx], "state.db"), "lab", "test-pin")
-	_, fp := freshClient(t)
-
-	err := nodes[followerIdx].Propose(func(db *sql.DB) (*cluster.Command, error) {
-		return agentprov.PlanProvisionWithPIN(db, "lab", "lab-1", fp, "test-pin", auth.VerifyPIN, time.Now())
-	})
 	if !cluster.IsNotLeader(err) {
 		t.Fatalf("follower PIN write must classify as transient not_leader before local Plan business errors; got %T %v", err, err)
 	}
