@@ -67,6 +67,13 @@ func planAlertSignal(db *sql.DB, p AlertSignalPayload, now time.Time) (*cluster.
 // leader-side transition gate makes the re-assert free). Call before Run. Post-D9 cutover this
 // is LIVE in CLUSTER mode (wireClusterLate calls it); SINGLE mode leaves b.alertSink nil (inert).
 func (b *Broker) AttachAlertSink(fwd *Forwarder) {
+	// External review B2: this sink discards its error by design, so without an observer its
+	// every-tick failure is invisible — the exact indistinguishability the forward counter was
+	// added to remove, on the exact path its godoc cites. Installing the observer here (not only
+	// in Broker.newForwarder) covers a caller that hands in a Forwarder it built itself.
+	if fwd.observe == nil {
+		fwd.observe = b.countForward
+	}
 	b.alertSink = func(active bool) {
 		p := AlertSignalPayload{
 			Kind:     cluster.AlertKindDiskPressure,

@@ -20,8 +20,8 @@ import (
 // WITHOUT a Raft write. writable_leader_confirmed is set ONLY after a VerifyLeaderRead barrier
 // — a partitioned ex-leader still reporting State()==Leader within its lease FAILS VerifyLeader
 // and answers false, so the gate fires precisely in the data-loss window.
-func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID))
+func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub))
 }
 
 // SubscribeClusterRosterPull (G3 #17) wires the member-reachable roster-pull responder: a ctl connected
@@ -54,14 +54,17 @@ func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool))
 // responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
 // observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).
 // Every broker answers (no queue group) so the leader collects each voter's AppliedIndex.
-func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID))
+func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub))
 }
 
 // clusterHealthResponder builds the shared health-reply handler used by both the member-
 // facing cluster-health RPC and the broker-only §17 cursor probe. topoSelf returns this broker's
-// latest C3 topology reconcile self-report (nil until the first pass / non-cluster).
-func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string) func(*nats.Msg) {
+// latest C3 topology reconcile self-report (nil until the first pass / non-cluster). accountPub
+// returns this broker's auth_callout account public key (batch B / B4 — see
+// proto.ClusterHealthResp.AccountNkPub); nil means the caller could not supply one, which is
+// reported as "did not answer" rather than as a match.
+func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -125,6 +128,17 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		// or a healthy leader). Additive omitempty — an old broker omits it and the ctl sees false.
 		if jsUnavail != nil {
 			resp.JetStreamUnavailable = jsUnavail()
+		}
+		// batch B / B4: self-report the auth_callout account key so `cluster status` can render an
+		// ACCT.NK column that is a real per-node answer instead of a hardcoded Y.
+		//
+		// Reported=true even when the key is EMPTY. That is the point of the flag: a clustered
+		// broker with no account seed is a genuine finding (it cannot answer auth_callout at all),
+		// and it must be distinguishable from a pre-v6 broker that simply omits the field. Only a
+		// nil accountPub — a caller that could not supply the getter — stays unreported.
+		if accountPub != nil {
+			resp.AccountNkPub = accountPub()
+			resp.AccountNkReported = true
 		}
 		if writable {
 			resp.WritableLeaderConfirmed = true

@@ -59,7 +59,7 @@ func (b *Broker) newTunnelServer(addr, host string, lookup tunnel.TokenLookup, l
 // (the expose stays un-homed; §7.4 reconvergence retries next reconnect).
 func (b *Broker) resolveHomeForAgent(sid, nid string) *clusternodes.HomeNode {
 	var natsServer string
-	if err := b.cfg.DB.QueryRow(
+	if err := b.read().QueryRow(
 		`SELECT nats_server FROM nodes WHERE sid=? AND nid=?`, sid, nid,
 	).Scan(&natsServer); err != nil {
 		return nil
@@ -133,7 +133,7 @@ func (b *Broker) homeForRegister(sid, nid string, _ proto.NodeRegisterReq) *prot
 		epoch      int64
 	}
 	var exposes []homed
-	rows, err := b.cfg.DB.Query(
+	rows, err := b.read().Query(
 		`SELECT port, name, home_broker, epoch FROM port_allocations
 		  WHERE sid=? AND nid=? AND state='ALLOCATED' AND home_broker != ''
 		  ORDER BY port`,

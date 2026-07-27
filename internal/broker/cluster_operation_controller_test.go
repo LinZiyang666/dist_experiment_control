@@ -9,6 +9,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // cluster_operation_controller_test.go (C4 Stage-C) — single-node FSM-backed tests of the operation
@@ -31,6 +32,7 @@ func makeJoinBundle(t *testing.T, nodeID, raftAddr, nonce string) (string, strin
 		NodeID: nodeID, Name: nodeID, NodeIdentPub: pub, NatsServerID: nodeID,
 		RaftAddr: raftAddr, NatsRoute: "nats://" + raftAddr, TunnelAddr: nodeID + ":7000", // C8 D10: identity-complete
 		JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig),
+		ProtoVer: proto.ProtoVersion, ReleaseVersion: proto.ReleaseVersion,
 	}
 	enc, err := cluster.EncodeJoinBundle(b)
 	if err != nil {

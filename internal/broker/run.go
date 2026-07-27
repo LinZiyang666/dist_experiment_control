@@ -2,13 +2,9 @@ package broker
 
 import (
 	"encoding/json"
-	"errors"
 	"strings"
 
-	"github.com/LinZiyang666/tether/internal/auth"
-	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
 
@@ -23,55 +19,24 @@ import (
 // On any pre-forward failure, broker replies with a RunChunk{Kind:failed}
 // so ctl gets a clean lifecycle message rather than a NATS timeout.
 func (b *Broker) handleRunReq(nc *nats.Conn, msg *nats.Msg) {
-	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "run" {
-		b.replyRunFailed(msg, "subject_malformed")
+	ing, den, ok := b.admitSubject(msg.Subject, runSpec)
+	if !ok {
+		b.replyRunFailed(msg, den.reason)
 		return
 	}
 	if b.isClusterFollower() {
 		return
 	}
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyRunFailed(msg, "actor_invalid: "+err.Error())
+	if den, ok := b.admitACL(&ing, runSpec); !ok {
+		b.replyRunFailed(msg, den.reason)
+		// Node refusals only — same asymmetry as exec, and the same one kill does NOT share.
+		if den.code == "node_not_found" || den.code == "node_offline" {
+			b.pubAuditCall(ing.sid, ing.fp, ing.actor, "run", ing.nid, false,
+				auditRefusal(den), msg.Reply, nil)
+		}
 		return
 	}
-
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyRunFailed(msg, "store_error: "+err.Error())
-		return
-	}
-	if !active {
-		b.replyRunFailed(msg, "session_not_found_or_deleting")
-		return
-	}
-
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyRunFailed(msg, "store_error: "+err.Error())
-		return
-	}
-	if !member {
-		b.replyRunFailed(msg, "not_a_member")
-		return
-	}
-
-	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
-	switch {
-	case errors.Is(err, node.ErrNotFound):
-		b.replyRunFailed(msg, "node_not_found")
-		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_not_found", msg.Reply, nil)
-		return
-	case err != nil:
-		b.replyRunFailed(msg, "store_error: "+err.Error())
-		return
-	case status != node.StateOnline:
-		b.replyRunFailed(msg, "node_offline: status="+string(status))
-		b.pubAuditCall(sid, fp, actor, "run", nid, false, "node_offline:"+string(status), msg.Reply, nil)
-		return
-	}
+	sid, actor, nid, fp, verb := ing.sid, ing.actor, ing.nid, ing.fp, ing.verb
 
 	// Re-marshal with broker-stamped ActorFP. Same C.1 §4 single-writer
 	// rule as exec — agent never invents the fp.
@@ -117,50 +82,23 @@ func (b *Broker) replyRunFailed(msg *nats.Msg, reason string) {
 // authority should not be able to take down a process started by
 // someone else.
 func (b *Broker) handleKillReq(nc *nats.Conn, msg *nats.Msg) {
-	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "kill" {
-		b.replyKillFailed(msg, "subject_malformed")
+	ing, den, ok := b.admitSubject(msg.Subject, killSpec)
+	if !ok {
+		b.replyKillFailed(msg, den.reason)
 		return
 	}
 	if b.isClusterFollower() {
 		return
 	}
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyKillFailed(msg, "actor_invalid: "+err.Error())
+	if den, ok := b.admitACL(&ing, killSpec); !ok {
+		// NO audit row on ANY refusal — including the node refusals where run, forty lines
+		// above with a doc comment claiming "same pre-flight as run.req", emits one. Nothing
+		// in the history says whether that is a decision or an omission; admit() reproduces it
+		// rather than quietly making the two agree. Pinned by ingress_characterization_test.go.
+		b.replyKillFailed(msg, den.reason)
 		return
 	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyKillFailed(msg, "store_error: "+err.Error())
-		return
-	}
-	if !active {
-		b.replyKillFailed(msg, "session_not_found_or_deleting")
-		return
-	}
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyKillFailed(msg, "store_error: "+err.Error())
-		return
-	}
-	if !member {
-		b.replyKillFailed(msg, "not_a_member")
-		return
-	}
-	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
-	switch {
-	case errors.Is(err, node.ErrNotFound):
-		b.replyKillFailed(msg, "node_not_found")
-		return
-	case err != nil:
-		b.replyKillFailed(msg, "store_error: "+err.Error())
-		return
-	case status != node.StateOnline:
-		b.replyKillFailed(msg, "node_offline: status="+string(status))
-		return
-	}
+	sid, actor, nid, fp, verb := ing.sid, ing.actor, ing.nid, ing.fp, ing.verb
 
 	var req proto.KillReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {

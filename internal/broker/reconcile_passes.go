@@ -114,11 +114,28 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// Idempotent path: proc.GCExited (a DELETE bounded by a cutoff — the second
 	// run over the same cutoff deletes nothing).
 	r.register("proc-gc", b.cfg.ProcGCInterval, false, func(_ context.Context, now time.Time) error {
+		// batch B / B3: this used b.livenessDB(), which was misleading in a way worth naming.
+		// The pass is NOT a liveness write — it DELETEs from `processes`, replicated state — and
+		// the mode gate above is the only thing that made the old handle safe. Asking
+		// singleWriter() instead makes the restriction STRUCTURAL: it returns (nil, false) in
+		// cluster mode, so deleting the guard below can no longer turn this into an
+		// outside-raft write to a replicated table. The guard stays as the early, cheap exit.
+		//
+		// (An earlier note in this batch claimed the old code already bypassed raft. It did not —
+		// the mode gate prevented it. The defect was the name, not the behaviour.)
 		if b.clusterMode {
 			return nil
 		}
+		db, ok := b.singleWriter()
+		if !ok {
+			// Unreachable given the gate above — which is exactly why it returns the named error
+			// rather than nil. If the two ever disagree, a silent nil means `processes` rows
+			// accumulate forever and nobody finds out; the reconciler logs a returned error, so
+			// the contradiction becomes visible instead of becoming a slow leak.
+			return singleWriteRefusal()
+		}
 		cutoff := now.Add(-b.cfg.ProcRetention)
-		n, err := proc.GCExited(b.livenessDB(), cutoff)
+		n, err := proc.GCExited(db, cutoff)
 		if err != nil {
 			b.cfg.Logger.Warn("broker: proc gc", "err", err)
 			return nil

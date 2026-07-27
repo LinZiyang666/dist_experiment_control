@@ -549,6 +549,11 @@ type Broker struct {
 	// use b.cfg.DB which Run re-points to cl.node.RODB().
 	cl *clusterRuntime
 
+	// forwards tallies authoritative raft write attempts by (verb, outcome) for
+	// tether_broker_raft_forward_total (batch B, B2). Its ZERO VALUE is usable, so the ~126
+	// package-internal &Broker{} literals need no change.
+	forwards forwardCounters
+
 	// lastObserveMu/lastObserve cache the leader's most recent per-peer observe (B5 OPS#1):
 	// the /metrics scrape reads THIS (up to observeTickInterval≈5s stale) instead of re-running
 	// the 2s-blocking pollClusterHealth scatter-gather on every request. nil until the first
@@ -851,7 +856,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// the authcallout PIN provision/join writes can route through raft (the handler is built
 	// next + needs the seam). wireClusterLate reuses this same forwarder (does not rebuild).
 	if b.clusterMode {
-		b.cl.forwarder = NewForwarder(nc, b.cfg.ExposeForwardTimeout())
+		b.cl.forwarder = b.newForwarder(nc, b.cfg.ExposeForwardTimeout())
 	}
 
 	if subAuth, err := b.installAuthCallout(nc); err != nil {
@@ -1196,6 +1201,10 @@ func (b *Broker) Run(ctx context.Context) error {
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).
 			backend.EvictWrite = b.evictNode
+			// batch B / B3: make a missing EvictWrite fail CLOSED instead of silently taking the
+			// single-mode direct tx. Set LAST, alongside the seam — internal/broker's
+			// TestAdminBackendClusterModeIsWiredBesideTheSeam asserts they stay together.
+			backend.ClusterMode = true
 		}
 		b.admin = adminsock.New(b.cfg.AdminSocketPath, backend)
 		if err := b.admin.Start(ctx); err != nil {

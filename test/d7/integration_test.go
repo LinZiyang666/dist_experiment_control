@@ -453,6 +453,55 @@ func (c *d7Cluster) adminForLeader(d time.Duration) (*broker.ClusterAdmin, error
 	}
 }
 
+// applyMetaSetOnLeaderAndWaitApplied commits through whichever node currently leads, then waits
+// until nodes[survivorIdx] has APPLIED the value.
+//
+// Both halves are load-bearing. Committing through the current leader replaces the old
+// `c.nodes[survivorIdx].ApplyMetaSet(...)`, which assumed the bootstrap node still led after two
+// membership changes and returned "node is not the leader" under `make e2e-parallel` load. Waiting
+// for the SURVIVOR to apply it is the other half: this seed exists so the restart can prove state was
+// preserved exactly, and the survivor is the node whose disk is reused — a commit on some other
+// leader proves nothing about what the survivor will replay.
+//
+// The survivor index is a PARAMETER, not nodes[0]: the caller already tracks it, and a helper that
+// hardcoded 0 would silently wait on the wrong node the day the caller picks a different survivor.
+func (c *d7Cluster) applyMetaSetOnLeaderAndWaitApplied(survivorIdx int, key, value string, d time.Duration) error {
+	deadline := time.Now().Add(d)
+	for {
+		for _, n := range c.nodes {
+			if n == nil || !n.IsLeader() {
+				continue
+			}
+			err := n.ApplyMetaSet(key, value)
+			if err == nil {
+				for time.Now().Before(deadline) {
+					var got string
+					readErr := c.nodes[survivorIdx].BoundedStaleRead(func(db *sql.DB) error {
+						return db.QueryRow(`SELECT value FROM cluster_meta WHERE key=?`, key).Scan(&got)
+					})
+					if readErr == nil && got == value {
+						return nil
+					}
+					if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+						return fmt.Errorf("observe committed meta on survivor: %w", readErr)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				return fmt.Errorf("survivor did not apply meta %q within %s", key, d)
+			}
+			if !cluster.IsNotLeader(err) {
+				return err
+			}
+			// A not-leader error means leadership moved between IsLeader() and the Apply — the same
+			// snapshot race this helper exists for. Fall through to re-scan for the current leader.
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no leader committed meta %q within %s", key, d)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // ensureSelfLeader restores the invariant the harness is built on: c.admin is
 // bound to nodes[0], so nodes[0] must be the leader.
 //
@@ -569,7 +618,7 @@ func testD7ForceSingleRecover(t *testing.T) {
 	// can prove state was preserved EXACTLY (not lost, not doubled) — review M7: the
 	// old test only checked applied_index monotonicity (vacuous). The no-double-apply
 	// of the replay itself is the D1 idempotent-skip property RecoverCluster reuses.
-	if err := c.nodes[survivorIdx].ApplyMetaSet("t:premark", "preval"); err != nil {
+	if err := c.applyMetaSetOnLeaderAndWaitApplied(survivorIdx, "t:premark", "preval", 10*time.Second); err != nil {
 		t.Fatalf("seed premark: %v", err)
 	}
 	appliedBefore, _ := c.nodes[survivorIdx].AppliedIndex()

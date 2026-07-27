@@ -110,6 +110,11 @@ func newClusterJoinPrepareCmd() *cobra.Command {
 				NodeID: nodeID, Name: name, NodeIdentPub: pub, NatsServerID: natsServerID,
 				RaftAddr: raftAddr, NatsRoute: natsRoute, TunnelAddr: tunnelAddr, PublicHost: publicHost,
 				CertFP: certFP, BusNkey: busNkey, JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig),
+				// B4: declare what this joiner speaks, so the leader can refuse a proto-skewed
+				// join in 50ms with a named reason instead of admitting it and letting the
+				// catch-up poll time out 2-30 minutes later with "check the joining broker".
+				// Advisory + unsigned (see JoinBundle's doc); the PoP remains the trust boundary.
+				ProtoVer: proto.ProtoVersion, ReleaseVersion: proto.ReleaseVersion,
 			})
 			if err != nil {
 				return err

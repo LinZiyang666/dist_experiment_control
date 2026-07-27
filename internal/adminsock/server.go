@@ -49,6 +49,22 @@ type Backend struct {
 	// nil ⇒ single mode: handleEvict does the direct tx (byte-identical to pre-D9).
 	EvictWrite func(sid, nid string) error
 
+	// ClusterMode makes a nil EvictWrite FAIL CLOSED instead of falling through to the direct tx
+	// (batch B, B3). It is the exact counterpart of authcallout.Handler.ClusterMode; see that field
+	// for the full argument. The short version: "EvictWrite != nil" was doing double duty as both
+	// the seam and the mode flag, so a clustered broker that failed to wire the seam silently got
+	// the single-mode write path against the read-only FSM handle.
+	//
+	// The consequence differs from authcallout's in ONE way that matters. Here the immediate
+	// symptom is loud — the operator invoked the evict and gets the error straight back on the
+	// socket. What is NOT loud is the second failure mode: if this package is ever handed the FSM
+	// WRITE pool instead of the read-only one, the direct tx SUCCEEDS and deletes
+	// agent_provisioning/nodes rows OUTSIDE raft. The agent is then evicted on one broker and
+	// still provisioned on the others, with no error anywhere.
+	//
+	// Zero value = single mode = today's behaviour, so no existing Backend literal changes meaning.
+	ClusterMode bool
+
 	// Now is the time source used for reply timestamps; nil →
 	// time.Now.
 	Now func() time.Time
@@ -427,6 +443,24 @@ func (s *Server) handleEvict(req Request) Response {
 			SID: req.SID, NID: req.NID,
 			NodeRowDeleted: nodeExisted, AgentProvDeleted: provExisted, BroadcastedEvicted: broadcasted,
 		}}
+	}
+	// FAIL CLOSED (batch B, B3): clustered, but the seam above is absent. Falling through to the
+	// direct tx would write the read-only FSM handle — or, with a write handle, delete rows outside
+	// raft. See Backend.ClusterMode.
+	//
+	// Unlike authcallout's twin, this message is DETAILED on purpose. That reply goes out over a
+	// root-owned unix socket to the operator who typed the command; there is no unauthenticated
+	// reader to disclose anything to, so the wire IS the operator's log and hiding the cause would
+	// just make a broker bug look like a missing agent.
+	if s.backend.ClusterMode {
+		if s.backend.Logger != nil {
+			s.backend.Logger.Error("adminsock: EvictWrite seam is not wired in cluster mode — "+
+				"refusing rather than writing the read-only FSM handle directly",
+				"seam", "EvictWrite", "sid", req.SID, "nid", req.NID)
+		}
+		return Response{Op: OpEvict, Code: CodeStoreError, Error: "evict is unavailable: this " +
+			"broker is clustered but its raft evict path is not wired (broker wiring bug, not a " +
+			"bad request) — refusing rather than writing un-replicated rows"}
 	}
 	tx, err := s.backend.DB.Begin()
 	if err != nil {

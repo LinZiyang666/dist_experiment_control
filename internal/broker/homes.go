@@ -20,7 +20,7 @@ func (b *Broker) buildHomesReport() (*adminsock.ClusterHomesReport, error) {
 		Errors:        []string{},
 	}
 	// proxy-first, then by port. LEFT JOIN so a row whose home is unknown still lists (PublicURL="").
-	rows, err := b.cfg.DB.Query(`
+	rows, err := b.read().Query(`
 		SELECT pa.name, pa.sid, pa.nid, pa.port, pa.home_broker, pa.epoch, pa.last_rehome_at,
 		       COALESCE(cn.public_host,''), COALESCE(cn.phase,''), COALESCE(cn.cert_fp,'')
 		FROM port_allocations pa
@@ -113,7 +113,7 @@ func exposeReadyReason(homeBroker, phase, certFP, publicHost string, reachable b
 // nodeStatusOnline reports whether the node row is ONLINE.
 func (b *Broker) nodeStatusOnline(sid, nid string) bool {
 	var status string
-	if err := b.cfg.DB.QueryRow(`SELECT status FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&status); err != nil {
+	if err := b.read().QueryRow(`SELECT status FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&status); err != nil {
 		return false
 	}
 	return status == "ONLINE"

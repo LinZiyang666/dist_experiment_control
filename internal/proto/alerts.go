@@ -7,9 +7,11 @@ package proto
 // reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v3 (G5/G7b) adds the
 // version-skew + JS-503 + voter self-report batch (ProxyHomeCount/ProxyHomeReported/JetStreamUnavailable/
 // CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive; v5 (R7b) adds the
-// two lock-lease expiries (UpgradeLeaseExpiry/GrowLeaseExpiry). No consumer gates
-// on this value — decoding is omitempty-additive — so it is a documentation ledger, not a compat switch.
-const ClusterHealthSchemaVersion = 5
+// two lock-lease expiries (UpgradeLeaseExpiry/GrowLeaseExpiry); v6 (batch B / B4) adds the account-key
+// self-report (AccountNkPub/AccountNkReported) that makes the `cluster status` ACCT.NK column honest.
+// No consumer gates on this value — decoding is omitempty-additive — so it is a documentation ledger,
+// not a compat switch.
+const ClusterHealthSchemaVersion = 6
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -103,6 +105,34 @@ type ClusterHealthResp struct {
 	// decodeCommand-poison the replicated entry (advance applied_index, skip the SQL), forking its
 	// replica. Additive omitempty: an older broker omits it (false ⇒ treated as NOT capable, fail-closed).
 	PhaseFluidityOps bool `json:"phase_fluidity_ops,omitempty"`
+	// AccountNkPub / AccountNkReported (batch B, B4, schema v6) are this broker's auth_callout ACCOUNT
+	// public key — the key it signs every auth_callout response JWT with — and a flag saying it
+	// answered at all.
+	//
+	// WHY THIS IS ON THE WIRE AT ALL. `cluster status` has always rendered an ACCT.NK column, and
+	// until this field existed the producer hardcoded `AccountNkMatch: true` — the column said Y for
+	// every node, always, including nodes it had never heard from. The legend admitted it
+	// ("currently always Y — per-node verification not yet wired"), which made it a documented lie
+	// rather than a fixed one. This closes it: the column now reflects a real per-node answer.
+	//
+	// WHAT DIVERGENCE MEANS. Every broker signs auth_callout JWTs with this key, and every
+	// nats-server validates the reply against the issuer pinned in ITS OWN rendered conf. The
+	// auth_callout subscription is queue-grouped ("tether-authcallout"), so a CONNECT raised at
+	// server A can be answered by broker B. If B holds a different account key than A pinned, that
+	// CONNECT fails — and the next one, answered by A, succeeds. The operator sees agents failing to
+	// join at random with no pattern and no error naming a key. This column is the only place that
+	// state is visible.
+	//
+	// NOT A NEW DISCLOSURE. The account public key is already member-visible: it is a field of the
+	// account-signed SeedBundle served by the member-reachable roster-pull responder
+	// (SubscribeClusterRosterPull → clusterroster.BuildSeeds → SeedBundle.AccountPub), and it is
+	// printed by `cluster seeds show`. It is the operator's ROOT PUBLIC authority, never a seed.
+	//
+	// AccountNkReported distinguishes "this broker has no account seed" (reported, empty) from "this
+	// broker predates the field" (not reported) — the same three-state discipline as
+	// TopoReported/ProxyHomeReported. The renderer prints "?" for the latter and never Y.
+	AccountNkPub      string `json:"account_nk_pub,omitempty"`
+	AccountNkReported bool   `json:"account_nk_reported,omitempty"`
 }
 
 // AlertView is one ACTIVE alert as rendered for the banner / `alert ls` (§10.1/§10.3).

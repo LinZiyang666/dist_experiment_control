@@ -84,6 +84,23 @@ type Handler struct {
 	JoinMemberWrite     func(sid, fp, pin string, now time.Time) error
 	ProvisionAgentWrite func(sid, nid, fp, pin string, now time.Time) error
 
+	// ClusterMode makes the seam-nil fallbacks FAIL CLOSED instead of writing (batch B, B3).
+	//
+	// The two seams above are set by internal/broker/authcallout.go inside a single
+	// `if b.clusterMode { … }`. That one `if` is the whole enforcement of "clustered ⇒ both seams
+	// wired", and nothing checked it. If it is ever missed — a third PIN write path added with its
+	// own seam, a refactor that reorders the wiring past this call — the nil fallback issues
+	// `ProvisionWithPIN(h.DB, …)` directly. h.DB is the READ-ONLY FSM handle in cluster mode, so
+	// that write fails at the SQLite layer with `attempt to write a readonly database`, on the
+	// AUTHENTICATION path, surfacing to the operator as "agents cannot join" with no hint why.
+	// Worse, if a future change hands this package the FSM WRITE pool instead, the same fallback
+	// succeeds and silently bypasses raft.
+	//
+	// Setting this alongside the seams turns both outcomes into one named refusal. It is a
+	// fail-closed marker, NOT a mode switch: when it is true and a seam is missing, the handler
+	// denies rather than guessing.
+	ClusterMode bool
+
 	// pinLimiter (P7/#25) throttles PIN-bootstrap brute force per client IP
 	// (architecture E.6). Created once on first use; shared across every callout
 	// this broker answers. See ratelimit.go for the trust-boundary rationale.
@@ -115,6 +132,29 @@ var ErrFenced = errors.New("fenced: node lost leader contact (retriable)")
 // the PIN oracle. Retriable once the source's bucket refills. It never touches a
 // legitimate already-provisioned reconnect (those skip the PIN path entirely).
 var ErrPINRateLimited = errors.New("rate_limited: too many PIN attempts from your network address; retry shortly")
+
+// ErrSeamNotWired is the fail-closed deny returned when the handler is in cluster mode but a
+// PIN-bootstrap write seam is nil (batch B, B3). It is a WIRING BUG in the broker, not a client
+// error.
+//
+// Before this existed, the same condition took the direct-mutator fallback and wrote h.DB — the
+// read-only FSM handle in cluster mode — so the symptom was a bare
+// `attempt to write a readonly database` surfacing on the authentication path.
+//
+// THE MESSAGE IS DELIBERATELY OPAQUE, and that is a decision, not laziness. Handle passes
+// err.Error() straight into h.deny, which puts the text on the wire to a client that has not
+// authenticated yet — the same channel batch B just pulled storage-error detail off of
+// (testing-standards §S4, see storeErrDenial in internal/broker/admit.go). A message naming the
+// seam would tell any anonymous connector that this broker is CLUSTERED and which internal write
+// path is missing. So: the wire gets "the operator must look at this broker", the Error log gets
+// which seam and why. TestSeamNotWiredKeepsDetailOffTheWire and
+// TestSeamNotWiredPutsDetailInTheLog pin those as two SEPARATE propositions — batch A's M13 was
+// exactly the mistake of treating them as one.
+//
+// It is also NOT worded as retriable, unlike ErrNotLeader/ErrFenced: retrying cannot help until an
+// operator restarts the broker, and a retriable-looking string would make an agent loop forever
+// against a broker that will never accept it.
+var ErrSeamNotWired = errors.New("pin_bootstrap_unavailable: this broker cannot complete PIN bootstrap; the operator must check the broker log")
 
 const defaultJWTTTL = 24 * time.Hour
 
@@ -310,6 +350,19 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin, clientIP
 	// else the direct local mutator (production default in D3).
 	provision := h.ProvisionAgentWrite
 	if provision == nil {
+		if h.ClusterMode {
+			// FAIL CLOSED: see ClusterMode's doc. h.DB is the read-only FSM handle here, so the
+			// direct mutator below would either fail with a bare readonly-database error on the
+			// auth path or (with a different handle) bypass raft entirely.
+			//
+			// This log line is the ONLY place the cause is stated: ErrSeamNotWired's wire text is
+			// deliberately opaque (it reaches an unauthenticated client), so an operator who does
+			// not see this line has no way to tell a wiring bug from a wrong PIN.
+			h.Logger.Error("authcallout: ProvisionAgentWrite seam is not wired in cluster mode — "+
+				"refusing rather than writing the read-only FSM handle directly",
+				"seam", "ProvisionAgentWrite", "sid", sid, "nid", nid)
+			return ErrSeamNotWired
+		}
 		provision = func(sid, nid, fp, pin string, now time.Time) error {
 			return agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, now)
 		}
@@ -376,6 +429,14 @@ func (h *Handler) ensureMember(sid, fp, pin, clientIP string) error {
 	// else the direct local mutator (production default in D3).
 	join := h.JoinMemberWrite
 	if join == nil {
+		if h.ClusterMode {
+			// FAIL CLOSED — same reason as the provision seam above, same opaque-wire/detailed-log
+			// split.
+			h.Logger.Error("authcallout: JoinMemberWrite seam is not wired in cluster mode — "+
+				"refusing rather than writing the read-only FSM handle directly",
+				"seam", "JoinMemberWrite", "sid", sid)
+			return ErrSeamNotWired
+		}
 		join = func(sid, fp, pin string, now time.Time) error {
 			return session.JoinWithPIN(h.DB, sid, fp, pin, auth.VerifyPIN, now)
 		}

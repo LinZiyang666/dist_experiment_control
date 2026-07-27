@@ -252,12 +252,25 @@ func TestProxyFalseOnlineRecoversAfterTunnelDrop(t *testing.T) {
 	}
 
 	// (2) self-heal via tunnel reconnect (NOT NATS / NOT process restart).
-	if !testharness.WaitFor(t, 10*time.Second, 50*time.Millisecond, func() bool {
+	//
+	// 15s, matched to step (1) above (testing-standards §T1). Step (1) was raised 5s→15s for load and
+	// step (2) was left at 10s, but step (2) waits on strictly MORE work: the agent's reconnect
+	// backoff, a fresh tunnel handshake, a REGISTER round-trip, and the broker's proxy_ready write —
+	// where step (1) only waits for drop DETECTION. Sizing the cheaper wait for a loaded box and the
+	// more expensive one for an idle box is backwards.
+	//
+	// HONEST ATTRIBUTION: this was prompted by ONE `make test` failure of this test that did not
+	// reproduce in a subsequent clean `make test`, 12 focused iterations, 8 whole-package iterations,
+	// or a full `./test/...` run — the last three deliberately under a concurrent `make e2e-parallel`.
+	// So the failing step is NOT confirmed and this is not a proven fix; it removes the one real
+	// §T1 asymmetry visible in the file. It cannot mask a product defect: the assertion is
+	// "eventually recovers", so a self-heal that never happens still fails, just later.
+	if !testharness.WaitFor(t, 15*time.Second, 50*time.Millisecond, func() bool {
 		return proxyReady(f.db, "lab", "lab-1")
 	}) {
 		t.Fatal("proxy_ready never recovered — tunnel reconnect did not self-heal")
 	}
-	waitTCP(t, f.pubAddr, true, 8*time.Second)
+	waitTCP(t, f.pubAddr, true, 15*time.Second)
 
 	// Negative control: the control plane was never disturbed — the node stayed
 	// ONLINE the whole time (recovery came from the data-plane reconnect alone).

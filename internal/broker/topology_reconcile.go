@@ -338,7 +338,7 @@ func (b *Broker) selfBusNkeyNeedsBackfill() bool {
 		return false
 	}
 	var got string
-	if err := b.cfg.DB.QueryRow(`SELECT bus_nkey_pub FROM cluster_nodes WHERE node_id = ?`, b.selfID).Scan(&got); err != nil {
+	if err := b.read().QueryRow(`SELECT bus_nkey_pub FROM cluster_nodes WHERE node_id = ?`, b.selfID).Scan(&got); err != nil {
 		return false
 	}
 	return got != want

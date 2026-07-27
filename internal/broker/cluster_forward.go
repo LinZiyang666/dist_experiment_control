@@ -148,6 +148,50 @@ type PortFreeAllocationPayload struct {
 	TokenHash string `json:"token_hash"`
 }
 
+// allocIdentity narrows a port.Allocation to the five identity columns that every
+// allocation state change fences on: internal/port/plan.go's planAllocationStateChange
+// (the raft path) and internal/port/port.go's updateAllocationState (the direct path)
+// both SELECT and UPDATE on exactly `port, sid, nid, name, token_hash`.
+//
+// WHY NARROW RATHER THAN WIDEN THE PAYLOAD (batch B, plan §5 decision #4)
+//
+// port.Allocation carries fourteen fields; this payload carries five. Before this
+// function the two halves of every port state change disagreed about which: the
+// LEADER-LOCAL closure captured the full struct while dispatchForward rebuilt one from
+// the five marshalled fields. That was correct only BY COINCIDENCE — both planners
+// happen to read only those five today.
+//
+// The moment someone fences PlanFreeAllocation on a sixth field, the coincidence ends and
+// the bug is invisible in the worst possible way: the leader-direct path still has the
+// field, so every leader-direct test stays green, and the failure only appears when ctl
+// happens to reach a FOLLOWER. HomeBroker and Epoch — the two fields most likely to be
+// fenced on next — are precisely the D6 §7.1-7.2 tunnel-plane identity columns, and
+// port.go:114-146's tunnelTokenLookup already gates a REGISTER on the epoch ladder, so a
+// fence on it here is a small step, not a hypothetical.
+//
+// (An earlier version of this comment claimed PlanAllocate is already fenced on Epoch.
+// Internal review showed that is false: PlanAllocate WRITES epoch=0 into the baked INSERT,
+// it does not fence a read on it. The point survives without the overstated precedent.)
+//
+// Narrowing once, here, makes all three call paths take the SAME five fields, so a sixth
+// field read becomes wrong EVERYWHERE at once, including in the fastest and most covered
+// path. Widening the payload instead would add wire surface and still leave the leader
+// closure reading a different value than the wire carries.
+func allocIdentity(a port.Allocation) PortFreeAllocationPayload {
+	return PortFreeAllocationPayload{
+		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
+	}
+}
+
+// allocation rebuilds the narrowed port.Allocation. It is the SAME projection
+// dispatchForward performs on the receiving side, named once so the two sides cannot
+// drift apart again.
+func (p PortFreeAllocationPayload) allocation() port.Allocation {
+	return port.Allocation{
+		Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash,
+	}
+}
+
 // SessionCreatePayload (D9) is the forwarded session-create request. The leader bakes the
 // created_at; SID == Name (name-keyed sessions), so the follower needs no id round-trip.
 type SessionCreatePayload struct {
@@ -386,6 +430,19 @@ type Forwarder struct {
 	// timeout returns the retriable not_leader sentinel → the agent's reconnect backoff
 	// smooths the herd over time. nil ⇒ unlimited (tests that don't exercise the herd).
 	limiter *rate.Limiter
+	// observe, when set, receives (verb, err) for EVERY Forward outcome. It is the
+	// tether_broker_raft_forward_total choke point (external review B2).
+	//
+	// It lives here, at the network boundary, rather than at the call sites, because the call
+	// sites are exactly what failed: counting was done inside proposeOrForward, and FIVE senders
+	// (alert signal, alert ack, transfer audit, provision, join) call Forward directly. Four of
+	// them discard the error, and the counter's own godoc named the disk-alert one as the reason
+	// the metric exists — so the single path the feature was justified by was the one it did not
+	// count. Any future direct sender is now counted without knowing this field exists.
+	//
+	// nil ⇒ uncounted, which is only correct for a Forwarder no Broker owns (a unit test
+	// exercising the wire shape). Broker.newForwarder and AttachAlertSink both install it.
+	observe func(verb string, err error)
 }
 
 // defaultForwardRatePerSec bounds the leader-forward rate (§18.2.18). Generous enough not
@@ -410,12 +467,40 @@ func NewForwarderWithLimit(nc *nats.Conn, timeout time.Duration, perSec int) *Fo
 	return f
 }
 
+// newForwarder is the BROKER-owned constructor: the returned Forwarder tallies every outcome into
+// b.forwards. Production must use this, never the bare NewForwarder — see Forwarder.observe, and
+// TestEveryBrokerOwnedForwarderIsObserved, which pins it structurally.
+func (b *Broker) newForwarder(nc *nats.Conn, timeout time.Duration) *Forwarder {
+	f := NewForwarder(nc, timeout)
+	f.observe = b.countForward
+	return f
+}
+
 // Forward sends one verb+payload and classifies the reply. Returns nil on ok,
 // cluster.ErrForwardNotLeader on not_leader OR a NATS timeout/no-responder (a timeout
 // is NOT proof of non-commit — the SAME ReqID dedups on retry), or a
 // *ForwardBusinessError on a permanent business error. The caller re-calls with the
 // SAME reqID on a retriable error; it MUST NOT mint a fresh key.
-func (f *Forwarder) Forward(verb, reqID string, payload []byte) error {
+// It is a thin wrapper over forward so that EVERY one of that function's seven exits is observed
+// through one deferred hook — an early `return` added later cannot escape the counter, which is
+// precisely how the metric came to miss five senders.
+func (f *Forwarder) Forward(verb, reqID string, payload []byte) (err error) {
+	defer func() { f.observeOutcome(verb, err) }()
+	return f.forward(verb, reqID, payload)
+}
+
+// observeOutcome reports one authoritative attempt through the Forwarder-owned
+// observer. Besides Forward's network boundary, the provision/join seams use it
+// for their direct leader-local Propose branch, which otherwise bypasses both
+// Forward and Broker.proposeOrForward. A nil receiver/observer is deliberately
+// safe for package fixtures and wire-only Forwarders.
+func (f *Forwarder) observeOutcome(verb string, err error) {
+	if f != nil && f.observe != nil {
+		f.observe(verb, err)
+	}
+}
+
+func (f *Forwarder) forward(verb, reqID string, payload []byte) error {
 	// §18.2.18 mass-reconnect bound: acquire a forward token (bounded by the request
 	// timeout). Exceeding the deadline is treated as retriable (not a commit) — the agent
 	// backs off, smoothing the herd; the SAME reqID dedups any eventual double-commit.
@@ -495,179 +580,149 @@ var ErrReqIDNotAllowed = errors.New("cluster_forward: this verb must not carry a
 // guard cannot reintroduce the stale-ledger false-success.
 var verbAllowsReqID = map[string]bool{VerbReconcile: true}
 
-// dispatchForward runs the verb's leader-only Plan on the leader. provision/join go
-// through node.Propose (NO ReqID, structurally idempotent, F1/RF1); reconcile goes
-// through node.ProposeWithReqID with its bootID-epoch key. Plan reads the LEADER DB.
-func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelope) error {
-	// CC-4: enforce the no-ReqID contract for EVERY verb not on the allow-list, at the wire
-	// boundary, so a future verb cannot reintroduce the external-F1 stale-ledger false-success.
-	if env.ReqID != "" && !verbAllowsReqID[env.Verb] {
-		return ErrReqIDNotAllowed
+// verbHandler decodes one forward envelope and runs the verb's leader-only Plan.
+type verbHandler func(node *cluster.Node, now func() time.Time, env forwardEnvelope) error
+
+// propose builds a handler that decodes payload type P and proposes plan against the LEADER's
+// committed view. The generic parameter is what keeps the table type-safe: before this, every arm
+// spelled out its own `var p T; json.Unmarshal(...); node.Propose(...)` and the only thing keeping
+// the decode type and the Plan call in agreement was reading them side by side.
+//
+// The plan closure receives (db, p, now) and may ignore any of them — several verbs need no db
+// (nodepkg.PlanEvict) or no now (proc.PlanInsert), and forcing them into a narrower signature
+// would mean several builders instead of one.
+func propose[P any](plan func(*sql.DB, P, time.Time) (*cluster.Command, error)) verbHandler {
+	return func(node *cluster.Node, now func() time.Time, env forwardEnvelope) error {
+		var p P
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return plan(db, p, now())
+		})
 	}
-	switch env.Verb {
-	case VerbProvision:
-		var p ProvisionPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return agentprov.PlanProvisionWithPIN(db, p.SID, p.NID, p.FP, p.PIN, auth.VerifyPIN, now())
-		})
-	case VerbJoin:
-		var p JoinPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return session.PlanJoinWithPIN(db, p.SID, p.FP, p.PIN, auth.VerifyPIN, now())
-		})
-	case VerbReconcile:
-		var p ReconcilePayload
+}
+
+// proposeWithReqID is propose() through node.ProposeWithReqID, for the one verb that carries an
+// idempotency key minted at the wire boundary (reconcile, whose bootID-epoch key dedups a
+// forwarder retry). It is a SEPARATE builder rather than a flag on propose() so that the choice
+// is visible in the table: a verb either has a boundary-minted ReqID or it does not, and
+// verbAllowsReqID must agree.
+func proposeWithReqID[P any](plan func(*sql.DB, P, time.Time) (*cluster.Command, error)) verbHandler {
+	return func(node *cluster.Node, now func() time.Time, env forwardEnvelope) error {
+		var p P
 		if err := json.Unmarshal(env.Payload, &p); err != nil {
 			return err
 		}
 		return node.ProposeWithReqID(env.ReqID, func(db *sql.DB) (*cluster.Command, error) {
-			procs, err := proc.ListBySessionFiltered(db, p.SID, proc.ListBySessionOpts{IncludeExited: false})
-			if err != nil {
-				return nil, err
-			}
-			ports, err := port.ListBySession(db, p.SID)
-			if err != nil {
-				return nil, err
-			}
-			return proc.PlanReconcileBatch(resolveReconcile(p.SID, p.NID, p.Req, procs, ports, now()))
+			return plan(db, p, now())
 		})
-	case VerbTransferAudit:
-		// D8a §9: re-derivable transfer audit. PlanTransferAudit sets the content-derived
-		// ReqID itself; node.Propose (empty arg) PRESERVES it (ProposeWithReqID only
-		// overwrites a NON-empty arg), so the 0011 ledger dedups a forwarder retry. No
-		// env.ReqID gate — the key is a pure function of the payload, not minted here.
-		var rec schema.AuditTransfer
-		if err := json.Unmarshal(env.Payload, &rec); err != nil {
-			return err
+	}
+}
+
+// writeVerbs is the leader-side dispatch table. It replaced a 17-arm switch (batch B, B2).
+//
+// WHAT DID NOT CHANGE, AND MUST NOT
+//
+//   - The CC-4 ReqID gate still runs at the WIRE BOUNDARY, before this table is consulted.
+//     dispatchForward's comment explains why; moving it inside a handler would let a future verb
+//     reintroduce the external-F1 stale-ledger false-success.
+//   - The unknown-verb error string is byte-identical. It reaches an operator terminal through
+//     cluster_health.go's alert-ack forward.
+//   - Every payload type and every Plan call is the same one the corresponding switch arm used.
+//     internal/broker/wire_freeze_test.go re-derives the type set from THIS table and requires
+//     each to be frozen, so a new entry cannot skip the wire freeze.
+var writeVerbs = map[string]verbHandler{
+	VerbProvision: propose(func(db *sql.DB, p ProvisionPayload, now time.Time) (*cluster.Command, error) {
+		return agentprov.PlanProvisionWithPIN(db, p.SID, p.NID, p.FP, p.PIN, auth.VerifyPIN, now)
+	}),
+	VerbJoin: propose(func(db *sql.DB, p JoinPayload, now time.Time) (*cluster.Command, error) {
+		return session.PlanJoinWithPIN(db, p.SID, p.FP, p.PIN, auth.VerifyPIN, now)
+	}),
+	VerbReconcile: proposeWithReqID(func(db *sql.DB, p ReconcilePayload, now time.Time) (*cluster.Command, error) {
+		procs, err := proc.ListBySessionFiltered(db, p.SID, proc.ListBySessionOpts{IncludeExited: false})
+		if err != nil {
+			return nil, err
 		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return xferaudit.PlanTransferAudit(rec)
-		})
-	case VerbAlertSignal:
-		// D8b §10.2: read the CURRENT ACTIVE state and commit a raise/clear ONLY on a
-		// transition — a nil command (no transition) issues no raft write, so a broker's
-		// every-tick re-assert is free and a dropped clear self-heals next tick.
-		var p AlertSignalPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
+		ports, err := port.ListBySession(db, p.SID)
+		if err != nil {
+			return nil, err
 		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return planAlertSignal(db, p, now())
-		})
-	case VerbAlertAck:
-		// D8b §10.1: cluster-level ack (idempotent UPSERT). User-initiated + rare, so no
-		// transition gate is needed (unlike the periodic signal).
-		var p AlertAckPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return cluster.PlanAlertAck(p.DedupKey, p.AckedBy, now())
-		})
-	case VerbSessionCreate:
-		// D9 §3: the leader bakes created_at via now() and commits OpSessionCreate;
-		// PlanCreate re-checks existence on the LEADER's committed view (ErrAlreadyExists
-		// surfaces as a typed forward error). SID == Name (name-keyed sessions).
-		var p SessionCreatePayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return session.PlanCreate(db, p.Name, p.Name, p.FP, p.PinHash, now())
-		})
-	case VerbBusNkeySet:
-		// C3: each broker self-reports its bus nkey pub; the leader bakes the all-literal UPDATE +
-		// topology_generation bump (PlanClusterBusNkeySet re-validates the nkey on the leader).
-		var p BusNkeySetPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return cluster.PlanClusterBusNkeySet(p.NodeID, p.BusNkeyPub, now())
-		})
-	case VerbPortFree:
-		var p PortMutatePayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return port.PlanFree(db, p.Port, now())
-		})
-	case VerbPortFreeAllocation:
-		var p PortFreeAllocationPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		a := port.Allocation{Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return port.PlanFreeAllocation(db, a, now())
-		})
-	case VerbPortRevoke:
-		var p PortFreeAllocationPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		a := port.Allocation{Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return port.PlanRevokeAllocation(db, a, now())
-		})
-	case VerbNodeRegister:
-		var in nodepkg.RegisterInput
-		if err := json.Unmarshal(env.Payload, &in); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return nodepkg.PlanRegister(db, in, now())
-		})
-	case VerbProcInsert:
-		var p proc.Process
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return proc.PlanInsert(db, p)
-		})
-	case VerbProcMarkExited:
-		var p ProcMarkExitedPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return proc.PlanMarkExited(db, p.Pid, p.ExitCode, p.EndedAt)
-		})
-	case VerbSessionTombstone:
-		var p SessionMutatePayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return session.PlanTombstone(db, p.SID, now())
-		})
-	case VerbSessionDrop:
-		var p SessionMutatePayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return session.PlanHardDelete(db, p.SID)
-		})
-	case VerbNodeEvict:
-		var p EvictPayload
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return nodepkg.PlanEvict(p.SID, p.NID)
-		})
-	default:
+		return proc.PlanReconcileBatch(resolveReconcile(p.SID, p.NID, p.Req, procs, ports, now))
+	}),
+	// D8a §9: PlanTransferAudit sets the content-derived ReqID itself; node.Propose PRESERVES it
+	// (ProposeWithReqID only overwrites a NON-empty arg), so the 0011 ledger dedups a forwarder
+	// retry. No env.ReqID gate — the key is a pure function of the payload, not minted here.
+	VerbTransferAudit: propose(func(_ *sql.DB, rec schema.AuditTransfer, _ time.Time) (*cluster.Command, error) {
+		return xferaudit.PlanTransferAudit(rec)
+	}),
+	// D8b §10.2: read the CURRENT ACTIVE state and commit a raise/clear ONLY on a transition — a
+	// nil command (no transition) issues no raft write, so a broker's every-tick re-assert is free
+	// and a dropped clear self-heals next tick.
+	VerbAlertSignal: propose(func(db *sql.DB, p AlertSignalPayload, now time.Time) (*cluster.Command, error) {
+		return planAlertSignal(db, p, now)
+	}),
+	// D8b §10.1: cluster-level ack (idempotent UPSERT). User-initiated + rare, so no transition
+	// gate is needed (unlike the periodic signal).
+	VerbAlertAck: propose(func(_ *sql.DB, p AlertAckPayload, now time.Time) (*cluster.Command, error) {
+		return cluster.PlanAlertAck(p.DedupKey, p.AckedBy, now)
+	}),
+	// D9 §3: the leader bakes created_at via now() and commits OpSessionCreate; PlanCreate
+	// re-checks existence on the LEADER's committed view (ErrAlreadyExists surfaces as a typed
+	// forward error). SID == Name (name-keyed sessions).
+	VerbSessionCreate: propose(func(db *sql.DB, p SessionCreatePayload, now time.Time) (*cluster.Command, error) {
+		return session.PlanCreate(db, p.Name, p.Name, p.FP, p.PinHash, now)
+	}),
+	// C3: each broker self-reports its bus nkey pub; the leader bakes the all-literal UPDATE +
+	// topology_generation bump (PlanClusterBusNkeySet re-validates the nkey on the leader).
+	VerbBusNkeySet: propose(func(_ *sql.DB, p BusNkeySetPayload, now time.Time) (*cluster.Command, error) {
+		return cluster.PlanClusterBusNkeySet(p.NodeID, p.BusNkeyPub, now)
+	}),
+	VerbPortFree: propose(func(db *sql.DB, p PortMutatePayload, now time.Time) (*cluster.Command, error) {
+		return port.PlanFree(db, p.Port, now)
+	}),
+	// Both allocation verbs rebuild through PortFreeAllocationPayload.allocation() — the SAME
+	// named projection the originating side applies (see allocIdentity). Spelling the rebuild out
+	// per arm is what let the two sides drift in the first place.
+	VerbPortFreeAllocation: propose(func(db *sql.DB, p PortFreeAllocationPayload, now time.Time) (*cluster.Command, error) {
+		return port.PlanFreeAllocation(db, p.allocation(), now)
+	}),
+	VerbPortRevoke: propose(func(db *sql.DB, p PortFreeAllocationPayload, now time.Time) (*cluster.Command, error) {
+		return port.PlanRevokeAllocation(db, p.allocation(), now)
+	}),
+	VerbNodeRegister: propose(func(db *sql.DB, in nodepkg.RegisterInput, now time.Time) (*cluster.Command, error) {
+		return nodepkg.PlanRegister(db, in, now)
+	}),
+	VerbProcInsert: propose(func(db *sql.DB, p proc.Process, _ time.Time) (*cluster.Command, error) {
+		return proc.PlanInsert(db, p)
+	}),
+	VerbProcMarkExited: propose(func(db *sql.DB, p ProcMarkExitedPayload, _ time.Time) (*cluster.Command, error) {
+		return proc.PlanMarkExited(db, p.Pid, p.ExitCode, p.EndedAt)
+	}),
+	VerbSessionTombstone: propose(func(db *sql.DB, p SessionMutatePayload, now time.Time) (*cluster.Command, error) {
+		return session.PlanTombstone(db, p.SID, now)
+	}),
+	VerbSessionDrop: propose(func(db *sql.DB, p SessionMutatePayload, _ time.Time) (*cluster.Command, error) {
+		return session.PlanHardDelete(db, p.SID)
+	}),
+	VerbNodeEvict: propose(func(_ *sql.DB, p EvictPayload, _ time.Time) (*cluster.Command, error) {
+		return nodepkg.PlanEvict(p.SID, p.NID)
+	}),
+}
+
+// dispatchForward runs the verb's leader-only Plan on the leader. Plan reads the LEADER DB.
+func dispatchForward(node *cluster.Node, now func() time.Time, env forwardEnvelope) error {
+	// CC-4: enforce the no-ReqID contract for EVERY verb not on the allow-list, at the wire
+	// boundary, so a future verb cannot reintroduce the external-F1 stale-ledger false-success.
+	// This stays BEFORE the table lookup — see writeVerbs' doc.
+	if env.ReqID != "" && !verbAllowsReqID[env.Verb] {
+		return ErrReqIDNotAllowed
+	}
+	h, ok := writeVerbs[env.Verb]
+	if !ok {
 		return fmt.Errorf("cluster_forward: unknown verb %q", env.Verb)
 	}
+	return h(node, now, env)
 }
 
 // isLeaderUnavailable reports whether err is the transient "no leader committed this write
@@ -715,9 +770,11 @@ func NewProvisionSeam(node *cluster.Node, fwd *Forwarder) func(sid, nid, fp, pin
 			// Propose gate / Apply (raft.ErrNotLeader / ErrLeadershipLost) to the
 			// transient sentinel, mirroring the forward branch (review M1 — the seam
 			// is the single raft->authcallout translation point; both branches must map).
-			if err := node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			err := node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 				return agentprov.PlanProvisionWithPIN(db, sid, nid, fp, pin, auth.VerifyPIN, t)
-			}); err != nil {
+			})
+			fwd.observeOutcome(VerbProvision, err)
+			if err != nil {
 				if cluster.IsNotLeader(err) {
 					return authcallout.ErrNotLeader
 				}
@@ -745,9 +802,11 @@ func NewProvisionSeam(node *cluster.Node, fwd *Forwarder) func(sid, nid, fp, pin
 func NewJoinSeam(node *cluster.Node, fwd *Forwarder) func(sid, fp, pin string, t time.Time) error {
 	return func(sid, fp, pin string, t time.Time) error {
 		if node.IsLeader() {
-			if err := node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			err := node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 				return session.PlanJoinWithPIN(db, sid, fp, pin, auth.VerifyPIN, t)
-			}); err != nil {
+			})
+			fwd.observeOutcome(VerbJoin, err)
+			if err != nil {
 				if cluster.IsNotLeader(err) {
 					return authcallout.ErrNotLeader
 				}

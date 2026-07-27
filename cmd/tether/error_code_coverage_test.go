@@ -168,18 +168,68 @@ var unresolvedCodeSites = map[string]string{
 	"internal/broker/cluster_manifest.go:114":        "clusterCodeFor returns the typed adminsock error namespace.",
 
 	// Every site below is an adminsock.Response.Code populated by clusterCodeFor.
-	"internal/broker/clusterstatus.go:667":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:687":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:692":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:700":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:712":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:717":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:722":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:727":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:732":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:747":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:827":       "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:890":       "adminsock response; clusterCodeFor maps typed cluster errors.",
+	// Batch B: all twelve shifted by +8 when versionSkewRefusal / ErrJoinVersionSkew were
+	// extracted above them. The reasons are unchanged, byte for byte — only the line moved.
+	"internal/broker/clusterstatus.go:747": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:767": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:772": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:780": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:792": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:797": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:802": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:807": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:812": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:827": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:907": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:970": "adminsock response; clusterCodeFor maps typed cluster errors.",
+
+	// Batch B / B1: the six ingress handlers converted to admit() pass the gate's `den.code`
+	// through to their reply helper, so the value is a variable rather than a literal here.
+	//
+	// An earlier version of these entries claimed "the literals live in internal/broker/admit.go
+	// and are scanned there". That was FALSE and internal review caught it: admit.go builds every
+	// refusal through deny(), which is not in codeCarryingHelpers, so the scanner does not read
+	// those literals either. Registering deny() would not work — TestCodeCarryingHelperListIsComplete
+	// derives the list from bodies that assign a parameter to a `Code:`/`Reason:` field, and
+	// denial's fields are lower-case, so deny() cannot be auto-derived and a manual entry is
+	// rejected as stale.
+	//
+	// The SECOND version of this reason claimed "all eight codes are still emitted as literals
+	// elsewhere in the scanned tree". Internal review refuted that too, by mutation, on both
+	// trees: node_offline and node_not_found have NO scanner-visible emitter left anywhere. Their
+	// only other emitters are transferGate's bare `return "node_offline"` / `return
+	// "node_not_found"` (internal/broker/transfer.go), and this file's own header says the scanner
+	// covers forms 1-3 and 8 EXACTLY — a returned bare literal is form 5, which it explicitly
+	// cannot resolve. Twice wrong in one increment, in the sentence whose job is to say what is true.
+	//
+	// So, stated without inference:
+	//
+	//   - The scanner cannot resolve the six sites below. That is why they are exempted.
+	//   - admit()'s refusal set is CLOSED at eight, re-derived from the AST by
+	//     internal/broker.TestAdmitRefusalCodeSet, which fails on a ninth.
+	//   - Every one of the eight has an exit class today, asserted by
+	//     TestAdmitRefusalCodesAreClassified below. That assertion exists precisely BECAUSE two of
+	//     them have no visible emitter: without it, deleting their entry from brokerCodeExitClasses
+	//     would be invisible to this gate (no emitter found -> nothing to check) and they would
+	//     silently fall to exit 70, which docs/usage.md §9.13 tells automation to retry.
+	//
+	// (An exported broker.AdmitRefusalCodes() consumed from here was considered and rejected: it
+	// manufactures the cross-package sync point A1 exists to remove. The eight literals are
+	// duplicated below instead — a bounded, local list whose broker-side counterpart is kept
+	// closed by the test named above.)
+	"internal/broker/run.go:24":     "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/run.go:31":     "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:171": "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:343": "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:352": "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/upgrade.go:45": "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	// The ctrl-family verbs, converted when plan §15.2's deferral was completed. Same closed
+	// eight-code set — admitCtrl shares admitACL with the cmd.by family, so it cannot introduce a
+	// code the set does not already contain. proxy.status is absent from this list because it
+	// replies through proxyErr, which is not in codeCarryingHelpers and is therefore invisible to
+	// the scanner either way (it was invisible before the conversion too).
+	"internal/broker/exec.go:160":                "admitCtrl() denial code (node.list); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/exec.go:194":                "admitCtrl() denial code (ps); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
 	"internal/broker/force_single_online.go:212": "force-single refusal code is a typed adminsock constant returned by fsArmVerdict.",
 
 	"internal/broker/proxy_cluster_wire.go:138": "proxyDegradedCode returns the finite proxy cluster status code set.",
@@ -637,6 +687,61 @@ func TestCodeCarryingHelperListIsComplete(t *testing.T) {
 		if _, ok := found[name]; !ok {
 			t.Errorf("codeCarryingHelpers lists %q but no such code-carrying helper exists any more; delete it", name)
 		}
+	}
+}
+
+// admitRefusalCodesForClassCheck duplicates internal/broker's admitRefusalCodes. The duplication
+// is deliberate and bounded — see the note above unresolvedCodeSites' six admit() entries for why
+// an exported accessor was rejected — and the broker side is kept closed by
+// internal/broker.TestAdmitRefusalCodeSet, which re-derives the set from admit.go's AST.
+var admitRefusalCodesForClassCheck = []string{
+	"subject_malformed",
+	"actor_invalid",
+	"store_error",
+	"session_not_found_or_deleting",
+	"not_a_member",
+	"not_owner",
+	"node_not_found",
+	"node_offline",
+}
+
+// TestAdmitRefusalCodesAreClassified closes the gap the six admit() exemptions would otherwise
+// leave open.
+//
+// TestErrorCodeCoverage checks that every code it can SEE has an exit class. Two of admit()'s
+// eight — node_offline and node_not_found — have no scanner-visible emitter anywhere since B1
+// collapsed the inline copies (their only other emitters are transferGate's bare returns, a form
+// this scanner explicitly cannot resolve). For those two, "no emitter found" means "nothing to
+// check", so deleting their entry from brokerCodeExitClasses would be completely silent — and
+// they would fall to exitInternal (70), which docs/usage.md §9.13 tells automation to RETRY. A
+// non-member hitting an offline node would be retried forever.
+//
+// This asserts the classification directly, from the code list rather than from what the scanner
+// happened to find.
+func TestAdmitRefusalCodesAreClassified(t *testing.T) {
+	for _, code := range admitRefusalCodesForClassCheck {
+		class := brokerCodeExitClass(code)
+		if class == exitInternal {
+			// exitInternal is also the DEFAULT for an unknown code, so it cannot distinguish
+			// "deliberately 70" from "fell off the table". Require the code to be present in the
+			// table explicitly for that case.
+			if _, listed := brokerCodeExitClasses[code]; !listed {
+				t.Errorf("admit() can reply %q and it has NO entry in brokerCodeExitClasses, so it "+
+					"falls through to exit 70 — which docs/usage.md §9.13 tells automation to retry. "+
+					"Nothing else catches this: %q has no scanner-visible emitter left, so "+
+					"TestErrorCodeCoverage never examines it.", code, code)
+			}
+		}
+	}
+	// Non-vacuity: a code that genuinely has no class must be reported, else the loop above is
+	// checking nothing.
+	if _, listed := brokerCodeExitClasses["definitely_not_a_real_code_xyz"]; listed {
+		t.Fatal("the control code is somehow present in brokerCodeExitClasses — this test's " +
+			"lookup is not doing what it claims")
+	}
+	if len(admitRefusalCodesForClassCheck) != 8 {
+		t.Errorf("this list has %d entries; internal/broker.TestAdmitRefusalCodeSet pins admit()'s "+
+			"set at 8. If admit() gained or lost a code, update BOTH.", len(admitRefusalCodesForClassCheck))
 	}
 }
 

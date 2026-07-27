@@ -71,6 +71,16 @@ type ClusterAdmin struct {
 	// StatusReport stamps the self row from it authoritatively (self does not poll itself for topo).
 	topoSelf func() *topoSelfReport
 
+	// accountPubSelf (batch B / B4), when set (wireClusterLate), returns THIS broker's auth_callout
+	// account public key. StatusReport compares every peer's self-reported key against it to render a
+	// truthful ACCT.NK column; before this existed the column was hardcoded Y.
+	//
+	// nil (or a getter returning "") means this view cannot name its own account key, and then NO row
+	// gets an ACCT.NK verdict — a broker that does not know its own key has no standing to declare
+	// anyone else's mismatched, and inventing N for the whole cluster during an outage is exactly the
+	// fabricated-signal defect this replaced.
+	accountPubSelf func() string
+
 	// caughtUpFn / streamsReadyFn (C4), when set (wireClusterLate), are the broker's catch-up + stream
 	// readiness probes the operation controller drives (same funcs AddNode/DrainNode take as params).
 	caughtUpFn     func(nodeID string, barrier uint64) (bool, error)

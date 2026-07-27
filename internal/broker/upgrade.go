@@ -17,70 +17,42 @@ package broker
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
-	"github.com/LinZiyang666/tether/internal/auth"
-	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
 
 var sha256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
-	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "upgrade" {
-		b.replyUpgradeErr(msg, "subject_malformed", "")
+	// upgrade has NO cluster-role short circuit, and `.upgrade.req` is absent from
+	// isBroadcastClusterSubject (clusterwrite.go:59-80 lists exec/run/kill/expose/expose-rm and
+	// the transfer family, not upgrade), so it is QUEUE-GROUPED: exactly one broker handles each
+	// request.
+	//
+	// Do NOT "tidy up" the missing short circuit. Adding a leader-only gate to a queue-grouped
+	// subject is the precise shape of Mega-audit MAJ-2, whose write-up sits at broker.go:1001-1006
+	// — that one was about the `.proxy.sub.*` wildcard, not about upgrade, but the mechanism
+	// transfers exactly: the queue group hands the request to an arbitrary member, a leader-only
+	// handler on a follower returns silently, and ctl times out ~(N-1)/N of the time. upgrade is
+	// the fleet's only remote-update verb, so that failure mode would land on the one command an
+	// operator reaches for when a node is already misbehaving.
+	ing, den, ok := b.admit(msg.Subject, upgradeSpec)
+	if !ok {
+		b.replyUpgradeErr(msg, den.code, den.detail)
+		// upgrade is the only converted verb that audits its OWNERSHIP refusal as well as its
+		// node refusals.
+		switch den.code {
+		case "not_owner", "node_not_found", "node_offline":
+			b.pubAuditCall(ing.sid, ing.fp, ing.actor, "upgrade", ing.nid, false,
+				auditRefusal(den), msg.Reply, nil)
+		}
 		return
 	}
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyUpgradeErr(msg, "actor_invalid", err.Error())
-		return
-	}
-
-	// C.1 §6 ingress gate (same as exec/run/expose/register).
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyUpgradeErr(msg, "store_error", err.Error())
-		return
-	}
-	if !active {
-		b.replyUpgradeErr(msg, "session_not_found_or_deleting", "")
-		return
-	}
-
-	// J.4 § owner-only.
-	owner, err := session.IsOwner(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyUpgradeErr(msg, "store_error", err.Error())
-		return
-	}
-	if !owner {
-		b.replyUpgradeErr(msg, "not_owner", "")
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "not_owner", msg.Reply, nil)
-		return
-	}
-
-	// Pre-forward node ONLINE check (mirrors handleExecReq).
-	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
-	switch {
-	case errors.Is(err, node.ErrNotFound):
-		b.replyUpgradeErr(msg, "node_not_found", "")
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_not_found", msg.Reply, nil)
-		return
-	case err != nil:
-		b.replyUpgradeErr(msg, "store_error", err.Error())
-		return
-	case status != node.StateOnline:
-		b.replyUpgradeErr(msg, "node_offline", string(status))
-		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "node_offline:"+string(status), msg.Reply, nil)
-		return
-	}
+	sid, actor, nid, fp := ing.sid, ing.actor, ing.nid, ing.fp
 
 	var req proto.UpgradeReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {

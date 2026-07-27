@@ -151,7 +151,7 @@ func (b *Broker) noInflightOps() bool {
 func (b *Broker) recentProxyRehome() bool {
 	cutoff := cluster.LitTime(b.cfg.Now().UTC().Add(-autoRebalanceQuietWindow))
 	var n int
-	if err := b.cfg.DB.QueryRow(
+	if err := b.read().QueryRow(
 		`SELECT COUNT(*) FROM port_allocations
 		   WHERE name='__proxy__' AND state='ALLOCATED'
 		     AND last_rehome_at IS NOT NULL AND last_rehome_at > ` + cutoff,

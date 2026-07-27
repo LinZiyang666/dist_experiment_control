@@ -294,7 +294,7 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 
 // clusterVoters returns the node_ids of the current VOTER roster (the §17 observe target).
 func (b *Broker) clusterVoters() ([]string, error) {
-	rows, err := b.cfg.DB.Query(`SELECT node_id FROM cluster_nodes WHERE phase = 'VOTER'`)
+	rows, err := b.read().Query(`SELECT node_id FROM cluster_nodes WHERE phase = 'VOTER'`)
 	if err != nil {
 		return nil, err
 	}

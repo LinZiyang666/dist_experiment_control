@@ -614,9 +614,9 @@ var dynamicSubscriptionExemptions = map[string]string{
 	"internal/broker/home_delivery.go:197": "Subscribe(inbox+\".>\", ...) — a broker-owned _INBOX ack " +
 		"channel for agent home-delivery acknowledgements, not a ctl-served endpoint; the random " +
 		"inbox is intentionally runtime-generated and does not belong in member pub grants.",
-	"internal/broker/broker.go:1029": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
+	"internal/broker/broker.go:1034": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
 		"subscription table; every row's subject IS extracted, from the table literal above.",
-	"internal/broker/broker.go:1031": "Subscribe(ss.subj, ...) — same loop variable as :1029.",
+	"internal/broker/broker.go:1036": "Subscribe(ss.subj, ...) — same loop variable as :1034.",
 }
 
 // TestACLDynamicSubscriptionsAreDeclared closes the second direction of R2: a

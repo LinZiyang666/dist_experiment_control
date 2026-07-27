@@ -245,8 +245,20 @@ func (n *Node) RODB() *sql.DB { return n.ro }
 
 // DB returns the node's WAL WRITE pool. It is the FSM's single-writer handle; callers
 // MUST NOT issue authoritative writes through it directly (that bypasses raft and
-// breaks replication) — it is exposed only for the offline `cluster init --from-existing`
-// seed path, which writes BEFORE raft is serving. Live writes go through Propose.
+// breaks replication). Live authoritative writes go through Propose.
+//
+// TWO callers are exempt, and both are named here because this godoc previously claimed there
+// was only one — while the second has been calling it on every heartbeat since D9 (batch B, B3):
+//
+//  1. the offline `cluster init --from-existing` seed path, which writes BEFORE raft is serving;
+//  2. internal/broker's livenessDB(), for the THREE non-replicated liveness columns
+//     (last_heartbeat_at, status, proxy_ready). Those are per-broker-local and high-frequency:
+//     routing heartbeats through Propose would flood raft and is semantically wrong, and the
+//     columns are disjoint from the replicated set. MaxOpenConns(1) serializes them with Apply.
+//
+// The carve-out for (2) was documented only on the broker side, so this godoc read as a
+// prohibition that production violated continuously. Stating it on BOTH sides is the point: a
+// MUST-NOT whose exception lives in another package is a MUST-NOT the next reader will believe.
 func (n *Node) DB() *sql.DB { return n.db }
 
 // BackupDBTo writes a consistent online-backup of the committed FSM DB into dstPath, off the

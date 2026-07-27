@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -289,7 +290,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// it; reuse it here (a second one would be a redundant client). Fall back if unset.
 	fwd := b.cl.forwarder
 	if fwd == nil {
-		fwd = NewForwarder(nc, b.cfg.ExposeForwardTimeout())
+		fwd = b.newForwarder(nc, b.cfg.ExposeForwardTimeout())
 		b.cl.forwarder = fwd
 	}
 
@@ -320,13 +321,13 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now) },
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
+			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty)
 		},
 		func() (*nats.Subscription, error) { return SubscribeClusterRosterPull(nc, b.manifestBytes) }, // G3 #17
 		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) },            // G5 #13 W2b
 		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) },               // G4 §B grow trigger
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID)
+			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty)
 		},
 		// R8a P1: the broker-owned _INBOX agents publish their APPLIED home acks to.
 		// Without it the home-delivery pass has no ACTUAL half to compare against and
@@ -416,6 +417,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		return pub.ObserveReplicas(context.Background())
 	}
 	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
+	b.cl.admin.accountPubSelf = b.accountPubOrEmpty   // batch B / B4: the ACCT.NK comparison baseline (see clusteradmin.go)
 	b.cl.admin.caughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
 	b.cl.admin.streamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
 	b.cl.admin.jsPlaceableFn = b.clusterJSPlaceable   // G69 (#67 sub-face 4): join terminal placement gate
@@ -578,8 +580,28 @@ func (b *Broker) clusterJSPlaceable() (bool, string) {
 	return true, ""
 }
 
-// livenessDB returns the handle for LIVENESS-column writes (last_heartbeat_at, status)
-// — the local, non-replicated state (§3.5: Apply never writes it, rebuilt on failover).
+// livenessDB returns the handle for LIVENESS-column writes — the local, non-replicated state
+// (§3.5: Apply never writes it, rebuilt on failover).
+//
+// THE COLUMN SET IS THREE, NOT TWO (batch B, B3 — reconciled before the accessors were named).
+// This godoc used to say "(last_heartbeat_at, status)". It was wrong: production writes a third,
+// `proxy_ready`, through this same handle — node.SetProxyReady from broker.go:1469 and
+// proxy.go:454. test/determinism/lint_skeleton_test.go's livenessColumnRe has always listed all
+// three; the two SSOTs disagreed and the regex was the correct one. Naming an accessor whose
+// contract was defined by a regex in a test that never runs against production would have
+// promoted the ambiguity rather than resolved it, so it is resolved here:
+//
+//	last_heartbeat_at  — Heartbeat (broker.go:1441, clusterwrite.go:815)
+//	status             — ReconcileStates (broker.go:1234, reconcile_passes.go:58)
+//	proxy_ready        — SetProxyReady (broker.go:1469, proxy.go:454)
+//
+// EVERY CALLER IS NOW A LIVENESS WRITE. This paragraph used to name proc-GC as a current anomaly —
+// a `processes` DELETE (replicated table) riding this handle — and to say moving it was tracked.
+// It was moved in the same delta that wrote that sentence: reconcile_passes.go's proc-gc pass asks
+// singleWriter(), which returns (nil, false) in cluster mode, so the restriction is structural
+// rather than a comment plus a mode `if`. The stale warning is removed rather than left to be
+// reasoned from (external review M2): an obsolete ownership claim in the one godoc a maintainer
+// comes to for ownership questions is worse than none.
 // In single mode that is the normal read+write handle; in cluster mode it is the FSM
 // write pool (node.DB()), written directly (NOT through raft): liveness is high-frequency
 // (heartbeats) and per-broker-local, so routing it through Propose would flood raft and
@@ -685,11 +707,75 @@ func (b *Broker) proposeOrForward(verb, reqID string, payload []byte, plan func(
 		// as a terminal "store_error", which the agent's register loop treats as a PERMANENT
 		// rejection and EXITS the process on a routine raft leader failover.
 		if err != nil && cluster.IsNotLeader(err) {
+			b.countForward(verb, cluster.ErrForwardNotLeader)
 			return cluster.ErrForwardNotLeader
 		}
+		b.countForward(verb, err)
 		return err
 	}
+	// NOT counted here: Forwarder.observe already tallies every Forward outcome at the network
+	// boundary (external review B2). Counting again would double every follower forward while
+	// leaving the five direct senders at zero — the worst of both.
 	return b.cl.forwarder.Forward(verb, reqID, payload)
+}
+
+// forwardCounters holds the (verb, outcome) tallies surfaced as
+// tether_broker_raft_forward_total. It is a separate type rather than two fields on Broker so the
+// zero value is usable by the ~126 package-internal &Broker{} literals without them knowing it
+// exists.
+type forwardCounters struct {
+	mu sync.Mutex
+	n  map[string]int64
+}
+
+func (f *forwardCounters) add(key string) {
+	f.mu.Lock()
+	if f.n == nil {
+		f.n = map[string]int64{}
+	}
+	f.n[key]++
+	f.mu.Unlock()
+}
+
+func (f *forwardCounters) snapshot() map[string]int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.n) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(f.n))
+	for k, v := range f.n {
+		out[k] = v
+	}
+	return out
+}
+
+// countForward classifies one authoritative write attempt.
+//
+// The three outcomes are NOT interchangeable and collapsing any two would remove the reason this
+// counter exists: `not_leader` is the routine leadership race every caller retries, `error` is a
+// typed business rejection that retrying will not fix, and `ok` is the denominator without which
+// neither rate means anything. Several production paths (alert_forward.go's disk signal,
+// cluster_health.go's alert ack, transfer_audit_forward.go, and the provision/join seams) discard
+// the error entirely because a level-triggered re-assert or a client retry self-heals — this is
+// what makes a forward that fails EVERY tick distinguishable from a broker with nothing to say,
+// without changing that retry policy.
+//
+// TWO instrumentation boundaries (external review B2/R1): proposeOrForward's LEADER-LOCAL branch
+// and Forwarder.observeOutcome. The latter covers every forward that crosses the wire and the
+// provision/join seams' direct leader-local Propose branches, which bypass proposeOrForward. The
+// previous arrangement counted only inside proposeOrForward, so the five direct senders above —
+// including the disk signal this godoc cites — were never counted at all.
+func (b *Broker) countForward(verb string, err error) {
+	outcome := "ok"
+	switch {
+	case err == nil:
+	case errors.Is(err, cluster.ErrForwardNotLeader), cluster.IsNotLeader(err):
+		outcome = "not_leader"
+	default:
+		outcome = "error"
+	}
+	b.forwards.add(verb + "/" + outcome)
 }
 
 // createSession routes a session create (D9 §3, audit #9). Single mode: the direct
@@ -836,18 +922,21 @@ func (b *Broker) recordProc(p proc.Process) error {
 	})
 }
 
+// freePortAllocation routes an expose-rm free. All three paths (single-mode direct,
+// leader-local Plan, forwarded Plan) take the SAME narrowed identity — see allocIdentity
+// in cluster_forward.go for why the leader must not keep the wider struct.
 func (b *Broker) freePortAllocation(a port.Allocation) error {
+	id := allocIdentity(a)
+	narrowed := id.allocation()
 	if !b.clusterMode {
-		return port.FreeAllocation(b.cfg.DB, a, b.cfg.Now())
+		return port.FreeAllocation(b.cfg.DB, narrowed, b.cfg.Now())
 	}
-	payload, err := json.Marshal(PortFreeAllocationPayload{
-		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
-	})
+	payload, err := json.Marshal(id)
 	if err != nil {
 		return err
 	}
 	return b.proposeOrForward(VerbPortFreeAllocation, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanFreeAllocation(db, a, b.cfg.Now())
+		return port.PlanFreeAllocation(db, narrowed, b.cfg.Now())
 	})
 }
 
@@ -898,18 +987,22 @@ func (b *Broker) subscribeTunnelClose(nc *nats.Conn) (*nats.Subscription, error)
 	})
 }
 
+// revokePortAllocation routes an offline-node revoke. Same three-path narrowing as
+// freePortAllocation; this one matters more, because its caller scans OFFLINE nodes and
+// the row it selected may already have been reused by a later allocation — the identity
+// fence is the only thing stopping a delayed revoke from hitting the wrong row.
 func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
+	id := allocIdentity(a)
+	narrowed := id.allocation()
 	if !b.clusterMode {
-		return port.RevokeAllocation(b.cfg.DB, a, now)
+		return port.RevokeAllocation(b.cfg.DB, narrowed, now)
 	}
-	payload, err := json.Marshal(PortFreeAllocationPayload{
-		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
-	})
+	payload, err := json.Marshal(id)
 	if err != nil {
 		return err
 	}
 	return b.proposeOrForward(VerbPortRevoke, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanRevokeAllocation(db, a, now)
+		return port.PlanRevokeAllocation(db, narrowed, now)
 	})
 }
 

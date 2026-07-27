@@ -53,7 +53,7 @@ func (b *Broker) driveProxyReconcile() {
 // reconcileProxyTeardown frees + disables every __proxy__ allocation whose session is no longer an
 // ACTIVE proxy-enabled session (the B1 OFF/teardown convergence).
 func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
-	rows, err := b.cfg.DB.Query(`
+	rows, err := b.read().Query(`
 		SELECT pa.sid, pa.nid, pa.port
 		FROM port_allocations pa
 		JOIN sessions s ON s.sid = pa.sid
@@ -104,7 +104,7 @@ func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
 }
 
 func (b *Broker) activeProxySessions() ([]string, error) {
-	rows, err := b.cfg.DB.Query(`SELECT sid FROM sessions WHERE state='ACTIVE' AND proxy_enabled=1`)
+	rows, err := b.read().Query(`SELECT sid FROM sessions WHERE state='ACTIVE' AND proxy_enabled=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +315,7 @@ func (b *Broker) rehomeProxy(nc *nats.Conn, sid, nid string, existing *port.Allo
 func (b *Broker) pickProxyRehomeTarget(currentHome string) string {
 	// A target must be a DELIVERABLE VOTER (cert + public_host, N4) and currently REACHABLE (M1: never
 	// rehome onto a dead broker), excluding the failed current home.
-	rows, err := b.cfg.DB.Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' AND node_id != ? ORDER BY node_id`, currentHome)
+	rows, err := b.read().Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' AND node_id != ? ORDER BY node_id`, currentHome)
 	if err != nil {
 		return ""
 	}
@@ -341,7 +341,7 @@ func (b *Broker) pickProxyRehomeTarget(currentHome string) string {
 			continue // skip an unreachable target
 		}
 		var load int
-		_ = b.cfg.DB.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE name='__proxy__' AND state='ALLOCATED' AND home_broker=?`, id).Scan(&load)
+		_ = b.read().QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE name='__proxy__' AND state='ALLOCATED' AND home_broker=?`, id).Scan(&load)
 		if load < bestLoad {
 			best, bestLoad = id, load
 		}

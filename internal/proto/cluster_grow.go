@@ -7,8 +7,30 @@ package proto
 // against its pinned account_pub (the operator's root authority, same trust as the signed roster/seeds).
 // ProtoVersion stays 2 (purely additive; older peers never subscribe the grow subject and stay silent).
 
-// ClusterGrowSchemaVersion versions the ClusterGrowReq/Resp wire shape (v1 = G4).
-const ClusterGrowSchemaVersion = 1
+// THERE IS DELIBERATELY NO ClusterGrowSchemaVersion CONSTANT (batch B, B4).
+//
+// One existed — `const ClusterGrowSchemaVersion = 1`, godoc'd as versioning the
+// ClusterGrowReq/Resp wire shape — with ZERO references anywhere in the tree. Batch A's
+// dead-symbol sweep (A4) deliberately spared it on the stated grounds that B4 would "stamp" it.
+// B4 investigated what stamping would mean and found there is nothing for it to do:
+//
+//   - Into ClusterGrowReq, INSIDE the signed bytes: every grow request already in flight during a
+//     mixed-release window stops verifying. `make test` and `make e2e-parallel` are both
+//     single-binary, so neither would see it.
+//   - Into ClusterGrowReq, OUTSIDE the signed bytes: it becomes the first unsigned field on a
+//     signed control message — a value a caller can set freely and a verifier would be tempted to
+//     trust.
+//   - Into ClusterGrowResp: nothing reads it. A field with a documented contract and no consumer
+//     is the same false-promise shape this batch spent its review budget removing.
+//
+// And the version it would carry is ALREADY carried, signed: CanonicalGrowReqBytes opens with the
+// domain-separation prefix "tether-cluster-grow-v2". A future canonical format uses a different
+// prefix, so a v2 verifier computes different bytes and the signature simply does not verify.
+// The schema version is enforced by construction; a separate constant was redundant with it.
+//
+// If a future change DOES need an in-band version, TestCanonicalGrowReqBytesCoversEveryField
+// (internal/proto/cluster_grow_test.go) is the guard that makes adding a field detectable — the
+// field-sensitivity test enumerates fields by hand and cannot notice a new one on its own.
 
 // ClusterGrowReq is one signed remote trigger in the grow orchestration.
 type ClusterGrowReq struct {

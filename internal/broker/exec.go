@@ -5,13 +5,11 @@ import (
 	"errors"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
-	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/nats-io/nats.go"
 )
 
@@ -30,61 +28,29 @@ import (
 // On any pre-forward failure, broker replies with an `ExecChunk{kind:error}`
 // so the ctl gets a clean message instead of a NATS timeout.
 func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
-	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "exec" {
-		b.replyExecErr(msg, "subject_malformed: "+msg.Subject)
+	// The subject-shape check runs BEFORE the follower short circuit, matching this
+	// handler's long-standing order: a follower still answers a malformed exec subject.
+	// (expose deliberately does the opposite; see its own comment.)
+	ing, den, ok := b.admitSubject(msg.Subject, execSpec)
+	if !ok {
+		b.replyExecErr(msg, den.reason)
 		return
 	}
 	if b.isClusterFollower() {
 		return
 	}
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyExecErr(msg, "actor_invalid: "+err.Error())
+	if den, ok := b.admitACL(&ing, execSpec); !ok {
+		b.replyExecErr(msg, den.reason)
+		// The node refusals — and ONLY those — carry an audit row here. The session and
+		// membership refusals deliberately do not; that asymmetry predates admit() and is
+		// pinned by ingress_characterization_test.go.
+		if den.code == "node_not_found" || den.code == "node_offline" {
+			b.pubAuditCall(ing.sid, ing.fp, ing.actor, "exec", ing.nid, false,
+				auditRefusal(den), msg.Reply, nil)
+		}
 		return
 	}
-
-	// C.1 §6 precheck.
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyExecErr(msg, "store_error: "+err.Error())
-		return
-	}
-	if !active {
-		b.replyExecErr(msg, "session_not_found_or_deleting")
-		return
-	}
-
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyExecErr(msg, "store_error: "+err.Error())
-		return
-	}
-	if !member {
-		b.replyExecErr(msg, "not_a_member")
-		return
-	}
-
-	// Pre-forward node check. Without this, a typoed nid or a
-	// long-OFFLINE agent would land on `.req.forwarded` with no
-	// subscriber and ctl would hang until its own timeout. Surface
-	// the failure as an ExecChunk{kind:error} per the contract in
-	// this handler's doc comment.
-	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
-	switch {
-	case errors.Is(err, node.ErrNotFound):
-		b.replyExecErr(msg, "node_not_found")
-		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_not_found", msg.Reply, nil)
-		return
-	case err != nil:
-		b.replyExecErr(msg, "store_error: "+err.Error())
-		return
-	case status != node.StateOnline:
-		b.replyExecErr(msg, "node_offline: status="+string(status))
-		b.pubAuditCall(sid, fp, actor, "exec", nid, false, "node_offline:"+string(status), msg.Reply, nil)
-		return
-	}
+	sid, actor, nid, fp, verb := ing.sid, ing.actor, ing.nid, ing.fp, ing.verb
 
 	// Re-marshal the body to stamp the broker-parsed actor fp. C.1 §4
 	// requires actor attribution to originate at the broker — the agent
@@ -188,43 +154,13 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 // `tether node upgrade --all` can target ONLINE agents that have
 // not exec'd anything.
 func (b *Broker) handleNodeListReq(msg *nats.Msg) {
-	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
-	if !ok {
-		b.replyJSON(msg, proto.NodeListResp{Code: "subject_malformed"})
-		return
-	}
 	// leaf = "s.<sid>.node.list.req"
-	parts := splitDot(leaf)
-	if len(parts) != 5 || parts[0] != "s" || parts[2] != "node" ||
-		parts[3] != "list" || parts[4] != "req" {
-		b.replyJSON(msg, proto.NodeListResp{Code: "subject_malformed", Error: leaf})
+	ing, den, ok := b.admitCtrl(msg.Subject, nodeListSpec)
+	if !ok {
+		b.replyJSON(msg, proto.NodeListResp{Code: den.code, Error: den.detail})
 		return
 	}
-	sid := parts[1]
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyJSON(msg, proto.NodeListResp{Code: "actor_invalid", Error: err.Error()})
-		return
-	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !active {
-		b.replyJSON(msg, proto.NodeListResp{Code: "session_not_found_or_deleting"})
-		return
-	}
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !member {
-		b.replyJSON(msg, proto.NodeListResp{Code: "not_a_member"})
-		return
-	}
+	sid := ing.sid
 
 	all, err := node.List(b.cfg.DB)
 	if err != nil {
@@ -252,46 +188,13 @@ func (b *Broker) handleNodeListReq(msg *nats.Msg) {
 // Subject layout: `ctrl.by.<actor>.s.<sid>.ps.req`. Architecture F.8 says
 // `tether ps` is read-only and never goes through agent forwarding.
 func (b *Broker) handlePsReq(msg *nats.Msg) {
-	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
+	// leaf = "s.<sid>.ps.req"; the ctrl family's own subject conventions live in admitCtrlSubject.
+	ing, den, ok := b.admitCtrl(msg.Subject, psSpec)
 	if !ok {
-		b.replyJSON(msg, proto.PsResp{Code: "subject_malformed"})
+		b.replyJSON(msg, proto.PsResp{Code: den.code, Error: den.detail})
 		return
 	}
-	// leaf = "s.<sid>.ps.req"
-	parts := splitDot(leaf)
-	if len(parts) != 4 || parts[0] != "s" || parts[2] != "ps" || parts[3] != "req" {
-		b.replyJSON(msg, proto.PsResp{Code: "subject_malformed", Error: leaf})
-		return
-	}
-	sid := parts[1]
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyJSON(msg, proto.PsResp{Code: "actor_invalid", Error: err.Error()})
-		return
-	}
-
-	// C.1 §6: every session-scoped ingress (P4 ps included, not just exec)
-	// must reject DELETING sessions before touching membership / data.
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !active {
-		b.replyJSON(msg, proto.PsResp{Code: "session_not_found_or_deleting"})
-		return
-	}
-
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
-		return
-	}
-	if !member {
-		b.replyJSON(msg, proto.PsResp{Code: "not_a_member"})
-		return
-	}
+	sid := ing.sid
 
 	var req proto.PsReq
 	if len(msg.Data) > 0 {

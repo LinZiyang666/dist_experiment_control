@@ -200,7 +200,7 @@ func (b *Broker) eligibleProxyHomes() []string {
 	// excluded as a rebalance target (mirrors the allocatePort guard, clusterwrite.go:550). A read error →
 	// treat as no-draining and proceed unfiltered rather than stall EVERY rehome on a transient error.
 	draining, _ := cluster.DrainingNodes(b.cfg.DB)
-	rows, err := b.cfg.DB.Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' ORDER BY node_id`)
+	rows, err := b.read().Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' ORDER BY node_id`)
 	if err != nil {
 		return nil
 	}
@@ -228,7 +228,7 @@ func (b *Broker) eligibleProxyHomes() []string {
 // tick). Returns minimal Allocations carrying the fields moveProxyHomeTo needs (Port/SID/NID/HomeBroker/
 // Epoch). The skipped not-ready / dead-homed proxies are the reaper's job, not rebalance's.
 func (b *Broker) movableProxyAllocs(voterSet map[string]bool) ([]*port.Allocation, error) {
-	rows, err := b.cfg.DB.Query(`
+	rows, err := b.read().Query(`
 		SELECT pa.sid, pa.nid, pa.port, pa.home_broker, pa.epoch
 		FROM port_allocations pa
 		JOIN sessions s ON s.sid = pa.sid

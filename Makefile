@@ -123,6 +123,11 @@ e2e-parallel:
 # machine and red on another with the same commit, and whoever has the newer
 # binary ends up "fixing" code to satisfy a check the repo never adopted.
 # Fail closed and point at `make tools`, which installs exactly $(GOLANGCI_VERSION).
+# The gofmt sweep after `golangci-lint run` is deliberate (external review M1): the pinned
+# golangci-lint v2 config does NOT enable a formatter, so `make lint` reported zero issues on a
+# tree with four unformatted files and only an independent `gofmt -l` caught it. A gate that is
+# green on unformatted code is a gate everybody trusts and nobody should. Both checks run before
+# either verdict is reported, so one invocation shows all the work.
 lint:
 	@GOPATH_BIN="$$(go env GOPATH)/bin/golangci-lint"; \
 	  if [ -x "$$GOPATH_BIN" ]; then LINT="$$GOPATH_BIN"; \
@@ -135,7 +140,20 @@ lint:
 	    echo "       Lint results are not comparable across versions. Run: make tools"; \
 	    exit 1; \
 	  fi; \
-	  "$$LINT" run
+	  "$$LINT" run; \
+	  LINT_RC=$$?; \
+	  UNFMT="$$(gofmt -l ./cmd ./internal ./test 2>&1)"; \
+	  GOFMT_RC=$$?; \
+	  if [ $$GOFMT_RC -ne 0 ]; then \
+	    echo "error: gofmt failed:"; printf '%s\n' "$$UNFMT"; \
+	    exit $$GOFMT_RC; \
+	  fi; \
+	  if [ -n "$$UNFMT" ]; then \
+	    echo "error: not gofmt-clean:"; printf '  %s\n' $$UNFMT; \
+	    echo "       run: gofmt -w <files>"; \
+	    exit 1; \
+	  fi; \
+	  exit $$LINT_RC
 
 # Build golangci-lint from source with the LOCAL Go toolchain (Go 1.25) via the
 # module proxy. This avoids both (a) the prebuilt v1.x binary that refuses Go

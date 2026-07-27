@@ -8,6 +8,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 func makeJoinBundleWithName(t *testing.T, nodeID, name, raftAddr, nonce string) string {
@@ -25,15 +26,17 @@ func makeJoinBundleWithName(t *testing.T, nodeID, name, raftAddr, nonce string) 
 		t.Fatal(err)
 	}
 	bundle, err := cluster.EncodeJoinBundle(cluster.JoinBundle{
-		NodeID:       nodeID,
-		Name:         name,
-		NodeIdentPub: pub,
-		NatsServerID: nodeID,
-		RaftAddr:     raftAddr,
-		NatsRoute:    "nats://" + raftAddr,
-		TunnelAddr:   nodeID + ":7000",
-		JoinNonce:    nonce,
-		JoinSigHex:   hex.EncodeToString(sig),
+		NodeID:         nodeID,
+		Name:           name,
+		NodeIdentPub:   pub,
+		NatsServerID:   nodeID,
+		RaftAddr:       raftAddr,
+		NatsRoute:      "nats://" + raftAddr,
+		TunnelAddr:     nodeID + ":7000",
+		JoinNonce:      nonce,
+		JoinSigHex:     hex.EncodeToString(sig),
+		ProtoVer:       proto.ProtoVersion,
+		ReleaseVersion: proto.ReleaseVersion,
 	})
 	if err != nil {
 		t.Fatal(err)

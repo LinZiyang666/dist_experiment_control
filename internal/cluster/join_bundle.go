@@ -31,7 +31,23 @@ type JoinBundle struct {
 	// ADMISSION so the leader bakes cluster_nodes.bus_nkey_pub immediately — breaking the learner
 	// self-backfill DEADLOCK (the self-backfill write must forward over a mesh that cannot render
 	// until bus_nkey exists). audit finding A.
-	BusNkey    string `json:"bus_nkey,omitempty"`
+	BusNkey string `json:"bus_nkey,omitempty"`
+
+	// ProtoVer / ReleaseVersion (batch B, B4) let the LEADER refuse a proto-skewed joiner
+	// before it consumes any operator intent, instead of admitting it and watching it never
+	// promote. They are ADVISORY and UNSIGNED — deliberately NOT part of JoinSignBytes, so a
+	// hand-crafted bundle can lie about them. That is acceptable because they are not a
+	// security boundary: the PoP over (domain‖node_id‖ident_pub‖nonce) is, and it is
+	// re-verified by every replica. What these buy is a 50ms named refusal in place of a
+	// 2-30 minute catch-up timeout whose last_error says "check the joining broker".
+	//
+	// omitempty + a plain json.Unmarshal on the receiving side (DecodeJoinBundle) makes this
+	// ADDITIVE in both directions: an older joiner sends neither field, the leader reads
+	// ProtoVer==0 and takes the existing warn-and-allow branch; an older leader receiving a
+	// newer bundle ignores both. ProtoVersion is untouched — no reinstall.
+	ProtoVer       int    `json:"proto_ver,omitempty"`
+	ReleaseVersion string `json:"release_version,omitempty"`
+
 	JoinNonce  string `json:"join_nonce"`
 	JoinSigHex string `json:"join_sig_hex"`
 }

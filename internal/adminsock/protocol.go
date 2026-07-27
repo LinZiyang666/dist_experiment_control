@@ -535,6 +535,19 @@ type ClusterStatusReport struct {
 	SelfRaftAdvertiseLoopback bool   `json:"self_raft_advertise_loopback,omitempty"`
 	SelfNatsRouteLoopback     bool   `json:"self_nats_route_loopback,omitempty"`
 	SelfRaftAdvertise         string `json:"self_raft_advertise,omitempty"`
+	// NatsConfPath (batch B / B4, additive omitempty; schema_version stays 1) is the nats.conf the
+	// RUNNING broker actually renders and reads. It exists to close TODO(n3-online-doctor): the
+	// online `cluster doctor` branch could not run the auth_callout issuer-skew cross-check, because
+	// the check needs a conf path and the CLI only had its own `--conf` DEFAULT — which on a
+	// custom-conf host is the wrong file, so running the check anyway would have emitted a permanent
+	// ADVISORY on every online doctor. The TODO named the proper fix as "reads the conf path from the
+	// running broker's config"; this is that field.
+	//
+	// It carries a filesystem path, and the admin socket is a root-owned local socket the operator
+	// already has (they can read the conf directly). "" when the broker was not given a conf path, or
+	// on a pre-batch-B broker — the doctor then reports that the cross-check did NOT run rather than
+	// silently skipping it.
+	NatsConfPath string `json:"nats_conf_path,omitempty"`
 }
 
 // ClusterHomesReport (C6 建议5) aggregates every ALLOCATED expose + __proxy__ allocation with its home
@@ -617,12 +630,26 @@ type ClusterNodeStatus struct {
 	// Audit OBS-MAJOR-1: last_contact_secs was a fabricated freshness signal (declared, NEVER
 	// written, always 0 = "just contacted" for a dead peer) — removed. Real reachability is
 	// Reachable / AppliedLag / ReachSource.
-	AccountNkMatch bool   `json:"account_nk_match"`
-	StreamActual   int    `json:"stream_actual"`
-	StreamTarget   int    `json:"stream_target"`
-	Reachable      bool   `json:"reachable"`
-	ReachSource    string `json:"reach_source"` // "self" | "unverified" | "nats-health" | "raft-ping" | "disk-snapshot"
-	Inconsistent   bool   `json:"inconsistent"` // phase says voter but raft config disagrees (or vice-versa)
+	// AccountNkMatch reports whether THIS node's auth_callout account key equals the viewing
+	// broker's. It is only meaningful when AccountNkReported is true.
+	//
+	// batch B / B4: until this pair existed, the producer hardcoded AccountNkMatch: true on the
+	// roster rows and left it at the zero value (false) on the two other construction sites — so the
+	// online view printed Y for every node including ones it had never heard from, and the offline
+	// view printed N for every node without ever comparing a key. Both were fabricated. A false
+	// AccountNkMatch is now a real per-node answer, and "no answer" is AccountNkReported == false,
+	// which the renderer prints as "?" rather than collapsing into either verdict.
+	AccountNkMatch bool `json:"account_nk_match"`
+	// AccountNkReported is false when this row carries NO account-key answer: an orphan raft voter
+	// with no roster row, the offline disk-snapshot view, or a broker predating
+	// proto.ClusterHealthResp.AccountNkPub. Additive omitempty — an older adminsock omits it, and an
+	// older CLI ignores it and renders exactly what it rendered before.
+	AccountNkReported bool   `json:"account_nk_reported,omitempty"`
+	StreamActual      int    `json:"stream_actual"`
+	StreamTarget      int    `json:"stream_target"`
+	Reachable         bool   `json:"reachable"`
+	ReachSource       string `json:"reach_source"` // "self" | "unverified" | "nats-health" | "raft-ping" | "disk-snapshot"
+	Inconsistent      bool   `json:"inconsistent"` // phase says voter but raft config disagrees (or vice-versa)
 
 	// B5 OPS#7 cert-rotation visibility (additive omitempty; schema_version stays 1). Public
 	// fingerprints only — never private cert material. CertValidSecs is now→valid_until in

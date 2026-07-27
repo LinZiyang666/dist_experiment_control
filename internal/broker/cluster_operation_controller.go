@@ -50,6 +50,17 @@ func (a *ClusterAdmin) StartJoinOperation(bundleStr string) (string, error) {
 	if err := cluster.VerifyBundlePoP(b); err != nil {
 		return "", err
 	}
+	// B4: the version gate. Position is load-bearing and follows the discipline this function
+	// already states below for the roster-name preflight — refuse BEFORE consuming operator
+	// intent into an op row, so a rejected joiner leaves no op, no nonvoter and no raft write.
+	//
+	// Until now this check existed but was wired to `handleAdd`, whose adminsock op
+	// (OpClusterAdd) is deliberately unrouted since v0.4.2 — so the gate was product-
+	// unreachable while b6_skew_test.go called it directly and stayed permanently green.
+	// This is the live path: `cluster join approve` -> StartJoinOperation -> driveJoin.
+	if err := versionSkewRefusal(b.ProtoVer, b.ReleaseVersion, b.NodeID, a.logger); err != nil {
+		return "", err
+	}
 	// m1 (review): symmetric with StartRetireOperation — refuse a join of a DIFFERENT node while a `cluster
 	// add` grow holds the marker (strict serialize). The marker is joiner-id-valued, so the grow's OWN join
 	// (b.NodeID == the active joiner) is NOT blocked (the self-op carve-out — else the grow would deadlock its

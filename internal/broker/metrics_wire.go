@@ -34,6 +34,11 @@ func (b *Broker) metricsSnapshot() brokermetrics.Snapshot {
 			s.AuditDeletedStreamLoss = int64(ap.DeletedStreamLossCount())
 		}
 	}
+	// batch B / B2: forward outcomes. Read BEFORE the cluster-mode early return so a broker that
+	// was clustered and has since been force-singled still exposes the tallies it accumulated —
+	// omitting them would make the series vanish exactly when an operator is investigating why.
+	s.ForwardOutcomes = b.forwards.snapshot()
+
 	if !b.clusterMode || b.cl == nil || b.cl.node == nil {
 		return s
 	}
@@ -100,7 +105,7 @@ func (b *Broker) metricsReady() (bool, string) {
 	}
 	selfID := n.SelfID()
 	var phase string
-	if err := b.cfg.DB.QueryRow(`SELECT phase FROM cluster_nodes WHERE node_id=?`, selfID).Scan(&phase); err != nil {
+	if err := b.read().QueryRow(`SELECT phase FROM cluster_nodes WHERE node_id=?`, selfID).Scan(&phase); err != nil {
 		return false, "self phase unknown: " + err.Error()
 	}
 	if phase != phaseVoter {

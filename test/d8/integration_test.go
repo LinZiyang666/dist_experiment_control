@@ -237,7 +237,10 @@ func testClusterHealthGate(t *testing.T) {
 	}
 
 	for i := 0; i < c.n; i++ {
-		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil, nil, "") // C3 topoSelf nil; G5/G7 jsUnavail nil + colocatedAgentNID "" = drill defaults
+		// C3 topoSelf nil; G5/G7 jsUnavail nil + colocatedAgentNID "" = drill defaults; batch B/B4
+		// accountPub nil = "this broker does not self-report an account key", which is what an
+		// un-wired drill broker genuinely is (the status column then renders "?", never Y).
+		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("subscribe health %d: %v", i, err)
 		}

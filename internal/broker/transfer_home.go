@@ -83,7 +83,7 @@ func (b *Broker) homeOwnsXferBucket(sid string) bool {
 	// via a nested query: the cluster DB is SetMaxOpenConns(1), so a resolveHomeForAgent
 	// issued while `rows` still holds the single connection would DEADLOCK (same hazard
 	// homeForRegister guards against).
-	rows, err := b.cfg.DB.Query(`SELECT nid FROM nodes WHERE sid=?`, sid)
+	rows, err := b.read().Query(`SELECT nid FROM nodes WHERE sid=?`, sid)
 	if err != nil {
 		return false
 	}
@@ -120,7 +120,7 @@ func (b *Broker) homeOwnsXferBucket(sid string) bool {
 // then-close discipline as homeOwnsXferBucket (SetMaxOpenConns(1)). A read error returns false —
 // observability must not fabricate a defect it cannot confirm.
 func (b *Broker) xferBucketOrphanedEverywhere(sid string) bool {
-	rows, err := b.cfg.DB.Query(`SELECT nid FROM nodes WHERE sid=?`, sid)
+	rows, err := b.read().Query(`SELECT nid FROM nodes WHERE sid=?`, sid)
 	if err != nil {
 		return false
 	}

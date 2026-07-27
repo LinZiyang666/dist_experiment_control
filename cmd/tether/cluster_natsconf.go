@@ -480,6 +480,35 @@ func parsePeerSpec(spec string) (natscluster.Broker, error) {
 	return natscluster.Broker{ServerName: parts[0], RouteURL: parts[1], NkeyPub: parts[2]}, nil
 }
 
+// onlineIssuerSkewChecks runs the auth_callout issuer/broker-nkey skew cross-check on the ONLINE
+// doctor path (batch B / B4 — TODO(n3-online-doctor)).
+//
+// WHICH CONF IT READS, in order:
+//
+// First an EXPLICIT --conf, because the operator overrode it and explicit always wins. Otherwise the
+// running broker's reported path, which is the file the daemon actually renders and reads.
+//
+// If neither is available it does NOT guess. The CLI's --conf DEFAULT is right only on a stock host;
+// on a custom-conf host it names a different (or absent) file, and a FATAL "issuer skew" derived from
+// the wrong file is worse than no check at all. It reports that the check did not run instead — the
+// N-3 asymmetry: a KNOWN mismatch fails closed, an ABSENT check is loud but non-fatal.
+func onlineIssuerSkewChecks(cmd *cobra.Command, secretsDir, flagConf, reportedConf string) []clusteroffline.DoctorCheck {
+	conf := reportedConf
+	if f := cmd.Flags().Lookup("conf"); f != nil && f.Changed {
+		conf = flagConf
+	}
+	if conf == "" {
+		return []clusteroffline.DoctorCheck{{
+			Name:   "auth-issuer-unverified",
+			Status: clusteroffline.DoctorAdvisory,
+			Detail: "auth_callout issuer cross-check SKIPPED: the running broker did not report its " +
+				"nats.conf path (a broker older than this CLI, or one started without one) — pass " +
+				"--conf <path> to run it. This is NOT proof the rendered issuer matches the on-disk seeds",
+		}}
+	}
+	return clusterAuthIssuerSkewChecks(secretsDir, conf)
+}
+
 func newClusterDoctorCmd() *cobra.Command {
 	var secretsDir, dbPath, confPath, raftAddr, natsRoute, socketPath string
 	var asJSON, offline bool
@@ -497,14 +526,18 @@ func newClusterDoctorCmd() *cobra.Command {
 			if !offline {
 				rep, err := fetchClusterStatusReport(socketPath)
 				if err == nil && rep != nil {
-					// TODO(n3-online-doctor): the ONLINE branch does NOT run clusterAuthIssuerSkewChecks
-					// (they only run in the offline/fallback branch below), so a rotated-but-not-re-rendered
-					// or unverified issuer is invisible to `cluster doctor` on a LIVE cluster — the mode a
-					// rotated cluster actually runs in. RECORDED, not fixed this phase (external review N-3
-					// adjacent): appending the checks here would emit a permanent ADVISORY on every custom-
-					// conf online doctor unless --conf is passed (a noise regression); the proper fix reads
-					// the conf path from the running broker's config. See release-readiness-followups-plan §2.
-					return renderDoctor(cmd, clusterDoctorOnline(rep), asJSON)
+					// batch B / B4 closes TODO(n3-online-doctor). The ONLINE branch used to skip
+					// clusterAuthIssuerSkewChecks entirely, so a rotated-but-not-re-rendered issuer was
+					// invisible on a LIVE cluster — the mode a rotated cluster actually runs in, and the
+					// one an operator reaches for after a rotation. The blocker the TODO recorded was
+					// that the CLI only had its own --conf DEFAULT, which on a custom-conf host names the
+					// wrong file: running the check anyway meant a permanent ADVISORY on every online
+					// doctor. The TODO named the fix ("reads the conf path from the running broker's
+					// config"); ClusterStatusReport.NatsConfPath is that, and onlineIssuerSkewChecks
+					// below prefers it over the CLI default.
+					online := clusterDoctorOnline(rep)
+					online = append(online, onlineIssuerSkewChecks(cmd, secretsDir, confPath, rep.NatsConfPath)...)
+					return renderDoctor(cmd, online, asJSON)
 				}
 				// Stage-C M5 + External-review F7: do NOT silently fall through to a green offline
 				// preflight. If the socket FILE EXISTS but the call failed (refused/EOF/mid-restart),

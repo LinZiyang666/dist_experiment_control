@@ -53,10 +53,10 @@ func (b *Broker) clearRehomeMark(port int) { b.rehomeEvt.Delete(port) }
 // NOT auto-rehomed on a crash — stranded until a drain/return). Secret-free (two COUNT reads).
 func (b *Broker) emitBrokerDownRehomeSummary(downBroker string) {
 	var proxyHomes, exposesStranded int
-	_ = b.cfg.DB.QueryRow(
+	_ = b.read().QueryRow(
 		`SELECT COUNT(*) FROM port_allocations WHERE name='__proxy__' AND state='ALLOCATED' AND home_broker=?`,
 		downBroker).Scan(&proxyHomes)
-	_ = b.cfg.DB.QueryRow(
+	_ = b.read().QueryRow(
 		`SELECT COUNT(*) FROM port_allocations WHERE name<>'__proxy__' AND state='ALLOCATED' AND home_broker=?`,
 		downBroker).Scan(&exposesStranded)
 	b.pubSysEvent(evBrokerDownRehomeSum, map[string]any{

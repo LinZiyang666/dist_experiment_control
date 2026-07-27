@@ -89,6 +89,13 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 		h.ProvisionAgentWrite = NewProvisionSeam(b.cl.node, b.cl.forwarder)
 		h.JoinMemberWrite = NewJoinSeam(b.cl.node, b.cl.forwarder)
 		h.LeaderContactStale = b.cl.node.LeaderContactStale
+		// batch B / B3: make the seam-nil fallbacks fail CLOSED. Until now this `if` was the
+		// entire enforcement of "clustered ⇒ both seams wired"; a third write path added with its
+		// own seam, or a refactor that moved this block, would silently fall back to writing the
+		// read-only FSM handle on the authentication path. Setting this LAST, alongside the seams,
+		// keeps the three in one place — and internal/broker's wiring guard test asserts they stay
+		// together.
+		h.ClusterMode = true
 	}
 
 	// QueueSubscribe (not Subscribe) so that in a ≥2-node cluster exactly ONE

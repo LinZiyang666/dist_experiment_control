@@ -443,15 +443,33 @@ func topoCell(n adminsock.ClusterNodeStatus, desired uint64) string {
 	}
 }
 
+// acctCell renders the ACCT.NK column as one of three states (batch B / B4).
+//
+// It used to be two states derived from a bool that the producer hardcoded true on the online path
+// and left false everywhere else — so the online view printed Y for nodes it had never contacted and
+// the offline view printed N for every node in the roster without ever comparing a key. Both were
+// fabricated, and N is the worse of the two: an operator running `cluster status --offline` during an
+// outage read "every broker's account key is wrong" as a finding.
+//
+// "?" is therefore not a cosmetic third state. It is the only truthful rendering for a row carrying
+// no answer: an orphan raft voter, the offline disk snapshot, a peer that did not reply to the health
+// scatter, or a broker predating proto.ClusterHealthResp.AccountNkPub.
+func acctCell(n adminsock.ClusterNodeStatus) string {
+	if !n.AccountNkReported {
+		return "?"
+	}
+	if n.AccountNkMatch {
+		return "Y"
+	}
+	return "N"
+}
+
 func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport) {
 	w := cmd.OutOrStdout()
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "NODE_ID\tNAME\tPHASE\tROLE\tVER\tLAG\tACCT.NK\tSTREAMS\tTOPO\tREACH")
 	for _, n := range rep.Nodes {
-		acct := "N"
-		if n.AccountNkMatch {
-			acct = "Y"
-		}
+		acct := acctCell(n)
 		reach := n.ReachSource
 		if !n.Reachable {
 			reach = "UNREACHABLE(" + n.ReachSource + ")"
@@ -470,10 +488,12 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 			topoCell(n, rep.TopoDesired), reach, flag)
 	}
 	_ = tw.Flush()
-	// B1 item 2: column legend (broker-host operator view). ACCT.NK is honest that per-node
-	// account-key verification is not yet wired (the column is currently always Y).
-	_, _ = fmt.Fprintln(w, "\ncolumns: LAG=raft entries behind the leader (0=caught up) · ACCT.NK=Y if this node's account key")
-	_, _ = fmt.Fprintln(w, "  matches (currently always Y — per-node verification not yet wired) · STREAMS=JetStream replicas")
+	// B1 item 2: column legend (broker-host operator view). batch B / B4: ACCT.NK is now a real
+	// per-node comparison against the viewing broker's own auth_callout account key, so the legend
+	// no longer has to admit the column is always Y — it documents the three states instead.
+	_, _ = fmt.Fprintln(w, "\ncolumns: LAG=raft entries behind the leader (0=caught up) · ACCT.NK=this node's auth_callout account")
+	_, _ = fmt.Fprintln(w, "  key vs this view's (Y=same · N=DIFFERENT, agents will fail auth at random depending on which")
+	_, _ = fmt.Fprintln(w, "  broker answers the callout · ?=no answer from this node, not verified) · STREAMS=JetStream replicas")
 	_, _ = fmt.Fprintln(w, "  actual/target (actual<target = degraded) · VER=running release (live self-report) · REACH=NATS/raft reachability")
 	_, _ = fmt.Fprintln(w, "  · TOPO=NATS topology applied/observed→desired gen (✓ converged · … catching up · STUCK fix conf or `cluster reconcile nats --manual`)")
 	// C6 建议6: show the hyphenated 5-state operator label; fall back to the legacy Health when unset

@@ -22,8 +22,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/auth"
-	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
@@ -164,49 +162,20 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	if b.clusterMode && !b.cl.node.IsLeader() {
 		return
 	}
-	sid, actor, nid, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "expose" {
-		b.replyExposeErr(msg, "subject_malformed", "")
+	// NOTE the ordering difference from exec/run/kill: expose's leader-only short circuit
+	// (above) runs BEFORE the subject is parsed, so a follower answers NOTHING for a
+	// malformed expose subject while exec answers subject_malformed. That is an externally
+	// observable difference and it is preserved, not unified.
+	ing, den, ok := b.admit(msg.Subject, exposeSpec)
+	if !ok {
+		b.replyExposeErr(msg, den.code, den.detail)
+		if den.code == "node_not_found" || den.code == "node_offline" {
+			b.pubAuditCall(ing.sid, ing.fp, ing.actor, "expose", ing.nid, false,
+				auditRefusal(den), msg.Reply, nil)
+		}
 		return
 	}
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyExposeErr(msg, "actor_invalid", err.Error())
-		return
-	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyExposeErr(msg, "store_error", err.Error())
-		return
-	}
-	if !active {
-		b.replyExposeErr(msg, "session_not_found_or_deleting", "")
-		return
-	}
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyExposeErr(msg, "store_error", err.Error())
-		return
-	}
-	if !member {
-		b.replyExposeErr(msg, "not_a_member", "")
-		return
-	}
-	status, err := node.LookupStatus(b.cfg.DB, sid, nid)
-	switch {
-	case errors.Is(err, node.ErrNotFound):
-		b.replyExposeErr(msg, "node_not_found", "")
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_not_found", msg.Reply, nil)
-		return
-	case err != nil:
-		b.replyExposeErr(msg, "store_error", err.Error())
-		return
-	case status != node.StateOnline:
-		b.replyExposeErr(msg, "node_offline", string(status))
-		b.pubAuditCall(sid, fp, actor, "expose", nid, false, "node_offline:"+string(status), msg.Reply, nil)
-		return
-	}
+	sid, actor, nid, fp := ing.sid, ing.actor, ing.nid, ing.fp
 
 	var req proto.ExposeReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
@@ -369,38 +338,21 @@ func (b *Broker) replyExposeErr(msg *nats.Msg, code, detail string) {
 // drop instruction to agent (best-effort: even if agent ACK fails, the
 // port is back in the pool — agent will catch up via reconciliation).
 func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
-	sid, actor, _, verb, ok := proto.ParseCmdBy(msg.Subject)
-	if !ok || verb != "expose-rm" {
-		b.replyExposeRmErr(msg, "subject_malformed", "")
+	ing, den, ok := b.admitSubject(msg.Subject, exposeRmSpec)
+	if !ok {
+		b.replyExposeRmErr(msg, den.code, den.detail)
 		return
 	}
 	if b.isClusterFollower() {
 		return
 	}
-
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.replyExposeRmErr(msg, "actor_invalid", err.Error())
+	if den, ok := b.admitACL(&ing, exposeRmSpec); !ok {
+		// No audit on any refusal here, and no node refusals to audit: exposeRmSpec sets
+		// skipNodeCheck because this handler resolves its target by (sid, name).
+		b.replyExposeRmErr(msg, den.code, den.detail)
 		return
 	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.replyExposeRmErr(msg, "store_error", err.Error())
-		return
-	}
-	if !active {
-		b.replyExposeRmErr(msg, "session_not_found_or_deleting", "")
-		return
-	}
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.replyExposeRmErr(msg, "store_error", err.Error())
-		return
-	}
-	if !member {
-		b.replyExposeRmErr(msg, "not_a_member", "")
-		return
-	}
+	sid, actor, fp := ing.sid, ing.actor, ing.fp
 
 	var req proto.ExposeRmReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {

@@ -314,33 +314,19 @@ func (b *Broker) proxySubRevoke(nc *nats.Conn, sid, fp, actor string, msg *nats.
 }
 
 func (b *Broker) handleProxyStatus(msg *nats.Msg) {
+	// proxy.status is the THIRD subject family: `ctrl.<sid>.proxy.<action>`, parsed by
+	// ParseCtrlProxy. Its subject resolution therefore stays here (admitCtrlSubject handles the
+	// `ctrl.by.<actor>.s.<sid>.…` shape, which this is not) while the ACL — session ACTIVE +
+	// member-readable, no node check because there is no nid — is the shared one.
 	actor, sid, action, ok := proto.ParseCtrlProxy(msg.Subject)
 	if !ok || action != "status" {
 		b.proxyErr(msg, "subject_malformed", "")
 		return
 	}
-	fp, err := auth.FingerprintFromActor(actor)
-	if err != nil {
-		b.proxyErr(msg, "actor_invalid", err.Error())
-		return
-	}
-	active, err := session.IsActive(b.cfg.DB, sid)
-	if err != nil {
-		b.proxyErr(msg, "store_error", err.Error())
-		return
-	}
-	if !active {
-		b.proxyErr(msg, "session_not_found_or_deleting", "")
-		return
-	}
+	ing := ingress{sid: sid, actor: actor}
 	// Member-readable (status carries no secrets).
-	member, err := session.IsMember(b.cfg.DB, sid, fp)
-	if err != nil {
-		b.proxyErr(msg, "store_error", err.Error())
-		return
-	}
-	if !member {
-		b.proxyErr(msg, "not_a_member", "")
+	if den, ok := b.admitACL(&ing, verbSpec{verb: "-", role: admitMember, skipNodeCheck: true}); !ok {
+		b.proxyErr(msg, den.code, den.detail)
 		return
 	}
 	var req proto.ProxyStatusReq
@@ -383,7 +369,7 @@ func (b *Broker) handleProxyStatus(msg *nats.Msg) {
 // ready} from replicated facts.
 func (b *Broker) proxyStatusNodesCluster(sid string) ([]proto.ProxyNodeEntry, error) {
 	sessionEpoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
-	rows, err := b.cfg.DB.Query(`SELECT nid, status FROM nodes WHERE sid=? AND proxy_capable=1 ORDER BY nid`, sid)
+	rows, err := b.read().Query(`SELECT nid, status FROM nodes WHERE sid=? AND proxy_capable=1 ORDER BY nid`, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -891,13 +877,13 @@ const maxGenSkewNanos = int64(10) * 365 * 24 * 60 * 60 * 1_000_000_000
 // nodeProxyCapable reports the node's persisted proxy-v1 capability.
 func (b *Broker) nodeProxyCapable(sid, nid string) bool {
 	var v int
-	_ = b.cfg.DB.QueryRow(`SELECT proxy_capable FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&v)
+	_ = b.read().QueryRow(`SELECT proxy_capable FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&v)
 	return v == 1
 }
 
 func (b *Broker) nodeProxyReady(sid, nid string) bool {
 	var v int
-	_ = b.cfg.DB.QueryRow(`SELECT proxy_ready FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&v)
+	_ = b.read().QueryRow(`SELECT proxy_ready FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&v)
 	return v == 1
 }
 
@@ -923,7 +909,7 @@ func (b *Broker) pushProxyDirective(nc *nats.Conn, sid, nid string, d *proto.Pro
 // Capability comes from nodes.proxy_capable (set at register from the explicit
 // proto.CapProxyV1 capability), NOT from a release-string guess.
 func (b *Broker) onlineNIDs(sid string) []string {
-	rows, err := b.cfg.DB.Query(
+	rows, err := b.read().Query(
 		`SELECT nid FROM nodes WHERE sid=? AND status='ONLINE' AND proxy_capable=1 ORDER BY nid`, sid)
 	if err != nil {
 		return nil
@@ -994,7 +980,7 @@ func nodeHasProxyCap(capabilities []string, release string) bool {
 }
 
 func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
-	rows, err := b.cfg.DB.Query(`
+	rows, err := b.read().Query(`
 		SELECT n.nid, n.status, n.proxy_ready, COALESCE(pa.port, 0), COALESCE(pa.home_broker, '')
 		FROM nodes n
 		LEFT JOIN port_allocations pa

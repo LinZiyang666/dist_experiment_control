@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -86,5 +87,101 @@ func TestClusterGrowResp_additiveOmitempty(t *testing.T) {
 	}
 	if got := string(raw); got != `{"ok":true}` {
 		t.Fatalf("a bare OK ClusterGrowResp must marshal to {\"ok\":true}, got %s", got)
+	}
+}
+
+// TestCanonicalGrowReqBytesCoversEveryField is the precondition B4 named for any future in-band
+// version field, and it closes a gap the field-sensitivity test cannot close on its own.
+//
+// TestCanonicalGrowReqBytes_fieldSensitivity mutates a HAND-WRITTEN list of fields. That proves
+// every listed field is signed; it says nothing about a field nobody added to the list. So adding
+// a tenth field to ClusterGrowReq — exactly what "stamp a schema version" would have done — leaves
+// both tests green while the new field rides the wire UNSIGNED, freely settable by any caller whose
+// signature covers only the other nine.
+//
+// This asserts the two sets agree: every exported field of ClusterGrowReq is either signed (its
+// value changes the canonical bytes) or listed below with a reason.
+func TestCanonicalGrowReqBytesCoversEveryField(t *testing.T) {
+	// Sig is excluded BY DESIGN: it is the signature over the other fields, so it cannot be inside
+	// its own input. Any other exclusion needs a reason written here.
+	unsignedByDesign := map[string]string{
+		"Sig": "the signature itself — CanonicalGrowReqBytes is its input, so including it is impossible",
+	}
+
+	rt := reflect.TypeOf(ClusterGrowReq{})
+	if rt.NumField() < 10 {
+		t.Fatalf("ClusterGrowReq has %d fields; this guard was written against 11 and a shrink means "+
+			"a signed field was REMOVED — check whether the canonical bytes still cover the rest",
+			rt.NumField())
+	}
+
+	base := &ClusterGrowReq{
+		Op: "mesh-cutover", TargetNode: "brk-a", JoinerNode: "brk-b",
+		JoinBundle: "tether-join:v1:aaa", OpID: "op-1", GrowEpoch: "e1", IssuedAt: "t",
+	}
+	b0 := string(CanonicalGrowReqBytes(base))
+
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported: not on the wire
+		}
+		if reason, ok := unsignedByDesign[f.Name]; ok {
+			if reason == "" {
+				t.Errorf("%s is excluded from the signed bytes with an empty reason", f.Name)
+			}
+			continue
+		}
+		// Perturb this field and require the canonical bytes to change.
+		mutated := *base
+		v := reflect.ValueOf(&mutated).Elem().Field(i)
+		switch v.Kind() {
+		case reflect.String:
+			v.SetString("PERTURBED-" + f.Name)
+		case reflect.Bool:
+			v.SetBool(!v.Bool())
+		case reflect.Int, reflect.Int64:
+			v.SetInt(v.Int() + 1)
+		default:
+			t.Errorf("%s has kind %s, which this guard does not know how to perturb — extend it "+
+				"rather than letting the field go unchecked", f.Name, v.Kind())
+			continue
+		}
+		if got := string(CanonicalGrowReqBytes(&mutated)); got == b0 {
+			t.Errorf("changing ClusterGrowReq.%s does NOT change the canonical signed bytes.\n"+
+				"That field rides the grow wire UNSIGNED: any caller can set it freely and a "+
+				"signature computed over the other fields still verifies. Either include it in "+
+				"CanonicalGrowReqBytes (a signed-bytes change — every in-flight request stops "+
+				"verifying, so it needs a cross-version story) or add it to unsignedByDesign with "+
+				"the reason it is safe unsigned.", f.Name)
+		}
+	}
+}
+
+// TestFieldCoverageGuardIsNotVacuous proves the guard above would actually catch a new unsigned
+// field. Without it, a perturbation loop that silently skipped every field would report full
+// coverage.
+func TestFieldCoverageGuardIsNotVacuous(t *testing.T) {
+	// A struct shaped like ClusterGrowReq but with a field the canonical function ignores.
+	type withUnsigned struct {
+		Op       string
+		Unsigned string
+	}
+	canonical := func(r *withUnsigned) string { return "prefix\n" + r.Op } // deliberately ignores Unsigned
+
+	base := &withUnsigned{Op: "x", Unsigned: "y"}
+	b0 := canonical(base)
+	rt := reflect.TypeOf(withUnsigned{})
+	var missed []string
+	for i := 0; i < rt.NumField(); i++ {
+		m := *base
+		reflect.ValueOf(&m).Elem().Field(i).SetString("PERTURBED")
+		if canonical(&m) == b0 {
+			missed = append(missed, rt.Field(i).Name)
+		}
+	}
+	if len(missed) != 1 || missed[0] != "Unsigned" {
+		t.Fatalf("the perturbation technique reported %v as unsigned, want exactly [Unsigned] — the "+
+			"loop in TestCanonicalGrowReqBytesCoversEveryField cannot detect an unsigned field", missed)
 	}
 }

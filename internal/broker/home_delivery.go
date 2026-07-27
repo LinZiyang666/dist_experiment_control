@@ -424,7 +424,7 @@ type homeDeliveryTarget struct{ sid, nid string }
 // attempts map for nodes that no longer own any homed expose (N-9). Returning the SAME `seen` map the
 // dedup uses keeps the prune key definitionally identical to the enumeration key — no drift.
 func (b *Broker) homeDeliveryTargets() ([]homeDeliveryTarget, map[int]struct{}, map[string]struct{}, error) {
-	rows, err := b.cfg.DB.Query(
+	rows, err := b.read().Query(
 		`SELECT DISTINCT sid, nid, port FROM port_allocations
 		  WHERE state='ALLOCATED' AND home_broker != ''
 		  ORDER BY sid, nid, port`)
@@ -631,7 +631,7 @@ func (b *Broker) pruneHomeAttempts(liveKeys map[string]struct{}) {
 // report everything unconverged, which is why handleUpgradeTrigger answers
 // not_leader instead of a verdict.
 func (b *Broker) homesUnconverged() ([]string, error) {
-	rows, err := b.cfg.DB.Query(
+	rows, err := b.read().Query(
 		`SELECT sid, nid, port, epoch FROM port_allocations
 		  WHERE state='ALLOCATED' AND home_broker != ''
 		  ORDER BY port`)

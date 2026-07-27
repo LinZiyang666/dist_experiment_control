@@ -62,6 +62,25 @@ type Snapshot struct {
 	AuditTruncationLoss    int64
 	AuditLagExceeded       int64
 	AuditDeletedStreamLoss int64
+
+	// ForwardOutcomes (batch B, B2) counts every authoritative raft write attempt by
+	// (verb, outcome). Keys are "<verb>/<outcome>" with outcome in {ok, not_leader, error};
+	// nil or empty in single mode, where nothing is forwarded.
+	//
+	// WHY THIS IS THE ONE OPERATOR-VISIBLE THING B2 ADDS
+	//
+	// Two forward paths discard their error entirely — internal/broker/alert_forward.go's
+	// disk-alert signal and topology_reconcile.go's bus-nkey self-report both call
+	// `_ = fwd.Forward(...)` because a level-triggered re-assert self-heals on the next tick.
+	// That is the right retry policy and the wrong observability: a broker whose forwards fail
+	// EVERY tick looks identical to one with nothing to say. Counting the outcome makes a
+	// persistently-failing forward visible without changing the retry behaviour.
+	//
+	// not_leader is deliberately its own outcome rather than folded into error: it is the
+	// routine leadership-race signal (cluster.ErrForwardNotLeader) that callers retry, so a
+	// rising not_leader rate means election churn while a rising error rate means a real
+	// rejection. Collapsing them would hide exactly the distinction an operator needs.
+	ForwardOutcomes map[string]int64
 }
 
 // Render writes the Prometheus text exposition for s. Every gauge that applies is ALWAYS present
@@ -94,6 +113,31 @@ func Render(w io.Writer, s Snapshot) {
 	c("tether_broker_audit_lag_exceeded_total", "Times the audit publisher exceeded its lag budget (A15).", s.AuditLagExceeded)
 	c("tether_broker_audit_deleted_stream_loss_total", "Audit records dropped because their target stream had been deleted (A15).", s.AuditDeletedStreamLoss)
 	g("tether_broker_xfer_unreapable_buckets", "Number of xfer buckets holding aged orphan objects that no broker's home-gated reaper will ever delete (split-home / zero-node session; N-6).", int64(s.XferUnreapableBuckets))
+	// batch B / B2: forward outcomes by (verb, outcome). Rendered as ONE labelled counter series
+	// rather than a gauge per key, because the key set is data (17 verbs x 3 outcomes) and a
+	// scraper needs rate() over it. Keys are sorted so the exposition is byte-stable across
+	// scrapes — an unsorted map would make the output non-deterministic and defeat any golden test.
+	if len(s.ForwardOutcomes) > 0 {
+		keys := make([]string, 0, len(s.ForwardOutcomes))
+		for k := range s.ForwardOutcomes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n",
+			"tether_broker_raft_forward_total",
+			"Authoritative raft write attempts by verb and outcome (ok|not_leader|error).",
+			"tether_broker_raft_forward_total")
+		for _, k := range keys {
+			verb, outcome, found := strings.Cut(k, "/")
+			if !found {
+				continue
+			}
+			// \"%s\" + escapeLabel, matching the peer series below. %q would double-escape,
+			// since escapeLabel already handles backslash / quote / newline.
+			_, _ = fmt.Fprintf(w, "tether_broker_raft_forward_total{verb=\"%s\",outcome=\"%s\"} %d\n",
+				escapeLabel(verb), escapeLabel(outcome), s.ForwardOutcomes[k])
+		}
+	}
 	// B6 OPS#4: JS stream replica posture (actual<target ⇒ replication degraded). Omitted when
 	// not observed this scrape (StreamsTarget==0) — a faked 0 would read as a degraded cluster.
 	if s.StreamsTarget > 0 {

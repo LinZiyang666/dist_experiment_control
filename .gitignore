@@ -71,3 +71,14 @@ Thumbs.db
 
 # Local build artifact — the binary is built via goreleaser/release flow, never committed
 /tether
+
+# Local out-of-band maintenance script — NOT part of tether and must never become a release
+# artifact. docs/testing-standards.md §S2 records why: it defaults to 0.0.0.0, an EMPTY token
+# (empty == no auth), no TTL, and plaintext TCP to an interactive root PTY — a complete remote
+# code execution surface. Two successive external reviews have had to find it in a staged tree
+# and block on it; ignoring that file is what stops a third from having to.
+#
+# If it is ever to ship, it needs fail-closed defaults (loopback bind, non-empty credential,
+# finite TTL), separate agent/operator authority, and transport confidentiality — and then it
+# belongs in its own increment with its own review, not carried along by an unrelated batch.
+/tools/rescue.py

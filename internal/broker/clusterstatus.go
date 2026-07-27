@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -32,6 +33,13 @@ func clusterCodeFor(err error) string {
 	var dp *ErrDataPlaneNotConverged
 	if errors.As(err, &dp) {
 		return codeDataplaneNotConverged
+	}
+	// B4: same rule, second application. A version-skewed joiner is a TERMINAL refusal —
+	// falling through to `default: ""` would classify it exit 70, which docs/usage.md §9.13
+	// tells automation to retry, so a mis-versioned node would be re-approved forever.
+	var vs *ErrJoinVersionSkew
+	if errors.As(err, &vs) {
+		return adminsock.CodeVersionSkew
 	}
 	s := err.Error()
 	switch {
@@ -243,6 +251,13 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	if a.healthPoll != nil {
 		health = a.healthPoll()
 	}
+	// batch B / B4: the ACCT.NK comparison baseline — the account key THIS broker signs auth_callout
+	// with. Empty when the getter is unwired or there is no account seed; every row then stays
+	// unreported (see ClusterAdmin.accountPubSelf).
+	selfAccountPub := ""
+	if a.accountPubSelf != nil {
+		selfAccountPub = a.accountPubSelf()
+	}
 	reachOf := func(nodeID string) (reachable bool, source string, lag uint64) {
 		if nodeID == a.node.SelfID() {
 			return true, "self", selfLag
@@ -268,9 +283,13 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		inconsistent := (r.phase == phaseVoter && (!inCfg || ro == "learner")) ||
 			(!inCfg && r.phase != phaseRetiring && r.phase != phaseAddFailed)
 		reachable, source, lag := reachOf(r.nodeID)
+		// batch B / B4: AccountNkMatch/AccountNkReported are deliberately NOT set here. This literal
+		// used to carry `AccountNkMatch: true` unconditionally, which is where the "column is always
+		// Y" lie came from. The answer now comes from the health self-report below, and a row with
+		// no self-report stays unreported — the renderer prints "?".
 		ns := adminsock.ClusterNodeStatus{
 			NodeID: r.nodeID, Name: r.name, Phase: r.phase, Role: ro,
-			AppliedLag: lag, AccountNkMatch: true,
+			AppliedLag:   lag,
 			StreamActual: streamActual, StreamTarget: streamTarget,
 			Reachable: reachable, ReachSource: source,
 			Inconsistent: inconsistent,
@@ -278,6 +297,17 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		// B6 OPS#4: stamp each broker's live self-reported version (from the health poll).
 		// C3: stamp the topology reconcile self-report (applied/observed/reason/reported).
 		if hr, ok := health[r.nodeID]; ok {
+			// batch B / B4: the honest ACCT.NK answer. selfAccountPub is the VIEWING broker's key;
+			// a node whose reported key differs signs auth_callout JWTs no nats-server pinned to
+			// this key will accept, which surfaces as agents failing to join at random.
+			//
+			// The comparison is only made when BOTH sides have a key. If this broker cannot name its
+			// own (no account seed configured), it is not entitled to call anyone else mismatched —
+			// the row stays unreported rather than rendering a fabricated N for the whole cluster.
+			if hr.AccountNkReported && selfAccountPub != "" {
+				ns.AccountNkReported = true
+				ns.AccountNkMatch = hr.AccountNkPub == selfAccountPub
+			}
 			ns.ReleaseVersion = hr.ReleaseVersion
 			ns.ProtoVer = hr.ProtoVer
 			ns.TopoApplied = hr.TopoApplied
@@ -313,6 +343,16 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 					ns.TopoObserved = ts.Observed
 					ns.TopoReconcileReason = ts.Reason
 				}
+			}
+			// batch B / B4: same authoritative-self rule for ACCT.NK. The self row's verdict is a
+			// tautology (this broker's key equals its own), and stating it locally rather than via the
+			// health echo is what makes it robust: at N=1 there is no healthPoll at all, and a self row
+			// rendered "?" on a single-broker cluster would read as "verification unavailable" on the
+			// only broker that can never be mismatched. Still gated on knowing the key — an unwired
+			// account seed reports nothing, in either mode.
+			if selfAccountPub != "" {
+				ns.AccountNkReported = true
+				ns.AccountNkMatch = true
 			}
 		}
 		rep.Nodes = append(rep.Nodes, ns)
@@ -379,10 +419,27 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		}
 		rep.Banner += adv
 	}
+	// batch B / B4: an account-key divergence is a REAL finding, and a column an operator only sees
+	// if they look at that column is a weak place to put it — the symptom is "agents fail to join at
+	// random", which nobody diagnoses by scanning ACCT.NK. Surface it on the banner too.
+	//
+	// ADVISORY ONLY, deliberately: it does NOT touch Health or ExitCode. Those are a monitoring
+	// contract (`cluster status --json || alert` branches on them), and widening what makes them
+	// non-zero is a deploy-surface change that belongs in its own increment with its own runbook
+	// note. Same asymmetry certExpiryAdvisory already established above.
+	if adv := accountKeySkewAdvisory(rep.Nodes); adv != "" {
+		if rep.Banner != "" {
+			rep.Banner += " "
+		}
+		rep.Banner += adv
+	}
 	// B1: stamp the view source (which broker self-reported, and whether it is the
 	// authoritative leader view) and the plain-language voter-count verdict.
 	rep.ViewHost = a.node.SelfID()
 	rep.IsLeaderView = leaderID == a.node.SelfID()
+	// batch B / B4: report the conf this broker actually uses, so the ONLINE `cluster doctor` can run
+	// the auth_callout issuer-skew cross-check against the RIGHT file (TODO(n3-online-doctor)).
+	rep.NatsConfPath = a.natsConfPath
 	rep.Verdict = clusterVerdict(voters, streamsAtTarget(rep.Nodes), rep.Health)
 	// v0.4.2 phase-fluidity grow-readiness: surface a loopback self-advertise (raft and/or NATS
 	// route) so the doctor/status can warn that a cross-network grow needs `cluster set-raft-addr`
@@ -540,6 +597,29 @@ func computeHealth(forceSingle bool, leaderID string, voters int, topoDesired ui
 		return healthDegraded, "a node is mid-join / draining or roster/raft INCONSISTENT — see the table", "cluster status"
 	}
 	return healthHealthyHA, "", ""
+}
+
+// accountKeySkewAdvisory (batch B / B4) returns an advisory naming every node that ANSWERED with an
+// auth_callout account key different from this view's. Returns "" when there is no divergence — which
+// includes every row being unreported, so an old cluster or an offline snapshot adds nothing.
+//
+// Only reported mismatches count. A "?" row is not evidence of anything, and treating absence of an
+// answer as a mismatch is precisely the fabricated-signal defect this whole item removed.
+func accountKeySkewAdvisory(nodes []adminsock.ClusterNodeStatus) string {
+	var skewed []string
+	for _, n := range nodes {
+		if n.AccountNkReported && !n.AccountNkMatch {
+			skewed = append(skewed, n.NodeID)
+		}
+	}
+	if len(skewed) == 0 {
+		return ""
+	}
+	return "ADVISORY: auth_callout ACCOUNT KEY DIVERGES on " + strings.Join(skewed, ", ") +
+		" — those brokers sign CONNECT approvals with a key the other brokers' nats-servers do not " +
+		"trust, so agent/ctl auth fails intermittently depending on which broker answers the callout. " +
+		"Re-render nats.conf from the ONE intended account.nk on every broker (`cluster reconcile nats`), " +
+		"then restart the odd brokers."
 }
 
 // certExpiryAdvisory (B5 OPS#7) returns an advisory string when any node's tunnel-cert rotation
@@ -893,35 +973,129 @@ func (b *clusterAdminBackend) handleAdd(req adminsock.Request) adminsock.Respons
 	return adminsock.Response{Op: req.Op, OK: true}
 }
 
-// versionSkewResponse is the B6 A3 gate (extracted so the ALLOW paths are unit-testable without a
-// live raft node). Proto mismatch is the ONLY hard reject (a different proto cannot speak the
-// wire). Release skew is advisory: a rolling upgrade runs followers-first, so the leader is
-// transiently OLDER than the joiner, and a re-joining drained node may be older than the
-// now-upgraded leader during rollback — rejecting on release would brick exactly the rolling
-// upgrade this gate exists to enable. A joiner that did not declare its proto (0, an older
-// `cluster add`) is allowed with a warning — the join-PoP + the real connection remain the
-// authoritative protections; this is a friendly early check, not the only gate.
+// versionSkewResponse adapts the shared fail-closed exact-version decision to the legacy adminsock
+// response shape. Only exact proto+release equality is admitted; missing or mismatched declarations
+// carry the same terminal version_skew code. The fields are an unsigned operator-error preflight,
+// while join PoP remains the authentication boundary.
 func (b *clusterAdminBackend) versionSkewResponse(req adminsock.Request) (adminsock.Response, bool) {
-	if req.JoinerProto != 0 && req.JoinerProto != proto.ProtoVersion {
-		return adminsock.Response{Op: req.Op, Code: adminsock.CodeVersionSkew,
-			Error: fmt.Sprintf("version skew: joiner speaks proto v%d but this cluster is proto v%d — reinstall the joiner on a matching release before adding it",
-				req.JoinerProto, proto.ProtoVersion)}, true
-	}
-	if req.JoinerProto == 0 {
-		b.admin.logger.Warn("cluster add: joiner did not declare its proto version (older `cluster add`?); cannot pre-verify compatibility", "node_id", req.NodeID)
-	}
-	if req.JoinerRelease != "" && req.JoinerRelease != proto.ReleaseVersion {
-		// Mega-audit MAJ-11 (tracked enforcement gap): release skew is advisory ONLY, but a column-adding
-		// migration (e.g. 0017 last_rehome_at) makes a same-proto OLDER-release member FSM-fail-stop on the
-		// first committed op that bakes the new column once leadership moves to a newer-release node. The
-		// reinstall-not-upgrade invariant (CLAUDE.md §5) governs this: a joiner MUST be on a
-		// migration-compatible release. An IN-BAND schema/migration-version floor in the join handshake
-		// (reject below the cluster's schema version, not just proto) is a tracked v2.x follow-up; until
-		// then this Warn + the runbook are the enforcement.
-		b.admin.logger.Warn("cluster add: joiner release differs from this node (allowed — rolling upgrades mix releases; the joiner MUST be migration-compatible, see runbook §schema)",
-			"node_id", req.NodeID, "joiner_release", req.JoinerRelease, "this_release", proto.ReleaseVersion)
+	if err := versionSkewRefusal(req.JoinerProto, req.JoinerRelease, req.NodeID, b.admin.logger); err != nil {
+		return adminsock.Response{Op: req.Op, Code: adminsock.CodeVersionSkew, Error: err.Error()}, true
 	}
 	return adminsock.Response{}, false
+}
+
+// ErrJoinVersionSkew is the TYPED refusal for a joiner whose declared proto cannot speak this
+// cluster's wire. It exists because the two callers return different envelopes — handleAdd an
+// adminsock.Response, StartJoinOperation a plain error — and clusterCodeFor's own doc
+// (see :24-35) records the rule: "classify by TYPE, not by prose". Without the type, the join
+// path's refusal falls through clusterCodeFor's `default: ""` to exit 70, which
+// docs/usage.md §9.13 tells automation to RETRY — manufacturing exactly the defect batch-A's
+// A1 existed to remove, on the very gate added to prevent a different one.
+type ErrJoinVersionSkew struct {
+	JoinerProto  int
+	ClusterProto int
+	// MissingField is set when the bundle omitted evidence required to prove exact compatibility.
+	// Decode remains additive/backward-compatible; admission fails closed until the operator
+	// regenerates the bundle with current tooling.
+	MissingField string
+	// JoinerRelease / ClusterRelease are set instead of the proto pair when the refusal is a
+	// RELEASE mismatch (external review B3). One type carries both because both are the same
+	// refusal to the operator and to clusterCodeFor: "reinstall the joiner, then retry".
+	JoinerRelease  string
+	ClusterRelease string
+}
+
+func (e *ErrJoinVersionSkew) Error() string {
+	if e.MissingField != "" {
+		return fmt.Sprintf("version skew: joiner did not declare %s — requirements §6.7 mandates identical major.minor.patch across the stack; upgrade the joiner and regenerate its join bundle before adding it",
+			e.MissingField)
+	}
+	if e.JoinerRelease != "" || e.ClusterRelease != "" {
+		return fmt.Sprintf("version skew: joiner runs release %s but this cluster runs %s — requirements §6.7 mandates identical major.minor.patch across the stack; reinstall the joiner at %s before adding it",
+			e.JoinerRelease, e.ClusterRelease, e.ClusterRelease)
+	}
+	return fmt.Sprintf("version skew: joiner speaks proto v%d but this cluster is proto v%d — reinstall the joiner on a matching release before adding it",
+		e.JoinerProto, e.ClusterProto)
+}
+
+// versionSkewRefusal decides whether a joiner declaring (joinerProto, joinerRelease) may join
+// this cluster. It returns *ErrJoinVersionSkew on refusal and nil on accept.
+//
+// Extracted from versionSkewResponse (which returned an adminsock.Response and was therefore
+// unusable from StartJoinOperation) so the SAME decision serves both entry points. That
+// matters because the entry point it was written for — handleAdd, via adminsock.OpClusterAdd
+// — is DELIBERATELY NOT ROUTED (internal/adminsock/protocol.go:150, v0.4.2), so until now the
+// gate was product-unreachable while its test called it directly and stayed green.
+//
+// Proto mismatch is a hard reject: a different proto cannot speak the wire.
+//
+// RELEASE MISMATCH IS ALSO A HARD REJECT (external review B3). It was advisory-only, on the
+// reasoning that "rejecting on release would brick exactly the rolling upgrade this gate exists to
+// enable". That reasoning was wrong on both halves:
+//
+//   - It contradicted the WHAT authority. docs/requirements.md §6.7 mandates identical
+//     major.minor.patch across the stack and says a mismatch must be REFUSED with a clear error.
+//     Under CLAUDE.md §1 requirements is layer 1; an implementation comment cannot quietly overrule
+//     it, and this one did, for a policy the operator can see.
+//   - It did not protect any real flow. A rolling `cluster upgrade` rolls EXISTING voters and never
+//     passes through this gate; the flows that do are `cluster join approve` / `cluster add`, i.e.
+//     admitting a NEW or re-installed broker, which is exactly where the requirement applies. The
+//     "re-joining drained node may be older during a rollback" case is not a counterexample: per
+//     requirements that node must be reinstalled at the cluster's release first, and the code's own
+//     comment already recorded why (a column-adding migration makes a same-proto OLDER-release
+//     member FSM-fail-stop once leadership moves to a newer-release node — a data-integrity failure
+//     the advisory Warn did nothing to prevent).
+//
+// WHAT THIS GATE IS NOT: the declared fields ride the join bundle UNSIGNED
+// (internal/cluster/join_bundle.go — extending JoinSignBytes would invalidate every already-issued
+// bundle, including the ones DR rejoin uses, so it is deliberately out of scope). A joiner that
+// wanted in could therefore declare a matching release. This gate is an OPERATOR-ERROR guard — it
+// stops the mismatched box an operator did not notice — not a boundary against a hostile joiner.
+// The authoritative protections remain the join PoP and the operator's explicit approval.
+//
+// Missing declarations fail closed (external re-review R2). Exact equality cannot be established
+// from absent evidence, and docs/testing-standards.md §S1 requires compatibility/safety evidence
+// that is missing or unparseable to reject. Decode remains backward-compatible so an operator gets
+// this typed, actionable refusal instead of a parse failure; the compliant path is to upgrade the
+// joiner and regenerate its bundle with current tooling.
+func versionSkewRefusal(joinerProto int, joinerRelease, nodeID string, log *slog.Logger) error {
+	if joinerProto == 0 {
+		logSkew(log, "cluster add: REFUSED — joiner did not declare its proto version; exact compatibility cannot be verified",
+			"node_id", nodeID, "this_proto", proto.ProtoVersion)
+		return &ErrJoinVersionSkew{
+			JoinerProto:  joinerProto,
+			ClusterProto: proto.ProtoVersion,
+			MissingField: "protocol version",
+		}
+	}
+	if joinerProto != proto.ProtoVersion {
+		return &ErrJoinVersionSkew{JoinerProto: joinerProto, ClusterProto: proto.ProtoVersion}
+	}
+	if joinerRelease == "" {
+		logSkew(log, "cluster add: REFUSED — joiner did not declare its release; requirements §6.7 exact-version compatibility cannot be verified",
+			"node_id", nodeID, "this_release", proto.ReleaseVersion)
+		return &ErrJoinVersionSkew{
+			ClusterRelease: proto.ReleaseVersion,
+			MissingField:   "release version",
+		}
+	}
+	if joinerRelease != proto.ReleaseVersion {
+		logSkew(log, "cluster add: REFUSED — joiner release differs from this broker (requirements §6.7: forced same version across the stack)",
+			"node_id", nodeID, "joiner_release", joinerRelease, "this_release", proto.ReleaseVersion)
+		return &ErrJoinVersionSkew{JoinerRelease: joinerRelease, ClusterRelease: proto.ReleaseVersion}
+	}
+	return nil
+}
+
+// logSkew tolerates a nil logger. StartJoinOperation runs on a ClusterAdmin whose logger is
+// injected by wireClusterLate, and two of the five package-internal test fixtures that build a
+// ClusterAdmin literal leave it unset. A gate that panicked on the logging path would replace an
+// actionable typed refusal with a process crash.
+func logSkew(log *slog.Logger, msg string, args ...any) {
+	if log == nil {
+		return
+	}
+	log.Warn(msg, args...)
 }
 
 // splitJoinToken parses "<nonce>:<sigHex>" (the `cluster sign-join` output).
