@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"testing"
+
+	"github.com/LinZiyang666/tether/internal/jsstream"
 )
 
 // cluster_observe_budget_test.go — the leader tick's JS observations must all carry a deadline (B7).
@@ -76,6 +78,64 @@ func TestReplicaObserveBudgetScalesWithSessions(t *testing.T) {
 	if base <= 0 {
 		t.Fatalf("a non-positive observation budget (%v) fails every observation instantly, and both call "+
 			"sites read a failed observation as NOT ready", base)
+	}
+}
+
+// TestObserveBudgetCountsXferStreamsNotJustSessions pins the fix for external review RB2 doubt 3.
+//
+// origin: batch B2 external re-review doubt 3 (post-release technical-debt cleanup)
+//
+// THE MISMATCH
+// ------------
+// The scaling term used to be `COUNT(*) FROM sessions WHERE state='ACTIVE'`. That predicts the
+// per-session history streams EXACTLY — AuditPublisherConfig.ListSIDs is literally that query — but it
+// counts the `OBJ_xfer-*` streams as ZERO, and ObserveReplicas walks every one of those too via
+// ListXferStreams. Those streams can OUTLIVE the session that created them (an orphaned transfer
+// bucket), so a transfer-heavy broker was handed a deadline sized for a fraction of the round trips it
+// was about to make, and "routinely unobserved" followed.
+//
+// The scaling input is now the PREVIOUS observation's own stream count, which already includes
+// events + history + xfer. This test pins that the count reaching the budget is the STREAM count, by
+// driving cacheReplicaSnapshot with a report whose stream count exceeds any plausible session count and
+// checking the budget responds.
+func TestObserveBudgetCountsXferStreamsNotJustSessions(t *testing.T) {
+	b := &Broker{}
+
+	// No observation yet: the fallback is used and there is nothing cached to read.
+	if got := b.observedStreamCount(); got != 0 {
+		t.Fatalf("a broker that has never observed must report 0 cached streams, got %d", got)
+	}
+
+	// An observation dominated by transfer streams: one events stream, one session history, and eight
+	// live OBJ_xfer buckets. A session-count-based term would size this as ~1; the stream count is 10.
+	streams := make([]jsstream.StreamReplicaState, 0, 10)
+	for i := 0; i < 10; i++ {
+		streams = append(streams, jsstream.StreamReplicaState{Actual: 3, Target: 3})
+	}
+	b.cacheReplicaSnapshot(ReplicaReport{Streams: streams, Observed: true})
+
+	if got := b.observedStreamCount(); got != 10 {
+		t.Fatalf("cached stream count = %d, want 10 — the budget's scaling input is this number, so if the "+
+			"snapshot does not record it the xfer streams go back to costing nothing", got)
+	}
+	if b.observedStreamCount() <= 1 {
+		t.Error("a report whose streams are mostly OBJ_xfer must not collapse to a session-shaped count")
+	}
+
+	// And the budget must actually respond to it, not merely store it.
+	if clusterReplicaObserveBudget(b.observedStreamCount()) <= clusterReplicaObserveBudget(1) {
+		t.Errorf("ten streams must buy more budget than one (%v vs %v) — otherwise the per-stream term is "+
+			"not wired to the quantity it names",
+			clusterReplicaObserveBudget(b.observedStreamCount()), clusterReplicaObserveBudget(1))
+	}
+
+	// An unobserved report must NOT overwrite a good count with 0: a transient meta-not-ready tick would
+	// otherwise shrink the next tick's budget precisely when the cluster is already struggling.
+	b.cacheReplicaSnapshot(ReplicaReport{Observed: false})
+	if got := b.observedStreamCount(); got != 10 {
+		t.Errorf("an UNOBSERVED report overwrote the cached stream count (now %d, was 10). A failed "+
+			"observation must not shrink the next one's deadline — that is a feedback loop that makes a "+
+			"struggling cluster fail faster.", got)
 	}
 }
 

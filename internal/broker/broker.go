@@ -568,6 +568,17 @@ type Broker struct {
 	lastReplicaMu     sync.Mutex
 	lastReplicaActual int
 	lastReplicaTarget int
+	// lastReplicaStreams is how many streams the previous ObserveReplicas actually enumerated. It
+	// sizes the NEXT observation's deadline (clusterReplicaObserveBudget), which is the only reason it
+	// is kept — it is not a metric.
+	//
+	// External review RB2 doubt 3: the budget scaled with `COUNT(*) FROM sessions WHERE state='ACTIVE'`,
+	// which correctly predicts the per-session history streams (ListSIDs is exactly that query) but
+	// counts the `OBJ_xfer-*` streams as ZERO. Those are enumerated by ListXferStreams and can outlive
+	// the session that created them, so a transfer-heavy or orphan-heavy broker was given a budget for a
+	// fraction of the round trips it was about to make. The previous observation's own stream count is
+	// the right predictor and costs nothing: it already includes events + history + xfer.
+	lastReplicaStreams int
 }
 
 // cacheReplicaSnapshot records the worst-case (min actual) stream replica posture for the
@@ -588,7 +599,17 @@ func (b *Broker) cacheReplicaSnapshot(rep ReplicaReport) {
 	}
 	b.lastReplicaMu.Lock()
 	b.lastReplicaActual, b.lastReplicaTarget = minActual, target
+	b.lastReplicaStreams = len(rep.Streams)
 	b.lastReplicaMu.Unlock()
+}
+
+// observedStreamCount is the previous observation's stream count, or 0 before the first one. It is the
+// scaling input for clusterReplicaObserveBudget — see the field comment for why the session count alone
+// under-counted.
+func (b *Broker) observedStreamCount() int {
+	b.lastReplicaMu.Lock()
+	defer b.lastReplicaMu.Unlock()
+	return b.lastReplicaStreams
 }
 
 // peerObserve is one cached per-peer health datum for the metrics endpoint.

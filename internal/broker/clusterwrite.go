@@ -431,7 +431,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		// ladder rather than just one status render — and a budget too small for the fleet turns a
 		// healthy cluster into a reported replica deficit (internal review B7-02).
 		ctx, cancel := context.WithTimeout(context.Background(),
-			clusterReplicaObserveBudget(b.activeSessionCountForBudget()))
+			clusterReplicaObserveBudget(b.observeStreamCountForBudget()))
 		defer cancel()
 		return pub.ObserveReplicas(ctx)
 	}
@@ -510,7 +510,7 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 	// ObserveReplicas calls that shared the leader tick; missing it would have left the path
 	// structurally unbounded while looking fixed.
 	ctx, cancel := context.WithTimeout(context.Background(),
-		clusterReplicaObserveBudget(b.activeSessionCountForBudget()))
+		clusterReplicaObserveBudget(b.observeStreamCountForBudget()))
 	defer cancel()
 	rep, err := ap.ObserveReplicas(ctx)
 	if err != nil {
@@ -519,18 +519,28 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 	return rep.AllAtTarget(), nil
 }
 
-// activeSessionCountForBudget is a cheap LOCAL read used only to size the replica-observation deadline.
+// observeStreamCountForBudget is how many streams the next ObserveReplicas is expected to enumerate.
+// It only sizes the deadline; nothing else reads it.
 //
-// It is deliberately best-effort: on any error it returns 0, which yields the base budget — the same
-// bound this code had before the budget scaled, so a DB hiccup degrades to the old behaviour rather
-// than to an unbounded call. It reads through b.read(), so it cannot write, and it is a single indexed
-// count against the local replica — not another round trip to the JS meta.
-func (b *Broker) activeSessionCountForBudget() int {
-	var n int
-	if err := b.read().QueryRow(`SELECT COUNT(*) FROM sessions WHERE state = 'ACTIVE'`).Scan(&n); err != nil {
+// The PREVIOUS observation's stream count is the primary source (RB2 doubt 3): it already includes the
+// events stream, every ACTIVE session's history stream AND every live `OBJ_xfer-*` stream, which is
+// exactly the set the next call walks. Before the first observation there is no such count, so it falls
+// back to `events + one history per ACTIVE session` — the old estimate, which is right for a broker with
+// no transfers in flight and is the state a freshly-started broker is in.
+//
+// Deliberately best-effort in both halves: a DB error yields the base budget, the same bound this code
+// had before the budget scaled at all, so a hiccup degrades to the old behaviour rather than to an
+// unbounded call. The read goes through b.read() so it cannot write, and it is one indexed COUNT against
+// the local replica — never another round trip to the JS meta.
+func (b *Broker) observeStreamCountForBudget() int {
+	if n := b.observedStreamCount(); n > 0 {
+		return n
+	}
+	var sessions int
+	if err := b.read().QueryRow(`SELECT COUNT(*) FROM sessions WHERE state = 'ACTIVE'`).Scan(&sessions); err != nil {
 		return 0
 	}
-	return n
+	return sessions + 1 // + the events stream, which ObserveReplicas always walks
 }
 
 // clusterJSPlaceProbeTimeout bounds the join-side placement probe.
@@ -553,11 +563,32 @@ const clusterJSPlaceProbeTimeout = 3 * time.Second
 // the half that stops the expiry from being routine in the first place.
 //
 // The base is the sibling JS probe's budget (same meta, same kind of work — not a second invented
-// number); the per-session term is what the sibling does not need because it queries one stream.
+// number); the per-STREAM term is what the sibling does not need because it queries one stream.
 // The RELATION, not the numbers, is pinned by TestReplicaObserveBudgetScalesWithSessions.
+//
+// WHAT THE SCALING TERM COUNTS, AND WHY IT CHANGED (external review RB2 doubt 3)
+// -----------------------------------------------------------------------------
+// It used to count ACTIVE SESSIONS. That predicts the per-session history streams exactly — ListSIDs IS
+// `sessions WHERE state='ACTIVE'` — but it counts the `OBJ_xfer-*` streams as ZERO, and ObserveReplicas
+// enumerates every one of those too (via ListXferStreams). Those streams can OUTLIVE the session that
+// created them, so a transfer-heavy or orphan-heavy broker was handed a budget sized for a fraction of
+// the round trips it was about to make, and "routinely unobserved" was the predictable result.
+//
+// The scaling input is now the PREVIOUS observation's own stream count, which already includes events +
+// history + xfer and costs nothing to obtain. It lags by one tick when the stream set grows, and that is
+// acceptable: the lag self-corrects on the next tick, the ceiling still bounds the leader tick, and an
+// under-budgeted tick reports UNOBSERVED (-1) rather than a fabricated measurement.
+//
+// STILL NOT CHARACTERISED, deliberately: the 250ms per-stream coefficient. Sizing it properly needs a
+// measured transfer-heavy fleet, and inventing a number would be exactly the "looks like
+// characterisation" artefact this batch spent its budget deleting. What is fixed here is the structural
+// mismatch (a term that ignored a whole class of streams), not the constant.
 const (
-	clusterReplicaObserveBase       = clusterJSPlaceProbeTimeout
-	clusterReplicaObservePerSession = 250 * time.Millisecond
+	clusterReplicaObserveBase = clusterJSPlaceProbeTimeout
+	// clusterReplicaObservePerStream is per STREAM enumerated, not per session (RB2 doubt 3). The name
+	// used to say PerSession, which is how the xfer streams came to be uncounted: the term looked correct
+	// for the quantity it was multiplied by.
+	clusterReplicaObservePerStream = 250 * time.Millisecond
 	// clusterReplicaObserveCeiling caps the derived budget. Without it a broker with a thousand stale
 	// sessions would hand the leader tick a multi-minute deadline, which is the unbounded behaviour this
 	// replaced wearing a different hat. At the cap the observation genuinely cannot finish and the
@@ -565,11 +596,11 @@ const (
 	clusterReplicaObserveCeiling = 30 * time.Second
 )
 
-func clusterReplicaObserveBudget(sessions int) time.Duration {
-	if sessions < 0 {
-		sessions = 0
+func clusterReplicaObserveBudget(streams int) time.Duration {
+	if streams < 0 {
+		streams = 0
 	}
-	d := clusterReplicaObserveBase + time.Duration(sessions)*clusterReplicaObservePerSession
+	d := clusterReplicaObserveBase + time.Duration(streams)*clusterReplicaObservePerStream
 	if d > clusterReplicaObserveCeiling {
 		return clusterReplicaObserveCeiling
 	}

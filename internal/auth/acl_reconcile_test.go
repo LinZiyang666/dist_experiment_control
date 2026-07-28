@@ -581,23 +581,47 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 				}
 				return false
 			}
-			ast.Inspect(f, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok || len(call.Args) == 0 {
+			// The site key is file:FUNCTION#ordinal, NOT file:line. A line key goes stale every time
+			// anything is inserted above the site — this map's two broker.go entries went stale when an
+			// unrelated field was added to the Broker struct, which is the same failure mode
+			// cmd/tether's unresolvedCodeSites hit eleven times. The ordinal counts UNRESOLVABLE
+			// subscriptions within the enclosing function, in source order, so nothing above the
+			// function can move it and only a change inside that function — exactly when the exemption
+			// deserves re-reading — invalidates it.
+			rel, _ := filepath.Rel(filepath.Dir(filepath.Dir(dir)), p)
+			relSlash := filepath.ToSlash(rel)
+			ord := map[string]int{}
+			var walk func(fnName string, n ast.Node)
+			walk = func(fnName string, n ast.Node) {
+				ast.Inspect(n, func(m ast.Node) bool {
+					if fd, ok := m.(*ast.FuncDecl); ok {
+						if fd.Body != nil {
+							walk(fd.Name.Name, fd.Body)
+						}
+						return false
+					}
+					call, ok := m.(*ast.CallExpr)
+					if !ok || len(call.Args) == 0 {
+						return true
+					}
+					sel, ok := call.Fun.(*ast.SelectorExpr)
+					if !ok || !subscribeFuncs[sel.Sel.Name] {
+						return true
+					}
+					if resolvable(call.Args[0]) {
+						return true
+					}
+					name := fnName
+					if name == "" {
+						name = "<file-scope>"
+					}
+					key := relSlash + ":" + name
+					ord[key]++
+					out = append(out, key+"#"+strconv.Itoa(ord[key]))
 					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || !subscribeFuncs[sel.Sel.Name] {
-					return true
-				}
-				if resolvable(call.Args[0]) {
-					return true
-				}
-				rel, _ := filepath.Rel(filepath.Dir(filepath.Dir(dir)), p)
-				out = append(out, filepath.ToSlash(rel)+":"+
-					strconv.Itoa(fset.Position(call.Pos()).Line))
-				return true
-			})
+				})
+			}
+			walk("", f)
 			return nil
 		})
 	}
@@ -607,16 +631,24 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 
 // dynamicSubscriptionExemptions records why a subscription subject that cannot
 // be read statically is nonetheless not an ACL gap. Each entry is a decision.
+//
+// KEYED file:FUNCTION#ordinal, NOT file:line. The two broker.go entries were `:1034`/`:1036` and went
+// stale the moment an unrelated field was added to the Broker struct — the same disease
+// cmd/tether's unresolvedCodeSites caught eleven times, in a second gate nobody had connected to the
+// first. A line key makes the maintenance edit (re-number) indistinguishable in a diff from the
+// subversion (silence a genuinely new dynamic subscription). The ordinal is the site's 1-based index
+// among UNRESOLVABLE subscriptions in its enclosing function, so only a change inside that function —
+// which is when the exemption deserves re-reading — can move it.
 var dynamicSubscriptionExemptions = map[string]string{
-	"internal/broker/observability.go:81": "SubscribeSync(inbox) — a per-request random _INBOX reply " +
-		"subject, not a served endpoint. Reply subjects are granted by NATS to the requester, " +
+	"internal/broker/observability.go:pollClusterHealth#1": "SubscribeSync(inbox) — a per-request random " +
+		"_INBOX reply subject, not a served endpoint. Reply subjects are granted by NATS to the requester, " +
 		"never by the ctl permission template, so no grant can or should exist.",
-	"internal/broker/home_delivery.go:197": "Subscribe(inbox+\".>\", ...) — a broker-owned _INBOX ack " +
-		"channel for agent home-delivery acknowledgements, not a ctl-served endpoint; the random " +
+	"internal/broker/home_delivery.go:subscribeHomeAcks#1": "Subscribe(inbox+\".>\", ...) — a broker-owned " +
+		"_INBOX ack channel for agent home-delivery acknowledgements, not a ctl-served endpoint; the random " +
 		"inbox is intentionally runtime-generated and does not belong in member pub grants.",
-	"internal/broker/broker.go:1034": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
+	"internal/broker/broker.go:Run#1": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
 		"subscription table; every row's subject IS extracted, from the table literal above.",
-	"internal/broker/broker.go:1036": "Subscribe(ss.subj, ...) — same loop variable as :1034.",
+	"internal/broker/broker.go:Run#2": "Subscribe(ss.subj, ...) — same loop variable as #1 in this function.",
 }
 
 // TestACLDynamicSubscriptionsAreDeclared closes the second direction of R2: a

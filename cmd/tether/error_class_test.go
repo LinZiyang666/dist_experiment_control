@@ -72,13 +72,28 @@ func TestExternalReviewUnresolvedCodeExemptionsAreSiteScopedAndLive(t *testing.T
 	root := repoRoot(t)
 	_, unresolved := scanTree(t, root, scannedTrees)
 	for key := range unresolvedCodeSites {
+		// The key is file:FUNCTION#ordinal. Both halves of the shape are load-bearing and are checked
+		// separately, because they fail for different reasons:
+		//
+		//	no "#ordinal"  -> the key names a FUNCTION, and a function-wide exemption hides every future
+		//	                  dynamic code added anywhere in it. clusterstatus.go's HandleCluster alone
+		//	                  holds ten unresolved sites, so this is not a theoretical concern.
+		//	no ":"         -> the key names a FILE, the original defect (external review R1).
 		i := strings.LastIndexByte(key, ':')
 		if i < 0 {
 			t.Errorf("file-wide unresolved exemption %q can hide every future dynamic code in that file", key)
 			continue
 		}
-		if _, err := strconv.Atoi(key[i+1:]); err != nil {
-			t.Errorf("unresolved exemption %q is not keyed by file:line", key)
+		h := strings.LastIndexByte(key, '#')
+		if h < i {
+			t.Errorf("unresolved exemption %q has no #ordinal, so it covers the whole function rather than "+
+				"one site — a second dynamic code added to that function would inherit the exemption "+
+				"silently. Key it as file:FUNCTION#N.", key)
+			continue
+		}
+		if n, err := strconv.Atoi(key[h+1:]); err != nil || n < 1 {
+			t.Errorf("unresolved exemption %q has a malformed ordinal (%q); it must be a 1-based site index "+
+				"within the enclosing function", key, key[h+1:])
 			continue
 		}
 		if _, ok := unresolved[key]; !ok {
