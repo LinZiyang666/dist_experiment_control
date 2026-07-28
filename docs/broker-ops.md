@@ -435,7 +435,23 @@ tether admin runtime [--json]               # 本进程 runtime 自省（gorouti
 >
 > **为什么不引入 pprof**：`admin runtime` 返回计数即足以定位泄漏（连采看爬升），且已被 root-only 的 0600 admin socket 网住。常驻 `net/http/pprof` 端点会额外引入攻击面（heap / goroutine-stack dump + CPU-profile DoS，暴露远超计数）与体积；深度栈级取证是**罕见、刻意、离线**的动作，不该做成常驻 HTTP 面。故：走 admin socket 返回计数，不上 pprof。
 >
-> **`--json`**：稳定 schema（`schema:"admin_runtime"` + `schema_version:1`）供监控采集。成功时**只有** JSON 落 stdout，失败只落 stderr + 非零退出——`admin runtime --json 2>&1 | jq` 不会被散文污染。
+> **`--json`**：稳定 schema（`schema:"admin_runtime"` + `schema_version:2`）供监控采集。
+> **v1→v2 是破坏性变更**（batch-B 余项 / B7）：`reconcilers[]` **删除了 `leader_only` 布尔**，
+> 由 `authority`（`"any"` / `"leader"`）取代——bool 只能回答"是不是 leader"，而 registry 现在同时承载
+> per-broker、leader-gated 与将来的其它门，第二种门只能以第二个 bool 混进来。
+> **按 usage.md 的 bump 政策，删键/改语义必须 bump**，所以采集端按 `leader_only` 写的规则会看到一个
+> 它不认识的 `schema_version`，而不是静默匹配不到任何东西。
+> 同批新增字段单独不构成 bump 理由（**外审 B2-7 订正**：原文写"都是 omitempty"，不准确——
+> `cluster_loops[].last_iter` 与 `.iterations` **刻意不是 omitempty**，理由见
+> `internal/adminsock/protocol.go` 的 `ClusterLoopInfo`：**零就是"死"这个含义本身**，
+> 一个 periodic 循环报 `iterations: 0` 表示它连一次循环体都没跑完，
+> 把键在零时丢掉恰恰会在坏消息发生时删掉信号。不 bump 的真实理由是**只加键、不改已有键的含义**）：
+> `reconcilers[]` 加 `last_dur_ms`/`max_dur_ms`/`overruns`（omitempty；pass 耗时与超支——"op 驱动器卡住"此前完全不可观测），
+> `cluster_loops[]` 加 `cadence_ms`（omitempty）与 `last_iter`/`iterations`（**非** omitempty，同上）：
+> 每次迭代的活性；`cadence_ms == 0` 表示事件驱动，此时 `iterations == 0` 不代表死。
+> **`iterations` 是活性、不是投递成功**（外审 B2-4）——被端点拒掉的 POST 仍是一次完成的迭代；
+> 投递结果在单独的 `alert_webhook.{accepted,rejected,drops}` 里，
+> 它是 omitempty 指针（不在场 = 没配 webhook），块内三个计数器则不是 omitempty（零有意义）。成功时**只有** JSON 落 stdout，失败只落 stderr + 非零退出——`admin runtime --json 2>&1 | jq` 不会被散文污染。
 
 > **`admin events` 为什么走 admin socket 而不是 NATS sub**：sys.events 的读者有两类——**member** 用 NATS 订阅（数据面成员信任层）、**operator** 用 admin socket（root-only 0600，与 `admin runtime`/`alert raise` 同层）。operator 在 broker 主机上通常没有 NATS 成员凭据，admin socket 才是它的信任面；且 `events` 是**持久化流**，admin socket 读它能给出**历史**（`--since` 翻过去、`--kind` 过滤），裸 NATS sub 只能拿到**订阅之后**的 live 事件。
 >

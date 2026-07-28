@@ -375,6 +375,44 @@ type RuntimeReport struct {
 	// are NOT folded into Reconcilers. omitempty: absent in single mode, so no
 	// schema_version bump (docs/usage.md §9.14 bump policy).
 	ClusterLoops []ClusterLoopInfo `json:"cluster_loops,omitempty"`
+
+	// AlertWebhook carries the alert-webhook poster's DELIVERY OUTCOME, which is a different question
+	// from the loop liveness in ClusterLoops (external review B2-4).
+	//
+	// It is a pointer with omitempty so its ABSENCE is unambiguous: no webhook is configured. When it is
+	// present the counters inside are NOT omitempty, because zero is a meaningful answer for each of them
+	// — the same reasoning as ClusterLoopInfo.Iterations. Additive, so no schema_version bump
+	// (docs/usage.md §9.14 bump policy).
+	AlertWebhook *AlertWebhookStats `json:"alert_webhook,omitempty"`
+}
+
+// AlertWebhookStats is the alert webhook's delivery outcome, reported separately from its loop liveness.
+//
+// WHY THIS EXISTS RATHER THAN A THIRD MEANING FOR cluster_loops[].iterations
+// -------------------------------------------------------------------------
+// The poster's beat had been keyed on "the endpoint accepted the POST", which made `iterations` answer
+// delivery success in a field the shared loopStat contract defines as per-completed-iteration liveness.
+// A live poster against an HTTP 401 endpoint then reported iterations=0 / last_iter=null — the exact
+// shape that means "this loop never ran". One integer cannot answer both questions, so `iterations` went
+// back to liveness and the outcome moved here.
+//
+// Reading the three states apart:
+//
+//	cluster_loops[alert-webhook].iterations == 0     nothing was dequeued (nothing fired, or wedged)
+//	iterations > 0 && rejected == 0                  alerts are going out
+//	iterations > 0 && accepted == 0                  the consumer is ALIVE and the endpoint refuses
+//	drops > 0                                        the queue overflowed: events never reached the loop
+//
+// accepted + rejected == the loop's completed iterations. drops is counted on the ENQUEUE side, so it is
+// deliberately outside that sum: a dropped event was never dequeued and never iterated.
+type AlertWebhookStats struct {
+	// Accepted is deliveries the endpoint answered with a non-error status below 400.
+	Accepted int64 `json:"accepted"`
+	// Rejected is completed delivery attempts that failed — marshal error, transport error, or >= 400.
+	Rejected int64 `json:"rejected"`
+	// Drops is events discarded at Post() because the queue was full (a hung or slow endpoint backing
+	// up). These never reached the loop, so they are NOT part of accepted+rejected.
+	Drops int64 `json:"drops"`
 }
 
 // ReconcilerTick is one R7 reconcile pass's observability row, projected from the registry's
@@ -390,21 +428,58 @@ type RuntimeReport struct {
 // `admin runtime --json` and every export-incident bundle is a worse outcome
 // than not reporting the loops at all.
 //
-// So they get their own key with only the field that is actually knowable. Per-iteration
-// liveness arrives when B7 moves these loops onto the reconciler registry.
+// So they get their own key with only the fields that are actually knowable.
+//
+// B7 added the per-iteration half, and NOT by moving these loops onto the reconciler registry (that
+// turned out to be a permanent no — see reconcile_registry.go, "WHY THE TWO LEADER DUTIES STAYED
+// OUT"). Each loop reports its own iterations instead, because each owns its own ticker:
+//
+//	Cadence != 0  periodic. Iters should grow at ~1/Cadence; Iters == 0 after startup means the loop
+//	              returned without ever iterating (topology-reconcile does exactly that when there is
+//	              no nats.conf to manage).
+//	Cadence == 0  event-driven (the alert webhook). Iters == 0 means "nothing happened", NOT dead.
 type ClusterLoopInfo struct {
 	Name      string    `json:"name"`
 	StartedAt time.Time `json:"started_at"`
+	CadenceMS int64     `json:"cadence_ms,omitempty"` // 0 == event-driven, see above
+	// LastIter / Iterations are NOT omitempty, deliberately (internal review of B7).
+	//
+	// Zero is the ONLY value that means DEAD here — a periodic loop that declared a cadence and reports
+	// zero iterations returned without ever running its body, which is exactly the case
+	// runTopologyReconcileLoop hits when there is no nats.conf to manage. Dropping the key on zero makes
+	// an export-incident bundle unable to tell "this loop never iterated" from "this producer does not
+	// report iterations at all", i.e. it deletes the signal precisely when the signal is bad news. Same
+	// reasoning as the branch-load-bearing fields in docs/usage.md's JSON contract: a field whose stable
+	// PRESENCE carries meaning must never be omitempty.
+	//
+	// LastIter is *time.Time rather than time.Time because `time.Time,omitempty` is inert —
+	// encoding/json never omits a struct — so the previous shape emitted
+	// "last_iter":"0001-01-01T00:00:00Z" for a loop that had never beaten, which reads as a timestamp
+	// rather than as "never". nil is unambiguous.
+	LastIter   *time.Time `json:"last_iter"`
+	Iterations uint64     `json:"iterations"`
 }
 
 type ReconcilerTick struct {
-	Name       string    `json:"name"`
-	IntervalMS int64     `json:"interval_ms"`
-	LeaderOnly bool      `json:"leader_only"`
-	LastTick   time.Time `json:"last_tick"` // last INVOCATION of the pass fn; zero == never invoked
-	Runs       uint64    `json:"runs"`
-	Skips      uint64    `json:"skips"` // came due but gated off by leaderOnly (never invoked)
-	LastErr    string    `json:"last_err,omitempty"`
+	Name       string `json:"name"`
+	IntervalMS int64  `json:"interval_ms"`
+	// Authority is who may run the pass: "any" (every broker) or "leader". It replaced a
+	// `leader_only bool` when the registry gained a named authority instead of one hardcoded gate —
+	// a bool could only ever say "leader or not", so a second kind of gate would have had to be
+	// smuggled in as a second bool.
+	Authority string    `json:"authority,omitempty"`
+	LastTick  time.Time `json:"last_tick"` // last INVOCATION of the pass fn; zero == never invoked
+	Runs      uint64    `json:"runs"`
+	Skips     uint64    `json:"skips"` // came due but gated off by Authority (never invoked)
+	LastErr   string    `json:"last_err,omitempty"`
+	// LastDurMS / MaxDurMS / Overruns are how long the pass TOOK. They are observability, not a
+	// timeout: the registry runs passes inline and cannot interrupt one that ignores its context.
+	// Overruns counts completions that took longer than the pass's own interval — and because the
+	// registry holds one lock across a sweep, an overrunning pass is delaying every other pass too.
+	// "The op driver is wedged" had no signal at all before these.
+	LastDurMS int64  `json:"last_dur_ms,omitempty"`
+	MaxDurMS  int64  `json:"max_dur_ms,omitempty"`
+	Overruns  uint64 `json:"overruns,omitempty"`
 }
 
 // ClusterOpEntry is one membership operation, DERIVED from a cluster_nodes row (B7 DOC#2). Kind is
@@ -499,6 +574,21 @@ type IncidentNode struct {
 // ClusterStatusReport is the broker's self-report for `cluster status`/`doctor`
 // (one report per NATS-reachable broker; the ctl view aggregates them). reach_source
 // distinguishes a self-report from a direct :7400 raft-ping (offline mode B).
+// ClusterStatusSchemaVersion is the ONE version number every producer of a ClusterStatusReport must
+// stamp. It lives next to the struct rather than in each producer because the two producers — the
+// broker's socket view (internal/broker/clusterstatus.go) and the CLI's offline disk-snapshot view
+// (cmd/tether/cluster.go) — emit the SAME struct, so a literal in each is a guaranteed future drift: a
+// monitor dispatching on (view, schema_version) would then see one type claiming two versions.
+//
+// v2 (batch B2, external review B2-2): ClusterNodeStatus.StreamActual gained the sentinel -1
+// ("observation did not complete"), widening a key whose v1 domain was measured non-negative counts.
+// docs/usage.md's bump policy requires a bump for a changed key meaning; see the long-form v1->v2
+// contract at internal/broker's statusSchemaVersion, and StreamActualUnobserved for the sentinel.
+//
+// TestClusterStatusProducersAgreeOnTheSchemaVersion (internal/broker) fails if a producer stamps
+// anything else.
+const ClusterStatusSchemaVersion = 2
+
 type ClusterStatusReport struct {
 	SchemaVersion int    `json:"schema_version"` // §17 / review F4: monitors negotiate on this
 	View          string `json:"view"`           // "ctl-nats" | "offline"

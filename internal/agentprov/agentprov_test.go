@@ -6,17 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
+// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 // seedSession is a minimum sessions-row insert so the FK on

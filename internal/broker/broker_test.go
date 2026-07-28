@@ -11,26 +11,19 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/storage"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
 // startNATS launches an embedded NATS server on an ephemeral port and returns
 // the client URL. The server is shut down via t.Cleanup.
+// B9: delegates to the single implementation in internal/testharness. The body here was
+// character-for-character identical to testharness.StartNATS — same DefaultTestOptions, same Port = -1,
+// same Shutdown+WaitForShutdown cleanup, same 2s readiness deadline. The local name is kept so the ~40
+// call sites in this package read unchanged.
 func startNATS(t *testing.T) string {
 	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	return ns.ClientURL()
+	return testharness.StartNATS(t)
 }
 
 // openDB returns a fresh in-memory SQLite. Some broker tests want the
@@ -40,14 +33,11 @@ func startNATS(t *testing.T) string {
 // Use :memory: in unit tests — modernc.org/sqlite occasionally leaves a
 // transient -journal file behind that races t.TempDir's RemoveAll. The
 // full-file path is exercised by test/p2 e2e instead.
+// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
+// openDBWithSession below still builds on it, so the seeding variants stay local where they belong.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 // openDBWithSession returns openDB(t) plus a single ACTIVE session row
@@ -65,8 +55,11 @@ func openDBWithSession(t *testing.T, sid string) *sql.DB {
 	return db
 }
 
+// B9: delegates to internal/testharness. The local body discarded unconditionally; the shared one adds
+// the TETHER_TEST_VERBOSE escape hatch, which is set nowhere in the repo, so the default path is
+// byte-identical — and a failing leak or reconcile test is exactly when you want those logs back.
 func silentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return testharness.SilentLog()
 }
 
 func TestNewRejectsBadConfig(t *testing.T) {

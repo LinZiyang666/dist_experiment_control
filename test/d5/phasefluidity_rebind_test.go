@@ -48,7 +48,7 @@ func sigHex(b []byte) string {
 func TestPhaseFluidityMTLSRebind(t *testing.T) {
 	// (1) lone real-mTLS voter: online advertise rebind + still writable.
 	ca := newRouteCA(t)
-	tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.clusterLeaf(t)})
+	tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{BindAddr: "127.0.0.1:0", CACert: ca.Pool, Leaf: ca.Leaf(t, d5CAName)})
 	if err != nil {
 		t.Fatalf("mtls transport: %v", err)
 	}

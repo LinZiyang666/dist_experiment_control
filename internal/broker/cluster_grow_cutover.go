@@ -10,9 +10,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
-	"github.com/LinZiyang666/tether/internal/natscluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
-	"github.com/LinZiyang666/tether/internal/natsreconcile"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -57,10 +55,19 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 	if err != nil {
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "preflight live conf: " + err.Error()}
 	}
+	// The operation is specifically a cutover INTO a clustered JetStream mesh. This precondition must
+	// dominate every topology stage: a cluster{} block can select Stage A/B, but it cannot prove that
+	// JetStream is enabled. In particular, an epoch sentinel plus `jetstream: false + cluster{}`
+	// previously bypassed the late guard and reached AlreadyDone or the SIGKILL/restart-only path.
+	if !own.HasJetStream() {
+		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest,
+			Error: "live conf has JetStream disabled or absent — refusing an ambiguous cutover into a clustered " +
+				"JetStream mesh (enable jetstream with an explicit store_dir first)"}
+	}
 	// A1: TOLERANT probe — a transient monitor error must not fall through to a spurious SIGKILL of a healthy
 	// clustered broker (mesh-cutover is re-invoked on any grow resume).
 	liveClustered, _ := b.probeNatsClusteredTolerant()
-	confClustered := own.IsClusteredJetStream()
+	confClustered := own.IsClusteredTopology() // TOPOLOGY (RB2-1): has this node's conf already grown?
 
 	// R16 A5-min: a survivor that is CLUSTERED but whose clustered state PREDATES this grow (online
 	// force-single / restore left it clustered — a stale single-node/dead-peer meta) must NEVER be silently
@@ -90,11 +97,6 @@ func (b *Broker) performGrowCutover(req *proto.ClusterGrowReq) *proto.ClusterGro
 	// revival failed/was interrupted. Re-SIGKILL + verify only (do NOT re-move the store — it is already reset).
 	if confClustered {
 		return b.restartAndVerifyClustered()
-	}
-
-	if !own.IsStandaloneJetStream() {
-		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest,
-			Error: "live conf is neither standalone nor clustered JetStream — refusing an ambiguous cutover"}
 	}
 
 	// R3 gate: the DATA-plane cutover follows the COMMITTED control plane — self must be in a committed
@@ -231,8 +233,33 @@ func (b *Broker) restartAndVerifyClustered() *proto.ClusterGrowResp {
 }
 
 // renderClusteredCutoverConf renders the clustered nats.conf via the SAME path the reconciler uses (peers
-// from the topology inputs + the secrets-dir mTLS fallback + the synthesized route listen), so the applied
-// conf is byte-identical to the one the reconciler DryRun-validated then withheld.
+// from the topology inputs + the secrets-dir mTLS fallback + the synthesized route listen).
+//
+// THE CONTRACT, STATED CORRECTLY (B5, BUG-3)
+// ------------------------------------------
+// The applied conf is byte-identical to the one the reconciler DryRun-validated then withheld, EXCEPT
+// for the HTTP monitor, which this path FORCES and the reconciler HARVESTS. That exception is not an
+// oversight — it is the m2 decision below, and restartAndVerifyClustered depends on it.
+//
+// The previous version of this comment claimed unqualified byte-identity, which was simply false: the
+// forcing is twenty lines further down, deliberate, and documented. It happened to be harmless because
+// the two renders agree whenever the live conf already carries `http: 127.0.0.1:8223` — and disagree
+// exactly when it does not, which is the case m2 exists for. A comment that overstates an invariant is
+// worse than no comment: the next person to add a Config field reads "byte-identical", assumes the two
+// paths cannot diverge, and does not go looking for the second assembly point.
+//
+// What makes the rest of the identity hold is no longer a coincidence, a convention, or a test: the two
+// paths call the SAME function. natsconf.RenderDesired is the single assembly, and the only thing this
+// file supplies beyond the shared topology inputs is its INTENT plus the two declared departures below.
+// A new Config field can no longer be present in one render and absent from the other, because there is
+// only one render — which is what the two deleted fields (natsconf.Config.JSDomain and Account, read by
+// the reconciler's old literal, set by nobody) would otherwise have been the vector for.
+//
+// Pinned by TestCutoverRenderForcesTheMonitorOntoAConfThatHasNone and its siblings in
+// cutover_render_test.go — the characterization tests for THIS function. (An earlier version of this
+// comment named TestCutoverRenderMatchesReconcilerRenderExceptTheMonitor, which was false: that test
+// builds both Configs from a fixture inside itself and never reaches this code, so deleting the forced
+// MonitorListen below left it green. The mutation-honesty audit caught the misattribution.)
 func (b *Broker) renderClusteredCutoverConf(own *natsconf.Ownership) (string, error) {
 	in, ok := b.buildTopologyInputs(1)
 	if !ok {
@@ -244,7 +271,7 @@ func (b *Broker) renderClusteredCutoverConf(own *natsconf.Ownership) (string, er
 	if in.SecretsDir == "" {
 		return "", fmt.Errorf("no secrets dir configured — cannot render routes mTLS for the first-grow cutover")
 	}
-	var self natscluster.Broker
+	var self natsconf.Broker
 	for _, p := range in.Peers {
 		if p.ServerName == in.SelfServerName {
 			self = p
@@ -253,24 +280,29 @@ func (b *Broker) renderClusteredCutoverConf(own *natsconf.Ownership) (string, er
 	if self.ServerName == "" {
 		return "", fmt.Errorf("self not present in the mesh peers")
 	}
-	cfg := natscluster.Config{
-		Standalone:    false,
-		Local:         self,
-		Peers:         in.Peers,
-		AccountIssuer: in.AccountIssuer,
-		JSStoreDir:    own.JSStoreDir(),
-		ClientListen:  own.ClientListen(),
-		// m2: FORCE the loopback monitor to topoMonitorListen (127.0.0.1:8223) — restartAndVerifyClustered
-		// probes exactly that address, so harvesting a possibly-absent http block would false-report a healthy
-		// revival as cutover_revival_failed (a 45s connection-refused). Every other restart-bearing takeover
-		// forces 8223 too (cluster_natsconf.go). The revived clustered nats must serve the monitor the probe hits.
+	// B5: ONE assembly, shared with the reconciler. It used to be a hand-built natsconf.Config literal
+	// here and another one there, with the route-listen derivation EXPORTED purely so this file could
+	// reproduce it byte-for-byte — the export's own doc said "Exported so the grow cutover renders the
+	// identical listen". That is what "these two renders agree" being a CONVENTION looks like; a call is
+	// the difference.
+	//
+	// IntentForceClustered, not inference: this runs ON the standalone->clustered transition, so the live
+	// conf is by definition still standalone and anything that reads the mode off it renders exactly the
+	// wrong thing.
+	//
+	// MonitorListen is FORCED to topoMonitorListen (127.0.0.1:8223) — restartAndVerifyClustered probes
+	// exactly that address, so harvesting a possibly-absent http block would false-report a healthy
+	// revival as cutover_revival_failed (a 45s connection-refused). This is legal here and illegal in the
+	// reconciler for the same reason: nats-server cannot hot-add an http port on SIGHUP, so only a
+	// restart-bearing path may ESTABLISH one. Every other restart-bearing takeover forces 8223 too.
+	//
+	// SecretsDir supplies the routes-mTLS identity + route listen, needed exactly because a standalone
+	// conf has no cluster{} block to harvest them from.
+	return natsconf.RenderDesired(in, own, natsconf.RenderOverride{
+		Intent:        natsconf.IntentForceClustered,
 		MonitorListen: topoMonitorListen,
-		CAFile:        filepath.Join(in.SecretsDir, "cluster-ca.pem"),
-		CertFile:      filepath.Join(in.SecretsDir, "route-cert.pem"),
-		KeyFile:       filepath.Join(in.SecretsDir, "route-key.pem"),
-		ClusterListen: natsreconcile.SynthesizeClusterListen(self.RouteURL),
-	}
-	return natsconf.BuildMergedConf(own, cfg)
+		SecretsDir:    in.SecretsDir,
+	})
 }
 
 // moveAsideJetStreamStore renames the standalone JS store to <store>.grow-bak.<epoch> (NEVER deletes) so the

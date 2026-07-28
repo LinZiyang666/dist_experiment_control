@@ -14,7 +14,6 @@ package security_test
 import (
 	"context"
 	"database/sql"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,29 +27,23 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/session"
-	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
 // silentLog returns a discard logger unless TETHER_TEST_VERBOSE is
 // set; matches the convention from test/p3/setup_test.go.
+// B9: delegates to internal/testharness — the body was a character-for-character copy, escape hatch
+// included, which is the shape where the two silently drift apart.
 func silentLog() *slog.Logger {
-	if os.Getenv("TETHER_TEST_VERBOSE") != "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return testharness.SilentLog()
 }
 
 // openDB opens a fresh in-memory SQLite with all migrations applied.
+// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 // startNATS starts an embedded nats-server (no JS).

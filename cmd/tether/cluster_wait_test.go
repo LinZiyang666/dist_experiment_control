@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
-	"github.com/LinZiyang666/tether/internal/natscluster"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/spf13/cobra"
 )
 
@@ -148,7 +148,7 @@ func TestB5RenderTakeoverPlanNoMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	peers := []natscluster.Broker{{ServerName: "brk-a", NkeyPub: "Uabc", RouteURL: "nats://10.0.0.1:6222"}}
+	peers := []natsconf.Broker{{ServerName: "brk-a", NkeyPub: "Uabc", RouteURL: "nats://10.0.0.1:6222"}}
 	cmd := waitCmd(t, context.Background())
 	if err := renderTakeoverPlan(cmd, confPath, "brk-a", "127.0.0.1:4222", "/var/lib/js", peers, "MERGED DIFFERENT CONTENT", "ok", true); err != nil {
 		t.Fatalf("renderTakeoverPlan (json): %v", err)

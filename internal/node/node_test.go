@@ -5,19 +5,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // openDB returns a fresh in-memory SQLite seeded with a single ACTIVE
 // session "lab" so node.Register can target it (Register requires the
 // session row to exist; FK enforced).
+// openDB opens the shared in-memory fixture and then SEEDS what this package's tests need.
+//
+// B9 collapsed the open-and-cleanup half into internal/testharness; the seed stays here because it is
+// not shared — a helper that seeded rows for every caller would give seven other packages state they
+// never asked for, which is the "wrong abstraction to remove duplication" the roadmap's §7.2 warns about.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("storage.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := testharness.OpenDB(t)
 	if _, err := db.Exec(
 		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
 		"lab", "lab", "SHA256:test-owner", "test-hash",

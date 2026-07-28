@@ -285,9 +285,14 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 			voters, err := b.clusterVoters()
 			if err != nil {
 				b.cfg.Logger.Debug("broker: observe loop voter read", "err", err)
+				// B7: beat before continuing. The iteration DID complete — a voter read that fails every
+				// tick is a live loop with a problem, and conflating it with a dead loop is what the beat
+				// exists to prevent.
+				b.cl.loops.Beat("observe")
 				continue
 			}
 			b.observeOnce(ctx, voters, observeLagThreshold)
+			b.cl.loops.Beat("observe")
 		}
 	}
 }

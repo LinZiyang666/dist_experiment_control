@@ -18,7 +18,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/storage"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // TestHeartbeatLifecycle drives the canonical P2 control loop:
@@ -118,19 +118,11 @@ func TestHeartbeatLifecycle(t *testing.T) {
 }
 
 // startNATS launches an embedded NATS server on an ephemeral port.
+// B9: delegates to the single implementation in internal/testharness — the body was
+// character-for-character identical.
 func startNATS(t *testing.T) string {
 	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	return ns.ClientURL()
+	return testharness.StartNATS(t)
 }
 
 // openDB returns a fresh on-disk SQLite seeded with the "lab" session row

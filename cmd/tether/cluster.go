@@ -347,7 +347,9 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	// daemon. This is an advisory liveness hint; the authoritative live-peer gate is still
 	// `cluster force-single --confirm-peers-dead` (which HARD-REFUSES any live peer).
 	rep := &adminsock.ClusterStatusReport{
-		SchemaVersion: 1, View: "offline", ExitCode: 0,
+		// external review B2-2: was a hardcoded 1 while the socket view bumped to 2 — one struct, two
+		// versions. Both producers now stamp the single constant next to the struct.
+		SchemaVersion: adminsock.ClusterStatusSchemaVersion, View: "offline", ExitCode: 0,
 		Banner:   "disk roster snapshot with a raft-port TCP liveness probe (advisory); for quorum loss use `cluster recovery force-single --confirm-peers-dead ...` (it re-probes + HARD-REFUSES any live peer)",
 		NextStep: "cluster recovery force-single --confirm-peers-dead <ids...>",
 	}
@@ -483,8 +485,17 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 		if ver == "" {
 			ver = "?"
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d/%d\t%s\t%s%s\n",
-			n.NodeID, n.Name, n.Phase, n.Role, ver, n.AppliedLag, acct, n.StreamActual, n.StreamTarget,
+		// STREAMS is three-state, like VER and ACCT.NK above it: "n/t" when the replica observation
+		// completed, "?/t" when it did not. A negative actual means UNOBSERVED (B7 / review B7-02) — it
+		// used to be rendered as a measured 0, so a timed-out probe on a busy broker printed "0/3" and
+		// an operator read a total replication failure that had not happened. It still counts as
+		// not-at-target everywhere that gates on replica health; it just no longer claims a measurement.
+		streams := fmt.Sprintf("%d/%d", n.StreamActual, n.StreamTarget)
+		if n.StreamActual < 0 {
+			streams = fmt.Sprintf("?/%d", n.StreamTarget)
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s%s\n",
+			n.NodeID, n.Name, n.Phase, n.Role, ver, n.AppliedLag, acct, streams,
 			topoCell(n, rep.TopoDesired), reach, flag)
 	}
 	_ = tw.Flush()

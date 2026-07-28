@@ -1,13 +1,12 @@
 package natsconf_test
 
 import (
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/LinZiyang666/tether/internal/natsconf"
 )
 
 // seedStore creates storeDir with `files` entries (empty dir if none).

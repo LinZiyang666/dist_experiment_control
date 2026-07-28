@@ -25,9 +25,9 @@ func TestDispatchRuntimeWiresBackend(t *testing.T) {
 
 	// wired hook → the report is returned verbatim.
 	want := &RuntimeReport{
-		Schema: "admin_runtime", SchemaVersion: 1,
+		Schema: "admin_runtime", SchemaVersion: 2,
 		Goroutines: 7, Threads: 3, OpenFDs: 12, RSSBytes: 4096, UptimeSeconds: 1.5,
-		Reconcilers: []ReconcilerTick{{Name: "ports", IntervalMS: 1000, LeaderOnly: true, LastTick: time.Unix(100, 0), Runs: 4}},
+		Reconcilers: []ReconcilerTick{{Name: "ports", IntervalMS: 1000, Authority: "leader", LastTick: time.Unix(100, 0), Runs: 4}},
 	}
 	called := 0
 	sOK := New("/unused", Backend{RuntimeSnapshot: func() *RuntimeReport { called++; return want }})
@@ -50,11 +50,11 @@ func TestDispatchRuntimeWiresBackend(t *testing.T) {
 // socket is line-delimited JSON), including the reconciler last-tick timestamp.
 func TestRuntimeReportRoundTripsOnWire(t *testing.T) {
 	in := Response{Op: OpRuntime, OK: true, Runtime: &RuntimeReport{
-		Schema: "admin_runtime", SchemaVersion: 1,
+		Schema: "admin_runtime", SchemaVersion: 2,
 		Goroutines: 41, Threads: 8, OpenFDs: 20, RSSBytes: 1 << 24, UptimeSeconds: 3600,
 		Reconcilers: []ReconcilerTick{
-			{Name: "node-states", IntervalMS: 1000, LeaderOnly: false, LastTick: time.Unix(1700, 0).UTC(), Runs: 3600, Skips: 0},
-			{Name: "home-delivery", IntervalMS: 5000, LeaderOnly: true, Runs: 0, Skips: 12, LastErr: "boom"},
+			{Name: "node-states", IntervalMS: 1000, Authority: "any", LastTick: time.Unix(1700, 0).UTC(), Runs: 3600, Skips: 0},
+			{Name: "home-delivery", IntervalMS: 5000, Authority: "leader", Runs: 0, Skips: 12, LastErr: "boom"},
 		},
 	}}
 	b, err := json.Marshal(&in)

@@ -14,12 +14,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -27,15 +25,17 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/LinZiyang666/tether/internal/tunnel"
-	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 )
 
 // silentLog returns a discard-only slog handler so test output is
 // not polluted by broker / agent / tunnel info lines.
+// B9: delegates to internal/testharness, like startNATS above. The handler allocates no goroutines in
+// either branch, so this is safe for a package whose whole purpose is counting them.
 func silentLog() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return testharness.SilentLog()
 }
 
 // shortSocketPath returns a Unix socket path under a SHORT temp dir.
@@ -55,26 +55,22 @@ func shortSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "tether-run", "admin.sock")
 }
 
-// startNATS launches an embedded NATS server on an ephemeral port.
-// Per-test (no t.Parallel here) so the server is torn down via
-// t.Cleanup. We deliberately do NOT use testharness.StartNATS even
-// though it'd be a one-liner — the tests need to assert goroutine
-// counts BEFORE / AFTER the server lifecycle and the harness reuses
-// a slog logger that allocates background goroutines we'd want to
-// account for; cloning it locally keeps the noise budget small.
+// startNATS launches an embedded NATS server on an ephemeral port, per-test (no t.Parallel here) so it
+// is torn down via t.Cleanup.
+//
+// B9: it now DELEGATES to testharness.StartNATS instead of cloning it. The clone's justification was
+// written down and it was false — "the harness reuses a slog logger that allocates background goroutines
+// we'd want to account for". testharness.StartNATS takes no logger and starts no goroutines of its own;
+// the two bodies were character-for-character identical (natstest.DefaultTestOptions, Port = -1,
+// RunServer, a Shutdown+WaitForShutdown cleanup, a 2s ReadyForConnections, ClientURL). So the copy was
+// costing this package a maintenance obligation it was told it had a reason for.
+//
+// This matters more here than in an ordinary package: these tests assert goroutine counts before and
+// after the server lifecycle, so a divergence between the two spellings would show up as a leak-gate
+// failure whose cause is in a file nobody would think to look at. One spelling, one teardown.
 func startNATS(t *testing.T) string {
 	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	return ns.ClientURL()
+	return testharness.StartNATS(t)
 }
 
 // openMemDB returns a fresh in-memory SQLite handle with all
@@ -121,35 +117,19 @@ func findFreePort(t *testing.T) int {
 	return port
 }
 
-// assertNoGoroutineLeak compares the current goroutine count to a
-// pre-recorded baseline, polling for up to ~1s. The runtime keeps a
-// few helper goroutines that shift around (GC, scavenger, dial
-// retry timers); ±2 is the empirical noise floor below which we
-// don't get false positives. Anything beyond that is a real leak.
+// assertNoGoroutineLeak delegates to the single implementation in internal/testharness (B9).
 //
-// Why a poll loop instead of a single read: post-Cancel teardown
-// has fan-in latency (sub.Unsubscribe drains async, nc.Drain spawns
-// a flusher, `defer` chains run after Run returns). The leak we
-// care about isn't "did everything exit by the next ns" — it's
-// "did goroutines exit at all" — so we wait up to 1s and call
-// success on the first sample at-or-below baseline+2.
+// The body used to live here, and identically in test/d4, test/d5 and test/d8 — four copies whose only
+// differences were a local variable name and one comment block. The derivation of the ±2 floor and the
+// ~1s poll window now lives in exactly one place, which matters because a number derived in four places
+// is a number that gets tuned in one.
+//
+// The local NAME stays so the ~15 call sites in this package do not churn; unlike silentLog and
+// startNATS below, this helper touches no logger and opens no server, so there is nothing about it that
+// needs to stay package-local.
 func assertNoGoroutineLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	var last int
-	for i := 0; i < 50; i++ {
-		runtime.Gosched()
-		last = runtime.NumGoroutine()
-		if last-before <= 2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	// Dump goroutine traces on failure so we can see which ones
-	// actually leaked. 64KiB is plenty for v1's goroutine inventory.
-	buf := make([]byte, 64*1024)
-	n := runtime.Stack(buf, true)
-	t.Errorf("%s: goroutine leak: before=%d after=%d (+%d)\n%s",
-		label, before, last, last-before, buf[:n])
+	testharness.AssertNoGoroutineLeak(t, label, before)
 }
 
 // startBrokerNoTunnel boots a minimal broker (no tunnel, no admin,

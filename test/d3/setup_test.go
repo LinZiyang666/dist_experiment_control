@@ -13,6 +13,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/authcallout"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/test/clusterharness"
 	"github.com/nats-io/jwt/v2"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
@@ -172,15 +173,11 @@ func sigFromSeed(seed []byte) func([]byte) ([]byte, error) {
 	}
 }
 
+// B9: delegates to test/clusterharness. Four suites (d3/d4/d5 as waitForCond, d8 as waitFor) carried a
+// character-for-character copy of this poll loop. The local name is kept so the call sites read
+// unchanged.
 func waitForCond(within time.Duration, pred func() bool) bool {
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if pred() {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return pred()
+	return clusterharness.WaitForCond(within, pred)
 }
 
 func jwtToServerPerms(p jwt.Permissions) *natsserver.Permissions {

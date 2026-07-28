@@ -244,7 +244,7 @@ func printRestoreNextSteps(cmd *cobra.Command, res *clusteroffline.RestoreResult
 	var perr error
 	if own, e := natsconf.Preflight(natsConfPath); e == nil {
 		confReadable = true
-		clustered = own.IsClusteredJetStream()
+		clustered = own.IsClusteredTopology() // TOPOLOGY (RB2-1): the backup labels the node's cluster mode
 	} else {
 		perr = e
 	}

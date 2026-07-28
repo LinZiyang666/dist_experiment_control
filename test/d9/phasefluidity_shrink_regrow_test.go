@@ -8,9 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/natscluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
-	"github.com/LinZiyang666/tether/internal/natsreconcile"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nkeys"
 )
@@ -48,12 +46,12 @@ func pfWriteConf(t *testing.T, conf string) string {
 // the destructive de-cluster boundary.
 func TestPhaseFluidityShrinkRegrowLifecycle(t *testing.T) {
 	acc, usr := pfNkeys(t)
-	self := natscluster.Broker{ServerName: "pf-solo", NkeyPub: usr, RouteURL: "nats://127.0.0.1:6222"}
+	self := natsconf.Broker{ServerName: "pf-solo", NkeyPub: usr, RouteURL: "nats://127.0.0.1:6222"}
 	store := filepath.Join(t.TempDir(), "js")
 
 	// (1) post-shrink: the rendered STANDALONE conf loads in a REAL nats-server with JS standalone.
-	standaloneConf, err := natscluster.Render(natscluster.Config{
-		Standalone: true, Local: self, Peers: []natscluster.Broker{self}, AccountIssuer: acc,
+	standaloneConf, err := natsconf.Render(natsconf.Config{
+		Standalone: true, Local: self, Peers: []natsconf.Broker{self}, AccountIssuer: acc,
 		JSStoreDir: store, ClientListen: "127.0.0.1:-1",
 	})
 	if err != nil {
@@ -82,22 +80,23 @@ func TestPhaseFluidityShrinkRegrowLifecycle(t *testing.T) {
 	}
 
 	// (2) the reconciler keeps the standalone N=1 conf converged (F4) — it does NOT rewrite it.
-	out := natsreconcile.ReconcileOnce(natsreconcile.Inputs{
-		SelfServerName: "pf-solo", Peers: []natscluster.Broker{self}, AccountIssuer: acc,
+	out := natsconf.ReconcileOnce(natsconf.Inputs{
+		SelfServerName: "pf-solo", Peers: []natsconf.Broker{self}, AccountIssuer: acc,
 		ConfPath: sPath, NatsServerBin: "/bin/true", DesiredGen: 3,
 	}, 0, 0, nil, func() (time.Time, error) { return time.Now().Add(time.Hour), nil })
-	if post, _ := natsconf.Preflight(sPath); post == nil || !post.IsStandaloneJetStream() {
+	// TOPOLOGY (external review RB2-1): what "converged standalone" means here is "no cluster{} block".
+	if post, _ := natsconf.Preflight(sPath); post == nil || !post.IsStandaloneTopology() {
 		t.Fatalf("reconciler rewrote a converged standalone N=1 conf; outcome=%+v", out)
 	}
 
 	// (3) a still-CLUSTERED N=1 conf is NOT auto-de-clustered by the reconciler (R3) — the destructive
 	// transition requires an explicit operator `reconcile nats --to-standalone`.
 	// The fixture carries a real (now-gone) peer so the clustered render has a route — a lone-self
-	// clustered render is unbootable and is now refused by natscluster.Render (audit D); this models the
+	// clustered render is unbootable and is now refused by natsconf.Render (audit D); this models the
 	// shape left after an N=2 cluster lost a node down to N=1 (the reconcile input below is still N=1).
-	pfGonePeer := natscluster.Broker{ServerName: "pf-gone", NkeyPub: "UPFGONE", RouteURL: "nats://127.0.0.2:6222"}
-	clusteredConf, err := natscluster.Render(natscluster.Config{
-		Local: self, Peers: []natscluster.Broker{self, pfGonePeer}, AccountIssuer: acc,
+	pfGonePeer := natsconf.Broker{ServerName: "pf-gone", NkeyPub: "UPFGONE", RouteURL: "nats://127.0.0.2:6222"}
+	clusteredConf, err := natsconf.Render(natsconf.Config{
+		Local: self, Peers: []natsconf.Broker{self, pfGonePeer}, AccountIssuer: acc,
 		JSStoreDir: filepath.Join(t.TempDir(), "js2"), ClientListen: "127.0.0.1:-1",
 		ClusterListen: "127.0.0.1:6222", ClusterName: "tether",
 		CAFile: "/run/tether/ca.pem", CertFile: "/run/tether/cert.pem", KeyFile: "/run/tether/key.pem",
@@ -106,15 +105,15 @@ func TestPhaseFluidityShrinkRegrowLifecycle(t *testing.T) {
 		t.Fatalf("render clustered: %v", err)
 	}
 	cPath := pfWriteConf(t, clusteredConf)
-	_ = natsreconcile.ReconcileOnce(natsreconcile.Inputs{
-		SelfServerName: "pf-solo", Peers: []natscluster.Broker{self}, AccountIssuer: acc,
+	_ = natsconf.ReconcileOnce(natsconf.Inputs{
+		SelfServerName: "pf-solo", Peers: []natsconf.Broker{self}, AccountIssuer: acc,
 		ConfPath: cPath, NatsServerBin: "/bin/true", DesiredGen: 4,
 	}, 0, 0, nil, func() (time.Time, error) { return time.Now().Add(time.Hour), nil })
 	post, err := natsconf.Preflight(cPath)
 	if err != nil {
 		t.Fatalf("preflight clustered post-reconcile: %v", err)
 	}
-	if !post.IsClusteredJetStream() {
+	if !post.IsClusteredTopology() {
 		t.Fatal("reconciler auto-removed cluster{} from a still-clustered N=1 conf without explicit de-cluster intent (R3)")
 	}
 }

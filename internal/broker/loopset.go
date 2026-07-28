@@ -39,27 +39,42 @@ type loopSet struct {
 	done    chan struct{}
 	started bool
 
-	// stats holds per-loop liveness for RuntimeReport. These loops were
-	// previously invisible: nothing reported whether the topology reconciler had
-	// ticked in the last minute or died quietly on its first iteration.
+	// stats holds per-loop liveness for RuntimeReport. These loops were previously invisible: nothing
+	// reported whether the topology reconciler had ticked in the last minute or died quietly on its
+	// first iteration. Since B7 the second half of that sentence is answerable — see loopStat.
 	stats map[string]*loopStat
 }
 
-// loopStat holds what the set can actually observe about a loop, which is
-// exactly one thing: when it was started.
+// loopStat holds what the set can actually observe about a loop.
 //
-// Batch-A review F-03: this originally also carried Runs and LastErr. Runs was
-// incremented once at startup and was therefore permanently 1; LastErr had a
-// reader in RuntimeReport and NO writer anywhere in the repo, so it reported the
-// empty string forever. Publishing a field an operator reads as "this loop's
-// last error" while nothing can ever set it is worse than publishing nothing —
-// an empty LastErr looks like "no errors".
+// Batch-A review F-03: this originally carried Runs and LastErr. Runs was incremented once at startup
+// and was therefore permanently 1; LastErr had a reader in RuntimeReport and NO writer anywhere in the
+// repo, so it reported the empty string forever. Publishing a field an operator reads as "this loop's
+// last error" while nothing can ever set it is worse than publishing nothing — an empty LastErr looks
+// like "no errors".
 //
-// The loops own their iteration cadence internally, so per-iteration liveness is
-// not observable from here. It comes from reconcileRegistry.status() for the
-// passes that registry manages; moving these four onto it is B7's job.
+// B7 restores per-iteration liveness WITHOUT restoring that defect. The distinction matters: F-03's
+// Runs was written once, at startup, so it could not tell a live loop from one that returned on its
+// first line. Iters/LastIter are written BY THE LOOP, once per completed iteration, via Beat — so a
+// loop that died after one iteration reports Iters=1 and a LastIter that stops advancing, which is
+// exactly the signal that was missing.
+//
+// The loops own their cadence internally (each creates its own ticker), so the set cannot infer
+// iterations; it has to be told. Cadence is the loop's DECLARED period and is what makes Iters
+// interpretable:
+//
+//	Cadence != 0  periodic. Iters must grow at roughly 1/Cadence; a stalled loop is one whose
+//	              LastIter is older than a few Cadences. Iters == 0 after startup means DEAD.
+//	Cadence == 0  event-driven (the alert webhook poster). Iters grows only when work arrives, so
+//	              Iters == 0 is NOT evidence of death and must not be read as such.
+//
+// A periodic loop that forgets to Beat reports Iters=0, i.e. it looks dead rather than looks healthy.
+// That is the correct direction for a liveness signal to fail in.
 type loopStat struct {
 	StartedAt time.Time
+	Cadence   time.Duration
+	LastIter  time.Time
+	Iters     uint64
 }
 
 func newLoopSet() *loopSet {
@@ -107,6 +122,42 @@ func (l *loopSet) markStarted(name string) {
 	defer l.mu.Unlock()
 	if st := l.stats[name]; st != nil {
 		st.StartedAt = time.Now()
+	}
+}
+
+// GoEvery starts a loop that DECLARES a period. It is otherwise identical to Go: the loop still owns
+// its own ticker, because these loops each have a shutdown/poll shape the set has no business
+// rewriting. What the declaration buys is interpretability — Snapshot's Iters is meaningless without a
+// cadence to compare it against, and a periodic loop reporting Iters=0 is only diagnosable as DEAD if
+// something recorded that it was supposed to be ticking.
+//
+// The loop must call Beat(name) once per completed iteration. Not calling it makes the loop look dead,
+// never healthy.
+func (l *loopSet) GoEvery(ctx context.Context, name string, cadence time.Duration, fn func(context.Context)) {
+	l.mu.Lock()
+	if l.stats[name] == nil {
+		l.stats[name] = &loopStat{}
+	}
+	l.stats[name].Cadence = cadence
+	l.mu.Unlock()
+	l.Go(ctx, name, fn)
+}
+
+// Beat records ONE completed iteration of a named loop.
+//
+// This is the field F-03 deleted, restored with the defect removed. F-03's Runs was written once at
+// startup, so "1" meant both "running fine" and "returned on its first line". Beat is written by the
+// loop body, so the count and the timestamp both stop advancing exactly when the loop stops — which is
+// the question an operator is actually asking when a convergence duty appears wedged.
+//
+// Unknown names are ignored rather than panicking: a Beat racing a Join during shutdown must not take
+// the process down.
+func (l *loopSet) Beat(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if st := l.stats[name]; st != nil {
+		st.Iters++
+		st.LastIter = time.Now()
 	}
 }
 

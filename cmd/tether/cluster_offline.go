@@ -9,7 +9,6 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
-	"github.com/LinZiyang666/tether/internal/natscluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/spf13/cobra"
@@ -73,11 +72,23 @@ func buildStandaloneConf(confPath, selfID, dbPath string) (merged, storeDir stri
 	if perr != nil {
 		return "", "", false, perr
 	}
-	if !own.IsClusteredJetStream() {
+	// TOPOLOGY, not JetStream (external review RB2-1). De-clustering is about removing the cluster{}
+	// block; whether JetStream is on is a separate question, asked separately below.
+	if own.IsStandaloneTopology() {
 		return "", own.JSStoreDir(), true, nil // already standalone — nothing to de-cluster (idempotent)
 	}
 	storeDir = own.JSStoreDir()
-	if storeDir == "" {
+	// The store_dir requirement exists so a standalone render cannot SILENTLY DISABLE JetStream. That
+	// hazard needs JetStream to be enabled in the first place — so the guard is now conditioned on
+	// HasJetStream() rather than on key presence.
+	//
+	// Before this, `jetstream: false` + cluster{} could not be de-clustered at all: the old compound
+	// predicate said "clustered JetStream" on key presence, this branch demanded a store_dir a disabled
+	// JetStream has none of, and force-single died with "source JetStream has no explicit store_dir" —
+	// telling an operator who had deliberately switched JetStream off to configure a store for it. That
+	// shape is exactly what someone reaches for during a JetStream incident, i.e. precisely when they
+	// need force-single to work.
+	if own.HasJetStream() && storeDir == "" {
 		return "", "", false, fmt.Errorf("source JetStream has no explicit store_dir (a standalone render would silently disable JetStream); set store_dir first")
 	}
 	serverName, brokerNkey, ierr := readSelfIdentity(dbPath, selfID)
@@ -92,17 +103,27 @@ func buildStandaloneConf(confPath, selfID, dbPath string) (merged, storeDir stri
 	if clientListen == "" {
 		return "", "", false, fmt.Errorf("could not determine the client listen address from %q", confPath)
 	}
-	self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey}
-	cfg := natscluster.Config{
-		Standalone:    true,
-		Local:         self,
-		Peers:         []natscluster.Broker{self},
-		AccountIssuer: accountIssuer,
-		JSStoreDir:    storeDir,
-		ClientListen:  clientListen,
-		MonitorListen: own.MonitorHTTP(),
-	}
-	merged, err = natsconf.BuildMergedConf(own, cfg)
+	// B5: one shared assembly. IntentForceStandalone rather than inference — the live conf is CLUSTERED
+	// (checked above), so anything that read the mode off it would render clustered, which is the exact
+	// opposite of what force-single is for. The monitor is deliberately NOT forced: this path does not
+	// restart nats-server, and nats-server cannot hot-add an http port on SIGHUP, so RenderDesired's
+	// harvest (own.MonitorHTTP()) is the only correct behaviour. It used to be spelled out here as
+	// `MonitorListen: own.MonitorHTTP()` — a hand-copy of the callee's own fallback, which is how a
+	// shared default comes to look optional.
+	//
+	// storeDir/clientListen are validated above and then re-read inside RenderDesired from the same
+	// Ownership; the checks stay here because they are POLICY (fail loud rather than silently disable
+	// JetStream or default-bind 0.0.0.0:4222), not intent.
+	self := natsconf.Broker{ServerName: serverName, NkeyPub: brokerNkey}
+	merged, err = natsconf.RenderDesired(
+		natsconf.Inputs{
+			SelfServerName: serverName,
+			Peers:          []natsconf.Broker{self},
+			AccountIssuer:  accountIssuer,
+		},
+		own,
+		natsconf.RenderOverride{Intent: natsconf.IntentForceStandalone},
+	)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -130,8 +151,13 @@ func deClusterStandaloneConf(confPath, natsServerBin, selfID, dbPath string) (st
 	}
 	if post, perr := natsconf.Preflight(confPath); perr != nil {
 		return "", false, fmt.Errorf("applied conf failed to re-parse: %w", perr)
-	} else if !post.IsStandaloneJetStream() {
-		return "", false, fmt.Errorf("applied conf is not standalone JetStream (the .bak is preserved for rollback)")
+	} else if post.IsClusteredTopology() {
+		// TOPOLOGY (RB2-1): the proof this de-cluster owes is "the cluster{} block is gone". Asserting
+		// "standalone JETSTREAM" here made the post-check fail for a conf whose JetStream was disabled —
+		// the render correctly emits no jetstream block, so the old compound predicate read false and
+		// reported a successful de-cluster as a failure. The store_dir equality below is the separate,
+		// and still exact, JetStream-side proof.
+		return "", false, fmt.Errorf("applied conf still carries a cluster{} block — de-cluster did not take effect (the .bak is preserved for rollback)")
 	} else if post.JSStoreDir() != storeDir {
 		return "", false, fmt.Errorf("applied conf store_dir %q != source %q (refusing to move the JS store)", post.JSStoreDir(), storeDir)
 	}

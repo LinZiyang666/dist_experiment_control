@@ -225,15 +225,32 @@ node id；`recovery force-single` 和 `recovery rejoin prepare` 都不会接受 
 **怎么读 `cluster status` 的输出**（broker 主机 / socket 视图）：
 
 - **列图例**：`LAG`=本节点落后 leader 的 raft 条目数（0=已追平）；`ACCT.NK`=Y 表示账户密钥匹配
-  （当前恒 Y——per-node 校验尚未接线）；`STREAMS`=JetStream 副本 actual/target（actual<target=降级）；
-  `REACH`=NATS/raft 可达性。
+  （当前恒 Y——per-node 校验尚未接线）；`STREAMS`=JetStream 副本 actual/target（actual<target=降级），
+  actual 显示 **`?`** 表示这一轮**没能观测到**（不是"观测到 0"）；`REACH`=NATS/raft 可达性。
 - **白话判定行**（按 voter 数，权威）：1 台=`NO redundancy`（坏了即停）；2 台=`NO fault-tolerant
   writes`（坏一台即只读）；≥3 台且 streams 达标且 HEALTHY=`HA active — survives <F> failure(s)`；
   否则=`HA configured but DEGRADED right now`。
 - **view 行**：`view_host` 是出这份自报告的 broker，`is_leader_view` 表示是否权威 leader 视图；
   非 leader 上会提示"re-run on the leader 拿权威判定"。
-- **`--json` schema**：B1 新增 `verdict` / `view_host` / `is_leader_view`（additive，**`schema_version`
+- **`--json` schema**：B1 新增 `verdict` / `view_host` / `is_leader_view`（additive，当时 **`schema_version`
   仍为 1**，不破坏只读未知 key 的监控）。
+- **`schema_version` = 2（batch B2，外审 B2-2）**：`nodes[].stream_actual` 的**值域变了**，
+  按 `docs/usage.md` 的 bump 政策（"改语义"即破坏性）必须升版本。v2 契约：
+
+  | `stream_actual` | 含义 |
+  |---|---|
+  | `>= 0` | 实测到的副本数 |
+  | `-1` | **没能观测到**（`ObserveReplicas` 超时/失败）。**不是计数**，人读视图显示 `?/target` |
+
+  `-1` 是刻意取的负数：任何 `actual < target` 的达标比较都因此**fail-closed**（§S1）——
+  观测不到的节点绝不会被读成"已达标"。v1 里这个位置只会出现非负实测值，
+  所以 v1 监控看到 `-1` 会把它当畸形值/真计数/严重缺副本，三种都错，这才是必须 bump 的原因。
+  **反面选项已评估并否决**：任何"保持 v1 值域、另加字段"的编码也一样破坏 v1——
+  没有哪个非负整数能诚实表达"未测"（`0` 正是本批删掉的**编造值**），而改成 `*int` 属于"改类型"，
+  同一条政策也判破坏性。
+  socket 视图与 offline 视图**共用一个 struct**，因此共用**一个常量**
+  `adminsock.ClusterStatusSchemaVersion`；`TestClusterStatusProducersAgreeOnTheSchemaVersion` 看守，
+  防止其中一个继续写字面量而漂移。
 
 **ctl 远程视图**（`tether cluster status --remote`，无需 broker 主机）：登录的 ctl 经 NATS 复用现有
 `cluster-health` responder（**无需额外 broker 配置 / ACL**），返回**用户摘要**——"几台 broker 应答 +

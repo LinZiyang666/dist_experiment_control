@@ -31,6 +31,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 )
@@ -42,8 +43,17 @@ import (
 // before the admin socket starts (happens-before), and reconcilers.status() is internally locked.
 func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 	rep := &adminsock.RuntimeReport{
-		Schema:        "admin_runtime",
-		SchemaVersion: 1,
+		Schema: "admin_runtime",
+		// v2 (B7): a BREAKING change to reconcilers[] — the `leader_only` bool was REMOVED and
+		// `authority` ("any"/"leader") took its semantic place. docs/usage.md's bump policy is explicit
+		// that deleting or changing a key bumps, and only additive omitempty fields do not. The fields
+		// added alongside it are last_dur_ms / max_dur_ms / overruns on reconcilers[] and cadence_ms /
+		// last_iter / iterations on cluster_loops[]. The first four are omitempty and would NOT have
+		// justified a bump on their own; last_iter and iterations are NOT omitempty, because zero is the
+		// value that means DEAD there and a dropped key would delete the signal exactly when it is bad
+		// news. Either way the REMOVAL above is what forces the bump. A monitoring rule keyed on leader_only now sees a
+		// schema_version it does not recognise instead of silently matching nothing.
+		SchemaVersion: 2,
 		Goroutines:    runtime.NumGoroutine(),               // in-process TRUTH, never the Threads proxy
 		Threads:       pprof.Lookup("threadcreate").Count(), // OS threads (M) EVER created — monotone, never falls
 		OpenFDs:       openFDCount(),                        // -1 if not measurable (non-Linux)
@@ -60,11 +70,14 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 			rep.Reconcilers = append(rep.Reconcilers, adminsock.ReconcilerTick{
 				Name:       st.Name,
 				IntervalMS: st.Interval.Milliseconds(),
-				LeaderOnly: st.LeaderOnly,
+				Authority:  st.Authority,
 				LastTick:   st.LastTick,
 				Runs:       st.Runs,
 				Skips:      st.Skips,
 				LastErr:    st.LastErr,
+				LastDurMS:  st.LastDur.Milliseconds(),
+				MaxDurMS:   st.MaxDur.Milliseconds(),
+				Overruns:   st.Overruns,
 			})
 		}
 	}
@@ -74,6 +87,18 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 	// in the last minute or had died quietly on its first iteration. They ride
 	// the same ReconcilerTick shape as the registry entries, tagged so the two
 	// sources stay distinguishable.
+	// RB2-4: ONE snapshot, taken BEFORE the loop rows are built, feeding both the alert_webhook block and
+	// the alert-webhook row's iteration count. Two independent reads is what let a caller observe
+	// accepted+rejected=1 next to iterations=0 — a state the wire contract says cannot exist.
+	var webhookIters uint64
+	var webhookLastIter time.Time
+	var haveWebhook bool
+	if b.cl != nil {
+		if p := b.cl.webhook.Load(); p != nil {
+			st, iters, lastIter := p.Stats()
+			rep.AlertWebhook, webhookIters, webhookLastIter, haveWebhook = &st, iters, lastIter, true
+		}
+	}
 	if b.cl != nil && b.cl.loops != nil {
 		// Sorted: a map range gives a different order every call, so two
 		// export-incident bundles taken seconds apart would diff for no reason
@@ -93,11 +118,36 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 			// produced 4-5 permanent false "stalled" entries in
 			// `admin runtime --json` and every export-incident bundle.
 			//
-			// They are reported under their own key instead, carrying only what is
-			// actually observable: the start time.
+			// They are reported under their own key instead, carrying what is actually observable:
+			// the start time, plus (B7) the declared cadence and the loop's own per-iteration beat.
+			// LastIter is a pointer so "never beat" is nil rather than the zero time, which reads as a
+			// timestamp in JSON. Iterations is always emitted: 0 is the value that means DEAD.
+			var lastIter *time.Time
+			if !st.LastIter.IsZero() {
+				li := st.LastIter
+				lastIter = &li
+			}
+			iters := st.Iters
+			if name == webhookLoopName && haveWebhook {
+				// From the SAME snapshot as rep.AlertWebhook above, so the documented equality
+				// `accepted + rejected == iterations` holds at every observable boundary rather than
+				// eventually (RB2-4). LastIter comes from that same poster snapshot too: mixing the
+				// poster's count with loopSet's separately-beaten timestamp allowed
+				// iterations=1,last_iter=null at the boundary between those writes.
+				iters = webhookIters
+				if webhookLastIter.IsZero() {
+					lastIter = nil
+				} else {
+					li := webhookLastIter
+					lastIter = &li
+				}
+			}
 			rep.ClusterLoops = append(rep.ClusterLoops, adminsock.ClusterLoopInfo{
-				Name:      name,
-				StartedAt: st.StartedAt,
+				Name:       name,
+				StartedAt:  st.StartedAt,
+				CadenceMS:  st.Cadence.Milliseconds(),
+				LastIter:   lastIter,
+				Iterations: iters,
 			})
 		}
 	}

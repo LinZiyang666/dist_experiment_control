@@ -104,6 +104,13 @@ type clusterRuntime struct {
 	// interval can land inside. atomic.Pointer keeps the read lock-free.
 	auditPub atomic.Pointer[AuditPublisher]
 	alertRec *AlertReconciler
+	// webhook is the optional alert-webhook poster, kept so RuntimeReport can publish its DELIVERY
+	// OUTCOME separately from the loop's liveness (external review B2-4). nil when no URL is configured.
+	//
+	// atomic.Pointer for the same reason as auditPub above and NOT as boilerplate: wireClusterLate
+	// assigns it while the adminsock goroutine may already be serving `admin runtime`, so a plain field
+	// would be an unsynchronised read of a seconds-wide window.
+	webhook atomic.Pointer[webhookPoster]
 	// cancel stops the leader-gated loops (a child of Run's ctx); loopDone receives one
 	// signal per loop on exit so the ordered shutdown can JOIN them (not guess via defer).
 	cancel func()
@@ -349,6 +356,9 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D8b alert reconciler (leader-gated raise/clear). Both leader-gated internally.
 	pub := NewAuditPublisher(AuditPublisherConfig{
 		Node: node, JS: b.js, Now: b.cfg.Now, Logger: b.cfg.Logger,
+		// B7 per-iteration liveness. The closure resolves b.cl.loops lazily: the set is assigned before
+		// the goroutine that will call this is started, so the goroutine-start edge publishes it.
+		Beat: func() { b.cl.loops.Beat("audit-publisher") },
 		ListSIDs: func(context.Context) ([]string, error) {
 			return listSessionsByState(b.cfg.DB, "ACTIVE")
 		},
@@ -388,6 +398,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		Observe: observeAndCache, Webhook: webhookPost, LeaderID: func() string { _, id := node.LeaderWithID(); return id },
 		SelfID:           b.selfID,                              // #93/H13: distinguishes a same-node lease blip from a genuine handoff when re-baselining the webhook
 		SetJSUnavailable: func(v bool) { b.jsUnavail.Store(v) }, // G7b #20③: leader-observed sustained JS-503 → health self-report
+		Beat:             func() { b.cl.loops.Beat("reconciler") },
 	})
 	b.cl.auditPub.Store(pub)
 	b.cl.alertRec = rec
@@ -414,7 +425,15 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// External-review F1: give the admin the read-only JS replica observation so `cluster
 	// status` renders the REAL stream actual (not a synthesized actual==target).
 	b.cl.admin.streamObserve = func() (ReplicaReport, error) {
-		return pub.ObserveReplicas(context.Background())
+		// B7: bounded, and the budget SCALES with the number of sessions the observation will walk.
+		// This seam is reached from StatusReport, which the operation controller calls on every leader
+		// tick (topoConvergedForOp), so an unbounded observation here stalls the whole convergence
+		// ladder rather than just one status render — and a budget too small for the fleet turns a
+		// healthy cluster into a reported replica deficit (internal review B7-02).
+		ctx, cancel := context.WithTimeout(context.Background(),
+			clusterReplicaObserveBudget(b.activeSessionCountForBudget()))
+		defer cancel()
+		return pub.ObserveReplicas(ctx)
 	}
 	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
 	b.cl.admin.accountPubSelf = b.accountPubOrEmpty   // batch B / B4: the ACCT.NK comparison baseline (see clusteradmin.go)
@@ -438,14 +457,25 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// `go` statements below it; undercounting it would let the ordered shutdown
 	// proceed to nc.Drain while a loop was still publishing.
 	b.cl.loops = newLoopSet()
-	b.cl.loops.Go(loopCtx, "audit-publisher", pub.Run)
-	b.cl.loops.Go(loopCtx, "reconciler", rec.Run)
+	// B7: the four PERIODIC loops declare their cadence and beat once per iteration. The declaration is
+	// what makes Iters diagnosable — "0 iterations against a 5s cadence" is dead, while the same 0 on
+	// the event-driven poster below just means no alerts fired. Before this, all five reported only a
+	// StartedAt, so a loop that returned on its first line was indistinguishable from a healthy one
+	// (topology-reconcile does exactly that when NatsConfPath is empty).
+	b.cl.loops.GoEvery(loopCtx, "audit-publisher", pub.cfg.Poll, pub.Run)
+	b.cl.loops.GoEvery(loopCtx, "reconciler", rec.cfg.Poll, rec.Run)
 	// D9 §17 step 10b: the leader-gated observability poll (broker_down / raft_lag).
-	b.cl.loops.Go(loopCtx, "observe", b.runObserveLoop)
+	b.cl.loops.GoEvery(loopCtx, "observe", observeTickInterval, b.runObserveLoop)
 	// C3: the per-broker (NOT leader-gated) NATS topology reconcile loop.
-	b.cl.loops.Go(loopCtx, "topology-reconcile", b.runTopologyReconcileLoop)
+	b.cl.loops.GoEvery(loopCtx, "topology-reconcile", topoReconcileInterval, b.runTopologyReconcileLoop)
 	if poster != nil {
-		b.cl.loops.Go(loopCtx, "alert-webhook", poster.Run)
+		// No cadence: it wakes on an event, not a tick. Cadence 0 tells a status reader that Iters is
+		// event-driven — it grows once per event DEQUEUED AND PROCESSED, so Iters == 0 means "nothing
+		// arrived", never "the endpoint refused us". Whether the endpoint accepted is a separate
+		// question, answered by the alert_webhook.accepted/rejected counters (external review B2-4).
+		poster.beat = func() { b.cl.loops.Beat(webhookLoopName) }
+		b.cl.webhook.Store(poster)
+		b.cl.loops.Go(loopCtx, webhookLoopName, poster.Run)
 	}
 	return nil
 }
@@ -474,18 +504,77 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 		// unobservable cluster is NOT ready.
 		return false, fmt.Errorf("broker: audit publisher not wired yet")
 	}
-	rep, err := ap.ObserveReplicas(context.Background())
+	// B7: bounded, and safe to bound precisely BECAUSE the error path is already fail-closed — a
+	// deadline exceeded returns (false, err), i.e. "not ready", which is the same answer an
+	// unobservable cluster already gets two lines above. This is the second of the two unbounded
+	// ObserveReplicas calls that shared the leader tick; missing it would have left the path
+	// structurally unbounded while looking fixed.
+	ctx, cancel := context.WithTimeout(context.Background(),
+		clusterReplicaObserveBudget(b.activeSessionCountForBudget()))
+	defer cancel()
+	rep, err := ap.ObserveReplicas(ctx)
 	if err != nil {
 		return false, err
 	}
 	return rep.AllAtTarget(), nil
 }
 
-// clusterJSPlaceProbeTimeout bounds the join-side placement probe. It is hygiene, not protection: the
-// same inline tick already embeds a 2s healthPoll and an unbounded ObserveReplicas (topoConvergedForOp
-// -> StatusReport -> streamObserve), so this cap does not keep the observe loop responsive and must not
-// be described as if it did.
+// activeSessionCountForBudget is a cheap LOCAL read used only to size the replica-observation deadline.
+//
+// It is deliberately best-effort: on any error it returns 0, which yields the base budget — the same
+// bound this code had before the budget scaled, so a DB hiccup degrades to the old behaviour rather
+// than to an unbounded call. It reads through b.read(), so it cannot write, and it is a single indexed
+// count against the local replica — not another round trip to the JS meta.
+func (b *Broker) activeSessionCountForBudget() int {
+	var n int
+	if err := b.read().QueryRow(`SELECT COUNT(*) FROM sessions WHERE state = 'ACTIVE'`).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// clusterJSPlaceProbeTimeout bounds the join-side placement probe.
+//
+// It USED to carry a caveat saying this cap "does not keep the observe loop responsive and must not be
+// described as if it did", because the same inline tick also embedded a 2s healthPoll and TWO unbounded
+// ObserveReplicas calls (one via topoConvergedForOp -> StatusReport -> streamObserve, one via
+// streamsReady). B7 closed both, so the caveat is gone rather than merely stale: every JS observation
+// on this tick now carries a deadline.
 const clusterJSPlaceProbeTimeout = 3 * time.Second
+
+// clusterReplicaObserveBudget bounds ONE JS replica observation, and it SCALES WITH THE WORK.
+//
+// A constant was wrong in shape, not merely in value (internal review B7-02). ObserveReplicas walks the
+// events stream and then EVERY session's history stream, serially, two JS round trips each
+// (audit_publisher.go's ObserveReplicas). A fixed 3s therefore covers a broker with three sessions and
+// silently expires on one with thirty — and because a failed observation used to render as a MEASURED
+// zero, expiry showed up to the operator as "stream replicas below target (0/N)" and DEGRADED on a
+// perfectly healthy cluster. The zero-vs-unobserved half of that is fixed in clusterstatus.go; this is
+// the half that stops the expiry from being routine in the first place.
+//
+// The base is the sibling JS probe's budget (same meta, same kind of work — not a second invented
+// number); the per-session term is what the sibling does not need because it queries one stream.
+// The RELATION, not the numbers, is pinned by TestReplicaObserveBudgetScalesWithSessions.
+const (
+	clusterReplicaObserveBase       = clusterJSPlaceProbeTimeout
+	clusterReplicaObservePerSession = 250 * time.Millisecond
+	// clusterReplicaObserveCeiling caps the derived budget. Without it a broker with a thousand stale
+	// sessions would hand the leader tick a multi-minute deadline, which is the unbounded behaviour this
+	// replaced wearing a different hat. At the cap the observation genuinely cannot finish and the
+	// UNOBSERVED result is the honest answer.
+	clusterReplicaObserveCeiling = 30 * time.Second
+)
+
+func clusterReplicaObserveBudget(sessions int) time.Duration {
+	if sessions < 0 {
+		sessions = 0
+	}
+	d := clusterReplicaObserveBase + time.Duration(sessions)*clusterReplicaObservePerSession
+	if d > clusterReplicaObserveCeiling {
+		return clusterReplicaObserveCeiling
+	}
+	return d
+}
 
 // jsPlaceableFrom is #67 sub-face 4's predicate in PURE form, split out so it is testable without a
 // broker or a JetStream connection.

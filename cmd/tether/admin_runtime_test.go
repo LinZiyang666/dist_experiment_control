@@ -26,8 +26,8 @@ func TestAdminRuntimeJSONStreamStaysClean(t *testing.T) {
 			t.Fatalf("unexpected op %q", req.Op)
 		}
 		return &adminsock.Response{Op: adminsock.OpRuntime, OK: true, Runtime: &adminsock.RuntimeReport{
-			Schema: "admin_runtime", SchemaVersion: 1, Goroutines: 12, Threads: 4, OpenFDs: 9, RSSBytes: 1 << 20, UptimeSeconds: 5,
-			Reconcilers: []adminsock.ReconcilerTick{{Name: "ports", IntervalMS: 1000, LeaderOnly: true, Runs: 3}},
+			Schema: "admin_runtime", SchemaVersion: 2, Goroutines: 12, Threads: 4, OpenFDs: 9, RSSBytes: 1 << 20, UptimeSeconds: 5,
+			Reconcilers: []adminsock.ReconcilerTick{{Name: "ports", IntervalMS: 1000, Authority: "leader", Runs: 3}},
 		}}, nil
 	})
 

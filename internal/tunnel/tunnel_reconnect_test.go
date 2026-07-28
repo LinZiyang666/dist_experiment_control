@@ -423,19 +423,26 @@ func TestTunnelReconnectVsConcurrentOpenSamePort(t *testing.T) {
 	runtime.GC()
 	baseline := runtime.NumGoroutine()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); h.srv.DropTransport(h.publicPort) }()
-	go func() {
-		defer wg.Done()
-		// A fresh full-rebuild Open on the same port (as applyProxyDirective does).
-		_ = h.cli.Open(h.publicPort, h.localPort, h.token)
-	}()
-	wg.Wait()
+	// Five rounds of the race, not one (internal review B9-1). Each round rebuilds a transport, so a leak
+	// of one goroutine per race is +1 per round; against the +2 ceiling below, a single round cannot see
+	// it. Repeating also samples the drop-vs-Open interleaving at different points, which is the whole
+	// reason this race is interesting.
+	const raceRounds = 5
+	for round := 0; round < raceRounds; round++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); h.srv.DropTransport(h.publicPort) }()
+		go func() {
+			defer wg.Done()
+			// A fresh full-rebuild Open on the same port (as applyProxyDirective does).
+			_ = h.cli.Open(h.publicPort, h.localPort, h.token)
+		}()
+		wg.Wait()
 
-	h.waitRoundTrip(t, 5*time.Second) // exactly one owner must serve
-	if !h.cli.SessionUp(h.publicPort) {
-		t.Fatal("port must still be owned after the race")
+		h.waitRoundTrip(t, 5*time.Second) // exactly one owner must serve
+		if !h.cli.SessionUp(h.publicPort) {
+			t.Fatalf("round %d: port must still be owned after the race", round)
+		}
 	}
 	if got := pollGoroutinesAtMost(baseline+2, 3*time.Second); got > baseline+2 {
 		buf := make([]byte, 64*1024)

@@ -10,49 +10,33 @@
 package d8_test
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"database/sql"
 	"fmt"
-	"math/big"
-	"net"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/clusterharness"
 	"github.com/hashicorp/raft"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// B9: both delegate to test/clusterharness — see the note in test/d3/setup_test.go. This suite spelled
+// the poll helper `waitFor` while d3/d4/d5 spelled it `waitForCond`; the local names are kept so the
+// call sites read unchanged, but there is now one implementation behind both spellings.
 func waitFor(within time.Duration, pred func() bool) bool {
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if pred() {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return pred()
+	return clusterharness.WaitForCond(within, pred)
 }
 
 func freeClusterPort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return p
+	return clusterharness.FreePort(t)
 }
 
 // startRoutedJS brings up n routed NATS servers with clustered JetStream (plain, no auth —
@@ -147,44 +131,18 @@ func attemptRoutedJS(t *testing.T, n int) ([]*natsserver.Server, bool) {
 
 // ---- mTLS raft CA ----
 
-type routeCA struct {
-	cert *x509.Certificate
-	key  ed25519.PrivateKey
-	pool *x509.CertPool
-}
+// B9: the route-mTLS CA moved to test/clusterharness — see the note in test/d4/setup_test.go.
+//
+// THIS copy is the reason sharing was worth doing rather than merely tidy: it had dropped the error
+// checks on BOTH x509.CreateCertificate calls (`der, _ := ...`). A failure there yielded a nil-DER
+// certificate that surfaced as a TLS handshake error inside the raft transport, one layer and several
+// seconds away from the actual fault. The shared implementation checks and t.Fatalf's at the point of
+// the failure, so this copy is fixed by construction.
+const d8CAName = "tether-d8"
 
-func newRouteCA(t *testing.T) *routeCA {
+func newRouteCA(t *testing.T) *clusterharness.RouteCA {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "tether-d8-ca"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, BasicConstraintsValid: true,
-	}
-	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &routeCA{cert: cert, key: priv, pool: pool}
-}
-
-func (ca *routeCA) leaf(t *testing.T) tls.Certificate {
-	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "tether-d8-node"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	}
-	der, _ := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, pub, ca.key)
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	return clusterharness.NewRouteCA(t, d8CAName)
 }
 
 // ---- combined harness ----
@@ -205,7 +163,7 @@ func startD8Cluster(t *testing.T, n int) *d8cluster {
 	trans := make([]*raft.NetworkTransport, n)
 	for i := range trans {
 		tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{
-			BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.leaf(t),
+			BindAddr: "127.0.0.1:0", CACert: ca.Pool, Leaf: ca.Leaf(t, d8CAName),
 		})
 		if err != nil {
 			t.Fatalf("transport %d: %v", i, err)
@@ -310,18 +268,9 @@ func (c *d8cluster) activeAlertOn(i int, dedupKey string) bool {
 
 // ---- leak gates (goleak deliberately NOT used; CLAUDE.md §5) ----
 
+// assertNoGoroutineLeak delegates to internal/testharness (B9) — see the note in
+// test/d4/setup_test.go. The local name stays so this suite's call sites do not churn.
 func assertNoGoroutineLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	var last int
-	for i := 0; i < 50; i++ {
-		runtime.Gosched()
-		last = runtime.NumGoroutine()
-		if last-before <= 2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	buf := make([]byte, 64*1024)
-	nb := runtime.Stack(buf, true)
-	t.Errorf("%s: goroutine leak: before=%d after=%d (+%d)\n%s", label, before, last, last-before, buf[:nb])
+	testharness.AssertNoGoroutineLeak(t, label, before)
 }

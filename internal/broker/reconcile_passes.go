@@ -54,7 +54,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// Idempotent path: node.ReconcileStates (a level-triggered UPDATE keyed on
 	// last_seen vs. StaleAfter/OfflineAfter — running it twice in a row is a
 	// no-op).
-	r.register("node-states", b.cfg.ReconcileInterval, false, func(_ context.Context, now time.Time) error {
+	r.register("node-states", b.cfg.ReconcileInterval, authorityAny, func(_ context.Context, now time.Time) error {
 		n, err := node.ReconcileStates(b.livenessDB(), now, b.cfg.StaleAfter, b.cfg.OfflineAfter)
 		if err != nil {
 			// Behavior-equivalence: the pre-R7 body LOGGED and continued. It
@@ -79,7 +79,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: b.reconcilePorts (PlanRevoke is keyed on the allocation
 	// row; re-revoking an already-revoked port is a no-op).
-	r.register("ports", b.cfg.ReconcileInterval, true, func(_ context.Context, now time.Time) error {
+	r.register("ports", b.cfg.ReconcileInterval, authorityLeader, func(_ context.Context, now time.Time) error {
 		if revoked := b.reconcilePorts(now); revoked > 0 {
 			b.cfg.Logger.Info("broker: port revocations", "count", revoked)
 		}
@@ -93,7 +93,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: b.reconcileTunnelSessions (closing an already-closed
 	// proxy is a no-op).
-	r.register("tunnel-sessions", b.cfg.ReconcileInterval, false, func(context.Context, time.Time) error {
+	r.register("tunnel-sessions", b.cfg.ReconcileInterval, authorityAny, func(context.Context, time.Time) error {
 		if closed := b.reconcileTunnelSessions(); closed > 0 {
 			b.cfg.Logger.Info("broker: stale tunnel proxies closed", "count", closed)
 		}
@@ -113,7 +113,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: proc.GCExited (a DELETE bounded by a cutoff — the second
 	// run over the same cutoff deletes nothing).
-	r.register("proc-gc", b.cfg.ProcGCInterval, false, func(_ context.Context, now time.Time) error {
+	r.register("proc-gc", b.cfg.ProcGCInterval, authorityAny, func(_ context.Context, now time.Time) error {
 		// batch B / B3: this used b.livenessDB(), which was misleading in a way worth naming.
 		// The pass is NOT a liveness write — it DELETEs from `processes`, replicated state — and
 		// the mode gate above is the only thing that made the old handle safe. Asking
@@ -176,7 +176,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: b.reconcileXferObjects (deleting an already-deleted
 	// object returns ErrObjectNotFound, which it swallows).
-	r.register("xfer-orphan-reap", b.cfg.XferReapInterval, false, func(ctx context.Context, _ time.Time) error {
+	r.register("xfer-orphan-reap", b.cfg.XferReapInterval, authorityAny, func(ctx context.Context, _ time.Time) error {
 		n, err := b.reconcileXferObjects(ctx)
 		if err != nil {
 			return err
@@ -191,7 +191,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// row whose HOME broker crashed mid-flight (the durable ledger file outlived the process but no terminal
 	// was written). Runs after Run's late-wiring attaches the cluster audit sink, so the synthetic terminal
 	// routes through leader Apply and its content-reqID dedups. Shares the reap cadence (no new goroutine).
-	r.register("xfer-inflight-finalize", b.cfg.XferReapInterval, false, func(ctx context.Context, _ time.Time) error {
+	r.register("xfer-inflight-finalize", b.cfg.XferReapInterval, authorityAny, func(ctx context.Context, _ time.Time) error {
 		n, err := b.finalizeStrandedXfers(ctx)
 		if err != nil {
 			return err
@@ -207,7 +207,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// Registered here; the pass body and its convergence predicate live in
 	// reconcile_grow_lock.go, which explains why this is the sample that proves
 	// the interface generalizes past "move the existing loop bodies".
-	r.register("grow-lock", b.cfg.GrowLockReapInterval, true, b.reconcileGrowLock)
+	r.register("grow-lock", b.cfg.GrowLockReapInterval, authorityLeader, b.reconcileGrowLock)
 
 	// --- P3 (R7b): expired upgrade roll-lock reaper (the LEASE shape) ---
 	//
@@ -215,7 +215,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// through raft — but its convergence predicate is a LEASE rather than
 	// evidence the product wrote. See reconcile_upgrade_lock.go for why that
 	// distinction is the whole reason R7 was split into a and b.
-	r.register("upgrade-lock", b.cfg.UpgradeLockReapInterval, true, b.reconcileUpgradeLock)
+	r.register("upgrade-lock", b.cfg.UpgradeLockReapInterval, authorityLeader, b.reconcileUpgradeLock)
 
 	// --- P1 (R8a): ACTIVE home-directive delivery (the DELIVERY shape) ---
 	//
@@ -238,5 +238,5 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// reply drives, epoch-monotone and documented non-tearing at equal epoch. This
 	// pass invents no directive: homeForRegister is the single builder for both
 	// delivery paths, so they cannot drift.
-	r.register("home-delivery", b.cfg.HomeDeliverInterval, true, b.reconcileHomeDelivery)
+	r.register("home-delivery", b.cfg.HomeDeliverInterval, authorityLeader, b.reconcileHomeDelivery)
 }

@@ -91,6 +91,23 @@ func (b *Broker) xferInflightDir() string {
 //	terminal       terminal      two terminal paths raced across a       pass 1 replays once and consumes
 //	                             directory failure                       both; pass 2 finds nothing
 //
+// THE TABLE ABOVE IS NOT THE WHOLE RULE — three more inputs decide every row (B8)
+// ------------------------------------------------------------------------------
+// The two columns are necessary but not sufficient, and for years the missing inputs lived only in
+// the branch order of finalizeStrandedXfers. They are now arguments to ledgerRowDisposition below,
+// because a rule that exists only as control flow cannot be tested row by row:
+//
+//	LIVE     a tracker entry for this transfer in THIS incarnation ⇒ NEVER finalize; its own terminal
+//	         path owns it. Checked at BOTH sites.
+//	NOW      a start row younger than its tier timeout + xferStrandedSlack is not stranded, it is slow.
+//	CENSUS   whether the outbox scan SUCCEEDED. A failed census is UNKNOWN, not empty (R6-F1): a
+//	         start-only row must not be synthesized while a higher-precedence exact terminal may still
+//	         be hidden in an unreadable outbox.
+//
+// And the SITE is itself an input, not a detail: the two passes apply these gates in a DIFFERENT
+// order (pass 2's staged-terminal branch does not consult the outbox census at all — only its
+// start-only branch does), and one transfer can hold a row at each site simultaneously.
+//
 // Retirement is therefore a single ordered operation (consumeXferLedgerRow): primary FIRST, and the
 // outbox row only once the primary row is confirmed gone. If the primary removal cannot be confirmed, the
 // outbox row STAYS — it is the only evidence that stops the surviving start row from being turned into a
@@ -320,22 +337,41 @@ func (b *Broker) removeXferInflight(transferID string) {
 // housekeeping that must happen on EVERY ledger directory: pruning orphaned atomic temps and
 // quarantining unreadable rows. Round-4 factored it out so the fallback outbox gets exactly the same
 // treatment as the primary in-flight directory rather than a thinner copy of it.
-func (b *Broker) forEachLedgerRecord(dir string, fn func(path string, rec xferInflightRecord)) error {
+//
+// It also returns the set of ledger filenames that EXIST but could not be turned into a record —
+// either unparseable now, or quarantined as <name>.corrupt by an earlier pass. That set is what stops
+// an unreadable row from reading as an ABSENT row (B8). The keys are canonical `<hash>.json` names:
+// the hash is one-way, so a caller cannot recover a transfer_id from one, but a caller that HAS a
+// transfer_id can compute the same name forward and ask.
+//
+// The `.corrupt` half is what makes the answer durable. Quarantining renames the row out of the
+// directory, so a set built only from parse failures would be non-empty on the pass that quarantined
+// the row and EMPTY on every pass after it — the synthesizer would simply be delayed by one tick
+// instead of blocked.
+func (b *Broker) forEachLedgerRecord(dir string, fn func(path string, rec xferInflightRecord)) (map[string]bool, error) {
+	unresolved := map[string]bool{}
 	if dir == "" {
-		return nil
+		return unresolved, nil
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return unresolved, nil
 		}
-		return err
+		return unresolved, err
 	}
 	for _, de := range entries {
 		if de.IsDir() {
 			continue
 		}
 		if !strings.HasSuffix(de.Name(), ".json") {
+			// A row quarantined by an earlier pass still means "a ledger row for this transfer exists and
+			// this process could not read it". Fold it back under its canonical name so the answer
+			// survives the rename that put it here.
+			if base, _, ok := strings.Cut(de.Name(), ".json.corrupt"); ok {
+				unresolved[base+".json"] = true
+				continue
+			}
 			// nit: prune an orphaned atomic temp (a crash between CreateTemp and Rename) once it is clearly
 			// stale, so .xfer-inflight-*.tmp files do not accumulate unbounded.
 			if strings.HasPrefix(de.Name(), ".xfer-inflight-") && strings.HasSuffix(de.Name(), ".tmp") {
@@ -348,6 +384,8 @@ func (b *Broker) forEachLedgerRecord(dir string, fn func(path string, rec xferIn
 		path := filepath.Join(dir, de.Name())
 		rec, rerr := readXferInflight(path)
 		if rerr != nil {
+			// Record it BEFORE the quarantine: from here on this row exists only under a .corrupt name.
+			unresolved[de.Name()] = true
 			// nit: a corrupt ledger would re-warn every pass forever — move it aside ONCE (preserved for
 			// inspection) so the log doesn't churn and the finalizer stops re-reading it.
 			// EXTERNAL REVIEW F6: when a .corrupt target already existed this left the NEW bad file in
@@ -368,7 +406,7 @@ func (b *Broker) forEachLedgerRecord(dir string, fn func(path string, rec xferIn
 		}
 		fn(path, rec)
 	}
-	return nil
+	return unresolved, nil
 }
 
 // replayStagedTerminal handles a ledger row that already carries the EXACT terminal, from either the
@@ -439,6 +477,94 @@ func (b *Broker) replayStagedTerminal(ctx context.Context, rec xferInflightRecor
 	return true
 }
 
+// ledgerSite says which of the two sibling directories a row was read from.
+type ledgerSite int
+
+const (
+	ledgerSiteOutbox  ledgerSite = iota // the fallback staging dir — scanned FIRST (pass 1)
+	ledgerSitePrimary                   // the in-flight dir (pass 2)
+)
+
+// ledgerDisposition is what a pass must do with ONE ledger row.
+type ledgerDisposition int
+
+const (
+	ledgerLeave      ledgerDisposition = iota // retain the row untouched; a later pass re-decides
+	ledgerReplay                              // replay the EXACT staged terminal, then consume both rows
+	ledgerSynthesize                          // no terminal exists anywhere — synthesize a deterministic one
+)
+
+// ledgerRowInputs is everything the precedence rule needs about ONE row. Assembling it is the
+// caller's job (it owns the tracker, the clock and the outbox census); deciding is this file's.
+type ledgerRowInputs struct {
+	Site ledgerSite
+	Rec  xferInflightRecord
+
+	// Live: a tracker entry exists for this transfer in THIS incarnation.
+	Live bool
+	// OutboxHasExactTerminal: the outbox census found a readable row carrying an exact terminal for
+	// this transfer. Only consulted for a primary start-only row.
+	OutboxHasExactTerminal bool
+	// OutboxCensusOK: the outbox scan completed. False ⇒ absence there is UNKNOWN, not empty (R6-F1).
+	OutboxCensusOK bool
+	// OutboxRowUnreadable: the outbox HOLDS a row for this transfer that this process could not turn
+	// into a record (unparseable now, or quarantined as .corrupt earlier). The ROW-level twin of
+	// OutboxCensusOK: the directory read fine, one file did not. Absence of a parsed terminal is then
+	// not evidence of an absent terminal, and the outbox stages terminals ONLY — so whatever is in
+	// there is a decided outcome that outranks a start row.
+	OutboxRowUnreadable bool
+	Now                 time.Time
+}
+
+// ledgerRowDisposition applies the durable-precedence rule documented at the top of this file to one
+// row. It is PURE — no disk, no clock, no tracker — so every legal combination is reachable from a
+// table-driven test instead of only from a crash sequence that has to be staged on disk.
+//
+// The returned reason is the rule that fired. Production puts it in the finalize log line, and the
+// table-driven test asserts on it, so a branch that is reached for the wrong reason is visible rather
+// than merely producing the right answer by luck.
+func ledgerRowDisposition(in ledgerRowInputs) (ledgerDisposition, string) {
+	// A live tracker entry outranks everything at BOTH sites: the transfer is genuinely in flight in
+	// this incarnation and its own terminal path will write the terminal and retire the ledger.
+	if in.Live {
+		return ledgerLeave, "live tracker entry — the in-flight terminal path owns this transfer"
+	}
+
+	if in.Site == ledgerSiteOutbox {
+		// The outbox only ever stages DECIDED terminals. A row here without one is not a start row to
+		// be finalized — it is a row this pass has nothing to say about.
+		if in.Rec.Terminal == nil {
+			return ledgerLeave, "outbox row carries no terminal — the outbox stages terminals only"
+		}
+		return ledgerReplay, "exact terminal staged in the outbox"
+	}
+
+	// Primary site. A terminal staged in place is replayed without consulting the outbox at all: an
+	// exact terminal is an exact terminal wherever it lives, and re-emitting the identical record is
+	// idempotent by construction (content-addressed reqID).
+	if in.Rec.Terminal != nil {
+		return ledgerReplay, "exact terminal staged in place"
+	}
+	// From here the row is start-only, i.e. the only path that can MANUFACTURE a terminal. Every gate
+	// below is fail-closed by design.
+	if !in.OutboxCensusOK {
+		return ledgerLeave, "outbox census failed — a terminal there would outrank this start row, and " +
+			"absence in an unreadable directory is UNKNOWN rather than empty (R6-F1)"
+	}
+	if in.OutboxHasExactTerminal {
+		return ledgerLeave, "an exact terminal in the outbox outranks this start row"
+	}
+	if in.OutboxRowUnreadable {
+		return ledgerLeave, "the outbox holds an UNREADABLE row for this transfer — the outbox stages " +
+			"terminals only, so that row is a decided outcome this process cannot read, and synthesizing " +
+			"beside it would commit a terminal that contradicts evidence still on disk"
+	}
+	if in.Now.Sub(in.Rec.StartedAt) < transferTimeoutFor(in.Rec.Tier)+xferStrandedSlack {
+		return ledgerLeave, "younger than its tier timeout + slack — slow, not stranded"
+	}
+	return ledgerSynthesize, "stranded past timeout + slack with no exact terminal at either site"
+}
+
 func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 	dir := b.xferInflightDir()
 	if dir == "" {
@@ -454,47 +580,72 @@ func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 	// its recovery depend on scanning the primary directory first would disable the fallback in the one
 	// state it was built for. A primary scan error must never preempt this pass.
 	outboxOwned := map[string]bool{}
-	obErr := b.forEachLedgerRecord(outboxDir, func(_ string, rec xferInflightRecord) {
-		if rec.Terminal == nil {
-			return
+	obUnreadable, obErr := b.forEachLedgerRecord(outboxDir, func(_ string, rec xferInflightRecord) {
+		// The census is maintained regardless of what this row's disposition turns out to be — even a
+		// row that is left alone here (a live transfer) still means an exact terminal EXISTS at this
+		// site, and pass 2 must not synthesize one from the start row it will find.
+		if rec.Terminal != nil {
+			outboxOwned[rec.TransferID] = true
 		}
-		// Claim the transfer even when the row is skipped or retained below: as long as an exact terminal
-		// exists here, the primary pass must NOT synthesize one from the start row it will find.
-		outboxOwned[rec.TransferID] = true
-		if b.transfers.get(rec.TransferID) != nil {
-			return // genuinely in flight in THIS incarnation — its own terminal path owns it
-		}
-		if b.replayStagedTerminal(ctx, rec) {
+		d, _ := ledgerRowDisposition(ledgerRowInputs{
+			Site: ledgerSiteOutbox,
+			Rec:  rec,
+			Live: b.transfers.get(rec.TransferID) != nil,
+			Now:  b.cfg.Now(),
+		})
+		if d == ledgerReplay && b.replayStagedTerminal(ctx, rec) {
 			finalized++
 		}
 	})
 
+	// blockedByUnreadable collects transfers that can never be finalized while an unreadable outbox row
+	// outranks their start row. Reported once per pass below — see the ledgerLeave branch.
+	var blockedByUnreadable []string
+
 	// PASS 2 — the primary directory: staged terminals, then start-only rows old enough to synthesize.
-	prErr := b.forEachLedgerRecord(dir, func(_ string, rec xferInflightRecord) {
-		// A LIVE tracker entry means this transfer is genuinely in flight in THIS incarnation — never
-		// finalize it (its own terminal path will write the terminal + remove the ledger).
-		if b.transfers.get(rec.TransferID) != nil {
-			return
+	_, prErr := b.forEachLedgerRecord(dir, func(_ string, rec xferInflightRecord) {
+		in := ledgerRowInputs{
+			Site:                   ledgerSitePrimary,
+			Rec:                    rec,
+			Live:                   b.transfers.get(rec.TransferID) != nil,
+			OutboxHasExactTerminal: outboxOwned[rec.TransferID],
+			OutboxCensusOK:         obErr == nil,
+			// The hash is one-way, so the census cannot name the transfers it failed to read — but this
+			// side HAS the transfer_id and computes the same filename forward.
+			OutboxRowUnreadable: obUnreadable[xferInflightFilename(rec.TransferID)],
+			Now:                 b.cfg.Now(),
 		}
-		if rec.Terminal != nil {
+		d, why := ledgerRowDisposition(in)
+		switch d {
+		case ledgerLeave:
+			// A row left alone because an UNREADABLE outbox row outranks it is a PERMANENT state, and it
+			// must not be a silent one (internal review B8-1).
+			//
+			// Every other ledgerLeave reason resolves itself: a live transfer finishes, a fresh one ages
+			// out, a failed census succeeds on the next pass. This one does not. The unreadable row was
+			// quarantined to <name>.corrupt on the pass that found it, the census folds that name back in
+			// forever, and nothing removes either file — so the transfer has ZERO terminals in the audit
+			// (the true one is in a file no code path will read again, the synthetic one is blocked) and
+			// the ledger row is immortal.
+			//
+			// That is still the right disposition: this file's own argument at replayStagedTerminal is
+			// that a dangling start is "detectable and repairable" while a contradictory pair corrupts the
+			// record. But "detectable" is a property something has to provide. One Warn on the pass that
+			// quarantined the row, possibly weeks ago and possibly rotated away, does not.
+			//
+			// So: count it, and report it once per pass at Warn with the operator's next step. It is
+			// bounded — one line per pass, not per row — and it names the directory to look in.
+			if in.OutboxRowUnreadable {
+				blockedByUnreadable = append(blockedByUnreadable, rec.TransferID)
+			}
+			return
+		case ledgerReplay:
 			if b.replayStagedTerminal(ctx, rec) {
 				finalized++
 			}
 			return
 		}
-		if obErr != nil {
-			// R6-F1: a failed outbox census is UNKNOWN, not empty. Primary staged terminals remain safe
-			// to replay above, but a start-only row cannot be synthesized while a higher-precedence exact
-			// terminal may still be hidden in the unreadable outbox.
-			return
-		}
-		if outboxOwned[rec.TransferID] {
-			return // the exact terminal outranks this start row; pass 1 owns the transfer
-		}
 		timeout := transferTimeoutFor(rec.Tier)
-		if b.cfg.Now().Sub(rec.StartedAt) < timeout+xferStrandedSlack {
-			return // too fresh — a slow-but-live transfer's real terminal may still arrive
-		}
 		synthetic := schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: rec.Verb,
 			Ts: rec.StartedAt.Add(timeout), Session: rec.Session, Node: rec.Node,
@@ -522,12 +673,49 @@ func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 		}
 		finalized++
 		b.cfg.Logger.Info("broker: finalized a stranded in-flight transfer after a home restart (#57)",
-			"transfer_id", rec.TransferID, "verb", rec.Verb, "tier", rec.Tier, "session", rec.Session)
+			"transfer_id", rec.TransferID, "verb", rec.Verb, "tier", rec.Tier, "session", rec.Session,
+			"reason", why)
 	})
 	// A scan failure of ONE source is a logged, retried condition — not a pass failure. Returning it would
 	// hand the caller (the reconcile pass) an error for a run in which the other source made real progress,
 	// and would keep doing so for as long as the broken directory stays broken. Only a run in which NO
 	// source could be read at all is a genuine failure worth propagating.
+	// B8-1: the one ledgerLeave that never resolves itself, surfaced once per pass rather than once ever.
+	// Bounded to one line and a capped sample so a hundred stuck rows do not become a hundred log lines.
+	if len(blockedByUnreadable) > 0 {
+		sample := blockedByUnreadable
+		if len(sample) > 5 {
+			sample = sample[:5]
+		}
+		// EXTERNAL REVIEW B2-3: both halves of the previous version of this text were FALSE, and the second
+		// half was destructive.
+		//
+		//   (a) "repair it in place (the next pass replays it)" — forEachLedgerRecord only ever calls fn for
+		//       entries ending in ".json" (see the suffix check at the top of its loop). A repaired
+		//       *.json.corrupt keeps a name the replay walk skips, so editing the bytes alone changes
+		//       nothing, forever. The file has to be RENAMED back to its canonical <hash>.json.
+		//
+		//   (b) "remove BOTH the .corrupt file and the matching in-flight row" — the in-flight start row is
+		//       the ONLY record synthesis can derive a deterministic terminal from (transfer id, verb, tier,
+		//       bucket, path, startedAt). Deleting it alongside the corrupt outbox row leaves neither a real
+		//       terminal nor anything to synthesize one from: the transfer becomes permanently unauditable,
+		//       which is worse than the state this warning is reporting. Removing ONLY the corrupt outbox row
+		//       is what unblocks synthesis — the census stops marking the name unresolved, the start row is
+		//       then a plain stale start row, and the next pass writes failed/home_broker_restart for it.
+		//
+		// Stated as two numbered operator actions rather than prose, because the difference between them is
+		// one filename and the cost of getting it wrong is an audit record that can never be reconstructed.
+		b.cfg.Logger.Warn("broker: transfer(s) can never be finalized — an UNREADABLE terminal is staged in "+
+			"the outbox and outranks their in-flight row, so no terminal audit will ever be written for them. "+
+			"Inspect the quarantined *.json.corrupt files in outbox_dir. (1) RECOVERABLE: repair the JSON and "+
+			"RENAME it back to its canonical <hash>.json name — a repaired file left under the .corrupt name is "+
+			"never replayed, because the ledger walk only reads *.json. (2) UNRECOVERABLE: delete ONLY the "+
+			".corrupt file in outbox_dir and KEEP the matching row in inflight_dir — that row is the only input "+
+			"a synthesized terminal can be derived from, so deleting it makes the transfer permanently "+
+			"unauditable instead of repairing it",
+			"count", len(blockedByUnreadable), "sample_transfer_ids", sample,
+			"outbox_dir", outboxDir, "inflight_dir", dir)
+	}
 	if obErr != nil {
 		b.cfg.Logger.Warn("broker: could not scan the transfer terminal outbox — retrying on the next pass",
 			"err", obErr, "dir", outboxDir)

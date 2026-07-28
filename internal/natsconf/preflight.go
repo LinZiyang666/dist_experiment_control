@@ -244,7 +244,7 @@ func (o *Ownership) AuthIdentity() (issuer, brokerNkey string) {
 
 // ClusterMTLS harvests the routes-mTLS identity from the LIVE conf's cluster{} block (C3-B1): the
 // reconciler does not carry the cert paths, so BuildMergedConf reads them here to render a COMPLETE
-// conf (natscluster.Render hard-rejects empty cert paths). Fail-closed: a cluster-mode broker's conf
+// conf (Render hard-rejects empty cert paths). Fail-closed: a cluster-mode broker's conf
 // MUST already carry cluster.tls — a missing block returns an error so the reconciler stays loud
 // (never renders a conf that would drop routes mTLS).
 func (o *Ownership) ClusterMTLS() (ca, cert, key, listen, name string, err error) {
@@ -288,29 +288,97 @@ func (o *Ownership) JSStoreDir() string {
 	return ""
 }
 
-// IsStandaloneJetStream reports whether the live conf runs JetStream WITHOUT a cluster{}
-// block — i.e. STANDALONE JS (the shape `cluster init --from-existing` leaves an N=1 broker
-// in, since clustered JS refuses to start without configured routes). Such a node CANNOT be
-// restarted with a cluster{} block in place: NATS does not migrate standalone JS state into a
-// clustered meta, so the meta wedges and the streams orphan (test/d9
-// TestD9Matrix/GrowStandaloneRestartWedgesJS). Converting it to clustered REQUIRES wiping its
-// JetStream store first — the takeover/reconcile surfaces this so an operator cannot grow into
-// the wedge silently.
-func (o *Ownership) IsStandaloneJetStream() bool {
-	_, hasJS := o.Parsed["jetstream"]
-	_, hasCluster := o.Parsed["cluster"]
-	return hasJS && !hasCluster
+// HasJetStream reports whether the live conf enables JetStream AT ALL, regardless of whether it is
+// clustered. It is deliberately weaker than its two siblings below, and the weakness is the point:
+// BuildMergedConf uses it to refuse rendering a conf with no jetstream{} block over one that HAS a
+// jetstream key but from which no store_dir could be harvested (BUG-1). The sibling predicates both
+// also inspect cluster{}, so neither can answer "would this render silently drop JetStream".
+//
+// Note it is true for a bare `jetstream {}` with no subkeys, which is exactly the input that made the
+// defect reachable: Preflight accepts that shape (jetstream is InstallSafe at the top level and
+// unrecognizedSubkeys returns nil for an empty map), so nothing upstream rejects it.
+func (o *Ownership) HasJetStream() bool {
+	v, ok := o.Parsed["jetstream"]
+	if !ok {
+		return false
+	}
+	// KEY PRESENCE IS NOT ENABLEMENT (internal review of B5's guard).
+	//
+	// nats-server accepts `jetstream: false` / `jetstream: disabled` / `jetstream: off` as an explicit
+	// DISABLE. The first version of this predicate returned true for those, and because BuildMergedConf's
+	// BUG-1 guard keys on it, a broker whose operator had deliberately switched JetStream off would be
+	// refused a render — permanently, in the 5-second reconcile loop, with a banner advising them to add
+	// a store_dir, i.e. to turn back on the subsystem they had turned off. The guard exists to stop
+	// JetStream being taken away by accident; a conf that asks for no JetStream is not that.
+	//
+	// The bare `jetstream {}` map with no store_dir stays TRUE, which is the shape that made the original
+	// defect reachable.
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "false", "disabled", "off", "no":
+			return false
+		}
+		return true
+	default:
+		// A map (the normal `jetstream { … }` block) or anything else structured: enabled.
+		return true
+	}
 }
 
-// IsClusteredJetStream reports whether the conf runs JetStream WITH a cluster{} block — the shape a
-// node holds while it is a cluster voter. The REVERSE of IsStandaloneJetStream (v0.4.2 shrink): when
-// the last voter shrinks to N=1 it must drop the cluster{} block and reset its JS store back to
-// standalone (the mirror of the grow §3a transition), since a lone node can never reach the
-// clustered JS meta quorum-of-2.
-func (o *Ownership) IsClusteredJetStream() bool {
-	_, hasJS := o.Parsed["jetstream"]
+// TWO FACTS, TWO PREDICATES — and the compound that used to blur them is gone (external review RB2-1)
+// ----------------------------------------------------------------------------------------------------
+// A nats.conf carries two INDEPENDENT facts, and every bug in this area came from a predicate that
+// answered both at once:
+//
+//	NATS TOPOLOGY        is there a cluster{} block?     -> IsClusteredTopology / IsStandaloneTopology
+//	JETSTREAM ENABLEMENT is JetStream actually ON?       -> HasJetStream (value-aware)
+//
+// They are independent: `jetstream: false` + `cluster{}` is a clustered NATS with JetStream switched
+// off, and it is a shape an operator reaches for during a JetStream incident.
+//
+// WHAT THE COMPOUND PREDICATES DID, AND WHY MY FIRST DEFENCE OF THEM WAS WRONG
+// ----------------------------------------------------------------------------
+// `IsStandaloneJetStream`/`IsClusteredJetStream` were `keyPresence && (!)hasCluster`. When external
+// review B2-1 said every JetStream decision should use one value-aware predicate, I agreed for the
+// enablement guard but REFUSED to touch these two, arguing that making them value-aware would break
+// force-single's de-cluster of a `jetstream: false` + `cluster{}` conf.
+//
+// The re-review (RB2-1) showed that argument rested on a false premise: that conf could not be
+// de-clustered EITHER WAY. `IsClusteredJetStream` said true (key present), so buildStandaloneConf
+// entered the de-cluster arm and then demanded a JS `store_dir` that a disabled JetStream does not
+// have — failing with "source JetStream has no explicit store_dir". My rebuttal described a regression
+// away from a state that never worked. The second half was wrong too: under TOPOLOGY predicates a lone
+// `jetstream: false` node is standalone, so IntentPreserve keeps rendering standalone and the
+// ActionRejected wedge I predicted does not arise. It only arose against the strawman of folding
+// topology INTO HasJetStream, which is not what was asked for.
+//
+// So the compounds are deleted rather than renamed. A caller that needs both facts now writes both,
+// and the second conjunct is visible at the call site instead of hidden in a predicate's name — which
+// is exactly where the two destructive bugs (a de-cluster that refuses, an `rm -rf` advised to a broker
+// with JetStream off) were able to hide.
+
+// IsClusteredTopology reports whether the conf has a cluster{} block — i.e. whether this node is
+// configured as a cluster member. It says NOTHING about JetStream.
+func (o *Ownership) IsClusteredTopology() bool {
 	_, hasCluster := o.Parsed["cluster"]
-	return hasJS && hasCluster
+	return hasCluster
+}
+
+// IsStandaloneTopology reports whether the conf has NO cluster{} block. The exact complement of
+// IsClusteredTopology, spelled out because "no cluster block" is what most call sites actually mean and
+// `!IsClusteredTopology()` reads as a double negative at the point of use.
+//
+// This is the shape `cluster init --from-existing` leaves an N=1 broker in (clustered JS refuses to
+// start without configured routes). A node in this shape that ALSO runs JetStream cannot simply be
+// restarted with a cluster{} block added: NATS does not migrate standalone JS state into a clustered
+// meta, so the meta forms and the streams orphan (test/d9 TestD9Matrix/GrowStandaloneRestartWedgesJS).
+// That migration hazard is a JETSTREAM fact, so the sites that warn about it pair this with
+// HasJetStream() rather than assuming it.
+func (o *Ownership) IsStandaloneTopology() bool {
+	return !o.IsClusteredTopology()
 }
 
 // ClientListen harvests the client listen address from the parsed conf: install.sh writes

@@ -40,6 +40,17 @@
 ### 阶段 C — 审查与收尾
 4. **多专家对抗性审查代码（用 Workflow 工具）**：主进程为当前 phase 现场草拟一个审查 workflow 脚本，并行多视角专家对抗性审查。**专家只读实现、可自行新增测试条目，但绝不修改实现代码。** 报告写入 `docs/reviews/p<N>-review.md`（多轮则 `-round2`/`-round3`）。
 5. **主进程评估审查正确性并修改**：逐条采纳/驳回 finding；整合专家新增的测试；**只有主进程能改实现**。
+5b. **测试归位**：本轮新增/整合的测试文件**按被测单元命名**（`tunnel_fence_test.go`），
+   **不允许**新建 `*_external_review_*_test.go` / `*_round<N>_*_test.go` / `p<N>_*` / `b<N>_*` / `g<N>_*`
+   这类**按开发过程事件**命名的文件。审查者的 finding 写成测试函数上方的一行
+   `// origin: p13 external review round 6 F2`——它扛得住改名，而文件名扛不住：
+   下一个改 `CloseProxy` 的人 grep 不到 `p13_external_review_round2_test.go`，
+   于是同一个不变量每轮审查被重新发现一次（`internal/tunnel` 曾有**四个**文件测同一条 fence，
+   round2 抓到 `CloseProxy` 漏 fence、round5 抓到 `CloseSession` 同样的洞、round6 抓到 `ForgetSession`——
+   **若 round2 就写成 `{verb, killFn}` 表，round5/round6 这两轮返工在结构上不会发生**）。
+   由 `test/determinism/test_naming_test.go` 的冻结门在 `make test` 里拦下；
+   存量 158 个在 `legacy_process_named_list.go` 的**递减账本**里，改名时同 commit 删掉对应行
+   （账本里已不存在的条目会让门变红，所以它不会腐化成永久豁免）。
 6. **外部审查（用户本人）**：提交给用户做最终人工外审；用户出报告 `docs/reviews/p<N>-external-review.md`，主进程评估后**在报告文件内逐条回复**并修改。**外审不过不算 done。**
 7. **phase 结束**：`git commit` + `git push`（见 §6）。
 

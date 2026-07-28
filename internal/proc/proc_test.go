@@ -6,18 +6,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // openDB returns a fresh in-memory SQLite seeded with one ACTIVE session
 // and one node — the (sid, nid) FK target proc.Insert needs.
+// openDB opens the shared in-memory fixture and then SEEDS this package's session + node rows — see the
+// note in internal/node/node_test.go for why the seed stays local.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := testharness.OpenDB(t)
 	if _, err := db.Exec(
 		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
 		"lab", "lab", "SHA256:owner", "phc",

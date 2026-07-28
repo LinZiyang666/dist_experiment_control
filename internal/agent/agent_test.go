@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
-	natstest "github.com/nats-io/nats-server/v2/test"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -45,19 +45,11 @@ func TestNewSetsDefaults(t *testing.T) {
 	}
 }
 
+// B9: delegates to the single implementation in internal/testharness — the body was
+// character-for-character identical.
 func startNATS(t *testing.T) string {
 	t.Helper()
-	opts := natstest.DefaultTestOptions
-	opts.Port = -1
-	ns := natstest.RunServer(&opts)
-	t.Cleanup(func() {
-		ns.Shutdown()
-		ns.WaitForShutdown()
-	})
-	if !ns.ReadyForConnections(2 * time.Second) {
-		t.Fatal("embedded nats-server not ready")
-	}
-	return ns.ClientURL()
+	return testharness.StartNATS(t)
 }
 
 // Run a real agent against a stub NATS subscriber that ACKs register and

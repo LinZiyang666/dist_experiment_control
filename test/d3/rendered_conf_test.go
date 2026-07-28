@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/authcallout"
-	"github.com/LinZiyang666/tether/internal/natscluster"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
@@ -115,18 +115,21 @@ func TestD3RenderedConfCrossServerCalloutDedupe(t *testing.T) {
 	// ports (conf cannot express a random cluster port, and a random client port
 	// proved unreliable for the routed second server).
 	mkConf := func(name string, local int, routeURLs [2]string, clusterPort, clientPort int) string {
-		peers := []natscluster.Broker{
+		peers := []natsconf.Broker{
 			{ServerName: "tether-1", NkeyPub: brokers[0].pub, RouteURL: routeURLs[0]},
 			{ServerName: "tether-2", NkeyPub: brokers[1].pub, RouteURL: routeURLs[1]},
 		}
-		cfg := natscluster.Config{
-			Local: peers[local], Peers: peers, AccountIssuer: acctPub, Account: "$G",
+		cfg := natsconf.Config{
+			// Config.Account deleted (external review B2-7): no production writer existed, so every
+			// caller passed the "$G" the renderer now hardcodes. This suite still asserts the rendered
+			// `account: "$G"` line, which is what proves the deletion changed no output.
+			Local: peers[local], Peers: peers, AccountIssuer: acctPub,
 			ClientListen: fmt.Sprintf("127.0.0.1:%d", clientPort), ClusterName: "tether",
 			ClusterListen: fmt.Sprintf("127.0.0.1:%d", clusterPort),
 			CAFile:        ca, CertFile: cert, KeyFile: key,
 			// JSStoreDir intentionally empty: this test exercises routes + callout, not JS.
 		}
-		conf, err := natscluster.Render(cfg)
+		conf, err := natsconf.Render(cfg)
 		if err != nil {
 			t.Fatalf("render %s: %v", name, err)
 		}

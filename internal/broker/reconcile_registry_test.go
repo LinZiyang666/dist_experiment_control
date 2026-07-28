@@ -80,10 +80,10 @@ func TestReconcileRegistryMatchesLegacyTickers(t *testing.T) {
 	}
 	// Registered with the SAME intervals and the SAME leadership gates as
 	// registerCoreReconcilePasses wires them in production.
-	r.register("node-states", reconcileInterval, false, count("node-states"))
-	r.register("ports", reconcileInterval, true, count("ports"))
-	r.register("tunnel-sessions", reconcileInterval, false, count("tunnel-sessions"))
-	r.register("proc-gc", procGCInterval, false, count("proc-gc"))
+	r.register("node-states", reconcileInterval, authorityAny, count("node-states"))
+	r.register("ports", reconcileInterval, authorityLeader, count("ports"))
+	r.register("tunnel-sessions", reconcileInterval, authorityAny, count("tunnel-sessions"))
+	r.register("proc-gc", procGCInterval, authorityAny, count("proc-gc"))
 
 	if g := r.granularity(); g != reconcileInterval {
 		t.Fatalf("driving ticker period must be the shortest registered interval: got %v, want %v", g, reconcileInterval)
@@ -139,8 +139,8 @@ func TestReconcileRegistryFiresOnTheSameInstants(t *testing.T) {
 
 	var fired []time.Time
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("driver", granularity, false, func(context.Context, time.Time) error { return nil })
-	r.register("periodic", period, false, func(_ context.Context, now time.Time) error {
+	r.register("driver", granularity, authorityAny, func(context.Context, time.Time) error { return nil })
+	r.register("periodic", period, authorityAny, func(_ context.Context, now time.Time) error {
 		fired = append(fired, now)
 		return nil
 	})
@@ -171,7 +171,7 @@ func TestReconcileRegistryFiresOnTheSameInstants(t *testing.T) {
 func TestReconcileRegistryNoCatchupBurst(t *testing.T) {
 	var runs int
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("p", time.Second, false, func(context.Context, time.Time) error { runs++; return nil })
+	r.register("p", time.Second, authorityAny, func(context.Context, time.Time) error { runs++; return nil })
 
 	clk := newFakeClock(regEpoch)
 	r.start(clk.Now())
@@ -206,8 +206,8 @@ func TestReconcileRegistryLeaderGate(t *testing.T) {
 	var leaderRuns, localRuns int
 
 	r := newReconcileRegistry(silentLogger(), leader.Load)
-	r.register("leader-only", time.Second, true, func(context.Context, time.Time) error { leaderRuns++; return nil })
-	r.register("per-broker", time.Second, false, func(context.Context, time.Time) error { localRuns++; return nil })
+	r.register("leader-only", time.Second, authorityLeader, func(context.Context, time.Time) error { leaderRuns++; return nil })
+	r.register("per-broker", time.Second, authorityAny, func(context.Context, time.Time) error { localRuns++; return nil })
 
 	clk := newFakeClock(regEpoch)
 	r.start(clk.Now())
@@ -275,7 +275,7 @@ func TestReconcileRegistryBackoff(t *testing.T) {
 	fail.Store(true)
 
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("flaky", time.Second, false, func(context.Context, time.Time) error {
+	r.register("flaky", time.Second, authorityAny, func(context.Context, time.Time) error {
 		attempts++
 		if fail.Load() {
 			return failing
@@ -342,13 +342,13 @@ func TestReconcileRegistryRejectsBadRegistration(t *testing.T) {
 		name string
 		call func(r *reconcileRegistry)
 	}{
-		{"empty name", func(r *reconcileRegistry) { r.register("", time.Second, false, ok) }},
-		{"zero interval", func(r *reconcileRegistry) { r.register("p", 0, false, ok) }},
-		{"negative interval", func(r *reconcileRegistry) { r.register("p", -time.Second, false, ok) }},
-		{"nil fn", func(r *reconcileRegistry) { r.register("p", time.Second, false, nil) }},
+		{"empty name", func(r *reconcileRegistry) { r.register("", time.Second, authorityAny, ok) }},
+		{"zero interval", func(r *reconcileRegistry) { r.register("p", 0, authorityAny, ok) }},
+		{"negative interval", func(r *reconcileRegistry) { r.register("p", -time.Second, authorityAny, ok) }},
+		{"nil fn", func(r *reconcileRegistry) { r.register("p", time.Second, authorityAny, nil) }},
 		{"duplicate name", func(r *reconcileRegistry) {
-			r.register("dup", time.Second, false, ok)
-			r.register("dup", time.Second, false, ok)
+			r.register("dup", time.Second, authorityAny, ok)
+			r.register("dup", time.Second, authorityAny, ok)
 		}},
 	}
 	for _, tc := range cases {
@@ -369,13 +369,13 @@ func TestReconcileRegistryRejectsBadRegistration(t *testing.T) {
 func TestReconcileRegistryLateRegistrationIsAppendOnly(t *testing.T) {
 	var early, late int
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("early", time.Second, false, func(context.Context, time.Time) error { early++; return nil })
+	r.register("early", time.Second, authorityAny, func(context.Context, time.Time) error { early++; return nil })
 
 	clk := newFakeClock(regEpoch)
 	r.start(clk.Now())
 	r.runDue(context.Background(), clk.advance(time.Second))
 
-	r.register("late", time.Second, false, func(context.Context, time.Time) error { late++; return nil })
+	r.register("late", time.Second, authorityAny, func(context.Context, time.Time) error { late++; return nil })
 	for i := 0; i < 3; i++ {
 		r.runDue(context.Background(), clk.advance(time.Second))
 	}
@@ -394,8 +394,8 @@ func TestReconcileRegistryStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var first, second int
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("first", time.Second, false, func(context.Context, time.Time) error { first++; cancel(); return nil })
-	r.register("second", time.Second, false, func(context.Context, time.Time) error { second++; return nil })
+	r.register("first", time.Second, authorityAny, func(context.Context, time.Time) error { first++; cancel(); return nil })
+	r.register("second", time.Second, authorityAny, func(context.Context, time.Time) error { second++; return nil })
 
 	clk := newFakeClock(regEpoch)
 	r.start(clk.Now())
@@ -417,7 +417,7 @@ func TestReconcileRegistryConcurrentDriversSerialize(t *testing.T) {
 	var runs atomic.Int32
 
 	r := newReconcileRegistry(silentLogger(), nil)
-	r.register("p", time.Millisecond, false, func(context.Context, time.Time) error {
+	r.register("p", time.Millisecond, authorityAny, func(context.Context, time.Time) error {
 		if inFlight.Add(1) > 1 {
 			overlaps.Add(1)
 		}
@@ -465,18 +465,23 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
 	b.registerCoreReconcilePasses()
 
+	const any, leader = "any", "leader"
 	want := []reconcilePassStatus{
-		{Name: "node-states", Interval: time.Second, LeaderOnly: false},
-		{Name: "ports", Interval: time.Second, LeaderOnly: true},
-		{Name: "tunnel-sessions", Interval: time.Second, LeaderOnly: false},
-		{Name: "proc-gc", Interval: 5 * time.Minute, LeaderOnly: false},
-		{Name: "xfer-orphan-reap", Interval: 5 * time.Minute, LeaderOnly: false},       // #58/P10: home-authoritative, per-broker (see reaperCaughtUp+homeOwnsXferBucket)
-		{Name: "xfer-inflight-finalize", Interval: 5 * time.Minute, LeaderOnly: false}, // R16 #57: finalize-on-recovery for stranded in-flight transfers (shares the reap cadence)
-		{Name: "grow-lock", Interval: 30 * time.Second, LeaderOnly: true},
-		{Name: "upgrade-lock", Interval: 30 * time.Second, LeaderOnly: true},
-		// R8a P1: leader-only — it re-delivers what the leader's homeForRegister computes
+		{Name: "node-states", Interval: time.Second, Authority: any},
+		{Name: "ports", Interval: time.Second, Authority: leader},
+		{Name: "tunnel-sessions", Interval: time.Second, Authority: any},
+		{Name: "proc-gc", Interval: 5 * time.Minute, Authority: any},
+		{Name: "xfer-orphan-reap", Interval: 5 * time.Minute, Authority: any},       // #58/P10: home-authoritative, per-broker (see reaperCaughtUp+homeOwnsXferBucket)
+		{Name: "xfer-inflight-finalize", Interval: 5 * time.Minute, Authority: any}, // R16 #57: finalize-on-recovery for stranded in-flight transfers (shares the reap cadence)
+		{Name: "grow-lock", Interval: 30 * time.Second, Authority: leader},
+		{Name: "upgrade-lock", Interval: 30 * time.Second, Authority: leader},
+		// R8a P1: leader-gated — it re-delivers what the leader's homeForRegister computes
 		// from replicated rows; N brokers pushing the same assignment is pure amplification.
-		{Name: "home-delivery", Interval: 5 * time.Second, LeaderOnly: true},
+		{Name: "home-delivery", Interval: 5 * time.Second, Authority: leader},
+		// B7 deliberately did NOT add leader-maintenance / proxy-reap passes here. Both available
+		// shapes are regressions and the reasoning is recorded at the top of this file's production
+		// counterpart (reconcile_registry.go, "WHY THE TWO LEADER DUTIES STAYED OUT"). If a future
+		// increment revisits it, this list is where the decision becomes visible again.
 	}
 	got := b.reconcilers.status()
 	if len(got) != len(want) {
@@ -484,9 +489,9 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 	}
 	for i, w := range want {
 		g := got[i]
-		if g.Name != w.Name || g.Interval != w.Interval || g.LeaderOnly != w.LeaderOnly {
-			t.Errorf("pass %d: got (%s, %v, leaderOnly=%v), want (%s, %v, leaderOnly=%v)",
-				i, g.Name, g.Interval, g.LeaderOnly, w.Name, w.Interval, w.LeaderOnly)
+		if g.Name != w.Name || g.Interval != w.Interval || g.Authority != w.Authority {
+			t.Errorf("pass %d: got (%s, %v, authority=%q), want (%s, %v, authority=%q)",
+				i, g.Name, g.Interval, g.Authority, w.Name, w.Interval, w.Authority)
 		}
 	}
 	// The driving ticker must be the shortest interval, or a 1s pass would run

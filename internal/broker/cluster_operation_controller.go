@@ -264,12 +264,10 @@ func (a *ClusterAdmin) ConfirmOp(opID string) error {
 			// catchup_deadline to 0 so boundRehomeConvergence re-stamps a new deadline on the next
 			// REHOME_EXPOSES hold — otherwise the op re-enters carrying its OLD, already-expired deadline
 			// and boundRehomeConvergence re-BLOCKs it on the very next tick, making `cluster ops confirm` a
-			// no-op. (catchup_deadline only persists alongside SetBarrier — see operation_ops.go.)
+			// no-op. The reset is OpVal(0), NOT nil: nil preserves the column, which is exactly the
+			// already-expired deadline this branch exists to discard (operation_ops.go).
 			return a.transition(op, cluster.OpStateDrainRequested, false, "", func(in *cluster.OpTransitionInput) {
-				in.SetBarrier = true
-				in.Barrier = op.Barrier
-				in.CatchupDeadline = 0
-				in.TopoTargetGen = op.TopoTargetGen
+				in.CatchupDeadline = cluster.OpVal(int64(0))
 			})
 		}
 		return nil
@@ -500,7 +498,8 @@ func (a *ClusterAdmin) readSubstrate(target string) (substrate, error) {
 
 // transition commits one predecessor-CAS cursor advance with a fresh timeline entry. The new timeline
 // is computed leader-side (current + entry, capped) and baked as a literal — deterministic on every
-// replica. opt mutators (SetBarrier) are passed through.
+// replica. The mutator may set any of the three capture-column pointers; whatever it leaves nil keeps
+// its stored value (cluster.OpTransitionInput).
 func (a *ClusterAdmin) transition(op *cluster.Operation, to string, terminal bool, lastErr string, mut func(*cluster.OpTransitionInput)) error {
 	tl := appendTimeline(op.Timeline, opTimelineEntry{S: to, T: a.now().UTC().Format(time.RFC3339), E: lastErr})
 	in := cluster.OpTransitionInput{
@@ -567,10 +566,10 @@ func (a *ClusterAdmin) driveJoin(op *cluster.Operation, sub substrate) {
 		}
 		deadline := a.adaptiveCatchupDeadline()
 		_ = a.transition(op, cluster.OpStateRaftAdding, false, "", func(in *cluster.OpTransitionInput) {
-			in.SetBarrier = true
-			in.Barrier = barrier
-			in.CatchupDeadline = deadline
-			in.TopoTargetGen = op.TopoTargetGen
+			// The freshly-captured barrier and its deadline are written; topo_target_gen is left ALONE
+			// (nil) rather than re-copied — this step has nothing new to say about the topology target.
+			in.Barrier = cluster.OpVal(barrier)
+			in.CatchupDeadline = cluster.OpVal(deadline)
 		})
 	case cluster.OpStateRaftAdding:
 		// The barrier is persisted now. v0.4.2 wedge-prevention (the keystone): stage the joiner as
@@ -758,10 +757,10 @@ func (a *ClusterAdmin) boundCatchingUp(op *cluster.Operation) {
 	if op.CatchupDeadline == 0 {
 		deadline := a.adaptiveCatchupDeadline()
 		_ = a.transition(op, cluster.OpStateCatchingUp, false, op.LastError, func(in *cluster.OpTransitionInput) {
-			in.SetBarrier = true
-			in.Barrier = op.Barrier
-			in.CatchupDeadline = deadline
-			in.TopoTargetGen = op.TopoTargetGen
+			// Only the missing deadline is stamped. The barrier and the topology target are left ALONE,
+			// which is what "lazy stamp" always meant — previously it had to re-copy both to avoid
+			// zeroing them.
+			in.CatchupDeadline = cluster.OpVal(deadline)
 		})
 		return
 	}
@@ -786,13 +785,11 @@ func (a *ClusterAdmin) boundCatchingUp(op *cluster.Operation) {
 func (a *ClusterAdmin) boundRehomeConvergence(op *cluster.Operation, holdErr error) (blocked, stamped bool) {
 	if op.CatchupDeadline == 0 {
 		deadline := a.now().Add(opRehomeConvergeTimeout).UnixNano()
-		// catchup_deadline is only persisted alongside the SetBarrier capture step (operation_ops.go),
-		// so set it and PRESERVE the current barrier + topo target (mirrors boundCatchingUp).
+		// Stamp the convergence window and leave the barrier + topology target alone (mirrors
+		// boundCatchingUp). Preserving them is now the DEFAULT rather than something this call site has
+		// to remember to re-copy.
 		_ = a.transition(op, cluster.OpStateRehomeExposes, false, holdErr.Error(), func(in *cluster.OpTransitionInput) {
-			in.SetBarrier = true
-			in.Barrier = op.Barrier
-			in.CatchupDeadline = deadline
-			in.TopoTargetGen = op.TopoTargetGen
+			in.CatchupDeadline = cluster.OpVal(deadline)
 		})
 		return false, true
 	}
@@ -1254,10 +1251,11 @@ func (a *ClusterAdmin) toNatsRolledOut(op *cluster.Operation) {
 	}
 	a.clearOpAttempts(op.OpID)
 	_ = a.transition(op, cluster.OpStateNatsRolledOut, false, "", func(in *cluster.OpTransitionInput) {
-		in.SetBarrier = true
-		in.Barrier = op.Barrier
-		in.CatchupDeadline = a.now().Add(opTopoConvergeTimeout).UnixNano()
-		in.TopoTargetGen = gen
+		// This is the ONE step that has a new topology target to persist, and C4-M5 above guarantees it
+		// is non-zero (a read error returns early rather than advancing with 0, which topoConvergedForOp
+		// would read as "converged"). The barrier is left alone.
+		in.CatchupDeadline = cluster.OpVal(a.now().Add(opTopoConvergeTimeout).UnixNano())
+		in.TopoTargetGen = cluster.OpVal(gen)
 	})
 }
 

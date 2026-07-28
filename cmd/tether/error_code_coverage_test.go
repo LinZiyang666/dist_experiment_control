@@ -168,20 +168,31 @@ var unresolvedCodeSites = map[string]string{
 	"internal/broker/cluster_manifest.go:114":        "clusterCodeFor returns the typed adminsock error namespace.",
 
 	// Every site below is an adminsock.Response.Code populated by clusterCodeFor.
+	//
 	// Batch B: all twelve shifted by +8 when versionSkewRefusal / ErrJoinVersionSkew were
-	// extracted above them. The reasons are unchanged, byte for byte — only the line moved.
-	"internal/broker/clusterstatus.go:747": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:767": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:772": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:780": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:792": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:797": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:802": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:807": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:812": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:827": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:907": "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:970": "adminsock response; clusterCodeFor maps typed cluster errors.",
+	// extracted above them. Batch B2 / external review B2-2: they shifted again (+24 at the top,
+	// tapering) when the statusSchemaVersion v1->v2 contract was documented above them. The reasons are
+	// unchanged, byte for byte — only the lines moved, for the TENTH time in this file's history.
+	//
+	// That count is the finding, not the churn: keying an exemption to file:line means every comment
+	// added above a site invalidates it, and the re-key is mechanical, unreviewable and indistinguishable
+	// from someone silencing a NEW site. docs/testing-standards.md G3 requires site-scoped exemptions and
+	// it is right to — file-scoped ones hide future problems — but "site" does not have to mean "line".
+	// A stable key (the enclosing function name plus the code, or a `// unresolved:` marker at the site)
+	// would survive edits above it. That is a change to the gate rather than to its data, so it is NOT
+	// being made mid-review; it is recorded here as the next reader's first question.
+	"internal/broker/clusterstatus.go:797":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:817":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:822":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:830":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:842":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:847":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:852":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:857":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:862":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:877":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:957":  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:1020": "adminsock response; clusterCodeFor maps typed cluster errors.",
 
 	// Batch B / B1: the six ingress handlers converted to admit() pass the gate's `den.code`
 	// through to their reply helper, so the value is a variable rather than a literal here.

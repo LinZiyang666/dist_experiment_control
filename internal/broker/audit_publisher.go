@@ -77,6 +77,10 @@ type AuditPublisherConfig struct {
 	// while a still-existing session means the stream is merely not-yet-ensured (transient → R-22
 	// retry). nil ⇒ conservative "exists" (always retry; preserves pre-M5 behavior in tests).
 	SessionExists func(sid string) (bool, error)
+	// Beat (B7), when non-nil, is called once per completed loop iteration so loopSet.Snapshot can
+	// report per-iteration liveness. The loop owns its own ticker, so this is the only way the set can
+	// tell a live loop from one that returned on its first line. nil ⇒ no liveness reported (tests).
+	Beat func()
 }
 
 // AuditPublisher is the merged leader-only loop (Mechanism A publish + Mechanism B
@@ -125,6 +129,9 @@ func (p *AuditPublisher) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			p.tick(ctx)
+			if p.cfg.Beat != nil {
+				p.cfg.Beat()
+			}
 		}
 	}
 }

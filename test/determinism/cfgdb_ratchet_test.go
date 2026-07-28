@@ -158,7 +158,7 @@ func TestCfgDBDirectAccessRatchet(t *testing.T) {
 	if total != cfgDBBaselineTotal {
 		t.Errorf("total direct b.cfg.DB sites = %d, baseline says %d.\n"+
 			"If you CONVERTED sites, lower cfgDBBaselineTotal in the same commit — that is how this "+
-			"ratchet works. If you ADDED one, use b.read() / b.liveness() / b.singleWriter() instead; "+
+			"ratchet works. If you ADDED one, use b.read() / b.livenessDB() / b.singleWriter() instead; "+
 			"see internal/broker/dbrole.go for which.", total, cfgDBBaselineTotal)
 	}
 
@@ -184,7 +184,7 @@ func TestCfgDBDirectAccessRatchet(t *testing.T) {
 				"In cluster mode that handle is READ-ONLY (broker.go re-points it to node.RODB()), so a "+
 				"write here fails at runtime and ONLY in cluster mode — which this package's ~126 "+
 				"zero-value &Broker{} test literals do not exercise. Use b.read() for reads, "+
-				"b.liveness() for the three liveness columns, or route the write through raft.", k, have)
+				"b.livenessDB() for the three liveness columns, or route the write through raft.", k, have)
 		case have == 0:
 			t.Errorf("baseline lists %s with %d site(s) but it now has none — the function was renamed, "+
 				"deleted, or fully converted. Remove the entry in the same commit, or the table stops "+
@@ -259,7 +259,7 @@ func countCfgDB(n ast.Node) int {
 func TestCfgDBRatchetSelfCheck(t *testing.T) {
 	const src = `package broker
 func hit() { _ = b.cfg.DB; _ = b.cfg.DB }
-func viaAccessor() { _ = b.read(); _ = b.liveness() }
+func viaAccessor() { _ = b.read(); _ = b.livenessDB() }
 func otherReceiver() { _ = other.cfg.DB }
 func otherField() { _ = b.other.DB }
 func otherSel() { _ = b.cfg.Other }

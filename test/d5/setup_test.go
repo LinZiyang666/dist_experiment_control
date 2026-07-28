@@ -15,23 +15,16 @@ package d5_test
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
-	"math/big"
-	"net"
-	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/clusterharness"
 	"github.com/hashicorp/raft"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -44,15 +37,9 @@ import (
 // ids — keyed on the ReqID, not the raft index.
 const testReqID = "d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5"
 
+// B9: delegates to test/clusterharness — see the note in test/d3/setup_test.go.
 func waitForCond(within time.Duration, pred func() bool) bool {
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if pred() {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return pred()
+	return clusterharness.WaitForCond(within, pred)
 }
 
 // ---- routed NATS cluster with clustered JetStream (plain, no auth) ----
@@ -64,13 +51,7 @@ func waitForCond(within time.Duration, pred func() bool) bool {
 // (the seed-then-join pattern that works for plain NATS does not work for clustered JS).
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	return clusterharness.FreePort(t) // B9: shared with test/d8's freeClusterPort
 }
 
 // startRoutedJS brings up an n-server clustered-JetStream NATS mesh. Under the full
@@ -180,50 +161,12 @@ func attemptRoutedJS(t *testing.T, n int) ([]*natsserver.Server, bool) {
 
 // ---- mTLS raft CA (mirror test/d4) ----
 
-type routeCA struct {
-	cert *x509.Certificate
-	key  ed25519.PrivateKey
-	pool *x509.CertPool
-}
+// B9: the route-mTLS CA moved to test/clusterharness — see the note in test/d4/setup_test.go.
+const d5CAName = "tether-d5"
 
-func newRouteCA(t *testing.T) *routeCA {
+func newRouteCA(t *testing.T) *clusterharness.RouteCA {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "tether-d5-ca"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &routeCA{cert: cert, key: priv, pool: pool}
-}
-
-func (ca *routeCA) clusterLeaf(t *testing.T) tls.Certificate {
-	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "tether-d5-node"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, pub, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	return clusterharness.NewRouteCA(t, d5CAName)
 }
 
 // ---- the combined harness ----
@@ -248,7 +191,7 @@ func startCluster5(t *testing.T, n int) *cluster5 {
 	trans := make([]*raft.NetworkTransport, n)
 	for i := range trans {
 		tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{
-			BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.clusterLeaf(t),
+			BindAddr: "127.0.0.1:0", CACert: ca.Pool, Leaf: ca.Leaf(t, d5CAName),
 		})
 		if err != nil {
 			t.Fatalf("transport %d: %v", i, err)
@@ -427,42 +370,21 @@ func waitForStreamReplicas(t *testing.T, js jetstream.JetStream, name string, wa
 
 // ---- goroutine / fd leak gates (copied: goleak is deliberately NOT used; CLAUDE.md §5) ----
 
+// assertNoGoroutineLeak / assertNoFDLeak delegate to internal/testharness (B9) — see the note in
+// test/d4/setup_test.go. The local names stay so this suite's call sites do not churn.
 func assertNoGoroutineLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	var last int
-	for i := 0; i < 50; i++ {
-		runtime.Gosched()
-		last = runtime.NumGoroutine()
-		if last-before <= 2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	buf := make([]byte, 64*1024)
-	nb := runtime.Stack(buf, true)
-	t.Errorf("%s: goroutine leak: before=%d after=%d (+%d)\n%s", label, before, last, last-before, buf[:nb])
+	testharness.AssertNoGoroutineLeak(t, label, before)
 }
 
-func fdCount() int {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	return len(entries)
-}
+func fdCount() int { return testharness.FDCount() }
+
+// d5FDTolerance mirrors d4's: this suite also churns NATS/raft internals, which shift a few
+// descriptors. It is passed explicitly rather than baked into the shared helper because the repo has
+// three different derived tolerances and collapsing them would break one of the two ends.
+const d5FDTolerance = 4
 
 func assertNoFDLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	if before < 0 {
-		return
-	}
-	var last int
-	for i := 0; i < 50; i++ {
-		last = fdCount()
-		if last-before <= 4 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("%s: fd leak: before=%d after=%d (+%d)", label, before, last, last-before)
+	testharness.AssertNoFDLeak(t, label, before, d5FDTolerance)
 }

@@ -358,21 +358,31 @@ func TestD5RunPublishesAndNoLeak(t *testing.T) {
 	runtime.GC()
 	before, fdBefore := runtime.NumGoroutine(), fdCount()
 
-	runCtx, runCancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { p.Run(runCtx); close(done) }()
+	// leakExercises rounds, not one (internal review B9-1). p.Run's per-invocation goroutines and its JS
+	// subscription are exactly per-Run shaped, so a leak of one of them is +1 per round — invisible in a
+	// single round against the ±2 noise floor that assertNoGoroutineLeak derives. The audit publish is
+	// only asserted on the FIRST round: after that the stream already holds the record and the count
+	// would not move, so re-asserting it would be asserting nothing.
+	const leakExercises = 5
+	for round := 0; round < leakExercises; round++ {
+		runCtx, runCancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { p.Run(runCtx); close(done) }()
 
-	commitReconcile(t, c.nodes[li], "", "lab",
-		[]proc.ReconProcAudit{auditProc("lab-1", "01ddd", "reconciled_closed")}, nil)
-	if !waitForCond(8*time.Second, func() bool { return streamMsgs(t, c.js[li], jsstream.HistoryStreamName("lab")) == 2 }) {
-		t.Fatalf("Run did not publish the committed audit (got %d, want 2)", streamMsgs(t, c.js[li], jsstream.HistoryStreamName("lab")))
-	}
+		if round == 0 {
+			commitReconcile(t, c.nodes[li], "", "lab",
+				[]proc.ReconProcAudit{auditProc("lab-1", "01ddd", "reconciled_closed")}, nil)
+			if !waitForCond(8*time.Second, func() bool { return streamMsgs(t, c.js[li], jsstream.HistoryStreamName("lab")) == 2 }) {
+				t.Fatalf("Run did not publish the committed audit (got %d, want 2)", streamMsgs(t, c.js[li], jsstream.HistoryStreamName("lab")))
+			}
+		}
 
-	runCancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not exit after ctx cancel")
+		runCancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: Run did not exit after ctx cancel", round)
+		}
 	}
 	assertNoGoroutineLeak(t, "publisher-run", before)
 	assertNoFDLeak(t, "publisher-run", fdBefore)

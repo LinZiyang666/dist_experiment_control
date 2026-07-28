@@ -281,3 +281,23 @@ func TestD7StatusReportRendersRoleAndHealth(t *testing.T) {
 		t.Errorf("N=1 verdict = %q, want 'NO redundancy'", rep.Verdict)
 	}
 }
+
+// origin: batch B2 independent external review F2
+func TestClusterStatusSchemaBumpsWhenStreamActualGainsAnUnobservedSentinel(t *testing.T) {
+	rep := adminsock.ClusterStatusReport{
+		SchemaVersion: statusSchemaVersion,
+		Nodes: []adminsock.ClusterNodeStatus{{
+			StreamActual: StreamActualUnobserved,
+			StreamTarget: 3,
+		}},
+	}
+	payload, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if StreamActualUnobserved < 0 && statusSchemaVersion < 2 {
+		t.Fatalf("cluster status emits a new negative stream_actual value under schema_version=%d: %s; "+
+			"docs/usage.md requires a schema bump when a field's value domain or semantics changes",
+			statusSchemaVersion, payload)
+	}
+}

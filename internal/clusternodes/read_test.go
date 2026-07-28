@@ -6,17 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
+// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 func insertNode(t *testing.T, db *sql.DB, nodeID, natsServer, tunnelAddr, certFP string, prev *string, valid *time.Time, phase string) {

@@ -14,7 +14,6 @@ package p3_test
 import (
 	"context"
 	"database/sql"
-	"io"
 	"log/slog"
 	"os"
 	"testing"
@@ -23,7 +22,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/cli"
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/jwt/v2"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
@@ -175,22 +174,17 @@ func jwtToServerPerms(p jwt.Permissions) *natsserver.Permissions {
 	}
 }
 
+// B9: delegates to internal/testharness — the body was a character-for-character copy, escape hatch
+// included, which is the shape where the two silently drift apart.
 func silentLog() *slog.Logger {
-	if os.Getenv("TETHER_TEST_VERBOSE") != "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return testharness.SilentLog()
 }
 
 // openDB returns a fresh in-memory SQLite for the broker.
+// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 // freshIdentity generates an isolated CLI identity inside a per-test home.

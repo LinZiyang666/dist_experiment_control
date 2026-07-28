@@ -7,17 +7,15 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
+// openDB delegates to internal/testharness (B9). Seven packages carried a byte-identical copy of this
+// eight-line body; the local name is kept so this package's call sites do not churn, which is the same
+// one-line-shim shape the e2e suites already use.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return testharness.OpenDB(t)
 }
 
 const (

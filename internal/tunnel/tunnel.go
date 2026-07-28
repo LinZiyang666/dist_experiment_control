@@ -256,7 +256,14 @@ func (s *Server) Start(ctx context.Context) error {
 	s.ln = ln
 	s.mu.Unlock()
 
-	go s.acceptLoop(ctx, ln)
+	// The accept loop owns every subsequent wg.Add for handleAgent. Register it before launch so Close's
+	// Wait cannot observe a zero counter while an accepted connection is still about to Add a handler.
+	// Its Done is the proof that no future handler Add is possible.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.acceptLoop(ctx, ln)
+	}()
 	go func() {
 		<-ctx.Done()
 		s.Close()

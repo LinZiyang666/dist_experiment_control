@@ -72,7 +72,31 @@ const (
 
 	// statusSchemaVersion is the --json schema discriminator (§17 / external review
 	// F4); bump on any breaking shape change so monitors can negotiate.
-	statusSchemaVersion = 1
+	//
+	// v1 -> v2 (batch B2, external review B2-2): `stream_actual` gained the sentinel
+	// StreamActualUnobserved (-1), meaning "the replica observation did not complete", where v1's
+	// domain was non-negative measured counts only. That is a CHANGE OF MEANING for an existing key, and
+	// docs/usage.md's bump policy names exactly that as requiring a bump ("仅破坏性改动（删/改键、改类型、
+	// 改语义）才 bump").
+	//
+	// It shipped at v1 first, which was the defect: a v1 collector could read -1 as malformed, as a real
+	// count, or as a catastrophic deficit, with no discriminator to tell it the field had acquired a new
+	// value class. The alternative — keeping v1's domain and encoding "unobserved" additively — was
+	// considered and rejected: every honest additive encoding also breaks v1, because there is no
+	// non-negative integer that truthfully means "not measured" (0 is the FABRICATED value this batch
+	// removed, and `*int` is a type change, which the same policy also calls breaking). So the value
+	// domain has to widen, and widening it is a v2.
+	//
+	// v2 contract for `nodes[].stream_actual`:
+	//
+	//	>= 0   the observed replica count for this node's per-session streams
+	//	  -1   StreamActualUnobserved: observation failed or timed out. It is NOT a count, and it is
+	//	       deliberately < any stream_target, so every at-target comparison stays fail-closed (§S1).
+	//	       The human renderer prints "?/target" for it.
+	//
+	// The NUMBER lives in adminsock next to the struct it stamps, because the offline view in
+	// cmd/tether/cluster.go emits the same struct and a second literal would drift.
+	statusSchemaVersion = adminsock.ClusterStatusSchemaVersion
 
 	// certRotationWindow is how long the previous tunnel cert pin stays valid after a
 	// rotate-tunnel-cert (the cutover window agents reconnect within).
@@ -232,14 +256,25 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	topoDesired, _ := cluster.TopologyGeneration(a.node.RODB()) // C3: cluster-wide desired topology gen
 	streamTarget := jsstream.ReplicasFor(voters)
 	// External-review F1: report the REAL stream actual, not a synthesized actual==target. An
-	// unwired probe (N=1) keeps the optimistic default; a wired-but-incomplete observation
-	// reports 0 (unknown → a visible deficit in `actual/target`, never a false green).
+	// unwired probe (N=1) keeps the optimistic default.
+	//
+	// B7 / internal review B7-02 — UNOBSERVED IS NOT THE SAME AS MEASURED ZERO.
+	// A wired-but-failed observation used to report 0, which every consumer then read as a measured
+	// deficit: `cluster status` renders "0/3", computeHealth marks the node DEGRADED, and doctor says
+	// "stream replicas below target". That conflation was tolerable while the observation only failed on
+	// a genuinely broken JS meta. It stopped being tolerable when B7 put a 3s deadline on the call:
+	// ObserveReplicas walks EVERY session's history stream serially, so on a broker with many sessions a
+	// timeout is now an ordinary outcome, and an ordinary outcome must not render as a fault.
+	//
+	// -1 means UNOBSERVED. testing-standards §S1 asks for fail-closed on missing data, and it still is:
+	// StreamsAllAtTarget below treats -1 as NOT at target, so nothing that gates on replica health opens
+	// up. What changes is that the operator is told "not measured" instead of a number that is false.
 	streamActual := streamTarget
 	if a.streamObserve != nil {
 		if rep, err := a.streamObserve(); err == nil && rep.Observed {
 			streamActual = minStreamActual(rep, streamTarget)
 		} else {
-			streamActual = 0
+			streamActual = StreamActualUnobserved
 		}
 	}
 
@@ -377,7 +412,13 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// missing/unreadable conf just skips the extra banner (never fails the report).
 	jsClusteredForceSingle := false
 	if forceSingle && a.natsConfPath != "" {
-		if own, perr := natsconf.Preflight(a.natsConfPath); perr == nil && own.IsClusteredJetStream() {
+		// BOTH facts (external review RB2-1). The banner this raises asserts "JetStream is UNAVAILABLE —
+		// nats.conf is still clustered after force-single … transfers/history/audit return 503", and that
+		// causal claim needs JetStream to be ENABLED. On a conf with `jetstream: false` the 503s are not
+		// happening and the remedy offered would be answering a question nobody asked; the honest report
+		// there is the plain force-single banner without the data-plane-degraded clause.
+		if own, perr := natsconf.Preflight(a.natsConfPath); perr == nil &&
+			own.IsClusteredTopology() && own.HasJetStream() {
 			jsClusteredForceSingle = true
 		}
 	}
@@ -454,8 +495,17 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	return rep, nil
 }
 
+// StreamActualUnobserved is the ClusterNodeStatus.StreamActual value meaning "the replica observation
+// did not complete" — as distinct from a measured zero (B7 / internal review B7-02).
+//
+// It is negative on purpose: every existing consumer compares `StreamActual < StreamTarget`, so -1 keeps
+// the fail-closed behaviour that 0 had (nothing gated on replica health opens up) WITHOUT claiming a
+// measurement that was never taken. The CLI renders it as "?" rather than a number.
+const StreamActualUnobserved = -1
+
 // streamsAtTarget reports whether every node row with a KNOWN target is at or above it.
 // StreamTarget==0 means "not observed" and never counts as a deficit (matches computeHealth F1).
+// StreamActual == StreamActualUnobserved (-1) DOES count as not-at-target — fail-closed, §S1.
 func streamsAtTarget(nodes []adminsock.ClusterNodeStatus) bool {
 	for _, n := range nodes {
 		if n.StreamTarget > 0 && n.StreamActual < n.StreamTarget {

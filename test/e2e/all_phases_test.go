@@ -220,16 +220,30 @@ func TestD2Matrix(t *testing.T) {
 }
 
 // TestD3Matrix runs the D3 NATS-cluster-layer surface under -race: the mTLS raft
-// transport + fail-closed predicate (internal/cluster), the conf renderer
-// (internal/natscluster), the RF1 ACL templates + proto SSOT (internal/auth,
+// transport + fail-closed predicate (internal/cluster), the conf renderer + parser +
+// reconciler (internal/natsconf), the RF1 ACL templates + proto SSOT (internal/auth,
 // internal/proto), the handler seams (internal/authcallout), and the real ≥2-node
 // behavioral suite (test/d3). Dedicated -race subprocess like TestD1/D2Matrix; the
 // explicit 300s timeout overrides the suite default for the cluster election waits.
+//
+// B5 COVERAGE NOTE (roadmap §7.6 requires this to be stated, not assumed).
+// The glob below said `./internal/natscluster/...` until that package merged into
+// internal/natsconf. The two failure directions are NOT symmetric and that is why this
+// note exists: leaving the stale path is LOUD (`FAIL [setup failed]`, exit 1), but
+// DELETING it without adding the successor is SILENT — `make test` still covers the
+// package, `go vet` passes, and the parallel runner's scheduled-vs-reported
+// reconciliation compares identities WITHIN each unit, both derived from this same
+// command, so a shrunk package list reconciles cleanly.
+//
+// So: `./internal/natsconf/...` replaces it and ALSO newly brings in the parser +
+// reconciler surface, which previously ran only under `make test` (no -race). Coverage
+// strictly INCREASES. Verified by comparing the -race matrix's package set and its test
+// function set before and after; the diff is additions only.
 func TestD3Matrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
 	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
-		"./internal/cluster/...", "./internal/natscluster/...", "./internal/authcallout/...",
+		"./internal/cluster/...", "./internal/natsconf/...", "./internal/authcallout/...",
 		"./internal/auth/...", "./internal/proto/...", "./test/d3/...")
 	cmd.Dir = repoRoot
 	var buf bytes.Buffer
@@ -412,7 +426,17 @@ func TestRemoteFSMatrix(t *testing.T) {
 	// under -race here, not only spawnsafe).
 	run("spawnsafe", "./internal/spawnsafe/...")
 	run("pty", "./internal/pty/...")
-	run("concurrency", "-run", "Spawnsafe", "./test/concurrency/...")
+	// B9: widened from `-run Spawnsafe` to include the leak gates.
+	//
+	// test/concurrency holds 26 tests, ELEVEN of which are the repo's goroutine- and fd-leak gates — and
+	// the filter here matched exactly one of them (TestSpawnsafePolicy_concurrentGenSwap). `make test` is
+	// a bare `go test ./...` with no -race, and this `run` helper is the only place -race is applied. So
+	// the gates CLAUDE.md §5 requires every concurrency-touching change to pass had themselves never run
+	// under -race in any gate, while the F13 note above this block claims they must.
+	//
+	// This ADDS coverage, so roadmap §7.6 (which forbids silently REDUCING matrix coverage) is satisfied
+	// rather than merely not violated.
+	run("concurrency", "-run", "Spawnsafe|Leak|FDStable", "./test/concurrency/...")
 	run("cmd-config", "-run", "RemoteFS|AgentYAML_remoteFS|ParseOptDuration|SafeFlagOrdering", "./cmd/tether/...")
 	// Targeted wiring cases across agent + proto + p4.
 	run("wiring",

@@ -1162,6 +1162,10 @@ func (b *Broker) Run(ctx context.Context) error {
 	// b.reconcilers is race-free (the goroutine-start happens-before edge publishes the fully
 	// populated registry). start()/granularity()/the driving ticker stay below, next to the loop.
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
+	// B7: wire the duration clock. Without it every pass reports a zero duration — inert, but a
+	// reader with no writer, which this repo has shipped once before (loopset.go records it) and which
+	// is worse than no field at all because the status output looks answered.
+	b.reconcilers.now = b.cfg.Now
 	b.registerCoreReconcilePasses()
 
 	// P9 / I.2b — local admin socket. No-op when path empty (the

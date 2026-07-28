@@ -531,7 +531,7 @@ func startSoloRaftLeader(t *testing.T) (*cluster.Node, string) {
 	t.Helper()
 	ca := newRouteCA(t)
 	tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{
-		BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.clusterLeaf(t),
+		BindAddr: "127.0.0.1:0", CACert: ca.Pool, Leaf: ca.Leaf(t, d4CAName),
 	})
 	if err != nil {
 		t.Fatalf("solo transport: %v", err)

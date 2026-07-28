@@ -7,13 +7,11 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
-	"github.com/LinZiyang666/tether/internal/natscluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/spf13/cobra"
 )
@@ -71,6 +69,23 @@ func bindNatsconfTakeoverFlags(cmd *cobra.Command, f *natsconfTakeoverFlags) {
 // clustered restart will orphan its streams unless the JS store is reset — with the accurate
 // data impact (the wipe drops ALL audit/history; the re-derive cursor survives it). The runbook
 // §1 step 3a is the authoritative procedure; this fires on the manual takeover / `--plan` paths.
+// standaloneJSMigrationHazard reports whether THIS node is in the one state warnStandaloneJSGrow is
+// about: no cluster{} block AND JetStream actually enabled, so a clustered restart would orphan real
+// streams unless the store is reset first.
+//
+// BOTH conjuncts are load-bearing, and the second one was missing (external review RB2-1). The gate
+// used to be the compound `IsStandaloneJetStream()`, which was true on mere key presence — so a broker
+// with `jetstream: false` or `jetstream: disabled` was told:
+//
+//	sudo systemctl stop nats-server && sudo rm -rf <jetstream store_dir from nats.conf>
+//
+// There is no active standalone JS meta to migrate on such a node, and a dormant store directory may
+// hold the only recoverable copy of its history. The command printed a destructive instruction, with a
+// placeholder path because JSStoreDir() was empty, on a premise that was false.
+func standaloneJSMigrationHazard(own *natsconf.Ownership) bool {
+	return own.IsStandaloneTopology() && own.HasJetStream()
+}
+
 func warnStandaloneJSGrow(w io.Writer, storeDir string) {
 	if storeDir == "" {
 		storeDir = "<jetstream store_dir from nats.conf>"
@@ -102,7 +117,7 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	if err != nil {
 		return err
 	}
-	if !own.IsClusteredJetStream() {
+	if own.IsStandaloneTopology() { // TOPOLOGY (RB2-1): "is there a cluster{} block to remove"
 		// M4: an already-standalone CONF can still sit over a clustered JS STORE (a pre-R16 / hand-de-clustered
 		// host — racknerd-legacy — or a crash after the conf swap but before the store move). With --reset-js,
 		// forward-complete JUST the gated store move (the conf is already standalone → skip render/apply; there
@@ -132,7 +147,7 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	if !confirmSingle {
 		return fmt.Errorf("reconcile nats --to-standalone: de-clustering is the FINAL N=1 step — `cluster retire` down to a SINGLE voter first, then re-run with --confirm-single (de-clustering with live peers would tear the route mesh)")
 	}
-	// F3 fail-closed: the source enables clustered JetStream, but natscluster.Render OMITS jetstream{}
+	// F3 fail-closed: the source enables clustered JetStream, but natsconf.Render OMITS jetstream{}
 	// entirely when store_dir is empty — so a source `jetstream {}` with no explicit store_dir would
 	// SILENTLY disable JetStream on the next restart while this command claims standalone JS. Mirror
 	// the grow-takeover guard: refuse unless an explicit store_dir is present (and reuse it below).
@@ -194,18 +209,21 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	if clientListen == "" {
 		return fmt.Errorf("reconcile nats --to-standalone: could not determine the client listen address from %q", f.confPath)
 	}
-	self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey}
-	standalonePeers := []natscluster.Broker{self} // a lone survivor advertises only itself (standalone JS, no routes)
-	cfg := natscluster.Config{
-		Standalone:    true,
-		Local:         self,
-		Peers:         standalonePeers,
-		AccountIssuer: accountIssuer,
-		JSStoreDir:    storeDir,
-		ClientListen:  clientListen,
-		MonitorListen: own.MonitorHTTP(), // preserve any existing loopback monitor
-	}
-	merged, err := natsconf.BuildMergedConf(own, cfg)
+	// B5: one shared assembly. IntentForceStandalone because --to-standalone IS the operator's intent —
+	// the N=1 proof above is what earns it, and inference from the (still clustered) live conf would
+	// render the opposite. The monitor is left to RenderDesired's harvest rather than hand-copied here:
+	// this path does not restart nats-server, so it can only ever PRESERVE an existing loopback monitor.
+	self := natsconf.Broker{ServerName: serverName, NkeyPub: brokerNkey}
+	merged, err := natsconf.RenderDesired(
+		natsconf.Inputs{
+			SelfServerName: serverName,
+			// a lone survivor advertises only itself (standalone JS, no routes)
+			Peers:         []natsconf.Broker{self},
+			AccountIssuer: accountIssuer,
+		},
+		own,
+		natsconf.RenderOverride{Intent: natsconf.IntentForceStandalone},
+	)
 	if err != nil {
 		return err
 	}
@@ -251,8 +269,10 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	// SAME store_dir — never silently JS-less, never a moved store. Apply preserves the pristine .bak.
 	if post, perr := natsconf.Preflight(f.confPath); perr != nil {
 		return fmt.Errorf("reconcile nats --to-standalone: applied conf failed to re-parse: %w", perr)
-	} else if !post.IsStandaloneJetStream() {
-		return fmt.Errorf("reconcile nats --to-standalone: applied conf is not standalone JetStream — aborting (the .bak is preserved for rollback)")
+	} else if post.IsClusteredTopology() {
+		// TOPOLOGY (RB2-1) — same reasoning as the offline post-check: what --to-standalone owes is
+		// "the cluster{} block is gone". store_dir equality below is the separate JetStream-side proof.
+		return fmt.Errorf("reconcile nats --to-standalone: applied conf still carries a cluster{} block — aborting (the .bak is preserved for rollback)")
 	} else if post.JSStoreDir() != storeDir {
 		return fmt.Errorf("reconcile nats --to-standalone: applied conf store_dir %q != source %q (refusing to move the JS store)", post.JSStoreDir(), storeDir)
 	}
@@ -326,13 +346,13 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			return fmt.Errorf("takeover-natsconf: could not determine the client listen address from %q "+
 				"(no host/port/listen) — refusing to emit a conf that would default-bind 0.0.0.0:4222", confPath)
 		}
-		self := natscluster.Broker{ServerName: serverName, NkeyPub: brokerNkey, RouteURL: routeURL}
+		self := natsconf.Broker{ServerName: serverName, NkeyPub: brokerNkey, RouteURL: routeURL}
 		// External-review F2: render the FULL peer mesh, not just self. Each --peer is a
 		// "server_name,route_url,bus_nkey" triple for ANOTHER broker; growth re-runs takeover
 		// on EVERY node with the complete set so routes + auth_users + per-broker ACLs form a
 		// real multi-node NATS mesh (Raft membership alone does not). N=1 takeover passes no
 		// --peer and renders just self.
-		peers := []natscluster.Broker{self}
+		peers := []natsconf.Broker{self}
 		for _, spec := range peerSpecs {
 			p, perr := parsePeerSpec(spec)
 			if perr != nil {
@@ -356,34 +376,51 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 						"ensure --peer lists EVERY current voter (a missing voter yields a valid-but-incomplete conf).")
 			}
 		}
-		cfg := natscluster.Config{
-			// audit D: a lone node (no --peer, just self) MUST render Standalone — a clustered conf with
-			// empty routes makes nats-server FATAL ("JetStream cluster requires configured routes") at boot
-			// while `nats-server -t` passes it. The grow re-renders clustered once the peer mesh is supplied.
-			Standalone:    len(peers) == 1,
-			Local:         self,
-			Peers:         peers,
-			AccountIssuer: accountIssuer,
-			JSStoreDir:    own.JSStoreDir(),
-			ClientListen:  clientListen,
-			ClusterListen: clusterListen,
-			// C3-B3: emit the loopback HTTP monitor so a manual cutover (the ONE restart-bearing step)
-			// establishes `http:`; the per-broker reconciler then PRESERVES it (it can never hot-add a
-			// monitor via SIGHUP). Keep this addr in sync with the broker's topoMonitorListen.
-			MonitorListen: "127.0.0.1:8223",
-			CAFile:        filepath.Join(secretsDir, "cluster-ca.pem"),
-			CertFile:      filepath.Join(secretsDir, "route-cert.pem"),
-			KeyFile:       filepath.Join(secretsDir, "route-key.pem"),
-		}
 		// audit natsconf F2: if the existing conf ENABLES JetStream but no store_dir survived
 		// (empty), REFUSE rather than render a conf that silently DISABLES JetStream (the next
 		// restart would lose all streams). Fail-closed; install.sh always writes store_dir, so
 		// the common path is unaffected.
-		if _, hasJS := own.Parsed["jetstream"]; hasJS && own.JSStoreDir() == "" {
+		//
+		// EXTERNAL REVIEW B2-1: this used to read `_, hasJS := own.Parsed["jetstream"]` — raw KEY PRESENCE,
+		// which is not enablement. nats-server treats `jetstream: false|disabled|off|no` as an explicit
+		// DISABLE, so a conf whose operator had deliberately switched JetStream off hit this refusal and was
+		// told to "set jetstream.store_dir explicitly" — i.e. to turn back on the subsystem they turned off.
+		// The manual takeover is the documented recovery/cutover path, so that made it permanently
+		// unavailable for a supported configuration shape. Ownership.HasJetStream is the ONE value-aware
+		// enablement predicate; every enablement decision in the codebase now goes through it (the other one
+		// is BuildMergedConf's BUG-1 guard, which already did). The fail-closed refusal is unchanged for
+		// `jetstream: true|enabled` and for a bare `jetstream {}` with no resolvable store_dir — those DO
+		// enable it, and those are what the guard exists for.
+		if own.HasJetStream() && own.JSStoreDir() == "" {
 			return fmt.Errorf("natsconf takeover: existing conf enables jetstream but has no resolvable store_dir; " +
 				"refusing to render a conf that would silently DISABLE JetStream — set jetstream.store_dir explicitly")
 		}
-		merged, err := natsconf.BuildMergedConf(own, cfg)
+		// B5: one shared assembly. This is the site that MOTIVATED IntentStandaloneIfLone — it is a
+		// fourth decision, not a variant of the other three.
+		//
+		// audit D: a lone node (no --peer, just self) MUST render Standalone — a clustered conf with
+		// empty routes makes nats-server FATAL ("JetStream cluster requires configured routes") at boot
+		// while `nats-server -t` passes it. The grow re-renders clustered once the peer mesh is supplied.
+		// IntentForceStandalone would de-cluster a lone-peer takeover over an ALREADY-clustered conf;
+		// IntentPreserve would render clustered-with-zero-routes and hit Render's refusal. Hence the
+		// named intent, whose three cases are tabled in natsconf/render_intent_test.go.
+		//
+		// C3-B3: FORCE the loopback HTTP monitor so this manual cutover (the ONE restart-bearing step)
+		// ESTABLISHES `http:`; the per-broker reconciler then PRESERVES it (it can never hot-add a
+		// monitor via SIGHUP). Keep this addr in sync with the broker's topoMonitorListen.
+		//
+		// SecretsDir supplies the same three route-mTLS filenames this file used to spell out by hand;
+		// ClusterListen is the operator's --cluster-listen and wins over the derived one.
+		merged, err := natsconf.RenderDesired(
+			natsconf.Inputs{SelfServerName: serverName, Peers: peers, AccountIssuer: accountIssuer},
+			own,
+			natsconf.RenderOverride{
+				Intent:        natsconf.IntentStandaloneIfLone,
+				MonitorListen: "127.0.0.1:8223",
+				SecretsDir:    secretsDir,
+				ClusterListen: clusterListen,
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -401,7 +438,7 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			} else if e := natsconf.DryRun(natsServerBin, merged); e != nil {
 				dryRunResult = e.Error()
 			}
-			if own.IsStandaloneJetStream() {
+			if standaloneJSMigrationHazard(own) {
 				warnStandaloneJSGrow(cmd.ErrOrStderr(), own.JSStoreDir())
 			}
 			return renderTakeoverPlan(cmd, confPath, serverName, clientListen, own.JSStoreDir(), peers, merged, dryRunResult, asJSON)
@@ -416,7 +453,7 @@ func runNatsconfTakeover(cmd *cobra.Command, f *natsconfTakeoverFlags) error {
 			return err
 		}
 		_, _ = fmt.Fprint(cmd.OutOrStdout(), natsconf.OwnershipTable(own))
-		if own.IsStandaloneJetStream() {
+		if standaloneJSMigrationHazard(own) {
 			warnStandaloneJSGrow(cmd.ErrOrStderr(), own.JSStoreDir())
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(),
@@ -449,7 +486,7 @@ func newClusterTakeoverNatsconfCmd() *cobra.Command {
 // (External-review F8). It returns the voter node_ids absent from the peer ServerName set, and
 // whether the check could actually run (the socket answered an authoritative leader view). A
 // non-leader / unreachable / errored status returns checked=false (cannot verify).
-func missingVotersInMesh(socket string, peers []natscluster.Broker) (missing []string, checked bool) {
+func missingVotersInMesh(socket string, peers []natsconf.Broker) (missing []string, checked bool) {
 	rep, err := fetchClusterStatusReport(socket)
 	if err != nil || rep == nil || !rep.IsLeaderView || rep.Partial || len(rep.Errors) > 0 {
 		return nil, false
@@ -469,15 +506,15 @@ func missingVotersInMesh(socket string, peers []natscluster.Broker) (missing []s
 }
 
 // parsePeerSpec parses a --peer "server_name,route_url,bus_nkey" triple into a Broker.
-func parsePeerSpec(spec string) (natscluster.Broker, error) {
+func parsePeerSpec(spec string) (natsconf.Broker, error) {
 	parts := strings.Split(spec, ",")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return natscluster.Broker{}, fmt.Errorf("takeover-natsconf: --peer %q must be server_name,route_url,bus_nkey", spec)
+		return natsconf.Broker{}, fmt.Errorf("takeover-natsconf: --peer %q must be server_name,route_url,bus_nkey", spec)
 	}
 	if err := validateRouteURL("--peer", parts[1]); err != nil {
-		return natscluster.Broker{}, err
+		return natsconf.Broker{}, err
 	}
-	return natscluster.Broker{ServerName: parts[0], RouteURL: parts[1], NkeyPub: parts[2]}, nil
+	return natsconf.Broker{ServerName: parts[0], RouteURL: parts[1], NkeyPub: parts[2]}, nil
 }
 
 // onlineIssuerSkewChecks runs the auth_callout issuer/broker-nkey skew cross-check on the ONLINE
@@ -627,7 +664,7 @@ func renderDoctor(cmd *cobra.Command, checks []clusteroffline.DoctorCheck, asJSO
 // WOULD change, without writing anything. `changed` compares the rendered merged conf against the
 // current file bytes (the honest "would this rewrite the file?" signal). routes/auth_users come
 // from the resolved peer mesh; ownership_regenerated lists the sections takeover always rewrites.
-func renderTakeoverPlan(cmd *cobra.Command, confPath, serverName, clientListen, jsStoreDir string, peers []natscluster.Broker, merged, dryRun string, asJSON bool) error {
+func renderTakeoverPlan(cmd *cobra.Command, confPath, serverName, clientListen, jsStoreDir string, peers []natsconf.Broker, merged, dryRun string, asJSON bool) error {
 	current, _ := os.ReadFile(confPath) // a missing/unreadable conf ⇒ all-new (changed=true)
 	changed := string(current) != merged
 	var routes, authUsers []string

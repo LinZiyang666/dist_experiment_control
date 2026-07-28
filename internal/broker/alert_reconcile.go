@@ -56,6 +56,9 @@ type AlertReconcilerConfig struct {
 	// verdict: true once Observe has failed with the 10008 signature for >= jsDownThreshold, false on
 	// the first positive observation OR when this node is no longer leader. nil disables JS-503 signalling.
 	SetJSUnavailable func(bool)
+	// Beat (B7), when non-nil, is called once per completed loop iteration — see
+	// AuditPublisherConfig.Beat for why the set cannot infer this itself.
+	Beat func()
 }
 
 // AlertReconciler raises/clears the store-backed alerts the leader can cheaply determine:
@@ -108,6 +111,12 @@ func (r *AlertReconciler) Run(ctx context.Context) {
 		case <-t.C:
 			if err := r.ReconcileAlertsOnce(ctx); err != nil {
 				r.cfg.Logger.Warn("d8b: alert reconcile pass", "err", err)
+			}
+			// Beat on EVERY iteration, including the failing ones: the question this answers is "is the
+			// loop alive", and a loop that fails every pass is alive and needs its lastErr read, not to
+			// be mistaken for a dead one.
+			if r.cfg.Beat != nil {
+				r.cfg.Beat()
 			}
 		}
 	}

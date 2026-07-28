@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // findFreePort grabs an ephemeral port the kernel hands us, then
@@ -28,8 +30,11 @@ func findFreePort(t *testing.T) int {
 	return port
 }
 
+// B9: delegates to internal/testharness. See the note on internal/broker's silentLogger — same body,
+// same reasoning, and the shared version's TETHER_TEST_VERBOSE hatch is what you want when a fence or
+// reconnect test fails.
 func silentLog() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return testharness.SilentLog()
 }
 
 // TestTunnelRoundTripsHTTP is the architecture-mandated P6 test

@@ -20,7 +20,7 @@ func TestRuntimeSnapshotReportsRealProcessValues(t *testing.T) {
 	if snap == nil {
 		t.Fatal("nil snapshot")
 	}
-	if snap.Schema != "admin_runtime" || snap.SchemaVersion != 1 {
+	if snap.Schema != "admin_runtime" || snap.SchemaVersion != 2 {
 		t.Errorf("schema contract: got %q v%d", snap.Schema, snap.SchemaVersion)
 	}
 	// Goroutines is the in-process truth. A real Go process ALWAYS has >1 live goroutine.
@@ -100,8 +100,8 @@ func TestRuntimeSnapshotProjectsReconcilerLastTick(t *testing.T) {
 
 	reg := newReconcileRegistry(silentLogger(), nil)
 	var fired int
-	reg.register("fast", time.Second, false, func(context.Context, time.Time) error { fired++; return nil })
-	reg.register("slow", time.Hour, false, func(context.Context, time.Time) error { return nil })
+	reg.register("fast", time.Second, authorityAny, func(context.Context, time.Time) error { fired++; return nil })
+	reg.register("slow", time.Hour, authorityAny, func(context.Context, time.Time) error { return nil })
 	reg.start(base)
 	b.reconcilers = reg
 

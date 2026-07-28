@@ -238,17 +238,27 @@ func TestProxyFalseOnlineRecoversAfterTunnelDrop(t *testing.T) {
 
 	f.relay.sever() // data-plane blip; NATS untouched
 
-	// (1) the dead exit is dropped from /sub, not advertised: proxy_ready clears.
-	// (This is the reliable Defect-B signal; the public-port unbind is corroborating
-	// but transient — the agent self-heals within one backoff, so we don't race it.)
-	// 15s (was 5s): under the full make e2e-parallel matrix this -race subprocess runs after every
-	// other heavy matrix, so tunnel-drop detection + /sub re-advertise is slower; the assertion
-	// is "eventually clears" (it clears in ~0.5s in isolation), so the extra headroom only
-	// prevents a load-induced false Defect-B regression.
-	if !testharness.WaitFor(t, 15*time.Second, 20*time.Millisecond, func() bool {
-		return !proxyReady(f.db, "lab", "lab-1")
-	}) {
-		t.Fatal("proxy_ready did not clear on tunnel drop (Defect B: false-online persists)")
+	// (1) WAS a blocking assertion that proxy_ready clears. It is now a NON-BLOCKING observation, and
+	// the Defect-B signal it was standing in for lives in TestProxyPublishesUnreadyEdgeOnTunnelDrop.
+	//
+	// WHY, MEASURED (internal review, lane XC — this closes a flake that survived two batches):
+	// proxy_ready is cleared AND restored by the same agent goroutine. tunnel.Client.supervise
+	// publishes the down edge the instant runAcceptLoop returns, then redials after jitter(backoffBase)
+	// and publishes the up edge. So `!proxyReady(...)` is not a state that settles — it is a WINDOW,
+	// measured at 53ms / 407ms / 408ms on an idle -race box.
+	//
+	// A poll loop therefore has to be scheduled INSIDE that window. Under the full parallel matrix it
+	// only has to be descheduled across it once to miss, and then it reports a product defect that did
+	// not happen (§T4: starvation masquerading as a defect). Raising the deadline cannot help — after
+	// the agent self-heals the predicate is false forever, so 5s and 15s and 15 minutes all fail
+	// identically. The previous batch raised it 5s→15s and it failed again on the very next full run;
+	// that "hardening" was a provable no-op, and this comment replaces the claim that it was not.
+	//
+	// The edge assertion is immune: the unready ACK is a NATS message, buffered by the subscription,
+	// still there whenever the test is scheduled again.
+	if cleared := !proxyReady(f.db, "lab", "lab-1"); !cleared {
+		t.Logf("note: proxy_ready had already been restored by the time this sampled — expected under " +
+			"load, and NOT a failure. The edge is asserted by TestProxyPublishesUnreadyEdgeOnTunnelDrop.")
 	}
 
 	// (2) self-heal via tunnel reconnect (NOT NATS / NOT process restart).

@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/LinZiyang666/tether/internal/natscluster"
 )
 
 // DryRun validates the merged conf with `nats-server -c <temp> -t` BEFORE Apply swaps it
@@ -45,7 +43,7 @@ func DryRun(natsServerBin string, mergedConf string) error {
 }
 
 // takeover.go — the D9 §11 merge + atomic apply. BuildMergedConf renders the cluster
-// directives (natscluster.Render: server_name + listen + jetstream + cluster mTLS +
+// directives (Render: server_name + listen + jetstream + cluster mTLS +
 // authorization/auth_callout + per-broker ACLs) and APPENDS the install.sh directives
 // natscluster does NOT emit but that must survive: the websocket{} block (Caddy reverse-
 // proxies :8222) and the recognized tuning passthrough (max_payload etc.). Apply swaps the
@@ -54,10 +52,10 @@ func DryRun(natsServerBin string, mergedConf string) error {
 // auth_callout (so server_name == nats_server_id == the agent's ConnectedServerName, and
 // the account issuer matches the live one — SSOT by construction).
 
-// BuildMergedConf renders cfg via natscluster.Render and appends the preserved install.sh
+// BuildMergedConf renders cfg via Render and appends the preserved install.sh
 // websocket{} block + the recognized tuning passthrough directives from own. The result is
 // the full nats-server.conf for the cluster-mode broker.
-func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
+func BuildMergedConf(own *Ownership, cfg Config) (string, error) {
 	// C3-B1: when the caller (the reconciler) does not supply the routes-mTLS identity, harvest it
 	// from the LIVE conf's cluster{} block so the render is COMPLETE (Render rejects empty cert paths).
 	// Fail-closed via ClusterMTLS if the live conf carries no cluster TLS. v0.4.2 shrink (review minor):
@@ -83,7 +81,30 @@ func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
 	if cfg.MonitorListen == "" {
 		cfg.MonitorListen = own.MonitorHTTP()
 	}
-	rendered, err := natscluster.Render(cfg)
+	// BUG-1 (B5): FAIL CLOSED when the live conf runs JetStream but no store_dir could be resolved.
+	//
+	// Render OMITS the whole jetstream{} block when JSStoreDir is empty, and the result is
+	// SYNTACTICALLY VALID — `nats-server -t` passes it, so the DryRun gate waves it through and the
+	// swap proceeds. The broker then comes back with no JetStream at all, which is where history,
+	// audit and every in-flight transfer object live.
+	//
+	// Three of the five assembly points already guarded this themselves (cluster_natsconf.go's F2 and
+	// F3 paths, cluster_offline.go's force-single). The two that did NOT are the AUTOMATED ones — the
+	// topology reconciler's 5-second loop and the grow cutover — which is the worst possible split,
+	// and it is the roadmap's "the guard exists in the copies someone remembered" shape exactly. The
+	// guard belongs at the one point all five funnel through, which is here.
+	//
+	// Reachability is a hand-edited conf: install.sh always writes store_dir, and Preflight ACCEPTS a
+	// bare `jetstream {}` (jetstream is InstallSafe at top level, and unrecognizedSubkeys returns nil
+	// for an empty map). So this is latent rather than live — and the fleet's only broker has a
+	// hand-edited conf.
+	if own != nil && own.HasJetStream() && cfg.JSStoreDir == "" {
+		return "", fmt.Errorf("natsconf: the live conf enables JetStream but no jetstream.store_dir could be " +
+			"resolved — refusing to render a conf with NO JetStream block (that would take history/audit/" +
+			"in-flight transfers offline while `nats-server -t` still accepts the file). Add an explicit " +
+			"`jetstream { store_dir: … }` to the conf, then retry")
+	}
+	rendered, err := Render(cfg)
 	if err != nil {
 		return "", fmt.Errorf("natsconf: render cluster conf: %w", err)
 	}
@@ -92,7 +113,7 @@ func BuildMergedConf(own *Ownership, cfg natscluster.Config) (string, error) {
 	if !strings.HasSuffix(rendered, "\n") {
 		b.WriteString("\n")
 	}
-	// Preserve the install.sh websocket{} block verbatim-by-re-emit (natscluster.Render
+	// Preserve the install.sh websocket{} block verbatim-by-re-emit (Render
 	// does not emit it; Caddy reverse-proxies WSS :443 → this internal :8222). Re-emit from
 	// the parsed map (deterministic; comments are lost, owned).
 	if ws := websocketBlock(own); ws != "" {

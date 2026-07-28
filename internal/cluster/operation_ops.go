@@ -109,25 +109,59 @@ func PlanClusterOpStart(in OpStartInput, now time.Time) (*Command, error) {
 	return NewCommand(OpClusterOpStart, Stmt(sql)), nil
 }
 
-// OpTransitionInput is one predecessor-CAS state advance. Barrier/CatchupDeadline/TopoTargetGen are
-// optionally re-baked (0 = leave unchanged is NOT expressible — the controller always passes the
-// current values; see SetBarrier to write a freshly-captured barrier).
+// OpVal returns a pointer to a copy of v so a call site can express "write this value" inline. Go has
+// no address-of-literal, and the three columns below must distinguish "write 0" from "leave alone".
+func OpVal[T any](v T) *T { return &v }
+
+// OpTransitionInput is one predecessor-CAS state advance.
+//
+// THE THREE CAPTURE COLUMNS ARE POINTERS, AND THE THIRD STATE IS THE POINT
+// -----------------------------------------------------------------------
+// Barrier / CatchupDeadline / TopoTargetGen are three-state:
+//
+//	nil        the column is ABSENT from the SET clause — its stored value is preserved
+//	OpVal(v)   the column is written as v
+//	OpVal(0)   the column is written as 0 — an EXPLICIT reset
+//
+// The previous shape was a single `SetBarrier bool` gating all three columns, which the SET clause
+// then wrote UNCONDITIONALLY. Its own doc admitted the gap — "0 = leave unchanged is NOT
+// expressible — the controller always passes the current values" — and that convention was held
+// together by five hand-copied write-back sites in the broker's op controller (eight individual
+// field copies). A missed copy did not merely fail to update a column: it wrote ZERO over a live
+// value.
+//
+// For topo_target_gen zero is not a neutral value. topoConvergedForOp opens with
+// `if op.TopoTargetGen == 0 { return true }` — "nothing to converge" — while every other branch of
+// that function fails CLOSED. So the one value a forgotten copy manufactures is the one value that
+// means "converged", and the op announces SERVING/RETIRED with the topology unconverged. Under
+// pointers a forgotten field is a column that is not written, i.e. the stored value survives: the
+// failure mode drops from "silently destroys state and opens a gate" to "does not update".
+//
+// Pinned by TestBarrierOnlyCaptureMustNotZeroTopoTargetGen (operation_barrier_columns_test.go),
+// which is RED against the bool-gated shape.
+//
+// A RESET MUST BE WRITTEN AS OpVal(0), NEVER AS nil. `cluster ops confirm` needs catchup_deadline
+// back at zero so the next hold re-stamps a fresh convergence window; passing nil there would
+// preserve the ALREADY-EXPIRED deadline and the confirm would be a no-op that re-blocks on the very
+// next tick. Every call site therefore has to say which of the three it means, which is the whole
+// improvement — the bool could not ask the question.
 type OpTransitionInput struct {
-	OpID            string
-	FromState       string // predecessor-CAS guard: the UPDATE matches only if op_state == FromState
-	ToState         string
-	Terminal        bool
-	LastError       string
-	Timeline        string // the controller-computed capped JSON array (current + the new entry)
-	SetBarrier      bool   // when true, also write Barrier + CatchupDeadline + TopoTargetGen (capture step)
-	Barrier         uint64
-	CatchupDeadline int64
-	TopoTargetGen   uint64
+	OpID      string
+	FromState string // predecessor-CAS guard: the UPDATE matches only if op_state == FromState
+	ToState   string
+	Terminal  bool
+	LastError string
+	Timeline  string // the controller-computed capped JSON array (current + the new entry)
+
+	Barrier         *uint64 // nil = leave alone; OpVal(v) = write v; OpVal(0) = explicit reset
+	CatchupDeadline *int64  // UnixNano. nil = leave alone; OpVal(0) = explicit reset (a fresh window)
+	TopoTargetGen   *uint64 // nil = leave alone. NEVER write 0 to "clear" it — see above.
 }
 
 // PlanClusterOpTransition advances op_state via predecessor-CAS (UPDATE … WHERE op_state=FromState),
 // so a stale/duplicate drive is a RowsAffected==0 no-op (idempotent resume). It rewrites the durable
-// timeline + last_error + updated_at, and on a capture step also persists the barrier/deadline/target.
+// timeline + last_error + updated_at, plus whichever of barrier / catchup_deadline / topo_target_gen
+// the input actually supplies (see OpTransitionInput: nil means "do not touch that column").
 func PlanClusterOpTransition(in OpTransitionInput, now time.Time) (*Command, error) {
 	if !ValidOpState(in.FromState) || !ValidOpState(in.ToState) {
 		return nil, fmt.Errorf("cluster: op-transition: invalid state %q→%q", in.FromState, in.ToState)
@@ -146,10 +180,18 @@ func PlanClusterOpTransition(in OpTransitionInput, now time.Time) (*Command, err
 	}
 	set := `op_state = ` + to + `, terminal = ` + terminal + `, last_error = ` + lastErr +
 		`, timeline = ` + timeline + `, updated_at = ` + LitTime(now.UTC())
-	if in.SetBarrier {
-		set += `, barrier = ` + LitInt(int64(in.Barrier)) +
-			`, catchup_deadline = ` + LitInt(in.CatchupDeadline) +
-			`, topo_target_gen = ` + LitInt(int64(in.TopoTargetGen))
+	// Each capture column is emitted ONLY when the caller supplied one. A column that is absent from
+	// the SET clause keeps its stored value, so a forgotten field can no longer zero a live barrier,
+	// deadline or topology target. The emitted text stays a plain literal statement, so a shorter SET
+	// clause is still a statement every version of the FSM applies identically — no wire concern.
+	if in.Barrier != nil {
+		set += `, barrier = ` + LitInt(int64(*in.Barrier))
+	}
+	if in.CatchupDeadline != nil {
+		set += `, catchup_deadline = ` + LitInt(*in.CatchupDeadline)
+	}
+	if in.TopoTargetGen != nil {
+		set += `, topo_target_gen = ` + LitInt(int64(*in.TopoTargetGen))
 	}
 	sql := `UPDATE cluster_operations SET ` + set +
 		` WHERE op_id = ` + opID + ` AND op_state = ` + from

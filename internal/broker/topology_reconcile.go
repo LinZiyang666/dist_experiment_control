@@ -13,8 +13,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusternodes"
-	"github.com/LinZiyang666/tether/internal/natscluster"
-	"github.com/LinZiyang666/tether/internal/natsreconcile"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/nats-io/nkeys"
 )
 
@@ -75,6 +74,7 @@ func (b *Broker) runTopologyReconcileLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		lastApplied, lastObserved, lastReloadMtime, lastRestartMtime, lastEventKey = b.reconcileTopologyOnce(ctx, lastApplied, lastObserved, lastReloadMtime, lastRestartMtime, lastEventKey)
+		b.cl.loops.Beat("topology-reconcile")
 	}
 }
 
@@ -109,7 +109,7 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 		reloadedMtime = mt
 		return nil
 	}
-	out := natsreconcile.ReconcileOnce(in, lastApplied, lastObserved, reload, b.probeNatsConfigLoadTime)
+	out := natsconf.ReconcileOnce(in, lastApplied, lastObserved, reload, b.probeNatsConfigLoadTime)
 	eventKey := fmt.Sprintf("%d|%s|%s", desired, out.Action, out.Reason)
 	// NATS accepts the SIGHUP command even when a route/auth delta cannot be applied live.  In that
 	// case /varz remains reachable but config_load_time stays older than the swapped file.  Waiting
@@ -117,7 +117,7 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 	// roster-rank delay has elapsed, request the same-uid SIGKILL lifecycle already used by the first-
 	// grow cutover; systemd Restart=always revives NATS on the new conf.  We deliberately require a
 	// successful stale /varz sample: monitor loss is not evidence that a restart is required.
-	if out.Action == natsreconcile.ActionSwappedReloadPending && out.AppliedGen == desired {
+	if out.Action == natsconf.ActionSwappedReloadPending && out.AppliedGen == desired {
 		mt := topoConfMtime(in.ConfPath)
 		// Rank by NATS server_name, not raft node_id.  They are deliberately distinct fields in the
 		// roster and only happen to be equal in the sim fixture; comparing b.selfID against ServerName
@@ -151,7 +151,7 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 	// would also stall if JS is the unhealthy thing). Skip the steady-state noop/unresolvable.
 	// Include the desired generation: the same action/reason on a NEW topology delta is a distinct
 	// operator event and must not be suppressed by the previous generation's change gate.
-	if out.Action != natsreconcile.ActionNoop && out.Action != natsreconcile.ActionUnresolvable && eventKey != lastEventKey {
+	if out.Action != natsconf.ActionNoop && out.Action != natsconf.ActionUnresolvable && eventKey != lastEventKey {
 		b.pubSysEvent("nats_topology_"+out.Action, map[string]any{
 			"applied": out.AppliedGen, "observed": out.ObservedGen, "reason": out.Reason,
 		})
@@ -183,7 +183,7 @@ func (b *Broker) waitNatsLoaded(ctx context.Context, confTime time.Time) error {
 
 // topologyRestartDue assigns every peer a unique, deterministic restart slot from the replicated
 // server-name set.  It is pure so the no-simultaneous-bounce safety property is unit-testable.
-func topologyRestartDue(self string, peers []natscluster.Broker, confTime, now time.Time) bool {
+func topologyRestartDue(self string, peers []natsconf.Broker, confTime, now time.Time) bool {
 	names := make([]string, 0, len(peers))
 	for _, p := range peers {
 		if p.ServerName != "" {
@@ -209,16 +209,16 @@ func topoConfMtime(path string) int64 {
 	return fi.ModTime().UnixNano()
 }
 
-func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool) {
+func (b *Broker) buildTopologyInputs(desired uint64) (natsconf.Inputs, bool) {
 	peers, err := clusternodes.ListPeersForTopology(b.cfg.DB)
 	if err != nil {
-		return natsreconcile.Inputs{}, false
+		return natsconf.Inputs{}, false
 	}
 	peers = b.filterGhostPeers(peers)
-	brokers := make([]natscluster.Broker, 0, len(peers))
+	brokers := make([]natsconf.Broker, 0, len(peers))
 	selfServer := ""
 	for _, p := range peers {
-		brokers = append(brokers, natscluster.Broker{ServerName: p.NatsServer, NkeyPub: p.BusNkeyPub, RouteURL: p.NatsRoute})
+		brokers = append(brokers, natsconf.Broker{ServerName: p.NatsServer, NkeyPub: p.BusNkeyPub, RouteURL: p.NatsRoute})
 		if p.NodeID == b.selfID {
 			selfServer = p.NatsServer
 		}
@@ -227,7 +227,7 @@ func (b *Broker) buildTopologyInputs(desired uint64) (natsreconcile.Inputs, bool
 	if bin == "" {
 		bin = "nats-server"
 	}
-	return natsreconcile.Inputs{
+	return natsconf.Inputs{
 		SelfServerName: selfServer,
 		Peers:          brokers,
 		AccountIssuer:  b.accountPubOrEmpty(),

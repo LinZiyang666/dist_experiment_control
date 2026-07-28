@@ -8,17 +8,9 @@
 package d4_test
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"database/sql"
 	"fmt"
-	"math/big"
-	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -26,6 +18,8 @@ import (
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/clusterharness"
 	"github.com/hashicorp/raft"
 	"github.com/nats-io/jwt/v2"
 	natsserver "github.com/nats-io/nats-server/v2/server"
@@ -90,15 +84,9 @@ func jwtToServerPerms(p jwt.Permissions) *natsserver.Permissions {
 	}
 }
 
+// B9: delegates to test/clusterharness — see the note in test/d3/setup_test.go.
 func waitForCond(within time.Duration, pred func() bool) bool {
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if pred() {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return pred()
+	return clusterharness.WaitForCond(within, pred)
 }
 
 // ---- routed NATS (broker nkeys = AuthUsers + RF1 PermissionsForBroker) ----
@@ -158,50 +146,16 @@ func startRouted(t *testing.T, optsList []*natsserver.Options) []*natsserver.Ser
 
 // ---- mTLS raft CA (mirror test/d3 route_mtls_test.go) ----
 
-type routeCA struct {
-	cert *x509.Certificate
-	key  ed25519.PrivateKey
-	pool *x509.CertPool
-}
+// B9: the route-mTLS CA moved to test/clusterharness. d4, d5 and d8 each carried a
+// character-for-character copy of it (~45 lines apiece), differing only in the CN string — and the d8
+// copy had quietly dropped two error checks. A method cannot be declared on another package's type, so
+// call sites say ca.Leaf(t, d4CAName) rather than ca.clusterLeaf(t); that is the whole diff at the
+// call site.
+const d4CAName = "tether-d4"
 
-func newRouteCA(t *testing.T) *routeCA {
+func newRouteCA(t *testing.T) *clusterharness.RouteCA {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "tether-d4-ca"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		IsCA: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &routeCA{cert: cert, key: priv, pool: pool}
-}
-
-func (ca *routeCA) clusterLeaf(t *testing.T) tls.Certificate {
-	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "tether-d4-node"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, pub, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	return clusterharness.NewRouteCA(t, d4CAName)
 }
 
 // ---- the combined harness ----
@@ -235,7 +189,7 @@ func startCluster4(t *testing.T, n int) *cluster4 {
 	trans := make([]*raft.NetworkTransport, n)
 	for i := range trans {
 		tr, err := cluster.NewMTLSTransport(cluster.MTLSTransportConfig{
-			BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.clusterLeaf(t),
+			BindAddr: "127.0.0.1:0", CACert: ca.Pool, Leaf: ca.Leaf(t, d4CAName),
 		})
 		if err != nil {
 			t.Fatalf("transport %d: %v", i, err)
@@ -420,49 +374,32 @@ func mustDecodeResp(t *testing.T, respJWT string) *jwt.AuthorizationResponseClai
 
 // ---- goroutine leak gate (copied: goleak is deliberately NOT used; CLAUDE.md §5) ----
 
+// assertNoGoroutineLeak / assertNoFDLeak delegate to the single implementation in internal/testharness
+// (B9). Four suites carried byte-equivalent copies of the goroutine gate; the ±2 derivation and the ~1s
+// poll window now live in one place. The local names stay so this suite's call sites do not churn.
 func assertNoGoroutineLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	var last int
-	for i := 0; i < 50; i++ {
-		runtime.Gosched()
-		last = runtime.NumGoroutine()
-		if last-before <= 2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	buf := make([]byte, 64*1024)
-	n := runtime.Stack(buf, true)
-	t.Errorf("%s: goroutine leak: before=%d after=%d (+%d)\n%s", label, before, last, last-before, buf[:n])
+	testharness.AssertNoGoroutineLeak(t, label, before)
 }
 
 // fdCount returns the open-fd count for this process (-1 if unavailable, e.g.
 // non-Linux). Linux exposes them under /proc/self/fd. The plan (R-13) / CLAUDE.md §5
 // leak gate is NumGoroutine + fd baseline — a leaked NATS reply-inbox subscription
 // can leak an fd a pooled goroutine would mask.
-func fdCount() int {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	return len(entries)
-}
+func fdCount() int { return testharness.FDCount() }
 
-// assertNoFDLeak compares the current fd count to a pre-recorded baseline, polling
-// with a small tolerance (NATS/raft internals shift a few). A -1 baseline (non-Linux)
+// d4FDTolerance is this suite's fd noise floor, kept LOCAL and passed explicitly.
+//
+// Three different tolerances are in use across the repo (this one, the tunnel/storage suites' tighter
+// floor, and the broker suite's looser one), and each has a written derivation — the broker suite needs
+// more headroom because every iteration opens a fresh NATS connection. Unifying them would either loosen
+// the tight gates to the loosest number or make the loose one flake at the tightest, so
+// testharness.AssertNoFDLeak takes the tolerance as a parameter permanently.
+const d4FDTolerance = 4
+
+// assertNoFDLeak compares the current fd count to a pre-recorded baseline. A -1 baseline (non-Linux)
 // is a no-op.
 func assertNoFDLeak(t *testing.T, label string, before int) {
 	t.Helper()
-	if before < 0 {
-		return
-	}
-	var last int
-	for i := 0; i < 50; i++ {
-		last = fdCount()
-		if last-before <= 4 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("%s: fd leak: before=%d after=%d (+%d)", label, before, last, last-before)
+	testharness.AssertNoFDLeak(t, label, before, d4FDTolerance)
 }

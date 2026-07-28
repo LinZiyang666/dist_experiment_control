@@ -497,7 +497,7 @@ func TestPassTunnelSessionsIdempotence(t *testing.T) {
 	// asserted at the registry level: the pass is per-broker (never leader-
 	// gated) so every broker keeps reaping its own fds even as leadership moves.
 	for _, s := range b.reconcilers.status() {
-		if s.Name == "tunnel-sessions" && s.LeaderOnly {
+		if s.Name == "tunnel-sessions" && s.Authority == authorityLeader.String() {
 			t.Fatal("tunnel-sessions must NOT be leader-only: it reaps this process's own listener fds, and a follower that stopped reaping would leak them until it happened to win an election")
 		}
 	}
@@ -918,8 +918,8 @@ func TestPassXferOrphanReapIdempotence(t *testing.T) {
 		ran := false
 		for _, s := range follower.reconcilers.status() {
 			if s.Name == "xfer-orphan-reap" {
-				if s.LeaderOnly {
-					t.Fatal("#58/P10 regression: xfer-orphan-reap is leader-only again — a session homed to a follower would never be reaped, so its tier-B objects leak forever")
+				if s.Authority == authorityLeader.String() {
+					t.Fatal("#58/P10 regression: xfer-orphan-reap is leader-gated again — a session homed to a follower would never be reaped, so its tier-B objects leak forever")
 				}
 				ran = s.Runs > 0
 			}
