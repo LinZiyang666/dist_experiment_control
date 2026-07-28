@@ -588,6 +588,14 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 			// subscriptions within the enclosing function, in source order, so nothing above the
 			// function can move it and only a change inside that function — exactly when the exemption
 			// deserves re-reading — invalidates it.
+			//
+			// FUNCTION is receiver-qualified, and the ordinal map is per FILE and never reset. Both
+			// halves are load-bearing: with a bare name, two same-named methods on different receivers
+			// share one sequence, so adding a site to one silently renumbers the other's exemptions —
+			// and with a per-function counter they would collide outright. cmd/tether shipped the
+			// unqualified variant and internal review (M1/M2) reproduced the silent absorption on the
+			// real tree; the two gates now use ONE key scheme, so "copy the shape from the other one"
+			// is literally true rather than approximately true.
 			rel, _ := filepath.Rel(filepath.Dir(filepath.Dir(dir)), p)
 			relSlash := filepath.ToSlash(rel)
 			ord := map[string]int{}
@@ -596,7 +604,7 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 				ast.Inspect(n, func(m ast.Node) bool {
 					if fd, ok := m.(*ast.FuncDecl); ok {
 						if fd.Body != nil {
-							walk(fd.Name.Name, fd.Body)
+							walk(aclQualifiedFuncName(fd), fd.Body)
 						}
 						return false
 					}
@@ -643,12 +651,38 @@ var dynamicSubscriptionExemptions = map[string]string{
 	"internal/broker/observability.go:pollClusterHealth#1": "SubscribeSync(inbox) — a per-request random " +
 		"_INBOX reply subject, not a served endpoint. Reply subjects are granted by NATS to the requester, " +
 		"never by the ctl permission template, so no grant can or should exist.",
-	"internal/broker/home_delivery.go:subscribeHomeAcks#1": "Subscribe(inbox+\".>\", ...) — a broker-owned " +
+	"internal/broker/home_delivery.go:(*Broker).subscribeHomeAcks#1": "Subscribe(inbox+\".>\", ...) — a broker-owned " +
 		"_INBOX ack channel for agent home-delivery acknowledgements, not a ctl-served endpoint; the random " +
 		"inbox is intentionally runtime-generated and does not belong in member pub grants.",
-	"internal/broker/broker.go:Run#1": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
+	"internal/broker/broker.go:(*Broker).Run#1": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
 		"subscription table; every row's subject IS extracted, from the table literal above.",
-	"internal/broker/broker.go:Run#2": "Subscribe(ss.subj, ...) — same loop variable as #1 in this function.",
+	"internal/broker/broker.go:(*Broker).Run#2": "Subscribe(ss.subj, ...) — same loop variable as #1 in this function.",
+}
+
+// aclQualifiedFuncName renders a FuncDecl the way a site key names it: `(*Broker).Run` for a method,
+// `helper` for a plain function. Deliberately the same shape as cmd/tether's qualifiedFuncName — the two
+// gates guard different things but share one key scheme, and a reader who has learned one should not have
+// to re-derive the other. Duplicated rather than shared because they live in different packages and both
+// are test-only; a shared helper would need a non-test home for a rule that only tests apply.
+func aclQualifiedFuncName(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	return "(" + aclRecvTypeName(fd.Recv.List[0].Type) + ")." + fd.Name.Name
+}
+
+func aclRecvTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return "*" + aclRecvTypeName(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr:
+		return aclRecvTypeName(t.X)
+	case *ast.IndexListExpr:
+		return aclRecvTypeName(t.X)
+	}
+	return "<unknown-recv>"
 }
 
 // TestACLDynamicSubscriptionsAreDeclared closes the second direction of R2: a
@@ -660,7 +694,13 @@ func TestACLDynamicSubscriptionsAreDeclared(t *testing.T) {
 		t.Fatalf("getwd: %v", err)
 	}
 	root = filepath.Dir(filepath.Dir(root))
-	sites := unresolvedSubscriptionSites(t, filepath.Join(root, "internal", "broker"))
+	// The SAME two trees TestACLSubscribersHaveGrants extracts subjects from. origin: p-b2 internal
+	// review n5 — this scanned only internal/broker, so a dynamic subscription added to internal/proto
+	// would have been checked for a grant it could not have and exempted by nobody. Latent today (no
+	// non-test Subscribe( in internal/proto) and cheap to close before it is not.
+	sites := unresolvedSubscriptionSites(t,
+		filepath.Join(root, "internal", "broker"),
+		filepath.Join(root, "internal", "proto"))
 	live := map[string]bool{}
 	for _, s := range sites {
 		live[s] = true

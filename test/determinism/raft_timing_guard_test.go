@@ -49,16 +49,34 @@ func TestRaftTimingsUseProductionConstants(t *testing.T) {
 	// belongs here WITH its reason, not silently inline. Any value chosen here
 	// must still survive -race under full parallel load, which is exactly what
 	// the original hardcoded numbers did not.
+	//
+	// KEYED file:FUNCTION#ordinal, NOT file:line — the FOURTH map in this repo to make that move, and
+	// the last one. origin: p-b2 internal review m2.
+	//
+	// The other three were re-keyed because a line key goes stale on any insertion above the site and
+	// its maintenance edit (renumber) is indistinguishable in a diff from its subversion (silence a
+	// genuinely new site). This one was the weakest of the four: the keys were `:509`/`:510`, one reason
+	// cross-referenced the other BY LINE, and there was no stale-entry check at all — `exempt` was only
+	// ever READ, so a dead entry could sit here forever and a live one could quietly start covering a
+	// different site. Plan §4 row 6 had registered it with the mitigation "do not add or remove any line
+	// in transport_test.go", which is a real mitigation and also an admission that the key was the
+	// problem. The ordinal is the site's 1-based index among the NON-CONFORMING timing fields of its
+	// enclosing function, so nothing above the function can move it.
+	// THE RE-KEY FOUND A THIRD SYNTACTIC SITE. The old map had two entries, `:509` and `:510`, while line
+	// 509 carried HeartbeatTimeout AND ElectionTimeout. External review then checked whether all three
+	// were legitimate exceptions: heartbeat/election were literal 1s values equal to their production
+	// constants, so they now reference those constants. Only the 2s leader lease creates the deliberate
+	// invalid ordering and remains exempt.
 	exempt := map[string]string{
-		"internal/cluster/transport_test.go:509": "TestD3FailingNewReapsTransportNoLeak needs an " +
-			"INVALID ordering (lease 2s > heartbeat 1s) so raft.ValidateConfig rejects inside " +
-			"BootstrapCluster and New fails after the transport exists — that failure path is what " +
-			"the test reaps. Production constants are a valid ordering, so New would succeed and " +
-			"the test would assert nothing. Not a timing-sensitivity exemption: the invalidity IS " +
-			"the fixture.",
-		"internal/cluster/transport_test.go:510": "same site as :509 (LeaderLeaseTimeout half of the " +
-			"deliberately invalid pair).",
+		"internal/cluster/transport_test.go:TestD3FailingNewReapsTransportNoLeak#1": "LeaderLeaseTimeout " +
+			"(2s) deliberately exceeds the production HeartbeatTimeout (1s), so raft.ValidateConfig " +
+			"rejects inside BootstrapCluster AFTER the transport exists — the failure path this test " +
+			"must reap. HeartbeatTimeout and ElectionTimeout still use production constants; only this " +
+			"field needs to differ.",
 	}
+	// Every exemption must still name a live non-conforming site. Without this the map is write-only:
+	// the two entries below survived a rename and a file move purely because nothing ever checked them.
+	seen := map[string]bool{}
 
 	fields := map[string]string{
 		"HeartbeatTimeout":   "MultinodeHeartbeatTimeout",
@@ -87,29 +105,47 @@ func TestRaftTimingsUseProductionConstants(t *testing.T) {
 		}
 		rel, _ := filepath.Rel(root, p)
 		rel = filepath.ToSlash(rel)
-		ast.Inspect(f, func(n ast.Node) bool {
-			kv, ok := n.(*ast.KeyValueExpr)
-			if !ok {
+		ord := map[string]int{}
+		var walk func(fnName string, n ast.Node)
+		walk = func(fnName string, n ast.Node) {
+			ast.Inspect(n, func(m ast.Node) bool {
+				if fd, ok := m.(*ast.FuncDecl); ok {
+					if fd.Body != nil {
+						walk(guardFuncName(fd), fd.Body)
+					}
+					return false
+				}
+				kv, ok := m.(*ast.KeyValueExpr)
+				if !ok {
+					return true
+				}
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				expected, guarded := fields[key.Name]
+				if !guarded {
+					return true
+				}
+				if isExactTimingConstant(kv.Value, expected) {
+					return true
+				}
+				fn := fnName
+				if fn == "" {
+					fn = "<file-scope>"
+				}
+				siteKey := rel + ":" + fn
+				ord[siteKey]++
+				site := siteKey + "#" + itoa(ord[siteKey])
+				if _, ok := exempt[site]; ok {
+					seen[site] = true
+					return true
+				}
+				offenders = append(offenders, site+"  ("+key.Name+")")
 				return true
-			}
-			key, ok := kv.Key.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			expected, guarded := fields[key.Name]
-			if !guarded {
-				return true
-			}
-			if isExactTimingConstant(kv.Value, expected) {
-				return true
-			}
-			site := rel + ":" + itoa(fset.Position(kv.Pos()).Line)
-			if _, ok := exempt[site]; ok {
-				return true
-			}
-			offenders = append(offenders, site+"  ("+key.Name+")")
-			return true
-		})
+			})
+		}
+		walk("", f)
 		return nil
 	})
 	if err != nil {
@@ -125,6 +161,20 @@ func TestRaftTimingsUseProductionConstants(t *testing.T) {
 			"stopped reaching the suites)", n)
 	}
 
+	var stale []string
+	for site := range exempt {
+		if !seen[site] {
+			stale = append(stale, site)
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Errorf("%d raft-timing exemption(s) no longer name a non-conforming site; re-read and remove "+
+			"or update them:\n  %s\n"+
+			"An exemption nothing checks is write-only: it survives the deletion of the code it excused "+
+			"and is then free to start covering something else.", len(stale), strings.Join(stale, "\n  "))
+	}
+
 	sort.Strings(offenders)
 	if len(offenders) > 0 {
 		t.Errorf("%d raft timing(s) hardcoded in tests instead of referencing "+
@@ -134,6 +184,30 @@ func TestRaftTimingsUseProductionConstants(t *testing.T) {
 			"genuinely needs different values, add it to the exempt map WITH a reason.",
 			len(offenders), strings.Join(offenders, "\n  "))
 	}
+}
+
+// guardFuncName renders a FuncDecl the way an exemption key names it: `(*T).Method` for a method,
+// `TestFoo` for a plain function. Same shape as cmd/tether's qualifiedFuncName and internal/auth's
+// aclQualifiedFuncName — four site-keyed exemption maps in this repo, one key scheme between them.
+func guardFuncName(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	return "(" + guardRecvName(fd.Recv.List[0].Type) + ")." + fd.Name.Name
+}
+
+func guardRecvName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return "*" + guardRecvName(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr:
+		return guardRecvName(t.X)
+	case *ast.IndexListExpr:
+		return guardRecvName(t.X)
+	}
+	return "<unknown-recv>"
 }
 
 // countProductionConstantUses counts test sites that reference the production

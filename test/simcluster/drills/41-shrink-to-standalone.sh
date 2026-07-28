@@ -147,30 +147,74 @@ for _b in $(list_nodes broker); do
         elif poll_until 30 3 "retire $_b terminal RETIRED" -- _retired "$_b"; then
             _as_pass "SHRINK retire $_b reaches its own terminal op_state=RETIRED"
             if [ "$_b" = "$AGENT_RETIRE_TARGET" ]; then
-                # FIRST retire (non-final, N=3→2) — CORRECTED (R15, agent aca27ecf): the retired broker's
-                # nats-server stays UP and ON THE ROUTE MESH here (retire is a topology change, not a credential
-                # revocation), so the leader keeps answering agt1's roster refresh → the 3-silent-refresh
-                # silence-rebuild path CANNOT structurally fire on THIS retire (it fires only on TRUE isolation —
-                # proven by the final N=1 island arm below, which really de-clusters the mesh). The earlier cut
-                # asserted a hard connz PHYSICAL disconnect within a "silence-rebuild SLA" — but that SLA does not
-                # apply to a meshed retire, and demanding physical severance OVER-SPECIFIES what tether does: agt1
-                # stays FUNCTIONALLY reachable through the mesh (the real correctness invariant, asserted below)
-                # and migrates on TRUE decommission via the ~20s disconnect-watchdog. The PROACTIVE fast-path
-                # (rosterRequiresReconnect, roster.go:409-437) IS designed to re-home agt1 off a broker the signed
-                # roster marks leaving/removed, but it did not physically move agt1 off the retired-but-meshed
-                # broker in-window (likely a host/IP match gap — unconfirmed from a torn-down run); that is a
-                # fast-path OPTIMIZATION gap, recorded — not asserted as a hard disconnect that REDs a
-                # functionally-correct agent.
-                # kept_sites/anti-deletion (external review H-1/M2): the earlier cut asserted THREE things —
-                # agt1 PHYSICALLY leaves the retired broker, agt1 RECONNECTS to a remaining VOTER, and agt1
-                # stays functionally reachable. The first two OVER-SPECIFY a meshed retire (see above) and are
-                # honestly un-coverable here, but they are TWO DISTINCT claims — so they are TRADED into two
-                # distinct not_covered(gap) sites, not collapsed into one (collapsing surrendered a site and
-                # RED-ed the anti-deletion gate). Coverage is re-classified, never quietly dropped.
-                not_covered "41 SHRINK first-retire PROACTIVE fast-path #1: agt1 does not PHYSICALLY leave the retired-but-still-meshed $_b in-window (rosterRequiresReconnect)" \
-                    "on a non-final retire the retired broker's nats-server stays up + meshed, so the leader answers agt1's roster refresh and the silence-rebuild path cannot fire (it fires on TRUE isolation — the final N=1 island arm below proves it). agt1 stays FUNCTIONALLY reachable (asserted below) and migrates on true decommission via the ~20s disconnect-watchdog; the retire-time PROACTIVE move (rosterRequiresReconnect, roster.go:409-437) is a fast-path optimization that did not physically re-home agt1 off the meshed broker this run — an unconfirmed fast-path gap (host/IP match), NOT a correctness failure, so it is RECORDED rather than asserted as a hard connz disconnect (which would over-specify a meshed retire)" gap
-                not_covered "41 SHRINK first-retire PROACTIVE fast-path #2: agt1 does not RECONNECT directly to a remaining VOTER in-window on the meshed retire" \
-                    "the companion claim to #1: because agt1 never physically left the still-meshed retired broker in-window, there is no in-window RECONNECT-to-a-remaining-VOTER to observe either. Same root cause (a non-final, still-meshed retire), same resolution — agt1 re-homes to a VOTER on true decommission via the disconnect-watchdog. Recorded as a distinct gap so the anti-deletion gate sees the claim traded, not surrendered" gap
+                # FIRST retire (non-final, N=3→2). Two claims here were RECORDED AS GAPS and are now
+                # ASSERTED again, because the premise behind the trade was measured and found FALSE.
+                #
+                # WHAT THE GAPS SAID, AND WHAT ACTUALLY HAPPENS
+                # ---------------------------------------------
+                # The recorded reasoning was: a retire keeps the retired broker's nats-server UP and ON THE
+                # MESH, so the leader keeps answering agt1's roster refresh and the 3-silent-refresh
+                # silence-rebuild path cannot fire — from which it concluded that agt1 does not physically
+                # leave the retired broker in-window, and named a suspected "host/IP match gap" in the
+                # PROACTIVE path, explicitly flagged as "unconfirmed from a torn-down run".
+                #
+                # The first half is true and irrelevant; the conclusion is wrong. The silence path indeed
+                # cannot fire on a meshed retire — but it is not the mechanism here. The PROACTIVE path is,
+                # and it works. Measured on a live drill run, captured from the agent's journal before
+                # teardown:
+                #
+                #   08:16:20  agent registered on the retire target, roster pinned (TOFU)
+                #   08:17:17  WARN "current broker is leaving the signed roster; rebuilding NATS session on
+                #             a voter"   connected_url=nats://brk2:4222   <- a HOSTNAME, so no host/IP gap
+                #   08:17:17  "rebuilding NATS session on the freshest roster"
+                #   08:17:17  "agent: registered"        <- 62 MILLISECONDS after the decision
+                #
+                # and at that moment /connz reported: brk2 (retiring) 0 agt1 connections, brk1 (voter) 1.
+                # Both traded claims are therefore observable facts, not over-specification: agt1 DOES
+                # physically leave, and it DOES land on a remaining voter.
+                #
+                # BUT IT IS INTERMITTENT, SO IT GOES BACK TO A GAP — WITH A DIFFERENT REASON.
+                # ------------------------------------------------------------------------
+                # Four runs, measured, not argued:
+                #
+                #   run 1, 2   (pre-restoration captures)  moved ~57s after registration, 88 ms apart
+                #   run 3      poll_until 60 3             PASS
+                #   run 4      poll_until 60 3             TIMED OUT, both arms
+                #   run 5      poll_until 210 3            TIMED OUT, both arms
+                #
+                # 210s is the 180s full-jitter ceiling plus margin — the window this arm carried before it
+                # was ever traded for a gap — and it still timed out. Widening further would be inventing
+                # an SLA to make a red go green, which is the one thing this harness must never do. So the
+                # two sites go back to not_covered(gap). The ANTI-INFLATION reading is the same in both
+                # directions: 2 sites out, 2 sites in, kept_sites unchanged.
+                #
+                # WHAT IS DIFFERENT FROM THE GAPS THIS REPLACES. The old ones said agt1 "does not
+                # physically leave" and blamed a suspected host/IP match failure, flagged as "unconfirmed
+                # from a torn-down run". BOTH of those are now known to be FALSE: agt1 DOES leave, the
+                # connected URL in the capture is a HOSTNAME (nats://brk2:4222), and /connz confirmed the
+                # move. What is actually open is that it is UNRELIABLE within any window this drill can
+                # justify — a different claim, with measurements behind it instead of a hypothesis.
+                #
+                # CANDIDATE MECHANISM, recorded as candidate (internal/agent/roster.go, agent.go):
+                # the re-home rides the roster refresh loop, whose timer is jitterDur(3 min) =
+                # UNIFORM(0, 180s], REDRAWN after every wake. A nats_topology_* sys.event can wake it
+                # early, but that nudge is BEST EFFORT AND UNRETRIED: buffered-1, coalescing, and DROPPED
+                # (with a fresh full-jitter reset) if the loop wakes while reconnectInFlight or rebuilding
+                # is set. Two consecutive drops already exceed 210s. A second candidate is the
+                # string-identity blindness pinned by
+                # internal/agent.TestProactiveRehomeIsBlindToAConnectedHostTheRosterDoesNotName: if the
+                # connected URL is spelled differently from the roster entry, BOTH arms go quiet forever.
+                # Neither is confirmed here, and this comment does not claim one — that is what the last
+                # three review rounds got wrong about this very block.
+                #
+                # THE CORRECTNESS INVARIANT IS UNAFFECTED and is asserted below: agt1 stays functionally
+                # reachable across the retire, and on TRUE decommission it escapes via the #48
+                # silence-rebuild path (asserted at the N=1 island arm, which passed in every run above).
+                # This gap is about the fast path's LATENCY, not about whether the agent survives.
+                not_covered "41 SHRINK first-retire PROACTIVE fast-path #1: agt1 does not RELIABLY leave the retired-but-still-meshed $_b inside a justifiable window" \
+                    "MEASURED, not hypothesised: it DOES leave — a live journal capture shows rosterRequiresReconnect firing with connected_url=nats://brk2:4222 (a HOSTNAME, so the host/IP gap the previous version of this note guessed at is NOT the mechanism) and /connz reading brk2=0 / brk1=1. But across five runs it made the move inside the window three times and missed it twice, including once at poll_until 210 3 — the 180s full-jitter ceiling plus margin, and the window this arm carried historically. Widening further would be inventing an SLA to turn a red green. Candidates (neither confirmed): the nats_topology_* wake-up is best-effort and UNRETRIED (buffered-1, dropped with a fresh jitterDur(3min) draw when reconnectInFlight/rebuilding is set), and the string-identity blindness pinned by internal/agent.TestProactiveRehomeIsBlindToAConnectedHostTheRosterDoesNotName. The correctness invariant is unaffected and asserted below; the agent still escapes on true decommission via #48" gap
+                not_covered "41 SHRINK first-retire PROACTIVE fast-path #2: agt1 does not RELIABLY reconnect to a remaining VOTER inside that window" \
+                    "the companion claim to #1 and the same evidence: when the move happens the re-register lands on a remaining voter 62 MILLISECONDS after the decision, so this arm is not separately slow — it simply has nothing to observe in the runs where #1 does not fire. Kept as a DISTINCT site rather than merged into #1 so the anti-deletion ledger sees two claims traded rather than one surrendered, and so that a future fix which makes the agent leave but land nowhere authoritative is still a visible hole" gap
                 assert_ok "SHRINK first-retire: agt1 stays FUNCTIONALLY reachable across the retire — a real exec crosses the post-retire command path (the correctness invariant on a meshed retire; NON-VACUITY: _agent_live is a bounded ctl exec, a dead path REDs)" \
                     poll_until 60 3 "agent command path after first retire" -- _agent_live
             fi

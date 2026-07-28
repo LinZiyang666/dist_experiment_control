@@ -417,9 +417,6 @@ func rosterRequiresReconnect(previous, current *proto.ClusterRoster, connectedUR
 	currentLeaving := false
 	otherVoter := false
 	for _, b := range current.Brokers {
-		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
-			continue
-		}
 		isCurrent := rosterBrokerMatchesHost(b, connectedHost)
 		if isCurrent {
 			currentPresent = true
@@ -427,6 +424,12 @@ func rosterRequiresReconnect(previous, current *proto.ClusterRoster, connectedUR
 			case proto.RosterPhaseDraining, proto.RosterPhaseRetiring, proto.RosterPhaseAddFailed:
 				currentLeaving = true
 			}
+			continue
+		}
+		// Dialability filters destinations, not identity. A cfg.NATSURL floor may legitimately connect
+		// a local/dev agent to a loopback roster entry; skipping that entry before the identity check
+		// makes an unchanged roster look like a removal and churns the session every refresh.
+		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
 			continue
 		}
 		if b.Phase == proto.RosterPhaseVoter {

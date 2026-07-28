@@ -25,7 +25,7 @@
 31-node-upgrade-fleet	INCOMPLETE	1	-	#28-FIXED (success-re-exec gap owed a dedicated drill)	31-node-upgrade-fleet
 32-install-lifecycle	GREEN	0	-	-	32-install-lifecycle
 40-drain-retire	GREEN	0	-	-	40-drain-retire
-41-shrink-to-standalone	INCOMPLETE	2	-	first-retire PROACTIVE fast-path gap (rosterRequiresReconnect on meshed retire; functional reachability GREEN) — over-specified connz-disconnect asserts corrected to honest gap	41-shrink-to-standalone
+41-shrink-to-standalone	INCOMPLETE	2	-	first-retire PROACTIVE fast-path is INTERMITTENT (measured 3/5 runs in-window, incl. a miss at the 210s full-jitter ceiling); the move itself is confirmed, the latency is not bounded	41-shrink-to-standalone
 42-rejoin-returning	GREEN	0	-	-	42-rejoin-returning
 43-migrate-live-data	GREEN	0	-	-	43-migrate-live-data
 50-backup-restore	GREEN	0	-	-	50-backup-restore

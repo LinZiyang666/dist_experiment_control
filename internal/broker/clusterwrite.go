@@ -384,13 +384,21 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		poster = p
 		webhookPost = p.Post
 	}
-	// B6 OPS#4: wrap Observe so each reconciler tick also refreshes the cached stream replica
-	// posture for the /metrics gauge (no extra JS call — reuses the report the reconciler fetches).
-	observeAndCache := func(ctx context.Context) (ReplicaReport, error) {
+	// B6 OPS#4: wrap Observe so each reconciler tick also refreshes the cached stream replica posture —
+	// the min-actual for the /metrics gauge AND the stream count that sizes the NEXT observation's
+	// deadline (no extra JS call; it reuses the report the reconciler already fetches). This is the ONLY
+	// writer of that cache, and it runs on the leader tick, which is why a follower's count stays 0.
+	// This third ObserveReplicas call also needs its OWN bound: the reconciler passes its process-lifetime
+	// loop context, so relying on the caller would let one stalled JS request wedge alert reconciliation
+	// forever.
+	observeAndCache := func(parent context.Context) (ReplicaReport, error) {
+		ctx, cancel := context.WithTimeout(parent,
+			clusterReplicaObserveBudget(b.observeStreamCountForBudget()))
+		defer cancel()
 		rep, err := pub.ObserveReplicas(ctx)
-		if err == nil {
-			b.cacheReplicaSnapshot(rep)
-		}
+		// A failed per-stream collection may still carry the complete work-set count discovered first.
+		// Cache it for the next budget, but cacheReplicaSnapshot never treats it as measured posture.
+		b.cacheReplicaSnapshot(rep)
 		return rep, err
 	}
 	rec := NewAlertReconciler(AlertReconcilerConfig{
@@ -522,25 +530,29 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 // observeStreamCountForBudget is how many streams the next ObserveReplicas is expected to enumerate.
 // It only sizes the deadline; nothing else reads it.
 //
-// The PREVIOUS observation's stream count is the primary source (RB2 doubt 3): it already includes the
-// events stream, every ACTIVE session's history stream AND every live `OBJ_xfer-*` stream, which is
-// exactly the set the next call walks. Before the first observation there is no such count, so it falls
-// back to `events + one history per ACTIVE session` — the old estimate, which is right for a broker with
-// no transfers in flight and is the state a freshly-started broker is in.
+// Two lower bounds are combined: the PREVIOUS observation's stream count includes the events stream,
+// every ACTIVE session's history stream AND every live `OBJ_xfer-*` stream; the current
+// `events + one history per ACTIVE session` count sees session growth since that observation. The
+// maximum retains the transfer coverage without ever regressing below the old live-session estimate.
 //
-// Deliberately best-effort in both halves: a DB error yields the base budget, the same bound this code
-// had before the budget scaled at all, so a hiccup degrades to the old behaviour rather than to an
-// unbounded call. The read goes through b.read() so it cannot write, and it is one indexed COUNT against
-// the local replica — never another round trip to the JS meta.
+// Only the leader writes the observation cache. A follower therefore uses the live-session estimate for
+// its whole life, and a newly elected leader uses it until its first complete observation. A demoted
+// leader retains its old count; maxing it with the live floor is conservative in either direction.
+//
+// Deliberately best-effort: a DB error keeps any cached observation (or yields the base budget if none
+// exists). The read goes through b.read() so it cannot write, and it is one indexed COUNT against the
+// local replica — never another round trip to the JS meta.
 func (b *Broker) observeStreamCountForBudget() int {
-	if n := b.observedStreamCount(); n > 0 {
-		return n
-	}
+	observed := b.observedStreamCount()
 	var sessions int
 	if err := b.read().QueryRow(`SELECT COUNT(*) FROM sessions WHERE state = 'ACTIVE'`).Scan(&sessions); err != nil {
-		return 0
+		return observed
 	}
-	return sessions + 1 // + the events stream, which ObserveReplicas always walks
+	liveFloor := sessions + 1 // + the events stream, which ObserveReplicas always walks
+	if observed > liveFloor {
+		return observed
+	}
+	return liveFloor
 }
 
 // clusterJSPlaceProbeTimeout bounds the join-side placement probe.
@@ -564,7 +576,7 @@ const clusterJSPlaceProbeTimeout = 3 * time.Second
 //
 // The base is the sibling JS probe's budget (same meta, same kind of work — not a second invented
 // number); the per-STREAM term is what the sibling does not need because it queries one stream.
-// The RELATION, not the numbers, is pinned by TestReplicaObserveBudgetScalesWithSessions.
+// The RELATION, not the numbers, is pinned by TestReplicaObserveBudgetScalesWithStreams.
 //
 // WHAT THE SCALING TERM COUNTS, AND WHY IT CHANGED (external review RB2 doubt 3)
 // -----------------------------------------------------------------------------
@@ -575,9 +587,20 @@ const clusterJSPlaceProbeTimeout = 3 * time.Second
 // the round trips it was about to make, and "routinely unobserved" was the predictable result.
 //
 // The scaling input is now the PREVIOUS observation's own stream count, which already includes events +
-// history + xfer and costs nothing to obtain. It lags by one tick when the stream set grows, and that is
-// acceptable: the lag self-corrects on the next tick, the ceiling still bounds the leader tick, and an
-// under-budgeted tick reports UNOBSERVED (-1) rather than a fabricated measurement.
+// history + xfer and costs nothing to obtain.
+//
+// TWO LIMITS OF THAT INPUT:
+//
+//	it lags an OBJ_xfer-only growth burst until the next observation enumerates the complete work set.
+//	ObserveReplicas now does that enumeration before per-stream collection and returns StreamCount even
+//	if collection times out, so the following pass is correctly sized without treating partial replica
+//	state as observed. Session growth is covered immediately by the live floor above.
+//
+//	only the LEADER observes. cacheReplicaSnapshot is written from the alert reconciler's observe tick,
+//	which is leader-only. A follower and a just-elected leader use the live session floor until they
+//	have a complete cached observation; this still cannot see orphan transfer streams. A DEMOTED leader
+//	keeps whatever count it last measured. That direction is conservative — an over-large budget is a
+//	bound that stops binding, and only costs wall-clock when the JS meta is unresponsive.
 //
 // STILL NOT CHARACTERISED, deliberately: the 250ms per-stream coefficient. Sizing it properly needs a
 // measured transfer-heavy fleet, and inventing a number would be exactly the "looks like
@@ -593,6 +616,13 @@ const (
 	// sessions would hand the leader tick a multi-minute deadline, which is the unbounded behaviour this
 	// replaced wearing a different hat. At the cap the observation genuinely cannot finish and the
 	// UNOBSERVED result is the honest answer.
+	//
+	// It binds at (30s - 3s) / 250ms = 108 streams — roughly 54 sessions each carrying one transfer.
+	// Above that the scaling term stops mattering and every broker gets 30s, so on a genuinely
+	// transfer-heavy fleet the old session-count term and the new stream count give the SAME answer.
+	// What the fix buys is the range below the cap, which is where the observed "routinely unobserved"
+	// brokers actually sat. Raising the cap is not obviously right (it lengthens a tick other work waits
+	// on) and needs the same measured fleet the 250ms coefficient does.
 	clusterReplicaObserveCeiling = 30 * time.Second
 )
 

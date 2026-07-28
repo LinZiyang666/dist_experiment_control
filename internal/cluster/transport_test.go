@@ -495,18 +495,16 @@ func TestD3FailingNewReapsTransportNoLeak(t *testing.T) {
 			t.Fatalf("transport: %v", err)
 		}
 		dir := t.TempDir()
-		// DELIBERATELY INVALID, and exempt from TestRaftTimingsUseProductionConstants
-		// for that reason: LeaderLeaseTimeout (2s) > HeartbeatTimeout (1s) makes
+		// DELIBERATELY INVALID: LeaderLeaseTimeout (2s) > HeartbeatTimeout (1s) makes
 		// raft.ValidateConfig reject inside BootstrapCluster, so New fails AFTER the
 		// transport is built — which is the whole point, this test checks the
-		// transport is still reaped on that failure path. Production constants are a
-		// VALID ordering, so using them here makes New succeed and the test asserts
-		// nothing. (A batch that replaced every hardcoded timing did exactly that,
-		// and this test caught it — see docs/testing-standards.md T2's exception.)
+		// transport is still reaped on that failure path. Only the lease differs from
+		// production; heartbeat/election use their production constants so the
+		// exemption is the smallest physical site that creates the invalid ordering.
 		n, err := New(Config{
 			LocalID: raft.ServerID(fmt.Sprintf("failnew-%d", i)), DataDir: dir,
 			DBPath: filepath.Join(dir, "state.db"), Transport: tr, Logger: quietLogger(),
-			HeartbeatTimeout: 1 * time.Second, ElectionTimeout: 1 * time.Second,
+			HeartbeatTimeout: MultinodeHeartbeatTimeout, ElectionTimeout: MultinodeElectionTimeout,
 			LeaderLeaseTimeout: 2 * time.Second,
 		})
 		if err == nil {

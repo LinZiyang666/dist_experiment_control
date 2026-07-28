@@ -800,7 +800,7 @@ agt1 全程**功能可达**（下方断言证明），真正退役时经 ~20s �
 | B6 | −500 行 | **诚实修正为 ≈ −190**（`L07:139` 自己说改名 0 净减行）——不是缩范围，是路线图数字错 |
 | B7 | `reconcilePass` 加执行模式 inline / own-goroutine-with-timeout | **DECLINED（N1，永久）** |
 | B7 | per-pass state slot | **YES ✔核**：`lastDur` / `maxDur` / `overruns`，用注入时钟量，落进 `reconcilePassStatus` → adminsock → CLI 的 `SLOWEST`/`OVERRUNS` 两列。这是路线图 line 492-493 的"最小闭合"（把「op 驱动器卡住」从不可观测变成可观测）在**能真正做到**的形态下的交付。**两处内审订正**：(a) 本 plan §0.4 曾写"采用"的 `budget` + `context.WithDeadline` 被放弃却没入 §7，现补为 **N21**；(b) `maxDur` 的高水位断言原本 **VACUOUS**——`slow` pass 每轮都把假时钟推 3s，所以第二轮又是 3s，把 `if dur > p.maxDur` 改成无条件赋值也全绿。已重写成"第二轮**恢复**"形态（同时断言 `LastDur == 0 && MaxDur == 3s`）并变异验证必红 |
-| B7 | `driveProxyReconcile` / `driveLeaderMaintenance` 移进 registry | **DECLINED（N0，永久）**——实现时发现两条可行路径都是真回归，见 N0。**替代交付**：把它们**真正会无限挂**的两处 `ObserveReplicas(context.Background())`（`clusterwrite.go:417` streamObserve seam、`:477` `clusterStreamsReady`）在各自 seam 上限界（那里的 deadline 真能取消东西），并加 AST 门 `TestNoUnboundedJSObservationOnTheLeaderTick` 防止第三个出现（带非空性地板，扫不到 2 个站点就 Fatal）。第二处是 critique 抓到的——只堵一处等于没堵 |
+| B7 | `driveProxyReconcile` / `driveLeaderMaintenance` 移进 registry | **DECLINED（N0，永久）**——实现时发现两条可行路径都是真回归，见 N0。**替代交付**：把它们**真正会无限挂**的两处 `ObserveReplicas(context.Background())`（`clusterwrite.go:417` streamObserve seam、`:477` `clusterStreamsReady`）在各自 seam 上限界（那里的 deadline 真能取消东西），并加 AST 门（当时叫 `…OnTheLeaderTick`）防止第三个出现（带非空性地板，扫不到 2 个站点就 Fatal）。第二处是 critique 抓到的——只堵一处等于没堵。**后续（外审 F1）**：第三个真的存在——alert reconciler 的 observe wrapper 直接吃进程级 loop context；它已限界，门改名 `TestNoUnboundedJSObservationOnClusterMaintenance` 并从"≥2 的地板"收紧为"恰好 3 个调用 + 3 个派生 deadline"|
 | B7 | `leaderOnly bool` → `authority func() bool` | **YES**（每 sweep 只评估一次） |
 | B7 | 「4 个游离循环的 lastTick/runs/lastErr 塞进 RuntimeReport（已在 A5 做）」 | **路线图记错 ⇒ 本轮补做**：A5 做的是骨架 + 接线，每迭代活性字段被批次 A 的 review F-03 删了。本轮用 `GoEvery` 交付**每迭代**证据（不复活 `Runs`） |
 | B7 | 明确不做：五条循环并进单 goroutine | **DECLINED（N2，永久）**，附四条独立证据 |
@@ -953,8 +953,233 @@ tag 门控的套件只有 `make e2e-parallel` 或显式 `-tags` 才会编译。
 （B2-1 的判据副本、RB2-4 的自检副本），所以一并改成同样的 `file:FUNCTION#序号` 并同样验证免疫。
 这条本身是个教训：**同一个坏形状在仓库里往往不止一处，修的时候要去找它的兄弟。**
 
-**仍未闭合的一项，如实登记**：simcluster `41-shrink-to-standalone` 保持 INCOMPLETE。
-两个 GAP 是 agent 在非终态、被退役 broker 仍在网格中的 retire 上不走主动快路径，
-**先于本批存在**（B5–B9 不碰 agent 重连路径；我与外审两轮 drill 给出逐字相同的两个 GAP）。
-不请求豁免、不为让 drill 变绿去改产品——按 simcluster 定位铁律保持 recorded，
-留给独立的 agent-rehome 增量。
+### 10.3 drill 41 的两个 gap：不是产品缺陷，是**基于未验证假设记下的错误 gap**
+
+这是本轮最后一笔技术债，结论与所有人（包括我自己前三轮的复述）预期的相反。
+
+**drill 记的是什么**：两条 `not_covered(gap)` —— "agt1 在窗口内**没有物理离开**被退役的 broker"、
+"因此也**没有直连到剩余 VOTER**"，并把成因猜为 `rosterRequiresReconnect` 的
+**host/IP 匹配缺口**，自己标注 **"unconfirmed from a torn-down run"**。
+
+**我先按这个假设查，验到了一半就停住了**：`rosterRequiresReconnect` 确实在 connectedURL 是 IP
+时返回 false（纯函数可复现）。但那只证明"这个洞存在"，不证明"本例是它造成的"。
+另外三个候选逐一排除：`rosterForRegister` 不按 agent 世代门控（不会回 nil roster）、
+`applied` 用的是 `>=`（等世代仍应用）、member ACL 已授权订阅 `sys.events`。
+剩下"3 分钟刷新周期 vs ~20 秒 retire 窗口"看似成立，但唤醒通道存在（`nats_topology_*` +
+`topoReconcileInterval=5s`），所以**仍然缺实证**。
+
+**于是跑 drill 并在拆机前抓 agent journal**：
+
+```
+08:16:20  registered on the retire target, roster pinned (TOFU)
+08:17:17  WARN "current broker is leaving the signed roster; rebuilding NATS session on a voter"
+          connected_url=nats://brk2:4222        ← 主机名，host/IP 假设在本例中不成立
+08:17:17  "rebuilding NATS session on the freshest roster"
+08:17:17  "agent: registered"                   ← 决策后 62 毫秒
+```
+
+同时刻 `/connz`：被退役的 **brk2 = 0** 个 agt1 连接，**brk1（VOTER）= 1** 个。
+
+**两条 gap 都是事实错误。产品是好的**：主动快路径触发、62ms 完成迁移、落在剩余 VOTER 上；
+唤醒不是靠 3 分钟定时器而是靠 `nats_topology_*` 事件（迁移发生在注册后 ~57 秒，远早于周期）。
+
+**处置**：把两条 `not_covered(gap)` **恢复成硬断言**（drill 里 `_agent_not_direct_on` /
+`_agent_direct_on_voter` 两个 helper 当初就写好了，只是被换掉了）。
+按反注水规则：`not_covered → assert_ok` 是 **strengthen**，站点数 2 进 2 出、`kept_sites` 不降。
+
+**当时的结果**：drill 41 **GREEN，pass=33**（原 31 + 恢复的 2 条），`not_covered=0`、`product_red=0`。
+
+> **⚠ 本节的处置在 §11.6 被本人推翻。** 上面这个 GREEN 是真的，但它是**三次运行里的一次**。
+> 内审后补跑，第四次在 60s 超时、第五次在 **210s**（全抖动上限 + 余量）同样超时。
+> **移动本身确认无误，延迟无界**——两处站点已改回 `not_covered(gap)`，但**换了理由**：
+> 不是当年那条被证伪的"不会物理离开 / 疑似 host/IP 缺口"，而是实测到的"不可靠"。详见 §11.6。
+
+**教训，值得单列**：把一条断言降级成 gap 时，**降级的依据本身必须被验证**。
+这次的 gap 注释诚实地写了 "unconfirmed"，但它一旦落盘就被后续三轮（含两轮外审、含我自己）
+反复当作既成事实转述——"先于本批存在的 agent 快路径缺口"。
+**未经验证的降级会把一个工作正常的机制记成缺陷，并且让该机制真正回归时无人发现。**
+
+**而 §11.6 补上了这条教训的另一半，也是更贵的那一半**：**升级的依据同样必须被验证**。
+我用两次落在 88 ms 内的观测推出了一个 60s 的 SLA——那两次观测是关于**那两次运行**的证据，
+不是关于**机制**的证据。同一个错误、相反的方向，而且是在写下上面那段教训的同一次编辑里犯的。
+
+**补上缺失的那一层覆盖**：`refreshRosterOnce → rosterRequiresReconnect → requestRosterReconnect`
+这条**接线**此前没有任何 hermetic 测试——现有测试只覆盖纯 predicate。这正是"deploy tier 看得见、
+单元层看不见"的形状：真回归时两边都不会红（drill 已把失败写成预期）。
+新增 `internal/agent/roster_proactive_rehome_test.go`，用真 NATS + 假 broker 走完整路径；
+**变异验证**：切断那行接线 ⇒ 新测试红、原 predicate 测试**依旧全绿**，正好证明了缺的是哪一层。
+
+**顺带记录两处真实的既有限制**（都写成可执行断言，不是散文）：
+1. `rosterRequiresReconnect` 对 **IP 形态的 connectedURL 视而不见**——nats.go 重连到 discovery
+   来的服务器时 URL 是 IP，与 roster 的主机名字符串比不上，两条臂都哑火。
+   彻底修需要在签名 roster 里加 broker 的 nats server_name（wire 变更，属独立增量）。
+2. 当前 roster 扫描会过滤 undialable 主机、而 previous fence **不过滤**，
+   于是一个 loopback 主机的当前 broker 在**未变更**的 roster 上被读成"已移除"，每次刷新都重建会话。
+   生产可达性低（`DialURLs` 同样过滤，正常不会拨到它），但这是真实的逻辑不对称。
+   **不在此处修**：修它要决定"哪一侧过滤"，而在刚发布之后凭直觉挑一边，正是这块地方前三次出错的方式。
+
+**此前登记为"仍未闭合"的那一项**（订正见 §10.3，**再订正见 §11.6**）：simcluster
+`41-shrink-to-standalone` 的两条 gap 的**理由**被证伪并重写，但 **verdict 仍是 INCOMPLETE / 2 gaps**。
+一次运行给出的 GREEN pass=33 是真的，但五次运行里有两次超时（含一次在 210s），
+所以"疏散会发生"成立、"疏散在任何可辩护的窗口内发生"不成立。
+
+我在前三轮里反复把它转述为"先于本批存在的 agent 快路径缺口"，那是**照抄了一条自己标注为
+未经确认的假设**。这是本轮最该记住的一条教训，完整记录在 §10.3。
+
+---
+
+## 11. 内审判定（2026-07-28，`docs/reviews/batch-b2-debt-review.md`）
+
+对 §10.2 / §10.3 的债务清理增量做了一轮 5 lane 审查 + 5 lane 对抗性核验 + 1 综合（11 agent，
+每阶段数量静态固定，全部继承会话 Opus 5）。综合结论：**产品代码零缺陷**——10 个 lane 没有一条 finding
+指向 `internal/**` 的行为错误；A1 的谓词组成、锁、A2 的 51↔51 数据迁移都被两组独立方法证明正确。
+**但两个核心机制各有一个被实测复现的洞**，都已在本轮闭合。
+
+### 11.1 两条硬前置（BLOCKER 级），已修 + 变异验证
+
+**M1/M2 — `cmd/tether` 的新 key 不是单射的（本增量风险最高的一处）。**
+`scanTree` 用 `fd.Name.Name` 作 key（丢 receiver），且在 FuncDecl **退出**时把序号计数器归零。
+两个独立成因，后果相同且是最坏的那种：**静默吸收**——一个全新的 unresolved 站点继承既有豁免，
+三个门全绿、diff 里看不出任何东西。
+
+- 成因 A：`clusterstatus.go` 里再加一个 admin backend 类型、其 `HandleCluster` 回 `Response{Code: …}`，
+  序号从 `#1` 重开，落进已豁免的十条 `HandleCluster` 里。
+- 成因 B：`<file-scope>` 桶**连同名碰撞都不需要**——任意一个 `func` 把两个包级站点隔开，两者都是 `#1`。
+
+**这是本增量唯一一处"把吵闹的错换成安静的错"的交易**：旧 `file:line` key 腐烂时**必然变红**
+（烦人但诚实），新 key 在这两种形态下无声。而正确实现就在同一个 commit 里、30 行之外的
+`internal/auth`（per-file `map[string]int`、不重置）。一次 commit 写出同一套 key 方案的两个实现、
+一个单射一个不单射，并把不单射的那个用在守护 exit-70 契约的那张表上——这不是取舍，是遗漏。
+
+修法：序号计数器改成**per-file、按限定函数名、永不重置**，并把 **receiver 放进 key**
+（`internal/broker/run.go:(*Broker).handleRunReq#1`）。receiver 不是装饰——没有它，两个同名方法共用一条
+序列，给其中一个加站点会静默重编另一个的豁免；有了它每个方法各有独立序列，**key 由构造保证唯一**，
+而不是靠"两个名字碰巧不同"。
+
+**51 条重键是严格双射，机械可验**：新 key 去掉 receiver 后与旧集合**逐字节相同**，序号一个未动
+（26 个持有豁免的函数全是方法，每个 `(file, func)` 只有一个 receiver）。reason 文本一字未改，
+三条 `#N in this function` 的互指因此仍然成立。
+
+**变异验证三个方向**（全部用 `Edit` 注入、`Edit` 还原，不用 `git checkout`）：
+1. 去掉 receiver ⇒ 新增的 `TestUnresolvedSiteKeysAreInjective` 红，并点名 `HandleCluster#2/#3` 碰撞；
+2. 恢复"FuncDecl 退出归零" ⇒ file-scope 两站点塌成一个 key，两个门都红；
+3. **真实树探针**——往 `clusterstatus.go` 加第二个 `HandleCluster`（不同 receiver、发一个全新动态 code），
+   `TestErrorCodeCoverage` 红并点名 `internal/broker/clusterstatus.go:(*mutationProbeBackend).HandleCluster#1`。
+   **这正是旧 key 下全绿的那个用例。** 同型探针在 `internal/auth` 上报 `(*mutationProbeRunner).Run#1`
+   而非 `Run#3`，证明序列彼此独立、既有豁免未被扰动。
+
+顺带：`internal/auth` 也改成同一套 receiver-qualified key（原注释说"函数内计数"、实际在同名碰撞时
+跨函数计数——n6），并把 `TestExternalReviewErrorCodeGateReportsEveryDynamicSite` 的 fixture 从
+"两个站点同**函数**"扩成四行表（同函数 / 跨函数 / 同名不同 receiver / file-scope 被 func 隔开）——
+**那个存在目的就是证明 site-scoping 的回归测试，对 M1/M2 结构性盲**：它的注释说"同一**文件**内不得互相遮蔽"，
+fixture 却恰好摆成 ordinal 唯一处理正确的那种排布（n4）。缺陷与"证明缺陷不存在"的测试是同一次编辑写下的。
+
+**M4 — Part B 的三份持久记录没跟着改。** `expected-verdicts.tsv:28` 仍是 `INCOMPLETE / 2`，
+下一次 `run-drills.sh` 会把 drill 41 **确定性地**判成 DEVIATION（`classify_match` 对 GREEN≠INCOMPLETE
+且无 band 直接落 DEVIATION），丢掉历次报告都在依赖的 "NO DEVIATIONS" 性质；
+`expected-verdicts-log.md` 与 `docs/reviews/simcluster-coverage-boundary.md` 仍在描述改动前的世界，
+后者还留着一条**站着的指令**（"不 launder：不假装物理断连稳定发生"）与 drill 的硬断言正面冲突。
+三份全部同步。**同步的方向与我最初写的相反**——见 §11.6：补跑推翻了 §10.3 的 GREEN，
+tsv 保持 `INCOMPLETE / 2`，两条 gap 的**理由**被替换为实测结论。
+M4 的核心指控（三份持久记录与 drill 不一致、下一次 sweep 会确定性 DEVIATION）完全成立，
+只是最终一致的那个状态不是 GREEN。
+
+### 11.2 MAJOR，已修 + 变异验证
+
+| # | 问题 | 处理 |
+|---|---|---|
+| **M3** | `observeStreamCountForBudget`（修复真正加的那个函数、两个调用点唯一调用的那个）**零测试引用**——测试断言 `observedStreamCount()` 后**手工**拼预算，从不走真正做组合的那条路。删掉消费分支 = 修复的**逐字节回退**，`internal/broker` 整包绿 | 测试改为全程走真入口，并用真 DB 播两条 ACTIVE session，使回退项是**已知的 3**，于是每条断言都能区分"读了流数"与"退回了 session 数"。变异（删消费分支）⇒ 红，报 `budget input = 3, want 10` |
+| **M5** | wiring 测试的正向断言**过定**：fixture 把 loopback 放进 `PublicHost`，而 `rosterRequiresReconnect` 先按 `IsUndialableHost(b.PublicHost)` 过滤（`roster.go:420`），于是 `currentPresent` 永远为 false、removal 臂**无视 served roster** 恒触发。喂一个逐字节相同的 roster 也照样触发 | `PublicHost` 改为可拨号名、loopback 放 `NatsRoute`（过滤读 PublicHost、匹配读 PublicHost **或** NatsRoute）。新增"roster 未变"负控制行。变异（把 PublicHost 换回 loopback）⇒ 负控制行红，**证明旧 fixture 下两条正向行都是为错误的理由通过的** |
+| **M6** | "hermetic 测试到不了 LEAVING 臂"**是事实错误**，且后果不是措辞：LEAVING 臂（每次真实 `cluster shrink` 都走）在 CI 的所有层里**没有 wiring 覆盖** | 同一处 fixture 修好后该臂即可达，新增 RETIRING 行。变异（只切 leaving 分支）⇒ 只有该行红、removal 行照绿，正好量出这一层新增的价值 |
+| **M7** | 预算修复**只在 leader 上生效**：`cacheReplicaSnapshot` 只由 leader-only 的 observe tick 写，follower 终生拿 `sessions+1` 回退——正是被谴责的那一项；而 commit 与 §10.2 把回退描述成"**首轮**" | 不改行为（fail-closed、严格优于改前、非回归），**改那句不准确的话**：注释写明"follower 与新选出的 leader 之间是**每轮**，不是首轮"，并把 m7（增长突发下新项可能**小于**旧项，约 8 倍）与 n2（降级 leader 保留旧计数）一并如实写进同一段 |
+
+### 11.3 MINOR / NIT 处理
+
+已修：**m1**（`accepted &&` 无任何断言——新增"世代回滚被拒的 roster 不得触发重建"行，
+变异 `_ = accepted` ⇒ 红）、**m2**（第四张行号表 `raft_timing_guard_test.go` 同样重键，**并补上它缺失的
+陈旧条目检查**；重键当场发现 `:509` **一行上有两个被守护字段**，即 2 条豁免盖 3 个站点——
+行号 key 无法表达"一行几个站点"，所以没人看得见）、**m3**（6 处引用产品源码的行号散文全部改成**符号名**；
+其中 4 处今天就是错的）、**m4**（改名只到常量为止，钉关系的门的**输出**仍点名一个不存在的常量）、
+**m5/m6/n1**（UNOBSERVED 探针不带流、只向上驱动计数、以及一条穿着 `if` 的死断言）、
+**m8**（被重键的文件里三句话仍说自己是 line-keyed，其中一句坐在 map **内部**说这改动"不在本次做"）、
+**m10**（记录的是"IP 盲"这个最不可达的实例，实为**字符串同一性盲**——补 alias 行并改名）、
+**m11**（drill 注释把 nudge 当**实测事实**写；两份 journal 只证明了效果，无任何 publish/接收记录——
+改为 MEASURED / INFERRED 分栏）、**n5**（auth 豁免扫描只覆盖 `internal/broker`，
+而它保护的 `subscribedSubjects` 覆盖 broker + proto）、**n7**（fixture 里 `rosterRefreshNow` 是死赋值、
+承重的是 `cfg.RegisterTimeout`；表把 fixture 形状耦合到期望字段，改成每行显式 `prev`）、
+**n8**（两处注释仍说缓存"是给 /metrics gauge 用的"）、**n3**（上限在 108 流处生效，
+即目标工况上两项给同一答案——写进常量注释）。
+
+**m9 如实记录、不修**：ordinal key 声称"函数内增删站点会变红"，但对**一增一减相抵**的编辑为假
+（把一个站点变可解析 + 同函数内新增一个 unresolved，N 不变、每个 key 仍活、三门全绿，
+而每条 reason 现在描述另一个物理站点）。这是普通重构的形状，不是构造出来的。
+**没有任何"不是完整站点指纹"的 key 能抓住它**——写进 map 头部，与"改到带豁免的函数时要读 reason"一起。
+
+### 11.4 被驳回 / 被夸大（下一轮不要再提）
+
+- **B1-F1 BLOCKER**（"这两条断言历史上跑红过、窗口被从 210s 收窄"）——技术论证被其 verifier 逐条驳回：
+  ①"同一份代码"是假的，`55b1451` 重写了这条路径**而且它本身就是把两条臂换成 gap 的那个 commit**，
+  所以每次红都早于当前代码；②证据是**两次独立运行**、时延差 **88 毫秒**，在该 lane 自己的 full-jitter
+  模型下概率 ≈0.1%——它用自己的统计推翻了自己的推断；③两条臂在日志里都没有 `poll_until: condition met`
+  行（仅在 elapsed≥5s 时打印）⇒ 60s 预算实际消耗 **<5s**，"只剩 3s 余量"的算术是错的；
+  ④臂 #2 的窗口是 **30→60，是放宽**；⑤它倚重的那个 GREEN 数据点是 `r15v1`，而 `r2-plan.md §21.1`
+  明写作废。**存活的只有程序性那半**（三份记录要同步）= M4。
+- **B1-F5**（臂 #1 fail-open 假绿）——机械事实成立，但这**一对**断言产生不了假绿：臂 #2 是 fail-closed
+  且正向要求 agt1 出现在某个**当前 VOTER** 的 /connz 上，而此时 brk2 已 RETIRED；
+  NATS 客户端只有一条 session 连接，故"在 voter 上"蕴含"不在 brk2 上"。
+- **B2-F4**（`RosterRefreshOnly: true→false` 存活 ⇒ 全车队写风暴）——头号变异被驳回：
+  lane 跑的是 `-run` 限定的单测，包级跑同一变异时 `roster_runtime_test.go` 三个测试红。
+  它测的是"新测试抓不到这个变异"，报成了"这个变异存活"。
+- **X-F3**（第四张表"没人看过"）——框架被驳回：§4 row 6 早已按 file:line 登记并给出缓解。
+  存活的是更窄的一句：§10.2 写下"要去找它的兄弟"这条教训，却没回头看自己 §4 早已索引的那个兄弟 ⇒ m2。
+
+### 11.5 完备性判定（lane X）
+
+三笔债：**D2 的数据迁移真关**（51↔51 严格双射由两种不同方法独立重建：0 丢 0 得、48 条 reason 逐字节相同、
+3 条 retarget 全部正确），**D1 部分关**（谓词组成完备、锁完整，但只在 leader；且 doubt 3 真正点的**上限区间**未动），
+**D3 两边都没关**（§11.6：drill 的两条断言在补跑下不成立，恢复为 gap；
+ledger 三份记录已与之对齐 = M4 的实质要求，只是对齐到 INCOMPLETE 而非 GREEN）。
+另有 **D6 一笔模范级的诚实重标注**——
+两条 recorded-limitation 都是**会在被修好时自毁**的可执行陈述，各有定向变红的变异，
+两条局限都被独立追到 shipped 配置层面证实为真，不是冻结 bug 的恒等式测试。
+**没有一笔是"改个标签就算关了"**；测试函数清单 `54f125a^`→`54f125a` 为 2387→2388、**0 删除**，
+verify-X 另把这条 name-only 扫描扩展到两个被重写的 **body**，确认没有任何测试为了变绿被掏空。
+
+### 11.6 补跑推翻了 §10.3：drill 41 的两条断言恢复为 gap（理由已换）
+
+M4 要求把三份持久记录与 drill 对齐。对齐**必须**先确定 drill 到底产出什么，于是本轮在
+weilandserver 上用**重建镜像**补跑了 drill 41。结果推翻了 §10.3 的结论：
+
+| 运行 | 窗口 | 结果 |
+|---|---|---|
+| run1 / run2（§10.3 引用的捕获） | — | 注册后 **~57s** 移动，两次相差 **88 ms** |
+| run3（本轮，重建镜像） | `poll_until 60 3` | **PASS**，`verdict=GREEN pass=33 nc_gap=0` |
+| run4（本轮） | `poll_until 60 3` | **两条臂双双 60s 超时**，`ASSERT-FAIL pass=31` |
+| run5（本轮，窗口已放宽） | `poll_until 210 3` | **210s 仍超时**，`ASSERT-FAIL pass=31` |
+
+210s = `defaultRosterRefreshInterval` 全抖动上限 180s + 余量，**也正是这条臂在被换成 gap 之前
+历史上带的窗口**（`02913d9`）。它仍然不够。**再往上放窗口就是为了把红变绿而发明 SLA**，
+按 Mandate（「忠实复现真实部署环境、如实暴露缺陷，绝不替 tether 弥补」）不做。
+
+**处置**：两处站点改回 `not_covered(...) gap`，`kept_sites` 仍是 2 进 2 出、不降；
+tsv 回到 `INCOMPLETE / 2`；四道反注水门（lint-drills / validate-verdicts / kept-sites / ledger-crosscheck）全绿。
+
+**但两条 gap 的理由被完全替换**，这才是本节的产出：
+
+- **旧理由（已证伪）**：「agt1 不会物理离开还在 mesh 上的 retired broker」+「疑似 host/IP 匹配缺口」+
+  自标「unconfirmed from a torn-down run」。实测：它**会**离开，`connected_url=nats://brk2:4222`
+  是**主机名不是 IP**，`/connz` 同刻 brk2=0 / brk1=1，再注册只花 **62 ms**。
+- **新理由（实测）**：移动本身已确认，**延迟无界**——五次里三次在窗口内、两次不在（含 210s 那次）。
+- **候选机制，明确标为候选**：刷新循环定时器是 `jitterDur(3 min)` = **UNIFORM(0, 180s]、每次唤醒后重抽**；
+  能提前唤醒它的 `nats_topology_*` sys.event **best-effort 且不重试**（缓冲 1、合并，唤醒时若
+  `reconnectInFlight`/`rebuilding` 为真则**丢弃**并重置为新抽样）——**连丢两次即超过 210s**。
+  第二个候选是字符串同一性盲。**两者都未确认，注释里也这么写**——把候选当结论转述正是前三轮的错误。
+- **正确性不变量不受影响**且仍在断言：跨 retire 功能可达、真下线时经 #48 逃出，**五次运行全部通过**。
+
+**这条教训的完整形态**：§10.3 已经写下「降级的依据必须被验证」，
+而我在同一次编辑里犯了它的镜像——**升级的依据同样必须被验证**。
+两次落在 88 ms 内的观测是关于**那两次运行**的证据，不是关于**机制**的证据；
+把它当机制证据、据此发明一个 60s 的 SLA，与当年那两条 gap 是同一类错误、只是方向相反。
+内审的 **B1-F1** 正是在说这件事（它的技术论证被其 verifier 逐条驳回、我在 §11.4 也照录了那份驳回），
+**而它的结论是对的**：那两条断言不该在那个窗口下作为硬断言站着。
+一条被逐条驳倒的论证仍然可以指向一个正确的结论——这轮内审最该记住的一条。

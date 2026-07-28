@@ -77,9 +77,39 @@ stable across both runs
 
 ## 41-shrink-to-standalone
 
-- **batch**: `R15+G69`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
+- **batch**: `B2-debt`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
-G69 (2026-07-22): this drill was the THIRD call site of `reconcile nats --to-standalone`, whose contract R16's A4 changed (add --reset-js on a data-bearing JS store). It was failing ASSERT-FAIL because it called the bare verb and then hand-rolled `mv /var/lib/tether/jetstream` — a Mandate-2 concealment that A4 also made BROKEN (refusal => conf never swapped => the hand-mv restarted a lone voter onto a still-CLUSTERED conf => n1ClusteredJetStreamFatal => the whole recovery leg cascaded). Now: one product verb `--to-standalone --reset-js`, with the ACKNOWLEDGEMENT GATE pinned BEFORE the happy path, a standalone-bak.* move-aside postcondition, and (internal review G-16) a PRECONDITION asserting the conf is still clustered - without it the already-standalone refusal, which also mentions --reset-js, would bank the guard for the wrong reason and the de-cluster arm would go green without de-clustering. Only the service restart remains sim-side. Verdict unchanged at INCOMPLETE: its 2 gaps are the pre-existing first-retire PROACTIVE fast-path pair. | R15: was timing-flake; r15w2 confirmed INCOMPLETE
+B2-debt (2026-07-28, post-release technical-debt cleanup): verdict stays INCOMPLETE / 2 gaps, but BOTH
+GAP TEXTS ARE REPLACED, because the old reasoning was measured and found false and the new reasoning was
+measured too. The old gaps said agt1 "does not physically leave the retired-but-still-meshed broker
+in-window", blamed a suspected host/IP match failure in `rosterRequiresReconnect`, and flagged their own
+reasoning as "unconfirmed from a torn-down run".
+
+WHAT FIVE RUNS ACTUALLY SHOW.
+
+- It DOES leave. A live journal capture has `rosterRequiresReconnect` firing with
+  `connected_url=nats://brk2:4222` — a HOSTNAME, so the guessed host/IP gap is NOT the mechanism — and
+  the agent re-registering on a remaining voter 62 MILLISECONDS later, with `/connz` reading brk2
+  (retiring) 0 connections and brk1 (voter) 1.
+- It does NOT do so reliably. Runs 1–2 moved ~57s after registration (88 ms apart). Run 3 passed at
+  `poll_until 60 3`. Run 4 TIMED OUT at 60s on both arms. Run 5 TIMED OUT at **210s** — the 180s
+  full-jitter ceiling plus margin, and the window this arm carried historically.
+
+So the honest claim is not "it doesn't work" and not "it works"; it is "the move is confirmed, its
+LATENCY is not bounded by anything this drill can justify". Widening past 210s would be inventing an SLA
+to turn a red green, which is the one thing the harness must never do.
+
+CANDIDATE MECHANISMS, recorded as candidates. The re-home rides the roster refresh loop, whose timer is
+`jitterDur(3 min)` = UNIFORM(0, 180s] REDRAWN after every wake; the `nats_topology_*` sys.event that can
+wake it early is best-effort and UNRETRIED — buffered-1, coalescing, DROPPED with a fresh full-jitter
+reset if the loop wakes while `reconnectInFlight` or `rebuilding` is set, so two consecutive drops
+already exceed 210s. The second candidate is the string-identity blindness now pinned as an executable
+statement in `internal/agent`. Neither is confirmed, and the notes say so — assuming one and repeating it
+as fact is exactly how the previous pair of gaps came to be wrong.
+
+The correctness invariant is untouched and still asserted: agt1 stays functionally reachable across the
+retire, and escapes via the #48 silence-rebuild path on true decommission — which passed in every run
+above, including both runs where the fast path missed its window. | G69 (2026-07-22): this drill was the THIRD call site of `reconcile nats --to-standalone`, whose contract R16's A4 changed (add --reset-js on a data-bearing JS store). It was failing ASSERT-FAIL because it called the bare verb and then hand-rolled `mv /var/lib/tether/jetstream` — a Mandate-2 concealment that A4 also made BROKEN (refusal => conf never swapped => the hand-mv restarted a lone voter onto a still-CLUSTERED conf => n1ClusteredJetStreamFatal => the whole recovery leg cascaded). Now: one product verb `--to-standalone --reset-js`, with the ACKNOWLEDGEMENT GATE pinned BEFORE the happy path, a standalone-bak.* move-aside postcondition, and (internal review G-16) a PRECONDITION asserting the conf is still clustered - without it the already-standalone refusal, which also mentions --reset-js, would bank the guard for the wrong reason and the de-cluster arm would go green without de-clustering. Only the service restart remains sim-side. Verdict unchanged at INCOMPLETE: its 2 gaps are the pre-existing first-retire PROACTIVE fast-path pair. | R15: was timing-flake; r15w2 confirmed INCOMPLETE
 
 ## 42-rejoin-returning
 

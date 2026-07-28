@@ -27,7 +27,16 @@ import (
 // effort: failure to publish doesn't fail the underlying operation
 // (ops events are observability, not authoritative state). Routes
 // through publishAudit so it lands in the `events` JetStream stream
-// when JS is available; falls back to core publish otherwise.
+// when JS is available; core publish is used when there is no JS.
+//
+// "Falls back to core publish otherwise" would be the wrong reading and
+// this comment used to invite it (internal review n9): the fallback is
+// chosen by whether JS EXISTS, not by whether the publish SUCCEEDED. A
+// JS publish that times out returns the error and drops the event —
+// there is no core retry. That is deliberate under best-effort, but it
+// has one consequence worth naming: callers that record an idempotency
+// key BEFORE checking the result (topology_reconcile's eventKey) will
+// never retry that event for that (gen|action|reason).
 //
 // kind values ACTUALLY emitted (architecture H.1): session_created /
 // session_destroyed / member_joined / pin_failed / tetherd_restarted /

@@ -445,8 +445,13 @@ func auditMsgID(raftIndex uint64, reqID, kind string, seq int) string {
 // set the leader observed this tick. D5 ships only the predicate (D7 consumes AllAtTarget
 // as its retire gate; D8b writes the replication_degraded alert row).
 type ReplicaReport struct {
-	Streams  []jsstream.StreamReplicaState
-	Observed bool // false => the pass could not complete a canonical observation
+	Streams []jsstream.StreamReplicaState
+	// StreamCount is the complete work-set size discovered before per-stream collection begins.
+	// It may be non-zero when Observed is false: that lets the next bounded observation size itself
+	// correctly after this one timed out partway through collection, without treating partial replica
+	// state as a measurement.
+	StreamCount int
+	Observed    bool // false => the pass could not complete a canonical observation
 }
 
 // AllAtTarget reports whether EVERY observed stream has reached its target replica count
@@ -523,38 +528,48 @@ func (p *AuditPublisher) ObserveReplicas(ctx context.Context) (ReplicaReport, er
 	}
 	target := jsstream.ReplicasFor(nv)
 
-	ev, eerr := jsstream.CollectStreamState(ctx, p.cfg.JS, jsstream.EventsStreamName, target)
-	if eerr != nil {
-		return ReplicaReport{}, eerr
-	}
-	states := []jsstream.StreamReplicaState{ev}
-
 	sids, lerr := p.cfg.ListSIDs(ctx)
 	if lerr != nil {
 		return ReplicaReport{}, lerr
 	}
+
+	var xstreams []string
+	if p.cfg.XferState != nil { // same gate ReconcileOnce uses to enable OBJ_xfer
+		var xerr error
+		xstreams, xerr = jsstream.ListXferStreams(ctx, p.cfg.JS)
+		if xerr != nil {
+			return ReplicaReport{}, xerr
+		}
+	}
+	// Discover the complete work set BEFORE serial collection. If collection hits its deadline, callers
+	// can retain this count for the next budget without mistaking partial state for an observation.
+	streamCount := 1 + len(sids) + len(xstreams)
+	failed := func(err error) (ReplicaReport, error) {
+		return ReplicaReport{StreamCount: streamCount}, err
+	}
+
+	ev, eerr := jsstream.CollectStreamState(ctx, p.cfg.JS, jsstream.EventsStreamName, target)
+	if eerr != nil {
+		return failed(eerr)
+	}
+	states := []jsstream.StreamReplicaState{ev}
+
 	for _, sid := range sids {
 		hs, herr := jsstream.CollectStreamState(ctx, p.cfg.JS, jsstream.HistoryStreamName(sid), target)
 		if herr != nil {
-			return ReplicaReport{}, herr
+			return failed(herr)
 		}
 		states = append(states, hs)
 	}
 
-	if p.cfg.XferState != nil { // same gate ReconcileOnce uses to enable OBJ_xfer
-		xstreams, xerr := jsstream.ListXferStreams(ctx, p.cfg.JS)
-		if xerr != nil {
-			return ReplicaReport{}, xerr
+	for _, name := range xstreams {
+		xs, cerr := jsstream.CollectStreamState(ctx, p.cfg.JS, name, target)
+		if cerr != nil {
+			return failed(cerr)
 		}
-		for _, name := range xstreams {
-			xs, cerr := jsstream.CollectStreamState(ctx, p.cfg.JS, name, target)
-			if cerr != nil {
-				return ReplicaReport{}, cerr
-			}
-			states = append(states, xs)
-		}
+		states = append(states, xs)
 	}
-	return ReplicaReport{Streams: states, Observed: true}, nil
+	return ReplicaReport{Streams: states, StreamCount: streamCount, Observed: true}, nil
 }
 
 // reconcileSessions raises + collects history-<sid> and OBJ_xfer-<sid> for every active

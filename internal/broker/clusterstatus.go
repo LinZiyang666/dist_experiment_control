@@ -263,8 +263,9 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// deficit: `cluster status` renders "0/3", computeHealth marks the node DEGRADED, and doctor says
 	// "stream replicas below target". That conflation was tolerable while the observation only failed on
 	// a genuinely broken JS meta. It stopped being tolerable when B7 put a 3s deadline on the call:
-	// ObserveReplicas walks EVERY session's history stream serially, so on a broker with many sessions a
-	// timeout is now an ordinary outcome, and an ordinary outcome must not render as a fault.
+	// ObserveReplicas walks the events stream, EVERY session's history stream and EVERY live OBJ_xfer
+	// stream serially, so on a busy broker a timeout is now an ordinary outcome, and an ordinary outcome
+	// must not render as a fault.
 	//
 	// -1 means UNOBSERVED. testing-standards §S1 asks for fail-closed on missing data, and it still is:
 	// StreamsAllAtTarget below treats -1 as NOT at target, so nothing that gates on replica health opens

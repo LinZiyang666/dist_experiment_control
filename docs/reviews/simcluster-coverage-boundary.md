@@ -58,8 +58,13 @@
 
 **与 R15 已修的区分**：#31/#45 mid-grow-**bundle** 残留（bundle 在 membership-op 中途拍摄→leaked lock/stalled op 被带进 restored origin）是**另一回事**，已由 R15 restore-侧修复闭合（`normalizeRestoreStaging` 清 grow/upgrade marker+lease+非终态 op；hermetic verifier `TestRestoreClearsStaleGrowUpgradeAndOpResidue`）；51 的 bundle 取自健康 N=3，不含该残留，故非此路径所阻。
 
-### 41 · first-retire 主动疏散 fast-path（`rosterRequiresReconnect`）— TIMING，需监控
-- **live 证据**：re-run r15v1 中 41 **GREEN**（:157/:159 疏散断言通过）；但 -j1 隔离串行 flake-rerun 中**红**。→ 这是 SLA 边界的 **timing flake**（-j6 vs -j1 时序差），非结构 over-spec；两轮全套里可能间歇红。fast-path（roster.go:409-437）设计上意图迁移，实际时序变异。**处理**：在两轮全套里监控稳定性；若稳绿则 GREEN，若间歇则 signature-guard 登记为 timing-band flake（同 41 历史 210→300s 窗口带）。**不 launder**：不假装物理断连稳定发生。
+### 41 · first-retire 主动疏散 fast-path（`rosterRequiresReconnect`）— **仍 OPEN；理由已换（2026-07-28，B2 债务清理）**
+- **verdict 不变（INCOMPLETE / 2 gaps），但两条 gap 的**理由**全部重写**：旧理由是猜的且已被证伪，新理由是实测的。
+- **旧理由错在哪**：原条目从"meshed retire 下 silence-rebuild 路径**结构上不能**触发"（真）推出"所以 agt1 不会在窗口内物理离开"（假），并把原因归给一个"疑似 host/IP 匹配缺口"、自标"未经确认"。实测：agent journal 里 proactive 路径**命中**，`connected_url=nats://brk2:4222`（**hostname，不是 IP**），**62 ms** 后 `agent: registered`，同刻 `/connz`：brk2（retiring）0、brk1（voter）1。**疏散确实发生，怀疑的机制不是真凶。**
+- **新理由（实测五次）**：run1/run2 在注册后 ~57s 移动、相差 88 ms；run3 在 `poll_until 60 3` 下 PASS；**run4 在 60s 超时**；**run5 在 210s 超时**——210s 是 180s 全抖动上限 + 余量，也正是这条臂历史上带的窗口。⇒ **移动本身已确认，延迟无界**。再往上放窗口就是为了把红变绿而发明 SLA，harness 绝不做这件事。
+- **候选机制（记为候选，不下结论）**：疏散搭的是 roster 刷新循环，定时器 `jitterDur(3 min)` = **UNIFORM(0, 180s]**、每次唤醒后**重抽**；能提前唤醒它的 `nats_topology_*` sys.event 是 **best-effort 且不重试**（缓冲 1、合并，唤醒时若 `reconnectInFlight`/`rebuilding` 为真则**丢弃**并重置为新的全抖动抽样）——**连丢两次即超过 210s**。第二个候选是字符串同一性盲（已在 `internal/agent` 写成可执行断言）。两者都未确认，**这正是前三轮在这一块犯的错**：把候选当结论转述。
+- **"不 launder" 全程生效，并且这次是它抓住了我。** 88 ms 的重合是关于**那两次运行**的证据、不是关于**机制**的证据；据此发明一个 60s 的 SLA，与当年那两条 gap 是同一类错误、方向相反。
+- **正确性不变量不受影响**且仍在断言：agt1 跨 retire 保持功能可达，真正下线时经 #48 silence-rebuild 逃出——**上述每一次运行都通过**，包括快路径没赶上窗口的那两次。这条 gap 只关于**延迟**，不关于 agent 是否存活。
 
 ---
 

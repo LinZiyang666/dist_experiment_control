@@ -576,16 +576,27 @@ type Broker struct {
 	// which correctly predicts the per-session history streams (ListSIDs is exactly that query) but
 	// counts the `OBJ_xfer-*` streams as ZERO. Those are enumerated by ListXferStreams and can outlive
 	// the session that created them, so a transfer-heavy or orphan-heavy broker was given a budget for a
-	// fraction of the round trips it was about to make. The previous observation's own stream count is
-	// the right predictor and costs nothing: it already includes events + history + xfer.
+	// fraction of the round trips it was about to make. The previous observation's own stream count
+	// captures those streams; observeStreamCountForBudget maxes it with the live session floor so a
+	// stale snapshot cannot regress below the old estimate.
 	lastReplicaStreams int
 }
 
-// cacheReplicaSnapshot records the worst-case (min actual) stream replica posture for the
-// /metrics gauge. A report with no observed streams leaves the cache untouched (avoids flapping
-// the gauge to 0 on a transient meta-not-ready tick).
+// cacheReplicaSnapshot records TWO things from one observation: the worst-case (min actual) stream
+// replica posture, which the /metrics gauge reads, and the number of streams enumerated, which is NOT a
+// metric — it sizes the next observation's deadline (see lastReplicaStreams).
+//
+// A report that was not observed never changes the gauge. If it discovered a complete StreamCount before
+// failing per-stream collection, that count DOES update the budget cache: otherwise a deadline caused by
+// an OBJ_xfer burst preserves the stale short deadline forever. An unobserved report without a count
+// leaves both untouched.
 func (b *Broker) cacheReplicaSnapshot(rep ReplicaReport) {
 	if !rep.Observed || len(rep.Streams) == 0 {
+		if rep.StreamCount > 0 {
+			b.lastReplicaMu.Lock()
+			b.lastReplicaStreams = rep.StreamCount
+			b.lastReplicaMu.Unlock()
+		}
 		return
 	}
 	minActual, target := rep.Streams[0].Actual, 0
@@ -599,7 +610,11 @@ func (b *Broker) cacheReplicaSnapshot(rep ReplicaReport) {
 	}
 	b.lastReplicaMu.Lock()
 	b.lastReplicaActual, b.lastReplicaTarget = minActual, target
-	b.lastReplicaStreams = len(rep.Streams)
+	if rep.StreamCount > 0 {
+		b.lastReplicaStreams = rep.StreamCount
+	} else {
+		b.lastReplicaStreams = len(rep.Streams)
+	}
 	b.lastReplicaMu.Unlock()
 }
 

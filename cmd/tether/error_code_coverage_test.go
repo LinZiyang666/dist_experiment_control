@@ -79,18 +79,29 @@ var codeCarryingHelpers = map[string]int{
 // class. EVERY entry needs a reason — an allowlist without reasons is just a
 // slower way of having no gate. TestAllowlistEntriesStillHaveEmitters fails if
 // an entry stops being emitted, so this cannot become a graveyard.
+//
+// REASONS NAME SYMBOLS, NOT LINE NUMBERS. origin: p-b2 internal review m3, which found FOUR of these
+// prose references already pointing at the wrong line — including one the plan had explicitly registered
+// as needing a sweep, whose site had moved two commits before this map was last touched. That is the
+// same rot the site KEYS above were re-keyed to escape, in the same file, arrived at from the other
+// direction: a reader who follows a stale line lands on unrelated code and either deletes a live
+// exemption as expired or re-derives an argument that was already settled. A function name survives
+// every edit above it, and `grep` finds it.
 var unclassifiedCodeAllowlist = map[string]string{
 	"agent_rejected": "NOT a terminal code: it is the documented PREFIX of " +
 		"`\"agent_rejected:\" + agentResp.Code`, surfaced here because the scanner now reads " +
-		"literal prefixes out of concatenations (form 9). cmd/tether/error_hints.go:158-166 " +
-		"strips it before the class lookup — pinned by error_hints_test.go:80 — so the agent's " +
-		"own code is what actually classifies, and that code is scanned on the agent side. " +
+		"literal prefixes out of concatenations (form 9). cmd/tether's brokerErrorMessage " +
+		"strips it before the class lookup — pinned by TestBrokerErrorMessageStripsAgentRejectedPrefix " +
+		"and by the agent_rejected: rows of TestBrokerErrorMessageExitClass — so the agent's own code is what " +
+		"actually classifies, and that code is scanned on the agent side. " +
 		"Giving the prefix its own exit class would shadow every underlying code with one class.",
 	"bucket_create_failed": "the deliberately-UNCLASSIFIED remainder of the tier-B split: " +
 		"jetstream_not_ready (75) and tier_b_store_too_small (64) are its classified halves. " +
-		"Documented in error_hints.go:90-97; 70 is the correct answer for 'we do not know'.",
-	"home_broker_restart": "audit-only: emitted into schema.AuditTransfer at xfer_inflight.go:504, " +
-		"never onto a ctl reply, so no exit class applies.",
+		"Documented at the tier_b_store_too_small entry of brokerCodeExitClasses in error_hints.go; " +
+		"70 is the correct answer for 'we do not know'.",
+	"home_broker_restart": "audit-only: emitted into schema.AuditTransfer by " +
+		"(*Broker).finalizeStrandedXfers in internal/broker/xfer_inflight.go, never onto a ctl reply, " +
+		"so no exit class applies.",
 
 	// The three below are CATCH-ALL branches: both a permanent cause (disk full,
 	// quota) and a transient one (momentary I/O pressure) land here, and the
@@ -100,12 +111,15 @@ var unclassifiedCodeAllowlist = map[string]string{
 	// honest answer, and it is the same call error_hints.go already made for
 	// bucket_create_failed. Split them into classified halves (as G67 did with
 	// jetstream_not_ready / tier_b_store_too_small) before classifying.
-	"alloc_failed": "catch-all `case err != nil` of public-port allocation (expose.go:262-264); " +
-		"covers both DB faults and exhaustion-shaped races with no way to distinguish them.",
-	"io_error": "catch-all I/O failure of the agent's pull path (transfer.go:335-337); a full disk " +
-		"and a momentary EIO are indistinguishable here. Retrying a full disk is exactly what A1 removes.",
-	"object_put_failed": "catch-all JetStream object-store Put failure (transfer.go:420-422). Its " +
-		"classified halves already exist (jetstream_not_ready=75, tier_b_store_too_small=64); this is the remainder.",
+	"alloc_failed": "catch-all `case err != nil` of public-port allocation in " +
+		"(*Broker).handleExposeReq; covers both DB faults and exhaustion-shaped races with no way to " +
+		"distinguish them.",
+	"io_error": "catch-all I/O failure of the agent's transfer path ((*Agent).handlePushForwarded and " +
+		"its finalize calls); a full disk and a momentary EIO are indistinguishable here. Retrying a " +
+		"full disk is exactly what A1 removes.",
+	"object_put_failed": "catch-all JetStream object-store Put failure in (*Agent).handlePullForwarded. " +
+		"Its classified halves already exist (jetstream_not_ready=75, tier_b_store_too_small=64); this " +
+		"is the remainder.",
 
 	// External review M2: these two were classified 75 (self-healing transient)
 	// on the strength of their most common cause, but each emitter funnels
@@ -113,10 +127,10 @@ var unclassifiedCodeAllowlist = map[string]string{
 	//
 	//   pty_alloc_failed  — transient fd/pty pressure, a permanently absent
 	//                       /dev/ptmx, and a failed NATS SubscribeSync
-	//                       (internal/agent/run.go:96-123)
+	//                       ((*Agent).handleRunForwarded, internal/agent/run.go)
 	//   download_failed   — a network blip, a permanent HTTP 404/non-2xx, and
 	//                       exceeding the 64 MiB artifact ceiling
-	//                       (internal/agent/upgrade.go:241-260)
+	//                       ((*Agent).handleUpgradeForwarded, internal/agent/upgrade.go)
 	//
 	// Calling those 75 tells automation to retry a missing /dev/ptmx and a 404
 	// forever — the same defect A1 set out to remove, introduced by A1 itself.
@@ -145,8 +159,9 @@ var unclassifiedCodeAllowlist = map[string]string{
 // someone silencing a genuinely new unresolved site. A gate whose maintenance looks identical to its
 // subversion is a gate that will eventually be subverted by accident.
 //
-// The ordinal is the site's 1-based index among the UNRESOLVED sites of its enclosing function, counted
-// in source order (see nextSite in scanTree). That choice is deliberate on three axes:
+// FUNCTION is RECEIVER-QUALIFIED — `(*Broker).handleRunReq`, not `handleRunReq`. The ordinal is the
+// site's 1-based index among the UNRESOLVED sites of that one function, counted in source order (see
+// nextSite in scanTree). That choice is deliberate on three axes:
 //
 //	site-scoped   #ordinal means one entry covers one site. A function-wide key would be the old
 //	              file-wide defect at a smaller scale, and it would bite immediately:
@@ -157,62 +172,87 @@ var unclassifiedCodeAllowlist = map[string]string{
 //	              function — and that is precisely when the surrounding exemptions deserve re-reading,
 //	              so the remaining churn is the useful kind rather than the mechanical kind.
 //
+// ONE EDIT SHAPE SLIPS THROUGH, and it is worth knowing about (internal review m9). "Goes stale when a
+// site is added or removed" holds for an add OR a remove — not for an add AND a remove that CANCEL. Make
+// one site in a function resolvable (turn a variable into a literal) and add a new unresolved one below
+// it in the same function, and the count is unchanged, every key still names a live site, and all three
+// gates stay green while each reason now describes a different physical site than it was written for.
+// That is an ordinary refactor shape, not a contrived one. No key that is not a full site fingerprint
+// can catch it; what catches it is reading the reasons when you touch a function that has them, which
+// is what the ordinal makes cheap by keeping the churn down to functions you actually edited.
+//
+// The receiver is the part internal review had to add (M1/M2). Without it the key was NOT INJECTIVE and
+// the failure mode was the one thing worse than churn — SILENT ABSORPTION. Two shapes, both reproduced
+// on the real tree, both leaving all three gates green while a brand-new unresolved site inherited an
+// existing exemption:
+//
+//	a second method of the same name on a different receiver in the same file restarted the ordinal at
+//	#1 and landed inside the ten HandleCluster entries below;
+//
+//	the counter was also zeroed on every FuncDecl EXIT, so the <file-scope> bucket restarted after every
+//	func — two package-level sites separated by any function both keyed <file-scope>#1, with no name
+//	collision required at all.
+//
+// A quieter gate is a worse gate than a noisier one. file:line at least went RED when it rotted; this
+// key must be unique BY CONSTRUCTION, which is why the receiver is in it and the ordinal counter is
+// per-file and never reset. TestUnresolvedSiteKeysAreInjective is the guard.
+//
 // Only unresolved sites are counted, so adding a resolvable literal to the same function changes
 // nothing. TestExternalReviewUnresolvedCodeExemptionsAreSiteScopedAndLive rejects a key without an
 // ordinal, and both live-checks below still reject a key that names no unresolved site.
 var unresolvedCodeSites = map[string]string{
 	// Agent run reasons are finite locals selected immediately above each site.
-	"internal/agent/run.go:handleRunForwarded#1":                          "Reason is remoteFSFailReason(ferr); its literal outcomes are scanned at their definitions.",
-	"internal/agent/run.go:handleRunForwarded#2":                          "pubPtyFailed forwards the same remoteFSFailReason value as #1 in this function.",
-	"internal/agent/run.go:handleRunForwarded#3":                          "Reason is exec_failed or remoteFSFailReason(startErr), selected immediately above.",
-	"internal/agent/run.go:handleRunForwarded#4":                          "pubPtyFailed forwards the same finite reason value as #3 in this function.",
-	"internal/agent/transfer.go:handlePushForwarded#1":                    "code is io_error or PathValidationError.Code; both origins are scanned.",
-	"internal/agent/transfer.go:handlePushForwarded#2":                    "audit emission forwards the same code as #1 in this function.",
-	"internal/agent/transfer.go:handlePushTierA#1":                        "finalize's code parameter is supplied by literal/PathValidationError call sites in this function.",
-	"internal/agent/transfer.go:handlePushTierA#2":                        "audit emission forwards finalize's same code parameter.",
-	"internal/agent/transfer.go:handlePushCommitForwarded#1":              "PathValidationError.Code is defined by the path validator's finite code set.",
-	"internal/agent/transfer.go:handlePullForwarded#1":                    "transfer failure code is selected by the local state machine before this reply.",
-	"internal/agent/transfer.go:handlePullForwarded#2":                    "transfer failure audit forwards the same locally selected code.",
-	"internal/broker/cluster_grow_trigger.go:handleGrowTrigger#1":         "verbatim adminsock response code; adminsock has its own registry.",
-	"internal/broker/cluster_grow_trigger.go:handleGrowTrigger#2":         "verbatim adminsock response code; adminsock has its own registry.",
-	"internal/broker/cluster_grow_trigger.go:handleGrowTrigger#3":         "verbatim adminsock response code; adminsock has its own registry.",
-	"internal/broker/cluster_upgrade_trigger.go:handleUpgradeTrigger#1":   "verbatim adminsock response code; adminsock has its own registry.",
-	"internal/broker/cluster_upgrade_trigger.go:handleUpgradeTrigger#2":   "verbatim adminsock response code; adminsock has its own registry.",
-	"internal/broker/cluster_upgrade_trigger.go:handleUpgradeTrigger#3":   "codeDataplaneNotConverged is a local alias of the classified proto code.",
-	"internal/broker/cluster_manifest.go:handleSeedsPublish#1":            "clusterCodeFor returns the typed adminsock error namespace.",
-	"internal/broker/clusterstatus.go:HandleCluster#1":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#2":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#3":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#4":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#5":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#6":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#7":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#8":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#9":                    "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:HandleCluster#10":                   "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:handleDrain#1":                      "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/clusterstatus.go:handleAdd#1":                        "adminsock response; clusterCodeFor maps typed cluster errors.",
-	"internal/broker/run.go:handleRunReq#1":                               "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/run.go:handleRunReq#2":                               "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/expose.go:handleExposeReq#1":                         "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/expose.go:handleExposeRmReq#1":                       "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/expose.go:handleExposeRmReq#2":                       "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/upgrade.go:handleUpgradeReq#1":                       "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/exec.go:handleNodeListReq#1":                         "admitCtrl() denial code (node.list); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/exec.go:handlePsReq#1":                               "admitCtrl() denial code (ps); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
-	"internal/broker/force_single_online.go:handleForceSingleArm#1":       "force-single refusal code is a typed adminsock constant returned by fsArmVerdict.",
-	"internal/broker/proxy_cluster_wire.go:handleProxySubCreateCluster#1": "proxyDegradedCode returns the finite proxy cluster status code set.",
-	"internal/broker/topology_reconcile.go:reconcileTopologyOnce#1":       "false positive: topoSelfReport.Reason is an internal report field, not a wire reply code.",
-	"internal/broker/transfer.go:startTransferWatchdog#1":                 "audit-only watchdog code selected by the switch immediately above.",
-	"internal/broker/transfer.go:handlePushReq#1":                         "transferGate returns the finite session/member/node/store refusal set.",
-	"internal/broker/transfer.go:handlePushReq#2":                         "xferProvisionRefusal returns the finite bucket provisioning refusal set.",
-	"internal/broker/transfer.go:handlePushReq#3":                         "transfers.put returns duplicate or in-flight-cap refusal codes.",
-	"internal/broker/transfer.go:handlePullReq#1":                         "transferGate returns the finite session/member/node/store refusal set.",
-	"internal/broker/transfer.go:handlePullReq#2":                         "xferProvisionRefusal returns the finite bucket provisioning refusal set.",
-	"internal/broker/transfer.go:handlePullReq#3":                         "transfers.put returns duplicate or in-flight-cap refusal codes.",
-	"internal/broker/transfer.go:handlePushCommitReq#1":                   "transferGate returns the finite session/member/node/store refusal set.",
-	"internal/broker/transfer.go:handleCapsReq#1":                         "transferGate returns the finite session/member/store refusal set.",
-	"internal/broker/transfer.go:handleFinalizeReq#1":                     "transferGate returns the finite session/member/store refusal set.",
+	"internal/agent/run.go:(*Agent).handleRunForwarded#1":                                  "Reason is remoteFSFailReason(ferr); its literal outcomes are scanned at their definitions.",
+	"internal/agent/run.go:(*Agent).handleRunForwarded#2":                                  "pubPtyFailed forwards the same remoteFSFailReason value as #1 in this function.",
+	"internal/agent/run.go:(*Agent).handleRunForwarded#3":                                  "Reason is exec_failed or remoteFSFailReason(startErr), selected immediately above.",
+	"internal/agent/run.go:(*Agent).handleRunForwarded#4":                                  "pubPtyFailed forwards the same finite reason value as #3 in this function.",
+	"internal/agent/transfer.go:(*Agent).handlePushForwarded#1":                            "code is io_error or PathValidationError.Code; both origins are scanned.",
+	"internal/agent/transfer.go:(*Agent).handlePushForwarded#2":                            "audit emission forwards the same code as #1 in this function.",
+	"internal/agent/transfer.go:(*Agent).handlePushTierA#1":                                "finalize's code parameter is supplied by literal/PathValidationError call sites in this function.",
+	"internal/agent/transfer.go:(*Agent).handlePushTierA#2":                                "audit emission forwards finalize's same code parameter.",
+	"internal/agent/transfer.go:(*Agent).handlePushCommitForwarded#1":                      "PathValidationError.Code is defined by the path validator's finite code set.",
+	"internal/agent/transfer.go:(*Agent).handlePullForwarded#1":                            "transfer failure code is selected by the local state machine before this reply.",
+	"internal/agent/transfer.go:(*Agent).handlePullForwarded#2":                            "transfer failure audit forwards the same locally selected code.",
+	"internal/broker/cluster_grow_trigger.go:(*Broker).handleGrowTrigger#1":                "verbatim adminsock response code; adminsock has its own registry.",
+	"internal/broker/cluster_grow_trigger.go:(*Broker).handleGrowTrigger#2":                "verbatim adminsock response code; adminsock has its own registry.",
+	"internal/broker/cluster_grow_trigger.go:(*Broker).handleGrowTrigger#3":                "verbatim adminsock response code; adminsock has its own registry.",
+	"internal/broker/cluster_upgrade_trigger.go:(*Broker).handleUpgradeTrigger#1":          "verbatim adminsock response code; adminsock has its own registry.",
+	"internal/broker/cluster_upgrade_trigger.go:(*Broker).handleUpgradeTrigger#2":          "verbatim adminsock response code; adminsock has its own registry.",
+	"internal/broker/cluster_upgrade_trigger.go:(*Broker).handleUpgradeTrigger#3":          "codeDataplaneNotConverged is a local alias of the classified proto code.",
+	"internal/broker/cluster_manifest.go:(*clusterAdminBackend).handleSeedsPublish#1":      "clusterCodeFor returns the typed adminsock error namespace.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#1":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#2":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#3":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#4":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#5":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#6":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#7":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#8":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#9":              "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).HandleCluster#10":             "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).handleDrain#1":                "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/clusterstatus.go:(*clusterAdminBackend).handleAdd#1":                  "adminsock response; clusterCodeFor maps typed cluster errors.",
+	"internal/broker/run.go:(*Broker).handleRunReq#1":                                      "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/run.go:(*Broker).handleRunReq#2":                                      "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:(*Broker).handleExposeReq#1":                                "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:(*Broker).handleExposeRmReq#1":                              "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/expose.go:(*Broker).handleExposeRmReq#2":                              "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/upgrade.go:(*Broker).handleUpgradeReq#1":                              "admit() denial code; the eight-code set is pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/exec.go:(*Broker).handleNodeListReq#1":                                "admitCtrl() denial code (node.list); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/exec.go:(*Broker).handlePsReq#1":                                      "admitCtrl() denial code (ps); same closed set, pinned by internal/broker.TestAdmitRefusalCodeSet.",
+	"internal/broker/force_single_online.go:(*clusterAdminBackend).handleForceSingleArm#1": "force-single refusal code is a typed adminsock constant returned by fsArmVerdict.",
+	"internal/broker/proxy_cluster_wire.go:(*Broker).handleProxySubCreateCluster#1":        "proxyDegradedCode returns the finite proxy cluster status code set.",
+	"internal/broker/topology_reconcile.go:(*Broker).reconcileTopologyOnce#1":              "false positive: topoSelfReport.Reason is an internal report field, not a wire reply code.",
+	"internal/broker/transfer.go:(*Broker).startTransferWatchdog#1":                        "audit-only watchdog code selected by the switch immediately above.",
+	"internal/broker/transfer.go:(*Broker).handlePushReq#1":                                "transferGate returns the finite session/member/node/store refusal set.",
+	"internal/broker/transfer.go:(*Broker).handlePushReq#2":                                "xferProvisionRefusal returns the finite bucket provisioning refusal set.",
+	"internal/broker/transfer.go:(*Broker).handlePushReq#3":                                "transfers.put returns duplicate or in-flight-cap refusal codes.",
+	"internal/broker/transfer.go:(*Broker).handlePullReq#1":                                "transferGate returns the finite session/member/node/store refusal set.",
+	"internal/broker/transfer.go:(*Broker).handlePullReq#2":                                "xferProvisionRefusal returns the finite bucket provisioning refusal set.",
+	"internal/broker/transfer.go:(*Broker).handlePullReq#3":                                "transfers.put returns duplicate or in-flight-cap refusal codes.",
+	"internal/broker/transfer.go:(*Broker).handlePushCommitReq#1":                          "transferGate returns the finite session/member/node/store refusal set.",
+	"internal/broker/transfer.go:(*Broker).handleCapsReq#1":                                "transferGate returns the finite session/member/store refusal set.",
+	"internal/broker/transfer.go:(*Broker).handleFinalizeReq#1":                            "transferGate returns the finite session/member/store refusal set.",
 
 	// Agent transfer codes come from PathValidationError or the local transfer
 	// state machine; this scanner does not perform interprocedural data flow.
@@ -230,9 +270,10 @@ var unresolvedCodeSites = map[string]string{
 	// added above a site invalidates it, and the re-key is mechanical, unreviewable and indistinguishable
 	// from someone silencing a NEW site. docs/testing-standards.md G3 requires site-scoped exemptions and
 	// it is right to — file-scoped ones hide future problems — but "site" does not have to mean "line".
-	// A stable key (the enclosing function name plus the code, or a `// unresolved:` marker at the site)
-	// would survive edits above it. That is a change to the gate rather than to its data, so it is NOT
-	// being made mid-review; it is recorded here as the next reader's first question.
+	//
+	// That is what the file:FUNCTION#ordinal key above now is; this paragraph is kept because the
+	// TENTH-drift measurement is the argument for it. The ELEVENTH drift then landed in a SECOND gate
+	// (internal/auth's dynamicSubscriptionExemptions), which is why both were re-keyed together.
 
 	// Batch B / B1: the six ingress handlers converted to admit() pass the gate's `den.code`
 	// through to their reply helper, so the value is a variable rather than a literal here.
@@ -384,27 +425,46 @@ func scanTree(t *testing.T, root string, dirs []string) (codes []emittedCode, un
 		// "covered at its call sites" argument actually holds for.
 		params := map[string]bool{}
 		inCodeHelper := false
-		// curFunc / funcSiteOrd build the STABLE site key. See unresolvedCodeSites for why it is not a
+		// curFunc / siteOrd build the STABLE site key. See unresolvedCodeSites for why it is not a
 		// line number any more.
+		//
+		// siteOrd is per FILE and keyed by the qualified function name; it is NEVER reset. Internal
+		// review M1/M2 broke the previous shape — a single counter zeroed on every FuncDecl boundary —
+		// two independent ways, and both silently ABSORBED a brand-new unresolved site into an existing
+		// exemption while all three gates stayed green:
+		//
+		//	same-name methods  curFunc was fd.Name.Name, so a second `HandleCluster` on a different
+		//	                   receiver in clusterstatus.go restarted at #1 and collided with the ten
+		//	                   entries already exempted for *clusterAdminBackend.
+		//	<file-scope>       zeroing on FuncDecl EXIT reset the file-scope bucket too, so any two
+		//	                   package-level sites separated by any func both keyed <file-scope>#1 — no
+		//	                   name collision required at all.
+		//
+		// Both were reproduced on the real tree. The receiver is now part of the key, so each method has
+		// its own independent sequence: the counter is unique by construction rather than by two names
+		// happening to differ. internal/auth's dynamicSubscriptionExemptions already used the per-file
+		// map and was injective; the same commit shipped two implementations of one key scheme and used
+		// the unsafe one on the gate guarding unclassified wire codes.
+		siteOrd := map[string]int{}
 		curFunc := ""
-		funcSiteOrd := 0
-		nextSite := func(rel string) string {
-			funcSiteOrd++
+		nextSite := func() string {
 			fn := curFunc
 			if fn == "" {
 				fn = "<file-scope>"
 			}
-			return rel + ":" + fn + "#" + itoa(funcSiteOrd)
+			key := rel + ":" + fn
+			siteOrd[key]++
+			return key + "#" + itoa(siteOrd[key])
 		}
 		var walk func(n ast.Node) bool
 		walk = func(n ast.Node) bool {
 			if fd, ok := n.(*ast.FuncDecl); ok {
 				params = map[string]bool{}
 				_, inCodeHelper = codeCarryingHelpers[fd.Name.Name]
-				// Site keys are file:FUNCTION#ordinal (see unresolvedCodeSites). The ordinal counts
-				// unresolved sites within THIS function, so it resets per function and is independent of
-				// everything above the function in the file.
-				curFunc, funcSiteOrd = fd.Name.Name, 0
+				// Site keys are file:FUNCTION#ordinal (see unresolvedCodeSites), FUNCTION being
+				// receiver-qualified. The ordinal counts unresolved sites within THIS function, in source
+				// order, and is independent of everything above the function in the file.
+				curFunc = qualifiedFuncName(fd)
 				if fd.Type.Params != nil {
 					for _, fl := range fd.Type.Params.List {
 						for _, nm := range fl.Names {
@@ -417,7 +477,7 @@ func scanTree(t *testing.T, root string, dirs []string) (codes []emittedCode, un
 				}
 				params = map[string]bool{}
 				inCodeHelper = false
-				curFunc, funcSiteOrd = "", 0
+				curFunc = ""
 				return false
 			}
 			switch node := n.(type) {
@@ -437,7 +497,7 @@ func scanTree(t *testing.T, root string, dirs []string) (codes []emittedCode, un
 					if c, ok := literalCodePrefix(v); ok {
 						add(c, site)
 					} else {
-						unresolved[nextSite(rel)] = rel
+						unresolved[nextSite()] = rel
 					}
 				case *ast.BasicLit:
 					if v.Kind == token.STRING {
@@ -449,16 +509,16 @@ func scanTree(t *testing.T, root string, dirs []string) (codes []emittedCode, un
 					if s, ok := constVal[v.Name]; ok {
 						add(s, site)
 					} else {
-						unresolved[nextSite(rel)] = rel
+						unresolved[nextSite()] = rel
 					}
 				case *ast.SelectorExpr:
 					if s, ok := constVal[v.Sel.Name]; ok {
 						add(s, site)
 					} else {
-						unresolved[nextSite(rel)] = rel
+						unresolved[nextSite()] = rel
 					}
 				default:
-					unresolved[nextSite(rel)] = rel
+					unresolved[nextSite()] = rel
 				}
 
 			// Form 3: an argument flowing into a known code-carrying helper.
@@ -485,7 +545,7 @@ func scanTree(t *testing.T, root string, dirs []string) (codes []emittedCode, un
 				// an explicit exemption; silently vanishing is the one outcome it
 				// must never produce, because it makes "0 unclassified codes" mean
 				// "we could not see any".
-				unres := func() { unresolved[nextSite(rel)] = rel }
+				unres := func() { unresolved[nextSite()] = rel }
 				switch a := node.Args[idx].(type) {
 				case *ast.BinaryExpr:
 					// Form 9: `"code: " + err.Error()`. These reached the gate as
@@ -564,6 +624,34 @@ func forEachGoFile(t *testing.T, root string, dirs []string, fn func(rel string,
 
 func itoa(i int) string { return strconv.Itoa(i) }
 
+// qualifiedFuncName renders a FuncDecl as it appears in a site key: `handleFoo` for a plain function,
+// `(*Broker).handleFoo` for a method. The receiver is load-bearing, not decoration — see the siteOrd
+// comment in scanTree. It also makes the key readable on its own: `HandleCluster#7` does not say which
+// of two admin backends it belongs to, and every one of the 26 functions holding an exemption today is a
+// method.
+func qualifiedFuncName(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	return "(" + recvTypeName(fd.Recv.List[0].Type) + ")." + fd.Name.Name
+}
+
+func recvTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return "*" + recvTypeName(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr: // generic receiver: Foo[T]
+		return recvTypeName(t.X)
+	case *ast.IndexListExpr: // generic receiver: Foo[T, U]
+		return recvTypeName(t.X)
+	}
+	// Unreachable for well-formed Go, but a silent "" would make two receivers collide again, which is
+	// the defect this function exists to close. A visible placeholder fails the live-site check loudly.
+	return "<unknown-recv>"
+}
+
 // scannedTrees is the set of packages that emit ctl-facing reply codes.
 var scannedTrees = []string{"internal/broker", "internal/agent", "internal/proto", "internal/spawnsafe"}
 
@@ -609,11 +697,13 @@ func TestErrorCodeCoverage(t *testing.T) {
 	// site in each file, so a second one in the same file vanished — the same
 	// "one entry blankets the rest" defect the file-wide exemptions had, moved
 	// into the reporting side (external review R1). File-wide exemption entries
-	// are gone with it; an exemption now names one line and covers one line.
+	// are gone with it; an exemption names ONE SITE and covers one site — see the
+	// unresolvedCodeSites header for why that site is file:FUNCTION#ordinal rather
+	// than file:line.
 	var undeclared []string
 	for site := range unresolved {
 		if _, ok := unresolvedCodeSites[site]; ok {
-			continue // exempted at this exact line
+			continue // exempted at this exact site
 		}
 		undeclared = append(undeclared, site)
 	}

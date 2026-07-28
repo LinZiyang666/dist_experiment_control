@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -49,22 +50,121 @@ func emit() {
 // exemption is site-scoped only if the scanner returns every site; storing one
 // map entry per file keeps the old blanket-exemption behavior under a new
 // file:line-shaped key.
+//
+// origin: p-b2 internal review NIT n4. The comment above has always said "in the
+// same FILE", but the fixture put both sites in the same FUNCTION — the one
+// arrangement the file:FUNCTION#ordinal key handled correctly even while it was
+// collapsing two sites into one key across functions (M1/M2). The test that
+// existed to prove sites cannot hide each other was structurally blind to the way
+// they actually did. Both arrangements are now rows.
 func TestExternalReviewErrorCodeGateReportsEveryDynamicSite(t *testing.T) {
-	dir := t.TempDir()
-	src := `package sample
+	for _, tc := range []struct {
+		name string
+		src  string
+	}{
+		{"same function", `package sample
 func replyExposeErr(msg any, code string, detail string) {}
 func emit(first, second string) {
 	replyExposeErr(nil, first, "")
 	replyExposeErr(nil, second, "")
 }
+`},
+		{"different functions", `package sample
+func replyExposeErr(msg any, code string, detail string) {}
+func emitFirst(first string) { replyExposeErr(nil, first, "") }
+func emitSecond(second string) { replyExposeErr(nil, second, "") }
+`},
+		{"different receivers, same method name", `package sample
+func replyExposeErr(msg any, code string, detail string) {}
+type backendA struct{}
+type backendB struct{}
+func (a *backendA) Handle(code string) { replyExposeErr(nil, code, "") }
+func (b *backendB) Handle(code string) { replyExposeErr(nil, code, "") }
+`},
+		{"file scope, separated by a func", `package sample
+type resp struct{ Code string }
+var dyn string
+var one = resp{Code: dyn}
+func spacer() {}
+var two = resp{Code: dyn}
+`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(tc.src), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, unresolved := scanTree(t, dir, []string{"."})
+			if len(unresolved) != 2 {
+				t.Fatalf("scanner returned %d unresolved site(s), want 2; two sites in one file must not "+
+					"collapse into one key, whatever their arrangement: %v", len(unresolved), unresolved)
+			}
+		})
+	}
+}
+
+// TestUnresolvedSiteKeysAreInjective is the M1/M2 guard, and the reason the site key carries a receiver.
+//
+// origin: p-b2 internal review M1 + M2. A site key that is not injective does not merely rot — it
+// SILENTLY ABSORBS a brand-new unresolved site into an exemption written for a different one, with every
+// gate green and nothing visible in the diff. The old key had two independent ways to do that: it used
+// the bare method name (so two receivers collided), and it zeroed the ordinal counter on every FuncDecl
+// exit (so the <file-scope> bucket restarted after each func, no name collision needed).
+//
+// This asserts the whole key set, not just its size, because the shape is the claim: if the receiver
+// ever stops appearing, the collision comes straight back and only an exact-set assertion notices.
+func TestUnresolvedSiteKeysAreInjective(t *testing.T) {
+	dir := t.TempDir()
+	// Five unresolved sites, arranged as the three shapes that can collide:
+	// two same-named methods on different receivers, a plain function of that same name, and two
+	// package-level sites separated by a func.
+	src := `package sample
+
+type resp struct{ Code string }
+
+type backendA struct{}
+type backendB struct{}
+
+var dyn string
+
+var fileScopeOne = resp{Code: dyn}
+
+func spacer() {}
+
+var fileScopeTwo = resp{Code: dyn}
+
+func (a *backendA) HandleCluster(code string) resp { return resp{Code: code} }
+
+func (b *backendB) HandleCluster(code string) resp { return resp{Code: code} }
+
+func HandleCluster(code string) resp { return resp{Code: code} }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, unresolved := scanTree(t, dir, []string{"."})
-	if len(unresolved) != 2 {
-		t.Fatalf("scanner returned %d unresolved site(s), want 2; sites in one file must not hide each other: %v",
-			len(unresolved), unresolved)
+
+	want := map[string]bool{
+		"sample.go:(*backendA).HandleCluster#1": true,
+		"sample.go:(*backendB).HandleCluster#1": true,
+		"sample.go:HandleCluster#1":             true,
+		"sample.go:<file-scope>#1":              true,
+		"sample.go:<file-scope>#2":              true,
+	}
+	var got []string
+	for k := range unresolved {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	if len(unresolved) != len(want) {
+		t.Fatalf("scanner produced %d key(s) for 5 unresolved sites — keys COLLIDED, so one exemption "+
+			"would silently cover two sites:\n  %s", len(unresolved), strings.Join(got, "\n  "))
+	}
+	for k := range unresolved {
+		if !want[k] {
+			t.Errorf("unexpected site key %q; the key must be file:RECEIVER-QUALIFIED-FUNC#ordinal so that "+
+				"two receivers cannot share a sequence. Got:\n  %s", k, strings.Join(got, "\n  "))
+		}
 	}
 }
 
