@@ -244,6 +244,15 @@ type Config struct {
 	// an already-dead lock is noticed, never how long a live one survives.
 	UpgradeLockReapInterval time.Duration
 
+	// DrainMarkerReapInterval (batch C) is how often the registry looks for an ORPHANED
+	// broker_draining marker — one whose node has no cluster_nodes row at all, which happens when the
+	// retire ladder's marker-clear Propose fails (its error is discarded) and the roster row is then
+	// deleted. The result is a permanent broker_draining alert naming a node that no longer exists.
+	// Defaults to 30s, the same family as the two lock reapers above; deliberately its OWN field
+	// rather than a reuse of GrowLockReapInterval, because one field with two meanings is the exact
+	// defect batch B spent a phase removing.
+	DrainMarkerReapInterval time.Duration
+
 	// HomeDeliverInterval (R8a) is how often the registry re-delivers home
 	// directives to agents whose CONFIRMED-applied home epoch is behind the
 	// allocation's. Defaults to 5s.
@@ -739,6 +748,9 @@ func New(cfg Config) (*Broker, error) {
 	}
 	if cfg.UpgradeLockReapInterval == 0 {
 		cfg.UpgradeLockReapInterval = 30 * time.Second
+	}
+	if cfg.DrainMarkerReapInterval == 0 {
+		cfg.DrainMarkerReapInterval = 30 * time.Second
 	}
 	if cfg.HomeDeliverInterval == 0 {
 		cfg.HomeDeliverInterval = 5 * time.Second

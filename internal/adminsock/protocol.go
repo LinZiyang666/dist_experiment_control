@@ -688,7 +688,23 @@ type ForceSingleReport struct {
 	Peers          []ForceSinglePeerProbe `json:"peers,omitempty"`           // per-peer liveness verdict
 	DwellRemaining string                 `json:"dwell_remaining,omitempty"` // time left before the quorum-loss dwell is satisfied ("" = satisfied)
 	ArmToken       string                 `json:"arm_token,omitempty"`       // Arm (non-dry-run): present this on Commit
-	Abandoned      []string               `json:"abandoned,omitempty"`       // Commit: node_ids removed from the new {self} config
+	// Abandoned are the node_ids the recovery moved OUT of the raft configuration. Their roster rows
+	// are pruned synchronously on the success path; when that prune fails, FinalizeOpID names the
+	// operation retrying it and the rows are NOT yet gone. Read the two together — "abandoned" states
+	// intent, not completion.
+	Abandoned []string `json:"abandoned,omitempty"`
+	// FinalizeOpID (batch C) names the operation retrying a failed roster prune. Empty on the ordinary
+	// success path, where there is no operation at all — AND ALSO empty when the prune failed and the
+	// retry op could not be created, which is why it must not be used to decide whether the prune
+	// completed. PruneIncomplete is that signal.
+	FinalizeOpID string `json:"finalize_op_id,omitempty"`
+	// PruneIncomplete (batch C) says the abandoned peers' roster rows are STILL PRESENT. It exists
+	// because there are three outcomes and FinalizeOpID only separates two: pruned; not pruned but a
+	// retry op is running; not pruned and no retry op either. Reading "no op id" as "pruned" printed
+	// the operator a causal instruction ("the abandoned peers are already pruned, so the N=1 proof now
+	// passes") on precisely the branch where it is false, and the next command they run —
+	// `reconcile nats --to-standalone` — then refuses with an error about an unrecognized raft role.
+	PruneIncomplete bool `json:"prune_incomplete,omitempty"`
 }
 
 // ForceSinglePeerProbe is one peer's liveness verdict in a ForceSingleReport.
@@ -740,6 +756,15 @@ type ClusterNodeStatus struct {
 	Reachable         bool   `json:"reachable"`
 	ReachSource       string `json:"reach_source"` // "self" | "unverified" | "nats-health" | "raft-ping" | "disk-snapshot"
 	Inconsistent      bool   `json:"inconsistent"` // phase says voter but raft config disagrees (or vice-versa)
+	// InconsistentReason (batch C, EXTERNAL review m1) names WHICH inconsistency this is. The bool
+	// carried one meaning for years; batch C gave it a second (a DRAINING node whose drain marker is
+	// gone and which no operation is driving), and every consumer kept printing the roster/raft text —
+	// so the new case was reported with the wrong cause AND the wrong remedy, which for the drain case
+	// pointed the operator back at the command they were already running.
+	//
+	// Additive omitempty: an older broker omits it, and consumers fall back to the historical wording.
+	// Values: "roster_raft" | "draining_without_marker".
+	InconsistentReason string `json:"inconsistent_reason,omitempty"`
 
 	// B5 OPS#7 cert-rotation visibility (additive omitempty; schema_version stays 1). Public
 	// fingerprints only — never private cert material. CertValidSecs is now→valid_until in
@@ -764,9 +789,13 @@ type ClusterNodeStatus struct {
 	// generation in the on-disk conf; Observed = generation the live nats-server confirmed loading.
 	// TopoReported distinguishes a C3 broker (always reports) from an older one — the HEALTHY-HA gate
 	// degrades only a REPORTING voter whose Observed trails TopoDesired.
+	// TopoAction (batch C) is the natsconf.Action* the reporting broker's last reconcile pass
+	// returned — a CLOSED enum. Both renderers classify on it via natsconf.ClassifyTopo; empty means
+	// a pre-batch-C broker, which falls back to the shared reason matcher. Additive omitempty.
 	TopoApplied         uint64 `json:"topo_applied,omitempty"`
 	TopoObserved        uint64 `json:"topo_observed,omitempty"`
 	TopoReconcileReason string `json:"topo_reconcile_reason,omitempty"`
+	TopoAction          string `json:"topo_action,omitempty"`
 	TopoReported        bool   `json:"topo_reported,omitempty"`
 }
 
@@ -837,4 +866,35 @@ type EvictResult struct {
 	NodeRowDeleted     bool   `json:"node_row_deleted"`
 	AgentProvDeleted   bool   `json:"agent_prov_deleted"`
 	BroadcastedEvicted bool   `json:"broadcasted_evicted"`
+}
+
+// Inconsistency reasons for ClusterNodeStatus.InconsistentReason (batch C, EXTERNAL review m1).
+//
+// They live here rather than in internal/broker because BOTH ends need them: the broker sets one and
+// the ctl renders a different cause and remedy for each. Values are wire strings, so they may be
+// added to but never renamed.
+const (
+	// InconsistentRosterRaft: the roster phase and the committed raft configuration disagree. This is
+	// the historical meaning of the bool, and the one that can fork membership.
+	InconsistentRosterRaft = "roster_raft"
+	// InconsistentDrainingWithoutMarker: the node is phase DRAINING, its broker_draining marker is
+	// GONE, and no operation is driving it. Every producer writes the marker before the phase and
+	// clears it after restoring the phase, so this is not a legal transient — a drain died between its
+	// own steps and nothing will resume it. The remedy is `cluster drain --abort`, NOT the roster/raft
+	// advice, and certainly not "run cluster doctor" from inside cluster doctor.
+	InconsistentDrainingWithoutMarker = "draining_without_marker"
+)
+
+// InconsistencyDetail renders the cause + remedy for an InconsistentReason. An empty or unrecognized
+// reason falls back to the historical roster/raft wording, which is what a pre-batch-C broker means.
+func InconsistencyDetail(reason string) string {
+	switch reason {
+	case InconsistentDrainingWithoutMarker:
+		return "phase DRAINING but its broker_draining marker is gone and no operation is driving it — " +
+			"a drain died between its own steps; run `tether cluster drain --abort <node>` to return it " +
+			"to VOTER, or `tether cluster retire <node>` to finish removing it"
+	default:
+		return "roster phase and the committed raft configuration disagree — run `tether cluster status` " +
+			"and, if a live node is missing from raft, `tether cluster recovery node remove <id> --manual`"
+	}
 }

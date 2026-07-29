@@ -382,19 +382,65 @@ func runForceSingleOnline(cmd *cobra.Command, socket, selfID string, confirmDead
 	if !commit.OK {
 		return clusterAdminError("force-single", commit)
 	}
-	abandoned := 0
+	abandoned, finalizeOp, pruneIncomplete := 0, "", false
 	if commit.ForceSingle != nil {
 		abandoned = len(commit.ForceSingle.Abandoned)
+		finalizeOp = commit.ForceSingle.FinalizeOpID
+		pruneIncomplete = commit.ForceSingle.PruneIncomplete
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n"+
-			"NEXT — the DATA plane (JetStream: file transfers / history / audit) stays 503 until you de-cluster this survivor's nats.conf:\n"+
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(out,
+		"online force-single complete: %q is now a single-voter cluster (%d node(s) abandoned), writable WITHOUT a broker restart.\n",
+		selfID, abandoned)
+	// batch C: the de-cluster instruction below used to end with "(the abandoned peers are already
+	// pruned, so the N=1 proof now passes)". That is a CAUSAL claim, not a description: it tells the
+	// operator the next command will work, and names the reason. When the prune failed it was simply
+	// false — `--to-standalone` refuses on a ghost's empty raft role — so the operator would run it,
+	// get an error naming a raft role, and have no path from there. Split by branch so each says only
+	// what is true on it.
+	if pruneIncomplete {
+		next := "  tether cluster ops show " + finalizeOp + "\n"
+		if finalizeOp == "" {
+			// The prune failed AND no retry operation could be created. There is nothing to watch, so
+			// the only honest instruction is the manual finalizer — and this is the branch the old
+			// single-predicate version printed "already pruned" on.
+			next = "  (no retry operation could be started — see the broker log)\n"
+		}
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"WARNING: the roster prune of the abandoned peers did NOT complete.\n"+
+				"%s"+
+				"DO NOT de-cluster yet. Until those rows are gone `reconcile nats --to-standalone` REFUSES\n"+
+				"(a ghost roster row has no raft role, so N=1 cannot be proven) and JetStream stays 503.\n"+
+				// origin: batch-c internal review sweep-F1 — --manual is mandatory; without it the command
+				// refuses and redirects to `cluster retire`, which must never be aimed at a ghost.
+				// --confirm-node-id is spelled out because a recovery is often driven from systemd-run
+				// or a script, where there is no TTY to type the confirmation into.
+				"Run `tether cluster recovery node remove <id> --manual` for each abandoned id that\n"+
+				"survives (add `--confirm-node-id <id>` when there is no TTY), then\n"+
+				"continue with the de-cluster below.\n", next)
+	}
+	_, _ = fmt.Fprintf(out,
+		"NEXT — the DATA plane (JetStream: file transfers / history / audit) stays 503 until you de-cluster this survivor's nats.conf:\n"+
 			"  "+natsconf.DeClusterRemedyCmd+"\n"+
 			"  "+natsconf.DeClusterRemedyResetJSNote+"\n"+
 			"  (server-name is this broker's nats_server_id — the conf's server_name: line; broker-nkey is its bus nkey — derive it from the broker.nk seed in secrets_dir, or read cluster_nodes.bus_nkey_pub; it is NOT in broker.yaml. A multi-broker conf can't auto-pick self's nkey)\n"+
-			"then a FULL `systemctl restart nats-server` (the abandoned peers are already pruned, so the N=1 proof now passes). `cluster status` shows a DATA-PLANE-DEGRADED banner until you do.\n",
-		selfID, abandoned)
+			"then a FULL `systemctl restart nats-server`%s. `cluster status` shows a DATA-PLANE-DEGRADED banner until you do.\n",
+		declusterPruneNote(pruneIncomplete))
 	return nil
+}
+
+// declusterPruneNote renders the parenthetical that explains WHY the N=1 proof will pass — but only
+// on the branch where it actually will.
+//
+// It keys on whether the prune COMPLETED, not on whether a retry operation exists. Those are not the
+// same question: there are three outcomes and an op id only distinguishes two of them, so keying on
+// the op id printed the reassuring causal clause on the worst branch — prune failed AND no retry
+// running — which is exactly where an operator following it walks into `--to-standalone` refusing.
+func declusterPruneNote(pruneIncomplete bool) string {
+	if pruneIncomplete {
+		return " — but ONLY after every abandoned roster row is gone (see the WARNING above)"
+	}
+	return " (the abandoned peers are already pruned, so the N=1 proof now passes)"
 }
 
 func printForceSingleReport(cmd *cobra.Command, r *adminsock.ForceSingleReport) {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
@@ -71,6 +72,49 @@ func TestRound5B1_CorruptJournalIsNotSilentlyIgnored(t *testing.T) {
 	}
 	if _, err := readJournal(dir); err == nil {
 		t.Fatal("a corrupt journal was silently ignored — an in-flight rebuild would be forgotten")
+	}
+}
+
+// TestOnlineIntentRejectsStructurallyUnsafeRecords ensures valid JSON is not confused with a valid
+// recovery instruction.
+//
+// origin: batch-c external re-review B1. This file can trigger replicated emergency mutations, so an
+// empty epoch, self-prune target, duplicate target, bad timestamp, or trailing JSON must fail closed.
+func TestOnlineIntentRejectsStructurallyUnsafeRecords(t *testing.T) {
+	valid := OnlineIntent{
+		SelfID: "brk1", Abandoned: []string{"brk2"}, Epoch: "epoch-1",
+		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	cases := map[string]OnlineIntent{
+		"empty self":     {Epoch: valid.Epoch, MarkedAt: valid.MarkedAt},
+		"empty epoch":    {SelfID: valid.SelfID, MarkedAt: valid.MarkedAt},
+		"bad timestamp":  {SelfID: valid.SelfID, Epoch: valid.Epoch, MarkedAt: "not-a-time"},
+		"self abandoned": {SelfID: valid.SelfID, Epoch: valid.Epoch, MarkedAt: valid.MarkedAt, Abandoned: []string{"brk1"}},
+		"duplicate peer": {SelfID: valid.SelfID, Epoch: valid.Epoch, MarkedAt: valid.MarkedAt, Abandoned: []string{"brk2", "brk2"}},
+		"empty peer":     {SelfID: valid.SelfID, Epoch: valid.Epoch, MarkedAt: valid.MarkedAt, Abandoned: []string{""}},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateOnlineIntent(in); err == nil {
+				t.Fatal("unsafe intent accepted")
+			}
+		})
+	}
+
+	dir := t.TempDir()
+	if err := WriteOnlineIntent(dir, valid); err != nil {
+		t.Fatalf("write valid intent: %v", err)
+	}
+	p := onlineIntentPath(dir)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(b, []byte(`{"second":"document"}`)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadOnlineIntent(dir); err == nil {
+		t.Fatal("intent reader accepted trailing JSON after the recovery record")
 	}
 }
 

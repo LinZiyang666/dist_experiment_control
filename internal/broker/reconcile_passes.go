@@ -239,4 +239,10 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// pass invents no directive: homeForRegister is the single builder for both
 	// delivery paths, so they cannot drift.
 	r.register("home-delivery", b.cfg.HomeDeliverInterval, authorityLeader, b.reconcileHomeDelivery)
+
+	// batch C: clear broker_draining markers whose node has no roster row left. See
+	// reconcile_drain_marker.go for why this is the ONLY case it clears, and why the two wider
+	// predicates the refactor roadmap proposed would each break something. Idempotent path:
+	// cluster.PlanClusterDrainSet(node, nil), the same command AbortDrain and the retire ladder use.
+	r.register("drain-marker", b.cfg.DrainMarkerReapInterval, authorityLeader, b.reconcileDrainMarkers)
 }

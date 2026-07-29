@@ -151,6 +151,19 @@ const (
 	// in TestDataplaneNotConvergedCodeIsWireStable.
 	CodeDataplaneNotConverged = "dataplane_not_converged"
 
+	// --- transfer ---
+
+	// CodeTransferBudgetExceeded (batch C / C2): the broker's tier-B watchdog fired before the
+	// receiver's finalization signal arrived. It replaces CodeAgentNoResponders on THAT path only,
+	// because that attribution was wrong in the common case: the agent may have been reachable and
+	// transferring the entire time — what ran out was the broker's budget, which before batch C was a
+	// fixed 5 minutes that did not derive from the 2 GiB size ceiling it had to cover TWICE. Sending
+	// the operator to "check the agent is running and connected" for a transfer that was healthy but
+	// slow is the misdirection this code exists to end. EX_TEMPFAIL: retrying a smaller file, or the
+	// same file on a faster link, genuinely works. The real no-responders emitters (expose, upgrade,
+	// the cluster upgrade trigger) keep CodeAgentNoResponders.
+	CodeTransferBudgetExceeded = "transfer_budget_exceeded"
+
 	// --- shared with internal/adminsock ---
 	//
 	// These wire strings travel on BOTH the NATS control plane and the local

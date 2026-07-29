@@ -16,6 +16,14 @@ import (
 const (
 	OpKindJoin   = "join"
 	OpKindRetire = "retire"
+	// OpKindForceSingleFinalize (batch C / C1) drives the RETRY of an online force-single's roster
+	// prune after the synchronous attempt failed. The synchronous path is unchanged and still does
+	// everything on the happy path; this op exists only because a failed prune used to be a PERMANENT
+	// dead end — the code said so itself: "a re-run to retry a failed prune is REFUSED by the dwell
+	// gate (CodeQuorumNotLost)". A lingering ghost roster row is not cosmetic: `cluster status` gives
+	// it Role "" (it is absent from the raft config), and `reconcile nats --to-standalone` refuses on
+	// an unrecognized role — so the survivor's JetStream stays 503 with no way forward.
+	OpKindForceSingleFinalize = "force_single_finalize"
 )
 
 // Operation workflow states (the named cursor). Join + retire ladders + the shared terminals/blocked.
@@ -41,6 +49,17 @@ const (
 	OpStateRaftRemoved       = "RAFT_REMOVED"
 	OpStateRetired           = "RETIRED" // retire terminal (NO substrate — the op row is its only record)
 
+	// force-single finalize ladder (batch C). Entered only when the SYNCHRONOUS prune failed.
+	//
+	// It deliberately has NO blocked state. Today a failed prune leaves ghosts and a loud log line,
+	// and the operator still has `cluster recovery node remove <ghost>` as a deterministic finalizer.
+	// A non-terminal op would be WORSE than that: assertNoActiveOp fences the target's membership
+	// plane, and an operator standing over a freshly force-singled survivor has neither a peer to
+	// confirm against nor a reason to look at `cluster ops`. Every exit here is terminal.
+	OpStateFSPrunePending = "FS_PRUNE_PENDING" // retrying PlanClusterNodePrune for params.abandoned
+	OpStateFSFinalized    = "FS_FINALIZED"     // terminal success: the ghosts are gone and seeds re-derived
+	OpStateFSGhostLeft    = "FS_GHOST_LEFT"    // terminal: budget spent, ghosts remain; last_error names the manual finalizer
+
 	// shared non-progress states.
 	OpStateRetireFailed = "RETIRE_FAILED" // terminal failure
 	OpStateAborted      = "ABORTED"       // operator-aborted terminal (frees the active slot, substrate untouched)
@@ -53,11 +72,14 @@ var validOpStates = map[string]bool{
 	OpStateDrainRequested: true, OpStateNoNewHome: true, OpStateRehomeExposes: true,
 	OpStateStreamsAtTarget: true, OpStateSeedWithdrawn: true, OpStateLeaderTransferred: true,
 	OpStateRaftRemoved: true, OpStateRetired: true,
+	OpStateFSPrunePending: true, OpStateFSFinalized: true, OpStateFSGhostLeft: true,
 	OpStateRetireFailed: true, OpStateAborted: true, OpStateBlocked: true,
 }
 
 // ValidOpKind / ValidOpState are the leader-side bake-surface validators (no sql CHECK).
-func ValidOpKind(k string) bool  { return k == OpKindJoin || k == OpKindRetire }
+func ValidOpKind(k string) bool {
+	return k == OpKindJoin || k == OpKindRetire || k == OpKindForceSingleFinalize
+}
 func ValidOpState(s string) bool { return validOpStates[s] }
 
 // OpStartInput is the fully-formed initial operation row the leader inserts.
@@ -195,6 +217,31 @@ func PlanClusterOpTransition(in OpTransitionInput, now time.Time) (*Command, err
 	}
 	sql := `UPDATE cluster_operations SET ` + set +
 		` WHERE op_id = ` + opID + ` AND op_state = ` + from
+	return NewCommand(OpClusterOpTransition, Stmt(sql)), nil
+}
+
+// PlanClusterOpAbort is the operator's escape hatch: force ANY non-terminal operation to ABORTED,
+// guarded ONLY on `terminal = 0`.
+//
+// It exists because PlanClusterOpTransition validates the FROM state against this binary's compiled-in
+// validOpStates, which quietly made `cluster ops abort` version-fragile: a binary that does not know
+// the state an op is sitting in cannot abort it, so a ROLLBACK past the release that introduced a
+// state would leave every op in it un-abortable AND un-drivable, with assertNoActiveOp fencing that
+// node's membership plane permanently. The escape hatch has to work on states this binary has never
+// heard of — that is the entire point of an escape hatch — so it does not consult the enum at all.
+// PlanClusterOpConfirm next to it already uses exactly this shape.
+func PlanClusterOpAbort(opID, lastErr, timeline string, now time.Time) (*Command, error) {
+	if opID == "" {
+		return nil, fmt.Errorf("cluster: op-abort: op_id required")
+	}
+	lits, err := LitTextAll(opID, OpStateAborted, lastErr, timeline)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: op-abort: literal: %w", err)
+	}
+	id, to, le, tl := lits[0], lits[1], lits[2], lits[3]
+	sql := `UPDATE cluster_operations SET op_state = ` + to + `, terminal = 1, last_error = ` + le +
+		`, timeline = ` + tl + `, updated_at = ` + LitTime(now.UTC()) +
+		` WHERE op_id = ` + id + ` AND terminal = 0`
 	return NewCommand(OpClusterOpTransition, Stmt(sql)), nil
 }
 

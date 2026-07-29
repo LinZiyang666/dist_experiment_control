@@ -1034,6 +1034,7 @@ func TestHomeDeliveryIsRegisteredInTheProductionPassSet(t *testing.T) {
 		Logger: silentLogger(), ReconcileInterval: time.Second, ProcGCInterval: time.Minute,
 		XferReapInterval: time.Minute, GrowLockReapInterval: time.Minute,
 		UpgradeLockReapInterval: time.Minute, HomeDeliverInterval: 5 * time.Second,
+		DrainMarkerReapInterval: time.Minute,
 	}
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
 	b.registerCoreReconcilePasses()

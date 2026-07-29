@@ -128,7 +128,8 @@ func passBroker(t *testing.T, db *sql.DB, clk *fakeClock) *Broker {
 		// R7b: registering a pass with a zero interval is a wiring PANIC by design, so a fixture that
 		// forgets a new pass's interval fails loudly rather than silently dropping the pass.
 		UpgradeLockReapInterval: 30 * time.Second,
-		HomeDeliverInterval:     5 * time.Second, // R8a P1 home-delivery pass
+		HomeDeliverInterval:     5 * time.Second,  // R8a P1 home-delivery pass
+		DrainMarkerReapInterval: 30 * time.Second, // batch C drain-marker orphan reaper
 	}
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
 	b.registerCoreReconcilePasses()
@@ -1524,6 +1525,75 @@ func TestXferReapShieldsFreshObjects(t *testing.T) {
 	}
 	if n := liveCount(); n != 0 {
 		t.Fatalf("with the grace disabled the orphan must be reaped; %d live objects remain", n)
+	}
+}
+
+// TestXferReapAfterRestartPreservesLedgerBackedLiveObject exercises the production deletion path,
+// not just the timeout constants.
+//
+// origin: batch-c external review C12. A broker restart rebuilds transfers EMPTY but preserves the
+// xfer-inflight ledger. That ledger is the only durable proof that an object is still covered by the
+// size-derived watchdog. The home reaper must consult it (or provide an equivalent durable guard)
+// before deleting an object older than the short orphan grace.
+func TestXferReapAfterRestartPreservesLedgerBackedLiveObject(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	db := passTestDB(t)
+	now := time.Now().UTC()
+	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
+	b.cfg = Config{
+		DB:             db,
+		Logger:         silentLogger(),
+		Now:            func() time.Time { return now.Add(xferReapMinObjectAge + time.Minute) },
+		ClusterDataDir: t.TempDir(),
+	}
+	b.js = js
+	b.nc.Store(nc)
+	b.xferReapMinAge = xferReapMinObjectAge
+	seedHomedNode(t, db, "restart-live", "agent-1", "srv-A", "node-A")
+
+	store, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: "xfer-restart-live"})
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	payload := make([]byte, 64*1024*1024)
+	if _, err := store.PutBytes(ctx, "tid-restart-live", payload); err != nil {
+		t.Fatalf("put live object: %v", err)
+	}
+
+	// Persist exactly the record the prepare path writes, then model the restarted process by leaving
+	// its new in-memory tracker empty. At +3m this transfer is still within its >=5m budget.
+	b.writeXferInflight(&transferEntry{
+		transferID: "tid-restart-live",
+		sid:        "restart-live",
+		nid:        "agent-1",
+		verb:       "push",
+		tier:       "b",
+		bucket:     "xfer-restart-live",
+		path:       "/dst",
+		size:       int64(len(payload)),
+		startedAt:  now,
+	})
+	if b.transfers.get("tid-restart-live") != nil {
+		t.Fatal("restart fixture is invalid: the new process tracker must be empty")
+	}
+
+	if _, err := b.reconcileXferObjects(ctx); err != nil {
+		t.Fatalf("reconcileXferObjects: %v", err)
+	}
+	if _, err := store.GetInfo(ctx, "tid-restart-live"); err != nil {
+		t.Fatalf("home reaper deleted a ledger-backed live transfer only %s after restart: %v; its "+
+			"size-derived watchdog budget is %s", xferReapMinObjectAge+time.Minute, err,
+			proto.XferBudget("b", int64(len(payload)), proto.XferPushLegs))
 	}
 }
 

@@ -247,6 +247,9 @@ func (a *ClusterAdmin) ConfirmOp(opID string) error {
 	if op == nil || op.Terminal {
 		return fmt.Errorf("operation %q is not an in-flight op", opID)
 	}
+	if err := a.confirmOpKindGuard(op); err != nil {
+		return err
+	}
 	a.clearOpAttempts(opID)
 	if op.Kind == cluster.OpKindRetire {
 		voters, err := a.node.NumVoters()
@@ -281,9 +284,22 @@ func (a *ClusterAdmin) ConfirmOp(opID string) error {
 	return fmt.Errorf("operation %q (%s/%s) is not awaiting a confirm", opID, op.Kind, op.OpState)
 }
 
-// AbortOp transitions a non-terminal op to ABORTED (predecessor-CAS), freeing the per-node active slot
-// WITHOUT touching the substrate (the membership stays whatever the gates left it; reconcile/doctor
-// heals). The stuck-op escape hatch.
+// AbortOp transitions a non-terminal op to ABORTED, freeing the per-node active slot WITHOUT touching
+// the substrate (the membership stays whatever the gates left it). The stuck-op escape hatch.
+//
+// origin: batch-c internal review F3. This comment previously said "(predecessor-CAS)" and
+// "reconcile/doctor heals", and batch C made both false:
+//
+//   - It is NOT a predecessor-CAS any more. It goes through cluster.PlanClusterOpAbort, whose only
+//     guard is `terminal = 0` — deliberately, so the escape hatch works on an op whose state this
+//     binary has never heard of. See that function for why.
+//   - "reconcile/doctor heals" promised an automatic healer that did not exist. What batch C actually
+//     added is narrow: the `drain-marker` reconcile pass clears a broker_draining marker ONLY when the
+//     node has no cluster_nodes row at all (see reconcile_drain_marker.go, which explains why the two
+//     wider predicates were rejected). EVERYTHING ELSE this abort leaves behind is the operator's:
+//     `cluster drain --abort` to return a DRAINING node to VOTER, `cluster recovery node remove <id>
+//     --manual` for a roster row with no raft membership. `cluster doctor` reports both — it does not
+//     fix them.
 func (a *ClusterAdmin) AbortOp(opID string) error {
 	op, err := cluster.OperationByID(a.node.RODB(), opID)
 	if err != nil {
@@ -295,7 +311,18 @@ func (a *ClusterAdmin) AbortOp(opID string) error {
 	if op.Terminal {
 		return nil // already terminal — idempotent
 	}
-	return a.transition(op, cluster.OpStateAborted, true, "aborted by operator", nil)
+	// batch C: PlanClusterOpAbort, NOT transition(). transition() routes through
+	// PlanClusterOpTransition, which validates the FROM state against THIS binary's compiled-in
+	// validOpStates — so an operator running a binary that predates a state could not abort an op
+	// sitting in it, and `driveOne` would not advance it either (no case for its kind). That
+	// combination is a permanently non-terminal op, which assertNoActiveOp turns into a permanent
+	// fence on that node's membership plane. An escape hatch that only works for states the binary
+	// already knows is not an escape hatch.
+	tl := appendTimeline(op.Timeline, opTimelineEntry{
+		S: cluster.OpStateAborted, T: a.now().UTC().Format(time.RFC3339), E: "aborted by operator"})
+	return a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		return cluster.PlanClusterOpAbort(op.OpID, "aborted by operator", tl, a.now())
+	})
 }
 
 // initTimeline bakes the single-entry initial timeline for a new op.
@@ -368,6 +395,12 @@ func (a *ClusterAdmin) driveLeaderMaintenance() {
 		return
 	}
 	a.driveInFlightOperations()
+	// batch-c external re-review audit: forward-complete an INTERRUPTED online force-single. The
+	// leadership-edge resume covers the restart shape; this covers the shape that has NO next edge —
+	// a freshly recovered single-voter raft whose marker/epoch propose failed inside the commit
+	// handler. Placed AFTER driveInFlightOperations so an op it starts takes its first step on the
+	// next tick, keeping the one-idempotent-step-per-tick contract.
+	a.driveInterruptedForceSingle()
 	if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
 		a.logger.Debug("cluster: periodic seed converge", "err", serr)
 	}
@@ -410,9 +443,18 @@ func (a *ClusterAdmin) driveInFlightOperations() {
 	// start-gate. While it is held, FREEZE every non-terminal membership op — do NOT drive phase
 	// transitions / AddVoter / drain / RemoveServer — so an already-in-flight join/retire cannot cross the
 	// rolling restart. The op state persists in raft; driving resumes automatically once the lock releases.
-	if upgradeActive(a.node.RODB()) {
-		return
-	}
+	//
+	// batch C: the freeze is now PER OP rather than a whole-loop return, because a force-single
+	// finalize must NOT be frozen by it. "A rolling upgrade rolled the quorum away" is one of the
+	// canonical reasons an operator reaches for force-single at all, and the upgrade marker is renewed
+	// (and deleted) by a LEADER Propose — so in exactly that scenario the marker is held and cannot be
+	// cleared. Freezing the finalize op there would leave it non-terminal forever: ghosts remain, the
+	// survivor's JetStream stays 503, and `cluster ops show` displays something that looks like
+	// progress. The exemption is safe because finalize performs no membership change: raft is ALREADY
+	// {self}, prune only deletes roster rows for peers the recovery abandoned, and seed convergence is
+	// client discovery. The B2 property the freeze protects — no join/retire crossing a rolling
+	// restart — is untouched, and TestUpgradeLockStillFreezesJoinAndRetire pins that.
+	frozenByUpgrade := upgradeActive(a.node.RODB())
 	// G4 §B / review M6: do NOT add a growActive() freeze here. Unlike upgrade, a `cluster add` grow DRIVES its
 	// OWN OpKindJoin op through this loop (AddNonvoter → catch-up → AddVoter); freezing on growActive would
 	// deadlock the grow's own op forever (it never reaches SERVING, the marker never releases). Grow serializes
@@ -424,8 +466,26 @@ func (a *ClusterAdmin) driveInFlightOperations() {
 		return
 	}
 	for i := range ops {
+		if opFrozenByUpgradeLock(frozenByUpgrade, ops[i].Kind) {
+			continue
+		}
 		a.driveOne(&ops[i])
 	}
+}
+
+// opFrozenByUpgradeLock decides whether the `cluster upgrade` roll lock freezes this op.
+//
+// It is a named predicate rather than an inline condition so the carve-out can be tested without
+// standing up a cluster, and so the exemption cannot silently widen: the B2 property being protected
+// is "no MEMBERSHIP change crosses a rolling restart", and a finalize performs none — raft is already
+// {self}, the prune only deletes roster rows for peers the recovery abandoned, and seed convergence
+// is client discovery. Any FUTURE kind is frozen by default; adding another exemption means editing
+// this function, which is exactly where the argument for it belongs.
+func opFrozenByUpgradeLock(upgradeLockHeld bool, kind string) bool {
+	if !upgradeLockHeld {
+		return false
+	}
+	return kind != cluster.OpKindForceSingleFinalize
 }
 
 // driveOne advances ONE operation by a single transition (best-effort; errors are recorded in
@@ -451,6 +511,34 @@ func (a *ClusterAdmin) driveOne(op *cluster.Operation) {
 		a.driveJoin(op, sub)
 	case cluster.OpKindRetire:
 		a.driveRetire(op, sub)
+	case cluster.OpKindForceSingleFinalize:
+		a.driveForceSingleFinalize(op)
+	default:
+		// FAIL CLOSED: report, and leave the operation ALONE.
+		//
+		// origin: batch-c EXTERNAL review M4. Batch C first made this branch auto-abort the op, reasoning
+		// that a non-terminal op fences the target's membership plane. That reasoning was right about
+		// the cost and wrong about the remedy: aborting is a MUTATION performed by the binary that just
+		// admitted it does not understand the operation. On a rollback or a mixed-version window it
+		// would destroy the only durable record driving a newer version's workflow, and hand the
+		// half-finished substrate back to a binary that cannot know what state it was left in. That the
+		// force-single finalize happens to be reconstructible from substrate does not generalise to
+		// every future kind, and this branch is generic.
+		//
+		// The operator's escape hatch stays available and is enum-independent by design:
+		// `cluster ops abort <id>` goes through PlanClusterOpAbort, which guards only on terminal = 0
+		// and therefore works on a state this binary has never heard of. "An operator CAN abort it" does
+		// not imply "this process SHOULD abort it".
+		//
+		// The log is Error, not Warn: a fence on the membership plane is a real operational condition
+		// and the message has to name both the cause and the one command that resolves it.
+		a.logger.Error("cluster op controller: UNKNOWN operation kind — this binary is OLDER than the one "+
+			"that created this operation. Refusing to drive it AND refusing to abort it: this process "+
+			"cannot know what substrate the operation left behind. It will keep `assertNoActiveOp` "+
+			"fencing membership changes for this target until it is resolved. Upgrade this broker to the "+
+			"release that created the op, or — if you accept losing that operation's intent — run "+
+			"`tether cluster ops abort "+op.OpID+"` deliberately.",
+			"op", op.OpID, "kind", op.Kind, "target", op.TargetNode, "state", op.OpState)
 	}
 }
 
@@ -1073,6 +1161,13 @@ func (a *ClusterAdmin) retireGatePasses(op *cluster.Operation, sub substrate) bo
 // observed this op's target topology generation. FAIL-CLOSED: an unreachable/UNKNOWN voter counts as
 // NOT converged (never false-greens SERVING/RETIRED). Deliberately differs from computeHealth's
 // inlined predicate, which excludes unreachable voters.
+//
+// batch C folded the two STATUS renderers onto the shared natsconf.ClassifyTopo and DELIBERATELY left
+// this one alone. It is not a fourth copy of the same question: the renderers answer "what should the
+// operator be told", which is why an unreachable voter is excluded there, while this answers "may an
+// IRREVERSIBLE membership step proceed", where an unreachable voter must count as not-converged. Both
+// polarities are correct for their own question; unifying them would make one of them wrong. Do not
+// "finish the refactor" by routing this through ClassifyTopo.
 func (a *ClusterAdmin) topoConvergedForOp(op *cluster.Operation, joining bool) (bool, string) {
 	if op.TopoTargetGen == 0 {
 		return true, "" // nothing to converge (no topology managed)

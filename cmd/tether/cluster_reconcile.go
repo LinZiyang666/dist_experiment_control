@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/spf13/cobra"
 )
 
@@ -135,6 +136,15 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no topology generation is being managed yet (nothing to converge).")
 			return true, nil
 		}
+		// batch C: bail out of the poll the moment a reachable voter is in a state that cannot
+		// self-heal. exitInternal, NOT exitTransient: a conf that will not validate, or a withheld
+		// cutover awaiting `cluster add`, is not "try again later" — 75 would drive a retry loop to
+		// keep waiting forever, which is exactly the misdirection C3 removes at the status layer.
+		if wedged, worst := topoWedged(rep); len(wedged) > 0 {
+			return false, &ExitError{Class: exitInternal, Err: fmt.Errorf(
+				"reconcile nats: topology cannot converge on its own: %s — %s",
+				strings.Join(wedged, ", "), worst.NextStep())}
+		}
 		laggards := topoLaggards(rep)
 		if len(laggards) == 0 {
 			// Topology generation converged — but re-check the issuer skew before declaring
@@ -168,6 +178,12 @@ func runReconcileNatsAuto(cmd *cobra.Command, socket, secretsDir, confPath strin
 // voters and voters that do not report topology (C3-M2: a voter that is DEGRADED in `cluster status`
 // must NOT be reported as converged here, or `--wait` would exit 0 on a false all-clear). Each is
 // rendered with its state for a no-false-green wait.
+//
+// batch C: the laggard predicate was a THIRD polarity (`observed<desired || reason!=""`) beside the
+// broker's and topoCell's. It now derives from the same natsconf.ClassifyTopo as those two. The set
+// of laggards is unchanged by construction — every state ClassifyTopo marks Degrades() is one the
+// old disjunction also caught — but the rendered token is now the shared vocabulary, so a wedged
+// broker reads "STUCK" here, in `cluster status`, and in the card with the same word.
 func topoLaggards(rep *adminsock.ClusterStatusReport) []string {
 	if rep == nil || rep.TopoDesired == 0 {
 		return nil
@@ -177,14 +193,41 @@ func topoLaggards(rep *adminsock.ClusterStatusReport) []string {
 		if n.Phase != "VOTER" {
 			continue
 		}
-		switch {
+		switch st := natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, rep.TopoDesired, n.TopoReported); {
 		case !n.Reachable:
 			out = append(out, fmt.Sprintf("%s(UNREACHABLE)", n.NodeID))
 		case !n.TopoReported:
 			out = append(out, fmt.Sprintf("%s(not-reporting-topology)", n.NodeID))
-		case n.TopoObserved < rep.TopoDesired || n.TopoReconcileReason != "":
-			out = append(out, fmt.Sprintf("%s(%d/%d→%d %s)", n.NodeID, n.TopoApplied, n.TopoObserved, rep.TopoDesired, n.TopoReconcileReason))
+		case st.Degrades():
+			out = append(out, fmt.Sprintf("%s(%d/%d→%d %s %s)", n.NodeID, n.TopoApplied, n.TopoObserved, rep.TopoDesired, st, n.TopoReconcileReason))
 		}
 	}
 	return out
+}
+
+// topoWedged returns the reachable voters whose reconcile CANNOT self-heal — STUCK (the conf will
+// not render/validate) or HELD (a standalone→clustered cutover deliberately withheld pending
+// `cluster add`). Polling either to the deadline is the same defect this batch exists to remove, one
+// layer down: `--wait` would burn its whole timeout waiting for a self-heal that is not coming, and
+// then exit 75 (EX_TEMPFAIL) — telling a retry loop to keep waiting.
+func topoWedged(rep *adminsock.ClusterStatusReport) (nodes []string, worst natsconf.TopoState) {
+	if rep == nil || rep.TopoDesired == 0 {
+		return nil, natsconf.TopoUnreported
+	}
+	for _, n := range rep.Nodes {
+		if n.Phase != "VOTER" || !n.Reachable {
+			continue
+		}
+		st := natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, rep.TopoDesired, n.TopoReported)
+		// origin: batch-c EXTERNAL review M2 — TopoUnknownAction belongs here too. Polling on it burns
+		// the whole deadline and then exits 75 (EX_TEMPFAIL), telling automation to retry; but the peer
+		// is reporting an action THIS binary does not know, and no amount of waiting teaches it. The
+		// remedy is to upgrade the reader, which is what bailing out with that next-step says.
+		if st != natsconf.TopoStuck && st != natsconf.TopoHeld && st != natsconf.TopoUnknownAction {
+			continue
+		}
+		nodes = append(nodes, fmt.Sprintf("%s(%s %s)", n.NodeID, st, n.TopoReconcileReason))
+		worst = natsconf.WorstTopoState(worst, st)
+	}
+	return nodes, worst
 }

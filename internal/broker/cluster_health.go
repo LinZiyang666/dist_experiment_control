@@ -103,6 +103,7 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 				resp.TopoApplied = ts.Applied
 				resp.TopoObserved = ts.Observed
 				resp.TopoReconcileReason = ts.Reason
+				resp.TopoAction = ts.Action
 			}
 		}
 		// D9 §17 (step 10b): self-report the command-domain AppliedIndex so the leader's

@@ -689,3 +689,121 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
 - [ ] 提交前硬闸 `make test`+`make e2e-parallel`+`make lint` 全绿；新 phase 进 e2e 矩阵。
 
 > **范围边界**：本分解只覆盖 §0 北极星点名的数据（session/member/node/process/port+审计）的 HA。**P13 proxy / 文件传输 multipath 不在 D0–D9**（§0 显式不做）；待 P13 转无条件 PASS 再单做 "proxy-HA" 叶子。
+
+---
+
+## 20. 批次 C 的绑定契约增补（v0.4.8）
+
+> 本节是**第 2 层实现契约**的一部分（CLAUDE.md §1）。批次 C 的三项改动都是加法式的：
+> `internal/proto.ProtoVersion` **未变**，现网 agent **不需要重装、不需要同步升级**。
+
+### 20.1 topology reconcile 的 `Action` 上 wire（C3）
+
+- **新字段**（全部 additive `omitempty`，沿用 `TopoReported` 的"老 broker 不带此字段"惯例）：
+  `proto.ClusterHealthResp.TopoAction`、`adminsock.ClusterNodeStatus.TopoAction`。
+  `proto.ClusterHealthSchemaVersion` 6→7（该常量自陈是 **documentation ledger, not a compat switch**，
+  无消费者 gate 在它上面）。
+- **唯一分类器**：`internal/natsconf.ClassifyTopo(action, reason, observed, desired, reported) TopoState`。
+  `TopoState ∈ {Unreported, Converged, Behind, Held, Stuck, UnknownAction}`。
+  banner / next-step / TOPO 列 token 全部由它派生，broker 与 ctl **共用同一份**。
+- **不变量**：`Stuck` 与 `Held` 的判定**不得**被 `observed < desired` 门住。
+  `ActionUnknownDirective` / `ActionRejected` 返回的 applied/observed 是**不变的**，
+  所以一个"收敛之后才卡死"的 reconciler 满足 `observed == desired`，
+  加门会让它报 HEALTHY_HA（这是 C3 修掉的真实缺陷之一）。
+- **`Held` 的 next-step 必须带否定子句**：`awaiting_clustered_cutover` 是**故意扣住**的首次
+  standalone→clustered 换装，conf 完全正常。改动前它被子串 `render`（Reason 里的 "rende**red**"）
+  判成 STUCK，而 STUCK 的 next-step 推荐 `reconcile nats --manual` ——
+  那正是 `natsconf/reconcile.go` 写明会造成 G4 #10 / #4 的动作。
+- **故意不统一**：`cluster_operation_controller.go` 的 `topoConvergedForOp` 保持 fail-closed，
+  **不得**改用 `ClassifyTopo`。它回答的是"能否推进一次不可逆的 membership 变更"，
+  对不可达 voter 必须判未收敛；渲染器回答的是"该告诉运维什么"，对不可达 voter 排除。
+  两种极性各自正确，统一会让其中一个变错。
+- **结构门**：`test/determinism/topo_classification_test.go` 用 AST 断言除分类器外
+  没有任何文件把 topology reason 标记传给 `strings.Contains` 一族。
+
+### 20.2 tier-B 传输预算（C2）
+
+- **单一来源**：`internal/proto` 的 `XferTierAMaxBytes`(8 MiB) / `XferMaxBytes`(2 GiB) /
+  `XferMinThroughput`(2 MiB/s) / `XferPushLegs`(2) / `XferTimeoutTierA` / `XferTimeoutTierBFloor` /
+  `XferTierBMaxBudget`(2108s=35m08s，含 60s setup/finalize margin) /
+  `XferLegBudget()` / `XferBudget()`。
+  broker、agent、ctl 三端全部引用它，**不再各自声明**（AST 门 `TestXferTierCeilingsHaveOneSource`）。
+- **预算式**：tier a 固定 30s；tier b = `max(5min, legs × ⌈size / 2 MiB/s⌉)`。
+  broker 覆盖 **2 腿**（发送方 Put + 接收方 Get，看门狗在转发 prepare 之前就武装），
+  每一**端**只覆盖自己那 1 腿。`size == 0`（pull 无申报 size / 批 C 之前写下的 ledger 记录）
+  ⇒ 回落固定下限 = 改动前的行为。
+- **有界**：admission 在武装看门狗之前就拒掉 `size > XferMaxBytes`，
+  所以 `XferTierBMaxBudget` 是编译期常量。**无上界的看门狗不是更长的超时，是没有超时。**
+- **崩溃恢复必须同步**：`transferTimeoutFor(tier, size)` 与活看门狗同式，
+  否则恢复方会给一个仍在传的传输写 `failed`。
+- **但 synthetic terminal 的 `Ts`/`DurationMs` 故意留在 tier 下限**：`Ts` 是 dedup reqID 的载体，
+  若它依赖 `XferMinThroughput`，回滚后新旧二进制会从同一条 ledger 记录算出不同的 `Ts` ⇒
+  同一个 transfer 出现两条互相矛盾的终态。
+- **跨 home GC 的下限改为逐对象增量**：`floor(obj) = base + max(0, budget(obj.size) − tierBFloor)`。
+  **不抬全局常量**——`serveconf.MinXferCrossHomeReapAge` 是生产 YAML 的**硬拒下限**，
+  抬高会让显式设过该 knob 的 broker 升级后拒绝启动；而且增量式保住了 drill 压缩该下限的能力。
+- **归因订正**：看门狗超时的 push 路径写 `transfer_budget_exceeded`（新 code，EX_TEMPFAIL），
+  不再写 `agent_no_responders`（agent 可能一直在传，只是不够快）。
+  `expose` / `upgrade` / `cluster upgrade` 三处的 `agent_no_responders` **保持不变**——那里是真的无响应。
+- **agent 侧 prep 缓存按 size 逐条到期**，且容量满时**拒新 prepare 而不是淘汰最旧的**：
+  最旧的那条按构造就是跑得最久、最大的那次传输。
+
+### 20.3 force-single 的 prune 重试 op（C1）
+
+- **新 op kind** `force_single_finalize`，ladder：`FS_PRUNE_PENDING → FS_FINALIZED | FS_GHOST_LEFT`。
+  **无 migration**（`cluster_operations.kind` 无 CHECK），**不动 ProtoVersion**。
+- **同步路径逐字不变**：`RecoverToSelfOnline` → `WaitForLeader` → marker → epoch → prune → seeds。
+  三条独立理由要求它保持同步：
+  1. destructive gate 是 `QuorumLost || ForceSingleActive`，恢复一返回本节点即可写 leader ⇒
+     `QuorumLost=false`；marker 若异步写，中间存在一个**门全开**的窗口。
+  2. ghost roster 行没有 raft role，`reconcile nats --to-standalone` 对未知 role **直接拒绝**，
+     而 runbook 明写"已 pruned 所以 N=1 通过"——异步化会打断运维的下一条命令。
+  3. seeds 每个 leader tick 都自愈，本来就不需要 ladder。
+- **op 只在同步 prune 失败时创建**。成功路径**不建 op 行**、CLI 文案不变。
+- **不可逆改写之前先落 durable intent**（外审 B1）：`<ClusterDataDir>/.force-single-online.intent`
+  在 `RecoverToSelfOnline` **之前** fsync（temp→fsync→rename→fsync(dir)，与 offline journal 同一原语），
+  内含 `self_id` / `abandoned` / **epoch**（在此处 mint，每次 resume 复用同一个值）/ `marked_at`。
+  它是**本地文件、不需要 quorum**——而这条路径恰恰跑在 quorum-lost 节点上。写不成功就**拒绝开始**改写。
+  改写之后的每一步（marker、epoch、prune）都可从 intent 幂等重放；
+  intent 只在**全部事实经读回确认**后才清除。
+  - **intent 存在 ≠ 改写已发生**（复审 R1）：presence 只证明"恢复被授权"。
+    forward-complete 之前必须另证 committed raft config **恰为 `{self}` 单 voter**；
+    读到旧配置 ⇒ 这是 pre-rewrite crash，durably 丢弃 intent、不写 raft；读不出来 ⇒ 保留 intent、拒绝猜。
+  - **`RecoverToSelfOnline` 返回 error 时保留 intent**（复审 R2）：它可能在 `RecoverCluster` 已落盘之后、
+    重建 transport 时才失败，调用方从 error 分不出相位——删掉就重新打开 B1 那个窗口。
+  - **两个触发点**：leadership-acquired **边沿**（`ReconcileMembershipOnLeadership`，覆盖重启形态）
+    与**每个 leader tick**（`driveLeaderMaintenance` → `driveInterruptedForceSingle`，
+    覆盖**没有下一个边沿**的形态——刚恢复的单 voter raft 永不再选举，
+    而 commit handler 的 marker/epoch 失败分支正是跑在它上面）。
+    per-tick 那条以"两条复制事实是否都已可见"为门，所以 intent 因 ghost 未清而长期存在时它不会每 5s 重刷日志。
+  - 进程内 `forceSingleIntentMu`：commit handler 持有新 intent 直到同步 prune 出结果，
+    两个 resume 触发点都用 `TryLock`（在 observe loop 上，**不得阻塞**）——
+    这保住了"干净恢复不建 op"这条契约。
+- **崩溃窗口**（intent 之前的老部署 / intent 文件丢失）由 `ReconcileMembershipOnLeadership` 的
+  **substrate 推断**兜底：四条全中才建 op ——
+  ① `force_single_active` 已置 ② `NumVoters()==1` ③ roster 行 `phase == VOTER` 且不在 raft config
+  ④ 无以 self 为 target 的非终态 op。③ 用 `VOTER` 而非任意 live phase：
+  正在 join 的行是 `PENDING`/`CATCHING_UP`，会短暂满足"不在 config 中"。
+- **`target_node = self`，绝不是 ghost**：`assertNoActiveOp` 是 per-target 的，
+  以 ghost 为 target 会让这个 op **fence 掉 `cluster recovery node remove <ghost>`** ——
+  为了修 ghost 而废掉清 ghost 的工具。
+- **永不 BLOCKED**：预算耗尽进终态 `FS_GHOST_LEFT`，`last_error` 点名残留 id、
+  `cluster recovery node remove`、以及"在清干净之前 `--to-standalone` 会拒绝、JetStream 保持 503"。
+- **预算是复制式 deadline**（`catchup_deadline` 列），不是进程内 attempt 计数器：
+  后者 leader 翻转即归零，且只在 step 返回 error 时递增——
+  而"propose 返回 nil 但观测恒假"（`RowsAffected==0` / poison-skip / bounded-stale 落后）
+  这一主要失败类根本不计数。
+- **upgrade lock 对 finalize 豁免**：rolling upgrade 滚死 quorum 正是 force-single 的典型触发场景，
+  而 upgrade marker 靠 leader Propose 续期/删除——那种场景下它被持有且清不掉。
+  join/retire 的冻结**保持不变**（`TestUpgradeLockStillFreezesJoinAndRetire` 钉住）。
+- **`AbortOp` 不再依赖 `FromState` 枚举**（改用 `PlanClusterOpAbort`，只 guard `terminal = 0`）。
+  原因：`PlanClusterOpTransition` **连 FromState 一起校验**，
+  所以旧二进制既驱动不了新 state 的 op、也 abort 不了它 ⇒ 该节点 membership plane 被永久 fence。
+  `driveOne` 的 `default:` 分支**fail closed：只报告，绝不改动那个 op**（外审 M4 推翻了批 C 初稿的
+  "强制转终态"——abort 是**由刚承认自己看不懂这个 op 的二进制**执行的一次 mutation，
+  回滚/混版窗口下它会销毁新版本 workflow 唯一的持久记录。运维出口是 enum 无关的
+  `cluster ops abort <id>`，见上一条）。
+- **伴生的 drain-marker 愈合 pass**：只清**可证明的孤儿**（marker 存在但该节点**没有 roster 行**）。
+  半完成的裸 drain（marker 在、phase 仍 VOTER、无 op）**故意不碰**——
+  `DrainNode` 的失败出口明文让运维重跑，期间 marker 及其告警是那次 drain **唯一**的可见证据。
+  「phase=DRAINING ∧ marker 缺失 ∧ 无非终态 op」在**渲染期**记 `Inconsistent`（不写库）。

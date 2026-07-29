@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 )
 
 // cluster_status_card.go — B7 DOC#6(a): the `cluster status --card` glance render. It is a SECOND
@@ -41,6 +42,9 @@ func renderClusterStatusCard(w io.Writer, rep *adminsock.ClusterStatusReport) {
 			flags := ""
 			if n.Inconsistent {
 				flags += " INCONSISTENT"
+				if n.InconsistentReason == adminsock.InconsistentDrainingWithoutMarker {
+					flags = " INCONSISTENT(drain)"
+				}
 			}
 			role := n.Role
 			if role == "" {
@@ -102,9 +106,50 @@ func cardHeadline(rep *adminsock.ClusterStatusReport) string {
 // cardTopReason extracts the single most important degraded reason from the node table — a pure
 // CLI mirror of the computeHealth degraded=true triggers (it does NOT recompute the verdict).
 func cardTopReason(rep *adminsock.ClusterStatusReport) string {
+	// batch C: topology comes FIRST because that is computeHealth's BANNER precedence — the topology
+	// banner is returned ahead of the generic "a node is mid-join / draining or roster/raft
+	// INCONSISTENT" one, so a card that ranked topology below them would contradict the very banner
+	// it sits under. This branch did not exist at all: a cluster whose ONLY degraded trigger was a
+	// wedged reconcile fell all the way through to the "fault tolerance reduced — see the table"
+	// fallback, which is not merely vague but false (fault tolerance was fine) and pointed the
+	// operator at `cluster add` instead of at the broker's nats.conf.
+	// origin: batch-c internal review tests-F9. This scans ALL nodes and folds by SEVERITY before
+	// picking one, rather than returning whichever degraded node came first in the table. Returning by
+	// table order contradicted the very banner this card sits under: computeHealth folds with
+	// WorstTopoState, so a cluster with one HELD broker and one STUCK broker printed a headline about
+	// the HELD one ("run `cluster add`") beneath a banner about the STUCK one ("its nats.conf cannot be
+	// rendered/validated"). A card whose headline disagrees with its own banner is worse than no
+	// headline.
+	worst, worstNode := natsconf.TopoUnreported, ""
+	for _, n := range rep.Nodes {
+		reached := n.ReachSource == "self" || (n.ReachSource == "nats-health" && n.Reachable)
+		if n.Phase != "VOTER" || !reached {
+			continue
+		}
+		st := natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, rep.TopoDesired, n.TopoReported)
+		if natsconf.WorstTopoState(worst, st) == st && st != worst {
+			worst, worstNode = st, n.NodeID
+		}
+	}
+	switch worst {
+	case natsconf.TopoStuck:
+		return "broker " + worstNode + " NATS topology reconcile STUCK"
+	case natsconf.TopoHeld:
+		return "broker " + worstNode + " standalone→clustered cutover WITHHELD (run `cluster add`)"
+	case natsconf.TopoUnknownAction:
+		return "broker " + worstNode + " reported an unrecognized topology action (newer release?)"
+	}
 	for _, n := range rep.Nodes {
 		if n.Inconsistent {
-			return "node " + n.NodeID + " roster/raft INCONSISTENT"
+			// EXTERNAL review m1: name the ACTUAL inconsistency. Batch C gave this bool a second
+			// meaning; printing the roster/raft cause for a dead drain misstated both the cause and
+			// the remedy.
+			switch n.InconsistentReason {
+			case adminsock.InconsistentDrainingWithoutMarker:
+				return "node " + n.NodeID + " DRAINING with no drain marker (run `cluster drain --abort`)"
+			default:
+				return "node " + n.NodeID + " roster/raft INCONSISTENT"
+			}
 		}
 	}
 	for _, n := range rep.Nodes {

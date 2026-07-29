@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
 )
@@ -47,6 +48,11 @@ type xferInflightRecord struct {
 	Bucket     string    `json:"bucket"`
 	Path       string    `json:"path"`
 	StartedAt  time.Time `json:"started_at"`
+	// Size (batch C) is the declared transfer size, so a recovering broker derives the SAME budget the
+	// live watchdog was using. Additive omitempty: a record written before batch C has no size, which
+	// degrades to the fixed tier floor — the pre-batch-C behaviour, and the fail-SAFE direction (a
+	// live transfer is declared stranded no EARLIER than it used to be, never sooner).
+	Size int64 `json:"size,omitempty"`
 
 	// Terminal (external RE-REVIEW F1) is the COMPLETE, already-decided terminal audit record, staged
 	// here BEFORE it is forwarded. It turns this ledger into an OUTBOX and is what closes the second
@@ -135,7 +141,31 @@ func xferInflightFilename(transferID string) string {
 	return hex.EncodeToString(sum[:]) + ".json"
 }
 
-func transferTimeoutFor(tier string) time.Duration {
+// transferTimeoutFor is the budget a RECOVERING broker attributes to a transfer it finds in the
+// ledger. It must agree with the live watchdog (proto.XferBudget over the same legs), or crash
+// recovery declares a transfer stranded while the process that owned it would still have been
+// waiting — writing a `failed` terminal for something that was healthy.
+//
+// size==0 is an old record (written before batch C added Size) and yields the fixed tier floor: the
+// pre-batch-C behaviour, and the direction that can only wait LONGER, never reap sooner.
+func transferTimeoutFor(tier string, size int64) time.Duration {
+	return proto.XferBudget(tier, size, proto.XferPushLegs)
+}
+
+// transferTierFloorFor is the FIXED per-tier timeout, and it is deliberately NOT the size-derived
+// budget. It has exactly one caller: the synthetic terminal's Ts and DurationMs.
+//
+// Ts is the dedup carrier. TransferRecordReqID hashes the whole normalized record, so two
+// incarnations that disagree about Ts produce two DIFFERENT reqIDs for the same transfer and the
+// replicated dedup ledger cannot collapse them — the audit then claims the transfer both failed and
+// failed again, at two timestamps. Deriving Ts from the size-derived budget would make it depend on
+// XferMinThroughput, so a ROLLBACK (or any future retune of that constant) would have the old and
+// new binaries stamp different Ts for the identical ledger record. Pinning Ts to the tier floor
+// keeps it a pure function of (StartedAt, tier), which is stable across versions by construction.
+//
+// The stranded DECISION does use the real budget — that one must track the live watchdog or recovery
+// declares a healthy slow transfer stranded. The two uses are genuinely different questions.
+func transferTierFloorFor(tier string) time.Duration {
 	if tier == "b" {
 		return transferTimeoutTierB
 	}
@@ -206,9 +236,12 @@ func (b *Broker) stageXferInflightTerminal(transferID string, rec schema.AuditTr
 	if err != nil {
 		// No start record (single-mode, pre-ledger transfer, or an unreadable file): stage a
 		// self-contained record so recovery can still replay the exact terminal.
+		// batch C: Size is carried here too. This is the SECOND writer of an xferInflightRecord, and
+		// the one easy to miss — a Size filled only on the start path would leave every
+		// synthesized-terminal record at 0 and quietly re-fix the budget at the tier floor.
 		cur = xferInflightRecord{TransferID: transferID, Session: rec.Session, Node: rec.Node,
 			ActorNkey: rec.ActorNkey, ActorFp: rec.ActorFp, Verb: rec.Verb, Tier: rec.Tier,
-			Bucket: rec.Bucket, Path: rec.Path, StartedAt: rec.Ts}
+			Bucket: rec.Bucket, Path: rec.Path, StartedAt: rec.Ts, Size: rec.Bytes}
 	}
 	cur.Terminal = &rec
 	werr := b.writeLedgerRecord(dir, cur)
@@ -247,7 +280,7 @@ func (b *Broker) writeXferInflight(e *transferEntry) {
 	if err := b.writeLedgerRecord(dir, xferInflightRecord{
 		TransferID: e.transferID, Session: e.sid, Node: e.nid,
 		ActorNkey: e.actor, ActorFp: e.actorFP, Verb: e.verb, Tier: e.tier,
-		Bucket: e.bucket, Path: e.path, StartedAt: e.startedAt,
+		Bucket: e.bucket, Path: e.path, StartedAt: e.startedAt, Size: e.size,
 	}); err != nil {
 		b.cfg.Logger.Warn("broker: install xfer-inflight ledger", "err", err)
 		return
@@ -559,10 +592,57 @@ func ledgerRowDisposition(in ledgerRowInputs) (ledgerDisposition, string) {
 			"terminals only, so that row is a decided outcome this process cannot read, and synthesizing " +
 			"beside it would commit a terminal that contradicts evidence still on disk"
 	}
-	if in.Now.Sub(in.Rec.StartedAt) < transferTimeoutFor(in.Rec.Tier)+xferStrandedSlack {
+	if in.Now.Sub(in.Rec.StartedAt) < transferTimeoutFor(in.Rec.Tier, in.Rec.Size)+xferStrandedSlack {
 		return ledgerLeave, "younger than its tier timeout + slack — slow, not stranded"
 	}
 	return ledgerSynthesize, "stranded past timeout + slack with no exact terminal at either site"
+}
+
+// ledgerProtectedObjects returns the object names the DURABLE ledger says are still inside their
+// watchdog budget, keyed by "<bucket>/<object>". The object name IS the transfer id at every writer
+// (the ctl's Put and the agent's Put both use it), so this is an exact identity match, not a heuristic.
+//
+// origin: batch-c EXTERNAL review B2. The orphan reaper decided "nobody owns this object" from the
+// IN-MEMORY tracker alone — which a restart rebuilds EMPTY. With the tier-B budget now size-derived
+// (up to 35m08s) and the home grace still 2 minutes, a broker restart during a large transfer meant
+// the reaper deleted an object whose transfer was very much alive, roughly two minutes in. The
+// internal review had recorded that as an accepted residual on the grounds that there was no durable
+// evidence of ownership; that was simply wrong. This ledger has existed since #57 and already carries
+// the transfer id, bucket, size and start time — everything the decision needs.
+//
+// Read errors yield an EMPTY set and are reported. The caller must treat "I could not read the
+// ledger" as "do not delete anything on evidence I do not have", never as "nothing is protected".
+func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, error) {
+	protected := map[string]bool{}
+	var firstErr error
+	for _, dir := range []string{b.xferInflightDir(), b.xferTerminalOutboxDir()} {
+		if dir == "" {
+			continue
+		}
+		unresolved, err := b.forEachLedgerRecord(dir, func(_ string, rec xferInflightRecord) {
+			// A row carrying a TERMINAL is a decided outcome — its object is disposable.
+			if rec.Terminal != nil || rec.Bucket == "" || rec.TransferID == "" {
+				return
+			}
+			if rec.StartedAt.IsZero() {
+				// No start time to judge against. Protect it: a row we cannot age is exactly the kind of
+				// evidence that must not be resolved in favour of deletion.
+				protected[rec.Bucket+"/"+rec.TransferID] = true
+				return
+			}
+			budget := transferTimeoutFor(rec.Tier, rec.Size) + xferStrandedSlack
+			if now.Sub(rec.StartedAt) < budget {
+				protected[rec.Bucket+"/"+rec.TransferID] = true
+			}
+		})
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if len(unresolved) > 0 && firstErr == nil {
+			firstErr = fmt.Errorf("%d unreadable ledger row(s) in %s", len(unresolved), dir)
+		}
+	}
+	return protected, firstErr
 }
 
 func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
@@ -645,7 +725,8 @@ func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 			}
 			return
 		}
-		timeout := transferTimeoutFor(rec.Tier)
+		// DELIBERATELY the tier floor, not the size-derived budget — see transferTierFloorFor.
+		timeout := transferTierFloorFor(rec.Tier)
 		synthetic := schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: rec.Verb,
 			Ts: rec.StartedAt.Add(timeout), Session: rec.Session, Node: rec.Node,

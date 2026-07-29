@@ -31,10 +31,13 @@ var brokerCodeHints = map[string]string{
 	"already_exists": "a session with that name already exists. If an earlier `session create` request timed out with no reply, the write may still have committed — check `tether session ls`; otherwise the name is taken, pick another.",
 	"actor_invalid":  "your identity is malformed; if this persists, regenerate keys with `rm -rf ~/.tether/keys/` (loses session memberships).",
 	// Node lifecycle
-	"node_not_found":       "no agent registered under that nid in this session; check `tether ps`.",
-	"node_offline":         "the agent is OFFLINE (no recent heartbeat); start it with `tether agent --session <sid> --nid <nid>`.",
-	"agent_no_responders":  "the agent isn't reachable on NATS; check it's running and connected.",
-	"agent_malformed_resp": "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
+	"node_not_found":      "no agent registered under that nid in this session; check `tether ps`.",
+	"node_offline":        "the agent is OFFLINE (no recent heartbeat); start it with `tether agent --session <sid> --nid <nid>`.",
+	"agent_no_responders": "the agent isn't reachable on NATS; check it's running and connected.",
+	// batch C: the tier-B watchdog's own code. Deliberately NOT the agent_no_responders hint — this
+	// fires on a transfer that may have been perfectly healthy, just slower than the budget.
+	"transfer_budget_exceeded": "the transfer did not finish inside the broker's budget (derived from the file size and the slowest link tether promises to cover). The agent may be fine — check the link, or split the file; `tether expose` + rsync is the escape hatch for very large or very slow transfers.",
+	"agent_malformed_resp":     "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
 	// Upgrade
 	"url_not_allowed":               "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
 	"url_not_allowed_local":         "the agent re-checks the URL against its OWN allowlist, and that URL isn't on it; set the agent's `--upgrade-url-allow` flag or the `upgrade.url_allow` list in its agent.yaml (opening the broker's allowlist alone is not enough).",
@@ -81,7 +84,10 @@ var brokerCodeExitClasses = map[string]int{
 	"not_owner": exitNoPerm, "not_owner_or_creator": exitNoPerm, "not_a_member": exitNoPerm,
 	// positively transient (self-healing) -> retry-later
 	"agent_no_responders": exitTransient, "leader_unavailable": exitTransient,
-	"home_catching_up": exitTransient, "try_again": exitTransient,
+	// batch C: a budget overrun is retry-able — the same file on a faster link, or a smaller file,
+	// genuinely succeeds. 75 rather than 70 keeps a monitor from reading it as a tether bug.
+	"transfer_budget_exceeded": exitTransient,
+	"home_catching_up":         exitTransient, "try_again": exitTransient,
 	// Mega-audit MAJ-7: C5 proxy quorum-loss is a designed self-healing transient (the leader heals on
 	// re-election) — map to 75 so a monitor retries instead of treating it as a tether bug (70).
 	"proxy_disabled_no_quorum": exitTransient, "proxy_frozen_readonly": exitTransient,

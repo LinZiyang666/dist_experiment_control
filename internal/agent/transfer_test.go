@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // canonDir resolves symlinks in a test dir path. t.TempDir() is not
@@ -161,29 +163,89 @@ func TestNew_PartialDropNarrow(t *testing.T) {
 
 func TestPushCommitCacheExpiresAndStaysBounded(t *testing.T) {
 	now := time.Now()
+	// Expiry is PER ENTRY, keyed on that entry's own size, so a tiny transfer's prep is short-lived.
 	a := &Agent{pushCommitCache: map[string]pushCommitEntry{
-		"stale": {added: now.Add(-pushCommitCacheTTL - time.Second)},
+		"stale": {added: now.Add(-pushCommitEntryTTL(0) - time.Second)},
 	}}
-	a.rememberPushCommit("fresh", pushCommitEntry{})
+	if !a.rememberPushCommit("fresh", pushCommitEntry{}) {
+		t.Fatal("remember refused with a nearly-empty cache")
+	}
 	if _, ok := a.pushCommitCache["stale"]; ok {
 		t.Fatal("stale push commit entry was not purged")
 	}
 	if _, ok := a.pushCommitCache["fresh"]; !ok {
 		t.Fatal("fresh push commit entry missing")
 	}
+}
 
-	a.pushCommitCache = make(map[string]pushCommitEntry, pushCommitCacheMaxEntries)
-	for i := 0; i < pushCommitCacheMaxEntries; i++ {
-		a.pushCommitCache[fmt.Sprintf("id-%04d", i)] = pushCommitEntry{
-			added: now.Add(time.Duration(i) * time.Nanosecond),
+// TestPushCommitCacheNeverEvictsALiveLargeTransfer pins the batch-C behaviour change, and it is the
+// test that has to be BEHAVIOURAL rather than a constant inequality.
+//
+// The pre-batch-C cache had TWO eviction paths: the TTL sweep, and "at capacity, delete the entry
+// with the earliest `added`". Making a large transfer's prep entry live longer — which the size-
+// derived budget REQUIRES, since the ctl now takes ~17 minutes to upload 2 GiB — makes that second
+// path fire on precisely the entry being protected: the oldest live entry is by construction the
+// longest-running, largest transfer. A test asserting only `TTL > uploadBudget` would stay green
+// while the capacity path silently killed the transfer.
+//
+// Mutations: (a) restore evict-oldest instead of refusing; (b) make pushCommitEntryTTL a single
+// global constant again. Either reddens.
+func TestPushCommitCacheNeverEvictsALiveLargeTransfer(t *testing.T) {
+	now := time.Now()
+	a := &Agent{pushCommitCache: map[string]pushCommitEntry{}}
+
+	// The entry we must not lose: a maximum-size transfer whose upload has been running for a quarter
+	// of an hour. Under the old flat 6-minute TTL it would already be gone.
+	big := pushCommitEntry{size: proto.XferMaxBytes, added: now.Add(-15 * time.Minute)}
+	a.pushCommitCache["big"] = big
+	if pushCommitEntryExpired(big, now) {
+		t.Fatalf("a %d-byte transfer's prep expired after 15m; its TTL is %s and the ctl needs %s just "+
+			"to upload it", proto.XferMaxBytes, pushCommitEntryTTL(big.size), proto.XferLegBudget(big.size))
+	}
+
+	// Now flood the cache to capacity with small, still-live entries.
+	for i := 0; len(a.pushCommitCache) < pushCommitCacheMaxEntries; i++ {
+		a.pushCommitCache[fmt.Sprintf("id-%04d", i)] = pushCommitEntry{added: now}
+	}
+	if a.rememberPushCommit("newest", pushCommitEntry{}) {
+		t.Fatal("remember accepted an entry while the cache was full of LIVE entries — the only way to " +
+			"make room is to evict one, and the victim would be the oldest, i.e. the biggest transfer " +
+			"in flight")
+	}
+	if _, ok := a.pushCommitCache["big"]; !ok {
+		t.Fatal("the long-running large transfer's prep entry was evicted to make room for a new one")
+	}
+	if _, ok := a.pushCommitCache["newest"]; ok {
+		t.Fatal("the refused entry was stored anyway")
+	}
+
+	// Once the small entries age out, the cache accepts again — the refusal is retriable, not a wedge.
+	for id, e := range a.pushCommitCache {
+		if id == "big" {
+			continue
 		}
+		e.added = now.Add(-pushCommitEntryTTL(0) - time.Second)
+		a.pushCommitCache[id] = e
 	}
-	a.rememberPushCommit("newest", pushCommitEntry{})
-	if got := len(a.pushCommitCache); got != pushCommitCacheMaxEntries {
-		t.Fatalf("cache len=%d, want %d", got, pushCommitCacheMaxEntries)
+	if !a.rememberPushCommit("newest", pushCommitEntry{}) {
+		t.Fatal("the cache never recovers: expired entries were not swept on the next insert")
 	}
-	if _, ok := a.pushCommitCache["newest"]; !ok {
-		t.Fatal("new entry was not retained at cache cap")
+	if _, ok := a.pushCommitCache["big"]; !ok {
+		t.Fatal("the sweep took the live large entry with it")
+	}
+}
+
+// TestPushCommitTTLCoversTheUploadItWaitsOn: the prep entry has to outlive the ctl's upload of that
+// exact file, or push-commit arrives to a cache miss and the agent answers transfer_unknown.
+//
+// Mutation: drop pushCommitCacheSlack, or key the TTL on something other than size — reddens.
+func TestPushCommitTTLCoversTheUploadItWaitsOn(t *testing.T) {
+	for _, size := range []int64{0, 1, 8 * 1024 * 1024, 512 * 1024 * 1024, proto.XferMaxBytes} {
+		ttl, upload := pushCommitEntryTTL(size), proto.XferLegBudget(size)
+		if ttl <= upload {
+			t.Errorf("size=%d: prep TTL %s does not exceed the ctl's own upload budget %s — the entry "+
+				"can expire before push-commit is even sent", size, ttl, upload)
+		}
 	}
 }
 

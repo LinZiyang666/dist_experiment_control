@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 )
 
 // cluster_doctor_online.go — B7 DOC#6(b): the ONLINE `cluster doctor` diagnostic. `cluster doctor`
@@ -44,10 +47,23 @@ func clusterDoctorOnline(rep *adminsock.ClusterStatusReport) []clusteroffline.Do
 
 	// per-node conditions.
 	var inconsistent, unreachable, behind, streamShort, lowDisk, nearPorts int
+	// batch C: topology had NO doctor check at all, so `cluster doctor` PASSed every item on a
+	// cluster whose reconciler was permanently wedged. Counted per state because the remedies differ:
+	// STUCK needs the conf fixed, HELD needs `cluster add` and must never be told to run `--manual`.
+	// origin: batch-c EXTERNAL review M2. This collected only Stuck and Held, so a Behind or an
+	// UnknownAction voter fell through to the PASS branch — `cluster doctor` then printed "every
+	// reached voter's NATS topology reconcile is converging" while the authoritative health report said
+	// DEGRADED about that same voter. UnknownAction is the worse of the two to call PASS: it means this
+	// binary CANNOT judge that broker, and the remedy is to upgrade the reader, not to wait.
+	// The state set is closed, so the consumer covers all of it.
+	var topoStuck, topoHeld, topoBehind, topoUnknown []string
 	versions := map[string]bool{}
+	// EXTERNAL review m1: keep the per-reason detail so the check names the right cause and remedy.
+	inconsistentDetail := map[string]bool{}
 	for _, n := range rep.Nodes {
 		if n.Inconsistent {
 			inconsistent++
+			inconsistentDetail[adminsock.InconsistencyDetail(n.InconsistentReason)] = true
 		}
 		if n.ReachSource == "nats-health" && !n.Reachable {
 			unreachable++
@@ -69,6 +85,20 @@ func clusterDoctorOnline(rep *adminsock.ClusterStatusReport) []clusteroffline.Do
 		if n.ReleaseVersion != "" {
 			versions[n.ReleaseVersion] = true
 		}
+		// Only a REACHED voter's topology report means anything — mirror computeHealth's `reached`
+		// gate rather than inventing a third one.
+		if n.Phase == "VOTER" && (n.ReachSource == "self" || (n.ReachSource == "nats-health" && n.Reachable)) {
+			switch natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, rep.TopoDesired, n.TopoReported) {
+			case natsconf.TopoStuck:
+				topoStuck = append(topoStuck, n.NodeID)
+			case natsconf.TopoHeld:
+				topoHeld = append(topoHeld, n.NodeID)
+			case natsconf.TopoBehind:
+				topoBehind = append(topoBehind, n.NodeID)
+			case natsconf.TopoUnknownAction:
+				topoUnknown = append(topoUnknown, n.NodeID)
+			}
+		}
 	}
 	add := func(name string, n int, fatal bool, okDetail, badFmt string) {
 		switch {
@@ -80,12 +110,51 @@ func clusterDoctorOnline(rep *adminsock.ClusterStatusReport) []clusteroffline.Do
 			out = append(out, check(name, clusteroffline.DoctorAdvisory, fmt.Sprintf(badFmt, n)))
 		}
 	}
-	add("roster_consistency", inconsistent, true, "no roster/raft INCONSISTENT nodes", "%d node(s) roster/raft INCONSISTENT — run `cluster doctor`/`status`")
+	// EXTERNAL review m1: the old bad-format text said "roster/raft INCONSISTENT — run cluster
+	// doctor/status", which for the drain case named the wrong cause AND recursed the operator back
+	// into the command they were already running. The detail is now derived per reason.
+	if inconsistent == 0 {
+		out = append(out, check("roster_consistency", clusteroffline.DoctorPass, "no INCONSISTENT nodes"))
+	} else {
+		reasons := make([]string, 0, len(inconsistentDetail))
+		for d := range inconsistentDetail {
+			reasons = append(reasons, d)
+		}
+		sort.Strings(reasons)
+		out = append(out, check("roster_consistency", clusteroffline.DoctorFatal,
+			fmt.Sprintf("%d node(s) INCONSISTENT: %s", inconsistent, strings.Join(reasons, "; "))))
+	}
 	add("reachability", unreachable, false, "every polled voter is reachable", "%d voter(s) unreachable")
 	add("catch_up", behind, false, "every voter is caught up", "%d voter(s) trailing the leader's commit")
 	add("stream_replicas", streamShort, false, "JS streams at target replicas", "%d stream(s) below target replica count")
 	add("disk", lowDisk, false, "disk headroom ok on every reporting node", "%d node(s) low on disk (<10%% free)")
 	add("ports", nearPorts, false, "port headroom ok", "%d node(s) near port exhaustion (>=90%% used)")
+
+	// batch C: topology. STUCK is FATAL — the reconciler is fail-closed and no further topology
+	// change on that broker can land, so the next grow/retire will hang at NATS_ROLLED_OUT. HELD is
+	// ADVISORY and carries the NEGATIVE clause: before this batch a withheld cutover was classified
+	// STUCK, whose remedy text recommends `reconcile nats --manual` — the one command that would
+	// apply a clustered conf under a running standalone nats-server (G4 #10/#4).
+	switch {
+	case len(topoStuck) > 0:
+		out = append(out, check("topology", clusteroffline.DoctorFatal, fmt.Sprintf(
+			"topology reconcile STUCK on %v — %s", topoStuck, natsconf.TopoStuck.NextStep())))
+	case len(topoHeld) > 0:
+		out = append(out, check("topology", clusteroffline.DoctorAdvisory, fmt.Sprintf(
+			"standalone→clustered cutover WITHHELD on %v — %s", topoHeld, natsconf.TopoHeld.NextStep())))
+	case len(topoUnknown) > 0:
+		// ADVISORY, not PASS and not FATAL: this binary cannot judge those brokers, and saying so is the
+		// only honest verdict. FATAL would be an over-claim — a newer broker reporting a newer action is
+		// not evidence of a fault.
+		out = append(out, check("topology", clusteroffline.DoctorAdvisory, fmt.Sprintf(
+			"topology action UNRECOGNIZED from %v (they are probably NEWER than this binary) — %s",
+			topoUnknown, natsconf.TopoUnknownAction.NextStep())))
+	case len(topoBehind) > 0:
+		out = append(out, check("topology", clusteroffline.DoctorAdvisory, fmt.Sprintf(
+			"topology still converging on %v — %s", topoBehind, natsconf.TopoBehind.NextStep())))
+	default:
+		out = append(out, check("topology", clusteroffline.DoctorPass, "every reached voter's NATS topology reconcile is converging"))
+	}
 
 	if len(versions) > 1 {
 		out = append(out, check("version_skew", clusteroffline.DoctorAdvisory, fmt.Sprintf("%d distinct releases running — finish the rolling upgrade", len(versions))))

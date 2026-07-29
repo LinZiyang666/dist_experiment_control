@@ -458,8 +458,36 @@ JetStream. `cluster status` now raises a **DATA-PLANE DEGRADED** banner when thi
   survivor$ sudo systemd-run --collect --unit tether-nats-restart sh -c 'systemctl restart nats-server'
   ```
 
-  The abandoned peers are already pruned (below), so the N=1 voter tally passes and `--to-standalone`
-  is unlocked.
+  **先确认 abandoned peers 的 roster 行真的没了，再执行上面这步。** `--to-standalone` 的 N=1 证明
+  逐节点校验 raft role，而 ghost 行的 role 是空串，会被
+  `node %q has an unrecognized raft role "" — cannot prove N=1, refusing` 直接拒绝。
+
+  正常情况下 force-single 的 commit 已经同步 prune 完，`cluster status` 里看不到那些节点，直接往下走即可。
+  **若 commit 打印了 `WARNING: the roster prune of the abandoned peers did NOT complete`**（v0.4.8 起）：
+
+  - 它同时会给出一个 finalize operation 的 id ⇒ `tether cluster ops show <op-id>` 跟到终态；
+    终态是 `FS_FINALIZED` 就可以继续；是 `FS_GHOST_LEFT` 就按它 `last_error` 里列的 id 逐个手工清。
+  - 它说 "no retry operation could be started" ⇒ 没有可跟的 op，直接手工清。
+
+  **若 commit 报的是 `online recover did not finish` 或 `persisting the emergency state FAILED`**
+  （v0.4.8 起）：不要重跑 `--online`——arm 门会以 `quorum_not_lost` 拒绝你，因为改写若已落盘，
+  这个节点现在**有 leader 联系（它自己）**。改写之前已经有一份 fsync 过的 recovery intent 落在
+  `<ClusterDataDir>/.force-single-online.intent`，两条错误分别对应：
+
+  - `online recover did not finish` ⇒ 不确定 raft 改写是否落盘 ⇒ **重启这个 broker**。
+    它起来后会读 committed raft 配置：还是旧配置就把 intent 安全丢弃（什么都没发生过），
+    恰为 `{self}` 就照 intent 把 marker/epoch/prune 补完。
+  - `persisting the emergency state FAILED` ⇒ 改写已落盘、只差复制事实 ⇒ **不用做任何事**，
+    下一个 leader tick（秒级）会补完。补完之前 `cluster status` 可能还不显示 FORCE_SINGLE，
+    **这段时间不要跑 destructive 命令**（门是 `QuorumLost || ForceSingleActive`，此刻两个都是假）。
+
+  两条都用**在 broker 主机上**的 `tether cluster status --json | jq -r .health` 确认补完
+  （socket view，补完后是 `FORCE_SINGLE`；从 ctl 远程看是 `.force_single_active`）；
+  intent 文件消失 = 连 ghost roster 行都清干净了。
+
+  手工清的命令就是下一段的 `cluster recovery node remove <id> --manual`
+  （无 TTY 时加 `--confirm-node-id <id>`）。清干净之前**不要**执行上面的 `--to-standalone`：
+  它只会拒绝，而错误串讲的是 raft role，看不出真正的原因。
 
 **Abandoned-peer roster (#12).** force-single now PRUNES the abandoned peers from the roster automatically
 (both the online and offline paths), so agents/ctl converge to N=1 immediately — the dead endpoints stop

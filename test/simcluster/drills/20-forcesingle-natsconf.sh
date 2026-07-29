@@ -87,6 +87,58 @@ assert_ok "#20 FIXED: tier-B push WORKS at N=1 after auto-de-cluster (standalone
 assert_ok "#12 FIXED: abandoned brk2 pruned from the roster (no ghost VOTER)" \
     sh -c "! $SIM status --json | jq -e '.nodes[]? | select(.node_id==\"brk2\")' >/dev/null 2>&1"
 
+# ── EXTERNAL review T1/B1: an INTERRUPTED recovery must FORWARD-COMPLETE from its on-disk intent ────
+#
+# The window B1 names is: the irreversible raft rewrite LANDED and the marker/epoch/prune did not.
+# Before the durable intent existed that state was unrecoverable — `cluster status` did not report
+# FORCE_SINGLE, the ctl destructive gate (QuorumLost || ForceSingleActive) was FULLY OPEN because the
+# rewrite had just made QuorumLost false, and the documented repair (`re-run --online`) is refused by
+# the arm gate precisely because the node now has leader contact: its own.
+#
+# This drill is where the injection is REACHABLE: it ends with a de-clustered, bootable N=1 whose
+# JetStream works (asserted directly above), so the broker can actually be restarted and come back.
+# (22-forcesingle-online deliberately leaves the conf CLUSTERED, which is the #35 startup crash-loop
+# context — measured there at NRestarts=21 in a 45s window.)
+#
+# The intent and missing replicated facts are planted rather than raced into a sub-second SIGKILL
+# window: what is under test is the RECOVERY, and the state an interruption leaves is exactly a
+# rewritten {self} raft store + fsync'd intent + absent marker/epoch. The broker is stopped while
+# sqlite is fault-injected, so no live writer is bypassed. This reproduces the crash boundary; it
+# does not perform any recovery step on the product's behalf.
+_t1_intent=/var/lib/tether/.force-single-online.intent
+_t1_plant() {
+    $SIM exec brk1 -- sh -c "cat > $_t1_intent <<JSON
+{\"self_id\":\"brk1\",\"abandoned\":[\"brk2\"],\"epoch\":\"0123456789abcdef0123456789abcdef\",\"marked_at\":\"2026-07-29T00:00:00Z\"}
+JSON
+chown tether:tether $_t1_intent && chmod 600 $_t1_intent"
+}
+_t1_consumed()   { ! $SIM exec brk1 -- test -f "$_t1_intent"; }
+_t1_up()         { $SIM exec brk1 -- sh -c 'tether cluster status --json 2>/dev/null | jq -e ".leader_id!=\"\"" >/dev/null' 2>/dev/null; }
+
+assert_ok "T1/B1 setup: stop the broker before fault-injecting its post-rewrite durable state" \
+    "$SIM" exec brk1 -- systemctl stop tether-broker
+assert_ok "T1/B1 setup: delete marker+epoch to reproduce the exact crash window after raft rewrite" \
+    "$SIM" exec brk1 -- runuser -u tether -- sqlite3 /var/lib/tether/tether.db \
+        "DELETE FROM cluster_meta WHERE key IN ('force_single_active','force_single_epoch');"
+assert_ok "T1/B1 setup: plant the durable intent an INTERRUPTED online force-single would have left" _t1_plant
+assert_ok "T1/B1 non-vacuity: intent EXISTS and marker+epoch are both ABSENT before restart" \
+    sh -c "$SIM exec brk1 -- sh -c 'test -f $_t1_intent && test \"\$(sqlite3 -readonly /var/lib/tether/tether.db \"SELECT count(*) FROM cluster_meta WHERE key IN ('\\''force_single_active'\\'','\\''force_single_epoch'\\'')\")\" = 0'"
+assert_ok "T1/B1 setup: start brk1 so the intent is met on a fresh leadership acquisition" \
+    sh -c "$SIM exec brk1 -- systemctl start tether-broker"
+assert_ok "T1/B1 precondition: brk1 comes back up and has a leader (this drill's de-clustered N=1 is bootable, unlike drill 22's clustered survivor)" \
+    poll_until 60 3 "brk1 leader after restart" -- _t1_up
+if poll_until 90 3 "brk1 consumed the planted recovery intent" -- _t1_consumed; then
+    assert_ok "T1/B1: an INTERRUPTED recovery forward-completes from its on-disk intent — the trigger is the INTENT, not the force_single_active marker it may never have written" sh -c "true"
+    assert_ok "T1/B1: force_single_active is reported afterwards, so cluster status shows the emergency and the ctl destructive gate stays CLOSED" \
+        sh -c "$SIM exec brk1 -- sh -c 'tether cluster status --json 2>/dev/null | jq -e \".force_single==true or (.health_label|test(\\\"FORCE.?SINGLE\\\";\\\"i\\\"))\" >/dev/null'"
+    assert_ok "T1/B1: the exact epoch from the pre-rewrite intent was restored (no fresh token minted)" \
+        sh -c "$SIM exec brk1 -- sh -c '[ \"\$(sqlite3 -readonly /var/lib/tether/tether.db \"SELECT value FROM cluster_meta WHERE key='\\''force_single_epoch'\\''\")\" = 0123456789abcdef0123456789abcdef ]'"
+else
+    log "DIAG T1/B1: broker log →"
+    $SIM exec brk1 -- sh -c 'journalctl -u tether-broker --no-pager -n 500 2>/dev/null | grep -iE "intent|data dir|force.single" | tail -25' 2>&1 | sed 's/^/[diag t1] /'
+    product_red "T1/B1 NOT recovered: brk1 restarted cleanly and has a leader, yet the planted force-single intent was still on disk 90s later — an interrupted recovery does not forward-complete, so the post-rewrite window remains unrecoverable (external review B1)"
+fi
+
 # GREEN regression since the #20 (offline auto-de-cluster from cluster_nodes identity) + #12 (abandoned
 # prune) fixes. Was RED: force-single left the conf clustered → JS silently 503-rotted for days.
 drill_end

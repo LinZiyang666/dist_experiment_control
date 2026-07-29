@@ -253,50 +253,109 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	if err != nil {
 		return fsRefuse(op, adminsock.CodeForceSingleRefused, "resolve self raft addr: %v", err)
 	}
-	// THE in-process swap. On failure the node stays read-only (never bricked); offline is the floor.
-	if err := b.admin.node.RecoverToSelfOnline(selfAddr); err != nil {
-		return fsRefuse(op, adminsock.CodeStoreError, "online recover: %v", err)
-	}
-	// F1: the marker + epoch are part of the success boundary. The raft rewrite already succeeded (the
-	// node is a writable single voter), so on any failure below we return a LOUD failure naming the
-	// repair — re-running re-arms + retries (RecoverToSelfOnline is idempotent on an already-{self} node).
-	if err := b.admin.node.WaitForLeader(forceSingleLeaderWait); err != nil {
-		return fsRefuse(op, adminsock.CodeStoreError,
-			"online recover rewrote raft to {self} but leadership did not settle in %s (%v); "+
-				"re-run `cluster recovery force-single --online` to retry the marker write", forceSingleLeaderWait, err)
-	}
-	if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetForceSingle(time.Now()) }); err != nil {
-		return fsRefuse(op, adminsock.CodeStoreError,
-			"online recover succeeded (node is a writable single voter) but persisting force_single_active FAILED (%v); "+
-				"status will NOT show the emergency — re-run `cluster recovery force-single --online` to retry", err)
-	}
-	epoch, err := newRecoveryEpoch()
-	if err != nil {
-		return fsRefuse(op, adminsock.CodeStoreError,
-			"online recover + force_single_active set, but generating the recovery epoch FAILED (%v); "+
-				"re-run `cluster recovery force-single --online` to retry", err)
-	}
-	if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanForceSingleEpoch(epoch) }); err != nil {
-		return fsRefuse(op, adminsock.CodeStoreError,
-			"online recover + force_single_active set, but persisting the recovery epoch FAILED (%v); "+
-				"the split-brain detector has no durable epoch — re-run `cluster recovery force-single --online` to retry", err)
-	}
+	// origin: batch-c EXTERNAL review B1. The DURABLE INTENT is written and fsync'd BEFORE the
+	// irreversible rewrite, and it is what makes every window past this point recoverable.
+	//
+	// Before this, the only record that a force-single had happened was the force_single_active marker
+	// — written AFTER the rewrite. So the very failure that mattered most (the marker not landing) also
+	// erased the evidence needed to notice it: `cluster status` showed a merely-DEGRADED cluster, the
+	// destructive gate (QuorumLost || ForceSingleActive) went FULLY OPEN because the rewrite had just
+	// made QuorumLost false, the error text told the operator to re-run a command the dwell gate now
+	// refuses (the node has leader contact — its own), and the leadership-edge resume was keyed on that
+	// same missing marker.
+	//
+	// It is a local file, so it needs no quorum — which is the point, since this runs on a quorum-lost
+	// node. The epoch is minted HERE and carried in the intent so every resume proposes the SAME value:
+	// minting it after the rewrite is what made "did the epoch I promised actually land?" unanswerable
+	// when the epoch write was the step that failed.
 	abandoned := make([]string, 0, len(roster))
 	for _, p := range roster {
 		abandoned = append(abandoned, p.NodeID)
 	}
+	epoch, err := newRecoveryEpoch()
+	if err != nil {
+		// Fail BEFORE the rewrite: nothing irreversible has happened yet, so a plain refusal is honest
+		// and the operator can simply re-run.
+		return fsRefuse(op, adminsock.CodeStoreError, "generate the recovery epoch: %v", err)
+	}
+	intent := clusteroffline.OnlineIntent{
+		SelfID: selfID, Abandoned: abandoned, Epoch: epoch,
+		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	// A leadership edge can be observed as soon as the replacement raft elects itself. Keep that
+	// recovery callback out until this handler has either completed its synchronous prune or returned:
+	// otherwise the callback can create a retry op for the same ghosts while the happy path is still
+	// running, violating the "clean recovery creates no op" contract.
+	b.admin.forceSingleIntentMu.Lock()
+	defer b.admin.forceSingleIntentMu.Unlock()
+	if err := clusteroffline.WriteOnlineIntent(b.admin.dataDir, intent); err != nil {
+		return fsRefuse(op, adminsock.CodeStoreError,
+			"could not record the force-single intent on disk (%v); refusing to start an irreversible "+
+				"raft rewrite that nothing would be able to finish if this process died", err)
+	}
+
+	// THE in-process swap. On failure the node stays read-only (never bricked); offline is the floor.
+	if err := b.admin.node.RecoverToSelfOnline(selfAddr); err != nil {
+		// RecoverToSelfOnline can fail either BEFORE RecoverCluster changes disk, or AFTER disk is
+		// already {self} while rebuilding the transport. The caller cannot distinguish those phases
+		// from the error, so deleting the intent here reopens the exact post-rewrite crash window it
+		// exists to close. Retain it. On restart the leadership path inspects the committed raft
+		// configuration: old configuration => safely discard; exact {self} => forward-complete.
+		return fsRefuse(op, adminsock.CodeStoreError,
+			"online recover did not finish (%v); the recovery intent remains on disk because the raft "+
+				"rewrite may already have landed. Restart this broker: it will inspect the committed "+
+				"configuration and either discard a pre-rewrite intent or forward-complete a {self} recovery",
+			err)
+	}
+	// From here the rewrite has LANDED. Every remaining step is idempotent and re-derivable from the
+	// intent, so a failure returns a loud error AND leaves the intent in place for
+	// resumeForceSingleFinalizeOnLeadership to forward-complete — the repair no longer depends on an
+	// operator re-running a command the arm gate would refuse.
+	if err := b.admin.node.WaitForLeader(forceSingleLeaderWait); err != nil {
+		return fsRefuse(op, adminsock.CodeStoreError,
+			"online recover rewrote raft to {self} but leadership did not settle in %s (%v); the recovery "+
+				"intent is recorded on disk and this broker will finish it automatically as soon as it "+
+				"becomes leader — watch `tether cluster status` and `tether cluster ops ls`",
+			forceSingleLeaderWait, err)
+	}
+	if err := b.admin.applyForceSingleIntent(intent); err != nil {
+		return fsRefuse(op, adminsock.CodeStoreError,
+			"online recover succeeded (node is a writable single voter) but persisting the emergency "+
+				"state FAILED (%v); the recovery intent is recorded on disk and will be completed "+
+				"automatically on the next leader tick (seconds) — until then `cluster status` may not "+
+				"show FORCE_SINGLE, so do NOT run destructive commands", err)
+	}
 	// G2 #12: prune the abandoned peers from cluster_nodes so the signed roster converges to {self} and
 	// clients stop dialing (and failover-preferring) the dead endpoints. The raft config is ALREADY {self}
 	// (RecoverToSelfOnline moved the abandoned out above), so deleting their roster rows cannot fork quorum.
-	// BEST-EFFORT: a re-run to retry a failed prune is REFUSED by the dwell gate (the node now HAS leader
-	// contact → CodeQuorumNotLost), so a LOUD fail here would be an unreachable dead-end; log + carry on,
-	// and `cluster recovery node remove <ghost>` is the deterministic operator finalizer.
+	//
+	// batch C: the SYNCHRONOUS attempt below is unchanged, because the operator's very next documented
+	// step depends on it — a ghost roster row has no raft role, and `reconcile nats --to-standalone`
+	// refuses on an unrecognized role, so an un-pruned survivor cannot de-cluster and its JetStream
+	// stays 503. What changed is the FAILURE branch. It used to be a dead end and said so: a re-run is
+	// refused by the dwell gate (the node now HAS leader contact → CodeQuorumNotLost), so the prune had
+	// exactly one attempt and a permanent ghost on failure. Now a failure starts an
+	// OpKindForceSingleFinalize that the controller retries to a terminal state.
+	report := adminsock.ForceSingleReport{BrokerSelfID: selfID, Abandoned: abandoned}
 	if len(abandoned) > 0 {
 		if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 			return cluster.PlanClusterNodePrune(abandoned, time.Now())
 		}); err != nil {
-			b.admin.logger.Warn("online force-single: roster prune of abandoned peers failed; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is a roster/status blemish, not a quorum risk)",
-				"abandoned", abandoned, "err", err)
+			// The rows are still there on BOTH sub-branches below; say so explicitly rather than
+			// leaving the CLI to infer it from whether an op id came back.
+			report.PruneIncomplete = true
+			opID, serr := b.admin.startForceSingleFinalize(selfID, abandoned)
+			if serr != nil {
+				// Fall back to EXACTLY the pre-batch-C behaviour. Creating the op is an improvement, not
+				// a precondition: turning a survivable recovery into a hard failure at this moment would
+				// be the "one more failure mode during an emergency" this change exists to avoid.
+				b.admin.logger.Warn("online force-single: roster prune of abandoned peers failed AND a retry operation could not be started; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is not a quorum risk — but `reconcile nats --to-standalone` will REFUSE until they are gone)",
+					"abandoned", abandoned, "prune_err", err, "op_err", serr)
+			} else {
+				report.FinalizeOpID = opID
+				b.admin.logger.Warn("online force-single: roster prune failed; started a finalize operation to retry it",
+					"abandoned", abandoned, "err", err, "op", opID)
+			}
 		} else if serr := b.admin.deriveAndConvergeSeedsFromRoster(); serr != nil {
 			// G3 #1: prune succeeded → roster is {self}; converge the published seeds so clients stop
 			// dialing (and failover-preferring) the abandoned endpoints. GATED on prune success (INV-4):
@@ -305,7 +364,17 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 				"err", serr)
 		}
 	}
-	return adminsock.Response{Op: op, OK: true, ForceSingle: &adminsock.ForceSingleReport{BrokerSelfID: selfID, Abandoned: abandoned}}
+	// The intent is cleared ONLY when every promised fact is confirmed landed: marker + epoch (above)
+	// and the roster prune. If a finalize op is still retrying the prune, the intent stays so that a
+	// crash before that op terminates is still recoverable from disk.
+	if !report.PruneIncomplete {
+		if err := clusteroffline.ClearOnlineIntent(b.admin.dataDir); err != nil {
+			b.admin.logger.Warn("online force-single: completed, but the on-disk recovery intent could "+
+				"not be cleared; a later leadership tick will find it, re-verify the same facts and "+
+				"clear it then (the operations are idempotent)", "err", err)
+		}
+	}
+	return adminsock.Response{Op: op, OK: true, ForceSingle: &report}
 }
 
 // newRecoveryEpoch mints the per-recovery epoch tag (the durable input to a future cross-node

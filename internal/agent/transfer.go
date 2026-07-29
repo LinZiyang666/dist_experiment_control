@@ -43,17 +43,51 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// tier-A inline ceiling mirrors broker side; file-transfer-plan §Tier selection.
-const agentTierAMaxBytes = 8 * 1024 * 1024
+// tier-A inline ceiling. batch C: the value now comes from internal/proto, which the broker and the
+// ctl also read — three hand-kept copies of a bound the BROKER refuses at is three chances to drift
+// on one edit, and the ctl offering what the broker will refuse is a user-visible failure.
+const agentTierAMaxBytes = proto.XferTierAMaxBytes
 
 // Hard per-transfer ceiling. Every streaming path enforces this while
 // reading, not only from a pre-read stat, because regular files can grow.
-const agentTransferMaxBytes = int64(2 * 1024 * 1024 * 1024)
+const agentTransferMaxBytes = int64(proto.XferMaxBytes)
 
-const (
-	pushCommitCacheTTL        = 6 * time.Minute
-	pushCommitCacheMaxEntries = 1024
-)
+// pushCommitCacheSlack is the headroom a prep entry keeps beyond the time the CTL needs to upload
+// that file. It preserves the shape of the pre-batch-C constant: the old TTL was 6m against a 5m
+// tier-B watchdog, and that ONE MINUTE OF MARGIN was the entire meaning of the 6 — written nowhere.
+const pushCommitCacheSlack = time.Minute
+
+const pushCommitCacheMaxEntries = 1024
+
+// pushCommitEntryTTL is how long ONE prep entry stays valid, derived from ITS OWN size.
+//
+// It used to be a single 6-minute constant, which worked only because it happened to sit just above
+// the fixed 5-minute tier-B watchdog. Once the watchdog became size-derived, a 2 GiB push takes the
+// ctl ~17 minutes to upload and the entry would be swept long before push-commit arrived — the agent
+// would answer `transfer_unknown` and the whole transfer would fail, on exactly the large slow files
+// this batch exists to make work.
+//
+// PER-ENTRY, not a raised global TTL, and that distinction is load-bearing. Raising the TTL globally
+// would make every small entry linger ~3x longer, push the 1024-entry cache to capacity sooner, and
+// the capacity path evicts the OLDEST entry — which is precisely the multi-minute large transfer we
+// just extended the TTL to protect. Keying expiry on each entry's own size keeps small entries
+// short-lived, so capacity pressure does not rise at all.
+func pushCommitEntryTTL(size int64) time.Duration {
+	// XferBudget, not XferLegBudget: the former carries the TIER FLOOR, the latter is raw
+	// size/throughput. Deriving from the raw leg made the comment above a lie in the direction that
+	// matters — an 8 MiB tier-B push got 5s+60s = 65 SECONDS where it used to have 6 minutes, and a
+	// 100 MiB one got 110s. Every tier-B transfer under ~480 MiB came out with a prep entry SHORTER
+	// than the broker's own watchdog for the same transfer, so a second concurrent prepare (the only
+	// thing that sweeps this map) could evict it mid-upload and the push-commit would land on
+	// transfer_unknown. A batch whose purpose is to make slow large files work must not shrink the
+	// tolerance of medium ones to a fifth. With the floor, size==0 gives 5m+1m — byte-for-byte the
+	// pre-batch-C constant — and 2 GiB gives 17m+1m.
+	return proto.XferBudget("b", size, 1) + pushCommitCacheSlack
+}
+
+func pushCommitEntryExpired(e pushCommitEntry, now time.Time) bool {
+	return now.Sub(e.added) >= pushCommitEntryTTL(e.size)
+}
 
 // handlePushForwarded — push.req.forwarded entrypoint.
 func (a *Agent) handlePushForwarded(nc *nats.Conn, msg *nats.Msg) {
@@ -96,13 +130,21 @@ func (a *Agent) handlePushForwarded(nc *nats.Conn, msg *nats.Msg) {
 	case "b":
 		// Cache prep state so push-commit knows what bucket + path
 		// + sha to use. Bucket name was stamped by the broker.
-		a.rememberPushCommit(req.TransferID, pushCommitEntry{
+		if !a.rememberPushCommit(req.TransferID, pushCommitEntry{
 			vp:     vp,
 			path:   req.Path,
 			sha256: req.SHA256,
 			size:   req.Size,
 			force:  req.Force,
-		})
+		}) {
+			// batch C: the prep cache is full of LIVE entries. Refuse instead of evicting one — see
+			// rememberPushCommit. Retriable: the entries drain as their transfers finish.
+			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
+				OK: false, Code: "too_many_in_flight",
+				Error: "this agent already holds the maximum number of in-flight tier-B prepares; retry shortly"})
+			a.pubTransferEvFailed(nc, "push", &req, req.Tier, "too_many_in_flight", "agent prep cache full", 0)
+			return
+		}
 		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{OK: true, Tier: "b"})
 	}
 }
@@ -183,28 +225,34 @@ func (a *Agent) handlePushCommitForwarded(nc *nats.Conn, msg *nats.Msg) {
 			OK: false, Code: "jetstream_unavailable"})
 		return
 	}
-	commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	store, err := a.js.ObjectStore(commitCtx, req.Bucket)
-	if err != nil {
-		cancel()
-		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
-			OK: false, Code: "bucket_unknown", Error: err.Error()})
-		return
-	}
-
 	// Look up the expected SHA + path + allow_roots validation saved
 	// during push.req prepare (a.pushCommitCache — no object metadata
 	// is written, the original PushPrepareReq is the only carrier).
 	// Cache miss (agent restarted between prep and commit) →
 	// transfer_unknown; the broker's watchdog writes the failed audit.
+	//
+	// batch C moved this lookup AHEAD of the context so the download deadline can be derived from the
+	// transfer's own size. It used to be a hardcoded 5 minutes, which silently capped every tier-B
+	// download at the value the broker's fixed watchdog happened to use — so raising only the broker's
+	// budget would have made things WORSE, not better: the broker would patiently hold a bucket and a
+	// goroutine for half an hour waiting on a download this side had already abandoned at 5 minutes.
 	a.pushCacheMu.Lock()
 	cached, hit := a.pushCommitCache[req.TransferID]
 	a.pushCacheMu.Unlock()
 	if !hit {
-		cancel()
 		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
 			OK: false, Code: "transfer_unknown",
 			Error: "no in-process prep entry for this transfer"})
+		return
+	}
+
+	// ONE leg: this end only performs the Get. The broker covers both crossings.
+	commitCtx, cancel := context.WithTimeout(context.Background(), proto.XferBudget("b", cached.size, 1))
+	store, err := a.js.ObjectStore(commitCtx, req.Bucket)
+	if err != nil {
+		cancel()
+		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
+			OK: false, Code: "bucket_unknown", Error: err.Error()})
 		return
 	}
 
@@ -361,7 +409,8 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 	if size > agentTransferMaxBytes {
 		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
 			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file size=%d > 2 GiB", size)})
+			// origin: batch-c internal review F4 — DERIVED, not hand-copied. See proto.HumanBytes.
+			Error: fmt.Sprintf("file size=%d > %s", size, proto.HumanBytes(agentTransferMaxBytes))})
 		return
 	}
 	maxInline := req.MaxInline
@@ -405,7 +454,21 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 			Error: "broker did not supply a bucket name"})
 		return
 	}
-	putCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// batch C: the PULL leg deliberately does NOT use the file's real size, and that asymmetry with
+	// the push leg above is the point.
+	//
+	// proto.PullPrepareReq carries no size, so the BROKER's pull watchdog has none either and budgets
+	// the flat tier floor. Deriving this end from the real size would raise only one side of the same
+	// transfer: a 2 GiB pull would give the agent ~17 minutes while the broker gave up at 5, wrote a
+	// failed terminal, deleted the tracker entry and released the bucket from activeOBJStreams — after
+	// which the home reaper's 2-minute grace can delete the object out from under a ctl that is still
+	// downloading it. That is the "raise only one end and it gets WORSE" argument this batch is built
+	// on, pointing the other way. Getting a real budget onto the pull path needs the size on the wire,
+	// which is the deferred medium half (permanent decision N5).
+	//
+	// XferBudget with size 0 is the tier floor, written this way rather than as the constant so it
+	// tracks whatever the broker's pull watchdog computes.
+	putCtx, cancel := context.WithTimeout(context.Background(), proto.XferBudget("b", 0, 1))
 	defer cancel()
 	store, err := a.js.ObjectStore(putCtx, bucket)
 	if err != nil {
@@ -427,7 +490,8 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 		_ = store.Delete(putCtx, objectKey)
 		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
 			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file grew beyond 2 GiB while reading (read=%d)", uploaded)})
+			Error: fmt.Sprintf("file grew beyond %s while reading (read=%d)",
+				proto.HumanBytes(agentTransferMaxBytes), uploaded)})
 		return
 	}
 	sha := hex.EncodeToString(h.Sum(nil))
@@ -499,7 +563,12 @@ type pushCommitEntry struct {
 // rememberPushCommit stores a prep entry. Must be called from
 // handlePushForwarded BEFORE replying OK so a fast push-commit can
 // race in without losing the entry.
-func (a *Agent) rememberPushCommit(transferID string, e pushCommitEntry) {
+// It returns false when the cache is full of entries that are all still LIVE. The caller must then
+// refuse the prepare rather than proceed: the pre-batch-C code evicted the oldest entry instead, and
+// with a size-derived budget the oldest live entry is by construction the largest, longest-running
+// transfer — the capacity path would silently kill the exact transfer the budget work protects, and a
+// constant-inequality test on the TTL would never see it.
+func (a *Agent) rememberPushCommit(transferID string, e pushCommitEntry) bool {
 	a.pushCacheMu.Lock()
 	defer a.pushCacheMu.Unlock()
 	if a.pushCommitCache == nil {
@@ -507,22 +576,18 @@ func (a *Agent) rememberPushCommit(transferID string, e pushCommitEntry) {
 	}
 	now := time.Now()
 	for id, cached := range a.pushCommitCache {
-		if now.Sub(cached.added) >= pushCommitCacheTTL {
+		if pushCommitEntryExpired(cached, now) {
 			delete(a.pushCommitCache, id)
 		}
 	}
 	if len(a.pushCommitCache) >= pushCommitCacheMaxEntries {
-		var oldestID string
-		var oldest time.Time
-		for id, cached := range a.pushCommitCache {
-			if oldestID == "" || cached.added.Before(oldest) {
-				oldestID, oldest = id, cached.added
-			}
-		}
-		delete(a.pushCommitCache, oldestID)
+		// Every remaining entry is live. Refusing is honest and retriable; evicting one is a silent
+		// failure whose victim is chosen to be the most expensive transfer in flight.
+		return false
 	}
 	e.added = now
 	a.pushCommitCache[transferID] = e
+	return true
 }
 
 func (a *Agent) purgePushCommitCache(transferID string) {

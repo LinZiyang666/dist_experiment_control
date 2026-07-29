@@ -161,6 +161,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 	// under the single-conn pool (the D6 deadlock lesson).
 	var roster []rosterRow
 	var forceSingle bool
+	var drainMarked, activeOpTarget map[string]bool
 	var portsUsed int
 	var portsKnown bool
 	var selfNatsRoute string
@@ -190,6 +191,34 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			forceSingle = true
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		// batch C: the drain markers and the non-terminal op targets, read in the SAME snapshot as the
+		// roster so the DRAINING-without-marker verdict below cannot be manufactured by two reads
+		// landing either side of a concurrent write. Both queries run AFTER the roster rows are closed
+		// — nesting a query inside an open *sql.Rows deadlocks the single-conn pool (the D6 lesson).
+		marked, derr := cluster.DrainingNodes(db)
+		if derr != nil {
+			return derr
+		}
+		drainMarked = make(map[string]bool, len(marked))
+		for _, id := range marked {
+			drainMarked[id] = true
+		}
+		opRows, oerr := db.Query(`SELECT target_node FROM cluster_operations WHERE terminal = 0`)
+		if oerr != nil {
+			return oerr
+		}
+		defer func() { _ = opRows.Close() }()
+		activeOpTarget = map[string]bool{}
+		for opRows.Next() {
+			var target string
+			if serr := opRows.Scan(&target); serr != nil {
+				return serr
+			}
+			activeOpTarget[target] = true
+		}
+		if oerr := opRows.Err(); oerr != nil {
+			return oerr
 		}
 		// B5 OPS#9: self-row ports_used = exposes THIS broker homes (the countOwnedExposes
 		// pattern — home_broker-scoped, since port_allocations is the replicated cluster table).
@@ -316,8 +345,28 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 		ro, inCfg := role[r.nodeID]
 		// INCONSISTENT cross-render: roster says VOTER but raft config disagrees (or
 		// the row is absent from the config), or vice-versa.
-		inconsistent := (r.phase == phaseVoter && (!inCfg || ro == "learner")) ||
+		rosterRaftSkew := (r.phase == phaseVoter && (!inCfg || ro == "learner")) ||
 			(!inCfg && r.phase != phaseRetiring && r.phase != phaseAddFailed)
+		drainSkew :=
+			// batch C: a node stuck in DRAINING with NO drain marker and no operation driving it. Every
+			// producer writes the marker before the phase and clears it after restoring the phase, so
+			// this combination is not a legal transient — it means a drain died between its own steps
+			// and nothing will resume it. Deliberately NOT the roadmap's literal "DRAINING with no
+			// active op", which is the normal, indefinitely-stable end state of a SUCCESSFUL
+			// `cluster drain` (that path never creates an op row at all) and would have made
+			// `cluster doctor` exit 64 on every correctly drained node.
+			drainingWithoutMarker(r.phase, drainMarked[r.nodeID], activeOpTarget[r.nodeID])
+		inconsistent := rosterRaftSkew || drainSkew
+		// EXTERNAL review m1: name WHICH inconsistency, so consumers stop printing the roster/raft cause
+		// (and the roster/raft remedy) for a drain that died between its own steps. roster/raft wins when
+		// both hold: it is the one that can fork membership.
+		inconsistentReason := ""
+		switch {
+		case rosterRaftSkew:
+			inconsistentReason = adminsock.InconsistentRosterRaft
+		case drainSkew:
+			inconsistentReason = adminsock.InconsistentDrainingWithoutMarker
+		}
 		reachable, source, lag := reachOf(r.nodeID)
 		// batch B / B4: AccountNkMatch/AccountNkReported are deliberately NOT set here. This literal
 		// used to carry `AccountNkMatch: true` unconditionally, which is where the "column is always
@@ -328,7 +377,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			AppliedLag:   lag,
 			StreamActual: streamActual, StreamTarget: streamTarget,
 			Reachable: reachable, ReachSource: source,
-			Inconsistent: inconsistent,
+			Inconsistent: inconsistent, InconsistentReason: inconsistentReason,
 		}
 		// B6 OPS#4: stamp each broker's live self-reported version (from the health poll).
 		// C3: stamp the topology reconcile self-report (applied/observed/reason/reported).
@@ -349,6 +398,7 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			ns.TopoApplied = hr.TopoApplied
 			ns.TopoObserved = hr.TopoObserved
 			ns.TopoReconcileReason = hr.TopoReconcileReason
+			ns.TopoAction = hr.TopoAction
 			ns.TopoReported = hr.TopoReported
 		}
 		// B5 OPS#7: cert fingerprints (public) for every row; CertValidSecs derived now→valid.
@@ -378,6 +428,12 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 					ns.TopoApplied = ts.Applied
 					ns.TopoObserved = ts.Observed
 					ns.TopoReconcileReason = ts.Reason
+					// batch C: the SELF row must carry the action too. Omitting it here (and only
+					// here) would leave the leader's own TOPO cell permanently on the legacy
+					// reason-substring fallback — and a wedged reconcile is most often on the very
+					// broker you are asking, so the one row that would silently keep the old
+					// behaviour is the one that matters most.
+					ns.TopoAction = ts.Action
 				}
 			}
 			// batch B / B4: same authoritative-self rule for ACCT.NK. The self row's verdict is a
@@ -399,7 +455,9 @@ func (a *ClusterAdmin) StatusReport(view string) (*adminsock.ClusterStatusReport
 			reachable, source, _ := reachOf(s.NodeID)
 			rep.Nodes = append(rep.Nodes, adminsock.ClusterNodeStatus{
 				NodeID: s.NodeID, Role: role[s.NodeID], Reachable: reachable,
+				// An orphan raft voter with no roster row at all — the roster/raft class by construction.
 				ReachSource: source, Inconsistent: true,
+				InconsistentReason: adminsock.InconsistentRosterRaft,
 			})
 		}
 	}
@@ -574,7 +632,10 @@ func computeHealth(forceSingle bool, leaderID string, voters int, topoDesired ui
 			"on each survivor: cluster status --offline --db /var/lib/tether/tether.db ; then only after confirming peers dead: cluster recovery force-single --self-id <this-node-id> --self-addr <this-host:7400> --confirm-peers-dead <ids...>"
 	}
 	degraded := false
-	var topoStuck, topoBehind bool // C3-M5: distinguish a wedged reconcile from a still-catching-up one
+	// batch C: ONE classifier (natsconf.ClassifyTopo), folded across nodes by severity. It replaces
+	// the two local booleans AND the three reason substrings they were derived from — see
+	// natsconf/topostate.go for the three defects that shape cost.
+	var topoWorst natsconf.TopoState
 	for _, n := range nodes {
 		if n.Inconsistent || n.Phase == phaseCatchingUp || n.Phase == phaseAddFailed || n.Phase == phaseDraining || n.Phase == phaseRetiring {
 			degraded = true
@@ -595,18 +656,19 @@ func computeHealth(forceSingle bool, leaderID string, voters int, topoDesired ui
 			// TopoReported (presence) — NOT a TopoObserved>0 magnitude guard — so a just-promoted voter at
 			// observed=0 with topoDesired>0 still degrades. observed<desired subsumes applied<desired
 			// (never rendered) AND observed<applied (swapped-not-reloaded), since observed≤applied≤desired.
+			//
+			// batch C: the observed<desired test moved INSIDE ClassifyTopo, and the STUCK/HELD verdicts
+			// deliberately do NOT depend on it. Gating them on generations was a real defect: an
+			// unrecognized-directive pass returns applied/observed UNCHANGED, so a broker wedged AFTER
+			// converging had observed == desired, skipped the whole branch, and the cluster reported
+			// HEALTHY_HA with a permanently fail-closed reconciler on it.
 			reached := n.ReachSource == "self" || (n.ReachSource == "nats-health" && n.Reachable)
-			if topoDesired > 0 && n.TopoReported && reached && n.TopoObserved < topoDesired {
-				degraded = true
-				// C3-M5: a STUCK reconcile (rejected render / unknown directive) needs a DIFFERENT next
-				// step (fix the conf / `reconcile nats --manual`) than a broker still catching up.
-				if strings.Contains(n.TopoReconcileReason, "unrecognized directive") ||
-					strings.Contains(n.TopoReconcileReason, "nats-server -t") ||
-					strings.Contains(n.TopoReconcileReason, "render") {
-					topoStuck = true
-				} else {
-					topoBehind = true
+			if reached {
+				st := natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, topoDesired, n.TopoReported)
+				if st.Degrades() {
+					degraded = true
 				}
+				topoWorst = natsconf.WorstTopoState(topoWorst, st)
 			}
 		}
 		// External-review F1: a JS stream below its target replica count (observed actual <
@@ -632,17 +694,12 @@ func computeHealth(forceSingle bool, leaderID string, voters int, topoDesired ui
 			fmt.Sprintf("only tolerates %d failures (%d voters, quorum=%d) — add a node for HA", proj.FaultTolerance, proj.Voters, proj.Quorum),
 			"on the NEW broker: cluster join prepare --node-id <id> --raft-addr <host:7400> --nats-route nats://<host:6222> --tunnel-addr <host:7000>; then on the leader: cluster join approve <bundle> --wait"
 	}
-	// C3-M5: topology-specific banner + next-step (the TOPO column shows which broker). A STUCK
-	// reconcile wins over a merely-behind one (it needs operator action, not just waiting).
-	if topoStuck {
-		return healthDegraded,
-			"a broker's NATS topology reconcile is STUCK (see the TOPO column) — its nats.conf cannot be rendered/validated",
-			"fix that broker's nats.conf, or run `tether cluster reconcile nats --manual` on it"
-	}
-	if topoBehind {
-		return healthDegraded,
-			"a broker's NATS topology has not caught the desired generation yet (see the TOPO column)",
-			"tether cluster reconcile nats --all --wait"
+	// C3-M5 / batch C: topology-specific banner + next-step (the TOPO column shows which broker).
+	// WorstTopoState carries the precedence STUCK > HELD > UNKNOWN > BEHIND, so the node needing
+	// hands wins over the one that only needs patience. The banner/next-step text now lives with the
+	// classifier, which is what keeps this end and the CLI from wording the same verdict differently.
+	if banner := topoWorst.Banner(); banner != "" {
+		return healthDegraded, banner, topoWorst.NextStep()
 	}
 	if degraded {
 		return healthDegraded, "a node is mid-join / draining or roster/raft INCONSISTENT — see the table", "cluster status"

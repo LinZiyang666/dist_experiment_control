@@ -934,8 +934,8 @@ NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让
 **命令**：
 
 ```
-tether push <local-path> <nid>:<remote-path> [--force] [--timeout 10m] [--ack-alerts]
-tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m] [--ack-alerts]
+tether push <local-path> <nid>:<remote-path> [--force] [--timeout D] [--ack-alerts]
+tether pull <nid>:<remote-path> <local-path> [--force] [--timeout D] [--ack-alerts]
 ```
 
 参数与语义：
@@ -945,7 +945,7 @@ tether pull <nid>:<remote-path> <local-path> [--force] [--timeout 10m] [--ack-al
 | `<local-path>` | (必填) | ctl 所在机器上的本地文件路径；push 源必须是普通文件，pull 目标可相对/绝对 |
 | `<nid>:<remote-path>` | (必填) | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
 | `--force` | false | 目标已存在时覆盖；缺省直接拒（`dst_exists` 或本地 path exists） |
-| `--timeout` | `10m` | 整次传输上限；tier A 一般 < 30s，tier B 取决于带宽 |
+| `--timeout` | `37m08s` | ctl 等待每个阶段的上限；tier A 一般 < 30s，push tier B 由**文件大小推导**（见下），默认值为 broker 最坏预算再加 2 分钟；pull 的内部上限不随此 flag 增长 |
 | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续传输；只确认本次风险 |
 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
@@ -970,8 +970,25 @@ tier-B ObjectStore bucket 按 cluster replica 策略创建；传输开始后，�
 - pull 还会做 dev+inode TOCTOU 校验（`lstat` 与 `open` 之间的换底攻击）；
 - broker 是 ObjectStore bucket 的**唯一所有者**：member/agent JWT 都没有
   `STREAM.CREATE / DELETE / PURGE` 权限，bucket 由 broker 在 prepare 阶段
-  创建、在 `ev.transfer` / `finalize.req` 收到时删除；超时（tier A 30s /
-  tier B 5min）broker watchdog 也会兜底删除并写 audit failed。
+  创建、在 `ev.transfer` / `finalize.req` 收到时删除；超时后 broker watchdog
+  也会兜底删除并写 audit failed。
+
+**push 的 tier-B 超时预算由文件大小推导**（v0.4.8 起）：tier A 固定 30s；**push** 的 tier B 是
+`max(5min, 2 × ⌈size / 2 MiB/s⌉ + 1min)`——`2 MiB/s`（≈16.8 Mbit/s）是本产品承诺覆盖的
+**最慢链路**，`2 ×` 是因为一次 tier-B 传输要**两次穿过 object store**（发送方 Put、
+接收方 Get），额外 1 分钟覆盖 prepare 往返、对象存储打开、校验/fsync、finalize 与事件传播。
+于是 2 GiB push 的 broker 上限预算是 `2 × 1024s + 60s = 2108s = 35m08s`；
+ctl 默认再留 2 分钟，因此是 `37m08s`。
+改动前这里是固定 5 分钟，而它要覆盖的是 2 GiB × 2 —— 隐含断言了 ~114 Mbit/s 的
+端到端吞吐，超时后还会**删掉正在传的对象**并写 `agent_no_responders`（归因错误：
+agent 可能一直在传，只是不够快）。现在超时写的是 `transfer_budget_exceeded`。
+
+> **pull 不在此列——它仍是固定 5 分钟。**
+> `pull.req` 的 wire 消息**不带文件大小**（大小只有 agent 那侧知道），所以 broker 的看门狗
+> 和 agent 的上传腿都无从推导，两端一致地取固定下限。把 `--timeout` 调大**不会**让一个
+> 又大又慢的 pull 成功：ctl 还在等，agent 和 broker 已经在 5 分钟处结束了。
+> 大文件 / 慢链路的 pull 请改用 `tether expose` + rsync。
+> 给 pull 补 size 需要同时改 `proto.PullPrepareReq` + agent + ctl 三端，属被判缓的中期半。
 
 **典型用例**：
 

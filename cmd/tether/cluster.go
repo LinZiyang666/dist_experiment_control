@@ -12,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
+	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/spf13/cobra"
@@ -427,22 +428,22 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 	return nil
 }
 
-// topoCell renders the C3 topology column `applied/observed→desired` with a convergence marker: "✓"
-// converged, "…" still catching up, "STUCK" when the reconcile is wedged (bad render / unknown
-// directive). "-" when the node does not report topology (older broker / nothing desired yet).
+// topoCell renders the C3 topology column `applied/observed→desired` plus a marker from the SHARED
+// classifier: "✓" converged, "…" catching up, "HOLD" a deliberately withheld standalone→clustered
+// cutover, "STUCK" wedged, "?" an action this binary does not know. "-" when the node does not
+// report topology (older broker / nothing desired yet).
+//
+// batch C: this used to substring-match TopoReconcileReason with its OWN set, which was missing the
+// render-failure marker the broker side had. The two ends disagreed, so a render failure rendered
+// here as "still catching up" while the broker correctly ruled the cluster DEGRADED — telling the
+// operator to wait for a self-heal that was never coming. Both ends now call ClassifyTopo, so they
+// cannot word the same state differently again.
 func topoCell(n adminsock.ClusterNodeStatus, desired uint64) string {
-	if !n.TopoReported || desired == 0 {
+	st := natsconf.ClassifyTopo(n.TopoAction, n.TopoReconcileReason, n.TopoObserved, desired, n.TopoReported)
+	if st == natsconf.TopoUnreported {
 		return "-"
 	}
-	s := fmt.Sprintf("%d/%d→%d", n.TopoApplied, n.TopoObserved, desired)
-	switch {
-	case strings.Contains(n.TopoReconcileReason, "unrecognized directive") || strings.Contains(n.TopoReconcileReason, "nats-server -t"):
-		return s + " STUCK"
-	case n.TopoObserved >= desired:
-		return s + " ✓"
-	default:
-		return s + " …"
-	}
+	return fmt.Sprintf("%d/%d→%d %s", n.TopoApplied, n.TopoObserved, desired, st.Cell())
 }
 
 // acctCell renders the ACCT.NK column as one of three states (batch B / B4).
@@ -478,7 +479,12 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 		}
 		flag := ""
 		if n.Inconsistent {
+			// EXTERNAL review m1: the bare word carried one meaning for years and now carries two.
+			// Qualify it so the table row itself says which.
 			flag = " INCONSISTENT"
+			if n.InconsistentReason == adminsock.InconsistentDrainingWithoutMarker {
+				flag = " INCONSISTENT(drain)"
+			}
 		}
 		// B6 OPS#4: VER = the node's live self-reported release ("?" if it did not report).
 		ver := n.ReleaseVersion
@@ -506,7 +512,10 @@ func renderClusterStatus(cmd *cobra.Command, rep *adminsock.ClusterStatusReport)
 	_, _ = fmt.Fprintln(w, "  key vs this view's (Y=same · N=DIFFERENT, agents will fail auth at random depending on which")
 	_, _ = fmt.Fprintln(w, "  broker answers the callout · ?=no answer from this node, not verified) · STREAMS=JetStream replicas")
 	_, _ = fmt.Fprintln(w, "  actual/target (actual<target = degraded) · VER=running release (live self-report) · REACH=NATS/raft reachability")
-	_, _ = fmt.Fprintln(w, "  · TOPO=NATS topology applied/observed→desired gen (✓ converged · … catching up · STUCK fix conf or `cluster reconcile nats --manual`)")
+	// origin: batch-c internal review C3-F1 — derived from the classifier, not hand-written, so a new
+	// TOPO token can never ship without its key. The hand-written version was missing HOLD, and its
+	// only non-converged remedy pointed HOLD operators at the one command that damages their data.
+	_, _ = fmt.Fprintln(w, "  · "+natsconf.TopoCellLegend())
 	// C6 建议6: show the hyphenated 5-state operator label; fall back to the legacy Health when unset
 	// (an old broker that predates health_label) so legacy fixtures stay green.
 	healthHeadline := rep.HealthLabel

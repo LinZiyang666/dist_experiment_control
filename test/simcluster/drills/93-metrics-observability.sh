@@ -118,6 +118,64 @@ assert_ok "MET FG: follower /metrics has is_leader==0 + NO peer_applied_lag{node
     sh -c "$SIM exec $FOLL -- curl -s http://127.0.0.1:$MPORT/metrics 2>/dev/null | { grep -qE '^tether_broker_is_leader 0' && ! grep -qE '^tether_broker_peer_applied_lag\\{node='; }"
 assert_ok "MET: POST to /metrics → 405" sh -c "[ \"\$($SIM exec $LDR -- curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$MPORT/metrics 2>/dev/null)\" = 405 ]"
 
+# ── TOPO-ACTION (batch C / C3): the topology reconcile ACTION reaches the ctl over the wire ─────────
+# Before batch C both status renderers classified a wedged reconcile by substring-matching a free-text
+# Reason, with DIFFERENT substring sets — so a render failure showed STUCK on one end and "still
+# catching up" on the other. The fix puts the closed-enum Action on the wire. These assert the WIRE
+# CHAIN end to end on a live cluster (broker self-report → health responder → adminsock → ctl render);
+# the STUCK/HELD/BEHIND classification itself is covered hermetically in internal/natsconf.
+#
+# Deliberately BOTH the self row and a peer row: the field is populated on two separate code paths
+# (the health-echo fold and the authoritative self overwrite), and the self row is the one a wedged
+# broker reports about ITSELF — so a chain that works only for peers would miss the common case.
+assert_ok "TOPO-ACTION: cluster status --json carries topo_action on EVERY reporting voter (self row AND peer rows)" \
+    sh -c "$SIM exec $LDR -- sh -c 'tether cluster status --json 2>/dev/null | jq -e \"[.nodes[]|select(.topo_reported==true)] | length>=3 and (map(has(\\\"topo_action\\\")) | all)\" >/dev/null'"
+assert_ok "TOPO-ACTION: a converged cluster reports the converged actions, never a failure one" \
+    sh -c "$SIM exec $LDR -- sh -c 'tether cluster status --json 2>/dev/null | jq -e \"[.nodes[]|select(.topo_reported==true)|.topo_action] | all(. == \\\"noop\\\" or . == \\\"reloaded\\\")\" >/dev/null'"
+# The TOPO cell is `applied/observed→desired <marker>` and CONTAINS A SPACE, so a column index would
+# split it — match the whole cell shape instead, and require one per voter so a single converged row
+# cannot stand in for three.
+# TOPO-STUCK (batch C / C3-13): the FAILURE polarity, on the real stack.
+#
+# The converged assertions above prove the wire chain carries a value; they cannot prove the value is
+# CLASSIFIED correctly, because every classification maps to the same rendering when nothing is wrong.
+# This wedges a real broker's real nats.conf with an unrecognized directive — the exact way an operator
+# hand-edits one — and asserts the polarity the pre-batch-C code got wrong on BOTH ends: the TOPO cell
+# must read STUCK (it rendered "…" for a render/apply failure) and the health verdict must be DEGRADED
+# naming STUCK (it reported HEALTHY_HA when the wedge happened at the already-converged generation).
+#
+# It restores the conf and re-asserts convergence, so the wedge cannot leak into the drills after it.
+_topo_wedge()   { $SIM exec "$FOLL" -- sh -c 'cp /etc/tether/nats.d/nats.conf /tmp/nats.conf.batchc.bak && printf "\ntotally_unrecognized_directive: 1\n" >> /etc/tether/nats.d/nats.conf'; }
+_topo_unwedge() { $SIM exec "$FOLL" -- sh -c 'test -f /tmp/nats.conf.batchc.bak && mv /tmp/nats.conf.batchc.bak /etc/tether/nats.d/nats.conf'; }
+_topo_action_of() { $SIM exec "$LDR" -- sh -c "tether cluster status --json 2>/dev/null | jq -r '.nodes[]|select(.node_id==\"$FOLL\")|.topo_action // empty'"; }
+_topo_is_stuck()  { [ "$(_topo_action_of)" = "unknown_directive" ]; }
+# A predicate FUNCTION, not an `sh -c` body: the helpers above are shell functions in THIS shell and a
+# subshell spawned by `sh -c` cannot see them (it would silently evaluate an empty string forever).
+_topo_converged_again() { _a=$(_topo_action_of); [ "$_a" = noop ] || [ "$_a" = reloaded ]; }
+
+assert_ok "setup: TOPO-STUCK wedge $FOLL's nats.conf with an unrecognized directive" _topo_wedge
+if poll_until 45 5 "$FOLL reports unknown_directive" -- _topo_is_stuck; then
+    assert_ok "TOPO-STUCK: the wedged broker's topo_action reaches the ctl as the closed-enum value (not a free-text reason)" sh -c "true"
+    assert_ok "TOPO-STUCK: the TOPO column renders STUCK for it — NOT the catching-up marker the pre-batch-C ctl showed for a render/apply failure" \
+        sh -c "$SIM exec $LDR -- sh -c 'tether cluster status 2>/dev/null' | grep -E '^$FOLL[[:space:]]' | grep -q 'STUCK'"
+    assert_ok "TOPO-STUCK: the health verdict is DEGRADED and its banner names STUCK (the wedge is at the CONVERGED generation, which the pre-batch-C gate reported HEALTHY_HA)" \
+        sh -c "$SIM exec $LDR -- sh -c 'tether cluster status --json 2>/dev/null' | jq -e '(.health|test(\"DEGRADED\")) and (.banner|test(\"STUCK\"))' >/dev/null"
+    assert_ok "TOPO-STUCK: cluster doctor reports the topology check FATAL and names the wedged broker" \
+        sh -c "$SIM exec $LDR -- sh -c 'tether cluster doctor 2>&1' | grep -iE 'topology' | grep -q '$FOLL'"
+else
+    not_covered "93 TOPO-STUCK (the reconciler did not report unknown_directive within 45s of the conf edit)" \
+        "the wedge is a real conf edit and the reconcile loop is 5s, so this should be prompt; if it recurs, capture the broker's topology-reconcile log lines before treating it as a product defect"
+fi
+assert_ok "setup: TOPO-STUCK restore $FOLL's nats.conf" _topo_unwedge
+assert_ok "TOPO-STUCK: the wedge CLEARS once the conf is fixed (no sticky STUCK — the classification is derived per pass, not latched)" \
+    poll_until 90 5 "$FOLL back to a converged action" -- _topo_converged_again
+
+assert_ok "TOPO-ACTION: the human TOPO column agrees — all 3 voters render the converged marker, none renders catching-up or STUCK" \
+    sh -c "out=\$($SIM exec $LDR -- sh -c 'tether cluster status 2>/dev/null'); \
+      n=\$(printf '%s\n' \"\$out\" | grep -cE '→[0-9]+ ✓'); \
+      bad=\$(printf '%s\n' \"\$out\" | grep -cE '→[0-9]+ (…|STUCK|HOLD|\\?)'); \
+      [ \"\$n\" -ge 3 ] && [ \"\$bad\" = 0 ] || { printf '%s\n' \"\$out\"; false; }"
+
 # ── ADMINRT (R13): `admin runtime` — the broker's PROCESS self-introspection observability surface. It
 # complements /metrics (cluster gauges) with process gauges (goroutines/threads/fds/rss/uptime) + each R7
 # reconciler's last_tick — the "is a reconciler STALLED?" live-broker diagnostic. Broker-local admin
@@ -131,7 +189,7 @@ _rt_advanced() {
     [ "$(printf '%s\n%s\n' "${RT0:-}" "$_cur" | LC_ALL=C sort | tail -1)" = "$_cur" ]
 }
 assert_ok "ADMINRT: admin runtime --json emits the stable schema with a positive live goroutine count, thread count and uptime (the process-introspection surface exists and is sane)" \
-    sh -c "$SIM exec $LDR -- runuser -u tether -- tether admin runtime --json 2>/dev/null | jq -e '.schema==\"admin_runtime\" and .schema_version==1 and .goroutines>0 and .threads>0 and .uptime_seconds>0' >/dev/null"
+    sh -c "$SIM exec $LDR -- runuser -u tether -- tether admin runtime --json 2>/dev/null | jq -e '.schema==\"admin_runtime\" and .schema_version==2 and .goroutines>0 and .threads>0 and .uptime_seconds>0' >/dev/null"
 assert_ok "ADMINRT: the per-reconciler last_tick surface is populated (>=1 registered R7 reconciler — the stalled-reconciler diagnostic has rows to age)" \
     sh -c "$SIM exec $LDR -- runuser -u tether -- tether admin runtime --json 2>/dev/null | jq -e '(.reconcilers|length)>=1' >/dev/null"
 RT0=$(_rt_max)

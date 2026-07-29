@@ -62,6 +62,10 @@ func fsTestBackend(t *testing.T, selfID, peerID, peerRaftAddr string) (*clusterA
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(peerIn) }); err != nil {
 		t.Fatalf("insert peer row: %v", err)
 	}
+	// EXTERNAL review B1: production always has a ClusterDataDir (it is where raft lives, so a
+	// cluster-mode broker cannot exist without one), and the commit path now refuses to start an
+	// irreversible rewrite it could not first record an intent for. Give the fixture the same.
+	admin.dataDir = t.TempDir()
 	return &clusterAdminBackend{admin: admin, fsArm: newForceSingleArm()}, n
 }
 

@@ -45,10 +45,19 @@ const (
 // by the cut-over broker). All admin changes are leader-local (§8.1): a non-leader
 // fails fast naming the leader host (NonLeaderHint).
 type ClusterAdmin struct {
-	node      *cluster.Node
-	logger    *slog.Logger
+	node   *cluster.Node
+	logger *slog.Logger
+	// dataDir is ClusterDataDir — the parent of the raft sub-tree. It holds the ONLINE force-single
+	// intent (EXTERNAL review B1), which must be writable without quorum because it is written on a
+	// quorum-lost node before an irreversible rewrite. Empty in unit fixtures: the intent is then
+	// skipped, and the resume path treats "no data dir" as "no intent".
+	dataDir   string
 	catchPoll time.Duration
 	now       func() time.Time
+	// forceSingleIntentMu keeps the live commit handler and the leadership-edge crash recovery from
+	// driving the same freshly written intent concurrently. The durable safety comes from the file;
+	// this mutex only preserves the ordinary success contract (synchronous prune, no retry op).
+	forceSingleIntentMu sync.Mutex
 
 	// healthPoll, when set (wireClusterLate injects the broker-only cursor scatter-gather),
 	// returns each reachable broker's self-reported AppliedIndex keyed by node_id. StatusReport
@@ -304,7 +313,15 @@ func (a *ClusterAdmin) AddNode(in cluster.ClusterNodeUpsertInput, raftAddr strin
 	}
 	// HA restored (review M3): once there is more than one voter, clear any
 	// force_single_active marker left by a prior force-single, so the regrown cluster
-	// stops reporting FORCE_SINGLE (exit 3). Best-effort; reconciliation re-clears.
+	// stops reporting FORCE_SINGLE (exit 3).
+	//
+	// origin: batch-c internal review C1-L2 — this said "Best-effort; reconciliation re-clears", and
+	// that was FALSE: PlanClearForceSingle has exactly two call sites (this one and the retire
+	// ladder's), both best-effort, and NO reconcile pass re-clears it. A dropped clear therefore leaves
+	// a stale force_single_active marker until the next successful grow or retire. Saying so plainly
+	// matters because resumeForceSingleFinalizeOnLeadership gates on that marker: a stale one is one of
+	// the four conditions that would have to line up for it to act on a cluster that is no longer in an
+	// emergency (the other three still hold it off).
 	if nv, verr := a.node.NumVoters(); verr == nil && nv > 1 {
 		if perr := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 			return cluster.PlanClearForceSingle()
@@ -403,6 +420,15 @@ func (a *ClusterAdmin) ReconcileMembershipOnLeadership() error {
 	if serr := a.deriveAndConvergeSeedsFromRoster(); serr != nil {
 		a.logger.Warn("cluster reconcile: seed auto-converge failed", "err", serr)
 	}
+	// batch C: cover the force-single CRASH WINDOW. RecoverToSelfOnline writes the {self} configuration
+	// to disk before returning, so a process killed between that and the roster prune leaves a healthy
+	// single-voter survivor carrying ghost rows that the (long-gone) commit handler will never clean
+	// up. The loop just above ALREADY detects them — it is the "roster row in a live phase but NOT a
+	// raft voter" branch, which logs INCONSISTENT and deliberately refuses to auto-heal because it
+	// cannot know how the divergence arose. This call supplies exactly that missing knowledge: with
+	// force_single_active set and a single voter, the divergence has one explanation, and the heal is a
+	// row DELETE rather than the re-admission the branch above rightly refuses to guess at.
+	a.resumeForceSingleFinalizeOnLeadership()
 	return nil
 }
 

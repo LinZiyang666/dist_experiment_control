@@ -66,6 +66,24 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 	if !b.reaperCaughtUp() {
 		return 0, nil
 	}
+	// origin: batch-c EXTERNAL review B2. The in-memory tracker consulted below is rebuilt EMPTY by a
+	// restart, so "no tracker entry" has never meant "nobody owns this object" — it also means "this
+	// process was not the one that started it". That was survivable while the tier-B watchdog was a
+	// fixed 5 minutes against a 2-minute orphan grace. It stopped being survivable when batch C made
+	// the budget size-derived (up to 35m08s): a restart mid-transfer left roughly half an hour in which
+	// the reaper would delete a live object two minutes in.
+	//
+	// The durable evidence exists and always has — the #57 xfer-inflight ledger records the transfer
+	// id, bucket, size and start time, and the object's NAME IS THE TRANSFER ID at every writer. So the
+	// protection is an exact identity match rather than a heuristic. A ledger that cannot be read is
+	// treated as "delete nothing this pass": acting on evidence we could not read is precisely the
+	// failure this guard exists to prevent.
+	protected, lerr := b.ledgerProtectedObjects(b.now())
+	if lerr != nil {
+		b.cfg.Logger.Warn("broker: xfer ledger unreadable — skipping the orphan reap this pass rather "+
+			"than deleting objects on evidence we could not read", "err", lerr)
+		return 0, nil
+	}
 	infos := b.js.ListStreams(ctx)
 	deleted := 0
 	unreapable := 0 // N-6: buckets no broker can ever reap that hold aged garbage (observability only)
@@ -98,7 +116,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 				// The caught-up LEADER GCs objects past the LONGER cross-home floor (only the leader, so no two
 				// brokers race; the longer floor protects a transfer still live on another home across clock skew).
 				if b.reaperMayDelete() {
-					if reaped := b.reapBucketObjects(ctx, name, b.crossHomeReapAge()); reaped > 0 {
+					if reaped := b.reapBucketObjects(ctx, name, b.crossHomeReapAge(), true, protected); reaped > 0 {
 						deleted += reaped
 						b.cfg.Logger.Info("broker: cross-home GC reaped aged orphan xfer objects (split-home/zero-node bucket)",
 							"bucket", name, "sid", sid, "deleted", reaped)
@@ -124,7 +142,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		if _, busy := b.transfers.activeOBJStreams()[name]; busy {
 			continue
 		}
-		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge)
+		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge, false, protected)
 		deleted += reaped
 		if reaped > 0 {
 			b.cfg.Logger.Info("broker: orphan xfer objects reaped",
@@ -141,7 +159,13 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 // returns the count deleted. Shared by the home-owned reap (per-home grace b.xferReapMinAge) and the #58
 // leader cross-home GC (the longer crossHomeReapAge). minAge<=0 reaps everything (the zero-value test
 // broker's prompt-reap semantics).
-func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration) (deleted int) {
+// sizeAware (batch C) extends minAge PER OBJECT by whatever its size-derived watchdog budget exceeds
+// the tier floor by. The cross-home GC passes true: it is deleting another home's objects, and since
+// the watchdog became size-derived a single global floor can no longer bound "still live over there".
+// The home-owned reap passes false — its short grace is protected by the per-bucket busy re-read
+// instead, and widening it would make orphan garbage linger on exactly the small-disk brokers this
+// sweep exists to protect.
+func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration, sizeAware bool, protected map[string]bool) (deleted int) {
 	bucket := strings.TrimPrefix(name, "OBJ_")
 	store, err := b.js.ObjectStore(ctx, bucket)
 	if err != nil {
@@ -164,7 +188,17 @@ func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time
 		// object created between that check and this Delete — or one a mid-transfer rehome left on a broker
 		// whose tracker no longer tracks it — must not be torn out mid-upload. It ages past the grace and is
 		// reaped later. The cross-home GC uses a longer floor so a peer-home's live transfer is never torn out.
-		if minAge > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < minAge {
+		// EXTERNAL review B2: the durable ledger outranks every age heuristic below. A row that is
+		// still inside its own budget means a live transfer owns this object, whatever this process's
+		// in-memory tracker happens to remember.
+		if protected[bucket+"/"+obj.Name] {
+			continue
+		}
+		floor := minAge
+		if sizeAware && floor > 0 {
+			floor += xferCrossHomeExtraFor(int64(obj.Size))
+		}
+		if floor > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < floor {
 			continue
 		}
 		if err := store.Delete(ctx, obj.Name); err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {

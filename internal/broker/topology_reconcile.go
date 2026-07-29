@@ -146,7 +146,7 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 			}
 		}
 	}
-	b.cl.topoSelf.Store(&topoSelfReport{Applied: out.AppliedGen, Observed: out.ObservedGen, Reason: out.Reason})
+	b.cl.topoSelf.Store(&topoSelfReport{Applied: out.AppliedGen, Observed: out.ObservedGen, Action: out.Action, Reason: out.Reason})
 	// C3-m7: change-gate the sys.event so a stuck broker does not spam JS every 5s (a publish per tick
 	// would also stall if JS is the unhealthy thing). Skip the steady-state noop/unresolvable.
 	// Include the desired generation: the same action/reason on a NEW topology delta is a distinct

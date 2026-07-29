@@ -58,6 +58,18 @@ assert_ok "#12 FIXED: brk2 auto-pruned from the roster (no ghost VOTER — the R
 assert_ok "#12 FIXED: recovery node remove of the pruned brk2 reports 'no such roster node' (not a deadlock refusal)" \
     sh -c "$SIM exec brk1 -- env TETHER_CONFIRM_NODE_ID=brk2 tether cluster recovery node remove brk2 --manual --confirm-node-id brk2 2>&1 | grep -q 'no such roster node'"
 
+# batch C regression guard. C1 added an OpKindForceSingleFinalize retry, but ONLY on the ONLINE path
+# and ONLY when its synchronous prune fails. This drill exercises the OFFLINE path, where the prune is
+# done in-process by clusteroffline.ForceSingle against the stopped broker's disk — the finalize
+# machinery does not participate at all.
+#
+# So the honest deploy-tier assertion here is that batch C did NOT reach into this path: no operation
+# row appears, and the ghost outcome is byte-for-byte what it was before. (Injecting a prune failure to
+# exercise the retry belongs on the ONLINE path, and lives in 22-forcesingle-online.sh — manufacturing
+# one here would be testing a mechanism this path never invokes.)
+assert_ok "batch-C: the OFFLINE force-single path creates NO force_single_finalize op (the retry op is ONLINE-only, and only on a failed prune)" \
+    sh -c "! $SIM exec brk1 -- sh -c 'tether cluster ops ls --json 2>/dev/null | grep -q force_single_finalize'"
+
 # GREEN regression since the #12 fix (force-single auto-prune). Was RED: force-single left brk2 phase==VOTER
 # and all three online removal paths refused it (the three-non deadlock). The upgrade-leftover ghost
 # (VOTER-not-in-committed-config from a pre-#12 binary) → `recovery node remove` passthrough is covered by

@@ -64,6 +64,22 @@ func opEntryFromOperation(op cluster.Operation) adminsock.ClusterOpEntry {
 	case cluster.OpStateRetireFailed, cluster.OpStateAborted:
 		e.State = "failed"
 		e.Resume = "operation ended: " + op.OpState + " — see last_error; `cluster ops show " + op.OpID + "`"
+	case cluster.OpStateFSFinalized:
+		e.State = "done"
+	case cluster.OpStateFSGhostLeft:
+		// batch C: NOT the generic failed text. The remedy is specific and the consequence of skipping
+		// it is a survivor whose JetStream never comes back, so name both.
+		e.State = "failed"
+		e.Resume = "force-single finalize could not remove every abandoned roster row — run " +
+			// origin: batch-c internal review sweep-F1 — the flag is NOT optional. `remove` without
+			// --manual returns a usage error that points the operator at `cluster retire <id>`, which is
+			// the one command that must never be aimed at a ghost (it has no raft role and is absent
+			// from the configuration).
+			"`tether cluster recovery node remove <id> --manual` for each id in last_error. Until they are gone, " +
+			"`tether cluster reconcile nats --to-standalone` refuses and this broker's JetStream stays 503."
+	case cluster.OpStateFSPrunePending:
+		e.State = "in_progress"
+		e.Resume = "retrying the roster prune left over from an online force-single; `cluster ops show " + op.OpID + "`"
 	case cluster.OpStateBlocked:
 		e.State = "stalled"
 		e.Resume = "blocked awaiting operator — `cluster ops confirm " + op.OpID + "` (or `cluster ops abort " + op.OpID + "`)"

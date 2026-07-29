@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"syscall"
+	"time"
 )
 
 // journal.go — the force-single RECOVERY JOURNAL (external review round-5 B1).
@@ -102,40 +103,54 @@ func writeJournal(dataDir string, j *forceSingleJournal) error {
 	if err != nil {
 		return fmt.Errorf("clusteroffline: encode force-single journal: %w", err)
 	}
-	// Round-6: NEVER O_CREATE|O_TRUNC a FIXED, predictable temp path. force-single is run as root per the
-	// runbook, and the data dir is tether-owned — a `tether`-writable directory. A pre-planted symlink at
-	// `<dataDir>/.force-single.journal.tmp` would make root's O_TRUNC open follow it and truncate ANY file
-	// on the box (/etc/shadow, another service's DB): a tether→root local privilege-escalation primitive.
-	// O_EXCL|O_NOFOLLOW refuses to follow a symlink and refuses to reuse an existing path; a random suffix
-	// makes the name unpredictable and lets two callers not collide. The temp is always cleaned up.
-	tmpf, err := os.CreateTemp(dataDir, journalFileName+".tmp-*")
+	return writeFileDurably(dataDir, journalPath(dataDir), journalFileName, b)
+}
+
+// writeFileDurably installs b at dst via temp -> chmod -> write -> fsync(file) -> close -> rename ->
+// fsync(dir). Shared by the offline journal and the ONLINE intent (EXTERNAL review B1) so both get the
+// same durability AND the same symlink refusal.
+//
+// Round-6: NEVER O_CREATE|O_TRUNC a FIXED, predictable temp path. force-single is run as root per the
+// runbook, and the data dir is tether-owned — a `tether`-writable directory. A pre-planted symlink at
+// a predictable `<dataDir>/<name>.tmp` would make root's O_TRUNC open follow it and truncate ANY file
+// on the box (/etc/shadow, another service's DB): a tether->root local privilege-escalation primitive.
+// CreateTemp refuses to reuse an existing path and makes the name unpredictable; the temp is always
+// cleaned up.
+func writeFileDurably(dataDir, dst, prefix string, b []byte) error {
+	tmpf, err := os.CreateTemp(dataDir, prefix+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("clusteroffline: create force-single journal: %w", err)
+		return fmt.Errorf("clusteroffline: create %s: %w", prefix, err)
 	}
 	tmp := tmpf.Name()
 	defer func() { _ = os.Remove(tmp) }() // no-op once the rename below succeeded
 	if err := tmpf.Chmod(0o600); err != nil {
 		_ = tmpf.Close()
-		return fmt.Errorf("clusteroffline: chmod force-single journal: %w", err)
+		return fmt.Errorf("clusteroffline: chmod %s: %w", prefix, err)
 	}
-	f := tmpf
-	if _, err := f.Write(b); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("clusteroffline: write force-single journal: %w", err)
+	if _, err := tmpf.Write(b); err != nil {
+		_ = tmpf.Close()
+		return fmt.Errorf("clusteroffline: write %s: %w", prefix, err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("clusteroffline: fsync force-single journal: %w", err)
+	if err := tmpf.Sync(); err != nil {
+		_ = tmpf.Close()
+		return fmt.Errorf("clusteroffline: fsync %s: %w", prefix, err)
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("clusteroffline: close force-single journal: %w", err)
+	if err := tmpf.Close(); err != nil {
+		return fmt.Errorf("clusteroffline: close %s: %w", prefix, err)
 	}
-	if err := os.Rename(tmp, journalPath(dataDir)); err != nil {
-		return fmt.Errorf("clusteroffline: install force-single journal: %w", err)
+	if err := os.Rename(tmp, dst); err != nil {
+		return fmt.Errorf("clusteroffline: install %s: %w", prefix, err)
 	}
-	if d, err := os.Open(dataDir); err == nil {
-		_ = d.Sync()
+	d, err := os.Open(dataDir)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: open parent dir for %s fsync: %w", prefix, err)
+	}
+	if err := d.Sync(); err != nil {
 		_ = d.Close()
+		return fmt.Errorf("clusteroffline: fsync parent dir for %s: %w", prefix, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("clusteroffline: close parent dir for %s: %w", prefix, err)
 	}
 	return nil
 }
@@ -205,4 +220,144 @@ func resumeConfirmation(current []string, j *forceSingleJournal, roster []Peer) 
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ─── ONLINE force-single intent (batch C, EXTERNAL review B1) ────────────────────────────────────
+//
+// The ONLINE path had the same re-entrancy hole this file was built to close for the offline one, and
+// it was worse there because nothing crash-loops to make it visible.
+//
+// handleForceSingleCommit performs an IRREVERSIBLE raft rewrite and only THEN writes the
+// force_single_active marker and the recovery epoch. If anything between those points fails — a
+// leader-wait timeout, a marker propose, a crash — the node is a perfectly healthy writable N=1
+// cluster with NO record that an emergency happened:
+//
+//   - `cluster status` shows DEGRADED-for-fault-tolerance, not FORCE_SINGLE, so the operator is not
+//     told the cluster has no integrity;
+//   - the ctl destructive gate is `QuorumLost || ForceSingleActive`, and the rewrite made QuorumLost
+//     false, so with the marker missing the gate is FULLY OPEN on a zero-redundancy node;
+//   - the error text says "re-run `cluster recovery force-single --online`", but the re-run is refused
+//     at the arm gate with quorum_not_lost — the node now has leader contact, because it is its own
+//     leader. The documented repair is unreachable.
+//   - and the leadership-edge resume cannot help either, because ITS trigger was the very marker that
+//     failed to be written.
+//
+// The fix is the one this file already implements for the offline path: record the INTENT on local
+// disk, fsync'd, BEFORE the first irreversible step. It needs no quorum (it is a file), it carries the
+// epoch so a resume re-uses the SAME one rather than minting a second, and it makes the resume trigger
+// independent of any raft state the failure may have prevented.
+
+const onlineIntentFileName = ".force-single-online.intent"
+
+// OnlineIntent is the pre-rewrite record. Every field is needed to FORWARD-COMPLETE without asking the
+// operator anything again.
+type OnlineIntent struct {
+	SelfID string `json:"self_id"`
+	// Abandoned is the peer set the rewrite moves out of the raft configuration. Captured before the
+	// rewrite because afterwards the roster may already be partly pruned.
+	Abandoned []string `json:"abandoned"`
+	// Epoch is minted BEFORE the rewrite and reused by every resume. Minting it during recovery is what
+	// made the split-brain detector's durable input unrecoverable when the epoch write was the step
+	// that failed: a later attempt would have generated a DIFFERENT value, so "did the epoch I promised
+	// actually land" became unanswerable.
+	Epoch string `json:"epoch"`
+	// MarkedAt is the force_single_active value, baked once so every resume proposes identical bytes.
+	MarkedAt string `json:"marked_at"`
+}
+
+func onlineIntentPath(dataDir string) string { return filepath.Join(dataDir, onlineIntentFileName) }
+
+// WriteOnlineIntent fsyncs the intent before the caller performs any irreversible step. It reuses the
+// same symlink-refusing, unpredictable-temp-name write as the offline journal: this runs on a
+// tether-writable directory, potentially as root.
+func WriteOnlineIntent(dataDir string, in OnlineIntent) error {
+	if dataDir == "" {
+		return fmt.Errorf("clusteroffline: online force-single intent needs a data dir")
+	}
+	if err := ValidateOnlineIntent(in); err != nil {
+		return err
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: encode online force-single intent: %w", err)
+	}
+	return writeFileDurably(dataDir, onlineIntentPath(dataDir), onlineIntentFileName, b)
+}
+
+// ReadOnlineIntent returns the in-flight intent, or (nil, nil) when there is none.
+func ReadOnlineIntent(dataDir string) (*OnlineIntent, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	f, err := os.OpenFile(onlineIntentPath(dataDir), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("clusteroffline: %s is a SYMLINK — refusing to follow it", onlineIntentPath(dataDir))
+		}
+		return nil, fmt.Errorf("clusteroffline: read online force-single intent: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("clusteroffline: read online force-single intent: %w", err)
+	}
+	var in OnlineIntent
+	if err := json.Unmarshal(b, &in); err != nil {
+		return nil, fmt.Errorf("clusteroffline: decode online force-single intent: %w", err)
+	}
+	if err := ValidateOnlineIntent(in); err != nil {
+		return nil, err
+	}
+	return &in, nil
+}
+
+// ValidateOnlineIntent rejects a syntactically valid but unusable record before it can mutate
+// replicated emergency state. Unknown additive JSON fields remain compatible.
+func ValidateOnlineIntent(in OnlineIntent) error {
+	if in.SelfID == "" {
+		return fmt.Errorf("clusteroffline: online force-single intent has an empty self_id")
+	}
+	if in.Epoch == "" {
+		return fmt.Errorf("clusteroffline: online force-single intent has an empty epoch")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, in.MarkedAt); err != nil {
+		return fmt.Errorf("clusteroffline: online force-single intent has invalid marked_at %q: %w",
+			in.MarkedAt, err)
+	}
+	seen := make(map[string]struct{}, len(in.Abandoned))
+	for _, id := range in.Abandoned {
+		if id == "" {
+			return fmt.Errorf("clusteroffline: online force-single intent has an empty abandoned node id")
+		}
+		if id == in.SelfID {
+			return fmt.Errorf("clusteroffline: online force-single intent abandons its own node %q", id)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("clusteroffline: online force-single intent repeats abandoned node %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+// ClearOnlineIntent removes the intent once every post-rewrite step is CONFIRMED landed. Absent is OK.
+func ClearOnlineIntent(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	if err := os.Remove(onlineIntentPath(dataDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clusteroffline: clear online force-single intent: %w", err)
+	}
+	d, err := os.Open(dataDir)
+	if err != nil {
+		return fmt.Errorf("clusteroffline: open parent dir to clear online force-single intent: %w", err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("clusteroffline: fsync parent dir to clear online force-single intent: %w", err)
+	}
+	return nil
 }

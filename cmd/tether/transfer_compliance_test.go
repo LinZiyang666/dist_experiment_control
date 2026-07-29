@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -60,5 +61,21 @@ func TestCommitLocalTempNoForceConcurrentSingleWinner(t *testing.T) {
 	}
 	if string(got) != "A" && string(got) != "B" {
 		t.Fatalf("dst=%q", got)
+	}
+}
+
+// TestPullHelpDoesNotPromiseASizeDerivedBudget pins the user-visible boundary of C2.
+//
+// origin: batch-c external review C5/C16. PullPrepareReq carries no size, and both the agent and the
+// broker intentionally call XferBudget with size=0 for pull, which is the fixed five-minute floor.
+// The CLI must not promise the push-only size-derived behavior for a large pull.
+func TestPullHelpDoesNotPromiseASizeDerivedBudget(t *testing.T) {
+	flag := newPullCmd().Flags().Lookup("timeout")
+	if flag == nil {
+		t.Fatal("pull has no --timeout flag")
+	}
+	if strings.Contains(strings.ToLower(flag.Usage), "derived from the file size") {
+		t.Fatalf("pull --timeout help falsely promises a size-derived tier-B budget: %q; the pull "+
+			"protocol carries no size to the agent/broker budget sites and remains fixed at the floor", flag.Usage)
 	}
 }

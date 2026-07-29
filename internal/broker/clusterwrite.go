@@ -121,9 +121,10 @@ type clusterRuntime struct {
 	// fsArm tracks the online force-single sustained-quorum-loss dwell + arm token. Shared between the
 	// (non-leader-gated) observe tick that feeds it and the adminsock backend handlers that read it.
 	fsArm *forceSingleArm
-	// topoSelf (C3) is this broker's latest topology-reconcile self-report (applied/observed/reason),
-	// published by the per-broker reconcile loop and read by the status/health responders. atomic so
-	// the responder (other goroutine) reads it race-free; nil until the first reconcile pass.
+	// topoSelf (C3) is this broker's latest topology-reconcile self-report
+	// (applied/observed/action/reason), published by the per-broker reconcile loop and read by the
+	// status/health responders. atomic so the responder (other goroutine) reads it race-free; nil
+	// until the first reconcile pass.
 	topoSelf atomic.Pointer[topoSelfReport]
 }
 
@@ -131,7 +132,11 @@ type clusterRuntime struct {
 type topoSelfReport struct {
 	Applied  uint64
 	Observed uint64
-	Reason   string
+	// Action (batch C) is the natsconf.Action* the last pass returned — a CLOSED enum, unlike
+	// Reason. It is what both status renderers classify on; Reason survives only as the operator's
+	// detail text and as the mixed-version fallback for a broker that predates this field.
+	Action string
+	Reason string
 }
 
 // ClusterAdminForTest exposes the membership orchestrator for the d9_integration harness
@@ -413,6 +418,8 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D7 membership orchestrator — constructed in cluster mode regardless of the admin
 	// socket (the adminsock backend, wired later in Run, uses it iff the socket is set).
 	b.cl.admin = NewClusterAdmin(node, b.cfg.Logger)
+	// EXTERNAL review B1: the ONLINE force-single intent lives beside the raft sub-tree.
+	b.cl.admin.dataDir = b.cfg.ClusterDataDir
 	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
 	// B5 OPS#9: self-row capacity probes (disk statfs + port band) for `cluster status`.
 	b.cl.admin.SetCapacityProbes(b.cfg.StoreDir, b.cfg.PortBandLow, b.cfg.PortBandHigh)

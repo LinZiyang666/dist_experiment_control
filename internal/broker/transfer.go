@@ -46,10 +46,18 @@ import (
 // signal to arrive. Past these the broker writes a synthetic
 // failed-audit and reclaims the bucket. file-transfer-plan §Audit
 // (timeout fallback) and §Object bucket lifecycle.
+// batch C: the numbers moved to internal/proto so the broker, the agent and the ctl stop each
+// declaring their own copy of a bound the broker REFUSES at. These aliases keep the ~30 broker-local
+// call sites readable; proto owns the values and the derivation.
+//
+// transferTimeoutTierB is now the FLOOR of a size-derived budget, not the whole budget — see
+// proto.XferBudget. It keeps its name because everything that legitimately still wants "the fixed
+// tier-B floor" (the tier-A/B split, the ledger fallback for a record written before Size existed)
+// wants exactly this value.
 const (
-	transferTimeoutTierA  = 30 * time.Second
-	transferTimeoutTierB  = 5 * time.Minute
-	transferTierAMaxBytes = 8 * 1024 * 1024
+	transferTimeoutTierA  = proto.XferTimeoutTierA
+	transferTimeoutTierB  = proto.XferTimeoutTierBFloor
+	transferTierAMaxBytes = proto.XferTierAMaxBytes
 )
 
 // xferCrossHomeReapAge (R16 #58 Lane C) is the age floor for the LEADER-driven cross-home GC of a
@@ -59,12 +67,50 @@ const (
 // transfer still live on ANOTHER broker's home must never be torn out. Derived from transferTimeoutTierB (a
 // live tier-B transfer terminates by its watchdog within one tier-B timeout) with a 3× margin; pinned by a
 // test so the relation cannot silently drift. A deploy-tier drill compresses it via the serveconf seam.
+//
+// batch C: this stays the FLOOR and its value is UNCHANGED. The watchdog budget is now size-derived and
+// can reach proto.XferTierBMaxBudget (35m08s), so the invariant "the GC never deletes an object a live
+// watchdog still covers" no longer follows from one global constant. Raising the constant to cover the
+// worst case was rejected twice over: serveconf.MinXferCrossHomeReapAge is a HARD floor enforced on
+// production YAML, so raising it makes a broker that explicitly set the knob REFUSE TO START after an
+// upgrade — and it would punish every small object with the worst object's grace on exactly the
+// small-disk brokers that can least afford it. xferCrossHomeFloorFor makes the invariant per-object
+// instead, which is both exact and free of deployment surface.
 const xferCrossHomeReapAge = 3 * transferTimeoutTierB
+
+// xferCrossHomeExtraFor is the EXTRA grace an object of this size earns on top of whatever base floor
+// is in effect: exactly the amount by which its watchdog budget exceeds the fixed tier floor.
+//
+// It is an INCREMENT, not an absolute floor, and that is the whole design. Two things would break if
+// it returned an absolute value:
+//
+//   - the serveconf knob (broker.cluster.xfer_cross_home_reap_age) and the deploy-tier drill that
+//     COMPRESSES it would stop working — a drill that sets the floor to seconds so it can observe a
+//     reap would find every small object pinned for 15 minutes instead;
+//   - every small object would inherit the worst object's grace, on precisely the small-disk brokers
+//     that can least afford holding garbage.
+//
+// As an increment, an object whose budget is the plain tier floor earns nothing (behaviour byte-for-
+// byte unchanged, drill seam intact), while a 2 GiB object earns the ~29 extra minutes its own budget
+// bought. size<=0 (unknown) earns nothing, which is the fail-SAFE direction only because the base
+// floor already covers the tier floor with its historical margin.
+func xferCrossHomeExtraFor(size int64) time.Duration {
+	if size <= 0 {
+		return 0
+	}
+	if extra := proto.XferBudget("b", size, proto.XferPushLegs) - transferTimeoutTierB; extra > 0 {
+		return extra
+	}
+	return 0
+}
 
 // transferMaxBytes is the GLOBAL hard upper bound for one tier-B transfer (2 GiB). On a small-disk
 // broker the per-session bucket ceiling (xferBucketMaxBytes, G6 #21) can be LOWER, and the push
 // admission gate rejects at min(transferMaxBytes, that bucket ceiling).
-const transferMaxBytes = 2 * 1024 * 1024 * 1024
+//
+// It is ALSO what makes the size-derived watchdog budget bounded: admission refuses anything larger
+// before the watchdog is armed, so proto.XferTierBMaxBudget is a compile-time ceiling.
+const transferMaxBytes = proto.XferMaxBytes
 
 // G6 #21: OBJ_xfer per-session bucket sizing. The bucket MaxBytes is disk-aware — a fraction of the JS
 // store ceiling left after the events/history reservations — clamped to [floor, cap]. Below the floor we
@@ -79,11 +125,24 @@ const (
 // transferTrackerMaxEntries caps the in-memory tracker map so a fast
 // attacker spamming push.req / pull.req can't OOM the broker before
 // the per-tier watchdog reaps stale entries. At the worst case
-// (5-min Tier-B timeout * 1024 entries * ~200 bytes/entry) the cap
-// holds memory under ~200 KiB. New requests past the cap are
-// rejected with `too_many_in_flight` so callers get a clean error
-// instead of silent slowdown. Audit shard P11 F2.
+// (1024 entries * ~200 bytes/entry) the cap holds memory under
+// ~200 KiB. New requests past the cap are rejected with
+// `too_many_in_flight` so callers get a clean error instead of silent
+// slowdown. Audit shard P11 F2.
+//
+// batch C: the MEMORY bound above is unchanged, but the EXHAUSTION WINDOW is not. This comment used
+// to derive the bound from a "5-min Tier-B timeout"; with a size-derived budget an entry can now live
+// up to proto.XferTierBMaxBudget (35m08s), so a client declaring the maximum size and then sending
+// nothing holds a slot ~6.8x longer than before. That is accepted rather than defended against: only
+// a session MEMBER can reach this path, and a member already has unrestricted `run`/`exec` (per the
+// documented boundary in docs/usage.md), so a member wanting to exhaust a broker has far more direct
+// options. Recording the changed window matters more than the (unchanged) byte count.
 const transferTrackerMaxEntries = 1024
+
+// xferRecentlyReapedTTL bounds how long the tracker remembers that it reaped a transfer id. Long
+// enough for the receiver's real completion to arrive after a watchdog fire (that is the whole point
+// — the receiver was still working), short enough that the set cannot grow without bound.
+const xferRecentlyReapedTTL = 10 * time.Minute
 
 // transferEntry is the broker's in-memory tracking record for one
 // in-flight transfer. Keyed by transfer_id in transferTracker.entries.
@@ -108,10 +167,38 @@ type transferEntry struct {
 type transferTracker struct {
 	mu      sync.Mutex
 	entries map[string]*transferEntry
+	// reaped (batch C) remembers ids the WATCHDOG terminated, with the time it happened. It exists so
+	// a receiver's genuine completion arriving after the budget expired can be LOGGED rather than
+	// dropped in silence — that silence is the last step of "the file landed but the audit says
+	// failed". Bounded by an opportunistic sweep on insert plus xferRecentlyReapedTTL.
+	reaped map[string]time.Time
 }
 
 func newTransferTracker() *transferTracker {
-	return &transferTracker{entries: map[string]*transferEntry{}}
+	return &transferTracker{entries: map[string]*transferEntry{}, reaped: map[string]time.Time{}}
+}
+
+// markReaped records that the watchdog (not a normal finalize) ended this transfer.
+func (t *transferTracker) markReaped(id string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.reaped == nil {
+		t.reaped = map[string]time.Time{}
+	}
+	for k, at := range t.reaped {
+		if now.Sub(at) >= xferRecentlyReapedTTL {
+			delete(t.reaped, k)
+		}
+	}
+	t.reaped[id] = now
+}
+
+// recentlyReaped reports whether the watchdog ended this transfer within the retention window.
+func (t *transferTracker) recentlyReaped(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	at, ok := t.reaped[id]
+	return ok && time.Since(at) < xferRecentlyReapedTTL
 }
 
 func (t *transferTracker) get(id string) *transferEntry {
@@ -395,16 +482,28 @@ func (b *Broker) deleteXferObject(ctx context.Context, sid, transferID string) e
 	return nil
 }
 
+// watchdogBudget is the duration startTransferWatchdog ACTUALLY arms.
+//
+// origin: batch-c internal review tests-F5. It is a named function so a test can assert the value the
+// watchdog uses rather than re-deriving proto.XferBudget(...) and comparing that to itself. The tests
+// that restated the formula stayed green when the real arm site was changed to cover one leg instead
+// of two — i.e. they could not see the very defect they were written for.
+//
+// The budget is derived from the declared size and covers BOTH object-store crossings, because the
+// watchdog is armed before the prepare is even forwarded. e.size is 0 on the pull path
+// (proto.PullPrepareReq carries no size — permanent decision N5), which yields the historical flat
+// floor rather than a zero budget.
+func watchdogBudget(e *transferEntry) time.Duration {
+	return proto.XferBudget(e.tier, e.size, proto.XferPushLegs)
+}
+
 // startTransferWatchdog arms a per-tier timeout. If the receiver-side
 // finalization signal does not arrive in time, the watchdog writes a
 // synthetic audit failed + reclaims the bucket. The returned cancel
 // is stored on the entry so a successful finalize stops the watchdog.
 func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry) context.CancelFunc {
 	ctx, cancel := context.WithCancel(parent)
-	d := transferTimeoutTierA
-	if e.tier == "b" {
-		d = transferTimeoutTierB
-	}
+	d := watchdogBudget(e)
 	go func() {
 		t := time.NewTimer(d)
 		defer t.Stop()
@@ -417,15 +516,17 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 		if !ok || ent == nil {
 			return
 		}
-		var code string
-		switch ent.verb {
-		case "push":
-			code = "agent_no_responders"
-		case "pull":
+		// batch C: the push arm used to write "agent_no_responders", which is a WRONG ATTRIBUTION —
+		// the agent may have been reachable and transferring the whole time; what ran out was the
+		// broker's budget. It is also the code the CLI classifies as EX_TEMPFAIL with the hint "the
+		// agent isn't reachable on NATS; check it's running and connected", sending an operator to
+		// debug connectivity that was never broken. The genuine no-responders emitters (expose,
+		// upgrade, the cluster upgrade trigger) keep that code; only this one changes.
+		code := proto.CodeTransferBudgetExceeded
+		if ent.verb == "pull" {
 			code = "ctl_disconnect"
-		default:
-			code = "timeout"
 		}
+		b.transfers.markReaped(ent.transferID, b.cfg.Now())
 		b.finalizeTransfer(ent, schema.AuditTransfer{
 			V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
 			Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
@@ -584,12 +685,15 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	if req.Size > transferMaxBytes {
-		b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > %d (2 GiB)", req.Size, transferMaxBytes))
+		// batch C: the human-readable size is DERIVED, not hand-copied. The "(2 GiB)" that used to be
+		// typed here would have kept saying 2 GiB after the constant moved — an operator reading the
+		// refusal would compute the wrong limit and keep retrying at it.
+		b.replyPushErr(msg, "too_large", fmt.Sprintf("size=%d > %d (%s)", req.Size, transferMaxBytes, proto.HumanBytes(transferMaxBytes)))
 		return
 	}
 	if req.Tier == "a" && req.Size > transferTierAMaxBytes {
 		b.replyPushErr(msg, "too_large",
-			fmt.Sprintf("tier-a size=%d > %d (8 MiB)", req.Size, transferTierAMaxBytes))
+			fmt.Sprintf("tier-a size=%d > %d (%s)", req.Size, transferTierAMaxBytes, proto.HumanBytes(transferTierAMaxBytes)))
 		return
 	}
 	if req.Tier == "a" && int64(len(req.InlineData)) != req.Size {
@@ -895,6 +999,18 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 	// state-mutating call.
 	preview := b.transfers.get(transferID)
 	if preview == nil {
+		// batch C: THIS is where a late completion is dropped, not the !claimed branch below —
+		// finalizeTransfer already called transfers.remove, so a watchdog-reaped transfer is simply
+		// absent by the time the receiver's real event lands. That silence is the last step of "the
+		// file landed on disk but the audit says failed", so say it out loud when we know we just
+		// reaped this id. Unknown ids (a replay, a foreign broker's transfer) stay quiet: they are
+		// routine and would drown the signal.
+		if b.transfers.recentlyReaped(transferID) {
+			b.cfg.Logger.Warn("broker: receiver reported a transfer AFTER the broker's budget expired and "+
+				"the terminal audit was already written — the audit says failed; the file may well be on "+
+				"disk at the destination",
+				"transfer_id", transferID, "kind", kind, "session", sid, "node", nid)
+		}
 		return // unknown transfer; ignore
 	}
 	if preview.sid != sid || preview.nid != nid {

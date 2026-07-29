@@ -69,8 +69,9 @@ allow_root.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite remote destination if it exists")
-	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
-		"upper bound on the whole transfer (tier A: ~30s; tier B: ~5min — keep some slack)")
+	cmd.Flags().DurationVar(&timeout, "timeout", cliTransferTimeoutDefault,
+		"upper bound on each phase of the transfer (tier A: ~30s; tier B: derived from the file size — "+
+			"the default covers the broker's own worst-case budget)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		// First positional is the local path: shell file completion.
 		if len(args) == 0 {
@@ -383,8 +384,16 @@ be relative.
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
 	cmd.Flags().Bool("ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite local destination if it exists")
-	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute,
-		"upper bound on the whole transfer")
+	// origin: batch-c EXTERNAL review M1. This used to say "tier B is derived from the file size",
+	// which is true for PUSH and false for PULL: proto.PullPrepareReq carries no size, so both the
+	// agent and the broker budget a pull at the fixed floor. Promising the push behaviour here made a
+	// large slow pull look protected by the generous CLI default when the server side would end it in
+	// five minutes.
+	cmd.Flags().DurationVar(&timeout, "timeout", cliTransferTimeoutDefault,
+		"upper bound on each phase of the transfer. NOTE: pull is bounded by a FIXED "+
+			proto.XferTimeoutTierBFloor.String()+" on the agent and broker (the pull request carries no "+
+			"file size, so neither end can derive a budget from it) — raising this flag alone will not "+
+			"make a large slow pull succeed; use `tether expose` + rsync for those")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) == 0 {
 			return completePushTarget(c, home, natsURL, toComplete)
@@ -519,7 +528,8 @@ func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 	pr proto.PullPrepareResp, force bool, timeout time.Duration) error {
 	if pr.Size < 0 || pr.Size > cliMaxBytes {
 		failAndFinalize(nc, actor, sid, transferID, "b", "too_large",
-			fmt.Sprintf("object size=%d exceeds 2 GiB limit", pr.Size), startedAt)
+			// origin: batch-c internal review F4 — DERIVED, not hand-copied. See proto.HumanBytes.
+			fmt.Sprintf("object size=%d exceeds the %s limit", pr.Size, proto.HumanBytes(cliMaxBytes)), startedAt)
 		return fmt.Errorf("pull (tier B): invalid size %d", pr.Size)
 	}
 	js, err := jetstream.New(nc)
@@ -680,14 +690,22 @@ func firstErr(errs ...error) error {
 
 // Tier-A inline ceiling (mirrors broker + agent ceilings). Files
 // <= this go inline; > this require JetStream tier B.
-const cliTierAMaxBytes = 8 * 1024 * 1024
+// batch C: single source in internal/proto — this end must not offer what the broker will refuse.
+const cliTierAMaxBytes = proto.XferTierAMaxBytes
+
+// cliTransferTimeoutDefault must not be TIGHTER than the broker's own worst-case budget, or the ctl
+// aborts a transfer the broker is still patiently waiting on and the user reads a client-side timeout
+// for a server-side success in progress. The old default was a flat 10 minutes with help text that
+// said "tier B: ~5min" — true only while the broker's budget was a fixed 5 minutes. It is an upper
+// bound per phase, not a wait, so covering the worst case costs a small transfer nothing.
+const cliTransferTimeoutDefault = proto.XferTierBMaxBudget + 2*time.Minute
 
 // cliMaxBytes is the hard upper bound for a single transfer. Past this
 // the user is expected to use `tether expose` + rsync (file-transfer-
 // plan §Goals). Bumped from 200 MiB → 2 GiB in v0.2.5; per-session JS
 // bucket MaxBytes scales accordingly (see internal/broker/transfer.go
 // ensureXferBucket).
-const cliMaxBytes = 2 * 1024 * 1024 * 1024
+const cliMaxBytes = proto.XferMaxBytes
 
 // remoteSpec is one parsed `<node>:<remote-path>` argument.
 type remoteSpec struct {

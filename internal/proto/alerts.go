@@ -8,10 +8,12 @@ package proto
 // version-skew + JS-503 + voter self-report batch (ProxyHomeCount/ProxyHomeReported/JetStreamUnavailable/
 // CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive; v5 (R7b) adds the
 // two lock-lease expiries (UpgradeLeaseExpiry/GrowLeaseExpiry); v6 (batch B / B4) adds the account-key
-// self-report (AccountNkPub/AccountNkReported) that makes the `cluster status` ACCT.NK column honest.
+// self-report (AccountNkPub/AccountNkReported) that makes the `cluster status` ACCT.NK column honest;
+// v7 (batch C / C3) adds TopoAction, the closed-enum topology reconcile action that replaces
+// substring-matching TopoReconcileReason on both status renderers.
 // No consumer gates on this value — decoding is omitempty-additive — so it is a documentation ledger,
 // not a compat switch.
-const ClusterHealthSchemaVersion = 6
+const ClusterHealthSchemaVersion = 7
 
 // ClusterHealthResp is one broker's answer to a broadcast cluster-health probe (§10.4). The
 // ctl corroborates ALL replies to decide a destructive gate WITHOUT a Raft write.
@@ -95,9 +97,18 @@ type ClusterHealthResp struct {
 	// the LIVE nats-server confirmed loading (via the /varz probe). TopoReported distinguishes a C3
 	// broker that genuinely reports (always true) from an older/non-reporting one — so the HEALTHY-HA
 	// gate degrades only a reporting voter that is behind, never false-greens via a >0 magnitude guard.
+	//
+	// TopoAction (batch C) is the natsconf.Action* the last reconcile pass returned. It exists because
+	// TopoReconcileReason is FREE TEXT and both status renderers were substring-matching it with
+	// DIFFERENT substring sets — a convention maintained across a package boundary, which duly
+	// diverged. Action is a closed enum the producer already emits, so classifying on it removes the
+	// divergence mechanism instead of this instance of it. Additive omitempty, exactly like
+	// TopoReported above: a pre-batch-C broker omits it and both ends fall back to the (now single,
+	// shared) reason matcher in natsconf.ClassifyTopo.
 	TopoApplied         uint64 `json:"topo_applied,omitempty"`
 	TopoObserved        uint64 `json:"topo_observed,omitempty"`
 	TopoReconcileReason string `json:"topo_reconcile_reason,omitempty"`
+	TopoAction          string `json:"topo_action,omitempty"`
 	TopoReported        bool   `json:"topo_reported,omitempty"`
 	// PhaseFluidityOps (review F5): this broker's binary advertises support for the v0.4.2
 	// phase-fluidity membership ops (OpClusterNodeReaddr/Route). The leader gates SetRaftAddr/

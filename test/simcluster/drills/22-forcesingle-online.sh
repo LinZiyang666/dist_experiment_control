@@ -168,6 +168,27 @@ positive|tamed)
     # R3: online does NOT de-cluster nats.conf (unlike offline #20) — it stays clustered + prints the remedy.
     assert_ok "POS R3: nats.conf STAYS clustered (online never de-clusters; offline-only #20)" \
         sh -c "$SIM exec brk1 -- grep -qE '^cluster' /etc/tether/nats.d/nats.conf"
+    # batch C: the roster prune stays SYNCHRONOUS on the happy path, and the finalize op exists only as
+    # the RETRY for a prune that failed. Two assertions, and the second is the one that matters: a
+    # finalize op present after a CLEAN recovery would mean the sync path was replaced rather than
+    # kept, which is exactly the half-measure the plan forbids — and it would leave the operator with
+    # `--to-standalone` refusing (a ghost carries no raft role, so N=1 cannot be proven).
+    assert_ok "batch-C: the abandoned peer's roster row is GONE right after commit (the prune is synchronous — the runbook's next step depends on it)" \
+        poll_until 20 2 "brk2 roster row pruned" -- sh -c "! $SIM exec brk1 -- sh -c 'tether cluster status --json 2>/dev/null | jq -e \".nodes[]|select(.node_id==\\\"brk2\\\")\" >/dev/null'"
+    assert_ok "batch-C: a CLEAN recovery creates NO force_single_finalize op (it is the failure-branch retry, not the happy path)" \
+        sh -c "! $SIM exec brk1 -- sh -c 'tether cluster ops ls --json 2>/dev/null | grep -q force_single_finalize'"
+    # EXTERNAL review B1 lifecycle: the on-disk intent is written BEFORE the irreversible rewrite and
+    # cleared only once every promised fact has landed. A clean recovery must leave nothing behind — an
+    # intent that survives would make every later leadership tick re-verify a finished recovery.
+    assert_ok "batch-C/B1: a CLEAN recovery leaves NO force-single intent file behind" \
+        sh -c "! $SIM exec brk1 -- test -f /var/lib/tether/.force-single-online.intent"
+
+    # The INTERRUPTED-recovery injection (EXTERNAL review T1) lives in 20-forcesingle-natsconf.sh, not
+    # here. It needs a broker that can be restarted and come back healthy, and after an ONLINE
+    # force-single this node still carries a CLUSTERED nats.conf with JetStream 503 (asserted two
+    # blocks up — online deliberately never de-clusters), which is the documented #35 startup
+    # crash-loop context: measured here at NRestarts=21 in a bounded 45s window. Drill 20 ends with a
+    # de-clustered, bootable N=1, which is where that injection is actually reachable.
     # (YES-online #36 is asserted PRE-kill on the healthy cluster — after the commit brk1 regains leader
     # contact, so --online --yes hits the quorum_not_lost gate, not the --yes/TTY surface.)
     ;;

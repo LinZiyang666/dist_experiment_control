@@ -462,6 +462,7 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 	b.cfg.GrowLockReapInterval = 30 * time.Second
 	b.cfg.UpgradeLockReapInterval = 30 * time.Second
 	b.cfg.HomeDeliverInterval = 5 * time.Second
+	b.cfg.DrainMarkerReapInterval = 30 * time.Second
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
 	b.registerCoreReconcilePasses()
 
@@ -478,6 +479,13 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 		// R8a P1: leader-gated — it re-delivers what the leader's homeForRegister computes
 		// from replicated rows; N brokers pushing the same assignment is pure amplification.
 		{Name: "home-delivery", Interval: 5 * time.Second, Authority: leader},
+		// batch C: clears a broker_draining marker whose node has NO roster row — the orphan the
+		// retire ladder leaves when its marker-clear Propose fails (that error is discarded) and the
+		// roster row is then deleted, stranding a permanent alert for a node nobody can name. Leader:
+		// it Proposes, and it needs a leader-consistent view of cluster_meta AND cluster_nodes. Its
+		// OWN interval field, deliberately not a reuse of GrowLockReapInterval — one field with two
+		// meanings is the defect batch B spent a phase removing.
+		{Name: "drain-marker", Interval: 30 * time.Second, Authority: leader},
 		// B7 deliberately did NOT add leader-maintenance / proxy-reap passes here. Both available
 		// shapes are regressions and the reasoning is recorded at the top of this file's production
 		// counterpart (reconcile_registry.go, "WHY THE TWO LEADER DUTIES STAYED OUT"). If a future
@@ -513,6 +521,7 @@ func TestReconcilePassesUseInjectedIntervals(t *testing.T) {
 	b.cfg.GrowLockReapInterval = 13 * time.Second
 	b.cfg.UpgradeLockReapInterval = 17 * time.Second
 	b.cfg.HomeDeliverInterval = 19 * time.Second
+	b.cfg.DrainMarkerReapInterval = 23 * time.Second
 	b.reconcilers = newReconcileRegistry(b.cfg.Logger, b.reconcileLeaderGate)
 	b.registerCoreReconcilePasses()
 
@@ -527,6 +536,7 @@ func TestReconcilePassesUseInjectedIntervals(t *testing.T) {
 		"grow-lock":        13 * time.Second,
 		"home-delivery":    19 * time.Second,
 		"upgrade-lock":     17 * time.Second,
+		"drain-marker":     23 * time.Second,
 	} {
 		if byName[name] != want {
 			t.Errorf("pass %q interval = %v, want the configured %v", name, byName[name], want)
