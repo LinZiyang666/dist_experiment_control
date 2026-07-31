@@ -27,7 +27,7 @@ func main() {
 	var (
 		workers     = flag.Int("workers", 0, "parallel workers (0 = auto: min(#tests, #physical cores/2, 20))")
 		runRe       = flag.String("run", "", "only run tests matching this regexp (default: all top-level tests)")
-		timeout     = flag.Duration("timeout", 25*time.Minute, "overall deadline")
+		timeout     = flag.Duration("timeout", minDeadline, "overall deadline (unset = derived from units/workers; see defaultDeadline)")
 		repeat      = flag.Int("repeat", 1, "run the whole set N times (flake hunting)")
 		dryRun      = flag.Bool("dry-run", false, "print the plan and exit")
 		verbose     = flag.Bool("v", false, "stream failing output in full")
@@ -181,11 +181,23 @@ func main() {
 	if heavy != nil {
 		fmt.Printf("  [wide, unsplittable units] %s\n", *heavy)
 	}
+	// The budget is part of the PLAN, so it is computed and printed before the dry-run return —
+	// `-dry-run` exists to answer "what would this host do", and on a small host the answer that
+	// matters most is "it would give itself 100 minutes, not 25".
+	budget := *timeout
+	if timeoutWasSet() {
+		fmt.Printf("deadline: %s (explicit -timeout)\n", budget)
+	} else {
+		budget = defaultDeadline(workItems, workerCount)
+		fmt.Printf("deadline: %s (derived: %d unit(s) / %d worker(s) = %d slot(s) deep; "+
+			"override with -timeout)\n", budget, workItems, workerCount, slotsPerWorker(workItems, workerCount))
+	}
 	if *dryRun {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	// ctx-root: the runner's own root; this process IS the round.
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	overallStart := time.Now()
@@ -210,6 +222,29 @@ func main() {
 		// External review M4: comparing COUNTS cannot see an item that was
 		// duplicated while another was dropped, or one silently substituted for
 		// another. The identities are compared as a multiset instead.
+		// A blown deadline is NOT a test failure, and saying so is the whole point of this block.
+		//
+		// origin: a 2-physical-core GitHub runner. It seated ONE worker, ran all 99 units serially,
+		// hit the 25m default at unit 85, and reported `FAIL D5:test/d5[1/8]: signal: killed` plus
+		// "17 scheduled item(s) produced no result". Every word of that is true and all of it points
+		// at the tests. Nothing said the host was too small for the budget, so the only way to learn
+		// what happened was to notice that the wall clock was 25m0.002s.
+		//
+		// The deadline exists to stop a runaway round, not to enforce a performance budget. When it
+		// fires, the round is still FAILED — an incomplete round must never read as a pass — but it
+		// is failed for a reason the operator can act on, and the action is not "debug test/d5".
+		if ctx.Err() != nil {
+			fmt.Printf("\nDEADLINE EXCEEDED: the round hit its %s budget. THIS IS NOT A TEST FAILURE.\n"+
+				"  the unit(s) reported killed below were killed BY this deadline, and any unit listed as\n"+
+				"  producing no result never started.\n\n"+
+				"  this host seated %d worker(s) from %d physical core(s), so %d unit(s) ran %d-at-a-time;\n"+
+				"  the round needed more wall clock than the budget allowed.\n\n"+
+				"  fix the BUDGET or the HOST, not the tests:\n"+
+				"    -timeout %s        (roughly what this shape needs, with headroom)\n"+
+				"    or run on a host with more physical cores — workers = min(units, cores/2, %d)\n",
+				budget.Round(time.Second), workerCount, topo.total, workItems, workerCount,
+				suggestDeadline(time.Since(overallStart)), maxAutoWorkers)
+		}
 		if missing, extra := reconcile(scheduledNames(*split, units, tests), results); len(missing) > 0 || len(extra) > 0 {
 			if len(missing) > 0 {
 				fmt.Printf("FAILURES: %d scheduled item(s) produced no result: %v — "+
@@ -533,13 +568,18 @@ func report(results []result, verbose bool) int {
 
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
 
+// maxAutoWorkers caps the automatic worker count. Named because the deadline
+// derivation and the operator-facing advice both have to quote it, and a third
+// copy of `20` is how those two drift apart.
+const maxAutoWorkers = 20
+
 // autoWorkerCount keeps the default usable on both the 44-core development
 // host and small CI runners. Hard-coding the development value in the Makefile
 // made a 2- or 4-core runner fail allocation before it ran a single test.
 func autoWorkerCount(physicalCores, workItems int) int {
 	w := physicalCores / 2
-	if w > 20 {
-		w = 20
+	if w > maxAutoWorkers {
+		w = maxAutoWorkers
 	}
 	if w > workItems {
 		w = workItems
@@ -548,6 +588,86 @@ func autoWorkerCount(physicalCores, workItems int) int {
 		w = 1
 	}
 	return w
+}
+
+// timeoutWasSet reports whether -timeout appeared on the command line. Without this the runner
+// cannot tell "the operator chose 25m" from "25m is the flag's default", and it must not silently
+// override an explicit choice.
+func timeoutWasSet() bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			set = true
+		}
+	})
+	return set
+}
+
+// slotsPerWorker is how many units one worker runs back-to-back. THIS, not the unit count, is what
+// a round's wall clock tracks: 99 units across 20 workers is a 5-deep queue, and across 1 worker it
+// is a 99-deep one.
+func slotsPerWorker(workItems, workers int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	n := workItems / workers
+	if workItems%workers != 0 {
+		n++
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// DEADLINE DERIVATION
+//
+// origin: a 2-physical-core GitHub runner blew a hard-coded 25m and reported it as a test failure.
+// 25m was never a property of the SUITE — it was a property of the 44-core box the runner was
+// written on, where 20 workers make the queue 5 deep. On a host that seats one worker the same
+// suite is a 99-deep queue and no fixed number can be right for both.
+//
+// So it is derived from the queue depth, anchored on two MEASURED points rather than a guess:
+//
+//	44-core dev host: 99 units / 20 workers =  5 slots -> 3m27s observed  (~41s per slot)
+//	2 physical cores: 99 units /  1 worker  = 99 slots -> 42m22s observed (~26s per slot), ALL PASS
+//
+// The 2-core figure was measured by restricting this repo's dev box to two physical cores with
+// `taskset -c 0,1,44,45`, the closest reproduction of a GitHub `ubuntu-latest` runner available
+// here. It matters that the round PASSED: nothing in the suite is fragile at one worker, so the CI
+// failure really was the budget and nothing else.
+//
+// Per-slot cost is NOT constant across those points — a worker with 2 cores to itself finishes a
+// slot faster than one of 20 workers fighting for memory bandwidth — so the constant is rounded up
+// from the LARGER of the two (41s -> 30s is below both; see the factor). A deadline that is
+// generous on a big host costs nothing: the deadline is a runaway-stopper, and the per-unit
+// `-timeout 20m` inside each `go test` is what actually catches a hung test.
+//
+// 30s x 2 puts the 1-worker budget at 1h39m against a measured 42m — 2.3x headroom, which is what
+// a CI runner slower than this box needs.
+const (
+	perSlotBudget  = 30 * time.Second // between the two measured per-slot costs (26s small, 41s loaded-big)
+	deadlineFactor = 2                // headroom: a loaded or slower runner must not trip it
+	minDeadline    = 25 * time.Minute // never go BELOW the historical default on a big host
+)
+
+func defaultDeadline(workItems, workers int) time.Duration {
+	d := time.Duration(slotsPerWorker(workItems, workers)) * perSlotBudget * deadlineFactor
+	if d < minDeadline {
+		d = minDeadline
+	}
+	return d.Round(time.Minute)
+}
+
+// suggestDeadline turns "how far it got before the budget ran out" into a number the operator can
+// paste back. Deliberately crude: it is a starting point, not a promise, and it says so by being a
+// round number well above what was observed.
+func suggestDeadline(elapsed time.Duration) time.Duration {
+	d := (elapsed * 2).Round(10 * time.Minute)
+	if d < 30*time.Minute {
+		d = 30 * time.Minute
+	}
+	return d
 }
 
 func fatal(format string, a ...any) {

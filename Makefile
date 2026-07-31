@@ -117,6 +117,15 @@ e2e-one:
 # any unit produced no result. Both checks exist because the loss they catch is
 # silent: a run that skips work looks exactly like a run that is fast.
 #
+# WALL CLOCK FOLLOWS THE HOST, AND SO DOES THE DEADLINE. Workers are
+# min(units, physical cores/2, 20), so this box seats 20 and a 2-core CI runner seats ONE — the
+# same 99 units go from a 5-deep queue to a 99-deep one. The round's global deadline used to be a
+# hard-coded 25m, which is a property of THIS box and not of the suite: on a GitHub `ubuntu-latest`
+# runner the round was killed at unit 85 and reported `signal: killed` + "17 produced no result",
+# a message that points squarely at the tests and says nothing about the host. The deadline is now
+# derived from the queue depth and printed in the plan, and blowing it prints DEADLINE EXCEEDED
+# with the host shape and a usable -timeout. Do NOT put a fixed -timeout back in this target.
+#
 # THIS IS THE GATE. It asserts top-level coverage at startup, fails closed on
 # unsupported command shapes/flags, and reconciles scheduled-vs-reported identities
 # at the end. Under load it exercises the contention that actually finds bugs. The suites that once

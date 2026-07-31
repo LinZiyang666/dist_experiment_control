@@ -63,6 +63,13 @@ jobs:
   e2e:
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    # `ubuntu-latest` has 2 physical cores, so the runner seats ONE worker and the 99 units run
+    # back-to-back. Measured on a 2-core-restricted host: 42m22s, ALL PASS. The round's own deadline
+    # is derived from that shape (1h39m at one worker) and is the thing that should fire first; this
+    # job-level cap only exists so a hung RUNNER cannot burn the 6-hour GitHub default. Do not lower
+    # it to "make CI faster" — it would kill a healthy round mid-suite, which is exactly the failure
+    # this whole change was made to stop misreporting.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
