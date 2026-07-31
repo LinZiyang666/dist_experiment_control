@@ -295,10 +295,13 @@ func (u unit) goTestArgs() []string {
 		if u.tags != "" {
 			args = append(args, "-tags", u.tags)
 		}
-		if u.timeo == "" {
-			u.timeo = "300s"
+		// A local, not a write to the value receiver: assigning to u.timeo here mutates a COPY, so the
+		// value would be silently discarded if anything downstream ever read it back.
+		timeo := u.timeo
+		if timeo == "" {
+			timeo = "300s"
 		}
-		args = append(args, "-timeout", u.timeo)
+		args = append(args, "-timeout", timeo)
 	}
 	if u.runFilter != "" && !u.hasRun {
 		args = append(args, "-run", u.runFilter)

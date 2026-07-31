@@ -85,7 +85,6 @@ func goldenPath(name string) string {
 // golden). With -update-golden it (re)writes the fixtures.
 func TestGoldenWireEncoding(t *testing.T) {
 	for _, f := range goldenFixtures(t) {
-		f := f
 		t.Run(f.name, func(t *testing.T) {
 			// Marshal with indentation for a readable, diffable golden.
 			got, err := json.MarshalIndent(f.v, "", "  ")

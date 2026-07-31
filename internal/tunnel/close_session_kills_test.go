@@ -63,7 +63,7 @@ func TestExternalReviewCloseSessionKillsListenersWithoutDB(t *testing.T) {
 	}
 
 	// Both listeners must be gone (no DB was consulted).
-	if waitListening(p1, false) == false || waitListening(p2, false) == false {
+	if !waitListening(p1, false) || !waitListening(p2, false) {
 		t.Fatal("CloseSession did not close both public listeners")
 	}
 

@@ -261,8 +261,20 @@ func (s *Server) Start(ctx context.Context, wantLocalPort int, keys []Key) (int,
 	if err != nil {
 		return 0, fmt.Errorf("ssproxy: listen: %w", err)
 	}
+	// ORDER MATTERS: assert before publishing ln to the struct.
+	//
+	// origin: line-2 external review, severity lane's blind-spot #2. The checked type assertion added
+	// earlier in this increment sat AFTER `s.ln = ln`, so on the error path the Server kept a pointer to
+	// a listener it had just Closed while localPort stayed 0 -- and the `if s.ln != nil` early-return at
+	// the top of this function then made the SECOND call return (0, nil). A zero port with a nil error is
+	// worse than the panic the assertion was added to prevent: a panic has a stack.
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		return 0, fmt.Errorf("ssproxy: listener address is %T, not *net.TCPAddr", ln.Addr())
+	}
 	s.ln = ln
-	s.localPort = ln.Addr().(*net.TCPAddr).Port
+	s.localPort = tcpAddr.Port
 	s.allConns = map[net.Conn]struct{}{}
 	s.keyConns = map[string]map[net.Conn]struct{}{}
 	s.setKeysLocked(keys)

@@ -724,6 +724,11 @@ func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 				finalized++
 			}
 			return
+		case ledgerSynthesize:
+			// Named rather than left to the fallthrough: the synthesis path is everything below this
+			// switch, and a new disposition joining the enum must not inherit it by default. Emitting a
+			// synthetic `failed` terminal for a transfer that should have been left alone would put a
+			// permanent lie in the audit log.
 		}
 		// DELIBERATELY the tier floor, not the size-derived budget — see transferTierFloorFor.
 		timeout := transferTierFloorFor(rec.Tier)

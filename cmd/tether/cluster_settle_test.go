@@ -35,7 +35,7 @@ func TestSettleReturnsHealthyImmediately(t *testing.T) {
 		advance(time.Second)
 		return rep(0), nil
 	})
-	got, err := settleClusterStatus(waitCmd(t, context.Background()), "/sock", 30*time.Second, time.Millisecond)
+	got, err := settleClusterStatus(waitCmd(context.Background(), t), "/sock", 30*time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestSettleDebouncesTransientDegraded(t *testing.T) {
 		advance(2 * time.Second)
 		return rep(e), nil
 	})
-	got, err := settleClusterStatus(waitCmd(t, context.Background()), "/sock", 30*time.Second, time.Millisecond)
+	got, err := settleClusterStatus(waitCmd(context.Background(), t), "/sock", 30*time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestSettleSurfacesSustainedDegraded(t *testing.T) {
 		advance(3 * time.Second)
 		return rep(1), nil
 	})
-	got, err := settleClusterStatus(waitCmd(t, context.Background()), "/sock", 10*time.Second, time.Millisecond)
+	got, err := settleClusterStatus(waitCmd(context.Background(), t), "/sock", 10*time.Second, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSettleReturnsHardStatesImmediately(t *testing.T) {
 			advance(time.Second)
 			return rep(hard), nil
 		})
-		got, err := settleClusterStatus(waitCmd(t, context.Background()), "/sock", time.Hour, time.Millisecond)
+		got, err := settleClusterStatus(waitCmd(context.Background(), t), "/sock", time.Hour, time.Millisecond)
 		if err != nil {
 			t.Fatal(err)
 		}

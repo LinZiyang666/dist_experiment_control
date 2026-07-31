@@ -381,6 +381,8 @@ func (b *Broker) hardRestartNatsServer() error {
 // probeNatsClusterName reads the loopback /varz and returns the live server's cluster name ("" = standalone /
 // not clustered / not up). A non-empty name proves nats revived in CLUSTER mode.
 func (b *Broker) probeNatsClusterName() (string, error) {
+	//nolint:noctx // performGrowCutover/restartAndVerifyClustered are RPC handlers two hops up and
+	// neither takes a ctx; this is a 3s loopback GET against a client with its own timeout.
 	resp, err := topoProbeClient.Get("http://" + topoMonitorListen + "/varz")
 	if err != nil {
 		return "", err

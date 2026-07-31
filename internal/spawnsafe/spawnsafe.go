@@ -865,7 +865,7 @@ func isExecutable(path string) bool {
 	// Match os/exec's permission-aware check closely enough for a non-setuid
 	// agent. Otherwise ACL/identity denial must not be mistaken for an executable
 	// candidate.
-	if err != syscall.ENOSYS && err != syscall.EPERM {
+	if !errors.Is(err, syscall.ENOSYS) && !errors.Is(err, syscall.EPERM) {
 		return false
 	}
 	return fi.Mode()&0o111 != 0

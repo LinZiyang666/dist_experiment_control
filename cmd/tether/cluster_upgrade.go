@@ -412,6 +412,10 @@ const upgradeTriggerCodeNotReady = "cluster_not_ready"
 // sendUpgradeTrigger signs + publishes a trigger and awaits the target broker's reply, RETRYING the
 // retriable cluster_not_ready (External-review M1: a broker that just re-exec'd answers health before its
 // admin backend wires — wait it out rather than HALT the roll). Bounded by upgradeConvergeTimeout.
+//
+// origin: line-2 review M14. cluster_add.go's sendGrowTrigger carries the argument for this pair.
+//
+//nolint:dupl // paired with sendGrowTrigger in cluster_add.go; coincidental send skeleton.
 func sendUpgradeTrigger(ctx context.Context, nc *nats.Conn, actor string, seed []byte, req *proto.ClusterUpgradeReq) (*proto.ClusterUpgradeResp, error) {
 	deadline := time.Now().Add(upgradeConvergeTimeout)
 	for {
@@ -427,6 +431,9 @@ func sendUpgradeTrigger(ctx context.Context, nc *nats.Conn, actor string, seed [
 	}
 }
 
+// origin: line-2 review M14. sendGrowTriggerOnce in cluster_add.go is this one's pair.
+//
+//nolint:dupl // paired with sendGrowTriggerOnce in cluster_add.go; single-attempt half.
 func sendUpgradeTriggerOnce(ctx context.Context, nc *nats.Conn, actor string, seed []byte, req *proto.ClusterUpgradeReq) (*proto.ClusterUpgradeResp, error) {
 	data, err := signUpgradeTrigger(seed, req, time.Now())
 	if err != nil {

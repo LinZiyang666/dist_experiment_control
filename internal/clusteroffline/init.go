@@ -197,12 +197,12 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 	// .bak/migration — so a secrets dir that would make cluster startup FATAL (missing
 	// node-ident.nk, a world-readable private key, …) is rejected up front instead of after
 	// the irreversible migration. FDE-absent stays a non-fatal advisory.
-	if adv, fatal := SecretsPreflight(opts.SecretsDir); fatal != nil {
+	adv, fatal := SecretsPreflight(opts.SecretsDir)
+	if fatal != nil {
 		return fmt.Errorf("clusteroffline: secrets preflight: %w", fatal)
-	} else {
-		for _, a := range adv {
-			opts.Logger.Warn("clusteroffline: secrets advisory", "detail", a)
-		}
+	}
+	for _, a := range adv {
+		opts.Logger.Warn("clusteroffline: secrets advisory", "detail", a)
 	}
 
 	// (4) .bak the pristine pre-migration DB (skip-if-exists: a prior half-run's .bak is the

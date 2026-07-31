@@ -30,8 +30,9 @@ import (
 )
 
 const (
-	lockFileName    = cluster.DataDirLockFile // round-5 B3: ONE SSOT shared with the daemon's lifetime lock
-	peerDialTimeout = 1500 * time.Millisecond
+	lockFileName            = cluster.DataDirLockFile // round-5 B3: ONE SSOT shared with the daemon's lifetime lock
+	peerDialTimeout         = 1500 * time.Millisecond
+	probeAdviceLookupBudget = 250 * time.Millisecond // diagnostic only; never hold a recovery refusal on DNS
 )
 
 // ErrDaemonRunning is returned when a live daemon still holds raft.db (the (b)
@@ -458,7 +459,7 @@ func checkPeersDead(roster []Peer, confirmed []string) error {
 	for _, p := range roster {
 		if alive, kind, addr := probePeer(p); alive {
 			return fmt.Errorf("clusteroffline: HARD-REFUSE — peer %q accepted a TCP connection on its %s port (%s); "+
-				"it is ALIVE, force-single would split-brain", p.NodeID, kind, addr)
+				"it is ALIVE, force-single would split-brain%s", p.NodeID, kind, addr, untrustworthyProbeAdvice(addr))
 		}
 	}
 	return nil
@@ -483,6 +484,79 @@ func probePeer(p Peer) (alive bool, kind, addr string) {
 		}
 	}
 	return false, "", ""
+}
+
+// WHY THE PROBE STAYS "A COMPLETED TCP CONNECT MEANS ALIVE", AND WHAT IS ADDED INSTEAD
+//
+// origin: line-2 external review follow-up, found while root-causing simcluster drill 42. On a host
+// running a fake-IP resolver (mihomo/clash: 198.18.0.0/15) or any wildcard/captive DNS, EVERY name
+// resolves and the TUN device completes the handshake. A peer that is genuinely dead then reads as
+// ALIVE, and this gate HARD-REFUSES a legitimate force-single — permanently, with a message that
+// sends the operator hunting a machine that does not exist. Measured, not theorised: three drill-42
+// runs produced the same ASSERT-FAIL from exactly this.
+//
+// The fix is NOT to make the probe smarter. Requiring a raft/TLS handshake before believing a peer
+// is alive would flip the failure into the DANGEROUS direction: a live peer with an expired cert or
+// a version skew would read as dead, and force-single would split-brain — which is the accident B-8
+// and audit CC-2 built this gate to prevent. Refusing is the safe verdict and it stays.
+//
+// What is added is the missing half: SAY WHY the verdict may be meaningless. Both signals below are
+// observations about the HOST, never about the peer, and neither can turn a refusal into an approval.
+var (
+	// syntheticProbeNet is RFC 2544's benchmarking range. It must never carry real traffic, so a
+	// cluster peer address inside it is by definition synthetic — this is the range mihomo/clash hands
+	// out for fake-IP.
+	syntheticProbeNet = &net.IPNet{IP: net.IPv4(198, 18, 0, 0).To4(), Mask: net.CIDRMask(15, 32)}
+	// nxdomainCanary is reserved by RFC 2606 and MUST NOT resolve. If it does, the host resolver
+	// fabricates answers for names that do not exist, and no TCP probe on this host means anything.
+	nxdomainCanary = "tether-liveness-canary.invalid"
+	// lookupHost is a seam so the canary check is testable without a resolver.
+	// The context is mandatory: advice must never turn a bounded safety refusal
+	// into an unbounded wait on a broken DNS server.
+	lookupHost = net.DefaultResolver.LookupHost
+)
+
+// untrustworthyProbeAdvice returns a diagnostic paragraph (leading newline) when the host makes TCP
+// liveness unmeasurable, or "" when it does not. Appended to the HARD-REFUSE message only.
+func untrustworthyProbeAdvice(addr string) string {
+	var reasons []string
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		if ips, lerr := lookupHostForProbeAdvice(host); lerr == nil {
+			for _, s := range ips {
+				if ip := net.ParseIP(s); ip != nil && syntheticProbeNet.Contains(ip) {
+					reasons = append(reasons, fmt.Sprintf(
+						"%s resolves to %s, inside 198.18.0.0/15 (RFC 2544 benchmarking; this is what "+
+							"mihomo/clash hands out for fake-IP). That address cannot be a real cluster peer.",
+						host, s))
+					break
+				}
+			}
+		}
+	}
+	if ips, err := lookupHostForProbeAdvice(nxdomainCanary); err == nil && len(ips) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"this host resolves %s (RFC 2606 reserved — it MUST NOT resolve) to %s, so it fabricates "+
+				"addresses for names that do not exist and every TCP liveness probe on it reports ALIVE.",
+			nxdomainCanary, strings.Join(ips, ", ")))
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+	return "\n\n  THE PROBE ABOVE MAY BE MEANINGLESS ON THIS HOST:\n    - " +
+		strings.Join(reasons, "\n    - ") +
+		"\n\n  The refusal STANDS — a probe that cannot tell alive from dead is not evidence that the peer is\n" +
+		"  dead, and force-single on a live peer splits the brain. Fix the host first (stop the fake-IP\n" +
+		"  resolver, or point /etc/resolv.conf at one that returns NXDOMAIN), then re-run and let the probe\n" +
+		"  give a real answer."
+}
+
+func lookupHostForProbeAdvice(host string) ([]string, error) {
+	// ctx-none: the whole force-single path is ctx-free by construction — ForceSingleOptions carries no
+	// context and the offline tool runs with the daemon stopped. The budget below is the only bound this
+	// lookup gets, which is why it is a named constant rather than an inherited deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), probeAdviceLookupBudget)
+	defer cancel()
+	return lookupHost(ctx, host)
 }
 
 // PeerLiveness is one peer's DISPLAY-only probe verdict for the online force-single report. The

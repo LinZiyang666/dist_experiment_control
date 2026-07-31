@@ -670,7 +670,6 @@ func TestWriteAtomic_NoForceConcurrentCommitHasSingleWinner(t *testing.T) {
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
 	for _, c := range candidates {
-		c := c
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

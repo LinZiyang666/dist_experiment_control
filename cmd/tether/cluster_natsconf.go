@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -257,6 +258,13 @@ func runReconcileToStandalone(cmd *cobra.Command, f *natsconfTakeoverFlags, conf
 	jsBackup := storeDir + ".standalone-bak." + nowStampUTC()
 	moved, mErr := natsconf.MoveAsideJSStore(storeDir, jsBackup, "", resetJS)
 	if mErr != nil {
+		// origin: line-2 closure verification m9 — see the sibling branch in cluster_offline.go.
+		if !errors.Is(mErr, natsconf.ErrJSStoreNeedsAck) {
+			return fmt.Errorf("reconcile nats --to-standalone: the clustered JS store could not be inspected or "+
+				"moved, and it must be reset to standalone before the conf is swapped — %w\n"+
+				"  --reset-js will NOT help here: the flag only acknowledges a data-bearing store, and this is a "+
+				"failure to read or write it. Fix the condition named above, then re-run", mErr)
+		}
 		return fmt.Errorf("reconcile nats --to-standalone: the clustered JS store must be reset to standalone before the "+
 			"conf is swapped — %w\n"+
 			"  re-run with --reset-js (moves %q aside, NEVER deleted; `nats stream backup` first to preserve it live).\n"+

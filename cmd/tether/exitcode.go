@@ -46,10 +46,33 @@ type ExitError struct {
 	// R11 deploy-tier failure, drill 52 B3/55c). The non-zero exit + the JSON already convey the
 	// failure, so the prose is redundant AND harmful there.
 	Quiet bool
+	// Code is the WIRE code this error was built from ("download_http_status", "not_owner", …), carried
+	// structurally so a caller can branch on it without reading the prose. Empty for errors that have no
+	// wire code (a NATS transport failure, a decode error, a CLI usage error).
+	//
+	// origin: line-2 external review 疑惑 #2. `node upgrade --all`'s isTransientError/isConfigError
+	// classified by strings.Contains(err.Error(), code) — the exact practice this file's own comment 10
+	// lines below forbids ("The classifier never string-sniffs prose for a class"). The failure it invites
+	// is not theoretical: broker prose is operator-facing and gets reworded, and a hint that happens to
+	// mention a code name flips a fleet rollout between "skip this node" and "abort the fleet". Setting
+	// the code at the source makes the branch positive evidence.
+	//
+	// The agent_rejected: wrapper is STRIPPED before this is set, so a caller matches the underlying code
+	// exactly and does not have to know which errors travelled wrapped.
+	Code string
 }
 
 func (e *ExitError) Error() string { return e.Err.Error() }
 func (e *ExitError) Unwrap() error { return e.Err }
+
+// wireCodeOf returns the structurally-carried wire code of err, or "" when err carries none.
+func wireCodeOf(err error) string {
+	var ee *ExitError
+	if errors.As(err, &ee) {
+		return ee.Code
+	}
+	return ""
+}
 
 // errorIsQuiet reports whether the terminal error opted out of the main sink's "error: ..." print
 // (an *ExitError with Quiet set). Used by the main sink so a machine-output command's non-zero exit

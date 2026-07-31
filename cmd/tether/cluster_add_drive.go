@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -809,6 +810,14 @@ func resetJoinerJSStore(out interface{ Write([]byte) (int, error) }, jp joinerPa
 	sentinel := filepath.Join(jp.DataDir, ".grow-joiner-reset-"+opID+".done")
 	moved, err := natsconf.MoveAsideJSStore(storeDir, backup, sentinel, jp.ResetFormerJS || jp.PreserveJSData)
 	if err != nil {
+		// origin: line-2 closure verification m9 — see the sibling branch in cluster_offline.go.
+		if !errors.Is(err, natsconf.ErrJSStoreNeedsAck) {
+			return fmt.Errorf("the JOINER %s has a JetStream store that could not be inspected or moved, and it "+
+				"must be reset before the node can boot clustered — %w\n"+
+				"  --reset-former-js / --preserve-js-data will NOT help here: they only acknowledge a "+
+				"data-bearing store, and this is a failure to read or write it. Fix the condition named above "+
+				"on %s, then re-run", jp.Joiner, err, jp.Joiner)
+		}
 		// Widen the refusal to name the JOINER end of the grow + the exact re-run (M2 stable-refusal).
 		return fmt.Errorf("the JOINER %s carries a pre-existing JetStream store that must be reset before it can "+
 			"boot clustered — %w\n  re-run `tether cluster add %s … --reset-former-js` (or --preserve-js-data): "+

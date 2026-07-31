@@ -9,6 +9,21 @@
 //     runs everything (or `make e2e-parallel` via the Makefile target);
 //   - the per-phase packages stay intact for fast iteration
 //     (`go test ./test/p7/...` is much shorter than `make e2e-parallel`);
+//
+// KNOWN REDUNDANCY, registered rather than fixed (S3 §9.6 / line-2 plan E5).
+//
+// The D-matrices re-run whole packages that other matrices already ran: internal/cluster is executed
+// once inside each of five D suites and internal/broker twice, which L07-F5 measured at roughly 940
+// redundant test-function executions per full matrix. S3 looked at de-duplicating it and declined --
+// not because the redundancy is imaginary, but because each D suite runs under a DIFFERENT `-tags`
+// set, so two runs of "the same" package are two different build configurations and dropping one
+// silently narrows coverage. Verifying which pairs are genuinely identical costs more than the minutes
+// it would save, and the parallel runner already absorbs most of the wall-clock.
+//
+// It is written down here because an unregistered known redundancy gets rediscovered: the next person
+// to profile the matrix finds the same 940 and repeats the same investigation. If it is ever revisited,
+// the thing to check FIRST is whether the -tags sets actually select the same files.
+//
 //   - a hang or long e2e in one phase doesn't drag the others —
 //     each subtest is its own subprocess with its own timeout;
 //   - failures bubble up with the phase name in t.Run output, so

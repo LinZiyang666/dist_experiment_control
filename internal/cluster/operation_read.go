@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -32,6 +33,12 @@ type Operation struct {
 const opSelectCols = `op_id, kind, target_node, op_state, confirmed, confirmed_ft, barrier, ` +
 	`catchup_deadline, topo_target_gen, join_nonce, params, last_error, timeline, terminal, created_at, updated_at`
 
+// scanOperation returns Scan's error UNWRAPPED, which is why the ErrNoRows checks in this file
+// historically used `==` and worked. They now use errors.Is: the `==` form was correct only because of
+// this function's behaviour, nothing stated the dependency and nothing protected it, and wrapping the
+// error here later -- a one-line change with no visible consequence -- would silently turn every "no
+// such operation" into "the query failed". The R7 grow-lock reaper distinguishes exactly those two
+// cases to decide whether a lock's holder is gone or has simply not created its operation yet.
 func scanOperation(s interface{ Scan(...any) error }) (*Operation, error) {
 	var o Operation
 	var confirmed, terminal int
@@ -78,7 +85,7 @@ func NonTerminalOperations(ro *sql.DB) ([]Operation, error) {
 func ActiveOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
 	row := ro.QueryRow(`SELECT `+opSelectCols+` FROM cluster_operations WHERE target_node = ? AND terminal = 0 LIMIT 1`, target)
 	o, err := scanOperation(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -96,7 +103,7 @@ func ActiveOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
 func LatestOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
 	row := ro.QueryRow(`SELECT `+opSelectCols+` FROM cluster_operations WHERE target_node = ? ORDER BY updated_at DESC, op_id LIMIT 1`, target)
 	o, err := scanOperation(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -109,7 +116,7 @@ func LatestOperationForTarget(ro *sql.DB, target string) (*Operation, error) {
 func OperationByID(ro *sql.DB, opID string) (*Operation, error) {
 	row := ro.QueryRow(`SELECT `+opSelectCols+` FROM cluster_operations WHERE op_id = ?`, opID)
 	o, err := scanOperation(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {

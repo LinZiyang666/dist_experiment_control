@@ -77,7 +77,12 @@ func ReadClusterEndpoints(home string) (*ClusterEndpoints, error) {
 	}
 	var ce ClusterEndpoints
 	if err := json.Unmarshal(b, &ce); err != nil {
-		return nil, nil // corrupt → treat as empty (floor-only), no panic
+		// corrupt → treat as empty (floor-only), no panic
+		//nolint:nilerr // This file is a CACHE. A corrupt one must degrade to "absent" so the caller
+		// falls back to the floor-only path, exactly as it does when the file was never written.
+		// Returning the parse error instead would turn a stale scratch file into a hard startup failure
+		// for a command that has a perfectly good answer without it.
+		return nil, nil
 	}
 	if ce.SchemaVersion > ClusterEndpointsSchemaVersion {
 		// A future-schema cache may change InviteSeeds/field semantics; an old binary must NOT trust it.

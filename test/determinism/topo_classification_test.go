@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -133,7 +134,7 @@ type topoMatchHit struct {
 }
 
 func (h topoMatchHit) String() string {
-	return h.file + ":" + itoa(h.line) + " strings." + h.fn + "(…, \"" + h.marker + "\")"
+	return h.file + ":" + strconv.Itoa(h.line) + " strings." + h.fn + "(…, \"" + h.marker + "\")"
 }
 
 func scanTopoReasonMatches(t *testing.T, root string) []topoMatchHit {
@@ -235,7 +236,7 @@ func TestXferTierCeilingsHaveOneSource(t *testing.T) {
 		if _, ok := xferTierConstAllowlist[h.fn]; ok {
 			continue
 		}
-		offenders = append(offenders, h.file+":"+itoa(h.line)+" const "+h.fn+" = "+h.marker)
+		offenders = append(offenders, h.file+":"+strconv.Itoa(h.line)+" const "+h.fn+" = "+h.marker)
 	}
 	sort.Strings(offenders)
 	if len(offenders) > 0 {

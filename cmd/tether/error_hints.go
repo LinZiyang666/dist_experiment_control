@@ -18,6 +18,12 @@ import (
 // daemons. Broker-internal callers should keep using the bare
 // codes for log + audit.
 var brokerCodeHints = map[string]string{
+	// origin: line-2 §12 Y2. `node upgrade` download failures, split out of the single download_failed
+	// catch-all. These are UpgradeForwardedResp.Code values (NOT RunChunk.Reason), which is why they are
+	// here and not in runFailureReasons — see the note there.
+	"download_http_status":    "the upgrade mirror answered with a non-2xx status; check the --url you passed (a typo'd path returns 404 and will do so on every retry).",
+	"download_http_retryable": "the upgrade mirror is temporarily unavailable or asks for a retry (408/421/425/429/500/502/503/504) — the URL and the artifact are fine. Retry with backoff; if the reply carried a Retry-After it is in the error text. `node upgrade --all` skips this node and keeps going rather than aborting the fleet.",
+	"download_too_large":      "the upgrade tarball is larger than the agent's ceiling; publish a smaller artifact or raise the limit — the same URL will be the same size next time.",
 	// Membership / ownership / lifecycle
 	"not_owner":                     "only the session owner can do this; ask the owner to run it.",
 	"not_owner_or_creator":          "only the session owner or the resource creator can do this.",
@@ -128,14 +134,44 @@ var brokerCodeExitClasses = map[string]int{
 	// not `node upgrade`" was the one instructing monitors to retry it forever.
 	// Two names for one operator action get one class.
 	"proto_bump_requires_reinstall": exitUsage,
-	// adminsock cluster codes (Item 4 sets these on the wire; the CLI maps them here)
-	"not_leader": exitNoPerm, "already_voter": exitUsage, "not_a_voter": exitUsage,
+	// adminsock cluster codes (Item 4 sets these on the wire; the CLI maps them here).
+	// `already_voter` used to be classified here too. It was removed by line-2 D1's reverse
+	// reconciliation: nothing has ever emitted it. B2 item 4 declared the code speculatively, and the
+	// design then went the other way -- adding a node that is already a voter is treated as IDEMPOTENT
+	// SUCCESS on the resume path (cluster_operation_controller.go, "staged (nonvoter, or already a
+	// voter on a resume)"), not as an error. A class for a code no binary can send is indistinguishable
+	// from a live one to the next reader, which is precisely what the reverse gate exists to stop.
+	"not_leader": exitNoPerm, "not_a_voter": exitUsage,
 	"catch_up_stalled": exitTransient, "quorum_confirm_required": exitUsage, "nonce_used": exitUsage,
 	// External-review F11: bad_request is operator input (backup dir exists, malformed args, bad
 	// --since) — exit 64 (usage), NOT 70. 70 is reserved for genuine internal failures.
 	"cluster_not_enabled": exitUsage, "node_unknown": exitUsage, "bad_request": exitUsage,
 	"remove_owns_resources": exitUsage, // B3 item 7: operator-actionable (drain --retire or --force)
-	"version_skew":          exitUsage, // B6 A3: reinstall the joiner on a matching release
+	// origin: line-2 §12 Y2. Both of these used to fall through to exitInternal (70), and
+	// docs/usage.md §9.13 tells automation to treat 70 as RETRYABLE — so a host that physically cannot
+	// allocate a PTY was being retried forever. They are classified oppositely because they ARE
+	// opposite: no /dev/ptmx is a property of the host (operator must act), while a failed attach
+	// subscription is a property of this instant (retry is the right response).
+	// exitUsage (64), NOT exitUnavailable (69). docs/usage.md's robust-retry rule says "treat 69/70/75 as
+	// retryable, only 64/77 as terminal" -- so 69 would have put this code in the retry class while its
+	// own hint says "Retrying will not help until the host changes". That is Y2's founding complaint
+	// (usage.md tells automation to retry 70, and too_large can never succeed) reproduced by Y2's own
+	// output; three review lanes caught it. 64 is the class for "a human has to change something",
+	// which is exactly what a missing /dev/ptmx is.
+	"pty_unavailable":         exitUsage,
+	"pty_alloc_failed":        exitTransient, // fd OR pty-count exhaustion (EMFILE/ENFILE/ENOSPC/ENOMEM/EAGAIN) — clears as sessions close
+	"attach_subscribe_failed": exitTransient, // the agent's NATS connection was unhealthy just now
+	// The other half of Y2: `download_failed` was carrying a 404, an oversize tarball and a transport
+	// blip under one name. The first two cannot succeed on a retry, so they must not land in the class
+	// automation retries.
+	"download_http_status": exitUsage, // wrong URL / wrong mirror — the operator has to fix the argument
+	// origin: external review M1. 408/429/5xx are NOT the operator's argument being wrong — the mirror is
+	// down or rate-limiting and the same command succeeds later. Folding them into download_http_status
+	// aborted the whole fleet and told automation never to retry.
+	"download_http_retryable": exitTransient,
+	"download_too_large":      exitUsage,     // the artifact is over the ceiling; same size on every retry
+	"download_failed":         exitTransient, // transport or read failure — this one really does clear
+	"version_skew":            exitUsage,     // B6 A3: reinstall the joiner on a matching release
 	// R8a P1: the control plane committed the rehome but the agents have not confirmed the new
 	// home yet. This is EX_TEMPFAIL, not a tether bug: the broker keeps re-delivering, so
 	// re-running the verb is the correct response. Crucially it is NOT 0 — `cluster drain`
@@ -275,7 +311,14 @@ func brokerErrorMessage(verb, code, errMsg string) error {
 	if hint != "" {
 		msg = hint
 	}
-	return &ExitError{Class: brokerCodeExitClass(lookup), Err: fmt.Errorf("%s failed: %s (%s)", verb, msg, code)}
+	// Code carries `lookup` (the agent_rejected:-stripped form), NOT the raw code: a caller branching on
+	// the code must not have to know which errors travelled wrapped. The PROSE still shows the raw code,
+	// because that is what an operator sees in the broker's own logs.
+	return &ExitError{
+		Class: brokerCodeExitClass(lookup),
+		Code:  lookup,
+		Err:   fmt.Errorf("%s failed: %s (%s)", verb, msg, code),
+	}
 }
 
 // connectError wraps a NATS connect failure with what the operator
@@ -306,11 +349,23 @@ func connectError(verb, natsURL string, err error) error {
 // a one-line operator-facing diagnosis. Reasons are agent-emitted
 // (architecture C.5.1), so the set is fixed.
 var runFailureReasons = map[string]string{
-	"attach_timeout":   "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
-	"pty_alloc_failed": "agent couldn't open a PTY pair; check the agent host's /dev/ptmx and any container restrictions.",
-	"exec_failed":      "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
-	"argv_required":    "you supplied no command to run.",
-	"json_parse":       "the agent couldn't parse our run request — tether bug, please report.",
+	"attach_timeout": "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
+	// origin: line-2 external review M17. This used to say only "ran out of file descriptors", which named
+	// the LESS likely of the two exhaustions: opening /dev/ptmx past the devpts limit returns ENOSPC, not
+	// EMFILE, so an operator hitting /proc/sys/kernel/pty/max was told to look at the wrong resource.
+	"pty_alloc_failed": "agent could not allocate a PTY because a limit is exhausted: either file descriptors (EMFILE/ENFILE) or the pty count itself (ENOSPC — see /proc/sys/kernel/pty/max, minus pty_reserve for non-root, or a devpts `max=` mount option). Close some sessions and retry; this one is transient. A host that cannot provide a PTY at all reports pty_unavailable instead.",
+	"pty_unavailable":  "the agent host cannot provide a PTY at all: check /dev/ptmx and any container restrictions. Retrying will not help until the host changes.",
+	// origin: line-2 §12 Y2 — split out of pty_alloc_failed, which was reporting both "this host
+	// cannot do PTYs" (terminal) and "the attach subscription did not come up" (transient) under one
+	// name. They classify differently, which is the whole reason to have two.
+	"attach_subscribe_failed": "the agent allocated the PTY but could not subscribe to the attach subject; its NATS connection is unhealthy. Retry; if it persists, check the agent's broker connectivity.",
+	// NOTE for the next person adding a Y2 code: download_http_status / download_too_large are NOT in
+	// this map. They travel on UpgradeForwardedResp.Code, not RunChunk.Reason, so their hints live in
+	// brokerCodeHints. A hint filed in the wrong map is never printed — it just reads, to whoever greps
+	// for the code, as though the operator was given guidance.
+	"exec_failed":   "agent allocated the PTY but the command failed to start; check argv (typo? not in PATH? not executable?).",
+	"argv_required": "you supplied no command to run.",
+	"json_parse":    "the agent couldn't parse our run request — tether bug, please report.",
 	// remote-fs-resilience (docs/reviews/remote-fs-resilience-plan.md): the
 	// agent refused/abandoned the spawn because a network filesystem is wedged.
 	"remote_fs_unhealthy":     "argv[0] is on an unresponsive network mount (NFS/CIFS/...); use a binary on local disk, or --cwd a local dir.",

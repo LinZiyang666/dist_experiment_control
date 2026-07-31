@@ -138,11 +138,11 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 	if err := cluster.VerifyIntegrity(stage); err != nil {
 		return nil, fmt.Errorf("clusteroffline: staging verify (pre-migration): %w", err)
 	}
-	if mdb, oerr := storage.Open("file:" + stage); oerr != nil {
+	mdb, oerr := storage.Open("file:" + stage)
+	if oerr != nil {
 		return nil, fmt.Errorf("clusteroffline: forward-migrate staging: %w", oerr)
-	} else {
-		_ = mdb.Close()
 	}
+	_ = mdb.Close()
 	// Test-only seam (Stage-C BLOCKER-2): lets a test corrupt the migrated staging so the
 	// post-migration verify is actually exercised — proving the live DB is NEVER installed when a
 	// migration-introduced corruption is present (the verify-before-swap ordering).

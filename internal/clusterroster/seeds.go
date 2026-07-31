@@ -90,6 +90,9 @@ func VerifySeeds(s *proto.SeedBundle, pinnedAccountPub string) error {
 // VerifySeedsAt is VerifySeeds PLUS a schema_version compatibility gate (an unknown future schema is
 // rejected, not mis-parsed) and an expiry gate (a captured/cached old bundle past expires_at is
 // refused). The HARDENED verifier the C2 consumer MUST use — mirrors VerifyAt.
+// origin: line-2 review M14. roster.go's VerifyAt carries the argument for this pair.
+//
+//nolint:dupl // paired with VerifyAt in roster.go; two unrelated signed types, one sequence.
 func VerifySeedsAt(s *proto.SeedBundle, pinnedAccountPub string, now time.Time) error {
 	if err := VerifySeeds(s, pinnedAccountPub); err != nil {
 		return err

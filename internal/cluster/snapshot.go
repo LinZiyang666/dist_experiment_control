@@ -75,6 +75,13 @@ func (s *fsmSnapshot) Release() {}
 // backupTo runs modernc's online-backup from ro into a fresh dst file. Step
 // returns true=MORE pages / false=DONE; Finish closes the unmanaged dst conn (a
 // missing Finish leaks an fd, which the §13.5 fd-baseline gate catches).
+// origin: line-2 review M14 (moved here from .golangci.yml, where the exemption was pinned to line
+// ranges a comment edit could invalidate). backupTo and restoreInPlace are deliberately symmetric: the
+// two halves are read as a PAIR when reasoning about what a snapshot round-trip preserves, and that
+// symmetry is the property being maintained. Collapsing them would hide the very correspondence a
+// reviewer checks.
+//
+//nolint:dupl // paired with restoreInPlace; argument above.
 func backupTo(ctx context.Context, ro *sql.DB, dstPath string) error {
 	conn, err := ro.Conn(ctx)
 	if err != nil {
@@ -125,6 +132,9 @@ func VerifyIntegrity(path string) error { return verifyIntegrity(path) }
 
 // restoreInPlace copies srcPath INTO the live write-pool conn (modernc
 // NewRestore) — no rename over the open inode (§3.8 D1 amendment).
+// origin: line-2 review M14. backupTo above carries the argument for this pair.
+//
+//nolint:dupl // paired with backupTo; the save/restore symmetry IS the property.
 func restoreInPlace(ctx context.Context, db *sql.DB, srcPath string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {

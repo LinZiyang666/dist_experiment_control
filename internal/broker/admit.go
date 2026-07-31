@@ -289,6 +289,9 @@ func (b *Broker) admitACL(ing *ingress, spec verbSpec) (denial, bool) {
 		if !member {
 			return deny("not_a_member", "", "not_a_member"), false
 		}
+	case admitOwner:
+		// Named explicitly so a new admitRole cannot inherit the owner path by being the zero value.
+		fallthrough
 	default: // admitOwner — also the zero value, so an unset role lands here.
 		owner, err := session.IsOwner(b.cfg.DB, sid, fp)
 		if err != nil {

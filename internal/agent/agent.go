@@ -880,10 +880,7 @@ const agentProxyDialTimeout = 10 * time.Second
 // Backoff reuses the same RegisterRetry knobs as register-retry — a single
 // pair of dials governs all transient-NATS-interaction backoff in v1.
 func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
-	connOpts, err := a.buildConnOptions()
-	if err != nil {
-		return nil, err
-	}
+	connOpts := a.buildConnOptions()
 	// Proxy-aware dial. Injected here (the single connect call site) rather than
 	// in buildConnOptions, which has two returns and no merge point — so both
 	// the anonymous and nkey branches are covered. No-op when no proxy env set.
@@ -1343,6 +1340,8 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 				// The persisted entry is gone (expose-rm) — nothing to open.
 				a.clearDeferred(port)
 				return
+			case openedOK:
+				// Fall through to `err = oerr`, AddProxy's result.
 			}
 			err = oerr // openedOK: AddProxy's result
 		} else {
@@ -1355,6 +1354,8 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 					return
 				case openPortAbsent:
 					return
+				case openedOK:
+					// Fall through to `err = oerr`, AddProxy's result.
 				}
 				err = oerr
 			} else {
@@ -1537,7 +1538,9 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 // Identity set, signs CONNECT challenges via the loaded nkey and presents
 // the auth_callout-aware Name. Without Identity, falls back to anonymous
 // CONNECT (P2-style / TETHER_DEV_NO_AUTH demos only).
-func (a *Agent) buildConnOptions() ([]nats.Option, error) {
+// It returns no error: every path here appends to a slice, and the (always-nil) error it used to
+// return made three call sites write handling for a failure that could not happen.
+func (a *Agent) buildConnOptions() []nats.Option {
 	opts := []nats.Option{
 		nats.MaxReconnects(-1),
 		// A reconnect can race a rolling NATS/broker restart: nats-server may accept CONNECT while
@@ -1589,7 +1592,7 @@ func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 		// Identity nil) fails CONNECT immediately rather than landing
 		// on an unintended role.
 		opts = append(opts, nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)))
-		return opts, nil
+		return opts
 	}
 
 	id := a.cfg.Identity
@@ -1609,7 +1612,7 @@ func (a *Agent) buildConnOptions() ([]nats.Option, error) {
 	if a.cfg.PIN != "" {
 		opts = append(opts, nats.Token(a.cfg.PIN))
 	}
-	return opts, nil
+	return opts
 }
 
 // isAuthFailure detects nats-server auth-rejection messages. These come

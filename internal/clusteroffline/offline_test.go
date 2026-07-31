@@ -1,6 +1,7 @@
 package clusteroffline
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net"
@@ -129,6 +130,110 @@ func TestD7PeerReachableHardRefuse(t *testing.T) {
 	if err := checkPeersDead([]Peer{{NodeID: "peer-dead", RaftAddr: "127.0.0.1:1"}}, []string{"peer-dead"}); err != nil {
 		t.Fatalf("a dead+listed peer should pass, got %v", err)
 	}
+}
+
+// TestHardRefuseNamesAnUntrustworthyResolver covers the case where the TCP probe CANNOT tell alive
+// from dead, and pins that the refusal survives it.
+//
+// origin: line-2 external review follow-up, root-causing simcluster drill 42. A host running a
+// fake-IP resolver (mihomo/clash, 198.18.0.0/15) or any wildcard DNS answers every name with a
+// connectable address, so a peer that is genuinely dead probes ALIVE and force-single is refused
+// forever, with a message that sends the operator hunting a machine that does not exist.
+//
+// TWO assertions, and the second one is the one that matters: the advice appears, AND the refusal is
+// still a refusal. Softening the verdict when the probe looks untrustworthy would flip the failure
+// into the dangerous direction — a live peer read as dead is exactly the split-brain B-8 and audit
+// CC-2 built this gate to prevent.
+func TestHardRefuseNamesAnUntrustworthyResolver(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	live := ln.Addr().String()
+
+	t.Run("honest resolver adds nothing", func(t *testing.T) {
+		swapLookupHost(t, func(_ context.Context, host string) ([]string, error) {
+			if host == nxdomainCanary {
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			}
+			return []string{"127.0.0.1"}, nil
+		})
+		err := checkPeersDead([]Peer{{NodeID: "p", RaftAddr: live}}, []string{"p"})
+		if err == nil || !strings.Contains(err.Error(), "HARD-REFUSE") {
+			t.Fatalf("a live peer must still HARD-REFUSE, got %v", err)
+		}
+		if strings.Contains(err.Error(), "MAY BE MEANINGLESS") {
+			t.Errorf("an honest resolver must not trigger the advice; message was:\n%v", err)
+		}
+	})
+
+	t.Run("fake-IP address is named", func(t *testing.T) {
+		swapLookupHost(t, func(_ context.Context, host string) ([]string, error) {
+			if host == nxdomainCanary {
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			}
+			return []string{"198.18.0.58"}, nil // inside RFC 2544 / clash fake-IP
+		})
+		err := checkPeersDead([]Peer{{NodeID: "p", RaftAddr: live}}, []string{"p"})
+		if err == nil || !strings.Contains(err.Error(), "HARD-REFUSE") {
+			t.Fatalf("the refusal must STAND when the probe is untrustworthy, got %v", err)
+		}
+		for _, want := range []string{"MAY BE MEANINGLESS", "198.18.0.0/15", "198.18.0.58", "refusal STANDS"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal message is missing %q; an operator cannot act on it:\n%v", want, err)
+			}
+		}
+	})
+
+	t.Run("wildcard resolver is named via the RFC 2606 canary", func(t *testing.T) {
+		// The peer address itself resolves to something perfectly ordinary — only the canary betrays
+		// the host. This is the shape that would otherwise be invisible.
+		swapLookupHost(t, func(_ context.Context, _ string) ([]string, error) { return []string{"10.0.0.7"}, nil })
+		err := checkPeersDead([]Peer{{NodeID: "p", RaftAddr: live}}, []string{"p"})
+		if err == nil || !strings.Contains(err.Error(), "HARD-REFUSE") {
+			t.Fatalf("the refusal must STAND, got %v", err)
+		}
+		for _, want := range []string{nxdomainCanary, "MUST NOT resolve", "10.0.0.7", "refusal STANDS"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal message is missing %q:\n%v", want, err)
+			}
+		}
+	})
+
+	t.Run("a dead peer still passes on a lying host", func(t *testing.T) {
+		// The advice is attached to the REFUSAL path only. A host with a broken resolver must not
+		// start refusing force-single for peers that probe dead — that would be a new denial of
+		// service invented by a diagnostic.
+		swapLookupHost(t, func(_ context.Context, _ string) ([]string, error) { return []string{"198.18.0.99"}, nil })
+		if err := checkPeersDead([]Peer{{NodeID: "d", RaftAddr: "127.0.0.1:1"}}, []string{"d"}); err != nil {
+			t.Fatalf("a dead+listed peer must still pass, got %v", err)
+		}
+	})
+
+	t.Run("resolver stalls cannot hold the safety refusal indefinitely", func(t *testing.T) {
+		swapLookupHost(t, func(ctx context.Context, _ string) ([]string, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		start := time.Now()
+		err := checkPeersDead([]Peer{{NodeID: "p", RaftAddr: live}}, []string{"p"})
+		elapsed := time.Since(start)
+		if err == nil || !strings.Contains(err.Error(), "HARD-REFUSE") {
+			t.Fatalf("the live peer must still HARD-REFUSE, got %v", err)
+		}
+		if elapsed > 2*probeAdviceLookupBudget+500*time.Millisecond {
+			t.Fatalf("diagnostic DNS held the refusal for %s; budget is at most two lookups × %s",
+				elapsed, probeAdviceLookupBudget)
+		}
+	})
+}
+
+func swapLookupHost(t *testing.T, fn func(context.Context, string) ([]string, error)) {
+	t.Helper()
+	orig := lookupHost
+	t.Cleanup(func() { lookupHost = orig })
+	lookupHost = fn
 }
 
 func TestD7ReadRosterRejectsUnknownSelfID(t *testing.T) {

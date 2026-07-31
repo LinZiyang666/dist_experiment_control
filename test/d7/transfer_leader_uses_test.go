@@ -2,6 +2,7 @@ package d7_test
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,36 @@ import (
 
 // external_review_test.go contains reviewer regressions for D7 contracts that are
 // advertised by the architecture/plan but not implemented by the current tree.
+
+// moduleRoot and readFile used to live in regression_test.go alongside the layering guards. Those
+// guards moved into the single table at test/architecture/layering_test.go (line-2 G3.5) and the file
+// went with them, so the two helpers this file still needs live here now.
+
+// moduleRoot walks up to the module root (go.mod).
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatal("could not locate module root (go.mod) above the test dir")
+	return ""
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
 
 // origin: external_review_test.go (renamed in B6) — docs/reviews/d7-external-review.md
 func TestD7ReviewTransferLeaderUsesRequestedTarget(t *testing.T) {

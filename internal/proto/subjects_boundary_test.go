@@ -58,7 +58,6 @@ func TestValidateSIDBoundaries(t *testing.T) {
 		{"reserved_prefix_ctl", "ctl-foo", false},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			err := ValidateSID(c.s)
 			gotOK := err == nil
@@ -99,7 +98,6 @@ func TestValidateNIDBoundaries(t *testing.T) {
 		{"len_1024", strings.Repeat("a", 1024), false},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			err := ValidateNID(c.s)
 			gotOK := err == nil
@@ -133,7 +131,6 @@ func TestValidateActorTokenBoundaries(t *testing.T) {
 		{"contains_nul", "U" + strings.Repeat("A", 27) + "\x00" + strings.Repeat("A", 27), false},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			err := ValidateActorToken(c.s)
 			gotOK := err == nil
@@ -205,7 +202,6 @@ func TestParseCmdByRejectsMalformed(t *testing.T) {
 			"tether.v2.s.lab.cmd.by." + validActor + ".node.lab.1.run.req"},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			if _, _, _, _, ok := ParseCmdBy(c.s); ok {
 				t.Fatalf("ParseCmdBy(%q) accepted a malformed subject", c.s)

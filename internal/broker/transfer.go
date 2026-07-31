@@ -225,12 +225,12 @@ func (t *transferTracker) put(e *transferEntry) string {
 	return ""
 }
 
-func (t *transferTracker) remove(id string) *transferEntry {
+// remove deletes the entry. It used to return it; nothing ever read the result, and a returned
+// value nobody reads reads like a handle somebody is holding.
+func (t *transferTracker) remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e := t.entries[id]
 	delete(t.entries, id)
-	return e
 }
 
 // claimFinalize atomically marks the entry as finalized iff:

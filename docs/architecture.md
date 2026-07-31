@@ -2323,7 +2323,7 @@ file-transfer(push/pull,v0.2.0)、ps-retention(v0.2.8)、**P12 expose `--remote-
 
 - [ ] 前一 phase 的"出口"断言全部通过。
 - [ ] 本文档当前 phase 状态翻成 ✔。
-- [ ] 新开分支 `phase/<N>-<slug>`；每个 phase 至少一个 PR。
+- [ ] 直接在 `main` 上工作（本仓单开发者，不开 phase 分支、无 PR 流程）。
 - [ ] `architecture.md` 若在实现中发现设计问题，**先改文档再改代码**。
 - [ ] 单元测试 + e2e 测试在同一 PR 内落盘，不拖延。
 

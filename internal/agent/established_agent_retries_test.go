@@ -10,10 +10,7 @@ import (
 // origin: s6_s8_external_review_test.go (renamed in B6) — docs/reviews/s6-s8-external-review.md
 func TestEstablishedAgentRetriesTransientReconnectAuthFailures(t *testing.T) {
 	a := &Agent{}
-	opts, err := a.buildConnOptions()
-	if err != nil {
-		t.Fatal(err)
-	}
+	opts := a.buildConnOptions()
 	got := nats.GetDefaultOptions()
 	for _, opt := range opts {
 		if err := opt(&got); err != nil {

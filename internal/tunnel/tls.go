@@ -61,8 +61,10 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // v1; D6 adds cert pinning (clientTLSConfigPinned) for clustered homes.
 func clientTLSConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, //nolint:gosec // documented v1 fallback per architecture F.5/§16.7 (N=1)
+		MinVersion: tls.VersionTLS12,
+		// Documented v1 fallback per architecture F.5/§16.7 (N=1): no cluster CA and no pins, so there
+		// is nothing to verify against. Registered in unverifiedTLSFallbacks with the full argument.
+		InsecureSkipVerify: true,
 	}
 }
 
@@ -117,8 +119,9 @@ func clientTLSConfigPinned(pins proto.CertPins) *tls.Config {
 		return clientTLSConfig()
 	}
 	return &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, //nolint:gosec // pin check is done in VerifyConnection below
+		MinVersion: tls.VersionTLS12,
+		// Hostname verification off, peer verification ON: the pin check is in VerifyConnection below.
+		InsecureSkipVerify: true,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return fmt.Errorf("tunnel tls: home presented no certificate")

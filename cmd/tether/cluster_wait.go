@@ -37,23 +37,53 @@ func watchClusterStatus(cmd *cobra.Command, socketPath string, asJSON bool, inte
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if asJSON {
-			// JSONL: no screen clear, one object per line.
-		} else if isTTY {
+		// THREE-way, and the first arm doing nothing is the point: --json emits neither a screen
+		// clear nor a separator, because BLK-1 (Stage-C) makes each frame one parseable JSON object
+		// per line and B5's external review already had to fix a violation of it once.
+		//
+		// A `switch` rather than if/else-if/else: the earlier if/else-if form needed an EMPTY BLOCK
+		// for the --json arm, revive's empty-block flagged it, and collapsing the three arms to two
+		// (`if !asJSON && isTTY {clear} else {separator}`) silently moved --json into the separator
+		// arm — re-introducing that exact BLOCKER as a side effect of a lint cleanup. A switch says
+		// "three cases, one of them deliberately empty" without an empty block for a linter to
+		// object to.
+		switch {
+		case asJSON:
+			// JSONL: no clear, no separator — the line must be the object.
+		case isTTY:
 			_, _ = fmt.Fprint(cmd.OutOrStdout(), "\033[H\033[2J") // cursor home + clear
-		} else {
+		default:
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "--- %s ---\n", time.Now().Format(time.RFC3339))
 		}
 		rep, err := fetchClusterStatusReport(socketPath)
-		if err != nil {
+		switch {
+		case err != nil && asJSON:
+			// EVERY FRAME IS A LINE, including a failed one. origin: line-2 closure verification §6 B2.
+			// This used to write the retry notice to stderr and nothing at all to stdout, so a JSONL
+			// consumer saw a silent GAP: no object, no error, just a frame that never arrived. The
+			// contract the comment above states ("each frame is one parseable JSON object per line") was
+			// therefore true only while the socket was healthy — which is the half of the time nobody
+			// needs the contract.
+			//
+			// The notice still goes to stderr for a human watching, and now a parseable error object goes
+			// to stdout for the machine.
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "watch: %v (retrying)\n", err)
-		} else if asJSON {
+			emitWatchFrameError(cmd, "fetch", err)
+		case err != nil:
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "watch: %v (retrying)\n", err)
+		case asJSON:
 			// BLK-1 (Stage-C): JSONL — one COMPACT object per frame (not the one-shot's pretty
 			// MarshalIndent), so `jq -c` / a line-reader parses each frame.
-			if b, merr := json.Marshal(rep); merr == nil {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
+			b, merr := json.Marshal(rep)
+			if merr != nil {
+				// Same rule as above: a marshal failure used to drop the frame silently (`if merr == nil`
+				// with no else), which is the one outcome a stream consumer cannot distinguish from "the
+				// cluster is fine and quiet".
+				emitWatchFrameError(cmd, "marshal", merr)
+				break
 			}
-		} else {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
+		default:
 			renderClusterStatusReport(cmd, rep, false)
 		}
 		select {
@@ -179,4 +209,61 @@ func settleClusterStatus(cmd *cobra.Command, socketPath string, settle, interval
 		case <-ticker.C:
 		}
 	}
+}
+
+// watchFrameError is what a failed `--watch --json` frame looks like on stdout.
+//
+// origin: line-2 closure verification §6 B2. A named type rather than an inline map so the shape is
+// greppable and can be pinned by a test — a stream contract that only exists inside a fmt.Fprintf is a
+// contract nobody can assert.
+//
+// `stage` distinguishes the two ways a frame can fail to appear: "fetch" (the admin socket did not answer)
+// and "marshal" (it answered with something unserialisable).
+//
+// THIS STREAM IS HETEROGENEOUS BY DESIGN, and the discriminator is the same one the rest of the machine-JSON
+// surface uses (jsonout.go: "a monitor keys on (schema, schema_version)"):
+//
+//	line has "schema":"cluster_status_watch_error"  → this type; the frame did NOT arrive
+//	line has "view":"ctl-nats"|"offline"            → adminsock.ClusterStatusReport; a real frame
+//
+// origin: line-2 external review, 疑惑 #1. The reviewer asked whether the error object also needs
+// schema_version. It does, and it was the only machine-JSON payload in the CLI without one — a strict
+// decoder that negotiated a version had no way to negotiate this line, so its only safe move on a transient
+// socket error was to exit. Both keys are non-omitempty: their stable presence IS the discriminator.
+//
+// TRAP, stated because the near-miss is silent: a status frame carries `errors` (PLURAL, broker-side
+// problems folded into a report that DID arrive) and this type carries `error` (SINGULAR, no report at all).
+// `jq 'select(.error)'` selects only frame failures; `jq 'select(.errors | length > 0)'` selects degraded
+// frames. Confusing them reads a healthy-but-degraded cluster as a dead socket, or vice versa.
+type watchFrameError struct {
+	Schema        string `json:"schema"`         // "cluster_status_watch_error"
+	SchemaVersion int    `json:"schema_version"` // 1
+	Error         string `json:"error"`
+	Stage         string `json:"stage"`
+	At            string `json:"at"`
+}
+
+const (
+	watchFrameErrorSchema        = "cluster_status_watch_error"
+	watchFrameErrorSchemaVersion = 1
+)
+
+func emitWatchFrameError(cmd *cobra.Command, stage string, err error) {
+	b, merr := json.Marshal(watchFrameError{
+		Schema:        watchFrameErrorSchema,
+		SchemaVersion: watchFrameErrorSchemaVersion,
+		Error:         err.Error(),
+		Stage:         stage,
+		At:            time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if merr != nil {
+		// Cannot happen for three strings, and if it somehow did, a hand-built line is still better than a
+		// dropped frame — which is the entire point of this function. The discriminator keys are carried
+		// here too: a fallback line that a versioned decoder cannot classify is a dropped frame with extra
+		// steps.
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "{\"schema\":%q,\"schema_version\":%d,\"error\":%q,\"stage\":%q}\n",
+			watchFrameErrorSchema, watchFrameErrorSchemaVersion, err.Error(), stage)
+		return
+	}
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
 }

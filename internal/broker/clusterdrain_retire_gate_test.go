@@ -7,7 +7,12 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 )
 
-// Batch-A A13. `cluster drain --retire` performed RemoveServer plus a roster row
+// origin: batch-A A13; renamed from a13_drain_retire_test.go during line-2 closure verification, which
+// widened the FILE-name pattern's batch-letter class from a hand-picked `(r|p|d|b|c|g|s)` to `[a-z]`
+// and immediately found this file — the same `A`-letter gap that had already been found one level down
+// in the function-name pattern. Named for the unit now: the retire gate on cluster drain.
+//
+// `cluster drain --retire` performed RemoveServer plus a roster row
 // delete — an irreversible raft membership change — through the SYNCHRONOUS
 // path, which (unlike the OpClusterRetire operation) has no opStillLive TOCTOU
 // recheck, no replicable deadline, no BLOCKED escape hatch and no resume.

@@ -227,6 +227,10 @@ func main() {
 	fmt.Printf("\ntotal wall clock: %s\n", time.Since(overallStart).Round(time.Millisecond))
 	if failures > 0 {
 		fmt.Printf("FAILURES: %d\n", failures)
+		// os.Exit skips deferred calls, so the `defer cancel()` above never runs on the failure path.
+		cancel()
+		//nolint:gocritic // exitAfterDefer: cancel() runs explicitly above; this is a test runner
+		// whose exit code IS its result.
 		os.Exit(1)
 	}
 	fmt.Println("ALL PASS")

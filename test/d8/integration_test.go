@@ -27,6 +27,9 @@ func TestD8Matrix(t *testing.T) {
 	t.Run("TransferAuditReDerivable", testTransferAuditReDerivable)
 	t.Run("ClusterHealthGate", testClusterHealthGate)
 	t.Run("TierBSurvivesHomeKill", testTierBSurvivesHomeKill)
+	// line-2 §12: this suite had no leak gate at all — assertNoGoroutineLeak was defined in
+	// setup_test.go and called from nowhere. See forward_churn_leak_test.go.
+	t.Run("ForwardChurnNoLeak", testD8ForwardChurnNoLeak)
 }
 
 // wireForwarders subscribes the §4.1 leader responder (dispatchForward) on every node and

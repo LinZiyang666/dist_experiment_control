@@ -75,3 +75,86 @@ func TestExternalReviewStaleSentinelCannotDisarmADataBearingReset(t *testing.T) 
 		t.Fatal("a stale sentinel suppressed reset of a currently data-bearing store")
 	}
 }
+
+// origin: line-2 C2. MoveAsideJSStore's stat of the store root was the one fail-OPEN left in a
+// function whose two other disk checks both fail closed:
+//
+//	if fi, serr := os.Stat(storeDir); serr != nil || !fi.IsDir() {
+//	    return "", nil // no store dir on disk yet — nothing to reset
+//	}
+//
+// ANY stat error meant "nothing to reset". os.Stat fails on EACCES, a broken symlink and I/O errors as
+// well as on absence, and in each of those the store may exist and hold data. Worse, the early return
+// jumps PAST the m4 ReadDir branch three lines below, so the "a store we cannot enumerate is
+// potentially data-bearing" rule never got to apply — the one guard written for exactly this case was
+// unreachable from this path.
+//
+// The two halves are asserted separately because collapsing them is how the bug was written in the
+// first place: absence and unreadability are different facts and only one of them is safe to ignore.
+func TestJSStoreRootStatErrorDoesNotSilentlySkipTheReset(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "locked")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := filepath.Join(parent, "jetstream")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "meta"), []byte("live data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Remove search permission on the parent so stat(store) fails with EACCES while the store very much
+	// still exists and holds data. Running as root defeats this, so skip rather than assert a false pass.
+	if err := os.Chmod(parent, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	if _, err := os.Stat(store); err == nil {
+		t.Skip("stat still succeeds on an unsearchable parent (running as root?) — the premise does not hold here")
+	}
+
+	moved, err := MoveAsideJSStore(store, filepath.Join(root, "bak"), "", true)
+	if err == nil {
+		t.Errorf("an unstatable store returned (%q, nil) — the caller reads that as "+
+			"'no store, nothing to reset' and proceeds to start a nats-server over data it never "+
+			"inspected", moved)
+	}
+	if moved != "" {
+		t.Errorf("no move can have happened, but the function reported backup path %q", moved)
+	}
+}
+
+// TestJSStoreAbsentRootIsStillANoOp is the other half: a store that genuinely does not exist must
+// remain a silent no-op. Without this, "fail closed on stat errors" could be satisfied by failing on
+// EVERY stat error including ENOENT, which would make a first-ever grow return an error.
+func TestJSStoreAbsentRootIsStillANoOp(t *testing.T) {
+	root := t.TempDir()
+	moved, err := MoveAsideJSStore(filepath.Join(root, "nope"), filepath.Join(root, "bak"), "", true)
+	if err != nil {
+		t.Fatalf("an absent store must be a no-op, got error: %v", err)
+	}
+	if moved != "" {
+		t.Errorf("an absent store reported a backup path %q", moved)
+	}
+}
+
+// origin: line-2 independent external review. A configured JetStream store path with the wrong
+// filesystem shape is corruption/misconfiguration, not evidence that no store exists. Returning
+// ("", nil) lets a destructive lifecycle command continue after inspecting neither data nor ownership.
+func TestMoveAsideJSStoreRejectsNonDirectoryStorePath(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "jetstream")
+	if err := os.WriteFile(store, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := MoveAsideJSStore(store, filepath.Join(root, "backup"), "", true)
+	if err == nil {
+		t.Fatalf("a non-directory JetStream store path returned (%q, nil); only an absent path may be "+
+			"treated as 'nothing to reset'", moved)
+	}
+	if moved != "" {
+		t.Fatalf("the invalid store path was not moved, but the function reported backup %q", moved)
+	}
+}

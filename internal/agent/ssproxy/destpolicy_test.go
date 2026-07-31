@@ -196,13 +196,19 @@ func rebindingDNSResponse(query []byte, aQueries *atomic.Int32) []byte {
 	questionEnd := i + 4
 	answer := qtype == 1
 
-	resp := make([]byte, 12)
-	copy(resp[0:2], query[0:2])
-	binary.BigEndian.PutUint16(resp[2:4], 0x8180)
-	binary.BigEndian.PutUint16(resp[4:6], 1)
+	// The 12-byte DNS header is a fixed-size struct, so it is built as one rather than as a
+	// `make([]byte, 12)` that is then appended to. Both produce identical bytes; this shape says "12
+	// bytes of header, then a body" instead of "a 12-long slice I am about to grow", which is the
+	// distinction makezero exists to draw (a `make([]byte, n)` followed by append is usually a
+	// misspelt `make([]byte, 0, n)` and silently ships n leading zero bytes).
+	var hdr [12]byte
+	copy(hdr[0:2], query[0:2])
+	binary.BigEndian.PutUint16(hdr[2:4], 0x8180)
+	binary.BigEndian.PutUint16(hdr[4:6], 1)
 	if answer {
-		binary.BigEndian.PutUint16(resp[6:8], 1)
+		binary.BigEndian.PutUint16(hdr[6:8], 1)
 	}
+	resp := append([]byte(nil), hdr[:]...)
 	resp = append(resp, query[12:questionEnd]...)
 	if !answer {
 		return resp

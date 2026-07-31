@@ -97,6 +97,11 @@ func clusterDoctorOnline(rep *adminsock.ClusterStatusReport) []clusteroffline.Do
 				topoBehind = append(topoBehind, n.NodeID)
 			case natsconf.TopoUnknownAction:
 				topoUnknown = append(topoUnknown, n.NodeID)
+			case natsconf.TopoUnreported, natsconf.TopoConverged:
+				// Non-degrading: this voter contributes no finding. Named explicitly so that a new
+				// TopoState cannot join the enum and be silently treated as healthy here — which is
+				// precisely how this function came to report PASS on a cluster that was not
+				// converging (batch-C external review M2).
 			}
 		}
 	}

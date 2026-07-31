@@ -142,10 +142,27 @@ func TestConnectErrorMentionsURL(t *testing.T) {
 // pins the current set.
 func TestRunFailureMessageMapsKnownReasons(t *testing.T) {
 	for reason, want := range map[string]string{
-		"attach_timeout":   "subscribe in time",
-		"pty_alloc_failed": "/dev/ptmx",
-		"exec_failed":      "command failed to start",
-		"argv_required":    "no command",
+		"attach_timeout": "subscribe in time",
+		// origin: line-2 §12 Y2, corrected twice by the line-2 review.
+		//
+		// `/dev/ptmx` moved from pty_alloc_failed to pty_unavailable when the emitter split by errno.
+		// pty_alloc_failed is the RESOURCE-EXHAUSTED case (EMFILE/ENFILE/ENOSPC/ENOMEM/EAGAIN — transient,
+		// exit 75) and pty_unavailable is the host that cannot provide a PTY at all (terminal, exit
+		// **64**, not 69: review M17 found 69 sits in usage.md's retryable class while this code's own
+		// hint says retrying will not help, so it went to 64 alongside download_http_status and the
+		// repo's other "a human must change something" codes).
+		//
+		// The pinned substring is `/proc/sys/kernel/pty/max`, not "file descriptors": review M17 showed
+		// the hint named only the less likely exhaustion, because devpts index exhaustion returns ENOSPC
+		// rather than EMFILE. Pinning the pty-limit phrase is what keeps the fix from being reworded away.
+		"pty_alloc_failed":        "/proc/sys/kernel/pty/max",
+		"pty_unavailable":         "/dev/ptmx",
+		"attach_subscribe_failed": "attach subject",
+		"exec_failed":             "command failed to start",
+		"argv_required":           "no command",
+		// download_http_status / download_too_large are deliberately absent: they are
+		// UpgradeForwardedResp.Code values, so their hints live in brokerCodeHints and are exercised by
+		// the broker-code hint test, not by runFailureMessage.
 	} {
 		t.Run(reason, func(t *testing.T) {
 			err := runFailureMessage(reason)

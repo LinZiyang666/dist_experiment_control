@@ -17,7 +17,12 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
+      # test/architecture/layering_test.go verifies the provenance of consolidated
+      # regression tests against a frozen ancestor commit. checkout's default
+      # fetch-depth=1 omits that object and makes `make test` deterministically red.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

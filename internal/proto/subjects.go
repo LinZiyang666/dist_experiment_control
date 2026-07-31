@@ -172,6 +172,15 @@ func ParseTransferFinalize(subject string) (actor, sid, transferID string, ok bo
 // ParseEvTransfer extracts (sid, nid, transfer_id, kind) from a
 // `tether.v2.s.<sid>.ev.node.<nid>.transfer.<id>.<kind>` subject.
 // kind ∈ {complete, failed}.
+// origin: line-2 review M14 (moved here from .golangci.yml, where the exemption was pinned to line
+// ranges a comment edit could invalidate). This file holds ~40 named subject builders and parsers. They
+// ARE structurally identical, and merging them into one parameterised builder would cost grep-ability
+// and type safety for nothing.
+//
+// The directive covers THIS declaration and its partner only, never the file: a third parser matching
+// one of them still reports. Getting that property was why the config-file form pinned line ranges.
+//
+//nolint:dupl // paired with ParseEvProc; argument above.
 func ParseEvTransfer(subject string) (sid, nid, transferID, kind string, ok bool) {
 	parts := strings.Split(subject, ".")
 	// 0:tether 1:v2 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:transfer 8:<id> 9:<kind>
@@ -295,6 +304,9 @@ const (
 // ParseEvProc extracts (sid, nid, pid, kind) from a process-lifecycle
 // event subject `tether.v2.s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`.
 // kind ∈ {"started", "exit"}.
+// origin: line-2 review M14. ParseEvTransfer above carries the argument for this pair.
+//
+//nolint:dupl // paired with ParseEvTransfer; ~40 parsers kept named on purpose.
 func ParseEvProc(subject string) (sid, nid, pid, kind string, ok bool) {
 	parts := strings.Split(subject, ".")
 	// 0:tether 1:v2 2:s 3:<sid> 4:ev 5:node 6:<nid> 7:proc 8:<pid> 9:<kind>

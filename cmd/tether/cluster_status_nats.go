@@ -197,6 +197,13 @@ func clusterStatusRemote(cmd *cobra.Command, home, natsURL string, asJSON bool) 
 	defer nc.Close()
 	s := summarizeClusterHealth(probeClusterHealth(nc, id.PublicKey))
 	renderCtlStatus(cmd.OutOrStdout(), s, asJSON)
+	// Close explicitly before exiting: os.Exit skips deferred calls, and nc.Close() is the flush that
+	// gets anything still buffered onto the wire. This path only reads, so nothing is known to be
+	// pending -- but "nothing is pending" is a property of today's call graph, not of this line.
+	nc.Close()
+	//nolint:gocritic // exitAfterDefer: the flush the deferred Close would have done now happens on
+	// the line above, explicitly. The shape stays because this command's whole contract is an exit
+	// CODE (docs/usage.md §9.13) and cobra has no way to return one.
 	os.Exit(ctlExitCode(s))
 	return nil
 }

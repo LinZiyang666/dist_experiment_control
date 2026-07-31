@@ -71,7 +71,7 @@ func TestSubRendersOnlyLiveNodes(t *testing.T) {
 	seedNode(t, db, "n-offline-ready", 14002, "OFFLINE", 1)
 
 	resp := get(t, db, "/sub/"+s.Token)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/yaml") {
@@ -106,7 +106,7 @@ func TestSubNoExistenceOracle(t *testing.T) {
 	seedNode(t, db, "n1", 14000, "ONLINE", 1)
 
 	unknown := get(t, db, "/sub/deadbeefdeadbeefdeadbeef")
-	if unknown.StatusCode != 404 {
+	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown token: status=%d want 404", unknown.StatusCode)
 	}
 	unknownBody := readBody(t, unknown)
@@ -115,7 +115,7 @@ func TestSubNoExistenceOracle(t *testing.T) {
 		t.Fatal(err)
 	}
 	revoked := get(t, db, "/sub/"+s.Token)
-	if revoked.StatusCode != 404 {
+	if revoked.StatusCode != http.StatusNotFound {
 		t.Fatalf("revoked token: status=%d want 404", revoked.StatusCode)
 	}
 	if got := readBody(t, revoked); got != unknownBody {
@@ -128,7 +128,7 @@ func TestSubNoExistenceOracle(t *testing.T) {
 		t.Fatal(err)
 	}
 	del := get(t, db, "/sub/"+s2.Token)
-	if del.StatusCode != 404 {
+	if del.StatusCode != http.StatusNotFound {
 		t.Fatalf("DELETING session token: status=%d want 404", del.StatusCode)
 	}
 }
@@ -166,7 +166,7 @@ func TestSubEmptyNodeSetValid(t *testing.T) {
 	db := newDB(t)
 	s, _ := proxysub.Create(db, "lab", "alice", "SHA256:o", time.Now())
 	resp := get(t, db, "/sub/"+s.Token)
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	body := readBody(t, resp)

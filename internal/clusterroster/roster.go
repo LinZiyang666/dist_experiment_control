@@ -123,6 +123,12 @@ var (
 // agent onto retired broker routes. A roster with NO expires_at (the current broker output) is NOT
 // rejected on freshness — the producer must start stamping a TTL before the consumer trusts it as
 // more than a short-lived fallback; VerifyAt makes the seam ready for that.
+// origin: line-2 review M14 (moved here from .golangci.yml, where the exemption was pinned to line
+// ranges a comment edit could invalidate). VerifyAt and seeds.go's VerifySeedsAt run parallel
+// verify+schema+expiry checks over two DIFFERENT signed artifacts. Unifying them needs a shared
+// interface over unrelated types, which buys less than it costs at two call sites.
+//
+//nolint:dupl // paired with VerifySeedsAt in seeds.go; argument above.
 func VerifyAt(r *proto.ClusterRoster, pinnedAccountPub string, now time.Time) error {
 	if err := Verify(r, pinnedAccountPub); err != nil {
 		return err

@@ -337,6 +337,12 @@ func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 // by `expose rm` and `session rm` cleanup. Returns ErrNotFound if no
 // row matches; nil on idempotent re-call against an already-non-ALLOCATED
 // row (the row exists, just nothing to do).
+// origin: line-2 review M14 (moved here from .golangci.yml, where the exemption was pinned to line
+// ranges a comment edit could invalidate). Free and Revoke share a shape, and batch-A A4 deliberately
+// kept the two paths SEPARATE after finding that sharing them turns a revoke into a footgun. Merging
+// here would undo a decision taken with a defect in hand.
+//
+//nolint:dupl // paired with Revoke; argument above.
 func Free(db *sql.DB, port int, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE port_allocations
@@ -418,6 +424,9 @@ func updateAllocationState(db *sql.DB, a Allocation, next State, label string, n
 // the same logicalHash). Its idempotence is load-bearing there and in
 // port_test.go:180/232/342/370, so it is NOT interchangeable with
 // RevokeAllocation, which returns ErrNotFound instead.
+// origin: line-2 review M14. Free above carries the argument for this pair.
+//
+//nolint:dupl // paired with Free; batch-A A4 kept these separate on purpose.
 func Revoke(db *sql.DB, port int, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE port_allocations

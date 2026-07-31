@@ -153,7 +153,7 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	// 2. migrate exposes homed here to another eligible VOTER (D6 rehome). The returned
 	// list is discarded — the durable gate below re-derives convergence (CRIT-1); what
 	// matters here is the raft move side effect.
-	if _, err := a.migrateExposes(nodeID); err != nil {
+	if err := a.migrateExposes(nodeID); err != nil {
 		return fmt.Errorf("cluster drain %s: migrate exposes: %w", nodeID, err)
 	}
 
@@ -704,7 +704,9 @@ func (e *ErrRebuildOffExposes) Error() string {
 // must now converge to. R8a: that list is the INPUT to the data-plane convergence
 // gate — "we wrote home_broker through raft" is a control-plane fact, and the whole
 // point of this batch is that a control-plane fact is not a data-plane fact.
-func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
+// The []rehomedExpose it used to return was read by nobody (both call sites spelled `_, err :=`);
+// the rehome events it emits internally are the actual output.
+func (a *ClusterAdmin) migrateExposes(nodeID string) error {
 	var rebuildOn, rebuildOff []int
 	names := map[int]string{} // B7 DOC#5: port → expose name, for the expose_rehomed event
 	sids := map[int]string{}  // Stage-C m1: port → sid, so the event can correlate to a session
@@ -746,14 +748,14 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 			`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND node_id != ? AND nats_server_id != '' ORDER BY node_id LIMIT 1`,
 			nodeID).Scan(&target)
 	}); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
+		return err
 	}
 	// Rebuild-OFF exposes are NEVER silently rehomed (F3): refuse + enumerate.
 	if len(rebuildOff) > 0 {
-		return nil, &ErrRebuildOffExposes{NodeID: nodeID, Ports: rebuildOff}
+		return &ErrRebuildOffExposes{NodeID: nodeID, Ports: rebuildOff}
 	}
 	if len(rebuildOn) == 0 {
-		return nil, nil // nothing to migrate
+		return nil // nothing to migrate
 	}
 	if target == "" {
 		// C6: rehome_stalled{expose,no_eligible_target} per port BEFORE returning the error (so the
@@ -764,11 +766,9 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 				"home_broker": nodeID, "reason": reasonNoEligibleTarget,
 			})
 		}
-		return nil, ErrNoMigrationTarget
+		return ErrNoMigrationTarget
 	}
-	var migrated []rehomedExpose
 	for _, p := range rebuildOn {
-		p := p
 		skipped := false
 		var newEpoch int64
 		if err := a.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
@@ -789,7 +789,7 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 				"kind": "expose", "name": names[p], "sid": sids[p], "port": p,
 				"from_broker": nodeID, "to_broker": target, "reason": classifyRehomeErr(err),
 			})
-			return nil, fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
+			return fmt.Errorf("rehome port %d -> %s: %w", p, target, err)
 		}
 		if skipped {
 			continue // BD8/C6-EVT-5: no started/succeeded/expose_rehomed for a raced-away row
@@ -805,12 +805,9 @@ func (a *ClusterAdmin) migrateExposes(nodeID string) ([]rehomedExpose, error) {
 		a.emitDrainEvent("expose_rehomed", map[string]any{
 			"port": p, "name": names[p], "sid": sids[p], "from_broker": nodeID, "to_broker": target,
 		})
-		migrated = append(migrated, rehomedExpose{
-			sid: sids[p], nid: nids[p], name: names[p], port: p, epoch: newEpoch, toBroker: target,
-		})
 	}
 	a.logger.Info("cluster drain: migrated rebuild-ON exposes", "node_id", nodeID, "count", len(rebuildOn), "target", target)
-	return migrated, nil
+	return nil
 }
 
 // pendingRetireConvergence is the DURABLE form of the drain/retire data-plane gate

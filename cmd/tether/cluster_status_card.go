@@ -138,6 +138,14 @@ func cardTopReason(rep *adminsock.ClusterStatusReport) string {
 		return "broker " + worstNode + " standalone→clustered cutover WITHHELD (run `cluster add`)"
 	case natsconf.TopoUnknownAction:
 		return "broker " + worstNode + " reported an unrecognized topology action (newer release?)"
+	case natsconf.TopoBehind:
+		// This case was MISSING. TopoBehind degrades (TopoState.Degrades returns true for it), so the
+		// cluster was already being reported as non-healthy — but the card that is supposed to say WHY
+		// fell through to the inconsistency loop below and produced no topology headline at all. The
+		// operator saw a degraded cluster with no stated cause.
+		return "broker " + worstNode + " NATS topology has not caught the desired generation yet"
+	case natsconf.TopoUnreported, natsconf.TopoConverged:
+		// Non-degrading: fall through to the inconsistency checks below.
 	}
 	for _, n := range rep.Nodes {
 		if n.Inconsistent {

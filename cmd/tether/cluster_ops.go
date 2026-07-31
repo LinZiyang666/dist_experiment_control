@@ -28,6 +28,16 @@ func newClusterOpsCmd(socketPath *string) *cobra.Command {
 
 // newClusterOpsConfirmCmd re-confirms a BLOCKED retire op (the operator re-acknowledged the worsened
 // fault tolerance), so the controller proceeds (C4 §4).
+// origin: line-2 review M14 (moved here from .golangci.yml). confirm and abort are two cobra
+// subcommands that differ only in the verb they send. The shared part is the cobra plumbing (flags, arg
+// validation, socket dial); factoring it out would replace two readable commands with one parameterised
+// one plus a table, for no behaviour change.
+//
+// Note what this directive does NOT do: it covers this declaration only. A THIRD clone of the skeleton
+// added to this file still reports — measured, and the reason the config-file version pinned line
+// ranges instead of exempting the file.
+//
+//nolint:dupl // paired with newClusterOpsAbortCmd below; see above.
 func newClusterOpsConfirmCmd(socketPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:     "confirm <op-id>",
@@ -53,6 +63,10 @@ func newClusterOpsConfirmCmd(socketPath *string) *cobra.Command {
 
 // newClusterOpsAbortCmd aborts a stuck operation, freeing the per-node active slot WITHOUT touching
 // the substrate (the escape hatch — the membership stays whatever the gates left it; C4 §5).
+//
+// origin: line-2 review M14. newClusterOpsConfirmCmd above carries the argument for this pair.
+//
+//nolint:dupl // paired with newClusterOpsConfirmCmd; identical cobra plumbing, different verb.
 func newClusterOpsAbortCmd(socketPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:     "abort <op-id>",

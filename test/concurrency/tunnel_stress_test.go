@@ -50,7 +50,7 @@ func TestTunnelConcurrentClientOpens(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
 		wg.Add(1)
-		i := i
+
 		go func() {
 			defer wg.Done()
 			cli := tunnel.NewClient(
@@ -131,7 +131,7 @@ func TestTunnelOpenDuringServerCloseRace(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < N; i++ {
 			wg.Add(1)
-			i := i
+
 			go func() {
 				defer wg.Done()
 				cli := tunnel.NewClient(

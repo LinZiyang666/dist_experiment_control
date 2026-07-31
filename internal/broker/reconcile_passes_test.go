@@ -1098,7 +1098,7 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 
 // putXferOrphan creates the OBJ_xfer-<bucket> object store and writes one orphan object into it (no
 // tracker entry), so the reap pass sees a bucket with accumulating garbage.
-func putXferOrphan(t *testing.T, ctx context.Context, js jetstream.JetStream, bucket, name string) {
+func putXferOrphan(ctx context.Context, t *testing.T, js jetstream.JetStream, bucket, name string) {
 	t.Helper()
 	store, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: bucket})
 	if err != nil {
@@ -1158,7 +1158,7 @@ func TestXferCrossHomeGCSkipsBusyBucket(t *testing.T) {
 	// split-home session (node-A + node-B), leader holds a LIVE tracker entry for its bucket.
 	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
 	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	putXferOrphan(ctx, t, js, "xfer-split", "obj")
 	if code := b.transfers.put(&transferEntry{transferID: "obj", sid: "split", nid: "sp1", verb: "pull", tier: "b", bucket: "xfer-split", startedAt: time.Now()}); code != "" {
 		t.Fatalf("put live: %s", code)
 	}
@@ -1205,12 +1205,12 @@ func TestXferCrossHomeGCReapsSplitHome(t *testing.T) {
 	// split-home (node-A + node-B) orphan → the LEADER cross-home GCs it.
 	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
 	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	putXferOrphan(ctx, t, js, "xfer-split", "obj")
 	// zero-node session orphan → cross-home GC'd.
-	putXferOrphan(t, ctx, js, "xfer-zero", "obj")
+	putXferOrphan(ctx, t, js, "xfer-zero", "obj")
 	// single-home ELSEWHERE (node-B) orphan → NOT orphaned-everywhere → left for node-B, NOT GC'd here.
 	seedHomedNode(t, db, "elsewhere", "e1", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-elsewhere", "obj")
+	putXferOrphan(ctx, t, js, "xfer-elsewhere", "obj")
 
 	if _, err := b.reconcileXferObjects(ctx); err != nil {
 		t.Fatalf("reconcileXferObjects: %v", err)
@@ -1277,12 +1277,12 @@ func TestXferUnreapableBucketCounter(t *testing.T) {
 	// split-home (node-A + node-B) with an orphan → COUNTS.
 	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
 	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-split", "obj")
+	putXferOrphan(ctx, t, js, "xfer-split", "obj")
 	// single-home elsewhere with an orphan → NOT counted (node-B reaps it — noise guard).
 	seedHomedNode(t, db, "elsewhere", "e1", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-elsewhere", "obj")
+	putXferOrphan(ctx, t, js, "xfer-elsewhere", "obj")
 	// zero-node session bucket with an orphan → COUNTS.
-	putXferOrphan(t, ctx, js, "xfer-zero", "obj")
+	putXferOrphan(ctx, t, js, "xfer-zero", "obj")
 	// split-home but EMPTY bucket → NOT counted (no aged garbage — aged guard).
 	seedHomedNode(t, db, "splitempty", "se1", "srv-A", "node-A")
 	seedHomedNode(t, db, "splitempty", "se2", "srv-B", "node-B")
@@ -1349,7 +1349,7 @@ func TestXferUnreapableBucketSkipsFreshObjects(t *testing.T) {
 
 	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
 	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
-	putXferOrphan(t, ctx, js, "xfer-split", "just-uploaded") // written now → inside the 1h grace
+	putXferOrphan(ctx, t, js, "xfer-split", "just-uploaded") // written now → inside the 1h grace
 
 	if _, err := b.reconcileXferObjects(ctx); err != nil {
 		t.Fatalf("reconcileXferObjects: %v", err)

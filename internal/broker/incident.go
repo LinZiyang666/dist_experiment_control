@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,8 +85,25 @@ func (b *clusterAdminBackend) handleExportIncident(req adminsock.Request) admins
 				}
 				continue
 			}
+			// origin: line-2 closure verification m11. scrubAuditBody fails CLOSED by returning nil — the
+			// right call, because handing back the unscrubbed original would export secrets from an
+			// incident bundle. But the nil was then written into the entry with no other trace: the
+			// bundle reported Partial:false and an empty Errors, i.e. a forensic reader saw an audit
+			// entry with no body and nothing telling them a body had been dropped.
+			//
+			// `partial` and `errs` are the mechanism for exactly this, and they are in scope two lines
+			// up (the history_unavailable branch uses them). A silent hole in an incident bundle is the
+			// same class of defect as rc=0 on an unconverged drain: the artifact says "complete" about
+			// something it is not.
 			for i := range entries {
-				entries[i].Body = scrubAuditBody(entries[i].Body)
+				scrubbed := scrubAuditBody(entries[i].Body)
+				if entries[i].Body != nil && scrubbed == nil {
+					partial = true
+					errs = append(errs, "audit for "+sid+": entry "+strconv.Itoa(i)+
+						" body dropped — the redaction pass could not produce a scrubbed map, so the body was "+
+						"withheld rather than exported unscrubbed")
+				}
+				entries[i].Body = scrubbed
 			}
 			audit[sid] = entries
 		}
@@ -165,7 +183,15 @@ func scrubAuditBody(body map[string]any) map[string]any {
 	if body == nil {
 		return nil
 	}
-	return scrubAny(body).(map[string]any)
+	// Checked, and it fails CLOSED. scrubAny returns a map for a map today, so the old unchecked
+	// assertion could not panic — but the failure mode if that ever stopped holding is the one that
+	// matters here: handing back the caller's ORIGINAL body would export an unscrubbed incident.
+	// Returning nil loses the body; returning the input would leak it.
+	scrubbed, ok := scrubAny(body).(map[string]any)
+	if !ok {
+		return nil
+	}
+	return scrubbed
 }
 
 // scrubAny applies the denylist recursively: a denylisted KEY redacts its whole subtree; an

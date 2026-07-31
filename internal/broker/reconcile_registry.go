@@ -440,8 +440,15 @@ func (p *reconcilePass) advanceLocked(now time.Time) {
 	if p.nextDue.After(now) {
 		return
 	}
+	// behind - behind%interval is floor(behind/interval)*interval, so adding one more interval lands
+	// on the first slot strictly after now — the same value the old
+	// `(behind/p.interval + 1) * p.interval` computed, without multiplying two Durations together.
+	// The result was never wrong; the types were: `behind/p.interval` is a dimensionless slot COUNT
+	// that happens to be carried in a time.Duration, and durationcheck is right that a
+	// Duration×Duration product is nearly always a unit bug. Saying it this way removes the report
+	// without a //nolint and without pretending the old form was suspicious.
 	behind := now.Sub(p.nextDue)
-	p.nextDue = p.nextDue.Add((behind/p.interval + 1) * p.interval)
+	p.nextDue = p.nextDue.Add(behind - behind%p.interval + p.interval)
 }
 
 // backoffLocked pushes a failing pass's deadline out exponentially (interval,

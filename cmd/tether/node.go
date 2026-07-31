@@ -290,21 +290,89 @@ func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	return nil
 }
 
-// isTransientError returns true for broker reply codes that signal
-// "this specific node is unreachable right now" — `--all` should
-// log + skip these so a single OFFLINE box doesn't abort a
-// fleet-wide rollout. The operator gets a final summary and can
-// retry just the skipped subset.
-func isTransientError(err error) bool {
-	msg := err.Error()
-	for _, needle := range []string{
-		"node_offline",
-		"node_not_found",
-		"agent_no_responders",
-		"agent_malformed_resp",
+// HOW `node upgrade --all` CLASSIFIES A PER-NODE FAILURE
+//
+// Two disjoint sets of WIRE CODES, matched EXACTLY against the code the error carries structurally
+// (ExitError.Code, set at the source by brokerErrorMessage), plus one narrow prose fallback for
+// errors that have no wire code at all.
+//
+// origin: line-2 external review 疑惑 #2. Both functions used to be
+// `strings.Contains(err.Error(), needle)` over the same code names — exactly what exitcode.go's own
+// comment forbids ("The classifier never string-sniffs prose for a class — that would make a
+// reworded message silently change a script's exit code"). The prose these matched is the
+// OPERATOR-FACING hint text from brokerCodeHints, which exists to be reworded; a hint that came to
+// mention "download_http_status" while explaining something else would silently turn a skip into a
+// fleet abort. Neither direction is safe: a false transient keeps rolling out a broken artifact, a
+// false config error halts a fleet over one bad box.
+//
+// The fallback is deliberately NOT the old full list. It holds only needles that can never arrive as
+// a wire code — Go's own transport/context prose — because for those there is nothing structural to
+// match and today's behaviour is all there is. Every code-bearing needle moved to exact matching.
+var (
+	// transientUpgradeCodes: "this specific node is unreachable right now". `--all` logs + skips these
+	// so a single OFFLINE box doesn't abort a fleet-wide rollout; the operator gets a final summary
+	// and can retry just the skipped subset.
+	transientUpgradeCodes = map[string]bool{
+		"node_offline":         true,
+		"node_not_found":       true,
+		"agent_no_responders":  true,
+		"agent_malformed_resp": true,
+		// origin: line-2 closure verification §6 B1. The other half of the Y2 split. These two really do
+		// clear on their own — a transport blip mid-download, and a PTY/fd/pty-count limit that frees as
+		// sessions close — so a fleet rollout should SKIP the node and keep going rather than counting it
+		// as a hard failure the operator has to interpret.
+		//
+		// pty_alloc_failed is here rather than in the config set for the same reason its exit class is 75:
+		// see internal/agent/run.go's ptyTransientErrnos. Its sibling pty_unavailable is deliberately in
+		// NEITHER set — a host with no /dev/ptmx is not transient, but it is also not a bad CALL, so
+		// aborting the whole fleet over one misconfigured box would be wrong. It stays a per-node failure.
+		"download_failed": true,
+		// origin: external review M1 — a mirror that is down or rate-limiting is exactly the case for
+		// skipping this node and continuing: the artifact is fine and the next node may well succeed.
+		"download_http_retryable": true,
+		"pty_alloc_failed":        true,
+	}
+	// configUpgradeCodes: the CALL itself is bad (not the target). Aborts `--all` because no other node
+	// will accept it either.
+	configUpgradeCodes = map[string]bool{
+		"not_owner":                     true,
+		"url_not_allowed":               true,
+		"sha256_invalid":                true,
+		"proto_bump_requires_reinstall": true,
+		"actor_invalid":                 true,
+		"session_not_found_or_deleting": true,
+		// origin: line-2 closure verification §6 B1, the review's self-declared most substantive item.
+		//
+		// The line-2 §12 Y2 split created these two codes precisely because `download_failed` was
+		// telling automation to retry a permanently-broken download forever. It fixed the EXIT CLASS
+		// (both → 64) and the hint text, and missed this list — a THIRD classification of the same
+		// codes, in the same package, reached by the one command Y2 was written to rescue.
+		//
+		// The consequence was worse than a wrong exit code. Neither code matched here nor in the
+		// transient set, so `node upgrade --all` counted the node as "✗ failed" and CARRIED ON —
+		// fanning a typo'd --url out to every remaining node in the fleet. Aborting on exactly that is
+		// what the comment above isConfigError's call site says this function is for.
+		//
+		// download_too_large is the same shape: the artifact is over the agent's ceiling, so it will be
+		// over the ceiling on node 2 through node N as well.
+		"download_http_status": true,
+		"download_too_large":   true,
+	}
+	// transientCodelessNeedles: prose that can only come from Go's transport/context layer, which never
+	// carries a wire code. Consulted ONLY when the error carries no code — never as an override.
+	transientCodelessNeedles = []string{
 		"deadline exceeded",
 		"context canceled",
-	} {
+	}
+)
+
+// isTransientError reports whether `--all` should skip this node and keep going.
+func isTransientError(err error) bool {
+	if code := wireCodeOf(err); code != "" {
+		return transientUpgradeCodes[code]
+	}
+	msg := err.Error()
+	for _, needle := range transientCodelessNeedles {
 		if strings.Contains(msg, needle) {
 			return true
 		}
@@ -312,24 +380,10 @@ func isTransientError(err error) bool {
 	return false
 }
 
-// isConfigError returns true for broker reply codes that mean the
-// CALL itself is bad (not the target). Aborts `--all` because no
-// other node will accept it either.
+// isConfigError reports whether `--all` should abort the rest of the fleet.
 func isConfigError(err error) bool {
-	msg := err.Error()
-	for _, needle := range []string{
-		"not_owner",
-		"url_not_allowed",
-		"sha256_invalid",
-		"proto_bump_requires_reinstall",
-		"actor_invalid",
-		"session_not_found_or_deleting",
-	} {
-		if strings.Contains(msg, needle) {
-			return true
-		}
-	}
-	return false
+	code := wireCodeOf(err)
+	return code != "" && configUpgradeCodes[code]
 }
 
 // listOnlineNIDs round-trips a node.list.req (architecture B.1

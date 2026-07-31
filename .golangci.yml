@@ -1,0 +1,417 @@
+# golangci-lint v2 configuration — tether
+#
+# The version is pinned in one place (Makefile GOLANGCI_VERSION = v2.5.0) and `make lint` enforces it,
+# because golangci-lint bundles its own staticcheck and a different build silently changes WHICH checks
+# run. This file only decides what to run. Editing it is editing a gate: see CLAUDE.md §5.
+#
+# READ THESE FOUR CONSTRAINTS BEFORE CHANGING ANYTHING HERE.
+#
+# 1) 29-33% of the lines in this repo are comments, and they carry incident history, external-review
+#    findings and invariant arguments. They are the most valuable thing in the tree. Any linter that
+#    counts PHYSICAL LINES turns them into violations and therefore pays people to delete them, so
+#    funlen / lll are deliberately NOT enabled for THAT reason.
+#
+#    gocyclo / gocognit / cyclop are also not enabled, but NOT for that reason — they count branches and
+#    are comment-immune. They are rejected by plan §11 X7 on the separate ground that their reports here
+#    are noise against conventions this repo has already reasoned through. origin: line-2 closure
+#    verification §6 B10: this paragraph used to put gocyclo in the physical-lines list and then, nine
+#    lines down, call it one of "the comment-immune ones" — the same linter condemned and recommended in
+#    one comment, in the file that is the doc anchor for X7's permanent rejection. Eight review lanes read
+#    past it. Two different reasons for two different rejections, said separately.
+#
+#    An earlier revision of this comment said maintidx was the safe alternative because it "only eats
+#    tokens and is immune to comments". That was measured and it is FALSE. maintidx's LOC term counts
+#    comment lines inside the function body: adding 20 pure-comment lines to handleGrowTrigger moves it
+#    17 -> 16 with Cyclomatic Complexity and Halstead Volume byte-identical, and DELETING 28 comment
+#    lines moves it 17 -> 19. There is no ignore-comments option (setting one is silently ignored).
+#    gocyclo and funlen{ignore-comments:true} are the comment-immune ones.
+#
+#    maintidx is still enabled, but ONLY as a set membership test: the exclusions below match on the
+#    function NAME and never on the measured index, so the ten registered god functions can be
+#    commented freely. What the gate still buys is the thing that matters -- an ELEVENTH one cannot
+#    appear without a deliberate edit here.
+#
+# 2) The error convention in this repo is `fmt.Errorf("%w: ...: %v", sentinel, cause)`: the sentinel
+#    stays errors.Is-able and the inner cause degrades to text. errorlint.errorf and wrapcheck both
+#    fight that convention (wrapcheck measured 570 prod issues), so wrapcheck is off and
+#    errorlint.errorf is false. errorlint's asserts/comparison halves are real bug detectors and stay on.
+#
+# 3) All SQL goes through SQLite with SetMaxOpenConns(1), and the raft FSM Apply path must be
+#    deterministic and non-cancellable. noctx's 244 database/sql reports would, if followed, thread a
+#    cancellable ctx into the FSM -- the wrong direction. That branch is excluded; http/exec/tls/dial
+#    are kept.
+#
+# 4) The issues section below turns OFF golangci-lint's default output caps. They are not cosmetic:
+#    max-same-issues=3 and uniq-by-line=true hide 21 real findings on this tree, including a
+#    forcetypeassert in internal/broker/rehome_events.go and four net.DialTimeout sites. A gate that
+#    silently truncates its own report cannot be reconciled against a remediation list.
+
+version: "2"
+
+run:
+  timeout: 10m
+
+issues:
+  # Report everything. See constraint 4.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    # -- T1: zero-baseline correctness detectors (must stay at 0 once cleared) --------------
+    - bodyclose        # unclosed HTTP response bodies
+    - copyloopvar      # the `x := x` dance that Go 1.22 made unnecessary
+    - durationcheck    # time.Duration multiplied by time.Duration (the classic unit bug)
+    - errorlint        # see settings: asserts + comparison only
+    - exhaustive       # a switch over a named type that misses a case
+    - forcetypeassert  # unchecked type assertions
+    - gocritic         # see settings: mainly exitAfterDefer
+    - makezero         # append to a non-zero-length make() slice
+    - nilerr           # err != nil, then return nil
+    - noctx            # see exclusions: http / exec / tls / dial only
+    - revive           # see settings: an explicit small rule set, NOT the default one
+    - usestdlibvars    # hardcoded "GET" / "200" instead of the stdlib constants
+    - wastedassign     # assignments that are overwritten before use
+
+    # -- T2: structural ratchet (baseline lands as named exemptions, must not grow) ---------
+    - dupl             # copy-paste, threshold 100 tokens
+    - maintidx         # god-function detector; see constraint 1 for how it is used here
+    - unparam          # constant parameters / never-checked returns
+
+    # -- T3: the gate's own gate -----------------------------------------------------------
+    - nolintlint       # //nolint must name a linter, carry a reason, and not dangle
+
+  settings:
+    errorlint:
+      # See constraint 2. errorf:true would report 25 deliberate uses on day one and cost the whole
+      # config its credibility.
+      errorf: false
+      asserts: true
+      comparison: true
+
+    exhaustive:
+      # A switch with a default is treated as exhaustive. Without this every default-carrying switch
+      # reports, which is noise.
+      #
+      # It also opens an escape hatch that has to be closed elsewhere: adding `default:` makes any
+      # exhaustive violation disappear, INCLUDING the batch-C external-review MAJOR (cluster doctor
+      # missing TopoBehind/TopoUnknownAction and reporting PASS on a non-converged cluster). Measured:
+      # with a default in place, re-injecting that exact defect produces no report at all. So
+      # test/determinism/enum_switch_default_test.go forbids `default:` on switches over this repo's
+      # own enum types, and violations here must be fixed by enumerating the missing cases.
+      default-signifies-exhaustive: true
+      # topoStateCount is the sentinel that terminates the TopoState enum, not a state. Writing a case
+      # for it would be wrong, so it is excluded from the requirement rather than nolint-ed at each site.
+      ignore-enum-members: "topoStateCount$"
+      # THIRD-PARTY enums, where "handle every case" is the wrong requirement: jetstream.ErrorCode has
+      # 26 members and grows with every nats.go release, and hclog.Level's NoLevel/Off are sentinels.
+      # The switches over them classify a handful of codes we care about and pass the rest through --
+      # that is the correct shape, and enumerating an upstream enum would turn a dependency bump into a
+      # compile-time chore that teaches people to add `default:` (see the note above for why that is
+      # the outcome to avoid). Only OUR enums are required to be exhaustive.
+      # Matched against the FULLY QUALIFIED type name (import path + "." + type), so these anchor on
+      # the right only -- a leading ^ silently matches nothing.
+      ignore-enum-types: "jetstream\\.ErrorCode$|hclog\\.Level$"
+
+    dupl:
+      # 100 was chosen by measurement: at 100 the prod set is small and every pair is real; at 120 two
+      # confirmed findings disappear; below 80 the test tree explodes (table-driven tests are supposed
+      # to look alike).
+      threshold: 100
+
+    maintidx:
+      # under:20 selects exactly the god functions the structural audit named. The value is a
+      # SELECTOR, not a budget -- the exclusions below suppress the registered ten by name, so this
+      # number's only job is to make an unregistered eleventh one appear.
+      under: 20
+
+      # THE BOUNDARY TAX, NAMED. origin: line-2 external review M13 / PI-3.
+      #
+      # maintidx is comment-sensitive and cannot be told not to be (design constraint 1 above; measured:
+      # handleGrowTrigger's MI drops 17 -> 16 on 20 lines of pure comment, with CC and Halstead volume
+      # byte-identical). Any threshold on such a metric has a boundary, and four UNREGISTERED functions
+      # currently sit exactly on this one at MI == 20:
+      #
+      #   driveRetire                          internal/broker/cluster_operation_controller.go   CC 38
+      #   clusterAdminBackend.HandleCluster                                                      CC 42
+      #   RestoreFromBackup                                                                      CC 38
+      #   runReconcileToStandalone                                                               CC 37
+      #
+      # Roughly 6 lines of pure comment inside any of them takes MI to 19 and `make lint` reports it.
+      # One line in each does not (measured: all four +1 line stays green), so the grain is a paragraph,
+      # not a sentence.
+      #
+      # WHAT TO DO WHEN THAT REPORT APPEARS: read the function, and if it deserves the note, ADD IT TO
+      # THIS REGISTER. That is a two-line edit and the honest outcome. What must NOT happen is deleting
+      # the comment to get green -- CLAUDE.md's rule that funlen/lll/gocyclo are deliberately off so that
+      # no line-count gate pays people to delete comments applies here too, and these four functions
+      # (a retire waypoint driver, the cluster admin dispatcher, a restore path, a standalone reconcile)
+      # are among the places incident notes are worth the most.
+      #
+      # WHY NOT JUST FIX IT: the two obvious fixes are both closed. Lowering `under` to 15 drops 6 of the
+      # 10 REGISTERED god functions (MI 17,17,17,18,18,19) out of reporting range, turning most of this
+      # register into dead exemptions and letting an eleventh god function at MI 16-19 appear in silence
+      # -- it moves the boundary, it does not remove it. Swapping in a comment-immune selector means
+      # gocyclo, which plan §11 X7 rejects forever. See plan §11 X3 for how that circularity was cut.
+
+    gocritic:
+      disabled-checks:
+        # Pure style; the if/else chains in this repo are short.
+        - ifElseChain
+      # The default set is kept for exitAfterDefer, which finds real resource leaks where os.Exit
+      # skips a defer.
+
+    revive:
+      # NOT the default rule set: it reports 179 prod issues here, 80 of them `exported` (a doc comment
+      # on every exported symbol). 34 of 35 packages are internal/ with no outside consumer, so those
+      # 80 are pure noise, and unused-parameter's 69 would fight the handler/pass signatures that must
+      # keep their shape. Only the bug-shaped rules are on.
+      rules:
+        - name: indent-error-flow
+        - name: empty-block
+        - name: context-as-argument
+        - name: range-val-address
+        - name: unreachable-code
+        - name: waitgroup-by-value      # there are 4 WaitGroup barriers here; passing one by value is fatal
+        - name: bool-literal-in-expr
+        - name: identical-branches
+        - name: modifies-value-receiver
+      # redefines-builtin-id is deliberately off: all 36 reports are locals named `clear`, `any`, `max`
+      # or `min` where that word is the right word.
+
+    nolintlint:
+      # These three are what keep T2's named-exemption mechanism from degenerating into //nolint
+      # everywhere.
+      require-explanation: true   # say why
+      require-specific: true      # //nolint:maintidx, never a bare //nolint
+      allow-unused: false         # a directive whose problem is fixed must be deleted, not left to rot
+      #
+      # KNOWN LIMIT: nolintlint does NOT report `//nolint:X` where X is not an enabled linter, so a
+      # directive can name a linter this repo never runs and never be examined by anything.
+      # test/architecture/nolint_directive_test.go covers that gap.
+
+  exclusions:
+    generated: lax
+    rules:
+      # -- noctx: keep only the half that means something ---------------------------------
+      # database/sql: 244 reports. See constraint 3.
+      - linters: [noctx]
+        text: "database/sql"
+      # net.Listen: ListenConfig only matters when the BIND itself should be cancellable. All three
+      # listeners here are bind-then-serve, so switching would change nothing observable.
+      - linters: [noctx]
+        text: "net.Listen must not be called"
+      #
+      # os/exec.Command in the child-process packages. CommandContext's cancellation sends a signal to
+      # the DIRECT CHILD only. internal/pty and internal/agent start their children in their own
+      # session/process group precisely so the whole group can be reaped (see the internal/pty package
+      # doc: "Process-group kill. Children are started in their own session"), and internal/spawnsafe
+      # exists because that reaping has to survive a wedged filesystem. Switching these to
+      # CommandContext would substitute a weaker kill for a stronger one that was written deliberately,
+      # and would do it invisibly -- the code would look MORE careful while reaping less.
+      - linters: [noctx]
+        path: internal/(pty|agent)/
+        text: "os/exec.Command must not be called"
+      #
+      # The test tree spawns child processes whose lifetime bound IS the test binary's: `go test`
+      # timeouts and t.Cleanup already own them, and the parallel e2e runner reaps its own workers.
+      #
+      # NARROWED to the exec.Command message. origin: line-2 external review m4 / F8. Without the
+      # `text:` this was a whole-tree noctx immunity, which contradicts two things this very file
+      # decides: the T1 note below argues at length that a correctness-class exemption must NOT be
+      # widened to `^test/` because "harness code is not test code just because it lives under test/",
+      # and plan §15's arbitration says in as many words that T1 exemptions cover `_test\.go` only while
+      # T2 structural ones may cover `^test/`. noctx is a T1 linter.
+      #
+      # Today's loss from the wide form was near zero (the absorbed sites are exec.Command in
+      # test/e2e/parallel and a net.Listen already covered by a global rule). The risk was forward:
+      # test/clusterharness is shared by the whole e2e matrix, and an un-timed http.Get added there to
+      # poll a broker's readyz would have gone unreported.
+      - linters: [noctx]
+        path: ^test/
+        text: "os/exec.Command must not be called"
+      #
+      # net.DialTimeout and tls.DialWithDialer: every remaining site passes an explicit timeout, which
+      # is the bound these paths were designed around. A ctx would add CANCELLATION on top of that
+      # bound, which is a real (if small) improvement for the two long-lived callers -- but the
+      # remaining sites are one-shot CLI probes (agent doctor, cluster status, the offline diagnose
+      # tool) where the process exits moments later and cancellation buys nothing at all. Enabling the
+      # rule only to blanket-nolint the CLI sites would make the exemption list, not the code, the
+      # thing being maintained.
+      #
+      # RECORDED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT: this is a decision not to thread a context
+      # through six dial sites, taken with the counts measured. If a broker is ever observed sitting in
+      # a dial during shutdown, this exclusion is the first thing to revisit.
+      - linters: [noctx]
+        text: "(net.DialTimeout|crypto/tls.DialWithDialer|net.LookupIP) must not be called"
+      #
+      # The last four sites, each blocked by a signature this repo does not own. Listed individually so
+      # that a fifth one cannot join them silently:
+      #
+      #   proxydial/httpconnect.go     nats.go's CustomDialer interface is Dial(network, address) --
+      #                                there is no ctx to thread, and the handshake is already bounded
+      #                                by the shared end-to-end deadline the dialer carries.
+      #   agent/upgrade.go             reached from a nats.go MsgHandler, whose signature is
+      #                                func(*nats.Msg). The download is bounded by the client Timeout.
+      #   broker/cluster_grow_cutover  performGrowCutover/restartAndVerifyClustered are RPC handlers
+      #                                two hops up and neither takes a ctx; the probe is a 3s loopback
+      #                                GET against a client with its own timeout.
+      #   natsconf/takeover.go DryRun  five call sites, two of them one-shot CLI commands where
+      #                                cancellation means nothing, and reaching the other three would
+      #                                change ReconcileOnce's callback signature -- a lot of interface
+      #                                churn to make a bounded local `nats-server -t` cancellable.
+      #
+      # Recorded as a DECISION, not an oversight: each is time-bounded already, and what a ctx would
+      # add is cancellation on shutdown. Revisit if a broker is ever seen sitting in one of these.
+      #
+      # The last four sites are NOT exempted here. They carry inline `//nolint:noctx` with a written
+      # reason instead, and the difference is not cosmetic: a config exclusion has no line anchor, so
+      # `path:` + `text:` exempts EVERY occurrence of that message in that file forever. Measured — with
+      # a path+text rule for internal/agent/upgrade.go, a freshly added timeout-less `http.Get` in that
+      # same file produced ZERO reports, because its message is byte-identical to the legitimate site's.
+      # An inline directive is anchored to the line, nolintlint forces it to carry a reason, and
+      # allow-unused:false deletes it automatically once the code moves. That is the site-scoping this
+      # file demands everywhere else.
+
+      # -- test tree, part 1: correctness linters, *_test.go only --------------------------
+      # Tests legitimately have parallel structure, long setup functions, and unchecked assertions
+      # backed by t.Fatal. Pushing production ergonomics onto them is the wrong direction.
+      #
+      # The path is `_test\.go` and NOT `^test/`, deliberately. Widening it to the whole test tree
+      # would also silence test/clusterharness/clusterharness.go:138 -- an unchecked type assertion in
+      # a shared harness, which panics with an unreadable message and is worth fixing rather than
+      # hiding. Harness code is not test code just because it lives under test/.
+      - path: _test\.go
+        linters:
+          - forcetypeassert
+          - bodyclose
+          - noctx
+          - errorlint
+          - gocritic
+          - nilerr        # Walk callbacks that skip an unparseable file are the intended shape here
+          - exhaustive    # reflect.Kind / token.Token are enormous external enums
+
+      # -- test tree, part 2: structural linters, the whole test/ tree ---------------------
+      # These three measure SHAPE, and the shape of test infrastructure is not the shape of production
+      # code. Unlike part 1 this does include non-_test.go files under test/ (the parallel e2e runner,
+      # the cluster harness), because a 40-branch main() in a test runner is not debt to pay down.
+      - path: (_test\.go|^test/)
+        linters:
+          - dupl
+          - maintidx
+          - unparam
+
+      # -- dupl: NO exclusion rules here, deliberately ------------------------------------
+      #
+      # origin: line-2 external review M14. There used to be seven rules here, one per examined pair,
+      # each pinning the PARTNER'S LINE RANGE in its `text:` regex (e.g.
+      # `duplicate of .internal/broker/(exec|run)\.go:(21-68|30-86)`). The pinning was itself a fix, for
+      # a measured defect: a file-wide rule silently absorbs the NEXT copy — appending a third clone of
+      # the confirm/abort skeleton to cluster_ops.go took its dupl count from 3 to 0 under a file-wide
+      # rule and stayed at 3 under the pinned ones. So the exemption was for the pair that was examined,
+      # not for the file forever, which is the right property.
+      #
+      # But a line range in a regex is invalidated by anything that shifts a line. Measured: adding ONE
+      # comment line after `package broker` in internal/broker/run.go makes `make lint` report 1 dupl
+      # issue — a red build, in a broker hot path, for a comment. And the two halves fail asymmetrically
+      # (the report ON run.go names exec.go's range and still matches), so the failure is one report of
+      # a pair, which reads like a new problem rather than a shifted number.
+      #
+      # Inline `//nolint:dupl` at each of the 16 sites keeps the good property and drops the bad one:
+      #
+      #   - it is anchored to the DECLARATION, so it moves with the code and no comment edit can break it
+      #   - it covers that declaration only, so a third copy elsewhere in the file still reports
+      #   - nolintlint checks it (names an enabled linter, carries a reason, is not dangling) — which is
+      #     exactly the reverse assertion a `text:` rule in this file does NOT have
+      #   - the argument for the pair lives where the next person to read that function will see it,
+      #     instead of in a config file they have no reason to open
+      #
+      # This RAISES the repo's `//nolint` count from 14 to 30, and plan §14 judgement 3 is restated for
+      # it. The suppression surface did not grow: seven off-ledger rules covering ten production files
+      # became thirty on-ledger directives naming sixteen declarations. The number went up because the
+      # suppression became countable.
+
+      # -- unparam: the two categories this architecture produces by design ----------------
+      #
+      # 1. HANDLER SHAPE. Every `nc is unused` / `ctx is unused` report is a NATS message handler or a
+      #    drive-loop step whose signature is fixed by the dispatch table it is registered in. Deleting
+      #    the parameter from the one handler that does not currently read it breaks the table and buys
+      #    nothing -- the next handler added will need it back. This is the same measured argument that
+      #    kept revive's unused-parameter rule off (69 reports, all seams): the shape IS the interface.
+      #
+      #    SITE-SCOPED, not name-scoped. An earlier revision matched on the PARAMETER name
+      #    ("(nc|ctx|out|req|...) is unused"), which would have silently absorbed every future finding
+      #    about any parameter that happened to be called `out` or `ctx` or `req` -- generic names, so
+      #    that is most of them. This is the same defect as a file-wide dupl exemption: it excuses the
+      #    pair that was examined AND every pair that shows up later. The function names are pinned
+      #    instead, so a new seam has to be looked at and added deliberately.
+      #
+      #    LEFT-ANCHORED with ^. origin: line-2 external review m1 / F5. Without it the alternation matched
+      #    anywhere in the message, so a future `myDriveAdd - x is unused` or `wrapCurrentLeader - ...`
+      #    would be absorbed in silence — a suffix collision is all it takes. Same defect class as the
+      #    parameter-name matching this rule already rejects, one level up.
+      #
+      #    The `(\(\*?\w+\)\.)?` prefix is not decoration: unparam names a METHOD as
+      #    `(*Agent).handleExposeForwarded`, so a bare ^ anchored to the function name broke 8 of these
+      #    exemptions the moment it was added (measured — `make lint` went from 0 to 8 unparam reports,
+      #    all of them methods). Anchoring an alternation is only half the job; the other half is knowing
+      #    what the tool actually prints.
+      - linters: [unparam]
+        text: "^(\\(\\*?\\w+\\)\\.)?(driveAdd|waitOpCatchingUp|renderJoinerClusteredConf|newClusterReconcileNatsCmd|currentLeader|canaryCommandVerCheck|finishPullTierA|finishPullTierB|handleExposeForwarded|handleExposeRmForwarded|handleKillForwarded|handleUpgradeForwarded|rosterForRegister) - \\w+ is unused"
+      #
+      # 2. TEST INJECTION POINTS. Every `X always receives <constant>` report is a parameter that
+      #    production calls with one value and a TEST calls with another -- a size limit, a TTL, a
+      #    window, a subject, an env key. unparam cannot see the test tree, so from its side these look
+      #    like dead knobs; from the test's side they are the only way to exercise the boundary without
+      #    reaching into package state. Removing them would trade a real test for a shorter signature.
+      #
+      #    Deliberately NOT a blanket unparam exemption: `result N is never used` reports are still on,
+      #    because a function returning something nobody reads is a genuine signal rather than a seam.
+      #    (Five of those were real and were deleted rather than exempted.)
+      #
+      #    Site-scoped for the same reason as above: a bare `text: "always receives"` would exempt the
+      #    whole CLASS of finding forever, including the next parameter that really is a dead knob.
+      - linters: [unparam]
+        #    The `(\$\d+)?` suffix matches unparam's name for a CLOSURE inside the named function
+        #    (`clusterDoctorOnline$2`). Without it the tighter regex missed that site while the loose
+        #    name-based one had swallowed it silently — a small demonstration that site-scoping is the
+        #    stricter choice, not merely the tidier one.
+        #    Left-anchored for the same reason as the list above (review m1): `mint` in particular is a
+        #    three-letter name that any number of future functions could end with.
+        text: "^(\\(\\*?\\w+\\)\\.)?(verifyClusterSeam|clusterDoctorOnline|pubTransferEvFailed|validAlertText|certExpiryAdvisory|proposeOrForward|mint|pollClusterHealth|envGet)(\\$\\d+)? - \\w+ always receives"
+
+      # -- maintidx: the god-function register --------------------------------------------
+      # Matched on function NAME only, never on the measured index -- see constraint 1. Each of these
+      # is a function four separate audit lanes agreed should not be split: the branches are a real
+      # decision tree and the comments explaining them sit next to the code they explain.
+      #
+      # clusterDoctorOnline (CC=41) joined the register DURING the change that landed this file, and how
+      # it joined is worth recording because it is constraint 1 happening in real time. It sat at MI 20,
+      # one point above the threshold. The edit that tipped it added five lines: one `case` clause and
+      # four lines of COMMENT explaining why that case must be named -- the comment describes the
+      # batch-C external-review MAJOR where this very function reported PASS on a non-converging
+      # cluster. Measured both ways: with the comment, maintidx reports; delete just those four comment
+      # lines and keep the case, and the report disappears.
+      #
+      # So the gate's demand, had the exemptions been pinned to MI VALUES as originally designed, would
+      # have been: delete the explanation of the defect in order to record the fix for it. Matching on
+      # the function NAME is what makes that trade go away.
+      #
+      # SITE-SCOPED via `path:`. An earlier revision had no path limiter, which made the bare `Run` in
+      # this alternation a REPOSITORY-WIDE name exemption: maintidx's message carries no receiver, so
+      # `Run` matched every `Run` method in the tree -- five of them, of which only Broker.Run was ever
+      # reviewed. `Agent.Run` (MI 49) was pre-exempted for free, and the claim two paragraphs up ("an
+      # ELEVENTH one cannot appear without a deliberate edit here") was false. Three review lanes found
+      # it independently. Splitting by path costs four rules and makes each name mean one function.
+      - path: cmd/tether/(cluster_add_drive|run|serve|session|cluster_doctor_online)\.go
+        linters: [maintidx]
+        text: "Function name: (driveAdd|newRunCmd|newServeCmd|newSessionCmd|clusterDoctorOnline),"
+      - path: internal/agent/run\.go
+        linters: [maintidx]
+        text: "Function name: handleRunForwarded,"
+      - path: internal/broker/(broker|cluster_grow_trigger|cluster_upgrade_trigger|clusterstatus)\.go
+        linters: [maintidx]
+        text: "Function name: (Run|handleGrowTrigger|handleUpgradeTrigger|StatusReport),"

@@ -191,6 +191,11 @@ func signGrowTrigger(seed []byte, req *proto.ClusterGrowReq, now time.Time) ([]b
 
 // sendGrowTrigger signs + publishes a grow trigger and awaits the target broker's reply, RETRYING the
 // retriable cluster_not_ready (a broker that just restarted answers health before its admin backend wires).
+// origin: line-2 review M14 (moved here from .golangci.yml). The grow and upgrade triggers share the
+// signed-trigger send skeleton with cluster_upgrade.go's sendUpgradeTrigger: coincidental shape, not
+// shared logic — they diverge in the request type and the verb, which is the part that matters.
+//
+//nolint:dupl // paired with sendUpgradeTrigger in cluster_upgrade.go; see above.
 func sendGrowTrigger(ctx context.Context, nc *nats.Conn, actor string, seed []byte, req *proto.ClusterGrowReq) (*proto.ClusterGrowResp, error) {
 	deadline := time.Now().Add(growConvergeTimeout)
 	for {
@@ -208,6 +213,9 @@ func sendGrowTrigger(ctx context.Context, nc *nats.Conn, actor string, seed []by
 
 const growTriggerCodeNotReadyCLI = "cluster_not_ready"
 
+// origin: line-2 review M14. sendGrowTrigger above carries the argument for this pair.
+//
+//nolint:dupl // paired with sendUpgradeTriggerOnce in cluster_upgrade.go; single-attempt half.
 func sendGrowTriggerOnce(ctx context.Context, nc *nats.Conn, actor string, seed []byte, req *proto.ClusterGrowReq) (*proto.ClusterGrowResp, error) {
 	data, err := signGrowTrigger(seed, req, time.Now())
 	if err != nil {

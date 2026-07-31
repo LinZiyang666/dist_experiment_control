@@ -21,6 +21,7 @@
 package pty
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,7 +63,12 @@ func Allocate(cols, rows int) (*Session, error) {
 	s := &Session{Master: master, slave: slave}
 	if err := s.SetSize(cols, rows); err != nil {
 		_ = s.Close()
-		return nil, err
+		// Wrapped with what failed. origin: line-2 external review M17. This returned the bare ioctl error,
+		// so a TIOCSWINSZ failure on a pty that HAD opened fine reached the agent indistinguishable from
+		// "/dev/ptmx is absent" and was reported as pty_unavailable. The classification stays the same (a
+		// freshly-opened pty that will not take a window size is not something a retry fixes), but the
+		// message now says which of the two steps failed.
+		return nil, fmt.Errorf("pty: set size: %w", err)
 	}
 	return s, nil
 }
@@ -171,7 +177,11 @@ func (s *Session) Wait() (int, error) {
 	if err == nil {
 		return 0, nil
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	// errors.As, not a bare type assertion: a wrapped *exec.ExitError would otherwise fall through to
+	// the -1 branch and report "could not determine exit code" for a process that exited perfectly
+	// normally with a non-zero status.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		return exitErr.ExitCode(), nil
 	}
 	return -1, err

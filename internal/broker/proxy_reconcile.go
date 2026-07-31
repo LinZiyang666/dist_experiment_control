@@ -180,7 +180,10 @@ func (b *Broker) reconcileProxySession(nc *nats.Conn, sid string) {
 func (b *Broker) emitProxyCountEvents(sid string, cur proxyEventCounts) {
 	var prev proxyEventCounts
 	if v, ok := b.proxyEvtCounts.Load(sid); ok {
-		prev = v.(proxyEventCounts)
+		// Checked: a type mismatch leaves prev at its zero value, so the transition is announced as if
+		// the sid were new. Losing one idle-suppression is the harmless direction; panicking inside a
+		// reconcile pass is not.
+		prev, _ = v.(proxyEventCounts)
 	}
 	for _, kind := range decideProxyEvents(prev, cur) {
 		b.pubSysEvent(kind, map[string]any{"sid": sid, "ready": cur.ReadyNodes, "capable": cur.CapableNodes})
@@ -365,7 +368,8 @@ func (b *Broker) pushProxyDirectiveWithHome(nc *nats.Conn, sid, nid string, allo
 
 func (b *Broker) bumpProxyDwell(p int) int {
 	v, _ := b.proxyDwell.LoadOrStore(p, 0)
-	n := v.(int) + 1
+	cur, _ := v.(int) // checked: a mismatch restarts the dwell at 0, which only delays a rehome
+	n := cur + 1
 	b.proxyDwell.Store(p, n)
 	return n
 }

@@ -123,8 +123,11 @@ const (
 // converge/monitoring script can branch on the failure KIND instead of substring-matching prose.
 // "" means success or a legacy/un-coded reply (the CLI then classifies it as exitInternal=70).
 const (
-	CodeNotLeader             = "not_leader"
-	CodeAlreadyVoter          = "already_voter"
+	CodeNotLeader = "not_leader"
+	// CodeAlreadyVoter was declared here by B2 item 4 and never wired: adding a node that is already a
+	// voter is idempotent success on the resume path, not an error, so no binary has ever sent it.
+	// Removed by line-2 D1 along with its exit class — a declared-but-unemitted code reads to the next
+	// person exactly like a live one.
 	CodeNotAVoter             = "not_a_voter"
 	CodeCatchUpStalled        = "catch_up_stalled"
 	CodeQuorumConfirmRequired = "quorum_confirm_required"

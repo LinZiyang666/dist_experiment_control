@@ -37,8 +37,12 @@ func classifyRehomeErr(err error) string {
 // emitRehomeOnce emits kind with fields ONLY when the change-key mark for this port differs from the
 // last one — so the ~5s reaper re-entry does not re-announce a steady condition (idle-zero-writes).
 func (b *Broker) emitRehomeOnce(port int, mark, kind string, fields map[string]any) {
-	if prev, ok := b.rehomeEvt.Load(port); ok && prev.(string) == mark {
-		return
+	// Checked: on a type mismatch the mark does not match, so the event is re-announced. Announcing a
+	// steady condition twice is the harmless direction; a panic in the reaper is not.
+	if prev, ok := b.rehomeEvt.Load(port); ok {
+		if s, isStr := prev.(string); isStr && s == mark {
+			return
+		}
 	}
 	b.rehomeEvt.Store(port, mark)
 	b.pubSysEvent(kind, fields)

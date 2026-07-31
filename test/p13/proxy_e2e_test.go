@@ -224,7 +224,7 @@ func TestProxySubscriptionE2E(t *testing.T) {
 
 func httpGet(t *testing.T, url string) (string, int) {
 	t.Helper()
-	resp, err := http.Get(url) //nolint:noctx // test
+	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}

@@ -597,7 +597,6 @@ func (p *AuditPublisher) reconcileSessions(ctx context.Context, sids []string, t
 		mu.Unlock()
 	}
 	for _, sid := range sids {
-		sid := sid
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {

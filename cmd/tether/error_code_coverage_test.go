@@ -4,8 +4,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,27 +123,37 @@ var unclassifiedCodeAllowlist = map[string]string{
 		"Its classified halves already exist (jetstream_not_ready=75, tier_b_store_too_small=64); this " +
 		"is the remainder.",
 
-	// External review M2: these two were classified 75 (self-healing transient)
-	// on the strength of their most common cause, but each emitter funnels
-	// several outcomes with OPPOSITE remedies into one code:
+	// pty_alloc_failed and download_failed used to live here. External review M2 put them here because
+	// A1 had classified both 75 on the strength of their most common cause while each emitter funnelled
+	// outcomes with OPPOSITE remedies into one code — telling automation to retry a missing /dev/ptmx
+	// and a 404 forever. 70 (unclassified) was the honest answer while that was true, and this entry
+	// named the fix: "splitting them at the emitter (download_http_status / download_too_large /
+	// pty_unavailable / attach_subscribe_failed) adds new wire values, which is its own increment."
 	//
-	//   pty_alloc_failed  — transient fd/pty pressure, a permanently absent
-	//                       /dev/ptmx, and a failed NATS SubscribeSync
-	//                       ((*Agent).handleRunForwarded, internal/agent/run.go)
-	//   download_failed   — a network blip, a permanent HTTP 404/non-2xx, and
-	//                       exceeding the 64 MiB artifact ceiling
-	//                       ((*Agent).handleUpgradeForwarded, internal/agent/upgrade.go)
+	// origin: line-2 §12 Y2 — that increment. All four codes now exist and each carries the retry
+	// semantics its own cause deserves:
 	//
-	// Calling those 75 tells automation to retry a missing /dev/ptmx and a 404
-	// forever — the same defect A1 set out to remove, introduced by A1 itself.
-	// Reverted to unclassified: 70 is the honest answer while one code covers
-	// both a retryable and a terminal cause. Splitting them at the emitter
-	// (download_http_status / download_too_large / pty_unavailable /
-	// attach_subscribe_failed) adds new wire values, which is its own increment.
-	"pty_alloc_failed": "mixes transient PTY pressure with a permanently absent /dev/ptmx and a failed " +
-		"SubscribeSync; no single retry semantics is correct until the emitter splits it.",
-	"download_failed": "mixes network blips with permanent HTTP 404/non-2xx and the 64 MiB ceiling; " +
-		"same reason.",
+	//   pty_unavailable          64  no /dev/ptmx or a container ban — a host property
+	//   pty_alloc_failed         75  a resource limit: fd (EMFILE/ENFILE) or the pty count (ENOSPC)
+	//   attach_subscribe_failed  75  the attach SubscribeSync failed; the PTY was fine
+	//   download_http_status     64  non-2xx mirror — the operator's URL is wrong
+	//   download_too_large       64  over the ceiling — same size on every retry
+	//   download_failed          75  transport/read failure only, which really does clear
+	//
+	// This table was WRONG in both places the increment later changed, and the closure verification (M17)
+	// caught it: it said pty_unavailable was 69 after error_hints.go had moved it to 64 (69 sits in
+	// usage.md's RETRYABLE class while this code's own hint says retrying will not help), and it said
+	// pty_alloc_failed was "EMFILE/ENFILE only" after ptyTransientErrnos grew to five errnos — ENOSPC
+	// being the important one, since devpts exhaustion is what /dev/ptmx actually returns when the pty
+	// limit is hit.
+	//
+	// A published table inside the gate file that contradicts the gate's own subject is the defect this
+	// whole increment is about. It is prose, so nothing checks it; the number that IS checked is
+	// brokerCodeExitClasses itself, and TestCauseSplitCodesHaveTriggerTests below is what ties each of
+	// these codes to a test of its trigger.
+	//
+	// So the exemption is gone rather than reworded: there is no longer a code here that mixes a
+	// retryable cause with a terminal one.
 }
 
 // unresolvedCodeSites lists the exact SITES whose code the scanner cannot
@@ -979,4 +991,315 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// The REVERSE direction: every key in a classification table must still be emitted.
+// ---------------------------------------------------------------------------
+//
+// origin: line-2 D1. Everything above this line asserts E ⊆ C — every code the tree EMITS is known to
+// some table. That is the direction that stops an unclassified failure from exiting 70 and being retried
+// forever. It is not the whole gate, and the repo has been running on half of it.
+//
+// The other direction is C ⊆ E: every key a table CLASSIFIES is still emitted by something. Nothing
+// asserted it. The tables can therefore accumulate keys for codes that were renamed or deleted, and a
+// stale key is not harmless: it is a hint that will never be printed sitting next to a live one, so the
+// next person editing the table cannot tell which entries are load-bearing, and a rename that should
+// have broken something silently does not.
+//
+// S3 §5 G3.1 called this out as the finding it had that the three lane reports did not -- "17 hint keys
+// have no emitter at all; the table drifted in BOTH directions, so the gate must be bidirectional". The
+// forward half landed with batch A. This is the half that did not.
+//
+// Today the stale count is ZERO: A1 grew brokerCodeExitClasses from 45 to 106 keys and reconciled the
+// whole set as it went. So this is a zero-baseline gate — it demands no remediation, only that the
+// tables stop being able to drift back.
+
+// staleClassificationKeys lists table keys that are deliberately kept without a live emitter. It is
+// empty, and the failure text below is written on the assumption that it usually will be: a key with no
+// emitter is nearly always a leftover, and the rare legitimate case (a code the broker may still send
+// from an older release) has to argue for itself in writing.
+var staleClassificationKeys = map[string]string{}
+
+// classificationTables is the set reconciled in the reverse direction, named so the failure message can
+// say which table a stale key is in.
+func classificationTables() map[string][]string {
+	keysOf := func(m map[string]string) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		return out
+	}
+	intKeysOf := func(m map[string]int) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		return out
+	}
+	return map[string][]string{
+		"brokerCodeHints":       keysOf(brokerCodeHints),
+		"brokerCodeExitClasses": intKeysOf(brokerCodeExitClasses),
+		"runFailureReasons":     keysOf(runFailureReasons),
+	}
+}
+
+// adminsockCodeConstants parses internal/adminsock/protocol.go for `CodeXxx = "literal"` declarations.
+//
+// This indirection is not optional. Two codes are emitted ONLY as `return adminsock.CodeNotAVoter` /
+// `adminsock.CodeRemoveOwnsResources` from the error->code mapper in internal/broker/clusterstatus.go —
+// form 5, which the forward scanner is explicitly honest about not covering, and whose literal
+// therefore never appears anywhere in the scanned trees. A universe built from literals alone reports
+// both as dead, which is a false positive that would have this gate demand the deletion of two live
+// classifications on its first run. (It did, before this function existed.)
+func adminsockCodeConstants(t *testing.T, root string) map[string]string {
+	t.Helper()
+	path := filepath.Join(root, "internal", "adminsock", "protocol.go")
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	out := map[string]string{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		vs, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range vs.Names {
+			if i >= len(vs.Values) || !strings.HasPrefix(name.Name, "Code") {
+				continue
+			}
+			lit, ok := vs.Values[i].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			if s, uerr := strconv.Unquote(lit.Value); uerr == nil {
+				out[name.Name] = s
+			}
+		}
+		return true
+	})
+	if len(out) == 0 {
+		t.Fatalf("no Code* string constants found in %s — the parser is broken, and every "+
+			"constant-referenced code would be reported dead", path)
+	}
+	return out
+}
+
+// emittedCodeUniverse is the conservative "is this string produced anywhere" set:
+//
+//	the forward scanner's exact results
+//	∪ every string literal in the scanned trees
+//	∪ the VALUE of every adminsock.Code* constant referenced from the scanned trees
+//
+// The union is deliberate. The scanner is honest that forms 5 and 7 are undecidable, so its exact set
+// alone would flag keys for codes that really are emitted through a return value. Each extra term can
+// only make this gate more permissive, never less — the right direction for a check whose false
+// positives cost someone a deletion they should not make.
+func emittedCodeUniverse(t *testing.T, root string) map[string]bool {
+	t.Helper()
+	codes, _ := scanTree(t, root, scannedTrees)
+	universe := map[string]bool{}
+	for _, c := range codes {
+		universe[c.code] = true
+	}
+	constants := adminsockCodeConstants(t, root)
+	forEachGoFile(t, root, scannedTrees, func(rel string, f *ast.File, fset *token.FileSet) {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.BasicLit:
+				if v.Kind == token.STRING {
+					if s, err := strconv.Unquote(v.Value); err == nil {
+						universe[s] = true
+					}
+				}
+			case *ast.SelectorExpr:
+				// adminsock.CodeXxx -> the code it stands for.
+				if pkg, ok := v.X.(*ast.Ident); ok && pkg.Name == "adminsock" {
+					if val, known := constants[v.Sel.Name]; known {
+						universe[val] = true
+					}
+				}
+			}
+			return true
+		})
+	})
+	return universe
+}
+
+// TestClassificationTableKeysStillHaveEmitters is the reverse reconciliation.
+func TestClassificationTableKeysStillHaveEmitters(t *testing.T) {
+	root := repoRoot(t)
+	universe := emittedCodeUniverse(t, root)
+
+	var stale []string
+	for table, keys := range classificationTables() {
+		sort.Strings(keys)
+		for _, k := range keys {
+			if universe[k] {
+				continue
+			}
+			if reason, exempt := staleClassificationKeys[k]; exempt {
+				if reason == "" {
+					t.Errorf("staleClassificationKeys[%q] has an empty reason — an exemption that does "+
+						"not argue for itself is just a slower way of having no gate", k)
+				}
+				continue
+			}
+			stale = append(stale, table+"["+k+"]")
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Errorf("%d classification key(s) name a code that nothing emits any more:\n  %s\n\n"+
+			"Delete them. A hint that can never print sits in the table looking exactly like one that "+
+			"can, so the next person editing it cannot tell which entries are load-bearing — and a "+
+			"rename that should have broken something quietly did not. If a key must stay (an older "+
+			"broker can still send it, say), add it to staleClassificationKeys WITH a reason.",
+			len(stale), strings.Join(stale, "\n  "))
+	}
+
+	// Reverse-of-the-reverse: an exemption for a key that IS emitted again, or that no table holds any
+	// more, is itself rot. Same rule as every other ledger in this repo.
+	all := map[string]bool{}
+	for _, keys := range classificationTables() {
+		for _, k := range keys {
+			all[k] = true
+		}
+	}
+	for k := range staleClassificationKeys {
+		switch {
+		case !all[k]:
+			t.Errorf("staleClassificationKeys[%q] is not a key of any classification table — delete it", k)
+		case universe[k]:
+			t.Errorf("staleClassificationKeys[%q] is emitted again; delete the exemption", k)
+		}
+	}
+}
+
+// TestClassificationReverseCheckIsNonVacuous proves the reverse check can fail. Its success state is
+// "no stale keys", which is indistinguishable from "the universe scan returned everything" — and the
+// universe is a UNION with every string literal in the tree, so degenerating to always-true is the
+// single most likely way for this gate to quietly stop working.
+func TestClassificationReverseCheckIsNonVacuous(t *testing.T) {
+	root := repoRoot(t)
+	universe := emittedCodeUniverse(t, root)
+
+	if len(universe) < 100 {
+		t.Fatalf("the emitted-code universe has only %d entries — the scan is broken", len(universe))
+	}
+	// A string that is certainly not in the tree must NOT be in the universe. If it is, the union has
+	// degenerated and every key would pass.
+	const impossible = "definitely_not_a_real_wire_code_zzz_line2_d1"
+	if universe[impossible] {
+		t.Fatalf("the universe contains %q, which appears nowhere in the tree — the scan is matching "+
+			"everything, so the reverse check would pass vacuously", impossible)
+	}
+	// And the tables must be non-empty, or there would be nothing to reconcile.
+	total := 0
+	for table, keys := range classificationTables() {
+		if len(keys) == 0 {
+			t.Errorf("classification table %s is empty", table)
+		}
+		total += len(keys)
+	}
+	if total < 100 {
+		t.Errorf("the three classification tables hold only %d keys between them; A1 left them at ~151", total)
+	}
+	// Finally: a key the tables really do hold must be found in the universe, proving the lookup works
+	// in the passing direction too and not just the failing one.
+	if !universe["not_owner"] {
+		t.Error("`not_owner` is classified and emitted, but the universe scan did not find it")
+	}
+}
+
+// causeSplitTriggerTests names, for each code the line-2 §12 Y2 split introduced, the test that asserts WHEN it
+// fires. The value is a test function name; the gate below checks that function actually exists.
+//
+// origin: line-2 external review M18 / PC-3. TestClassificationTableKeysStillHaveEmitters (above) checks
+// that each classified code has an EMITTER — a string literal somewhere in the tree. That is a real check
+// and it caught a real dead key (`already_voter`), but it is blind to the failure Y2 actually risks: the
+// literal stays put while the branch leading to it stops being reachable, or the sentinel chain that
+// selects between two literals gets cut. Both were measured on this very increment, and both left every
+// package green:
+//
+//	`fmt.Errorf("%w: ...", ErrUpgradeHTTPStatus)` -> `%v`   every 404 falls back to download_failed
+//	the pty errno condition -> `if false`                  pty_alloc_failed becomes unreachable
+//
+// Y2's entire deliverable is the mapping from cause to code, because that is what tells a monitor whether
+// to retry. A code whose trigger nothing asserts is a code that has a literal and no meaning.
+//
+// This registry is deliberately narrow: the four Y2 codes, not every code in the repo. Demanding a named
+// trigger test for all ~90 codes would be a large retrofit with most of the value already covered by the
+// emitter check; these four are the ones whose whole point IS the discrimination.
+var causeSplitTriggerTests = map[string]string{
+	"download_http_status":    "TestFetchURLWrapsStatusAndSizeSentinels",
+	"download_too_large":      "TestFetchURLWrapsStatusAndSizeSentinels",
+	"pty_unavailable":         "TestPTYFailureTransientClassification",
+	"attach_subscribe_failed": "TestAttachSubscribeFailureIsItsOwnCode",
+}
+
+// TestCauseSplitCodesHaveTriggerTests reconciles causeSplitTriggerTests against the tree in both directions.
+func TestCauseSplitCodesHaveTriggerTests(t *testing.T) {
+	root := repoRoot(t)
+
+	declared := map[string]bool{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		for _, m := range regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]*)\s*\(`).
+			FindAllStringSubmatch(string(src), -1) {
+			declared[m[1]] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(declared) < 100 {
+		t.Fatalf("the test-function scan found only %d declarations — it is broken, so every check below "+
+			"would pass vacuously", len(declared))
+	}
+
+	var missing []string
+	for code, testName := range causeSplitTriggerTests {
+		if !declared[testName] {
+			missing = append(missing, code+" -> "+testName)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("%d Y2 code(s) name a trigger test that does not exist:\n  %s\n\n"+
+			"Either the test was renamed (update this map in the same commit) or it was deleted, in which "+
+			"case the code's TRIGGER is now unasserted: the literal survives, the branch reaching it does "+
+			"not have to.", len(missing), strings.Join(missing, "\n  "))
+	}
+
+	// REVERSE: every Y2 code must be in the registry. The four are enumerated in the plan's §12 Y2 item;
+	// they are also exactly the codes whose hint text in error_hints.go cites Y2.
+	for _, code := range []string{
+		"download_http_status", "download_too_large", "pty_unavailable", "attach_subscribe_failed",
+	} {
+		if _, ok := causeSplitTriggerTests[code]; !ok {
+			t.Errorf("Y2 code %q has no entry in causeSplitTriggerTests — it was added to the wire without a test "+
+				"asserting when it fires", code)
+		}
+	}
 }

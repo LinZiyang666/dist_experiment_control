@@ -243,6 +243,13 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		h.Logger.Info("authcallout: agent allow",
 			"actor", clientNkey, "sid", sid, "nid", nid)
 		return h.allow(req, jwtSubject, auth.PermissionsForAgent(sid, nid))
+	case roleUnknown:
+		// Named explicitly (origin: line-2 review IDG-3). The default below already denies, so the
+		// behaviour is unchanged — but with only a default, exhaustive goes blind on this switch, and a
+		// FIFTH role added later would land in deny() silently. For an auth decision, "silently" is the
+		// part that matters: deny is the safe direction, so nobody would notice the new role never got
+		// its branch until someone asked why that client cannot connect.
+		fallthrough
 	default:
 		return h.deny(req, fmt.Sprintf("unknown role from name=%q", req.ConnectOptions.Name))
 	}

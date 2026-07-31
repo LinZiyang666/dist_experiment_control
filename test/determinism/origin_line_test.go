@@ -43,7 +43,7 @@ import (
 var originDocRef = regexp.MustCompile(`docs/[A-Za-z0-9._/-]+\.md`)
 
 func TestOriginLinesPointAtDocumentsThatExist(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 
 	var broken []string
 	lines := 0

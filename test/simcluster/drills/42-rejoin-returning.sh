@@ -157,11 +157,11 @@ assert_setup "I stage the transfer-audit payload on ctl1" \
     "$SIM" exec ctl1 -- sh -c 'head -c 4096 /dev/urandom > /tmp/pre-resnapshot.bin'
 # H8 (2026-07-18 full-suite run): this fixture's push used to run WITHOUT --ack-alerts and was BLOCKED
 # (rc=70) by the client-synth severe gate — the force-single above leaves force_single_active active, and
-# gateDestructive (cmd/tether/d8_alerts.go:71) covers push/pull/run/expose/session rm. That is the DESIGN,
+# gateDestructive (cmd/tether/alert_gate.go) covers push/pull/run/expose/session rm. That is the DESIGN,
 # not a defect, so the repair is to feed the fixture the override — and to PIN the gate itself rather than
 # quietly route around it. The negative runs FIRST and is side-effect-free (the gate returns before any
 # transfer starts), so it cannot disturb the audit window the positive below is building.
-assert_refuses "I GATE: the same push WITHOUT --ack-alerts is BLOCKED by the force_single_active severe gate (gateDestructive, d8_alerts.go:71 — a KEPT design guard, not a defect; this is why the fixture below must pass the override)" \
+assert_refuses "I GATE: the same push WITHOUT --ack-alerts is BLOCKED by the force_single_active severe gate (gateDestructive, alert_gate.go — a KEPT design guard, not a defect; this is why the fixture below must pass the override)" \
     "force_single_active|--ack-alerts|BLOCKED: this command needs a healthy broker cluster" \
     "$SIM" ctl -- push /tmp/pre-resnapshot.bin agt1:/tmp/pre-resnapshot-blocked.bin
 assert_setup "I create real post-force-single transfer-audit Raft entries (--ack-alerts overrides the force_single_active gate the assertion above pins)" \

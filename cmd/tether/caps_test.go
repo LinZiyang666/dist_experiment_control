@@ -63,7 +63,7 @@ func TestChooseTierNeverInventsACapabilityClaim(t *testing.T) {
 			"the optimistic path for a non-authoritative refusal; note transferGate re-checks membership authoritatively"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tier, _, err := chooseTier(big, tc.probe, 0)
+			tier, err := chooseTier(big, tc.probe, 0)
 			if err != nil {
 				t.Fatalf("a non-authoritative probe must NOT produce a local refusal, got %v — kills: %s", err, tc.kills)
 			}
@@ -79,7 +79,7 @@ func TestChooseTierNeverInventsACapabilityClaim(t *testing.T) {
 	// Authoritative "no JetStream" IS entitled to refuse — a genuine single-broker deployment without
 	// JetStream must still get an honest permanent error.
 	authoritative := capsProbe{Status: capsOK, Resp: proto.CapsResp{OK: true, JetStreamReady: false, MaxPayload: 16 * mib}}
-	_, _, err := chooseTier(big, authoritative, 16*mib)
+	_, err := chooseTier(big, authoritative, 16*mib)
 	if err == nil {
 		t.Fatal("an AUTHORITATIVE no-JetStream answer must still refuse; otherwise the honest permanent case is lost")
 	}
@@ -99,7 +99,7 @@ func TestChooseTierNeverInventsACapabilityClaim(t *testing.T) {
 	// is offered. This is the one case the pre-#67 message was accidentally right about.
 	small := int64(3 * mib)
 	tinyPayload := capsProbe{Status: capsOK, Resp: proto.CapsResp{OK: true, JetStreamReady: false, MaxPayload: 1 * mib}}
-	_, _, err = chooseTier(small, tinyPayload, 1*mib)
+	_, err = chooseTier(small, tinyPayload, 1*mib)
 	if err == nil {
 		t.Fatal("a file above the (tiny) inline budget with no JetStream must be refused")
 	}
@@ -108,7 +108,7 @@ func TestChooseTierNeverInventsACapabilityClaim(t *testing.T) {
 	}
 
 	// A file that fits inline is tier A and must never be blocked by a failed probe.
-	tier, _, err := chooseTier(1024, capsProbe{Status: capsUndetermined, Err: errors.New("boom")}, 0)
+	tier, err := chooseTier(1024, capsProbe{Status: capsUndetermined, Err: errors.New("boom")}, 0)
 	if err != nil || tier != "a" {
 		t.Fatalf("a small file must go tier A regardless of the probe: tier=%q err=%v", tier, err)
 	}

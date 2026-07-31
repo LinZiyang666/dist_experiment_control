@@ -9,7 +9,7 @@ LDFLAGS           := -s -w -X $(PKG)/internal/proto.ReleaseVersion=$(VERSION)
 # targeted Go version"). go.mod is at Go 1.25 because nats-io/jwt/v2 needs it.
 GOLANGCI_VERSION  ?= v2.5.0
 
-.PHONY: all build test e2e-one lint tools tidy clean nats-server-install nats-dev e2e-parallel
+.PHONY: all build test e2e-one lint tools tidy clean nats-server-install nats-dev e2e-parallel vet-tags gates
 
 all: build
 
@@ -17,7 +17,40 @@ build:
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/tether
 
-test:
+# Every custom build tag in the tree. 23 test files live behind these, and `go test ./...` compiles
+# NONE of them: a bare run is green while the guard suites it names have not been built at all.
+#
+# This list is NOT trusted on its own. A hand-typed tag list rots silently because Go does not error
+# on an unknown tag -- it just builds nothing for it. That is not hypothetical: the main process spent
+# several review rounds self-checking with `-tags phasefluidity,c7,d5,d6,d7,d8,d9_integration,e2e_matrix`,
+# in which SIX of the eight names do not exist (the real ones carry the `_integration` suffix), so six
+# of the eight hidden suites were never compiled by a command whose whole purpose was to compile them.
+# Injecting a compile error into test/d5/smoke_test.go left `go vet ./...`, `go test ./test/d5/` AND
+# that hand-typed command all green. TestBuildTagsAreReconciled (test/architecture) parses this
+# variable and reconciles it against the //go:build lines in the tree, in BOTH directions, so the list
+# cannot drift again.
+ALL_TEST_TAGS := d5_integration,d6_integration,d7_integration,d8_integration,d9_integration,e2e_matrix,phasefluidity_integration
+
+# vet-tags compiles what a bare `go test ./...` cannot reach.
+#
+# All seven tags at once rather than one at a time. That is STRICTER, not looser: a symbol collision between
+# two tag-gated files fails the combined run and passes both individual ones. No file in this tree needs a
+# second tag to compile, so the combined form loses nothing.
+#
+# The second line is the gap that granularity argument hides. origin: line-2 closure verification §6 B9.
+# `internal/cluster/exchangedir_other.go` is `//go:build !linux`, and on a linux host NO tag combination
+# compiles it — measured: inject a syntax error there and the all-tags vet above reports ZERO issues while
+# `GOOS=darwin go build ./internal/cluster/` reports it immediately. The blind spot was never about tags; it
+# was about GOOS, and the fix costs one cross-compile of one package.
+#
+# Build rather than vet for the cross-GOOS pass: vet needs to typecheck the test files too and would drag in
+# platform-specific test deps for an OS nobody develops on here. Compiling the package is what the guard is
+# actually for — "does the non-linux fallback still build".
+vet-tags:
+	go vet -tags '$(ALL_TEST_TAGS)' ./...
+	GOOS=darwin go build ./internal/cluster/
+
+test: vet-tags
 	go test ./...
 
 # P11 / architecture line 2141: P2-P10 e2e suites are the regression net for cross-phase
@@ -128,6 +161,23 @@ e2e-parallel:
 # tree with four unformatted files and only an independent `gofmt -l` caught it. A gate that is
 # green on unformatted code is a gate everybody trusts and nobody should. Both checks run before
 # either verdict is reported, so one invocation shows all the work.
+#
+# `-c .golangci.yml` is NOT redundant with golangci-lint's auto-discovery. Without it a MISSING config
+# silently falls back to the 5 default linters and reports "0 issues." with rc=0 -- so "make lint is
+# green" became indistinguishable from "the 23-linter configuration is not in effect at all". Six
+# independent review lanes found that, and it is the one shape a gate must never have: passing by
+# doing less. With -c, a missing or unreadable config is a hard error.
+#
+# `--build-tags $(ALL_TEST_TAGS)` for the same reason one level along. origin: line-2 external review
+# GI-2. Without it golangci-lint applies the default build context, so every file behind a `//go:build`
+# tag -- all of test/d5 through test/d9, the e2e matrix, the phase-fluidity suite -- was outside the
+# 23-linter configuration entirely, while `make lint` said "0 issues." for the whole repo.
+#
+# Measured rather than assumed, because 0-vs-0 proves nothing: injecting one wasted assignment into
+# test/d9/clusterstatus_remote_test.go is invisible to plain `run` and reports 3 issues
+# (ineffassign + wastedassign + unused) with the flag. The tagged tree itself is clean today, so this
+# costs no cleanup -- it costs nothing and it was buying nothing, which is precisely the state in which
+# a gate quietly stops covering a third of the test suite.
 lint:
 	@GOPATH_BIN="$$(go env GOPATH)/bin/golangci-lint"; \
 	  if [ -x "$$GOPATH_BIN" ]; then LINT="$$GOPATH_BIN"; \
@@ -140,7 +190,7 @@ lint:
 	    echo "       Lint results are not comparable across versions. Run: make tools"; \
 	    exit 1; \
 	  fi; \
-	  "$$LINT" run; \
+	  "$$LINT" run -c .golangci.yml --build-tags '$(ALL_TEST_TAGS)'; \
 	  LINT_RC=$$?; \
 	  UNFMT="$$(gofmt -l ./cmd ./internal ./test 2>&1)"; \
 	  GOFMT_RC=$$?; \
@@ -174,6 +224,37 @@ nats-dev:
 	@command -v nats-server >/dev/null || { \
 	  echo "error: nats-server not found. Run: make nats-server-install"; exit 1; }
 	nats-server -js -DV
+
+# gates re-runs every mechanical guard in one shot. Use it when you changed a GATE ITSELF -- a golden,
+# a draining ledger, .golangci.yml, a budget -- because those edits are edits to an invariant and the
+# only way to see what you loosened is to run the whole set.
+#
+# The list is explicit, not a glob, because the guards do not live in one place and pretending they do
+# is how half of them stop being run: layering/budgets/build-tags are in test/architecture, the
+# determinism and naming freezes are in test/determinism, the wire error-code reconciliation is in
+# cmd/tether, and the ACL<->subscription reconciliation is in internal/auth. S3 §6 listed only the
+# first two, which would have left the two oldest and most load-bearing gates outside the target named
+# after gates.
+#
+# It ends with `make lint` on purpose (the config IS a gate). That also means gates must not be run
+# concurrently with another lint: golangci-lint takes a global lock and a second same-argument
+# invocation exits rc=3 rather than waiting.
+#
+# It STARTS with vet-tags, and that is not cosmetic. origin: line-2 external review GI-7 / F7. The
+# build-tag reconciliation in test/architecture only reads `//go:build` lines as TEXT -- it proves the
+# tag list and the files agree, and proves nothing about whether those files COMPILE. The one command
+# that compiles them is `go vet -tags`, and it was reachable only through `make test`. So `make gates`,
+# the target whose entire promise is "re-run every mechanical guard", verified nothing at all about the
+# tag-gated suites: you could edit a d9_integration file into a syntax error and gates stayed green.
+# Six of the eight tag names in the original vet-tags list were invented, which is exactly the class of
+# mistake a compile step catches and a text comparison cannot.
+# test/concurrency was missing from this list until line-2 review m24 reconciled it against CLAUDE.md's
+# gate table -- which lists the NumGoroutine+fd leak gate as a gate, while the target that claims to run
+# every gate did not run it. The reconciliation is now itself a gate: test/architecture's
+# TestGatesTargetCoversEveryGateCLAUDEMdNames fails if the two lists drift again.
+gates: vet-tags
+	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/
+	$(MAKE) lint
 
 tidy:
 	go mod tidy

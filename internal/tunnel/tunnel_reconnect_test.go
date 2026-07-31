@@ -263,7 +263,7 @@ func TestTunnelReconnectFiresSessionStateCallback(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(events) != 2 || events[0] != false || events[1] != true {
+	if len(events) != 2 || events[0] || !events[1] {
 		t.Fatalf("want EXACTLY [false,true] edge sequence (one per edge), got %v", events)
 	}
 }

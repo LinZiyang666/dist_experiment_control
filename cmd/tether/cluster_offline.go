@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -315,6 +316,17 @@ func resetForceSingleJSStore(cmd *cobra.Command, storeDir, dataDir, epoch string
 	sentinel := filepath.Join(dataDir, ".force-single-js-reset."+epoch+".done")
 	moved, err := natsconf.MoveAsideJSStore(storeDir, backup, sentinel, resetJS)
 	if err != nil {
+		// origin: line-2 closure verification m9. The --reset-js advice is printed ONLY for the refusal
+		// the flag actually clears. On a permission or I/O failure the flag supplies nothing, and telling
+		// the operator to re-run with it sends them around the same loop while the real cause (usually a
+		// root-owned data dir — the error itself names the chown) goes unread.
+		if !errors.Is(err, natsconf.ErrJSStoreNeedsAck) {
+			return fmt.Errorf("force-single: the survivor's clustered JetStream store could not be inspected or "+
+				"moved, and it must be reset to standalone before the broker can serve JS at N=1 — %w\n"+
+				"  --reset-js will NOT help here: this is not the data-bearing refusal, it is a failure to "+
+				"read or write the store. Fix the condition named above, then re-run (the peers you "+
+				"confirmed dead are journalled)", err)
+		}
 		return fmt.Errorf("force-single: the survivor's clustered JetStream store must be reset to standalone before "+
 			"the broker can serve JS at N=1 — %w\n"+
 			"  re-run this exact force-single command with --reset-js (the peers you confirmed dead are journalled).\n"+

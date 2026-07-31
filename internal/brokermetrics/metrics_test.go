@@ -91,7 +91,7 @@ func TestEndpointBands(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 405 {
+	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST /metrics = %d, want 405", resp.StatusCode)
 	}
 
@@ -103,7 +103,7 @@ func TestEndpointBands(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp2.Body.Close()
-	if resp2.StatusCode != 503 {
+	if resp2.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("/readyz without leader = %d, want 503", resp2.StatusCode)
 	}
 }
@@ -124,7 +124,7 @@ func TestMetricsSnapshotPanicRecovered(t *testing.T) {
 		t.Fatalf("/healthz after a panicking /metrics: %v", err)
 	}
 	_ = h.Body.Close()
-	if h.StatusCode != 200 {
+	if h.StatusCode != http.StatusOK {
 		t.Errorf("/healthz after panic = %d, want 200", h.StatusCode)
 	}
 }

@@ -70,7 +70,7 @@ func TestConcurrentPortAllocations(t *testing.T) {
 
 	for i := 0; i < N; i++ {
 		wg.Add(1)
-		i := i
+
 		go func() {
 			defer wg.Done()
 			latch.wait()
@@ -163,7 +163,7 @@ func TestConcurrentDesiredPortExactlyOneWins(t *testing.T) {
 
 	for i := 0; i < N; i++ {
 		wg.Add(1)
-		i := i
+
 		go func() {
 			defer wg.Done()
 			latch.wait()
@@ -414,7 +414,7 @@ func TestSessionRmAfterBrokerCancel(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, sid := range []string{"a", "b"} {
 		wg.Add(1)
-		sid := sid
+
 		go func() {
 			defer wg.Done()
 			subj := fmt.Sprintf("tether.v2.ctrl.by.fp.session.%s.rm.req", sid)

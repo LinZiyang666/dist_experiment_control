@@ -17,8 +17,57 @@ vol_etc()   { printf 'sim-%s-%s-etc' "$INSTANCE" "$1"; }
 vol_lib()   { printf 'sim-%s-%s-lib' "$INSTANCE" "$1"; }
 
 ensure_net() {
+    assert_host_dns_says_no
     d network inspect "$(net_name)" >/dev/null 2>&1 && return 0
     run d network create --driver bridge "$(net_name)" >/dev/null
+}
+
+# assert_host_dns_says_no — refuse to run when the host resolver fabricates an address for names that
+# do not exist.
+#
+# origin: line-2 external review follow-up. Drill 42 produced ASSERT-FAIL twice with a contradiction
+# nobody could explain: the sim proved brk2:7400 was connection-refused, and moments later the product
+# reported that brk2:7400 had ACCEPTED a TCP connection. Measured from inside brk1 after killing brk2:
+#
+#     getent hosts brk2                          ->  198.18.0.58   brk2.lan
+#     getent hosts thisnamedoesnotexist12345     ->  198.18.0.59   thisnamedoesnotexist12345.lan
+#
+# 198.18.0.0/15 is mihomo/clash FAKE-IP. This host runs mihomo with `search lan`, so once brk2's
+# container is gone and docker's embedded DNS stops knowing the name, the query is forwarded upstream
+# and comes back with a synthetic address whose TUN device COMPLETES the TCP handshake. Every
+# TCP-based liveness probe on such a host reports ALIVE for a machine that does not exist.
+#
+# WHY REFUSE RATHER THAN WORK AROUND IT. The Mandate (README §"定位铁律") is to reproduce the real
+# deployment faithfully and expose defects, never to compensate for tether. Pinning container IPs or
+# probing by address would make drill 42 green while leaving the drill unable to measure the thing it
+# exists to measure — a green that means nothing. Refusing says what is wrong and what to do about it.
+#
+# This is NOT a tether defect and NOT a drill defect: it is the host. But see the note in the external
+# review reply — tether's own probePeer has the same blind spot in production, where the consequence is
+# an operator permanently blocked from a legitimate force-single.
+assert_host_dns_says_no() {
+    [ "${SIM_ALLOW_FAKE_DNS:-0}" = "1" ] && return 0
+    _adns_probe="sim-nxdomain-probe-$$-does-not-exist"
+    # NXDOMAIN is getent rc=2. simcluster runs with `set -euo pipefail`, so
+    # without the explicit fallback the assignment itself terminates the whole
+    # command before the empty-output success branch below can run.
+    _adns_out=$(getent hosts "$_adns_probe" 2>/dev/null | head -1 || true)
+    [ -z "$_adns_out" ] && return 0
+    printf 'SIM-PREFLIGHT-FAIL: this host resolves names that do not exist.\n' >&2
+    printf '  getent hosts %s  ->  %s\n' "$_adns_probe" "$_adns_out" >&2
+    printf '\n' >&2
+    printf '  Every drill that proves a peer is DEAD by TCP-probing it is unmeasurable here: the\n' >&2
+    printf '  resolver hands back a synthetic address (mihomo/clash fake-IP is 198.18.0.0/15) whose\n' >&2
+    printf '  TUN device completes the handshake, so a killed node reads as ALIVE. Drill 42 spent two\n' >&2
+    printf '  full runs producing ASSERT-FAIL from exactly this.\n' >&2
+    printf '\n' >&2
+    printf '  Fix the host, do not work around it:\n' >&2
+    printf '    - stop the fake-IP resolver (mihomo/clash) for the duration of the drill, or\n' >&2
+    printf '    - switch it to redir-host mode, or\n' >&2
+    printf '    - point /etc/resolv.conf at a resolver that returns NXDOMAIN.\n' >&2
+    printf '  SIM_ALLOW_FAKE_DNS=1 overrides this check. Do not use it for any drill that asserts a\n' >&2
+    printf '  node is dead — the result would be a green that measured nothing.\n' >&2
+    return 1
 }
 
 node_exists()  { d inspect "$(ctr_name "$1")" >/dev/null 2>&1; }

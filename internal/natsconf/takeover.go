@@ -35,6 +35,9 @@ func DryRun(natsServerBin string, mergedConf string) error {
 		return fmt.Errorf("natsconf: dry-run write: %w", err)
 	}
 	_ = tmp.Close()
+	//nolint:noctx // Five call sites, two of them one-shot CLI commands where cancellation means
+	// nothing; reaching the other three would change ReconcileOnce's callback signature to make a
+	// bounded local `nats-server -t` cancellable.
 	out, err := exec.Command(natsServerBin, "-c", tmp.Name(), "-t").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("natsconf: `nats-server -t` REJECTED the merged conf (not swapping): %v\n%s", err, out)

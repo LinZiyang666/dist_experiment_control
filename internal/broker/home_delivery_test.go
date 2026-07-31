@@ -440,7 +440,7 @@ func TestHomeDeliveryConvergedIsSilent(t *testing.T) {
 	if !waitFor(2*time.Second, func() bool { return b.homeAppliedEpoch(14000) >= 1 }) {
 		t.Fatal("initial delivery never acked")
 	}
-	pushesAfterConverge, _ := b.homeDeliveryStats()
+	pushesAfterConverge := b.homeDeliveryStats()
 
 	// Ten more ticks over a converged fleet must publish NOTHING.
 	for i := 1; i <= 10; i++ {
@@ -448,7 +448,7 @@ func TestHomeDeliveryConvergedIsSilent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	pushes, _ := b.homeDeliveryStats()
+	pushes := b.homeDeliveryStats()
 	if pushes != pushesAfterConverge {
 		t.Fatalf("converged pass published %d extra assignment(s); a converged pass must be silent", pushes-pushesAfterConverge)
 	}
@@ -552,7 +552,7 @@ func TestHomeDeliveryIsInertInSingleMode(t *testing.T) {
 	if err := b.reconcileHomeDelivery(context.Background(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if pushes, _ := b.homeDeliveryStats(); pushes != 0 {
+	if pushes := b.homeDeliveryStats(); pushes != 0 {
 		t.Fatalf("single mode published %d home assignment(s); it must be inert", pushes)
 	}
 }

@@ -50,9 +50,7 @@ func TestAllocateAssignsLowestFreePort(t *testing.T) {
 	if a.Token == "" {
 		t.Error("raw token must be returned exactly once on Allocate")
 	}
-	if a.TokenHash == HashToken(a.Token) {
-		// good
-	} else {
+	if a.TokenHash != HashToken(a.Token) {
 		t.Errorf("token hash inconsistent: got %s want %s", a.TokenHash, HashToken(a.Token))
 	}
 	if a.State != StateAllocated {

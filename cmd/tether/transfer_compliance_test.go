@@ -34,7 +34,6 @@ func TestCommitLocalTempNoForceConcurrentSingleWinner(t *testing.T) {
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
 	for _, tmp := range []string{tmpA, tmpB} {
-		tmp := tmp
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

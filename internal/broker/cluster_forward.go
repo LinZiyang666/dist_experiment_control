@@ -659,9 +659,7 @@ var writeVerbs = map[string]verbHandler{
 	// D8b §10.2: read the CURRENT ACTIVE state and commit a raise/clear ONLY on a transition — a
 	// nil command (no transition) issues no raft write, so a broker's every-tick re-assert is free
 	// and a dropped clear self-heals next tick.
-	VerbAlertSignal: propose(func(db *sql.DB, p AlertSignalPayload, now time.Time) (*cluster.Command, error) {
-		return planAlertSignal(db, p, now)
-	}),
+	VerbAlertSignal: propose(planAlertSignal),
 	// D8b §10.1: cluster-level ack (idempotent UPSERT). User-initiated + rare, so no transition
 	// gate is needed (unlike the periodic signal).
 	VerbAlertAck: propose(func(_ *sql.DB, p AlertAckPayload, now time.Time) (*cluster.Command, error) {
@@ -690,9 +688,7 @@ var writeVerbs = map[string]verbHandler{
 	VerbPortRevoke: propose(func(db *sql.DB, p PortFreeAllocationPayload, now time.Time) (*cluster.Command, error) {
 		return port.PlanRevokeAllocation(db, p.allocation(), now)
 	}),
-	VerbNodeRegister: propose(func(db *sql.DB, in nodepkg.RegisterInput, now time.Time) (*cluster.Command, error) {
-		return nodepkg.PlanRegister(db, in, now)
-	}),
+	VerbNodeRegister: propose(nodepkg.PlanRegister),
 	VerbProcInsert: propose(func(db *sql.DB, p proc.Process, _ time.Time) (*cluster.Command, error) {
 		return proc.PlanInsert(db, p)
 	}),

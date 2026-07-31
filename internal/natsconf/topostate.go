@@ -134,9 +134,16 @@ func (s TopoState) Cell() string {
 // of health, and the alternative (silently folding it into Behind) is the false-green direction —
 // it would tell an operator to wait for a self-heal this binary cannot even see.
 func (s TopoState) Degrades() bool {
+	// Every member is named rather than relying on the trailing return. That is what makes adding a
+	// new TopoState a compile-visible decision at each of the four switches in this file instead of a
+	// silent inheritance of whatever the fallthrough happened to say — which is the exact shape of the
+	// batch-C external-review MAJOR, where the doctor inherited "converged" for two states it had
+	// never been taught about and reported PASS on a cluster that was not converging.
 	switch s {
 	case TopoUnreported, TopoConverged:
 		return false
+	case TopoBehind, TopoHeld, TopoStuck, TopoUnknownAction:
+		return true
 	}
 	return true
 }
@@ -155,6 +162,8 @@ func (s TopoState) severity() int {
 		return 2
 	case TopoConverged:
 		return 1
+	case TopoUnreported:
+		return 0
 	}
 	return 0
 }
@@ -170,6 +179,8 @@ func (s TopoState) Banner() string {
 		return "a broker's NATS topology has not caught the desired generation yet (see the TOPO column)"
 	case TopoUnknownAction:
 		return "a broker reported a topology reconcile action this binary does not recognize (see the TOPO column) — it is probably running a NEWER release"
+	case TopoUnreported, TopoConverged:
+		return "" // non-degrading: nothing to say at cluster level
 	}
 	return ""
 }
@@ -189,6 +200,8 @@ func (s TopoState) NextStep() string {
 		return "tether cluster reconcile nats --all --wait"
 	case TopoUnknownAction:
 		return "upgrade this ctl/broker to the fleet's release, then re-read `tether cluster status`"
+	case TopoUnreported, TopoConverged:
+		return "" // non-degrading: no operator action
 	}
 	return ""
 }

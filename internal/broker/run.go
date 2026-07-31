@@ -18,6 +18,9 @@ import (
 //
 // On any pre-forward failure, broker replies with a RunChunk{Kind:failed}
 // so ctl gets a clean lifecycle message rather than a NATS timeout.
+// origin: line-2 review M14. exec.go's handleExecReq carries the full argument for this pair.
+//
+//nolint:dupl // paired with handleExecReq in exec.go; argument there.
 func (b *Broker) handleRunReq(nc *nats.Conn, msg *nats.Msg) {
 	ing, den, ok := b.admitSubject(msg.Subject, runSpec)
 	if !ok {

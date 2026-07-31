@@ -166,7 +166,7 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 	// failed" indistinguishable from "the broker has no JetStream", and the CLI then asserted the
 	// latter with advice the broker never gave.
 	probe := probeCapsClassified(cmd.Context(), nc, id.PublicKey, sid, 3*time.Second)
-	tier, _, err := chooseTier(st.Size(), probe, nc.MaxPayload())
+	tier, err := chooseTier(st.Size(), probe, nc.MaxPayload())
 	if err != nil {
 		return err
 	}
@@ -784,6 +784,8 @@ func (p capsProbe) warning() string {
 		return fmt.Sprintf("warning: could not read broker capabilities (%v); proceeding and letting the broker decide", p.Err)
 	case capsRefused:
 		return fmt.Sprintf("warning: the broker declined to report its capabilities (%s); that says nothing about JetStream, so proceeding and letting the broker decide", p.Resp.Code)
+	case capsOK:
+		return "" // the probe answered; nothing to warn about
 	default:
 		return ""
 	}
@@ -848,27 +850,28 @@ func tierAInlineCeiling(connMaxPayload int64, probe capsProbe) int64 {
 //     (handlePushReq refuses with real prose if it has no JetStream). Refusing locally would mean
 //     inventing a second claim — which is exactly what #67 was.
 //
-// Returns ("a"|"b", maxInline, err).
-func chooseTier(size int64, probe capsProbe, connMaxPayload int64) (string, int64, error) {
+// Returns ("a"|"b", err). It used to also return maxInline, which no caller -- production or test --
+// ever read.
+func chooseTier(size int64, probe capsProbe, connMaxPayload int64) (string, error) {
 	if size > cliMaxBytes {
-		return "", 0, fmt.Errorf("too_large: file size %d > %d (use `tether expose` + rsync)", size, cliMaxBytes)
+		return "", fmt.Errorf("too_large: file size %d > %d (use `tether expose` + rsync)", size, cliMaxBytes)
 	}
 	maxInline := tierAInlineCeiling(connMaxPayload, probe)
 	if size <= maxInline {
-		return "a", maxInline, nil
+		return "a", nil
 	}
 	if probe.Status == capsOK && !probe.Resp.JetStreamReady {
 		// The max_payload clause is offered ONLY when raising it would actually help — i.e. when the
 		// file could travel inline. For a file above the 8 MiB tier-A design ceiling it never can,
 		// and offering it (as the pre-#67 message did unconditionally) is misdirection.
 		if size <= cliTierAMaxBytes {
-			return "", maxInline, usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B cannot be served, and this %d-byte file does not fit the current tier-A inline budget of %d bytes. Raise the broker's nats max_payload to at least %d bytes so this file travels inline as tier A, enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
+			return "", usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B cannot be served, and this %d-byte file does not fit the current tier-A inline budget of %d bytes. Raise the broker's nats max_payload to at least %d bytes so this file travels inline as tier A, enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
 				size, maxInline, size*2+2048)
 		}
-		return "", maxInline, usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B (files larger than %d bytes) cannot be served. Enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
+		return "", usageErr("jetstream_unavailable: this broker reports JetStream is not available, so tier B (files larger than %d bytes) cannot be served. Enable JetStream on the broker (docs/broker-ops.md), or use `tether expose` + rsync",
 			maxInline)
 	}
-	return "b", maxInline, nil
+	return "b", nil
 }
 
 // transferRefusalErr attaches an EXIT CLASS to a transfer refusal WITHOUT touching its text.

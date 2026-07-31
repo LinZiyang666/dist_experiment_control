@@ -74,6 +74,16 @@ func main() {
 		// tell "broker unreachable" (69) from "bad arg" (64) from "permission" (77) from an
 		// unclassified tether-side fault (70). 0 still means success; only the nonzero value is
 		// now informative. (cluster status / exec / run os.Exit() before reaching here.)
+		// stop() explicitly: os.Exit does not run deferred calls, so the `defer stop()` above would
+		// never fire on any non-zero exit. Harmless for a dying process, but a `defer` that provably
+		// cannot run on the path it was written for is a claim the code does not keep.
+		stop()
+		//nolint:gocritic // exitAfterDefer flags the SHAPE (a defer and an os.Exit in one function),
+		// which is still here. The substance it warns about is not: stop() runs on the line above, so
+		// the cleanup the `defer` promises actually happens on this path too. Restructuring into
+		// `os.Exit(run())` would satisfy the shape, but cobra's ExecuteContext already owns this frame
+		// and the exit code is derived from its error -- the wrapper would move the same two lines
+		// somewhere else and gain nothing.
 		os.Exit(classifyExit(err))
 	}
 }

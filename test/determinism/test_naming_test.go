@@ -48,21 +48,53 @@ var processNamedPattern = regexp.MustCompile(
 		// review-process events
 		`.*external_?rereview.*|.*external_review.*|.*_review_.*|.*_review$|` +
 		`.*round[0-9]+.*|.*codex.*|.*allgreen.*|.*megaaudit.*|` +
-		// bare phase / batch / audit identifiers used as the WHOLE prefix
-		`(r|p|d|b|c|g|s)[0-9]+(_[0-9a-z]+)*|` +
-		`(r|p|d|b|c|g|s)[0-9]+g?[0-9]*_.*|` +
+		// bare phase / batch / audit identifiers used as the WHOLE prefix.
+		//
+		// EVERY letter, not a hand-picked subset. origin: line-2 closure verification (M8 residual). The
+		// FUNCTION-name pattern below was widened from a curated letter list to [A-Z] during the review, on
+		// the argument that a curated list is one somebody has to remember to extend — and the proof was a
+		// live `A9` violation the curated version had let through. That argument applies word for word to
+		// this pattern, which was left on `(r|p|d|b|c|g|s)`: `a9_probe_test.go`, `x7_*`, `y1_*`, `m2_*` and
+		// `f3_*` all walked straight through the FILE freeze while their function-level equivalents were
+		// caught. Fixing one half and publishing the reasoning for both is worse than fixing neither,
+		// because the reasoning reads as applied.
+		`[a-z][0-9]+(_[0-9a-z]+)*|` +
+		`[a-z][0-9]+g?[0-9]*_.*|` +
 		`g[0-9]+g[0-9]+_.*|ops[0-9]+.*` +
 		`)$`)
 
+// fileProductPrefixRe extracts a file basename's leading `<letters><digits>` token, so the same
+// productPrefixes list that protects `TestS3…` also protects `x509_parse_test.go`.
+//
+// origin: line-2 closure verification. Widening this pattern's letter class from `(r|p|d|b|c|g|s)` to
+// `[a-z]` (which it had to be — see the note in processNamedPattern) makes it collide with exactly the
+// product names the function-name half already had to exempt: x509, s3, h2, sha256. Two patterns, one
+// subtraction list.
+var fileProductPrefixRe = regexp.MustCompile(`^([a-z]+[0-9]+)`)
+
 // isProcessNamed reports whether a test file BASENAME (without the _test.go suffix) is process-named.
 func isProcessNamed(base string) bool {
-	return processNamedPattern.MatchString(base)
+	if !processNamedPattern.MatchString(base) {
+		return false
+	}
+	// A review-process token in the NAME is decisive; only the bare batch-prefix shape is subtractable.
+	// (Same asymmetry, and same reason, as isProcessNamedFunc: subtracting from the review-token half
+	// would let `s3_external_review_test.go` through.)
+	for _, token := range []string{"external_review", "external_rereview", "_review", "round", "codex", "allgreen", "megaaudit", "ops"} {
+		if strings.Contains(base, token) {
+			return true
+		}
+	}
+	if m := fileProductPrefixRe.FindStringSubmatch(base); m != nil && hasProductPrefix(m[1]) {
+		return false
+	}
+	return true
 }
 
 // TestNoNewProcessNamedTestFiles is the freeze. It walks every *_test.go in the repo and fails on any
 // process-named file that is not in the draining ledger.
 func TestNoNewProcessNamedTestFiles(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 
 	var offenders []string
 	seen := map[string]bool{}
@@ -125,6 +157,330 @@ func TestNoNewProcessNamedTestFiles(t *testing.T) {
 			"exists (renamed, deleted, or the pattern changed):\n  %s\n\n"+
 			"Delete them in the same commit as the rename. An allow-list that is only ever appended to "+
 			"stops meaning anything.", len(stale), strings.Join(stale, "\n  "))
+	}
+}
+
+// THE FUNCTION-NAME RULE lives in TWO patterns below (reviewTokenFuncRe + batchPrefixFuncRe) rather than
+// one, because only ONE of the two halves may be subtracted from by productPrefixes. The single
+// combined regex that used to be here is gone: with the subtraction running before it, a name
+// carrying BOTH a product prefix and a review token escaped the gate entirely.
+// origin: line-2 closure verification.
+//
+// The rule is separate from processNamedPattern because the two shapes differ: a filename is
+// entirely process-named (`p13_external_review_round6`), whereas a function name carries the process
+// token as a PREFIX and then says something real (`TestB4ExposeExplainJSONNoDeferredKeys`). Reusing
+// the filename regex here would match almost nothing.
+//
+// WHY FUNCTION NAMES NEEDED THEIR OWN GATE
+// ----------------------------------------
+// The file freeze above drained to zero: 158 files renamed, ledger empty. That made the debt look
+// paid. It was not — the same rot was one level down and completely unguarded: 529 of 2467 test
+// functions (21.4%) still carried the batch or review round that produced them.
+//
+// The argument in CLAUDE.md §3 step 5b for putting provenance in a `// origin:` comment is that the
+// comment "survives a rename, and a filename does not". That is true, and it is EQUALLY true of
+// function names: someone changing classifyExit cannot grep their way to
+// TestBExternalReviewBadRequestIsUsage any more than they could have found
+// p13_external_review_round6_test.go. Freezing only filenames closed half the hole and made the other
+// half harder to see, because the ledger being empty read as "done".
+
+// productPrefixes are the `<Letter><digits>` tokens that name a PROTOCOL OR PRODUCT rather than a
+// development batch. They live in exactly the shape batchPrefixFuncRe matches, so without this list the
+// widened regex blocks correctly-named tests.
+//
+// origin: line-2 external review m16 / PF-11, which asked for synthetic negative controls on this regex.
+// Writing them found three live false positives introduced by the PF-7 widening from a curated letter
+// list to [A-Z]: TestS3BucketUploadRetries [example], TestH2StreamResetIsNotFatal [example],
+// TestX11ForwardingRefused [example]. (All three are synthetic; [example] is what keeps
+// promised_guard_test.go from reading a negative-control name as a promise that such a test exists.)
+//
+// WHY A SUBTRACTION LIST AND NOT A NARROWER REGEX. The two failure directions are not symmetric. A false
+// POSITIVE is loud — the author sees the error, reads this list, and adds a line. A false NEGATIVE is
+// silent, and a silent hole in exactly this gate is the defect PF-7 found (one live A9-prefixed violation
+// shipped by the commit that added the gate). So the shape stays broad and the exceptions are named.
+//
+// X11 IS GENUINELY AMBIGUOUS and is listed here on purpose: it is both the X Window System and this very
+// plan's eleventh permanent-rejection item. No test is named after a plan item today, and X11 the protocol
+// is a real thing a test could be about, so the protocol wins. If someone ever does want to name a test
+// after plan item X11, the `// origin:` line is where that belongs anyway — which is what step 5b says.
+var productPrefixes = map[string]string{
+	"S3":     "AWS S3",
+	"H2":     "HTTP/2",
+	"X11":    "the X Window System (also this plan's item X11 — see above)",
+	"SHA256": "the hash",
+	"TLS13":  "TLS 1.3",
+	"UTF8":   "the encoding",
+	"IPv6":   "the protocol",
+	"P2p":    "peer-to-peer (lowercase p, so the regex should already miss it — kept as a control)",
+	"K8s":    "Kubernetes",
+	"H3":     "HTTP/3",
+	"X509":   "the certificate standard — a file named x509_parse_test.go is about certificates",
+	"B64":    "base64",
+	"S390":   "the architecture (a GOARCH build-tag name)",
+}
+
+// TestProductPrefixesAreBoundedReasonedAndDoNotUnfreezeTheLedger is the reverse assertion on the
+// subtraction list.
+//
+// origin: line-2 closure verification, which flagged productPrefixes as a category-scoped allow-list with
+// no reverse assertion — the shape this repo forbids everywhere else. Two things are checkable:
+//
+//  1. every entry must carry a reason, so the list cannot grow by accretion;
+//  2. the count is capped, so growth is a visible edit;
+//  3. NO entry may excuse a name the LEDGER already records as process-named. The ledger is 439 names
+//     somebody classified by hand; if the product list excuses one of them, the two mechanisms
+//     contradict each other and the product list is silently un-freezing part of the debt.
+//
+// Clause 3 replaced a first attempt that tried to assert the entries are "shaped like products, not like
+// batch labels". That check was wrong and its own failure message said so: `TestS3BucketUpload` [example] and
+// `TestB4ExposeReq` are the SAME shape, which is precisely why a subtraction list is needed instead of a
+// narrower regex. A guard that contradicts its own error text is worse than no guard.
+//
+// What remains uncheckable is whether a named product exists at all — `Q7` could be invented. The cap is
+// the backstop: an invented entry has to be typed next to a number somebody has to raise.
+func TestProductPrefixesAreBoundedReasonedAndDoNotUnfreezeTheLedger(t *testing.T) {
+	const productPrefixCap = 13
+	if n := len(productPrefixes); n != productPrefixCap {
+		t.Errorf("productPrefixes has %d entries, cap is %d. Every entry is a hole in the naming gate, so "+
+			"growth must be a visible edit: raise the cap in the same commit and say which product it is.",
+			n, productPrefixCap)
+	}
+	for prefix, why := range productPrefixes {
+		if strings.TrimSpace(why) == "" {
+			t.Errorf("productPrefixes[%q] has no reason — an exemption that does not argue for itself is "+
+				"just a slower way of having no gate", prefix)
+		}
+	}
+
+	var unfrozen []string
+	for key := range legacyProcessNamedTestFuncs {
+		name := key
+		if i := strings.LastIndex(key, ": "); i >= 0 {
+			name = key[i+2:]
+		}
+		if !isProcessNamedFunc(name) {
+			unfrozen = append(unfrozen, key)
+		}
+	}
+	sort.Strings(unfrozen)
+	if len(unfrozen) > 0 {
+		t.Errorf("%d ledger entr(y/ies) are no longer recognised as process-named, so the product-prefix "+
+			"subtraction (or a regex edit) has silently un-frozen part of the debt:\n  %s\n\n"+
+			"The ledger is the hand-classified record of what this rule is about. If one of these really is "+
+			"a product name rather than a batch label, DELETE it from the ledger in the same commit — "+
+			"leaving it in a ledger that no longer applies to it makes both mechanisms lie.",
+			len(unfrozen), strings.Join(unfrozen, "\n  "))
+	}
+}
+
+var productPrefixRe = regexp.MustCompile(`^(?:Test|Benchmark|Fuzz)([A-Za-z]+[0-9]+[A-Za-z]?)`)
+
+// reviewTokenFuncRe is the half of the function-name rule that the product list must NEVER subtract from:
+// an explicit review-process token anywhere in the name. `ExternalReview`, `Round3`, `AllGreen`, `Codex`,
+// `MegaAudit` are not things a protocol is called.
+//
+// origin: line-2 closure verification. The first version of the subtraction ran BEFORE the whole regex and
+// returned false on any product-prefixed name, so `TestS3ExternalReviewRound6Fixes` [example] escaped the
+// gate entirely — the mitigation for a false-positive problem opened a false-NEGATIVE hole, which is the
+// strictly worse direction and the one this gate exists to close. Splitting the pattern means the
+// subtraction can only ever excuse the shape it was written for (a batch-letter prefix), never a name that
+// says "review round" out loud.
+var reviewTokenFuncRe = regexp.MustCompile(
+	`^(Test|Benchmark|Fuzz)(` +
+		`.*ExternalR[ee]?[Rr]eview.*|.*Rereview.*|.*Round[0-9].*|.*AllGreen.*|.*Codex.*|.*MegaAudit.*` +
+		`)$`)
+
+// batchPrefixFuncRe is the other half: a `<Letter><digits><Upper>` prefix. This is the shape that collides
+// with protocol and product names, so this is the only half productPrefixes subtracts from.
+var batchPrefixFuncRe = regexp.MustCompile(`^(Test|Benchmark|Fuzz)[A-Z][0-9]+[A-Z].*$`)
+
+// hasProductPrefix reports whether the leading `<letters><digits>` token of a test name is a known protocol
+// or product rather than a development batch. Case-insensitive so the same list serves file names (`s3_`,
+// `x509_`) and function names (`TestS3…`).
+func hasProductPrefix(token string) bool {
+	lower := strings.ToLower(token)
+	for prefix := range productPrefixes {
+		if strings.HasPrefix(lower, strings.ToLower(prefix)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isProcessNamedFunc(name string) bool {
+	// A review-process token is decisive and is never subtracted.
+	if reviewTokenFuncRe.MatchString(name) {
+		return true
+	}
+	if !batchPrefixFuncRe.MatchString(name) {
+		return false
+	}
+	if m := productPrefixRe.FindStringSubmatch(name); m != nil && hasProductPrefix(m[1]) {
+		return false
+	}
+	return true
+}
+
+var testFuncDeclRe = regexp.MustCompile(`(?m)^func ((?:Test|Benchmark|Fuzz)[A-Za-z0-9_]*)\s*\(`)
+
+// TestNoNewProcessNamedTestFunctions freezes function names the same way the file gate freezes
+// filenames, with the same draining ledger and the same reverse assertion.
+func TestNoNewProcessNamedTestFunctions(t *testing.T) {
+	root := repoRoot(t)
+
+	var offenders []string
+	seen := map[string]bool{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		rel, rlerr := filepath.Rel(root, p)
+		if rlerr != nil {
+			return rlerr
+		}
+		rel = filepath.ToSlash(rel)
+		for _, m := range testFuncDeclRe.FindAllStringSubmatch(string(src), -1) {
+			name := m[1]
+			if !isProcessNamedFunc(name) {
+				continue
+			}
+			// SITE-scoped key, not name-scoped. origin: line-2 external review M7 / PI-7. The first
+			// version keyed on the bare function name, which made each of the 436 entries a REUSABLE
+			// pass: a lane created test/zzprobe/probe_test.go containing nothing but
+			// `func TestB1ClusterVerdict` -- a name already in the ledger -- and the gate stayed green,
+			// while the same file with a fresh name reddened. That is a category-scoped exemption, the
+			// exact shape this repo's own rule forbids ("cover the sites that were examined, never
+			// future ones").
+			//
+			// It also broke draining: two same-named process-named functions in different packages meant
+			// renaming one left `seen[name]` true from the other, so the ledger line survived and went on
+			// excusing a third occurrence.
+			//
+			// The cost is real and is the point: moving a legacy-named test file now makes its entries
+			// stale and reddens, and the ledger must be edited in the same commit. That is what a
+			// site-scoped exemption feels like.
+			key := rel + ": " + name
+			seen[key] = true
+			if !legacyProcessNamedTestFuncs[key] {
+				offenders = append(offenders, key)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	sort.Strings(offenders)
+	if len(offenders) > 0 {
+		t.Errorf("%d test function(s) are named after a development-process event and are not in the "+
+			"legacy ledger:\n  %s\n\n"+
+			"Name the function after the BEHAVIOUR it pins (TestExposeExplainOmitsDeferredKeys, not "+
+			"TestB4ExposeExplainJSONNoDeferredKeys). The batch or review round that prompted it belongs in "+
+			"a `// origin:` line above the function, where it survives a rename instead of hiding the test "+
+			"from the next person who changes that behaviour. See CLAUDE.md §3 step 5b.",
+			len(offenders), strings.Join(offenders, "\n  "))
+	}
+
+	// GROWTH CAP. origin: line-2 external review IDG-6 / PF-13. The ledger's header says "an entry is
+	// only ever REMOVED, never added" and that was PROSE: a review lane added a violating function plus a
+	// matching ledger line and the gate went green at 437. Its sibling ledger (filenames) has
+	// `const published = 0` enforcing the same claim mechanically; this one had nothing.
+	//
+	// The number is the enforcement. Renaming drains it, so the cap only ever moves DOWN -- and lowering
+	// it is a one-token edit in the same commit as the rename, which is the friction that makes the
+	// draining visible in review rather than implied by a comment.
+	//
+	// 439, not 436: the count rose when the key became site-scoped (review M7). Three names each live in
+	// two packages and the name-keyed map had collapsed each pair into one entry, so the old number was
+	// undercounting present sites, not just permitting future ones. See legacy_process_named_funcs.go.
+	const legacyFuncLedgerCap = 439
+	if n := len(legacyProcessNamedTestFuncs); n > legacyFuncLedgerCap {
+		t.Errorf("legacyProcessNamedTestFuncs has %d entries, cap is %d.\n\n"+
+			"This ledger only drains. A new process-named test function must be RENAMED, not added here — "+
+			"the header has always said so, and this cap is what makes the sentence true. If you renamed "+
+			"something and the count went DOWN, lower the cap in the same commit.",
+			n, legacyFuncLedgerCap)
+	}
+	if n := len(legacyProcessNamedTestFuncs); n < legacyFuncLedgerCap {
+		t.Errorf("legacyProcessNamedTestFuncs is down to %d entries but the cap still says %d — lower the "+
+			"cap so the win is locked in (an unlowered cap is slack, and slack is how a ratchet stops "+
+			"measuring).", n, legacyFuncLedgerCap)
+	}
+
+	var stale []string
+	for name := range legacyProcessNamedTestFuncs {
+		if !seen[name] {
+			stale = append(stale, name)
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Errorf("%d entr(y/ies) in legacyProcessNamedTestFuncs no longer name an existing "+
+			"process-named test function:\n  %s\n\n"+
+			"Delete them in the same commit as the rename — that is how this ledger drains.",
+			len(stale), strings.Join(stale, "\n  "))
+	}
+}
+
+// TestNoProcessNamedProductionFiles is the same rule for production sources, and it carries NO ledger
+// on purpose: the tree had exactly one offender when this landed (cmd/tether/d8_alerts.go, renamed to
+// alert_gate.go in the same commit), so the rule starts at zero and can stay there. An allow-list with
+// nothing in it is not an allow-list.
+func TestNoProcessNamedProductionFiles(t *testing.T) {
+	root := repoRoot(t)
+
+	var offenders []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		if !isProcessNamed(strings.TrimSuffix(name, ".go")) {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		offenders = append(offenders, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	sort.Strings(offenders)
+	if len(offenders) > 0 {
+		t.Errorf("%d production file(s) are named after a development-process event:\n  %s\n\n"+
+			"Production files are named after the RESPONSIBILITY they hold (alert_gate.go, not "+
+			"d8_alerts.go). There is deliberately no legacy ledger for this rule — the tree was at zero "+
+			"when it landed, and it is cheap to keep there.",
+			len(offenders), strings.Join(offenders, "\n  "))
 	}
 }
 
@@ -212,5 +568,64 @@ var legacyProcessNamedTestFiles = func() map[string]bool {
 	return out
 }()
 
-// repoRootForGuards is defined in promised_guard_test.go (this package's shared meta-gate helper).
-var _ = os.Stat
+// TestProcessNamedFuncPatternRecognisesTheRealShapes is isProcessNamedFunc's companion, with synthetic
+// samples on both sides.
+//
+// origin: line-2 external review m16 / PF-11. The FILENAME regex had this companion from the start; the
+// FUNCTION regex — the harder of the two, hand-written, and widened during this same review from a curated
+// letter list to [A-Z] — had none. A regex with no negative controls is a regex whose false positives are
+// discovered by whoever it blocks next.
+//
+// The negative half is the load-bearing half here. `[A-Z][0-9]+[A-Z]` is a broad shape and product names
+// live in it: S3, H2, X11, K8s. A gate that demands `TestS3BucketUpload [example]` be entered into a legacy
+// ledger is a gate people route around.
+func TestProcessNamedFuncPatternRecognisesTheRealShapes(t *testing.T) {
+	mustMatch := []string{
+		"TestB4ExposeReqFlagsSerialize",
+		"TestP13ProxyFenceHoldsAcrossReconnect",
+		"TestG67FoldProxyHomeCounts",
+		"TestD9MatrixCutoverRestart",
+		"TestA9RebalanceTargetsExcludeDraining",  // the live violation the widening caught
+		"TestY2DownloadCodesSplitByCause",        // this plan's own item labels
+		"TestSomethingExternalReviewRound3Fixed", // review-process token anywhere in the name
+		// origin: line-2 closure verification. The product-prefix subtraction used to run BEFORE the
+		// whole regex, so a product-prefixed name carrying a review token escaped the gate entirely.
+		"TestS3ExternalReviewRound6Fixes",
+		"TestCodexAllGreenSweep",
+		"TestMegaAuditFindings",
+		"BenchmarkB4ExposeThroughput", // Benchmark and Fuzz are covered too
+		"FuzzP13SubjectParser",
+	}
+	for _, n := range mustMatch {
+		if !isProcessNamedFunc(n) {
+			t.Errorf("isProcessNamedFunc does NOT match %q — that is exactly the shape being frozen, so a "+
+				"new one would walk through the gate", n)
+		}
+	}
+
+	mustNotMatch := []string{
+		// Ordinary behaviour-named tests.
+		"TestExposeExplainOmitsDeferredKeys",
+		"TestCloseProxyInvalidatesInFlightRegister",
+		"TestPackageLayering",
+		"TestNoDefaultOnRepoEnumSwitch",
+		// PRODUCT AND PROTOCOL NAMES that live in the [A-Z][0-9]+[A-Z] shape. These are the false
+		// positives the widening risks, and each one is a real thing a test here could be named after.
+		"TestS3BucketUploadRetries",
+		"TestH2StreamResetIsNotFatal",
+		"TestX11ForwardingRefused",
+		"TestSHA256HelpersRoundTrip",
+		"TestTLS13HandshakeRejectsOldCipher",
+		"TestUTF8SubjectNamesAreRejected",
+		"TestIPv6RouteAddrParses",
+		// A digit-then-lowercase sequence must not trip it either.
+		"TestP2pDialFallsBack",
+	}
+	for _, n := range mustNotMatch {
+		if isProcessNamedFunc(n) {
+			t.Errorf("isProcessNamedFunc WRONGLY matches %q. A false positive forces a correctly-named test "+
+				"into the legacy ledger, which is both a lie about the ledger's contents and the friction "+
+				"that teaches people to bypass the gate.", n)
+		}
+	}
+}

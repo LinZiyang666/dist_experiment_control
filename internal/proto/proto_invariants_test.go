@@ -147,7 +147,6 @@ func allRoundtripCases() []roundtripCase {
 // custom MarshalJSON that isn't an inverse of UnmarshalJSON.
 func TestRoundtripAllMessages(t *testing.T) {
 	for _, c := range allRoundtripCases() {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			first, err := json.Marshal(c.value)
 			if err != nil {
@@ -182,7 +181,6 @@ func TestRoundtripAllMessages(t *testing.T) {
 // known fields must be preserved.
 func TestUnknownFieldsIgnored(t *testing.T) {
 	for _, c := range allRoundtripCases() {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			orig, err := json.Marshal(c.value)
 			if err != nil {
@@ -294,7 +292,6 @@ func TestBinaryPayloadRoundtrip(t *testing.T) {
 	}
 
 	for name, payload := range payloads {
-		payload := payload
 		t.Run("ExecChunk/"+name, func(t *testing.T) {
 			ec := ExecChunk{Kind: "stdout", Data: payload}
 			b, err := json.Marshal(&ec)
@@ -376,7 +373,6 @@ func TestOKCodeErrorCombinations(t *testing.T) {
 			func(t *testing.T, raw string) { check(t, raw, &NodeRegisterResp{}) }},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) { c.decode(t, c.raw) })
 	}
 }

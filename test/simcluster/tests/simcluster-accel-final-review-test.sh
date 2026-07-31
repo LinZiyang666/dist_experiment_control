@@ -190,7 +190,7 @@ exit 0
 EOF
 chmod +x "$U/fake-docker" "$U/simcluster"
 
-if TMPDIR="$U/tmp" DOCKER="$U/fake-docker" "$U/simcluster" up \
+if TMPDIR="$U/tmp" DOCKER="$U/fake-docker" SIM_ALLOW_FAKE_DNS=1 "$U/simcluster" up \
     --brokers 1 --agents 0 --ctl 0 >/dev/null 2>&1 &&
    [ -z "$(find "$U/tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     pass "cmd_up success removes its unpredictable temp directory under a custom TMPDIR"
@@ -198,7 +198,7 @@ else
     fail "cmd_up success failed or leaked temp state under a custom TMPDIR"
 fi
 
-if TMPDIR="$U/tmp" DOCKER="$U/fake-docker" FAKE_PROVISION_FAIL=1 "$U/simcluster" up \
+if TMPDIR="$U/tmp" DOCKER="$U/fake-docker" SIM_ALLOW_FAKE_DNS=1 FAKE_PROVISION_FAIL=1 "$U/simcluster" up \
     --brokers 1 --agents 0 --ctl 0 >/dev/null 2>&1; then
     fail "cmd_up accepted a failed background provisioner"
 elif [ -z "$(find "$U/tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
@@ -210,7 +210,7 @@ fi
 for uspec in INT:130 TERM:143; do
     usig=${uspec%%:*}; uwant=${uspec#*:}
     umarker="$U/orphan-$usig.marker"
-    TMPDIR="$U/tmp" DOCKER="$U/fake-docker" FAKE_PROVISION_SLOW=1 \
+    TMPDIR="$U/tmp" DOCKER="$U/fake-docker" SIM_ALLOW_FAKE_DNS=1 FAKE_PROVISION_SLOW=1 \
         UP_SURVIVOR_MARKER="$umarker" timeout --preserve-status -k 5 -s "$usig" 1 \
         "$U/simcluster" up --brokers 1 --agents 0 --ctl 0 >/dev/null 2>&1
     urc=$?

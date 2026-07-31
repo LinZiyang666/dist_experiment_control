@@ -197,7 +197,10 @@ func (l *loopSet) Join(timeout time.Duration, logger *slog.Logger) {
 // self-counting property — the whole point of this type — rather than by
 // production code, which never needs to ask.
 //
-//nolint:unused // asserted by loopset_test.go; see the type doc.
+// (There used to be a //nolint:unused here. nolintlint's allow-unused:false found it dangling: the
+// method IS used, from loopset_test.go, so `unused` never reported it and the directive suppressed
+// nothing. A directive that suppresses nothing still reads to the next person as "this is knowingly
+// unused", which is the opposite of true.)
 func (l *loopSet) Count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()

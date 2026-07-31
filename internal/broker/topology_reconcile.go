@@ -109,7 +109,8 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 		reloadedMtime = mt
 		return nil
 	}
-	out := natsconf.ReconcileOnce(in, lastApplied, lastObserved, reload, b.probeNatsConfigLoadTime)
+	probe := func() (time.Time, error) { return b.probeNatsConfigLoadTime(ctx) }
+	out := natsconf.ReconcileOnce(in, lastApplied, lastObserved, reload, probe)
 	eventKey := fmt.Sprintf("%d|%s|%s", desired, out.Action, out.Reason)
 	// NATS accepts the SIGHUP command even when a route/auth delta cannot be applied live.  In that
 	// case /varz remains reachable but config_load_time stays older than the swapped file.  Waiting
@@ -124,7 +125,7 @@ func (b *Broker) reconcileTopologyOnce(ctx context.Context, lastApplied, lastObs
 		// makes the restart permanently ineligible in a valid production deployment.
 		confTime := time.Unix(0, mt)
 		due := mt != 0 && topologyRestartDue(in.SelfServerName, in.Peers, confTime, b.cfg.Now())
-		loadTime, probeErr := b.probeNatsConfigLoadTime()
+		loadTime, probeErr := b.probeNatsConfigLoadTime(ctx)
 		staleLoad := probeErr == nil && !loadTime.IsZero() && loadTime.Before(confTime)
 		if lastEventKey != eventKey {
 			b.cfg.Logger.Warn("topology reconcile: live config remains stale after reload",
@@ -173,7 +174,7 @@ func (b *Broker) waitNatsLoaded(ctx context.Context, confTime time.Time) error {
 		case <-deadline.C:
 			return fmt.Errorf("config_load_time did not reach %s within 30s", confTime.UTC().Format(time.RFC3339Nano))
 		case <-tick.C:
-			loadTime, err := b.probeNatsConfigLoadTime()
+			loadTime, err := b.probeNatsConfigLoadTime(ctx)
 			if err == nil && !loadTime.Before(confTime) {
 				return nil
 			}
@@ -307,8 +308,14 @@ func (b *Broker) reloadNatsServer(ctx context.Context) error {
 
 // probeNatsConfigLoadTime reads the live server's config_load_time off the loopback /varz monitor,
 // using the shared topoProbeClient (built once — see M4) which bypasses HTTP_PROXY for the loopback.
-func (b *Broker) probeNatsConfigLoadTime() (time.Time, error) {
-	resp, err := topoProbeClient.Get("http://" + topoMonitorListen + "/varz")
+// It takes a ctx so a broker that is shutting down does not sit in this probe: the reconcile loop
+// already has one, and the client's own timeout only bounds the wait, it does not abort it.
+func (b *Broker) probeNatsConfigLoadTime(ctx context.Context) (time.Time, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+topoMonitorListen+"/varz", nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	resp, err := topoProbeClient.Do(req)
 	if err != nil {
 		return time.Time{}, err
 	}

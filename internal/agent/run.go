@@ -95,11 +95,39 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 
 	sess, err := pty.Allocate(cols, rows)
 	if err != nil {
-		a.cfg.Logger.Warn("agent: pty allocate", "err", err, "pid", pid)
+		// origin: line-2 §12 Y2, completing the split the unclassifiedCodeAllowlist entry named.
+		// pty.Allocate wraps cpty.Open, and its failures divide cleanly by errno into causes with
+		// OPPOSITE remedies:
+		//
+		//   a resource limit  fds (EMFILE/ENFILE), the pty count itself (ENOSPC), or kernel memory
+		//                    (ENOMEM/EAGAIN). Self-healing — the next attempt after some sessions close
+		//                    will succeed. Retry is correct. The exact list, and why ENOSPC is the one
+		//                    that matters most, is at ptyTransientErrnos.
+		//   anything else    /dev/ptmx is absent, not permitted, or the container forbids it. That is
+		//                    a property of the HOST, not of this instant; retrying is guaranteed to
+		//                    fail again and the operator has to change something.
+		//
+		// One code for both told automation to retry a missing /dev/ptmx forever — which A1 had
+		// classified 75 on the strength of the common cause, and external review M2 reverted to
+		// unclassified precisely because no single retry semantics fits. Two codes fit two semantics.
+		// Written as two literal branches rather than a `reason` variable on purpose: the wire-code
+		// coverage gate resolves codes statically, and a variable here would become an "unresolved
+		// site" needing an entry in unresolvedCodeSites. An exemption that can be avoided by writing
+		// the code out is an exemption that should not exist.
+		if ptyFailureIsTransient(err) {
+			a.cfg.Logger.Warn("agent: pty allocate (a resource limit is exhausted — fds or the pty count)",
+				"err", err, "pid", pid)
+			a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
+				Kind: "failed", PID: pid, Reason: "pty_alloc_failed",
+			})
+			a.pubPtyFailed(nc, pid, "pty_alloc_failed", err.Error())
+			return
+		}
+		a.cfg.Logger.Warn("agent: pty allocate (host cannot provide a PTY)", "err", err, "pid", pid)
 		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
-			Kind: "failed", PID: pid, Reason: "pty_alloc_failed",
+			Kind: "failed", PID: pid, Reason: "pty_unavailable",
 		})
-		a.pubPtyFailed(nc, pid, "pty_alloc_failed", err.Error())
+		a.pubPtyFailed(nc, pid, "pty_unavailable", err.Error())
 		return
 	}
 
@@ -116,8 +144,14 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	if err != nil {
 		a.cfg.Logger.Warn("agent: SubscribeSync attach", "err", err, "pid", pid)
 		_ = sess.Close()
+		// origin: line-2 §12 Y2. This used to report pty_alloc_failed, which was a lie about WHICH
+		// thing failed and, worse, a lie with a retry policy attached: the PTY allocated fine (we are
+		// past pty.Allocate and closing the session on the way out) — it is the NATS subscription that
+		// did not come up. Sharing one code made those two indistinguishable to a monitor, so a host
+		// that can NEVER allocate a PTY (no /dev/ptmx, container restriction) got the same
+		// retry-forever treatment as a NATS hiccup that really does clear on its own.
 		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
-			Kind: "failed", PID: pid, Reason: "pty_alloc_failed",
+			Kind: "failed", PID: pid, Reason: "attach_subscribe_failed",
 		})
 		return
 	}
@@ -547,4 +581,59 @@ func normalizedSize(cols, rows int) (int, int) {
 		rows = 24
 	}
 	return cols, rows
+}
+
+// ptyFailureIsTransient decides which of the two PTY-failure wire codes a pty.Allocate error earns.
+//
+// origin: line-2 external review M18 / PC-3. This predicate used to be written inline in handleRunReq,
+// which made the DECISION untestable while leaving the two code literals testable — and the review
+// measured the consequence: replacing the condition with `if false` (the transient branch permanently
+// unreachable) left ./internal/agent/ and ./cmd/tether/ both green. The wire-code coverage gate only
+// asserts that each code literal EXISTS somewhere, so it could not see that one of them had become
+// dead. Extracting the predicate is what gives the criterion itself a test
+// (TestPTYFailureTransientClassification).
+//
+// The two code literals stay written out at the two call sites, unchanged: the coverage gate resolves
+// codes statically and a `reason` variable there would need an unresolvedCodeSites exemption, which is an
+// exemption avoidable by writing the code out.
+//
+// EMFILE / ENFILE  the process or the host is out of file descriptors. Self-healing — the next attempt
+//
+//	after some sessions close will succeed, so pty_alloc_failed is retryable.
+//
+// anything else    /dev/ptmx is absent, not permitted, or the container forbids it. A property of the
+//
+//	HOST, not of this instant; pty_unavailable tells automation to stop retrying.
+//
+// ptyTransientErrnos are the allocation failures that clear on their own as sessions close.
+//
+// ENOSPC is the one that matters most and was missing. origin: line-2 external review M17 / PC-2 / F2 / D5.
+// Opening /dev/ptmx goes ptmx_open -> devpts_new_index, and when the devpts instance is at its limit
+// (/proc/sys/kernel/pty/max, minus pty_reserve for non-root, or a `max=` mount option) that returns
+// -ENOSPC, not EMFILE. So PTY EXHAUSTION -- the single most likely transient PTY failure on a busy host,
+// and the exact thing pty_alloc_failed exists to name -- was landing in the terminal branch and telling
+// automation to stop retrying something that clears in seconds.
+//
+// Measured, not inferred: in a privileged container with devpts mounted `newinstance,max=1`, the second
+// open returns `no space left on device` with EMFILE=false ENFILE=false ENOSPC=true. This host's
+// /proc/sys/kernel/pty/max is 4096, so an ordinary busy broker can reach it.
+//
+// ENOMEM and EAGAIN are included on the same principle: both are resource-pressure errnos that a later
+// attempt can win. The list is a variable while the two Reason literals at the call site stay written out
+// -- the wire-code coverage gate resolves codes statically, and an errno list is not a code.
+var ptyTransientErrnos = []syscall.Errno{
+	syscall.EMFILE, // this process is out of file descriptors
+	syscall.ENFILE, // the host's file table is full
+	syscall.ENOSPC, // devpts index exhaustion -- the pty limit, see above
+	syscall.ENOMEM, // kernel allocation pressure
+	syscall.EAGAIN, // resource temporarily unavailable
+}
+
+func ptyFailureIsTransient(err error) bool {
+	for _, e := range ptyTransientErrnos {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }

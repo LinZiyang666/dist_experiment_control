@@ -81,6 +81,8 @@ func (i RenderIntent) String() string {
 		return "force-clustered"
 	case IntentStandaloneIfLone:
 		return "standalone-if-lone"
+	case IntentPreserve:
+		return "preserve"
 	default:
 		return "preserve"
 	}
@@ -159,6 +161,8 @@ func (i RenderIntent) standalone(in Inputs, own *Ownership) bool {
 		return false
 	case IntentStandaloneIfLone:
 		return lone
+	case IntentPreserve:
+		fallthrough
 	default: // IntentPreserve
 		// review F4 + R3: lone AND already-standalone. The second conjunct is what stops the autonomous
 		// loop from stripping cluster{} off a still-clustered N=1 — that transition bypasses

@@ -1202,8 +1202,16 @@ flag：
 
 | 类型 | code | --all 行为 |
 |---|---|---|
-| 瞬时 | `node_offline` / `node_not_found` / `agent_no_responders` / `agent_malformed_resp` / `deadline exceeded` / `context canceled` | log + skip，结尾汇总 |
-| 配置 | `not_owner` / `url_not_allowed` / `sha256_invalid` / `proto_bump_requires_reinstall` / `actor_invalid` / `session_not_found_or_deleting` | 立即终止（fail-fast） |
+| 瞬时 | `node_offline` / `node_not_found` / `agent_no_responders` / `agent_malformed_resp` / `download_failed` / `download_http_retryable` / `pty_alloc_failed` | log + skip，结尾汇总 |
+| 配置 | `not_owner` / `url_not_allowed` / `sha256_invalid` / `proto_bump_requires_reinstall` / `actor_invalid` / `session_not_found_or_deleting` / `download_http_status` / `download_too_large` | 立即终止（fail-fast） |
+| 两者皆非 | 其余（如 `pty_unavailable`） | 记为该节点失败，继续跑完剩余节点 |
+
+分类**按 wire code 精确匹配**（结构化携带在错误上，见 `cmd/tether/exitcode.go` 的 `ExitError.Code`），
+**不读错误文案**——运维可读的 hint 文案本来就会被改写，让它左右 fleet 控制流会在改一句话时
+静默把「跳过这台」变成「中止全队」。`agent_rejected:` 前缀在源头剥除，调用方按裸 code 匹配。
+
+唯一的文案兜底是 Go 自己的 transport/context 串（`deadline exceeded` / `context canceled`）——
+那类错误压根没有 wire code；且只在**没有**结构化 code 时才咨询，永不覆盖结构化判定。
 
 单台模式（不带 `--all`）任何错都直接终止。
 
@@ -1491,10 +1499,17 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 
 | reason | 含义 | 处置 |
 |---|---|---|
-| `attach_timeout`   | agent 分配了 PTY 但 ctl 3s 内没订阅 | 重试；持续出现查 NATS 时延 / clock skew |
-| `pty_alloc_failed` | agent 端 `/dev/ptmx` 不可用 | 容器内常见，加 `--device=/dev/ptmx` 或开 `--privileged` |
+| `attach_timeout`   | agent 分配了 PTY 但 ctl 未在 attach deadline 内订阅（默认 15s，见 `TETHER_AGENT_ATTACH_DEADLINE`） | 重试；持续出现查 NATS 时延 / clock skew |
+| `pty_alloc_failed` | **资源上限耗尽**：fd（EMFILE/ENFILE）或 **pty 数量本身**（ENOSPC——见 `/proc/sys/kernel/pty/max`，非 root 还要再减 `pty_reserve`，或 devpts 的 `max=` 挂载选项） | **可重试（75）**，几秒内会随会话关闭自行恢复；持续出现则抬高 `kernel.pty.max` 或查是否有会话泄漏 |
+| `pty_unavailable`  | 宿主**根本给不出** PTY：`/dev/ptmx` 不存在、无权限，或容器禁止 | **终态（64）**，重试不会好。容器内加 `--device=/dev/ptmx` 或开 `--privileged` |
+| `attach_subscribe_failed` | PTY 分配成功，但 agent 订阅 attach 主题失败——它的 NATS 连接此刻不健康 | **可重试（75）**；持续出现查 agent 到 broker 的连通性 |
 | `exec_failed`      | PTY 分了但 argv 起不来 | 检查 argv（typo / not in PATH / no exec bit） |
 | `argv_required`    | 没传 argv | `tether run gpu-01 -- bash` 形式调用 |
+
+> **本表在线二 §12 Y2 拆码后曾整节漏扫**（闭合核验 M17）：`/dev/ptmx 不可用` 当时仍挂在
+> `pty_alloc_failed` 名下，而那个码已改为专指资源耗尽，且新增的 `pty_unavailable` /
+> `attach_subscribe_failed` 两行完全没有。**同一个码在文档与代码里表示两件事，比没有文档更坏**——
+> 运维照表去加 `--device=/dev/ptmx`，而实际发生的是 pty 数量到顶。
 
 ### 9.6 存储 / 通用
 
@@ -1545,7 +1560,7 @@ language version 1.23 is lower than the targeted Go version 1.25
 | 退出码 | 含义 | 典型场景 |
 |---|---|---|
 | `0` | 成功 | — |
-| `64` | 用法/参数错（EX_USAGE） | 缺必填 flag、互斥 flag、`--local` 越界、`name_taken`/`port_exhausted` 等需人工处置的 broker 码 |
+| `64` | 用法/参数错（EX_USAGE） | 缺必填 flag、互斥 flag、`--local` 越界、`name_taken`/`port_exhausted` 等需人工处置的 broker 码；也包括 **`pty_unavailable`**（宿主根本给不出 PTY：`/dev/ptmx` 不存在或容器禁止）与 **`download_http_status` / `download_too_large`**（URL 打错、产物超上限）——这三个物理上不可能靠重试成功，故归终态类而非 69 |
 | `69` | 服务不可达（EX_UNAVAILABLE） | broker/NATS 连不上、no-responder、admin socket 不在 |
 | `70` | 内部/未分类（EX_SOFTWARE） | malformed reply、解码失败、tether 没能分类的错误（=该上报的 tether 侧缺口） |
 | `75` | 瞬时可重试（EX_TEMPFAIL） | `leader_unavailable`/`home_catching_up`/`catch_up_stalled`、deadline、no-responder 的 agent |
@@ -1557,6 +1572,13 @@ language version 1.23 is lower than the targeted Go version 1.25
 - `exec` / `run` **透传远端进程退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器；判别靠"你跑的是哪个命令"，不是值。所以"77=权限"仅限 broker-RPC 命令。
 
 **健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。
+
+> **这条规则没有例外，是靠把码归对类来维持的**（线二内审 M17）。审查发现 `pty_unavailable` 当时归了
+> `69`，而它自己的 hint 写着「retrying will not help until the host changes」——同一个码同时被规则说成
+> 可重试、被自己的说明说成不可重试。处置是**改码的归类**（→ `64`）而不是给这条规则加例外：
+> 一条带例外的重试规则要求每个写自动化的人都记住例外，而归类只需要改一处。
+> 同理 `pty_alloc_failed` 保持 `75`——它是 fd 或 **pty 数量**（ENOSPC，见 `/proc/sys/kernel/pty/max`）
+> 耗尽，几秒内就会自行恢复，真的该重试。
 
 > **batch-A A1 订正**：此前有 **62 个** broker/agent 错误码**没有** exit class 归类，因而全部落 `70`——
 > 也就是被上面这条规则指示"退避重试"。其中包括物理上不可能靠重试成功的（`too_large` 超 2 GiB 硬上限、
@@ -1592,8 +1614,21 @@ list/status/结果类命令支持 `--json`（**opt-in，默认人读文本字节
 - `cluster status --json` **不再吞 broker 错误**：报告在场但 broker 同时报错时，`errors[]` 收录、
   `partial:true`（绝不静默丢）；无报告则退出 `69`。`cluster status --remote --json` 是轻量 ctl 摘要
   （带 `view:"ctl-remote"`、**无 schema_version**），监控契约请用 socket/offline 的 `--json`（见 cluster.md §5.6）。
+- **`cluster status --watch --json` 是异构 JSONL**（每行一个对象，两种 shape），判别符与上面同一条规则：
 
-adminsock cluster admin 回复带稳定 `code`（`not_leader`/`already_voter`/`not_a_voter`/`catch_up_stalled`/
+  | 该行 | 判别 | 含义 |
+  |---|---|---|
+  | 状态帧 | 有 `view`（`ctl-nats`/`offline`）、`schema_version` | 这一帧**到达了** |
+  | 帧错误 | 有 `schema:"cluster_status_watch_error"`、`schema_version:1` | 这一帧**没到达**；`stage` = `fetch`（admin socket 没应答）\| `marshal`（应答了但序列化不了），另带 `error`、`at`(RFC3339Nano) |
+
+  失败帧**也是一行**（不是静默跳过），所以数帧的消费者不会把「socket 死了」读成「集群安静」；
+  人读的重试提示仍在 stderr。严格 decoder 用 `schema` 分流即可，不必在暂态错误上退出。
+
+  ⚠ **单复数陷阱**：到达的状态帧带 `errors`（**复数**，broker 侧问题，配 `partial:true`），
+  没到达的帧带 `error`（**单数**）。`jq 'select(.error)'` 只选帧失败；
+  `jq 'select(.errors|length>0)'` 只选降级帧。搞反会把「降级但活着」当成「socket 死了」，或反之对真故障沉默。
+
+adminsock cluster admin 回复带稳定 `code`（`not_leader`/`not_a_voter`/`catch_up_stalled`/
 `quorum_confirm_required`/`nonce_used`/`cluster_not_enabled`/`node_unknown`/`store_error`/`bad_request`），
 CLI 据此映射退出类 + 提示。
 

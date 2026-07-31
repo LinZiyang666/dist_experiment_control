@@ -1,0 +1,70 @@
+# structural_budget_golden.txt — the debt ledger for test/architecture/structural_budget_test.go.
+#
+# Only entities ALREADY over threshold are listed, so this file is a list of debts, not an
+# inventory. Both directions of drift fail: growth demands a hand edit plus a justification in
+# the commit message, shrinkage demands `go test ./test/architecture/ -update-structural-budget`
+# so the improvement is locked in and cannot silently become slack.
+#
+# thresholds: type-methods > 40 methods, pkg-files > 20 files, pkg-code-lines > 2000
+# code lines. The two code-line dimensions are quantised DOWN (pkg-code-lines to 2000,
+# main-noncli-code-lines to 100) so ordinary commits are invisible and only crossing a boundary
+# is an event. main-noncli-code-lines has no lower threshold: it is always tracked.
+#
+# NOTE: -update-structural-budget only ever TIGHTENS. It refuses to write a value wider than the
+# one already here, and it refuses to admit a NEW over-budget entity at all, which is what makes
+# running it a safe routine action.
+# ==== everything below this line is hand-written and survives regeneration ====
+# main-noncli-code-lines: non-CLI logic trapped in package main (L03-F6), comment-stripped.
+#
+# HISTORY. This shipped as an EXACT line count and was raised twice by hand inside the increment that
+# introduced it, 1102 -> 1106 -> 1116:
+#
+# +4  the missing natsconf.TopoBehind branch in cluster_status_card.go plus the explicit non-degrading
+#     case in cluster_doctor_online.go. TopoBehind degrades, so the cluster was already being reported
+#     unhealthy while the card that says WHY produced nothing.
+# +10 the line-2 §12 Y2 error-code split: hints and exit classes for pty_unavailable,
+#     attach_subscribe_failed, download_http_status and download_too_large. Those tables live in
+#     error_hints.go, which does not import cobra and so counts as non-CLI. The alternative to paying
+#     ten lines here was leaving `tether node upgrade` against a typo'd URL retried forever.
+#
+# Both raises bought an operator a stated cause where they previously got silence — the trade this
+# ledger exists to make VISIBLE, not to forbid. But two hand-raises for +4 and +10 lines of ordinary
+# work is also the review's PI-9 finding: at that grain the gate reddens on everything and teaches
+# people to run `-update` without reading. Hence the quantum of 100.
+#
+# The value moved 1116 -> 1100 for two reasons at once, both from the line-2 review:
+#   PI-2  the classifier stopped exempting files by SUBSTRING and now parses the import list, which
+#         added cmd/tether/poll.go (44 code lines, discusses cobra in prose, imports nothing of the
+#         sort — previously exempt from the one dimension meant to catch it). Measured, not argued:
+#         with the substring classifier restored, appending the single comment line
+#         "// The cobra command tree wires this in" to error_hints.go drops the total 1160 -> 800,
+#         and the failure that produces says "DEBT SHRANK, run -update" — so one comment line, plus
+#         the command the gate itself tells you to run, permanently removes a 360-line file from the
+#         budget. Parsing imports: same probe, no change.
+#   PI-9  quantisation to 100. Raw is 1160; 1160 rounded down is 1100.
+main-noncli-code-lines cmd/tether 1100
+# pkg-code-lines: the FOURTH dimension, added during line-2's own review (plan §11 X2 re-adjudicated).
+#
+# X2 had rejected S3's pkg-lines forever, on the condition that it be reopened if someone found a
+# comment-immune package-size measure AND showed pkg-files missing real growth. Both were true inside the
+# same change: countCodeLines is that measure, and a review lane appended 1082 lines of real code to
+# internal/broker/loopset.go with every gate green. type-methods and pkg-files are both blind to growth
+# INSIDE existing files -- which is the cheapest thing to do and the thing CLAUDE.md's "prefer merging
+# into an existing file" rule actively recommends. A ratchet whose only gap is the path of least
+# resistance shapes behaviour toward god files.
+#
+# These five lines are a FIRST REGISTRATION, not a raise: the dimension did not exist before, so there is
+# no earlier value to compare against. Values are code lines rounded DOWN to 2000 so ordinary commits are
+# invisible and only crossing a boundary is an event. -update-structural-budget refuses to admit a new
+# over-budget entity on its own (see GI-4), which is why these were typed here by hand.
+pkg-code-lines cmd/tether 10000
+pkg-code-lines internal/agent 4000
+pkg-code-lines internal/broker 14000
+pkg-code-lines internal/cluster 2000
+pkg-code-lines internal/clusteroffline 2000
+pkg-files cmd/tether 52
+pkg-files internal/broker 70
+pkg-files internal/cluster 32
+type-methods internal/agent.Agent 106
+type-methods internal/broker.Broker 279
+type-methods internal/broker.ClusterAdmin 86

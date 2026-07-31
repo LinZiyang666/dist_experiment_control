@@ -27,6 +27,18 @@ import (
 //
 // On any pre-forward failure, broker replies with an `ExecChunk{kind:error}`
 // so the ctl gets a clean message instead of a NATS timeout.
+// The dupl exemption for this handler and handleRunReq lives HERE rather than in .golangci.yml.
+// origin: line-2 review M14 — the config-file form pinned the partner's LINE RANGE in a regex, and one
+// added comment line in run.go turned `make lint` red in a broker hot path.
+//
+// This one IS real duplication: the ingress admission skeleton (admitSubject -> follower short-circuit
+// -> admitACL -> node-refusal audit) copied across verb handlers, which is the debt the admit()
+// consolidation exists to pay down. Exempted rather than merged because the merge is that
+// consolidation's job, and because the handlers are NOT interchangeable — see the comment inside on the
+// subject-shape check running BEFORE the follower short-circuit here, where expose does the opposite.
+// A naive collapse would silently pick one order for all of them.
+//
+//nolint:dupl // paired with handleRunReq in run.go; argument above.
 func (b *Broker) handleExecReq(nc *nats.Conn, msg *nats.Msg) {
 	// The subject-shape check runs BEFORE the follower short circuit, matching this
 	// handler's long-standing order: a follower still answers a malformed exec subject.

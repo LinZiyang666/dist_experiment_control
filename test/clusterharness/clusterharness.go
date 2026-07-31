@@ -135,7 +135,15 @@ func FreePort(t *testing.T) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
+	// Checked even though net.Listen("tcp") always yields a *net.TCPAddr: this is shared harness code,
+	// and an unchecked assertion here would surface as a bare panic inside whichever suite happened to
+	// call it, with no indication that the harness — not the test — is what broke.
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = l.Close()
+		t.Fatalf("clusterharness: listener address is %T, not *net.TCPAddr", l.Addr())
+	}
+	port := addr.Port
 	_ = l.Close()
 	return port
 }

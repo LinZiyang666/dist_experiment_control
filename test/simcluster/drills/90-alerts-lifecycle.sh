@@ -10,7 +10,7 @@
 # socket (operator tier; run `dexec -u tether $LDR -- tether alert raise …`); `alert ls`/`alert ack` =
 # ctl-over-NATS (member read; run from ctl). broker_down/disk_pressure are INFO severity
 # (observability.go:208 hardcodes AlertSeverityInfo) and renderBanner filters to `severe` only
-# (d8_alerts.go) → they surface ONLY in `alert ls`, NEVER in the ps/node banner (C2). The severe banner
+# (alert_gate.go) → they surface ONLY in `alert ls`, NEVER in the ps/node banner (C2). The severe banner
 # is provable ONLY via `manual --severity severe`.
 #
 # FALSE-GREEN GUARDS (plan §9-90): clean-baseline gate before every arm (no pre-pulled broker_down/manual

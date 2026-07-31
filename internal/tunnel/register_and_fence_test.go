@@ -286,8 +286,9 @@ func TestD6VerifyConnectionRunsOnResume(t *testing.T) {
 	)
 	base := clientTLSConfigPinned(pins)
 	clientCfg := &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: true, //nolint:gosec // pin check is in VerifyConnection
+		MinVersion: tls.VersionTLS13,
+		// Hostname verification off, peer verification ON via VerifyConnection below.
+		InsecureSkipVerify: true,
 		ClientSessionCache: tls.NewLRUClientSessionCache(4),
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			mu.Lock()

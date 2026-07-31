@@ -129,7 +129,10 @@ func diskUsage(path string) (used, total uint64, err error) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
 	}
-	bsize := uint64(st.Bsize) //nolint:unconvert,gosec // Statfs_t.Bsize is int64 on linux
+	// Statfs_t.Bsize is int64 on linux, so the conversion is real. (There used to be a
+	// //nolint here naming unconvert+gosec; neither is enabled, so it suppressed nothing while
+	// reading as a considered exemption. TestNolintDirectivesNameEnabledLinters now forbids that.)
+	bsize := uint64(st.Bsize)
 	total = uint64(st.Blocks) * bsize
 	free := uint64(st.Bavail) * bsize
 	if free > total {

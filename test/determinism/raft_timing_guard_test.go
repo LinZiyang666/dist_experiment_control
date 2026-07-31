@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -43,7 +44,7 @@ import (
 //
 // See docs/testing-standards.md T1/T2.
 func TestRaftTimingsUseProductionConstants(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 
 	// Deliberate deviations. A suite whose ASSERTION depends on specific timings
 	// belongs here WITH its reason, not silently inline. Any value chosen here
@@ -136,7 +137,7 @@ func TestRaftTimingsUseProductionConstants(t *testing.T) {
 				}
 				siteKey := rel + ":" + fn
 				ord[siteKey]++
-				site := siteKey + "#" + itoa(ord[siteKey])
+				site := siteKey + "#" + strconv.Itoa(ord[siteKey])
 				if _, ok := exempt[site]; ok {
 					seen[site] = true
 					return true

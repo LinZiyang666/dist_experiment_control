@@ -137,8 +137,19 @@ type homeDeliveryState struct {
 	// delivery must see this stay at zero.
 	pushes uint64
 
-	// acks counts applied-acks accepted from agents.
-	acks uint64
+	// There is no `acks` counter. origin: line-2 external review m8 / PI-4. There was one: incremented
+	// under the lock on every accepted applied-ack, and read by nothing in the repo. homeDeliveryStats had
+	// already stopped returning it (its own doc comment records why — every call site spelled
+	// `pushes, _`), which left the field write-only.
+	//
+	// Deleted rather than re-surfaced, because re-surfacing is how batch-A F-03 happened: loopStat carried
+	// Runs and LastErr, one incremented once at startup and one with a reader and NO writer, and an
+	// operator reading "last error: (empty)" concluded there had been no errors. A counter that exists to
+	// satisfy a reader who does not exist is the same defect with the arrow reversed.
+	//
+	// The authoritative per-port confirmation is hd.applied, and homeAppliedEpoch is the oracle the
+	// drain/retire/upgrade rc semantics actually consult. Anyone who wants an ack RATE should add it here
+	// together with the thing that reads it, in one change.
 }
 
 type homeDeliveryAttempt struct {
@@ -319,7 +330,6 @@ func (b *Broker) handleHomeAck(msg *nats.Msg) {
 		if cur, seen := hd.applied[d.PublicPort]; !seen || confirmed > cur {
 			hd.applied[d.PublicPort] = confirmed
 		}
-		hd.acks++
 	}
 	if len(o.dirs) == 0 {
 		delete(hd.outstanding, token) // fully confirmed — free it now (else TTL prunes a partial one)
@@ -336,12 +346,15 @@ func (b *Broker) homeAppliedEpoch(publicPort int) int64 {
 	return hd.applied[publicPort]
 }
 
-// homeDeliveryStats snapshots the counters (tests + R13 status).
-func (b *Broker) homeDeliveryStats() (pushes, acks uint64) {
+// homeDeliveryStats snapshots the push counter (tests + R13 status).
+//
+// It used to return acks too. No caller ever read it -- every call site spelled `pushes, _` -- so the
+// second value advertised a signal that was not actually being surfaced anywhere.
+func (b *Broker) homeDeliveryStats() (pushes uint64) {
 	hd := b.homeDelivery()
 	hd.mu.Lock()
 	defer hd.mu.Unlock()
-	return hd.pushes, hd.acks
+	return hd.pushes
 }
 
 // --- publishing ------------------------------------------------------------

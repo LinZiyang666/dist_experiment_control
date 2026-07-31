@@ -10,12 +10,16 @@ import (
 // origin: g1g7_audit_test.go (renamed in B6) — the G1–G7 cross-cutting audit's broker-side pins;
 // docs/reviews/g1-external-review.md and the g4/g5/g7 review documents alongside it.
 
-// TestA9RebalanceTargetsExcludeDraining pins that BOTH proxy-home target selectors exclude a broker that is
-// mid-drain: DrainNode raises the broker_draining marker + migrates exposes BEFORE flipping VOTER->DRAINING,
-// so a draining node is still phase=VOTER (otherwise eligible) in that window and must never be chosen as a
-// rebalance/rehome target (mirrors the allocatePort DrainingNodes guard). brk-b here is reachable + healthy,
-// so the ONLY reason to exclude it is the draining marker — a sense-lock against dropping the filter.
-func TestA9RebalanceTargetsExcludeDraining(t *testing.T) {
+// origin: batch-A A9; renamed during line-2 review PF-7, which found the function-name freeze's regex
+// had no `A` in its batch-letter list and so had let this one through.
+//
+// TestRebalanceTargetsExcludeDrainingBroker pins that BOTH proxy-home target selectors exclude a broker that
+// is mid-drain: DrainNode raises the broker_draining marker + migrates exposes BEFORE flipping
+// VOTER->DRAINING, so a draining node is still phase=VOTER (otherwise eligible) in that window and must never
+// be chosen as a rebalance/rehome target (mirrors the allocatePort DrainingNodes guard). brk-b here is
+// reachable + healthy, so the ONLY reason to exclude it is the draining marker — a sense-lock against
+// dropping the filter.
+func TestRebalanceTargetsExcludeDrainingBroker(t *testing.T) {
 	db := openDB(t)
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), PublicHost: "a.example"}, selfID: "brk-a"}
 	b.clusterMode = true

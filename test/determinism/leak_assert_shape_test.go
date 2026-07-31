@@ -143,7 +143,7 @@ var leakExerciseAnchors = map[string]string{
 }
 
 func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 
 	var offenders []string
 	seenAnchors := map[string]bool{}
@@ -213,7 +213,7 @@ func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
 // (internal/cluster/transport_test.go:waitGoroutineBaseline) while the scan only ever iterates Test*
 // functions, so it could never match. It read as a considered exemption for two batches.
 func TestSingleExerciseExemptionsAreLiveAndSiteScoped(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 
 	live := map[string]bool{}
 	err := walkTestFilesForLeakShape(t, root, func(rel string, fn *ast.FuncDecl) {
@@ -571,7 +571,7 @@ outer:
 // number is re-read from source; a silent drift would make the gate demand a different N from the one
 // the tests use.
 func TestLeakRoundsConstantMatchesTheFloor(t *testing.T) {
-	root := repoRootForGuards(t)
+	root := repoRoot(t)
 	path := filepath.Join(root, "internal", "testharness", "leakgate.go")
 	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {

@@ -404,6 +404,13 @@ func clusterStatusOffline(cmd *cobra.Command, dbPath string, asJSON bool) error 
 		b, _ := json.MarshalIndent(rep, "", "  ")
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
 		if rep.ExitCode != 0 {
+			// os.Exit skips the `defer rows.Close()` above; Close is idempotent, so calling it here
+			// makes the cleanup happen on BOTH exits from this function rather than only the one that
+			// returns normally.
+			_ = rows.Close()
+			//nolint:gocritic // exitAfterDefer: rows.Close() runs explicitly on the line above, so the
+			// deferred close is not the thing being skipped. The shape stays because this command's
+			// contract is an exit CODE and cobra cannot return one.
 			os.Exit(rep.ExitCode)
 		}
 		return nil

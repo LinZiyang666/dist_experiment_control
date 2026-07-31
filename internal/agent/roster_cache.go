@@ -98,6 +98,11 @@ func ReadRosterCache(home, sid string) (*RosterCache, error) {
 	}
 	// Migration: a C1 agent stored the cache inside state.json.Roster.
 	sf, serr := newStateStore(home, sid).load()
+	//nolint:nilerr // Deliberate, and the doc comment above already promises it: "nil (no error) when
+	// neither exists". This is a DISCOVERY CACHE and the migration read is best-effort — an unreadable
+	// or corrupt state.json here means the agent re-discovers the roster, which is the same work it
+	// does on a first run. Surfacing the error instead would turn a stale scratch file into a hard
+	// failure of a call whose entire contract is "give me the cache if there is one".
 	if serr != nil || sf == nil || sf.Roster == nil {
 		return nil, nil
 	}

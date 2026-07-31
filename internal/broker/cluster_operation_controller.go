@@ -972,7 +972,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		// already re-pointed). The RETURN value is deliberately discarded — the gate below
 		// reads the DURABLE convergence set, because migrateExposes' list self-destructs on
 		// the second tick (see pendingRetireConvergence / CRIT-1).
-		if _, err := a.migrateExposes(op.TargetNode); err != nil {
+		if err := a.migrateExposes(op.TargetNode); err != nil {
 			a.recordOpError(op, fmt.Errorf("migrate exposes: %w", err)) // rebuild-OFF refusal surfaces here, loud
 			return
 		}
