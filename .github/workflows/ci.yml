@@ -3,12 +3,28 @@ name: ci
 on:
   push:
   pull_request:
-  # P11 architecture line 2147-2148: P2-P10 e2e matrix runs nightly
-  # so a regression that survives the per-PR `make test` window
-  # surfaces within 24h. 02:30 UTC = small overlap with low-traffic
-  # window globally.
+  # WEEKLY, not nightly. P11 (architecture line 2147-2148) specified a nightly e2e matrix so a
+  # regression surviving the per-PR `make test` window surfaced within 24h. That reasoning assumed
+  # the e2e matrix was CI's ONLY run of it. It is not: CLAUDE.md §5 makes `make e2e-parallel` a hard
+  # gate before every commit, on a 44-core box where it takes ~3.5 min. Every commit therefore
+  # already carries a full-matrix pass.
+  #
+  # What CI's e2e adds on top is a DIFFERENT ENVIRONMENT — a 2-core GitHub runner, cold caches, a
+  # fresh runner image, whatever Go patch release setup-go resolves today. That surface changes on
+  # the order of weeks, not hours, so a nightly re-run of it mostly re-proves yesterday's answer.
+  #
+  # It is not free either: measured at 42m22s on a 2-core host (one worker, 99 units back-to-back).
+  # At 38 pushes to main in the last 30 days, the old "schedule OR push to main" trigger came to
+  # ~1300 min/month for e2e alone, against a 2000 min/month free allowance also feeding build-test
+  # and lint on every push. Weekly + on tags + manual is ~150 min/month plus releases.
+  #
+  # Monday 02:30 UTC: after the weekend, before the week's work lands on top of a stale answer.
   schedule:
-    - cron: "30 2 * * *"
+    - cron: "30 2 * * 1"
+  # Manual trigger, so "run the full matrix in a clean environment right now" does not require
+  # inventing a commit. This is the escape hatch that makes the weekly cadence affordable — without
+  # it, the only way to get an on-demand CI e2e is to push.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -60,8 +76,18 @@ jobs:
   # for the maintainer's own commits). Skipped on PR triggers
   # because each phase spins up embedded NATS / JetStream and
   # would slow PR review without adding much over the unit suite.
+  # WHEN THIS RUNS: weekly on the schedule above, on every version tag, and on demand. NOT on a
+  # push to main — see the `schedule:` comment for why (the local pre-commit gate already runs the
+  # same matrix on every commit; this job exists for the ENVIRONMENT, not the code).
+  #
+  # The tag arm is the one that is not about cadence at all: a release is the single moment where
+  # "it passed on the maintainer's box" is not good enough, because the artifact goes to other
+  # people's machines. `on: push` fires for tags too, hence the refs/tags/ test.
   e2e:
-    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # `ubuntu-latest` has 2 physical cores, so the runner seats ONE worker and the 99 units run
     # back-to-back. Measured on a 2-core-restricted host: 42m22s, ALL PASS. The round's own deadline

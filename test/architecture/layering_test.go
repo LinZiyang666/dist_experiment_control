@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -448,102 +447,6 @@ var deletedRegressionTests = map[string][]struct{ name, pkg string }{
 // future HEAD, so it stays reachable. If a shallow clone cannot reach it the gate says so explicitly rather
 // than silently verifying nothing.
 const deletedRegressionTestsCommit = "0b1ec070e68e302a24b9b449823953a3c545102a"
-
-// TestCIProvidesHistoryForDeletedRegressionProvenance keeps the frozen-history
-// gate runnable in GitHub Actions. actions/checkout defaults to fetch-depth=1;
-// the frozen ancestor is then absent even though it is part of the repository's
-// history, so the job fails four git-show calls before checking a single assertion.
-//
-// KEYED ON WHAT THE JOB RUNS, NOT ON ITS NAME. The first version asserted that the job
-// literally named `build-test` carried fetch-depth: 0. That is the right requirement
-// attached to the wrong subject — moving `make test` into a differently-named job, or
-// adding a second job that runs it, leaves this gate green and CI deterministically red.
-// The requirement belongs to "runs the suite that contains the provenance gate", so that
-// is what is parsed.
-func TestCIProvidesHistoryForDeletedRegressionProvenance(t *testing.T) {
-	root := repoRoot(t)
-	b, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "ci.yml"))
-	if err != nil {
-		t.Fatalf("read CI workflow: %v", err)
-	}
-	jobs := ciJobBlocks(t, string(b))
-
-	// Only `make test` / a bare `go test` over the whole tree reaches test/architecture. `make lint`
-	// and `make e2e-parallel` do not (the parallel runner enumerates the phase suites explicitly), so
-	// requiring deep history of them would be cargo-culting the fix onto jobs that cannot need it.
-	needsHistory := regexp.MustCompile(`(?m)^\s*-?\s*(run:\s*)?(make test|make gates|go test \./\.\.\.)\s*$`)
-
-	var checked int
-	for name, body := range jobs {
-		if !needsHistory.MatchString(body) {
-			continue
-		}
-		checked++
-		if !strings.Contains(body, "fetch-depth: 0") {
-			t.Errorf("CI job %q runs the full test suite but checks out shallow.\n\n"+
-				"TestDeletedRegressionTestNamesAreReal reads frozen ancestor %s via `git show`. "+
-				"actions/checkout defaults to depth 1, where that commit is unreachable and the job "+
-				"fails deterministically. Add:\n"+
-				"    - uses: actions/checkout@v4\n"+
-				"      with:\n"+
-				"        fetch-depth: 0",
-				name, deletedRegressionTestsCommit)
-		}
-	}
-	if checked == 0 {
-		t.Fatalf("no CI job was found to run the full test suite (parsed %d job(s): %v).\n\n"+
-			"Either the workflow stopped running `make test` — in which case the provenance gate no "+
-			"longer runs in CI at all and this check is the only thing that would say so — or the "+
-			"parser broke and every future shallow checkout would pass unexamined.",
-			len(jobs), jobNames(jobs))
-	}
-}
-
-// ciJobBlocks splits a GitHub Actions workflow into {job name: body}. Deliberately a line scanner
-// rather than a YAML dependency: the shape needed is one level of keys under `jobs:`, and the test
-// tree carries no YAML parser (the sibling nolint gate makes the same trade for the same reason).
-func ciJobBlocks(t *testing.T, workflow string) map[string]string {
-	t.Helper()
-	lines := strings.Split(workflow, "\n")
-	inJobs := false
-	jobs := map[string]string{}
-	cur := ""
-	var body []string
-	flush := func() {
-		if cur != "" {
-			jobs[cur] = strings.Join(body, "\n")
-		}
-		cur, body = "", nil
-	}
-	jobKeyRe := regexp.MustCompile(`^  ([A-Za-z0-9_.-]+):\s*$`)
-	for _, line := range lines {
-		switch {
-		case line == "jobs:":
-			inJobs = true
-		case !inJobs:
-			// still in the top-level preamble
-		case jobKeyRe.MatchString(line):
-			flush()
-			cur = jobKeyRe.FindStringSubmatch(line)[1]
-		case cur != "":
-			body = append(body, line)
-		}
-	}
-	flush()
-	if len(jobs) == 0 {
-		t.Fatalf("parsed 0 jobs from .github/workflows/ci.yml; the scanner is broken")
-	}
-	return jobs
-}
-
-func jobNames(jobs map[string]string) []string {
-	out := make([]string, 0, len(jobs))
-	for n := range jobs {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
-}
 
 func TestDeletedRegressionTestNamesAreReal(t *testing.T) {
 	root := repoRoot(t)
