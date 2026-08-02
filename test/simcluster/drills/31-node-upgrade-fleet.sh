@@ -38,6 +38,7 @@ set -u
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
 . "$HERE/drills/lib/ingress.sh"; . "$HERE/drills/lib/artifact.sh"
+. "$HERE/drills/lib/upgradecfg.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
@@ -57,39 +58,12 @@ CTL() { "$SIM" ctl -- "$@"; }
 # NB: dexec runs `docker exec` WITHOUT -i, so a heredoc stdin does NOT reach the container. Pass the edit as a
 # python3 -c program (one arg). $INSTANCE is interpolated by the drill shell (double-quoted); the code uses
 # single quotes only, so there is no quote clash.
-_allow_artifact() {
-    # NON-destructive APPEND (indent 2, sibling of broker.cluster). A yaml round-trip rewrite dropped install.sh's
-    # cluster seam and bricked the broker (session create → no active session). broker.yaml is one top-level
-    # `broker:` map, so a 2-space-indented `upgrade:` block appended at EOF lands under broker:.
-    # TWO prefixes: `-artifact/` is the served release; `-mirror/` is a DELIBERATELY WIDER broker entry with no
-    # matching agent entry, so the (b) non-vacuity + F3 probes can present a broker-allowed-but-agent-denied URL
-    # that reaches the AGENT url gate. N1's off-band `evil.invalid` matches NEITHER prefix → still broker-refused.
-    dexec brk1 -- sh -c "grep -q 'url_allow' /etc/tether/broker.yaml || printf '  upgrade:\n    url_allow:\n      - https://%s-artifact/\n      - https://%s-mirror/\n' '$INSTANCE' '$INSTANCE' >> /etc/tether/broker.yaml" \
-        && sctl brk1 restart tether-broker && poll_until 30 2 "brk1 broker back after url_allow config" -- _broker_up
-}
-# labeled DEPLOYMENT config (Mandate ③, NOT compensating for a tether gap): configure the AGENT's OWN upgrade
-# URL allow-list — the #28 FIX (cmd/tether/agent.go resolveAgentUpgradeAllow + internal/agent/upgrade.go:76,
-# which consumes Config.UpgradeURLAllowlist). agent-join runs the daemon FLAGFUL (--session/--nid/--nats-url)
-# but with NO --upgrade-url-allow, and the daemon ALWAYS loads agent.yaml (agent.go:285) — so the yaml's
-# top-level `upgrade.url_allow` is the ONLY lever a systemd-managed agent has, and it is exactly what an
-# operator self-hosting a mirror must set. agent-join writes NO agent.yaml, so this CREATEs a minimal one
-# (only the upgrade block; every other value stays on the unit's flags — a lone `upgrade:` map loads clean
-# under the strict-KnownFields loader). Written as user sim so it stays sim:sim 0600 under the 0700 agent/<sid>
-# tree (install.sh shape). The agent list carries ONLY the `-artifact/` prefix (NOT the broker's wider
-# `-mirror/`) so the (b) non-vacuity + F3 probes can hit the AGENT gate with a broker-allowed-but-agent-denied
-# URL. Then restart + poll ONLINE so the NEW yaml-driven daemon is serving before any upgrade arm runs.
-_allow_artifact_agent() {
-    dexec agt1 -- runuser -u sim -- sh -c "
-        set -e
-        install -d -m 0700 /home/sim/.tether/agent/$SID
-        f=/home/sim/.tether/agent/$SID/agent.yaml
-        grep -q 'url_allow' \"\$f\" 2>/dev/null || {
-            printf 'upgrade:\n  url_allow:\n    - https://%s-artifact/\n' '$INSTANCE' >> \"\$f\"
-            chmod 600 \"\$f\"
-        }" \
-        && sctl agt1 restart tether-agent \
-        && poll_until 30 2 "agt1 back ONLINE after agent.upgrade.url_allow config" -- _pre_agt1_owner
-}
+# Bodies extracted VERBATIM to drills/lib/upgradecfg.sh (shared with drill 33 — upgrade-safety
+# follow-up #2); these thin shells keep 31's call sites and probe wiring unchanged.
+_allow_artifact() { upgradecfg_allow_broker brk1 _broker_up; }
+# Full Mandate-③ rationale (why yaml is the only lever, sim-user 0600 shape, -artifact vs -mirror prefix
+# split) lives with the body in drills/lib/upgradecfg.sh.
+_allow_artifact_agent() { upgradecfg_allow_agent agt1 _pre_agt1_owner; }
 # after a restart, is-active is NOT enough — the broker must be FUNCTIONALLY ready (leader elected) before
 # session create works, or it fails "no active session". Poll the leader view.
 _broker_up() { "$SIM" exec brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id=="brk1"' >/dev/null 2>&1; }
@@ -186,23 +160,26 @@ _allcfg=$("$SIM" ctl -- node upgrade --all --url "$AGENT_DENIED_URL" --sha256 "$
 log "31-DBG --all(agent-denied) rc=$_allcfg_rc out=$(printf '%s' "$_allcfg" | tr '\n' '~')"
 assert_ok "F3 --all dispatched to ONLINE agt1 → aborted on the agent's url_not_allowed_local gate (isConfigError aborts the fleet; reached an agent, not a no-op)"  sh -c '[ "$1" -ne 0 ] && printf "%s" "$2" | grep -q "url_not_allowed_local"' _ "$_allcfg_rc" "$_allcfg"
 assert_ok "F3b --all did NOT dispatch to the OFFLINE agt2 (enumerated out — the abort names agt1, never agt2)"  sh -c '! printf "%s" "$1" | grep -q "agt2"' _ "$_allcfg"
-# F4 — --timeout threading + transient skip-continue: bring agt2 back ONLINE, run --all --timeout 0 → every
-# dispatch hits an immediately-expired context (deadline exceeded = TRANSIENT, node.go:298-313) → --all SKIPS +
-# continues past each node → exit 0 with the "(N skipped)" summary. Proves --timeout is threaded AND the
-# transient-skip path (distinct from F3's config-abort).
+# F4 — --timeout threading under the CANARY contract (upgrade-safety 增量, node.go runUpgradeAll): the
+# FIRST node (lexicographic → agt1) is the canary; ANY canary dispatch failure — transient included —
+# ABORTS the fleet with the rest untouched. So `--all --timeout 0` no longer skip-continues across every
+# node (the pre-upgrade-safety contract this arm used to pin): the canary's immediately-expired context
+# (deadline exceeded = codeless transient) must abort with "canary agt1 failed, 1 node(s) untouched" and
+# agt2 must never be dispatched. Transient SKIP-continue still exists but only for the post-canary rest —
+# deploy-tier not re-provable here without a healthy canary re-exec (that is drill 33's ground; hermetic:
+# test/p10/upgrade_all_test.go TestUpgradeAllSkipsOfflineContinuesNext).
 assert_ok "F4-setup restart agt2 daemon"                      "$SIM" exec agt2 -- systemctl start tether-agent
 assert_ok "F4-setup2 agt2 back ONLINE (2-node fleet again)"   poll_until 45 3 "agt2 ONLINE" -- _ls_has_online agt2
-# external-review R2-M6: capture the exact ONLINE set + rc + per-node skip lines; assert rc=0, distinct skipped
-# count == ONLINE count, both agt1+agt2 skipped, and the exact "(N node(s) skipped...)" summary — NOT just a
-# loose grep for "skipped|transient" (which a nonzero rc + one synthetic skip line would have satisfied).
 _online_n=$(_ls_online_nids | grep -c .)
 _allto=$("$SIM" ctl -- node upgrade --all --timeout 0 --url "$ART_URL" --sha256 "$ART_SHA" 2>&1); _allto_rc=$?
-_skip_n=$(printf '%s' "$_allto" | grep -c 'skipped (transient)')
-log "31-DBG --all --timeout 0 rc=$_allto_rc online_n=$_online_n skip_lines=$_skip_n out=$(printf '%s' "$_allto" | tr '\n' '~')"
-assert_ok "F4a --all --timeout 0 exits 0 (transient-skip CONTINUES + summarises, does NOT abort like F3's config error)"  sh -c "[ '$_allto_rc' = 0 ]"
-assert_ok "F4b every ONLINE node is skipped-transient: distinct skip-line count ($_skip_n) == ONLINE set ($_online_n) AND both agt1+agt2 appear in a 'skipped (transient)' line"  sh -c "[ '$_skip_n' = '$_online_n' ] && [ '$_online_n' -ge 2 ] && printf '%s' \"\$1\" | grep -qE 'agt1 skipped \\(transient\\)' && printf '%s' \"\$1\" | grep -qE 'agt2 skipped \\(transient\\)'" _ "$_allto"
-assert_ok "F4c fleet continues to the EXACT skip summary '($_online_n node(s) skipped due to transient errors...)' (--timeout threaded; transient-skip path, NOT F3's config-abort)"  sh -c "printf '%s' \"\$1\" | grep -qE '\\($_online_n node\\(s\\) skipped due to transient'" _ "$_allto"
-not_covered "31 (external-review M4, honest): a SUCCESSFUL fleet upgrade (PID-preserving re-exec + version bump + two-node summary)" \
-    "DELIBERATELY not exercised here: #28 is FIXED (this drill PROVES the configured URL passes the agent gate), so the success path is now reachable in principle — but a real re-exec would REWRITE the shared binary + re-home the 2-node fleet mid-drill, polluting the enumeration/dispatch/timeout arms. This drill covers the CONTROL surface: agent allow-list flip + non-vacuity (#28), ENUMERATION (F1/F2), DISPATCH + config-abort (F3), --timeout + transient-skip (F4). A dedicated destructive success/PID/version/rollback/--wait drill must be created; it currently has no owner." gap
+log "31-DBG --all --timeout 0 rc=$_allto_rc online_n=$_online_n out=$(printf '%s' "$_allto" | tr '\n' '~')"
+assert_ok "F4a --all --timeout 0 announces the canary hold-back ('canary: agt1' with the rest held) — proves 2-node enumeration reached the canary split"  sh -c "[ '$_online_n' -ge 2 ] && printf '%s' \"\$1\" | grep -q 'canary: agt1'" _ "$_allto"
+assert_ok "F4b canary transient failure ABORTS the fleet non-zero: rc!=0 AND 'canary agt1 failed, 1 node(s) untouched' (a canary that cannot even dispatch must hold the fleet — upgrade-safety plan §5)"  sh -c '[ "$1" -ne 0 ] && printf "%s" "$2" | grep -q "canary agt1 failed, 1 node(s) untouched"' _ "$_allto_rc" "$_allto"
+# origin: external review F6 — enumerating two FAILURE states let a regression through: if the fleet
+# wrongly dispatched agt2 after the canary aborted, the SUCCESS line `✔ lab/agt2: staged …` matched
+# neither "skipped" nor "failed" and the assertion passed. "Untouched" means NO agt2 line of ANY kind.
+assert_ok "F4c agt2 was NEVER dispatched (NO line mentioning agt2 at all — a success line must fail this too, not just skipped/failed)"  sh -c '! printf "%s" "$1" | grep -q "agt2"' _ "$_allto"
+not_covered "31 (external-review M4, honest — rescoped after drill 33 took single-node ownership): a SUCCESSFUL fleet-wide --all rollout (healthy canary COMMITTED + fan-out + two-node summary)" \
+    "DELIBERATELY not exercised here: a real fleet fan-out needs a healthy canary re-exec first, which would REWRITE the shared binary + re-home the 2-node fleet mid-drill, polluting the enumeration/dispatch/timeout arms. Single-node success/PID/version/rollback/--wait is OWNED by drill 33-node-upgrade-success; what remains unowned is only the fleet-wide fan-out after a committed canary. This drill covers the CONTROL surface: agent allow-list flip + non-vacuity (#28 FIXED), ENUMERATION (F1/F2), DISPATCH + config-abort (F3), --timeout + canary-abort (F4)." gap
 
 drill_end

@@ -267,7 +267,11 @@ func TestNolintDirectivesNameEnabledLinters(t *testing.T) {
 	// exemptions inside the host-wide flock closures (their error return
 	// carries LOCK failures only; a bad marker/self-hash is contractually
 	// "nothing to do", not an error). Enumerated in line2-plan §14.1.
-	const expectedDirectives = 34
+	// 34 → 35: external review F4's teardown-specific prev restore adds one nilerr exemption inside
+	// the host-flock closure (same semantics as the four before it: the closure's error return
+	// carries LOCK failures only, and "no pending marker" means there is nothing to restore).
+	// Enumerated in line2-plan §14.1.
+	const expectedDirectives = 35
 	if scanned != expectedDirectives {
 		t.Errorf("the scan found %d //nolint directive(s), expected exactly %d.\n\n"+
 			"MORE: a new exemption was added. Add it to plan §14.1's enumeration and bump this constant in "+

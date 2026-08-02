@@ -22,7 +22,9 @@
 21-smalldisk-tierb	GREEN	0	-	-	21-smalldisk-tierb
 22-forcesingle-online	GREEN	0	-	-	22-forcesingle-online
 30-rolling-upgrade	INCOMPLETE	-	-	30-C-neg-control + leader-hop-HALT + #66 p2 leader-hop write-availability window + #31 grow-lock leak (its [GAP #31] pin lives in THIS drill per the ledger; the owner cell had never named it — R16 ledger hygiene); #70 (grow-concurrency flake, DELIBERATELY NOT banded)	30-rolling-upgrade
-31-node-upgrade-fleet	INCOMPLETE	1	-	#28-FIXED (success-re-exec gap owed a dedicated drill)	31-node-upgrade-fleet
+31-node-upgrade-fleet	INCOMPLETE	1	-	#28-FIXED (single-node success/rollback/--wait owned by 33; fleet --all fan-out after a committed canary remains unowned)	31-node-upgrade-fleet
+33-node-upgrade-success	INCOMPLETE	1	-	#73 (non-tether artifact past the smoke gate: no boot shim, marker pends forever — probe drill or product defense pending)	33-node-upgrade-success
+98-stuck-redial-recovery	INCOMPLETE	1	-	#72 (WSS write-path blackhole not constructable until simcluster fronts wss://; this drill pins the WRITTEN recovery budget over nats:// — the teardown-order contract itself is owned by internal/agent conn_teardown_test.go)	98-stuck-redial-recovery
 32-install-lifecycle	GREEN	0	-	-	32-install-lifecycle
 40-drain-retire	GREEN	0	-	-	40-drain-retire
 41-shrink-to-standalone	INCOMPLETE	2	-	first-retire PROACTIVE fast-path is INTERMITTENT (measured 3/5 runs in-window, incl. a miss at the 210s full-jitter ceiling); the move itself is confirmed, the latency is not bounded	41-shrink-to-standalone

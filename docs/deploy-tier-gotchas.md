@@ -589,8 +589,11 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 
 ### #72 — agent 的 stuck-disconnect watchdog 在取消 session 前同步 `nc.Close()`；WSS close 卡住时 systemd 假活、节点 OFFLINE、数据面暂存
 
-- **状态：🔴 OPEN（2026-08-01 裸机 LIVE-CONFIRMED；症状与阻塞区间已实证，缺触发时 goroutine dump，故最内层
-  阻塞点标为高置信归因而非伪装成已逐帧证明）。** 发现环境不是 simcluster：真实 `systemd --user` agent，已发布
+- **状态：🟡 OPEN — 产品修复已落地（2026-08-01，见文末「修复」段），但 flip 条件未满足**：
+  真 WSS 黑洞 deploy-tier drill 尚不可构造（simcluster 无 wss 前端），故不移入 closed。
+  原始记录（2026-08-01 裸机 LIVE-CONFIRMED；症状与阻塞区间已实证，缺触发时 goroutine dump，
+  故最内层阻塞点标为高置信归因而非伪装成已逐帧证明）如下，**机理段的主嫌疑已被修复轮的逐帧核对订正**
+  （见文末）。 发现环境不是 simcluster：真实 `systemd --user` agent，已发布
   `tether 0.4.7 (proto v2)`；本条仍登记在 deploy-tier 台账，因为只有长驻进程 + 真 WSS/NAT + 真双平面隧道的部署栈
   才呈现该故障。尚无 drill / `assert_bug`，不能据此声称已被自动化钉住。
 
@@ -683,6 +686,56 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   - **可观测性回归**：故障窗口内 health/readiness 必须 RED，即使 PID 存活、socket ESTABLISHED、旧 expose 仍传字节。
   - **flip**：上述 package 回归 + 真 WSS deploy-tier drill 都 GREEN，且多轮运行中 OFFLINE 窗口有硬上界、无资源泄漏、
     revoke/home fencing 不回退，方可将 #72 移入 closed 台账；单次人工 `systemctl restart` 或本次自行恢复不算关闭。
+
+- **修复（2026-08-01 落地，plan：`docs/reviews/gotcha72-teardown-plan.md`）**：
+  - **机理订正**：修复轮逐帧核对 nats.go v1.52.0 后，主嫌疑**从 close-frame flush 改为
+    `doReconnect` 持 `nc.mu` 跨 `createConn`/`processConnectInit`** —— 其中 `net.LookupHost` 无 ctx、
+    `makeTLSConn` 的 `Handshake()` 在 `processConnectInit` 设 deadline **之前**、ws `req.Write` 无写
+    deadline。close-frame flush 反而受 `FlusherTimeout` 约束、且 RECONNECTING 时直接跳过。
+    仍**不升格**为逐帧证明（无现场 dump），但修复覆盖全部三层 + 兜底，不依赖归因收窄。
+  - **产品修复**：teardown 改为状态机——**先 cancel**（纯指针/chan，不碰 nats.go 锁）→ close 放
+    closer goroutine 并限时 **10s** → 超时**粘性毒化**底层 socket（`SetDeadline(过去)+Close`，且此后
+    新拨号一律拒绝）再等 **10s** → 仍卡则升级：**rebuild 场景原地 self-exec**（PID 不变，setsid 也活）、
+    **关停场景 exit 91**。S3/S4 正常返回前 closer 必须 join；S5 以 process replacement/exit
+    终结当前进程，不会把活 closer 带回 `Run`（timeout 后遗弃 goroutine 仍是台账点名的假修复）。
+    恢复硬上界 ≈ redialAfter 20s + 10s + 10s + 重连 ≈ **≤60s**（替换原文的"结构上无硬上界"）。
+    同型缺陷 `rebuildOntoVoter` 一并修复——**外审 F3 订正**：它原先在 cancel 之前调用
+    `nc.ConnectedUrl()`（该 observer 取 `nc.mu.RLock`，正是卡死的那把锁），修复后改读健康期抓取的
+    无锁快照，teardown 路径上不再有任何 `*nats.Conn` observer。
+  - **落点**：`internal/agent/conn_teardown.go`（新）、`roster.go` 两处、`agent.go`（tracker dialer /
+    session finalizer / `rebuilding` 复位顺序）、`usage.md §9.9`。
+  - **钉住**：`conn_teardown_test.go`（顺序/有界/单飞/毒化粘性/escalate 双意图）+
+    `conn_teardown_leak_test.go`（20 轮楔死 teardown 后 goroutine+fd 回基线，用仓库内建泄漏门）+
+    `test/simcluster/drills/98-stuck-redial-recovery.sh`（nats:// 面的恢复回归，ledger owner）。
+  - **残余**：WSS 面在 simcluster 不可构造（98 的 `[GAP #72]`）；DNS 层（`LookupHost` 持锁、无 fd 可毒）
+    是 escalate 存在的理由，如实写在代码与本条。
+  - **外审轮补修（2026-08-02，F1–F4）**：首版仍有三条可绕过状态机的可达路径——`subEvict.Unsubscribe`
+    留在有界 finalizer 之前（defer LIFO，`fin.Do` 根本启动不了）、register 循环用父 ctx 而非 runCtx
+    （连接已 finalize 仍无限重试，session 永不返回）、`rebuildOntoVoter` 的 observer 调用（见上）；
+    另有 escalate 误用普通升级的"旧进程存活"契约（teardown 时本进程可能是 NEW 映像）。四条均已修并有
+    外审提供的反例钉住。**本条在这些修复通过复审前，不应被读作"#72 已闭合"**。
+
+### #73 — 能骗过冒烟门 version 串的非 tether 产物 ⇒ 无 boot shim ⇒ 升级永 pending、NAT 后节点永久失联
+
+- **状态：🔴 OPEN（upgrade-safety success-drill 规划轮推理定格；33 drill 以 `not_covered[gap]` 指认，
+  尚无自动化复现——登记先于 drill 实测，威胁形态本身不依赖实测）。**
+- **形态**：`node upgrade` 的冒烟门只验证候选产物 exec 后按冻结格式回答 `tether <release> (proto vN)`
+  且纪元相等（architecture §21.3）。一个**不是 tether 的产物**（如打印该行的脚本/别的程序——真实事故
+  形态是 CI 打包错产物，sha 由 operator 自己背书所以 sha 门不设防）能通过冒烟并被 flip + exec。
+  此后三层收敛器**全部旁路**：产物没有 Go boot shim ⇒ boot 预算永不消耗；watchdog 活在被 exec 掉的
+  旧进程里 ⇒ 随之消亡；marker 永 pending ⇒ 后续 `node upgrade` 重试被入口门拒到 deadline、之后的
+  重试又对**同一坏产物域**反复 staging。supervisor 拉起的永远是坏产物，节点在 NAT 后永久失联，
+  `.prev` 里的好二进制在盘上无人问津。
+- **与 §21.3 已接受窗口的边界**：架构接受的"崩得早于启动检查"窗口，前提是**产物是 tether 二进制**
+  （静态 Go、shim 在 main() 最前）。非 tether 产物令该前提整体失效——这不在已接受窗口内，是真 gap。
+- **运维处置**：只用 goreleaser 产物 + `SHA256SUMS` 的哈希（照 broker-ops §8.6/8.7 的发布流程走，
+  别给手工拼的 tarball 背书）；中招后需带外访问：恢复 `<二进制>.prev` 覆盖 dst 并重启 unit。
+- **产品修复方向（未定案）**：冒烟门加"产物自证 shim"——例如候选以专用参数运行时必须回显 marker
+  相关的自证信息（仅新产物会实现；对老产物退化为现状，不破坏 N-1 窗口）；或 `version` 输出加入可验证
+  的构建自证。任何方案都要过"不把冒烟门变成假安全感"的外审。
+- **钉住它的**：`test/simcluster/drills/33-node-upgrade-success.sh` 的 `not_covered[gap]` 指认本条；
+  hermetic 面 `TestSmokeVersionTable` 已钉冒烟门对格式/纪元的拒绝（但对"格式全对的非 tether 产物"
+  结构上不可判——这正是 gap 所在）。owner 待定：34 号探针 drill 或产品防御，二选一后 flip。
 
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 

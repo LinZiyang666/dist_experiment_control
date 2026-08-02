@@ -63,6 +63,75 @@ R9-D rewrite: assert_fail=0 in r9d-b + r9d-c + r9d-d (pass=50/53/53). The 2 gaps
 
 R15: stable across both runs
 
+upgrade-safety follow-up (2026-08-01): F4 rewritten for the CANARY contract (`--all --timeout 0` now
+aborts on the canary's transient failure instead of skip-continuing across the fleet — a product
+behavior change this drill would have caught red on its next run); allow-config bodies extracted to
+drills/lib/upgradecfg.sh (thin shells, behavior unchanged); nc_gap rescoped — single-node
+success/rollback/`--wait` ownership moved to drill 33, only the fleet-wide fan-out after a committed
+canary remains here. **REAL RUN 2026-08-02: INCOMPLETE, pass=30, assert_fail=0, nc_gap=1 — matches
+this row.** The first attempt ran against a STALE sim image and the three new F4 assertions went red
+on the pre-canary binary — an unplanned but decisive two-sided proof that they have teeth: red on the
+old contract, green on the new one after `./local.sh --build build`.
+
+## 98-stuck-redial-recovery
+
+- **batch**: `gotcha #72 fix`  _(expected/owner authoritative in expected-verdicts.tsv)_
+
+Born INCOMPLETE/1 by design and honestly scoped: this is the POST-FIX bounded-teardown RECOVERY
+regression over nats:// (black-hole the connected broker's client port, assert heartbeat resumes via
+another voter within the written budget, classify the recovery path by MainPID three ways) — NOT a
+pre-fix reproduction of #72 itself: the live incident rode a half-dead wss:// handshake and simcluster
+fronts no wss:// listener, so that arm is the drill's own [GAP #72] and the ledger's flip condition.
+The row exists from the fix increment's day one so ledger-crosscheck has a non-GREEN owner for #72
+(gotcha stays OPEN until the wss arm lands and runs GREEN repeatedly). Plan: docs/reviews/gotcha72-teardown-plan.md.
+
+**REAL RUN 2026-08-02 (weilandserver): INCOMPLETE, pass=13, assert_fail=0, nc_gap=1 — matches this
+row.** Five rounds, and the IMPACT arm (added by internal review F98-2: prove the fault bit the LIVE
+connection before claiming any recovery) caught every one of them:
+  1. "the agent is on brk1 because agent-join dialled it first" — WRONG on a 3-voter cluster: after
+     the agent adopts the signed roster its dial pool is VOTER-first with an intra-voter shuffle.
+  2. "whichever broker LOGGED the register holds the connection" — also wrong: register is a
+     QUEUE-GROUP subject, so the handling member need not own the TCP connection. (Measured runs put
+     the agent on brk2 and later brk3.) The authoritative source is nats-server's own `/connz`,
+     which drill 41 already uses; the drill now discovers the edge from it and asserts recovery
+     against it too.
+  3. A "heartbeat stalls" impact probe compared against a watermark captured BEFORE the discovery
+     and injection steps, so the heartbeat had already advanced past it through the healthy link.
+     Replaced by the unambiguous fact from the same source: the client connection LEFT the cut broker.
+  4. The recovery budget was 90s — structurally unsatisfiable, and its one PASS was luck. tether does
+     not set `nats.Options.PingInterval`/`MaxPingsOut`, so under a SILENT DROP (no RST) nats.go takes
+     up to ~4min to declare the disconnect. Budget re-derived term by term to 330s and written into
+     the script. The product's published ≤60s bound covers only the part AFTER that declaration
+     (usage.md §9.9), so a drill measuring detection + recovery must budget for both.
+
+## 33-node-upgrade-success
+
+- **batch**: `upgrade-safety follow-up`  _(expected/owner authoritative in expected-verdicts.tsv)_
+
+Born INCOMPLETE/1 by design: the drill's own not_covered names gotcha #73 (a NON-tether artifact that
+fakes the frozen version line passes the smoke gate and then has no boot shim — budget never ticks,
+marker pends forever). Staging that artifact would wedge agt1 into exactly the stranded state it
+describes, so the gap is registered, not exercised; it flips when #73 lands an owner (probe drill 34
+or a product shim-self-attestation defense). Plan and oracle table: docs/reviews/upgrade-success-drill-plan.md.
+
+**REAL RUN 2026-08-02 (weilandserver, `./local.sh drill`): INCOMPLETE, pass=29, assert_fail=0,
+nc_gap=1 — matches this row.** The expected verdict is now measured, not claimed.
+
+Took four rounds, and every red was THIS DRILL'S ORACLE — the product behaved correctly on the very
+first run (real in-place `syscall.Exec` with PID and `ExecMainStartTimestamp` unchanged, real 120s
+watchdog rollback, real domain refusal, real domain release). The oracle defects, worth recording
+because two of them are traps any future drill can fall into:
+  1. `jq .release` — the wire field is `release_version` (proto.NodeListEntry). OLD_RELEASE captured
+     the literal "null" and five downstream assertions silently compared against it.
+  2. C's phrase-pin. ctl replaces the agent's own sentence with the operator HINT keyed by the wire
+     code, so the three `upgrade_in_progress` emitters are indistinguishable from the ctl side. Now
+     pinned on the `agent_rejected:` prefix (proves it came from the agent process, not the broker);
+     WHICH gate fired stays owned by the hermetic test that can read the raw reply.
+  3. Reading the broker log from journald. install.sh's broker unit sets
+     `StandardOutput=append:/var/log/tether/broker.log`, so `journalctl -u tether-broker` is EMPTY by
+     construction — the first "fix" (widening the journal window) did nothing, which is what exposed
+     the real cause. Read the file the unit writes.
+
 ## 32-install-lifecycle
 
 - **batch**: `-`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_

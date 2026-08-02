@@ -901,7 +901,9 @@ N-1 纪元的端发布在 `tether.v(N-1).*` 主题树上——在双订阅（§2
 - **已知 GAP（如实标注，不弥补）**：setsid-nohup 无监督路径下"起来即崩"无人拉起（与增量前同险）；
   "崩得早于启动检查"的窗口 = boot shim 之前的 Go 运行时初始化（外审 F2 订正：在 shim 前置到
   Cobra 解析之前**以前**，这个窗口其实覆盖 flag/YAML/logger 整个启动面，旧论断"极窄"不成立；
-  前置后才真正只剩运行时初始化，静态二进制已过真实 exec 冒烟，接受）；
+  前置后才真正只剩运行时初始化，静态二进制已过真实 exec 冒烟，接受）——⚠ 该接受以**产物是 tether
+  二进制**为前提：一个格式全对的**非 tether 产物**骗过冒烟后没有 shim，预算/watchdog/marker 三层
+  收敛器全旁路、节点永久失联，这不在接受窗口内，见 deploy-tier-gotchas **#73**（OPEN）；
   register 成功但行为异常不在承诺边界内——运维手段是金丝雀 + 手动指旧版本 URL 再升一次。
 - co-located agent 的 `ReExecOnly` 路径**不进状态机**（bin 目录 root-owned，`cluster upgrade`
   已有 staging + sha + quorum 保护）。

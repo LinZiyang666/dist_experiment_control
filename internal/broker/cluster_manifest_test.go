@@ -87,9 +87,32 @@ func TestManifestNoSecrets(t *testing.T) {
 	if strings.Contains(s, string(seed)) {
 		t.Fatal("manifest must NEVER contain the raw account signing seed")
 	}
-	for _, forbidden := range []string{"SUA", "SUB", "SAA", "SAB", "PRIVATE", "BEGIN ", "account.nk", "session_pin", "\"pin\""} {
+	// origin: upgrade follow-ups e2e run 2026-08-02 — FLAKE FIX, not a weakening.
+	//
+	// The seed-prefix needles are 3-char substrings, and they were grepped over the WHOLE body,
+	// which includes the account PUBLIC key. A public key is random base32: roughly a 1-in-a-few-
+	// hundred chance per run that it contains "SUB"/"SAA"/… by luck, and the suite duly failed one
+	// e2e round on the public key `…BSUBDJZIQJH2MIODZ2` — a false accusation with a scary message.
+	//
+	// A seed can only ever appear as a WHOLE token in this JSON (a field value, never spliced into
+	// the middle of another key), so match the token boundary instead: scan the decoded values for
+	// a string that STARTS with a seed prefix and has nkey length. That keeps the guard's real
+	// power — a leaked seed still fails — while making a lucky public key impossible to accuse.
+	// The literal-substring needles that cannot collide (PEM markers, filenames, field names) stay
+	// as plain Contains.
+	for _, forbidden := range []string{"PRIVATE", "BEGIN ", "account.nk", "session_pin", "\"pin\""} {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("manifest must not contain %q: %s", forbidden, s)
+		}
+	}
+	for _, tok := range manifestStringTokens(t, body) {
+		if tok == accountPub {
+			continue // the account PUBLIC key is required to be here (asserted below)
+		}
+		for _, pfx := range []string{"SUA", "SUB", "SAA", "SAB"} {
+			if strings.HasPrefix(tok, pfx) && len(tok) >= 56 {
+				t.Fatalf("manifest carries what looks like an nkey SEED (%s…): %s", pfx, s)
+			}
 		}
 	}
 	if !strings.Contains(s, accountPub) {
@@ -106,4 +129,33 @@ func TestManifestServesFromCache(t *testing.T) {
 	if string(b1) != string(b2) {
 		t.Fatal("a second GET within the cache window must serve byte-identical cached bytes")
 	}
+}
+
+// manifestStringTokens decodes the manifest and returns every string VALUE and KEY in it, so the
+// seed-prefix guard above can match whole tokens instead of grepping raw bytes (see its comment).
+func manifestStringTokens(t *testing.T, body []byte) []string {
+	t.Helper()
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("manifest is not valid JSON: %v", err)
+	}
+	var out []string
+	var walk func(any)
+	walk = func(n any) {
+		switch x := n.(type) {
+		case map[string]any:
+			for k, sub := range x {
+				out = append(out, k)
+				walk(sub)
+			}
+		case []any:
+			for _, sub := range x {
+				walk(sub)
+			}
+		case string:
+			out = append(out, x)
+		}
+	}
+	walk(v)
+	return out
 }

@@ -396,7 +396,7 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
 		// a stale route island after the broker is removed. Trigger a single session rebuild only
 		// after the signed roster was actually accepted (verified, non-rollback and persisted).
 		if accepted && rosterRequiresReconnect(previous, resp.Roster, nc.ConnectedUrl()) {
-			a.requestRosterReconnect(nc)
+			a.requestRosterReconnect()
 		}
 	}
 	return true // a single/non-cluster broker (nil roster) is a successful no-op, not a retry
@@ -459,28 +459,50 @@ func rosterBrokerMatchesHost(b proto.RosterBroker, host string) bool {
 	return err == nil && ru.Hostname() != "" && strings.EqualFold(host, ru.Hostname())
 }
 
-func (a *Agent) requestRosterReconnect(nc *nats.Conn) {
-	a.rebuildOntoVoter(nc, "agent: current broker is leaving the signed roster; rebuilding NATS session on a voter")
+// nc dropped for the same reason as rebuildOntoVoter's (external review F3): nothing on this path
+// may touch the *nats.Conn before the finalizer has cancelled.
+func (a *Agent) requestRosterReconnect() {
+	a.rebuildOntoVoter("agent: current broker is leaving the signed roster; rebuilding NATS session on a voter")
 }
 
 // rebuildOntoVoter tears the current session down so the Run loop re-dials the freshest pool. It
 // single-flights via `rebuilding` (returns false if a rebuild is already in flight); the shared
 // body for both the roster-says-leaving path (requestRosterReconnect) and the broker-silence path
 // (rebuildOnBrokerSilence). reason is logged.
-func (a *Agent) rebuildOntoVoter(nc *nats.Conn, reason string) bool {
+// origin: gotcha #72 — the SAME Close-before-cancel defect as fireRedial lived here (this path is
+// reached from the roster-says-leaving and broker-silence callbacks, both of which run while the
+// link may already be half-dead). Same fix, same reasons: bounded finalizer, cancel first.
+// origin: external review F3 — `nc` is GONE from the signature on purpose. It existed only to call
+// nc.ConnectedUrl() for the log line, and that observer takes the very mutex a wedged doReconnect
+// holds. Keeping an unused *nats.Conn parameter here would be an open invitation to "just peek at
+// the conn" again; the connected URL now comes from the lock-free healthy-period snapshot.
+func (a *Agent) rebuildOntoVoter(reason string) bool {
 	if !a.rebuilding.CompareAndSwap(false, true) {
 		return false
 	}
 	a.rebuildRequested.Store(true)
-	a.cfg.Logger.Warn(reason, "connected_url", nc.ConnectedUrl())
-	nc.Close()
+	// origin: external review F3 (BLOCKER) — read the lock-free snapshot, never nc.ConnectedUrl():
+	// that observer takes nc.mu.RLock, which a wedged doReconnect holds in write across a
+	// no-deadline dial/handshake, so this log line alone could hang the whole teardown before
+	// cancel-first ran. `nc` stays in the signature for the caller's identity checks only.
+	a.cfg.Logger.Warn(reason, "connected_url", a.connectedURLSnapshot())
+	if fin := a.loadSessionFinalizer(); fin != nil {
+		fin.Do(teardownRebuild)
+		return true
+	}
 	a.sessCancelMu.Lock()
 	cancel := a.sessCancel
 	a.sessCancelMu.Unlock()
 	if cancel != nil {
 		cancel()
+		return true
 	}
-	return true
+	// Same rollback as fireRedial (internal review CT-2 / S5): with neither a finalizer nor a
+	// cancel there is no session to rebuild, and latched flags would disarm the successor.
+	a.rebuilding.Store(false)
+	a.rebuildRequested.Store(false)
+	a.cfg.Logger.Warn("agent: rebuild requested with no live session to tear down; rolled back the rebuild flags")
+	return false
 }
 
 // rebuildOnBrokerSilence (#48) fires when the current broker has gone silent. It only acts when the
@@ -498,7 +520,7 @@ func (a *Agent) rebuildOnBrokerSilence(nc *nats.Conn) bool {
 		return false
 	}
 	a.setAvoidHost(host)
-	if !a.rebuildOntoVoter(nc, "agent: current broker went silent (no roster reply — retired-broker island); rebuilding onto a known voter") {
+	if !a.rebuildOntoVoter("agent: current broker went silent (no roster reply — retired-broker island); rebuilding onto a known voter") {
 		return false // a rebuild is already in flight; the avoid hint is consumed next connect
 	}
 	fireAfterSilenceEscape(a, host)
@@ -598,23 +620,42 @@ func (a *Agent) stopRedialWatchdog() {
 // fireRedial rebuilds the session when nats.go has been stuck-disconnected past redialAfter (its boot
 // pool is dead — exactly the case a newly-added broker rescues). It single-flights via `rebuilding`
 // (so onNATSReconnect no-ops on the dying conn — no double-subscribe), signals the session loop to
-// return rebuild=true, Closes the dying conn (Close does NOT fire ReconnectHandler), and cancels the
-// session ctx to unblock heartbeatLoop.
+// return rebuild=true, and hands the dying session to its BOUNDED FINALIZER, which cancels the
+// session ctx FIRST and only then runs a budgeted close.
+//
+// origin: gotcha #72 — ORDER IS THE FIX. This used to call nc.Close() synchronously and cancel the
+// session ctx only afterwards; nats.go's Close takes the same nc.mu that doReconnect holds across a
+// no-deadline DNS lookup / TLS / ws handshake, so on a half-dead link the cancel this watchdog
+// exists to deliver sat behind a block that lasted 10m58s in the field. Now: pin the dying session's
+// finalizer (never re-read ncBox — a late close must not target the successor), then let the
+// finalizer cancel FIRST and run the close under a budget with poisoning + escalation behind it.
 func (a *Agent) fireRedial() {
 	if !a.rebuilding.CompareAndSwap(false, true) {
 		return
 	}
 	a.rebuildRequested.Store(true)
 	a.cfg.Logger.Warn("agent: NATS stuck-disconnected; rebuilding session on the freshest roster")
-	if nc := a.ncBox.Load(); nc != nil {
-		nc.Close()
+	if fin := a.loadSessionFinalizer(); fin != nil {
+		fin.Do(teardownRebuild)
+		return
 	}
+	// No finalizer published (a rebuild fired before this session installed one): fall back to the
+	// cancel alone. NEVER a bare nc.Close() here — that is the unbounded call this fix removed.
 	a.sessCancelMu.Lock()
 	cancel := a.sessCancel
 	a.sessCancelMu.Unlock()
 	if cancel != nil {
 		cancel()
+		return
 	}
+	// origin: internal review CT-2 (S5) — NOTHING to tear down: a stale timer fired inside the
+	// successor's connect window, before that session published either a finalizer or a cancel.
+	// Leaving `rebuilding`/`rebuildRequested` latched would silently disarm the NEXT session
+	// (onNATSReconnect early-returns while rebuilding, the roster refresh loop skips, the redial
+	// watchdog self-cancels) and would make a later clean shutdown read as a rebuild. Roll back.
+	a.rebuilding.Store(false)
+	a.rebuildRequested.Store(false)
+	a.cfg.Logger.Warn("agent: stale redial fired with no live session to tear down; rolled back the rebuild flags")
 }
 
 // setRunCtx / loadRunCtx synchronize a.runCtx across the session goroutine (which rewrites it every

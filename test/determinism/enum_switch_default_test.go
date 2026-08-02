@@ -57,7 +57,11 @@ import (
 // TestEnumFamiliesCoverEveryIotaEnum below re-derives this list from source and fails when an enum
 // appears without an entry, so the 3/13 state cannot recur silently.
 var enumFamilies = map[string][]string{
-	"agent.openOutcome":            {"openState", "openPort", "opened"},
+	"agent.openOutcome": {"openState", "openPort", "opened"},
+	// origin: gotcha #72 — the bounded-teardown ladder's caller intent. Two members today
+	// (rebuild / shutdown) with genuinely different terminal moves (self-exec vs exit); a third
+	// would need its own, so a `default:` over this must never be allowed to silence exhaustive.
+	"agent.teardownIntent":         {"teardown"},
 	"agent.transferMode":           {"mode"},
 	"authcallout.role":             {"role"},
 	"broker.admitRole":             {"admit"},

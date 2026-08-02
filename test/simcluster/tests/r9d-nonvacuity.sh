@@ -406,5 +406,47 @@ WH1=brk1; WH2=brk1; rm -f "$TMP/whl"; expect T "TRUE  stable leader (brk1 == brk
 WH1=brk1; WH2=brk2; rm -f "$TMP/whl"; expect F "MUTATION leadership CHURNS (brk1 → brk2) → must RED (re-seed risk)" _wh_leader_stable
 WH1='';   WH2='';   rm -f "$TMP/whl"; expect F "MUTATION no leader visible (empty) → fail closed"                  _wh_leader_stable
 
+section "drill 33 — _b3_pending_staged / _b4_rolled_back (the whole-conjunction upgrade oracles)"
+eval "$(extract "$SIMDIR/drills/33-node-upgrade-success.sh" _b3_pending_staged _b4_rolled_back)"
+# stub every probe the conjunctions compose (the drill's probes do container IO; the conjunction LOGIC is
+# what must be two-sided). PID0/NEXTBIN_SHA/OLD_SHA are the drill globals the functions read.
+_marker_json()    { [ -n "$NV_MARKER" ] && printf '%s' "$NV_MARKER"; }
+_dst_sha()        { printf '%s' "$NV_DST"; }
+_mainpid()        { printf '%s' "$NV_PID"; }
+_exe_sha_of_pid() { printf '%s' "$NV_EXE"; }
+_prev_gone()      { [ "$NV_PREVGONE" = 1 ]; }
+PID0=777; NEXTBIN_SHA=shaNEW; OLD_SHA=shaOLD
+M_B3='{"state":"pending","boot_count":1}'
+NV_MARKER=$M_B3; NV_DST=shaNEW; NV_PID=777; NV_EXE=shaNEW; NV_PREVGONE=0
+expect T "TRUE  B3 on the full pending conjunction (pending ∧ boot_count>=1 ∧ dst==NEW ∧ pid ∧ exe==NEW)" _b3_pending_staged
+NV_MARKER='{"state":"pending","boot_count":0}'
+expect F "MUTATION B3 boot_count==0 (install-time marker; the staged image never booted) → must RED" _b3_pending_staged
+NV_MARKER='{"state":"committed","boot_count":1}'
+expect F "MUTATION B3 already committed → not the pending window"                                    _b3_pending_staged
+NV_MARKER=$M_B3; NV_DST=shaOLD
+expect F "MUTATION B3 dst still OLD (flip never happened) → must RED"                                _b3_pending_staged
+NV_DST=shaNEW; NV_PID=888
+expect F "MUTATION B3 MainPID changed (a supervisor restart, not an in-place exec) → must RED"       _b3_pending_staged
+NV_PID=777; NV_EXE=shaOLD
+expect F "MUTATION B3 running image is OLD (flip-without-exec) → must RED"                           _b3_pending_staged
+NV_MARKER=''
+expect F "MUTATION B3 marker unreadable → fail closed"                                               _b3_pending_staged
+
+M_B4='{"state":"rolled_back","detail":"register deadline exceeded (2m0s) without a successful register"}'
+NV_MARKER=$M_B4; NV_DST=shaOLD; NV_PID=777; NV_EXE=shaOLD; NV_PREVGONE=1
+expect T "TRUE  B4 on the full rollback conjunction (rolled_back ∧ watchdog Detail ∧ dst==OLD ∧ prev consumed ∧ pid ∧ exe==OLD)" _b4_rolled_back
+NV_MARKER='{"state":"rolled_back","detail":"syscall.Exec of the new binary failed: x"}'
+expect F "MUTATION B4 exec-fail sibling Detail → must NOT be laundered into the watchdog leg"         _b4_rolled_back
+NV_MARKER='{"state":"rolled_back","detail":"boot: budget/deadline exhausted (boot_count=3/3, deadline=x)"}'
+expect F "MUTATION B4 boot-budget sibling Detail → must NOT be laundered into the watchdog leg"       _b4_rolled_back
+NV_MARKER=$M_B4; NV_PREVGONE=0
+expect F "MUTATION B4 .prev still present (restore rename never consumed it) → must RED"              _b4_rolled_back
+NV_PREVGONE=1; NV_DST=shaNEW
+expect F "MUTATION B4 dst still NEW (no restore happened) → must RED"                                 _b4_rolled_back
+NV_DST=shaOLD; NV_EXE=shaNEW
+expect F "MUTATION B4 running image still NEW (marker written but no re-exec into the restored dst) → must RED" _b4_rolled_back
+NV_EXE=shaOLD; NV_MARKER=''
+expect F "MUTATION B4 marker unreadable → fail closed (internal review TQ-7: B3 had this arm, B4 did not)" _b4_rolled_back
+
 printf '\n─────────────────────────────────────────────\nnonvacuity: %s proved, %s FAILED\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

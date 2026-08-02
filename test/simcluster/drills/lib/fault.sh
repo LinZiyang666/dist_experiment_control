@@ -11,12 +11,17 @@
 # easier — it removes tether's ability to notice the failure quickly. If a drill ever needed a rule to make
 # a tether command SUCCEED, that is a defect to expose, not a rule to keep.
 #
-# THREE DISTINCT FAILURE SEMANTICS — pick deliberately, they are NOT interchangeable:
+# FOUR DISTINCT FAILURE SEMANTICS — pick deliberately, they are NOT interchangeable:
 #   partition (iptables DROP)  packets vanish. Sockets hang. tether learns nothing until its own timeouts
 #                              fire. This is a NETWORK PARTITION.
 #   crash     (node_kill)      process gone, kernel RSTs. Peers learn INSTANTLY. This is a HOST DEATH.
 #   freeze    (SIGSTOP)        socket still open, kernel still ACKs into a filling receive buffer, systemd
 #                              Restart= never fires. This is a WEDGED-BUT-ALIVE broker.
+#   syn-block (SYN-only DROP)  ESTABLISHED flows keep working; every NEW outbound connection to the port
+#                              black-holes. This is a STATEFUL-MIDDLEBOX / NAT-rebind failure — the weak-NAT
+#                              shape broker-ops §8.7 documents for upgrade-rollback (drill 33): the old
+#                              agent's live registration survives while the re-exec'd new process can
+#                              never complete its first register.
 #
 # THE DROP-vs-REJECT DISCRIMINATOR IS A FIRST-CLASS ASSERTION, NOT A CONVENTION.
 #   fault_assert_blackholed -> connect HANGS  -> `timeout` kills it -> rc 124
@@ -99,6 +104,43 @@ fault_partition_on() {
 fault_partition_off() {
     dexec "$1" -- iptables -F "$FAULT_CHAIN" >/dev/null 2>&1 || true
     log "fault: healed $1 (flushed $FAULT_CHAIN)"
+}
+
+# fault_synblock_on <node> <port> : drop only OUTBOUND SYNs to <port> (drill 33's upgrade-rollback
+# instrument). ESTABLISHED flows are untouched — deliberately ASYMMETRIC vs fault_partition_on: the point
+# is that the still-running old agent's registration stays ONLINE while any NEW connection (the re-exec'd
+# binary's first register dial) black-holes until the 120s watchdog rolls back. Lives in the SIMFAULT
+# chain like every other rule so the single-flush cleanup discipline holds. `--syn` expands to
+# `--tcp-flags FIN,SYN,RST,ACK SYN` (spike-verified on the sim image's nf_tables backend).
+fault_synblock_on() {
+    _fs_node=$1; _fs_port=$2
+    [ -n "${_fs_port:-}" ] || { err "fault_synblock_on <node> <port> — no port given"; return 1; }
+    _fault_chain_ensure "$_fs_node" || { err "fault_synblock_on: could not create $FAULT_CHAIN on $_fs_node"; return 1; }
+    dexec "$_fs_node" -- iptables -A "$FAULT_CHAIN" -p tcp --syn --dport "$_fs_port" -j DROP >/dev/null 2>&1 \
+        || { err "fault_synblock_on: iptables failed on $_fs_node port $_fs_port"; return 1; }
+    log "fault: syn-blocked $_fs_node -> :$_fs_port (new connections black-hole, established flows live)"
+}
+
+# fault_synblock_off <node> : heal. Same single-flush contract as fault_partition_off.
+fault_synblock_off() { fault_partition_off "$1"; }
+
+# fault_partition_peer_on <node> <peer> <port> : DROP <node>'s traffic to/from ONE PEER's <port>,
+# leaving every other peer reachable. origin: internal review F98-1 — fault_partition_on is
+# deliberately PEER-AGNOSTIC (it cuts a port toward everyone), so using it for "cut the connected
+# broker, recover via another voter" black-holes the failover targets too and there is no recovery
+# path left to measure. The peer's container IP is resolved through docker (the sim network's own
+# DNS), so this cuts exactly one edge of the mesh.
+fault_partition_peer_on() {
+    _fpp_node=$1; _fpp_peer=$2; _fpp_port=$3
+    [ -n "${_fpp_port:-}" ] || { err "fault_partition_peer_on <node> <peer> <port> — missing args"; return 1; }
+    _fpp_ip=$(d inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(ctr_name "$_fpp_peer")" 2>/dev/null)
+    [ -n "$_fpp_ip" ] || { err "fault_partition_peer_on: could not resolve $_fpp_peer's container IP"; return 1; }
+    _fault_chain_ensure "$_fpp_node" || { err "fault_partition_peer_on: could not create $FAULT_CHAIN on $_fpp_node"; return 1; }
+    dexec "$_fpp_node" -- sh -c "
+        iptables -A $FAULT_CHAIN -p tcp -d $_fpp_ip --dport $_fpp_port -j DROP
+        iptables -A $FAULT_CHAIN -p tcp -s $_fpp_ip --sport $_fpp_port -j DROP
+    " >/dev/null 2>&1 || { err "fault_partition_peer_on: iptables failed on $_fpp_node"; return 1; }
+    log "fault: partitioned $_fpp_node -> $_fpp_peer($_fpp_ip):$_fpp_port only (other peers still reachable)"
 }
 
 # fault_cleanup_all : unconditional teardown for the drill's single EXIT trap (R-TRAP). Flushes the chain

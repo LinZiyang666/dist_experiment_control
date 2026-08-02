@@ -130,6 +130,12 @@ func TestRosterRefreshTriggersProactiveRehomeOffALeavingBroker(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newRosterRehomeAgent(t, accountPub)
+			// origin: internal review CT-2 (S5) — publish a session cancel so this fixture
+			// represents a LIVE session. rebuildOntoVoter now rolls the rebuild flags back when
+			// there is neither a finalizer nor a cancel (nothing to tear down: latching them
+			// would disarm the successor session). Without this line the fixture would exercise
+			// that rollback instead of the wiring this test is about.
+			a.setSessionCancel(func() {})
 			seedRoster := mustBuildRoster(t, seed, accountPub, seedGen, tc.prev)
 			if !a.adoptRoster(seedRoster) {
 				t.Fatal("fixture: the agent must adopt the initial signed roster")

@@ -28,6 +28,7 @@ import (
 	"io"
 	"log/slog"
 	mrand "math/rand/v2"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -138,6 +139,25 @@ type Config struct {
 	// inject an observing fake to assert "exec'd with the restored path"
 	// without replacing the go-test binary.
 	UpgradeExecFn func(exePath string) error
+
+	// TeardownEscalateFn replaces the S5 escalation of the bounded-teardown
+	// ladder (gotcha #72): nil in production, where a wedged rebuild teardown
+	// self-execs in place and a wedged shutdown exits non-zero. Tests inject an
+	// observer so the escalation can be asserted without replacing or killing
+	// the test binary. The argument is "rebuild" or "shutdown".
+	TeardownEscalateFn func(intent string)
+
+	// TeardownCloseFn replaces the actual nats.Conn close the bounded-teardown
+	// ladder performs (gotcha #72): nil in production (nc.Close). Tests use it
+	// to park the close until the tracked conn is poisoned, reproducing the
+	// field wedge deterministically without a half-dead network.
+	TeardownCloseFn func(nc *nats.Conn)
+
+	// TeardownDialFn replaces the raw dialer the connTracker wraps (gotcha #72
+	// test seam): nil in production, where the tracker wraps the proxy-aware
+	// dialer. A test hands back a conn whose Write blocks forever, reproducing
+	// the field hang deterministically through real nats.go frames.
+	TeardownDialFn func(ctx context.Context, network, address string) (net.Conn, error)
 
 	// UpgradeRunningImagePath overrides where the upgrade state machine reads
 	// THIS PROCESS'S OWN executing image from when it needs proof that "we
@@ -293,6 +313,17 @@ type Agent struct {
 	upgradeMu           sync.Mutex
 	upgradeWatchdogStop context.CancelFunc
 	upgradeBootProofID  string
+
+	// sessFin publishes the CURRENT session's bounded-teardown finalizer to the
+	// callback goroutines that must tear a session down without owning it
+	// (fireRedial / rebuildOntoVoter — gotcha #72). Same mutex discipline as
+	// sessCancel: rewritten every session, read from other goroutines.
+	sessFinMu sync.Mutex
+	sessFin   *sessionFinalizer
+	// sessTracker holds the connTracker built for the connection currently being dialed, until
+	// session() hands it to that session's finalizer (takeSessionTracker).
+	sessTrackerMu sync.Mutex
+	sessTracker   *connTracker
 	// upgradeInstallMu (internal review S2) makes the WHOLE install pipeline
 	// (entry gate → download → smoke → prev slot → marker → flip) mutually
 	// exclusive with itself: every forwarded upgrade message runs in its own
@@ -379,6 +410,11 @@ type Agent struct {
 	// after connectNATS and re-stored in onNATSReconnect (the pointer is stable
 	// across nats.go auto-reconnect, but we re-store defensively).
 	ncBox atomic.Pointer[nats.Conn]
+
+	// connURLBox is the lock-free snapshot of the current connection's URL, taken while the link is
+	// healthy (external review F3). Teardown/logging paths read THIS, never nc.ConnectedUrl(),
+	// because every *nats.Conn observer takes the mutex a wedged doReconnect is holding.
+	connURLBox atomic.Pointer[string]
 
 	// proxyPublicPort is the lock-free mirror of the embedded proxy's public
 	// port (0 when not serving). The tunnel hook reads it to FILTER: only the
@@ -685,6 +721,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		rebuild, err := a.session(ctx)
 		// The dying session's defers have run (conn drained, subs gone); allow the next
 		// session's onNATSReconnect to operate again, and reset the rebuild request.
+		//
+		// origin: gotcha #72 — this clear MUST stay behind session()'s return, and session()'s
+		// teardown defer now BLOCKS on the bounded finalizer (which joins its closer goroutine).
+		// That ordering is load-bearing twice over: clearing `rebuilding` early would let a late
+		// nats.go reconnect on the DYING conn pass the ReconnectHandler's guard and re-subscribe
+		// (double dispatch), and would let a late close target the SUCCESSOR's connection. The
+		// finalizer's poison+escalate ladder is what keeps that block bounded instead of
+		// reintroducing the hang one frame up.
 		a.rebuilding.Store(false)
 		a.rebuildRequested.Store(false)
 		if err != nil {
@@ -721,27 +765,70 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// double-fault. cancelRun is deferred at its original position below (preserving teardown LIFO).
 	runCtx, cancelRun := context.WithCancel(ctx)
 	a.setRunCtx(runCtx)
+	// Clear only a PREVIOUS session's watchdog before this connection can publish disconnect
+	// callbacks. Doing this after connectNATS returns races an immediate DisconnectErrHandler: the
+	// new session can arm its only watchdog and then have session() silently cancel it.
+	a.stopRedialWatchdog()
 
 	nc, err := a.connectNATS(ctx)
 	if err != nil {
 		cancelRun()
 		return false, err
 	}
-	a.stopRedialWatchdog() // connected → not stuck (clears any expired watchdog from a rebuild)
-	a.ncBox.Store(nc)      // publish nc for the lock-free tunnel session-state hook
-	defer func() { _ = nc.Drain() }()
-	// F9 / round-2 F4: drain in-flight proxy-keys handlers before the connection
-	// drains. Set proxyDraining FIRST (under the lock) so dispatch cannot Add a
-	// new handler after this point, THEN Wait — a sound barrier (no Add races
-	// the Wait). Runs just before nc.Drain (registered right after it).
+	// origin: gotcha #72 — the session's own teardown goes through the SAME bounded finalizer the
+	// rebuild callbacks use (single-flight per session). A bare `nc.Drain()` here is exactly the
+	// unbounded call the incident hung on: on a RECONNECTING conn nats.go turns Drain into Close and
+	// takes the same nc.mu that doReconnect holds across a no-deadline dial/handshake. Registered at
+	// the position the old Drain held so teardown LIFO is unchanged. `cancelRun` is threaded in so
+	// the finalizer can cancel FIRST; the later `defer cancelRun()` stays as the clean-path cancel
+	// (it is idempotent).
+	fin := &sessionFinalizer{
+		nc: nc, tracker: a.takeSessionTracker(), cancel: cancelRun, parent: ctx, agent: a,
+	}
+	a.setSessionFinalizer(fin)
 	defer func() {
+		intent := teardownShutdown
+		if ctx.Err() == nil && a.rebuildRequested.Load() {
+			intent = teardownRebuild
+		}
+		fin.Do(intent)
+		a.setSessionFinalizer(nil)
+	}()
+	// A parent cancellation must be able to enter the finalizer even if this session goroutine is
+	// parked in a nats.Conn observer before reaching heartbeatLoop. stopParentTeardown prevents the
+	// callback from outliving a session that returned for another reason; sync.Once handles races.
+	stopParentTeardown := context.AfterFunc(ctx, func() { fin.Do(teardownShutdown) })
+	defer stopParentTeardown()
+
+	a.ncBox.Store(nc) // publish nc for the lock-free tunnel session-state hook
+	// Snapshot the URL for teardown diagnostics only AFTER publishing the bounded finalizer. This
+	// observer takes nc.mu.RLock; an immediate reconnect can already hold nc.mu across an unbounded
+	// dial/handshake by the time connectNATS returns. The parent AfterFunc and redial watchdog above
+	// now have a published finalizer with which to break/escalate that wedge.
+	connURL := nc.ConnectedUrl()
+	a.connURLBox.Store(&connURL)
+	// F9 / round-2 F4: drain in-flight proxy-keys handlers before the connection drains. Set
+	// proxyDraining FIRST (under the lock) so dispatch cannot Add a new handler after this point,
+	// THEN Wait — a sound barrier (no Add races the Wait).
+	//
+	// origin: internal review CT-1 (S4) — moved from a plain defer into the finalizer's bounded
+	// cleanups for the same reason as the Unsubscribe above: an in-flight proxy handler blocked on
+	// a wedged connection would make this Wait unbounded, and as a defer it ran BEFORE the ladder.
+	// Ordering inside the closer is preserved (drain barrier first, then subscription teardown,
+	// then the close) because cleanups run in registration order and this one is registered first.
+	fin.addBoundedCleanup(func() {
 		a.proxyDrainMu.Lock()
 		a.proxyDraining = true
 		a.proxyDrainMu.Unlock()
 		a.proxyHandlerWG.Wait()
-	}()
+	})
 
-	resp, err := a.register(ctx, nc)
+	// origin: external review F2 (BLOCKER) — runCtx, NOT the parent ctx. A disconnect callback can
+	// request a rebuild BEFORE the first register completes; the finalizer then cancels runCtx and
+	// closes/poisons the conn, but a register loop watching only the parent ctx keeps Request-ing on
+	// a dead connection forever. session() never returns, so Run can neither clear `rebuilding` nor
+	// start a successor: the node is permanently OFFLINE without the close ever wedging.
+	resp, err := a.register(runCtx, nc)
 	if err != nil {
 		cancelRun()
 		return false, err
@@ -787,7 +874,12 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 		cancelRun()
 		return false, fmt.Errorf("agent: subscribe forwarded: %w", err)
 	}
-	defer func() { _ = subFwd.Unsubscribe() }()
+	// origin: internal review CT-1 (S4) — Unsubscribe takes nc.mu, the SAME mutex a wedged
+	// doReconnect holds. Registered as a plain defer it would run BEFORE the bounded finalizer
+	// (defer LIFO) and hang the teardown right back up, ladder and all — which is precisely the
+	// hostage situation #72 exists to end. Hand it to the finalizer instead: it runs inside the
+	// budgeted closer goroutine, so poisoning bounds it like the close itself.
+	fin.addBoundedCleanup(func() { _ = subFwd.Unsubscribe() })
 
 	// P9 — listen for sys.events{type:agent_evicted, sid, nid}
 	// addressed to us so `tether admin evict` takes effect within
@@ -844,7 +936,13 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("agent: subscribe sys.events: %w", err)
 	}
-	defer func() { _ = subEvict.Unsubscribe() }()
+	// origin: external review F1 (BLOCKER). This was a DIRECT defer while its sibling subFwd went
+	// through addBoundedCleanup — and defer LIFO put it AHEAD of the finalizer, so on a wedged
+	// connection Unsubscribe (which takes nc.mu) blocked forever and fin.Do never even started:
+	// cancel-first, the 10s budget, poisoning and the escalation were all unreachable. Both NATS
+	// subscriptions must go through the bounded path; TestSessionTeardownBoundsEveryNATSUnsubscribe
+	// fails if any Unsubscribe is left as a plain defer.
+	fin.addBoundedCleanup(func() { _ = subEvict.Unsubscribe() })
 
 	// G.1 reply application MUST run before replay so any RevokePorts
 	// have already pruned state.json by the time replayPortsFromState
@@ -945,6 +1043,11 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		return nil, perr
 	}
 	connOpts = append(connOpts, popts...)
+	// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
+	// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
+	// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
+	// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
+	connOpts = append(connOpts, a.trackerDialOption(ctx, connOpts))
 	// #48: a ONE-SHOT host to skip on the FIRST dial (the just-silent island broker). Consumed
 	// here so a later rebuild for an unrelated reason is unaffected; dropped after attempt 1 so a
 	// momentarily-unreachable survivor falls back to the full pool rather than locking out forever.

@@ -1574,6 +1574,23 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
    防火墙偶尔会切）；
 3. agent 重连后 broker 自动跑 G.1 reconcile，`tether ps` 应该自愈。
 
+**别只看 `systemctl is-active`**（gotcha #72 的教训）：进程存活、TCP socket 还 ESTABLISHED，
+控制面照样可能已经死了。判据是 `tether node ls --json` 的 `last_heartbeat_at` 有没有推进。
+
+**恢复有硬上界**（本增量起）：agent 侧的连接终结改为「先 cancel、再有界 close（10s）、
+超时毒化底层 socket（再 10s 宽限）、仍卡则升级处置」，日志里能看到
+`NATS close exceeded its budget; poisoning…` 与 `NATS teardown WEDGED…; escalating`。
+**总上界 ≈ redialAfter 20s + 10s + 10s + 重连 ≈ ≤60s**（该上界的前提是 teardown 路径上不再有无界调用；
+外审 2026-08-02 曾发现三条绕过路径并已修复，见 deploy-tier-gotchas #72 的「外审轮补修」），
+⚠ **起点是 nats.go 判定断连的那一刻**
+（`redialAfter` 由 DisconnectErrHandler 起算）：静默丢包时这个判定要等 NATS ping 超时，
+所以从「链路开始坏」到「恢复」还要加上检测时延，这条上界管的是**判定之后**的部分。
+升级处置分两种：**rebuild 场景原地 self-exec**（PID 不变，systemd 与 setsid-nohup 都能活下来；
+若这次 self-exec 也失败、且没有待提交的升级，则同样以 **91** 退出交监督者）；
+**关停场景退出码 91**（进程本来就要死，不许被卡住的 close 挟持）。
+**91 = teardown 卡死**，监控可据此与其它非零退出精确区分（见 §9.13）。
+看到 escalating 的日志请连同 `journalctl` 与 `node ls --json` 一起留档，那是 #72 残余面的现场。
+
 > §9.10（admin 命令 connection refused）见 [`broker-ops.md`](broker-ops.md) §9.10。
 
 ### 9.11 `make lint` 抱怨 Go 版本
@@ -1608,6 +1625,10 @@ language version 1.23 is lower than the targeted Go version 1.25
 **保留区间（不来自上表）**：
 
 - `0..3` 仅 `tether cluster status` 的健康码（`0`=HEALTHY-HA、`1`=DEGRADED、`2`=read-only/quorum-lost、`3`=force-single），**只有该命令发**，且 `--remote` 更薄（永不出 1，见 cluster.md §5.6）。注：`cluster status` 只要**产出报告**就退 `0..3`（按健康），broker 侧错误经 `errors[]`/`partial`/stderr 暴露而非改退出码；**只有拿不到报告才退 69**。
+- `91` 只由 **agent 守护进程**发（不是 ctl 命令，故不入上表）：NATS 连接终结楔死、越过有界 close +
+  毒化宽限后仍不返回（gotcha #72 的升级处置）。两种来路——关停场景直接退 91；rebuild 场景先尝试
+  原地 self-exec，**self-exec 也失败且无待提交升级**时退 91。监控看到 91 = 「teardown 卡死」，
+  应连同 agent journal（`teardown WEDGED`）与 `node ls --json` 一起留档，见 §9.9。
 - `exec` / `run` **透传远端进程退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器；判别靠"你跑的是哪个命令"，不是值。所以"77=权限"仅限 broker-RPC 命令。
 
 **健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。

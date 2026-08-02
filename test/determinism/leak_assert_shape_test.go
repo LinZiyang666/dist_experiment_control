@@ -125,6 +125,9 @@ var singleExerciseExemptions = map[string]string{}
 // file:function key keeps this list site-scoped; the live/stale checks below make additions, renames and
 // deletions fail closed.
 var leakExerciseAnchors = map[string]string{
+	// origin: gotcha #72 — the anchor is the ladder itself: a loop that merely dialt sockets would
+	// prove nothing about whether a WEDGED teardown leaks its closer goroutine and socket.
+	"internal/agent/conn_teardown_leak_test.go:TestWedgedTeardownRepeatsWithoutLeaking":             "Do",
 	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectChurnNoGoroutineLeak":              "DropTransport",
 	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectVsConcurrentOpenSamePort":          "Open",
 	"test/concurrency/goroutine_leak_rounds_test.go:TestAdminsockRepeatedStartCloseNoGoroutineLeak": "Start",

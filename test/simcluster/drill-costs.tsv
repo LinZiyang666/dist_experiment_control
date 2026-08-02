@@ -47,6 +47,8 @@
 32-install-lifecycle	65	short	-
 80-session-isolation	62	short	-
 31-node-upgrade-fleet	62	short	-
+33-node-upgrade-success	540	long	measured 2026-08-02 (one rigid 120s watchdog window + ctl 150s wait + heal poll)
+98-stuck-redial-recovery	700	long	measured-ish: N=3 up/grow ≈3min + up to 4min nats.go ping detection under a silent DROP + bounded teardown + heal poll
 62-remote-fs-safe	52	short	-
 70-expose-journey	47	short	-
 43-migrate-live-data	46	short	-
