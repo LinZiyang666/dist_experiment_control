@@ -22,6 +22,8 @@ var brokerCodeHints = map[string]string{
 	// catch-all. These are UpgradeForwardedResp.Code values (NOT RunChunk.Reason), which is why they are
 	// here and not in runFailureReasons — see the note there.
 	"download_http_status":    "the upgrade mirror answered with a non-2xx status; check the --url you passed (a typo'd path returns 404 and will do so on every retry).",
+	"smoke_failed":            "the downloaded binary passed sha256 but failed the pre-install smoke gate (could not exec, or `version` printed no release tag) — wrong architecture, truncated artifact, or not a tether binary. Nothing on disk was changed. Fix the --url artifact; the same tarball will fail on every node.",
+	"upgrade_in_progress":     "a previous upgrade on this node staged its binary and is still inside its register deadline (commit-or-rollback resolves within ~2 minutes). Retry this node after it settles; `node upgrade --all` skips it and keeps going — unless it is the CANARY, whose failure aborts the fleet by design.",
 	"download_http_retryable": "the upgrade mirror is temporarily unavailable or asks for a retry (408/421/425/429/500/502/503/504) — the URL and the artifact are fine. Retry with backoff; if the reply carried a Retry-After it is in the error text. `node upgrade --all` skips this node and keeps going rather than aborting the fleet.",
 	"download_too_large":      "the upgrade tarball is larger than the agent's ceiling; publish a smaller artifact or raise the limit — the same URL will be the same size next time.",
 	// Membership / ownership / lifecycle
@@ -171,7 +173,15 @@ var brokerCodeExitClasses = map[string]int{
 	"download_http_retryable": exitTransient,
 	"download_too_large":      exitUsage,     // the artifact is over the ceiling; same size on every retry
 	"download_failed":         exitTransient, // transport or read failure — this one really does clear
-	"version_skew":            exitUsage,     // B6 A3: reinstall the joiner on a matching release
+	// origin: upgrade-safety plan §4. smoke_failed = the sha-verified artifact could not exec or did not
+	// answer `version` — wrong arch, truncated upload, not a tether binary. The ARTIFACT is bad, so it is
+	// bad on every node and on every retry: operator-action class, and `node upgrade --all` aborts the
+	// fleet on it (configUpgradeCodes). upgrade_in_progress is its temporal opposite — a prior upgrade on
+	// THIS node is still inside its register deadline; it self-resolves (commit or rollback) within that
+	// bound, which is the definition of the retry class.
+	"smoke_failed":        exitUsage,
+	"upgrade_in_progress": exitTransient,
+	"version_skew":        exitUsage, // B6 A3: reinstall the joiner on a matching release
 	// R8a P1: the control plane committed the rehome but the agents have not confirmed the new
 	// home yet. This is EX_TEMPFAIL, not a tether bug: the broker keeps re-delivering, so
 	// re-running the verb is the correct response. Crucially it is NOT 0 — `cluster drain`

@@ -60,6 +60,9 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
+	// origin: upgrade-safety N-1 window — exact equality (architecture §21.1
+	// site #2): a cross-epoch upgrade is the one permitted compatibility
+	// break and goes through reinstall, never this verb. See §21.4.
 	if req.ProtoVersion != proto.ProtoVersion {
 		b.replyUpgradeErr(msg, "proto_bump_requires_reinstall",
 			fmt.Sprintf("broker proto=%d, request proto=%d", proto.ProtoVersion, req.ProtoVersion))
@@ -105,7 +108,9 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	out := proto.UpgradeResp{OK: true}
+	// upgrade-safety: relay the smoke-normalized release tag — ctl --wait
+	// polls node.list until ReleaseVersion equals exactly this string.
+	out := proto.UpgradeResp{OK: true, NewVersion: agentResp.NewVersion}
 	body, _ = json.Marshal(&out)
 	if msg.Reply != "" {
 		_ = msg.Respond(body)

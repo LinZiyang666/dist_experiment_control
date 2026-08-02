@@ -221,6 +221,68 @@ func TestBrokerRejectsBadPayloads(t *testing.T) {
 	}
 }
 
+// origin: upgrade-safety plan §2 — N-1 window nail for the register handshake
+// (architecture §21.1 site #1).
+//
+// The handshake pins EXACT ProtoVersion equality — deliberately NOT an
+// [N-1, N] acceptance window. The N-1 compatibility unit is the release; the
+// wire epoch (ProtoVersion) is frozen inside the window, so same-window peers
+// are always epoch-equal and this check never fires on them. A peer from the
+// PREVIOUS epoch publishes on the tether.v(N-1).* subject tree this broker
+// does not even subscribe, so an acceptance branch here would be unreachable
+// dead code advertising a compatibility that transport routing denies.
+// If you are bumping ProtoVersion and this test got in your way: you owe the
+// dual-tree subscription first — see architecture §21.4.
+func TestRegisterProtoEqualityIsExact(t *testing.T) {
+	url := startNATS(t)
+	db := openDBWithSession(t, "lab") // the accept arm must clear the C.1 session gate in every mode
+
+	b, _ := New(Config{NATSURL: url, DB: db, Logger: silentLogger()})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+	waitNATSReady(t, url)
+
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+
+	cases := []struct {
+		name       string
+		protoVer   int
+		wantOK     bool
+		wantReject string
+	}{
+		{name: "exact_epoch_accepted", protoVer: proto.ProtoVersion, wantOK: true},
+		{name: "previous_epoch_rejected", protoVer: proto.ProtoVersion - 1, wantReject: "proto_mismatch"},
+		{name: "next_epoch_rejected", protoVer: proto.ProtoVersion + 1, wantReject: "proto_mismatch"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := mustJSON(proto.NodeRegisterReq{
+				ProtoVersion: c.protoVer, ReleaseVersion: proto.ReleaseVersion,
+				NID: "lab-1", OS: "linux", Arch: "amd64",
+			})
+			reply, err := nc.Request(proto.SubjNodeRegister("lab", "lab-1"), body, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resp proto.NodeRegisterResp
+			if err := json.Unmarshal(reply.Data, &resp); err != nil {
+				t.Fatal(err)
+			}
+			if c.wantOK {
+				if !resp.OK {
+					t.Fatalf("same-epoch register must succeed; got code=%q err=%q", resp.Code, resp.Error)
+				}
+				return
+			}
+			if resp.OK || resp.Code != c.wantReject {
+				t.Errorf("proto=%d: got ok=%v code=%q, want reject %q", c.protoVer, resp.OK, resp.Code, c.wantReject)
+			}
+		})
+	}
+}
+
 // Heartbeat for an unknown node must not crash the broker (warning log only).
 func TestHeartbeatForUnknownNodeIgnored(t *testing.T) {
 	url := startNATS(t)

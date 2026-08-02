@@ -263,7 +263,11 @@ func TestNolintDirectivesNameEnabledLinters(t *testing.T) {
 	//
 	// The number is the enforcement. A new directive must be typed here as well, which is the friction that
 	// makes the suppression surface countable — plan §14.1 enumerates all 30 by name for the same reason.
-	const expectedDirectives = 30
+	// 30 → 34: upgrade-safety external-review fix round added four nilerr
+	// exemptions inside the host-wide flock closures (their error return
+	// carries LOCK failures only; a bad marker/self-hash is contractually
+	// "nothing to do", not an error). Enumerated in line2-plan §14.1.
+	const expectedDirectives = 34
 	if scanned != expectedDirectives {
 		t.Errorf("the scan found %d //nolint directive(s), expected exactly %d.\n\n"+
 			"MORE: a new exemption was added. Add it to plan §14.1's enumeration and bump this constant in "+

@@ -65,6 +65,6 @@ pkg-code-lines internal/clusteroffline 2000
 pkg-files cmd/tether 52
 pkg-files internal/broker 70
 pkg-files internal/cluster 32
-type-methods internal/agent.Agent 106
+type-methods internal/agent.Agent 118
 type-methods internal/broker.Broker 279
 type-methods internal/broker.ClusterAdmin 86

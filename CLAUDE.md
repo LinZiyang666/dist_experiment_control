@@ -105,7 +105,10 @@
   **按 §1 权威链取尺**（外审 R6 订正：这里原写"以 `architecture.md` 为准…都以它为尺"，与 §1"第 3 层不作为实现依据"直接冲突）——
   集群面/v2 的不变量以 `distributed-broker-architecture.md` + `deploy-tier-gotchas.md`（第 2 层）为准；
   `architecture.md` §A–§K 只提供**当初为何这样取舍**的论证，其标识符与拓扑细节已过时，不作实现依据。
-- **wire 协议**：`internal/proto.ProtoVersion` 是 SSOT；任何破坏性 wire 变更走整次跨版本路径（`tether.v1.*` → `v2.*`），**不兼容则必须重装而非 upgrade**。
+- **wire 协议**：`internal/proto.ProtoVersion` 是 SSOT。**N-1 兼容窗口**（requirements §6.7 +
+  architecture §21）：相邻 release 间一切 wire 变更必须 additive/omitempty 且零值合法（append-only
+  账本闸门在守）；**ProtoVersion bump = 纪元更替**，是唯一被许可的兼容断裂——必须重装而非 upgrade，
+  且 bump 者背双 subject 树订阅义务（`tether.v(N)` + `v(N-1)`，见 §21.4）。
 - **`context.Background()` 只在两处合法**（S3 §2 裁决 5 采纳的那一半；`contextcheck` 被判 REJECT-FOREVER，
   所以这条靠人读，站点注释就是它的载体）：
   1. **进程/循环的根**——`main`、一个后台 loop 的起点、一个 offline 工具的顶层。
@@ -142,6 +145,7 @@
   | 枚举 switch 的 `default:` | `test/determinism/enum_switch_default_test.go` | 15 个自有枚举家族：`default:` 只在**每个成员都被列举**时允许——`exhaustive` 的 `default-signifies-exhaustive:true` 让一个裸 `default:` 永久瞎掉该 switch（实测：注入 batch-C 那个 doctor 缺陷，加 default 后零报告）。`TestEnumFamiliesCoverEveryIotaEnum` 反向对账，防止家族表退回 3/15 |
   | wire 错误码 ↔ exit class | `cmd/tether/` 4 处 | 每个码都有归类，不静默退 70；**双向**（含表键反查发射点） |
   | ACL ↔ 订阅表 | `internal/auth/acl_reconcile_test.go` | 双向：无订阅者的授权、无授权的订阅都报 |
+  | wire 字段清单 append-only | `internal/proto/wire_inventory_test.go` + `testdata/` | N-1 窗口的机械半（requirements §6.7 / architecture §21.2）：每个导出消息结构的 {字段名, tag, 类型} 只增不删不改；updater 拒绝收缩——收缩是纪元决策，必须手改账本并在 commit message 写明理由 |
   | CLI 表面 golden | `cmd/tether/command_tree_inventory_test.go` | 命令/flag/Hidden 位漂移即红 |
   | 泄漏门 | `test/concurrency/helpers_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak** |
   | docs 布局 | `test/architecture/docs_layout_test.go` | 已跟踪的过程产物（`*-plan/review/tasklist/roadmap.md`）不许留在 `docs/` 顶层——§3 step 7 那条曾整条无闸门 |
@@ -163,6 +167,17 @@
     **全量串行的 target 已从 Makefile 删除**——不是弃用，是拿掉了，因为存在的 target 就会有人跑。
     串行唯一合法用途是**定位并行报出的那一个**：`make e2e-one T=TestD5Matrix`（`T` 强制、无 "all" 模式）。
     理由与四类根因见 `docs/reviews/parallel-flake-rootcause.md`；写测试的规范见 `docs/testing-standards.md`。
+    - **约 3–4 min 是本机 44 核的数**，不是套件的属性：worker 数 = `min(单元数, 物理核/2, 20)`，
+      **2 核机只坐得下 1 个 worker**，同样 99 个单元从 5 层队列变成 99 层。实测（`taskset` 限到 2 物理核）
+      **42m22s、ALL PASS**——套件在小机器上不脆，只是慢。整轮 deadline 已改为**按队列深度推导**并打进 plan，
+      不再是写死的 25m（那是开发机的属性）；打满预算会印 `DEADLINE EXCEEDED` 并明说这不是测试失败。
+    - **CI 不再每次 push 跑全矩阵**：`.github/workflows/ci.yml` 的 e2e job 触发改为
+      **每周一 02:30 UTC + 版本 tag + 手动 `workflow_dispatch`**。理由是本条的硬闸已让**每个 commit**
+      在本机跑过全矩阵，CI 那份加的是**另一套环境**（2 核 runner、冷缓存、新 runner 镜像、
+      setup-go 当天解析到的 Go 补丁版），而环境按周变不按小时变。成本也真实：42m × 每月 38 次 push
+      ≈ 1300 min，而免费额度 2000 min/月还要喂 build-test 与 lint。
+      `test/architecture/ci_workflow_test.go` 钉住**这个 job 仍然可达**——`if:` 点名的每个事件必须在
+      `on:` 里真声明，且至少留一个**无人值守**触发（只剩手动不算闸）。
   - 表驱动；`make test` 用嵌入式 `nats-server/v2/test`，**不需要本机 nats-server**。
   - 并发安全：`-race` + **仓库内建泄漏门**（NumGoroutine + fd 基线，见 `test/concurrency/helpers_test.go`；
     **刻意不用 goleak**）；触碰隧道/PTY/reconcile/传输/Raft 必须带 race + leak 门。

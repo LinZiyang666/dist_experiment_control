@@ -696,6 +696,7 @@ god function 从此静默出现——**它搬走边界，不消除边界**；换
 | `gocritic` | `cmd/tether/main.go:81` | 是 | 该检查报的是**形状**（一函数内同时有 defer 与 `os.Exit`），此处形状即预期 |
 | `gocritic` | `test/e2e/parallel/main.go:232` | 是 | `cancel()` 已在上方显式调用；这是测试 runner |
 | `nilerr` | `internal/agent/roster_cache.go:101` | 是 | 文档注释已明确承诺「损坏时返回 nil 错误」 |
+| `nilerr` ×4 | `internal/agent/upgrade.go` recoverFromFailedExec、`upgrade_state.go` watchdogRollback / commitUpgradeAfterRegister ×2 | 2026-08 upgrade-safety 外审修复轮追加（计数 30→34） | flock 闭包的 error 返回只承载**锁**失败；marker 读损按契约是 idle、运行映像读不出按契约是「提交证明不成立」——返回 nil 是这四处的语义本体，不是吞错 |
 | `nilerr` | `internal/cli/cluster_endpoints.go:81` | 是 | 这是**缓存**：损坏必须降级为「不存在」而非向上冒错 |
 | `noctx` | `internal/agent/upgrade.go:276` | 是 | 由 `nats.MsgHandler`（`func(*nats.Msg)`）到达，没有 ctx 可穿 |
 | `noctx` | `internal/broker/cluster_grow_cutover.go:384` | 是 | 两跳之上是 RPC handler |

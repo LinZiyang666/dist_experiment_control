@@ -807,3 +807,107 @@ D9  一次性迁移 + 在位 nats.conf 接管 + 发布硬化            ← HA G
   半完成的裸 drain（marker 在、phase 仍 VOTER、无 op）**故意不碰**——
   `DrainNode` 的失败出口明文让运维重跑，期间 marker 及其告警是那次 drain **唯一**的可见证据。
   「phase=DRAINING ∧ marker 缺失 ∧ 无非终态 op」在**渲染期**记 `Inconsistent`（不写库）。
+
+## 21. 版本兼容窗口与升级安全（upgrade-safety 增量）
+
+> WHAT 层条文在 `docs/requirements.md §6.7`（N-1 窗口）。本节是 HOW 层绑定契约：
+> 版本检查站点的语义、additive 纪律的闸门、agent 升级状态机、marker 格式、对未来 bump 者的义务。
+
+### 21.1 版本检查站点盘点（今日全量）
+
+| # | 站点 | 行为 | N-1 规则下的语义 |
+|---|---|---|---|
+| 1 | `internal/broker/broker.go` handleRegister | `req.ProtoVersion != proto.ProtoVersion` → 拒 | **保持精确相等**。窗口的兼容单位是 release，不是 proto——proto 在窗口内冻结（§21.2），所以同窗口内两端 proto 恒等，相等检查永真；跨纪元时它正是 `proto_bump_requires_reinstall` 的执行点 |
+| 2 | `internal/broker/upgrade.go` HandleUpgrade | 同上 | 同上 |
+| 3 | `internal/broker/clusterstatus.go` join（`ErrJoinVersionSkew`） | joiner proto ≠ 本集群 proto → 拒 | 同上（broker 车队滚动升级期间同 proto，不受影响） |
+| 3b | 同上 join 门的 **release 相等**检查（`versionSkewRefusal`，缺声明 fail-closed） | joiner release ≠ 本集群 release → 拒 | **保持硬拒——§6.7 的显式豁免**：joiner 是正在添置的新机器（重装即匹配），拒绝不卡任何已部署节点的回滚；放行会让 FSM schema 迁移在混 release 集群 fail-stop（外审 B3） |
+| 4 | agent/ctl 侧 | **无反向检查**（broker 的 OK=false 当永久错误上抛） | 保持无——任何 release 层拒绝都会卡死回滚路径 |
+
+三处相等检查**一行不改**，站点注释 `// origin: upgrade-safety N-1 window` 钉住"为何是相等而非区间"：
+subject 前缀内嵌 `v<ProtoVersion>`（`internal/proto/version.go` `SubjectVersionToken`），
+N-1 纪元的端发布在 `tether.v(N-1).*` 主题树上——在双订阅（§21.4）落地之前，
+任何"接受集"分支都是不可达的死代码。
+
+### 21.2 additive 纪律与闸门
+
+- 相邻 release 间一切 wire 变更必须 additive：新增字段 `omitempty` 且**缺省零值是合法语义**；
+  新增错误码必须能走旧端 default 分支优雅呈现（`xfer_provision.go` 的 Code-string 增量是既有示范；
+  enum-switch-default 闸门保证本仓自己的 switch 不会瞎掉）。
+- **机械闸门**：`internal/proto` 的 `TestWireFieldInventoryAppendOnly`——testdata 账本记录每个导出
+  消息结构的 {字段名, json tag, 类型}，**只增不删不改**（删 / 改名 / 改 tag / 改类型即红）；
+  updater 拒绝删除条目，收窄唯一的出口是手改账本并在 commit message 里写明理由
+  （与结构预算棘轮同一摩擦哲学）。**刻意不查 omitempty**：旧端本就忽略未知 JSON 字段，
+  真约束是"零值必须是合法语义"——那由本节条文 + 审查纪律扛，不假装机械。
+  **闸门边界（内审 S17）**：账本只覆盖 `internal/proto` 包内的导出结构。包外的 wire 面
+  （如 `internal/cluster/join_bundle.go` 的 join bundle JSON、adminsock 协议）由本节条文 +
+  审查纪律覆盖——写明这条边界，不假称机械闸门管到了它没扫的地方。
+- "零值合法"的判据：旧端发来的报文**没有**这个字段时，新端解出零值后的行为必须与增量前一致。
+
+### 21.3 agent 升级状态机（`node upgrade` 安全化）
+
+安装序：下载 → sha256 → **冒烟门** → **prev 槽** → marker=pending → 单次 `rename(tmp, dst)` → 回执 → exec。
+
+- **冒烟门**：rename 前对 tmp 二进制跑 `<tmp> version`（5s 超时，stdout 有 64KiB 上限 +
+  `WaitDelay` 防子进程占管道）；exec 失败或首行不符冻结格式 → `smoke_failed`；首行报告的
+  **proto 纪元 ≠ 本 agent 纪元** → `proto_bump_requires_reinstall`（外审 F5：请求里的
+  ProtoVersion 只证明 ctl/broker/本 agent 同纪元，不证明**下载的字节**属于该纪元——跨纪元
+  产物必须走重装，不许被 upgrade 偷运）。两者磁盘零变更。首行严格解析冻结格式
+  `tether <release> (proto v<N>)`，提取的 release 与 register 上报的 `ReleaseVersion`
+  **同一格式**（ctl `--wait` 的判据依赖该等式）。
+- **prev 槽**：`os.Remove(prev)` → `os.Link(dst, prev)`（硬链接，同 fs 零拷贝；link 失败降级 copy）→
+  单次 rename 进位。**dst 在任意断点都在位**——这是对"双 rename 断电后 ExecStart ENOENT 永久失联"
+  的结构性排除。prev 路径 = `dst + ".prev"`。
+- **marker**：`<dst 同目录>/.tether-upgrade.json`，tmp+rename 原子写。字段：
+  `state`（`pending|committed|rolled_back|rollback_failed`）、`prev_sha`、`new_sha`、`prev_version`、
+  `new_version`、`deadline`（绝对墙钟）、`boot_count`、`boot_budget`（=3）。JSON 损坏视为 idle 并告警。
+- **入口门**：marker=pending 时再来 upgrade → `upgrade_in_progress` 拒绝（防二次升级把唯一好二进制
+  clobber 成 prev）。
+- **exec 失败就地恢复**：`syscall.Exec` 失败时旧进程映像是**唯一存活的旧代码**——
+  `rename(prev, dst)` 恢复、写 `rolled_back`、旧进程继续跑**不退出**（同时闭合 setsid-nohup 路径）。
+- **启动检查**：`decideBoot(marker, selfSHA, now)` 纯函数，挂在 **`main()` 里 Cobra 解析之前**
+  的 boot shim 上（按 argv 形状识别 `tether agent` 守护调用；`version`/help/install 子命令
+  绝不碰 marker）。**必须早于一切可失败的启动步骤**（外审 F2）：新二进制若在 flag 解析、
+  strict YAML、logger 初始化上回归，进程在到达 RunE 前就退出——boot 检查若在这些步骤之后，
+  预算永不消耗、回退永不触发。黑盒钉子：`cmd/tether/agent_boot_shim_test.go` 用真实构建的
+  二进制 + 必被 Cobra 拒绝的 flag 连续启动，断言预算逐次消耗并在耗尽时回退。分支：
+  pending ∧ self==new_sha ∧ 预算内 ∧ 未过期 → boot_count++、继续、武装 watchdog；
+  pending ∧（boot_count≥budget ∨ 过 deadline）→ 校验 prev_sha、恢复 prev、写 `rolled_back`、exec dst；
+  pending ∧ self==prev_sha → 收敛写 `rolled_back`；prev 缺失/sha 不符 → `rollback_failed` 终态、
+  响亮日志、以现状继续（不制造新循环）。
+- **健康签到**：register 成功 = 提交点 → marker 写 `committed`。提交证明是**三件套**（外审 F1）：
+  ① marker 的 `target_sid/target_nid` == 本实例（`node upgrade <nid>` 点名谁就只有谁能提交/上报）；
+  ② `boot_count > 0`（staged 映像至少经过一次 decideBoot——install 时恒写 0，堵 flip→exec 窗口）；
+  ③ **运行映像 sha == new_sha**——取自 `/proc/self/exe`（读的是本进程正在执行的字节，即使路径
+  已被 rename 顶替），而非磁盘路径：flip 之后磁盘路径对宿主上**所有**进程都是 NewSHA，
+  只有真正 re-exec 过的那个进程运行着它，故该证明不可被共享二进制的兄弟进程借用。
+  pending 期武装 register-deadline watchdog（120s 常量；**只有 target 实例武装**——兄弟进程
+  重启不代管别人的升级，target 死亡场景由其 supervisor 下次拉起时的 boot 检查收敛）：
+  到期未 commit → 恢复 prev、`rolled_back`、exec dst。commit 与回退**互斥**：进程内靠
+  upgradeMu，跨进程靠二进制目录下 `.tether-upgrade.lock` 的 **flock**（install 全段非阻塞持有，
+  boot/commit/watchdog/exec-failure 四个短临界区阻塞持有）——**同宿主共享二进制 = 一个升级域**。
+- **有序持久化协议**（外审 F6；rename 只给崩溃原子性，不给断电持久性）：候选文件在**同一 fd 上**
+  chmod 0755 → fsync → close；prev 槽建立后 fsync 目录；marker tmp fsync → rename → fsync 目录；
+  dst flip rename → fsync 目录；rollback 的恢复 rename 与终态 marker 同样补目录 fsync。
+  install 路径上任何 sync 失败 → `install_failed` 收场（marker 尚未存在，盘面回到起点）。
+  顺序由 `upgradeSyncObserver` 注入点钉住（`upgrade_durability_test.go`：顺序断言 + 注入
+  sync 失败断言 fail-closed）。
+- **boot 预算 = 宿主上 staged 映像的启动次数**：boot shim 早于配置解析、无从得知 sid/nid，
+  而 flip 之后宿主上任何进程启动跑的都是 staged 字节——任何一次即崩都是对该映像的证据。
+  代价是共享二进制的兄弟实例在 120s 窗口内的正常重启也计入预算（罕见、方向安全，如实记录）。
+- **boot_budget 论证**：本仓两个 unit 是 `Restart=always RestartSec=2`（`scripts/install.sh`）与
+  `Restart=on-failure RestartSec=5`（user 单元）；按 systemd 默认
+  `StartLimitIntervalSec=10s / StartLimitBurst=5`，2s/5s 间隔**不会烧穿 start-limit**——
+  起来即崩的二进制会无限循环。boot_budget=3 是"起来即崩"的真正闭合者（~15s 收敛），deadline 是后备。
+- **已知 GAP（如实标注，不弥补）**：setsid-nohup 无监督路径下"起来即崩"无人拉起（与增量前同险）；
+  "崩得早于启动检查"的窗口 = boot shim 之前的 Go 运行时初始化（外审 F2 订正：在 shim 前置到
+  Cobra 解析之前**以前**，这个窗口其实覆盖 flag/YAML/logger 整个启动面，旧论断"极窄"不成立；
+  前置后才真正只剩运行时初始化，静态二进制已过真实 exec 冒烟，接受）；
+  register 成功但行为异常不在承诺边界内——运维手段是金丝雀 + 手动指旧版本 URL 再升一次。
+- co-located agent 的 `ReExecOnly` 路径**不进状态机**（bin 目录 root-owned，`cluster upgrade`
+  已有 staging + sha + quorum 保护）。
+
+### 21.4 对未来 ProtoVersion bump 者的义务
+
+bump = 纪元更替，必须整体交付：新 broker 同时订阅 `tether.v(N)` 与 `tether.v(N-1)` 两棵 subject 树、
+在请求方的前缀上应答、并保持双订阅至少一个 release 窗口；agent/ctl 端重装（不得 `node upgrade` 跨纪元）。
+`internal/proto` 的钉子测试失败信息会把 bump 者引到本节。

@@ -66,6 +66,24 @@ type NodeRegisterReq struct {
 	// reconcile (D5 idle-zero-writes preserved). false (boot / reconnect register) ⇒ the full path,
 	// byte-identical to today. Additive/omitempty (proto stays 2).
 	RosterRefreshOnly bool `json:"roster_refresh_only,omitempty"`
+
+	// UpgradeState (upgrade-safety) reports the outcome of a just-finished
+	// `node upgrade` on this agent's FIRST register after the re-exec:
+	// "committed" (this register is the new binary's health check-in),
+	// "rolled_back" (the new binary failed its boot budget or register
+	// deadline and the agent restored the prev slot), or "rollback_failed"
+	// (the prev slot was missing/corrupt; the agent runs whatever is on
+	// disk). Empty on every ordinary register — without this field the
+	// broker cannot tell a rollback from a plain reconnect. The broker only
+	// logs it (no persistence: nodes rows travel through the raft-frozen
+	// RegisterInput payload, where a new field would silently drop in a
+	// mixed-version cluster). Additive/omitempty (proto stays 2, zero value
+	// = ordinary register).
+	UpgradeState string `json:"upgrade_state,omitempty"`
+	// UpgradeDetail carries the human-readable reason for UpgradeState
+	// ("register deadline exceeded", "boot budget exhausted", …). Log-only,
+	// same additive rules as UpgradeState.
+	UpgradeDetail string `json:"upgrade_detail,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -730,6 +748,15 @@ type UpgradeResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"`
 	Error string `json:"error,omitempty"`
+	// NewVersion (upgrade-safety) relays the agent's smoke-gate-normalized
+	// release tag to ctl — the exact string the new binary will report as
+	// ReleaseVersion on register, which is what `node upgrade --wait` polls
+	// for. CAUTION (internal review S3): a PRE-upgrade-safety agent fills
+	// the forwarded NewVersion with the FULL `tether version` first line
+	// ("tether v0.4.7 (proto v2)"), not a bare tag — ctl normalizes
+	// defensively (whitespace / no leading "v" ⇒ treat as legacy, use the
+	// release-change fallback). Additive/omitempty; proto stays 2.
+	NewVersion string `json:"new_version,omitempty"`
 }
 
 // UpgradeForwardedReq — broker pub on

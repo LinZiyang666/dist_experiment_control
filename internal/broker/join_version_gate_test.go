@@ -45,11 +45,14 @@ import (
 func TestVersionSkewRefusalDecisions(t *testing.T) {
 	log := silentLogger()
 	// EXTERNAL REVIEW B3: the two "release skew is allowed" rows below used to assert the opposite.
-	// They pinned an implementation choice that contradicted docs/requirements.md §6.7 ("三端强制同
-	// 版本 … 不一致 → 拒绝连接"), which is the layer-1 WHAT authority under CLAUDE.md §1. A test can
-	// pin a policy; it cannot confer authority on one. Release mismatch now refuses.
+	// They pinned an implementation choice that contradicted docs/requirements.md §6.7 as then
+	// written ("三端强制同版本 … 不一致 → 拒绝连接"), the layer-1 WHAT authority under CLAUDE.md §1.
+	// A test can pin a policy; it cannot confer authority on one. Release mismatch now refuses.
+	// (upgrade-safety S10: §6.7 has since become the N-1 window, and this JOIN GATE is its
+	// explicitly-named exemption — membership admission keeps the exact-release match; the window
+	// governs online interop only.)
 	//
-	// ABSENT declarations also refuse: they cannot prove the exact equality required by §6.7.
+	// ABSENT declarations also refuse: they cannot prove the exact equality the join gate requires.
 	// Decoding remains additive so an old bundle receives an actionable typed error rather than a
 	// parse failure; the operator complies by upgrading and regenerating the bundle.
 	cases := []struct {

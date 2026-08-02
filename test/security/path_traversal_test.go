@@ -249,7 +249,10 @@ func TestUpgradeTarballHardlinkEntryRejected(t *testing.T) {
 // silently skips non-matching names; this test pins that
 // "tether" + decorative entries works.
 func TestUpgradeTarballMultipleEntriesOnlyTetherAccepted(t *testing.T) {
-	binBody := []byte("#!/bin/sh\necho ok\n")
+	// Executable AND smoke-gate-compatible: the upgrade pipeline now runs
+	// `<staged> version` before the flip (upgrade-safety §21.3), so a
+	// success-path fixture must answer with a real version line.
+	binBody := []byte("#!/bin/sh\necho 'tether v9.9.9-test (proto v2)'\n")
 	tarball, sum := buildTarball(t, []tarEntry{
 		{name: "README", typeflag: tar.TypeReg, body: []byte("hi")},
 		{name: "LICENSE", typeflag: tar.TypeReg, body: []byte("MIT")},

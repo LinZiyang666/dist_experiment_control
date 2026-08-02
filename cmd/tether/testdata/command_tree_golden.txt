@@ -76,7 +76,7 @@ tether login	flags: --broker --home --nats-url --pin --session
 tether logout	flags: --home
 tether node	flags:
 tether node ls	flags: --all --brokers --home --json --nats-url
-tether node upgrade	flags: --all --home --nats-url --sha256 --timeout --url
+tether node upgrade	flags: --all --home --nats-url --sha256 --timeout --url --wait
 tether proxy	flags: --home --nats-url
 tether proxy off	flags: --home --nats-url
 tether proxy on	flags: --ha-policy --home --nats-url --yes

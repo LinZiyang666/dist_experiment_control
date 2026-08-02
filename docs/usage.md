@@ -1185,7 +1185,8 @@ flag：
 |---|---|---|
 | `--url`     | (必填) | 绝对 `https://` 的 release tarball URL；必须前缀匹配 `broker.upgrade.url_allow` |
 | `--sha256`  | (必填) | tarball 的 SHA256 hex（64 位小写） |
-| `--all`     | false  | 升级全部 ONLINE 节点（与 positional `<nid>` 互斥） |
+| `--all`     | false  | 升级全部 ONLINE 节点（与 positional `<nid>` 互斥）；**第一台是金丝雀**，见下 |
+| `--wait`    | 单台默认 `true`；`--all` 下仅金丝雀强制 wait | dispatch 后轮询 `node.list` 直到该节点以新版本重新 register（COMMITTED）或超时（可能已回退）；`--wait=false` 恢复"只等回执"的旧行为 |
 | `--timeout` | `60`（秒） | 单台 upgrade 的总超时；超大 tarball / 慢链路要显式调大 |
 | `--nats-url`| 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | `--home`    | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
@@ -1194,16 +1195,54 @@ flag：
   小写 hex；任一不过 ⇒ 拒绝（`url_not_allowed` / `not_owner` / `proto_bump_*` /
   `sha256_invalid`）。
 - agent 收到后：本地再校验 URL 白名单 → 流式下载（封顶 64 MiB，`io.LimitReader`）
-  → SHA256 校验 → 解 tarball（白名单只允许 `tether` 这一个文件，
-  `O_EXCL|O_NOFOLLOW`）→ 原子替换自身 → `syscall.Exec` 原地重启（PID 不变）。
-- 新二进制重连后跑 G.1 reconcile（保留进程清单 / 端口分配，OFFLINE → ONLINE）。
+  → SHA256 校验 → 解 tarball（白名单只允许 `tether` 这一个文件，`O_EXCL|O_NOFOLLOW`）
+  → **冒烟门**（对新二进制跑 `version`：起不来/答不对 ⇒ `smoke_failed`；报告的 **proto 纪元
+  与本 agent 不同** ⇒ `proto_bump_requires_reinstall`——跨纪元产物不许走 upgrade。两者磁盘零变更）
+  → **保留旧二进制**到 `<二进制路径>.prev` → 写升级 marker（pending，记录目标 sid/nid）→ 原子替换自身
+  → `syscall.Exec` 原地重启（PID 不变）。全程持有二进制目录的跨进程 flock——
+  **同宿主共享该二进制的多个 agent 是一个升级域**，同一时刻只有一个在途升级。
+- 新二进制重连后跑 G.1 reconcile（保留进程清单 / 端口分配，OFFLINE → ONLINE）；
+  **register 成功即"提交"**（marker → committed）。
+- **自动回退**：新二进制起不来（启动 3 次仍失败）或 120s 内 register 不成 ⇒ agent 自己把
+  `.prev` 换回来并 re-exec 旧版本（marker → rolled_back）。回退后节点仍以旧版本在线——
+  升级失败**不再**意味着 NAT 后的 agent 永久失联。`.prev` 丢失/被改则记 rollback_failed
+  并以现状继续跑（不制造重启循环）。机制全图见
+  `distributed-broker-architecture.md §21.3`；setsid-nohup 无监督部署下"起来即崩"仍无人拉起（GAP，与旧版同险）。
+
+`--wait` 下的典型输出时序（单台默认开启；与 `cmd/tether` 测试逐字钉住）：
+
+```
+✔ lab/nid1: staged (→ v0.5.0, smoke ok); agent re-exec in progress
+  waiting for re-register (deadline 120s) …
+✔ nid1: registered as v0.5.0 — upgrade COMMITTED
+```
+
+失败时（超时仍是旧版本）：
+
+```
+✗ nid1: still v0.4.7 after deadline — likely ROLLED BACK (check agent log / broker log)
+```
+
+三条硬语义（外审 F3/F4 收紧）：
+
+- **COMMITTED 是推断不是断言**：判据为 `node.list` 轮询到"新 release + ONLINE"；权威状态查
+  agent/broker 日志（broker 侧 `agent-reported upgrade outcome` 行）。
+- **同 tag 重推 fail-closed**：目标版本 == 节点当前版本时无法用 release 变化确认，`--wait`
+  打印 ⚠ 并以 **UNCONFIRMED** 非零退出；`--all` 的金丝雀遇到它中止扇出。同 tag 修复请逐台跑。
+- **baseline 读不到就不发**：`--wait`/金丝雀需要 dispatch 前的 release 基线；`node.list`
+  查询失败会**拒绝 dispatch**（而不是盲等出假结论）。`--wait=false` 是明示放弃确认的逃生门。
+
+`--all` 的金丝雀语义：按 nid 字典序取**第一台强制 `--wait` 全确认**（staged → re-register 新版本）；
+金丝雀失败 / 回退 / 超时 ⇒ **中止其余全部节点**并打印 `canary failed, N nodes untouched`。
+金丝雀确认后其余节点沿既有 sequential 扇出（不逐台 wait），收尾提示用 `tether node ls`
+复核各节点 `RELEASE` 列。
 
 `--all` 的失败分类策略（区分瞬时 vs 配置错）：
 
 | 类型 | code | --all 行为 |
 |---|---|---|
-| 瞬时 | `node_offline` / `node_not_found` / `agent_no_responders` / `agent_malformed_resp` / `download_failed` / `download_http_retryable` / `pty_alloc_failed` | log + skip，结尾汇总 |
-| 配置 | `not_owner` / `url_not_allowed` / `sha256_invalid` / `proto_bump_requires_reinstall` / `actor_invalid` / `session_not_found_or_deleting` / `download_http_status` / `download_too_large` | 立即终止（fail-fast） |
+| 瞬时 | `node_offline` / `node_not_found` / `agent_no_responders` / `agent_malformed_resp` / `download_failed` / `download_http_retryable` / `pty_alloc_failed` / `upgrade_in_progress` | log + skip，结尾汇总 |
+| 配置 | `not_owner` / `url_not_allowed` / `sha256_invalid` / `proto_bump_requires_reinstall` / `actor_invalid` / `session_not_found_or_deleting` / `download_http_status` / `download_too_large` / `smoke_failed` | 立即终止（fail-fast） |
 | 两者皆非 | 其余（如 `pty_unavailable`） | 记为该节点失败，继续跑完剩余节点 |
 
 分类**按 wire code 精确匹配**（结构化携带在错误上，见 `cmd/tether/exitcode.go` 的 `ExitError.Code`），

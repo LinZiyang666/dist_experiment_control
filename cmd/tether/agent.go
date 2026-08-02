@@ -299,6 +299,12 @@ func newAgentCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The boot half of the upgrade state machine runs in main(),
+			// BEFORE Cobra parsing — see isAgentDaemonInvocation (external
+			// review F2: running it here, after flag/YAML/logger steps, left
+			// the boot budget unconsumed exactly when the staged binary
+			// broke on those steps). Deliberately NOT called again here — a
+			// second call would double-count the boot.
 
 			// The FLAGS+YAML → agent.Config fold lives in one testable function (see #28's wiring
 			// tests): assembling it inline here made it impossible to assert that a resolved setting

@@ -305,11 +305,29 @@
 - 家目录 `$HOME` 有写权限。
 - 启动方式由用户决定（手动 / crontab @reboot / systemd --user / 登录脚本）；agent 自带重连循环，具体启动时机对系统无差别。
 
-### 6.7 版本兼容
+### 6.7 版本兼容（N-1 窗口）
 
-- **三端（ctl / controllerd / agent）强制同版本**（major.minor.patch 全一致）。
-- 握手时携带版本号；不一致 → 拒绝连接并返回明确错误提示。
-- 同仓库同 commit 产物；升级时全栈滚动重启。
+> 2026-08 upgrade-safety 增量改写。原条文（"三端强制同 major.minor.patch，不一致拒绝连接"）
+> 从未被实现——握手历来只校验 wire 协议版本（ProtoVersion），release 层从未做过运行时拒绝。
+> 本改写让规范追认并收紧现实；机制细节见 `docs/distributed-broker-architecture.md`「版本兼容窗口与升级安全」。
+
+- 兼容单位是 **release（git tag）**。每个新 release 必须与其**直接前一个 release** 在线互通：
+  ctl / broker / agent 任意两两混配，覆盖滚动升级与回滚的全部中间态。
+- **基线**：本条生效后发布的第一个 release 为兼容基线；不为更早历史版本提供任何追溯兼容。
+- **升级顺序恒为 broker 先、agent/ctl 后**；回滚顺序相反。
+- **wire 纪元（ProtoVersion）在窗口内冻结**：相邻 release 间一切 wire 变更必须 additive
+  （新增字段 omitempty，**缺省零值必须是合法语义**）；新增错误码必须能被 N-1 端的 default
+  分支优雅呈现。
+- **ProtoVersion bump = 纪元更替**，是唯一被许可的兼容断裂：必须重装，不得走 `node upgrade`
+  （`proto_bump_requires_reinstall` 是其执行点）。bump 时新 broker 必须同时订阅
+  `tether.v(N)` 与 `tether.v(N-1)` 两棵 subject 树并在请求方前缀上应答——这是对未来
+  bump 者的义务，由钉子测试的失败信息指路。
+- 握手仍以 ProtoVersion 精确匹配拒绝；agent/ctl 面的 release 偏差不做运行时拒绝——**回滚是一等公民**：
+  升级失败退回前一 release 的节点必须仍能 register 并工作，任何 release 层拒绝都会卡死回滚路径。
+- **显式豁免：broker 集群 join 门**（`cluster join approve` / `cluster add`）对 joiner 的 release
+  保持**精确相等硬拒**。它准入的是运维正在添置的**新机器**——重装即匹配，拒绝不会卡住任何已部署
+  节点的回滚；而放行会让 FSM schema 迁移在混 release 集群里 fail-stop（外审 B3 论证，见
+  `internal/broker/clusterstatus.go` versionSkewRefusal）。窗口条款管的是**在线互通**，不管集群成员准入。
 
 ---
 

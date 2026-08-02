@@ -15,6 +15,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -70,6 +72,63 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// download/install (it cannot write the root-owned bin dir; staging is the privileged precondition).
 	if req.ReExecOnly {
 		a.handleReExecOnly(msg, req)
+		return
+	}
+
+	// origin: upgrade-safety internal review S2. One install at a time: the
+	// forwarded-message handler runs one goroutine per message, and the
+	// pending-marker entry gate below only sees markers that have already
+	// been WRITTEN — a second install arriving while the first is still
+	// downloading/smoking would pass the gate and clobber the prev slot.
+	if !a.upgradeInstallMu.TryLock() {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code:  "upgrade_in_progress",
+			Error: "another upgrade install is running on this agent right now; retry after it finishes",
+		})
+		return
+	}
+	defer a.upgradeInstallMu.Unlock()
+	// External review F1: the in-process TryLock above cannot exclude a
+	// SIBLING AGENT PROCESS sharing this binary path — the host-wide flock
+	// can. Non-blocking for the same reason as the TryLock: a loser replies
+	// upgrade_in_progress instead of queueing behind a ~35s download.
+	exePathForLock, lockErr := a.upgradeExePath()
+	if lockErr != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: lockErr.Error()})
+		return
+	}
+	installErr := withUpgradeFileLock(exePathForLock, false, func() error {
+		a.handleUpgradeInstallLocked(msg, req, exePathForLock)
+		return nil
+	})
+	if errors.Is(installErr, errUpgradeLockBusy) {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code:  "upgrade_in_progress",
+			Error: "another agent process on this host is installing an upgrade of the shared binary; retry after it finishes",
+		})
+	} else if installErr != nil {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "install_failed", Error: installErr.Error()})
+	}
+}
+
+// handleUpgradeInstallLocked is the install pipeline body, entered holding
+// BOTH the in-process install mutex and the host-wide upgrade flock.
+func (a *Agent) handleUpgradeInstallLocked(msg *nats.Msg, req proto.UpgradeForwardedReq, exePath string) {
+	// upgrade-safety plan §3.1 install entry gate: a pending marker means a
+	// prior upgrade staged its binary but has not committed or rolled back —
+	// installing over it would clobber the only known-good binary (the prev
+	// slot). Bounded: pending resolves at the register deadline, and a STALE
+	// pending marker (deadline passed with no process alive to resolve it —
+	// e.g. a failed install flip) stops blocking here so the operator can
+	// simply retry. A corrupt marker is idle (loud, never a block).
+	if m, merr := readUpgradeMarker(upgradeMarkerPath(exePath)); merr != nil {
+		a.cfg.Logger.Warn("agent: upgrade marker unreadable — treating as idle", "err", merr)
+	} else if m != nil && m.State == upgradeStatePending && a.upgradeNow().Before(m.Deadline) {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code: "upgrade_in_progress",
+			Error: fmt.Sprintf("an upgrade to %s is pending its register deadline (%s); retry after it commits or rolls back",
+				m.NewVersion, m.Deadline.UTC().Format(time.RFC3339)),
+		})
 		return
 	}
 
@@ -131,19 +190,26 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	exePath := a.cfg.UpgradeExecutablePath
-	if exePath == "" {
-		var err error
-		exePath, err = os.Executable()
-		if err != nil {
+	newVersion, err := a.installNewBinary(body, exePath)
+	if err != nil {
+		// Literal branches rather than a code variable — the wire-code
+		// coverage gate resolves codes statically (same shape as the
+		// fetchURL split above).
+		if errors.Is(err, errUpgradeEpochMismatch) {
+			// external review F5: a cross-epoch ARTIFACT is the same refusal
+			// as a cross-epoch peer — reinstall, never `node upgrade`. The
+			// disk is untouched (the smoke gate runs before any mutation).
 			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "self_path", Error: err.Error(),
+				Code: "proto_bump_requires_reinstall", Error: err.Error(),
 			})
 			return
 		}
-	}
-	newVersion, err := installNewBinary(body, exePath)
-	if err != nil {
+		if errors.Is(err, errUpgradeSmokeFailed) {
+			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+				Code: "smoke_failed", Error: err.Error(),
+			})
+			return
+		}
 		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
 			Code: "install_failed", Error: err.Error(),
 		})
@@ -212,9 +278,15 @@ func (a *Agent) handleReExecOnly(msg *nats.Msg, req proto.UpgradeForwardedReq) {
 }
 
 // reExecInPlace replaces this agent process image with the on-disk binary at exePath (same PID; the old
-// NATS conn drops as the kernel closes fds across exec). A tiny delay lets the OK reply drain first. On
-// exec failure it exits non-zero so a supervisor (systemd Restart=on-failure) relaunches. Tests pin
-// UpgradeNoExit so the in-process harness does not replace the go-test binary.
+// NATS conn drops as the kernel closes fds across exec). A tiny delay lets the OK reply drain first.
+//
+// On exec failure with a PENDING upgrade marker (the `node upgrade` path), this process — the OLD image,
+// the only surviving copy of the old code — restores the prev slot IN PLACE and keeps running (plan §3.2
+// F3). It must NOT exit: os.Exit would hand a clean-exit to Restart=on-failure (agent stays down) and the
+// setsid-nohup path has no supervisor at all, while the rollback code needed at next boot would be living
+// inside a binary that just proved it cannot exec. Without a pending marker (the ReExecOnly / cluster
+// upgrade leg, which stages no marker) the old exit-non-zero contract is preserved unchanged.
+// Tests pin UpgradeNoExit so the in-process harness does not replace the go-test binary.
 func (a *Agent) reExecInPlace(exePath string) {
 	if a.cfg.UpgradeNoExit {
 		return
@@ -224,11 +296,51 @@ func (a *Agent) reExecInPlace(exePath string) {
 		argv := append([]string(nil), os.Args...)
 		argv[0] = exePath
 		if err := syscall.Exec(exePath, argv, os.Environ()); err != nil {
-			a.cfg.Logger.Error("agent: re-exec failed; exiting non-zero for supervisor restart",
-				"err", err, "exe", exePath)
+			a.cfg.Logger.Error("agent: re-exec into the new binary failed", "err", err, "exe", exePath)
+			if a.recoverFromFailedExec(exePath, err) {
+				return
+			}
+			a.cfg.Logger.Error("agent: re-exec failed with no pending upgrade marker; exiting non-zero for supervisor restart",
+				"exe", exePath)
 			os.Exit(1)
 		}
 	}()
+}
+
+// recoverFromFailedExec is the F3 closer (upgrade-safety plan §3.2): when
+// syscall.Exec of the just-installed binary fails, the still-running OLD
+// process image is the only surviving copy of the old code — restore the prev
+// slot in place and keep running (reexec=false: we already ARE the restored
+// code). Returns true when a pending marker was found and handled; false
+// means this exec was not a marker-tracked upgrade (the ReExecOnly leg) and
+// the caller keeps its historical exit-non-zero contract.
+func (a *Agent) recoverFromFailedExec(exePath string, execErr error) bool {
+	a.upgradeMu.Lock()
+	defer a.upgradeMu.Unlock()
+	handled := false
+	// Host-wide flock (external review F1): exclude sibling processes from
+	// the marker/prev/dst read-modify-write.
+	lerr := withUpgradeFileLock(exePath, true, func() error {
+		m, merr := readUpgradeMarker(upgradeMarkerPath(exePath))
+		if merr != nil || m == nil || m.State != upgradeStatePending {
+			//nolint:nilerr // The closure's error return propagates LOCK failures only; a corrupt
+			// marker is by contract "idle" (loud elsewhere, never a block) and means: nothing to recover.
+			return nil
+		}
+		executeRollback(exePath, m, fmt.Sprintf("syscall.Exec of the new binary failed: %v", execErr),
+			a.cfg.Logger, false, nil)
+		handled = true
+		return nil
+	})
+	if lerr != nil {
+		// We cannot safely prove that this was the untracked re-exec-only
+		// path without the lock. Keep the only known-live old process rather
+		// than exit and risk leaving an unsupervised node permanently down.
+		a.cfg.Logger.Error("agent: re-exec recovery: host-wide lock unavailable; keeping the old process alive",
+			"err", lerr)
+		return true
+	}
+	return handled
 }
 
 func (a *Agent) replyUpgradeForwarded(msg *nats.Msg, resp proto.UpgradeForwardedResp) {
@@ -296,6 +408,11 @@ var (
 	// ErrUpgradeTooLarge means the body exceeded upgradeMaxTarballBytes. Not retryable — the same URL
 	// will be the same size next time.
 	ErrUpgradeTooLarge = errors.New("upgrade: tarball exceeds the size ceiling")
+	// errUpgradeSmokeFailed marks a smoke-gate refusal (upgrade-safety plan
+	// §3.1): the sha-verified artifact could not exec or printed no parsable
+	// release tag. The artifact is bad for every node — maps to the
+	// `smoke_failed` wire code, which aborts a fleet rollout.
+	errUpgradeSmokeFailed = errors.New("upgrade: staged binary failed the smoke gate")
 )
 
 // upgradeRetryableStatuses are the HTTP statuses that can succeed later without anyone changing the
@@ -367,15 +484,20 @@ func sha256OfFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// installNewBinary atomically replaces dst with the `tether` binary
+// installNewBinary stages and atomically installs the `tether` binary
 // contained in the just-downloaded gzipped tar. The release tarball
 // layout (build/goreleaser.yaml § archives) carries a single file
 // named `tether` at the archive root plus README/LICENSE; we
 // extract just `tether` into a sibling tmp file, chmod +x, then
+// (upgrade-safety plan §3.1) run the SMOKE GATE, hardlink the current
+// binary into the prev slot, write the pending marker, and finally
 // rename onto dst. Rename is atomic on the same fs; running
 // processes keep their open inode handle (the new binary only
 // loads on the next exec), so this is safe to do while the agent
-// is still serving the upgrade reply.
+// is still serving the upgrade reply. dst itself is IN PLACE at every
+// interruption point — the prev slot is a hardlink plus a single
+// rename, never a remove-then-replace window (plan §10.2: the
+// two-rename variant would strand a crashed host on ENOENT).
 //
 // Uses archive/tar + compress/gzip directly (audit Sec F1: shelling
 // out to host tar opens path-traversal exposure under non-GNU tar
@@ -383,10 +505,13 @@ func sha256OfFile(path string) (string, error) {
 // exactly "tether" — anything with a path separator, leading slash,
 // or "..", or any other filename, is refused.
 //
-// Returns the new tether version string parsed from the binary
-// (best-effort via `tether version`); on parse failure the field
-// stays empty but the install is still considered a success.
-func installNewBinary(tarball []byte, dst string) (string, error) {
+// Returns the release tag the smoke gate parsed out of `<staged> version` —
+// GUARANTEED non-empty and in the same format the new binary will report as
+// ReleaseVersion on register (ctl --wait compares the two). A failure
+// wrapping errUpgradeSmokeFailed means the artifact is bad everywhere and the
+// disk was untouched; any other failure is a local IO problem
+// (install_failed).
+func (a *Agent) installNewBinary(tarball []byte, dst string) (string, error) {
 	tmpDir, err := os.MkdirTemp(filepath.Dir(dst), ".tether-upgrade-*")
 	if err != nil {
 		return "", fmt.Errorf("mkdir tmp: %w", err)
@@ -397,13 +522,141 @@ func installNewBinary(tarball []byte, dst string) (string, error) {
 	if err := extractTetherBinary(tarball, binPath); err != nil {
 		return "", err
 	}
-	if err := os.Chmod(binPath, 0o755); err != nil {
-		return "", fmt.Errorf("chmod: %w", err)
+
+	// Smoke gate: the staged binary must exec and answer `version` with a
+	// parsable release tag BEFORE anything on disk changes. Catches wrong
+	// arch, truncation, and not-a-tether-binary — the failure classes that
+	// used to be discovered only by syscall.Exec, after the flip.
+	newVersion, err := smokeVersion(binPath)
+	if err != nil {
+		return "", fmt.Errorf("staged binary failed the smoke gate (disk unchanged): %w: %w", errUpgradeSmokeFailed, err)
+	}
+
+	// Prev slot: hardlink the CURRENT binary aside (same dir ⇒ same fs ⇒
+	// zero-copy; a hardlink shares the old inode, so the later rename of the
+	// new binary over dst cannot touch it). Some filesystems refuse links —
+	// fall back to a copy. Old prev from a previous upgrade is replaced.
+	prevPath := upgradePrevPath(dst)
+	prevSHA, err := sha256OfFile(dst)
+	if err != nil {
+		return "", fmt.Errorf("hash current binary: %w", err)
+	}
+	newSHA, err := sha256OfFile(binPath)
+	if err != nil {
+		return "", fmt.Errorf("hash staged binary: %w", err)
+	}
+	var upgradeNonce [16]byte
+	if _, err := rand.Read(upgradeNonce[:]); err != nil {
+		return "", fmt.Errorf("generate upgrade transaction id: %w", err)
+	}
+	if err := os.Remove(prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("clear old prev slot: %w", err)
+	}
+	if err := os.Link(dst, prevPath); err != nil {
+		if cerr := copyFile(dst, prevPath); cerr != nil {
+			return "", fmt.Errorf("prev slot: link failed (%v) and copy failed: %w", err, cerr)
+		}
+	}
+	// F6 ordered durability: the prev slot's directory entry must be on
+	// stable storage BEFORE the marker that references it exists — a power
+	// cut between marker and prev would otherwise leave a rollback promise
+	// with nothing to roll back to.
+	if err := syncDirE(filepath.Dir(dst)); err != nil {
+		_ = os.Remove(prevPath)
+		return "", fmt.Errorf("sync dir after prev slot: %w", err)
+	}
+
+	// Marker BEFORE the flip: if the flip below fails, the error path clears
+	// it back to a terminal state; if that clearing is itself lost (process
+	// death mid-install), the pending marker goes stale at the deadline and
+	// the install entry gate stops honoring it.
+	deadline := a.upgradeNow().Add(upgradeRegisterDeadline)
+	marker := &upgradeMarker{
+		State:       upgradeStatePending,
+		PrevSHA:     prevSHA,
+		NewSHA:      newSHA,
+		PrevVersion: proto.ReleaseVersion,
+		NewVersion:  newVersion,
+		Deadline:    deadline,
+		BootBudget:  upgradeBootBudget,
+		// external review F1: pin the upgrade to the instance `node upgrade
+		// <nid>` targeted — a co-hosted sibling must neither claim nor clear
+		// it. UpgradeID is also the process-local boot proof, so it must be
+		// unique even for rapid same-artifact retries.
+		TargetSID: a.cfg.SID,
+		TargetNID: a.cfg.NID,
+		UpgradeID: hex.EncodeToString(upgradeNonce[:]),
+	}
+	// The caller holds the host-wide flock, which serializes this marker write
+	// against commit/watchdog in this process and every sibling process. Do
+	// not take upgradeMu here: those transitions take upgradeMu before the
+	// flock, and reversing that order here creates an ABBA deadlock.
+	markerPath := upgradeMarkerPath(dst)
+	werr := writeUpgradeMarker(markerPath, marker)
+	if werr != nil {
+		// external re-review F11: writeUpgradeMarker can fail AFTER its
+		// rename landed (the directory-fsync step) — the transaction is
+		// aborting, but a visible pending marker would make this healthy
+		// old process reject every retry as upgrade_in_progress until the
+		// 120s deadline. Compensate under the same locks (host flock is
+		// held by the caller): remove whatever landed and re-sync.
+		if landed, rerr := readUpgradeMarker(markerPath); rerr == nil && landed != nil &&
+			landed.UpgradeID == marker.UpgradeID {
+			_ = os.Remove(markerPath)
+			syncDir(filepath.Dir(markerPath))
+		}
+	}
+	if werr != nil {
+		_ = os.Remove(prevPath)
+		syncDir(filepath.Dir(prevPath))
+		return "", fmt.Errorf("write upgrade marker: %w", werr)
 	}
 	if err := os.Rename(binPath, dst); err != nil {
+		// dst is untouched (the rename failed) — record the aborted attempt
+		// so the entry gate does not block on a flip that never happened.
+		marker.State = upgradeStateRolledBack
+		marker.Detail = fmt.Sprintf("install aborted before the flip: %v", err)
+		werr := writeUpgradeMarker(markerPath, marker)
+		if werr != nil {
+			a.cfg.Logger.Warn("agent: could not record aborted install; pending marker will go stale at its deadline", "err", werr)
+		}
+		_ = os.Remove(prevPath)
 		return "", fmt.Errorf("atomic rename: %w", err)
 	}
-	return readVersionString(dst), nil
+	// F6: make the flip itself durable. Past this point the transaction is
+	// complete on stable storage; a failure here is logged, not unwound —
+	// the runtime state (reply, re-exec) matches the disk either way.
+	if err := syncDirE(filepath.Dir(dst)); err != nil {
+		a.cfg.Logger.Warn("agent: dir fsync after the flip failed — a power cut may resurface the old binary (marker converges it at boot)", "err", err)
+	}
+	return newVersion, nil
+}
+
+// copyFile is the prev-slot fallback for filesystems that refuse hardlinks.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	_, cpErr := io.Copy(out, in)
+	chmodErr := out.Chmod(0o755) // fd-chmod before the fsync (F6): OpenFile's mode is umask-clipped
+	syncErr := syncFile(out)     // S13: the prev slot must survive a power cut — it IS the rollback
+	closeErr := out.Close()
+	if cpErr != nil {
+		return cpErr
+	}
+	if chmodErr != nil {
+		return chmodErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // extractTetherBinary scans the gzipped tar for a single file
@@ -454,9 +707,24 @@ func extractTetherBinary(tarball []byte, outPath string) error {
 			return fmt.Errorf("create binary: %w", err)
 		}
 		_, err = io.CopyN(f, tr, hdr.Size)
+		// chmod on the SAME fd, BEFORE the fsync (external review F6): a
+		// chmod after the sync would leave the executable bit unpersisted —
+		// after a power cut the new dst exists but cannot exec, which no
+		// rollback path detects.
+		chmodErr := f.Chmod(0o755)
+		// fsync before the later rename onto the live binary path (internal
+		// review S13): a post-rename power cut must not leave a truncated
+		// dst — that is the one artifact the rollback machinery cannot fix.
+		syncErr := syncFile(f)
 		closeErr := f.Close()
 		if err != nil {
 			return fmt.Errorf("write binary: %w", err)
+		}
+		if chmodErr != nil {
+			return fmt.Errorf("chmod binary: %w", chmodErr)
+		}
+		if syncErr != nil {
+			return fmt.Errorf("sync binary: %w", syncErr)
 		}
 		if closeErr != nil {
 			return fmt.Errorf("close binary: %w", closeErr)
@@ -465,19 +733,78 @@ func extractTetherBinary(tarball []byte, outPath string) error {
 	}
 }
 
-// readVersionString runs `<exe> version` and returns the first line
-// trimmed. Failure is non-fatal — install still succeeded; we just
-// won't have the new version number to report.
-func readVersionString(exe string) string {
-	out, err := exec.Command(exe, "version").Output()
-	if err != nil {
-		return ""
+// upgradeSmokeTimeout bounds the smoke gate's `version` probe. A healthy
+// static binary answers in milliseconds; 5s absorbs a cold page cache.
+const upgradeSmokeTimeout = 5 * time.Second
+
+// errUpgradeEpochMismatch marks a smoke-gate refusal because the CANDIDATE
+// binary belongs to a different ProtoVersion epoch (external review F5): the
+// request's ProtoVersion only proves ctl/broker/this-agent agree — it says
+// nothing about the downloaded bytes. Installing a cross-epoch binary would
+// smuggle an epoch change past `proto_bump_requires_reinstall`, and the new
+// process would be exactly rejected by every same-epoch broker.
+var errUpgradeEpochMismatch = errors.New("upgrade: staged binary belongs to a different proto epoch")
+
+// smokeOutputCap bounds how much of the candidate's stdout we will hold
+// (external review 疑惑 2): a hostile/broken candidate spraying output must
+// not OOM the agent. The real line is <100 bytes.
+const smokeOutputCap = 64 * 1024
+
+// smokeVersion is the smoke gate (upgrade-safety plan §3.1): run
+// `<staged> version` and STRICTLY parse its first non-empty line against the
+// frozen format `tether <release> (proto v<N>)` (proto.VersionLine — the
+// cross-version seam both emitter and this parser derive from). Refuses on
+// exec failure, unparsable output, or an epoch N different from this
+// agent's own ProtoVersion (external review F5). The returned tag is
+// normalized to EXACTLY what the new binary reports as ReleaseVersion on
+// register — ctl's --wait equality check depends on that (pinned by test).
+func smokeVersion(binPath string) (string, error) {
+	// ctx-none: reached from a nats.go MsgHandler (func(*nats.Msg)) — no ctx
+	// to thread; the probe is bounded by its own timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), upgradeSmokeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binPath, "version")
+	// 疑惑 2 hardening: cap captured output, and don't let an inherited pipe
+	// (a candidate that forks children) hold Wait open past the timeout.
+	var buf bytes.Buffer
+	cmd.Stdout = &capWriter{w: &buf, n: smokeOutputCap}
+	cmd.WaitDelay = 2 * time.Second
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("exec `version` on the staged binary: %w", err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(buf.String(), "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" {
-			return line
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		// Frozen shape: exactly `tether <release> (proto v<N>)`.
+		if len(fields) != 4 || fields[0] != "tether" || fields[2] != "(proto" || !strings.HasSuffix(fields[3], ")") {
+			return "", fmt.Errorf("staged binary's version line %q is not `tether <release> (proto vN)`", line)
+		}
+		epoch := strings.TrimSuffix(fields[3], ")")
+		if epoch != proto.SubjectVersionToken {
+			return "", fmt.Errorf("%w: candidate reports %q, this agent is %q — an epoch change must go through reinstall",
+				errUpgradeEpochMismatch, epoch, proto.SubjectVersionToken)
+		}
+		return fields[1], nil
+	}
+	return "", fmt.Errorf("staged binary printed no version line")
+}
+
+// capWriter drops bytes past n (the parser only needs the first line).
+type capWriter struct {
+	w *bytes.Buffer
+	n int
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if room := c.n - c.w.Len(); room > 0 {
+		if len(p) > room {
+			c.w.Write(p[:room])
+		} else {
+			c.w.Write(p)
 		}
 	}
-	return ""
+	return len(p), nil
 }

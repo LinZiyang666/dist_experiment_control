@@ -31,7 +31,8 @@
 #  - NO arm triggers a real re-exec (which would mutate the shared binary + re-home the fleet mid-drill): (a)
 #    fails on the wrong sha; the non-vacuity + F3 probes fail at the agent url gate; N3 fails at the broker
 #    owner gate (pre-forward); F4's --timeout 0 request is never even published (nats.go context.go:49). The
-#    SUCCESSFUL re-exec path is a first-class not_covered (see drill_end), owned by a dedicated success drill.
+#    SUCCESSFUL re-exec path is a first-class not_covered (see drill_end). A dedicated success drill must
+#    be created; no owner currently exists.
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/lib/secrets.sh"
@@ -202,6 +203,6 @@ assert_ok "F4a --all --timeout 0 exits 0 (transient-skip CONTINUES + summarises,
 assert_ok "F4b every ONLINE node is skipped-transient: distinct skip-line count ($_skip_n) == ONLINE set ($_online_n) AND both agt1+agt2 appear in a 'skipped (transient)' line"  sh -c "[ '$_skip_n' = '$_online_n' ] && [ '$_online_n' -ge 2 ] && printf '%s' \"\$1\" | grep -qE 'agt1 skipped \\(transient\\)' && printf '%s' \"\$1\" | grep -qE 'agt2 skipped \\(transient\\)'" _ "$_allto"
 assert_ok "F4c fleet continues to the EXACT skip summary '($_online_n node(s) skipped due to transient errors...)' (--timeout threaded; transient-skip path, NOT F3's config-abort)"  sh -c "printf '%s' \"\$1\" | grep -qE '\\($_online_n node\\(s\\) skipped due to transient'" _ "$_allto"
 not_covered "31 (external-review M4, honest): a SUCCESSFUL fleet upgrade (PID-preserving re-exec + version bump + two-node summary)" \
-    "DELIBERATELY not exercised here: #28 is FIXED (this drill PROVES the configured URL passes the agent gate), so the success path is now reachable in principle — but a real re-exec would REWRITE the shared binary + re-home the 2-node fleet mid-drill, polluting the enumeration/dispatch/timeout arms. This drill covers the CONTROL surface: agent allow-list flip + non-vacuity (#28), ENUMERATION (F1/F2), DISPATCH + config-abort (F3), --timeout + transient-skip (F4). The destructive success/PID/version path is owned by a dedicated upgrade-success drill." gap
+    "DELIBERATELY not exercised here: #28 is FIXED (this drill PROVES the configured URL passes the agent gate), so the success path is now reachable in principle — but a real re-exec would REWRITE the shared binary + re-home the 2-node fleet mid-drill, polluting the enumeration/dispatch/timeout arms. This drill covers the CONTROL surface: agent allow-list flip + non-vacuity (#28), ENUMERATION (F1/F2), DISPATCH + config-abort (F3), --timeout + transient-skip (F4). A dedicated destructive success/PID/version/rollback/--wait drill must be created; it currently has no owner." gap
 
 drill_end

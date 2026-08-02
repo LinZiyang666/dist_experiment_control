@@ -600,6 +600,9 @@ append 的标准写法。
 
 ## 8. 升级（broker）
 
+> **车队滚动顺序**（requirements §6.7 N-1 窗口）：**broker 先升，agent/ctl 后升**；回滚顺序相反。
+> 混合 release 车队在一个窗口（相邻两个 release）内是受支持状态。
+
 ### 8.4 broker 升级
 
 ```bash
@@ -700,6 +703,35 @@ root-init 污染的机器：停 daemon → `sudo chown -R tether:tether /var/lib
 **#24 — route/tunnel 证书须带 SAN**：见 [`cluster-runbook.md`](cluster-runbook.md) 的 route-cert 铸证段
 （nats route mesh 走标准 x509、需 `subjectAltName` 匹配 route-URL host；tether 自己的 raft transport 不需要，
 勿被 `internal/cluster/transport.go` 的注释误导）。
+
+### 8.7 agent 升级安全（upgrade-safety 增量）— 运维须知
+
+机制全图（冒烟门 / prev 槽 / marker / 自动回退）见 `distributed-broker-architecture.md §21.3`，
+使用者视角见 `usage.md §5.19`。运维需要知道的硬事实：
+
+- **磁盘足迹**：升级期间 agent 二进制目录会多出 `<二进制>.prev`（旧版硬链接，≈10 MiB）与
+  `.tether-upgrade.json`（marker，<1 KiB），升级提交后 prev 保留（下次升级时被替换）。
+  小盘 VPS（如 racknerd）`df` 时记得算上这份常驻 ≈10 MiB；下载/解压期间另有一份新二进制的
+  **瞬时** tmp 副本（同目录 `.tether-upgrade-*`，安装结束即删，峰值再 +≈10 MiB）。
+- **首跳无保护**：把带本设施的第一个 release 推上现网的那一次 `node upgrade`，执行者仍是
+  **旧 agent 代码**（无冒烟/无 prev/无回退），风险与历史版本等同——那一跳请手工金丝雀：
+  先升 1 台非关键 agent，`tether node ls` 确认 RELEASE 列变了再扇出。
+- **setsid-nohup 部署 GAP**：无监督路径下"新二进制起来即崩"无人拉起（与旧版同险）；
+  systemd 部署（system 层或 user 层单元）不受此限。
+- **NAT 弱网下的假回退**：120s 内 register 不成会触发自动回退——弱网节点可能明明二进制没问题
+  也被退回旧版。无害（节点仍在线、旧版本），代价是浪费一轮：网络恢复后重跑一次 upgrade 即可。
+- **回退的观测**（外审 F7 订正措辞）：ctl 的 `--wait` **不消费任何持久升级状态**——
+  `COMMITTED` 是对 `node.list` release 轮询的**推断**（新 release + ONLINE），超时打印的是
+  `likely ROLLED BACK`（推断，非断言）。**权威状态**看两处日志：agent log 的状态机行、
+  broker log 的 `agent-reported upgrade outcome` 行（agent 重新 register 时携带
+  `upgrade_state`：committed / rolled_back / rollback_failed）。
+- **同宿主多 agent = 一个升级域**（外审 F1 裁决）：共享同一 `tether` 二进制的多个 agent
+  共享 prev/marker，同一时刻只允许一个在途升级（其余节点该跳返回 `upgrade_in_progress`，
+  `--all` 会 transient-skip、稍后重试）；升级的提交/回退只由 `node upgrade` 点名的那个
+  nid 驱动。跨进程互斥由二进制目录下的 `.tether-upgrade.lock`（flock）保证。
+- **同 tag 重装（same-tag re-push）**：`--wait` 无法用 release 变化区分"旧行"与"新 register"，
+  一律 fail-closed 报 **UNCONFIRMED**（exit 非零）；`--all` 的金丝雀遇到它会中止扇出。
+  同 tag 修复损坏二进制请**逐台**执行并以 agent/broker 日志人工确认。
 
 ---
 

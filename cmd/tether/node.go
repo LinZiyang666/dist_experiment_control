@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -141,6 +142,7 @@ func newNodeUpgradeCmd() *cobra.Command {
 		home       string
 		timeoutSec int
 		all        bool
+		wait       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "upgrade <nid>|--all",
@@ -148,18 +150,26 @@ func newNodeUpgradeCmd() *cobra.Command {
 		Long: fmt.Sprintf(`Sends a %s.s.<sid>.cmd.by.<actor>.node.<nid>.upgrade.req
 to the broker. The broker enforces owner-only + URL allowlist +
 proto match before forwarding to the agent. The agent downloads
-the tarball, verifies SHA256 + URL allowlist locally, atomically
-replaces its own binary, then re-execs in place (PID preserved
-under systemd / setsid). G.1 reconcile runs as the new binary
-re-registers.
+the tarball, verifies SHA256 + URL allowlist locally, smoke-tests
+the staged binary (`+"`version`"+` must answer), keeps the old
+binary in a .prev slot, atomically replaces itself, then re-execs
+in place (PID preserved under systemd / setsid). The new binary's
+first successful register COMMITS the upgrade; if it cannot
+register within its deadline (~2 min) the agent rolls itself back
+to .prev. See architecture §21.3.
 
 URL must be one the broker has whitelisted (broker.yaml or
 --upgrade-url-allow). SHA256 is the hex digest of the tarball,
 NOT of the extracted binary.
 
---all upgrades every ONLINE node in the active session (sequential,
-fail-fast). Use it for fleet-wide patch rollouts; for canary
-testing run a single <nid> first.`, proto.SubjectPrefix),
+--wait (default on for a single <nid>) polls until the node
+re-registers with the new release (COMMITTED) or reports that the
+deadline passed (likely rolled back).
+
+--all upgrades every ONLINE node in the active session. The first
+node (lexicographic) is the CANARY: it is always fully confirmed
+(staged + re-registered) before the rest are touched; if it fails
+or rolls back, the remaining nodes are left untouched.`, proto.SubjectPrefix),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if urlFlag == "" || shaFlag == "" {
@@ -198,47 +208,35 @@ testing run a single <nid> first.`, proto.SubjectPrefix),
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no ONLINE nodes in session)")
 					return nil
 				}
+				// Deterministic canary selection (upgrade-safety plan §5):
+				// lexicographic order, first node is the canary.
+				sort.Strings(targets)
 			}
+			timeout := time.Duration(timeoutSec) * time.Second
 
-			// Fleet rollouts must distinguish transient from
-			// configuration errors:
-			//   - node_offline / agent_no_responders / timeout: keep
-			//     going; the operator will retry these later.
-			//   - everything else (not_owner / url_not_allowed /
-			//     proto_bump / sha256_invalid): config bug, abort
-			//     the rest of the fleet so we don't fan-out a known-
-			//     bad request.
-			// Single-nid mode (len(targets) == 1) keeps the original
-			// strict behavior: one explicit target, one yes/no answer.
-			var skipped, failed int
-			strict := !all
-			for _, nid := range targets {
-				err := dispatchUpgrade(cmd, nc, sid, id.PublicKey, nid,
-					urlFlag, shaFlag, time.Duration(timeoutSec)*time.Second)
-				if err == nil {
-					continue
+			// Single explicit <nid>: dispatch, then (default) wait for the
+			// commit/rollback verdict. Baseline BEFORE dispatch (S11), and a
+			// baseline failure refuses the dispatch outright (F4).
+			if !all {
+				nid := targets[0]
+				startRelease := ""
+				if wait {
+					startRelease, err = captureReleaseBaseline(cmd, nc, sid, id.PublicKey, nid)
+					if err != nil {
+						return err
+					}
 				}
-				if strict || isConfigError(err) {
+				newVersion, err := dispatchUpgrade(cmd, nc, sid, id.PublicKey, nid, urlFlag, shaFlag, timeout)
+				if err != nil {
 					return err
 				}
-				if isTransientError(err) {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-						"⚠ %s/%s skipped (transient): %v\n", sid, nid, err)
-					skipped++
-					continue
+				if !wait {
+					return nil
 				}
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-					"✗ %s/%s failed: %v\n", sid, nid, err)
-				failed++
+				return waitForUpgradeCommit(cmd, nc, sid, id.PublicKey, nid, newVersion, startRelease)
 			}
-			if failed > 0 {
-				return fmt.Errorf("upgrade --all: %d failed (%d transiently skipped)", failed, skipped)
-			}
-			if all && skipped > 0 {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-					"(%d node(s) skipped due to transient errors — retry later)\n", skipped)
-			}
-			return nil
+
+			return runUpgradeAll(cmd, nc, sid, id.PublicKey, targets, urlFlag, shaFlag, timeout)
 		},
 	}
 	cmd.Flags().StringVar(&urlFlag, "url", "", "absolute https:// URL of the new release tarball (required)")
@@ -248,7 +246,9 @@ testing run a single <nid> first.`, proto.SubjectPrefix),
 	cmd.Flags().IntVar(&timeoutSec, "timeout", 60,
 		"seconds to wait for broker reply (must exceed agent download time)")
 	cmd.Flags().BoolVar(&all, "all", false,
-		"upgrade every ONLINE node in the active session (sequential, fail-fast)")
+		"upgrade every ONLINE node in the active session (canary-first, then sequential)")
+	cmd.Flags().BoolVar(&wait, "wait", true,
+		"single-<nid> mode: poll until the node re-registers with the new release (COMMITTED) or the deadline passes; --all always confirms its canary regardless")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 || all {
 			return nil, cobra.ShellCompDirectiveNoFileComp
@@ -261,11 +261,81 @@ testing run a single <nid> first.`, proto.SubjectPrefix),
 	return cmd
 }
 
-// dispatchUpgrade fires one upgrade.req at (sid, nid) and reports
-// the broker's reply. Extracted so the --all loop can reuse it.
+// runUpgradeAll is the `--all` body (extracted from RunE for testability).
+// The CANARY (first node of the sorted target list) is always fully
+// confirmed — staged AND re-registered as the new release — before any other
+// node is touched; a canary failure leaves the rest of the fleet untouched
+// (upgrade-safety plan §5). The remainder is NOT per-node waited (N×2min of
+// serial waiting buys nothing after a confirmed canary) — the closing hint
+// points at `tether node ls`.
+func runUpgradeAll(cmd *cobra.Command, nc *nats.Conn,
+	sid, actor string, targets []string, urlFlag, shaFlag string, timeout time.Duration,
+) error {
+	canary, rest := targets[0], targets[1:]
+	if len(rest) > 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"canary: %s (%d more node(s) held until it commits)\n", canary, len(rest))
+	}
+	// Baseline before dispatch (S11); failure holds the WHOLE fleet (F4) —
+	// a canary whose confirmation would be blind is no canary.
+	startRelease, err := captureReleaseBaseline(cmd, nc, sid, actor, canary)
+	if err != nil {
+		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
+	}
+	newVersion, err := dispatchUpgrade(cmd, nc, sid, actor, canary, urlFlag, shaFlag, timeout)
+	if err != nil {
+		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
+	}
+	if err := waitForUpgradeCommit(cmd, nc, sid, actor, canary, newVersion, startRelease); err != nil {
+		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
+	}
+
+	// Fleet rollouts must distinguish transient from configuration errors:
+	//   - node_offline / agent_no_responders / upgrade_in_progress /
+	//     timeout: keep going; the operator will retry these later.
+	//   - everything else (not_owner / url_not_allowed / proto_bump /
+	//     sha256_invalid / smoke_failed): config bug, abort the rest of the
+	//     fleet so we don't fan-out a known-bad request.
+	var skipped, failed int
+	for _, nid := range rest {
+		_, err := dispatchUpgrade(cmd, nc, sid, actor, nid, urlFlag, shaFlag, timeout)
+		if err == nil {
+			continue
+		}
+		if isConfigError(err) {
+			return err
+		}
+		if isTransientError(err) {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				"⚠ %s/%s skipped (transient): %v\n", sid, nid, err)
+			skipped++
+			continue
+		}
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"✗ %s/%s failed: %v\n", sid, nid, err)
+		failed++
+	}
+	if failed > 0 {
+		return fmt.Errorf("upgrade --all: %d failed (%d transiently skipped)", failed, skipped)
+	}
+	if skipped > 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"(%d node(s) skipped due to transient errors — retry later)\n", skipped)
+	}
+	if len(rest) > 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"fleet dispatched; verify releases with `tether node ls`\n")
+	}
+	return nil
+}
+
+// dispatchUpgrade fires one upgrade.req at (sid, nid) and reports the
+// broker's reply. Returns the smoke-gate-normalized release tag the agent
+// staged (empty from a pre-upgrade-safety agent) so callers can wait for the
+// matching re-register. Extracted so the --all loop can reuse it.
 func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	sid, actor, nid, url, sha256 string, timeout time.Duration,
-) error {
+) (string, error) {
 	body, _ := json.Marshal(proto.UpgradeReq{
 		URL:          url,
 		SHA256:       sha256,
@@ -276,18 +346,182 @@ func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	respMsg, err := nc.RequestWithContext(ctx,
 		proto.SubjCmdBy(sid, actor, nid, "upgrade"), body)
 	if err != nil {
-		return fmt.Errorf("upgrade %s/%s: %w (broker or agent unreachable on NATS)", sid, nid, err)
+		return "", fmt.Errorf("upgrade %s/%s: %w (broker or agent unreachable on NATS)", sid, nid, err)
 	}
 	var resp proto.UpgradeResp
 	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
-		return fmt.Errorf("decode reply for %s: %w (broker version skew?)", nid, err)
+		return "", fmt.Errorf("decode reply for %s: %w (broker version skew?)", nid, err)
 	}
 	if !resp.OK {
-		return brokerErrorMessage(fmt.Sprintf("upgrade %s/%s", sid, nid), resp.Code, resp.Error)
+		return "", brokerErrorMessage(fmt.Sprintf("upgrade %s/%s", sid, nid), resp.Code, resp.Error)
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-		"✔ upgrade dispatched to %s/%s (agent re-exec in progress)\n", sid, nid)
-	return nil
+	// origin: internal review S3. A PRE-upgrade-safety agent (every deployed
+	// release up to and including the one before this shipped) fills
+	// NewVersion with the FULL first line of `tether version` — e.g.
+	// "tether v0.4.7 (proto v2)" — not the bare tag: its readVersionString
+	// was best-effort whole-line. Treating that as a comparable tag makes
+	// --wait's equality test unsatisfiable → every successful first-hop
+	// upgrade reads as ROLLED BACK and the canary aborts the whole fleet.
+	// Normalize defensively: anything with whitespace or without a leading
+	// "v" is legacy — drop to "" so --wait uses the release-changed fallback.
+	newVersion := resp.NewVersion
+	if newVersion != "" && (strings.ContainsAny(newVersion, " \t") || !strings.HasPrefix(newVersion, "v")) {
+		newVersion = ""
+	}
+	if newVersion != "" {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"✔ %s/%s: staged (→ %s, smoke ok); agent re-exec in progress\n", sid, nid, newVersion)
+	} else {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"✔ upgrade dispatched to %s/%s (agent re-exec in progress)\n", sid, nid)
+	}
+	return newVersion, nil
+}
+
+// upgradeWaitBudget bounds waitForUpgradeCommit's polling: the agent's own
+// register deadline is 120s (internal/agent upgradeRegisterDeadline — the
+// number in the "deadline 120s" line below), plus slack for the re-exec, the
+// reconnect backoff, and our 3s poll grain. A var, not a const, so the
+// timeout-path test does not have to sit through the real budget.
+var upgradeWaitBudget = 150 * time.Second
+
+// upgradeWaitPoll is the node.list polling grain. A var (internal review
+// S30) so tests can tighten it instead of sleeping in 3s steps.
+var upgradeWaitPoll = 3 * time.Second
+
+// waitForUpgradeCommit polls node.list (the same replicated view `node ls`
+// reads — zero new schema, zero new subscriptions) until nid re-registers
+// ONLINE with the upgraded release, or the wait budget runs out (by then the
+// agent's own deadline has passed, so a still-old release almost certainly
+// means it ROLLED BACK). newVersion=="" (pre-upgrade-safety agent: no
+// smoke-normalized tag to compare) falls back to "any release change from
+// startRelease" — the baseline the CALLER captured BEFORE dispatching
+// (internal review S11: capturing it after dispatch races a fast re-register
+// into a false ROLLED BACK). origin: upgrade-safety plan §5.
+func waitForUpgradeCommit(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid, newVersion, startRelease string) error {
+	// origin: internal review S4, HARDENED by external review F3. A same-tag
+	// re-push (re-installing the release the node already runs — this
+	// fleet's standard recovery move for a corrupted binary) makes the
+	// release-equality criterion satisfiable by the STALE pre-upgrade row:
+	// the very first poll would report a hollow COMMITTED. There is no
+	// remote signal that separates "old row" from "new register" without
+	// new wire (deliberately out of scope this increment). The internal
+	// round downgraded to a warning and returned success; the external
+	// review is right that a canary is a HEALTH gate, not an artifact gate —
+	// `version` passing says nothing about Agent.Run/register/watchdog, so
+	// "unconfirmable" must FAIL CLOSED: a loud UNCONFIRMED error. Single-
+	// node operators read the message and check the logs; `--all` treats it
+	// as a canary failure and leaves the fleet untouched. Same-tag fleet
+	// reinstalls are done node-by-node until a wire-level registration
+	// generation exists (recorded as the long-term fix).
+	if newVersion != "" && newVersion == startRelease {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+			"⚠ %s: node already reports %s — a same-tag re-push cannot be confirmed via release change.\n"+
+				"  UNCONFIRMED: staged + smoke passed, but re-register proof is unavailable; verify via the\n"+
+				"  agent/broker logs (upgrade_state line) before trusting this node.\n",
+			nid, newVersion)
+		return &ExitError{Class: exitUsage, Err: fmt.Errorf(
+			"upgrade %s/%s: UNCONFIRMED — same-tag re-push has no re-register proof (verify via agent/broker logs)",
+			sid, nid)}
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  waiting for re-register (deadline 120s) …\n")
+
+	deadline := time.Now().Add(upgradeWaitBudget)
+	lastSeen := startRelease
+	for {
+		if time.Now().After(deadline) {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"✗ %s: still %s after deadline — likely ROLLED BACK (check agent log / broker log)\n",
+				nid, orUnknown(lastSeen))
+			// exitUsage, not transient (internal review S6): a retry hits
+			// the same artifact and the same rollback — automation told
+			// "retry" would push a broken binary in a loop, each round
+			// crash-booting the target three times. A human has to change
+			// the --url (or read the logs); that is the 64 class.
+			return &ExitError{Class: exitUsage, Err: fmt.Errorf(
+				"upgrade %s/%s: node did not re-register with the new release within %s (likely rolled back)",
+				sid, nid, upgradeWaitBudget)}
+		}
+		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
+		case <-time.After(upgradeWaitPoll):
+		}
+		entry, err := lookupNodeEntry(cmd.Context(), nc, sid, actor, nid)
+		if err != nil {
+			continue // transient lookup failure — the budget bounds us
+		}
+		if entry.ReleaseVersion != "" {
+			lastSeen = entry.ReleaseVersion
+		}
+		if entry.Status != "ONLINE" {
+			continue
+		}
+		if newVersion != "" {
+			if entry.ReleaseVersion == newVersion {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"✔ %s: registered as %s — upgrade COMMITTED\n", nid, entry.ReleaseVersion)
+				return nil
+			}
+		} else if startRelease != "" && entry.ReleaseVersion != "" && entry.ReleaseVersion != startRelease {
+			// The legacy fallback is meaningful ONLY against a known non-empty
+			// baseline (external review F4): with startRelease=="", every
+			// ordinary stale ONLINE row is "different" on the first poll and
+			// would mint a hollow COMMITTED. Baseline capture is mandatory
+			// before dispatch, so "" here means the pre-upgrade row itself had
+			// no release — fail toward the timeout verdict, never toward a
+			// fabricated commit.
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+				"✔ %s: registered as %s (release changed) — upgrade COMMITTED\n", nid, entry.ReleaseVersion)
+			return nil
+		}
+	}
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "(unknown release)"
+	}
+	return s
+}
+
+// captureReleaseBaseline reads nid's currently-registered release BEFORE the
+// upgrade is dispatched — the comparison base --wait's verdicts stand on.
+// HARD failure (external review F4, superseding internal S11's warn-and-
+// continue): with an unknown baseline, the legacy fallback would read ANY
+// stale ONLINE row as "release changed" on its very first poll and print a
+// hollow COMMITTED, and the same-tag guard would be silently bypassed. When
+// confirmation is requested, no baseline ⇒ no dispatch.
+func captureReleaseBaseline(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid string) (string, error) {
+	entry, err := lookupNodeEntry(cmd.Context(), nc, sid, actor, nid)
+	if err != nil {
+		return "", fmt.Errorf("upgrade %s/%s: cannot read the pre-upgrade release baseline (%w) — refusing to dispatch with --wait confirmation blind; retry, or use --wait=false for a fire-and-forget dispatch", sid, nid, err)
+	}
+	return entry.ReleaseVersion, nil
+}
+
+// lookupNodeEntry fetches one node's row from the node.list RPC.
+func lookupNodeEntry(ctx context.Context, nc *nats.Conn, sid, actor, nid string) (proto.NodeListEntry, error) {
+	body, _ := json.Marshal(proto.NodeListReq{})
+	respCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	respMsg, err := nc.RequestWithContext(respCtx, proto.SubjCtrlNodeList(actor, sid), body)
+	if err != nil {
+		return proto.NodeListEntry{}, err
+	}
+	var nl proto.NodeListResp
+	if err := json.Unmarshal(respMsg.Data, &nl); err != nil {
+		return proto.NodeListEntry{}, err
+	}
+	if nl.Code != "" {
+		return proto.NodeListEntry{}, fmt.Errorf("node.list rejected: %s %s", nl.Code, nl.Error)
+	}
+	for _, n := range nl.Nodes {
+		if n.NID == nid {
+			return n, nil
+		}
+	}
+	return proto.NodeListEntry{}, fmt.Errorf("node %s not in node.list", nid)
 }
 
 // HOW `node upgrade --all` CLASSIFIES A PER-NODE FAILURE
@@ -331,6 +565,9 @@ var (
 		// skipping this node and continuing: the artifact is fine and the next node may well succeed.
 		"download_http_retryable": true,
 		"pty_alloc_failed":        true,
+		// origin: upgrade-safety plan §4 — a prior upgrade on THIS node is inside its register
+		// deadline; it self-resolves (commit or rollback) within that bound. Skip and retry later.
+		"upgrade_in_progress": true,
 	}
 	// configUpgradeCodes: the CALL itself is bad (not the target). Aborts `--all` because no other node
 	// will accept it either.
@@ -357,6 +594,11 @@ var (
 		// over the ceiling on node 2 through node N as well.
 		"download_http_status": true,
 		"download_too_large":   true,
+		// origin: upgrade-safety plan §4 — the sha-verified artifact failed the agent's pre-install
+		// smoke gate (cannot exec / no version line): wrong arch or truncated build, which is wrong for
+		// EVERY node. `--all` presumes a homogeneous fleet (one URL, one sha for all), so fanning it out
+		// after the first smoke failure would push a known-bad artifact at the remaining N-1 nodes.
+		"smoke_failed": true,
 	}
 	// transientCodelessNeedles: prose that can only come from Go's transport/context layer, which never
 	// carries a wire code. Consulted ONLY when the error carries no code — never as an override.

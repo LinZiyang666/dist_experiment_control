@@ -24,7 +24,12 @@ func TestSubjectPrefixStable(t *testing.T) {
 	// Bumping SubjectPrefix without a ProtoVersion bump would silently break
 	// every subscriber. Pin them together. v2 = distributed-broker D0 flip.
 	if SubjectPrefix != "tether.v2" {
-		t.Fatalf("SubjectPrefix must equal 'tether.v2' for ProtoVersion=2, got %q", SubjectPrefix)
+		t.Fatalf("SubjectPrefix must equal 'tether.v2' for ProtoVersion=2, got %q.\n"+
+			"If you are bumping the epoch on purpose: that is the ONE permitted compatibility "+
+			"break of the N-1 window, and it comes with obligations — the new broker must "+
+			"subscribe BOTH tether.v(N) and tether.v(N-1) subject trees and answer on the "+
+			"requester's prefix for at least one release window. Read "+
+			"docs/distributed-broker-architecture.md §21.4 before updating this pin", SubjectPrefix)
 	}
 }
 

@@ -36,3 +36,18 @@ const (
 //
 //	-ldflags "-X github.com/LinZiyang666/tether/internal/proto.ReleaseVersion=v0.3.2"
 var ReleaseVersion = "v0.0.0-dev"
+
+// VersionLine is the single source of `tether version`'s FIRST LINE. It is a
+// cross-version compatibility seam, not cosmetics (internal review S5): the
+// upgrade smoke gate of every DEPLOYED agent parses this line out of the
+// binary it is about to install — emitter (cmd/tether newVersionCmd) and
+// parser (internal/agent smokeVersion) live in different releases of the
+// binary, so the format is frozen here where both sides import it. The
+// second whitespace-separated field must remain the bare release tag: an
+// N-1 agent extracts it with strings.Fields(line)[1] and reports it as
+// UpgradeForwardedResp.NewVersion, which ctl --wait compares against the
+// new binary's registered ReleaseVersion. Changing this shape strands the
+// FLEET's ability to upgrade INTO the release that changed it.
+func VersionLine() string {
+	return "tether " + ReleaseVersion + " (proto " + SubjectVersionToken + ")"
+}

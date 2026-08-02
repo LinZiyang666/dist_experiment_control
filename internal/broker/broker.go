@@ -1372,6 +1372,10 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		return
 	}
 
+	// origin: upgrade-safety N-1 window — EXACT equality, deliberately not an
+	// [N-1, N] window (architecture §21.1 site #1): the epoch is frozen inside
+	// a release window, and an N-1-epoch peer publishes on a subject tree this
+	// broker does not subscribe. Bumping ProtoVersion? Read §21.4 first.
 	if req.ProtoVersion != proto.ProtoVersion {
 		b.replyErr(msg, "proto_mismatch",
 			fmt.Sprintf("server proto=%d, client proto=%d", proto.ProtoVersion, req.ProtoVersion))
@@ -1452,6 +1456,19 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 
 	b.cfg.Logger.Info("broker: node registered",
 		"sid", sid, "nid", nid, "release", req.ReleaseVersion)
+	// upgrade-safety plan §4: an agent's first register after a `node upgrade`
+	// carries the outcome — without this line a rollback is indistinguishable
+	// from a plain reconnect on the broker side. Log-only by design: nodes rows
+	// travel through the raft-frozen RegisterInput payload, where a new field
+	// would silently drop in a mixed-version cluster (wire_freeze_test.go).
+	// "agent-reported" wording is deliberate (internal review S23): an
+	// in-flight register racing the agent's own rollback can carry a state
+	// the marker no longer holds; a later register delivers the correction.
+	if req.UpgradeState != "" {
+		b.cfg.Logger.Info("broker: agent-reported upgrade outcome",
+			"sid", sid, "nid", nid, "upgrade_state", req.UpgradeState,
+			"detail", req.UpgradeDetail, "release", req.ReleaseVersion)
+	}
 	b.pubSysEvent("agent_registered", map[string]any{
 		"sid": sid, "nid": nid, "release": req.ReleaseVersion,
 		"os": req.OS, "arch": req.Arch,

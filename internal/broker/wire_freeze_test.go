@@ -129,9 +129,13 @@ var frozenPayloadKeys = map[string][]string{
 
 	// Reached through ReconcilePayload.Req. These ride the forward envelope AND are the
 	// agent->broker register wire, so a change here breaks two wires at once.
+	// upgrade_state / upgrade_detail: upgrade-safety plan §4, ADDITIVE (omitempty, zero value =
+	// ordinary register; the broker only logs them, never persists — an old leader ignoring the
+	// unknown keys loses one log line and nothing else). Freeze-listed like every other key: from
+	// here on a RENAME of either is the cross-version break this test exists to catch.
 	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "local_ports", "local_processes",
 		"nid", "os", "proto_version", "release_version", "roster_gen", "roster_refresh_only",
-		"server_id"},
+		"server_id", "upgrade_detail", "upgrade_state"},
 	"proto.LocalProcess": {"pid", "rc", "start_time_ticks", "started_at", "state"},
 	"proto.LocalPort":    {"local_port", "name", "port", "token_hash"},
 }

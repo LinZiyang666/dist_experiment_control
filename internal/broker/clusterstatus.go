@@ -1114,12 +1114,17 @@ type ErrJoinVersionSkew struct {
 }
 
 func (e *ErrJoinVersionSkew) Error() string {
+	// Wording note (upgrade-safety S10): requirements §6.7 is now the N-1
+	// window; the JOIN gate is its explicitly-named exemption (a joiner is a
+	// machine being added — reinstalling it to match blocks no deployed
+	// node's rollback). These strings cite the exemption, not the old
+	// "identical major.minor.patch across the stack" rule it replaced.
 	if e.MissingField != "" {
-		return fmt.Sprintf("version skew: joiner did not declare %s — requirements §6.7 mandates identical major.minor.patch across the stack; upgrade the joiner and regenerate its join bundle before adding it",
+		return fmt.Sprintf("version skew: joiner did not declare %s — cluster membership requires an exact release match (requirements §6.7 join-gate exemption); upgrade the joiner and regenerate its join bundle before adding it",
 			e.MissingField)
 	}
 	if e.JoinerRelease != "" || e.ClusterRelease != "" {
-		return fmt.Sprintf("version skew: joiner runs release %s but this cluster runs %s — requirements §6.7 mandates identical major.minor.patch across the stack; reinstall the joiner at %s before adding it",
+		return fmt.Sprintf("version skew: joiner runs release %s but this cluster runs %s — cluster membership requires an exact release match (requirements §6.7 join-gate exemption); reinstall the joiner at %s before adding it",
 			e.JoinerRelease, e.ClusterRelease, e.ClusterRelease)
 	}
 	return fmt.Sprintf("version skew: joiner speaks proto v%d but this cluster is proto v%d — reinstall the joiner on a matching release before adding it",
@@ -1137,14 +1142,16 @@ func (e *ErrJoinVersionSkew) Error() string {
 //
 // Proto mismatch is a hard reject: a different proto cannot speak the wire.
 //
-// RELEASE MISMATCH IS ALSO A HARD REJECT (external review B3). It was advisory-only, on the
-// reasoning that "rejecting on release would brick exactly the rolling upgrade this gate exists to
-// enable". That reasoning was wrong on both halves:
+// RELEASE MISMATCH IS ALSO A HARD REJECT (external review B3; kept as the EXPLICIT EXEMPTION when
+// §6.7 became the N-1 window — upgrade-safety S10). It was advisory-only, on the reasoning that
+// "rejecting on release would brick exactly the rolling upgrade this gate exists to enable". That
+// reasoning was wrong on both halves:
 //
-//   - It contradicted the WHAT authority. docs/requirements.md §6.7 mandates identical
-//     major.minor.patch across the stack and says a mismatch must be REFUSED with a clear error.
-//     Under CLAUDE.md §1 requirements is layer 1; an implementation comment cannot quietly overrule
-//     it, and this one did, for a policy the operator can see.
+//   - It contradicted the WHAT authority. docs/requirements.md §6.7 (as then written) mandated
+//     identical major.minor.patch and said a mismatch must be REFUSED with a clear error. §6.7 is
+//     now the N-1 window and names THIS GATE as its explicit exemption: a joiner is a machine being
+//     ADDED — reinstalling it to match blocks no deployed node's rollback, while the window clause
+//     governs online interop, not cluster-membership admission.
 //   - It did not protect any real flow. A rolling `cluster upgrade` rolls EXISTING voters and never
 //     passes through this gate; the flows that do are `cluster join approve` / `cluster add`, i.e.
 //     admitting a NEW or re-installed broker, which is exactly where the requirement applies. The
@@ -1176,11 +1183,14 @@ func versionSkewRefusal(joinerProto int, joinerRelease, nodeID string, log *slog
 			MissingField: "protocol version",
 		}
 	}
+	// origin: upgrade-safety N-1 window — exact equality (architecture §21.1
+	// site #3): same-window peers are epoch-equal by construction; a bumper
+	// owes the dual-tree subscription first (§21.4).
 	if joinerProto != proto.ProtoVersion {
 		return &ErrJoinVersionSkew{JoinerProto: joinerProto, ClusterProto: proto.ProtoVersion}
 	}
 	if joinerRelease == "" {
-		logSkew(log, "cluster add: REFUSED — joiner did not declare its release; requirements §6.7 exact-version compatibility cannot be verified",
+		logSkew(log, "cluster add: REFUSED — joiner did not declare its release; the join gate's exact-release match (requirements §6.7 exemption) cannot be verified",
 			"node_id", nodeID, "this_release", proto.ReleaseVersion)
 		return &ErrJoinVersionSkew{
 			ClusterRelease: proto.ReleaseVersion,
@@ -1188,7 +1198,7 @@ func versionSkewRefusal(joinerProto int, joinerRelease, nodeID string, log *slog
 		}
 	}
 	if joinerRelease != proto.ReleaseVersion {
-		logSkew(log, "cluster add: REFUSED — joiner release differs from this broker (requirements §6.7: forced same version across the stack)",
+		logSkew(log, "cluster add: REFUSED — joiner release differs from this broker (requirements §6.7 join-gate exemption: membership admission requires an exact release match)",
 			"node_id", nodeID, "joiner_release", joinerRelease, "this_release", proto.ReleaseVersion)
 		return &ErrJoinVersionSkew{JoinerRelease: joinerRelease, ClusterRelease: proto.ReleaseVersion}
 	}

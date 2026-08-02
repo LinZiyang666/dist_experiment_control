@@ -125,7 +125,36 @@ type Config struct {
 	// so the upgrade flow doesn't trample the go-test binary
 	// itself (a successful overwrite mid-test is silent until the
 	// next subprocess fork tries to exec the corrupted binary).
+	// The upgrade marker and prev slot derive from its directory.
 	UpgradeExecutablePath string
+
+	// UpgradeNowFn overrides the clock the upgrade state machine reads
+	// (marker deadline stamping, watchdog arming, boot decisions). nil →
+	// time.Now. Tests use it to walk the register deadline without sleeping.
+	UpgradeNowFn func() time.Time
+
+	// UpgradeExecFn overrides the process-replacement call used by the
+	// watchdog/boot rollback paths. nil → syscall.Exec (production). Tests
+	// inject an observing fake to assert "exec'd with the restored path"
+	// without replacing the go-test binary.
+	UpgradeExecFn func(exePath string) error
+
+	// UpgradeRunningImagePath overrides where the upgrade state machine reads
+	// THIS PROCESS'S OWN executing image from when it needs proof that "we
+	// are the staged binary" (external review F1). "" → /proc/self/exe on
+	// Linux — which reads the bytes of the image this process is actually
+	// running, even after the on-disk path was renamed over — falling back
+	// to os.Executable elsewhere. The distinction is the whole point: on a
+	// shared-binary host a sibling agent that never re-exec'd hashes the
+	// REPLACED path to NewSHA while its own image is still the old binary;
+	// hashing the running image instead makes the commit proof
+	// process-local and unborrowable. Tests point this at a fixture file.
+	UpgradeRunningImagePath string
+
+	// UpgradeBootProofID injects the process-local boot proof in tests. In
+	// production it is empty and New consumes the proof recorded by the
+	// pre-Cobra BootUpgradeCheck for this process.
+	UpgradeBootProofID string
 
 	// ProxyFailClosedGrace (P13) is how long the agent may stay partitioned
 	// from NATS while still serving the embedded proxy before it proactively
@@ -256,6 +285,23 @@ type Agent struct {
 	// was written once before any callback, so a bare field was race-free; the rebuild loop is not.
 	runCtxMu sync.Mutex
 	runCtx   context.Context
+
+	// upgradeMu serializes every post-boot upgrade-marker transition
+	// (commit-on-register vs the register-deadline watchdog rollback) so the
+	// two can never both act on the same pending marker; upgradeWatchdogStop
+	// cancels the armed watchdog once a commit lands. See upgrade_state.go.
+	upgradeMu           sync.Mutex
+	upgradeWatchdogStop context.CancelFunc
+	upgradeBootProofID  string
+	// upgradeInstallMu (internal review S2) makes the WHOLE install pipeline
+	// (entry gate → download → smoke → prev slot → marker → flip) mutually
+	// exclusive with itself: every forwarded upgrade message runs in its own
+	// nats.go handler goroutine, and two interleaved installs would clobber
+	// the prev slot out from under the other's marker. TryLock only — a
+	// loser replies upgrade_in_progress instead of queueing (~35s hold). A
+	// separate mutex from upgradeMu on purpose: holding upgradeMu for the
+	// whole download would starve the watchdog and the commit path.
+	upgradeInstallMu sync.Mutex
 
 	// js is the JetStream context the agent uses for file-transfer
 	// Tier-B ObjectStore Put/Get. nil when the underlying nats-server
@@ -528,8 +574,13 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.RegisterRetryMax == 0 {
 		cfg.RegisterRetryMax = 2 * time.Second
 	}
+	bootProofID := cfg.UpgradeBootProofID
+	if bootProofID == "" {
+		bootProofID = currentUpgradeBootProof()
+	}
 	a := &Agent{
 		cfg:                      cfg,
+		upgradeBootProofID:       bootProofID,
 		procs:                    map[string]*procRec{},
 		execChildren:             map[string]*os.Process{},
 		canonAllowRoots:          CanonAllowRoots(cfg.AllowRoots),
@@ -614,6 +665,11 @@ func (a *Agent) spawnTimeout() time.Duration {
 // session exit.
 func (a *Agent) Run(ctx context.Context) error {
 	a.loadRosterCacheAtBoot() // seed the dial pool from state.json before the first connect
+	// upgrade-safety plan §3.1: while an upgrade marker is pending, this
+	// process must either register (commit) or roll back before the deadline
+	// — armed here, INSIDE the new binary, so the guarantee holds even on the
+	// unsupervised setsid-nohup path where no supervisor exists to help.
+	a.armUpgradeWatchdog(ctx)
 	// C2 §2.4 tier 2: at cold-start, asynchronously fetch the well-known manifest and adopt it (never
 	// blocks Run; best-effort; a no-op without a pin). Helps when the configured NATS endpoints are
 	// all dead but the HTTPS manifest is reachable; steady-state stays the NATS refresh loop.
@@ -986,6 +1042,10 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 		// sustained-behind agent (agent_roster_stale). 0 ⇒ pre-C1 / no cache. Advisory.
 		RosterGen: a.cachedRosterGen(),
 	}
+	// upgrade-safety plan §3.1: the first register after a `node upgrade`
+	// carries the outcome (this one IS the health check-in when pending);
+	// empty strings on every ordinary register keep the wire byte-identical.
+	req.UpgradeState, req.UpgradeDetail = a.upgradeRegisterReport()
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return proto.NodeRegisterResp{}, fmt.Errorf("agent: marshal register: %w", err)
@@ -1015,6 +1075,11 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 					a.cfg.Logger.Info("agent: register succeeded after retry",
 						"attempts", attempt)
 				}
+				// Register success is the upgrade commit point (plan §3.1):
+				// promote a pending marker to committed / clear the terminal
+				// record this very register delivered. Mutex-racing the
+				// deadline watchdog — the loser of that race no-ops.
+				a.commitUpgradeAfterRegister(req.UpgradeState)
 				return resp, nil
 			case resp.Code == proto.CodeLeaderUnavailable:
 				// audit M2 / write-forward F3: a leadership race (raft failover / election) is

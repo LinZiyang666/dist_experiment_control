@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 
+	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/spf13/cobra"
 )
@@ -48,9 +52,12 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print version",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// First line via proto.VersionLine — a frozen cross-version seam
+			// (deployed agents' smoke gates parse it; see its doc comment),
+			// not a printf to be reworded here.
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"tether %s (proto v%d)\n%s/%s\n%s\n",
-				proto.ReleaseVersion, proto.ProtoVersion,
+				"%s\n%s/%s\n%s\n",
+				proto.VersionLine(),
 				runtime.GOOS, runtime.GOARCH, runtime.Version())
 			return nil
 		},
@@ -58,6 +65,18 @@ func newVersionCmd() *cobra.Command {
 }
 
 func main() {
+	// origin: upgrade-safety external review F2. The boot half of the
+	// upgrade state machine must run BEFORE Cobra parsing and before any
+	// config/YAML/logger step: a staged binary that regresses on flag
+	// parsing or strict YAML decoding exits on those paths, and if the boot
+	// check lived after them the boot budget would never be consumed — the
+	// supervisor would relaunch the same broken binary forever with the
+	// rollback machinery never engaging. Recognition is deliberately
+	// pre-parse and conservative (argv shape only); the check itself is a
+	// no-op without a pending marker next to the executable.
+	if isAgentDaemonInvocation(os.Args) {
+		agent.BootUpgradeCheck(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	}
 	// ExecuteContext + signal.NotifyContext so Ctrl-C / SIGTERM tear
 	// down running subcommands (`tether ps`, `history --follow`,
 	// `exec`, `session rm`, etc.) instead of waiting for each
@@ -86,6 +105,41 @@ func main() {
 		// somewhere else and gain nothing.
 		os.Exit(classifyExit(err))
 	}
+}
+
+// isAgentDaemonInvocation recognizes `tether agent ...` BY ARGV SHAPE ONLY —
+// it must work before Cobra parses anything (external review F2: the whole
+// point is to consume boot budget even when parsing itself is what the
+// staged binary breaks on). Conservative exclusions: help output and the
+// install/uninstall service paths never touch the upgrade marker (the smoke
+// gate's own `version` probe is already excluded by args[1] != "agent").
+func isAgentDaemonInvocation(args []string) bool {
+	if len(args) < 2 || args[1] != "agent" {
+		return false
+	}
+	for _, arg := range args[2:] {
+		name, val, hasVal := strings.Cut(arg, "=")
+		switch name {
+		case "--help", "-h", "--install-user-service", "--uninstall":
+			// external re-review F10: honor the bool-flag forms Cobra
+			// accepts — `--flag=true` is set, `--flag=false` is not. An
+			// unparsable value is treated as set (conservative: Cobra will
+			// reject it before RunE, and a non-daemon misread only skips a
+			// boot-budget tick; the reverse misread would burn budget on a
+			// service-install invocation).
+			if !hasVal {
+				return false
+			}
+			if b, err := strconv.ParseBool(val); err != nil || b {
+				return false
+			}
+		case "help":
+			if !hasVal {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // renderTerminalError is the main sink's stderr print, factored out so it is testable and so a QUIET

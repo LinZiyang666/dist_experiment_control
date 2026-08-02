@@ -587,6 +587,103 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   `NOT-COVERED[gap] #71 AMBIGUOUS`，直到专用复现提供可与 heal 边界排序的 product artifact。结构不可达的
   长连接 condition Y 仍是相关覆盖缺口。
 
+### #72 — agent 的 stuck-disconnect watchdog 在取消 session 前同步 `nc.Close()`；WSS close 卡住时 systemd 假活、节点 OFFLINE、数据面暂存
+
+- **状态：🔴 OPEN（2026-08-01 裸机 LIVE-CONFIRMED；症状与阻塞区间已实证，缺触发时 goroutine dump，故最内层
+  阻塞点标为高置信归因而非伪装成已逐帧证明）。** 发现环境不是 simcluster：真实 `systemd --user` agent，已发布
+  `tether 0.4.7 (proto v2)`；本条仍登记在 deploy-tier 台账，因为只有长驻进程 + 真 WSS/NAT + 真双平面隧道的部署栈
+  才呈现该故障。尚无 drill / `assert_bug`，不能据此声称已被自动化钉住。
+
+- **用户可见现象**：RackNerd 一侧的 ctl 长时间把本机 agent `weilandserver` 看成 OFFLINE / 不列出，但本机
+  `tether-agent@lab.service` 始终是 `active (running)`；先前建立的 expose 在一段时间内仍能工作。这不是观测矛盾：
+  NATS WSS `:443` 是注册/心跳/命令的**控制面**，yamux-over-TCP `:7000` 是 expose 的**数据面**，两条连接独立。
+  控制面已经失活时，旧数据面可以继续传字节，直到自己的 keepalive、broker fence 或 allocation revoke 使它关闭。
+
+- **2026-08-01 CDT 现场时间线（取自 `~/.tether/agent/lab/agent.log` + 同机 ctl/systemd 探针）**：
+  1. `09:00:40`：agent 最后一次记录 `re-registered after reconnect`，旧 expose 为 `__proxy__:14006` 与
+     `ssh:14022`；随后两条隧道分别 reset / keepalive timeout。
+  2. `09:08:59.453`：明确记录 `agent: NATS stuck-disconnected; rebuilding session on the freshest roster`。
+     这行位于 `fireRedial` 设置 `rebuildRequested=true` 后、同步 `nc.Close()` **之前**。
+  3. 约 `09:19` 的首次 `tether node ls --json` 经 `linziyang.top`（roster node `racknerd`）成功返回；`racknerd`
+     与其余节点均 ONLINE，唯独 `weilandserver` 整行不存在。故不是 ctl 全局连不上、不是 RackNerd broker 整体停机，
+     而是该 agent 没有注册/心跳。同期 `tether ps --json` 等待 15s 后超时。
+  4. 全窗口 systemd 的 `MainPID=618208`、`NRestarts=0`、`active/running`，进程从 2026-07-29 起未退出；宿主还看到
+     tether 保有一条 ESTABLISHED `:443` socket。故「PID 存活 / TCP 表面 ESTABLISHED」均不是 agent 就绪判据。
+  5. `09:17:53`：旧 14022/14006 数据面才收到 EOF；14022 下一次 REGISTER 被权威拒绝
+     `token_unknown_or_revoked`。这解释了为何控制面 OFFLINE 窗口内 expose 看起来仍正常，也证明数据面最终不会永久
+     越过 broker revoke fence。
+  6. `09:19:57.953`：直到 watchdog 日志后 **10m58.500s**，才出现 heartbeatLoop 的
+     `agent: shutting down`，同一时刻 Run loop 记录 `rebuilding NATS session on the freshest roster`。
+  7. `09:20:03.254`：**同一 PID、无 systemd restart** 重新注册成功，broker 回复 `revoke_ports=2`；
+     `09:20:06.593` 新 `__proxy__` tunnel 在 14004 打开。其后间隔 6s 的两次 `node ls` 均显示
+     `weilandserver ONLINE`，5s 心跳持续推进；`racknerd` 也一直 ONLINE。
+
+- **排除项 / 伴随噪声**：
+  - ctl floor 是 `wss://linziyang.top:443`，agent YAML floor 是 `wss://weiland.top:443`，但 agent 的有效签名 roster
+    同时含 `pc732/weiland.top` 与 `racknerd/linziyang.top` 两个 `VOTER`，缓存当时新鲜且在恢复后继续更新；所以「没有
+    可切换 endpoint」不是本次近因。不同 floor 在 HA 中本身合法，不应把它当配置错误修掉。
+  - 日志中长期出现 `dial tcp 127.0.0.1:40243: connect: connection refused`，说明旧 `ssh` expose 的本地服务未监听；
+    它只在数据面收到入站 stream 时发生，与 NATS 心跳连接独立，是需要另行清理的 stale expose / 本地服务问题，
+    不是本次控制面 teardown 停顿的根因。
+  - 没有在故障窗口抓 goroutine dump，因此本文不声称已经证明 nats.go 的哪一个具体 syscall 阻塞了 10m58s；实证能
+    钉死的是 `fireRedial` 已进入而 session cancel 长时间没有生效。
+
+- **高置信机理定位（源码顺序 + 日志相邻点）**：
+  1. `internal/agent/roster.go:603-617` 的 `fireRedial` 先置 `rebuilding/rebuildRequested` 并写上述 watchdog 日志，
+     然后在 `:609-611` **同步**调用 `nc.Close()`；只有它返回后，`:612-617` 才取得 `sessCancel` 并 `cancel()`。
+  2. `internal/agent/agent.go:1570-1578` 的 heartbeatLoop 只在 session ctx 被 cancel 后写
+     `agent: shutting down`。两条日志夹住的 10m58.500s 因而发生在 `nc.Close()` + 后续极短的
+     `sessCancelMu` 临界区之间；`setSessionCancel/clearSessionCancel` 仅做一次指针赋值，长期持锁的结构证据不存在，
+     所以阻塞高度集中到 `nc.Close()`。
+  3. 本仓锁定的 `nats.go v1.52.0` 中，`Conn.Close()` 对 WebSocket 先调用 `wsClose()`；后者持 `nc.mu` 组 close frame
+     并同步 `nc.bw.flush()`，之后才进入通用 `close()` 关闭 transport。对已经 stuck-disconnected 的 WSS，close-frame
+     flush 位于「真正强制关 socket」之前，具备被坏链路/代理写路径拖住的结构条件。这与现场使用 WSS、日志区间以及
+     最终自行解卡吻合；但在补充 goroutine dump 或确定性复现前，具体卡在 flush / conn mutex / 底层 write 中哪一层仍
+     保留为待证。
+  4. 现有 watchdog 的意图是 disconnected 超过 `redialAfter=20s` 后取消 heartbeatLoop，让 `session()` 返回
+     `rebuild=true` 并用最新 roster 重拨；但取消动作排在一个**无 agent 侧 deadline 的同步 close 后面**，所以 20s
+     watchdog 并没有形成恢复时延上界。最坏情况下主进程永久存活、systemd 永远不拉起新实例。
+
+- **影响与安全边界**：
+  - ctl 的 node/exec/ps 视图与 agent 真实进程分裂：node 行 OFFLINE/消失，agent PID 与 TCP socket 看起来仍健康；仅用
+    `systemctl is-active` 的监控会假绿。
+  - agent 不接收新命令、注册回复、reconcile 或新的 home directive；控制面恢复时间从设计的约 20s 退化为此次近 11min，
+    结构上无硬上界。
+  - 已建立 expose 可在窗口前半继续服务，随后按独立数据面机制失效；因此「expose 还能用」既不能证明 agent ONLINE，
+    也不表示安全 fence 失效。本次旧 token 最终被 broker 拒绝，未观察到 revoke 后复活或双绑。
+  - 恢复时 broker 撤销两个旧 port、重建 proxy 到新端口，普通 expose 的公网端口/可用性可能变化；不能把自行恢复视为
+    无扰动恢复。
+
+- **立即运维处置**：先用 `tether node ls --json` 看 `last_heartbeat_at` 是否推进，而非只看 systemd；若日志已经出现
+  `NATS stuck-disconnected`，经过一个明确的小预算仍无 `agent: rebuilding NATS session` / `agent: registered`，执行
+  `systemctl --user restart tether-agent@lab.service`。这会中断现存数据面，且可能触发 allocation revoke/replay；先记录
+  日志与 `node ls`，有条件时在 restart 前抓 `SIGQUIT` goroutine dump，才能把上面的最内层待证点闭合。不要删除
+  `state.json` / keys，也不要用重新 expose 掩盖控制面故障。
+
+- **产品修复方向（尚未定案，不把候选写成契约）**：
+  1. teardown 顺序必须让 session cancel **先于任何可能阻塞的 WSS close/flush**，使 heartbeat、roster refresh 与 handler
+     生产者先停；但仅把 `nc.Close()` 丢进无界 goroutine 会把一次假死变成 goroutine/FD 泄漏，不是合格修复。
+  2. 为 NATS session teardown 定义产品级有界预算；预算耗尽时宁可让 agent 非零退出交给 systemd `Restart=on-failure`，
+     也不能保持 `active/running` 的不可用进程。setsid/nohup 路径没有 systemd，需同时定义其退出与外部拉起责任，不能只
+     修 systemd 场景。
+  3. 核对/上游化 `nats.go` WSS `Close → wsClose → bw.flush` 的无 deadline 行为，评估能否在不碰私有 transport 的前提下
+     强制打断；若必须引入 seam，须同时守住 callback drain、subscription teardown、no-double-subscribe 与 FD/goroutine
+     回收。
+  4. 增加 agent readiness/health 信号：至少区分「process active」「NATS connected」「registered + heartbeat recent」，
+     避免 systemd/监控继续把半死态显示为健康。此项是可观测性补强，不能替代恢复路径本身的有界修复。
+
+- **钉住它的测试 / drill（当前缺口与 flip）**：
+  - **确定性包内回归**：给连接 teardown 引入最窄可注入 seam，使 `Close` 永久阻塞；触发 redial watchdog 后断言 session ctx
+    在恢复预算内先被 cancel，且主循环不会在 `Close` 前永久停住。变异验证：恢复成「Close 后 cancel」，测试必须精确红。
+  - **并发/泄漏门**：同一故障注入下重复 disconnect/rebuild，断言至多一个 successor session、无 double subscription，
+    `-race` + fd/NumGoroutine 门不增长；禁止以 timeout 后遗弃一个永不返回的 close goroutine 来骗绿。
+  - **deploy-tier WSS drill**：在 agent 已注册且 expose 正在传字节时，黑洞当前 NATS WSS 的写路径（不是 clean FIN/RST），
+    保持另一 voter 可达；断言 agent 在书面预算内出现在另一 voter 的 `node ls` 且心跳推进，同时记录旧数据面的独立存活/
+    fence 时序。要检查 `MainPID`：同进程 rebuild 与超时后由 systemd restart 两条允许恢复路径都必须明确归类。
+  - **可观测性回归**：故障窗口内 health/readiness 必须 RED，即使 PID 存活、socket ESTABLISHED、旧 expose 仍传字节。
+  - **flip**：上述 package 回归 + 真 WSS deploy-tier drill 都 GREEN，且多轮运行中 OFFLINE 窗口有硬上界、无资源泄漏、
+    revoke/home fencing 不回退，方可将 #72 移入 closed 台账；单次人工 `systemctl restart` 或本次自行恢复不算关闭。
+
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 
 编号保持全局连续；下列条目已了结，正文已剥离归档。

@@ -112,9 +112,24 @@ const (
 	// address on the agent. A deliberate SSRF-shaped refusal, not a transient.
 	CodeURLNotAllowedLocal = "url_not_allowed_local"
 	// CodeProtoBumpRequiresReinstall: the peer's ProtoVersion differs across a
-	// breaking boundary. Upgrading in place cannot fix it — see CLAUDE.md §5
-	// "wire 协议" (tether.v1 -> v2 requires reinstall, not upgrade).
+	// breaking boundary. Upgrading in place cannot fix it — a ProtoVersion bump
+	// is an epoch change, the one permitted compatibility break of the N-1
+	// window (requirements §6.7; the bumper's obligations live in
+	// distributed-broker-architecture §21.4). Reinstall, do not upgrade.
 	CodeProtoBumpRequiresReinstall = "proto_bump_requires_reinstall"
+	// CodeSmokeFailed: the downloaded binary failed the pre-install smoke gate
+	// (could not exec, or `version` printed no parsable release tag). The disk
+	// was NOT touched. The artifact is bad for every node it would be sent to
+	// (wrong arch, truncated, not a tether binary) — not retryable, and
+	// `node upgrade --all` must abort the fleet rather than fan it out.
+	CodeSmokeFailed = "smoke_failed"
+	// CodeUpgradeInProgress: an upgrade marker in state "pending" exists — a
+	// prior upgrade on this agent has staged its binary but has not yet
+	// committed (re-registered as the new version) or rolled back. Installing
+	// over it would clobber the only known-good binary in the prev slot.
+	// Transient: resolves as soon as the in-flight upgrade commits or rolls
+	// back (bounded by the register deadline).
+	CodeUpgradeInProgress = "upgrade_in_progress"
 	// CodeFrpcFailed: the agent's data-plane helper failed to come up.
 	// Needs a human to read the agent log; blind retry does not help.
 	CodeFrpcFailed = "frpc_failed"

@@ -48,6 +48,24 @@ func TestIsTransientError(t *testing.T) {
 	}
 }
 
+// origin: upgrade-safety plan §4 + internal review S7. smoke_failed aborts
+// the fleet (a sha-verified artifact that cannot exec is bad on EVERY node);
+// upgrade_in_progress is skipped (a prior upgrade on THIS node self-resolves
+// within its register deadline). Both arrive agent_rejected:-wrapped on the
+// wire (internal/broker/upgrade.go); brokerErrorMessage strips the wrapper.
+func TestUpgradeSafetyCodesFleetClassification(t *testing.T) {
+	for _, code := range []string{"smoke_failed", "agent_rejected:smoke_failed"} {
+		if !isConfigError(brokerErr(code)) || isTransientError(brokerErr(code)) {
+			t.Errorf("%q must abort --all (config), never be skipped", code)
+		}
+	}
+	for _, code := range []string{"upgrade_in_progress", "agent_rejected:upgrade_in_progress"} {
+		if !isTransientError(brokerErr(code)) || isConfigError(brokerErr(code)) {
+			t.Errorf("%q must be skipped (transient), never abort the fleet", code)
+		}
+	}
+}
+
 // TestIsConfigError covers the codes that abort `--all` because
 // the request itself is wrong; no other node will accept it
 // either, so dispatching the rest is wasted broker work.
