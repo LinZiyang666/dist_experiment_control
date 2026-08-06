@@ -43,6 +43,11 @@ func TestTierAInlineCeilingNeverWidenedByAMissingMeasurement(t *testing.T) {
 	if got := tierAInlineCeiling(2*mib, both); got != wantSmall {
 		t.Fatalf("the TIGHTEST known measurement must win: got %d want %d", got, wantSmall)
 	}
+	// A known tiny max_payload must close tier A rather than being ignored as though it were an
+	// unknown measurement. The documented formula is authoritative even below its 1 KiB allowance.
+	if got := tierAInlineCeiling(1024, capsProbe{Status: capsUndetermined}); got != 0 {
+		t.Fatalf("tiny known max_payload widened tier A: got %d want 0", got)
+	}
 }
 
 // TestChooseTierNeverInventsACapabilityClaim is the #67 face-B headline: only an AUTHORITATIVE answer

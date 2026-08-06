@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 )
@@ -54,6 +55,10 @@ func (r readDB) Query(query string, args ...any) (*sql.Rows, error) {
 
 func (r readDB) QueryRow(query string, args ...any) *sql.Row {
 	return r.db.QueryRow(query, args...)
+}
+
+func (r readDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return r.db.QueryRowContext(ctx, query, args...)
 }
 
 // SQL is the escape hatch for the domain functions that still take a concrete *sql.DB.

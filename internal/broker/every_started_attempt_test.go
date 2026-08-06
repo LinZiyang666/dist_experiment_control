@@ -218,17 +218,29 @@ func TestG67AbortedProvisionIsRetriableAndNotAJetStreamVerdict(t *testing.T) {
 // TestG67SizingTimeoutCannotMoveTheAdmissionDecision is the REJECTION of the review's
 // "the 1.5s sizing cut silently disables the disk-aware ceiling" finding, made durable.
 //
-// The finding was refuted (independently, by two verifiers against a real nats-server) on this fact:
-// tether-rendered nats.conf never sets max_file_store — drills/21-smalldisk-tierb.sh:22 asserts its
-// ABSENCE, because that subkey bricks reconcile — so AccountInfo reports MaxStore = -1 (unlimited) and
-// jsStoreCeiling ALWAYS falls through to the statfs estimate, which is a local syscall that no network
-// deadline can starve. The AccountInfo latency therefore cannot move the admission decision on any
-// configuration tether produces.
+// The finding was refuted on this fact, and the fact HOLDS — it was re-verified against the live
+// broker during the smalldisk increment: tether renders neither an account JWT limit nor
+// max_file_store, so AccountInfo reports MaxStore = -1 (UNLIMITED) and jsStoreCeiling falls through
+// to the statfs estimate, a local syscall no network deadline can starve.
 //
-// Rejecting a finding is only safe if the reason is pinned: if someone ever makes MaxStore finite (or
-// makes the ceiling depend on a network round trip again), this test goes red and the rejection has to
-// be re-argued rather than silently inherited.
+//	live AccountInfo, racknerd:  "storage":49485651  "reserved_storage":10737418240  "max_storage":-1
+//
+// A DIGRESSION WORTH KEEPING, because it cost this increment a wrong turn. /jsz reports
+// config.max_storage = 10.33 GiB on that same broker, which looks like a contradiction and is not:
+// that figure is the SERVER's limit (nats derives it from diskAvailable when max_file_store is
+// unset), while AccountInfo.Limits.MaxStore is the ACCOUNT's. The smalldisk increment briefly
+// "corrected" this comment on the strength of the /jsz number, and in doing so built a convergence
+// trigger gated on a finite account limit — i.e. dead code on every real broker. Three independent
+// reviewers caught it; `nats account info` ("Storage: 47 MiB of Unlimited") settled it. If you are
+// about to conclude that MaxStore is finite here, check WHICH MaxStore you are reading.
+//
+// Rejecting a finding is only safe if the reason is pinned: if someone ever makes the ACCOUNT limit
+// finite (or makes the ceiling depend on a network round trip again), this test goes red and the
+// rejection has to be re-argued rather than silently inherited. The fixture below therefore keeps
+// MaxStore = -1 deliberately — it is reproducing production, not asserting its own premise.
+
 func TestG67SizingTimeoutCannotMoveTheAdmissionDecision(t *testing.T) {
+	// PRODUCTION SHAPE: the ACCOUNT limit is unlimited, so the ceiling comes from statfs.
 	slow := &slowAccountInfoJS{delay: xferSizingTimeout * 3, maxStore: -1}
 	b := newProvisionBroker(slow)
 	b.cfg.StoreDir = t.TempDir()
@@ -239,28 +251,24 @@ func TestG67SizingTimeoutCannotMoveTheAdmissionDecision(t *testing.T) {
 	starved := b.jsStoreCeiling(sctx)
 	cancel()
 
-	// The invariant is that the sizing deadline cannot move the ADMISSION DECISION — not that two live
-	// disk readings are bit-identical. The first version of this test demanded exact equality of two
-	// statfs results taken milliseconds apart; free space moves under a concurrent test suite, so it was
-	// structurally flaky and reddened the shared `make e2e-parallel` gate twice (internal review G-9, which the
-	// main process read and did not act on until it bit). Compare the DERIVED ceiling within a tolerance
-	// and, decisively, the admission verdict itself.
+	// Both calls must yield a usable statfs-derived ceiling. A zero would mean the fallback path
+	// changed and the rejected finding may have become real.
 	if fast <= 0 || starved <= 0 {
-		t.Fatalf("expected a statfs-derived ceiling from BOTH calls, got fast=%d starved=%d — a zero "+
-			"means the fallback path changed and the rejected finding may have become real", fast, starved)
+		t.Fatalf("expected a statfs-derived ceiling from BOTH calls, got fast=%d starved=%d", fast, starved)
 	}
-	const tolerance = 0.02 // 2%: free space drifts under a concurrent suite; a REGRESSION would be a
-	// different ORDER of magnitude (the legacy 8 GiB cap, or 0), never a fraction of a percent.
+	// Free space drifts under a concurrent suite, so compare within a tolerance; a REGRESSION would
+	// be a different ORDER of magnitude (the cap, or 0), never a fraction of a percent.
+	const tolerance = 0.02
 	if delta := math.Abs(float64(fast-starved)) / float64(fast); delta > tolerance {
 		t.Fatalf("the ceiling moved by %.2f%% when AccountInfo was starved (%d vs %d). On a "+
-			"tether-rendered conf MaxStore is -1, so the ceiling must come from statfs and be insensitive "+
-			"to the sizing deadline. If this fails, the review's rejected 'sizing cut degrades the "+
-			"admission gate' finding has become REAL and must be re-adjudicated", delta*100, fast, starved)
+			"tether-rendered conf the ACCOUNT limit is -1, so the ceiling must come from statfs and be "+
+			"insensitive to the sizing deadline. If this fails, the review's rejected 'sizing cut "+
+			"degrades the admission gate' finding has become REAL and must be re-adjudicated", delta*100, fast, starved)
 	}
 	// The decisive form: the same push size must get the same verdict either way.
 	probe := fast / 2
-	fastMax, fastErr := xferMaxBytesForCeiling(fast)
-	starvedMax, starvedErr := xferMaxBytesForCeiling(starved)
+	fastMax, fastErr := xferMaxBytesForCeiling(fast, 1, 1)
+	starvedMax, starvedErr := xferMaxBytesForCeiling(starved, 1, 1)
 	if (fastErr == nil) != (starvedErr == nil) {
 		t.Fatalf("the sizing deadline changed whether the store is judged too small: fast=%v starved=%v",
 			fastErr, starvedErr)
@@ -295,19 +303,20 @@ func TestG67AdmissionGateStillRefusesOversizeWithItsOwnCode(t *testing.T) {
 	js := &countingJS{maxStore: ceiling}
 	b := newProvisionBroker(js)
 
-	maxBytes, err := xferMaxBytesForCeiling(ceiling)
+	maxBytes, err := xferMaxBytesForCeiling(ceiling, 1, 1)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}
-	bucket, tooLarge, perr := b.provisionXferBucket(context.Background(), "sess", maxBytes+1)
+	payloadMax := xferPayloadLimit(maxBytes, 0)
+	bucket, tooLarge, perr := b.provisionXferBucket(context.Background(), "sess", payloadMax+1)
 
 	if tooLarge == nil {
 		t.Fatal("a size above the per-session ceiling must be refused by the ADMISSION gate — without " +
 			"this the G6 #21 refusal degrades into bucket_create_failed (or vanishes) and a small-disk " +
 			"broker accepts a transfer it cannot store, which is the racknerd fill shape")
 	}
-	if tooLarge.MaxBytes != maxBytes {
-		t.Fatalf("the refusal must quote the real ceiling: got %d want %d", tooLarge.MaxBytes, maxBytes)
+	if tooLarge.MaxBytes != payloadMax {
+		t.Fatalf("the refusal must quote the real payload ceiling: got %d want %d", tooLarge.MaxBytes, payloadMax)
 	}
 	if perr != nil || bucket != "" {
 		t.Fatalf("admission refusal must not also report a provisioning failure: perr=%v bucket=%q", perr, bucket)
@@ -468,4 +477,14 @@ func TestStagedTerminalReplayDetectsPriorCommitOnARealLedger(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "xfer-inflight", xferInflightFilename(e.transferID))); !os.IsNotExist(err) {
 		t.Fatal("once the prior commit is detected the ledger must be dropped, or every pass re-checks it forever")
 	}
+}
+
+// Stream: same reason as the create-path fakes in xfer_provision_test.go — this fixture measures the
+// CREATE attempt budget, so the resolve lookup must report "not found" and fall through.
+func (b *blockingJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	return nil, jetstream.ErrStreamNotFound
+}
+
+func (s *slowAccountInfoJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	return nil, jetstream.ErrStreamNotFound
 }

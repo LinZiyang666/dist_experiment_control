@@ -83,6 +83,28 @@ func SIDFromHistoryStream(stream string) (string, bool) {
 	return strings.TrimPrefix(stream, HistoryStreamPref), true
 }
 
+// EventsMaxBytes is the events stream's JetStream reservation.
+//
+// EXPORTED because it is an INPUT to another package's arithmetic, not merely
+// this file's business: internal/broker sizes the per-session OBJ_xfer bucket
+// against "what the non-xfer streams will reserve", and that quantity is
+// EventsMaxBytes + nSessions*HistoryMaxBytesPerSession. That sum used to be a
+// hand-copied 2 GiB constant in internal/broker with nothing tying it to these
+// two numbers — so editing either one here silently falsified the sizing math
+// over there. A reservation figure that two packages must agree on has to have
+// exactly one definition; the guard that pins the sum lives in
+// internal/broker (see xferReserveFor).
+const EventsMaxBytes = 1 << 30 // 1 GiB
+
+// HistoryMaxBytesPerSession is the per-session history stream's reservation.
+//
+// PER SESSION is the load-bearing word: N sessions reserve N GiB, so the xfer
+// sizing must MULTIPLY by the live session count rather than treat the total as
+// a constant. The pre-existing hand-copied "2 GiB events+history reserve" in
+// internal/broker was only ever correct at exactly one session.
+// EXPORTED for the same reason as EventsMaxBytes.
+const HistoryMaxBytesPerSession = 1 << 30 // 1 GiB
+
 // EnsureEventsStream creates the events stream if it doesn't exist.
 // Idempotent: a CreateStream returning "stream name already in use"
 // is treated as success. Architecture H.1 spec values are inlined
@@ -94,7 +116,7 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream, targetRepli
 		Subjects:  []string{proto.SubjSysEvents},
 		Retention: jetstream.LimitsPolicy,
 		MaxAge:    30 * 24 * time.Hour,
-		MaxBytes:  1 << 30, // 1 GiB
+		MaxBytes:  EventsMaxBytes,
 		Discard:   jetstream.DiscardOld,
 		Storage:   jetstream.FileStorage,
 		Replicas:  targetReplicas, // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle
@@ -118,15 +140,13 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream, targetRepli
 // shard 03 F3: previously MaxBytes=-1 made DiscardNew unreachable
 // code; the 80%-disk advisory monitor (H.4) still warns long
 // before this cap matters in practice.
-const historyMaxBytesPerSession = 1 << 30 // 1 GiB
-
 func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string, targetReplicas int) error {
 	cfg := jetstream.StreamConfig{
 		Name:       HistoryStreamName(sid),
 		Subjects:   []string{historyFilterSubject(sid)},
 		Retention:  jetstream.LimitsPolicy,
 		MaxAge:     0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
-		MaxBytes:   historyMaxBytesPerSession,
+		MaxBytes:   HistoryMaxBytesPerSession,
 		Discard:    jetstream.DiscardNew,
 		Storage:    jetstream.FileStorage,
 		Replicas:   targetReplicas,   // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle

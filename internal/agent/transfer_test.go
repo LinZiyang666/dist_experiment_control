@@ -15,6 +15,33 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
+// TestPullBucketPayloadCeilingHonorsBrokerCapacity pins the additive broker→agent field used when
+// only the pull sender can stat the file. A missing field preserves N-1 behavior; a present zero is
+// intentionally distinct and closes tier B when existing objects leave no usable bucket space.
+func TestPullBucketPayloadCeilingHonorsBrokerCapacity(t *testing.T) {
+	zero := int64(0)
+	small := int64(512 * 1024 * 1024)
+	huge := agentTransferMaxBytes + 1
+	negative := int64(-1)
+	for _, tc := range []struct {
+		name string
+		in   *int64
+		want int64
+	}{
+		{"old broker omits field", nil, agentTransferMaxBytes},
+		{"small disk", &small, small},
+		{"no capacity", &zero, 0},
+		{"invalid negative is closed", &negative, 0},
+		{"broker cannot widen global cap", &huge, agentTransferMaxBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pullBucketPayloadCeiling(tc.in); got != tc.want {
+				t.Fatalf("got %d want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // canonDir resolves symlinks in a test dir path. t.TempDir() is not
 // guaranteed canonical (macOS: /var → /private/var), while
 // CanonAllowRoots / ValidateFor* return EvalSymlinks-resolved paths —

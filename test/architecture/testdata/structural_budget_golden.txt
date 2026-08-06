@@ -66,5 +66,5 @@ pkg-files cmd/tether 56
 pkg-files internal/broker 70
 pkg-files internal/cluster 32
 type-methods internal/agent.Agent 127
-type-methods internal/broker.Broker 282
+type-methods internal/broker.Broker 285
 type-methods internal/broker.ClusterAdmin 86

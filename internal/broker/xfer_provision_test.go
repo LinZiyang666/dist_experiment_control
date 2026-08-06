@@ -392,3 +392,19 @@ func TestPushHandlerNilJetStreamHasRealProse(t *testing.T) {
 			"failed), because the broker never re-probes and cannot claim it is disabled; got %q", resp.Error)
 	}
 }
+
+// Stream is what the resolve-before-create lookup calls. These fixtures exist to exercise the CREATE
+// path, so they report "no such stream" and the lookup falls through exactly as it did before that
+// step existed. (Without this the embedded nil interface panics — which is the fixture pattern doing
+// its job: it announced that the code under test began calling something new.)
+func (c *countingJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	return nil, jetstream.ErrStreamNotFound
+}
+
+// Stream is what the resolve-before-create lookup calls. These fixtures exist to exercise the CREATE
+// path, so they report "no such stream" and the lookup falls through exactly as it did before that
+// step existed. (Without this the embedded nil interface panics — which is the fixture pattern doing
+// its job: it announced that the code under test began calling something new.)
+func (s *stallJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	return nil, jetstream.ErrStreamNotFound
+}

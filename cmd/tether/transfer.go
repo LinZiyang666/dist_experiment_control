@@ -43,9 +43,16 @@ func newPushCmd() *cobra.Command {
 
 File size limits (file-transfer-plan v0.2.0):
 
-  - Up to 8 MiB        : tier A (inline over NATS, no JetStream needed).
-  - 8 MiB – 2 GiB      : tier B (JetStream Object Store; broker must
-                         have JetStream enabled).
+  - tier A (inline over NATS, no JetStream needed): up to HALF the NATS
+    server's max_payload minus 1 KiB — NOT a flat 8 MiB. With the stock
+    max_payload of 1 MiB that is ~511 KiB. 8 MiB is the DESIGN ceiling,
+    reached only where max_payload is raised to 16 MiB + 2 KiB (16779264
+    bytes) — at exactly 16 MiB the formula still yields 8387584, a KiB short. This
+    command prints the tier it chose for every transfer.
+  - tier B (JetStream Object Store; broker must have JetStream enabled):
+    everything above the tier-A ceiling, up to 2 GiB. On a default
+    broker that is most real files, so tier B is the common path, not
+    the exception.
   - > 2 GiB            : refused; use ` + "`tether expose`" + ` + rsync.
 
 The remote path must be absolute. By default it may be any path the
@@ -828,7 +835,11 @@ func tierAInlineCeiling(connMaxPayload int64, probe capsProbe) int64 {
 		if p <= 0 {
 			return
 		}
-		if half := p/2 - 1024; half > 0 && half < ceiling {
+		half := p/2 - 1024
+		if half < 0 {
+			half = 0
+		}
+		if half < ceiling {
 			ceiling = half
 		}
 	}

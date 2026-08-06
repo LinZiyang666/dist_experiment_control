@@ -935,9 +935,13 @@ agent register 也不会收到 proxy directive；`proxy status` 最多只能读�
 
 | 大小 | 档位 | 通道 | 是否需 JetStream |
 |---|---|---|---|
-| ≤ 8 MiB（且 ≤ broker `max_payload`/2） | A | 直接塞进 NATS 消息体 | 否 |
-| 8 MiB – 2 GiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
+| ≤ `max_payload/2 − 1 KiB`（默认 `max_payload` 1 MiB ⇒ **~511 KiB**；上限封顶 8 MiB） | A | 直接塞进 NATS 消息体 | 否 |
+| 大于上面那条线，至 2 GiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
 | > 2 GiB | — | 拒绝（`too_large`）；改走 `tether expose` + rsync | — |
+
+> ⚠️ 这张表以前写「≤ 8 MiB → A」。**默认部署上那是错的**：8 MiB 是设计封顶，实际分界由
+> `max_payload` 决定，默认只有 ~511 KiB。照旧表判断，会把一个 600 KiB 文件走 tier B 当成
+> JetStream 故障去查。`tether push` 每次都会打印它选了哪一档。
 
 ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload()`，
 据此选档；agent 也会复算一次（防止操作员把 broker 的 `max_payload` 调
@@ -949,7 +953,8 @@ ctl 在请求前会先打一次 `caps.req` 探测 broker 能力 + `nc.MaxPayload
 caps 探测（零值 `CapsResp`）会把上限悄悄抬回 8 MiB 默认值、无声挪动 tier-A/B 分界；现在缺失的测量
 一律忽略，`nc.MaxPayload()` 这一项在任何已连接的连接上都可得。
 NATS 默认 `max_payload`（1 MiB）下 tier A 实际只能塞 ~500 KiB；要让 tier A 跑满
-8 MiB，broker 的 NATS `max_payload` 必须 ≥ 16 MiB（broker.yaml 之外的 nats.conf
+8 MiB，broker 的 NATS `max_payload` 必须 ≥ **16 MiB + 2 KiB**（`16779264` 字节——恰好 16 MiB 时
+`16777216/2 − 1024 = 8387584`，仍差 1 KiB 到不了 8 MiB；broker.yaml 之外的 nats.conf
 配置）。超过此阈值的请求由 ctl 自动升 tier B。
 
 **先决条件**：
@@ -1398,7 +1403,7 @@ tether push ./train.py a100:/srv/local/alice/jobs/train.py
 # 拉日志回来
 tether pull a100:/srv/local/alice/jobs/run.log ./run.log
 
-# 大文件用 tier B（broker 自动选档；> 8 MiB 走 ObjectStore）
+# 大文件用 tier B（broker 自动选档；超过 max_payload/2−1KiB 即走 ObjectStore，默认约 511 KiB）
 tether push ./checkpoint.bin a100:/srv/local/alice/ckpt.bin --force
 
 # 文件 > 2 GiB：先 expose、再 rsync

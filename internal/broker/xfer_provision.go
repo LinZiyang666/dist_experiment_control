@@ -154,7 +154,7 @@ func (e *xferProvisionErr) Error() string { return e.Err.Error() }
 // parent MUST be b.runCtx, not context.Background(): with Background() the shutdown branch is dead
 // code AND ordinary budget exhaustion would be reported as "the broker is shutting down" — a brand
 // new false statement of exactly the species #67 exists to remove.
-func (b *Broker) provisionXferBucket(parent context.Context, sid string, size int64) (string, *xferTooLarge, *xferProvisionErr) {
+func provisionXferBucketWithLimit(parent context.Context, b *Broker, sid string, size int64) (string, int64, *xferTooLarge, *xferProvisionErr) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -167,16 +167,20 @@ func (b *Broker) provisionXferBucket(parent context.Context, sid string, size in
 	sizingMs := time.Since(sizingStart).Milliseconds()
 	scancel()
 
-	// ── 2. admission (G6 #21), semantics unchanged ──────────────────────────────────────────
-	if sizeErr == nil && size > maxBytes {
-		return "", &xferTooLarge{MaxBytes: maxBytes}, nil
+	// ── 2. pre-admission against the proposed backing stream ─────────────────────────────────
+	proposedPayloadMax := xferPayloadLimit(maxBytes, 0)
+	if sizeErr == nil && size > proposedPayloadMax {
+		return "", 0, &xferTooLarge{MaxBytes: proposedPayloadMax}, nil
 	}
 
 	// ── 3. a too-small store is PERMANENT: zero create attempts ─────────────────────────────
-	// ensureXferBucketSized already short-circuits on sizeErr without touching JetStream; making it
-	// explicit here keeps the "no attempts were made" fact out of the attempt counter.
+	// THIS is the short-circuit — the only one. ensureXferBucketSized used to take a sizeErr
+	// parameter and re-check the same condition, but every caller passed nil (this return runs
+	// first), so the second copy was unreachable defence that no test could exercise; unparam
+	// flagged it and it was removed rather than suppressed. TestXferProvisionSizingRefusalMakesZero
+	// Attempts covers the live guard here.
 	if sizeErr != nil {
-		return "", nil, &xferProvisionErr{
+		return "", 0, nil, &xferProvisionErr{
 			Err: fmt.Errorf("xfer bucket sizing: %w", sizeErr), Transient: false,
 			Attempts: 0, Elapsed: time.Since(start), SizingMs: sizingMs,
 		}
@@ -202,17 +206,22 @@ func (b *Broker) provisionXferBucket(parent context.Context, sid string, size in
 
 		actx, acancel := context.WithTimeout(parent, attemptTO)
 		createStart := time.Now()
-		bucket, err := b.ensureXferBucketSized(actx, sid, b.xferTargetReplicas(), maxBytes, nil)
+		bucket, payloadMax, err := ensureXferBucketSizedWithLimit(actx, b, sid, b.xferTargetReplicas(), maxBytes)
 		createMs += time.Since(createStart).Milliseconds()
 		acancel() // NOT deferred: this is a loop.
 
 		if err == nil {
+			// Existing operator-sized buckets and orphan bytes can make the real capacity smaller than
+			// the proposed target. Reject before any Put rather than discovering that at DiscardNew.
+			if size > payloadMax {
+				return "", 0, &xferTooLarge{MaxBytes: payloadMax}, nil
+			}
 			if attempts > 1 {
 				b.cfg.Logger.Info("broker: tier-B bucket provisioned after retry",
 					"sid", sid, "attempts", attempts, "elapsed_ms", time.Since(start).Milliseconds(),
 					"sizing_ms", sizingMs, "create_ms", createMs)
 			}
-			return bucket, nil, nil
+			return bucket, payloadMax, nil, nil
 		}
 		lastErr = err
 
@@ -223,7 +232,7 @@ func (b *Broker) provisionXferBucket(parent context.Context, sid string, size in
 		// about a JetStream that was never asked; (2) a broker that is shutting down is the most
 		// RETRIABLE condition there is, so it must not carry a terminal class either.
 		if parent.Err() != nil {
-			return "", nil, &xferProvisionErr{
+			return "", 0, nil, &xferProvisionErr{
 				Err: lastErr, Transient: false, Aborted: true,
 				AbortCause: parent.Err(),
 				Attempts:   attempts, Elapsed: time.Since(start), SizingMs: sizingMs, CreateMs: createMs,
@@ -242,7 +251,7 @@ func (b *Broker) provisionXferBucket(parent context.Context, sid string, size in
 		b.cfg.Logger.Warn("broker: tier-B bucket provisioning retried",
 			"sid", sid, "attempt", attempts, "backoff_ms", jittered.Milliseconds(), "err", err)
 		if !sleepCtx(parent, jittered) {
-			return "", nil, &xferProvisionErr{
+			return "", 0, nil, &xferProvisionErr{
 				Err: lastErr, Transient: false, Aborted: true, AbortCause: parent.Err(),
 				Attempts: attempts, Elapsed: time.Since(start), SizingMs: sizingMs, CreateMs: createMs,
 			}
@@ -254,10 +263,17 @@ func (b *Broker) provisionXferBucket(parent context.Context, sid string, size in
 	b.cfg.Logger.Warn("broker: tier-B bucket provisioning gave up",
 		"sid", sid, "attempts", attempts, "elapsed_ms", time.Since(start).Milliseconds(),
 		"sizing_ms", sizingMs, "create_ms", createMs, "transient", transient, "err", lastErr)
-	return "", nil, &xferProvisionErr{
+	return "", 0, nil, &xferProvisionErr{
 		Err: lastErr, Transient: transient, Attempts: attempts,
 		Elapsed: time.Since(start), SizingMs: sizingMs, CreateMs: createMs,
 	}
+}
+
+// provisionXferBucket preserves the established push/test call shape. Pull uses the WithLimit form
+// because only the agent learns the file size and therefore needs the actual payload ceiling.
+func (b *Broker) provisionXferBucket(parent context.Context, sid string, size int64) (string, *xferTooLarge, *xferProvisionErr) {
+	bucket, _, tooLarge, perr := provisionXferBucketWithLimit(parent, b, sid, size)
+	return bucket, tooLarge, perr
 }
 
 // jitter spreads retries by +/-25% so a fleet coming out of a rolling broker restart does not

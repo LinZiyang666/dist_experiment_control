@@ -52,6 +52,16 @@ const agentTierAMaxBytes = proto.XferTierAMaxBytes
 // reading, not only from a pre-read stat, because regular files can grow.
 const agentTransferMaxBytes = int64(proto.XferMaxBytes)
 
+func pullBucketPayloadCeiling(advertised *int64) int64 {
+	if advertised == nil || *advertised > agentTransferMaxBytes {
+		return agentTransferMaxBytes
+	}
+	if *advertised < 0 {
+		return 0
+	}
+	return *advertised
+}
+
 // pushCommitCacheSlack is the headroom a prep entry keeps beyond the time the CTL needs to upload
 // that file. It preserves the shape of the pre-batch-C constant: the old TTL was 6m against a 5m
 // tier-B watchdog, and that ONE MINUTE OF MARGIN was the entire meaning of the 6 — written nowhere.
@@ -356,8 +366,9 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 	}
 	var combined struct {
 		proto.PullPrepareReq
-		Bucket    string `json:"bucket,omitempty"`
-		ObjectKey string `json:"object_key,omitempty"`
+		Bucket                string `json:"bucket,omitempty"`
+		ObjectKey             string `json:"object_key,omitempty"`
+		BucketPayloadMaxBytes *int64 `json:"bucket_payload_max_bytes,omitempty"`
 	}
 	if err := json.Unmarshal(msg.Data, &combined); err != nil {
 		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
@@ -454,6 +465,13 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 			Error: "broker did not supply a bucket name"})
 		return
 	}
+	payloadMax := pullBucketPayloadCeiling(combined.BucketPayloadMaxBytes)
+	if size > payloadMax {
+		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
+			OK: false, Code: "too_large",
+			Error: fmt.Sprintf("file size=%d > broker bucket payload ceiling %d", size, payloadMax)})
+		return
+	}
 	// batch C: the PULL leg deliberately does NOT use the file's real size, and that asymmetry with
 	// the push leg above is the point.
 	//
@@ -477,7 +495,7 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	h := sha256.New()
-	limited := &io.LimitedReader{R: f, N: agentTransferMaxBytes + 1}
+	limited := &io.LimitedReader{R: f, N: payloadMax + 1}
 	tee := io.TeeReader(limited, h)
 	info, err := store.Put(putCtx, jetstream.ObjectMeta{Name: objectKey}, tee)
 	if err != nil {
@@ -486,12 +504,12 @@ func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	uploaded := int64(info.Size)
-	if uploaded > agentTransferMaxBytes {
+	if uploaded > payloadMax {
 		_ = store.Delete(putCtx, objectKey)
 		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
 			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file grew beyond %s while reading (read=%d)",
-				proto.HumanBytes(agentTransferMaxBytes), uploaded)})
+			Error: fmt.Sprintf("file grew beyond broker bucket payload ceiling %d while reading (read=%d)",
+				payloadMax, uploaded)})
 		return
 	}
 	sha := hex.EncodeToString(h.Sum(nil))
