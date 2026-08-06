@@ -42,7 +42,7 @@
 #         the command the gate itself tells you to run, permanently removes a 360-line file from the
 #         budget. Parsing imports: same probe, no change.
 #   PI-9  quantisation to 100. Raw is 1160; 1160 rounded down is 1100.
-main-noncli-code-lines cmd/tether 1100
+main-noncli-code-lines cmd/tether 1200
 # pkg-code-lines: the FOURTH dimension, added during line-2's own review (plan §11 X2 re-adjudicated).
 #
 # X2 had rejected S3's pkg-lines forever, on the condition that it be reopened if someone found a
@@ -62,9 +62,9 @@ pkg-code-lines internal/agent 4000
 pkg-code-lines internal/broker 14000
 pkg-code-lines internal/cluster 2000
 pkg-code-lines internal/clusteroffline 2000
-pkg-files cmd/tether 52
+pkg-files cmd/tether 56
 pkg-files internal/broker 70
 pkg-files internal/cluster 32
-type-methods internal/agent.Agent 126
-type-methods internal/broker.Broker 279
+type-methods internal/agent.Agent 127
+type-methods internal/broker.Broker 282
 type-methods internal/broker.ClusterAdmin 86

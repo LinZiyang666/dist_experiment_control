@@ -635,6 +635,20 @@ LOST 是 read-derived 状态——broker 的 SQLite 行还停在 RUNNING，
 的 agent 跟丢了"。当 agent 重新 register 时，G.1 reconcile 会把
 对应行收敛到 EXITED(rc=-1, missed-exit) 或重新接受 RUNNING。
 
+**两节都是有界的（h1 A1）**：broker 每节最多回 500 行。默认视图**只回活着的**——
+RUNNING/LOST 进程 + ALLOCATED 端口；`-a` 才带上 EXITED 进程与 FREED/REVOKED 端口历史。
+被截断时表格下方会打一行 `(truncated: 500 of NNN …)`，`--json` 里对应
+`procs_total` / `procs_truncated` / `ports_total` / `ports_truncated` 四个字段
+（additive，`schema_version` 仍是 1）。`-a` 的端口按**活行优先**排序：历史行永远不会
+把活行挤掉。但**上限对所有状态一视同仁**——如果一个 session 的 ALLOCATED 行本身超过 500
+（端口段 14000-14999 允许），仍会有活行落在视图外。此时以 `ports_total` 为准。
+
+> **为什么要有界**：h1 之前 PORTS 节完全不设限。2026-08-04 那次事故里，一个 agent 的 proxy
+> 每 20 秒失败重试一轮、每轮留下一条 FREED 行，累计 24k 行——回包越过 NATS 的 1 MiB
+> `max_payload`，被客户端库拒发，而 broker 当时**静默吞掉了这个错误**，于是 `tether ps` 对所有人
+> 超时了五天，其它命令却全部正常。现在：回包有界，发不出去也一定有 ERROR 日志 + 一个
+> `reply_too_large` 的明确报错（§9.13.1）。
+
 分布式 HA 影响：`ps` 是 read-only，不需要 `--ack-alerts`，也不会改动任何
 cluster 状态。若当前有 severe cluster alert，`ps` 会把 alert banner 打到 stderr，
 stdout 的表格保持可脚本解析。PORTS 节里看到的 expose 可能已经 rehome 到其它
@@ -737,6 +751,27 @@ flag：
 
 非 tty 调用（如 `tether run nid -- bash <<<EOF ... EOF`）时 SIGINT 转成
 `kill.req{SIGINT}` 发往 agent 的进程组。
+
+**ctl 存活契约（h1 D）——关掉终端窗口不再留下永生进程**
+
+`run` 期间 ctl 每 5 秒往 `pty.<pid>.ka` 发一个空心跳。agent 端按
+`grace = max(6×间隔, 3 分钟)` 计时：**在 agent 自己的连接被证明健康的前提下**心跳静默超过
+grace，agent 就对该进程组发 `SIGHUP` 并关掉 PTY master——正是真实终端被关掉时会发生的事。
+语义等同 sshd 配了 `ClientAliveInterval`：
+
+- `tmux attach` 会退出（rc=-1，信号死亡），**tmux server 本身照常存活**，重新 attach 即可；
+- 对 `SIGHUP` 免疫的程序会继续跑，`ps` 里也如实继续显示 RUNNING——这不是 kill 升级，只是"终端没了"；
+- **误杀防护有三层**：agent 自身连接不健康的那些 tick 一律不计（静默不能算在 ctl 头上）、
+  动手前先做一次连接往返探测（`nc.Status()` 在静默分区下会撒谎，实测能"CONNECTED"好几分钟）、
+  且必须**连续两个**探测通过的 tick 都静默才动手。
+
+**代价（明确的设计取舍）**：笔记本合盖/挂起**超过 3 分钟**，回来时那条交互会话已经被挂断——
+和 sshd 的行为一致。3 分钟以内不受影响。要跑长命令又不想被这条约束管，用 `tether exec`
+（批处理形态，不参与本契约），或在远端先 `tmux new -d` 再 attach——挂断只会断 attach，
+tmux 里的活照跑。
+
+旧版 ctl（v0.4.7 及更早）不发心跳，agent 对它们**永不**执行挂断（保持老行为）。
+
 
 分布式 HA 影响：`run` 会打开新的交互式远程进程，属于可能扩大损害面的写操作；
 ctl 会先检查 cluster health。看到 `quorum_lost` 或 `force_single_active` 时默认拒绝，
@@ -1632,6 +1667,8 @@ language version 1.23 is lower than the targeted Go version 1.25
 - `exec` / `run` **透传远端进程退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器；判别靠"你跑的是哪个命令"，不是值。所以"77=权限"仅限 broker-RPC 命令。
 
 **健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。
+**唯一的成文例外是 `reply_too_large`（h1 A2）**：它也退 `70`，但重试必然再次失败——broker 每次都会
+重新构造同一个超限回包。见下面 §9.13.1。
 
 > **这条规则没有例外，是靠把码归对类来维持的**（线二内审 M17）。审查发现 `pty_unavailable` 当时归了
 > `69`，而它自己的 hint 写着「retrying will not help until the host changes」——同一个码同时被规则说成
@@ -1648,6 +1685,23 @@ language version 1.23 is lower than the targeted Go version 1.25
 >
 > 62 个码现已逐个归类（77×2 / 75×10 / 64×42 / 70×8）——其中 8 个经判断确属我方 bug、
 > **仍归 70 但现在是显式声明**（"判过"与"没人看过"因此可区分），所以**退出码真正发生变化的是 54 个**。
+
+#### 9.13.1 `reply_too_large`（h1 A2）——70 里那个不该重试的
+
+**症状**：命令立刻失败，错误串形如
+`<N>-byte reply exceeds server max_payload <M>; this is a tether bug (every reply section is bounded) — report it`。
+
+**含义**：broker 把回包构造出来了，但它大过 NATS 服务端的 `max_payload`，客户端库拒发。broker 于是
+改发这个**必然装得下**的小回包，并在自己的日志里打一条 ERROR（含 subject 与字节数）。
+
+**为什么它退 70 却不该重试**：h1 之后每个回包分节都是有界的（`ps` 的 processes / ports 各 500 行封顶），
+所以走到这一步只能是 tether 的 bug——同一条请求重试会得到同样大的回包。**请连同 broker 日志里那条
+ERROR 的 subject 一起上报**，不要写重试循环。
+
+**它替换掉了什么**：h1 之前 broker 对这种情况是**静默**的（`_ = msg.Respond(payload)` 把
+`ErrMaxPayload` 丢掉），使用者只看得到超时。2026-08-04 那次事故就是这样跑了五天：`tether ps` 全员
+超时，而 broker 对其它每条命令都正常应答。现在任何回包发不出去都会留下 ERROR 日志，超限的那类还会
+把原因回给使用者。
 > 由 `cmd/tether/error_code_coverage_test.go`
 > 的守门测试防止再次漏归。**wire 上的码字符串一个字节未改**，只改了进程退出码，
 > 现网混版本 broker/agent/ctl 无感。

@@ -105,12 +105,30 @@ func (b *Broker) replyExecErr(msg *nats.Msg, reason string) {
 		return
 	}
 	payload, _ := json.Marshal(proto.ExecChunk{Kind: "error", Error: reason})
-	_ = msg.Respond(payload)
+	b.respondBytes(msg, payload)
 }
 
 // handleProcEvent is invoked for `s.<sid>.ev.node.<nid>.proc.<pid>.<kind>`
 // (kind = started | exit). The broker is the SQLite single-writer; the
 // agent only ships the runtime fact, the broker turns it into a row.
+//
+// h1 C3: since h1 the agent's courier sends these as ACKed REQUESTS — when a
+// Reply inbox is present the broker answers proto.ProcEventAck after the
+// write settles, so the courier can stop retrying. A pre-h1 agent publishes
+// with no Reply and takes the byte-identical old path (ackProcEvent no-ops).
+//
+// The ack rules encode two hard-won constraints (plan critique-1):
+//
+//   - unknown_pid ({OK:true} — "the row is gone, stop") may ONLY be derived
+//     from the write path itself, i.e. the LEADER-COMMITTED view: in cluster
+//     mode this handler can run on a follower whose RODB lags the `started`
+//     insert, and a local not-found ack would delete the courier's entry for
+//     a REAL process — re-creating zombie class (a) through the ack path.
+//   - the LOCAL pre-read (b.read()) is used ONLY for audit dedup:
+//     already_exited/already_recorded are MONOTONE facts (EXITED is terminal;
+//     a row once inserted is never un-inserted short of GC), so a lagging
+//     replica that sees them can trust them — and skipping the duplicate
+//     pubAuditProc is what keeps a courier retry from double-writing audit.
 func (b *Broker) handleProcEvent(msg *nats.Msg) {
 	sid, nid, pid, kind, ok := proto.ParseEvProc(msg.Subject)
 	if !ok {
@@ -121,6 +139,11 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 		var ev proto.ProcStartedEvent
 		if err := json.Unmarshal(msg.Data, &ev); err != nil {
 			b.cfg.Logger.Warn("broker: proc.started parse", "err", err)
+			return
+		}
+		// Audit-dedup pre-read (monotone: rows are never un-inserted).
+		if existing, gerr := proc.Get(b.read().SQL(), pid); gerr == nil && existing != nil {
+			b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "already_recorded"})
 			return
 		}
 		// D9 §3 (audit #4): cluster mode routes the proc record through raft; single
@@ -139,12 +162,24 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			// with no authoritative DB record (best-effort audit must not claim a process that has
 			// no row). A genuinely-running orphan is reconciled at the agent's next register
 			// (reconcileOnRegister), which is the authoritative missed-proc path.
-			if !errors.Is(err, proc.ErrNodeMissing) {
-				b.cfg.Logger.Warn("broker: proc.started insert", "err", err, "pid", pid)
+			if errors.Is(err, proc.ErrNodeMissing) {
+				// Transient for the courier: the node row lands with the next
+				// register, after which the retry (or the register snapshot)
+				// succeeds. NOT an OK:true — dropping the entry here would
+				// lose the start and turn the eventual exit into unknown_pid.
+				b.ackProcEvent(msg, proto.ProcEventAck{OK: false, Code: "node_missing"})
+				return
 			}
+			b.cfg.Logger.Warn("broker: proc.started insert", "err", err, "pid", pid)
+			// origin: h1 external review F6. The store detail stays in the WARN
+			// above; it must NOT ride the wire. testing-standards.md S4: a
+			// reply carries the CODE, because SQLite text can leak paths and
+			// schema shape, and the courier only needs OK=false to retry.
+			b.ackProcEvent(msg, proto.ProcEventAck{OK: false, Code: "store_error"})
 			return
 		}
 		b.pubAuditProc(sid, "start", nid, pid, ev.Argv, 0, ev.StartedAt)
+		b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "recorded"})
 
 	case "exit":
 		var ev proto.ProcExitEvent
@@ -152,11 +187,42 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			b.cfg.Logger.Warn("broker: proc.exit parse", "err", err)
 			return
 		}
+		// Audit-dedup pre-read (monotone: EXITED is terminal).
+		if existing, gerr := proc.Get(b.read().SQL(), pid); gerr == nil && existing != nil && existing.Status == proc.StateExited {
+			b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "already_exited"})
+			return
+		}
 		if err := b.markProcExited(pid, ev.ExitCode, ev.EndedAt); err != nil {
+			// Leader-committed not-found (direct in single mode; carried
+			// across the forward as kind proc_not_found in cluster mode) is
+			// the ONE terminal ack: the row was GC'd or never existed on the
+			// authoritative view — nothing left to deliver.
+			if errors.Is(err, proc.ErrNotFound) {
+				b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "unknown_pid"})
+				return
+			}
 			b.cfg.Logger.Warn("broker: proc.exit mark", "err", err, "pid", pid)
+			// origin: h1 external review F6. The store detail stays in the WARN
+			// above; it must NOT ride the wire. testing-standards.md S4: a
+			// reply carries the CODE, because SQLite text can leak paths and
+			// schema shape, and the courier only needs OK=false to retry.
+			b.ackProcEvent(msg, proto.ProcEventAck{OK: false, Code: "store_error"})
+			return
 		}
 		b.pubAuditProc(sid, "exit", nid, pid, nil, ev.ExitCode, ev.EndedAt)
+		b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "recorded"})
 	}
+}
+
+// ackProcEvent answers a couriered proc event (h1 C3). No Reply inbox — the
+// pre-h1 fire-and-forget publish — is a silent no-op, keeping the old-agent
+// wire byte-identical. The ~60B ack rides respondBytes (ErrMaxPayload is
+// structurally impossible at this size; the egress logging is the point).
+func (b *Broker) ackProcEvent(msg *nats.Msg, ack proto.ProcEventAck) {
+	if msg.Reply == "" {
+		return
+	}
+	b.replyJSON(msg, ack)
 }
 
 // handleNodeListReq answers ctrl.by.<actor>.s.<sid>.node.list.req
@@ -228,12 +294,26 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		IncludeExited: req.IncludeExited,
 		Limit:         req.Limit,
 	}
+	// serverMaxLimit caps BOTH reply sections (h1 A1). Processes have been
+	// capped since v0.2.8; ports were not, and 24k FREED rows once pushed the
+	// marshaled PsResp past NATS max_payload — the reply was then silently
+	// dropped (pre-h1 replyJSON swallowed ErrMaxPayload) and every `tether ps`
+	// timed out for five days (2026-08-04 incident, docs/reviews/h1-plan.md).
 	const serverMaxLimit = 500
 	if opts.Limit <= 0 || opts.Limit > serverMaxLimit {
 		opts.Limit = serverMaxLimit
 	}
 
 	procs, err := proc.ListBySessionFiltered(b.cfg.DB, sid, opts)
+	if err != nil {
+		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	// Totals go through b.read() (not b.cfg.DB): the cfgdb ratchet pins this
+	// function at exactly 3 direct sites, and these are plain bounded-stale
+	// reads. A count/list pair is two non-transactional reads by design —
+	// see proto.PsResp for why the ±1 skew is accepted.
+	procsTotal, err := proc.CountBySession(b.read().SQL(), sid, req.IncludeExited)
 	if err != nil {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
 		return
@@ -276,8 +356,19 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 		procOut = append(procOut, entry)
 	}
 
-	// P6 / architecture F.8 — same query also returns the ports.
-	ports, err := port.ListBySession(b.cfg.DB, sid)
+	// P6 / architecture F.8 — same query also returns the ports. Bounded and
+	// FREED-excluded by default since h1 A1 (the incident section); `-a` sets
+	// IncludeFreedPorts and gets live-first ordering so a truncated view can
+	// never omit a live allocation.
+	ports, err := port.ListBySessionFiltered(b.read().SQL(), sid, port.ListBySessionOpts{
+		IncludeFreed: req.IncludeFreedPorts,
+		Limit:        serverMaxLimit,
+	})
+	if err != nil {
+		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
+		return
+	}
+	portsTotal, err := port.CountBySession(b.read().SQL(), sid, req.IncludeFreedPorts)
 	if err != nil {
 		b.replyJSON(msg, proto.PsResp{Code: "store_error", Error: err.Error()})
 		return
@@ -299,7 +390,11 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 			RebuildOff: pa.RebuildOff,
 		})
 	}
-	b.replyJSON(msg, proto.PsResp{Processes: procOut, Ports: portOut})
+	b.replyJSON(msg, proto.PsResp{
+		Processes: procOut, Ports: portOut,
+		ProcsTotal: procsTotal, ProcsTruncated: procsTotal > len(procOut),
+		PortsTotal: portsTotal, PortsTruncated: portsTotal > len(portOut),
+	})
 }
 
 // splitDot exists so we don't import "strings" just for one Split call

@@ -149,6 +149,7 @@
   | CLI 表面 golden | `cmd/tether/command_tree_inventory_test.go` | 命令/flag/Hidden 位漂移即红 |
   | 泄漏门 | `test/concurrency/helpers_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak** |
   | docs 布局 | `test/architecture/docs_layout_test.go` | 已跟踪的过程产物（`*-plan/review/tasklist/roadmap.md`）不许留在 `docs/` 顶层——§3 step 7 那条曾整条无闸门 |
+  | simcluster 日志 oracle | `test/architecture/simcluster_log_oracle_test.go` | drill 只许经 `drills/lib/logs.sh` **一份**映射读四条流（broker slog／broker panic／agent slog／agent panic）；调用 helper 必须 source（漏 source 是 runtime not-found，`bash -n` 看不见）；例外进**精确计数**的递减账本。h1 挪了两条流，十来个各自内联的 drill 同时开始把**健康的产品报成失败**——这是本 harness 最坏的输出 |
   | 闸门清单自对账 | `test/architecture/gate_registry_test.go` | ① 本表点到的位置必须真在 `make gates` 里跑；② `.golangci.yml` 的函数名账本里每个名字必须还存在（死豁免会被报出）|
 
   - **改闸门本身走同一流程**：动 `.golangci.yml`、任何 golden、任何递减账本**等同于改不变量**，

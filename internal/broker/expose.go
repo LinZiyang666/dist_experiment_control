@@ -302,7 +302,7 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	respBody, _ := json.Marshal(&resp)
 	if msg.Reply != "" {
-		_ = msg.Respond(respBody)
+		b.respondBytes(msg, respBody)
 	}
 	b.cfg.Logger.Info("broker: expose allocated",
 		"sid", sid, "nid", nid, "name", req.Name,
@@ -330,7 +330,7 @@ func (b *Broker) replyExposeErr(msg *nats.Msg, code, detail string) {
 		return
 	}
 	body, _ := json.Marshal(proto.ExposeResp{Code: code, Error: detail})
-	_ = msg.Respond(body)
+	b.respondBytes(msg, body)
 }
 
 // handleExposeRmReq is the broker entry point for `tether expose rm`.
@@ -411,7 +411,7 @@ func (b *Broker) handleExposeRmReq(nc *nats.Conn, msg *nats.Msg) {
 
 	if msg.Reply != "" {
 		body, _ := json.Marshal(proto.ExposeRmResp{OK: true, Port: alloc.Port})
-		_ = msg.Respond(body)
+		b.respondBytes(msg, body)
 	}
 	b.cfg.Logger.Info("broker: expose freed",
 		"sid", sid, "nid", alloc.NID, "name", req.Name, "port", alloc.Port, "fp", fp)
@@ -426,7 +426,7 @@ func (b *Broker) replyExposeRmErr(msg *nats.Msg, code, detail string) {
 		return
 	}
 	body, _ := json.Marshal(proto.ExposeRmResp{Code: code, Error: detail})
-	_ = msg.Respond(body)
+	b.respondBytes(msg, body)
 }
 
 // reconcilePorts is the broker tick that walks ALLOCATED ports owned

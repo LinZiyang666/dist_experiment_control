@@ -67,6 +67,7 @@
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/cluster.sh"; . "$HERE/drills/lib/dataplane.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CTL() { "$SIM" ctl -- "$@"; }
@@ -106,10 +107,18 @@ _drain_dataplane_pending() {
     [ "${1:-}" = 75 ] || return 1
     printf '%s' "${2:-}" | grep -qE 'the control plane committed the rehome but .* have NOT confirmed'
 }
-# _agt_journal_count <agent> <since> <ere> : how many lines in the agent's OWN journal window match <ere>.
-# Prints a number, or NOTHING when the journal is unreadable — callers treat empty as FAIL, never as zero.
+# _agt_journal_count <agent> <cursor> <ere> : how many lines in the agent's OWN
+# slog, after <cursor>, match <ere>.
+# Prints a number, or NOTHING when the slog is unreadable — callers treat empty as FAIL, never as zero.
+#
+# h1 F3: the agent's slog left journald for $HOME/.tether/agent/<sid>/agent.log,
+# and <cursor> is now a BYTE OFFSET rather than a `--since` timestamp. This
+# helper's empty≠zero contract is exactly what h1 threatened: post-h1 the
+# journal still EXISTS (boot output) but no longer carries a single slog line,
+# so the old reader would have returned a confident "0" for the ANTI-VACUITY
+# half (i) and turned a healthy product into an assertion failure.
 _agt_journal_count() {
-    dexec "$1" -- sh -c "journalctl -u tether-agent --since='$2' --no-pager 2>/dev/null | grep -cE '$3'" 2>/dev/null
+    sim_agent_slog_count "$1" "$3" "$2"
 }
 _agt_mainpid() { "$SIM" exec "$1" -- systemctl show tether-agent -p MainPID --value 2>/dev/null; }
 # _agt_silent_since <agent> <since> : the P1 PREMISE. Over the drain window the agent
@@ -277,9 +286,13 @@ if [ "$FIXTURE" = 1 ]; then
         # the drill would be measuring its own flag rather than the product. Dropping it hands the gate its
         # designed 30s drain-notice budget, which makes the rc oracle genuinely TWO-SIDED (rc=0 is reachable).
         AGT_PID0=$(_agt_mainpid agt1)
-        BSINCE=$(dexec agt1 -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
-        [ -n "$BSINCE" ] || BSINCE="-10 min"
-        log "71: Arm B pre-drain — agt1 tether-agent MainPID=[${AGT_PID0:-?}] journal window opens at [$BSINCE]"
+        # h1 F3: a BYTE OFFSET into agt1's slog, not a timestamp. The 0 fallback
+        # keeps the old "-10 min" fallback's direction — a WIDER window, which
+        # can only make the anti-vacuity half easier and the zero-reconnects
+        # half harder, never the reverse.
+        BSINCE=$(sim_agent_slog_cursor agt1)
+        [ -n "$BSINCE" ] || BSINCE=0
+        log "71: Arm B pre-drain — agt1 tether-agent MainPID=[${AGT_PID0:-?}] slog window opens at byte offset [$BSINCE]"
         _dm_out=$(dexec -u tether "$LDR0" -- env HOME=/var/lib/tether tether cluster drain brk3 2>&1); _dmrc=$?
         log "71: Arm B cluster drain brk3 rc=$_dmrc out=[$(printf '%s' "$_dm_out" | tr '\n' '|' | head -c 300)]"
         if [ "$_dmrc" = 0 ] || _drain_dataplane_pending "$_dmrc" "$_dm_out"; then

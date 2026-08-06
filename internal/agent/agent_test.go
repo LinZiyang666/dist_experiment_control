@@ -225,6 +225,75 @@ func TestAgentRegisterRetriesOnLeaderUnavailable(t *testing.T) {
 	}
 }
 
+// TestAgentRegisterRetriesOnReplyTooLarge is the h1 A2 critique-4 regression:
+// a broker whose register REPLY exceeded max_payload now sends the typed
+// reply_too_large fallback instead of silence. That fallback is a BROKER bug,
+// not this agent's config — treating it as an authoritative reject would EXIT
+// the agent and turn a self-healing condition (pre-h1: silent drop → timeout →
+// retry) into fleet-node death. Same stub shape as the leader_unavailable
+// test: two reply_too_large replies, then OK; the agent must retry through.
+// origin: docs/reviews/h1-plan.md workstream A2 (non-ctl decoder audit).
+func TestAgentRegisterRetriesOnReplyTooLarge(t *testing.T) {
+	url := startNATS(t)
+	stub, _ := nats.Connect(url)
+	defer stub.Close()
+
+	var attempts atomic.Int32
+	if _, err := stub.Subscribe(
+		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
+		func(msg *nats.Msg) {
+			var resp []byte
+			if attempts.Add(1) <= 2 {
+				resp, _ = json.Marshal(proto.ReplyTooLarge{
+					Code: proto.CodeReplyTooLarge, Error: "999999-byte reply exceeds server max_payload 1048576",
+				})
+			} else {
+				resp, _ = json.Marshal(proto.NodeRegisterResp{OK: true})
+			}
+			_ = msg.Respond(resp)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = stub.Flush()
+
+	a, err := New(Config{
+		NATSURL:              url,
+		SID:                  "lab",
+		NID:                  "lab-1",
+		HeartbeatInterval:    50 * time.Millisecond,
+		RegisterTimeout:      200 * time.Millisecond,
+		RegisterRetryInitial: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for attempts.Load() < 3 {
+		select {
+		case err := <-done:
+			t.Fatalf("agent EXITED on reply_too_large instead of retrying: %v (attempts=%d)", err, attempts.Load())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("register did not reach attempt 3 (got %d) — retry on reply_too_large not working", attempts.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not exit after cancel")
+	}
+}
+
 // Register must retry on transient failures (no responders, garbled reply,
 // per-attempt timeout) until the parent context is canceled or the broker
 // returns a real OK reply. Mirrors the reviewer's e2e regression test

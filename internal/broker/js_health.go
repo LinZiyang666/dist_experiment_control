@@ -1,8 +1,11 @@
 package broker
 
 import (
+	"context"
 	"errors"
+	"fmt"
 
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -29,4 +32,29 @@ func classifyJSUnavailable(err error) bool {
 		return apiErr.ErrorCode == jsErrCodeUnavailable
 	}
 	return false
+}
+
+// classifyJSErrClass buckets an error into the COARSE class strings the h1 E3
+// backoff trackers key their log discipline on. Classes must be enum-ish and
+// stable — NEVER err.Error() (free text defeats suppression on any variable
+// detail: a byte count, a stream name) — and coarse on purpose: two different
+// api codes are two classes (each gets one logged line), but every occurrence
+// of the same code is one class (suppressed after the first).
+func classifyJSErrClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, jsstream.ErrMetaGroupNotReady):
+		return "meta_not_ready"
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return "ctx"
+	}
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode == jsErrCodeUnavailable {
+			return "js_unavailable"
+		}
+		return fmt.Sprintf("api:%d", apiErr.ErrorCode)
+	}
+	return "other"
 }

@@ -335,3 +335,70 @@ func sameMultiset(a, b []string) bool {
 	}
 	return true
 }
+
+// TestRegisterReconcilePortReadFailureIssuesNoPortDirectives is the port half of
+// the fail-closed rule.
+//
+// origin: h1 external review round 2, R1 — extending the reviewer's fix rather
+// than repeating it. That fix returns early when the PROCESS list fails, and its
+// regression test forces the failure by closing the whole DB, so BOTH reads fail
+// and the early return hides the port path entirely. The dangerous asymmetric
+// case — process read fine, port read broken — was left uncovered AND unfixed,
+// even though the reviewer's own report named the hazard.
+//
+// Why it matters: with an empty portByHash every port the agent re-presented
+// falls into the "broker has no record of this tunnel" arm and is REVOKED. One
+// transient read error on port_allocations would tear down every public expose
+// in the session — the same shape as killing live processes on a bad process
+// read, on the data plane instead of the process table.
+//
+// The injection drops ONLY port_allocations, so proc.ListBySessionFiltered still
+// succeeds and the port query fails with "no such table". That asymmetry is the
+// whole point; a closed DB cannot express it.
+func TestRegisterReconcilePortReadFailureIssuesNoPortDirectives(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('lab','lab','o','p','ACTIVE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at) VALUES('n1','lab','ONLINE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	// Drop ONLY the port table: proc.ListBySessionFiltered must still succeed.
+	if _, err := db.Exec(`DROP TABLE port_allocations`); err != nil {
+		t.Fatal(err)
+	}
+
+	b := &Broker{}
+	b.cfg.DB = db
+	b.cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	b.cfg.Now = time.Now
+
+	accepted, _, keepPorts, revokePorts, _ := b.reconcileOnRegister("lab", "n1", proto.NodeRegisterReq{
+		LocalProcesses: []proto.LocalProcess{{PID: "live", State: "running"}},
+		LocalPorts: []proto.LocalPort{
+			{Port: 14000, Name: "web", LocalPort: 8080, TokenHash: "h-web"},
+			{Port: 14001, Name: "api", LocalPort: 8081, TokenHash: "h-api"},
+		},
+	})
+
+	if len(revokePorts) != 0 {
+		t.Fatalf("an unreadable port table produced revokes %v — a transient read error must never "+
+			"tear down live tunnels; an authority that cannot be read proves nothing", revokePorts)
+	}
+	if len(keepPorts) != 0 {
+		t.Fatalf("keepPorts=%v on an unreadable port table — a keep is a claim about committed state "+
+			"too, and none was observed", keepPorts)
+	}
+	// The PROCESS half read cleanly, so its conclusions still stand: this is a
+	// scoped fail-closed, not a blanket bail-out. "live" is unknown to the
+	// broker, so it is an orphan; what must NOT happen is the port teardown.
+	if len(accepted) != 0 {
+		t.Fatalf("accepted=%v: the process read succeeded and 'live' has no broker row, so it is an "+
+			"orphan, not an accepted process", accepted)
+	}
+}

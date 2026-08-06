@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/backoff"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proc"
@@ -91,6 +92,18 @@ type AuditPublisher struct {
 	lossCnt      atomic.Uint64 // truncation-loss counter (R-6 non-vacuity, E-A6)
 	lagCnt       atomic.Uint64 // §6.3 R-7: times the publish lag breached MaxLag (truncation-risk)
 	delStreamCnt atomic.Uint64 // audit M5: records dropped because the destination history-<sid> stream was deleted (racing session-rm)
+
+	// h1 E3 dampers (single-goroutine: only Run's tick touches them — see
+	// internal/backoff pkgdoc). reconBO paces ReconcileOnce ATTEMPTS
+	// (1s→…→5min on persistent failure) — this loop retried a failing
+	// JetStream stream-create every 100ms for five weeks and wrote 5.3GB of
+	// identical WARN lines (the 2026-08-04 incident). pubBO is LOG-discipline
+	// ONLY for PublishOnce errors: its cadence is untouched, because slowing
+	// the publish drain would erode the §6.3 R-7 lag bound
+	// (CommitIndex - published < TrailingLogs) that keeps snapshots from
+	// truncating unpublished audit.
+	reconBO *backoff.Tracker
+	pubBO   *backoff.Tracker
 }
 
 // NewAuditPublisher validates + defaults the config.
@@ -113,7 +126,11 @@ func NewAuditPublisher(cfg AuditPublisherConfig) *AuditPublisher {
 	if cfg.MaxLag == 0 {
 		cfg.MaxLag = cluster.TrailingLogs // §6.3 R-7: the raft snapshot-retention bound
 	}
-	return &AuditPublisher{cfg: cfg}
+	return &AuditPublisher{
+		cfg:     cfg,
+		reconBO: backoff.New(backoff.Policy{Base: time.Second, Cap: 5 * time.Minute}),
+		pubBO:   backoff.New(backoff.Policy{Base: time.Second, Cap: 5 * time.Minute}),
+	}
 }
 
 // Run is the ONE long-lived goroutine (R-13), tied to ctx (R-14). Each tick: gate on
@@ -142,11 +159,33 @@ func (p *AuditPublisher) tick(ctx context.Context) {
 	if !p.cfg.Node.IsLeader() || p.cfg.Node.LeaderContactStale(p.cfg.Now()) {
 		return
 	}
+	// h1 E3 log discipline. PublishOnce runs EVERY tick (the R-7 lag bound
+	// depends on its cadence); only its logging is damped: first failure and
+	// error-class changes log, repeats are counted, recovery logs the count.
+	now := p.cfg.Now()
 	if _, err := p.PublishOnce(ctx); err != nil {
-		p.cfg.Logger.Warn("d5: audit publish", "err", err)
+		if p.pubBO.Fail(now, classifyJSErrClass(err)) {
+			p.cfg.Logger.Warn("d5: audit publish", "err", err)
+		}
+	} else if suppressed, ok := p.pubBO.Recover(now); ok {
+		p.cfg.Logger.Info("d5: audit publish recovered", "suppressed_failures", suppressed)
 	}
-	if _, err := p.ReconcileOnce(ctx); err != nil && !errors.Is(err, jsstream.ErrMetaGroupNotReady) {
-		p.cfg.Logger.Warn("d5: replica reconcile", "err", err)
+	// ReconcileOnce is ATTEMPT-damped: a persistently failing reconcile
+	// (e.g. `create events: insufficient storage` — the incident) retries at
+	// 1s→…→5min instead of every 100ms tick. ErrMetaGroupNotReady keeps its
+	// historical no-Warn (a booting meta-group is normal) but participates in
+	// the backoff so it stops hot-looping too. Accepted trade (plan E3): a
+	// post-outage replica raise may start up to one cap-interval (5min) late.
+	if !p.reconBO.Due(now) {
+		return
+	}
+	if _, err := p.ReconcileOnce(ctx); err != nil {
+		logNow := p.reconBO.Fail(now, classifyJSErrClass(err))
+		if logNow && !errors.Is(err, jsstream.ErrMetaGroupNotReady) {
+			p.cfg.Logger.Warn("d5: replica reconcile (entering backoff; repeats suppressed)", "err", err)
+		}
+	} else if suppressed, ok := p.reconBO.Recover(now); ok {
+		p.cfg.Logger.Info("d5: replica reconcile recovered", "suppressed_failures", suppressed)
 	}
 }
 

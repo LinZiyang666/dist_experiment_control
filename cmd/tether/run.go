@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -107,6 +108,9 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			}
 			body, err := json.Marshal(proto.RunReq{
 				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows, Env: env, Safe: safe,
+				// h1 D2: advertise the ctl-liveness keepalive (5s beat). An
+				// old agent ignores the field and never reaps — safe skew.
+				KAIntervalMS: int(runKeepaliveInterval / time.Millisecond),
 			})
 			if err != nil {
 				return err
@@ -216,6 +220,14 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			if isTTY {
 				go pumpStdinToBus(ctxRun, nc, proto.SubjPtyIn(sid, pid), os.Stdin)
 			}
+
+			// h1 D2: keepalive beat → pty.<pid>.ka. Runs regardless of isTTY
+			// (a piped-stdin run dies with its ctl just the same). If this
+			// ctl's JWT predates the .ka grant (old broker minted it), the
+			// server -ERRs every publish — the pump stops on the first such
+			// violation (see kaPubDenied) instead of spamming an error into
+			// a raw-mode terminal every 5s.
+			go pumpKeepaliveToBus(ctxRun, nc, proto.SubjPtyKeepalive(sid, pid))
 
 			// SIGWINCH → pty.<pid>.resize
 			winchCh := make(chan os.Signal, 1)
@@ -356,6 +368,37 @@ func pumpStdinToBus(ctx context.Context, nc *nats.Conn, subj string, src io.Read
 		}
 		if err != nil {
 			return
+		}
+	}
+}
+
+// runKeepaliveInterval is the h1 D2 ctl-liveness beat: an empty publish every
+// 5s on pty.<pid>.ka for the run's lifetime. The agent's grace is
+// max(6×interval, 3min), so a suspended/killed ctl hangs the session up like
+// sshd with ClientAliveInterval would.
+const runKeepaliveInterval = 5 * time.Second
+
+// kaPubDenied flips when the broker rejects a keepalive publish with a
+// permissions violation (a v0.4.7-minted JWT has no .ka grant). Set by the
+// async ErrorHandler in connectCtl; every keepalive pump stops on it — the
+// alternative is nats.go's default handler printing the -ERR into a RAW-MODE
+// terminal every 5s for the whole session (h1 plan critique-4).
+var kaPubDenied atomic.Bool
+
+// pumpKeepaliveToBus publishes the liveness beat until the run context ends
+// or the broker denies the subject (old-broker skew).
+func pumpKeepaliveToBus(ctx context.Context, nc *nats.Conn, subj string) {
+	t := time.NewTicker(runKeepaliveInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if kaPubDenied.Load() {
+				return
+			}
+			_ = nc.Publish(subj, nil)
 		}
 	}
 }

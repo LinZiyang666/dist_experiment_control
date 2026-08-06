@@ -439,6 +439,18 @@ type Broker struct {
 	// then publish Enabled:true after a concurrent OFF has completed.
 	proxyOpMu sync.Mutex
 
+	// proxyRotate / proxyReadyTicks (h1 E2) are the leader-local M3 rotation
+	// dampers: proxyRotate maps "sid/nid" → *backoff.Tracker (rotation
+	// schedule 20s→40s→…→10min + the proxy_bind_stalled alert trigger at the
+	// 3rd consecutive rotation), proxyReadyTicks maps "sid/nid" → consecutive
+	// ready-tick count (the 60s clear-side hysteresis; short ready blips only
+	// DECAY the tracker one step). Both are observe-loop-only — the reaper is
+	// a single goroutine, so the Trackers inside are deliberately not
+	// goroutine-safe (see internal/backoff pkgdoc). Entries are dropped on
+	// recover + teardown (no leak).
+	proxyRotate     sync.Map
+	proxyReadyTicks sync.Map
+
 	// proxyDwell (C5) is the leader-local consecutive-home-down tick counter (port → count) for the
 	// proxy rehome hysteresis. Reset on a leadership change is fine (the new leader re-counts).
 	proxyDwell sync.Map
@@ -1411,7 +1423,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
 		payload, _ := json.Marshal(resp)
 		if msg.Reply != "" {
-			_ = msg.Respond(payload)
+			b.respondBytes(msg, payload)
 		}
 		return
 	}
@@ -1504,7 +1516,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 
 	payload, _ := json.Marshal(resp)
 	if msg.Reply != "" {
-		_ = msg.Respond(payload)
+		b.respondBytes(msg, payload)
 	}
 }
 
@@ -1559,5 +1571,5 @@ func (b *Broker) replyErr(msg *nats.Msg, code, message string) {
 	payload, _ := json.Marshal(proto.NodeRegisterResp{
 		OK: false, Code: code, Error: message,
 	})
-	_ = msg.Respond(payload)
+	b.respondBytes(msg, payload)
 }

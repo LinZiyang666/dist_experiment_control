@@ -127,10 +127,16 @@ because two of them are traps any future drill can fall into:
      code, so the three `upgrade_in_progress` emitters are indistinguishable from the ctl side. Now
      pinned on the `agent_rejected:` prefix (proves it came from the agent process, not the broker);
      WHICH gate fired stays owned by the hermetic test that can read the raw reply.
-  3. Reading the broker log from journald. install.sh's broker unit sets
-     `StandardOutput=append:/var/log/tether/broker.log`, so `journalctl -u tether-broker` is EMPTY by
-     construction — the first "fix" (widening the journal window) did nothing, which is what exposed
-     the real cause. Read the file the unit writes.
+  3. Reading the broker log from journald. The broker's application lines go to a FILE, so
+     `journalctl -u tether-broker` does not carry them — the first "fix" (widening the journal
+     window) did nothing, which is what exposed the real cause. Read the file.
+     h1 F3 UPDATE: WHICH file, and why, both changed. The unit no longer redirects at all
+     (`StandardOutput=journal`/`StandardError=journal`); the slog is a process-owned rotating file
+     named by broker.yaml's `log_file:` (/var/log/tether/broker.log). The journal is consequently NO
+     LONGER empty — it now holds panics and stacktraces. The lesson survives the change but its
+     sharper form is: the two streams are DISTINCT, and an oracle that reads the wrong one fails in
+     the worst possible direction, reporting a healthy product as broken. drills/lib/logs.sh is the
+     one place that knows the mapping.
 
 ## 32-install-lifecycle
 

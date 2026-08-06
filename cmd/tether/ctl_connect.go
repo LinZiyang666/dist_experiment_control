@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
@@ -48,6 +50,21 @@ func connectCtlOpts(cmd *cobra.Command, verb, home, natsURL string, id *cli.Iden
 	expandable := !flagChanged && os.Getenv(cli.DefaultBrokerURLEnv) == ""
 	dial := cli.DialFor(flagChanged, base, home, time.Now())
 	opts := append([]nats.Option(nil), extra...)
+	// h1 D2: route async NATS errors through OUR handler instead of nats.go's
+	// default (which prints straight to stderr — catastrophic under `run`'s
+	// raw-mode terminal). A permissions violation on a `.ka` keepalive
+	// publish additionally flips kaPubDenied so the pump stops: that is the
+	// new-ctl + old-broker skew (the v0.4.7-minted JWT has no .ka grant).
+	opts = append(opts, nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+		if err == nil {
+			return
+		}
+		if strings.Contains(err.Error(), "Permissions Violation") && strings.Contains(err.Error(), ".ka") {
+			kaPubDenied.Store(true)
+			return // silent: the degraded mode IS the old behavior (no liveness contract)
+		}
+		fmt.Fprintf(os.Stderr, "\r\ntether: nats async error: %v\r\n", err)
+	}))
 	if dial != base {
 		// expanded path: DontRandomize honors the floor-last order; Timeout(3s) bounds the per-endpoint
 		// stall on a filtered/hung broker (proxydial is 10s/endpoint). No-ops for a single URL → kept off

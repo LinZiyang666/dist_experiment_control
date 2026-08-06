@@ -24,8 +24,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -259,6 +261,11 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		osPID:          sess.OSPID(),
 		startTimeTicks: startTicks,
 		startedAt:      time.Now().UTC(),
+		// h1 D2: arm the ctl-liveness reaper ONLY when the ctl advertised
+		// keepalives (0 = pre-h1 ctl = never reap). lastKA seeds at spawn so
+		// the first window measures from the run's start, not the epoch.
+		kaGrace: kaGraceFor(req.KAIntervalMS),
+		lastKA:  time.Now(),
 	}
 	a.registerProc(pid, rec)
 	// Hook into the shared process state machine: `tether run`
@@ -268,7 +275,8 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// exec_failed) deliberately do NOT pub proc.started — no child
 	// was started, so no SQLite row should exist. Those surface via
 	// PtyFailedEvent → audit.proc{kind:reason} instead.
-	a.pubProcStartedWithTriple(nc, pid, req.Argv, req.ActorFP,
+	// h1 C1: through the courier — see handleExecForwarded's note.
+	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP,
 		readBootID(), startTicks, rec.startedAt)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
 
@@ -301,6 +309,16 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	}()
 
 	exitCode, _ := sess.Wait()
+	// h1 D3: latch waitDone the INSTANT Wait returns, under procsMu — from
+	// here to unregisterProc the child's pgid is dead and can be RECYCLED,
+	// and the liveness reaper must never SIGHUP a recycled pgid. Checked (not
+	// cmd.ProcessState — reading that races Wait's own write) by
+	// shouldReapRun before any Hangup.
+	a.procsMu.Lock()
+	if lrec, ok := a.procs[pid]; ok {
+		lrec.waitDone = true
+	}
+	a.procsMu.Unlock()
 	// Wait returning means the child closed its end of the slave;
 	// reading from the master will hit EOF imminently. Wait for the
 	// pump to drain so the very last bytes (e.g. "$ exit\r\n") aren't
@@ -319,12 +337,20 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	a.unregisterProc(pid)
 	_ = sess.Close()
 
-	// Symmetric with pubProcStarted above: emit ev.proc.exit so the
-	// broker's existing handleProcEvent transcribes the SQLite row to
-	// EXITED + writes audit.proc{kind:exit}. Done BEFORE the lifecycle
-	// chunk so the row is updated by the time ctl reacts to exit.
-	a.pubProcExit(nc, pid, exitCode)
-	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
+	// Symmetric with the started enqueue above: the courier delivers
+	// ev.proc.exit (ACKed, current-conn) so the broker transcribes the row to
+	// EXITED + writes audit.proc{kind:exit}. Enqueued BEFORE the lifecycle
+	// chunk so delivery is already in flight when ctl reacts to exit.
+	a.courier.enqueueExit(pid, exitCode)
+	// h1 C1: the exit lifecycle chunk rides the CURRENT conn — after a mid-run
+	// conn rebuild the captured spawn conn is closed and the chunk (like the
+	// old exit publish) would silently vanish. Fall back to the captured conn
+	// only when no current conn exists (tests that never store ncBox).
+	exitConn := a.ncBox.Load()
+	if exitConn == nil {
+		exitConn = nc
+	}
+	a.replyRunChunk(exitConn, msg.Reply, proto.RunChunk{
 		Kind: "exit", PID: pid, ExitCode: exitCode,
 	})
 	a.cfg.Logger.Info("agent: run exit", "pid", pid, "code", exitCode)
@@ -636,4 +662,222 @@ func ptyFailureIsTransient(err error) bool {
 		}
 	}
 	return false
+}
+
+// ---- h1 D: ctl-liveness contract for interactive runs -----------------------
+// origin: docs/reviews/h1-plan.md workstream D (2026-08-04 incident, zombie
+// class b: `tether run tmux attach` + a killed terminal window = a process
+// that lives forever because nobody ever hangs its PTY up — contrast sshd,
+// where client death SIGHUPs the session).
+
+// ctlLivenessTick is a var (not const) ONLY so the package tests can shrink
+// the reaper cadence; production never mutates it.
+var ctlLivenessTick = 5 * time.Second
+
+const (
+	// kaGraceFloor: the reap window never drops below 3 minutes (h1 plan Q3).
+	// A laptop lid-close under 3min resumes its keepalives unharmed; longer
+	// suspends hang the session up — sshd-with-ClientAliveInterval semantics,
+	// documented in usage.md. For tmux the cost is a reattach.
+	kaGraceFloor = 3 * time.Minute
+	// ctlProbeTimeout bounds the reaper's round-trip proof (h1 plan
+	// critique-4 BLOCKER): nc.Status() stays CONNECTED for minutes on a
+	// silent partition (nats.go only notices via socket error or its 2min
+	// ping cycle), so before ANY reap the conn must prove it can round-trip.
+	ctlProbeTimeout = 2 * time.Second
+)
+
+// ctlConnProbe is the reaper's round-trip proof, indirected through a var so
+// the tests can pin it INDEPENDENTLY of the `IsConnected()` guard.
+//
+// That independence is the whole point (internal review): the two guards are
+// defense-in-depth, and against an embedded NATS server they cover for each
+// other — shutting the server down flips nats.go to reconnecting, so
+// IsConnected() alone already stops the reap and a deleted probe stays
+// invisible. The state where ONLY the probe saves us — the socket is up,
+// nats.go still says CONNECTED, and nothing can round-trip (a blackholed
+// path; nats.go needs its 2min ping cycle to notice) — is the production
+// hazard and cannot be produced with an in-process server. Injecting the
+// probe is how that hazard gets a real test instead of a hopeful comment.
+var ctlConnProbe = func(nc *nats.Conn) error { return nc.FlushTimeout(ctlProbeTimeout) }
+
+// kaGraceFor derives the reap window from a ctl-advertised keepalive
+// interval: 0 = not advertised = never reap; otherwise the interval clamps to
+// [1s, 60s] and the grace is max(6×interval, kaGraceFloor) — six missed beats
+// or three minutes, whichever is longer.
+func kaGraceFor(intervalMS int) time.Duration {
+	if intervalMS <= 0 {
+		return 0
+	}
+	iv := time.Duration(intervalMS) * time.Millisecond
+	if iv < time.Second {
+		iv = time.Second
+	}
+	if iv > time.Minute {
+		iv = time.Minute
+	}
+	if g := 6 * iv; g > kaGraceFloor {
+		return g
+	}
+	return kaGraceFloor
+}
+
+// reapVerdict is shouldReapRun's decision for one run on one reaper tick.
+type reapVerdict int
+
+const (
+	reapNone    reapVerdict = iota // healthy / not armed / already handled
+	reapConfirm                    // expired once with a proven conn — arm the second strike
+	reapNow                        // second probe-backed strike — hang it up
+)
+
+// shouldReapRun is the PURE reap decision (table-tested): a run is reaped
+// only when (armed) ∧ (not already reaped) ∧ (child not already exited —
+// recycled-pgid guard) ∧ (keepalive silence exceeds grace) ∧ (the agent's
+// conn was verifiably healthy on THIS tick) ∧ (this is the second
+// consecutive such tick). Anything less reaps healthy sessions: an
+// unhealthy-conn tick proves only that the AGENT is deaf, not that the ctl
+// is dead.
+func shouldReapRun(now time.Time, rec *procRec, connProven bool) reapVerdict {
+	if rec.kaGrace <= 0 || rec.reaped || rec.waitDone {
+		return reapNone
+	}
+	if now.Sub(rec.lastKA) <= rec.kaGrace {
+		return reapNone
+	}
+	if !connProven {
+		return reapNone
+	}
+	if !rec.probeConfirmed {
+		return reapConfirm
+	}
+	return reapNow
+}
+
+// ctlLivenessReaper is the per-session watchdog goroutine (h1 D3): every tick
+// it inspects armed runs and hangs up those whose ctl has been silent past
+// grace — with the false-positive ladder above. Started in session() beside
+// the other per-session loops; exits with runCtx.
+// ctx-root: per-session background loop.
+func (a *Agent) ctlLivenessReaper(ctx context.Context) {
+	t := time.NewTicker(ctlLivenessTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		nc := a.ncBox.Load()
+		if nc == nil || !nc.IsConnected() {
+			// Unobservable silence NEVER counts against the ctl: while the
+			// agent itself is deaf, every stamp is pushed forward so the
+			// window restarts once the conn heals.
+			a.restampProcKA()
+			continue
+		}
+		now := time.Now()
+		a.procsMu.Lock()
+		anyExpired := false
+		for _, rec := range a.procs {
+			if rec.kaGrace > 0 && !rec.reaped && !rec.waitDone && now.Sub(rec.lastKA) > rec.kaGrace {
+				anyExpired = true
+			}
+		}
+		a.procsMu.Unlock()
+		if !anyExpired {
+			continue
+		}
+		// Round-trip proof BEFORE acting (never under procsMu — Flush blocks).
+		// A failed probe means the conn is lying about its health: restamp,
+		// don't reap.
+		if err := ctlConnProbe(nc); err != nil {
+			a.restampProcKA()
+			continue
+		}
+		var hangups []*procRec
+		a.procsMu.Lock()
+		for pid, rec := range a.procs {
+			switch shouldReapRun(now, rec, true) {
+			case reapNone:
+				// Healthy / unarmed / already handled — nothing to do. Listed
+				// explicitly (never a `default:`) so a future verdict cannot
+				// silently inherit the no-op branch: see
+				// test/determinism/enum_switch_default_test.go.
+			case reapConfirm:
+				rec.probeConfirmed = true
+			case reapNow:
+				rec.reaped = true
+				hangups = append(hangups, rec)
+				a.cfg.Logger.Info("agent: hanging up interactive run — ctl keepalive silent past grace",
+					"pid", pid, "grace", rec.kaGrace, "silent_for", now.Sub(rec.lastKA))
+			}
+		}
+		a.procsMu.Unlock()
+		for _, rec := range hangups {
+			// Outside procsMu: Hangup takes the session mutex and kills a
+			// process group. After SIGHUP the run handler's Wait returns and
+			// the NORMAL exit path (courier exit event, rc=-1 for a
+			// signal-death per pty.Wait) clears the ps row — no special state.
+			rec.sess.Hangup()
+		}
+	}
+}
+
+// startCtlLiveness wires the h1 D intake + reaper for one session: ONE
+// session-scoped wildcard subscription (never a per-run sub on the spawn
+// conn — per-run wiring on a captured conn is exactly the trap behind zombie
+// class a), the deaf-window restamp, and the reaper goroutine. Bounded
+// teardown matches subFwd's: Unsubscribe takes nc.mu, so it goes through the
+// finalizer rather than a plain defer (origin: internal review CT-1 / #72).
+func (a *Agent) startCtlLiveness(runCtx context.Context, nc *nats.Conn, fin *sessionFinalizer) error {
+	subKA, err := nc.Subscribe(
+		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.ka",
+		func(msg *nats.Msg) {
+			// ctx-none: nats.go MsgHandler has no ctx.
+			// Subject: <prefix>.s.<sid>.pty.<pid>.ka — pid is token n-2.
+			parts := strings.Split(msg.Subject, ".")
+			if len(parts) < 2 || parts[len(parts)-1] != "ka" {
+				return
+			}
+			a.touchProcKA(parts[len(parts)-2])
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe pty keepalive: %w", err)
+	}
+	fin.addBoundedCleanup(func() { _ = subKA.Unsubscribe() })
+	// A session (re)build reopens the intake after a deaf window — restamp so
+	// the silence that accumulated while we could not HEAR keepalives never
+	// counts against the ctl.
+	a.restampProcKA()
+	go a.ctlLivenessReaper(runCtx)
+	return nil
+}
+
+// touchProcKA stamps a keepalive receipt for pid (the `.ka` subscription
+// handler). A beat also disarms a pending second strike.
+func (a *Agent) touchProcKA(pid string) {
+	a.procsMu.Lock()
+	if rec, ok := a.procs[pid]; ok {
+		rec.lastKA = time.Now()
+		rec.probeConfirmed = false
+	}
+	a.procsMu.Unlock()
+}
+
+// restampProcKA pushes every armed run's keepalive stamp to now — called
+// whenever keepalive silence stops being attributable to the ctl (conn
+// unhealthy tick, failed probe, reconnect, fresh `.ka` subscription after a
+// session rebuild).
+func (a *Agent) restampProcKA() {
+	now := time.Now()
+	a.procsMu.Lock()
+	for _, rec := range a.procs {
+		if rec.kaGrace > 0 && !rec.reaped {
+			rec.lastKA = now
+			rec.probeConfirmed = false
+		}
+	}
+	a.procsMu.Unlock()
 }

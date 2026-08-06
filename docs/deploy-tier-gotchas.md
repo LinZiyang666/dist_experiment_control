@@ -737,6 +737,25 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   hermetic 面 `TestSmokeVersionTable` 已钉冒烟门对格式/纪元的拒绝（但对"格式全对的非 tether 产物"
   结构上不可判——这正是 gap 所在）。owner 待定：34 号探针 drill 或产品防御，二选一后 flip。
 
+### #74 — h1 引入的新 FSM op 与新告警种类要求 broker 锁步升级；日志重放式回滚被封死
+
+- **状态：🟡 OPEN-BY-DESIGN（h1 明确取舍，非缺陷；记在这里是因为它约束运维动作）。**
+- **形态**：h1 给 raft 词汇表加了两个 op（`ProcGC` / `PortGC`，存储保留期 GC）和一个
+  `alerts.kind` 枚举成员（`proxy_bind_stalled`，migration 0018 重建表）。三者都是**新 broker 才认识**
+  的东西：
+  - 一个**旧 broker**收到 `ProcGC`/`PortGC` 的 committed entry 会走 unknown-op 路径；
+  - `proxy_bind_stalled` 的行在 0009 的 CHECK 下非法，**从零重放日志**会 fail-stop。
+- **约束（两条，都是硬的）**：
+  1. **多 broker 集群必须锁步升级**——所有 broker 装上 h1 之后，新词汇才可能开始流动。
+     现网是 force-single N=1，天然满足；将来长到 N≥2 之前必须先把这条写进 grow 流程。
+  2. **回滚到 h1 之前只支持 snapshot-restore**，一旦 `proxy_bind_stalled` 被 raise 过就
+     **不能**用日志重放（`fsm.Restore` 的前向迁移让 snapshot 路径两个方向都安全）。
+- **为什么不做能力门**：h1 plan X-1 的裁决——production 是 force-single N=1，任何第二个 broker
+  都会在**它自己**那一跳装上新二进制，能力门防的是一个当下不存在的拓扑，代价是一个 wire 字段
+  + health 面板管道 + 一套测试。反转条件已记在 plan 的 Q6：一旦滚动多 broker 升级成为支持路径，
+  B 和 E 两个 workstream 都要补门。
+- **运维处置**：见 `broker-ops.md §8.8`（升级顺序 broker→agent、迁移步骤、冒烟检查）。
+
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 
 编号保持全局连续；下列条目已了结，正文已剥离归档。

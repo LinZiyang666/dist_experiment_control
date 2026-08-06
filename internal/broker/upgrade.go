@@ -113,7 +113,7 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 	out := proto.UpgradeResp{OK: true, NewVersion: agentResp.NewVersion}
 	body, _ = json.Marshal(&out)
 	if msg.Reply != "" {
-		_ = msg.Respond(body)
+		b.respondBytes(msg, body)
 	}
 	b.cfg.Logger.Info("broker: upgrade dispatched",
 		"sid", sid, "nid", nid, "url", req.URL, "actor_fp", fp,
@@ -127,7 +127,7 @@ func (b *Broker) replyUpgradeErr(msg *nats.Msg, code, detail string) {
 		return
 	}
 	body, _ := json.Marshal(proto.UpgradeResp{Code: code, Error: detail})
-	_ = msg.Respond(body)
+	b.respondBytes(msg, body)
 }
 
 // urlAllowed returns true iff url has any prefix in allow. Empty

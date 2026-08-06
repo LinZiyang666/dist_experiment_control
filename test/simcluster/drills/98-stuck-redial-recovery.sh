@@ -22,6 +22,7 @@ set -u
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
 . "$HERE/drills/lib/fault.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 # Written recovery budget — DERIVED, not guessed (first real runs, 2026-08-02: a 90s budget passed
@@ -83,12 +84,27 @@ _budget_left() {
 }
 # Recovery must LAND on a different voter, not on brk1 healing (which cannot happen: the DROP stays
 # armed). Reads the surviving voters' journals for this agent's registration.
-# origin: drill 33's first real run — BOTH units redirect their logs to FILES (install.sh:
-# `StandardOutput=append:/var/log/tether/broker.log`; the sim agent unit likewise writes
-# ~/.tether/agent/<sid>/agent.log), so `journalctl -u <unit>` — which is what `$SIM logs` reads — is
-# EMPTY for them by construction. Read the files the units actually write.
-_brk_log_of()  { dexec "$1" -- sh -c 'cat /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null'; }
-_agt1_log()    { dexec agt1 -- sh -c 'cat /home/sim/.tether/agent/'"$SID"'/agent.log 2>/dev/null'; }
+# origin: drill 33's first real run — neither process's application log reaches journald, so
+# `journalctl -u <unit>` (which is what `$SIM logs` reads) does not carry it. Read the files.
+# h1 F3 UPDATE: the ORIGINAL note here blamed unit-level redirects for both
+# processes. That was only ever true of the broker, and h1 changed even that.
+# The accurate account: each process writes its own slog to its own file
+# (broker.yaml `log_file:` -> broker.log; the agent binary's default ->
+# ~/.tether/agent/<sid>/agent.log), and h1 flipped install.sh's broker unit to
+# `StandardOutput=journal` / `StandardError=journal`, and moved the slog into a
+# PROCESS-OWNED rotating file named by broker.yaml's `log_file:` (broker.log).
+# So: slog -> broker.log (still a FILE, still not journald), while panics and
+# stacktraces now DO reach journald. `journalctl -u tether-broker` is therefore no
+# longer "empty by construction" — it is the PANIC stream, and treating it as the
+# slog stream would let a stacktrace satisfy an application-line assertion.
+# Use drills/lib/logs.sh, which keeps the two apart.
+_brk_log_of()  { sim_broker_slog "$1" 4000; }
+# h1 F3: agent.log is written by the AGENT BINARY (its default sink), not by a
+# unit redirect — image/units/tether-agent.service sets no Standard*= at all.
+# The distinction matters: the unit's journal therefore still receives the
+# agent's pre-logger boot output, so it is not empty and must not be mistaken
+# for the slog.
+_agt1_log()    { sim_agent_slog_tail agt1 2000; }
 # origin: first real run (2026-08-02), TWO wrong ways to find the connection — both recorded.
 # (1) The drill ASSUMED agt1 stays on brk1 because agent-join dials it first. WRONG on a 3-voter
 #     cluster: after the agent adopts the signed roster its dial pool is VOTER-first with an

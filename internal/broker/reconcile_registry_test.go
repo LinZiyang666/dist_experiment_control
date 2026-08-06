@@ -471,7 +471,13 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 		{Name: "node-states", Interval: time.Second, Authority: any},
 		{Name: "ports", Interval: time.Second, Authority: leader},
 		{Name: "tunnel-sessions", Interval: time.Second, Authority: any},
-		{Name: "proc-gc", Interval: 5 * time.Minute, Authority: any},
+		// h1 B1: proc-gc went authorityAny → authorityLeader when its cluster
+		// branch became a real raft path (gcProposeChunks — only the leader
+		// plans + Proposes; vacuously true in single mode). port-gc is its new
+		// sibling: port_allocations history had NO retention in any mode
+		// before h1 (the 2026-08-04 24k-FREED-row incident).
+		{Name: "proc-gc", Interval: 5 * time.Minute, Authority: leader},
+		{Name: "port-gc", Interval: 5 * time.Minute, Authority: leader},
 		{Name: "xfer-orphan-reap", Interval: 5 * time.Minute, Authority: any},       // #58/P10: home-authoritative, per-broker (see reaperCaughtUp+homeOwnsXferBucket)
 		{Name: "xfer-inflight-finalize", Interval: 5 * time.Minute, Authority: any}, // R16 #57: finalize-on-recovery for stranded in-flight transfers (shares the reap cadence)
 		{Name: "grow-lock", Interval: 30 * time.Second, Authority: leader},

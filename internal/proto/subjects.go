@@ -216,6 +216,14 @@ func SubjPtyFailed(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.failed", SubjectPrefix, sid, pid)
 }
 
+// SubjPtyKeepalive (h1 D1) is the ctl-liveness beat for one interactive run:
+// ctl → agent direct (the broker is not in the path), empty body, published
+// every RunReq.KAIntervalMS. Its ABSENCE is the signal — see the agent's
+// ctlLivenessReaper.
+func SubjPtyKeepalive(sid, pid string) string {
+	return fmt.Sprintf("%s.s.%s.pty.%s.ka", SubjectPrefix, sid, pid)
+}
+
 // SubjCtrlPs returns the per-actor, per-session ps subject.
 //
 // `tether ps` is read-only (no agent forwarding) — the broker answers

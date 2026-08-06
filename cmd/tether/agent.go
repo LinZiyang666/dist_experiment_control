@@ -32,12 +32,20 @@ type agentYAML struct {
 	// set it disables roster TOFU and is enforced against every roster/seed bundle. BootstrapURL is
 	// the well-known HTTPS manifest URL for cold-start discovery. Both additive; a pre-C2 agent.yaml
 	// (no keys) still round-trips through KnownFields(true) → "" → C1 TOFU behavior.
-	AccountPub   string             `yaml:"account_pub,omitempty"`
-	BootstrapURL string             `yaml:"bootstrap_url,omitempty"`
-	TunnelAddr   string             `yaml:"tunnel_addr"`
-	FileTransfer fileTransferConfig `yaml:"file_transfer"`
-	Proxy        proxyConfig        `yaml:"proxy"`
-	RemoteFS     remoteFSConfig     `yaml:"remote_fs"`
+	AccountPub   string `yaml:"account_pub,omitempty"`
+	BootstrapURL string `yaml:"bootstrap_url,omitempty"`
+	TunnelAddr   string `yaml:"tunnel_addr"`
+	// LogFile / LogMaxSizeMB / LogMaxBackups (h1 F) tune the agent's
+	// in-process size-capped log sink. All optional: absent ⇒ the BINARY
+	// default (<home>/agent/<sid>/agent.log, 50MB × 2), which is the only
+	// channel that reaches the frozen-argv nohup fleet at the release hop.
+	// '-' in LogFile opts back out to stderr.
+	LogFile       string             `yaml:"log_file,omitempty"`
+	LogMaxSizeMB  int                `yaml:"log_max_size_mb,omitempty"`
+	LogMaxBackups int                `yaml:"log_max_backups,omitempty"`
+	FileTransfer  fileTransferConfig `yaml:"file_transfer"`
+	Proxy         proxyConfig        `yaml:"proxy"`
+	RemoteFS      remoteFSConfig     `yaml:"remote_fs"`
 	// Upgrade (#28) is the agent's own upgrade policy. The agent has ALWAYS re-checked the download
 	// URL against a local allowlist (architecture J.4 § 安全约束 — belt and braces behind the broker's
 	// gate), but until now that allowlist was a hardcoded constant with no operator input: an operator
@@ -253,6 +261,7 @@ func newAgentCmd() *cobra.Command {
 		uninstall          bool
 		logLevel           string
 		logJSON            bool
+		logFile            string
 	)
 	cmd := &cobra.Command{
 		Use:   "agent",
@@ -295,9 +304,25 @@ func newAgentCmd() *cobra.Command {
 				return fmt.Errorf("--nid is required (set on CLI or in agent.yaml)")
 			}
 
-			logger, err := newLogger(logLevel, logJSON)
+			// h1 F: the agent daemon's log sink is a size-capped rotating
+			// file BY DEFAULT (unlike serve, whose deployed path comes from
+			// broker.yaml). The binary default is the only channel that
+			// reaches the fleet's frozen-argv `nohup … >> agent.log` agents
+			// at the release hop — they self-upgrade via syscall.Exec, so
+			// their redirect and fds are inherited for life and no per-host
+			// action is possible. '-' opts back out to stderr.
+			logSink, bootErrPath := resolveAgentLogSink(cmd, home, sid, logFile, ay)
+			logger, err := newLoggerTo(logLevel, logJSON, logSink)
 			if err != nil {
 				return err
+			}
+			// h1 F: and point fd 2 at a process-owned boot.err. Without this,
+			// an inherited fd 2 follows the rotation chain (agent.log →
+			// .1 → .2 → unlinked inode) and every future PANIC lands in a
+			// file nobody can open. dup2 makes the panic destination a
+			// property of the PROCESS, not of how it was launched.
+			if bootErrPath != "" {
+				redirectStderrTo(bootErrPath, logger)
 			}
 			// The boot half of the upgrade state machine runs in main(),
 			// BEFORE Cobra parsing — see isAgentDaemonInvocation (external
@@ -376,6 +401,7 @@ func newAgentCmd() *cobra.Command {
 		"write ~/.config/systemd/user/tether-agent@<sid>.service and exit (does NOT start)")
 	cmd.Flags().BoolVar(&uninstall, "uninstall", false,
 		"remove the user systemd unit for this session and exit (does NOT stop running agents)")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write logs to this size-capped rotating file ('-' = stderr; default <home>/agent/<sid>/agent.log, size/backups from agent.yaml log_max_size_mb/log_max_backups, default 50MB x 2)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	// C2: agent join / config refresh / doctor (the daemon RunE still runs when no subcommand is given).
@@ -471,12 +497,16 @@ Type=simple
 ExecStart=%s agent --session %s --nid %s%s
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:%%h/.tether/agent/%s/agent.log
-StandardError=append:%%h/.tether/agent/%s/agent.log
+# h1 F: the agent owns its log file (%%h/.tether/agent/%s/agent.log, size-capped
+# in-process) and re-points its own fd 2 at agent.boot.err. journald — which is
+# itself capped — takes stdout/stderr, i.e. panics and pre-logger boot output.
+# An append: sink here would be unbounded and would fight the in-process cap.
+StandardOutput=journal
+StandardError=journal
 %s
 [Install]
 WantedBy=default.target
-`, sid, nid, exe, sid, nid, extraArgs, sid, sid, envLines)
+`, sid, nid, exe, sid, nid, extraArgs, sid, envLines)
 }
 
 // shellQuote wraps a value in single quotes, escaping embedded

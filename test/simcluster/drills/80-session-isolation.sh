@@ -36,6 +36,7 @@ set -u
 . "$HERE/lib/tether.sh"
 . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/ident.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 
 SID_A=lab;  PIN_A=135790
@@ -62,7 +63,8 @@ _ev_joined()    { "$SIM" exec ctl1 -- sh -c "grep '\"type\":\"member_joined\"' $
 # callout reason behind a client-generic Authorization Violation, so the proof that a refusal was the §E.6
 # limiter (not some unrelated auth fault) is the broker's OWN warning line
 # (`authcallout: {ctl,agent} PIN attempt rate-limited`), read from the broker journal / broker.err.
-_rl_logged() { "$SIM" exec brk1 -- sh -c "journalctl -u tether-broker --no-pager 2>/dev/null | grep -qiE 'PIN attempt rate-limited' || grep -qiE 'PIN attempt rate-limited' /var/log/tether/broker.err 2>/dev/null"; }
+# h1 F3: this is a SLOG line — broker.log since h1, broker.err before it.
+_rl_logged() { sim_broker_slog_grep brk1 "PIN attempt rate-limited"; }
 # _r_second_source: a CORRECT-PIN member join from a DIFFERENT source IP (agt1's container = a distinct TCP
 # peer ⇒ a distinct client_info.host bucket). It must STILL succeed while ctl1 is throttled — proving the
 # §E.6 throttle is per-IP (no collateral lockout of an innocent joiner), not a global refusal.
@@ -147,7 +149,7 @@ assert_refuses "I3-rm: non-owner session rm → not_owner" \
                CTLH T session rm "$SID_A"
 assert_refuses "I3-up: non-owner node upgrade → not_owner (before url/sha validation)" \
                "not_owner" \
-               CTLH T node upgrade agt1 --url https://x.invalid/x.tgz --sha256 0000000000000000000000000000000000000000000000000000000000000000
+               CTLH T node upgrade agt2 --url https://x.invalid/x.tgz --sha256 0000000000000000000000000000000000000000000000000000000000000000
 
 # ── Neg→pos + sys.events oracle (wrong-PIN → correct-PIN; pin_failed; member_joined) ─────────────────
 ev_sub_start

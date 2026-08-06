@@ -264,6 +264,26 @@ type procRec struct {
 	osPID          int
 	startTimeTicks int64
 	startedAt      time.Time
+
+	// h1 D ctl-liveness fields, all under procsMu.
+	//
+	// kaGrace is the reap window derived from RunReq.KAIntervalMS
+	// (max(6×interval, 3min)); 0 = the ctl never advertised keepalives =
+	// NEVER reap (every pre-h1 ctl). lastKA is the agent-side receipt stamp
+	// of the most recent keepalive (seeded at spawn). probeConfirmed is the
+	// two-strike state: a candidate survives its FIRST expired-and-probed
+	// tick and is reaped only if a SECOND probe-backed tick still finds
+	// silence — closing the race where a healed link's retransmitted
+	// keepalives arrive a beat late. reaped latches so Hangup fires once.
+	// waitDone is set the instant sess.Wait returns: between Wait and
+	// unregisterProc the child's pgid can be RECYCLED by the kernel, and a
+	// reaper firing SIGHUP at a recycled pgid would shoot an innocent
+	// process (plan critique-2).
+	kaGrace        time.Duration
+	lastKA         time.Time
+	probeConfirmed bool
+	reaped         bool
+	waitDone       bool
 }
 
 type Agent struct {
@@ -365,6 +385,12 @@ type Agent struct {
 	// proxy is the P13 embedded SS proxy runtime (lazily created on the
 	// first directive). nil-safe; methods serialize through its own mutex.
 	proxy *proxyRuntime
+
+	// courier is the h1 C proc-event delivery loop (started/exit as ACKed
+	// requests on the CURRENT conn + register-snapshot replay). Lifetime-owned,
+	// created eagerly in New like proxy; every method hangs on procCourier
+	// (the Agent type-methods ledger is exact-count).
+	courier *procCourier
 
 	// spawnPolicy is the hung-network-filesystem-safe spawn engine for
 	// exec/run (docs/reviews/remote-fs-resilience-plan.md). Always non-nil
@@ -630,6 +656,7 @@ func New(cfg Config) (*Agent, error) {
 		rosterRefreshNow:         make(chan struct{}, 1),
 		rosterRefreshFailBackoff: defaultRosterRefreshFailBackoff,
 	}
+	a.courier = newProcCourier(a) // h1 C: lifetime-owned, eager like proxy
 	if a.transferMode == modeOpen {
 		// Posture-change signal: with no allow_roots configured, push/pull
 		// now reaches the whole filesystem (matching run/exec). Logged once
@@ -701,6 +728,10 @@ func (a *Agent) spawnTimeout() time.Duration {
 // session exit.
 func (a *Agent) Run(ctx context.Context) error {
 	a.loadRosterCacheAtBoot() // seed the dial pool from state.json before the first connect
+	// h1 C: the proc-event courier outlives session rebuilds (it delivers on
+	// whatever conn a.ncBox currently holds), so it binds to the PARENT ctx —
+	// exactly one goroutine per agent lifetime (leak-gate covered).
+	go a.courier.run(ctx)
 	// upgrade-safety plan §3.1: while an upgrade marker is pending, this
 	// process must either register (commit) or roll back before the deadline
 	// — armed here, INSIDE the new binary, so the guarantee holds even on the
@@ -828,11 +859,18 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// closes/poisons the conn, but a register loop watching only the parent ctx keeps Request-ing on
 	// a dead connection forever. session() never returns, so Run can neither clear `rebuilding` nor
 	// start a successor: the node is permanently OFFLINE without the close ever wedging.
+	// h1 C4: flush pending proc.started events BEFORE the register snapshot is
+	// built — a started that never landed makes G.1's orphan pass KILL the
+	// live process it describes. Bounded to one request timeout; best-effort.
+	a.courier.drainStarted(runCtx, nc)
 	resp, err := a.register(runCtx, nc)
 	if err != nil {
 		cancelRun()
 		return false, err
 	}
+	// h1 C4: the register reply settles the courier's replay channel (pending
+	// exits ride the snapshot; clearance per onRegisterSuccess's rules).
+	a.courier.onRegisterSuccess(resp)
 	// Connected + registered = healthy: cancel any fail-closed countdown a prior session's
 	// partition (preserved across a rebuild — see the conditional defer below) left armed.
 	// Parity with onNATSReconnect, which cancels it on a nats.go reconnect.
@@ -880,6 +918,11 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// hostage situation #72 exists to end. Hand it to the finalizer instead: it runs inside the
 	// budgeted closer goroutine, so poisoning bounds it like the close itself.
 	fin.addBoundedCleanup(func() { _ = subFwd.Unsubscribe() })
+
+	if err := a.startCtlLiveness(runCtx, nc, fin); err != nil {
+		cancelRun()
+		return false, err
+	}
 
 	// P9 — listen for sys.events{type:agent_evicted, sid, nid}
 	// addressed to us so `tether admin evict` takes effect within
@@ -1190,6 +1233,16 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 				// process. break exits the switch and falls through to the backoff sleep below.
 				a.cfg.Logger.Warn("agent: register hit a transient leader failover; retrying",
 					"attempt", attempt, "next_backoff", backoff)
+			case resp.Code == proto.CodeReplyTooLarge:
+				// h1 A2 (plan critique-4 MAJOR): an oversize register REPLY is a
+				// broker-side bug, not this agent's config. Pre-h1 the oversize
+				// reply was silently dropped and register self-healed via the
+				// timeout/retry path; letting it fall into the authoritative-reject
+				// default below would instead EXIT the agent — converting a
+				// self-healing condition into fleet-node death. Keep the
+				// self-healing shape: retry with backoff.
+				a.cfg.Logger.Warn("agent: register reply exceeded broker max_payload (broker bug); retrying",
+					"attempt", attempt, "next_backoff", backoff, "detail", resp.Error)
 			default:
 				// Authoritative reject from broker. Don't retry; the operator
 				// must fix config (proto, nid uniqueness, etc.).
@@ -1315,6 +1368,12 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 		})
 	}
 	a.procsMu.Unlock()
+	// h1 C4: pending (undelivered) exits ride the snapshot as State:"exited"
+	// rows — the register round-trip is the courier's replay channel, so one
+	// reconnect settles every exit a broker outage dropped, with the REAL rc
+	// instead of G.1's -1. No pid appears twice: unregisterProc precedes the
+	// exit enqueue (see enqueueExit's documented gap).
+	procs = append(procs, a.courier.pendingExitSnapshot()...)
 
 	var ports []proto.LocalPort
 	if sf, ok := a.loadStateBounded("register snapshot"); ok {

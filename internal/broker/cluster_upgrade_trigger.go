@@ -71,7 +71,7 @@ func (b *Broker) SubscribeClusterUpgradeTrigger(nc *nats.Conn) (*nats.Subscripti
 			return // not for this broker → stay silent
 		}
 		body, _ := json.Marshal(resp)
-		_ = msg.Respond(body)
+		b.respondBytes(msg, body)
 	})
 }
 

@@ -6,7 +6,7 @@ tether admin evict	flags: --socket
 tether admin nodes	flags: --json --socket
 tether admin runtime	flags: --json --socket
 tether admin sessions	flags: --json --socket
-tether agent	flags: --install-user-service --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall --upgrade-url-allow
+tether agent	flags: --install-user-service --log-file --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall --upgrade-url-allow
 tether agent config	flags:
 tether agent config refresh	flags: --once --session
 tether agent doctor	flags: --session
@@ -89,7 +89,7 @@ tether ps	flags: --all --home --json --nats-url
 tether pull	flags: --ack-alerts --force --home --nats-url --timeout
 tether push	flags: --ack-alerts --force --home --nats-url --timeout
 tether run	flags: --ack-alerts --cwd --home --nats-url --safe
-tether serve	flags: --admin-socket --alert-webhook-url --auth-callout-seeds-dir --cluster-data-dir --cluster-manifest-listen --cluster-raft-addr --cluster-secrets-dir --colocated-agent-nid --config --db --disk-check-interval --log-json --log-level --metrics-listen --nats-conf-path --nats-server-bin --nats-url --public-host --store-dir --sub-http-listen --tunnel-addr --tunnel-public-host --upgrade-url-allow
+tether serve	flags: --admin-socket --alert-webhook-url --auth-callout-seeds-dir --cluster-data-dir --cluster-manifest-listen --cluster-raft-addr --cluster-secrets-dir --colocated-agent-nid --config --db --disk-check-interval --log-file --log-json --log-level --metrics-listen --nats-conf-path --nats-server-bin --nats-url --public-host --store-dir --sub-http-listen --tunnel-addr --tunnel-public-host --upgrade-url-allow
 tether session	flags: --home --nats-url
 tether session create	flags: --home --nats-url --pin
 tether session ls	flags: --home --json --nats-url

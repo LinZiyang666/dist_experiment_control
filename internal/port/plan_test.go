@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
 var testRehomeTime = time.Unix(1700000000, 0).UTC()
@@ -287,4 +289,142 @@ func readHomeEpoch(t *testing.T, db *sql.DB, port int) (string, int64) {
 		t.Fatalf("read home/epoch: %v", err)
 	}
 	return home, epoch
+}
+
+// ---- h1 B1: OpPortGC plan ---------------------------------------------------
+// origin: docs/reviews/h1-plan.md workstream B (2026-08-04 incident: 24k FREED
+// rows, no retention in any mode).
+
+func seedGCPortRow(t *testing.T, db *sql.DB, portN int, name, state string, createdAt time.Time, revokedAt any) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at)
+		 VALUES (?,?,?,?,0,?,?, 'SHA256:t', ?, ?)`,
+		portN, "s1", "n1", name, name+"-h", state, createdAt, revokedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlanGCTerminatedSelectsTerminalOnly(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "s1", "n1")
+	old := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	cutoff := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+
+	seedGCPortRow(t, db, 14000, "live", "ALLOCATED", old, nil)           // live: NEVER collected
+	seedGCPortRow(t, db, 14001, "freed-old", "FREED", old, old)          // due
+	seedGCPortRow(t, db, 14002, "revoked-old", "REVOKED", old, old)      // due
+	seedGCPortRow(t, db, 14003, "freed-recent", "FREED", recent, recent) // inside retention
+	// NULL revoked_at terminal row: COALESCE falls back to created_at — must
+	// not be immortal.
+	seedGCPortRow(t, db, 14004, "freed-null", "FREED", old, nil) // due via created_at
+
+	cmd, n, err := PlanGCTerminated(db, cutoff, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("planned %d rows, want 3 (freed-old, revoked-old, freed-null)", n)
+	}
+	baked := cmd.Body[0].SQL
+	if len(cmd.Body[0].Args) != 0 || strings.Contains(baked, "?") {
+		t.Fatalf("GC Apply SQL must be all-literal: %q args=%v", baked, cmd.Body[0].Args)
+	}
+	// Determinism: the replicated DELETE must key on ids + state guard only —
+	// NO timestamp ever reaches a replica (the heterogeneous-text hazard).
+	if strings.Contains(baked, "2026") || strings.Contains(strings.ToLower(baked), "now") {
+		t.Fatalf("GC Apply SQL leaked a timestamp/now to the replica: %q", baked)
+	}
+	if !strings.Contains(baked, "state IN ('FREED','REVOKED')") {
+		t.Fatalf("GC Apply SQL dropped the terminal-state guard: %q", baked)
+	}
+
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatal(err)
+	}
+	// Replay the SAME command (a raft re-apply): deterministic idempotent no-op.
+	if err := cluster.ExecCommand(db, cmd); err != nil {
+		t.Fatalf("replaying the baked GC command must be a no-op, got %v", err)
+	}
+	var left int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 2 {
+		t.Fatalf("after GC: %d rows left, want 2 (live + freed-recent)", left)
+	}
+	var liveState string
+	if err := db.QueryRow(`SELECT state FROM port_allocations WHERE name='live'`).Scan(&liveState); err != nil {
+		t.Fatalf("live row was deleted: %v", err)
+	}
+
+	// Nothing further due → nil command, zero count (Propose no-ops on nil).
+	cmd2, n2, err := PlanGCTerminated(db, cutoff, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd2 != nil || n2 != 0 {
+		t.Fatalf("re-plan after convergence: cmd=%v n=%d, want nil/0", cmd2, n2)
+	}
+}
+
+func TestPlanGCTerminatedChunkLimit(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "s1", "n1")
+	old := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	cutoff := old.AddDate(0, 0, 2)
+	for i := 0; i < 7; i++ {
+		seedGCPortRow(t, db, 14000+i, "f", "FREED", old, old)
+	}
+	total := 0
+	rounds := 0
+	for {
+		cmd, n, err := PlanGCTerminated(db, cutoff, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if n > 3 {
+			t.Fatalf("chunk exceeded limit: %d > 3", n)
+		}
+		if err := cluster.ExecCommand(db, cmd); err != nil {
+			t.Fatal(err)
+		}
+		total += n
+		if rounds++; rounds > 10 {
+			t.Fatal("chunk loop did not converge")
+		}
+	}
+	if total != 7 || rounds != 3 {
+		t.Fatalf("drained %d rows in %d chunks, want 7 in 3 (3+3+1)", total, rounds)
+	}
+}
+
+// TestPlanGCTerminatedClosesRows pins the Rows-close contract: fsm.db and n.db
+// share ONE SetMaxOpenConns(1) pool, so a plan that returned while holding
+// *sql.Rows would wedge fsm.Apply's Begin() forever. db.Stats().InUse must be
+// zero the moment the plan returns.
+func TestPlanGCTerminatedClosesRows(t *testing.T) {
+	db := openDB(t)
+	db.SetMaxOpenConns(1)
+	seedSessionAndNode(t, db, "s1", "n1")
+	old := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	seedGCPortRow(t, db, 14000, "f", "FREED", old, old)
+
+	if _, _, err := PlanGCTerminated(db, old.AddDate(0, 0, 1), 500); err != nil {
+		t.Fatal(err)
+	}
+	if in := db.Stats().InUse; in != 0 {
+		t.Fatalf("plan returned with %d connection(s) still in use — an open *sql.Rows here deadlocks the FSM pool", in)
+	}
+	// The proof by consequence: a Begin on the 1-conn pool must succeed now.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin after plan on a 1-conn pool: %v", err)
+	}
+	_ = tx.Rollback()
 }

@@ -40,7 +40,7 @@ func wireForwarders(t *testing.T, c *d8cluster) []*broker.Forwarder {
 	now := func() time.Time { return time.Now().UTC() }
 	fwds := make([]*broker.Forwarder, c.n)
 	for i := 0; i < c.n; i++ {
-		sub, err := broker.SubscribeClusterApply(c.conns[i], c.nodes[i], now)
+		sub, err := broker.SubscribeClusterApply(c.conns[i], c.nodes[i], now, nil)
 		if err != nil {
 			t.Fatalf("subscribe apply %d: %v", i, err)
 		}
@@ -130,7 +130,7 @@ func testAlertClusterLevelAck(t *testing.T) {
 	c := startD8Cluster(t, 3)
 	wireForwarders(t, c)
 	for i := 0; i < c.n; i++ {
-		sub, err := broker.SubscribeAlertAck(c.conns[i], broker.NewForwarder(c.conns[i], 3*time.Second))
+		sub, err := broker.SubscribeAlertAck(c.conns[i], broker.NewForwarder(c.conns[i], 3*time.Second), nil)
 		if err != nil {
 			t.Fatalf("subscribe ack %d: %v", i, err)
 		}
@@ -243,7 +243,7 @@ func testClusterHealthGate(t *testing.T) {
 		// C3 topoSelf nil; G5/G7 jsUnavail nil + colocatedAgentNID "" = drill defaults; batch B/B4
 		// accountPub nil = "this broker does not self-report an account key", which is what an
 		// un-wired drill broker genuinely is (the status column then renders "?", never Y).
-		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil, nil, "", nil)
+		sub, err := broker.SubscribeClusterHealth(c.conns[i], c.nodes[i], c.dbs[i], now, nil, nil, "", nil, nil)
 		if err != nil {
 			t.Fatalf("subscribe health %d: %v", i, err)
 		}

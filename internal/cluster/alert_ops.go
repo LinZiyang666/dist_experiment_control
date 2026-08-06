@@ -5,8 +5,9 @@ import (
 	"time"
 )
 
-// Alert kinds (the store-backed subset; §10.2). The 0009 CHECK enumerates exactly these —
-// the two client-synthesized severe kinds (quorum_lost / force_single_active) are NOT here
+// Alert kinds (the store-backed subset; §10.2). The alerts.kind CHECK (0009,
+// widened by the 0018 rebuild) enumerates exactly these — the two
+// client-synthesized severe kinds (quorum_lost / force_single_active) are NOT here
 // (they cannot be Raft-written when quorum is lost). raft_lag / broker_down are in the 0009
 // catalog but writerless until D9 (leader cannot read per-peer cursor/liveness pre-D9).
 const (
@@ -17,6 +18,12 @@ const (
 	AlertKindReplicationDegraded = "replication_degraded"
 	AlertKindDiskPressure        = "disk_pressure"
 	AlertKindRaftLag             = "raft_lag"
+	// AlertKindProxyBindStalled (h1 E2, migration 0018): a node's __proxy__
+	// tunnel repeatedly fails to bind and the reaper's rotation loop entered
+	// backoff. Severity is ALWAYS info (h1 plan Q7: severe would drag the
+	// --ack-alerts friction gate onto every destructive command while one
+	// node's link is down). Dedup key: proxy_bind_stalled:<sid>/<nid>.
+	AlertKindProxyBindStalled = "proxy_bind_stalled"
 )
 
 // Alert severities (0009 CHECK).
@@ -32,7 +39,8 @@ const (
 func ValidAlertKind(kind string) bool {
 	switch kind {
 	case AlertKindManual, AlertKindBelowQuorum, AlertKindBrokerDraining, AlertKindBrokerDown,
-		AlertKindReplicationDegraded, AlertKindDiskPressure, AlertKindRaftLag:
+		AlertKindReplicationDegraded, AlertKindDiskPressure, AlertKindRaftLag,
+		AlertKindProxyBindStalled:
 		return true
 	}
 	return false

@@ -549,7 +549,35 @@ _forced_single() {
 
 cmd_exec()  { _n=${1:?node}; shift; [ "${1:-}" = "--" ] && shift; dexec "$_n" -- "$@"; }
 cmd_shell() { dexec_it "${1:?node}" -- bash; }
-cmd_logs()  { _n=${1:?node}; _u=${2:-}; if [ -n "$_u" ]; then dexec "$_n" -- journalctl -u "$_u" --no-pager -n 200; else dexec "$_n" -- journalctl --no-pager -n 200; fi; }
+# cmd_logs — the JOURNAL, plus whichever process-owned slog belongs to the unit.
+#
+# h1 F3: tether's two daemons write their APPLICATION log to their own files
+# (broker.yaml `log_file:` -> /var/log/tether/broker.log; the agent binary's
+# default -> ~/.tether/agent/<sid>/agent.log) and leave journald carrying
+# panics + pre-logger boot output. A `logs` verb that showed only the journal
+# would hand an operator an empty screen for a perfectly talkative daemon —
+# the human-facing version of the false verdict F3 was about. README's
+# debugging section points people straight here, so it must show both.
+cmd_logs()  {
+    _n=${1:?node}; _u=${2:-}
+    if [ -n "$_u" ]; then
+        printf -- '--- journalctl -u %s (panics + pre-logger boot output) ---\n' "$_u"
+        dexec "$_n" -- journalctl -u "$_u" --no-pager -n 200
+        case "$_u" in
+            tether-broker)
+                printf -- '\n--- broker slog (/var/log/tether/broker.log; broker.err pre-h1) ---\n'
+                dexec "$_n" -- sh -c 'tail -n 200 /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null' ;;
+            tether-agent)
+                printf -- '\n--- agent slog (~/.tether/agent/<sid>/agent.log) + panic sink ---\n'
+                dexec "$_n" -- sh -c '. /etc/tether/agent.env 2>/dev/null
+d=/home/sim/.tether/agent/${SID:-lab}
+tail -n 200 "$d/agent.log" 2>/dev/null
+[ -s "$d/agent.boot.err" ] && { printf -- "\n--- agent panic sink (%s/agent.boot.err) ---\n" "$d"; tail -n 40 "$d/agent.boot.err"; }' ;;
+        esac
+    else
+        dexec "$_n" -- journalctl --no-pager -n 200
+    fi
+}
 cmd_natsconf() { _n=${1:?node}; dexec "$_n" -- sh -c 'echo "--- /etc/tether/nats.d/nats.conf ($(stat -c %y /etc/tether/nats.d/nats.conf 2>/dev/null)) ---"; grep -nE "cluster|route|host|jetstream" /etc/tether/nats.d/nats.conf 2>/dev/null || echo "(no nats.conf)"'; }
 
 cmd_status() {

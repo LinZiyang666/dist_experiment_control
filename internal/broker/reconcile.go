@@ -66,6 +66,11 @@ func intp(i int) *int { return &i }
 // Equivalence (marks AND audit, compared as a set) is proven in
 // reconcile_marks_test.go.
 func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.Process, portRows []port.Allocation, now time.Time) proc.ReconcileBatchInput {
+	// h1 B1: normalize HERE, at the classifier boundary, so BOTH callers
+	// (single-mode reconcileOnRegister and the cluster VerbReconcile forward
+	// arm) bake homogeneous UTC ended_at text — see reconcileOnRegister for
+	// the lexical-compare rationale.
+	now = now.UTC()
 	out := proc.ReconcileBatchInput{SID: sid}
 
 	agentByPID := map[string]proto.LocalProcess{}
@@ -97,8 +102,9 @@ func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.P
 				if lp.RC != nil {
 					rc = *lp.RC
 				}
-				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: now})
-				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(rc), Ts: now})
+				when := exitStamp(lp, now)
+				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: when})
+				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(rc), Ts: when})
 			default:
 				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
 				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
@@ -139,6 +145,21 @@ func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.P
 	return out
 }
 
+// exitStamp picks the ended_at instant for an agent-reported "exited" row
+// (h1 C4): the agent's TRUE end instant when it carried one (the courier's
+// snapshot rows do), clamped to `now` so a skewed agent clock can never write
+// a FUTURE ended_at into replicated state; a pre-h1 agent omits EndedAt and
+// falls back to register-time now — exactly today's semantics. Used
+// IDENTICALLY by both classifier paths (resolveReconcile for the cluster
+// batch, reconcileOnRegister's inline single-mode branch) so the
+// reconcile-marks equivalence tests keep holding.
+func exitStamp(lp proto.LocalProcess, now time.Time) time.Time {
+	if lp.EndedAt != nil && lp.EndedAt.Before(now) {
+		return lp.EndedAt.UTC()
+	}
+	return now
+}
+
 // reconcileOnRegister runs G.1 over (sid, nid) using req.LocalProcesses /
 // req.LocalPorts as the agent's truth. Side effects:
 //   - SQLite UPDATEs for processes that need to leave RUNNING/LOST,
@@ -152,7 +173,13 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	revokePorts []int,
 	dropProcesses []string,
 ) {
-	now := b.cfg.Now()
+	// h1 B1 (plan critique-1): .UTC() so every G.1 missed-exit stamp — direct
+	// markProcExited in single mode, LitTime-baked in the cluster batch — is
+	// homogeneous with agent-published exit stamps ("+0000 UTC" text). The
+	// pre-h1 raw local now baked zone-name + monotonic-suffix text into
+	// ended_at, which SQLite's lexical TEXT compare (retention GC's leader
+	// SELECT) cannot order against UTC rows.
+	now := b.cfg.Now().UTC()
 
 	// Reconcile only consumes RUNNING/LOST rows (see the explicit
 	// filter below at `if p.Status != proc.StateRunning && p.Status
@@ -163,6 +190,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 		proc.ListBySessionOpts{IncludeExited: false})
 	if err != nil {
 		b.cfg.Logger.Warn("broker: reconcileOnRegister list procs", "err", err, "sid", sid)
+		return retainPendingExits(req.LocalProcesses), nil, nil, nil, nil
 	}
 
 	agentByPID := map[string]proto.LocalProcess{}
@@ -198,6 +226,15 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 					// swallow-and-schedule behavior; only the audit is gated on success.
 					if err := b.markProcExited(p.PID, -1, now); err != nil {
 						b.cfg.Logger.Warn("broker: reconcile pid-reuse close", "err", err, "pid", p.PID)
+						// Deliberately NOT added to `accepted` (contrast the two
+						// F1 sites below): this pid is being re-treated as an
+						// orphan on the next line, and one pid may never appear
+						// in accepted AND dropProcesses at once. It also cannot
+						// strand a courier exit: a tether PID is a ULID minted
+						// once per run, so a pid the agent reports as RUNNING has
+						// not been unregistered and therefore has no pending exit
+						// event. (The "reuse" here is OS-pid recycling detected
+						// via the boot/start-ticks triple, not tether-PID reuse.)
 						agentByPID[p.PID] = lp
 						continue
 					}
@@ -215,19 +252,37 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 				if lp.RC != nil {
 					rc = *lp.RC
 				}
-				if err := b.markProcExited(p.PID, rc, now); err != nil {
+				when := exitStamp(lp, now)
+				if err := b.markProcExited(p.PID, rc, when); err != nil {
 					b.cfg.Logger.Warn("broker: reconcile mark exited", "err", err, "pid", p.PID)
+					// origin: h1 external review F1 (Blocker). A bare `continue`
+					// left this pid in NEITHER response set, and the agent's
+					// courier reads "absent from AcceptedProcesses" as SETTLED —
+					// so it deleted the only copy of the real exit code while the
+					// broker row stayed RUNNING. A transient SQLite/raft fault
+					// thus manufactured exactly the zombie row this increment
+					// exists to abolish.
+					//
+					// The write failed, so the row IS still RUNNING, and
+					// `accepted` means precisely "the broker still believes this
+					// pid is running". Saying so is the truth AND makes the
+					// courier keep its pending exit for the next attempt.
+					accepted = append(accepted, p.PID)
 					continue
 				}
 				reconciled = append(reconciled, proto.ReconciledProc{
 					PID: p.PID, NewState: "EXITED", RC: rc,
 				})
-				b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, rc, now)
+				b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, rc, when)
 			default:
 				// Unknown state from agent — treat as missed-exit so we
 				// don't leave the row stuck RUNNING forever.
 				if err := b.markProcExited(p.PID, -1, now); err != nil {
 					b.cfg.Logger.Warn("broker: reconcile unknown-state close", "err", err, "pid", p.PID)
+					// Same F1 reasoning as the "exited" branch above: the write
+					// failed, the row is still RUNNING, so report it as accepted
+					// rather than letting silence read as "settled".
+					accepted = append(accepted, p.PID)
 					continue
 				}
 				reconciled = append(reconciled, proto.ReconciledProc{
@@ -266,6 +321,8 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	portRows, err := port.ListBySession(b.cfg.DB, sid)
 	if err != nil {
 		b.cfg.Logger.Warn("broker: reconcileOnRegister list ports", "err", err, "sid", sid)
+		// Port half of the same fail-closed rule — see reconcileReadFailure.
+		return accepted, reconciled, nil, nil, dropProcesses
 	}
 	portByHash := map[string]*port.Allocation{}
 	for i := range portRows {
@@ -305,6 +362,46 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// would force operators to re-expose by hand on every restart.
 
 	return
+}
+
+// reconcileReadFailure — WHY AN UNREADABLE AUTHORITY ISSUES NO DIRECTIVES.
+//
+// reconcileOnRegister answers two questions from committed state: which
+// processes the broker still believes are running, and which tunnels it still
+// backs. Both reads can fail transiently (SQLite busy, a raft read on a node
+// that just lost leadership). Neither failure may be treated as an empty
+// answer, because "empty" is itself a strong, destructive claim:
+//
+//   - empty process set ⇒ every agent-reported exit is ABSENT from
+//     AcceptedProcesses, which the courier reads as SETTLED and deletes (the
+//     only copy of the real exit code is gone), AND every live process is an
+//     orphan to KILL. origin: h1 external review round 2, R1.
+//   - empty port set ⇒ every tunnel the agent re-presents falls into the
+//     "broker has no record of this" arm and is REVOKED, tearing down every
+//     public expose in the session. origin: same round, extending R1 — whose
+//     fix returned early only on the PROCESS read, while its regression test
+//     closed the whole DB so both reads failed at once and the port path was
+//     never exercised.
+//
+// The rule is therefore: issue no directive the read did not prove. Empty
+// directives are inert on the agent — RevokePorts drives all teardown,
+// KeepPorts has no consumer, and an unacknowledged started/exit event simply
+// stays pending in the courier — so the next register reconciles against real
+// state. Each half is scoped: a failed port read does NOT discard the process
+// conclusions, which their own successful read did prove.
+//
+// retainPendingExits is the one directive that IS safe to emit blind: naming an
+// exited pid in AcceptedProcesses says "the broker still believes this pid is
+// running", which is exactly true when we could not observe otherwise, and it
+// keeps the courier's pending exit alive for the retry.
+func retainPendingExits(lps []proto.LocalProcess) []string {
+	var accepted []string
+	for _, lp := range lps {
+		if lp.State == "exited" {
+			accepted = append(accepted, lp.PID)
+		}
+	}
+	return accepted
 }
 
 // pidReused implements the architecture G.1 (boot_id, pid,

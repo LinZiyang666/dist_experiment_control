@@ -479,15 +479,22 @@ func (a *Agent) onNATSReconnect(nc *nats.Conn) {
 		return
 	}
 	a.ncBox.Store(nc) // keep the session-state hook publishing on the live conn
+	// h1 D3: a reconnect ends a deaf window — keepalive silence accumulated
+	// across it must not count against any ctl (mirror of session()'s
+	// restamp after the .ka subscribe).
+	a.restampProcKA()
 	ctx := a.loadRunCtx()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// h1 C4: same started-drain + replay-settlement as session()'s register.
+	a.courier.drainStarted(ctx, nc)
 	resp, err := a.register(ctx, nc)
 	if err != nil {
 		a.cfg.Logger.Warn("agent: re-register on reconnect failed", "err", err)
 		return
 	}
+	a.courier.onRegisterSuccess(resp)
 	a.applyReconciliation(ctx, resp)
 	a.applyProxyDirective(ctx, nc, resp.Proxy)
 	// M3: re-ACK readiness if we are serving (covers a lost first ACK or a

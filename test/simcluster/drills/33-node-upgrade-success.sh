@@ -49,6 +49,7 @@ set -u
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
 . "$HERE/drills/lib/ingress.sh"; . "$HERE/drills/lib/artifact.sh"
 . "$HERE/drills/lib/upgradecfg.sh"; . "$HERE/drills/lib/fault.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
@@ -107,7 +108,16 @@ _b4_rolled_back() {
 # EMPTY for this unit by construction. The evidence was never missing (B6d proves the register
 # carried upgrade_state: the terminal marker is only cleared when the reported state matches); the
 # drill was reading a stream the product does not write to. Read the FILE the unit actually writes.
-_brk_log()           { dexec brk1 -- sh -c 'cat /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null'; }
+# h1 F3 UPDATE: the mechanism above is now WRONG in its details even though its
+# conclusion still holds. h1 flipped install.sh's broker unit to
+# `StandardOutput=journal` / `StandardError=journal`, and moved the slog into a
+# PROCESS-OWNED rotating file named by broker.yaml's `log_file:` (broker.log).
+# So: slog -> broker.log (still a FILE, still not journald), while panics and
+# stacktraces now DO reach journald. `journalctl -u tether-broker` is therefore no
+# longer "empty by construction" — it is the PANIC stream, and treating it as the
+# slog stream would let a stacktrace satisfy an application-line assertion.
+# Use drills/lib/logs.sh, which keeps the two apart.
+_brk_log()           { sim_broker_slog brk1 4000; }
 _b6_outcome_logged() { _brk_log | grep 'agent-reported upgrade outcome' | grep -q 'rolled_back'; }
 _b6_marker_gone()    { dexec agt1 -- test ! -e "$MARKER"; }
 _a2_inplace() {

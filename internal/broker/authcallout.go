@@ -110,6 +110,12 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 			return
 		}
 		if msg.Reply != "" {
+			// h1 A2 egress exemption (the ONE bare Respond outside respondLogged,
+			// pinned by reply_egress_test.go): the consumer is nats-server's
+			// auth-callout machinery, which expects a signed JWT or nothing — a
+			// JSON reply_too_large fallback would be garbage to it, and the JWT
+			// is structurally far below any max_payload. Errors here are already
+			// surfaced by the server itself as an auth timeout.
 			_ = msg.Respond([]byte(respJWT))
 		}
 	})

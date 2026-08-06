@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -212,5 +215,78 @@ func (b *Broker) replyJSON(msg *nats.Msg, v any) {
 		b.cfg.Logger.Warn("broker: marshal reply", "err", err, "subject", msg.Subject)
 		return
 	}
-	_ = msg.Respond(payload)
+	b.respondBytes(msg, payload)
+}
+
+// respondBytes is the ONE egress point for broker control-plane replies
+// (h1 A2). Every reply — via replyJSON, via the reply*Err helpers, or a raw
+// site — must leave through here so a failed Respond can never again be
+// silent: the pre-h1 shape was `_ = msg.Respond(payload)`, which swallowed
+// ErrMaxPayload for five days while every `tether ps` timed out against a
+// broker that was answering (2026-08-04 incident; docs/reviews/h1-plan.md A2).
+// internal/broker/reply_egress_test.go pins the census of .Respond( call
+// sites so a new bare site goes red.
+func (b *Broker) respondBytes(msg *nats.Msg, payload []byte) {
+	respondLogged(b.cfg.Logger, b.nc.Load(), msg, payload)
+}
+
+// respondLogged is respondBytes' package-level body, split out because a
+// handful of reply sites live in FREE subscriber functions
+// (SubscribeClusterHealth, SubscribeAlertAck, SubscribeClusterApply, …) that
+// have no *Broker receiver — they take a logger parameter and call this
+// directly. nc is only consulted for the advertised MaxPayload in the
+// fallback text (nil → -1); logger is nil-tolerant so test wiring can pass
+// nil — the SEND semantics never depend on either being present.
+//
+// Failure handling:
+//   - ErrMaxPayload → ERROR log with subject + byte count, then a
+//     bounded-small typed fallback {code: reply_too_large} on the same
+//     reply inbox. The fallback is built from proto.ReplyTooLarge (~200B,
+//     pinned ≤512B by test) and sent with a
+//     direct Respond — structurally non-recursive; if IT fails too, log and
+//     return.
+//   - conn closed / draining → WARN, not ERROR: broker teardown races every
+//     in-flight handler and must not read as an error burst in the last log
+//     lines before exit.
+//   - anything else → ERROR log. There is no retry here: control replies are
+//     request-scoped, the requester's own timeout is the retry boundary.
+func respondLogged(logger *slog.Logger, nc *nats.Conn, msg *nats.Msg, payload []byte) {
+	if msg.Reply == "" {
+		return
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	err := msg.Respond(payload)
+	if err == nil {
+		return
+	}
+	switch {
+	case errors.Is(err, nats.ErrMaxPayload):
+		maxPayload := int64(-1) // -1 = conn handle absent, advertised limit unknown
+		if nc != nil {
+			maxPayload = nc.MaxPayload()
+		}
+		logger.Error("broker: reply exceeds max_payload — sending reply_too_large fallback",
+			"subject", msg.Subject, "reply_bytes", len(payload), "max_payload", maxPayload)
+		fallback, merr := json.Marshal(proto.ReplyTooLarge{
+			Code: proto.CodeReplyTooLarge,
+			Error: fmt.Sprintf("%d-byte reply exceeds server max_payload %d; this is a tether bug (every reply section is bounded) — report it",
+				len(payload), maxPayload),
+		})
+		if merr != nil {
+			logger.Error("broker: marshal reply_too_large fallback", "err", merr, "subject", msg.Subject)
+			return
+		}
+		if rerr := msg.Respond(fallback); rerr != nil {
+			logger.Error("broker: reply_too_large fallback send failed",
+				"err", rerr, "subject", msg.Subject)
+		}
+	case errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionDraining):
+		logger.Warn("broker: reply dropped on closing conn",
+			"err", err, "subject", msg.Subject, "reply_bytes", len(payload))
+	default:
+		logger.Error("broker: reply send failed",
+			"err", err, "subject", msg.Subject, "reply_bytes", len(payload))
+	}
 }

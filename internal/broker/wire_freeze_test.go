@@ -136,7 +136,13 @@ var frozenPayloadKeys = map[string][]string{
 	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "local_ports", "local_processes",
 		"nid", "os", "proto_version", "release_version", "roster_gen", "roster_refresh_only",
 		"server_id", "upgrade_detail", "upgrade_state"},
-	"proto.LocalProcess": {"pid", "rc", "start_time_ticks", "started_at", "state"},
+	// ended_at: h1 C4, ADDITIVE (omitempty pointer; a courier's pending-exit
+	// snapshot row carries the true end instant, the broker clamps it to
+	// min(EndedAt, now), and an old leader ignoring the unknown key falls
+	// back to register-time now — exactly the pre-h1 semantics). Same
+	// freeze-on-entry contract as upgrade_state above: from here on a RENAME
+	// is the cross-version break this test exists to catch.
+	"proto.LocalProcess": {"ended_at", "pid", "rc", "start_time_ticks", "started_at", "state"},
 	"proto.LocalPort":    {"local_port", "name", "port", "token_hash"},
 }
 

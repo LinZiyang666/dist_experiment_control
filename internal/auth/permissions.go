@@ -128,6 +128,8 @@ func PermissionsForActivatedMember(actor, sid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
 			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			// h1 D1: the ctl-liveness keepalive beat (ctl → agent direct).
+			subjectPrefix + ".s." + sid + ".pty.*.ka",
 			"$JS.API.STREAM.INFO.history-" + sid,
 			"$JS.API.CONSUMER.CREATE.history-" + sid,
 			"$JS.API.CONSUMER.CREATE.history-" + sid + ".>",
@@ -214,6 +216,8 @@ func PermissionsForAgent(sid, nid string) jwt.Permissions {
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
 			subjectPrefix + ".s." + sid + ".pty.*.attach",
+			// h1 D3: the agent's session-scoped keepalive intake.
+			subjectPrefix + ".s." + sid + ".pty.*.ka",
 			// Agent must receive sys.events to react to admin evict
 			// (architecture P9 / I.2b — agent self-shutdown on
 			// agent_evicted), session_deleting (refuse calls in

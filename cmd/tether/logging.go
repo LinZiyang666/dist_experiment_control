@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
+
+	"github.com/LinZiyang666/tether/internal/logrotate"
 )
 
 // logging.go (B5 OPS#8) — structured-log construction shared by `serve` and `agent`.
@@ -15,6 +19,13 @@ import (
 // a usage error (exit 64) — never a silent default, so a typo'd `--log-level debg` fails loudly
 // instead of quietly staying at info. level is case-insensitive (debug/info/warn/error).
 func newLogger(level string, jsonOut bool) (*slog.Logger, error) {
+	return newLoggerTo(level, jsonOut, os.Stderr)
+}
+
+// newLoggerTo is newLogger with an explicit sink (h1 F): serve/agent resolve a
+// size-capped logrotate.Writer and pass it here. newLogger(level, json) stays
+// the byte-equivalence anchor — same handler, same options, os.Stderr.
+func newLoggerTo(level string, jsonOut bool, w io.Writer) (*slog.Logger, error) {
 	var lv slog.Level
 	if err := lv.UnmarshalText([]byte(level)); err != nil {
 		return nil, usageErr("--log-level %q is not one of debug/info/warn/error", level)
@@ -22,9 +33,33 @@ func newLogger(level string, jsonOut bool) (*slog.Logger, error) {
 	opts := &slog.HandlerOptions{Level: lv}
 	var h slog.Handler
 	if jsonOut {
-		h = slog.NewJSONHandler(os.Stderr, opts)
+		h = slog.NewJSONHandler(w, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stderr, opts)
+		h = slog.NewTextHandler(w, opts)
 	}
 	return slog.New(h), nil
+}
+
+// resolveLogSink turns a resolved (path, sizeMB, backups) triple into the
+// io.Writer newLoggerTo writes through (h1 F). "" or "-" mean stderr —
+// explicitly, so a deployment can opt back out. A file sink NEVER fails the
+// command: logrotate.Open degrades to stderr and keeps retrying, because a
+// broker that refuses to boot over its log file is a worse outage than a
+// broker logging to stderr.
+func resolveLogSink(path string, maxMB, backups int) io.Writer {
+	if path == "" || path == "-" {
+		return os.Stderr
+	}
+	if maxMB <= 0 {
+		maxMB = logrotate.DefaultMaxMB
+	}
+	if backups <= 0 {
+		backups = logrotate.DefaultBackups
+	}
+	w, err := logrotate.Open(path, int64(maxMB)<<20, backups, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tether: log file %s unusable (%v); logging to stderr\n", path, err)
+		return os.Stderr
+	}
+	return w
 }

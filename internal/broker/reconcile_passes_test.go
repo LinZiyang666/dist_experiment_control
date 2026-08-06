@@ -597,11 +597,16 @@ func TestPassProcGCIdempotence(t *testing.T) {
 	})
 
 	// (c) In cluster mode `processes` is replicated, so deleting rows outside
-	// raft would fork leader/follower SQLite contents. The pass must remain a
-	// hard no-op there — this is the "two brokers must not both write" property
-	// for proc-gc, and it is enforced by a MODE gate, not a leadership gate
-	// (a leader deleting replicated rows outside raft is just as wrong).
-	t.Run("cluster mode is a hard no-op", func(t *testing.T) {
+	// raft would fork leader/follower SQLite contents. Since h1 B1 the cluster
+	// branch routes the deletion through raft (OpProcGC via gcProposeChunks);
+	// what this subtest pins is the DIRECT-write half of that invariant: with
+	// cluster wiring absent (b.cl == nil — the boot window, and every test
+	// broker literal), the pass must touch NOTHING outside raft. The raft
+	// path itself is covered by TestGCProposeChunksBoundsPerTickWork below
+	// (chunk/budget contract) and end-to-end by test/d9's
+	// TestClusterStorageGCDrainsBacklogThroughRaft (a real single-voter
+	// broker draining a real backlog through real raft entries).
+	t.Run("cluster mode never deletes outside raft", func(t *testing.T) {
 		clk := newFakeClock(passEpoch)
 		db := passTestDB(t)
 		seedProcFixture(t, db)
@@ -616,6 +621,199 @@ func TestPassProcGCIdempotence(t *testing.T) {
 		}
 		if got := procPIDs(t, db); !sameStringMap(got, before) {
 			t.Fatalf("proc-gc deleted replicated rows outside raft in cluster mode: %v -> %v", before, got)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// 2d'. pass: port-gc (h1 B1 — the sibling retention pass; port_allocations
+// FREED/REVOKED history had NO retention in ANY mode before this)
+// origin: docs/reviews/h1-plan.md workstream B.
+// --------------------------------------------------------------------------
+
+func seedPortGCFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('gc','gc','o','p','ACTIVE',?)`, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at,last_heartbeat_at) VALUES('n1','gc','ONLINE',?,?)`, passEpoch, passEpoch); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(portN int, name, state string, endedAgo time.Duration) {
+		if _, err := db.Exec(
+			`INSERT INTO port_allocations(port,sid,nid,name,local_port,token_hash,state,created_by_fp,created_at,revoked_at)
+			 VALUES (?,?,?,?,0,?,?, 'SHA256:t', ?, ?)`,
+			portN, "gc", "n1", name, name+"-h", state,
+			passEpoch.Add(-endedAgo-time.Minute), passEpoch.Add(-endedAgo),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(14000, "old-freed", "FREED", 30*time.Hour)     // past 24h retention ⇒ collectable
+	mk(14001, "old-revoked", "REVOKED", 25*time.Hour) // past retention ⇒ collectable
+	mk(14002, "recent-freed", "FREED", time.Hour)     // inside retention
+	if _, err := db.Exec(
+		`INSERT INTO port_allocations(port,sid,nid,name,local_port,token_hash,state,created_by_fp,created_at)
+		 VALUES (14003,'gc','n1','live',0,'live-h','ALLOCATED','SHA256:t',?)`,
+		passEpoch.Add(-40*time.Hour), // ancient AND live: retention must never touch it
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func portGCNames(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT name, state FROM port_allocations`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var name, state string
+		if err := rows.Scan(&name, &state); err != nil {
+			t.Fatal(err)
+		}
+		out[name] = state
+	}
+	return out
+}
+
+// TestGCProposeChunksBoundsPerTickWork pins the cluster-mode GC driver's two
+// bounds (h1 B1): one tick issues at most maxGCChunksPerTick Proposes, each
+// carrying at most gcChunkRows keys, and it STOPS as soon as a chunk comes
+// back empty (idle-zero-writes — an idle GC pass must not churn raft). The
+// plan closure is stubbed so this pins the DRIVER, not the SQL.
+// origin: docs/reviews/h1-plan.md workstream B.
+func TestGCProposeChunksBoundsPerTickWork(t *testing.T) {
+	t.Run("no cluster wiring is a no-op", func(t *testing.T) {
+		b := &Broker{}
+		b.cfg.Logger = silentLogger()
+		calls := 0
+		err := gcProposeChunks(b, "test", func(*sql.DB) (*cluster.Command, int, error) {
+			calls++
+			return nil, 0, nil
+		})
+		if err != nil || calls != 0 {
+			t.Fatalf("boot-window call: err=%v plans=%d, want nil/0 (b.cl is nil)", err, calls)
+		}
+	})
+
+	// The two loop bounds are driven through the REAL gcDrain with a fake
+	// propose (gcProposeChunks is gcDrain + the cluster/caught-up gates).
+	t.Run("stops on the first empty chunk", func(t *testing.T) {
+		proposes := 0
+		propose := func(f func(*sql.DB) (*cluster.Command, error)) error {
+			proposes++
+			_, err := f(nil)
+			return err
+		}
+		remaining := 2
+		plan := func(*sql.DB) (*cluster.Command, int, error) {
+			if remaining == 0 {
+				return nil, 0, nil // nothing due → Propose no-ops on a nil command
+			}
+			remaining--
+			return cluster.NewCommand(cluster.OpProcGC), gcChunkRows, nil
+		}
+		if err := gcDrain(silentLogger(), "test", propose, plan); err != nil {
+			t.Fatal(err)
+		}
+		if proposes != 3 {
+			t.Fatalf("proposes=%d, want 3 (2 full chunks + the empty one that stops the loop)", proposes)
+		}
+	})
+
+	t.Run("per-tick budget caps an endless backlog", func(t *testing.T) {
+		proposes := 0
+		propose := func(f func(*sql.DB) (*cluster.Command, error)) error {
+			proposes++
+			_, err := f(nil)
+			return err
+		}
+		// A backlog that NEVER empties: the budget is the only thing that can
+		// end the tick. Without it, one pass would drain unboundedly and hold
+		// the 1-vCPU broker's single applyMu for the whole backlog.
+		plan := func(*sql.DB) (*cluster.Command, int, error) {
+			return cluster.NewCommand(cluster.OpProcGC), gcChunkRows, nil
+		}
+		if err := gcDrain(silentLogger(), "test", propose, plan); err != nil {
+			t.Fatal(err)
+		}
+		if proposes != maxGCChunksPerTick {
+			t.Fatalf("endless backlog issued %d proposes, want the %d per-tick cap", proposes, maxGCChunksPerTick)
+		}
+	})
+
+	t.Run("a propose error aborts the tick", func(t *testing.T) {
+		proposes := 0
+		want := errors.New("no quorum")
+		propose := func(func(*sql.DB) (*cluster.Command, error)) error {
+			proposes++
+			return want
+		}
+		plan := func(*sql.DB) (*cluster.Command, int, error) {
+			return cluster.NewCommand(cluster.OpProcGC), gcChunkRows, nil
+		}
+		if err := gcDrain(silentLogger(), "test", propose, plan); !errors.Is(err, want) {
+			t.Fatalf("err=%v, want the propose error surfaced to the registry (its backoff is the damper)", err)
+		}
+		if proposes != 1 {
+			t.Fatalf("proposes=%d after an error, want 1 (abort, do not hammer)", proposes)
+		}
+	})
+}
+
+func TestPortGCPassRetention(t *testing.T) {
+	// (a) single mode: terminal rows past 24h are deleted; live rows are
+	// immortal regardless of age; recent history survives.
+	t.Run("single mode converges", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedPortGCFixture(t, db)
+		b := passBroker(t, db, clk)
+
+		if err := runPass(t, b, "port-gc", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		got := portGCNames(t, db)
+		want := map[string]string{"recent-freed": "FREED", "live": "ALLOCATED"}
+		if !sameStringMap(got, want) {
+			t.Fatalf("port-gc single mode: got %v want %v", got, want)
+		}
+		// Idempotent: a second run over the same cutoff deletes nothing.
+		if err := runPass(t, b, "port-gc", clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if got2 := portGCNames(t, db); !sameStringMap(got2, want) {
+			t.Fatalf("port-gc second run changed rows: %v", got2)
+		}
+		// Aging: once recent-freed passes retention, it is collected too.
+		if err := runPass(t, b, "port-gc", clk.advance(30*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if got3 := portGCNames(t, db); !sameStringMap(got3, map[string]string{"live": "ALLOCATED"}) {
+			t.Fatalf("port-gc did not collect aged history: %v", got3)
+		}
+	})
+
+	// (b) cluster mode with no cluster wiring (b.cl == nil): must touch
+	// NOTHING outside raft — same invariant as proc-gc's subtest.
+	t.Run("cluster mode never deletes outside raft", func(t *testing.T) {
+		clk := newFakeClock(passEpoch)
+		db := passTestDB(t)
+		seedPortGCFixture(t, db)
+		b := passBroker(t, db, clk)
+		before := portGCNames(t, db)
+		b.clusterMode = true
+
+		for i := 0; i < 3; i++ {
+			if err := runPass(t, b, "port-gc", clk.advance(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := portGCNames(t, db); !sameStringMap(got, before) {
+			t.Fatalf("port-gc deleted replicated rows outside raft in cluster mode: %v -> %v", before, got)
 		}
 	})
 }

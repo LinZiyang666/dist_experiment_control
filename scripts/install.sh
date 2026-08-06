@@ -360,6 +360,18 @@ tunnel_addr: $TUNNEL_ADDR
 #     - /srv/data
 #     - /tmp
 #   # allow_roots: []      # explicit empty list disables push/pull entirely
+#
+# logging — optional, ALREADY BOUNDED without any of these keys.
+# The agent's binary default writes a size-capped, rotating log to
+# <home>/agent/<session>/agent.log, and re-points its own fd 2 at a bounded
+# agent.boot.err beside it so panics and stacktraces cannot vanish. These
+# knobs only RESIZE that; leaving them out is a supported choice, not an
+# unbounded one. They are listed here because the broker's broker.yaml is
+# written with its equivalents spelled out, and an operator comparing the two
+# would otherwise conclude the agent has no cap at all.
+# log_file: /var/log/tether/agent.log   # '-' means stderr (opts OUT of the cap)
+# log_max_size_mb: 50
+# log_max_backups: 2
 EOF
         chmod 600 "$SESSION_DIR/agent.yaml"
     else
@@ -377,7 +389,13 @@ EOF
 
 To start the agent now (architecture K.1; install.sh does NOT start anything):
     setsid nohup $BIN_DIR/tether agent --session $SESSION --nid $NID${PIN:+ --pin $PIN} \\
-      >> $SESSION_DIR/agent.log 2>&1 &
+      1>/dev/null 2>> $SESSION_DIR/agent.boot.err &
+
+    # h1 F: the agent writes its own size-capped rotating log to
+    # $SESSION_DIR/agent.log (50MB x 2) — do NOT redirect stdout there, or the
+    # shell's unbounded append fd fights the in-process cap. stderr carries
+    # only pre-logger boot output; the agent re-points fd 2 at agent.boot.err
+    # itself once started, so this redirect just covers the boot window.
 
 For auto-start across logins (optional):
     $BIN_DIR/tether agent --install-user-service --session $SESSION --nid $NID
@@ -557,6 +575,14 @@ broker:
   storage:
     db: $LIB_DIR/tether.db
     js_store: $LIB_DIR/jetstream
+  observability:
+    # h1 F: the broker's own size-capped rotating log sink. The unit sends
+    # stdout/stderr to journald (panics + pre-logger boot output only); THIS
+    # file is where slog writes, and the cap is enforced in-process so the
+    # host needs no logrotate. 50MB x 2 backups = 150MB worst case.
+    log_file: $LOG_DIR/broker.log
+    log_max_size_mb: 50
+    log_max_backups: 2
   # cluster: HA mode (opt-in via 'tether cluster init --from-existing'). Uncomment when joining/forming
   # a cluster. The C3 topology reconciler manages nats.conf in cluster mode; the loopback http:127.0.0.1:8223
   # monitor it probes is established by the one-time 'cluster reconcile nats --manual' cutover (reload
@@ -778,8 +804,14 @@ ExecStart=$bin/tether serve --config $etc/broker.yaml
 # deliberately do NOT set StartLimitIntervalSec=0 (that would mask a wedged broker).
 Restart=always
 RestartSec=2
-StandardOutput=append:$log_dir/broker.log
-StandardError=append:$log_dir/broker.err
+# h1 F: slog output goes to a PROCESS-OWNED, size-capped rotating file
+# ($log_dir/broker.log, configured under observability: in broker.yaml), NOT
+# to systemd's unbounded append: sink. The 2026-08-04 incident wrote 5.3GB of
+# broker.err onto a 19GB disk exactly because append: has no cap and the host
+# had no logrotate. stdout/stderr stay on journald, which IS capped, and carry
+# only panics/stacktraces and pre-logger boot output.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

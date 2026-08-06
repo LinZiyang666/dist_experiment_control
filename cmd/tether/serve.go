@@ -46,6 +46,7 @@ func newServeCmd() *cobra.Command {
 		colocatedAgentNID string
 		logLevel          string
 		logJSON           bool
+		logFile           string
 		metricsListen     string
 		manifestListen    string
 		natsConfPath      string
@@ -203,7 +204,15 @@ func newServeCmd() *cobra.Command {
 				}
 			}
 
-			logger, err := newLogger(logLevel, logJSON)
+			// h1 F: --log-file (or broker.yaml observability.log_file) points
+			// slog at an in-process size-capped rotating file. Binary default
+			// stays stderr — dev runs and the embedded-NATS test harness are
+			// byte-unchanged; the DEPLOYED default lives in install.sh's
+			// broker.yaml. Panics/stacktraces keep going to raw stderr, which
+			// the unit routes to journald.
+			logFile = pickFlagOrYaml(cmd, "log-file", logFile, fileCfg.Broker.Obs.LogFile)
+			logger, err := newLoggerTo(logLevel, logJSON,
+				resolveLogSink(logFile, fileCfg.Broker.Obs.LogMaxSizeMB, fileCfg.Broker.Obs.LogMaxBackups))
 			if err != nil {
 				return err
 			}
@@ -314,6 +323,7 @@ func newServeCmd() *cobra.Command {
 		"G5 #19: the nid of the tether agent co-located on this broker host (self-reported so `node ls --brokers` correlates broker+agent versions)")
 	cmd.Flags().StringVar(&clusterSecrets, "cluster-secrets-dir", "",
 		"D9 cluster: secrets dir (cluster-ca, route leaf, tunnel-cert, broker.nk, node-ident, account.nk); required in cluster mode")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write logs to this size-capped rotating file instead of stderr ('-' = stderr; size/backups from broker.yaml observability.*, default 50MB x 2)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug | info | warn | error (B5 OPS#8)")
 	cmd.Flags().BoolVar(&logJSON, "log-json", false, "emit structured JSON logs instead of text (B5 OPS#8)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "address for the Prometheus /metrics + /healthz + /readyz HTTP endpoint (e.g. 127.0.0.1:9090); empty disables it (B5 OPS#1)")

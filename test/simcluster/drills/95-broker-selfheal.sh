@@ -25,7 +25,8 @@
 #     go up cannot tell the two apart, and #23's entire argument evaporates.
 #  3. `ActiveState==active` IS NOT A TERMINUS. The unit is Type=simple, so it is "active" the instant exec
 #     happens — long before the broker is usable. Close on `broker: ready` line COUNT increasing in
-#     /var/log/tether/broker.err (R-BROKERLOG: the broker's output is NOT in journald) plus real traffic.
+#     the broker slog (R-BROKERLOG: application lines are NOT in journald) plus real traffic.
+#     h1 F3: that slog is /var/log/tether/broker.log now, broker.err pre-h1; sim_broker_slog reads both.
 #  4. T3 is a HARD claim + a RECORDED mechanism, not accept-both. `inactive (dead)` / `failed` there is
 #     #23's symptom and an ASSERT-FAIL (a regression of G1's Restart=always fix), never a shrug. Only
 #     WHICH of the three recovery paths it takes is recorded — because the clean-exit trigger is
@@ -43,6 +44,7 @@ set -u
 . "$HERE/lib/docker.sh"
 . "$HERE/lib/tether.sh"
 . "$HERE/drills/lib/cluster.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/drills/lib/events.sh"
@@ -55,8 +57,9 @@ EV_NURL="$NURL"
 EVCAP=/tmp/95-events.jsonl
 
 _bt() { _btn=$1; shift; [ "$1" = "--" ] && shift; dexec -u tether "$_btn" -- "$@"; }
-_berr() { dexec "$1" -- tail -n "${2:-40}" /var/log/tether/broker.err 2>/dev/null; }
-_ready_count() { dexec "$1" -- sh -c 'grep -c "broker: ready" /var/log/tether/broker.err 2>/dev/null || echo 0' | tr -d '\r'; }
+# h1 F3: broker slog moved broker.err -> broker.log; sim_broker_slog reads both.
+_berr() { sim_broker_slog "$1" "${2:-40}"; }
+_ready_count() { sim_broker_slog_count "$1" "broker: ready"; }
 _mainpid() { dexec "$1" -- systemctl show -p MainPID --value tether-broker 2>/dev/null | tr -d '\r'; }
 _nrestarts() { dexec "$1" -- systemctl show -p NRestarts --value tether-broker 2>/dev/null | tr -d '\r'; }
 _result() { dexec "$1" -- systemctl show -p Result --value tether-broker 2>/dev/null | tr -d '\r'; }
@@ -64,8 +67,14 @@ _active() { [ "$(dexec "$1" -- systemctl is-active tether-broker 2>/dev/null | t
 # Timestamp gate, not --after-cursor (the export cursor silently filters everything — drill 94's lesson).
 _jcursor_b() { dexec "$1" -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null | tr -d '\r'; }
 _jafter() { dexec "$1" -- sh -c "journalctl -u tether-broker --since='$2' --no-pager 2>/dev/null | grep -qF '$3'"; }
-_acursor() { dexec "$1" -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null | tr -d '\r'; }
-_agent_jafter() { dexec "$1" -- sh -c "journalctl -u tether-agent --since='$2' --no-pager 2>/dev/null | grep -qF '$3'"; }
+# h1 F3: the agent's slog left journald for $HOME/.tether/agent/<sid>/agent.log,
+# so the cursor is now a BYTE OFFSET into that file rather than a timestamp.
+# This is strictly stronger than --since: no clock-format agreement is needed
+# and a line written before the cursor cannot false-pass. T2 below asserts the
+# ABSENCE of a reconnect line, and an oracle reading an empty journal would
+# have made that absence trivially true — a permanently-green assertion.
+_acursor() { sim_agent_slog_cursor "$1"; }
+_agent_jafter() { sim_agent_slog_grep "$1" "$3" "$2"; }
 # R-LIVENESS-NOT-HEALTH: cluster status returns a HEALTH exit code (1=DEGRADED); liveness = parseable JSON.
 _broker_live() { _bt brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id != null' >/dev/null 2>&1; }
 _agt1_online() { "$SIM" ctl -- node ls --json 2>/dev/null | jq -e '.nodes[]?|select(.nid=="agt1")|select(.status=="ONLINE")' >/dev/null 2>&1; }
@@ -157,7 +166,7 @@ assert_ok "T1c and NOT 'Main process exited, code=' — this is T2's exact count
 assert_ok "T1d systemd revived it (NRestarts grew past $NR0) — with SuccessExitStatus unset (grep -c = 0), exit 0 is the ONLY success, so Restart=on-failure would have left it inactive-not-failed. THIS is #23's first behavioural proof" \
     poll_until 60 2 "NRestarts grows after the clean exit" -- _t1_restarted
 assert_ok "T1e a NEW MainPID replaced $PID0" poll_until 30 2 "a new MainPID appears" -- _t1_new_pid
-assert_ok "T1f the broker is REALLY ready — 'broker: ready' line count grew in broker.err (NOT ActiveState==active: Type=simple is 'active' the instant exec happens, long before it can serve)" \
+assert_ok "T1f the broker is REALLY ready — 'broker: ready' line count grew in the broker slog (NOT ActiveState==active: Type=simple is 'active' the instant exec happens, long before it can serve)" \
     poll_until 90 3 "a new 'broker: ready' line lands" -- _t1_ready_grew
 assert_ok "T1g FUNCTION really recovered: the data plane serves the exact sentinel again" \
     poll_until 90 2 "sentinel after the clean-exit revival" -- dp_curl_ok_body ctl1 "http://brk1:$PUB/" "$TOK"

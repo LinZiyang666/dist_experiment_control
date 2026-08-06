@@ -57,7 +57,9 @@
 # 11. THE DR-STEP-LEDGER IS A FIRST-CLASS DELIVERABLE. Wrapping the script in a `dr_restore_all()` that
 #     reports GREEN is explicitly forbidden: that is Mandate (4)'s inversion — the operation "succeeding"
 #     only because the sim wrote clever bash IS tether's failure being concealed.
-# 12. Broker application lines are in /var/log/tether/broker.err, NOT journalctl (R-BROKERLOG).
+# 12. Broker application lines are in the broker's own slog FILE, NOT journalctl (R-BROKERLOG).
+#     h1 F3: that file is /var/log/tether/broker.log (broker.yaml `log_file:`); pre-h1 hosts have
+#     /var/log/tether/broker.err. sim_broker_slog reads both. journald now holds PANICS, not slog.
 
 set -u
 . "$HERE/lib/log.sh"
@@ -66,6 +68,7 @@ set -u
 . "$HERE/lib/vault.sh"
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/cluster.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/lib/assert.sh"
@@ -95,7 +98,8 @@ _pty() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec -u tether "$_p
 # the broker-ops-#6 user (tether) cannot write there (measured: "seam could NOT be applied … permission
 # denied", failing CLOSED). So the seam-applying path is the root one — with the #6 chown remedy after.
 _pty_root() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec "$_pn" -- python3 /opt/sim/pty-confirm.py "$_pa" -- "$@"; }
-_berr() { dexec "$1" -- tail -n "${2:-80}" /var/log/tether/broker.err 2>/dev/null; }
+# h1 F3: broker slog moved broker.err -> broker.log; sim_broker_slog reads both.
+_berr() { sim_broker_slog "$1" "${2:-80}"; }
 
 # `node ls --json` uses `nid` — NOT `node_id`. (`node_id` is `cluster status --json`'s field; the two
 # APIs differ, proto/messages.go:379-385 vs the cluster status report.) Querying the wrong key silently

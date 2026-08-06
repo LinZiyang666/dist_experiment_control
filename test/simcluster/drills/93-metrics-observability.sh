@@ -13,14 +13,59 @@
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/cluster.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 MPORT=9100; WPORT=9199
-# obs_enable <brk>: append the observability: seam under broker: in the root-owned broker.yaml (as root via
-# dexec), then restart the broker. Idempotency-guarded. metrics on loopback; webhook → the ctl receiver.
+# obs_enable <brk>: put metrics_listen / alert_webhook_url / log_json into the
+# root-owned broker.yaml's `observability:` map (as root via dexec), then restart.
+#
+# THE GUARD KEYS ON THE KEYS IT ADDS, NOT ON THE SECTION HEADER.
+#
+# origin: h1 (2026-08-05). This used to read
+# `grep -qE '^  observability:' … || printf '  observability:\\n    metrics_listen: …' >>`,
+# i.e. "if the section exists, assume my keys are in it". h1 made install.sh
+# write an `observability:` block BY DEFAULT (for log_file/log_max_*), so the
+# guard started matching on every fresh install, the three keys were never
+# added, and 15 assertions across /metrics, /healthz, /readyz, the webhook arm
+# and LOGJSON went red — against a product that was working perfectly. Same
+# shape as the h1 F3 log-oracle break, one level up: a harness marker that a
+# product default quietly made universal.
+#
+# Appending a SECOND `observability:` block would not have been a fix either —
+# a duplicate mapping key in YAML is last-wins at best and a parse error at
+# worst, and either way the broker's own log_file/cap settings would be at the
+# mercy of ordering. So the keys are INSERTED INTO the existing map.
+#
+# obs_verify below is the other half: a setup step must prove what it claims to
+# have done. Without it, ANY future reason the write silently no-ops produces
+# the same 15 red assertions blamed on the product.
 obs_enable() {
-    dexec "$1" -- sh -c "grep -qE '^  observability:' /etc/tether/broker.yaml || printf '  observability:\n    metrics_listen: 127.0.0.1:$MPORT\n    alert_webhook_url: http://ctl1:$WPORT/\n    log_json: true\n' >> /etc/tether/broker.yaml"
+    dexec "$1" -- sh -c "
+        f=/etc/tether/broker.yaml
+        grep -qE '^    metrics_listen:' \"\$f\" && exit 0
+        if grep -qE '^  observability:' \"\$f\"; then
+            awk '/^  observability:\$/ { print; print \"    metrics_listen: 127.0.0.1:$MPORT\"; print \"    alert_webhook_url: http://ctl1:$WPORT/\"; print \"    log_json: true\"; next } { print }' \"\$f\" > \"\$f.tmp\" && mv \"\$f.tmp\" \"\$f\"
+        else
+            printf '  observability:\n    metrics_listen: 127.0.0.1:$MPORT\n    alert_webhook_url: http://ctl1:$WPORT/\n    log_json: true\n' >> \"\$f\"
+        fi
+    "
     dexec "$1" -- systemctl restart tether-broker
+}
+
+# obs_verify <brk>: the three keys are really on disk, exactly once each. "Exactly"
+# matters: a second copy means a duplicate-key yaml whose winner is parser-defined.
+#
+# Verified against four synthetic broker.yaml worlds rather than assumed (the
+# regex is the risky part — it must match the 4-space indent AND must not count
+# h1's sibling log_file/log_max_* keys):
+#   both keys present + h1 defaults    -> count=3  PASS
+#   h1 defaults only, obs_enable SKIPPED -> count=0  FAIL   <- the 15-red world
+#   partial write (2 of 3 keys)        -> count=2  FAIL
+#   duplicate observability map        -> count=6  FAIL
+obs_verify() {
+    _ov=$(dexec "$1" -- sh -c "grep -cE '^    (metrics_listen|alert_webhook_url|log_json):' /etc/tether/broker.yaml" 2>/dev/null | tr -d '\r')
+    [ "$_ov" = 3 ]
 }
 _curl_brk() { dexec "$1" -- curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$2$3" 2>/dev/null; }
 _metrics()  { dexec "$1" -- curl -s "http://127.0.0.1:$MPORT/metrics" 2>/dev/null; }
@@ -56,8 +101,8 @@ _webhook_broker_diag() {   # $1 = context label
     _wcur=$("$SIM" exec "$LDR" -- runuser -u tether -- tether cluster status --json 2>/dev/null | jq -r '.leader_id // empty' 2>/dev/null)
     log "DIAG webhook ($1): LDR captured at setup=[$LDR]  vs  current cluster leader=[$_wcur]  (differ ⇒ leadership moved ⇒ reconciler re-seeded, swallowing the raise delta; the cluster_leader field would also mismatch)"
     for _wb in brk1 brk2 brk3; do
-        log "DIAG webhook ($1): $_wb broker.err alert/webhook lines (last 10) — a 'alert webhook:' Warn = send path FAILED (regression); NONE = delta never generated (seeding/timing):"
-        dexec "$_wb" -- sh -c "grep -nE 'alert webhook|d8b:|alert (raise|clear)' /var/log/tether/broker.err 2>/dev/null | tail -10" 2>/dev/null | sed "s/^/[$_wb] /"
+        log "DIAG webhook ($1): $_wb broker-slog alert/webhook lines (last 10) — a 'alert webhook:' Warn = send path FAILED (regression); NONE = delta never generated (seeding/timing):"
+        sim_broker_slog "$_wb" 4000 2>/dev/null | grep -nE 'alert webhook|d8b:|alert (raise|clear)' | tail -10 | sed "s/^/[$_wb] /"
     done
 }
 _hook_warmup_seen() {
@@ -103,7 +148,15 @@ sleep 1
 assert_ok "[env] webhook receiver up on ctl1:$WPORT" sh -c "$SIM exec ctl1 -- sh -c 'kill -0 \$(cat /tmp/hookrx.pid) 2>/dev/null'"
 
 # ── [env] obs_enable each broker (observability seam + rolling restart, keep quorum) ────────────────
-for b in brk1 brk2 brk3; do assert_setup "enable observability on $b and restart successfully" obs_enable "$b"; sleep 3; done
+for b in brk1 brk2 brk3; do
+    assert_setup "enable observability on $b and restart successfully" obs_enable "$b"
+    # The postcondition, not the command's exit code: obs_enable's write is
+    # conditional, and a silently-skipped write is indistinguishable from a
+    # successful one until 15 assertions later. h1 proved that is not
+    # hypothetical.
+    assert_setup "PROOF the seam really landed on $b (3 keys, exactly once each — a duplicate observability map is parser-defined)" obs_verify "$b"
+    sleep 3
+done
 assert_setup "N=3 healthy after observability rolling restart" poll_until 60 4 "N=3 healthy" -- sh -c "[ \"\$($SIM status --json 2>/dev/null | jq '[.nodes[]?|select(.phase==\"VOTER\")]|length')\" = 3 ]"
 LDR=$(sim_leader); FOLL=$(a_non_leader_voter)
 log "DIAG /metrics on $LDR →"; _metrics "$LDR" | grep -E '^tether_broker_' | head -12 | sed 's/^/[diag met] /'
@@ -241,7 +294,11 @@ if poll_until 20 2 "exact raised POST" -- _hook_raised_exact; then _hkr=1; else 
 # regression), as opposed to NONE (the delta was never generated → the raft-lease-jitter timing race).
 _webhook_send_warned() {
     for _wb in brk1 brk2 brk3; do
-        dexec "$_wb" -- sh -c 'grep -q "alert webhook:" /var/log/tether/broker.err' 2>/dev/null && return 0
+        # h1 F3: 'alert webhook:' is a SLOG line, and h1 moved the broker slog
+        # from broker.err to broker.log. Reading only broker.err would have
+        # silently degraded this branch to "never warned", which turns a REAL
+        # send-path regression into the benign not_covered below.
+        sim_broker_slog_grep "$_wb" "alert webhook:" && return 0
     done
     return 1
 }
@@ -256,7 +313,7 @@ _webhook_send_warned() {
 if [ "$_hkr" = 1 ]; then
     assert_ok "WEBHOOK raised: exact schema, transition, alert identity, leader and key whitelist" sh -c "true"
 elif _webhook_send_warned; then
-    _as_fail "WEBHOOK raised: the POST SEND PATH failed ('alert webhook:' Warn in a broker.err) — a real regression, not a timing miss"
+    _as_fail "WEBHOOK raised: the POST SEND PATH failed ('alert webhook:' Warn in a broker slog) — a real regression, not a timing miss"
 else
     not_covered "93 WEBHOOK raised (NONE — the committed alert delta was never generated: raft-lease-jitter timing race)" \
         "the exact-raised POST did not land within the window and the receiver log is BLANK (NONE, not a send-path Warn) — the leader's IN-MEMORY alert-transition baseline is not durable across a sub-second raft lease step-down/re-elect on a saturated deploy-tier host (alert_reconcile.go). R15's conditional-reset product fix (preserve the baseline across a same-node blip, re-seed only on a genuine handoff — TestWebhookSurvivesSameNodeLeaseBlip) REDUCES but does not eliminate it; the reliable fix is a persistent committed-transition cursor, owed to a follow-up. The send path + EXACT schema ARE proven by the warmup(raised+cleared) arm above — only this raise-under-jitter arm is intermittently unobservable in-sim." runtime-guard
@@ -274,9 +331,34 @@ BAD=$FOLL
 assert_setup "WEBHOOK-URL negative: install a forbidden ftp:// URL on $BAD" \
     dexec "$BAD" -- sed -i -E 's#alert_webhook_url:.*#alert_webhook_url: ftp://invalid.example/hook#' /etc/tether/broker.yaml
 "$SIM" exec "$BAD" -- systemctl restart tether-broker >/dev/null 2>&1 || true
+# h1 F3: a FUNCTION, not an `sh -c` string — `sh -c` starts a fresh shell that
+# does not inherit logs.sh's helpers, so the stream mapping has to be reachable
+# from the predicate itself (and R-NOSHC wants predicates as functions anyway).
+#
+# READS THE BOOT STREAM FIRST, AND THAT IS THE WHOLE POINT OF THIS ARM.
+#
+# This assertion is about a STARTUP refusal: the broker rejects a non-http(s)
+# webhook URL during config validation and exits non-zero. That happens BEFORE
+# the slog sink exists, so the diagnostic goes to raw fd 2 — which h1 routes to
+# journald. My first cut of this migration pointed it at the slog and the arm
+# went red against a broker that was refusing exactly as designed: the unit did
+# fail to start (the follow-on restore step proves it), the message was simply
+# in the other stream.
+#
+# Recorded because it is the sharpest illustration of why logs.sh keeps the
+# four streams apart rather than merging them: "the broker said X" is not one
+# question. A pre-logger refusal is ONLY ever in the boot stream, and an
+# oracle that knows the difference is the difference between reporting a
+# working fail-closed guard and reporting a product failure.
+#
+# The slog is still checked as a fallback: if validation ever moves to after
+# logger setup, this arm should keep working rather than silently invert.
+_bad_url_diagnostic() {
+    _bud='[Aa]lert webhook.*scheme.*not allowed|http/https only'
+    sim_broker_panic_journal "$BAD" "$_bud" || sim_broker_slog_grep "$BAD" "$_bud"
+}
 assert_ok "WEBHOOK-URL negative: startup fails loudly on non-http(s), not a later POST timeout" \
-    poll_until 30 2 "forbidden webhook URL startup diagnostic" -- sh -c \
-    "$SIM exec $BAD -- sh -c \"grep -qiE 'alert webhook.*scheme.*not allowed|http/https only' /var/log/tether/broker.err\""
+    poll_until 30 2 "forbidden webhook URL startup diagnostic" -- _bad_url_diagnostic
 assert_setup "WEBHOOK-URL negative: restore valid receiver URL and restart $BAD" \
     dexec "$BAD" -- sh -c "sed -i -E 's#alert_webhook_url:.*#alert_webhook_url: http://ctl1:$WPORT/#' /etc/tether/broker.yaml; systemctl restart tether-broker"
 assert_setup "WEBHOOK-URL negative: restored follower returns VOTER" \

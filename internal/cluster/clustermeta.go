@@ -94,10 +94,12 @@ func defaultAppliers() map[OpType]Applier {
 		OpNodeEvict:          exec,
 		OpProcCreate:         exec,
 		OpProcMarkExited:     exec,
+		OpProcGC:             exec, // h1 B1: keyed DELETE, terminal-state guard baked
 		OpReconcileBatch:     exec,
 		OpPortAllocate:       exec,
 		OpPortFree:           exec,
 		OpPortRevoke:         exec,
+		OpPortGC:             exec, // h1 B1: keyed DELETE, terminal-state guard baked
 		OpAgentProvision:     exec,
 		OpAuditCheckpointSet: exec, // D5 §6.3: monotonic cursor UPSERT, baked WHERE guard
 		OpPortReassignHome:   exec, // D6 §7.1-7.2: home re-point + epoch bump, baked CAS guard

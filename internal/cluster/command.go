@@ -41,6 +41,20 @@ const (
 	OpPortRevoke        OpType = "PortRevoke"
 	OpAgentProvision    OpType = "AgentProvision"
 
+	// OpProcGC / OpPortGC (h1 B1) delete terminal-state history rows —
+	// EXITED processes, FREED/REVOKED port_allocations — older than a
+	// retention the LEADER computes. The retention comparison happens only in
+	// the leader-side Plan SELECT; the baked Apply SQL keys on an explicit
+	// pid/row_id set with the terminal-state guard re-asserted, so replay is
+	// a deterministic idempotent no-op and the heterogeneous-timestamp-text
+	// problem (see proc.PlanGCExited) can never reach a replica. Chunked at
+	// ≤500 keys per command so one raft entry stays small. Both ride
+	// genericExecApplier. Before these ops, cluster mode had NO retention at
+	// all ("skip GC until it has a replicated command") — the 2026-08-04
+	// incident fleet had accumulated 24k FREED + 8.5k EXITED rows.
+	OpProcGC OpType = "ProcGC"
+	OpPortGC OpType = "PortGC"
+
 	// OpAuditCheckpointSet (D5, §6.3) advances the REPLICATED audit-publish cursor
 	// cluster_meta.audit_published_index. It is NOT a relaxation of OpClusterMetaSet's
 	// "t:" prefix guard (that exists for §2.10 collision prevention) — it is a distinct
@@ -337,10 +351,12 @@ var knownOps = map[OpType]bool{
 	OpNodeEvict:           true,
 	OpProcCreate:          true,
 	OpProcMarkExited:      true,
+	OpProcGC:              true,
 	OpReconcileBatch:      true,
 	OpPortAllocate:        true,
 	OpPortFree:            true,
 	OpPortRevoke:          true,
+	OpPortGC:              true,
 	OpAgentProvision:      true,
 	OpAuditCheckpointSet:  true,
 	OpPortReassignHome:    true,
@@ -365,6 +381,23 @@ var knownOps = map[OpType]bool{
 	OpAlertRaise:          true,
 	OpAlertClear:          true,
 	OpAlertAck:            true,
+}
+
+// KnownOpsForDocs returns a COPY of the known-op set, for the one consumer
+// that must compare the FSM's real vocabulary against prose: the layer-2
+// architecture doc's §5 op catalog
+// (test/determinism/op_catalog_test.go).
+//
+// origin: docs/reviews/h1-external-review.md F5 — h1 added OpProcGC/OpPortGC
+// and the binding doc kept asserting the opposite ("ProcGC = leader-local, not
+// in Raft"), which per CLAUDE.md §1 outranks the code as the contract. A copy,
+// not the map, so no caller can mutate the registry through the accessor.
+func KnownOpsForDocs() map[OpType]bool {
+	out := make(map[OpType]bool, len(knownOps))
+	for op, ok := range knownOps {
+		out[op] = ok
+	}
+	return out
 }
 
 // HasPhaseFluidityOps reports whether THIS binary's knownOps includes the v0.4.2 phase-fluidity

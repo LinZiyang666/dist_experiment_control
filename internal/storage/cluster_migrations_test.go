@@ -228,6 +228,7 @@ func TestAlerts_KindCheck(t *testing.T) {
 	accept := []string{
 		"manual", "below_quorum", "broker_draining", "broker_down",
 		"replication_degraded", "disk_pressure", "raft_lag",
+		"proxy_bind_stalled", // h1 E2 (0018 rebuild widened the CHECK)
 	}
 	for i, k := range accept {
 		if err := insertAlert(db, "ok"+k, k, "info", "dk-ok-"+k, "ACTIVE"); err != nil {
@@ -549,6 +550,7 @@ func TestClusterMigrations_MigrationOrderContiguous(t *testing.T) {
 		"0013_cluster_nodes_join_pop.sql", "0014_cluster_nodes_bus_nkey.sql",
 		"0015_cluster_operations.sql", "0016_proxy_cluster.sql",
 		"0017_port_alloc_last_rehome.sql",
+		"0018_alerts_kind_proxy_bind_stalled.sql",
 	}
 	got := migrationNames(t)
 	if len(got) != len(want) {

@@ -550,25 +550,33 @@ JetStream store 占用超过磁盘 80% 时 broker 会发出 `sys.events{type:dis
 分布式模式不要把某个旧 peer 的 `tether.db`/`raft/` 直接塞回新时间线；按
 `docs/cluster-runbook.md` 的 force-single / recover 流程处理，并重新跑 `cluster status`。
 
-### 7.5 日志轮转
+### 7.5 日志轮转（h1 F 起：进程内封顶，不再依赖 logrotate）
 
-systemd unit 用 `StandardOutput=append:/var/log/tether/broker.log`。建议 logrotate
-配置：
+**现状（h1 及以后）**：broker 的 slog 输出走**自己的**大小封顶轮转文件，由
+`broker.yaml` 的 `observability:` 块配置，默认 50MB × 2 个备份（最坏 150MB）：
 
-```
-/var/log/tether/*.log {
-    daily
-    rotate 14
-    compress
-    notifempty
-    missingok
-    copytruncate
-    su tether tether
-}
+```yaml
+broker:
+  observability:
+    log_file: /var/log/tether/broker.log
+    log_max_size_mb: 50
+    log_max_backups: 2
 ```
 
-注意 **不要用 `create`**（会破坏 systemd append 的 fd）；`copytruncate` 是配合
-append 的标准写法。
+systemd unit 改成 `StandardOutput=journal` / `StandardError=journal`——**stdout/stderr
+只承载 panic、stacktrace 和 logger 建起来之前的启动输出**，而 journald 自身是有配额的。
+agent 侧同理：默认写 `<home>/agent/<sid>/agent.log`（同样 50MB × 2），并把自己的 fd 2
+指到 `agent.boot.err`。
+
+**为什么改**：`append:` 这个 sink 没有任何上限，而宿主不一定装了 logrotate——
+2026-08-04 事故里 `/var/log/tether/broker.err` 在 19GB 的盘上长到 **5.3GB**
+（d5 循环每 100ms 一条同样的 WARN，刷了五周）。上限必须在**进程里**，因为那是唯一
+无论怎么启动都跟着走的东西。
+
+**不再需要 logrotate 配置**。若你已经装了针对 `/var/log/tether/*.log` 的 logrotate
+规则，删掉它：两套轮转互相打架（外部 rename 会让进程内的大小计数与磁盘脱节）。
+
+**从 h1 之前的部署迁移（必须按顺序）**，见 §8.8。
 
 ### 7.6 监控 tether 自身
 
@@ -732,6 +740,45 @@ root-init 污染的机器：停 daemon → `sudo chown -R tether:tether /var/lib
 - **同 tag 重装（same-tag re-push）**：`--wait` 无法用 release 变化区分"旧行"与"新 register"，
   一律 fail-closed 报 **UNCONFIRMED**（exit 非零）；`--all` 的金丝雀遇到它会中止扇出。
   同 tag 修复损坏二进制请**逐台**执行并以 agent/broker 日志人工确认。
+
+### 8.8 h1 增量的 broker 迁移（日志封顶 + 存储 GC + 新告警种类）
+
+h1 改了三样运维可见的东西：日志 sink、`port_allocations`/`processes` 的保留期 GC、
+以及一个新的 `proxy_bind_stalled` 告警种类（migration 0018）。**升级顺序：先 broker，
+后 agent**（新 agent 的 proc-event ACK 需要新 broker 才有人应答；旧 broker 只会让 agent
+降级回老行为，但没必要制造这段噪声）。
+
+**在已有部署上（例如 racknerd）逐步做，别重跑 install.sh**——它会覆盖你手工维护的
+`cluster:` 段。手工执行：
+
+1. **确认 journald 持久化**（新 unit 把 panic 交给它）：
+   `mkdir -p /var/log/journal && systemctl restart systemd-journald`，
+   并在 `/etc/systemd/journald.conf` 设一个与磁盘匹配的 `SystemMaxUse=`（19GB 盘建议 ≤500M）。
+2. **改 unit**：`/etc/systemd/system/tether-broker.service` 里
+   `StandardOutput=append:…` / `StandardError=append:…` 两行换成 `journal`。
+3. **加 yaml 块**：broker.yaml 的 `broker:` 下补 §7.5 的 `observability:` 三行。
+4. **删掉旧的 root-owned 日志文件**：
+   `rm -f /var/log/tether/broker.log /var/log/tether/broker.err`。
+   ⚠ **这一步不能省，`truncate` 也不行**：systemd 的 `append:` 是在**降权到 tether 之前**
+   打开/创建这两个文件的，所以它们属 root；换成进程内 sink 之后，tether 用户去 open 会
+   EACCES，Writer 就永久停在 degraded 模式（内容只 spill 到 stderr）。truncate 不改属主。
+   （先留档就 `tail -c 50M … | gzip > /root/broker.err.tail.gz` 再删。）
+5. `systemctl daemon-reload && systemctl restart tether-broker`。
+6. **冒烟检查**（三条都要看）：
+   - `ls -l /var/log/tether/broker.log` → 属主是 **tether**，且在增长；
+   - `tether ps` 毫秒级返回（h1 A 的有界回包）；
+   - `tether alert ls` → 若现网有 agent 的 proxy 绑不上，会看到
+     `proxy_bind_stalled:<sid>/<nid>`（severity **info**，不会挡破坏性命令）。
+
+**GC 的一次性追赶**：启动后 GC 每 5 分钟一轮、每轮每张表最多 5000 行。
+2026-08-04 的积压（24k FREED 端口行 + 8.5k EXITED 进程行）约 **25 分钟**排干；
+期间 `tether ps -a` 的 total 计数会一路下降。保留期：processes 1 小时（`proc_retention`），
+port_allocations 24 小时（常量，无配置项）。
+
+**回滚约束（N-1 窗口）**：一旦 `proxy_bind_stalled` 告警被写进过 raft 日志，
+**从零重放日志**到 h1 之前的二进制会撞 0009 的 CHECK（fail-stop）。回滚只支持
+**snapshot-restore**，不支持 log-replay。同理，多 broker 集群必须**锁步**升级——
+新的 FSM op（`ProcGC`/`PortGC`）与新告警种类在旧 broker 上都是未知的。
 
 ---
 

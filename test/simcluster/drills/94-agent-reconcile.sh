@@ -40,8 +40,9 @@
 #     what show the kill was a RECONCILIATION rather than something else killing it.
 #  7. THE CONTROL SOURCE MUST BE POLLED AND PAIRED (B7): prove X is alive -> assert Y is dead -> prove X is
 #     STILL alive in the same window. Proving X only before Y does not exclude both dying together.
-#  8. A JOURNAL CURSOR GATE is mandatory: without --after-cursor we would match a re-registration line from
-#     an EARLIER reconnect and call it evidence.
+#  8. A CURSOR GATE is mandatory: without one we would match a re-registration line from an EARLIER
+#     reconnect and call it evidence. Since h1 the agent's slog lives in its own file rather than the
+#     journal, so the cursor is a BYTE OFFSET into that file (see _jcursor / _agent_slog_after).
 #  9. THE 15-MINUTE PORT REVOKE TIMER (expose.go:484-485: reconcilePorts only revokes for a node OFFLINE
 #     >15min) must not contaminate B7 — the backup->restore window is asserted to be < 300s.
 # 10. RESTORE RUNS AS User=tether. That is broker-ops.md:621-626 (#6) and the product's own words
@@ -66,6 +67,7 @@ set -u
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/drills/lib/events.sh"
 . "$HERE/lib/assert.sh"
+. "$HERE/drills/lib/logs.sh"
 
 SID=lab
 PIN=949494
@@ -83,11 +85,33 @@ _pty() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec -u tether "$_p
 # FOREVER. Using the exit code as a liveness probe polls until timeout against a perfectly healthy broker
 # and manufactures a FAKE product failure. Liveness = "it answered with parseable JSON".
 _broker_ready() { _bt brk1 -- tether cluster status --json 2>/dev/null | jq -e '.leader_id != null' >/dev/null 2>&1; }
-# Timestamp gate rather than --after-cursor: the export cursor was silently filtering EVERYTHING (the
-# audit rows proved the orphan was killed while a cursor-gated grep saw nothing). Capture the container's
-# clock; journalctl --since is robust. Format matches `date '+%Y-%m-%d %H:%M:%S'`.
-_jcursor() { dexec "$1" -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null | tr -d '\r'; }
-_agent_journal_after() { dexec "$1" -- sh -c "journalctl -u tether-agent --since='$2' --no-pager 2>/dev/null | grep -qF '$3'"; }
+# AGENT SLOG ORACLE — h1 moved this out from under journalctl.
+#
+# origin: docs/reviews/h1-external-review.md F3. Until h1 the agent's slog went
+# to the journal (the sim unit sets no StandardOutput=, so it defaulted there)
+# and this drill grepped `journalctl -u tether-agent`. h1 gives the agent its
+# own size-capped file at $HOME/.tether/agent/<sid>/agent.log and leaves the
+# journal carrying only panics + pre-logger boot output. The old oracle
+# therefore found NOTHING and reported two assertion failures against a product
+# that was behaving correctly — a failing oracle masquerading as a product
+# verdict, which is the one thing this harness must never do.
+#
+# The MAPPING now lives in drills/lib/logs.sh and these are thin aliases. Two
+# copies of a path mapping is precisely how F3 happened: the move updated one
+# and left the other reading a file nothing writes to any more.
+#
+# The cursor is a BYTE OFFSET into that file rather than a timestamp: it needs
+# no clock-format agreement, and it cannot let a line written BEFORE the cursor
+# false-pass a later assertion (the exact failure mode the timestamp gate
+# replaced --after-cursor for).
+_jcursor()          { sim_agent_slog_cursor "$1"; }
+# _agent_slog_after: does the agent's slog contain $3 in the bytes written
+# AFTER offset $2? Reads the native log file (h1 contract), not the journal.
+_agent_slog_after() { sim_agent_slog_grep "$1" "$3" "$2"; }
+# _agent_panic_journal: the OTHER half of the h1 split — panics and pre-logger
+# boot output still land on the journal via raw fd 2. Kept separate on purpose:
+# blurring the two oracles would let a slog assertion pass on a panic line.
+_agent_panic_journal() { dexec "$1" -- sh -c "journalctl -u tether-agent --since='$2' --no-pager 2>/dev/null | grep -qF '$3'"; }
 
 _node_status() { "$SIM" ctl -- node ls -a --json 2>/dev/null | jq -r --arg n "$1" '.nodes[]?|select(.nid==$n)|.status // empty'; }
 # `node ls --json` uses `nid` — NOT `node_id`. (`node_id` is `cluster status --json`'s field; the two
@@ -121,7 +145,7 @@ _b2_start_pty_proc() {
 }
 _b2_proc_running() { "$SIM" ctl -- ps --json 2>/dev/null | jq -e '[.processes[]?|select(.nid=="agt1")|select(.argv|join(" ")|test("sleep 9199"))|select(.status=="RUNNING")]|length>=1' >/dev/null 2>&1; }
 _b3_window_under_300s() { [ $(( $(date +%s) - BK_TS )) -lt 300 ]; }
-_b3_no_reregister() { ! _agent_journal_after agt1 "$CUR0" 'agent: re-registered after reconnect'; }
+_b3_no_reregister() { ! _agent_slog_after agt1 "$CUR0" 'agent: re-registered after reconnect'; }
 _b4_orphan_row()   { "$SIM" ctl -- history --kind proc -n 100 2>/dev/null | grep -qF "PROC  $SID/agt1  pid=$PIDO  kind=killed_orphan  rc=<nil>"; }
 # The NEGATIVE half of the no-rc guarantee: no killed_orphan row for this ULID may carry a numeric rc.
 _b4_orphan_no_rc() { ! "$SIM" ctl -- history --kind proc -n 100 2>/dev/null | grep -qE "pid=$PIDO  kind=killed_orphan  rc=-?[0-9]+"; }
@@ -288,15 +312,15 @@ assert_ok "B4a restart nats-server (NEVER 'systemctl restart tether-agent': syst
 # Three INDEPENDENT timeouts — merging them would blur three different failures into one.
 assert_ok "B1-timeout the broker is reachable again" poll_until 60 2 "broker ready post nats restart" -- _broker_ready
 # DIAGNOSTIC (R-DIAG-OUTSIDE): what did the agent actually do after the nats restart?
-log "B2-diag agent journal after nats restart:"; dexec agt1 -- sh -c "journalctl -u tether-agent --after-cursor='$CUR' --no-pager 2>/dev/null | tail -15" >&2 || true
+log "B2-diag agent slog after nats restart:"; sim_agent_slog_tail agt1 15 >&2 || true
 assert_ok "B2-timeout PRIMARY: the agent RE-REGISTERED (proxy.go:486's exact line, gated on a journal cursor). 'node ls' going ONLINE is explicitly NOT accepted: the restored bundle still holds agt1's node row, so heartbeats alone flip it back with zero register calls" \
-    poll_until 60 2 "agt1 logs 'agent: re-registered after reconnect'" -- _agent_journal_after agt1 "$CUR" 'agent: re-registered after reconnect'
+    poll_until 60 2 "agt1 logs 'agent: re-registered after reconnect'" -- _agent_slog_after agt1 "$CUR" 'agent: re-registered after reconnect'
 assert_ok "B3-timeout the orphan was KILLED (the broker returned a drop directive for a process it has no record of)" \
     poll_until 30 1 "the orphan process is gone" -- _no_orph
 
 # ── B4/B5 — the arm does NOT end at "the process is gone" ───────────────────────────────────────────
 assert_ok "B5 the agent logged the orphan kill (this line IS the evidence the drop directive was received AND acted on; the reconnect path prints no drop_procs count — DOC-25)" \
-    _agent_journal_after agt1 "$CUR" 'agent: kill orphan'
+    _agent_slog_after agt1 "$CUR" 'agent: kill orphan'
 assert_ok "B4a G.5: the killed_orphan audit row exists for the orphan's ULID" \
     poll_until 30 3 "the killed_orphan audit row lands" -- _b4_orphan_row
 assert_ok "B4b and it carries NO rc (product guarantee: exec.go:451-454 sets RC only for exit|reconciled_closed) — asserted in BOTH directions" \

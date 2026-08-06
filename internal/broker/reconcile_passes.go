@@ -2,11 +2,82 @@ package broker
 
 import (
 	"context"
+	"database/sql"
+	"log/slog"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 )
+
+// h1 B1 GC bounds. gcChunkRows caps the keyset baked into ONE raft entry
+// (bounds both the entry size and the Apply txn); maxGCChunksPerTick bounds
+// how many sequential synchronous Proposes one pass tick may issue — worst
+// case the tick blocks for one raft-apply timeout before the registry's own
+// error handling takes over. 10×500 rows / 5min drains the incident's 24k-row
+// backlog in ~25 minutes without ever building a mega-entry. portRetention is
+// deliberately a const, not a knob (h1 plan Q4): FREED/REVOKED rows are pure
+// history; 24h of it is plenty for `ps -a` forensics.
+const (
+	gcChunkRows        = 500
+	maxGCChunksPerTick = 10
+	portRetention      = 24 * time.Hour
+)
+
+// gcProposeChunks drives one cluster-mode GC pass tick: plan a ≤gcChunkRows
+// keyset chunk on the leader DB, Propose it, repeat until a chunk comes back
+// empty or the per-tick chunk budget is spent. A FREE function, not a Broker
+// method, on purpose (h1 plan X-2: the type-methods ledger hand-raise for
+// this increment is spent on respondBytes).
+//
+// Gates: leader-only is enforced by the pass's authorityLeader registration;
+// reaperCaughtUp() keeps a just-elected leader from planning deletes off a
+// still-catching-up FSM view (same gate the xfer reaper uses). Propose errors
+// return to the registry, whose per-pass backoff is the damper.
+func gcProposeChunks(b *Broker, pass string, plan func(db *sql.DB) (*cluster.Command, int, error)) error {
+	if b.cl == nil || b.cl.node == nil {
+		return nil // cluster wiring not up yet (boot window)
+	}
+	if !b.reaperCaughtUp() {
+		return nil
+	}
+	return gcDrain(b.cfg.Logger, pass, b.cl.node.Propose, plan)
+}
+
+// gcDrain is gcProposeChunks' loop with the raft node lifted out as a
+// `propose` parameter, so the two bounds that matter — at most
+// maxGCChunksPerTick Proposes per tick, and STOP at the first empty chunk
+// (idle-zero-writes: an idle GC pass must issue no raft writes at all) — are
+// directly testable without standing up a cluster.
+func gcDrain(
+	logger *slog.Logger,
+	pass string,
+	propose func(func(*sql.DB) (*cluster.Command, error)) error,
+	plan func(db *sql.DB) (*cluster.Command, int, error),
+) error {
+	total := 0
+	for i := 0; i < maxGCChunksPerTick; i++ {
+		n := 0
+		err := propose(func(db *sql.DB) (*cluster.Command, error) {
+			cmd, planned, perr := plan(db)
+			n = planned
+			return cmd, perr
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			break
+		}
+		total += n
+	}
+	if total > 0 {
+		logger.Info("broker: storage gc proposed", "pass", pass, "rows", total)
+	}
+	return nil
+}
 
 // reconcile_passes.go (R7a) — the broker's registered convergence passes.
 //
@@ -100,38 +171,38 @@ func (b *Broker) registerCoreReconcilePasses() {
 		return nil
 	})
 
-	// --- pass 4/4: process-row retention GC (the DIFFERENT-CADENCE shape) ---
+	// --- pass 4: process-row retention GC (the DIFFERENT-CADENCE shape) ---
 	//
 	// This is the pass that makes a flat single-interval table impossible: it
 	// runs on ProcGCInterval (5 min), not ReconcileInterval (1s). Sweeping
 	// retention 300× more often than needed would be pure write amplification.
 	//
-	// The cluster-mode skip is a MODE gate, not a leadership gate, and is kept
-	// verbatim: `processes` is replicated state, so deleting rows outside raft
-	// would fork leader/follower SQLite contents. It stays single-node-only
-	// until it has a replicated command.
+	// h1 B1: the old `if b.clusterMode { return nil }` MODE gate is replaced by
+	// a real cluster branch. That skip was correct for its stated reason —
+	// `processes` is replicated state, deleting outside raft forks the FSM —
+	// but its consequence was that a cluster-mode fleet had NO retention at
+	// all: the 2026-08-04 incident broker (force-single N=1) had accumulated
+	// 8,479 EXITED rows with nothing ever able to delete them. The cluster
+	// branch routes the same retention decision through raft (OpProcGC,
+	// leader-planned explicit pid keysets — see proc.PlanGCExited), so the
+	// pass is now authorityLeader: in single mode that predicate is vacuously
+	// true (byte-identical behavior); in cluster mode only the leader plans
+	// and Proposes.
 	//
-	// Idempotent path: proc.GCExited (a DELETE bounded by a cutoff — the second
-	// run over the same cutoff deletes nothing).
-	r.register("proc-gc", b.cfg.ProcGCInterval, authorityAny, func(_ context.Context, now time.Time) error {
-		// batch B / B3: this used b.livenessDB(), which was misleading in a way worth naming.
-		// The pass is NOT a liveness write — it DELETEs from `processes`, replicated state — and
-		// the mode gate above is the only thing that made the old handle safe. Asking
-		// singleWriter() instead makes the restriction STRUCTURAL: it returns (nil, false) in
-		// cluster mode, so deleting the guard below can no longer turn this into an
-		// outside-raft write to a replicated table. The guard stays as the early, cheap exit.
-		//
-		// (An earlier note in this batch claimed the old code already bypassed raft. It did not —
-		// the mode gate prevented it. The defect was the name, not the behaviour.)
+	// Idempotent path: single mode proc.GCExited (cutoff-bounded DELETE);
+	// cluster mode keyed DELETE + re-asserted status guard (replay no-ops).
+	r.register("proc-gc", b.cfg.ProcGCInterval, authorityLeader, func(_ context.Context, now time.Time) error {
 		if b.clusterMode {
-			return nil
+			return gcProposeChunks(b, "proc-gc", func(db *sql.DB) (*cluster.Command, int, error) {
+				return proc.PlanGCExited(db, now.Add(-b.cfg.ProcRetention), gcChunkRows)
+			})
 		}
 		db, ok := b.singleWriter()
 		if !ok {
-			// Unreachable given the gate above — which is exactly why it returns the named error
-			// rather than nil. If the two ever disagree, a silent nil means `processes` rows
-			// accumulate forever and nobody finds out; the reconciler logs a returned error, so
-			// the contradiction becomes visible instead of becoming a slow leak.
+			// Unreachable given the mode branch above — which is exactly why it returns the
+			// named error rather than nil. If the two ever disagree, a silent nil means
+			// `processes` rows accumulate forever and nobody finds out; the reconciler logs a
+			// returned error, so the contradiction becomes visible instead of a slow leak.
 			return singleWriteRefusal()
 		}
 		cutoff := now.Add(-b.cfg.ProcRetention)
@@ -142,6 +213,36 @@ func (b *Broker) registerCoreReconcilePasses() {
 		}
 		if n > 0 {
 			b.cfg.Logger.Info("broker: proc gc", "deleted", n, "cutoff", cutoff)
+		}
+		return nil
+	})
+
+	// --- pass 5: port-allocation history retention GC (h1 B1) ---
+	//
+	// port_allocations FREED/REVOKED rows had NO retention in ANY mode — the
+	// gap behind the 2026-08-04 `tether ps` incident (a hot reaper-rotation
+	// loop minted one FREED `__proxy__` row per 20s for five weeks; 24k rows
+	// pushed the unbounded ps reply past max_payload). Same cadence and the
+	// same single/cluster split as proc-gc; retention is the hardcoded
+	// portRetention (24h — no knob until someone asks; h1 plan Q4).
+	r.register("port-gc", b.cfg.ProcGCInterval, authorityLeader, func(_ context.Context, now time.Time) error {
+		if b.clusterMode {
+			return gcProposeChunks(b, "port-gc", func(db *sql.DB) (*cluster.Command, int, error) {
+				return port.PlanGCTerminated(db, now.Add(-portRetention), gcChunkRows)
+			})
+		}
+		db, ok := b.singleWriter()
+		if !ok {
+			return singleWriteRefusal()
+		}
+		cutoff := now.Add(-portRetention)
+		n, err := port.GCTerminated(db, cutoff)
+		if err != nil {
+			b.cfg.Logger.Warn("broker: port gc", "err", err)
+			return nil
+		}
+		if n > 0 {
+			b.cfg.Logger.Info("broker: port gc", "deleted", n, "cutoff", cutoff)
 		}
 		return nil
 	})

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -248,4 +249,65 @@ func ReplayReconcileAudit(cmd *cluster.Command) ([]schema.AuditProc, []schema.Au
 		})
 	}
 	return procs, ports, nil
+}
+
+// PlanGCExited renders one OpProcGC chunk (h1 B1): up to `limit` EXITED rows
+// whose end-of-life timestamp is older than `cutoff`, deleted by EXPLICIT pid
+// keyset with the terminal-state guard re-asserted. Returns (nil, 0, nil)
+// when nothing is due — Propose treats a nil planned command as a no-op, so
+// an idle tick writes zero raft entries.
+//
+// TIMESTAMP CONTRACT (h1 plan critique-1): processes.ended_at is TEXT holding
+// heterogeneous encodings — agent exits store modernc's bound-time form
+// ("… +0000 UTC"), while pre-h1 G.1 reconcile baked LitTime of a raw local
+// b.cfg.Now() (zone name + monotonic suffix). SQLite compares TEXT lexically,
+// so `< ?` against those legacy rows is best-effort, not exact. That is why
+// the retention COMPARISON stays HERE, on the leader, and the replicated
+// DELETE keys off pids only: a replica never re-evaluates a timestamp, so the
+// heterogeneity can skew WHEN a legacy row is collected (bounded by the
+// generous retention), never WHETHER replicas agree. cutoff MUST be UTC
+// (callers pass now.Add(-retention).UTC()); G.1 now bakes UTC going forward
+// (reconcile.go), so new rows are homogeneous.
+//
+// COALESCE(ended_at, started_at): an EXITED row with NULL ended_at (a
+// hand-repaired or crash-truncated row) must not be immortal.
+//
+// ROWS-CLOSE CONTRACT (h1 plan critique-2): fsm.db and n.db share ONE
+// SetMaxOpenConns(1) pool. The keyset is materialized into a slice and
+// rows.Close()+rows.Err() are checked BEFORE the Command is built — a plan
+// closure that returned while holding *sql.Rows would deadlock fsm.Apply's
+// Begin() forever.
+func PlanGCExited(db *sql.DB, cutoff time.Time, limit int) (*cluster.Command, int, error) {
+	rows, err := db.Query(
+		`SELECT pid FROM processes
+		  WHERE status='EXITED' AND COALESCE(ended_at, started_at) < ?
+		  ORDER BY rowid LIMIT ?`,
+		cutoff.UTC(), limit,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("proc: plan gc select: %w", err)
+	}
+	var pids []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			_ = rows.Close()
+			return nil, 0, fmt.Errorf("proc: plan gc scan: %w", err)
+		}
+		pids = append(pids, pid)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("proc: plan gc rows: %w", err)
+	}
+	if len(pids) == 0 {
+		return nil, 0, nil
+	}
+	lits, err := cluster.LitTextAll(pids...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("proc: plan gc literal: %w", err)
+	}
+	sql := `DELETE FROM processes WHERE pid IN (` + strings.Join(lits, `, `) +
+		`) AND status='EXITED'`
+	return cluster.NewCommand(cluster.OpProcGC, cluster.Stmt(sql)), len(pids), nil
 }

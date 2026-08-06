@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/backoff"
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
@@ -79,6 +80,13 @@ type AlertReconciler struct {
 	// jsDownSince (G7b #20③) is the leader-local wall-clock of the FIRST JS-503 in the current run of
 	// failures (zero = not currently down). Reset on a positive observation or on losing leadership.
 	jsDownSince time.Time
+	// h1 E3 log-discipline dampers (single-goroutine: only Run's tick touches
+	// them). LOG-only — the 500ms cadence is untouched, because
+	// jsDownThreshold's sustained-window detection needs a per-tick
+	// evaluation. Without these, the same JS outage that drove the d5 loop's
+	// 5.3GB WARN spam also drove these two sites at 2 lines/s.
+	passBO    *backoff.Tracker
+	observeBO *backoff.Tracker
 }
 
 // jsDownThreshold is how long the leader's replica observation must fail with the JS-503 (10008)
@@ -96,7 +104,11 @@ func NewAlertReconciler(cfg AlertReconcilerConfig) *AlertReconciler {
 	if cfg.Poll <= 0 {
 		cfg.Poll = 500 * time.Millisecond
 	}
-	return &AlertReconciler{cfg: cfg}
+	return &AlertReconciler{
+		cfg:       cfg,
+		passBO:    backoff.New(backoff.Policy{Base: time.Second, Cap: 5 * time.Minute}),
+		observeBO: backoff.New(backoff.Policy{Base: time.Second, Cap: 5 * time.Minute}),
+	}
 }
 
 // Run ticks the reconciler until ctx is cancelled. Each tick is leader-gated; a non-leader or
@@ -110,7 +122,13 @@ func (r *AlertReconciler) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			if err := r.ReconcileAlertsOnce(ctx); err != nil {
-				r.cfg.Logger.Warn("d8b: alert reconcile pass", "err", err)
+				// h1 E3: log-discipline only (first failure + class change +
+				// recovery-with-count); the pass itself keeps its cadence.
+				if r.passBO.Fail(r.cfg.Now(), classifyJSErrClass(err)) {
+					r.cfg.Logger.Warn("d8b: alert reconcile pass (repeats suppressed)", "err", err)
+				}
+			} else if suppressed, ok := r.passBO.Recover(r.cfg.Now()); ok {
+				r.cfg.Logger.Info("d8b: alert reconcile recovered", "suppressed_failures", suppressed)
 			}
 			// Beat on EVERY iteration, including the failing ones: the question this answers is "is the
 			// loop alive", and a loop that fails every pass is alive and needs its lastErr read, not to
@@ -228,7 +246,12 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 	if r.cfg.Observe != nil {
 		rep, oerr := r.cfg.Observe(ctx)
 		if oerr != nil {
-			r.cfg.Logger.Warn("d8b: replica observation failed (state unchanged)", "err", oerr)
+			// h1 E3: same log discipline as the pass error above; the
+			// jsDownSince clock below still advances on EVERY failing tick —
+			// only the log line is damped.
+			if r.observeBO.Fail(r.cfg.Now(), classifyJSErrClass(oerr)) {
+				r.cfg.Logger.Warn("d8b: replica observation failed (state unchanged; repeats suppressed)", "err", oerr)
+			}
 			// G7b #20③: sustained JS-503 detection. Advance the down-since clock ONLY on the 10008
 			// "system temporarily unavailable" signature (a stream-not-found / timeout / no-responder is
 			// NOT a wedged JS and must not raise). Raise the synthetic signal once it has persisted for
@@ -251,6 +274,10 @@ func (r *AlertReconciler) ReconcileAlertsOnce(ctx context.Context) error {
 				}
 			}
 		} else if rep.Observed {
+			// h1 E3: end the observe-failure log run with its suppression count.
+			if suppressed, ok := r.observeBO.Recover(r.cfg.Now()); ok {
+				r.cfg.Logger.Info("d8b: replica observation recovered", "suppressed_failures", suppressed)
+			}
 			// G7b #20③: a POSITIVE observation means JS is answering again → clear the JS-503 signal.
 			r.jsDownSince = time.Time{}
 			if r.cfg.SetJSUnavailable != nil {

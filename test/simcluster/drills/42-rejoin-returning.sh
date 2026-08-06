@@ -17,6 +17,7 @@
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/setup-forcesingle.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 PIN=${SIMPIN:-135790}; SID=lab
 # offline recovery tool on a node, as the data-dir owner (tether), pty-fed if it needs a typed confirm.
@@ -28,9 +29,20 @@ _dead_diag() {
     [ "$_dd_rc" = 0 ] && printf '%s' "$_dd_out" | grep -qiE 'force-single .*--confirm-peers-dead brk2|All peers are dead'
 }
 _rejoin_diag() {
-    # install.sh routes StandardError to this durable service log; journalctl intentionally has no
-    # broker payload. Reading the journal made the original namesake arm a deterministic false failure.
-    _rj=$($SIM exec brk2 -- tail -n 1600 /var/log/tether/broker.err 2>/dev/null) || return 1
+    # The broker's application lines live in a durable FILE, never in journald; reading the
+    # journal made the original namesake arm a deterministic false failure.
+    # h1 F3: that file is now broker.log (broker.yaml `log_file:`) rather than the unit's
+    # StandardError redirect, and journald now carries the PANIC stream instead of nothing.
+    # sim_broker_slog reads both broker.log and the legacy broker.err.
+# STARTUP REFUSAL ⇒ BOOT STREAM. This needle is a `return fmt.Errorf(...)` out
+# of Broker.Run (internal/broker/broker.go), which cobra prints to stderr — and
+# h1 routes the unit's stderr to journald, NOT to the slog file. Reading only
+# the slog would make this arm red no matter how correctly the broker refuses.
+# See the rule in drills/lib/logs.sh: ask WHEN the line is written, not who
+# wrote it. The slog is kept as a fallback so the arm survives the refusal
+# moving to after logger setup.
+    _rj=$(sim_broker_panic_journal_dump brk2 2>/dev/null; sim_broker_slog brk2 1600 2>/dev/null)
+    [ -n "$_rj" ] || return 1
     printf '%s' "$_rj" | grep -qi 'recovery rejoin prepare' && printf '%s' "$_rj" | grep -qiE 'EJECTED|raft config still lists peer'
 }
 _reset_after_force_single() {
@@ -39,7 +51,7 @@ _reset_after_force_single() {
     # legitimately sim-side per Mandate ③): a FULL nats-server restart to load the standalone conf + the fresh
     # store, then start the broker. NO hand-rolled mv/rm — that concealment is retired.
     "$SIM" exec brk1 -- sh -eu -c '
-        trap '\''rc=$?; printf "reset failed rc=%s nats=%s broker=%s js=%s\n" "$rc" "$(systemctl is-active nats-server 2>/dev/null || true)" "$(systemctl is-active tether-broker 2>/dev/null || true)" "$(test -d /var/lib/tether/jetstream && echo present || echo missing)"; tail -n 2 /var/log/tether/nats.err /var/log/tether/broker.err 2>/dev/null || true; exit "$rc"'\'' 0
+        trap '\''rc=$?; printf "reset failed rc=%s nats=%s broker=%s js=%s\n" "$rc" "$(systemctl is-active nats-server 2>/dev/null || true)" "$(systemctl is-active tether-broker 2>/dev/null || true)" "$(test -d /var/lib/tether/jetstream && echo present || echo missing)"; tail -n 2 /var/log/tether/nats.err /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null || true; exit "$rc"'\'' 0
         systemctl restart nats-server
         systemctl start tether-broker
         test "$(systemctl is-active nats-server)" = active
@@ -111,7 +123,8 @@ sleep 5
 # (brk2 still exits 70 + Restart=always bounces — the diagnostic prints once per boot).
 node_start brk2
 # brk2 crash-loops (exit 70 + Restart=always), so the diagnostic prints once per boot into the durable
-# StandardError file. Poll that real sink rather than systemd's empty journal payload.
+# slog file (h1 F3: broker.log, named by broker.yaml's `log_file:`). Poll that real sink rather than
+# the journal, which carries the panic stream and not application lines.
 if poll_until 90 4 "brk2 exact rejoin diagnostic in journal" -- _rejoin_diag; then
     _as_pass "A Arm-A (namesake): abandoned brk2 cold-start emits the ACTIONABLE rejoin diagnostic (recovery rejoin prepare / EJECTED / raft config still lists peer) in its journal"
 else

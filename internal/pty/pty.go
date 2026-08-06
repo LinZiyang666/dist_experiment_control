@@ -257,6 +257,38 @@ func (s *Session) KillAndWaitAfterAbandonedStart() {
 	_ = cmd.Wait()
 }
 
+// Hangup is the h1 D ctl-liveness reap action: deliver what a real terminal
+// close delivers — SIGHUP to the child's process GROUP — and close the master
+// fd so the child's next PTY read/write sees EOF/EIO. `tmux attach` exits and
+// the tmux server survives detached; a HUP-immune child keeps running (and
+// keeps its RUNNING row, honestly) — there is deliberately NO SIGKILL
+// escalation here, because the contract is "the terminal went away", not
+// "die".
+//
+// Concurrency (h1 plan critique-4, corrected rationale): the master fd is
+// closed IN PLACE — s.Master stays non-nil and s.closed stays false. The
+// hazard being avoided is not a nil-deref panic (os.File methods are
+// nil-receiver safe) but a DATA RACE: run.go's `.in` callback reads
+// sess.Master without holding s.mu, so Close()'s `s.Master = nil` write would
+// race it under -race. Closing the fd is safe against concurrent Read/Write
+// (os.File serializes against Close) and against the later run-loop Close()
+// (double-Close of an os.File returns ErrClosed, which Close ignores for
+// firstErr purposes only after the nil check — hence closed-in-place).
+//
+// No-op when the child never started or the session is already closed.
+func (s *Session) Hangup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+	// ESRCH (group already gone) is fine — the exit is what we wanted.
+	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGHUP)
+	if s.Master != nil {
+		_ = s.Master.Close() // fd closed in place; pointer NOT nil'd (see above)
+	}
+}
+
 // Close releases the master + slave fds. Idempotent; safe to call after the
 // child has exited AND concurrently with an abandoned, still-wedged Start (it
 // sets closed so that Start, if it later resumes, kills its child and skips the

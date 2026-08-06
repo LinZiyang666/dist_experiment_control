@@ -44,6 +44,7 @@ set -u
 . "$HERE/lib/log.sh"
 . "$HERE/lib/docker.sh"
 . "$HERE/lib/assert.sh"
+. "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 PIN=${SIMPIN:-135790}; SID=lab
 
@@ -181,7 +182,7 @@ assert_ok "CONTROL(after): the SAME tier-B push SUCCEEDS once the peer is back, 
 # kept — the single most likely dishonest version of this fix. The load-bearing tooth is therefore the
 # broker's own journal line proving the retry ACTUALLY RAN.
 _g67_retry_logged() {
-    "$SIM" exec brk1 -- sh -c 'tail -n 400 /var/log/tether/broker.err 2>/dev/null' 2>/dev/null \
+    sim_broker_slog brk1 400 2>/dev/null \
         | grep -qE 'tier-B bucket provisioning retried'
 }
 
@@ -210,7 +211,7 @@ else
         _as_pass "#67 NON-VACUITY: the broker's own journal proves the bounded retry ran (not just re-worded)"
     else
         not_covered "#67 non-vacuity tooth" \
-            "the refusal was worded correctly but no 'tier-B bucket provisioning retried' line was readable in brk1's broker.err, so this run cannot distinguish a real bounded retry from wording alone. NOTE the tooth deliberately does NOT accept the 'gave up' line: that one is emitted even for a PERMANENT single-attempt refusal and would pass with the retry loop deleted" gap
+            "the refusal was worded correctly but no 'tier-B bucket provisioning retried' line was readable in brk1's broker slog, so this run cannot distinguish a real bounded retry from wording alone. NOTE the tooth deliberately does NOT accept the 'gave up' line: that one is emitted even for a PERMANENT single-attempt refusal and would pass with the retry loop deleted" gap
     fi
 fi
 

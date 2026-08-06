@@ -112,6 +112,14 @@ type LocalProcess struct {
 	RC             *int      `json:"rc,omitempty"`
 	StartedAt      time.Time `json:"started_at,omitempty"`
 	StartTimeTicks int64     `json:"start_time_ticks,omitempty"`
+
+	// EndedAt (h1 C4, additive/omitempty) rides a State:"exited" snapshot row
+	// so G.1 can stamp the TRUE end instant instead of register-time `now`.
+	// Pointer: "unknown" must be nil, not the zero time (an old agent omits
+	// it and the broker falls back to now — today's semantics). The broker
+	// clamps it to min(EndedAt, now): a skewed agent clock must not write a
+	// future ended_at into replicated state.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
 }
 
 // LocalPort is one entry in NodeRegisterReq.LocalPorts — the agent's
@@ -132,8 +140,18 @@ type LocalPort struct {
 //  1. RevokePorts — close tunnel sessions + prune state.json.
 //  2. DropProcesses — SIGTERM + 5s + SIGKILL the orphans.
 //
-// AcceptedProcesses / ReconciledProcesses / KeepPorts are
-// informational; the agent may log but isn't required to act.
+// ReconciledProcesses / KeepPorts are informational; the agent may log but
+// isn't required to act.
+//
+// AcceptedProcesses is NOT informational since h1 C4 (and the h1 external
+// review's F1 made the cost of that drift concrete): it means "after this
+// reconcile the broker still believes these pids are RUNNING", and the
+// agent's proc-event courier settles its pending queue against it — a pid
+// present here keeps its pending exit for another attempt, a pid absent is
+// treated as settled. A broker that fails to write an exit MUST therefore
+// still list the pid here (the row really is still RUNNING); reporting it in
+// neither set reads as "settled" and destroys the only copy of the real exit
+// code. See internal/broker/reconcile.go's F1 comments.
 type NodeRegisterResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"`  // e.g. "proto_mismatch", "session_not_found_or_deleting"
@@ -388,6 +406,25 @@ type ProcExitEvent struct {
 	EndedAt  time.Time `json:"ended_at"`
 }
 
+// ProcEventAck (h1 C3) is the broker's reply to an ACKed proc lifecycle
+// event: since h1 the agent's courier sends started/exit as a REQUEST on the
+// existing ev.proc subjects, and the broker responds after the write commits
+// so the courier can delete its pending entry. A pre-h1 agent publishes with
+// no reply inbox and never sees this (byte-identical old path).
+//
+// OK=true means "settled — stop retrying": committed, already recorded
+// (dup), or terminal by leader-committed knowledge (unknown_pid: the row was
+// GC'd or never existed on the COMMITTED view — a stale follower read must
+// never produce it, or the ack would delete a real process's entry and
+// re-create zombie class (a) through the ack path itself; plan critique-1).
+// OK=false means "transient — retry": store_error / leader_unavailable /
+// node_missing (the agent's node row lands with the next register).
+type ProcEventAck struct {
+	OK    bool   `json:"ok"`
+	Code  string `json:"code,omitempty"` // recorded | already_recorded | already_exited | unknown_pid | node_missing | store_error | leader_unavailable
+	Error string `json:"error,omitempty"`
+}
+
 // NodeListReq — ctl pub on ctrl.by.<actor>.s.<sid>.node.list.req
 // (architecture B.1 line 129). Empty body; sid in subject.
 //
@@ -424,9 +461,18 @@ type NodeListResp struct {
 // cannot raise it via Limit, only lower it.
 //
 // IncludeExited maps to the ctl `-a` flag.
+//
+// IncludeFreedPorts (h1 A1) is the ports-side twin of IncludeExited: the
+// default reply carries only live (ALLOCATED) port rows, because FREED/REVOKED
+// history is unbounded — 24k dead `__proxy__` rows once pushed the marshaled
+// PsResp past NATS max_payload and every `tether ps` timed out
+// (docs/reviews/h1-plan.md, 2026-08-04 incident). `-a` sets both flags. An old
+// broker ignores the field (additive/omitempty); the ctl's client-side
+// ALLOCATED filter stays as the belt for that skew.
 type PsReq struct {
-	IncludeExited bool `json:"include_exited,omitempty"`
-	Limit         int  `json:"limit,omitempty"`
+	IncludeExited     bool `json:"include_exited,omitempty"`
+	Limit             int  `json:"limit,omitempty"`
+	IncludeFreedPorts bool `json:"include_freed_ports,omitempty"`
 }
 
 // PsEntry describes one running/exited process for `tether ps`.
@@ -446,6 +492,48 @@ type PsResp struct {
 	Ports     []PsPortEntry `json:"ports,omitempty"`
 	Code      string        `json:"code,omitempty"`
 	Error     string        `json:"error,omitempty"`
+
+	// Truncation surface (h1 A1). Both sections are capped server-side (500);
+	// when a cap bites, the ctl must be able to SAY the view is partial instead
+	// of silently rendering a subset as the whole truth. *_Total is the
+	// uncapped row count of the section as filtered (a second, non-transactional
+	// read — a row landing between count and list can skew it by one; cosmetic,
+	// accepted in the plan).
+	//
+	// WIRE SHAPE — read this before repeating the claim it replaces. An earlier
+	// revision of this comment said "an untruncated reply marshals
+	// byte-identical to v0.4.7". That is FALSE and was corrected at h1 external
+	// review: *_Total is set unconditionally, and `omitempty` drops only the
+	// ZERO value, so any reply listing at least one row carries
+	// `"procs_total":N`. Byte-identity holds ONLY for a reply whose sections are
+	// both empty.
+	//
+	// The N-1 window is satisfied anyway, and by the property that actually
+	// matters: every field is ADDITIVE with a legal zero value, so an old ctl
+	// ignores the new keys and a new ctl reading an old broker's reply sees
+	// *_Total=0 / *_Truncated=false — "nothing was truncated", which is the
+	// correct reading of a broker that never truncates. Claiming byte-identity
+	// as the reason was both wrong and unnecessary, and a wrong justification
+	// is worse than none: the next person weighing a wire change inherits a
+	// test they think passed.
+	ProcsTotal     int  `json:"procs_total,omitempty"`
+	ProcsTruncated bool `json:"procs_truncated,omitempty"`
+	PortsTotal     int  `json:"ports_total,omitempty"`
+	PortsTruncated bool `json:"ports_truncated,omitempty"`
+}
+
+// ReplyTooLarge is the bounded-small fallback reply a broker sends when a
+// marshaled control-plane reply exceeds the NATS server max_payload
+// (h1 A2). Before it existed, msg.Respond's ErrMaxPayload was silently
+// discarded and the ctl saw only a timeout — the 2026-08-04 `tether ps`
+// incident ran five days on exactly that silence. Every *Resp decoder reads
+// Code/Error from the same JSON keys, so this decodes into any of them as a
+// typed error without a schema change. A unit test pins it to ≤512B. An
+// operator-configured max_payload below the fallback size can still reject it;
+// that second send failure is logged rather than recursively retried.
+type ReplyTooLarge struct {
+	Code  string `json:"code"`
+	Error string `json:"error,omitempty"`
 }
 
 // PsPortEntry is the read-side projection of one port_allocations row
@@ -496,6 +584,20 @@ type RunReq struct {
 	// ActorFP — broker-stamped at forward time; same semantics as
 	// ExecReq.ActorFP. Whatever ctl supplies is discarded.
 	ActorFP string `json:"actor_fp,omitempty"`
+
+	// KAIntervalMS (h1 D1, additive/omitempty) advertises the ctl-liveness
+	// keepalive: a ctl that sets it >0 promises to publish an empty keepalive
+	// on SubjPtyKeepalive every KAIntervalMS milliseconds for the run's
+	// lifetime, and the agent arms its reaper (grace = max(6×interval, 3min);
+	// sustained silence while the agent's own conn is verifiably healthy ⇒
+	// SIGHUP the process group — sshd-with-ClientAliveInterval semantics).
+	// 0/absent = capability not advertised = NEVER reap: a pre-h1 ctl sends
+	// nothing here and its runs keep today's live-forever behavior (that
+	// live-forever IS zombie class b, but reaping a client that never
+	// promised keepalives would kill every old ctl's session). An int, not a
+	// bool: additive wire fields are forever, and the interval is the actual
+	// contract term.
+	KAIntervalMS int `json:"ka_interval_ms,omitempty"`
 }
 
 // RunChunk is what the agent / broker streams back on the run.req reply

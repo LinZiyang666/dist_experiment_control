@@ -33,7 +33,7 @@ func (b *Broker) SubscribeClusterGrowTrigger(nc *nats.Conn) (*nats.Subscription,
 			return // not for this broker → stay silent
 		}
 		body, _ := json.Marshal(resp)
-		_ = msg.Respond(body)
+		b.respondBytes(msg, body)
 	})
 }
 

@@ -34,7 +34,8 @@
 #     would certify "re-pin works" while hiding "it only works if you restart the whole fleet"
 #     (Mandate 2). We inject a partition instead — a real network does that.
 #  2. A8 asserting only "the unit failed" would eat ANY crash as green. Guard: the exact
-#     `matches neither the pinned` string, read from broker.err (NOT journalctl — R-BROKERLOG).
+#     `matches neither the pinned` string, read from the broker slog (NOT journalctl — R-BROKERLOG).
+#     h1 F3: the slog is broker.log now (broker.err pre-h1); sim_broker_slog reads both.
 #  3. B2 asserting only "md5 unchanged" is ALSO true when the reconciler never ran at all. Guard: B0
 #     first proves the reconciler DOES re-render on a change it understands. Without B0, #54's mechanism
 #     is inferred rather than observed, and Stage-C would rightly throw it out.
@@ -68,6 +69,7 @@ set -u
 . "$HERE/lib/tether.sh"          # sctl / leader_node — agentyaml.sh depends on sctl
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/cluster.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/drills/lib/fault.sh"
@@ -80,7 +82,8 @@ INST="$INSTANCE"
 
 _bt() { _btn=$1; shift; [ "$1" = "--" ] && shift; dexec -u tether "$_btn" -- "$@"; }
 _pty() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec -u tether "$_pn" -- python3 /opt/sim/pty-confirm.py "$_pa" -- "$@"; }
-_berr() { dexec "$1" -- tail -n "${2:-60}" /var/log/tether/broker.err 2>/dev/null; }
+# h1 F3: broker slog moved broker.err -> broker.log; sim_broker_slog reads both.
+_berr() { sim_broker_slog "$1" "${2:-60}"; }
 
 _brk_active()      { [ "$(dexec "$1" -- systemctl is-active tether-broker 2>/dev/null | tr -d '\r')" = active ]; }
 _brk_not_active()  { ! _brk_active "$1"; }
@@ -357,11 +360,12 @@ assert_ok "A6 the rotation WINDOW is observable: brk1's node carries the new pin
 #       DIED (past the 30s keepalive), not merely that new connects are blocked. No down-edge -> not_covered.
 #   (2) the data plane serving the sentinel again — the fresh yamux redial (supervise -> redialWithBackoff,
 #       tunnel.go:1063 reads the CURRENT rotated cert pins) succeeded against the ROTATED cert = genuine re-pin.
-#   (3) a journalctl reconnect corroboration — INDEPENDENT, logged but NOT gating (its exact line is
+#   (3) an agent-slog reconnect corroboration — INDEPENDENT, logged but NOT gating (its exact line is
 #       agent-reconnect-path dependent, and with NATS left up it is usually unconfirmed; the data-plane edge carries it).
-_A7_TS=$(dexec agt1 -- date '+%Y-%m-%d %H:%M:%S' 2>/dev/null | tr -d '\r')
+# h1 F3: agent slog moved journald -> agent.log; the cursor is a byte offset.
+_A7_TS=$(sim_agent_slog_cursor agt1)
 _a7_dp_down()     { ! dp_curl_ok_body ctl1 "http://brk1:$PUB/" "$TOK"; }
-_a7_reconnected() { dexec agt1 -- sh -c "journalctl -u tether-agent --since '$_A7_TS' --no-pager 2>/dev/null | grep -qE 're-registered after reconnect|agent: registered|rebuilding session'"; }
+_a7_reconnected() { sim_agent_slog_grep agt1 're-registered after reconnect|agent: registered|rebuilding session' "$_A7_TS"; }
 assert_ok "A7a inject: blackhole brk1's tunnel LISTENING port 7000 (silent DROP on brk1) — long enough to outlast the 30s yamux keepalive so agt1's OLD session actually dies (the only way to force a genuine redial); only 7000 is cut, so NATS/route/raft stay up and the cluster is otherwise healthy" \
     fault_partition_on brk1 7000
 assert_ok "A7b PROOF the block took: agt1's connect to brk1:7000 HANGS (rc=124, not a refusal) — impossible unless the tunnel port is dropped, so it is the down-edge's proven fault source" \
@@ -382,7 +386,7 @@ if poll_until 80 3 "the DATA PLANE goes DOWN — the OLD tunnel session died pas
     assert_ok "A7d GENUINE re-pin (KEPT invariant, #63 REFUTED): after the OLD session provably DIED (down-edge past the 30s keepalive), a FRESH yamux redial re-serves the exact sentinel against brk1's ROTATED cert (up-edge) — NOT surviving-session traffic. A failure here is a re-pin REGRESSION, not a known defect" \
         poll_until 100 3 "the data plane serves the exact sentinel again — after a PROVEN down-edge this can only be a fresh redial that re-pinned to the ROTATED cert" -- dp_curl_ok_body ctl1 "http://brk1:$PUB/" "$TOK"
     # journal corroboration — INDEPENDENT, logged but NOT gating (its exact line is reconnect-path dependent).
-    if _a7_reconnected; then ok "A7d journal-CONFIRMED: agt1 re-registered/rebuilt in the same window"; else log "A7d journal-unconfirmed (the down->up data-plane edge is the load-bearing proof)"; fi
+    if _a7_reconnected; then ok "A7d SLOG-CONFIRMED: agt1 re-registered/rebuilt in the same window"; else log "A7d slog-unconfirmed (the down->up data-plane edge is the load-bearing proof)"; fi
 else
     assert_ok "A7c heal the partition (down-edge not observed)" fault_partition_off brk1
     not_covered "52 A7 re-pin (no session drop)" "the data plane never went down within 80s of blackholing brk1's tunnel port — the established TLS/yamux session outlasted the window, so a genuine redial could not be forced in-sim; re-pin is not judged rather than falsely claimed from surviving-session traffic (this is exactly the round-1 false-green the external review flagged)" runtime-guard
@@ -402,13 +406,13 @@ assert_ok "A8b restart brk2's broker (it must now refuse to start: the on-disk c
 assert_ok "A8c brk2's broker does NOT reach active (fail-closed, as designed)" \
     poll_until 25 3 "brk2 broker stays down" -- _brk_not_active brk2
 # The exact string, read from broker.err. "the unit failed" would swallow ANY crash as green.
-assert_ok "A8d broker.err carries the EXACT pin-mismatch refusal (not merely 'the unit failed' — that would eat any crash as green)" \
+assert_ok "A8d the broker slog carries the EXACT pin-mismatch refusal (not merely 'the unit failed' — that would eat any crash as green)" \
     _a8_pin_mismatch_logged
 # DOC-23 (R11 P12 FIXED): the OLD pin-mismatch error told the operator to re-run
 # `tether cluster rotate-tunnel-cert` — UNREACHABLE in this state (wireClusterEarly returns before the
 # admin socket is created, so the command can never connect). The text now points at the ONLY real way
 # out: a FILE-level restore of the pinned tunnel-cert.pem/tunnel-key.pem, then a restart.
-assert_ok "A8e DOC-23 FIXED: the pin-mismatch refusal in broker.err now guides FILE-level recovery ('FILE-level restore', 'put the PREVIOUS tunnel-cert.pem + tunnel-key.pem back', 'restart the broker') and NEVER points at the unreachable 'rotate-tunnel-cert' command it used to dead-end the operator with" \
+assert_ok "A8e DOC-23 FIXED: the pin-mismatch refusal in the broker slog now guides FILE-level recovery ('FILE-level restore', 'put the PREVIOUS tunnel-cert.pem + tunnel-key.pem back', 'restart the broker') and NEVER points at the unreachable 'rotate-tunnel-cert' command it used to dead-end the operator with" \
     _a8_doc23_file_recovery
 assert_ok "A8f restore brk2's SAVED OLD leaf (pre-A8 snapshot, fp==original pin — NOT the new unpinned leaf) and bring it back; the fail-closed broker reaching active is itself proof the restored cert matches the pin (reset-failed first: StartLimitBurst=5/10s is deliberately NOT disabled)" \
     _a8_recover_brk2

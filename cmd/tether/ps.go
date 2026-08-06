@@ -67,7 +67,11 @@ EXITED processes. Architecture F.8 — unified view.`,
 			}
 			defer nc.Close()
 
-			body, err := json.Marshal(proto.PsReq{IncludeExited: showAll})
+			// -a widens BOTH sections (h1 A1): EXITED processes and
+			// FREED/REVOKED port history. The default reply is live-only —
+			// FREED history is unbounded and once pushed the reply past
+			// NATS max_payload.
+			body, err := json.Marshal(proto.PsReq{IncludeExited: showAll, IncludeFreedPorts: showAll})
 			if err != nil {
 				return fmt.Errorf("ps: marshal req: %w", err)
 			}
@@ -91,10 +95,17 @@ EXITED processes. Architecture F.8 — unified view.`,
 						proto.SubjCtrlPs(id.PublicKey, sid), err)
 				}
 				if errors.Is(err, context.DeadlineExceeded) {
+					// h1 A3: the old hint blamed "the processes table may be
+					// unusually large" — provably wrong in the 2026-08-04
+					// incident (the reply was oversize and silently dropped;
+					// h1 made that a typed reply_too_large error instead).
+					// A timeout here now means the broker never answered at
+					// all: restarting, overloaded, or wedged.
 					return fmt.Errorf("ps: request timed out after %s: %w "+
-						"(broker is reachable for other commands; the "+
-						"processes table may be unusually large — "+
-						"retry, or contact your operator)", timeout, err)
+						"(the broker accepted the connection but never "+
+						"replied — it may be restarting or overloaded; "+
+						"check `tether alert ls` and the broker log, or "+
+						"raise TETHER_PS_TIMEOUT)", timeout, err)
 				}
 				return fmt.Errorf("ps: request failed: %w", err)
 			}
@@ -122,7 +133,12 @@ EXITED processes. Architecture F.8 — unified view.`,
 						ports = append(ports, p)
 					}
 				}
-				if err := emitJSON(out, psJSON{Schema: "ps", SchemaVersion: 1, Processes: normSlice(procs), Ports: normSlice(ports)}); err != nil {
+				if err := emitJSON(out, psJSON{
+					Schema: "ps", SchemaVersion: 1,
+					Processes: normSlice(procs), Ports: normSlice(ports),
+					ProcsTotal: resp.ProcsTotal, ProcsTruncated: resp.ProcsTruncated,
+					PortsTotal: resp.PortsTotal, PortsTruncated: resp.PortsTruncated,
+				}); err != nil {
 					return err
 				}
 				withBanner(nc, id.PublicKey, true) // suppressed under --json
@@ -158,9 +174,27 @@ EXITED processes. Architecture F.8 — unified view.`,
 			if err := tw.Flush(); err != nil {
 				return err
 			}
+			// h1 A1: a capped reply must SAY it is partial. The broker returns
+			// at most its server cap (500) per section and reports the
+			// uncapped total alongside.
+			if resp.ProcsTruncated {
+				_, _ = fmt.Fprintf(out, "  (truncated: %d of %d process rows returned — server cap)\n",
+					len(resp.Processes), resp.ProcsTotal)
+			}
 
 			if err := renderPortsTable(out, resp.Ports, showAll, now); err != nil {
 				return err
+			}
+			if resp.PortsTruncated {
+				// origin: h1 external review F7. The earlier wording promised
+				// "live rows are never omitted", which the 500-row cap cannot
+				// guarantee: the live-first sort keeps history from displacing
+				// live rows, but a session with MORE than the cap in ALLOCATED
+				// rows (the 14000-14999 band allows it) still loses some. Say
+				// what is actually true.
+				_, _ = fmt.Fprintf(out, "  (truncated: %d of %d port rows returned — live rows are listed first; "+
+					"a session with more than %d live rows can still have some omitted)\n",
+					len(resp.Ports), resp.PortsTotal, len(resp.Ports))
 			}
 			withBanner(nc, id.PublicKey, false) // D8b §10.3: severe-alert banner to stderr (stdout stays parseable)
 			return nil

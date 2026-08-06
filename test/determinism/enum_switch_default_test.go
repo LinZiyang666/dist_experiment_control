@@ -61,8 +61,14 @@ var enumFamilies = map[string][]string{
 	// origin: gotcha #72 — the bounded-teardown ladder's caller intent. Two members today
 	// (rebuild / shutdown) with genuinely different terminal moves (self-exec vs exit); a third
 	// would need its own, so a `default:` over this must never be allowed to silence exhaustive.
-	"agent.teardownIntent":         {"teardown"},
-	"agent.transferMode":           {"mode"},
+	"agent.teardownIntent": {"teardown"},
+	"agent.transferMode":   {"mode"},
+	// origin: h1 D (docs/reviews/h1-plan.md workstream D). shouldReapRun's
+	// three-way verdict: a future fourth state (say "reap without SIGHUP" for
+	// a non-PTY stream) must be forced through every switch rather than
+	// silently inheriting a `default:` — the whole point of the ladder is
+	// that each state maps to a DIFFERENT irreversible action.
+	"agent.reapVerdict":            {"reap"},
 	"authcallout.role":             {"role"},
 	"broker.admitRole":             {"admit"},
 	"broker.cutoverAction":         {"cutover"},
@@ -371,7 +377,11 @@ func TestNoDefaultOnRepoEnumSwitch(t *testing.T) {
 	// family NOT in this list that starts being hit means somebody wrote the first switch over that enum, and
 	// the gate says so — which is the moment its coverage becomes load-bearing.
 	familiesWithSwitches := map[string]bool{
-		"agent.openOutcome":        true,
+		"agent.openOutcome": true,
+		// h1 D: the ctl-liveness reaper switches on shouldReapRun's verdict —
+		// from here on that switch's exhaustiveness is load-bearing (each
+		// verdict maps to a different irreversible action).
+		"agent.reapVerdict":        true,
 		"authcallout.role":         true,
 		"broker.admitRole":         true,
 		"broker.cutoverAction":     true,

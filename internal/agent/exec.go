@@ -125,10 +125,14 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 	pid := proc.NewPID()
 	a.cfg.Logger.Info("agent: exec", "pid", pid, "argv", req.Argv)
 	a.replyChunk(nc, msg.Reply, proto.ExecChunk{Kind: "started", PID: pid})
-	a.pubProcStarted(nc, pid, req.Argv, req.ActorFP)
+	// h1 C1: lifecycle events go through the courier (current-conn, ACKed,
+	// register-replayed) — never a fire-and-forget publish on the captured
+	// spawn-time conn, which silently lost every exit after a conn rebuild
+	// (zombie class a, the 2026-08-04 incident).
+	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP, "", 0, time.Now().UTC())
 
 	exitCode, err := a.runChild(nc, msg.Reply, pid, &req)
-	a.pubProcExit(nc, pid, exitCode)
+	a.courier.enqueueExit(pid, exitCode)
 
 	if err != nil {
 		a.replyChunk(nc, msg.Reply, proto.ExecChunk{
@@ -257,57 +261,13 @@ func (a *Agent) replyChunk(nc *nats.Conn, replyTo string, c proto.ExecChunk) {
 	}
 }
 
-func (a *Agent) pubProcStarted(nc *nats.Conn, pid string, argv []string, actorFP string) {
-	a.pubProcStartedWithTriple(nc, pid, argv, actorFP, "", 0, time.Now().UTC())
-}
-
-// pubProcStartedWithTriple is the full-info variant: PTY children
-// can include the (boot_id, start_time_ticks) pair captured at fork
-// time so the broker persists them in processes.boot_id /
-// .start_time_ticks for the next G.1 reconcile to verify against.
-// Exec children call pubProcStarted (which leaves both empty) — they
-// have a sync lifecycle and no agent-side persistence path that would
-// need the verification.
-func (a *Agent) pubProcStartedWithTriple(
-	nc *nats.Conn,
-	pid string,
-	argv []string,
-	actorFP string,
-	bootID string,
-	startTimeTicks int64,
-	startedAt time.Time,
-) {
-	payload, err := json.Marshal(proto.ProcStartedEvent{
-		PID:            pid,
-		Argv:           argv,
-		StartedAt:      startedAt,
-		StartedByFP:    actorFP,
-		BootID:         bootID,
-		StartTimeTicks: startTimeTicks,
-	})
-	if err != nil {
-		return
-	}
-	subj := proto.SubjEvProc(a.cfg.SID, a.cfg.NID, pid, "started")
-	if err := nc.Publish(subj, payload); err != nil {
-		a.cfg.Logger.Warn("agent: pub proc.started", "err", err)
-	}
-}
-
-func (a *Agent) pubProcExit(nc *nats.Conn, pid string, exitCode int) {
-	payload, err := json.Marshal(proto.ProcExitEvent{
-		PID:      pid,
-		ExitCode: exitCode,
-		EndedAt:  time.Now().UTC(),
-	})
-	if err != nil {
-		return
-	}
-	subj := proto.SubjEvProc(a.cfg.SID, a.cfg.NID, pid, "exit")
-	if err := nc.Publish(subj, payload); err != nil {
-		a.cfg.Logger.Warn("agent: pub proc.exit", "err", err)
-	}
-}
+// pubProcStarted / pubProcStartedWithTriple / pubProcExit were DELETED in h1
+// C1: they fire-and-forget published on a CAPTURED conn, which is exactly the
+// zombie-class-a defect (a mid-run conn rebuild silently lost every exit).
+// Their replacement is the procCourier (proc_delivery.go) — current-conn,
+// ACKed, register-replayed. The (boot_id, start_time_ticks) full-info triple
+// the PTY variant carried now rides enqueueStarted's parameters; exec children
+// pass ""/0 as before (sync lifecycle, no G.1 verification need).
 
 func envSliceFromMap(m map[string]string) []string {
 	if len(m) == 0 {

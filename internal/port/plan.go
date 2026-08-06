@@ -3,6 +3,7 @@ package port
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -311,4 +312,55 @@ func planPortStateChange(db *sql.DB, op cluster.OpType, newState string, publicP
 		`, revoked_at=` + cluster.LitTime(now.UTC()) +
 		` WHERE port=` + cluster.LitInt(int64(publicPort)) + ` AND state='ALLOCATED'`
 	return cluster.NewCommand(op, cluster.Stmt(sql)), nil
+}
+
+// PlanGCTerminated renders one OpPortGC chunk (h1 B1): up to `limit`
+// FREED/REVOKED port_allocations rows whose end-of-life timestamp is older
+// than `cutoff`, deleted by EXPLICIT row_id keyset with the terminal-state
+// guard re-asserted. Returns (nil, 0, nil) when nothing is due (Propose
+// no-ops on a nil command → idle-zero-writes).
+//
+// This is the op that drains the 2026-08-04 incident backlog: 24k FREED
+// `__proxy__` rows minted by the reaper's 20s rotation loop, which nothing
+// ever deleted (port_allocations had NO GC in any mode).
+//
+// Same three contracts as proc.PlanGCExited, same rationale (see its doc):
+// retention comparison stays leader-side against heterogeneous timestamp
+// TEXT (cutoff MUST be UTC); COALESCE(revoked_at, created_at) so a NULL
+// revoked_at terminal row is not immortal; keyset materialized + Rows closed
+// BEFORE the Command is built (shared SetMaxOpenConns(1) pool — an open
+// *sql.Rows at Propose time wedges fsm.Apply forever).
+func PlanGCTerminated(db *sql.DB, cutoff time.Time, limit int) (*cluster.Command, int, error) {
+	rows, err := db.Query(
+		`SELECT row_id FROM port_allocations
+		  WHERE state IN ('FREED','REVOKED') AND COALESCE(revoked_at, created_at) < ?
+		  ORDER BY row_id LIMIT ?`,
+		cutoff.UTC(), limit,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("port: plan gc select: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, 0, fmt.Errorf("port: plan gc scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("port: plan gc rows: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, 0, nil
+	}
+	lits := make([]string, 0, len(ids))
+	for _, id := range ids {
+		lits = append(lits, cluster.LitInt(id))
+	}
+	sql := `DELETE FROM port_allocations WHERE row_id IN (` + strings.Join(lits, `, `) +
+		`) AND state IN ('FREED','REVOKED')`
+	return cluster.NewCommand(cluster.OpPortGC, cluster.Stmt(sql)), len(ids), nil
 }

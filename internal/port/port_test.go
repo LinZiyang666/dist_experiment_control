@@ -540,3 +540,102 @@ func TestSessionDeleteCascadesPortRows(t *testing.T) {
 		t.Errorf("session delete should cascade to port_allocations: got %d rows", len(rows))
 	}
 }
+
+// ---- h1 A1: bounded, live-first ps listing ----------------------------------
+// origin: docs/reviews/h1-plan.md workstream A1 (2026-08-04 `tether ps`
+// max_payload incident — 24k FREED rows in one session).
+
+// seedRawAllocation inserts a port_allocations row directly so tests can build
+// histories that Allocate's live-port uniqueness would refuse (thousands of
+// FREED rows on recycled ports, controlled created_at ordering).
+func seedRawAllocation(t *testing.T, db *sql.DB, sid, nid string, portN int, name, state string, createdAt time.Time) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
+		 VALUES (?, ?, ?, ?, 0, ?, ?, 'SHA256:test', ?)`,
+		portN, sid, nid, name, name+"-hash", state, createdAt.UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListBySessionFilteredLiveOnlyExcludesHistory(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "s1", "n1")
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	seedRawAllocation(t, db, "s1", "n1", 14000, "live-a", "ALLOCATED", base)
+	seedRawAllocation(t, db, "s1", "n1", 14001, "live-b", "ALLOCATED", base.Add(time.Hour))
+	seedRawAllocation(t, db, "s1", "n1", 14002, "dead-1", "FREED", base.Add(2*time.Hour))
+	seedRawAllocation(t, db, "s1", "n1", 14003, "dead-2", "FREED", base.Add(3*time.Hour))
+	seedRawAllocation(t, db, "s1", "n1", 14004, "dead-3", "REVOKED", base.Add(4*time.Hour))
+
+	got, err := ListBySessionFiltered(db, "s1", ListBySessionOpts{IncludeFreed: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("live-only view returned %d rows, want 2", len(got))
+	}
+	if got[0].Port != 14000 || got[1].Port != 14001 {
+		t.Fatalf("live-only view must keep port-ASC order, got %d,%d", got[0].Port, got[1].Port)
+	}
+	n, err := CountBySession(db, "s1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("CountBySession(live)=%d, want 2", n)
+	}
+}
+
+// TestListBySessionFilteredLiveRowsSurviveLimit is the critique-4 adversarial
+// fixture: live ALLOCATED rows are OLDER than a flood of newer FREED and
+// REVOKED history that alone exceeds the limit. A recency-only sort would
+// evict every live row from a truncated `-a` view; the live-first sort key
+// `(state='ALLOCATED') DESC` must keep them all, in first positions.
+func TestListBySessionFilteredLiveRowsSurviveLimit(t *testing.T) {
+	db := openDB(t)
+	seedSessionAndNode(t, db, "s1", "n1")
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	// 3 live rows, OLDEST timestamps in the whole table.
+	for i, name := range []string{"live-a", "live-b", "live-c"} {
+		seedRawAllocation(t, db, "s1", "n1", 14000+i, name, "ALLOCATED", base.Add(time.Duration(i)*time.Minute))
+	}
+	// 600 FREED newer + 550 REVOKED newest — the incident shape (reaper churn).
+	for i := 0; i < 600; i++ {
+		seedRawAllocation(t, db, "s1", "n1", 14005, "freed", "FREED", base.AddDate(0, 0, 1).Add(time.Duration(i)*time.Second))
+	}
+	for i := 0; i < 550; i++ {
+		seedRawAllocation(t, db, "s1", "n1", 14006, "revoked", "REVOKED", base.AddDate(0, 0, 2).Add(time.Duration(i)*time.Second))
+	}
+
+	const limit = 500
+	got, err := ListBySessionFiltered(db, "s1", ListBySessionOpts{IncludeFreed: true, Limit: limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != limit {
+		t.Fatalf("limited view returned %d rows, want %d", len(got), limit)
+	}
+	liveSeen := map[string]bool{}
+	for i, a := range got[:3] {
+		if a.State != StateAllocated {
+			t.Fatalf("row %d is %s %q — live rows must sort strictly first", i, a.State, a.Name)
+		}
+		liveSeen[a.Name] = true
+	}
+	if len(liveSeen) != 3 {
+		t.Fatalf("truncated view lost a live allocation: %v (1150 newer dead rows evicted it)", liveSeen)
+	}
+	// History fills the remainder newest-first.
+	if got[3].State == StateAllocated {
+		t.Fatalf("only 3 live rows were seeded; row 3 must be history, got ALLOCATED")
+	}
+	total, err := CountBySession(db, "s1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3+600+550 {
+		t.Fatalf("CountBySession(all)=%d, want %d", total, 3+600+550)
+	}
+}

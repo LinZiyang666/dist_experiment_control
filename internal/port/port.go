@@ -307,7 +307,14 @@ func LookupByTokenHash(db *sql.DB, tokenHash string) (*Allocation, error) {
 }
 
 // ListBySession returns every row (any state) for sid, sorted by port
-// ASC. Used by `tether ps` to render the PORTS section.
+// ASC. Kept as the unbounded, port-ordered iterator for the
+// reconcile/forward/proxy callers that must see every row in stable
+// port order; `tether ps` now goes through ListBySessionFiltered
+// (h1 A1) instead — an unbounded ps reply once crossed NATS
+// max_payload on 24k FREED rows and was silently dropped. NOT a
+// wrapper over ListBySessionFiltered on purpose: the filtered
+// IncludeFreed ordering is live-first/recency, and changing this
+// function's port-ASC contract would silently reorder those callers.
 func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 	rows, err := db.Query(
 		`SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
@@ -331,6 +338,93 @@ func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 		out = append(out, *a)
 	}
 	return out, rows.Err()
+}
+
+// ListBySessionOpts narrows ListBySessionFiltered (h1 A1), mirroring
+// proc.ListBySessionOpts on the processes side.
+//
+//   - IncludeFreed=false returns only live (state='ALLOCATED') rows,
+//     ordered by port ASC — byte-identical to the pre-h1 view after the
+//     ctl's own ALLOCATED filter, which is exactly what default
+//     `tether ps` renders.
+//   - IncludeFreed=true returns every state, ordered live-first:
+//     `(state='ALLOCATED') DESC, created_at DESC, port ASC`. Live rows
+//     sort strictly before any FREED/REVOKED history so a Limit can
+//     never push a live allocation out of a truncated `-a` view no
+//     matter how many newer dead rows exist (h1 plan, critique-4: a
+//     plain recency sort let >Limit newer REVOKED rows evict live ones).
+//   - Limit > 0 caps the returned slice; 0 = unbounded.
+type ListBySessionOpts struct {
+	IncludeFreed bool
+	Limit        int
+}
+
+// ListBySessionFiltered is the bounded per-session port listing behind
+// `tether ps` (h1 A1). See ListBySessionOpts for the ordering contract.
+func ListBySessionFiltered(db *sql.DB, sid string, opts ListBySessionOpts) ([]Allocation, error) {
+	q := `SELECT port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, revoked_at,
+	        home_broker, epoch, rebuild_on_failure
+	 FROM port_allocations
+	 WHERE sid=?`
+	args := []any{sid}
+	if opts.IncludeFreed {
+		q += ` ORDER BY (state='ALLOCATED') DESC, created_at DESC, port ASC`
+	} else {
+		q += ` AND state='ALLOCATED' ORDER BY port`
+	}
+	if opts.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, opts.Limit)
+	}
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("port: list: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Allocation
+	for rows.Next() {
+		a, err := scanRowWithHome(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	return out, rows.Err()
+}
+
+// GCTerminated deletes FREED/REVOKED rows whose end-of-life timestamp is
+// older than cutoff — the SINGLE-mode twin of the replicated OpPortGC path
+// (h1 B1; mirrors proc.GCExited). COALESCE keeps a NULL-revoked_at terminal
+// row from being immortal. Callers pass a UTC cutoff (the stored column is
+// heterogeneous TEXT — see PlanGCTerminated's timestamp contract).
+func GCTerminated(db *sql.DB, cutoff time.Time) (int64, error) {
+	res, err := db.Exec(
+		`DELETE FROM port_allocations
+		  WHERE state IN ('FREED','REVOKED') AND COALESCE(revoked_at, created_at) < ?`,
+		cutoff.UTC(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("port: gc terminated: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// CountBySession reports how many rows ListBySessionFiltered would
+// match WITHOUT its Limit — the `PortsTotal` the ps reply surfaces so a
+// truncated view can say so (h1 A1). Deliberately a second,
+// non-transactional read; the ±1 skew against the list is cosmetic and
+// documented on proto.PsResp.
+func CountBySession(db *sql.DB, sid string, includeFreed bool) (int, error) {
+	q := `SELECT COUNT(*) FROM port_allocations WHERE sid=?`
+	if !includeFreed {
+		q += ` AND state='ALLOCATED'`
+	}
+	var n int
+	if err := db.QueryRow(q, sid).Scan(&n); err != nil {
+		return 0, fmt.Errorf("port: count: %w", err)
+	}
+	return n, nil
 }
 
 // Free transitions ALLOCATED → FREED (or no-op on REVOKED/FREED). Used

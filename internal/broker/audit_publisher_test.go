@@ -2,6 +2,8 @@ package broker
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -24,14 +26,30 @@ type fakeReader struct {
 	published    uint64
 	advanceCalls int
 	advanceErr   error
+	// h1 E3 instrumentation: publishedReads counts PublishOnce ATTEMPTS (it
+	// reads the cursor first thing every attempt); numVotersErr makes
+	// ReconcileOnce fail deterministically at its first read, and
+	// numVotersCalls counts its attempts.
+	publishedReads int
+	numVotersErr   error
+	numVotersCalls int
 }
 
-func (f *fakeReader) IsLeader() bool                       { return f.leader }
-func (f *fakeReader) LeaderContactStale(time.Time) bool    { return f.stale }
-func (f *fakeReader) CommitIndex() uint64                  { return f.commit }
-func (f *fakeReader) LogFirstIndex() (uint64, error)       { return f.first, nil }
-func (f *fakeReader) AuditPublishedIndex() (uint64, error) { return f.published, nil }
-func (f *fakeReader) NumVoters() (int, error)              { return 3, nil }
+func (f *fakeReader) IsLeader() bool                    { return f.leader }
+func (f *fakeReader) LeaderContactStale(time.Time) bool { return f.stale }
+func (f *fakeReader) CommitIndex() uint64               { return f.commit }
+func (f *fakeReader) LogFirstIndex() (uint64, error)    { return f.first, nil }
+func (f *fakeReader) AuditPublishedIndex() (uint64, error) {
+	f.publishedReads++
+	return f.published, nil
+}
+func (f *fakeReader) NumVoters() (int, error) {
+	f.numVotersCalls++
+	if f.numVotersErr != nil {
+		return 0, f.numVotersErr
+	}
+	return 3, nil
+}
 func (f *fakeReader) CommittedCommandAt(idx uint64) (*cluster.Command, error) {
 	if idx < f.first {
 		return nil, cluster.ErrLogTruncated
@@ -286,3 +304,53 @@ func TestD5AllAtTargetCanonical(t *testing.T) {
 		t.Fatal("all-ready must be AllAtTarget && !Degraded")
 	}
 }
+
+// TestReconcileBackoffNeverThrottlesAuditPublish is the h1 E3 R-7-protection
+// contract: with ReconcileOnce failing persistently, (1) PublishOnce is still
+// ATTEMPTED on every tick — its cadence is what keeps the audit-publish lag
+// inside the TrailingLogs bound, so the backoff must never gate it; (2) the
+// reconcile ATTEMPTS collapse onto the 1s→…→5min backoff schedule instead of
+// one per 100ms tick; (3) exactly ONE warn line is emitted for the whole
+// failing run (the incident wrote one line per tick for five weeks — 5.3GB).
+//
+// Mutation checks: gating PublishOnce behind reconBO.Due → (1) red; removing
+// the reconBO.Due gate in tick → (2) red; removing the Fail log discipline →
+// (3) red.
+func TestReconcileBackoffNeverThrottlesAuditPublish(t *testing.T) {
+	f := &fakeReader{leader: true, numVotersErr: errStubReconcile}
+	clk := newFakeClock(passEpoch)
+	rec := &levelRecorder{}
+	p := NewAuditPublisher(AuditPublisherConfig{
+		Node:   f,
+		Now:    clk.Now,
+		Logger: slog.New(rec),
+	})
+
+	const ticks = 1000 // 100s of fake time at the 100ms poll
+	for i := 0; i < ticks; i++ {
+		p.tick(context.Background())
+		clk.advance(100 * time.Millisecond)
+	}
+
+	if f.publishedReads != ticks {
+		t.Fatalf("PublishOnce attempted %d/%d ticks — the backoff must NEVER gate the publish drain (R-7 lag bound)", f.publishedReads, ticks)
+	}
+	// 100s under 1s→2s→4s→… ⇒ attempts at t=0,1,3,7,15,31,63 ≈ 7; anything
+	// near the tick count means the damper is off.
+	if f.numVotersCalls > 20 {
+		t.Fatalf("ReconcileOnce attempted %d times in 100s — backoff is not pacing attempts", f.numVotersCalls)
+	}
+	warns := 0
+	for _, lv := range rec.levels() {
+		if lv == slog.LevelWarn {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("persistent same-class reconcile failure logged %d warns, want exactly 1 (first of the run)", warns)
+	}
+}
+
+// errStubReconcile is the deterministic persistent failure the backoff test
+// drives ReconcileOnce with (classified "other" — one stable class).
+var errStubReconcile = errors.New("stub: reconcile down")

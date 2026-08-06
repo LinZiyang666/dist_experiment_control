@@ -70,6 +70,9 @@ var brokerCodeHints = map[string]string{
 	// Storage / generic
 	"store_error": "the broker hit a SQLite error; check the broker log.",
 	"json_parse":  "the broker couldn't parse our request; this is a tether bug — please report.",
+	"reply_too_large": "the broker's reply exceeded its NATS max_payload and only this stub arrived. " +
+		"Reply sections are bounded, so this is a tether bug (not fixed by retrying) — " +
+		"check the broker ERROR log for the oversize subject and report it.",
 	// Cluster transient states (B1 item 6). All three are FAILOVER/transient artifacts — nothing
 	// the user did wrong, just wait and retry. NOTE: as of today NONE of these reaches a ctl
 	// reply: home_catching_up + try_again are returned from tunnelTokenLookup (the AGENT's tunnel
@@ -129,6 +132,12 @@ var brokerCodeExitClasses = map[string]int{
 	// our bug / version skew -> internal
 	"agent_malformed_resp": exitInternal, "json_parse": exitInternal,
 	"store_error": exitInternal,
+	// h1 A2 (plan Q1 ruling): the broker built a reply larger than its own NATS
+	// max_payload and sent the tiny typed fallback instead. Every reply section
+	// is bounded after h1 A1, so this is deterministically a tether bug — 70,
+	// and the ONE documented non-retryable exception to §9.13's "retry 70"
+	// guidance (retrying re-sends the same oversize reply forever).
+	"reply_too_large": exitInternal,
 	// External review M1: proto_bump_requires_reinstall was exitInternal(70)
 	// while proto_mismatch — the same refusal, same remedy — was 64. docs/usage.md
 	// says both need a full reinstall, and §9.13 tells automation that 70 is

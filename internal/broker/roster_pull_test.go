@@ -35,7 +35,7 @@ func TestG3ClusterRosterPullServesSignedManifest(t *testing.T) {
 	nc := g3NatsConn(t)
 	b, accountPub, _ := newManifestTestBroker(t)
 
-	sub, err := SubscribeClusterRosterPull(nc, b.manifestBytes)
+	sub, err := SubscribeClusterRosterPull(nc, b.manifestBytes, nil)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestG3ClusterRosterPullUnsignedIsSilentTimeout(t *testing.T) {
 	b, _, _ := newManifestTestBroker(t)
 	b.selfID = "" // manifestBytes returns (nil,false) → responder stays silent
 
-	sub, err := SubscribeClusterRosterPull(nc, b.manifestBytes)
+	sub, err := SubscribeClusterRosterPull(nc, b.manifestBytes, nil)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestG3RosterPullDelegatesToManifestFn(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return []byte(`{"schema_version":1}`), true
 	}
-	sub, err := SubscribeClusterRosterPull(nc, fakeFn)
+	sub, err := SubscribeClusterRosterPull(nc, fakeFn, nil)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

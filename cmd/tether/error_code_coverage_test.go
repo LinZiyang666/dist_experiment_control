@@ -105,6 +105,17 @@ var unclassifiedCodeAllowlist = map[string]string{
 		"(*Broker).finalizeStrandedXfers in internal/broker/xfer_inflight.go, never onto a ctl reply, " +
 		"so no exit class applies.",
 
+	// h1 C3: the five proto.ProcEventAck codes. Consumed EXCLUSIVELY by the
+	// agent's proc-event courier (internal/agent/proc_delivery.go — it reads
+	// ack.OK, and OK carries the whole retry/stop decision); no ctl command
+	// ever receives them, so no exit class applies. The OK bit, not the code,
+	// is the machine contract — the code is operator-log vocabulary.
+	"recorded":         "ProcEventAck code, agent-courier-only (see the h1 C3 block note above).",
+	"already_recorded": "ProcEventAck code, agent-courier-only (see the h1 C3 block note above).",
+	"already_exited":   "ProcEventAck code, agent-courier-only (see the h1 C3 block note above).",
+	"unknown_pid":      "ProcEventAck code, agent-courier-only (see the h1 C3 block note above).",
+	"node_missing":     "ProcEventAck code, agent-courier-only (see the h1 C3 block note above).",
+
 	// The three below are CATCH-ALL branches: both a permanent cause (disk full,
 	// quota) and a transient one (momentary I/O pressure) land here, and the
 	// code carries no way to tell them apart. Guessing 75 would tell a monitor

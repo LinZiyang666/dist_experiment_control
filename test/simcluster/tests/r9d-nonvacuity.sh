@@ -333,14 +333,20 @@ endpoints: '
 expect F "MUTATION _ep_has brk3 on an empty endpoints line → fail closed"                          _ep_has brk3
 
 section "drill 80 — _rl_logged (#25 CLOSED: broker rate-limit signature; H12 empty-needle guard)"
-cat > "$TMP/bin/journalctl" <<'JEOF'
-#!/bin/sh
-printf '%s\n' "$NV_LOG"
-JEOF
-chmod +x "$TMP/bin/journalctl"
-export NV_LOG
-SIM=_sim_rl_stub
-_sim_rl_stub() { shift 3; PATH="$TMP/bin:$PATH" "$@"; }   # emulate `$SIM exec brk1 -- sh -c "<payload>"`
+# h1 F3: the seam moved. This section used to stub `journalctl` onto PATH and
+# emulate `$SIM exec brk1 -- sh -c "<payload>"`, because _rl_logged inlined its
+# own journal read. It now delegates to drills/lib/logs.sh, so the honest seam
+# is that LIBRARY FUNCTION — stub it and drive the same two-sided table.
+#
+# This is worth a note beyond the mechanical fix, because of HOW the break
+# presented: after the migration the old stub no longer intercepted anything,
+# _rl_logged became permanently false, and the two MUTATION arms went on
+# "passing" — for entirely the wrong reason. Only the positive arm caught it.
+# A nonvacuity suite whose negative arms can pass on a dead oracle is exactly
+# the thing this file exists to prevent, so the lesson is the general one: when
+# a predicate is re-pointed at a new seam, the stub must follow it to that seam,
+# never sit on the transport it used to reach through.
+sim_broker_slog_grep() { printf '%s\n' "$NV_LOG" | grep -qE "$2"; }
 eval "$(extract "$SIMDIR/drills/80-session-isolation.sh" _rl_logged)"
 NV_LOG='ts level=WARN msg="authcallout: ctl PIN attempt rate-limited" sid=lab ip=10.0.0.9'
 expect T "TRUE  _rl_logged when the broker log carries the rate-limit warning (per-IP §E.6 limiter fired)" _rl_logged

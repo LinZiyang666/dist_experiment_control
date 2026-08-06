@@ -62,6 +62,7 @@ set -u
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/drills/lib/fault.sh"
 . "$HERE/drills/lib/events.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/lib/assert.sh"
 
 SID=lab
@@ -485,7 +486,10 @@ else
     # GC (R16 Lane C, the only thing that can reclaim a STRUCTURALLY split-home bucket no home owns).
     _reaped_anywhere=0
     for _rb in brk1 brk2 brk3; do
-        if dexec "$_rb" -- sh -c 'grep -qE "orphan xfer objects reaped|cross-home GC reaped aged orphan xfer objects" /var/log/tether/broker.err' 2>/dev/null; then _reaped_anywhere=1; break; fi
+        # h1 F3: both reap signatures are SLOG lines, which moved to broker.log.
+        # Reading only broker.err would make _reaped_anywhere permanently 0 and
+        # send every run down the "never reaped" branch.
+        if sim_broker_slog_grep "$_rb" "orphan xfer objects reaped|cross-home GC reaped aged orphan xfer objects"; then _reaped_anywhere=1; break; fi
     done
     if [ "$_C_AFTER" = unreadable ]; then
         not_covered "96-A2 (#58) object count became unreadable after the restart" "cannot judge whether the orphan was reaped" runtime-guard

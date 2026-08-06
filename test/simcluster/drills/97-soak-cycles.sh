@@ -91,6 +91,7 @@ set -u
 . "$HERE/lib/docker.sh"
 . "$HERE/lib/tether.sh"
 . "$HERE/drills/lib/cluster.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/agentyaml.sh"
 . "$HERE/drills/lib/fault.sh"
@@ -142,8 +143,22 @@ _xfer_terminal() { "$SIM" ctl -- history --kind transfer -n 100 2>/dev/null | gr
 # 97's deliverable is the leak oracle, so requiring completion here would fail on the very disruption the
 # cycle injects.
 _xfer_started() { "$SIM" ctl -- history --kind transfer -n 100 2>/dev/null | grep -qF "${_SOAK_XFER_SRC:-soak.bin}"; }
-_brk_err_clean() { ! dexec "$1" -- sh -c "grep -qE '$JOURNAL_BAD_SIG' /var/log/tether/broker.err 2>/dev/null"; }
-_agt_journal_clean() { ! dexec "$1" -- sh -c "journalctl -u tether-agent --no-pager 2>/dev/null | grep -qE '$JOURNAL_BAD_SIG'"; }
+# h1 F3: this oracle asks "is there ANY crash/integrity signature in the
+# broker's output", and after h1 that output is SPLIT — panics and data races
+# go to journald (raw fd 2), while FK violations and DB-corruption slog lines
+# go to broker.log. Merging is correct HERE precisely because the question is
+# stream-agnostic; the slog-vs-panic assertions elsewhere must NOT merge, or a
+# panic line could satisfy a slog expectation.
+_brk_err_clean() {
+    ! sim_broker_slog_grep "$1" "$JOURNAL_BAD_SIG" && ! sim_broker_panic_journal "$1" "$JOURNAL_BAD_SIG"
+}
+# Same split on the agent side: slog -> agent.log, panics -> agent.boot.err
+# (dup2'd fd 2) with the journal still carrying pre-logger boot output.
+_agt_journal_clean() {
+    ! sim_agent_slog_grep "$1" "$JOURNAL_BAD_SIG" &&
+        ! sim_agent_panic_sink "$1" "$JOURNAL_BAD_SIG" &&
+        ! dexec "$1" -- sh -c "journalctl -u tether-agent --no-pager 2>/dev/null | grep -qE '$JOURNAL_BAD_SIG'"
+}
 
 # ── goroutine leak gate helpers (R13) — admin runtime .goroutines is runtime.NumGoroutine() (the
 #    IN-PROCESS TRUTH), NOT /proc Threads. Broker-local admin socket, run ON the broker as tether. ──────
@@ -375,11 +390,12 @@ else
 fi
 
 # ── THE ORTHOGONAL CRASH/INTEGRITY ORACLE (never substitutes for the leak oracle, nor it for this) ──
-# Broker payload lives in /var/log/tether/broker.err (install.sh:756-757), NOT journald — a Go panic goes
-# to stderr, so grepping the journal for it would be looking in the wrong file (R-BROKERLOG).
-assert_ok "INTEGRITY brk1's broker.err has no panic / FK violation / data race / DB corruption (read from broker.err, NOT journald — R-BROKERLOG)" _brk_err_clean brk1
-assert_ok "INTEGRITY brk2's broker.err is clean" _brk_err_clean brk2
-assert_ok "INTEGRITY brk3's broker.err is clean" _brk_err_clean brk3
+# h1 F3 (was R-BROKERLOG): the broker's output is no longer one file. slog is
+# /var/log/tether/broker.log (process-owned, capped); panics/stacktraces/data
+# races reach journald via raw fd 2. Both are checked — see _brk_err_clean.
+assert_ok "INTEGRITY brk1 has no panic / FK violation / data race / DB corruption (broker slog AND journal)" _brk_err_clean brk1
+assert_ok "INTEGRITY brk2 is clean (broker slog AND journal)" _brk_err_clean brk2
+assert_ok "INTEGRITY brk3 is clean (broker slog AND journal)" _brk_err_clean brk3
 assert_ok "INTEGRITY agt2's agent journal is clean (the agent unit is NOT redirected, so journald is right here)" _agt_journal_clean agt2
 
 # ── P8 24h PARITY: a batch-level registration, deliberately NOT a not_covered() ─────────────────────

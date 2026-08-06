@@ -184,7 +184,7 @@ func TestEverySilentForwardSenderIsCounted(t *testing.T) {
 			name: "alert ack (error goes to the ctl reply, never to the counter before this fix)",
 			verb: VerbAlertAck,
 			drive: func(t *testing.T, b *Broker, fwd *Forwarder, nc *nats.Conn) {
-				sub, err := SubscribeAlertAck(nc, fwd)
+				sub, err := SubscribeAlertAck(nc, fwd, nil)
 				if err != nil {
 					t.Fatal(err)
 				}

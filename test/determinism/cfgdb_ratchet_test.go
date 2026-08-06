@@ -80,7 +80,7 @@ var cfgDBBaseline = map[string]int{
 	// Lowered from 3 / 5 when ps and node.list moved onto admitCtrl (plan §15.2). The ratchet
 	// requires this in the SAME change as the conversion — that is its working mechanism.
 	"exec.go:handleNodeListReq":                          1,
-	"exec.go:handlePsReq":                                3,
+	"exec.go:handlePsReq":                                2, // -1: h1 A1 ports read → b.read() (counts/list additions all ride b.read too)
 	"expose.go:handleExposeRmReq":                        2,
 	"expose.go:reconcilePorts":                           1,
 	"expose.go:tunnelTokenLookup":                        2,
@@ -141,7 +141,7 @@ var cfgDBBaseline = map[string]int{
 // false: 25 sites consumed the handle INLINE (b.cfg.DB.Query(`SELECT …`) right there, never passing
 // it on), and those become structurally unable to write, because readDB has no Exec/Begin at all.
 // Those 25 are what moved 144 → 119. The remaining 119 are the domain-function calls, and they stay.
-const cfgDBBaselineTotal = 119
+const cfgDBBaselineTotal = 118 // -1: h1 A1 moved handlePsReq's ports read onto b.read()
 
 func TestCfgDBDirectAccessRatchet(t *testing.T) {
 	got, files := scanCfgDBSites(t)

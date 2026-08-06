@@ -77,7 +77,7 @@ func (b *Broker) replyRunFailed(msg *nats.Msg, reason string) {
 		return
 	}
 	payload, _ := json.Marshal(proto.RunChunk{Kind: "failed", Reason: reason})
-	_ = msg.Respond(payload)
+	b.respondBytes(msg, payload)
 }
 
 // handleKillReq forwards a Ctrl-C signal request. Same pre-flight as
@@ -132,7 +132,7 @@ func (b *Broker) replyKillFailed(msg *nats.Msg, reason string) {
 		return
 	}
 	payload, _ := json.Marshal(proto.KillResp{Code: "rejected", Error: reason})
-	_ = msg.Respond(payload)
+	b.respondBytes(msg, payload)
 }
 
 // handlePtyFailed subscribes to `s.*.pty.*.failed` and writes

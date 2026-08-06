@@ -140,8 +140,17 @@ cmd/tether/
 ---
 
 ## 5. Raft op 集（自描述、不要 catch-all）
-`{t:OpType, v, r:ReqID, b:渲染 SQL+元}`。op：`SessionCreate/Tombstone/HardDelete`、`MemberJoin/Kick`、`NodeRegister/Remove`、`ProcCreate/MarkExited/ReconcileBatch`、`PortAllocate/Free/Revoke/ReassignHome`、`RotatePin`、`AlertRaise/AlertAck/AlertClear`、`ClusterNodeUpsert/Phase/Remove`、`ClusterMetaSet`。
-> **裁定（R2-major）**：**删 `GenericRowMutate` catch-all**（绕过 per-mutator lint、毁 raft-log 可读性）——低频 op 本无运行期成本，保持窄类型化。`ProcGC` = **leader-local**（选后 G.2 重跑，不进 Raft，从 §3.4 baked-time 表与 lint 移除）。proxy/`AllocateProxy/ProxyGenAdvance` 随 P13 移出 v1（§0）。`ReconcileBatch` 承载 §4.1 整个 reconcile 结果。
+`{t:OpType, v, r:ReqID, b:渲染 SQL+元}`。op：`SessionCreate/Tombstone/HardDelete`、`MemberJoin/Kick`、`NodeRegister/Remove`、`ProcCreate/MarkExited/ReconcileBatch`、**`ProcGC`**、`PortAllocate/Free/Revoke/ReassignHome`、**`PortGC`**、`RotatePin`、`AlertRaise/AlertAck/AlertClear`、`ClusterNodeUpsert/Phase/Remove`、`ClusterMetaSet`。
+> **裁定（R2-major）**：**删 `GenericRowMutate` catch-all**（绕过 per-mutator lint、毁 raft-log 可读性）——低频 op 本无运行期成本，保持窄类型化。proxy/`AllocateProxy/ProxyGenAdvance` 随 P13 移出 v1（§0）。`ReconcileBatch` 承载 §4.1 整个 reconcile 结果。
+>
+> **h1 订正（推翻 R2-major 的 "ProcGC = leader-local"）**：R2 当年判 `ProcGC` 为 leader-local、不进 Raft。**该裁定已被 h1 撤销**，因为它的实际后果是 cluster 模式**根本没有保留期 GC**——现网 broker 因此攒下 24k 条 FREED `port_allocations` + 8.5k 条 EXITED `processes`，并让 `tether ps` 的回包越过 NATS `max_payload`（2026-08-04 事故）。`processes`/`port_allocations` 是**被复制状态**，在 raft 之外删行会 fork FSM，所以删除必须是 op。
+>
+> h1 因此新增两个**窄类型** op —— **`ProcGC`**（EXITED 行）与 **`PortGC`**（FREED/REVOKED 行），均走 `genericExecApplier`：
+> - **leader 侧 Plan** 计算 cutoff 并 SELECT 出**显式主键集**（`proc.PlanGCExited` / `port.PlanGCTerminated`）；
+> - **Apply 侧 SQL 只按 key 删**并**重申终态守卫**（`AND status='EXITED'` / `AND state IN ('FREED','REVOKED')`），因此 replay 是确定性幂等 no-op，且**任何时间戳都不会到达 replica**（存量 `ended_at` 是异构 TEXT，按字典序比较——比较只发生在 leader）；
+> - 每条命令 ≤500 个 key、每 tick ≤10 条，`reaperCaughtUp()` 门住刚当选的 leader。
+>
+> **N-1 约束**：新 op 属于新词汇。多 broker 集群必须**锁步升级**；一旦 `proxy_bind_stalled`（migration 0018 的新 alert 种类）被 raise 过，**回滚只支持 snapshot-restore，不支持从零日志重放**（旧 binary 会在未知 op / 0009 CHECK 上 fail-stop）。运维步骤见 `broker-ops.md §8.8`、约束登记见 `deploy-tier-gotchas.md #74`。
 > **层次澄清（R3F1）**：上列均为**业务 FSM op**（走 `FSM.Apply`，followers 可校验）；**`ClusterNodeUpsert` 携 `{node_ident_pub, join_nonce, join_sig, cert_fp}`，followers 在 Apply 复算 join PoP**（入群密码学门）。**`raft.AddVoter`/`raft.RemoveServer` 不在本 op 集**——它们是 hashicorp/raft 的**配置变更路径、非 `FSM.Apply` 拦截点**；membership 两阶段顺序（先 `ClusterNodeUpsert` committed 再 `raft.AddVoter`）见 §8.1。
 > **D1 实现注（raft-log 编码 ≠ proto v2 SSOT）**：raft-log `Data` 字段编码（D1 用 `encoding/json`，D1 量级无性能顾虑、可读）**不属 proto v2 subject SSOT**——proto v2 只管 NATS subject grammar，不管 raft log wire。**`Args []any` over `encoding/json` 非 round-trip 类型稳定**（int→float64、`[]byte`→base64）：故 D1 `ClusterMetaSet` 把值烤成 **SQL 字面量**（不走 typed Args 回环），**D2 携参 op 必须用 leader 烤的 SQL 字面量或 typed/positional 编码**，不得把 JSON `[]any` 信封冻结为 D2 传参机制。
 
@@ -393,7 +402,7 @@ follower 死(N≥3)：leader 保 quorum；info。leader 死：选举~1-2s(PreVot
 ---
 
 ## 14. open issues 裁定（承前 13 + 本轮新增）
-NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQLite；kill-9=门；force-single=**自我观测 fence + offline 子命令 + runbook**（撤"结构性"）；PreVote=前置门；危险操作=TTY+typed 无旁路；JWT=短 TTL + **撤销靠主动断连**（非 TTL）；psk=删 DEK + **FDE 可验证 preflight 门**；expose=先确认后回包 + cert_fp 钉证硬要求；JS=**退 per-session 流** + 显式副本重配；home=agent 自报 server_id 桥接 + 自身 NATS 重连自驱 rehome；audit=可重导 + dedup 窗口 > 选举+扫尾（0 丢失"近似"登记）；**P13/proxy 移出 v1 HA**；**leader-only 发布实为 ~63 处**（机械契约 + lint 门）；op 集删 GenericRowMutate、ProcGC 转 leader-local。
+NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQLite；kill-9=门；force-single=**自我观测 fence + offline 子命令 + runbook**（撤"结构性"）；PreVote=前置门；危险操作=TTY+typed 无旁路；JWT=短 TTL + **撤销靠主动断连**（非 TTL）；psk=删 DEK + **FDE 可验证 preflight 门**；expose=先确认后回包 + cert_fp 钉证硬要求；JS=**退 per-session 流** + 显式副本重配；home=agent 自报 server_id 桥接 + 自身 NATS 重连自驱 rehome；audit=可重导 + dedup 窗口 > 选举+扫尾（0 丢失"近似"登记）；**P13/proxy 移出 v1 HA**；**leader-only 发布实为 ~63 处**（机械契约 + lint 门）；op 集删 GenericRowMutate；~~ProcGC 转 leader-local~~ **← h1 撤销**：`ProcGC`/`PortGC` 现为窄类型 raft op（见 §5 的 h1 订正；leader-local 的实际后果是 cluster 模式零保留期，2026-08-04 事故的存储侧根因）。
 
 ---
 

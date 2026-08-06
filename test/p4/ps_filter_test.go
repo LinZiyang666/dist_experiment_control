@@ -675,3 +675,115 @@ func TestPsFilter_OldCtlPsADashRegression(t *testing.T) {
 		}
 	}
 }
+
+// --------------------------------------------------------------------
+// h1 A1 — the 2026-08-04 incident replay: one session accumulated 24k
+// FREED `__proxy__` rows, the unbounded ports section pushed the
+// marshaled PsResp past NATS max_payload (1 MiB), the broker's Respond
+// error was swallowed, and every `tether ps` timed out for five days.
+// After h1: the default reply excludes FREED history entirely (small in
+// bytes, live rows intact), and `-a` returns a capped, live-first,
+// truncation-flagged view.
+// origin: docs/reviews/h1-plan.md workstream A1.
+// --------------------------------------------------------------------
+
+func seedRawPortRow(t *testing.T, db *sql.DB, sid, nid string, portN int, name, state string, createdAt time.Time) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO nodes(sid, nid, status) VALUES (?,?,?)`, sid, nid, "ONLINE",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
+		 VALUES (?,?,?,?,0,?,?, 'SHA256:u', ?)`,
+		portN, sid, nid, name, fmt.Sprintf("%s-%d-hash", name, createdAt.UnixNano()), state, createdAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPsPortsIncidentReplay24kFreedRows(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	pub, fp := freshUserPub(t)
+	seedSession(t, db, "lab", fp)
+	defer startBroker(t, url, db)()
+
+	base := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
+	// The incident's live set: a handful of ALLOCATED rows, OLDER than the flood.
+	for i := 0; i < 7; i++ {
+		seedRawPortRow(t, db, "lab", "wsl", 14000+i, fmt.Sprintf("live-%d", i), "ALLOCATED", base.Add(time.Duration(i)*time.Minute))
+	}
+	// The flood: 24k FREED rows, one per 20s reaper rotation, all newer.
+	flood := base.AddDate(0, 0, 1)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(
+		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
+		 VALUES (?,?,?,?,0,?,'FREED','SHA256:u',?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 24000; i++ {
+		if _, err := stmt.Exec(14005+i%2, "lab", "wsl", "__proxy__",
+			fmt.Sprintf("f%d-hash", i), flood.Add(time.Duration(i)*20*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	nc, _ := nats.Connect(url)
+	defer nc.Close()
+
+	// Default view: FREED history excluded server-side; the whole raw reply
+	// must be far below the 1 MiB default max_payload that killed the
+	// incident fleet (the plan pins <64KB).
+	msg, err := nc.Request(proto.SubjCtrlPs(pub, "lab"), []byte("{}"), 10*time.Second)
+	if err != nil {
+		t.Fatalf("default ps against 24k FREED rows: %v (the incident timeout shape)", err)
+	}
+	if len(msg.Data) >= 64*1024 {
+		t.Fatalf("default ps reply is %d bytes on a 24k-FREED-row session; want <64KB", len(msg.Data))
+	}
+	var resp proto.PsResp
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Ports) != 7 {
+		t.Fatalf("default view: want exactly the 7 live rows, got %d", len(resp.Ports))
+	}
+	if resp.PortsTruncated {
+		t.Fatalf("default live-only view of 7 rows must not be flagged truncated")
+	}
+
+	// -a view: capped at 500, truncation surfaced, every live row present.
+	bodyAll, _ := json.Marshal(proto.PsReq{IncludeExited: true, IncludeFreedPorts: true})
+	respAll := psWith(t, nc, pub, "lab", bodyAll)
+	if respAll.Code != "" {
+		t.Fatalf("ps -a rejected: %s %s", respAll.Code, respAll.Error)
+	}
+	if len(respAll.Ports) != 500 {
+		t.Fatalf("-a ports: want server cap 500, got %d", len(respAll.Ports))
+	}
+	if !respAll.PortsTruncated || respAll.PortsTotal != 24007 {
+		t.Fatalf("-a truncation surface wrong: truncated=%v total=%d (want true/24007)",
+			respAll.PortsTruncated, respAll.PortsTotal)
+	}
+	live := 0
+	for i, p := range respAll.Ports {
+		if p.State == "ALLOCATED" {
+			live++
+			if i >= 7 {
+				t.Fatalf("live row %q at position %d — live rows must sort strictly first", p.Name, i)
+			}
+		}
+	}
+	if live != 7 {
+		t.Fatalf("truncated -a view lost live allocations: %d of 7 present", live)
+	}
+}

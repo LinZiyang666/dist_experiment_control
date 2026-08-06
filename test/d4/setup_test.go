@@ -233,7 +233,7 @@ func startCluster4(t *testing.T, n int) *cluster4 {
 		}
 		t.Cleanup(func() { nc.Close() })
 		conns[i] = nc
-		if _, err := broker.SubscribeClusterApply(nc, nodes[i], time.Now); err != nil {
+		if _, err := broker.SubscribeClusterApply(nc, nodes[i], time.Now, nil); err != nil {
 			t.Fatalf("cluster.apply responder %d: %v", i, err)
 		}
 		_ = nc.Flush()

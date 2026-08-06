@@ -168,7 +168,8 @@ The Quickstart, explained. On `weilandserver` these are `./simcluster <verb>`; f
    broker URL persist).
 
 **Debugging (like ssh-ing into a machine):** `remote.sh shell brk1` (or `ssh brk1`) for a shell inside a
-node · `remote.sh logs brk1 tether-broker` for journalctl · `remote.sh status` for the node table + leader
+node · `remote.sh logs brk1 tether-broker` for the journal **and** the daemon's own slog (see below) ·
+`remote.sh status` for the node table + leader
 view · `remote.sh nats-conf brk1` to inspect nats.conf (the #20 probe) · `remote.sh exec brk1 -- <cmd>`
 for any command · `remote.sh doctor` for PID1 + ownership drift checks (the #22 tripwire).
 
@@ -178,6 +179,26 @@ for any command · `remote.sh doctor` for PID1 + ownership drift checks (the #22
 **Isolation:** `--instance <name>` (or env `INSTANCE=`) namespaces containers/volumes/network, so
 destructive `drill`s run on throwaway `drill-*` instances that never touch your persistent cluster (each
 drill nukes its own instance on exit).
+
+## Where the logs are (four streams, and why they must stay apart)
+
+tether's daemons do NOT put their application log in journald. Each writes its own size-capped file,
+and journald is left carrying panics and pre-logger boot output:
+
+| Stream | Lives in |
+|---|---|
+| broker slog | `/var/log/tether/broker.log` (named by broker.yaml's `log_file:`; `broker.err` on pre-h1 hosts) |
+| broker panic / stacktrace | journald — `journalctl -u tether-broker` |
+| agent slog | `$HOME/.tether/agent/<sid>/agent.log` (the agent binary's default sink) |
+| agent panic / stacktrace | `$HOME/.tether/agent/<sid>/agent.boot.err` (fd 2 is dup2'd there) |
+
+**Drills must read these through `drills/lib/logs.sh` — never inline the paths.** When h1 moved two of
+the four streams, roughly a dozen drills each held their own copy of the mapping, and the move turned
+working oracles into ASSERTION FAILURES against a product that was behaving correctly. A harness whose
+job is to expose real defects faithfully had started manufacturing them. `sim_broker_slog`,
+`sim_broker_panic_journal`, `sim_agent_slog_grep`, `sim_agent_panic_sink` and friends keep the streams
+distinct on purpose: merged into one "grep the logs" helper, a panic could satisfy a slog assertion.
+`test/architecture/simcluster_log_oracle_test.go` holds the line in `make gates`.
 
 ## Verbs (reference)
 
@@ -194,7 +215,7 @@ drill nukes its own instance on exit).
 | `status [--json]` | node table + the leader's cluster status |
 | `exec <node> -- <cmd…>` | docker exec inside a node |
 | `shell <node>` / `ssh <node>` | interactive shell (docker exec / real sshd) |
-| `logs <node> [unit]` | journalctl inside a node |
+| `logs <node> [unit]` | journalctl inside a node, **plus** that unit's process-owned slog (see “Where the logs are”) |
 | `nats-conf <node>` | inspect `/etc/tether/nats.d/nats.conf` (the #20 probe) |
 | `drill <name>` | run `drills/<name>.sh` on an isolated throwaway instance |
 | `down [-v]` · `nuke` | stop (keep volumes; `-v` removes) · full clean slate |

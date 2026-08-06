@@ -84,6 +84,15 @@ const (
 	// CodeAgentMalformedResp: an agent replied with something we could not
 	// decode. Version skew or an agent bug — ours to fix, not the operator's.
 	CodeAgentMalformedResp = "agent_malformed_resp"
+	// CodeReplyTooLarge (h1 A2): the broker built a reply larger than the NATS
+	// server max_payload; the real payload was dropped by the client library
+	// (ErrMaxPayload) and this tiny typed fallback was sent instead of the
+	// pre-h1 behavior — silence, which the ctl could only read as a timeout
+	// (the 2026-08-04 `tether ps` incident). Exit class 70 (EX_SOFTWARE):
+	// every reply section is bounded after h1 A1, so an oversize reply can
+	// only be a tether bug. Deterministic — the one documented NON-retryable
+	// exception to usage.md §9.13's "retry on 70" guidance.
+	CodeReplyTooLarge = "reply_too_large"
 
 	// --- expose / public port allocation ---
 

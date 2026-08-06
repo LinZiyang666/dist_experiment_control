@@ -47,6 +47,17 @@ type ObsSection struct {
 	// StoreDir usage. Accepts Go time.Duration syntax ("5m", "30s", "1h"). Empty → broker
 	// default (5m). Values below 1s are rejected at Load() — see DiskCheckIntervalDuration.
 	DiskCheckInterval string `yaml:"disk_check_interval"`
+
+	// LogFile / LogMaxSizeMB / LogMaxBackups (h1 F) point the broker's slog
+	// output at an in-process size-capped rotating file instead of stderr.
+	// Empty LogFile ⇒ stderr (the binary default, so dev + the embedded-NATS
+	// test harness are byte-unchanged); install.sh writes the real path into
+	// the deployed broker.yaml. Sizes default to 50MB × 2 backups.
+	// The cap lives in the PROCESS because the incident host had no
+	// logrotate and systemd's append: sink is unbounded by construction.
+	LogFile       string `yaml:"log_file"`
+	LogMaxSizeMB  int    `yaml:"log_max_size_mb"`
+	LogMaxBackups int    `yaml:"log_max_backups"`
 }
 
 // ClusterSection mirrors broker.cluster — the D9 cutover surface. It carries

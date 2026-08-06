@@ -256,6 +256,24 @@ func ListBySession(db *sql.DB, sid string) ([]Process, error) {
 	return ListBySessionFiltered(db, sid, ListBySessionOpts{IncludeExited: true})
 }
 
+// CountBySession reports how many rows ListBySessionFiltered would
+// match WITHOUT its Limit — the `ProcsTotal` the ps reply surfaces so
+// a truncated view can say so (h1 A1; symmetric with
+// port.CountBySession). Second, non-transactional read by design; the
+// ±1 skew against the list is cosmetic and documented on proto.PsResp.
+func CountBySession(db *sql.DB, sid string, includeExited bool) (int, error) {
+	q := `SELECT COUNT(*) FROM processes WHERE sid = ?`
+	if !includeExited {
+		// Equality, not inequality — same rationale as ListBySessionOpts.
+		q += ` AND status = 'RUNNING'`
+	}
+	var n int
+	if err := db.QueryRow(q, sid).Scan(&n); err != nil {
+		return 0, fmt.Errorf("proc: count: %w", err)
+	}
+	return n, nil
+}
+
 // GCExited deletes EXITED rows whose ended_at is older than cutoff.
 // Returns the number of rows removed (for log lines / metrics).
 //
@@ -269,9 +287,17 @@ func ListBySession(db *sql.DB, sid string) ([]Process, error) {
 // equality on the leading column, then range scan on ended_at over
 // a tight contiguous prefix.
 func GCExited(db *sql.DB, cutoff time.Time) (int64, error) {
+	// COALESCE + UTC keep this symmetric with its three siblings
+	// (PlanGCExited, port.GCTerminated, port.PlanGCTerminated): an EXITED row
+	// with a NULL ended_at (crash-truncated / hand-repaired) must not be
+	// immortal, and the stored column is heterogeneous TEXT compared
+	// lexically — see PlanGCExited's timestamp contract. Before this the
+	// single-mode path diverged from the cluster path on exactly that row
+	// class (internal review, raft lens).
 	res, err := db.Exec(
-		`DELETE FROM processes WHERE status = 'EXITED' AND ended_at < ?`,
-		cutoff,
+		`DELETE FROM processes
+		  WHERE status = 'EXITED' AND COALESCE(ended_at, started_at) < ?`,
+		cutoff.UTC(),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("proc: gc exited: %w", err)

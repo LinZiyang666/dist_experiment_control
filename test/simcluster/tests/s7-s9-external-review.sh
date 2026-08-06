@@ -35,12 +35,18 @@ fi
 # serving bytes without observing the new certificate. A short silent DROP proves a
 # new TCP connect hangs, but does not close an established TCP/yamux session. Therefore
 # post-heal traffic alone still cannot prove that a fresh TLS handshake occurred.
+# h1 F3: `sim_agent_slog` joins `journalctl` in the corroboration alternation
+# below. The agent's slog moved out of journald into its own file, so the A7
+# arm now reads it through drills/lib/logs.sh — the same independent
+# corroboration, spelled differently. A checker that recognises only the old
+# spelling reports the loss of a proof that is still there, which is the same
+# class of false verdict h1 F3 is about, one level up.
 a7_block=$(sed -n '/# A7 /,/# A8 /p' "$SIMROOT/drills/52-credential-rotation.sh")
 if printf '%s' "$a7_block" | grep -v '^[[:space:]]*#' | grep -q 'fault_partition_on agt1 7000'; then
   fail "52-A7 installs local-port DROP rules on agt1, but 7000/4222 are listening on brk1; the agent's outbound connections are not cut"
 elif printf '%s' "$a7_block" | grep -q 'fault_partition_off' &&
    printf '%s' "$a7_block" | grep -q -- '-- dp_curl_ok_body' &&
-   ! printf '%s' "$a7_block" | grep -v '^[[:space:]]*#' | grep -qE '(journalctl|conntrack|session.*generation|reconnect.*event|redial.*event)'; then
+   ! printf '%s' "$a7_block" | grep -v '^[[:space:]]*#' | grep -qE '(journalctl|sim_agent_slog|conntrack|session.*generation|reconnect.*event|redial.*event)'; then
   fail "52-A7 heals a short DROP then uses traffic alone; it still does not prove the old TLS/yamux session was replaced"
 elif grep -q 'if poll_until 45 3 "the agent re-pins on its own after the rotation" -- dp_curl_ok_body' \
      "$SIMROOT/drills/52-credential-rotation.sh"; then

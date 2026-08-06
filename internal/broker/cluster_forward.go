@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"time"
@@ -318,6 +319,13 @@ func forwardErrKind(err error) string {
 		return "node_session_not_active"
 	case errors.Is(err, proc.ErrNodeMissing):
 		return "proc_node_missing"
+	// h1 C3: unknown_pid may only be acked to the courier off the LEADER's
+	// committed view; when a follower forwards MarkExited, the leader's
+	// proc.ErrNotFound must keep its identity across the wire or the
+	// follower's handler would classify it store_error and the courier would
+	// retry a GC'd pid forever.
+	case errors.Is(err, proc.ErrNotFound):
+		return "proc_not_found"
 	default:
 		return ""
 	}
@@ -546,7 +554,7 @@ func (f *Forwarder) forward(verb, reqID string, payload []byte) error {
 // cluster.apply.> wildcard; only when this node believes it is leader does it run the
 // verb's leader-only Plan through node.ProposeWithReqID and reply. now is the leader's
 // clock (it bakes its own time per §3.4). Constructed only when a cluster.Node exists.
-func SubscribeClusterApply(nc *nats.Conn, node *cluster.Node, now func() time.Time) (*nats.Subscription, error) {
+func SubscribeClusterApply(nc *nats.Conn, node *cluster.Node, now func() time.Time, logger *slog.Logger) (*nats.Subscription, error) {
 	return nc.Subscribe(proto.SubjClusterApplyWildcard, func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -558,7 +566,7 @@ func SubscribeClusterApply(nc *nats.Conn, node *cluster.Node, now func() time.Ti
 		if !node.IsLeader() {
 			return // stay silent; the leader (if any) answers
 		}
-		_ = msg.Respond(marshalForwardReply(dispatchForward(node, now, env)))
+		respondLogged(logger, nc, msg, marshalForwardReply(dispatchForward(node, now, env)))
 	})
 }
 

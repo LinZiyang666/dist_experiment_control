@@ -60,6 +60,12 @@ type psJSON struct {
 	SchemaVersion int                 `json:"schema_version"` // 1
 	Processes     []proto.PsEntry     `json:"processes"`
 	Ports         []proto.PsPortEntry `json:"ports"`
+	// h1 A1 truncation surface — additive/omitempty (SchemaVersion stays 1
+	// per docs/usage.md's bump policy: additive omitempty keys do not bump).
+	ProcsTotal     int  `json:"procs_total,omitempty"`
+	ProcsTruncated bool `json:"procs_truncated,omitempty"`
+	PortsTotal     int  `json:"ports_total,omitempty"`
+	PortsTruncated bool `json:"ports_truncated,omitempty"`
 }
 
 type sessionLsJSON struct {

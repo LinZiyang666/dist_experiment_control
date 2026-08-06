@@ -21,6 +21,7 @@
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/lib/secrets.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
 . "$HERE/drills/lib/ingress.sh"; . "$HERE/drills/lib/proxy.sh"; . "$HERE/drills/lib/dataplane.sh"
 SIM="${SIM:-$HERE/simcluster}"
@@ -77,7 +78,8 @@ _ss_neg_privdest() {   # agt2 (default deny) exit → sink blocked; authoritativ
     ss_curl ctl1 1081 "http://$SINK_IP:9090/" >/dev/null 2>&1   # expected to FAIL (blocked)
     poll_until 10 2 "agt2 blocked-dest log" -- _agt2_blocked "$_t0"
 }
-_agt2_blocked() { dexec agt2 -- journalctl -u tether-agent --since "$1" 2>/dev/null | grep -qiE 'block.*(non-public|private|destination)|destination.*not.*allow'; }
+# h1 F3: the agent's slog left journald for its own capped file.
+_agt2_blocked() { sim_agent_slog_grep agt2 'block.*(non-public|private|destination)|destination.*not.*allow'; }
 _aead_wrongpsk() {   # AEAD trial-decrypt failure via a DATA-PLANE effect, not a journal line
     # DISCRIMINATOR (Stage-C harness-safety-2, revised after live probe): target agt1 (ALLOW_PRIVATE) and assert
     # wrong-PSK yields NO SINK BYTES. Since agt1 NEVER dest-blocks (SS-pos proved it flows with the CORRECT PSK to

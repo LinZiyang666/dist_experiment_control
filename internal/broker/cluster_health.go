@@ -8,6 +8,7 @@ package broker
 import (
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -20,8 +21,8 @@ import (
 // WITHOUT a Raft write. writable_leader_confirmed is set ONLY after a VerifyLeaderRead barrier
 // — a partitioned ex-leader still reporting State()==Leader within its lease FAILS VerifyLeader
 // and answers false, so the gate fires precisely in the data-loss window.
-func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub))
+func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string, logger *slog.Logger) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjCtrlClusterHealthWildcard, clusterHealthResponder(nc, node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub, logger))
 }
 
 // SubscribeClusterRosterPull (G3 #17) wires the member-reachable roster-pull responder: a ctl connected
@@ -32,7 +33,7 @@ func SubscribeClusterHealth(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 // group). In single mode / with no account seed manifestBytes() returns ok=false → the responder stays
 // silent → a ctl probe gets ErrNoResponders and falls back (byte-identical to today). The reply is the
 // discovery-only, account-signed ClusterManifest (roster + seeds; zero secrets).
-func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool)) (*nats.Subscription, error) {
+func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool), logger *slog.Logger) (*nats.Subscription, error) {
 	return nc.Subscribe(proto.SubjCtrlClusterRosterWildcard, func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -46,7 +47,7 @@ func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool))
 			// narrow window; correctness holds (the ctl still falls back to HTTP/cache).
 			return
 		}
-		_ = msg.Respond(body)
+		respondLogged(logger, nc, msg, body)
 	})
 }
 
@@ -54,8 +55,8 @@ func SubscribeClusterRosterPull(nc *nats.Conn, manifestFn func() ([]byte, bool))
 // responder on the BROKER-ONLY tether.v2.cluster.cursor.req subject — the one the leader's
 // observability poll scatters to (its broker nkey can pub+sub cluster.> but not ctrl.by.*).
 // Every broker answers (no queue group) so the leader collects each voter's AppliedIndex.
-func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) (*nats.Subscription, error) {
-	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub))
+func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string, logger *slog.Logger) (*nats.Subscription, error) {
+	return nc.Subscribe(proto.SubjClusterCursor, clusterHealthResponder(nc, node, db, now, topoSelf, jsUnavail, colocatedAgentNID, accountPub, logger))
 }
 
 // clusterHealthResponder builds the shared health-reply handler used by both the member-
@@ -64,7 +65,7 @@ func SubscribeClusterCursor(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 // returns this broker's auth_callout account public key (batch B / B4 — see
 // proto.ClusterHealthResp.AccountNkPub); nil means the caller could not supply one, which is
 // reported as "did not answer" rather than as a match.
-func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string) func(*nats.Msg) {
+func clusterHealthResponder(nc *nats.Conn, node *cluster.Node, db *sql.DB, now func() time.Time, topoSelf func() *topoSelfReport, jsUnavail func() bool, colocatedAgentNID string, accountPub func() string, logger *slog.Logger) func(*nats.Msg) {
 	return func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -151,7 +152,7 @@ func clusterHealthResponder(node *cluster.Node, db *sql.DB, now func() time.Time
 		if err != nil {
 			return
 		}
-		_ = msg.Respond(b)
+		respondLogged(logger, nc, msg, b)
 	}
 }
 
@@ -172,7 +173,7 @@ func healthContactStale(fenced, stateLeader, writable bool, leaderID, selfID str
 // SubscribeAlertLs wires the QUEUE-GROUP alert-ls responder (§10.1/§10.3): any ONE broker
 // serves the bounded-stale replicated read (alerts are Raft-replicated, so any broker is
 // authoritative-enough for the banner). One round-trip, best-effort.
-func SubscribeAlertLs(nc *nats.Conn, db *sql.DB) (*nats.Subscription, error) {
+func SubscribeAlertLs(nc *nats.Conn, db *sql.DB, logger *slog.Logger) (*nats.Subscription, error) {
 	return nc.QueueSubscribe(proto.SubjCtrlAlertLsWildcard, "alert-ls", func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
@@ -192,38 +193,38 @@ func SubscribeAlertLs(nc *nats.Conn, db *sql.DB) (*nats.Subscription, error) {
 		if err != nil {
 			return
 		}
-		_ = msg.Respond(b)
+		respondLogged(logger, nc, msg, b)
 	})
 }
 
 // SubscribeAlertAck wires the QUEUE-GROUP ack responder (§10.1): ONE broker forwards the ack
 // to the leader (VerbAlertAck). acked_by is the NATS-authenticated actor from the subject
 // (display-only) — the ctl never asserts it. Replies "ok" or a short error.
-func SubscribeAlertAck(nc *nats.Conn, fwd *Forwarder) (*nats.Subscription, error) {
+func SubscribeAlertAck(nc *nats.Conn, fwd *Forwarder, logger *slog.Logger) (*nats.Subscription, error) {
 	return nc.QueueSubscribe(proto.SubjCtrlAlertAckWildcard, "alert-ack", func(msg *nats.Msg) {
 		if msg.Reply == "" {
 			return
 		}
 		actor, _, ok := proto.ParseCtrlBy(msg.Subject)
 		if !ok {
-			_ = msg.Respond([]byte("error: bad subject"))
+			respondLogged(logger, nc, msg, []byte("error: bad subject"))
 			return
 		}
 		var req proto.AlertAckReq
 		if err := json.Unmarshal(msg.Data, &req); err != nil || req.DedupKey == "" {
-			_ = msg.Respond([]byte("error: bad request"))
+			respondLogged(logger, nc, msg, []byte("error: bad request"))
 			return
 		}
 		payload, err := json.Marshal(AlertAckPayload{DedupKey: req.DedupKey, AckedBy: actor})
 		if err != nil {
-			_ = msg.Respond([]byte("error: marshal"))
+			respondLogged(logger, nc, msg, []byte("error: marshal"))
 			return
 		}
 		if ferr := fwd.Forward(VerbAlertAck, "", payload); ferr != nil {
-			_ = msg.Respond([]byte("error: " + ferr.Error()))
+			respondLogged(logger, nc, msg, []byte("error: "+ferr.Error()))
 			return
 		}
-		_ = msg.Respond([]byte("ok"))
+		respondLogged(logger, nc, msg, []byte("ok"))
 	})
 }
 

@@ -330,24 +330,26 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D4 write-forward responder + D8b health/alert responders. Each stays silent on a
 	// follower (the leader answers); collected for ordered unsubscribe.
 	subscribers := []func() (*nats.Subscription, error){
-		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now) },
+		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now, b.cfg.Logger) },
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty)
+			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty, b.cfg.Logger)
 		},
-		func() (*nats.Subscription, error) { return SubscribeClusterRosterPull(nc, b.manifestBytes) }, // G3 #17
-		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) },            // G5 #13 W2b
-		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) },               // G4 §B grow trigger
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty)
+			return SubscribeClusterRosterPull(nc, b.manifestBytes, b.cfg.Logger)
+		}, // G3 #17
+		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) }, // G5 #13 W2b
+		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) },    // G4 §B grow trigger
+		func() (*nats.Subscription, error) {
+			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty, b.cfg.Logger)
 		},
 		// R8a P1: the broker-owned _INBOX agents publish their APPLIED home acks to.
 		// Without it the home-delivery pass has no ACTUAL half to compare against and
 		// would degrade into an un-acked re-delivery loop, so this subscribe failing
 		// must fail cluster wiring loudly (it is in the same fail-hard list).
 		func() (*nats.Subscription, error) { return b.subscribeHomeAcks(nc) },
-		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB) },
-		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd) },
+		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB, b.cfg.Logger) },
+		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd, b.cfg.Logger) },
 	}
 	for _, sub := range subscribers {
 		s, err := sub()

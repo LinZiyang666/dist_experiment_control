@@ -54,6 +54,7 @@ set -u
 . "$HERE/drills/lib/cluster.sh"
 . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/agentyaml.sh"
+. "$HERE/drills/lib/logs.sh"
 . "$HERE/lib/assert.sh"
 
 SID=lab
@@ -68,8 +69,15 @@ _bt() { _btn=$1; shift; [ "$1" = "--" ] && shift; dexec -u tether "$_btn" -- "$@
 _pty() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec -u tether "$_pn" -- python3 /opt/sim/pty-confirm.py "$_pa" -- "$@"; }
 # _pty_root <node> <answer> -- <tether args...> : same, as ROOT (arm J1 only, deliberately).
 _pty_root() { _pn=$1; _pa=$2; shift 2; [ "$1" = "--" ] && shift; dexec "$_pn" -- python3 /opt/sim/pty-confirm.py "$_pa" -- "$@"; }
-# _berr <node> [n] : the broker's APPLICATION log. NOT journalctl (R-BROKERLOG).
-_berr() { dexec "$1" -- tail -n "${2:-60}" /var/log/tether/broker.err 2>/dev/null; }
+# _berr <node> [n] : the broker's APPLICATION log (slog). NOT journalctl (R-BROKERLOG) — post-h1
+# journald carries the broker's PANIC stream, so reading it here would let a stacktrace stand in
+# for an application line.
+# h1 F3: that log moved broker.err -> broker.log; sim_broker_slog reads both, so
+# a pre-h1 image stays readable. The K2 arm below greps this for a specific
+# refusal string — pointing it at the now-frozen broker.err would have made the
+# refusal permanently "not observed" and laundered a regression into the
+# runtime-guard branch.
+_berr() { sim_broker_slog "$1" "${2:-60}"; }
 
 # LIVENESS, NOT HEALTH. `cluster status` returns a HEALTH exit code by design (0=healthy, 1=DEGRADED,
 # 2=QUORUM_LOST, 3=FORCE_SINGLE — clusterstatus.go:66-101), and a restored lone voter is DEGRADED
@@ -510,7 +518,17 @@ dexec brk1 -- sh -c 'systemctl reset-failed tether-broker 2>/dev/null; systemctl
 # written early in the loop is still present after recovery scrolls success on top. Non-vacuous: a broker
 # that came up clean (no refusal ever logged) makes this FALSE — which would mean the advice predicted a
 # failure that did not occur.
-_k64_predicted_refusal() { _berr brk1 400 | grep -qF 'cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 node'; }
+# STARTUP REFUSAL ⇒ BOOT STREAM. This needle is a `return fmt.Errorf(...)` out
+# of Broker.Run (internal/broker/broker.go), which cobra prints to stderr — and
+# h1 routes the unit's stderr to journald, NOT to the slog file. Reading only
+# the slog would make this arm red no matter how correctly the broker refuses.
+# See the rule in drills/lib/logs.sh: ask WHEN the line is written, not who
+# wrote it. The slog is kept as a fallback so the arm survives the refusal
+# moving to after logger setup.
+_k64_predicted_refusal() {
+    { sim_broker_panic_journal_dump brk1; _berr brk1 400; } 2>/dev/null |
+        grep -qF 'cluster mode requires JetStream, but it is UNAVAILABLE on a lone N=1 node'
+}
 _K64_PREDICTED=0
 if poll_until 90 3 "brk1 logs the lone-N=1 refusal the advice predicted (skipping de-cluster on purpose)" -- _k64_predicted_refusal; then _K64_PREDICTED=1; fi
 _K_READY=0
@@ -523,7 +541,7 @@ _k_ready() { [ "$_K_READY" = 1 ]; }
 if [ "$_K_READY" = 0 ]; then
     err "K2 diag 1 — what does cluster status actually SAY?"; _bt brk1 -- tether cluster status 2>&1 | head -6 >&2 || true
     err "K2 diag 2 — units:"; dexec brk1 -- systemctl is-active tether-broker nats-server 2>&1 | head -3 >&2 || true
-    err "K2 diag 3 — broker.err (R-BROKERLOG):"; _berr brk1 25 >&2 || true
+    err "K2 diag 3 — broker slog (R-BROKERLOG):"; _berr brk1 25 >&2 || true
     err "K2 diag 4 — the cluster seam in broker.yaml:"; dexec brk1 -- sh -c 'grep -A4 "^  cluster:" /etc/tether/broker.yaml 2>/dev/null | head -6' >&2 || true
     err "K2 diag 5 — what restore left on disk:"; dexec brk1 -- sh -c 'ls -la /var/lib/tether/ 2>&1 | head -10' >&2 || true
 fi
@@ -534,7 +552,7 @@ assert_ok "K1+K2 the broker becomes reachable after the restore (bounded self-he
 if [ "$_K64_PREDICTED" = 1 ]; then
     _as_pass "K-#64c the advice's PREDICTION held: brk1 did hit the lone-N=1 JetStream refusal when the de-cluster step was skipped — the warning is not just present, it is TRUE"
 elif [ "$_K_READY" = 1 ]; then
-    not_covered "50-K-#64c the predicted lone-N=1 refusal was not observed in broker.err this run" "the broker became reachable (self-heal off brk2's replica) but the refusal line was not captured in the crash-loop window — brk2's JS meta may have re-formed before the refusal was flushed. The ADVICE halves (K-#64a/b) are asserted deterministically above; this reality-tie is timing-dependent on the surviving peer" runtime-guard
+    not_covered "50-K-#64c the predicted lone-N=1 refusal was not observed in the broker slog this run" "the broker became reachable (self-heal off brk2's replica) but the refusal line was not captured in the crash-loop window — brk2's JS meta may have re-formed before the refusal was flushed. The ADVICE halves (K-#64a/b) are asserted deterministically above; this reality-tie is timing-dependent on the surviving peer" runtime-guard
 else
     _as_fail "K-#64c UNJUDGEABLE — the broker never became reachable AND the predicted refusal was never logged. Triage before judging (see the K2 diagnostics above)"
 fi
@@ -597,9 +615,14 @@ if poll_until 180 3 "agt1 ONLINE (window sized to the MEASURED ~73s #64 crash-lo
 _l4a_ok() { [ "$_L4A" = 1 ]; }
 if [ "$_L4A" = 0 ]; then
     err "L4a diag 1 — what does node ls -a actually show?"; "$SIM" ctl -- node ls -a 2>&1 | head -6 >&2 || true
-    err "L4a diag 2 — the agent's own view (is it even trying?):"; dexec agt1 -- journalctl -u tether-agent -n 15 --no-pager 2>&1 | tail -12 >&2 || true
+    err "L4a diag 2 — the agent's own view (is it even trying?):"
+    # h1 F3: the agent's slog is agent.log now; the journal keeps only
+    # pre-logger boot output. Both are dumped — this is a diagnostic, and a
+    # diagnostic that silently lost its payload is worse than a noisy one.
+    sim_agent_slog_tail agt1 15 2>&1 | tail -12 >&2 || true
+    dexec agt1 -- journalctl -u tether-agent -n 15 --no-pager 2>&1 | tail -6 >&2 || true
     err "L4a diag 3 — is the agent unit alive?"; dexec agt1 -- systemctl is-active tether-agent 2>&1 | head -2 >&2 || true
-    err "L4a diag 4 — broker.err tail:"; _berr brk1 12 >&2 || true
+    err "L4a diag 4 — broker slog tail:"; _berr brk1 12 >&2 || true
 fi
 assert_ok "L4a agt1 comes back ONLINE after the restore" _l4a_ok
 _l4b_same_port() { [ "$("$SIM" ctl -- expose explain live --json 2>/dev/null | jq -r '.public_port // empty')" = "$PX" ]; }
