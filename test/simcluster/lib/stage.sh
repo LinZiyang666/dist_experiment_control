@@ -76,5 +76,5 @@ sim_stage_binaries() {
 sim_is_sim_host() {
     case "$(hostname 2>/dev/null)" in weilandserver|weiland_server) return 0 ;; esac
     case "$(hostname -s 2>/dev/null)" in weilandserver|weiland_server) return 0 ;; esac
-    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "${SIM_HOST_IP:-192.168.1.150}"
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "${SIM_HOST_IP:-192.168.0.200}"
 }

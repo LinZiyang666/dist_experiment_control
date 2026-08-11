@@ -31,7 +31,7 @@ if ! sim_is_sim_host && [ "${SIM_ALLOW_ANY_HOST:-0}" != "1" ]; then
     cat >&2 <<EOF
 [local] this machine is not the sim host.
         hostname : $(hostname 2>/dev/null || echo '?')
-        expected : weilandserver / weiland_server, or IP ${SIM_HOST_IP:-192.168.1.150}
+        expected : weilandserver / weiland_server, or IP ${SIM_HOST_IP:-192.168.0.200}
 
         From another box use the external driver instead:
             ./remote.sh ${*:-status}

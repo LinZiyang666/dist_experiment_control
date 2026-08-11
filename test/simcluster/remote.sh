@@ -10,7 +10,7 @@
 #        ./remote.sh status
 set -euo pipefail
 
-SERVER="${SIM_SERVER:-weiland@192.168.1.150}"
+SERVER="${SIM_SERVER:-weiland@192.168.0.200}"
 REMOTE_DIR="${SIM_REMOTE_DIR:-/home/weiland/dist_experiment_control/test/simcluster}"
 
 here="$(cd "$(dirname "$0")" && pwd)"

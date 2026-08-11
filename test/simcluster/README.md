@@ -54,7 +54,7 @@ It is bound by the following, without exception:
 **The primary home is `weilandserver` itself** — it is both the main development box and the sim host,
 so the normal path is to work in the checkout on that machine and drive `./simcluster` directly. Check
 where you are first: `hostname` is `weilandserver` (note `/etc/hostname` says `weiland_server`), or
-`hostname -I` contains `192.168.1.150`.
+`hostname -I` contains `192.168.0.200`.
 
 `remote.sh` remains for the *optional* case of driving from a different box (build elsewhere, rsync in,
 ssh-run). On `weilandserver` itself, skip it — it would rsync the machine onto itself.

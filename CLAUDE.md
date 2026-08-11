@@ -186,7 +186,8 @@
   - **simcluster deploy-tier drill（`test/simcluster/`）**：第三层测试，不进 `go test`/CI。
     **⚠ 按需运行、非必要绝不运行**——只在改动真实部署栈（`install.sh` / `nats.conf` / systemd unit /
     集群生命周期 / 跨机 route mTLS）时跑，且只跑相关的那一个。跑在 `weilandserver`；
-    **本机就是它**（`hostname -I` 含 `192.168.1.150`）时直接 `cd test/simcluster && ./local.sh drill <name>`，
+    **本机就是它**（`hostname -I` 含 `192.168.0.200`；2026-08-10 前是 `192.168.1.150`）时直接
+    `cd test/simcluster && ./local.sh drill <name>`，
     不要 ssh、不要 `remote.sh`。全套用 `./run-drills.sh`（可并发）。
     **定位铁律：忠实复现真实部署环境、如实暴露缺陷，绝不替 tether 弥补**——
     tether 干不了的只呈现（标 `[GAP #N]`）、不代劳；靠复杂脚本才"成功"的操作是缺陷不是成就。
