@@ -35,17 +35,30 @@ import (
 // shutdownGrace bounds the drain of in-flight requests on context cancel.
 const shutdownGrace = 3 * time.Second
 
+// CheckLoopback is the PURE, side-effect-free half of Bind's loopback gate
+// (g75-g78 external review F1): a config preflight (broker.ValidateConfig →
+// `serve --config-check`) must reach the SAME verdict a real Bind reaches, so
+// both call this — never a second copy that could drift. Returns nil for a
+// loopback host, an error otherwise. Empty host (":8090" = all interfaces) is
+// NOT loopback.
+func CheckLoopback(name, addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s: bad listen addr %q: %w", name, addr, err)
+	}
+	if !isLoopbackHost(host) {
+		return fmt.Errorf("%s: listen addr %q must be loopback (this surface is unauthenticated)", name, addr)
+	}
+	return nil
+}
+
 // Bind listens on addr. When requireLoopback is set, a non-loopback host is
 // refused BEFORE the socket is opened — these surfaces are unauthenticated, so
 // failing closed is the whole point.
 func Bind(name, addr string, requireLoopback bool) (net.Listener, error) {
 	if requireLoopback {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("%s: bad listen addr %q: %w", name, addr, err)
-		}
-		if !isLoopbackHost(host) {
-			return nil, fmt.Errorf("%s: listen addr %q must be loopback (this surface is unauthenticated)", name, addr)
+		if err := CheckLoopback(name, addr); err != nil {
+			return nil, err
 		}
 	}
 	ln, err := net.Listen("tcp", addr)

@@ -53,6 +53,12 @@ agent_provision_yaml() {
                      # quote the mode: bare `off` is a YAML 1.1 false; the field is a string wanting "off".
                      _apy_block="remote_fs:
   mode: \"$_apy_mode\"" ;;
+        proxyoptout) # #78: the operator's documented per-node proxy egress opt-out (usage §5.15).
+                     _apy_block="proxy:
+  participate: false" ;;
+        proxyoptin)  # #78: the explicit flip-back (drill 78 arm D's recovery leg).
+                     _apy_block="proxy:
+  participate: true" ;;
         proxyprivate) # S4-72: agent.yaml opts into proxying to RFC1918 destinations (the docker bridge is all
                      # private), so this agent carries the POSITIVE SS egress leg. HIGH-RISK per usage §5.15
                      # (lends the agent's private network to subscription holders); exercised only in the sim.

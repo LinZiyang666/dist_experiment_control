@@ -158,12 +158,14 @@ func agentDaemonConfig(cmd *cobra.Command, in agentDaemonInputs) (agent.Config, 
 		AllowRoots:                    in.YAML.FileTransfer.AllowRoots,
 		RootsConfigured:               in.YAML.FileTransfer.AllowRoots != nil,
 		ProxyAllowPrivateDestinations: in.YAML.Proxy.AllowPrivateDestinations,
-		RemoteFSMode:                  in.YAML.RemoteFS.Mode,
-		RemoteFSSafeDir:               in.YAML.RemoteFS.SafeDir,
-		RemoteFSProbeTimeout:          probeTO,
-		RemoteFSSpawnTimeout:          spawnTO,
-		RemoteFSWedgeCeiling:          in.YAML.RemoteFS.WedgeCeiling,
-		UpgradeURLAllowlist:           upgradeAllow, // #28
+		// #78: only an explicit `participate: false` opts out (nil = absent = participate).
+		ProxyOptOut:          in.YAML.Proxy.Participate != nil && !*in.YAML.Proxy.Participate,
+		RemoteFSMode:         in.YAML.RemoteFS.Mode,
+		RemoteFSSafeDir:      in.YAML.RemoteFS.SafeDir,
+		RemoteFSProbeTimeout: probeTO,
+		RemoteFSSpawnTimeout: spawnTO,
+		RemoteFSWedgeCeiling: in.YAML.RemoteFS.WedgeCeiling,
+		UpgradeURLAllowlist:  upgradeAllow, // #28
 	}, nil
 }
 
@@ -171,6 +173,15 @@ func agentDaemonConfig(cmd *cobra.Command, in agentDaemonInputs) (agent.Config, 
 // allow_private_destinations opt-in must actually reach agent.Config.
 type proxyConfig struct {
 	AllowPrivateDestinations bool `yaml:"allow_private_destinations"`
+	// Participate (#78) opts this node out of serving as a session-proxy
+	// egress when explicitly false. MUST be *bool: yaml's bool zero value is
+	// false, so a plain bool would read "key absent" as "opted out" — nil
+	// means absent means participate, keeping every existing agent.yaml
+	// byte-compatible. ⚠ rollback brick: agent.yaml is strict-parsed
+	// (KnownFields), so once this key is written, a binary OLDER than #78
+	// (including a `node upgrade` automatic rollback target) refuses to
+	// boot — write it only on nodes that will not roll back below #78.
+	Participate *bool `yaml:"participate,omitempty"`
 }
 
 // fileTransferConfig controls `tether push` / `tether pull` containment.

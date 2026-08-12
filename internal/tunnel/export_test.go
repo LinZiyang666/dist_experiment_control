@@ -41,3 +41,11 @@ func (c *Client) SetBackoffForTest(base, max time.Duration) {
 	c.backoffMax = max
 	c.mu.Unlock()
 }
+
+// SetRegLogClockForTest injects the #78 REGISTER-log damper's clock so the
+// Recover anti-flap floor is assertable without real sleeps.
+func (s *Server) SetRegLogClockForTest(now func() time.Time) {
+	s.regLogMu.Lock()
+	s.regLogNow = now
+	s.regLogMu.Unlock()
+}

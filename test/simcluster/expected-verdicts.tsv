@@ -42,6 +42,7 @@
 72-proxy-subscription	GREEN	0	-	-	72-proxy-subscription
 73-proxy-cluster-ha	GREEN	0	-	#30 CLOSED (admin events); #34 not manifesting	73-proxy-cluster-ha
 74-rebalance-on-return	INCOMPLETE	-	ASSERT-FAIL@#34@sig:c-ss-preflow,ASSERT-FAIL@#67@sig:b-negctrl-create	#34 (proxy-home one-per-voter stability + auto-rebalance-on-return, CONFIRMED-open) persistent gap; #30 CLOSED (admin events); #67	74-rebalance-on-return
+78-proxy-dial-backoff	INCOMPLETE	1	-	broker read-REGISTER WARN damping (#78 face ②) not deploy-tier-constructable (post-TLS WARN site); hermetic-covered	78-proxy-dial-backoff
 80-session-isolation	GREEN	0	-	-	80-session-isolation
 81-admin-evict-session-rm	GREEN	0	-	-	81-admin-evict-session-rm
 82-agent-onboarding-invite	INCOMPLETE	1	-	U1-U4 user-service in-sim gap + intermittent C1-grow(N=2) ASSERT-FAIL band = #GROW-ONTO-RECOVERED family (R16; r15-finalization §9.1)	82-agent-onboarding-invite

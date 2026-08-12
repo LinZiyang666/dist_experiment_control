@@ -23,6 +23,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +35,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clustermanifest"
+	"github.com/LinZiyang666/tether/internal/httplisten"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/node"
@@ -468,6 +473,14 @@ type Broker struct {
 	rehomeEvt      sync.Map
 	proxyEvtCounts sync.Map
 
+	// proxyOptedOut (#78) is the "won't vs can't" visibility hint for proxy
+	// status: sid/nid → true when the node's last register carried
+	// proxy_opt_out. In-memory single-broker hint ONLY — not replicated, and
+	// empty after a broker restart until the agent's next re-register
+	// (documented [GAP]). Enforcement lives in nodes.proxy_capable, which is
+	// persisted and needs none of this.
+	proxyOptedOut sync.Map
+
 	// selfID + tunnelCert are the D6 home/cert seam. Post-D9 cutover, in CLUSTER mode
 	// wireClusterEarly calls AttachClusterSeam to set this broker's cluster identity + stable
 	// cert, so every D6 home-assignment path (homeForRegister / homeForExpose / selfNodeID / the
@@ -702,8 +715,11 @@ func (e errBrokerSentinel) Error() string { return string(e) }
 // New validates the config and returns a Broker not yet connected. Run
 // performs the actual NATS connect and blocks until ctx is canceled.
 func New(cfg Config) (*Broker, error) {
-	if cfg.NATSURL == "" {
-		return nil, fmt.Errorf("broker: NATSURL required")
+	// g75-g78 external review F1: the pure config validators run FIRST, shared
+	// with `serve --config-check` (validate.go), so the preflight and a real
+	// start reach the same verdict on webhook URL / listen addresses.
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
 	}
 	// D9 (steps 1-3): decide single vs cluster mode FIRST (raft-probe based, no DB
 	// needed), so the DB requirement can differ. Single mode needs an already-open DB
@@ -1435,7 +1451,14 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		OS:             req.OS,
 		Arch:           req.Arch,
 		BootID:         req.BootID,
-		ProxyCapable:   nodeHasProxyCap(req.Capabilities, req.ReleaseVersion),
+		// #78: the agent.yaml proxy.participate opt-out FOLDS into the
+		// existing capability column — deliberately NOT a new RegisterInput
+		// field (that payload is raft-replicated; a new field would silently
+		// drop in a mixed-version cluster). With proxy_capable=0 every
+		// downstream gate — repairProxy, the reaper's allocate loop,
+		// onlineProxyCapableNIDs, the /sub render — skips this node through
+		// the code path old non-P13 agents already exercise.
+		ProxyCapable: nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut,
 		// D6 §6.5 (external review F1): persist the agent's reported nats
 		// server_name into nodes.nats_server so the home bridge can resolve it at
 		// expose time. "" in production (single-node agent) → inert.
@@ -1464,6 +1487,21 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		}
 		b.replyErr(msg, "store_error", err.Error())
 		return
+	}
+
+	// #78 (review N1): update the "won't vs can't" visibility hint and free
+	// the existing allocation ONLY after the identity write COMMITTED — a
+	// register that failed (store_error / leader_unavailable) returned above,
+	// so the hint never disagrees with the persisted proxy_capable and status
+	// cannot render a self-contradictory row. In-memory hint only (empties on
+	// a broker restart until re-register — documented [GAP]); enforcement is
+	// nodes.proxy_capable. The single-mode free has no reaper to catch it
+	// later; cluster rows are the reaper teardown pass's job (raft-routed).
+	if req.ProxyOptOut {
+		b.proxyOptedOut.Store(sid+"/"+nid, true)
+		freeOptOutProxyRowSingle(b, sid, nid)
+	} else {
+		b.proxyOptedOut.Delete(sid + "/" + nid)
 	}
 
 	b.cfg.Logger.Info("broker: node registered",
@@ -1572,4 +1610,186 @@ func (b *Broker) replyErr(msg *nats.Msg, code, message string) {
 		OK: false, Code: code, Error: message,
 	})
 	b.respondBytes(msg, payload)
+}
+
+// ValidateConfig runs every pure config validator broker applies at startup.
+// Returns the first violation, or nil. It is side-effect-FREE (g75-g78 external
+// review F1): `serve --config-check` and a real `tether serve` must reach the
+// SAME verdict on a config. Before this, config-check returned right after the
+// strict YAML decode and so reported "config OK" for configs a real startup
+// rejects (a bad webhook URL, a non-loopback /sub bind). broker.New calls this
+// first, and cmd/tether's config-check calls it plus the two validators that
+// live outside broker (log level via newLoggerTo, auth seeds via
+// loadAuthCalloutSeeds), so the two paths validate the same surface.
+//
+// It opens NO DB, binds NO listener, reads NO file: pure format/range checks on
+// already-resolved values. Runtime availability (a port actually being free) is
+// deliberately NOT its job — "config OK" is about validity, not whether the
+// host is ready to bind.
+func ValidateConfig(cfg Config) error {
+	if cfg.NATSURL == "" {
+		return fmt.Errorf("broker: NATSURL required")
+	}
+	// Pure syntax of the NATS URL — a scheme-less garbage string like
+	// "://not-a-url" is rejected here so config-check agrees with a real
+	// nats.Connect, which cannot dial it (F1-A). "existing but momentarily
+	// unreachable" stays a runtime availability concern, NOT a syntax miss.
+	if err := validateNATSURL(cfg.NATSURL); err != nil {
+		return err
+	}
+	if cfg.AlertWebhookURL != "" {
+		if _, err := parseWebhookURL(cfg.AlertWebhookURL); err != nil {
+			return err
+		}
+	}
+	// Listen addresses that a bad host:port would only surface at bind time —
+	// caught here so config-check and startup agree. Empty = disabled/default,
+	// not an error. The /sub and cluster-manifest surfaces are unauthenticated
+	// + Caddy-fronted, so their real Bind REQUIRES loopback (httplisten,
+	// requireLoopback=true) — config-check must apply the SAME gate (F1
+	// parity), via the shared httplisten.CheckLoopback so the two can't drift.
+	// /metrics and the tunnel control addr are format-only (a private-interface
+	// bind is legitimate there).
+	for _, a := range []struct{ name, addr string }{
+		{"broker.observability.metrics_listen", cfg.MetricsAddr},
+		{"broker.frp.control_listen", cfg.TunnelControlAddr},
+	} {
+		if err := validateListenAddr(a.name, a.addr); err != nil {
+			return err
+		}
+	}
+	for _, a := range []struct{ name, addr string }{
+		{"broker.sub.listen", cfg.SubHTTPAddr},
+		{"broker.cluster.manifest_listen", cfg.ManifestAddr},
+	} {
+		if a.addr == "" {
+			continue // disabled
+		}
+		if err := validateListenAddr(a.name, a.addr); err != nil {
+			return err
+		}
+		if err := httplisten.CheckLoopback(a.name, a.addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateListenAddr checks a host:port listen address FORMAT (empty ⇒ ok,
+// meaning disabled or default). A ":8090" (host-less) form is valid — net.Listen
+// accepts it — so only the port must parse and be in range. Port 0 is VALID:
+// net.Listen treats it as "assign an ephemeral port", so config-check must
+// accept it too (F1 parity — a preflight must not reject what a real start
+// accepts).
+func validateListenAddr(name, addr string) error {
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s %q: %w", name, addr, err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("%s %q: port must be 0-65535", name, addr)
+	}
+	// A host, when present, must be a bare IP or a syntactically valid DNS
+	// hostname — reject what net.Listen would reject at bind (F1-B). A bare
+	// ":9090" (host-less wildcard) is fine.
+	if !validListenHost(host) {
+		return fmt.Errorf("%s %q: malformed host", name, addr)
+	}
+	return nil
+}
+
+// validateNATSURL checks the NATS server URL(s) for the same pure-syntax
+// validity nats.go requires, WITHOUT dialing (F1-A). The client accepts a
+// comma-separated list and gives a scheme-less "host:port" entry an implicit
+// "nats://"; this mirrors that so config-check and Connect reach one verdict.
+// Reachability (host resolvable, port open) is deliberately NOT checked — that
+// is a runtime availability concern, not a config error.
+func validateNATSURL(raw string) error {
+	// nats.go rejects a pool that mixes ws/wss with nats/tls before it dials
+	// anything (ErrMixingWebsocketSchemes). Track the same pool-level class;
+	// validating each URL independently is insufficient.
+	poolClass := -1 // 0 = nats/tls, 1 = ws/wss
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return fmt.Errorf("broker.nats.url %q: empty server entry", raw)
+		}
+		toParse := s
+		if !strings.Contains(toParse, "://") {
+			toParse = "nats://" + toParse // nats.go's implicit scheme
+		}
+		u, err := url.Parse(toParse)
+		if err != nil {
+			return fmt.Errorf("broker.nats.url %q: %w", s, err)
+		}
+		var class int
+		switch u.Scheme {
+		case "nats", "tls":
+			class = 0
+		case "ws", "wss":
+			class = 1
+		default:
+			return fmt.Errorf("broker.nats.url %q: scheme must be nats/tls/ws/wss", s)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("broker.nats.url %q: missing host", s)
+		}
+		if poolClass >= 0 && class != poolClass {
+			return fmt.Errorf("broker.nats.url %q: %w", raw, nats.ErrMixingWebsocketSchemes)
+		}
+		poolClass = class
+	}
+	return nil
+}
+
+// validListenHost reports whether host is a bind-legal listen host: empty
+// (wildcard), a bare IP (v4/v6, optional IPv6 zone), or a syntactically valid
+// DNS hostname. It rejects shell/URL metacharacters ("bad$host") that
+// net.Listen would fail on, so config-check and a real Bind agree (F1-B).
+func validListenHost(host string) bool {
+	if host == "" {
+		return true // wildcard bind
+	}
+	// A zone is legal only on an IPv6 literal (fe80::1%eth0). Do not strip an
+	// arbitrary suffix before DNS validation: example.com%eth0 is not an IPv6
+	// address and a real bind cannot interpret it as the hostname example.com.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		ip, zone := host[:i], host[i+1:]
+		return zone != "" && strings.Contains(ip, ":") && net.ParseIP(ip) != nil
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	// A single trailing dot is the standard absolute-FQDN spelling and is
+	// accepted by resolvers. Remove it for label validation, but reject ".".
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+	if len(host) > 253 {
+		return false
+	}
+	// DNS hostname: dot-separated labels of [A-Za-z0-9_-], each 1..63 chars,
+	// not starting/ending with '-'. Underscore is tolerated (real deployments
+	// use it in service names); '$', space, '/' and the like are not.
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }

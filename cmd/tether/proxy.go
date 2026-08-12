@@ -198,6 +198,16 @@ func newProxyStatusCmd(natsURL, home *string) *cobra.Command {
 					if n.PublicPort != 0 {
 						exit = fmt.Sprintf("%s:%d", n.PublicHost, n.PublicPort)
 					}
+					// #78: distinguish "won't" (agent.yaml proxy.participate=false)
+					// from a mere not-ready. Cluster view ([GAP], review Mi2): the
+					// node's whole ROW is absent there — proxyStatusNodesCluster
+					// filters proxy_capable=1 for status⟺/sub render-equivalence
+					// (BD12), and the opt-out folds into that replicated column;
+					// this is a query-shape gap, NOT a replication gap of the
+					// single-broker hint.
+					if n.OptedOut {
+						exit = "opted-out"
+					}
 					_, _ = fmt.Fprintf(w, "  %-20s %-8s %-6v %s\n", n.NID, n.Status, n.Ready, exit)
 				}
 			}

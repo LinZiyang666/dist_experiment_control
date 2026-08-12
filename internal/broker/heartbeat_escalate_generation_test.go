@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"testing"
 	"time"
 
@@ -206,15 +207,53 @@ func TestExternalReviewRegisterClearsStaleProxyReady(t *testing.T) {
 	}
 }
 
+// TestBrokerNewRejectsNonLoopbackSubscriptionListen pins the PREFLIGHT half of
+// the two-stage listener contract: a non-loopback /sub address is a POLICY
+// violation (the surface is unauthenticated + Caddy-fronted), so it must be
+// rejected at New() by the shared no-I/O validator — before any listener bind
+// or DB side effect — not deep inside Run(). This is the fail-closed direction:
+// an operator upgrading with --config-check learns the address is illegal
+// without the broker ever having half-started.
+// origin: docs/reviews/g75-g78-deploy-defaults-external-review.md F10
+func TestBrokerNewRejectsNonLoopbackSubscriptionListen(t *testing.T) {
+	if _, err := New(Config{
+		// New only validates this URL; it does not connect. Keeping the fixture
+		// offline proves the policy rejection really precedes network I/O and
+		// lets this pure-preflight test run in a no-network sandbox.
+		NATSURL:     "nats://127.0.0.1:4222",
+		DB:          openDB(t),
+		Logger:      silentLogger(),
+		SubHTTPAddr: "0.0.0.0:0", // wildcard bind = non-loopback = policy error
+	}); err == nil {
+		t.Fatal("New must reject a non-loopback subscription listener at preflight (fail-closed), not defer it to Run")
+	}
+}
+
+// TestExternalReviewBrokerPropagatesSubscriptionListenerStartupFailure pins the
+// RUNTIME half of the same contract (F10): an address that is format-valid AND
+// loopback (so the New() preflight legitimately passes) but whose port is
+// already occupied is an availability failure only Bind can discover. Run must
+// propagate it and exit, never leave a healthy-looking broker with a dead
+// subscription endpoint. Using a genuinely-occupied loopback port keeps this
+// test about the Run/bind layer now that pure address policy is caught earlier.
+// origin: docs/reviews/g75-g78-deploy-defaults-external-review.md F10
 func TestExternalReviewBrokerPropagatesSubscriptionListenerStartupFailure(t *testing.T) {
+	// Hold a loopback port so the bind inside Run fails with EADDRINUSE — a
+	// real runtime-availability error, not a config-policy one.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = occupied.Close() }()
+
 	b, err := New(Config{
 		NATSURL:     startNATS(t),
 		DB:          openDB(t),
 		Logger:      silentLogger(),
-		SubHTTPAddr: "0.0.0.0:0",
+		SubHTTPAddr: occupied.Addr().String(), // loopback + valid ⇒ preflight passes
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("New must accept a loopback listener even when the port is busy (availability is not the preflight's job): %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -224,7 +263,7 @@ func TestExternalReviewBrokerPropagatesSubscriptionListenerStartupFailure(t *tes
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("broker exited successfully despite an invalid subscription listener")
+			t.Fatal("broker exited successfully despite an unbindable subscription listener")
 		}
 	case <-time.After(500 * time.Millisecond):
 		cancel()
@@ -232,7 +271,7 @@ func TestExternalReviewBrokerPropagatesSubscriptionListenerStartupFailure(t *tes
 		case <-done:
 		case <-time.After(2 * time.Second):
 		}
-		t.Fatal("broker kept running after its configured subscription listener failed to start")
+		t.Fatal("broker kept running after its configured subscription listener failed to bind")
 	}
 }
 

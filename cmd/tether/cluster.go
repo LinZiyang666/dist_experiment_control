@@ -982,16 +982,24 @@ func applyClusterSeam(configPath, dataDir, raftAddr, secretsDir, natsConfPath st
 	// anything else — a stale/wrong raft_addr OR a partial seam missing the cluster-mode-trigger data_dir — is a
 	// HARD error, never left in place (serve keys cluster mode on a non-empty data_dir, so a partial seam boots
 	// SINGLE mode) and never inserted over (a second `cluster:` block would be malformed).
-	if existing, lerr := serveconf.Load(configPath); lerr == nil {
-		ec := existing.Broker.Cluster
-		if ec.RaftAddr != "" || ec.DataDir != "" || ec.SecretsDir != "" || ec.NatsConfPath != "" {
-			if ec.RaftAddr == raftAddr && ec.DataDir == dataDir && ec.SecretsDir == secretsDir && ec.NatsConfPath == natsConfPath {
-				return false, nil // complete + matching (idempotent)
-			}
-			return false, fmt.Errorf("broker.yaml %s already has a broker.cluster seam that is stale/incomplete for this node "+
-				"(have raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q; want raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q) — "+
-				"fix or remove it, then re-run", configPath, ec.RaftAddr, ec.DataDir, ec.SecretsDir, ec.NatsConfPath, raftAddr, dataDir, secretsDir, natsConfPath)
+	// #75: a Load error MUST propagate, not fall through as "no existing seam".
+	// With the strict serveconf decoder, an unparseable/typo'd broker.yaml
+	// used to be silently treated as seam-less here — the seam got inserted,
+	// and only the fail-closed verify at the tail blew up, with the cause
+	// mis-attributed to the freshly-written seam instead of the pre-existing
+	// typo. Refuse up front with the real parse error.
+	existing, lerr := serveconf.Load(configPath)
+	if lerr != nil {
+		return false, fmt.Errorf("applyClusterSeam: %s does not parse (fix it before clustering): %w", configPath, lerr)
+	}
+	ec := existing.Broker.Cluster
+	if ec.RaftAddr != "" || ec.DataDir != "" || ec.SecretsDir != "" || ec.NatsConfPath != "" {
+		if ec.RaftAddr == raftAddr && ec.DataDir == dataDir && ec.SecretsDir == secretsDir && ec.NatsConfPath == natsConfPath {
+			return false, nil // complete + matching (idempotent)
 		}
+		return false, fmt.Errorf("broker.yaml %s already has a broker.cluster seam that is stale/incomplete for this node "+
+			"(have raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q; want raft_addr=%q data_dir=%q secrets_dir=%q nats_conf_path=%q) — "+
+			"fix or remove it, then re-run", configPath, ec.RaftAddr, ec.DataDir, ec.SecretsDir, ec.NatsConfPath, raftAddr, dataDir, secretsDir, natsConfPath)
 	}
 	seam := fmt.Sprintf("  cluster:\n    data_dir: %s\n    raft_addr: %s\n    secrets_dir: %s\n    nats_conf_path: %s\n    nats_server_bin: nats-server",
 		dataDir, raftAddr, secretsDir, natsConfPath)

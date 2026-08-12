@@ -280,6 +280,30 @@ R15: R14: the QUORUM data-plane-separation THIS-RUN guard (384) was reclassified
 
 R15: r1a=GREEN r1b=ASSERT-FAIL r2=INCOMPLETE — flake band
 
+## 78-proxy-dial-backoff
+
+- **batch**: `g75-g78`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
+
+Deploy-tier regression for gotcha #78 (agent proxy first-dial exponential backoff + broker read-REGISTER
+WARN damping + `proxy.participate` opt-out). Verdict **INCOMPLETE** (1 nc_gap):
+- **Arm A** (agent backoff): dial cadence via the netfilter attempt-counter (NOT product logs) — total
+  attempts must fall well below the no-backoff ~39 baseline (≤20) AND show a decreasing per-bucket
+  trend. Fault-speed-decoupled (an absolute bucket count would couple to REJECT's fast-fail vs a slow
+  half-open timeout). GREEN on fixed binary (measured 6/4/3, total 13).
+- **Arm B** (operator bypass): `proxy off/on` mints a new epoch and establishes within 60s — no
+  backoff hangover. GREEN.
+- **Arm C** (broker WARN damping): **not_covered gap** — the `read REGISTER` WARN site is post-TLS
+  (control listener is `tls.NewListener`), so a raw junk-TCP storm fails at the TLS handshake and hits
+  the `accept` site, never reaching read-REGISTER (measured WARN delta 0). The half-open
+  TLS-completed-then-EOF shape needs a real TLS middlebox this sim doesn't front — same limit as the
+  header's WSS [NOT] clause. Hermetically covered by `internal/tunnel/register_log_damping_test.go`.
+- **Arm D** (opt-out): `proxy.participate: false` → zero dials across a live repair loop + allocation
+  freed + `proxy status` shows opted-out, then flip back re-enters the pool and serves. GREEN — the
+  strongest deploy-tier evidence for #78.
+
+Mutation note (against a pre-fix v0.5.0 binary): arms A/D predicted RED, arm B green. Plan:
+`docs/reviews/g75-g78-deploy-defaults-plan.md` §D8.
+
 ## 80-session-isolation
 
 - **batch**: `R12`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_

@@ -55,6 +55,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/backoff"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/tokenhash"
 	"github.com/hashicorp/yamux"
@@ -155,6 +156,36 @@ type Server struct {
 	closed bool
 	ln     net.Listener   // control listener; Close() must close it
 	wg     sync.WaitGroup // tracks in-flight handleAgent goroutines
+
+	// regLog (#78) dampens the `read REGISTER` WARN — the ONE unauthenticated
+	// internet-triggerable log site on this listener. A single agent behind a
+	// half-open :7000 (TCP connects, bytes die) produced one WARN every 5s
+	// forever, the fuel of the 2026-08-11 disk-fill.
+	//
+	// PER-CLASS Trackers (review M1): backoff.Tracker's log discipline fires
+	// on the first failure of a run AND on a class change — that class-change
+	// rule is correct for a SERIAL single-owner loop ("a new problem must not
+	// hide behind an old one's suppression"), but :7000 is a public port with
+	// MANY unrelated sources. Sharing one Tracker across classes meant two
+	// coexisting sources (an EOF prober + a timeout half-open agent) flip the
+	// class every event and log every time — the flood, undamped. So each
+	// coarse class {eof, timeout, other} gets its OWN Tracker: a class change
+	// is now a different Tracker, not a logged transition, and each class is
+	// independently paced. Fixed 3-wide, bounded memory — still the ONE damper
+	// (backoff.Tracker), not a second throttle (h1 E1).
+	//
+	// Each Tracker also uses Due() for time-based reaffirmation (review Mi5):
+	// a suppressed class re-logs once when its backoff instant passes, so a
+	// quiet broker's cross-week event is not silenced for the whole process
+	// lifetime and the Cap is a live "at most one line per Cap" pacing.
+	// regLogMu guards the map: handleAgent is one goroutine per conn and
+	// Tracker is not goroutine-safe.
+	regLogMu sync.Mutex
+	regLog   map[string]*backoff.Tracker
+	// regLogNow is the damper's clock seam (nil ⇒ time.Now). Test-only
+	// injection via SetRegLogClockForTest — Recover's anti-flap floor needs
+	// a controllable clock to be assertable.
+	regLogNow func() time.Time
 }
 
 // SessionInfo is the stable identity of an installed public proxy listener.
@@ -329,6 +360,108 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 	}
 }
 
+// regLogClasses is the fixed, coarse REGISTER-read failure taxonomy (review
+// M1). NEVER err.Error(): variable detail (a port, a byte count) would defeat
+// suppression. Each class carries its OWN Tracker so a class change is a
+// different Tracker, not a logged transition — independent per-class pacing.
+func regLogClass(err error) string {
+	var ne net.Error
+	switch {
+	case errors.Is(err, io.EOF):
+		return "eof"
+	case errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	default:
+		return "other"
+	}
+}
+
+// regLogTracker returns the per-class Tracker, creating it on first use.
+// Caller holds regLogMu.
+func (s *Server) regLogTracker(class string) *backoff.Tracker {
+	if s.regLog == nil {
+		s.regLog = map[string]*backoff.Tracker{}
+	}
+	t := s.regLog[class]
+	if t == nil {
+		t = backoff.New(backoff.Policy{Base: 30 * time.Second, Cap: 5 * time.Minute})
+		s.regLog[class] = t
+	}
+	return t
+}
+
+func (s *Server) regLogNowTime() time.Time {
+	if s.regLogNow != nil {
+		return s.regLogNow()
+	}
+	return time.Now()
+}
+
+// registerReadFailed (#78) is the damped replacement for the per-connection
+// `read REGISTER` WARN. The WARN carries the remote HOST (port stripped —
+// ephemeral) so the operator can finally see WHO is dialing, plus how many
+// identical failures were swallowed since the last logged line. Suppressed
+// repeats drop to Debug. Each coarse class is paced by its own Tracker, and
+// Due() gives a per-Cap reaffirmation so a quiet broker's cross-week event of
+// the same class is not silenced for the whole process lifetime.
+func (s *Server) registerReadFailed(conn net.Conn, err error) {
+	class := regLogClass(err)
+	remote := ""
+	if addr := conn.RemoteAddr(); addr != nil {
+		remote = addr.String()
+		if host, _, splitErr := net.SplitHostPort(remote); splitErr == nil {
+			remote = host
+		}
+	}
+	s.regLogMu.Lock()
+	now := s.regLogNowTime()
+	t := s.regLogTracker(class)
+	// FailReaffirm is the ONE primitive (external review F4): it logs on the
+	// first failure of a run and once per Cap window thereafter (reaffirmation),
+	// and RESETS the suppressed counter each time it says to log — so the next
+	// line never re-reports a count already disclosed. The old hand-cobbled
+	// Due+Fail double-counted: Fail incremented suppressed AFTER a reaffirmation
+	// read it, so every subsequent line reported an accumulating value.
+	logNow, suppressed := t.FailReaffirm(now, class)
+	fails := t.Fails()
+	s.regLogMu.Unlock()
+	if logNow {
+		s.logger.Warn("tunnel server: read REGISTER",
+			"class", class, "err", err, "remote", remote, "suppressed_since_last", suppressed)
+	} else {
+		s.logger.Debug("tunnel server: read REGISTER (suppressed repeat)",
+			"class", class, "err", err, "remote", remote, "fails", fails)
+	}
+}
+
+// registerReadOK (#78) ends every class's read-failure run on the first
+// AUTHORIZED REGISTER (called after tokenLookup succeeds — review M2: an
+// unauthenticated garbage line that merely parses must NOT fake a recovery
+// nor re-arm the WARN). Recover's anti-flap floor folds a run shorter than
+// the Base so a tight success/failure interleave never amplifies. A genuine
+// authorized register means the listener is healthy again, so ALL classes
+// recover together.
+func (s *Server) registerReadOK() {
+	s.regLogMu.Lock()
+	now := s.regLogNowTime()
+	type rec struct {
+		class      string
+		suppressed int
+	}
+	var recovered []rec
+	for class, t := range s.regLog {
+		if t.Failing() {
+			if sup, ok := t.Recover(now); ok {
+				recovered = append(recovered, rec{class, sup})
+			}
+		}
+	}
+	s.regLogMu.Unlock()
+	for _, r := range recovered {
+		s.logger.Info("tunnel server: REGISTER reads recovered", "class", r.class, "suppressed", r.suppressed)
+	}
+}
+
 // handleAgent reads the REGISTER line, validates, then runs the
 // public-port acceptor. One goroutine per agent control conn (= per
 // public port).
@@ -337,7 +470,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	br := bufio.NewReader(conn)
 	line, err := br.ReadString('\n')
 	if err != nil {
-		s.logger.Warn("tunnel server: read REGISTER", "err", err)
+		s.registerReadFailed(conn, err)
 		_ = conn.Close()
 		return
 	}
@@ -382,6 +515,10 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	// M2: recovery is signalled only by an AUTHORIZED register — an
+	// unauthenticated garbage line (which passed parse but fails tokenLookup)
+	// must not fake a recovery Info nor re-arm the damper.
+	s.registerReadOK()
 
 	// Bind the public port BEFORE writing OK so the agent's Open()
 	// returning unblocks only after our publicAcceptLoop is ready to

@@ -107,3 +107,30 @@ func TestProxyStructsRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 }
+
+// TestProxyOptOutFieldsZeroValueByteEquivalent is the mechanical half of the
+// #78 N-1 story: the two new wire fields must be INVISIBLE at their zero value
+// (omitempty), so every pre-#78 peer sees byte-identical messages.
+// NodeRegisterReq's half is also pinned by the frozen golden fixture; this
+// covers ProxyNodeEntry (not in the golden set) and states the property
+// explicitly for both.
+// origin: docs/deploy-tier-gotchas.md #78
+func TestProxyOptOutFieldsZeroValueByteEquivalent(t *testing.T) {
+	if b, _ := json.Marshal(NodeRegisterReq{NID: "lab-1"}); strings.Contains(string(b), "proxy_opt_out") {
+		t.Fatalf("zero-value ProxyOptOut must be omitted: %s", b)
+	}
+	if b, _ := json.Marshal(ProxyNodeEntry{NID: "lab-1"}); strings.Contains(string(b), "opted_out") {
+		t.Fatalf("zero-value OptedOut must be omitted: %s", b)
+	}
+	// And the true values round-trip.
+	b, _ := json.Marshal(ProxyNodeEntry{NID: "lab-1", OptedOut: true})
+	var e ProxyNodeEntry
+	if err := json.Unmarshal(b, &e); err != nil || !e.OptedOut {
+		t.Fatalf("OptedOut=true must round-trip, got %+v err=%v", e, err)
+	}
+	b, _ = json.Marshal(NodeRegisterReq{NID: "lab-1", ProxyOptOut: true})
+	var r NodeRegisterReq
+	if err := json.Unmarshal(b, &r); err != nil || !r.ProxyOptOut {
+		t.Fatalf("ProxyOptOut=true must round-trip, got %+v err=%v", r, err)
+	}
+}

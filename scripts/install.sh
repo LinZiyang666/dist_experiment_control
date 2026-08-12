@@ -3,11 +3,18 @@
 # install (architecture K). Pure POSIX sh; tested under bash, dash,
 # busybox sh.
 #
-# CORE INVARIANT (K.0 §2): this script ONLY lays down files, generates
-# configs, and writes systemd units. It NEVER starts anything. The
-# caller is the only thing that runs `tether agent` / `tether serve` /
-# `systemctl enable --now ...`. After this script returns,
-# `pgrep tether` MUST be empty.
+# CORE INVARIANT (K.0 §2, amended for #76): this script lays down files,
+# generates configs, writes systemd units, and — broker role only —
+# ENABLES those units for boot (symlink creation only; opt out with
+# --no-enable). It NEVER STARTS anything: enabling creates wants/
+# symlinks, not processes. The caller is the only thing that runs
+# `tether agent` / `tether serve` / `systemctl start ...`. After this
+# script returns, `pgrep tether` MUST be empty.
+# (#76 rationale: units were "generated but NOT enabled", the enable
+# step lived only in a printed banner, and the single production broker
+# shipped with boot-autostart silently missing — one reboot took the
+# whole fleet offline. Enablement is now the default because a symlink
+# is exactly as reversible as the banner command was skippable.)
 #
 # Usage:
 #   BASE=https://github.com/LinZiyang666/dist_experiment_control/releases/latest/download
@@ -40,10 +47,12 @@ VERSION="${TETHER_VERSION:-v0.0.0-dev}"
 PREFIX=""
 SKIP_DOWNLOAD=0
 UNINSTALL=0
+NO_ENABLE=0
 
 usage() {
     # UNQUOTED heredoc ON PURPOSE: ${VERSION} below must interpolate so --help shows the
-    # real default. Nothing else in the body expands (no other $, no backtick, no $(…)).
+    # real default. The only other shell-active characters in the body are the ESCAPED
+    # backticks on the --no-enable line (rendered literally); no other $, no $(…).
     cat <<EOF
 tether install.sh — install (do NOT start) one tether role.
 
@@ -59,6 +68,7 @@ Agent-only:
 Broker-only:
   --domain DOMAIN
   --acme-email EMAIL
+  --no-enable         do not \`systemctl enable\` the broker units (default: enabled for boot, never started)
 
 Common:
   --version VER       (default: ${VERSION})
@@ -84,6 +94,7 @@ while [ $# -gt 0 ]; do
         --prefix)        PREFIX="$2";        shift 2 ;;
         --dry-run)       DRY_RUN=1;          shift ;;
         --skip-download) SKIP_DOWNLOAD=1;    shift ;;
+        --no-enable)     NO_ENABLE=1;        shift ;;
         --uninstall)     UNINSTALL=1;        shift ;;
         -h|--help)       usage; exit 0 ;;
         *)
@@ -167,6 +178,10 @@ resolve_latest_version() {
 # what makes `curl .../latest/download/install.sh | sh` work without
 # the operator pinning a version.
 maybe_resolve_version() {
+    # review附记(g75-g78): uninstall never downloads anything, so it must not
+    # depend on resolving a release tag — an OFFLINE host could not uninstall
+    # (the resolver died before any removal ran).
+    [ "$UNINSTALL" -eq 1 ] && return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
     [ "$SKIP_DOWNLOAD" -eq 1 ] && return 0
     [ -n "$SOURCE_BASE" ] && return 0
@@ -372,6 +387,16 @@ tunnel_addr: $TUNNEL_ADDR
 # log_file: /var/log/tether/agent.log   # '-' means stderr (opts OUT of the cap)
 # log_max_size_mb: 50
 # log_max_backups: 2
+#
+# session proxy (tether proxy, P13) — optional, PARTICIPATE by default:
+# with no proxy key this node serves as a proxy egress whenever the session
+# owner runs 'proxy on'. Set participate: false ONLY on a node that cannot
+# reach the broker's tunnel port (e.g. an egress firewall blocks :7000) so
+# it stops dialing a tunnel it can never establish. #78 caveat: agent.yaml
+# is strict-parsed — once written, a tether OLDER than this key refuses to
+# boot (matters if this node might roll back).
+# proxy:
+#   participate: false
 EOF
         chmod 600 "$SESSION_DIR/agent.yaml"
     else
@@ -482,6 +507,131 @@ uninstall_ctl() {
 }
 
 # -- role: broker ----------------------------------------------------------
+
+# enable_broker_units (#76): `systemctl enable` (NO --now) the three broker
+# units so a host reboot brings the stack back. Enable creates wants/
+# symlinks only — no process starts, `pgrep tether` stays empty, so the
+# K.0 §2 never-start invariant is untouched. The single production broker
+# shipped disabled once and a reboot would have taken the fleet offline;
+# a printed banner had already proven insufficient. --no-enable opts out.
+# ENABLED_UNITS records whether enable_broker_units actually created boot
+# symlinks (review M4), so the closing banner cannot claim "ENABLED for boot"
+# on a --no-enable run or a systemd-less host where enable was skipped —
+# claiming it there would resurrect #76 on exactly the environment-guard path.
+ENABLED_UNITS=0
+enable_broker_units() {
+    if [ "$NO_ENABLE" -eq 1 ]; then
+        log "  + --no-enable: units left disabled; enable later with: systemctl enable --now nats-server tether-broker caddy"
+        return 0
+    fi
+    # Only probe for a live systemd when actually executing: a dry-run must
+    # preview the same intent on any build host (CI containers have no
+    # /run/systemd/system, and a host-dependent dry-run is unassertable).
+    if [ "$DRY_RUN" -eq 0 ]; then
+        if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+            log "  ! systemd is not running here — units NOT enabled. On the real host run: systemctl enable --now nats-server tether-broker caddy"
+            return 0
+        fi
+    fi
+    run "systemctl daemon-reload" || die "systemctl daemon-reload failed"
+    run "systemctl enable nats-server tether-broker caddy" \
+        || die "systemctl enable failed — units are written but the broker would NOT come back after a reboot; fix and re-run, or enable manually"
+    log "  ✔ units enabled for boot (nats-server tether-broker caddy) — NOT started"
+    ENABLED_UNITS=1
+}
+
+# write_journald_dropin (#77): give the broker host a tight journald size
+# cap. journald's built-in default is min(10% of the fs, 4G) — NOT unbounded,
+# but far too generous for a small disk sharing space with jetstream + DB
+# (19G production disk ⇒ 1.9G of journal, measured live 2026-08-11). The cap
+# is derived from the /var/log filesystem in three tiers and written as a
+# drop-in ONLY when no other file already sets SystemMaxUse explicitly — an
+# operator's own setting is always respected. Uniform M unit so tooling can
+# grep a single shape.
+#
+# TETHER_JOURNALD_ROOT is a TEST-ONLY seam (hermetic tests point it at a
+# tmpdir); production always resolves /etc/systemd.
+write_journald_dropin() {
+    _jroot="${TETHER_JOURNALD_ROOT:-/etc/systemd}"
+    _dropin_dir="$_jroot/journald.conf.d"
+    _dropin="$_dropin_dir/60-tether.conf"
+    # review F3 OWNERSHIP: our file is identified by a stable MARKER on its
+    # FIRST line, never by its path. A same-name file that lacks the marker is
+    # an operator / site-policy file that merely collided on the name — we must
+    # NOT overwrite or delete it (a root installer silently clobbering operator
+    # config is the defect). Ownership is proven, not assumed.
+    _marker='# managed-by: tether-install.sh (#77 journald cap)'
+
+    # F3: a same-name file WE did not write ⇒ fail closed: respect it, return.
+    if [ -f "$_dropin" ] && ! head -n1 "$_dropin" 2>/dev/null | grep -qF "$_marker"; then
+        log "  + $_dropin exists but is NOT tether-owned (no marker) — treating as an operator/site-policy file; not overwriting"
+        return 0
+    fi
+
+    # Respect any UNCOMMENTED SystemMaxUse= elsewhere. Only OUR OWN marked
+    # drop-in is excluded from the scan (a re-install overwrites it to pick up
+    # a grown disk); a foreign same-name file was already handled above. A
+    # commented-out `#SystemMaxUse=` is NOT a setting (the live incident host
+    # had exactly that commented stub). review Mi6: the pattern allows spaces
+    # around '=' (systemd ignores them). review N9: also scan the vendor/runtime
+    # drop-in dirs whose settings ours would otherwise shadow on filename sort.
+    for _f in "$_jroot/journald.conf" "$_dropin_dir"/*.conf \
+              /run/systemd/journald.conf.d/*.conf /usr/lib/systemd/journald.conf.d/*.conf; do
+        [ -f "$_f" ] || continue
+        if [ "$_f" = "$_dropin" ] && head -n1 "$_f" 2>/dev/null | grep -qF "$_marker"; then
+            continue   # our own marked file — never counts as an operator setting
+        fi
+        if grep -q '^[[:space:]]*SystemMaxUse[[:space:]]*=' "$_f" 2>/dev/null; then
+            log "  + journald SystemMaxUse already set in $_f (operator setting respected)"
+            # review M5: remove our OWN (marker-proven) stale drop-in so it
+            # stops shadowing the operator's setting (journald merges drop-ins
+            # over the main config by filename order). Only OUR file is removed.
+            if [ -f "$_dropin" ] && head -n1 "$_dropin" 2>/dev/null | grep -qF "$_marker"; then
+                run "rm -f '$_dropin'"
+                log "  + removed our stale journald drop-in $_dropin (operator setting now authoritative)"
+            fi
+            return 0
+        fi
+    done
+    # Tier by the /var/log filesystem size (POSIX df -Pk; blocks of 1K). review
+    # Mi9: a non-numeric df field (exotic df / pseudo-fs) falls to the SMALLEST
+    # tier, not the largest — failure direction must be conservative.
+    _fs_kb=$(df -Pk /var/log 2>/dev/null | awk 'NR==2 {print $2}')
+    case "$_fs_kb" in ''|*[!0-9]*) _fs_kb=0 ;; esac
+    if [ "$_fs_kb" -lt 10485760 ]; then
+        _cap="200M"        # < 10 GiB
+    elif [ "$_fs_kb" -lt 41943040 ]; then
+        _cap="500M"        # < 40 GiB (the 19G production disk lands here)
+    else
+        _cap="1024M"       # >= 40 GiB
+    fi
+    if [ "$DRY_RUN" -eq 0 ]; then
+        mkdir -p "$_dropin_dir"
+        # review F2: QUOTED heredoc — the body is fully literal, so the phrase
+        # "systemctl restart systemd-journald" in the comment can never be a
+        # command substitution executed as root at install time (an unquoted
+        # here-document with backticks did exactly that). Only the cap VALUE
+        # varies, so it is appended by printf, not expanded inside the heredoc.
+        {
+            cat <<'JEOF'
+# managed-by: tether-install.sh (#77 journald cap)
+# Safe to delete; removed by tether install.sh --uninstall.
+# journald's built-in default is min(10% of the filesystem, 4G): not unbounded,
+# but too generous for a small broker disk shared with jetstream + tether.db.
+# This cap is derived from the /var/log filesystem size at install time.
+# An explicit SystemMaxUse anywhere else always wins (install.sh skips this
+# file when one exists). Takes effect on the next journald restart or reboot.
+[Journal]
+JEOF
+            printf 'SystemMaxUse=%s\n' "$_cap"
+        } > "$_dropin"
+        chmod 644 "$_dropin"
+        log "  ✔ journald cap written: $_dropin (SystemMaxUse=$_cap)"
+    else
+        log "  + (dry-run) write $_dropin (SystemMaxUse=$_cap)"
+    fi
+    WROTE_JOURNALD_DROPIN=1
+}
 
 install_broker() {
     [ -n "$DOMAIN" ]     || die "--domain required for --role broker"
@@ -627,21 +777,61 @@ EOF
         log "  + (dry-run) write $ETC_DIR/Caddyfile"
     fi
 
-    # systemd units — generated but NOT enabled or started (K.0 §2).
+    # systemd units — generated + (by default) ENABLED for boot, NEVER
+    # started (K.0 §2 as amended for #76; --no-enable opts out).
     write_systemd_units "$SYSTEMD_DIR" "$BIN_DIR" "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+    enable_broker_units
+    write_journald_dropin
 
-    # QUOTED heredoc: this banner is fully literal (no variable, no command to run through the
-    # shell), so nothing here should ever be interpreted. Quoting it keeps a future edit that
+    # QUOTED heredocs: these banners are fully literal (no variable, no command to run through
+    # the shell), so nothing here should ever be interpreted. Quoting keeps a future edit that
     # adds a $ or a backtick from silently expanding — or executing — under root.
-    cat <<'EOF'
+    #
+    # THREE branches (review M4): the banner must match what actually happened.
+    # Claiming "ENABLED for boot" on a --no-enable run OR a systemd-less host
+    # (chroot image build, docker build) where enable was SKIPPED would send
+    # the operator to just `start` and reboot-autostart would still be missing
+    # — #76 resurrected on the environment-guard path. ENABLED_UNITS is set
+    # only when enable actually ran.
+    if [ "$ENABLED_UNITS" -eq 1 ]; then
+        cat <<'EOF'
 
 ✔ broker files installed.
-✔ systemd units created (nats-server, tether-broker, caddy).
+✔ systemd units created and ENABLED for boot (nats-server, tether-broker, caddy) — NOT started.
 
-To start the broker stack (install.sh did NOT start anything):
+To start the broker stack now (install.sh never starts anything):
+    sudo systemctl start nats-server tether-broker caddy
+EOF
+    elif [ "$NO_ENABLE" -eq 1 ]; then
+        cat <<'EOF'
+
+✔ broker files installed.
+✔ systemd units created (nats-server, tether-broker, caddy) — NOT enabled (--no-enable).
+
+To enable boot-autostart and start the broker stack (install.sh did NOT start anything):
     sudo systemctl daemon-reload
     sudo systemctl enable --now nats-server tether-broker caddy
 EOF
+    else
+        cat <<'EOF'
+
+✔ broker files installed.
+✔ systemd units created — but NOT enabled: systemd is not running on this host.
+
+On the real broker host you MUST enable boot-autostart yourself, or one reboot
+takes the fleet offline (#76):
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now nats-server tether-broker caddy
+EOF
+    fi
+    if [ "${WROTE_JOURNALD_DROPIN:-0}" -eq 1 ]; then
+        cat <<'EOF'
+
+A journald size cap was installed (60-tether.conf). It takes effect on the
+next reboot, or immediately after:
+    sudo systemctl restart systemd-journald
+EOF
+    fi
 }
 
 ### Sidecar binary installs ##############################################
@@ -839,12 +1029,56 @@ EOF
 uninstall_broker() {
     BIN_DIR="${PREFIX:-/usr/local/bin}"
     log "tether uninstall (role=broker)"
+    # #76 symmetry: disable BEFORE removing the unit files, so no dangling
+    # wants/ symlinks survive (this also cleans up after a manual
+    # `systemctl enable` on a pre-#76 install). review Mi7: the systemd probe
+    # is skipped in dry-run so the preview is host-INDEPENDENT and assertable
+    # (mirrors enable_broker_units' own principle). review Mi8: on a
+    # systemd-less host the disable is skipped, so explicitly rm the boot
+    # symlinks too or they dangle after the unit files go, and the closing
+    # log must not claim "disabled".
+    _DISABLED=0
+    if [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+        run "systemctl disable nats-server tether-broker caddy 2>/dev/null || true"
+        _DISABLED=1
+    else
+        # No systemd to run `disable`: drop the wants/ symlinks by hand so the
+        # unit removal below does not leave them dangling.
+        for u in nats-server tether-broker caddy; do
+            run "rm -f /etc/systemd/system/multi-user.target.wants/$u.service"
+        done
+    fi
     for u in nats-server tether-broker caddy; do
         run "rm -f /etc/systemd/system/$u.service"
     done
+    # #77 symmetry (review F3): remove the journald drop-in ONLY if it carries
+    # our ownership marker — a same-name operator/site-policy file that merely
+    # collided on the path must survive uninstall. Path is not proof; the
+    # first-line marker is.
+    _u_dropin="${TETHER_JOURNALD_ROOT:-/etc/systemd}/journald.conf.d/60-tether.conf"
+    _u_marker='# managed-by: tether-install.sh (#77 journald cap)'
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) remove $_u_dropin (only if it carries the tether ownership marker)"
+    elif [ ! -f "$_u_dropin" ]; then
+        : # nothing to remove
+    elif head -n1 "$_u_dropin" 2>/dev/null | grep -qF "$_u_marker"; then
+        run "rm -f '$_u_dropin'"
+    else
+        log "  ! $_u_dropin exists but is NOT tether-owned (no marker) — left in place"
+    fi
+    if [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+        # Best-effort: a daemon-reload refreshes systemd's view after the unit
+        # files went; it is cleanup, not correctness. Tolerate failure (e.g. a
+        # non-root/no-polkit context) so uninstall's file removals still stand.
+        run "systemctl daemon-reload 2>/dev/null || true"
+    fi
     run "rm -f '$BIN_DIR/tether'"
     run "rm -rf /etc/tether /var/lib/tether /var/log/tether /var/run/tether"
-    log "  ✔ removed broker files (systemd units, /etc/tether, /var/{lib,log,run}/tether)"
+    if [ "$_DISABLED" -eq 1 ]; then
+        log "  ✔ removed broker files (systemd units disabled+removed, journald drop-in, /etc/tether, /var/{lib,log,run}/tether)"
+    else
+        log "  ✔ removed broker files (unit files + boot symlinks removed [systemd not running], journald drop-in, /etc/tether, /var/{lib,log,run}/tether)"
+    fi
     log "  ✔ note: did NOT remove the 'tether' system user; do that manually if intended"
 }
 

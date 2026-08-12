@@ -515,3 +515,63 @@ oracle，41 必须保持不 restart agent、不改 env/cache、不停旧 broker�
 
 > **候选 #38/#40/#41（spike-decided，plan §4）**：#38(41 R3-recluster，default-GREEN)/#40(43 P2-agent-reconnect，default-GREEN)/#41(92 JS-503 banner 不发 on control-healthy N=1，RESERVED contingent on retire-to-N=1 spike OQ-D4-2)——各批 spike 定格。
 > **编号 reconciliation（round-2 M6 / round-3 M6）**：#37=plan §4 的 40-mid-retire-resume（**非** stall）；#45=retire NATS_ROLLED_OUT 收敛停滞（独立号，此前误标 "#37-family"）；#42=有界 `--remote` 窗口（#43/#44 折入）；#46=91 seeds 漏第 3 voter。本 ledger 与 `docs/reviews/s6-s8-plan.md §4` 表一致。
+
+---
+
+## g75-g78 部署层默认值（#75/#76/#77）— FIXED 全文归档（2026-08-11）
+
+> 增量 = `docs/reviews/g75-g78-deploy-defaults-plan.md` + `-review.md`（内审）+ `-external-review.md`（外审）。
+> #78 仍为 OPEN（product 已修，broker-WARN-damping 的 deploy-tier 面不可构造，由 drill 78 的 INCOMPLETE
+> not_covered 拥有），留在 active ledger。#75/#76/#77 已由 hermetic + live drill(32 GREEN / 93 #75 五臂 PASS)
+> 双证闭合，全文归档于此。
+
+### #75 — broker 日志无默认封顶；`observability.log_file` 实测不写文件 → `broker.err` 可无界爆盘 —— **FIXED**
+
+- **状态：✅ FIXED（g75-g78，2026-08-11；hermetic 全绿 + deploy-tier drill 93 的 #75 五臂 live PASS、product_red=0；外审 F1 config-check 提前成功已修）。**
+- **两半治**：① 静默吞根因——`internal/serveconf.Load` 改 `KnownFields(true)` 严格解析（镜像 agent 侧
+  `loadAgentYAML`）：错嵌套/键名 typo 现在**拒启**并报键名行号。官方模板自 P10 起带 `broker.tls.acme.email`，
+  裸严格化会 brick 每台官方装机——故加 inert `TLSSection` stub 吸收它，`TestInstallShTemplateParsesStrict`
+  （从真 heredoc 提取、含注释态 cluster 块变体 Mi12）长效钉模板↔schema 配对。`cmd/tether/cluster.go` 的
+  seam-probe 站吞错改传播。② sink 生效自证——`resolveLogSink` 打 `tether: log sink <path>` breadcrumb。
+  **unit→journal + in-process cap 早在 h1/v0.5.0 已落地**（② 面当时已修），本轮补静默吞与可见性两半。
+- **外审整合（F1）**：`tether serve --config-check` 曾在 strict decode 后即退出、漏 newLoggerTo(log level)/
+  auth seeds/webhook/listen 校验 → 假 "config OK"。已改为退出点后移到**全部纯校验器之后、任何副作用之前**，
+  并抽 `broker.ValidateConfig`（webhook URL + listen 地址，sub/manifest 经共享 `httplisten.CheckLoopback`）供
+  config-check 与真实 serve 共用；storage.Open 在 config-check 下跳过、logger 用 discard sink（不建日志文件）。
+- **现象（历史）**：手写/精简 broker.yaml 不含 `observability` 段 → slog 落 stderr → unit
+  `StandardError=append:<file>`（无上限），被 #78 的每 5s WARN 灌到 1.1 GB。补配 `observability.log_file` 后
+  broker.log 仍 0 字节（slog 走了 journal，in-process cap 没接管）。
+
+### #76 — install.sh 生成 broker/nats/caddy unit 但**不 enable** → 开机不自启（单 broker 是生产命脉）—— **FIXED**
+
+- **状态：✅ FIXED（g75-g78，2026-08-11；drill 32 live GREEN 54 assert、#76 四断言全过；外审 F2/M4 已修）。**
+- **修**：install.sh broker 角色装完**默认 `systemctl enable`**（不带 `--now`——仅 symlink，`pgrep tether`
+  必空的 K.0 §2 never-start 不变量原样保留）；`--no-enable` 退出口 + uninstall 对称 disable + 悬空 symlink
+  清理。K.0 §2 契约字句 sweep 全引用面。**banner 三分支**（外审 M4：无 systemd 宿主不再假称 ENABLED——
+  `ENABLED_UNITS` 只在 enable 真跑时置位）。存量装机 retrofit 见 broker-ops §2。
+- **外审整合（F2）**：journald drop-in 的**未引用 heredoc** 正文含反引号 `systemctl restart systemd-journald`
+  = command substitution，装机时以 root 执行——改**引用 heredoc + printf** 只展开 cap 值；`lint-install.sh`
+  纳入验证；`daemon-reload` 改 best-effort。
+- **现象（历史）**：racknerd 的 `tether-broker`/`nats-server` 竟是 disabled，一旦重启整车队失联。
+
+### #77 — journald 无默认 `SystemMaxUse` → 小盘 broker 的 journal 可无界增长 —— **FIXED**
+
+- **状态：✅ FIXED（g75-g78，2026-08-11；drill 32 live GREEN、#77 断言 drop-in 值独立复算 + operator 尊重 + uninstall 净全过；外审 F3 已修）。**
+- **修**：install.sh broker 角色**条件写** drop-in `/etc/systemd/journald.conf.d/60-tether.conf`，`SystemMaxUse`
+  按 `/var/log` 三档（<10G→200M / <40G→500M / ≥40G→1024M）。任何位置已有未注释 `SystemMaxUse=`（含 spaced
+  `=`，Mi6）则跳过；df 非数字向最小档（Mi9）。**台账"无界"订正**：journald 默认 = min(fs 10%, 4G)，非无界、对小盘太宽。
+- **外审整合（F3）**：drop-in 曾**仅凭路径**认领所有权——覆盖/删除同名 operator 文件。改为**首行 ownership
+  marker**（`# managed-by: tether-install.sh (#77 journald cap)`）证明所有权：无 marker 的同名文件视为
+  operator/site-policy 文件,写入跳过、uninstall 保留。foreign 文件(含无 SystemMaxUse 的)survives 均有 p10 钉。
+
+### #45 — retire op 卡 `NATS_ROLLED_OUT`、永不达 terminal RETIRED —— **FIXED**
+
+- **状态：✅ FIXED（2026-08-11 实测复核 drill 40 GREEN、`product_red=0 not_covered=0`）。** `cluster retire brk2`
+  顺利到 terminal RETIRED（drill 自述 `grow-lock released + converged this run`），不再卡 NATS_ROLLED_OUT；
+  同一 drill 名含 "#31 retire gate"，印证 #31 修复也解除了它对 retire 的阻塞。归档系 g75-g78 外审 F6 顺手
+  清偿的既有 bookkeeping 缺口（此前 prose 标"已修"但未迁 closed，导致 ledger-crosscheck 计其为 UNOWNED）。
+- **编号（外审 round-2/3 M6）**：本停滞此前误标 "#37-family"，与 plan §4 的 #37（mid-retire-resume）冲突——
+  故给独立 #45；#45 = retire START 后停滞；#31 = retire START 前被 grow-lock 拒；#37 = mid-retire-resume,三者相异。
+- **现象/机理**（41 M15）：一次 `cluster retire` 可 STALL 在 `NATS_ROLLED_OUT`（rehome/migrate 未完成）、
+  永不收敛到 terminal RETIRED；随后下一个 retire 被 `already in flight` 拒。
+- **钉**：`40` R-retire 要求 terminal RETIRED op_state；`41` shrink else-branch 区分 #31 grow-lock vs #45 stall。

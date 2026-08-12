@@ -107,6 +107,45 @@ func TestExternalReviewAgentYAMLExposesPrivateDestinationOptIn(t *testing.T) {
 	}
 }
 
+// TestLoadAgentYAMLProxyParticipateThreeStates (#78): proxy.participate must
+// be tri-state — ABSENT (nil) and explicit true both mean participate; only
+// an explicit false opts out. The field is *bool precisely because yaml's
+// bool zero value is false: a plain bool would read every existing agent.yaml
+// (key absent) as "opted out" — the N-1 zero-value disaster in one line.
+// origin: docs/deploy-tier-gotchas.md #78
+func TestLoadAgentYAMLProxyParticipateThreeStates(t *testing.T) {
+	load := func(t *testing.T, body string) agentYAML {
+		t.Helper()
+		home := t.TempDir()
+		dir := filepath.Join(home, "agent", "lab")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ay, err := loadAgentYAML(home, "lab")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ay
+	}
+	optOutOf := func(ay agentYAML) bool {
+		// The exact expression agentDaemonConfig wires into Config.ProxyOptOut.
+		return ay.Proxy.Participate != nil && !*ay.Proxy.Participate
+	}
+
+	if ay := load(t, "session: lab\nnid: lab-1\n"); ay.Proxy.Participate != nil || optOutOf(ay) {
+		t.Fatalf("ABSENT key must mean participate (nil), got %+v", ay.Proxy)
+	}
+	if ay := load(t, "session: lab\nnid: lab-1\nproxy:\n  participate: true\n"); optOutOf(ay) {
+		t.Fatal("explicit true must mean participate")
+	}
+	if ay := load(t, "session: lab\nnid: lab-1\nproxy:\n  participate: false\n"); !optOutOf(ay) {
+		t.Fatal("explicit false must opt out")
+	}
+}
+
 // TestLoadAgentYAMLMalformed: a typo in the operator's
 // hand-edited yaml should surface as an error rather than silent
 // fall-through to flag defaults — otherwise the operator wonders

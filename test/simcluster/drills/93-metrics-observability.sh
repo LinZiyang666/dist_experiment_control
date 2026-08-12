@@ -431,6 +431,42 @@ assert_ok "MET-degraded: recovery sample returns voters=3 and quorum_margin=1" \
     poll_until 60 3 "quorum_margin recovers to 1" -- sh -c \
     "$SIM exec $LDR -- curl -s http://127.0.0.1:$MPORT/metrics | grep -q '^tether_broker_voters 3$' && $SIM exec $LDR -- curl -s http://127.0.0.1:$MPORT/metrics | grep -q '^tether_broker_quorum_margin 1$'"
 
+# ── #75: strict broker.yaml + sink breadcrumb ─────────────────────────────────────────────────
+# Two faces of #75 on the real stack, on a follower so the other two voters hold quorum:
+#   (a) a MIS-NESTED observability block (the racknerd shape: `observability:` hoisted to the
+#       document ROOT instead of under broker:) must make the broker REFUSE to start, naming the
+#       offending key — the pre-#75 tolerant decoder silently ignored it and wrote unbounded logs
+#       elsewhere. The refusal is pre-logger, so it lands in the boot/panic stream (same reasoning
+#       as the WEBHOOK-URL negative arm above).
+#   (b) a healthy start emits the sink breadcrumb `tether: log sink <path>` to journal — the
+#       "is the file sink working or is the config dead?" answer the live incident lacked.
+N75=$(a_non_leader_voter) || setup_fail "no follower for #75"
+LDR=$(sim_leader)
+# (b) FIRST, while the config is still valid: a normal start must have printed the breadcrumb. The
+# install.sh broker.yaml carries observability.log_file, so this follower already logs to a file and
+# the breadcrumb is on its boot/journal stream.
+_sink_breadcrumb() { sim_broker_panic_journal "$N75" 'tether: log sink ' || sim_broker_slog_grep "$N75" 'tether: log sink '; }
+assert_ok "#75 healthy start emits the log-sink breadcrumb to journal (sink-visibility: config took effect)" \
+    poll_until 10 2 "sink breadcrumb present" -- _sink_breadcrumb
+# (a) inject the mis-nest by DERIVING it from the real template shape: append an `observability:` map
+# at the document root (column 0), which is exactly the "one level too shallow" mistake. Strict decode
+# must reject it BY KEY NAME.
+assert_setup "#75 inject a ROOT-level (mis-nested) observability block on $N75" \
+    dexec "$N75" -- sh -c "printf '\nobservability:\n  log_max_size_mb: 50\n' >> /etc/tether/broker.yaml"
+"$SIM" exec "$N75" -- systemctl restart tether-broker >/dev/null 2>&1 || true
+_misnest_diagnostic() {
+    _mnd='observability|field .*not found|serveconf: parse'
+    sim_broker_panic_journal "$N75" "$_mnd" || sim_broker_slog_grep "$N75" "$_mnd"
+}
+assert_ok "#75 mis-nested broker.yaml → broker REFUSES to start, diagnostic names the key (pre-#75: silently ignored)" \
+    poll_until 30 2 "mis-nest startup diagnostic" -- _misnest_diagnostic
+# restore: strip the bogus trailing block (the LAST observability: at column 0) and restart; the
+# follower must return VOTER — proving the refusal was the config, not a broken node.
+assert_setup "#75 restore $N75's broker.yaml (remove the root-level block) and restart" \
+    dexec "$N75" -- sh -c "sed -i '/^observability:/,\$d' /etc/tether/broker.yaml; systemctl restart tether-broker"
+assert_setup "#75 restored follower returns VOTER" \
+    poll_until 60 3 "$N75 returns VOTER" -- sh -c "$SIM status --json 2>/dev/null | jq -e --arg n '$N75' '.nodes[]?|select(.node_id==\$n and .phase==\"VOTER\" and .reachable==true)' >/dev/null"
+
 # ── EXIT taxonomy all-down (Stage-C M3: real ROSTER_UNREACHABLE, distinct from DEGRADED; DESTRUCTIVE — last) ─
 for b in brk1 brk2 brk3; do "$SIM" exec "$b" -- systemctl stop tether-broker nats-server >/dev/null 2>&1 || true; done
 sleep 3

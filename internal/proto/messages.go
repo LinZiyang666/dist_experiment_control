@@ -84,6 +84,20 @@ type NodeRegisterReq struct {
 	// ("register deadline exceeded", "boot budget exhausted", …). Log-only,
 	// same additive rules as UpgradeState.
 	UpgradeDetail string `json:"upgrade_detail,omitempty"`
+
+	// ProxyOptOut (#78) is the agent.yaml `proxy.participate: false` opt-out:
+	// this node must NOT serve as a session-proxy egress. It rides register
+	// (a boot-time static config, same journey as Capabilities), never the
+	// heartbeat. The broker folds it into the EXISTING nodes.proxy_capable
+	// computation (ProxyCapable = capability AND NOT opt-out) — deliberately
+	// NOT a new RegisterInput field: that payload is raft-replicated and a
+	// new field would silently drop in a mixed-version cluster.
+	// N-1 matrix: zero value (absent) = participate = today's behavior, both
+	// directions. Old broker × new opted-out agent: the broker keeps pushing
+	// directives; the agent's local directive gate refuses to dial (belt),
+	// so the #78 log flood still stops — the node just renders never-ready
+	// there (documented [GAP]). Additive/omitempty (proto stays 2).
+	ProxyOptOut bool `json:"proxy_opt_out,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -1169,6 +1183,13 @@ type ProxyNodeEntry struct {
 	ReadyReason string `json:"ready_reason,omitempty"` // no_home | catching_up | tunnel_down | keyset_stale | ready
 	HomeBroker  string `json:"home_broker,omitempty"`
 	Epoch       int64  `json:"epoch,omitempty"`
+	// OptedOut (#78) distinguishes "won't" from "can't": true when this node
+	// registered with proxy_opt_out (agent.yaml proxy.participate: false).
+	// Single-broker visibility hint only — the backing memory is not
+	// replicated and empties on a broker restart until the agent's next
+	// re-register (documented [GAP]); the ENFORCEMENT lives in
+	// nodes.proxy_capable, which needs no hint. Additive/omitempty.
+	OptedOut bool `json:"opted_out,omitempty"`
 }
 
 // ProxySubEntry is one subscriber row in status/list (NEVER carries token/psk).

@@ -30,6 +30,12 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 > `assert_bug` 语义相反，见 §0.2 注〕钉住，附 flip 条件）。三条均经**活体 server spike 实测**（2026-07-11）。
 
 ### #29 — cluster expose 的 home 不可投递到非-tunnel broker（un-homed 回落）；crash home → 常规 expose **全 voter 搁浅**（不自动 rehome），直到 home RETURN
+
+> **⬆ 2026-08-11 实测复核（drill 71 on v0.5.0 源码）→ 部分改善**（`product_red=0`）：**drain-migrate 门已通**
+> ——`cluster drain brk3` rc=0 + migrated expose 被 agent ACK 新 home（`B-cmd [R8]` PASS；之前被 #31 grow-lock 挡的
+> 那一重已随 #31 修复解除，Arm E rebuild-OFF 拒绝签名也 PASS）。**crash 后不自动 rehome 确认是设计行为**
+> （C/D-strand PASS、epoch 不变——非 bug，要不要改是产品决策）。**唯一 open 面**：普通 `expose`（无 --on-broker）在
+> rebalance/kill 动态窗口 create `rc=64`（drill 74 B-negctrl 实测复现）——homeForExpose 动态 eligibility 不稳定这一面未闭合。
 - **现象（LIVE-CONFIRMED，6 次 sim run 2026-07-12/13/14）**：
   - **home 不可投递到非-tunnel broker（净效果 = tunnel-coupling，但机制是 un-homed 回落）**：N=3 cluster 里
     `expose --on-broker <非-tunnel voter>`（agent 隧道在别处）→ `homeForExpose`（`internal/broker/home.go:96-113`）
@@ -87,6 +93,11 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   的搁浅断言翻 → 翻 GREEN 回归。
 
 ### #31 — `cluster add` 的 grow lock（`cluster_grow_active`）best-effort release 几乎总失败、残留、阻塞 upgrade（dry-run 看不见）
+
+> **⬆ 2026-08-11 实测复核（drill 30 on v0.5.0 源码）→ 已修**：grow brk2/brk3→N=3 后 rolling upgrade
+> **顺利过 acquire-lock，全程无 `membership operation in flight`**（output 零 `[GAP #31]`），`product_red=0`。
+> 旧版 3/3 在此 HALT——grow-lock best-effort release 现已可靠。verdict 仍是 INCOMPLETE，但只因 2 个**与
+> #31 无关**的覆盖缺口（N=2 负控制作者自证冗余 + leader-hop sim 结构不可达）。**产品行为已对，台账挂 OPEN 仅是 drill 翻不了绿。**
 - **现象**（`30-rolling-upgrade`，2026-07-12，3/3 live real roll 命中）：`cluster add`（grow）完成、joiner 达
   VOTER、命令 **exit 0 报成功**后，`cluster_grow_active` marker **几乎总残留**。后果：（a）`cluster upgrade` 的
   **real roll** 撞 `acquire upgrade lock refused: a cluster membership operation (join/retire) is in flight`
@@ -152,6 +163,12 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   正向 GREEN 断言。
 
 ### #34 — proxy home 分布无法稳定保持 one-per-voter；非-tunnel voter 的 proxy-eligibility 不稳定；auto-rebalance-on-return 不发火（external-review round-6 硬化 74 时暴露）
+
+> **⬆ 2026-08-11 实测复核（drill 74 on v0.5.0 源码）→ 核心多数 PASS，产品债门仍在**（`product_red=0`）：
+> `SKEW-reconstruct` 把分布重建成 1/1/1（spread==0）、**auto-rebalance-on-return 在 return edge 发火**
+> （`C-dp` 数据面 flow bytes + `C-event` `proxy_auto_rebalanced` count==1，均 PASS）——比台账原始描述改善明显。
+> 但 **`#34 REGISTERED-OPEN` 产品债门仍挂着**（drill 自述"非确定性复现、R15 did not fix #34、未 verified-fixed"）；
+> 本 run 的 `assert_fail=2` 实为 #29 家族的 expose-create `rc=64`（见 #29），不是 #34 本体。
 - **证据分级（R7 订正——区分"已证"与"观测但未独立归因"）**：
   - **已证 A（control-plane home 计数直读，无歧义）**：`cluster rebalance proxy` **能**把 3 个 __proxy__ exit 构造成
     one-per-voter（1/1/1，spread==0），但**随即又漂移回全堆 tunnel/leader broker brk1**（实测 1/1/1 → brk1=3/brk2=0/
@@ -189,11 +206,9 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 - **钉**：`92` leg-a——**fence-aware 对照**：探 on-broker socket（~1s 后翻 quorum-lost）vs `--remote`（窗口内仍 transient）→ 断二者在窗口内**不一致**（socket 已判 quorum-lost、--remote 仍 transient）；或 TFence 后断 `--remote` 自我纠正为 READ-ONLY(exit2)=GREEN。**（原 #42/#44 "永久"断法是误分类 RED、已废。）**
 - **flip**：`--remote`/destructive-gate 在窗口内即给 quorum-lost verdict（缩短或消除 TFence 误导）。#43/#44 折入本条与 #41（`--remote` remedy 与 banner 同受 `JetStreamUnavailable` gate `cluster_status_nats.go:161-168`，非独立缺陷）。
 
-### #45 — retire op 卡 `NATS_ROLLED_OUT`、永不达 terminal RETIRED（40/41 暴露；与 #31 grow-lock、与 plan §4 #37 mid-retire-resume 均相异）
-
-- **编号（外审 round-2 M6 / round-3 M6）**：本停滞此前误标 "#37-family"，与 **plan §4 的 #37（mid-retire-resume）语义冲突**——故给它**独立干净的 #45**（#38/#40/#41 已被候选占、#43/#44 已折入 #42，见下）。#45 = retire START 后停滞；#31 = retire START 前被 grow-lock 拒；#37(plan §4) = mid-retire-resume；三者相异。
-- **现象/机理**（41 M15）：一次 `cluster retire` 可 STALL 在 `NATS_ROLLED_OUT` 阶段（rehome/migrate 未完成）、永不收敛到 terminal RETIRED；随后下一个 retire 被 `already in flight` 拒（`cluster_operation_controller.go:33`）。
-- **钉**：`40` R-retire 要求 terminal RETIRED op_state（非仅 roster-absence；stall 则 `assert_bug #45` → PRODUCT-RED）；`41` shrink else-branch 区分二因（#31 grow-lock vs #45 stall）、`product_red` EXPOSE 本停滞。**flip**：retire op 在 rehome/migrate 完成后可靠推进到 RETIRED。
+> **#45 已 FIXED 并归档**（2026-08-11 实测复核 drill 40 GREEN、`product_red=0 not_covered=0`；g75-g78
+> 外审 F6 顺手清偿的既有 bookkeeping 缺口——此前 prose 标"已修"但未迁 closed）——全文见
+> `docs/reviews/deploy-tier-gotchas-closed.md`，下方索引表亦记。
 
 ## G-C（S7+S9）登记（#50+ / DOC-17+）— **实测中，随 Stage-B 真跑滚动补全**
 
@@ -756,6 +771,66 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   B 和 E 两个 workstream 都要补门。
 - **运维处置**：见 `broker-ops.md §8.8`（升级顺序 broker→agent、迁移步骤、冒烟检查）。
 
+## 真实车队 v0.5.0 全删重装发现（#75+；来源=生产车队运维，非 simcluster drill）
+
+> 2026-08-11 全车队 v0.5.0 从零重装（racknerd 洗成纯 single broker + 8 agent 重 join）过程中，
+> 在**真实生产栈**上暴露的一批**系统性短板**——共性是「本该是默认/傻瓜式的东西却要运维手动补，
+> 漏一步就出事」。区别于 S 系列（那是 simcluster drill 自动钉红）：这几条**尚无 drill oracle**，
+> 修复批落地时应顺手补 simcluster 覆盖（#75/#76/#77 都可在 deploy-tier 复现）。
+
+> **#75/#76/#77 已 FIXED 并归档**（2026-08-11，g75-g78）——全文见
+> `docs/reviews/deploy-tier-gotchas-closed.md`「g75-g78 部署层默认值」段，下方索引表亦记。
+> hermetic 全绿 + live drill(32 GREEN / 93 #75 五臂 PASS, product_red=0) 双证闭合；外审 F1/F2/F3 已整合。
+
+### #78 — agent 拨隧道失败无退避、broker WARN 无降频、且无 per-agent proxy opt-out → 拨不通的节点每 5s 刷屏
+
+> **⬆ 2026-08-11 修复（g75-g78）**：三条都做。**① agent 首拨指数退避**——`proxyStartLocked` 单咽喉
+> （broker 每 5s keyset repair 推送不变，agent 在退避窗内不拨）：5s→…→封顶 5min，key =
+> `{gen,epoch,port,token,homeEpoch}`，任一分量变化（proxy off/on、rotation、rehome）或 NATS 重连立即重试、清零
+> ——运维显式操作零延迟。复用 `internal/backoff.Tracker`，零新 timer/goroutine。**② broker WARN 降频**——
+> `tunnel handleAgent` 的 `read REGISTER` 站点接 **per-class 三个固定 `backoff.Tracker`**（class ∈
+> {eof,timeout,other}，带 `class`+`remote` 主机 + `suppressed_since_last`;内审 M1:单共享 Tracker 会被
+> 多源类别交替击穿）：同类风暴只打首条 + **Due 到点每 Cap(5min) 重申一条**(内审 Mi5) +
+> **已鉴权** REGISTER(内审 M2:过 tokenLookup 之后,垃圾行伪造不了 recovery)补 `recovered suppressed=N`。
+> **③ per-agent opt-out**——`agent.yaml proxy.participate: false`（`*bool` nil=参与，防零值灾难）→ register
+> 带 additive `proxy_opt_out`，broker 折入既有 `nodes.proxy_capable`（**不加 RegisterInput 字段**——那是 raft
+> payload；折入既有列即复制到位），停 mint/停推/停渲染 + 释放存量 __proxy__ 行；agent 侧 belt 对旧 broker
+> 也拒拨；`proxy status` 标 `opted-out`。wire +2 additive（N-1 四象限过）。hermetic 钉（各带变异验证）：
+> 退避表测 + opt-out 三态 + broker 闭环 + WARN 降频 + wire 零值字节等价。deploy-tier：新 `drills/78-proxy-dial-backoff.sh`
+> 四臂（退避 cadence 用 netfilter 计数器、operator bypass、WARN 降频、opt-out 释放+恢复）。
+> **⚠ 回滚砖**：agent.yaml 严格解析，写 `participate` 后回滚到旧二进制会拒启——仅在不再回滚到 <本版本时才写。
+- **状态：🟢 FIXED（g75-g78，2026-08-11；hermetic 已绿，drill 78 待实跑复核）。环境侧残余**：wsl 宿主
+  Windows 放行出站 :7000 不在产品面（opt-out + 退避已把"刷屏爆盘"这一半消掉）；**N-1 [GAP]**：旧 broker 仍会
+  给 opted-out 节点推 directive（agent 本地拒拨止血，但 broker 渲染该节点 never-ready）。
+- **现象（历史）**：weiland-wsl（WSL2 出站只放行 :443、隧道 :7000 半通——TCP 建立即 EOF）参与 session proxy，
+  **每 5 秒**拨隧道一次，broker 每次记 `tunnel server: read REGISTER err=EOF` WARN，**永不停**。
+- **机理**：① agent proxy 隧道重试是**固定 ~5s、无指数退避**；② broker 对同源同因 WARN **无 dedup/rate-limit**；
+  ③ proxy 是 **session 级**开关，拨不通的单个 agent **无法退出出口**（agent.yaml 无 proxy opt-out）——
+  只要 `proxy on` + 该 agent 在线，就无限刷。
+- **怎么修（该改进）**：失败重试**指数退避**（封顶如 5min）；broker 重复 WARN **降频/合并计数**；
+  agent.yaml 增 `proxy.participate: false`（或 broker 侧按连续拨失败自动摘除该节点出口）。
+  彻底根治本例还需在 wsl 宿主 Windows 放行出站 :7000——但那是环境侧，产品这三条能把「刷屏爆盘」这一半消掉。
+
+### #79 — [更正：非 v0.5.0 短板] force-single 的 roster prune 失败无重试 → 永久 ghost VOTER —— **0.4.7 死结，v0.5.0 batch C 已修 ✅**
+
+- **状态：✅ FIXED（v0.5.0 / batch C·C1，commit `92e01a4` `internal/broker/force_single_finalize.go`）。
+  本条最初误登为 v0.5.0 open 短板——经代码核实是 0.4.7 的死结、v0.5.0 已修，更正如下。**
+- **0.4.7 的病**：online force-single 同步 prune abandoned roster row 失败后，dwell gate
+  （`CodeQuorumNotLost`——该节点此刻自己就是 leader、有 leader contact）**拒绝 re-run** → 失败的 prune
+  永无重试 → ghost roster row（phase=VOTER 但**不在 raft config**、`cluster status` role 为空）永久残留 →
+  `reconcile nats --to-standalone` 因 "cannot prove N=1" 拒 → **降不回纯 single 的死结**。
+  `force_single_finalize.go:44–49` 自述：这正是现网 **pc732 permanent ghost VOTER 的直接成因**。
+- **v0.5.0 的修（batch C）**：加 `OpForceSingleFinalize` **自驱动 retry op**——replicated deadline
+  budget=`12 * observeTickInterval`（carried in `catchup_deadline` 列，**非 leader-local 计数器**，重启/换届/
+  no-op propose 都不丢），在同步 prune 失败时自动创建并重试 prune，直到 abandoned ghost roster row 被清、
+  to-standalone 的 N=1 tally 通过、降级解锁。deterministic finalizer 仍是 `cluster recovery node remove <ghost>`。
+- **本轮运维教训（非产品缺陷，记此备忘）**：这次清 pc732 时 racknerd broker **仍是 0.4.7**，所以只能走
+  推倒重建（删 `raft/`+`tether.db`）。**v0.5.0 下的正解是：先把 broker 升到 0.5.0 → 跑 `cluster recovery
+  force-single`（finalize retry 自动清 ghost）→ `reconcile nats --to-standalone` 降回纯 single，无需推倒重建。**
+  推倒重建同样达成了目的（且符合本次"全删重装"意图），但不是 v0.5.0 下的最优降级路径。
+- **对「双向切换」结论的修正**：分析里曾说"降下来最硬的缺口是 N=1 带死 voter 无在线清理"——**在 v0.5.0
+  这已不成立**，force-single finalize retry 补上了这条在线路径。
+
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 
 编号保持全局连续；下列条目已了结，正文已剥离归档。
@@ -769,6 +844,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 | #35 | REFUTED（证伪，非缺陷） | [CANDIDATE，未在 sim 复现] online force-single 的 dwell 在 quorum-los |
 | #36 | CLOSED | online force-single 的 --yes 不走 Tier-2 rejector（与 offline 分歧；TT |
 | #39 | CLOSED | disk_pressure monitor interval 固定 5-min、无 operator knob（90-M6  |
+| #45 | FIXED | retire op 卡 NATS_ROLLED_OUT 永不达 terminal RETIRED；drill 40 GREEN 确证（#31 修复连带解除） |
 | #46 | CLOSED | seeds change-gated auto-publish 漏第 3 voter（91 暴露；G3 client-con |
 | #47 | CLOSED | cluster add 可把可达 joiner 永久留在 CATCHING_UP，后续 grow 被串行锁阻断 |
 | #48 | CLOSED | 连续 shrink 时 agent 可黏在已退役 broker 的 NATS 孤岛，ONLINE 行与真实命令路径分裂 |
@@ -786,3 +862,6 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 | #64 | CLOSED | recovery restore 剪到单 voter 却不去集群化 nats.conf、也从不提示 ⇒ 照文档做必 cras |
 | #65 | REFUTED（证伪，非缺陷） | [CANDIDATE] 分区少数派的 stale-leader 写有时变持久 |
 | #68 | FIXED | R16 A4 的 --reset-js 确认门只更新了一半 remedy ⇒ JS-503 横幅让运维跑一条必被拒的命令 |
+| #75 | FIXED | broker.yaml 静默失效（serveconf 非严格解析）+ log-sink 无可见性；g75-g78 严格化 + inert TLS stub + config-check + breadcrumb（外审 F1 整合） |
+| #76 | FIXED | install.sh broker unit 不 enable → 开机不自启；g75-g78 默认 enable + --no-enable + 三分支 banner（外审 F2/M4 整合） |
+| #77 | FIXED | journald 无默认 SystemMaxUse；g75-g78 条件写三档 drop-in + ownership marker（外审 F3 整合） |

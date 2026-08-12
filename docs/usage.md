@@ -914,6 +914,22 @@ tether proxy sub revoke alice          # 撤销一个订阅(其他人不受影�
 - **责任警告**:开启后每个在线 agent 是对任意 link 持有者(含非成员)开放的互联网出口,
   流量从你 agent 的 IP 出去,你负责。一键关闭=`tether proxy off`。`tether proxy on` 因此强制确认。
 - **出口范围默认仅公网**:agent 默认拒绝订阅流量去 loopback / 内网(RFC1918+RFC6598 共享段)/ link-local / multicast / 云 metadata(`169.254.169.254`、`100.100.100.200` 等)等**非公网地址**,按**解析后 IP** 判定(挡 DNS-rebinding,连 NAT64/6to4 编码的内网 IPv4 也挡)。即订阅持有者**只能经 agent 出公网,碰不到 agent 本机/内网**。确需私网访问,在该 agent 的 `agent.yaml` 设 `proxy.allow_private_destinations: true` 显式开启(**高危**:等于把该 agent 所在内网借给订阅持有者)。
+- **单节点退出出口(#78,`proxy.participate: false`)**:某个 agent 不适合当出口
+  (典型:出站防火墙挡了隧道 :7000,拨号永远失败还每 5s 刷 broker 日志)时,在**该 agent** 的
+  `agent.yaml` 的 `proxy:` 块下写 `participate: false` 并重启 agent——broker 不再给它分配代理端口、
+  不再推送 directive,`/sub` 不再渲染它;单机 `proxy status` 里该节点标 `opted-out`
+  (broker 重启后、agent 未重连期间此标记暂时回落为普通 not-capable,仅显示层差异)。
+  **[GAP] cluster 模式的 `proxy status`**:opted-out 节点**整行缺席**(该视图与 /sub 渲染等价、
+  只列 proxy-capable 节点),无法区分 opted-out / pre-P13 / 已 evict——确认某节点是否 opt-out
+  看该 agent 自己的日志(`proxy participation disabled by agent.yaml`)。
+  改回 `true`(或删掉该键)重启即恢复入池。**只影响 P13 代理出口**——exec/run/expose/push 等一概不受影响。
+  ⚠ **回滚警告**:agent.yaml 是严格解析,写入本键后若把该机回滚到不认识它的旧版 tether
+  (含 `node upgrade` 失败自动回滚到旧槽),agent 会拒启——仅在确认该机不再会回滚到旧版时才写此键;
+  解法是删掉该键一行。
+- **拨号退避(#78)**:代理隧道**首次建立**失败后,agent 按 5s→10s→…→5min 指数退避重试
+  (broker 每 5s 的收敛推送不变,agent 在退避窗内不拨号)。任何"新东西"立即重试:
+  `proxy off/on`、端口轮换、rehome、NATS 重连都清零退避——运维显式操作永不等窗。
+  已建立会话的掉线重拨(0.5s→30s)是另一套机制,不受影响。
 - 这是应用层代理,不是整机 VPN;想整机路由,在你自己设备上用 Clash 的 TUN 模式(与 agent 无关)。
 - broker 侧需在 `broker.yaml` 设 `broker.sub.listen` 启用订阅 HTTP 端点；`tether serve --sub-http-listen`
   的 CLI 默认是空值（禁用），install.sh 生成的新 broker 配置通常写成 `127.0.0.1:8090`。

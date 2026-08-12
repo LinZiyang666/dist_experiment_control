@@ -124,6 +124,31 @@ fault_synblock_on() {
 # fault_synblock_off <node> : heal. Same single-flush contract as fault_partition_off.
 fault_synblock_off() { fault_partition_off "$1"; }
 
+# fault_reject_on <node> <port> : REJECT (tcp-reset) <node>'s OUTBOUND connects to <port> — a FIFTH
+# failure semantic, distinct from the four in the header: the dial fails FAST (connection refused),
+# like an egress firewall actively refusing the tunnel port (#78's weak analog of the live WSL
+# half-open :7000 — the exact live shape lets TCP establish and kills bytes, which needs a
+# middlebox this sim does not front; REJECT reproduces the "agent can never establish, retries
+# forever" driver without the client-side hang risk of PSH-drop). Lives in the SIMFAULT chain so
+# the single-flush cleanup contract holds.
+fault_reject_on() {
+    _fr_node=$1; _fr_port=$2
+    [ -n "${_fr_port:-}" ] || { err "fault_reject_on <node> <port> — no port given"; return 1; }
+    _fault_chain_ensure "$_fr_node" || { err "fault_reject_on: could not create $FAULT_CHAIN on $_fr_node"; return 1; }
+    dexec "$_fr_node" -- iptables -A "$FAULT_CHAIN" -p tcp --dport "$_fr_port" -j REJECT --reject-with tcp-reset >/dev/null 2>&1 \
+        || { err "fault_reject_on: iptables failed on $_fr_node port $_fr_port"; return 1; }
+    log "fault: rejecting $_fr_node -> :$_fr_port (fast refuse — the dial-never-establishes instrument)"
+}
+
+# fault_reject_pkts <node> <port> : the packet counter on the REJECT rule — one SYN per connect()
+# attempt, so this is a PRODUCT-INDEPENDENT dial-attempt counter (#78's backoff oracle: the damped
+# product logs deliberately stop restating attempts, so counting log lines would under-count by
+# design; the netfilter counter sees every attempt regardless).
+fault_reject_pkts() {
+    dexec "$1" -- iptables -L "$FAULT_CHAIN" -v -x -n 2>/dev/null \
+        | awk -v port="$2" '$0 ~ "REJECT" && $0 ~ ("dpt:" port) {print $1; exit}'
+}
+
 # fault_partition_peer_on <node> <peer> <port> : DROP <node>'s traffic to/from ONE PEER's <port>,
 # leaving every other peer reachable. origin: internal review F98-1 — fault_partition_on is
 # deliberately PEER-AGNOSTIC (it cuts a port toward everyone), so using it for "cut the connected

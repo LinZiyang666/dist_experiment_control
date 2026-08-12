@@ -55,6 +55,10 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
   逐个 sha256 校验后落地）
 - `/etc/tether/{broker.yaml, Caddyfile}`
 - `/etc/systemd/system/{nats-server, tether-broker, caddy}.service`
+  （#76:默认已 `systemctl enable`——仅建开机 symlink,**不启动**;`--no-enable` 退出）
+- `/etc/systemd/journald.conf.d/60-tether.conf`
+  (#77:journald `SystemMaxUse` 按盘三档 <10G→200M / <40G→500M / ≥40G→1024M;
+  任何位置已有显式 `SystemMaxUse=` 则不写;`systemctl restart systemd-journald` 或重启后生效)
 - `/var/{lib,log,run}/tether`（属主 `tether` 系统用户，`install.sh` 自动 useradd）
 
 > **分布式 HA（proto v2）安装边界**：升级成集群时，tether 接管 `nats.conf`（`tether cluster
@@ -64,13 +68,34 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 > 预检：缺/不可读/私钥权限松 = 拒；FDE 缺 = advisory）。现网单点→N≥3 的一次性迁移全流程 +
 > 回滚见 **`docs/cluster-runbook.md` 第 4 节**。proto v2 不与现网 v1 车队 wire 兼容（需协调全车队重装）。
 
-启动：
+启动（units 已由 install.sh enable,只差 start）：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now nats-server tether-broker caddy
+sudo systemctl start nats-server tether-broker caddy
 sudo systemctl status nats-server tether-broker caddy
 ```
+
+> **存量装机 retrofit(#76/#77)**:老版 install.sh 装的 broker(如 2026-08 前的现网)没有上面两项默认。
+> **不要**在存量机上重跑 install.sh(会覆写 broker.yaml/Caddyfile);一次性手动补齐:
+>
+> ```bash
+> sudo systemctl enable nats-server tether-broker caddy
+> # review F8: create the drop-in DIR first — on an old/minimal install it may not exist,
+> # and the `tee` would fail. The marker's first line matches install.sh's ownership check
+> # so a later `--uninstall` will clean this file up (F3).
+> sudo install -d -m 0755 /etc/systemd/journald.conf.d
+> printf '# managed-by: tether-install.sh (#77 journald cap)\n[Journal]\nSystemMaxUse=500M\n' \
+>   | sudo tee /etc/systemd/journald.conf.d/60-tether.conf
+> sudo systemctl restart systemd-journald
+> # verify the cap actually took (read-only). NOTE (review F8): do NOT use
+> # `systemctl show systemd-journald -p SystemMaxUse` — journald does not export
+> # that property, so it prints an empty value and exits 0, proving nothing.
+> # Read the MERGED config instead and confirm your drop-in is the LAST effective
+> # SystemMaxUse (drop-ins override /etc/systemd/journald.conf; last one wins):
+> systemd-analyze cat-config systemd/journald.conf | grep -nE '^\s*SystemMaxUse=|^# /'
+> # the final uncommented `SystemMaxUse=` printed must be the drop-in's `=500M`,
+> # and the `# /…/60-tether.conf` source header must appear after any base value.
+> ```
 
 `broker.upgrade.url_allow` 的内置默认值已经包含本仓库的 GitHub release 前缀，
 开箱即可 `tether node upgrade`；要自托管镜像才需要改 `broker.yaml` 或
@@ -87,6 +112,7 @@ sudo systemctl status nats-server tether-broker caddy
 | `--nid NID`                 | agent 用，必填 |
 | `--domain DOMAIN`           | broker 用，必填 |
 | `--acme-email EMAIL`        | broker 用，必填 |
+| `--no-enable`               | broker 用:不 `systemctl enable`(默认 enable,仅 symlink 不启动;#76) |
 | `--version VER`             | 默认 `v0.0.0-dev` ⇒ 触发 latest-tag 嗅探；显式如 `v0.1.0` 则锁版本 |
 | `--source-base URL`         | 覆盖 release tarball 基址（自托管镜像走这条；同时跳过 latest 嗅探） |
 | `--prefix DIR`              | 覆盖安装根目录 |
@@ -124,14 +150,7 @@ broker:
     # metrics_listen: 127.0.0.1:9090   # Prometheus /metrics + /healthz + /readyz（空 = 关）
     # alert_webhook_url: https://...   # 每次 committed 告警 raise/clear POST（仅集群，空 = 关）
     # disk_check_interval: 5m          # 磁盘监控采样间隔（#39；默认 5m；flag --disk-check-interval 优先）
-    # --- broker.cluster.* 的 xfer 回收节奏（仅 cluster 模式；生产通常全部留空用内建默认）---
-    # xfer_reap_interval: 5m           # #58/P10：home 权威的 orphan tier-B 对象回收周期（默认 5m；<1s 或 >24h 在 Load 期拒绝）
-    # xfer_cross_home_reap_age: 15m    # R16 #58：LEADER 跨-home GC 的年龄下限（**只能调高，不能调低**；
-    #                                   # 外审 F2：低于 tier-B 看门狗的下限会让 leader 删掉另一 home 上
-    #                                   # 仍在用的对象——leader 看不见别人的 tracker）。回收「没有任何 home 能回收」的
-    #                                  # split-home / 零节点会话 bucket。默认派生自 3×tier-B 超时(=15m)——比 per-home
-    #                                  # grace 长，护住另一 home 上仍在飞的传输（跨节点时钟偏斜留余量）。**没有生产调参
-    #                                  # 场景**，暴露它只为 deploy-tier drill 压缩排程；<1s 或 >24h 在 Load 期拒绝。
+    # ⚠ xfer_reap_interval / xfer_cross_home_reap_age 属于 broker.cluster.*，不在此段——见下方 cluster: 块
   upgrade:
     url_allow:                         # `tether node upgrade` 白名单（可选）
       - https://github.com/LinZiyang666/dist_experiment_control/releases/
@@ -140,6 +159,11 @@ broker:
     data_dir: /var/lib/tether          # holds raft/ + tether.db
     raft_addr: 10.0.0.1:7400           # 私网 Raft transport
     secrets_dir: /etc/tether/secrets   # cluster-ca/route/tunnel/node-ident/broker/account seeds
+    # xfer 回收节奏（仅 cluster 模式；生产通常全部留空用内建默认；#75 起就地取消注释即生效，键位正确）
+    # xfer_reap_interval: 5m           # #58/P10：home 权威的 orphan tier-B 对象回收周期（默认 5m；<1s 或 >24h 在 Load 期拒绝）
+    # xfer_cross_home_reap_age: 15m    # R16 #58：LEADER 跨-home GC 的年龄下限（**只能调高，不能调低**；外审 F2：
+    #                                  # 低于 tier-B 看门狗下限会让 leader 删掉另一 home 仍在用的对象——leader 看不见别人的
+    #                                  # tracker）。默认派生自 3×tier-B 超时(=15m)。**没有生产调参场景**，只为 drill 压缩排程。
 ```
 
 修改后 `sudo systemctl restart tether-broker` 生效（不支持热重载）。
@@ -576,6 +600,24 @@ agent 侧同理：默认写 `<home>/agent/<sid>/agent.log`（同样 50MB × 2）
 **不再需要 logrotate 配置**。若你已经装了针对 `/var/log/tether/*.log` 的 logrotate
 规则，删掉它：两套轮转互相打架（外部 rename 会让进程内的大小计数与磁盘脱节）。
 
+**sink 生效自证(#75)**:file sink 打开后 broker 往 stderr(→journal)打一行
+`tether: log sink /var/log/tether/broker.log (cap 50MB x 2 backups)`——`journalctl -u
+tether-broker` 里看到它即证明 observability 段真的生效;若看到的是 slog 业务日志本体,
+说明配置没接上(#75 修复后错嵌套/typo 会直接**拒启**并报键名行号,不会再静默忽略)。
+
+**隧道 REGISTER 读失败 WARN 的降频语义(#78,内审 M1/M2/Mi5 后的最终形态)**:
+`tunnel server: read REGISTER` 这条 WARN(唯一未鉴权、互联网可触发的日志站点)现在**按错误类
+(eof/timeout/other)各自独立降频**——两个异类故障源并存(比如一个半开 agent + 一个探测器)
+不会互相把对方"顶"成每事件一条。每类:风暴只打**第一条**(带 `class`、`remote` 主机与
+`suppressed_since_last` 计数),之后静默,**每约 5 分钟重申一条**("仍在发生"的确认——安静
+broker 上跨周的同类独立事件也因此不会被永久静音);直到**下一次已鉴权的 REGISTER**(过 token
+校验的真 agent——垃圾连接/TLS 探测器触发不了)打 `REGISTER reads recovered class=… suppressed=N`
+把账补上。需要逐条取证时把 log level 开到 debug(被抑制的重复以 Debug 级保留)。
+**⚠ `remote` 字段语义(外审疑惑2)**:每个 class 是**全进程一个** damper(不是 per-remote,内存有界),
+所以 WARN 里的 `remote` 只代表**恰好触发这条(首条或重申)的那个来源**;同 class 的其他来源被全局吞掉、
+不各自留 `remote`。**不要**把 `remote` 当 per-source 归因——它只说"这一类里至少有它在拨",要精确定位所有
+来源需 debug 级或 netfilter/`ss` 侧观测。
+
 **从 h1 之前的部署迁移（必须按顺序）**，见 §8.8。
 
 ### 7.6 监控 tether 自身
@@ -612,6 +654,15 @@ agent 侧同理：默认写 `<home>/agent/<sid>/agent.log`（同样 50MB × 2）
 > 混合 release 车队在一个窗口（相邻两个 release）内是受支持状态。
 
 ### 8.4 broker 升级
+
+> **#75 严格化升级注意**:自 #75 修复版起,broker 对 `broker.yaml` **严格解析**——未知/错嵌套的键
+> 会**拒启**并在错误里报键名与行号(此前是静默忽略)。手工编辑过 broker.yaml 的存量机(比如手抄过
+> `observability:` 段),flip 前用新二进制跑一次 **`tether serve --config /etc/tether/broker.yaml --config-check`**
+> ——它只做严格解析 + 全部校验器就退出(exit 0=配置 OK),**不开库、不跑 migration、不起监听**,
+> 因此可以安全地用新二进制对活库所在主机验证而不污染回退路径。**切勿用不带 `--config-check` 的
+> `tether serve` 做验证**:那会 `storage.Open` 并对活的 `tether.db` 应用新二进制的全部 pending
+> migrations,即便随后 Ctrl-C,"决定不 flip"的回退也已被污染。拒启的修法:按报错把键放回正确层级
+> (对照 install.sh 模板)。
 
 ```bash
 sudo systemctl stop tether-broker

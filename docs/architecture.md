@@ -1724,7 +1724,7 @@ agent 执行步骤：
 ### K.0 核心原则
 
 1. **单二进制 `tether`**：所有角色共用；安装即"把 `tether` 放到路径 + 准备配置 + 写启动单元（可选）"。
-2. **install ≠ start**：**安装脚本只铺文件、不启动任何服务**。用户必须手动执行 `tether serve` / `tether agent` / `systemctl start ...` 才会真正跑起来。这样可控、可审查、可在多次试错中安全重入。
+2. **install ≠ start**（#76 修订）：**安装脚本铺文件 + (broker 角色默认) `systemctl enable` 开机自启（仅建 symlink;`--no-enable` 退出),但绝不启动任何服务**。用户必须手动执行 `tether serve` / `tether agent` / `systemctl start ...` 才会真正跑起来。这样可控、可审查、可在多次试错中安全重入。enable 默认化的动因:单 broker 现网曾以 disabled 状态运行,一次重启即全车队失联——"运维必须自己 enable"被实证不可靠。
 3. **无权限优先**：agent 必须能在无 root 的实验机器上装。
 4. **分发渠道**：GitHub Releases + 反代域名 `<broker>/install.sh`。
 
@@ -1834,17 +1834,18 @@ curl -fsSL https://<broker>/install.sh | sudo sh -s -- \
 8. **打印下一步**：
    ```
    ✔ broker files installed.
-   ✔ systemd units created (nats-server, tether-broker, caddy).
+   ✔ systemd units created and ENABLED for boot (nats-server, tether-broker, caddy) — NOT started.
 
-   To start the broker stack:
-       sudo systemctl daemon-reload
-       sudo systemctl enable --now nats-server tether-broker caddy
+   To start the broker stack now (install.sh never starts anything):
+       sudo systemctl start nats-server tether-broker caddy
 
    First-time admin setup (after start):
        sudo -u tether tether admin init
    ```
 
-**运维必须自己 `systemctl enable --now`**——这是 K.0 原则 2 的体现。
+**units 默认已 enable(symlink only;`--no-enable` 退出),启动仍必须运维自己 `systemctl start`**——
+这是 K.0 原则 2(#76 修订版)的体现。#77:broker 角色同时按盘容量条件写入
+`/etc/systemd/journald.conf.d/60-tether.conf`(`SystemMaxUse` 三档;已有显式设置则跳过)。
 
 ### K.4 release 产物
 
@@ -1871,7 +1872,7 @@ SHA256SUMS.asc                           # v2 加 GPG 签名
 |---|---|---|
 | 使用者 | `curl install.sh \| sh` | `tether login -s <S> --pin <P>` |
 | 实验机器 | `curl install.sh \| sh -s -- --role agent --broker <U> --session <S> --pin <P> --nid <N>` | `setsid nohup tether agent --session <S> >> ~/.tether/agent/<S>/agent.log &`（或用户级 systemd `tether-agent@<S>`） |
-| 运维 | `curl install.sh \| sudo sh -s -- --role broker --domain <D>` | `sudo systemctl enable --now nats-server tether-broker caddy` |
+| 运维 | `curl install.sh \| sudo sh -s -- --role broker --domain <D>` | `sudo systemctl start nats-server tether-broker caddy`(units 已默认 enable,#76) |
 
 **强制语义**：`install.sh` 返回后没有任何 tether 进程在跑；用户必须显式执行启动命令才生效。
 

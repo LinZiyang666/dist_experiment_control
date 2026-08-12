@@ -133,7 +133,58 @@ assert_ok "ownership: /etc/tether root-owned AND /etc/tether/nats.d tether-owned
 # byte of an existing file moves the digest) — the guard that keeps the oracle from ever regressing to path-names.
 assert_ok "manifest is CONTENT-sensitive (mutating a byte of an existing tracked file MOVES the digest — the old path-name md5 could not detect this; M5)"  _manifest_detects_content
 
-# ── uninstall → units gone, reinstall idempotent ─────────────────────────────
+# ── #76: broker units ENABLED for boot (symlink only), never started ──────────────────────────
+# The K.0 §2 contract's two halves, pinned together: enabled≠started. is-enabled reports the boot
+# symlink exists; pgrep asserts NO process; the two together are exactly the amended invariant. The
+# live incident was a single broker shipped DISABLED — one reboot took the fleet offline.
+_units_enabled()  { for u in nats-server tether-broker caddy; do IN systemctl is-enabled "$u" 2>/dev/null | grep -qx enabled || return 1; done; }
+_units_disabled() { for u in nats-server tether-broker caddy; do _s=$(IN systemctl is-enabled "$u" 2>/dev/null); [ "$_s" = enabled ] && return 1; done; return 0; }
+assert_ok "#76 broker units are ENABLED for boot (nats-server tether-broker caddy all is-enabled)"  _units_enabled
+assert_ok "#76 enabled-but-NOT-started: still no tether process (enable is a symlink, not a start — K.0 §2 amended)"  _no_tether_running
+
+# #76 --no-enable opt-out: a fresh install with --no-enable leaves the units disabled.
+_broker_install_noenable() { IN sh -c "sh $INST --role broker --skip-download --no-enable --domain brkx --acme-email x@x.test" >/dev/null 2>&1; }
+assert_ok "uninstall before the --no-enable check"  _uninstall_zeroed
+assert_ok "#76 broker install --no-enable"  _broker_install_noenable
+assert_ok "#76 --no-enable leaves the units DISABLED (the operator opted out)"  _units_disabled
+assert_ok "reinstall broker (default, re-enables) for the #77 + uninstall checks below"  _broker_install
+assert_ok "#76 default reinstall re-enabled the units"  _units_enabled
+
+# ── #77: journald size cap drop-in, value derived from THIS container's /var/log filesystem ────
+# The drill INDEPENDENTLY recomputes the expected tier from df (never trusts the product's output),
+# so a wrong derivation is caught, not rubber-stamped.
+_expected_journald_cap() {
+    _kb=$(IN df -Pk /var/log 2>/dev/null | awk 'NR==2{print $2}'); _kb=${_kb:-0}
+    if   [ "$_kb" -lt 10485760 ]; then echo 200M
+    elif [ "$_kb" -lt 41943040 ]; then echo 500M
+    else echo 1024M; fi
+}
+_journald_dropin_value() { IN sh -c "grep -h '^SystemMaxUse=' /etc/systemd/journald.conf.d/60-tether.conf 2>/dev/null | cut -d= -f2"; }
+# assert_ok runs predicates as FUNCTIONS inheriting this shell (drill header /
+# R-NOSHC) — an outer `sh -c` would start a fresh shell where these helpers are
+# not-found, both command-subs empty, and `[ "" = "" ]` a false-GREEN identity.
+# The non-empty guard makes a double-empty read FAIL rather than pass.
+_caps_match() { _a=$(_journald_dropin_value); _b=$(_expected_journald_cap); [ -n "$_a" ] && [ "$_a" = "$_b" ]; }
+assert_ok "#77 journald drop-in exists (/etc/systemd/journald.conf.d/60-tether.conf)"  IN test -f /etc/systemd/journald.conf.d/60-tether.conf
+assert_ok "#77 drop-in SystemMaxUse == the tier the drill INDEPENDENTLY derives from df /var/log (not trusting the product's number)" \
+    _caps_match
+
+# #77 respect an operator's explicit setting: pre-seed journald.conf, reinstall, our drop-in must NOT appear.
+_seed_operator_journald() { IN sh -c "printf '[Journal]\nSystemMaxUse=800M\n' > /etc/systemd/journald.conf"; }
+assert_ok "uninstall before the operator-setting check"  _uninstall_zeroed
+assert_ok "#77 pre-seed an explicit operator SystemMaxUse in journald.conf"  _seed_operator_journald
+assert_ok "reinstall broker with the operator setting present"  _broker_install
+assert_ok "#77 our drop-in is NOT written when the operator already set SystemMaxUse (operator setting respected)" \
+    IN sh -c "! test -f /etc/systemd/journald.conf.d/60-tether.conf"
+assert_ok "#77 cleanup: remove the seeded journald.conf + reinstall clean for the uninstall check"  \
+    IN sh -c "rm -f /etc/systemd/journald.conf && sh $INST --role broker --skip-download --domain brkx --acme-email x@x.test >/dev/null 2>&1"
+
+# ── uninstall → units gone (+ disabled + drop-in removed), reinstall idempotent ───────────────
+# _units_notfound == _units_disabled (N10): both assert no unit reports is-enabled==enabled.
+_uninstall_then_notfound() { IN sh -c "sh $INST --role broker --uninstall" >/dev/null 2>&1; _units_disabled; }
+assert_ok "#76 uninstall DISABLES the units before removing them (no dangling boot symlinks)"  _uninstall_then_notfound
+assert_ok "#77 uninstall removed our journald drop-in"  IN sh -c "! test -f /etc/systemd/journald.conf.d/60-tether.conf"
+assert_ok "reinstall broker idempotent after the full-symmetry uninstall"  _broker_install
 assert_ok "uninstall broker → tether-broker.service removed"  _uninstall_zeroed
 assert_ok "reinstall broker idempotent (clean second install)"  _broker_install
 assert_ok "reinstall still never-starts"  _no_tether_running

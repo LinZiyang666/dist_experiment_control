@@ -58,8 +58,23 @@ func resolveLogSink(path string, maxMB, backups int) io.Writer {
 	}
 	w, err := logrotate.Open(path, int64(maxMB)<<20, backups, 0o600)
 	if err != nil {
+		// Unreachable TODAY: logrotate.Open never returns an error (a
+		// birth-degraded Writer spills to stderr, prints its own DEGRADED
+		// line, and keeps retrying). Kept as future-proofing — if Open ever
+		// grows a real error path this degrades loudly instead of nil-deref.
 		fmt.Fprintf(os.Stderr, "tether: log file %s unusable (%v); logging to stderr\n", path, err)
 		return os.Stderr
 	}
+	// #75 breadcrumb: once slog goes to the file, journal (where the unit
+	// routes stderr) would otherwise show NOTHING — the live incident read
+	// exactly like that ambiguity, "is the file sink working or is the
+	// config dead?". One stderr line at boot answers it from journalctl
+	// alone. Deliberately stderr, not the returned sink: printing it into
+	// the file it announces would miss the one place operators look.
+	// Phrased as the CONFIGURED sink, not a success claim: logrotate.Open
+	// never fails (a birth-degraded Writer spills to stderr and retries),
+	// and its own DEGRADED line — printed just above when applicable — is
+	// the authority on whether bytes actually reach the file.
+	fmt.Fprintf(os.Stderr, "tether: log sink %s (cap %dMB x %d backups)\n", path, maxMB, backups)
 	return w
 }

@@ -80,32 +80,59 @@ func (b *Broker) driveProxyReconcile() {
 }
 
 // reconcileProxyTeardown frees + disables every __proxy__ allocation whose session is no longer an
-// ACTIVE proxy-enabled session (the B1 OFF/teardown convergence).
-func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
+// ACTIVE proxy-enabled session (the B1 OFF/teardown convergence) — or (#78) whose NODE registered
+// as not proxy-capable (the opt-out fold): every allocate/repair/rotate gate skips a
+// proxy_capable=0 node, so without this leg an allocation made BEFORE the opt-out would keep its
+// public port forever — no gate would ever touch that row again (see
+// staleProxyTeardownRows for the full argument).
+// staleProxyRow is one __proxy__ allocation the teardown pass must free.
+type staleProxyRow struct {
+	sid, nid string
+	port     int
+}
+
+// staleProxyTeardownRows selects every ALLOCATED __proxy__ row the teardown
+// pass owns: the session is no longer ACTIVE+proxy-enabled, OR (#78) the node
+// registered as not proxy-capable (the opt-out fold) — every allocate/repair/
+// rotate gate skips a proxy_capable=0 node (the M3 rotation included: its only
+// entry is inside the onlineNIDs(proxy_capable=1) loop), so without the second
+// leg an allocation made BEFORE the opt-out would keep its public port forever
+// — no gate would ever touch that row again (review N3 corrected an earlier
+// claim that rotation would keep re-minting; it structurally cannot). Split
+// from the teardown executor so the selection is hermetically testable without
+// a raft harness.
+// FREE function taking *Broker (the h1 E2 precedent): the Broker
+// type-methods ratchet is deliberately not raised for plumbing.
+func staleProxyTeardownRows(b *Broker) ([]staleProxyRow, error) {
 	rows, err := b.read().Query(`
 		SELECT pa.sid, pa.nid, pa.port
 		FROM port_allocations pa
 		JOIN sessions s ON s.sid = pa.sid
 		WHERE pa.name = '__proxy__' AND pa.state = 'ALLOCATED'
-		  AND NOT (s.state = 'ACTIVE' AND s.proxy_enabled = 1)`)
+		  AND (NOT (s.state = 'ACTIVE' AND s.proxy_enabled = 1)
+		       OR EXISTS (SELECT 1 FROM nodes n
+		                   WHERE n.sid = pa.sid AND n.nid = pa.nid AND n.proxy_capable = 0))`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var stale []staleProxyRow
+	for rows.Next() {
+		var r staleProxyRow
+		if err := rows.Scan(&r.sid, &r.nid, &r.port); err != nil {
+			return nil, err
+		}
+		stale = append(stale, r)
+	}
+	return stale, rows.Err()
+}
+
+func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
+	stale, err := staleProxyTeardownRows(b)
 	if err != nil {
 		b.cfg.Logger.Warn("broker: proxy reaper teardown query", "err", err)
 		return
 	}
-	type row struct {
-		sid, nid string
-		port     int
-	}
-	var stale []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.sid, &r.nid, &r.port); err != nil {
-			_ = rows.Close()
-			return
-		}
-		stale = append(stale, r)
-	}
-	_ = rows.Close()
 	for _, r := range stale {
 		// Push Enabled:false so the agent tears down its SS server + tunnel (the tunnel drop closes the
 		// home broker's bound public listener). The epoch carries the post-off keyset bump → newer →
@@ -121,7 +148,13 @@ func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
 		if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return port.PlanFree(db, freePort, b.cfg.Now())
 		}); err != nil {
+			// review N4: the raft free did NOT commit — do NOT emit a `freed`
+			// event nor drop the marks/dwell for a row still ALLOCATED (a
+			// quorum-loss / leader-not-stepped-down window would repeat a false
+			// `freed` every tick). The next tick re-does the full teardown once
+			// the write can commit.
 			b.cfg.Logger.Warn("broker: proxy teardown free", "sid", r.sid, "port", freePort, "err", err)
+			continue
 		}
 		b.pubPortEvent(r.sid, r.port, port.ProxyPortName, r.nid, 0, "freed")
 		// C6-EVT-3: drop this freed port's rehome change-mark + dwell so a future allocation re-announces

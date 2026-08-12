@@ -133,9 +133,26 @@ var frozenPayloadKeys = map[string][]string{
 	// ordinary register; the broker only logs them, never persists — an old leader ignoring the
 	// unknown keys loses one log line and nothing else). Freeze-listed like every other key: from
 	// here on a RENAME of either is the cross-version break this test exists to catch.
+	// proxy_opt_out: #78, ADDITIVE (bool omitempty; zero value = participate =
+	// pre-#78 behavior). Cross-version story (review Mi1 corrected the
+	// attribution): the fold into RegisterInput.ProxyCapable happens on the
+	// ANSWERING broker (handleRegister, before json.Marshal(in)), and the
+	// forward payload is the key-frozen node.RegisterInput — there is no key
+	// to drop on the broker→leader hop, so the opt-out survives any leader
+	// version once an answering broker folded it. The real degradation point
+	// is an OLD ANSWERING broker dropping this key on the agent→broker
+	// register wire (messages.go's N-1 matrix documents it; the agent's local
+	// directive gate is the belt). The only forward carrying a raw
+	// NodeRegisterReq (ReconcilePayload.Req) never reads ProxyOptOut on the
+	// leader. No path decodes to a different-but-committed input. Residual
+	// mixed-version gap, recorded: NEW answerer × OLD leader commits
+	// proxy_capable=0 fine, but the OLD leader's reaper lacks the #78
+	// teardown leg, so a pre-existing __proxy__ row survives until an
+	// upgraded broker leads. Freeze-on-entry: from here on a RENAME of this
+	// key is the cross-version break this test exists to catch.
 	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "local_ports", "local_processes",
-		"nid", "os", "proto_version", "release_version", "roster_gen", "roster_refresh_only",
-		"server_id", "upgrade_detail", "upgrade_state"},
+		"nid", "os", "proto_version", "proxy_opt_out", "release_version", "roster_gen",
+		"roster_refresh_only", "server_id", "upgrade_detail", "upgrade_state"},
 	// ended_at: h1 C4, ADDITIVE (omitempty pointer; a courier's pending-exit
 	// snapshot row carries the true end instant, the broker clamps it to
 	// min(EndedAt, now), and an old leader ignoring the unknown key falls

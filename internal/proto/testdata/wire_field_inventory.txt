@@ -184,6 +184,7 @@ NodeRegisterReq.LocalProcesses	json:"local_processes,omitempty"	[]LocalProcess
 NodeRegisterReq.NID	json:"nid"	string
 NodeRegisterReq.OS	json:"os"	string
 NodeRegisterReq.ProtoVersion	json:"proto_version"	int
+NodeRegisterReq.ProxyOptOut	json:"proxy_opt_out,omitempty"	bool
 NodeRegisterReq.ReleaseVersion	json:"release_version"	string
 NodeRegisterReq.RosterGen	json:"roster_gen,omitempty"	uint64
 NodeRegisterReq.RosterRefreshOnly	json:"roster_refresh_only,omitempty"	bool
@@ -232,6 +233,7 @@ ProxyKey.SubID	json:"sub_id"	string
 ProxyNodeEntry.Epoch	json:"epoch,omitempty"	int64
 ProxyNodeEntry.HomeBroker	json:"home_broker,omitempty"	string
 ProxyNodeEntry.NID	json:"nid"	string
+ProxyNodeEntry.OptedOut	json:"opted_out,omitempty"	bool
 ProxyNodeEntry.PublicHost	json:"public_host,omitempty"	string
 ProxyNodeEntry.PublicPort	json:"public_port,omitempty"	int
 ProxyNodeEntry.Ready	json:"ready"	bool

@@ -9,6 +9,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/LinZiyang666/tether/internal/agent/ssproxy"
+	"github.com/LinZiyang666/tether/internal/backoff"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -41,6 +42,49 @@ type proxyRuntime struct {
 	// directive — the authoritative reconnect resync — to rebuild, even though it
 	// isn't strictly newer. Cleared on any successful (re)build or disable.
 	needsReestablish bool
+
+	// dial + lastFail (#78) are the FIRST-DIAL backoff for the proxy tunnel.
+	// The broker's heartbeat convergence loop re-pushes the directive every
+	// ~5s to a not-ready node, and each push used to re-dial unconditionally
+	// — a node whose tunnel path is broken (half-open :7000) dialed forever
+	// at 5s, feeding the broker's `read REGISTER` WARN flood (#78, the fuel
+	// of the #75/#77 disk-fill). The gate lives in proxyStartLocked (the
+	// single dial choke point — repair pushes are keyset-only and arrive
+	// here via the footprint-bootstrap arm) and ONLY holds back a retry of
+	// the SAME resolved dial identity: any new gen/epoch/port/token/home
+	// (operator proxy off/on, reaper re-mint, rehome) bypasses and resets.
+	// Both fields are guarded by mu — backoff.Tracker is NOT goroutine-safe
+	// on its own. dial==nil ⇒ healthy (next failure starts a fresh run at
+	// Base); the supervisor backoff for ESTABLISHED sessions (tunnel.Client)
+	// is a separate, untouched mechanism.
+	dial     *backoff.Tracker
+	lastFail proxyDialID
+
+	// optOutAnnounced (#78): the local opt-out gate logs at Info once per
+	// process, then at Debug — an old broker re-pushes every 5s and a 5s
+	// Info line would just move the flood from the broker's log to ours.
+	optOutAnnounced bool
+
+	// configWarnAnnounced (#78 review Mi3): the two config-wound arms of
+	// applyProxyDirective — a nil ExposeAdapter (`--tunnel-addr ""` debug
+	// shape) and a keyset push with no server AND no persisted footprint —
+	// do not self-heal within the push loop, yet the broker re-pushes every
+	// ~5s. WARN once then Debug so they don't recreate the very disk-fill
+	// flood #78 exists to end. Cleared on any successful start.
+	configWarnAnnounced bool
+}
+
+// proxyDialID is the resolved dial identity the #78 backoff keys on. Fields
+// mirror what proxyStartLocked is about to dial with — NOT the raw directive
+// (repair pushes are keyset-only with port=0/token="", which would never
+// match and defeat the backoff). Any component changing means the broker
+// minted something new and the retry must go out immediately.
+type proxyDialID struct {
+	gen       int64
+	epoch     int64
+	port      int
+	token     string // in-memory only, mirrors proxyRuntime.token; NEVER logged
+	homeEpoch int64  // C5: a rehome bumps ONLY this — without it a failover would sit out the old home's backoff
 }
 
 // proxyNewer reports whether directive (dGen,dEpoch) is strictly newer than the
@@ -116,6 +160,14 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 	// push and the heartbeat OFF repair (broker repairProxyEpoch). At fresh
 	// boot the agent isn't serving, so a nil is a clean no-op.
 	if d == nil {
+		return
+	}
+
+	// #78 opt-out gate (the N-1 belt): a #78-aware broker never pushes to an
+	// opted-out node (register folds ProxyOptOut into nodes.proxy_capable),
+	// so this arm exists for OLD brokers that keep pushing.
+	if a.cfg.ProxyOptOut {
+		refuseProxyDirectiveOptedOut(a, nc, p, d)
 		return
 	}
 
@@ -246,7 +298,7 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 		// otherwise wait for a full directive.
 		ps := a.loadProxyStateSafe()
 		if ps == nil || ps.PublicPort == 0 || ps.Token == "" {
-			a.cfg.Logger.Warn("agent: proxy keyset push with no server and no persisted footprint; awaiting full directive")
+			logConfigWarnOnce(a, p, "agent: proxy keyset push with no server and no persisted footprint; awaiting full directive")
 			return
 		}
 		// C5: prefer the directive's Home (has cert pins); else replay the persisted home (no pins →
@@ -273,11 +325,59 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 	}
 }
 
+// refuseProxyDirectiveOptedOut (#78) is the opted-out arm of applyProxyDirective,
+// extracted so the dispatcher stays under the god-function detector. It refuses
+// to build anything, keeps publishing unready so /sub never renders this node,
+// and never dials — the dial is exactly the 5s flood #78 documents. Info once,
+// Debug thereafter (an old broker re-pushes every heartbeat). Caller holds p.mu.
+func refuseProxyDirectiveOptedOut(a *Agent, nc *nats.Conn, p *proxyRuntime, d *proto.ProxyDirective) {
+	if p.optOutAnnounced {
+		a.cfg.Logger.Debug("agent: proxy directive ignored (proxy.participate=false)")
+	} else {
+		p.optOutAnnounced = true
+		a.cfg.Logger.Info("agent: proxy participation disabled by agent.yaml (proxy.participate=false); ignoring proxy directives")
+	}
+	if d.Enabled {
+		a.pubProxyReady(nc, false)
+	}
+}
+
 func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRuntime,
 	publicPort, wantLocal int, token string, gen, epoch int64, keys []ssproxy.Key, home *proto.HomeDirective) {
 
+	homeAddr, homeEpoch := "", int64(0)
+	var homePins proto.CertPins
+	if home != nil {
+		homeAddr, homeEpoch, homePins = home.BrokerAddr, home.Epoch, home.CertPins
+	}
+
+	// #78 backoff gate — BEFORE any side effect. Holds back ONLY an exact
+	// retry of the identity that just failed; anything the broker minted
+	// fresh (proxy off/on bumps epoch, a reaper rotation changes port+token,
+	// a rehome bumps homeEpoch) bypasses immediately, so no operator action
+	// ever waits out a backoff window. While held: no SS server, no dial, no
+	// ACK — the node simply stays unready until the next push after Due.
+	id := proxyDialID{gen: gen, epoch: epoch, port: publicPort, token: token, homeEpoch: homeEpoch}
+	now := proxyNow(a)
+	if p.dial != nil && id == p.lastFail && !p.dial.Due(now) {
+		a.cfg.Logger.Debug("agent: proxy dial backoff active; retry deferred",
+			"public_port", publicPort, "fails", p.dial.Fails())
+		return
+	}
+	if p.dial != nil && id != p.lastFail {
+		// A NEW identity is a NEW failure story: the deep schedule earned by
+		// the old (gen,epoch,port,token,home) must not throttle a fresh mint
+		// — an operator's `proxy off/on` or a reaper rotation deserves the
+		// full 5s-base ladder, not a 5min hangover.
+		p.dial = nil
+	}
+
 	if a.cfg.ExposeAdapter == nil {
-		a.cfg.Logger.Warn("agent: proxy tunnel adapter unavailable")
+		// Configuration wound, not a network one: deliberately OUTSIDE the
+		// backoff (a missing adapter never self-heals). WARN once then Debug
+		// (review Mi3) — the broker re-pushes every ~5s, so a per-push WARN
+		// would itself be the flood #78 ends.
+		logConfigWarnOnce(a, p, "agent: proxy tunnel adapter unavailable")
 		a.proxyFailCleanupLocked(p, nc)
 		return
 	}
@@ -292,7 +392,7 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	}
 	lp, err := srv.Start(ctx, wantLocal, keys)
 	if err != nil {
-		a.cfg.Logger.Warn("agent: ssproxy start", "err", err)
+		proxyDialFailedLocked(a, p, id, "ssproxy_start", err)
 		a.proxyFailCleanupLocked(p, nc)
 		return
 	}
@@ -300,11 +400,6 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	// the tunnel. If AddProxy then transiently fails, the footprint survives so
 	// the next keyset-only push can bootstrap-and-retry — instead of stranding a
 	// connected agent unready until an unrelated reconnect.
-	homeAddr, homeEpoch := "", int64(0)
-	var homePins proto.CertPins
-	if home != nil {
-		homeAddr, homeEpoch, homePins = home.BrokerAddr, home.Epoch, home.CertPins
-	}
 	if a.stateStore != nil {
 		if err := a.stateStore.SetProxy(&ProxyState{
 			PublicPort: publicPort, LocalPort: lp, Token: token, Epoch: epoch,
@@ -322,11 +417,25 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 		Name: proxyTokenName, Port: publicPort, LocalPort: lp, Token: token,
 		HomeBrokerAddr: homeAddr, Epoch: homeEpoch, CertPins: homePins,
 	}); err != nil {
-		a.cfg.Logger.Warn("agent: proxy tunnel open", "err", err)
+		proxyDialFailedLocked(a, p, id, "tunnel_dial", err)
 		srv.Stop()
 		a.proxyFailCleanupLocked(p, nc)
 		return
 	}
+	// #78: a successful dial ends the failure run — Recover both logs the
+	// suppressed count and resets the tracker (a dial can only be reached
+	// when Due, and the first window IS Base, so the run length is always
+	// ≥ Base and Recover's anti-flap fold cannot trigger here). Dropping the
+	// pointer afterwards is invariant maintenance, not a second reset:
+	// "p.dial != nil ⇒ a failure run is in progress" is what the entry gate
+	// reads.
+	if p.dial != nil && p.dial.Failing() {
+		suppressed, _ := p.dial.Recover(now)
+		a.cfg.Logger.Info("agent: proxy tunnel recovered", "suppressed", suppressed)
+	}
+	p.dial = nil
+	p.lastFail = proxyDialID{}
+	p.configWarnAnnounced = false // review Mi3: a healthy start re-arms the config-wound WARN
 	p.srv = srv
 	p.publicPort = publicPort
 	p.localPort = lp
@@ -339,6 +448,80 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	a.proxyTunnelUp.Store(true) // M2: tunnel just opened — ProxyBound now reflects a live tunnel
 	a.pubProxyReady(nc, true)
 	a.cfg.Logger.Info("agent: proxy enabled", "public_port", publicPort, "local_port", lp, "keys", len(keys))
+}
+
+// logConfigWarnOnce (#78 review Mi3) WARNs a config-wound condition once per
+// runtime lifecycle then drops to Debug, so a broker re-pushing every ~5s
+// cannot turn a structural (non-self-healing) condition into a log flood.
+// Caller holds p.mu. Cleared by a successful proxyStartLocked.
+func logConfigWarnOnce(a *Agent, p *proxyRuntime, msg string) {
+	if p.configWarnAnnounced {
+		a.cfg.Logger.Debug(msg + " (suppressed repeat)")
+		return
+	}
+	p.configWarnAnnounced = true
+	a.cfg.Logger.Warn(msg)
+}
+
+// proxyNow is the #78 backoff clock: Config.Now when injected (tests), else
+// the wall clock — same seam the roster expiry checks use.
+func proxyNow(a *Agent) time.Time {
+	if a.cfg.Now != nil {
+		return a.cfg.Now()
+	}
+	return time.Now()
+}
+
+// proxyDialPolicy resolves the #78 backoff schedule: 5s base (one heartbeat —
+// the first retry is as fast as today) doubling to a 5min cap, overridable
+// via Config for tests / unusual deployments.
+func proxyDialPolicy(a *Agent) backoff.Policy {
+	pol := backoff.Policy{Base: 5 * time.Second, Cap: 5 * time.Minute}
+	if a.cfg.ProxyDialRetryBase > 0 {
+		pol.Base = a.cfg.ProxyDialRetryBase
+	}
+	if a.cfg.ProxyDialRetryCap > 0 {
+		pol.Cap = a.cfg.ProxyDialRetryCap
+	}
+	return pol
+}
+
+// proxyDialFailedLocked records one failed proxy dial attempt (#78): arms the
+// backoff for the failed identity and applies the Tracker's log discipline —
+// WARN on the first failure of a run / a class change, Debug for the
+// suppressed repeats (the agent-side half of the flood; the broker-side WARN
+// damping is internal/tunnel's).
+func proxyDialFailedLocked(a *Agent, p *proxyRuntime, id proxyDialID, class string, err error) {
+	if p.dial == nil {
+		p.dial = backoff.New(proxyDialPolicy(a))
+	}
+	// review N2: the clock is read at the FAILURE instant, not at gate entry —
+	// a dial can block for its whole timeout (D≈Base in the half-open :7000
+	// case), and anchoring the next window at gate entry would shave ~D off
+	// the first window (Base·2ⁿ−D). Anchoring at the failure keeps the
+	// schedule honest (Base, 2·Base, …).
+	now := proxyNow(a)
+	p.lastFail = id
+	if logNow := p.dial.Fail(now, class); logNow {
+		a.cfg.Logger.Warn("agent: proxy "+class, "err", err, "public_port", id.port)
+	} else {
+		a.cfg.Logger.Debug("agent: proxy "+class+" (suppressed repeat)",
+			"err", err, "public_port", id.port, "fails", p.dial.Fails())
+	}
+}
+
+// resetProxyDialBackoff clears the #78 backoff state (a fresh NATS session /
+// authoritative OFF invalidates the failure run — the next directive must
+// dial immediately).
+func resetProxyDialBackoff(a *Agent) {
+	p := a.proxy
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.dial = nil
+	p.lastFail = proxyDialID{}
+	p.mu.Unlock()
 }
 
 // proxyFailCleanupLocked (F3) runs when a (re)build fails. It resets the
@@ -388,6 +571,11 @@ func (a *Agent) proxyTeardownLocked(p *proxyRuntime, nc *nats.Conn, clearPersist
 			_ = a.stateStore.SetProxy(nil)
 		}
 		a.pubProxyReady(nc, false)
+		// #78: an authoritative OFF ends the failure run — the next enable
+		// mints a new epoch (bypass anyway), but stale backoff state must
+		// not survive into a semantically new proxy lifecycle.
+		p.dial = nil
+		p.lastFail = proxyDialID{}
 	}
 }
 
@@ -496,6 +684,12 @@ func (a *Agent) onNATSReconnect(nc *nats.Conn) {
 	}
 	a.courier.onRegisterSuccess(resp)
 	a.applyReconciliation(ctx, resp)
+	// #78: a fresh NATS session invalidates the dial-failure run — the old
+	// path may have healed with the network. Reset BEFORE applying the
+	// directive: the register reply re-delivers the SAME (gen,epoch,token)
+	// when nothing changed broker-side, which the identity gate would
+	// otherwise still be suppressing.
+	resetProxyDialBackoff(a)
 	a.applyProxyDirective(ctx, nc, resp.Proxy)
 	// M3: re-ACK readiness if we are serving (covers a lost first ACK or a
 	// proxy_ready cleared while we were partitioned).

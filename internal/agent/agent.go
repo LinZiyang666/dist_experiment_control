@@ -217,6 +217,26 @@ type Config struct {
 	// intentionally expose private-network access.
 	ProxyAllowPrivateDestinations bool
 
+	// ProxyOptOut (#78) is agent.yaml `proxy.participate: false`: this node
+	// refuses to serve as a session-proxy egress. Reported at register
+	// (NodeRegisterReq.ProxyOptOut) so a #78-aware broker stops allocating /
+	// pushing entirely; ALSO enforced locally in applyProxyDirective as the
+	// N-1 belt — an older broker keeps pushing directives, and without the
+	// local gate this node would keep dialing a tunnel it can never serve
+	// (the exact 5s WARN flood #78 documents). Zero value = participate.
+	ProxyOptOut bool
+
+	// ProxyDialRetryBase / ProxyDialRetryCap (#78) tune the first-dial
+	// backoff for the proxy tunnel (proxyStartLocked). Zero ⇒ the defaults
+	// (5s base — one heartbeat — capped at 5min).
+	//
+	// review 疑惑1: these are a TEST SEAM ONLY — there is no agent.yaml key or
+	// CLI flag that sets them, so a deployment cannot tune them. They are NOT
+	// an operator knob; if that ever changes, wire a yaml/flag AND state the
+	// rollback compatibility (an older binary would ignore the key).
+	ProxyDialRetryBase time.Duration
+	ProxyDialRetryCap  time.Duration
+
 	// RemoteFS* configure hung-network-filesystem-safe spawn for exec/run
 	// (docs/reviews/remote-fs-resilience-plan.md). When a network mount backing
 	// $PATH/argv[0]/cwd is wedged in D-state, exec/run would otherwise hang at
@@ -668,6 +688,16 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
 		a.rosterCacheStore = newRosterCacheStore(cfg.Home, cfg.SID) // C2: discovery cache in its own file
+		// #78: an opted-out node must not carry a persisted proxy footprint —
+		// the keyset-only bootstrap path (applyProxyDirective's srv==nil arm)
+		// would otherwise re-dial a tunnel this node refuses to serve the
+		// moment an older broker re-pushes keys. Clearing at construction
+		// makes the opt-out effective even against pre-#78 brokers.
+		if cfg.ProxyOptOut {
+			if err := a.stateStore.SetProxy(nil); err != nil {
+				cfg.Logger.Warn("agent: clear proxy footprint for opt-out", "err", err)
+			}
+		}
 	}
 
 	// Build the hung-network-filesystem-safe spawn policy. Validate the mode
@@ -1002,6 +1032,10 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 
 	// P13: converge the embedded SS proxy to the broker's directive (nil
 	// when the session's proxy switch is off → ensures it's torn down).
+	// #78: a fresh session invalidates any dial-failure run first (mirrors
+	// onNATSReconnect — the register reply re-delivers the same identity,
+	// which the backoff gate would otherwise still suppress).
+	resetProxyDialBackoff(a)
 	a.applyProxyDirective(runCtx, nc, resp.Proxy)
 
 	// C1 §D-4: pull a fresh signed roster on a jittered cadence (roster-only register → no raft
@@ -1187,6 +1221,10 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 		// C1: report our cached signed-roster generation so the leader can flag a
 		// sustained-behind agent (agent_roster_stale). 0 ⇒ pre-C1 / no cache. Advisory.
 		RosterGen: a.cachedRosterGen(),
+		// #78: the proxy.participate opt-out. Capabilities stays untouched —
+		// nodeHasProxyCap falls back to a release-version check when the
+		// token is absent, so omitting CapProxyV1 could NOT express opt-out.
+		ProxyOptOut: a.cfg.ProxyOptOut,
 	}
 	// upgrade-safety plan §3.1: the first register after a `node upgrade`
 	// carries the outcome (this one IS the health check-in when pending);

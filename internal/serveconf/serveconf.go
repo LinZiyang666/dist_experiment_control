@@ -6,7 +6,10 @@
 package serveconf
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -24,6 +27,7 @@ type Config struct {
 type BrokerSection struct {
 	Domain     string         `yaml:"domain"`
 	PublicHost string         `yaml:"public_host"`
+	TLS        TLSSection     `yaml:"tls"`
 	NATS       NATSSection    `yaml:"nats"`
 	Frp        FrpSection     `yaml:"frp"`
 	Admin      AdminSection   `yaml:"admin"`
@@ -32,6 +36,19 @@ type BrokerSection struct {
 	Upgrade    UpgradeSection `yaml:"upgrade"`
 	Cluster    ClusterSection `yaml:"cluster"`
 	Obs        ObsSection     `yaml:"observability"`
+}
+
+// TLSSection is an INERT stub (#75): install.sh's broker.yaml template has
+// carried `broker.tls.acme.email` since P10 for Caddy/ops consumption — Go
+// never reads it. It exists ONLY so the strict KnownFields decoder in Load
+// does not refuse every officially-installed broker.yaml. Parsed, never
+// consumed; TestInstallShTemplateParsesStrict pins template↔schema pairing.
+type TLSSection struct {
+	ACME ACMESection `yaml:"acme"`
+}
+
+type ACMESection struct {
+	Email string `yaml:"email"`
 }
 
 // ObsSection (B5/B6) mirrors broker.observability: the declarative form of the
@@ -173,9 +190,43 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("serveconf: read %q: %w", path, err)
 	}
+	// #75: STRICT decode (KnownFields), mirroring loadAgentYAML. The
+	// non-strict yaml.Unmarshal this replaces silently dropped unknown or
+	// mis-nested keys — the live incident shape was an `observability:`
+	// block that never took effect, with zero warning, while the broker
+	// wrote unbounded logs elsewhere. yaml.v3 errors carry line + key, so
+	// a typo surfaces in `systemctl status` instead of vanishing. Ops-only
+	// template keys Go never consumes (broker.tls.*) are covered by inert
+	// stub fields above, NOT by loosening this decoder.
 	var cfg Config
-	if err := yaml.Unmarshal(body, &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(body))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		// An empty / comment-only / whitespace-only file has no document;
+		// tolerate it (zero config), matching the historical behavior and
+		// the agent-side loader.
+		if errors.Is(err, io.EOF) {
+			return &Config{}, nil
+		}
 		return nil, fmt.Errorf("serveconf: parse %q: %w", path, err)
+	}
+	// Reject any SECOND-or-later NON-EMPTY document: it could hide a
+	// section the first does not show. Benign empty trailing documents
+	// (a lone `---`) decode to nil and are tolerated; the scan MUST loop
+	// to io.EOF so an empty middle document cannot shield a later
+	// non-empty one (mirrors loadAgentYAML's F11 fail-open fix).
+	for {
+		var extra any
+		derr := dec.Decode(&extra)
+		if errors.Is(derr, io.EOF) {
+			break
+		}
+		if derr != nil {
+			return nil, fmt.Errorf("serveconf: parse %q: %w", path, derr)
+		}
+		if extra != nil {
+			return nil, fmt.Errorf("serveconf: parse %q: multiple YAML documents are not supported", path)
+		}
 	}
 	if _, err := cfg.ProcRetentionDuration(); err != nil {
 		return nil, err

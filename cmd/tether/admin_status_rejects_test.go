@@ -43,7 +43,9 @@ func TestVerifyClusterSeam(t *testing.T) {
 	dir := t.TempDir()
 
 	seamed := filepath.Join(dir, "clustered.yaml")
-	if err := os.WriteFile(seamed, []byte("broker:\n  domain: x\nstorage:\n  scratch: /tmp\n"), 0o644); err != nil {
+	// #75: fixture must be schema-legal now (strict decoder) — storage lives
+	// UNDER broker; the trailing comment keeps `broker:` a non-final line.
+	if err := os.WriteFile(seamed, []byte("broker:\n  domain: x\n  storage:\n    db: /tmp/t.db\n# trailing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := applyClusterSeam(seamed, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets", defaultNatsConfPath); err != nil {

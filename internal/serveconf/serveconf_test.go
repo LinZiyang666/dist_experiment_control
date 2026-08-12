@@ -10,6 +10,7 @@ package serveconf
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -288,5 +289,139 @@ broker:
     disk_check_interval: 500ms
 `)); err == nil {
 		t.Errorf("Load: sub-second disk_check_interval silently accepted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #75 strict decoding — the non-strict yaml.Unmarshal this pins against used
+// to swallow mis-nested / typo'd keys with zero warning. The live incident
+// shape was an `observability:` block that never took effect while the broker
+// wrote unbounded logs elsewhere. Every "must error" case below passed
+// SILENTLY before the strict decoder landed.
+// origin: docs/deploy-tier-gotchas.md #75
+// ---------------------------------------------------------------------------
+
+func TestLoadStrictRejectsUnknownAndMisnestedKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantKey string // substring the error must carry so the operator sees WHICH key
+	}{
+		{
+			// The live racknerd shape: observability hoisted to the document
+			// root instead of under broker: — silently ignored before.
+			name: "observability mis-nested at document root",
+			body: `
+broker:
+  domain: example.com
+observability:
+  log_file: /var/log/tether/broker.log
+  log_max_size_mb: 50
+`,
+			wantKey: "observability",
+		},
+		{
+			// One nesting level short: log_file directly under broker:.
+			name: "log_file directly under broker",
+			body: `
+broker:
+  domain: example.com
+  log_file: /var/log/tether/broker.log
+`,
+			wantKey: "log_file",
+		},
+		{
+			name: "typo'd key inside observability",
+			body: `
+broker:
+  observability:
+    log_flie: /var/log/tether/broker.log
+`,
+			wantKey: "log_flie",
+		},
+		{
+			name: "unknown top-level key",
+			body: `
+broker:
+  domain: example.com
+brokre:
+  domain: oops.example.com
+`,
+			wantKey: "brokre",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if err == nil {
+				t.Fatalf("mis-configured yaml silently accepted (the #75 failure mode)")
+			}
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Fatalf("error must name the offending key %q so the operator can find it; got: %v", tc.wantKey, err)
+			}
+		})
+	}
+}
+
+func TestLoadStrictAcceptsLegalShapes(t *testing.T) {
+	// Fully-populated legal config: every field lands where it should.
+	cfg, err := Load(writeConfig(t, `
+broker:
+  domain: example.com
+  public_host: example.com
+  tls:
+    acme:
+      email: ops@example.com
+  nats:
+    url: nats://127.0.0.1:4222
+    wss_listen: ":443"
+    ws_internal: "127.0.0.1:8222"
+  observability:
+    log_file: /var/log/tether/broker.log
+    log_max_size_mb: 50
+    log_max_backups: 2
+`))
+	if err != nil {
+		t.Fatalf("legal config refused: %v", err)
+	}
+	if cfg.Broker.Obs.LogFile != "/var/log/tether/broker.log" || cfg.Broker.Obs.LogMaxSizeMB != 50 {
+		t.Fatalf("observability did not land: %+v", cfg.Broker.Obs)
+	}
+	if cfg.Broker.TLS.ACME.Email != "ops@example.com" {
+		t.Fatalf("inert tls stub did not parse: %+v", cfg.Broker.TLS)
+	}
+
+	// Empty file and comment-only file = zero config, no error (the agent-side
+	// loader's EOF tolerance, mirrored).
+	for _, body := range []string{"", "# just a comment\n", "\n\n"} {
+		if _, err := Load(writeConfig(t, body)); err != nil {
+			t.Fatalf("empty/comment-only config must be tolerated, got: %v", err)
+		}
+	}
+
+	// Empty path = zero config (the no --config path).
+	if _, err := Load(""); err != nil {
+		t.Fatalf("empty path must yield zero config: %v", err)
+	}
+}
+
+func TestLoadStrictRejectsSecondDocument(t *testing.T) {
+	// A second non-empty document could hide a section the first doesn't show.
+	if _, err := Load(writeConfig(t, `
+broker:
+  domain: example.com
+---
+broker:
+  domain: hidden.example.com
+`)); err == nil {
+		t.Fatal("second non-empty YAML document silently accepted")
+	}
+	// A benign trailing `---` (empty second document) stays tolerated.
+	if _, err := Load(writeConfig(t, "broker:\n  domain: example.com\n---\n")); err != nil {
+		t.Fatalf("empty trailing document must be tolerated: %v", err)
+	}
+	// An empty MIDDLE document must not shield a later non-empty one.
+	if _, err := Load(writeConfig(t, "broker:\n  domain: example.com\n---\n---\nbroker:\n  domain: x\n")); err == nil {
+		t.Fatal("empty middle document shielded a hidden third document")
 	}
 }

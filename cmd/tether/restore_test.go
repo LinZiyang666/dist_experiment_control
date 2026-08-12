@@ -151,16 +151,20 @@ func newDRBox(t *testing.T) *drBox {
 		t.Fatalf("OfflineBackup: %v", err)
 	}
 
-	// The broker.yaml install.sh ships: `cluster:` fully commented out (scripts/install.sh:548-556).
+	// The broker.yaml install.sh ships: `cluster:` fully commented out.
+	// #75: the fixture must be schema-legal (strict decoder) — the old copy
+	// used `nats_url` (never a real key; the template writes nats.url) and a
+	// top-level `storage:`, shapes only the tolerant decoder let pass.
 	if err := os.WriteFile(b.configPath, []byte(
 		"broker:\n"+
-			"  nats_url: nats://127.0.0.1:4222\n"+
+			"  nats:\n"+
+			"    url: nats://127.0.0.1:4222\n"+
 			"  # cluster:\n"+
 			"  #   data_dir: /var/lib/tether\n"+
 			"  #   raft_addr: 10.0.0.1:7400\n"+
 			"  #   secrets_dir: /etc/tether/secrets\n"+
-			"storage:\n"+
-			"  db: /var/lib/tether/tether.db\n"), 0o644); err != nil {
+			"  storage:\n"+
+			"    db: /var/lib/tether/tether.db\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return b

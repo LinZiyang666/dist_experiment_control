@@ -135,3 +135,37 @@ func TestApplyClusterSeam_MissingFileIsNoError(t *testing.T) {
 		t.Fatal("a missing config cannot have had a seam applied")
 	}
 }
+
+// TestApplyClusterSeam_UnparseableConfigRefuses pins the #75 swallow fix: a
+// broker.yaml the strict decoder refuses must abort BEFORE any seam write.
+// The old `lerr == nil` guard silently treated a parse error as "no existing
+// seam", inserted the seam anyway, and only the tail fail-closed verify blew
+// up — attributing the failure to the freshly-written seam instead of the
+// pre-existing typo.
+// origin: docs/deploy-tier-gotchas.md #75
+func TestApplyClusterSeam_UnparseableConfigRefuses(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "broker.yaml")
+	// A typo'd top-level key: the strict serveconf decoder refuses this.
+	body := "broker:\n  domain: example.com\nobservability:\n  log_file: /var/log/x\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := applyClusterSeam(cfg, "/var/lib/tether", "brk-a:7400", "/etc/tether/secrets", defaultNatsConfPath)
+	if err == nil {
+		t.Fatal("an unparseable broker.yaml must refuse the seam, not treat the parse error as 'no seam'")
+	}
+	if applied {
+		t.Fatal("no seam may be applied to an unparseable config")
+	}
+	if !strings.Contains(err.Error(), "does not parse") {
+		t.Fatalf("the error must attribute the failure to the PRE-EXISTING config, got: %v", err)
+	}
+	// The file must be byte-untouched — no half-written seam.
+	after, rerr := os.ReadFile(cfg)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(after) != body {
+		t.Fatalf("broker.yaml was modified despite the refusal:\n%s", after)
+	}
+}

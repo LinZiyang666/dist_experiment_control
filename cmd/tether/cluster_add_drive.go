@@ -865,7 +865,11 @@ func dirExists(path string) bool {
 func verifyClusterSeam(configPath, wantRaftAddr, wantDataDir, wantSecretsDir, wantNatsConfPath string) error {
 	c, err := serveconf.Load(configPath)
 	if err != nil {
-		return fmt.Errorf("read broker.yaml %s to verify the cluster seam: %w — apply the broker.cluster seam as root, then re-run", configPath, err)
+		// review Mi10: since #75 the most common Load failure is a strict-decode
+		// error (a typo'd / mis-nested key), NOT a missing seam — pointing the
+		// operator at "apply the seam" would send them the wrong way and loop.
+		// Fix the named key first (the wrapped error carries key + line).
+		return fmt.Errorf("broker.yaml %s does not parse (strict since #75) — fix the named key, then re-run: %w", configPath, err)
 	}
 	cs := c.Broker.Cluster
 	if cs.RaftAddr == "" && cs.DataDir == "" && cs.SecretsDir == "" && cs.NatsConfPath == "" {

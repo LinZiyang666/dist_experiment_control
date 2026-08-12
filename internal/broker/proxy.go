@@ -470,7 +470,7 @@ func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegist
 		// allocation here (the leader-gated reaper owns the token-correct mint); a missing row ⇒ nil and
 		// the reaper pushes once it allocates.
 		enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
-		if err != nil || !enabled || !nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) {
+		if err != nil || !enabled || !nodeParticipatesInProxy(req) {
 			return nil
 		}
 		existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid)
@@ -492,10 +492,11 @@ func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegist
 	if err != nil || !enabled {
 		return nil
 	}
-	// F7/F5 capability gate: never allocate a proxy port / push a directive to a
-	// pre-P13 agent. Gate on the EXPLICIT proto.CapProxyV1 capability (release
-	// semver is only a secondary signal — see nodeHasProxyCap).
-	if !nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) {
+	// F7/F5 capability gate + #78 opt-out: never allocate a proxy port / push
+	// a directive to a pre-P13 agent OR an opted-out node. Gate on the
+	// EXPLICIT proto.CapProxyV1 capability (release semver is only a
+	// secondary signal — see nodeHasProxyCap / nodeParticipatesInProxy).
+	if !nodeParticipatesInProxy(req) {
 		return nil
 	}
 	keys, err := b.activeProxyKeys(sid)
@@ -685,6 +686,14 @@ func (b *Broker) repairProxy(sid, nid string, agentGen, agentEpoch int64) {
 	// repair, or readiness — gate on the persisted capability before trusting
 	// any P13 heartbeat field.
 	if !b.nodeProxyCapable(sid, nid) {
+		// review F7: a not-capable node (opted out via proxy.participate=false,
+		// or pre-P13) that still carries an ALLOCATED __proxy__ row is a
+		// leftover — the register-time inline free may have hit a transient DB
+		// error, and single mode has no reaper to catch it. The heartbeat is
+		// the single-mode convergence loop: retry the teardown here until it
+		// succeeds (idempotent — Free is a no-op once the row is gone). Then
+		// return; a not-capable node must not influence gen/repair/readiness.
+		freeOptOutProxyRowSingle(b, sid, nid)
 		return
 	}
 	epoch, err := session.GetProxyEpoch(b.cfg.DB, sid)
@@ -979,6 +988,60 @@ func nodeHasProxyCap(capabilities []string, release string) bool {
 	return isP13Capable(release)
 }
 
+// nodeParticipatesInProxy (#78) is the register-time gate both directive arms
+// share: capable AND not opted out. The opt-out must be checked HERE and not
+// folded into nodeHasProxyCap — the capability fallback (isP13Capable) means
+// "this build implements proxy-v1", which stays TRUE for an opted-out node;
+// participation is a config decision layered on top. Mirrors handleRegister's
+// nodes.proxy_capable fold so the directive path and the persisted column can
+// never disagree within one register.
+func nodeParticipatesInProxy(req proto.NodeRegisterReq) bool {
+	return nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut
+}
+
+// freeOptOutProxyRowSingle (#78, single mode): a register carrying
+// proxy_opt_out frees the node's existing ALLOCATED __proxy__ row inline —
+// the same close+free+event script disableProxy applies per allocation.
+// Without this, the row (and its public port) would outlive the opt-out
+// forever: single mode has no reaper pass, and every allocate/repair gate
+// now skips the node, so nothing else would ever touch the row again.
+// Cluster mode returns early — the reaper's teardown pass owns cluster rows
+// (raft-routed frees; an inline local write here would bypass raft).
+// FREE function taking *Broker (the h1 E2 precedent): the Broker
+// type-methods ratchet is deliberately not raised for plumbing.
+//
+// review Mi4: takes proxyOpMu so it serializes against enableProxy. Without
+// it, an interleave — enableProxy reads onlineNIDs (node still capable=1) →
+// this frees any existing row (finds none) → enableProxy AllocateProxy mints
+// a FRESH row+token the opted-out agent refuses — leaks an ALLOCATED row with
+// no single-mode reaper to collect it. Lock order is safe: the register path
+// holds no other lock here and no owner-visible mutation calls back into
+// register.
+func freeOptOutProxyRowSingle(b *Broker, sid, nid string) {
+	db, ok := b.singleWriter()
+	if !ok {
+		return // cluster mode: the reaper's raft-routed teardown pass owns it
+	}
+	b.proxyOpMu.Lock()
+	defer b.proxyOpMu.Unlock()
+	existing, err := port.LookupProxyByNode(db, sid, nid)
+	if err != nil || existing == nil {
+		return
+	}
+	if srv := b.tunnelSrv.Load(); srv != nil {
+		srv.CloseProxy(existing.Port)
+	}
+	if err := port.Free(db, existing.Port, b.cfg.Now()); err != nil {
+		b.cfg.Logger.Warn("broker: free opted-out proxy row",
+			"sid", sid, "nid", nid, "port", existing.Port, "err", err)
+		return
+	}
+	b.pubPortEvent(sid, existing.Port, port.ProxyPortName, nid, 0, "freed")
+	if err := node.SetProxyReady(b.livenessDB(), sid, nid, false); err != nil {
+		b.cfg.Logger.Warn("broker: clear proxy_ready on opt-out", "err", err)
+	}
+}
+
 func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 	rows, err := b.read().Query(`
 		SELECT n.nid, n.status, n.proxy_ready, COALESCE(pa.port, 0), COALESCE(pa.home_broker, '')
@@ -1023,6 +1086,12 @@ func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 			ready = false
 		}
 		e := proto.ProxyNodeEntry{NID: r.nid, Status: r.status, Ready: ready}
+		// #78 visibility: "won't" (opted out) vs "can't" (not capable). The
+		// hint is in-memory (empties on broker restart until re-register —
+		// documented [GAP]); enforcement is nodes.proxy_capable regardless.
+		if _, ok := b.proxyOptedOut.Load(sid + "/" + r.nid); ok {
+			e.OptedOut = true
+		}
 		if r.pport != 0 {
 			// G7a #2: the default (non---cluster) view must label each exit with its OWN home broker's
 			// public host (where /sub points subscribers) — NOT this answering broker's host. In cluster

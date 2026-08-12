@@ -76,6 +76,44 @@ func (t *Tracker) Fail(now time.Time, class string) (logNow bool) {
 	return logNow
 }
 
+// FailReaffirm is Fail plus a time-based reaffirmation, for a damper that
+// wants to re-log a still-active run once per Cap window rather than staying
+// silent for the whole process lifetime (the REGISTER-read damper, #78 / g75-g78
+// external review F4). It returns:
+//
+//   - logNow: true on the first failure of a run, on a class change, OR when a
+//     run's backoff instant has passed (a reaffirmation).
+//   - suppressed: how many failures were swallowed since the last logged line —
+//     the count the owner prints. It is RESET to 0 whenever logNow is true (the
+//     logged line is itself NOT a suppressed event, so the next line must not
+//     re-report it). This is the primitive the external review asked for: the
+//     owner must NOT hand-cobble Due+Fail, which double-counts the reaffirmation.
+//
+// The schedule advances exactly as Fail's, so consecutive reaffirmations stay
+// one-per-Cap.
+func (t *Tracker) FailReaffirm(now time.Time, class string) (logNow bool, suppressed int) {
+	reaffirm := t.fails > 0 && !now.Before(t.next)
+	// Fail resets suppressed to 0 on its own logNow (first-of-run / class
+	// change); we only need to capture-and-reset for the reaffirmation case,
+	// where Fail's logNow is false but we still log.
+	before := t.suppressed
+	logNow = t.Fail(now, class)
+	switch {
+	case logNow:
+		// Fail already zeroed t.suppressed; report what it zeroed (0 on a
+		// class change since the prior run's count belongs to the prior class,
+		// which Fail's own logNow handled — here `before` is the run's tail).
+		return true, before
+	case reaffirm:
+		// A reaffirmation: report the genuinely-suppressed repeats accumulated
+		// before this line, then reset so the NEXT line starts from zero.
+		t.suppressed = 0
+		return true, before
+	default:
+		return false, 0
+	}
+}
+
 // Recover ends a failure run. ok=true means the owner should log the
 // recovery (with Suppressed()'s count); ok=false folds a blip into the run —
 // the anti-flap floor (h1 plan, critique-4): a run that lasted less than one

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -53,6 +54,7 @@ func newServeCmd() *cobra.Command {
 		natsServerBin     string
 		alertWebhookURL   string
 		diskCheckInterval time.Duration
+		configCheck       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -179,8 +181,20 @@ func newServeCmd() *cobra.Command {
 			// listener un-bound and curl connection-REFUSED). Loopback-only + Caddy-fronted. An operator
 			// overrides the addr, or passes an explicit empty --cluster-manifest-listen to opt out.
 			manifestListen = resolveManifestListen(manifestListen, clusterMode, cmd.Flags().Changed("cluster-manifest-listen"))
+
+			// #75 review M6 / external review F1: --config-check validates the
+			// FULLY-RESOLVED config and exits before any side effect. It runs the
+			// SAME validators a real start does — strict decode + durations
+			// (above), the log-level check (newLoggerTo below, with a discard
+			// sink so no log file is created), the auth-seed read (below), and
+			// broker.ValidateConfig (webhook URL / listen addresses). The point
+			// (broker-ops §8.4): an operator can validate a strict broker.yaml
+			// with the NEW binary during an upgrade WITHOUT that binary opening +
+			// migrating the live tether.db. So storage.Open is SKIPPED in
+			// config-check (as it is in cluster mode); the exit is after the pure
+			// validators, before broker.New / listeners.
 			var db *sql.DB
-			if !clusterMode {
+			if !clusterMode && !configCheck {
 				db, err = storage.Open(dbPath)
 				if err != nil {
 					return err
@@ -211,8 +225,14 @@ func newServeCmd() *cobra.Command {
 			// broker.yaml. Panics/stacktraces keep going to raw stderr, which
 			// the unit routes to journald.
 			logFile = pickFlagOrYaml(cmd, "log-file", logFile, fileCfg.Broker.Obs.LogFile)
-			logger, err := newLoggerTo(logLevel, logJSON,
-				resolveLogSink(logFile, fileCfg.Broker.Obs.LogMaxSizeMB, fileCfg.Broker.Obs.LogMaxBackups))
+			// F1: config-check validates the log LEVEL (newLoggerTo's job) but
+			// must not create the log FILE — use a discard sink then. A real
+			// serve resolves the capped rotating sink.
+			logSink := io.Discard
+			if !configCheck {
+				logSink = resolveLogSink(logFile, fileCfg.Broker.Obs.LogMaxSizeMB, fileCfg.Broker.Obs.LogMaxBackups)
+			}
+			logger, err := newLoggerTo(logLevel, logJSON, logSink)
 			if err != nil {
 				return err
 			}
@@ -263,6 +283,23 @@ func newServeCmd() *cobra.Command {
 					return fmt.Errorf("auth_callout seeds: %w", err)
 				}
 				cfg.AuthCallout = ac
+			}
+
+			// F1: config-check exits HERE — after every pure validator (strict
+			// decode, durations, log level, auth seeds) and broker.ValidateConfig
+			// (webhook URL / listen addresses, the same call broker.New makes),
+			// before broker.New opens listeners / the DB was never opened. So a
+			// config a real start rejects can no longer earn a "config OK".
+			if configCheck {
+				if err := broker.ValidateConfig(cfg); err != nil {
+					return err
+				}
+				mode := "single"
+				if clusterMode {
+					mode = "cluster"
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "config OK: %s (mode=%s)\n", configPath, mode)
+				return nil
 			}
 
 			b, err := broker.New(cfg)
@@ -332,6 +369,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&natsServerBin, "nats-server-bin", "", "nats-server binary for the topology reconciler's `-t` dry-run + `--signal reload` (default: nats-server on PATH) (C3)")
 	cmd.Flags().StringVar(&alertWebhookURL, "alert-webhook-url", "", "POST every committed alert raise/clear to this http/https endpoint (cluster mode; B6 OPS#2); empty disables it")
 	cmd.Flags().DurationVar(&diskCheckInterval, "disk-check-interval", 0, "how often the disk-pressure monitor samples --store-dir (H.4/#39; e.g. 5m, 30s); 0 = built-in default (5m). Overrides broker.observability.disk_check_interval")
+	cmd.Flags().BoolVar(&configCheck, "config-check", false, "validate --config (strict parse + all validators) and exit 0 before any side effect (no DB open, no migration, no listeners); nonzero on a bad config. Safe to run with a NEW binary during an upgrade")
 	return cmd
 }
 

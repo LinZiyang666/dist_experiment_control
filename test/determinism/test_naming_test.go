@@ -45,8 +45,13 @@ import (
 // NUMBER 158" for the full reconciliation.
 var processNamedPattern = regexp.MustCompile(
 	`^(` +
-		// review-process events
-		`.*external_?rereview.*|.*external_review.*|.*_review_.*|.*_review$|` +
+		// review-process events. `.*rereview.*` (not `.*external_?rereview.*`)
+		// because a BARE `rereview` — `config_validation_rereview_test.go`,
+		// added by a second external review — walked straight through the old
+		// pattern that required an `external` prefix. Same lesson as the A9 note
+		// below: a token that only matches its most common spelling is a token
+		// somebody has to remember to widen; "rereview" is never a topic name.
+		`.*rereview.*|.*external_review.*|.*_review_.*|.*_review$|` +
 		`.*round[0-9]+.*|.*codex.*|.*allgreen.*|.*megaaudit.*|` +
 		// bare phase / batch / audit identifiers used as the WHOLE prefix.
 		//
@@ -80,7 +85,7 @@ func isProcessNamed(base string) bool {
 	// A review-process token in the NAME is decisive; only the bare batch-prefix shape is subtractable.
 	// (Same asymmetry, and same reason, as isProcessNamedFunc: subtracting from the review-token half
 	// would let `s3_external_review_test.go` through.)
-	for _, token := range []string{"external_review", "external_rereview", "_review", "round", "codex", "allgreen", "megaaudit", "ops"} {
+	for _, token := range []string{"external_review", "rereview", "_review", "round", "codex", "allgreen", "megaaudit", "ops"} {
 		if strings.Contains(base, token) {
 			return true
 		}
@@ -501,6 +506,9 @@ func TestProcessNamePatternRecognisesTheRealShapes(t *testing.T) {
 		"p13_external_review_round2",
 		"g4_external_review_fixes",
 		"g4_external_rereview",
+		// bare `rereview` with no `external` prefix — the exact shape that slipped
+		// the old `external_?rereview` pattern (a real second-review file did this).
+		"config_validation_rereview",
 		"b6_skew",
 		"g1g7_audit",
 		"r16_g67_g69_external_review",

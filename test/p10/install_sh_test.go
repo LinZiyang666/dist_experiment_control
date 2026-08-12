@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -278,14 +279,311 @@ func TestInstallShBrokerDryRun(t *testing.T) {
 		"--dry-run",
 		"--skip-download",
 	)
+	// #76: units are ENABLED for boot by default (symlink only, never
+	// started); the dry-run must preview both the daemon-reload and the
+	// enable, and the banner tells the operator to START (enable already
+	// happened) rather than enable --now.
 	for _, want := range []string{
 		"broker files installed",
-		"systemd units created",
-		"sudo systemctl daemon-reload",
+		"systemd units created and ENABLED for boot",
+		"(dry-run) systemctl daemon-reload",
+		"(dry-run) systemctl enable nats-server tether-broker caddy",
+		"sudo systemctl start nats-server tether-broker caddy",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in broker dry-run output; got:\n%s", want, out)
 		}
+	}
+	// The enable is symlink-only: the new banner must NOT resurrect an
+	// `enable --now` in the default path (--now would start processes).
+	if strings.Contains(out, "enable --now") {
+		t.Errorf("default banner must not suggest enable --now (units are already enabled; --now would start); got:\n%s", out)
+	}
+}
+
+// TestInstallShBrokerNoEnable pins the #76 opt-out: --no-enable skips the
+// enable entirely and the banner falls back to the full manual command.
+// origin: docs/deploy-tier-gotchas.md #76
+func TestInstallShBrokerNoEnable(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	out := runInstall(t, t.TempDir(),
+		"--role", "broker",
+		"--domain", "tether.example.com",
+		"--acme-email", "admin@example.com",
+		"--dry-run",
+		"--skip-download",
+		"--no-enable",
+	)
+	if strings.Contains(out, "(dry-run) systemctl enable") {
+		t.Errorf("--no-enable must skip the enable, got:\n%s", out)
+	}
+	// The opt-out banner must hand the operator the complete command,
+	// enable --now included — they chose to own that step.
+	if !strings.Contains(out, "sudo systemctl enable --now nats-server tether-broker caddy") {
+		t.Errorf("--no-enable banner must carry the full enable --now command; got:\n%s", out)
+	}
+}
+
+// TestInstallShJournaldDropin pins the #77 conditional journald cap.
+// TETHER_JOURNALD_ROOT is the test-only seam; the tier VALUE is asserted by
+// shape only ([0-9]+M) — the exact tier depends on the build host's /var/log
+// filesystem and is independently recomputed by drill 32 on a real container.
+// origin: docs/deploy-tier-gotchas.md #77
+func TestInstallShJournaldDropin(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	brokerDry := func(t *testing.T, jroot string) string {
+		t.Helper()
+		home := t.TempDir()
+		cmd := exec.Command("bash", scriptPath(t),
+			"--role", "broker",
+			"--domain", "tether.example.com",
+			"--acme-email", "admin@example.com",
+			"--dry-run",
+			"--skip-download",
+		)
+		cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("install.sh failed: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	dropinRe := regexp.MustCompile(`\(dry-run\) write .*journald\.conf\.d/60-tether\.conf \(SystemMaxUse=[0-9]+M\)`)
+
+	t.Run("no explicit setting: drop-in previewed with a derived cap", func(t *testing.T) {
+		out := brokerDry(t, t.TempDir())
+		if !dropinRe.MatchString(out) {
+			t.Errorf("expected a journald drop-in preview with a derived SystemMaxUse; got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit operator setting is respected", func(t *testing.T) {
+		jroot := t.TempDir()
+		if err := os.WriteFile(filepath.Join(jroot, "journald.conf"),
+			[]byte("[Journal]\nSystemMaxUse=800M\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if dropinRe.MatchString(out) {
+			t.Errorf("an explicit SystemMaxUse must suppress the drop-in; got:\n%s", out)
+		}
+		if !strings.Contains(out, "operator setting respected") {
+			t.Errorf("the skip must be announced; got:\n%s", out)
+		}
+	})
+
+	t.Run("commented-out stub is NOT a setting", func(t *testing.T) {
+		// The live incident host had exactly a commented `#SystemMaxUse=`
+		// stub — treating that as configured would be the #77 failure mode
+		// all over again.
+		jroot := t.TempDir()
+		if err := os.WriteFile(filepath.Join(jroot, "journald.conf"),
+			[]byte("[Journal]\n#SystemMaxUse=\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if !dropinRe.MatchString(out) {
+			t.Errorf("a commented-out SystemMaxUse is not a setting; the drop-in must still be previewed; got:\n%s", out)
+		}
+	})
+
+	t.Run("our own MARKED drop-in does not suppress a rewrite", func(t *testing.T) {
+		// Idempotence (review F3): a re-install must overwrite OUR file — proven
+		// by its ownership MARKER, not by its path — to pick up a grown disk. An
+		// UNMARKED same-name file is a foreign operator file (covered below).
+		jroot := t.TempDir()
+		dir := filepath.Join(jroot, "journald.conf.d")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "60-tether.conf"),
+			[]byte("# managed-by: tether-install.sh (#77 journald cap)\n[Journal]\nSystemMaxUse=200M\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if !dropinRe.MatchString(out) {
+			t.Errorf("our own MARKED prior drop-in must be overwritten on re-install; got:\n%s", out)
+		}
+	})
+
+	t.Run("foreign same-name drop-in is not claimed as ours", func(t *testing.T) {
+		// origin: docs/reviews/g75-g78-deploy-defaults-external-review.md F3
+		// A filename is not an ownership marker. An operator or configuration
+		// manager may already own 60-tether.conf; install.sh must not overwrite it
+		// merely because that is also tether's preferred basename.
+		jroot := t.TempDir()
+		dir := filepath.Join(jroot, "journald.conf.d")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "60-tether.conf"),
+			[]byte("# managed by site policy\n[Journal]\nSystemMaxUse=350M\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if dropinRe.MatchString(out) {
+			t.Errorf("install.sh claimed an unmarked operator-owned 60-tether.conf as its own and would overwrite it:\n%s", out)
+		}
+	})
+
+	t.Run("foreign same-name drop-in WITHOUT SystemMaxUse is still respected", func(t *testing.T) {
+		// The load-bearing case for the ownership marker (review F3): a foreign
+		// file that does NOT set SystemMaxUse would slip past the operator-scan
+		// (which only looks for SystemMaxUse) and be overwritten — unless the
+		// path-collision is caught by the marker check first.
+		jroot := t.TempDir()
+		dir := filepath.Join(jroot, "journald.conf.d")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "60-tether.conf"),
+			[]byte("# managed by site policy\n[Journal]\nRateLimitBurst=1000\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if dropinRe.MatchString(out) {
+			t.Errorf("install.sh would overwrite an unmarked foreign drop-in that sets no SystemMaxUse (F3):\n%s", out)
+		}
+		if !strings.Contains(out, "NOT tether-owned") {
+			t.Errorf("install.sh should announce it is leaving the foreign file; got:\n%s", out)
+		}
+	})
+
+	t.Run("another conf.d file with an explicit setting suppresses", func(t *testing.T) {
+		jroot := t.TempDir()
+		dir := filepath.Join(jroot, "journald.conf.d")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "50-site.conf"),
+			[]byte("[Journal]\nSystemMaxUse=2G\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := brokerDry(t, jroot)
+		if dropinRe.MatchString(out) {
+			t.Errorf("an operator conf.d setting must suppress the drop-in; got:\n%s", out)
+		}
+	})
+}
+
+// TestInstallShBrokerUninstallSymmetry (#76/#77): --uninstall previews the
+// disable and the journald drop-in removal.
+// origin: docs/deploy-tier-gotchas.md #76
+func TestInstallShBrokerUninstallSymmetry(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	out := runInstall(t, t.TempDir(),
+		"--role", "broker",
+		"--dry-run",
+		"--uninstall",
+	)
+	if !strings.Contains(out, "journald.conf.d/60-tether.conf") {
+		t.Errorf("uninstall must remove the journald drop-in; got:\n%s", out)
+	}
+	if !strings.Contains(out, "rm -f /etc/systemd/system/tether-broker.service") {
+		t.Errorf("uninstall must remove the unit files; got:\n%s", out)
+	}
+	// review Mi7: dry-run uninstall previews the disable host-INDEPENDENTLY
+	// (the systemd probe is skipped under --dry-run).
+	if !strings.Contains(out, "systemctl disable nats-server tether-broker caddy") {
+		t.Errorf("dry-run uninstall must preview the disable regardless of host systemd; got:\n%s", out)
+	}
+}
+
+// TestInstallShBrokerBannerSelfConsistent (review M4): the closing banner must
+// never claim "ENABLED for boot" and "NOT enabled" simultaneously — claiming
+// enabled where enable did not run is how #76 came back on the env-guard path.
+// origin: docs/deploy-tier-gotchas.md #76
+func TestInstallShBrokerBannerSelfConsistent(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	for _, extra := range [][]string{{}, {"--no-enable"}} {
+		args := append([]string{"--role", "broker", "--domain", "brkx",
+			"--acme-email", "x@x.test", "--dry-run", "--skip-download"}, extra...)
+		out := runInstall(t, t.TempDir(), args...)
+		enabled := strings.Contains(out, "ENABLED for boot")
+		notEnabled := strings.Contains(out, "NOT enabled")
+		if enabled && notEnabled {
+			t.Errorf("banner contradicts itself (both ENABLED and NOT enabled) for args %v:\n%s", extra, out)
+		}
+		if len(extra) == 0 && !enabled {
+			t.Errorf("default dry-run banner must state ENABLED for boot; got:\n%s", out)
+		}
+		if len(extra) == 1 && !notEnabled {
+			t.Errorf("--no-enable banner must state NOT enabled; got:\n%s", out)
+		}
+	}
+}
+
+// TestInstallShJournaldStaleDropinRemoved (review M5): if an operator sets
+// SystemMaxUse AFTER a prior install left our 60-tether.conf, a reinstall must
+// REMOVE our stale drop-in (journald merges by filename order, so a leftover
+// would keep overriding the operator's setting).
+// origin: docs/deploy-tier-gotchas.md #77
+func TestInstallShJournaldStaleDropinRemoved(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	jroot := t.TempDir()
+	// Operator's explicit setting in the main config (spaced form, review Mi6).
+	if err := os.WriteFile(filepath.Join(jroot, "journald.conf"),
+		[]byte("[Journal]\nSystemMaxUse = 2G\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A stale prior-install drop-in — MARKED as ours (review F3: only a
+	// marker-owned file may be removed; a foreign same-name file must survive).
+	dir := filepath.Join(jroot, "journald.conf.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "60-tether.conf"),
+		[]byte("# managed-by: tether-install.sh (#77 journald cap)\n[Journal]\nSystemMaxUse=200M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	cmd := exec.Command("bash", scriptPath(t),
+		"--role", "broker", "--domain", "brkx", "--acme-email", "x@x.test",
+		"--dry-run", "--skip-download")
+	cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh failed: %v\n%s", err, out)
+	}
+	s := string(out)
+	// Mi6: the spaced operator setting must be RECOGNIZED (respected)…
+	if !strings.Contains(s, "operator setting respected") {
+		t.Errorf("spaced `SystemMaxUse = 2G` must be recognized as an operator setting; got:\n%s", s)
+	}
+	// M5: …and our stale drop-in removed so it stops shadowing the operator.
+	if !strings.Contains(s, "removed our stale journald drop-in") {
+		t.Errorf("a stale 60-tether.conf must be removed when an operator setting exists; got:\n%s", s)
+	}
+}
+
+// TestInstallShJournaldForeignDropinSurvivesUninstall (review F3): a same-name
+// operator/site-policy file WITHOUT the tether ownership marker must NOT be
+// removed by --uninstall — a root uninstaller deleting operator config is the
+// mirror defect of the install-side overwrite.
+// origin: docs/reviews/g75-g78-deploy-defaults-external-review.md F3
+func TestInstallShJournaldForeignDropinSurvivesUninstall(t *testing.T) {
+	skipIfAgentOrBrokerUnsupported(t)
+	jroot := t.TempDir()
+	dir := filepath.Join(jroot, "journald.conf.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(dir, "60-tether.conf")
+	if err := os.WriteFile(foreign, []byte("# managed by site policy\n[Journal]\nSystemMaxUse=350M\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	cmd := exec.Command("bash", scriptPath(t), "--role", "broker", "--uninstall")
+	cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("uninstall failed: %v\n%s", err, out)
+	}
+	if _, statErr := os.Stat(foreign); statErr != nil {
+		t.Fatalf("uninstall deleted an UNMARKED operator drop-in (F3): %v\noutput:\n%s", statErr, out)
+	}
+	if !strings.Contains(string(out), "NOT tether-owned") {
+		t.Errorf("uninstall should announce it is leaving the foreign file; got:\n%s", out)
 	}
 }
 
