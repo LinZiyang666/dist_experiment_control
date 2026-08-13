@@ -1,8 +1,10 @@
 # 设备使用清单（openpi pi0.5 实验拓扑）
 
-> 本文件记录当前 openpi pi0.5 实验所使用的 4 台设备：硬件配置、角色、
+> 本文件记录当前 openpi pi0.5 实验所使用的设备：硬件配置、角色、
 > openpi 项目路径、公网暴露策略，以及 tmux 会话命名规则。
 > tether 操作细节请参考 `docs/usage.md`（使用者）、`docs/broker-ops.md`（broker 运维）、`docs/cluster.md`（集群 HA）。
+>
+> 更新记录：2026-08-13 增补 §2.5 weilandserver（自给自足 server+client 节点）与 §2.6 未配置节点。
 
 ---
 
@@ -20,15 +22,24 @@
           │                              +---------------------------------+
           │
           │                              +---------------------------------+
-          └──────── policy 调用 ────────►| jupyter-xuanlel2 (server)       |
-                                         | NAT 后, 无公网 IP, 资源受限     |
+          ├──────── policy 调用 ────────►| jupyter-xuanlel2 (server)       |
+          │                              | NAT 后, 无公网 IP, 资源受限     |
+          │                              +---------------------------------+
+          │
+          │                              +---------------------------------+
+          └──────── policy 调用 ────────►| weilandserver (server + client) |
+                                         | NAT 后, 无公网 IP, 4090 48G     |
+                                         | 本机自带 LIBERO 模拟环境        |
+                                         | → 可单机闭环, 见 §2.5           |
                                          +---------------------------------+
 ```
 
 - **client**：跑 openpi 的模拟环境，作为 policy 请求方；
 - **server**：加载 pi0.5 权重，对外提供推理服务，被 client 调用。
+- **自给自足节点**：weilandserver 两个角色都能担（client 走 `127.0.0.1` 直连本机 server，不经 broker），
+  适合不需要横向扩 client 的中小规模 rollout；大规模并发仍用 timan107 车队当 client。
 
-4 台设备角色分工与 tmux 会话命名见下表 §2、§3。
+设备角色分工与 tmux 会话命名见下表 §2、§3。
 
 ---
 
@@ -110,6 +121,9 @@ GPU 备注：8 张 GTX 1080 单卡仅 8 GiB 显存，**不适合**跑 pi0.5 推�
 
 ### 2.4 a100 — pi0.5 server（公网入口）
 
+> **⚠ 状态（2026-08-13 实测）**：`tether node ls` 中**没有 a100**，该节点当前不在线；
+> 下表为最后一次在线时的配置，重新启用前需确认机器与 agent 状态。
+
 > **⚠ 2026-05-26 换机**：原 a100（公网 149.165.151.106）已退役（数据/代码/模型擦除 + tether agent 卸载 + broker evict）。当前 a100 是新机（hostname `vla-cache`，公网 **149.165.152.105**），全套从旧机 rsync + uv 重建环境后接管 nid=`a100`。下表为新机。
 
 | 项 | 值 |
@@ -129,6 +143,100 @@ GPU 备注：8 张 GTX 1080 单卡仅 8 GiB 显存，**不适合**跑 pi0.5 推�
 - a100（149.165.152.105）是 3 台实验机中唯一有公网 IP 的；
 - **broker 不在 a100**，而在 **pc732**（域名 `weiland.top` → 155.98.36.32，tether 节点 `pc732`）；`tether admin` 须在 pc732 本机以 root/tether 用户跑（pc732 上 `lzy666` 有免密 sudo）；
 - 前两台（timan107 / jupyter）无公网 IP，对外服务通过 `tether expose` 打到 broker 公开的 `14000-14999` 端口段（如 jupyter 推理 → `weiland.top:14000`）。
+
+### 2.5 weilandserver — pi0.5 server + LIBERO client（自给自足节点）
+
+> 采集日期 2026-08-13。这台是后加入的自有物理机，既跑推理 server，也在本机跑 LIBERO 模拟 client，
+> 单机即可闭环（client 走 `127.0.0.1`，不经 broker）。
+
+| 项 | 值 |
+|---|---|
+| **角色** | server + client（两个角色都能担；本机闭环时 client → `127.0.0.1:<port>`） |
+| **公网 IP** | 无（NAT 后；LAN `192.168.0.200`）。对外服务一律 `tether expose`（现役 `wls-srv`→`:8000`、`wls-ssh`→`:22`） |
+| **OS** | Ubuntu 24.04.4 LTS |
+| **CPU** | 2 × Intel Xeon E5-2696 v4 @ 2.20 GHz，2 socket × 22 core × 2 thread = **88 logical CPU** |
+| **内存** | **251 GiB** |
+| **GPU** | **1 × NVIDIA GeForce RTX 4090（49140 MiB ≈ 48 GiB，大显存改装版）**，driver **595.71.05** |
+| **磁盘** | 913 GiB 根分区（2026-08-13 已用 284G / 可用 582G） |
+| **openpi 目录** | `/home/weiland/openpi`（uv venv `.venv`，python 3.11） |
+| **uv 二进制** | `/home/weiland/.local/bin/uv` |
+| **模型权重** | `/home/weiland/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch` |
+| **lerobot 环境** | venv `/home/weiland/lerobot_venv`（+ conda env `lerobot`），用于 SmolVLA / ACT sidecar |
+| **LIBERO 环境** | **`/home/weiland/libero_sim`**（conda prefix，python 3.8.20；2026-08-13 按 timan107 配方复刻，见下方“LIBERO 环境”小节） |
+| **conda** | `/home/weiland/miniconda3/bin/conda`（26.5.3） |
+| **tether agent** | 用户态进程 `tether agent --session lab --nid weilandserver`（非 systemd 服务） |
+| **tmux 会话前缀** | `srv0`, `srv1`, `srv2`, …（现役还有 `sml*` / `sm*` / `acts*` 系列 sidecar 会话，来自 ablation 实验） |
+
+**GPU 备注**：4090 是**独占卡**（util 与 memory 都是真实信号，不像 jupyter 系列共享卡只能看 `memory.free`）。
+显存 48 GiB 可同时驻多个 pi0.5 server + 若干小模型 sidecar；起新负载前照例先 `nvidia-smi` 查 `memory.free`。
+
+**LIBERO 环境（2026-08-13 新建，与 timan107 同配方）**：
+
+| 项 | timan107 | weilandserver |
+|---|---|---|
+| prefix | `/scratch/zixuans8/libero_sim` | `/home/weiland/libero_sim` |
+| python | 3.8.20 | 3.8.20（一致） |
+| 关键包 | libero 0.1.1 / robosuite 1.4.0 / mujoco 3.2.3 / bddl 1.0.1 / robomimic 0.2.0 / numpy 1.22.4 / torch 1.11.0+cu113 | 同左（按 timan107 `pip freeze` 逐版本 `--no-deps` 锁定，共 126 包） |
+| `openpi-client` | editable → `/scratch/zixuans8/openpi/packages/openpi-client` | editable → `/home/weiland/openpi/packages/openpi-client` |
+| LIBERO 配置 | `~/.libero/config.yaml` 指向 prefix 内 assets/bddl_files/init_files | 同样式（路径换成本机 prefix） |
+
+两处必须知道的差异：
+
+1. **libero 包用的是 timan107 的补丁版，不是 PyPI 原版**。PyPI 的 libero 0.1.1 在
+   `libero/libero/benchmark/__init__.py` 里调用 `torch.load(path, weights_only=False)`，
+   而 `weights_only` 参数在 torch 1.11 不存在 → `TypeError`。timan107 上该行已被改成
+   `torch.load(init_states_path, )`。复刻时直接从 timan107 打包整个 `libero/` 包覆盖过来，
+   不要用 `pip install libero`。同理 `egl_probe` 需要 CMake + EGL 头文件才能从源码编译，
+   本机没有编译依赖，直接搬 timan107 已编译好的 `egl_probe/` 目录。
+2. **NVIDIA 驱动是 `-server`（compute-only）变体，缺 EGL 用户态库** —— 装的是
+   `nvidia-headless-595-server` / `libnvidia-compute-595-server`，`/usr/share/glvnd/egl_vendor.d/`
+   里只有 `50_mesa.json`，没有 `libEGL_nvidia.so` → MuJoCo/robosuite 离屏渲染直接
+   `EGLError`。**免 root 的解法**（已落地）：
+   ```bash
+   # 1) 下载与内核模块版本精确匹配的 GL 包（apt download 不需要 root）
+   mkdir -p ~/nvidia-gl/dl && cd ~/nvidia-gl/dl
+   apt download libnvidia-gl-595-server          # 595.71.05-0ubuntu0.24.04.1
+   dpkg -x libnvidia-gl-595-server_*.deb ~/nvidia-gl/root
+   # 2) 由 conda activate 钩子自动注入（已写入 libero_sim/etc/conda/activate.d/nvidia_egl.sh）
+   export __EGL_VENDOR_LIBRARY_DIRS=~/nvidia-gl/root/usr/share/glvnd/egl_vendor.d
+   export LD_LIBRARY_PATH=~/nvidia-gl/root/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+   ```
+   ⚠ 换驱动版本后必须重下匹配版本的 GL 包（用户态与内核态版本必须一致），
+   `libnvidia-gl-595`（非 `-server`）候选是 595.84，**版本不匹配，不要装**。
+
+**使用方法（与 timan107 完全一致的调用形态）**：
+
+```bash
+# 本机闭环：client → 本机 server（不经 broker）
+tether exec weilandserver -- bash -lc '
+  export HOME=/home/weiland
+  cd /home/weiland/openpi
+  MUJOCO_EGL_DEVICE_ID=0 PYTHONPATH=. ~/miniconda3/bin/conda run -p /home/weiland/libero_sim \
+    python examples/libero/main.py \
+      --host 127.0.0.1 --port 8000 \
+      --task-suite-name libero_spatial --task-ids 0 --num-trials-per-task 50 \
+      --cuda-visible-devices 0 --num-workers 1 \
+      --save-episode-results --episode-results-path <out>/results.json
+'
+```
+
+- `conda run -p` 会触发 activate 钩子 → EGL 变量自动生效；**直接调 `libero_sim/bin/python` 不会生效**，
+  那种调法必须自己 export 上面两个变量。
+- `--num-workers` 上限同样是 15（MuJoCo 单 GPU EGL context 限制），要更高并发就开多进程。
+- 验收状态：2026-08-13 已跑通 1-ep 端到端 smoke（libero_spatial task 0 → 本机 `:8000` pi0.5 server，
+  `success=true`），GPU EGL 渲染 256×256 正常。
+
+### 2.6 已入网但未配置 openpi 的节点
+
+下列节点已在 tether session `lab` 内在线，但**没有 openpi repo / 环境**，用前需要先部署：
+
+| 节点 | 硬件 | 备注 |
+|---|---|---|
+| `timan1` | 48 logical CPU / 503 GiB RAM / **4 × RTX A6000（各 48 GiB）** | 车队里最大的一块未开发算力 |
+| `timan108` | 48 logical CPU / 251 GiB RAM / **3 × RTX A5000（各 24 GiB）** | 未开发 |
+| `weiland-optiplex-7050` | 小型机 | 跑 daemon（`daemon-console:14060` / `daemon-gw:14766`），非计算节点 |
+| `racknerd` | 1 vCPU VPS | 网络中转，非计算节点 |
+| `weiland-wsl` | 开发机（WSL2） | 本地 repo + 实验原始数据主副本，非计算节点 |
 
 ---
 
