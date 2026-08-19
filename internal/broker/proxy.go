@@ -996,7 +996,14 @@ func nodeHasProxyCap(capabilities []string, release string) bool {
 // nodes.proxy_capable fold so the directive path and the persisted column can
 // never disagree within one register.
 func nodeParticipatesInProxy(req proto.NodeRegisterReq) bool {
-	return nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut
+	// !req.LeasedNID mirrors the nodes.proxy_capable expression exactly. Both
+	// must agree, and this is the DIRECTIVE gate — the one that decides whether
+	// a register reply carries a token-bearing proxy directive. Folding the
+	// lease into the persisted column alone would still hand a leased instance
+	// a live keyset and a public port at register time, which is the outcome
+	// the eligibility rule exists to prevent: an ephemeral instance holding a
+	// public egress breaks every subscriber when its pod recycles.
+	return nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut && !req.LeasedNID
 }
 
 // freeOptOutProxyRowSingle (#78, single mode): a register carrying
@@ -1043,6 +1050,9 @@ func freeOptOutProxyRowSingle(b *Broker, sid, nid string) {
 }
 
 func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
+	// The SAME judgement node ls renders, from the same evidence (see
+	// leasedNIDsForSession): a lease has no credential binding of its own.
+	leasedNIDs := leasedNIDsForSession(b, sid)
 	rows, err := b.read().Query(`
 		SELECT n.nid, n.status, n.proxy_ready, COALESCE(pa.port, 0), COALESCE(pa.home_broker, '')
 		FROM nodes n
@@ -1091,6 +1101,23 @@ func (b *Broker) proxyStatusNodes(sid string) ([]proto.ProxyNodeEntry, error) {
 		// documented [GAP]); enforcement is nodes.proxy_capable regardless.
 		if _, ok := b.proxyOptedOut.Load(sid + "/" + r.nid); ok {
 			e.OptedOut = true
+		}
+		// A LEASED instance is ineligible by BROKER DECISION, not by capability
+		// and not by operator configuration. It gets its own reason rather than
+		// reusing OptedOut, whose contract ties it to an agent.yaml key that
+		// does not exist inside a baked image — an operator told "opted out"
+		// would go hunting for a setting nobody wrote. Without any reason at
+		// all the row is indistinguishable from a genuine capability defect.
+		//
+		// ONE SOURCE OF TRUTH, and it is not the name. external review F12: this
+		// site read lease-ness out of the string while node ls and the name
+		// allocator read it from the credential bindings, so a device the
+		// operator named `gpu-02` was reported proxy-ineligible here while being
+		// (correctly) treated as a real device everywhere else — three answers
+		// to one question. A name parser can validate a FORMAT; it cannot
+		// establish PROVENANCE.
+		if leasedNIDs[r.nid] {
+			e.ReadyReason = proto.ProxyReasonLeasedInstance
 		}
 		if r.pport != 0 {
 			// G7a #2: the default (non---cluster) view must label each exit with its OWN home broker's

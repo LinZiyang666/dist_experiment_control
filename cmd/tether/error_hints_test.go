@@ -27,6 +27,7 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 		{"sha256_invalid", "64 lowercase hex"},
 		{"sha256_mismatch", "doesn't match"},
 		{"proto_bump_requires_reinstall", "full reinstall"},
+		{"clone_family_upgrade_unsupported", "rebuild the source image"},
 		{"name_taken", "expose rm"},
 		{"port_exhausted", "free public port"},
 		{"port_taken", "already allocated"},

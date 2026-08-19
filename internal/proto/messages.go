@@ -98,6 +98,161 @@ type NodeRegisterReq struct {
 	// so the #78 log flood still stops — the node just renders never-ready
 	// there (documented [GAP]). Additive/omitempty (proto stays 2).
 	ProxyOptOut bool `json:"proxy_opt_out,omitempty"`
+
+	// InstanceID identifies ONE RUN of an agent process, so a broker can tell
+	// "my own agent reconnecting" from "a second process presenting the same
+	// credential". It is crypto/rand, 26 lowercase base32 chars, NEVER written
+	// to disk and NEVER derived from anything about the machine (no machine-id,
+	// DMI, MAC, boot_id, IP or hostname — every one of those has a failure mode
+	// across the virtualization forms this must survive, and two of them are
+	// already falsified on the live fleet: /etc/machine-id is empty in the
+	// reference pod, and boot_id is per-KERNEL so containers on one host share
+	// it). Not persisting it is what makes a cloned image unable to carry it.
+	//
+	// A non-empty value IS the capability advertisement — deliberately NOT a new
+	// Capabilities token, which would change every lone agent's register body
+	// beyond the single key this field adds.
+	//
+	// N-1: absent = a pre-feature agent, which the broker must treat exactly as
+	// today (single-instance semantics, including the clone fan-out — that is
+	// the pre-upgrade baseline, not a regression). Additive/omitempty, proto 2.
+	InstanceID string `json:"instance_id,omitempty"`
+
+	// LeasedNID reports that this agent is running under a broker-assigned
+	// lease name (`<basename>-NN`) rather than its configured basename. The
+	// broker folds it into the EXISTING nodes.proxy_capable computation
+	// (ProxyCapable = capability AND NOT opt-out AND NOT leased), the same
+	// shape #78 used for the opt-out — a leased instance is ephemeral by
+	// premise and must not hold a public egress port whose disappearance
+	// breaks every subscriber. Additive/omitempty; false = holds the basename
+	// = today's behavior in both directions.
+	LeasedNID bool `json:"leased_nid,omitempty"`
+
+	// PreviousNID is the name this agent registered under IMMEDIATELY BEFORE
+	// this one, set only on the first register after adopting a lease.
+	//
+	// WHY IT EXISTS. Adoption renames a LIVE agent, and its managed processes
+	// have rows filed under the OLD name. reconcileOnRegister scopes to
+	// (sid, nid), so without this the agent's own running pids arrive as pids
+	// the broker "has no record of" — the orphan arm — and the broker orders it
+	// to SIGTERM+SIGKILL the operator's work, while the rows under the old name
+	// stay RUNNING forever. That is a rename destroying live processes, and it
+	// is new with this increment: before it, a rename could not happen.
+	//
+	// Additive/omitempty; absent = an ordinary register with no predecessor,
+	// which is every register on every single-agent device.
+	PreviousNID string `json:"previous_nid,omitempty"`
+
+	// ReleasingName says this agent is shutting down GRACEFULLY and is giving
+	// the name back, so the next process to present this credential can have it.
+	//
+	// WHY IT EXISTS. Name adjudication has to separate two situations that look
+	// IDENTICAL from the outside: two clones launched together (the second must
+	// be suffixed) and one agent restarting quickly (it must keep its name).
+	// Both show a warm heartbeat, a recently granted holder, and — for the few
+	// hundred milliseconds before the server reaps the dead subscription — live
+	// interest with nobody answering. No clock can tell them apart, and guessing
+	// wrong either renames a device for restarting or lets two processes share
+	// one name.
+	//
+	// So the departing process says so, on the register subject it is already
+	// authorized for (no new subject, no ACL change). The broker drops its
+	// holder entry and the successor is adjudicated as a first arrival.
+	//
+	// It is an OPTIMISATION, never a requirement: a crash, a kill -9 or a
+	// partition sends nothing, and adjudication still resolves correctly through
+	// the grant window, the interest probe and the heartbeat clock. Nothing may
+	// be made to DEPEND on this arriving.
+	//
+	// Additive/omitempty; absent = every register that is not a farewell, which
+	// is all of them on a pre-feature agent.
+	ReleasingName bool `json:"releasing_name,omitempty"`
+
+	// ConfiguredNID is the name this agent was CONFIGURED with — the root of its
+	// credential family — as distinct from the name it is registering under.
+	//
+	// WHY THE BROKER CANNOT DERIVE IT. A lease name is `<base>-NN`, and so is a
+	// perfectly ordinary device name: `gpu-01 gpu-02 gpu-03` is this project's
+	// own example fleet. Parsing the presented name to recover a basename
+	// therefore folds a real machine called `gpu-02` into the `gpu` family, and
+	// its clone is offered `gpu-03` — a name that belongs to the WRONG
+	// credential family, that `gpu-02`'s own binding does not cover, and that
+	// may already be another operator's machine. The agent is the only party
+	// that knows which of the two its name is, so it says.
+	//
+	// Set on every register by an agent that has one; a lease reconnect carries
+	// the configured root here and the assigned name in NID. Additive/omitempty
+	// — absent means "the presented NID is itself the root", which is exactly
+	// what a pre-feature agent means and what an unleased agent means.
+	ConfiguredNID string `json:"configured_nid,omitempty"`
+}
+
+// NodeLease is the register reply's lease verdict (non-nil ONLY when the
+// register was contested). A POINTER + omitempty — the Proxy/Home/Roster
+// precedent — so an uncontested reply carries no "lease" key at all and stays
+// byte-identical to today for every device that will only ever run one agent.
+//
+// The agent adopts an assigned name by REBUILDING ITS SESSION (see
+// internal/agent: the routing name must be immutable for the lifetime of a
+// *nats.Conn, because nats.MaxReconnects(-1) makes nats.go replay
+// subscriptions on their original subjects and re-send the stored CONNECT
+// name, so an in-place rename silently reverts on the first blip).
+//
+// The assigned name is NEVER persisted: an agent always starts from its
+// agent.yaml basename, so an instance that was suffixed re-competes for the
+// basename on its next restart. That is what keeps a device which only ever
+// runs one agent permanently on its own name.
+// ProxyReasonLeasedInstance is the ready_reason for a node that is ineligible
+// to serve as a proxy egress because it is running under an assigned lease
+// name.
+//
+// It is deliberately NOT the #78 OptedOut hint: that one's contract ties it to
+// an agent.yaml key, and a baked image has no such key — an operator told
+// "opted out" would go looking for a setting nobody wrote. This is a BROKER
+// DECISION (an ephemeral instance must not hold a public egress port whose
+// disappearance breaks every subscriber), and it reads as one.
+const ProxyReasonLeasedInstance = "leased_instance"
+
+// ClaimProbeVerb is the forwarded-tree verb carrying a lease claim probe. It
+// lives here as the single source of truth because BOTH sides speak it — the
+// broker publishes, the agent answers — and a verb string defined twice is a
+// verb string that eventually differs in one place.
+//
+// It rides the EXISTING forwarded subject tree, so it costs zero ACL change:
+// both permission templates use full-token verb wildcards.
+const ClaimProbeVerb = "claim-probe"
+
+// ClaimProbeResp is an agent's answer to a lease claim probe.
+//
+// WHY THE PROBE NEEDS AN ANSWER AT ALL. Asking NATS "is anyone subscribed under
+// this name" is not enough, and gets the answer wrong in BOTH directions:
+//
+//   - It says "yes" when the only subscriber is the REGISTRANT ITSELF. nats.go
+//     replays every subscription BEFORE invoking its reconnect handler, and the
+//     agent re-registers from that handler on the same connection — so at
+//     re-register time its own forwarded subscription is live. A pure interest
+//     check would rename a device every time its network blipped.
+//   - It says "no" when a genuine incumbent has registered but not yet
+//     subscribed (the agent's order is connect → register → subscribe), so
+//     several clones starting together could each be told the name is free.
+//
+// Carrying the responder's instance id turns the probe from "is anyone there"
+// into "is anyone OTHER THAN ME there", which is the question the adjudicator
+// actually has.
+//
+// N-1: an agent that predates this verb lands in dispatchForwarded's default
+// arm, logs a warning and never replies, so the probe times out and the broker
+// takes the conservative branch — exactly what it did before this existed.
+type ClaimProbeResp struct {
+	InstanceID string `json:"instance_id,omitempty"`
+}
+
+type NodeLease struct {
+	// AssignedNID is the lease name this instance must adopt.
+	AssignedNID string `json:"assigned_nid"`
+	// Basename echoes the name the agent registered with, so the agent can log
+	// the transition without re-deriving it.
+	Basename string `json:"basename,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -196,6 +351,24 @@ type NodeRegisterResp struct {
 	// rosterForRegister selfID=="" gate) — produces a NodeRegisterResp byte-identical to today
 	// (the Proxy/Home precedent). Discovery-ONLY: it confers zero membership authority.
 	Roster *ClusterRoster `json:"roster,omitempty"`
+
+	// Lease, when non-nil, means this register was CONTESTED: another live
+	// instance already holds the name this agent presented, so the broker
+	// assigned it a different one. A contested register deliberately touches
+	// NOTHING ELSE — no registerNode, no reconcileOnRegister, no sys.event, no
+	// proxy directive — which is what keeps a clone from (a) zeroing the
+	// incumbent's proxy_ready through node.Register's ON CONFLICT clause and
+	// (b) closing every process row the incumbent is actually running, via the
+	// reconcile missed-exit arm. Both of those are fixed by this ordering
+	// alone, with no change to reconcile.go.
+	//
+	// POINTER + omitempty: an uncontested register — every register on every
+	// single-agent device — produces a reply with no "lease" key.
+	//
+	// N-1: an old broker never emits it, and the agent MUST treat a nil Lease
+	// as "legacy mode" and never rebuild its session, so new-agent × old-broker
+	// is exactly today's behaviour (no auth denial, no crash loop).
+	Lease *NodeLease `json:"lease,omitempty"`
 }
 
 // HomeAssignment is the register-reply container for per-expose home
@@ -280,6 +453,17 @@ const ReasonHomeCatchingUp = "home_catching_up"
 // from the config-error codes (proto_mismatch / nid_mismatch / store_error) which are
 // permanent and rightly terminal.
 const CodeLeaderUnavailable = "leader_unavailable"
+
+// NOTE ON LEASE FAILURES AND WIRE CODES. A lease that cannot be issued — an
+// over-long basename, an exhausted suffix space, a store error — deliberately
+// does NOT produce a reply code. The broker DEGRADES: it grants the presented
+// name and logs the reason. That is not a shortcut, it is the safe direction —
+// a refused register makes an agent flap or exit (connectNATS treats an initial
+// auth failure as fatal), so refusing a fleet's worth of agents because a name
+// is three characters too long would be far worse than running them with
+// today's semantics. The reasons are therefore broker-internal log values
+// (see internal/broker), not proto codes: defining them here would imply a ctl
+// path can observe them, which none can.
 
 // ReconciledProc reports one PID the broker just transitioned away
 // from RUNNING/LOST as part of the register reconciliation. NewState
@@ -457,6 +641,20 @@ type NodeListEntry struct {
 	BootID          string    `json:"boot_id,omitempty"`
 	ReleaseVersion  string    `json:"release_version,omitempty"`
 	ProtoVersion    int       `json:"proto_version,omitempty"`
+
+	// Leased marks a row whose nid is a broker-assigned lease name
+	// (`<basename>-NN`) rather than an agent's configured basename. It exists
+	// so `node upgrade --all` can exclude ephemeral instances: upgrading one is
+	// meaningless (it reverts to the image's binary on restart) and, because
+	// targets are sorted lexicographically and targets[0] gates the whole
+	// fleet, a leased instance whose pod recycles inside the wait budget would
+	// abort an entire fleet rollout.
+	//
+	// Set ONLY when true, so `node ls --json` on every single-agent device is
+	// byte-identical to today. Deliberately NOT a display-name or instance-id
+	// field: multiplicity is shown by the extra ROW, not by extra data — the
+	// operator should notice nothing except one more device.
+	Leased bool `json:"leased,omitempty"`
 }
 
 type NodeListResp struct {

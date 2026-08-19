@@ -260,7 +260,7 @@ func (c *procCourier) deliverRound(ctx context.Context) {
 
 // attempt sends one ACKed request and settles the entry's fate.
 func (c *procCourier) attempt(ctx context.Context, nc *nats.Conn, ev *pendingProcEvent) {
-	subj := proto.SubjEvProc(c.a.cfg.SID, c.a.cfg.NID, ev.pid, string(ev.kind))
+	subj := proto.SubjEvProc(c.a.cfg.SID, nidOf(c.a), ev.pid, string(ev.kind))
 	rctx, cancel := context.WithTimeout(ctx, courierRequestTimeout)
 	msg, err := nc.RequestWithContext(rctx, subj, ev.payload)
 	cancel()
@@ -372,6 +372,20 @@ func (c *procCourier) drainStarted(ctx context.Context, nc *nats.Conn) {
 // Parked entries settle here too — this is exactly the register-replay they
 // were parked for.
 func (c *procCourier) onRegisterSuccess(resp proto.NodeRegisterResp) {
+	// A CONTESTED reply is not a successful register. The broker returned
+	// BEFORE registerNode, so it never read LocalProcesses and never accepted a
+	// single pid — and this function reads "pid absent from AcceptedProcesses"
+	// as "the broker already has this exit". Settling against an empty set would
+	// therefore DELETE every pending exit: the real rc is lost forever and the
+	// ps row stays RUNNING. That is the 2026-08-04 zombie-row class, re-armed.
+	//
+	// The guard lives here rather than only at the two call sites on purpose:
+	// this is the function whose contract the emptiness would violate, and a
+	// third register site added later would otherwise re-introduce the bug
+	// silently.
+	if resp.Lease != nil {
+		return
+	}
 	accepted := make(map[string]bool, len(resp.AcceptedProcesses))
 	for _, pid := range resp.AcceptedProcesses {
 		accepted[pid] = true

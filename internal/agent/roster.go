@@ -368,7 +368,7 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
 	req := proto.NodeRegisterReq{
 		ProtoVersion:      proto.ProtoVersion,
-		NID:               a.cfg.NID,
+		NID:               nidOf(a),
 		RosterGen:         a.cachedRosterGen(),
 		RosterRefreshOnly: true,
 	}
@@ -377,7 +377,7 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
 		return false
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, a.cfg.RegisterTimeout)
-	msg, err := nc.RequestWithContext(reqCtx, proto.SubjNodeRegister(a.cfg.SID, a.cfg.NID), payload)
+	msg, err := nc.RequestWithContext(reqCtx, proto.SubjNodeRegister(a.cfg.SID, nidOf(a)), payload)
 	cancel()
 	if err != nil {
 		return false

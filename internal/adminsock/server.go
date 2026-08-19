@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // Backend is everything the server needs from the broker. Decoupled
@@ -423,6 +425,33 @@ func (s *Server) rowExists(query string, args ...any) bool {
 func (s *Server) handleEvict(req Request) Response {
 	if req.SID == "" || req.NID == "" {
 		return Response{Op: OpEvict, Error: "sid and nid required"}
+	}
+	// REFUSE TO "EVICT" A LEASE NAME (external review F10).
+	//
+	// Evict means REVOKE A CREDENTIAL: it deletes the agent_provisioning binding
+	// so the agent can no longer authenticate, and broadcasts agent_evicted so a
+	// live one disconnects. A broker-assigned lease name has neither half. It
+	// owns no binding — it is admitted through its BASENAME's fingerprint — and
+	// the eviction broadcast is matched by agents on their CONFIGURED name, so a
+	// running leased instance never hears it.
+	//
+	// Running it anyway did the damage without the effect: node/process/port
+	// rows deleted, `ok` reported, the instance still running and still able to
+	// come back through the suffix fallback. An operator following §5.18's
+	// OFFLINE-cleanup advice would silently destroy live bookkeeping.
+	//
+	// So: refuse, and say which name to use instead. Revoking the whole clone
+	// family is `evict <basename>` — a real, coherent operation. Stopping one
+	// instance is a job for the host that runs it, not for credential
+	// revocation, and the CLI now says so rather than implying otherwise.
+	if base, _, leased := proto.SplitLeaseName(req.NID); leased &&
+		!s.rowExists(`SELECT 1 FROM agent_provisioning WHERE sid=? AND nid=?`, req.SID, req.NID) {
+		return Response{Op: OpEvict, Code: CodeBadRequest, Error: fmt.Sprintf(
+			"%q is a broker-assigned lease name, not a credential: it owns no provisioning row to "+
+				"revoke, and the eviction broadcast is matched on an agent's CONFIGURED name so a "+
+				"running instance would not hear it. To revoke the whole clone family use "+
+				"`evict %s`; to stop one instance, stop it on the host that runs it.",
+			req.NID, base)}
 	}
 	// D9 round-2 BLOCKER: in cluster mode the direct tx below writes the READ-ONLY FSM
 	// handle and fails ("readonly database"). Route through raft via the EvictWrite seam

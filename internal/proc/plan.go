@@ -85,6 +85,42 @@ func PlanMarkExited(db *sql.DB, pid string, exitCode int, when time.Time) (*clus
 	return cluster.NewCommand(cluster.OpProcMarkExited, cluster.Stmt(sql)), nil
 }
 
+// PlanRefileStatements renders the process-row moves that accompany a node
+// register after lease adoption. The statements are appended to the existing
+// OpNodeRegister command, so old replicas already know the op and execute the
+// additional generic SQL without a command-version fork.
+func PlanRefileStatements(sid, from, to string, pids []string) ([]cluster.Statement, error) {
+	if from == "" || from == to || len(pids) == 0 {
+		return nil, nil
+	}
+	uniq := make(map[string]struct{}, len(pids))
+	for _, pid := range pids {
+		if pid != "" {
+			uniq[pid] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(uniq))
+	for pid := range uniq {
+		ordered = append(ordered, pid)
+	}
+	sort.Strings(ordered)
+	lits, err := cluster.LitTextAll(to, sid, from)
+	if err != nil {
+		return nil, fmt.Errorf("proc: refile literal: %w", err)
+	}
+	toL, sidL, fromL := lits[0], lits[1], lits[2]
+	out := make([]cluster.Statement, 0, len(ordered))
+	for _, pid := range ordered {
+		pidL, err := cluster.LitText(pid)
+		if err != nil {
+			return nil, fmt.Errorf("proc: refile pid literal: %w", err)
+		}
+		out = append(out, cluster.Stmt(`UPDATE processes SET nid=`+toL+
+			` WHERE sid=`+sidL+` AND pid=`+pidL+` AND nid=`+fromL+` AND status='RUNNING'`))
+	}
+	return out, nil
+}
+
 // markExitedSQL is the ONE canonical renderer for a MarkExited UPDATE, shared by
 // PlanMarkExited (single exit) and PlanReconcileBatch (G.1 reconcile) so the two
 // paths cannot drift into byte-different SQL (d2-plan §2).

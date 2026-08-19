@@ -292,6 +292,7 @@ func TestFleetClassifiersReconcileWithTheExitClassTable(t *testing.T) {
 		"url_not_allowed", "url_not_allowed_local", "sha256_invalid", "sha256_mismatch",
 		"proto_bump_requires_reinstall", "node_offline", "node_not_found",
 		"agent_no_responders", "agent_malformed_resp", "not_owner", "version_skew",
+		"clone_family_upgrade_unsupported",
 	}
 	stillNeeded := map[string]bool{}
 	for _, code := range upgradeCodes {

@@ -96,6 +96,12 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 		go a.handlePullForwarded(nc, msg)
 	case "push-commit":
 		go a.handlePushCommitForwarded(nc, msg)
+	case proto.ClaimProbeVerb:
+		// Answered INLINE rather than in a goroutine: the reply is two fields
+		// and the broker is holding a register slot open waiting for it, so the
+		// dispatch cost of a goroutine would be pure added latency on the one
+		// path where latency turns into a wrong lease verdict.
+		replyClaimProbe(a, nc, msg)
 	default:
 		a.cfg.Logger.Warn("agent: unknown forwarded verb", "verb", verb)
 	}
@@ -295,7 +301,7 @@ func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision,
 		return nil, spawnsafe.Decision{}, err
 	}
 	if !d.Active {
-		// Legacy path (booted with no hangable mount) — byte-identical to today.
+		// Legacy path (booted with no hangable mount).
 		cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 		if req.Cwd != "" {
 			cmd.Dir = req.Cwd
@@ -303,6 +309,11 @@ func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision,
 		if len(req.Env) > 0 {
 			cmd.Env = envSliceFromMap(req.Env)
 		}
+		// Env stays nil here on purpose (remote-fs-resilience M2 pins this path
+		// as byte-identical). The instance lineage cannot leak through it
+		// because the agent UNSETS those variables from its own environment at
+		// startup — see mintInstanceID. A child cannot inherit what the parent
+		// no longer has.
 		setExecProcGroup(cmd)
 		return cmd, d, nil
 	}
@@ -322,6 +333,8 @@ func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision,
 		if len(req.Env) > 0 {
 			cmd.Env = envSliceFromMap(req.Env)
 		}
+		// Same as the legacy branch: nil is deliberate, and the lineage is
+		// already absent from this process's environment.
 	}
 	setExecProcGroup(cmd)
 	return cmd, d, nil
@@ -347,7 +360,11 @@ func (a *Agent) execBaseEnv(req *proto.ExecReq) []string {
 	if len(req.Env) > 0 {
 		return envSliceFromMap(req.Env)
 	}
-	return os.Environ()
+	// Defence in depth: the agent already unsets the lineage variables from its
+	// own environment at startup (mintInstanceID), so os.Environ() cannot carry
+	// them. Stripping again costs one pass and makes this call site correct even
+	// if something re-set them.
+	return stripInstanceEnv(os.Environ())
 }
 
 // startBounded runs start (a cmd.Start) under the safe-mode spawn-window
@@ -410,7 +427,9 @@ func remoteFSFailReason(err error) string {
 // children may want a stricter env (no inherited TERM since stdout
 // isn't a tty); they keep using envSliceFromMap directly.
 func mergeChildEnv(override map[string]string) []string {
-	base := os.Environ()
+	// stripInstanceEnv for the same reason as execBaseEnv: a PTY child that
+	// launches an agent must start its own lineage, not continue ours.
+	base := stripInstanceEnv(os.Environ())
 	out := make([]string, 0, len(base)+len(override)+1)
 	out = append(out, base...)
 	hasTerm := false

@@ -74,6 +74,13 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.handleReExecOnly(msg, req)
 		return
 	}
+	if leasedInstanceRefusesUpgrade(a) {
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
+			Code:  "clone_family_upgrade_unsupported",
+			Error: "this process runs under an assigned lease name; rebuild the shared image instead of remotely replacing its upgrade-domain binary",
+		})
+		return
+	}
 
 	// origin: upgrade-safety internal review S2. One install at a time: the
 	// forwarded-message handler runs one goroutine per message, and the
@@ -109,6 +116,10 @@ func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 	} else if installErr != nil {
 		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "install_failed", Error: installErr.Error()})
 	}
+}
+
+func leasedInstanceRefusesUpgrade(a *Agent) bool {
+	return nidOf(a) != a.cfg.NID
 }
 
 // handleUpgradeInstallLocked is the install pipeline body, entered holding
@@ -295,7 +306,12 @@ func (a *Agent) reExecInPlace(exePath string) {
 		time.Sleep(100 * time.Millisecond)
 		argv := append([]string(nil), os.Args...)
 		argv[0] = exePath
-		if err := syscall.Exec(exePath, argv, os.Environ()); err != nil {
+		// execEnv, not os.Environ: carry the instance lineage across the
+		// re-exec so the new image continues THIS instance. With a bare
+		// environment the post-exec process would mint a fresh id, contest the
+		// name its own predecessor still holds, and get suffixed — i.e.
+		// `node upgrade` would rename every node it upgraded.
+		if err := syscall.Exec(exePath, argv, execEnv()); err != nil {
 			a.cfg.Logger.Error("agent: re-exec into the new binary failed", "err", err, "exe", exePath)
 			if a.recoverFromFailedExec(exePath, err) {
 				return
@@ -585,7 +601,13 @@ func (a *Agent) installNewBinary(tarball []byte, dst string) (string, error) {
 		// unique even for rapid same-artifact retries.
 		TargetSID: a.cfg.SID,
 		TargetNID: a.cfg.NID,
-		UpgradeID: hex.EncodeToString(upgradeNonce[:]),
+		// Stamp WHICH instance started this upgrade. TargetNID is the basename
+		// and every clone of one image shares it, so without this the marker
+		// cannot tell the upgrading instance from its siblings — and the first
+		// sibling to boot would report this upgrade's outcome and clear the
+		// marker out from under the instance that actually ran it.
+		TargetInstance: a.instanceID,
+		UpgradeID:      hex.EncodeToString(upgradeNonce[:]),
 	}
 	// The caller holds the host-wide flock, which serializes this marker write
 	// against commit/watchdog in this process and every sibling process. Do

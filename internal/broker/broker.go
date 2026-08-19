@@ -74,6 +74,30 @@ type Config struct {
 	StaleAfter   time.Duration
 	OfflineAfter time.Duration
 
+	// LeaseGrace is how recently a name must have heartbeat for a DIFFERENT
+	// instance's register to be treated as CONTESTED. It is deliberately its
+	// own knob and must never be conflated with StaleAfter or OfflineAfter:
+	// those answer "is this node usable", this one answers "might the previous
+	// holder still be alive". OfflineAfter (60s) would suffix every ordinary
+	// `systemctl restart` (RestartSec=5); StaleAfter (5s) is shorter than one
+	// heartbeat interval.
+	//
+	// The arithmetic, which matters: a beat lands at T, the process dies at
+	// T+ε with ε ∈ [0, HeartbeatInterval], systemd waits RestartSec, and the
+	// successor registers at T+ε+RestartSec+boot. With the default 6s a
+	// hard-killed lone agent whose ε+boot < 1s lands INSIDE the window — so
+	// the window alone would rename it. That is exactly why entering the
+	// window is not the verdict: it only triggers the interest probe, which
+	// returns ErrNoResponders instantly for a dead predecessor.
+	// Default: DefaultLeaseGrace.
+	LeaseGrace time.Duration
+
+	// MaxInstancesPerBasename caps how many concurrent instances one basename
+	// may carry. Default DefaultMaxInstancesPerBasename; the hard ceiling is
+	// node.MaxLeaseSuffix, above which a suffix no longer fits the zero-padded
+	// width.
+	MaxInstancesPerBasename int
+
 	// AuthCallout, if non-nil, makes the broker connect with the configured
 	// nkey credentials AND subscribe to $SYS.REQ.USER.AUTH to issue per-
 	// connection user JWTs. Required for the architecture B.2 NATS-level
@@ -480,6 +504,27 @@ type Broker struct {
 	// (documented [GAP]). Enforcement lives in nodes.proxy_capable, which is
 	// persisted and needs none of this.
 	proxyOptedOut sync.Map
+
+	// leaseHolder is a leader-local PROBE-AVOIDANCE cache for the
+	// cloned-credential lease: "sid/nid" → the instance id that most recently
+	// registered under that name.
+	//
+	// It is deliberately NOT the source of truth, and the contest test does NOT
+	// require it to be populated. An in-memory map is empty after a broker
+	// restart or a leader election, so a rule shaped
+	// `contested := holder != "" && holder != req.InstanceID` would read as
+	// UNCONTESTED for both live clones and hand them the same name in
+	// sequence — restoring the fan-out with no clone arrival and no death.
+	// Contest is therefore driven by nodes.last_heartbeat_at, which is in
+	// SQLite and survives both events; this map only lets an incumbent's own
+	// reconnect skip the interest probe.
+	leaseHolder sync.Map
+
+	// probeCache / probeInFlight back the OFF-HANDLER interest probe. See
+	// probeVerdict: running it inline would serialize every other node's
+	// register behind it and force its budget to be too small for a real WAN.
+	probeCache    sync.Map
+	probeInFlight sync.Map
 
 	// selfID + tunnelCert are the D6 home/cert seam. Post-D9 cutover, in CLUSTER mode
 	// wireClusterEarly calls AttachClusterSeam to set this broker's cluster identity + stable
@@ -1378,6 +1423,767 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 }
 
+// Cloned-credential lease defaults. See Config.LeaseGrace for the arithmetic.
+const (
+	DefaultLeaseGrace              = 6 * time.Second
+	DefaultMaxInstancesPerBasename = 64
+	// claimProbeBudget bounds the interest probe. It is only ever paid when a
+	// recent heartbeat and a different instance id coincide: a live incumbent
+	// answers in ~1ms locally, and a dead one returns ErrNoResponders
+	// INSTANTLY (no-responders is a server-side signal, not a timeout). The
+	// full budget is therefore only spent in a partition, where the answer is
+	// "suffix" anyway.
+	// claimProbeBudget bounds the interest probe.
+	//
+	// A CURRENT agent answers from its claim-probe arm in about a millisecond
+	// locally, and a dead one returns ErrNoResponders instantly (no-responders
+	// is a server-side signal, not a timeout). The full budget is therefore only
+	// ever paid by a subscriber that does NOT implement the verb — a pre-feature
+	// agent — or by a partition.
+	//
+	// IT IS DELIBERATELY SMALL because handleRegister is an async subscription
+	// handler and nats.go delivers one subscription serially on ONE goroutine:
+	// every millisecond spent here is a millisecond no OTHER node's register is
+	// being handled. Making it generous would convert one ambiguous name into
+	// fleet-wide register latency. Residual, recorded in the review: even at
+	// this size the stall is real, and removing it needs a per-basename lock
+	// with an asynchronous handler rather than a smaller number.
+	claimProbeBudget = 50 * time.Millisecond
+
+	// Lease failure reasons. These are LOG values, not wire codes: a lease that
+	// cannot be issued degrades to today's behaviour rather than refusing the
+	// register, so no ctl path ever observes them. They are named constants so
+	// an operator can grep for them and so the two sites cannot drift apart.
+	leaseReasonUnavailable   = "nid_lease_unavailable"
+	leaseReasonBadInstanceID = "instance_id_invalid"
+	leaseReasonStoreError    = "store_error"
+	// leaseReasonProbePending is TRANSIENT: the interest probe is running off
+	// the handler and the answer is not cached yet. The register is answered
+	// with a retriable code rather than being decided on a guess.
+	leaseReasonProbePending = "lease_probe_pending"
+)
+
+// leaseKey is the leaseHolder map key.
+func leaseKey(sid, nid string) string { return sid + "/" + nid }
+
+// probeVerdict caches one interest probe's answer.
+//
+// THE PROBE MUST NOT RUN INLINE. handleRegister is an async subscription
+// handler and nats.go delivers one subscription SERIALLY on a single goroutine,
+// so a blocking probe stalls every OTHER node's register behind it — a fleet
+// re-registering after a broker restart would be serialized at the probe's
+// budget. And an inline probe must be short to limit that damage, which makes
+// its budget a constant rather than a function of the fleet's round-trip time:
+// on this deployment the broker is a public VPS with agents on other
+// continents, so a healthy lone agent that merely answers slowly would be
+// renamed on the very path the identity answer was added to protect.
+//
+// So the probe runs in the background with a budget generous enough for a real
+// WAN, and the register that needed it is answered with a TRANSIENT code the
+// agent already retries. The retry lands on the cached verdict and is decided
+// without blocking anyone.
+// It caches the OBSERVATION, never a verdict: see probeAnswer for why an
+// asker-relative answer cannot be shared between askers.
+type probeVerdict struct {
+	answer probeAnswer
+	at     time.Time
+}
+
+// probeTTL is how long a cached verdict is trusted. It must be short enough
+// that a name freed in the meantime is not held hostage, and long enough that
+// the agent's own retry arrives INSIDE it — otherwise the retry misses the
+// cache, launches a second probe, and the pair livelocks at one probe per
+// retry.
+//
+// The arithmetic that fixes the value: the agent's register backoff caps at
+// RegisterRetryMax (2s), and against a subscriber that never answers the probe
+// itself burns backgroundProbeBudget (3s) before it writes anything. A verdict
+// must therefore stay valid for at least 3s+2s after it lands. 10s carries
+// that with room for a loaded broker.
+const probeTTL = 10 * time.Second
+
+// backgroundProbeBudget is the budget of the OFF-HANDLER probe. It can afford
+// to be generous precisely because nothing waits on it — the value covers an
+// intercontinental round trip with room to spare.
+const backgroundProbeBudget = 3 * time.Second
+
+// leaseSubscribeSettle is how long after a grant the broker still refuses to
+// read silence as death.
+//
+// A granted agent has to get the reply, then install its forwarded
+// subscription, before it can answer a claim probe at all. Until that has
+// certainly happened, silence proves nothing — and treating it as proof puts a
+// clone on the incumbent's name. Comfortably larger than the grant window and
+// than any local register→subscribe turnaround, while staying far below the
+// heartbeat grace, so a genuinely dead predecessor is still reclaimed within
+// one ordinary restart.
+const leaseSubscribeSettle = 5 * time.Second
+
+// inlineProbeGrace is how long the register handler is willing to wait for a
+// DEFINITE probe answer before deferring to the background.
+//
+// It exists to keep the common path exactly as fast as it was before the probe
+// was made asynchronous. The two definite answers both arrive far inside it:
+// ErrNoResponders is synthesised by the SERVER the moment it finds no interest
+// (no round trip to any agent at all), and a live local agent's claim-probe
+// reply is a single hop. What does NOT fit is the ambiguous case — interest
+// exists but nothing answers — and that is the one case worth deferring.
+//
+// Keep it small. Every millisecond here is head-of-line latency for every other
+// node's register, because nats.go delivers one subscription serially.
+const inlineProbeGrace = 15 * time.Millisecond
+
+// errProbePending is the transient outcome when a verdict is not cached yet.
+var errProbePending = errors.New("lease: interest probe in flight; retry")
+
+// leaseProbe returns a cached probe verdict, starting a background probe when
+// there is none. ok=false means "ask again shortly" — never a decision.
+func leaseProbe(b *Broker, sid, nid string, now time.Time) (v probeVerdict, ok bool) {
+	key := leaseKey(sid, nid)
+	if raw, hit := b.probeCache.Load(key); hit {
+		if cached, _ := raw.(probeVerdict); now.Sub(cached.at) < probeTTL {
+			// CONSUME IT. The entry exists for exactly one purpose: to let the
+			// agent that was told "retry" land on the answer its own probe
+			// produced. Once it has decided a register it has done its job.
+			//
+			// Leaving it readable for the rest of probeTTL lets an observation
+			// outlive the process it describes. The incumbent dies, its
+			// replacement registers inside the window, and a cached "somebody
+			// else holds this" — evidence about a process that no longer exists
+			// — renames the restarting agent. The name the operator addresses
+			// then goes STALE while a perfectly healthy device sits under a
+			// suffix nobody asked for.
+			//
+			// Re-probing instead costs the inline grace, and only in the
+			// ambiguous branch.
+			b.probeCache.Delete(key)
+			return cached, true
+		}
+	}
+	// INLINE GRACE FIRST — this is what keeps I1 intact.
+	//
+	// Going fully async cost more than it bought. The ordinary single-agent
+	// RESTART lands here: the process is new (new instance id) while its own
+	// row is still warm, so it takes the ambiguity branch. Under a synchronous
+	// probe that case was already fast — the dead predecessor holds no
+	// subscription, so the SERVER answers ErrNoResponders immediately, in about
+	// a millisecond. Deferring it to a background goroutine replaced that
+	// millisecond with a transient code plus a full agent backoff, which is a
+	// visible slowdown on the most common path there is. (test/p4's
+	// TestAgentReconnectsWithoutPINAfterBootstrap caught exactly this.)
+	//
+	// So: spend a few milliseconds inline. Any DEFINITE answer — nobody
+	// subscribed, or somebody actually replied — is taken right here and the
+	// handler never defers. Only the genuinely ambiguous shape, "interest
+	// exists but nothing answered in the grace", goes to the background, and
+	// that is precisely the shape that would otherwise have burned the full
+	// budget on the handler goroutine.
+	if a := probeObserve(b, sid, nid, inlineProbeGrace); a.definitive {
+		// NOT cached. This observation is being consumed by the caller right
+		// now, so storing it can only serve SOMEBODY ELSE later — and a probe
+		// result is evidence about one moment, not a standing fact. Caching it
+		// here is what let a "held by A" answer outlive A: A gets hard-killed,
+		// its replacement registers, and a stored observation of a process that
+		// no longer exists renames the restarting agent while the operator's
+		// bare name goes STALE.
+		//
+		// The cache exists for exactly one job — carrying a background probe's
+		// result to the retry that was told to come back — and that is the only
+		// place that writes it.
+		return probeVerdict{answer: a, at: now}, true
+	}
+
+	// Single-flight: only the first caller launches the background probe.
+	if _, busy := b.probeInFlight.LoadOrStore(key, true); busy {
+		return probeVerdict{}, false
+	}
+	startedAt := now
+	go func() {
+		defer b.probeInFlight.Delete(key)
+		a := probeObserve(b, sid, nid, backgroundProbeBudget)
+		// RE-CHECK SILENCE BEFORE RECORDING IT.
+		//
+		// This probe may have spent three seconds, and "nobody answered" is a
+		// statement about the moment it was asked. The incumbent very plausibly
+		// finished subscribing DURING those three seconds — that is the whole
+		// reason the ambiguous branch existed — so a silence observed at the
+		// start is not silence now. Writing it down anyway lets the silence rule
+		// declare a live, answering agent dead and hand its name to a clone.
+		//
+		// One more grace-length ask settles it. Only for silence: a definite
+		// answer is already evidence about a responder that spoke.
+		if !a.answered {
+			if recheck := probeObserve(b, sid, nid, inlineProbeGrace); recheck.answered {
+				a = recheck
+			}
+		}
+		// DO NOT CLOBBER A NEWER OBSERVATION.
+		//
+		// This probe may have spent the full background budget, and the world
+		// moves inside it: the incumbent finishes subscribing and answers a
+		// later, INLINE probe, which caches a fresh "it is alive". Storing this
+		// result unconditionally would then overwrite that with evidence
+		// gathered BEFORE the incumbent could speak, and the silence rule would
+		// read a live, answering agent as dead and hand its name to a clone.
+		//
+		// Timestamp order is the whole test: keep whichever observation is
+		// younger. Losing this write costs nothing — the next register probes
+		// again.
+		if prev, ok := b.probeCache.Load(key); ok {
+			if pv, _ := prev.(probeVerdict); pv.at.After(startedAt) {
+				return
+			}
+		}
+		b.probeCache.Store(key, probeVerdict{answer: a, at: time.Now().UTC()})
+	}()
+	return probeVerdict{}, false
+}
+
+// leaseGrant is what leaseHolder stores: WHO was granted a name and WHEN.
+//
+// The timestamp is load-bearing, not diagnostic. Within leaseGrantWindow of a
+// grant this map — not the interest probe — is the authority on whether a name
+// is taken, because a just-granted agent has registered but not yet subscribed
+// (its order is connect → register → subscribe, and the broker replies last).
+// A probe in that window answers ErrNoResponders and would hand a second clone
+// the same name.
+type leaseGrant struct {
+	instanceID string
+	grantedAt  time.Time
+
+	// released marks a holder that said goodbye (ReleasingName).
+	//
+	// The entry is KEPT rather than deleted, because deleting it throws away the
+	// one fact the successor's adjudication needs: that the last holder was a
+	// lease-aware process. Without that, silence from the departed agent is
+	// "uninformative" instead of "it is gone", and the successor gets suffixed —
+	// so DELIVERING a farewell renamed the device while LOSING it did not,
+	// exactly backwards from a best-effort optimisation.
+	//
+	// Kept and flagged, the entry means "this name was held, by someone who has
+	// now left". That is strictly more information than an empty map.
+	released bool
+}
+
+// leaseGrantWindow is how long a fresh grant is treated as authoritative
+// without a probe.
+//
+// IT MODELS EXACTLY ONE GAP: between the broker replying to a grant and that
+// agent installing its forwarded subscription. The agent does both in adjacent
+// steps of one function, so the real gap is milliseconds; two seconds is a
+// generous ceiling for a loaded host.
+//
+// SIZING IT LARGER IS A REAL DEFECT, not extra safety. The window suppresses
+// the probe, and the probe is the ONLY thing that can tell a dead predecessor
+// from a live one. A 30s window (the first value here) made a fast agent
+// restart — crash loop, `systemctl restart`, an upgrade re-exec — look like a
+// second clone arriving, because the grant to its predecessor was still
+// "recent". It renamed a durable device, which is precisely the outcome the
+// whole design is built to avoid. Caught by
+// TestRestartedInstanceReclaimsItsNameRatherThanBeingSuffixed.
+//
+// SIZING IT SMALLER IS ALSO A REAL DEFECT, and one only the deploy-tier drill
+// could show. At one second it stopped covering the gap it models. In
+// simcluster drill 83 the incumbent re-registered at 06:55:16 and the clone was
+// adjudicated at 06:55:18: two seconds later, so past the window, but still
+// inside the incumbent's register→subscribe turnaround on a loaded container
+// host. The probe then asked a name nobody had subscribed to yet, the server
+// answered ErrNoResponders — correctly, there WAS no interest — and the clone
+// was handed the bare name. Both instances subscribed to one forwarded subject
+// and B2b/B2c caught one command producing two start rows and two exit rows:
+// the exact fan-out this increment exists to remove, reintroduced by a timing
+// constant. Hermetic tests could not see it; every one of them registers and
+// subscribes inside one fast process.
+//
+// So it is now the SAME constant as leaseSubscribeSettle, because it is the
+// same physical quantity seen from both sides: how long after a grant the
+// broker still refuses to draw conclusions from the probe. Before the settle
+// point, silence means "not subscribed yet" and the grant is authoritative;
+// after it, silence means "dead" and the probe is authoritative.
+//
+// A restart quicker than this is handled by the departing agent's farewell
+// (ReleasingName), not by shrinking the window — that is what makes the fast
+// path fast WITHOUT reopening the fan-out.
+const leaseGrantWindow = leaseSubscribeSettle
+
+// adjudicateLease decides whether this register is CONTESTED — i.e. whether a
+// different live process already holds the name being presented.
+//
+// Returns a non-nil lease when the caller must reply with it and TOUCH NOTHING
+// ELSE. That ordering is the whole fix: a contested register that fell through
+// to registerNode would (a) zero the incumbent's proxy_ready through
+// node.Register's ON CONFLICT clause, knocking a healthy exit out of /sub, and
+// (b) walk the incumbent's RUNNING process rows in reconcileOnRegister, find
+// them absent from this agent's LocalProcesses, and close them all with
+// ExitMark{-1} — after which the incumbent's own next register sees them as
+// orphans and SIGKILLs the operator's work. Both fall out of the ordering
+// alone; reconcile.go is not touched.
+//
+// It is a package-level function taking *Broker rather than a method because
+// the structural-budget ratchet pins internal/broker.Broker's method count
+// exactly, and growing a type's surface is the thing that gate exists to make
+// deliberate.
+func adjudicateLease(b *Broker, sid, nid string, req *proto.NodeRegisterReq, now time.Time) (*proto.NodeLease, string, error) {
+	// A pre-feature agent advertises nothing, and MUST get exactly today's
+	// behaviour — including the clone fan-out, which is the pre-upgrade
+	// baseline rather than a regression. A non-empty InstanceID IS the
+	// capability advertisement (deliberately not a Capabilities token, which
+	// would perturb every lone agent's register body).
+	if req.InstanceID == "" {
+		return nil, "", nil
+	}
+	// THE CO-LOCATED AGENT IS EXEMPT, and this is a safety interlock rather
+	// than a courtesy (external review F5; plan §2 already adjudicated it).
+	//
+	// A cluster broker upgrade drives its own host's agent by publishing to a
+	// STATIC nid it was configured with (cluster_upgrade_trigger.go). That name
+	// is not negotiable: if this agent were ever handed a suffix, the upgrade
+	// leg would be addressed to a name nobody is subscribed to, and the host
+	// would stop half-upgraded — broker on the new binary, agent on the old,
+	// with no path forward that does not involve physical access.
+	//
+	// One machine runs one co-located agent by construction, so exempting it
+	// costs nothing: there is no clone for it to be confused with.
+	if b.cfg.ColocatedAgentNID != "" && nid == b.cfg.ColocatedAgentNID {
+		return nil, "", nil
+	}
+	if err := proto.ValidateInstanceID(req.InstanceID); err != nil {
+		return nil, leaseReasonBadInstanceID, err
+	}
+
+	now = now.UTC()
+	// priorHolderSpoke records that the LAST process granted this name was
+	// itself a lease-aware agent. That single bit is what lets an ordinary
+	// restart keep its name — see the silence rule at the end of this function.
+	priorHolderSpoke := false
+	priorReleased := false
+	var priorGrantedAt time.Time
+	if v, ok := b.leaseHolder.Load(leaseKey(sid, nid)); ok {
+		if g, _ := v.(leaseGrant); g.instanceID != "" {
+			priorHolderSpoke = true
+			priorGrantedAt = g.grantedAt
+			priorReleased = g.released
+			// Fast path: the recorded holder reconnecting. Idempotent by
+			// construction — without matching on the instance id, every NATS
+			// reconnect would burn a fresh suffix (gpu1 → gpu1-02 → …) while
+			// the same live process still held the previous ones.
+			if g.instanceID == req.InstanceID {
+				return nil, "", nil
+			}
+			// THE SIMULTANEOUS-LAUNCH CASE, and the reason this branch does not
+			// consult the probe.
+			//
+			// Both registers land on the same leader and nats.go delivers them
+			// SERIALLY on one goroutine, so when a different instance was
+			// granted this name moments ago, this map is authoritative — more
+			// authoritative than any probe can be. The probe cannot see the
+			// incumbent yet: the agent's order is connect → register →
+			// subscribe, and the broker replies at the very END of
+			// handleRegister, so the first clone has not subscribed when the
+			// second is adjudicated. Asking NATS would answer ErrNoResponders
+			// and hand BOTH of them the basename — which is the canonical
+			// deployment shape (`kubectl scale`, `rollout restart`, or both
+			// pods returning after a broker outage), not an exotic race.
+			// …unless that holder has SAID IT IS LEAVING. The window is a proxy
+			// for "the incumbent may be alive but not yet visible to a probe";
+			// an explicit farewell answers that question directly and outranks
+			// the guess. Skipping the window here is what lets a restart inside
+			// it keep its name — the entire point of the farewell.
+			if !g.released && now.Sub(g.grantedAt) < leaseGrantWindow {
+				return assignLeaseName(b, sid, configuredBasename(b, sid, nid, req), now)
+			}
+		}
+	}
+
+	// Contest is driven by SQLite, not by the in-memory map: the map is empty
+	// after a broker restart or a leader election, and a rule that required a
+	// recorded holder would pass BOTH live clones through as uncontested.
+	age, exists, err := node.HeartbeatAge(b.read().SQL(), sid, nid, now)
+	if err != nil {
+		return nil, leaseReasonStoreError, err
+	}
+	grace := b.cfg.LeaseGrace
+	if grace <= 0 {
+		grace = DefaultLeaseGrace
+	}
+	if !exists {
+		// No row at all: nobody has ever held this name in this session. No
+		// probe — this is the first register of every ordinary agent and must
+		// stay fast.
+		b.leaseHolder.Store(leaseKey(sid, nid), leaseGrant{instanceID: req.InstanceID, grantedAt: now})
+		return nil, "", nil
+	}
+	if age > grace {
+		// The previous holder has been silent past the grace window. The clock
+		// says it is gone — but a clock is not evidence. Gotcha #72 is exactly
+		// an agent whose heartbeat stopped while its socket stayed ESTABLISHED
+		// and its subscriptions stayed live (10m58s, live-confirmed on this
+		// fleet), and granting its name away would put two processes on one
+		// forwarded subject with the incumbent still serving traffic.
+		//
+		// So ask. A dead predecessor answers ErrNoResponders instantly, so the
+		// ordinary restart path pays nothing measurable; only the ambiguous
+		// case pays the budget.
+		v, ready := leaseProbe(b, sid, nid, now)
+		if !ready {
+			return nil, leaseReasonProbePending, errProbePending
+		}
+		// An UNKNOWN answer here (unparseable, or nobody answered inside a
+		// WAN-sized budget) falls back to the clock, and the clock already said
+		// the holder is long gone. Taking over is the right call: the
+		// alternative renames a device for being far away.
+		// Rendered for THIS asker — the cache holds the observation, not a
+		// verdict, precisely so a stale answer computed for a different instance
+		// cannot be replayed here.
+		if held, known := v.answer.heldByOther(req.InstanceID); !held || !known {
+			b.leaseHolder.Store(leaseKey(sid, nid), leaseGrant{instanceID: req.InstanceID, grantedAt: now})
+			return nil, "", nil
+		}
+		return assignLeaseName(b, sid, configuredBasename(b, sid, nid, req), now)
+	}
+
+	// Ambiguous window: a recent beat AND a different instance id. Ask whether
+	// the incumbent is actually a live subscriber rather than guessing from a
+	// clock — a hard-killed agent that restarts in under LeaseGrace is
+	// indistinguishable from a clone by timestamp alone.
+	v, ready := leaseProbe(b, sid, nid, now)
+	if !ready {
+		return nil, leaseReasonProbePending, errProbePending
+	}
+	held, known := v.answer.heldByOther(req.InstanceID)
+	// The ambiguous branch is rare (it needs a warm beat AND a different
+	// instance id), and it is where every hard call is made. Log the evidence,
+	// not just the outcome: which of "someone else holds it", "nobody is there"
+	// and "nobody answered" was observed is exactly what an operator asking
+	// "why did my device get renamed?" needs, and it cannot be reconstructed
+	// afterwards.
+	b.cfg.Logger.Info("broker: adjudicating a contested node name",
+		"sid", sid, "nid", nid, "asker", req.InstanceID,
+		"answered", v.answer.answered, "responder", v.answer.responder,
+		"held_by_other", held, "answer_known", known,
+		"prior_holder_known", priorHolderSpoke, "beat_age", age.String())
+	// Inside the grace window an UNKNOWN answer keeps the conservative reading:
+	// the clock says a holder was alive moments ago, so a name that nobody
+	// clearly disowned stays taken. This is the one place where suffixing a
+	// possibly-live device is the safer error — it self-corrects on the next
+	// restart (the suffix is never persisted), while two processes on one name
+	// do not.
+	if !held && known {
+		b.leaseHolder.Store(leaseKey(sid, nid), leaseGrant{instanceID: req.InstanceID, grantedAt: now})
+		return nil, "", nil
+	}
+
+	// THE SILENCE RULE — what makes an ordinary restart keep its name.
+	//
+	// Getting here means interest exists on the name but nothing answered the
+	// claim probe. Read literally that is ambiguous, and the conservative
+	// reading above would suffix. But it is only ambiguous when we know nothing
+	// about who held the name. When priorHolderSpoke is set, this broker
+	// GRANTED the name to a lease-aware process, and a lease-aware process that
+	// is still running always answers claim-probe (internal/agent,
+	// replyClaimProbe, served off the forwarded subscription). So silence from
+	// a holder we know can speak is evidence of DEATH, not of distance.
+	//
+	// The interest that remains is the dead process's subscription, which the
+	// server has not finished reaping — every ordinary restart looks exactly
+	// like this, and test/p4's TestAgentReconnectsWithoutPINAfterBootstrap is
+	// that shape: stop the agent, start it again under the same nid, and the
+	// old subscription is still in the interest table when the new process
+	// registers. Suffixing there would rename a device for restarting, and the
+	// bare name would go STALE while the user kept addressing it.
+	//
+	// THE SETTLE WINDOW IS LOAD-BEARING — without it this rule reintroduces the
+	// very defect the increment exists to remove.
+	//
+	// "A live lease-aware holder always answers" only becomes true once that
+	// holder has SUBSCRIBED, and the agent's order is connect → register →
+	// subscribe. A clone arriving while the incumbent is still between its
+	// register and its subscribe meets silence from a perfectly healthy
+	// process. Reading that silence as death hands the clone the bare name, and
+	// both then serve one forwarded subject: every exec runs twice.
+	//
+	// That is not hypothetical — it is what the simcluster deploy-tier drill
+	// (83-cloned-image-instances) reported the moment this rule was added
+	// without the window: B1 (two distinct rows) failed and B2b/B2c caught ONE
+	// command producing TWO start rows and TWO exit rows. The grant window
+	// covers the first second; past it, only elapsed time can establish that a
+	// living holder would have finished subscribing and answered.
+	//
+	// The rule deliberately does NOT fire when the holder map is cold (broker
+	// restart / leader election): then we have no evidence about the incumbent
+	// and the conservative branch is right. It also does not fire for a
+	// pre-feature holder, which never recorded an instance id and so never sets
+	// this bit — silence from one of those really is uninformative.
+	// A RELEASED holder needs no settle time: it did not merely go quiet, it
+	// announced its departure. Waiting out the window there would suffix a
+	// device for restarting promptly, which is the case the farewell exists to
+	// make fast.
+	if priorHolderSpoke && !known && (priorReleased || now.Sub(priorGrantedAt) > leaseSubscribeSettle) {
+		b.leaseHolder.Store(leaseKey(sid, nid), leaseGrant{instanceID: req.InstanceID, grantedAt: now})
+		return nil, "", nil
+	}
+
+	return assignLeaseName(b, sid, configuredBasename(b, sid, nid, req), now)
+}
+
+// replyLeaseVerdict adjudicates the cloned-credential lease and, when the
+// register is CONTESTED, answers it and reports true so the caller returns
+// having touched nothing else.
+//
+// POSITION IS LOAD-BEARING IN BOTH DIRECTIONS at the call site: after the
+// RosterRefreshOnly short-circuit (a periodic refresh carries no InstanceID and
+// would otherwise be adjudicated ~20 times an hour per agent for nothing), and
+// STRICTLY BEFORE registerNode — in single mode, which is what the live fleet
+// runs, registerNode IS the upsert, so a verdict reached after it has already
+// overwritten the incumbent's row. That ordering, not any change to
+// reconcile.go, is what stops a clone from zeroing the incumbent's proxy_ready
+// and from closing every process row it is running.
+//
+// A package-level function taking *Broker: the structural-budget ratchet pins
+// this type's method count exactly, and extracting it also keeps handleRegister
+// inside the maintainability-index gate.
+func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.NodeRegisterReq) bool {
+	// A FAREWELL, handled before anything else: the agent is stopping cleanly and
+	// is handing the name back. Forget who held it so the next process to present
+	// this credential is adjudicated as a first arrival and keeps the bare name.
+	//
+	// Deliberately does NOT touch the nodes row: liveness stays the heartbeat's
+	// job, and rewriting status here would race the ordinary OFFLINE sweep.
+	// Deliberately not authenticated beyond the register subject's own ACL
+	// either — the worst a forged farewell can do is discard a cache entry that
+	// the interest probe and the heartbeat clock immediately reconstruct.
+	if req.ReleasingName && req.InstanceID != "" {
+		if v, ok := b.leaseHolder.Load(leaseKey(sid, nid)); ok {
+			// Only the CURRENT holder may release: a straggler clone saying
+			// goodbye must not hand away the name its sibling now holds.
+			if g, _ := v.(leaseGrant); g.instanceID == req.InstanceID {
+				// FLAG, do not delete — see leaseGrant.released.
+				g.released = true
+				b.leaseHolder.Store(leaseKey(sid, nid), g)
+			}
+		}
+		b.probeCache.Delete(leaseKey(sid, nid))
+		// TAKE THE ROW OFFLINE TOO, or the name is not actually released.
+		//
+		// external review F11: clearing only the in-memory grant left the nodes
+		// row ONLINE for the full OfflineAfter window (60s), and the allocator
+		// reads that row — so the name this agent just handed back still counted
+		// as occupied and its own restart was issued the NEXT suffix. A device
+		// that restarts every few minutes walks -02, -03, -04 … until the suffix
+		// space is exhausted and it is refused outright, while operators' saved
+		// commands, exposes and scripts keep pointing at names that are now
+		// ghosts showing ONLINE.
+		//
+		// Only for a name this agent actually held, and only for a LEASE (a
+		// configured device's row is not ours to take offline on a farewell —
+		// its liveness is the heartbeat's business). The write is scoped to the
+		// row and idempotent.
+		if _, _, isLease := proto.SplitLeaseName(nid); isLease && req.LeasedNID {
+			if err := markNodeOfflineOnRelease(b, sid, nid); err != nil {
+				b.cfg.Logger.Warn("broker: could not take a released lease row offline",
+					"err", err, "sid", sid, "nid", nid)
+			}
+		}
+		// Stop here. Falling through would run the ordinary register and stamp a
+		// FRESH heartbeat for a process that is on its way out — making the row
+		// look more alive at the moment of death than it did while running.
+		b.replyJSON(msg, proto.NodeRegisterResp{OK: true})
+		return true
+	}
+
+	lease, code, lerr := adjudicateLease(b, sid, nid, req, time.Now().UTC())
+	// Say WHY, every time a name is adjudicated to anything other than "keep it".
+	//
+	// A device that silently turns into gpu1-02 is the single most confusing
+	// thing this feature can do to an operator, and the deciding evidence
+	// (heartbeat age, who answered the probe, which branch fired) exists only
+	// here. Without this line the only way to find out is to attach a debugger
+	// to a production broker.
+	if lease != nil || code != "" {
+		b.cfg.Logger.Info("broker: node name adjudicated",
+			"sid", sid, "requested_nid", nid, "instance", req.InstanceID,
+			"assigned", leaseAssignedName(lease), "reason", code)
+	}
+	if lease == nil {
+		if code == leaseReasonProbePending {
+			// TRANSIENT, and deliberately NOT a degrade: degrading would run the
+			// full register under a name we have not yet established is free,
+			// which is the double-execution this increment exists to prevent.
+			// CodeLeaderUnavailable is the code the agent's register loop
+			// already retries — reusing it means no new client behaviour and no
+			// new exit-class mapping.
+			b.replyErr(msg, proto.CodeLeaderUnavailable,
+				"adjudicating this name against the current holder; retrying shortly")
+			return true
+		}
+		if code != "" {
+			// DEGRADE, NEVER REFUSE. A refused register makes an agent flap or
+			// exit (connectNATS treats an initial auth failure as fatal), so
+			// when the lease machinery cannot answer — a store error, a
+			// malformed instance id — the broker falls through to exactly
+			// today's behaviour and grants the presented name. The operator
+			// sees the reason here rather than a fleet that cannot start.
+			b.cfg.Logger.Warn("broker: lease unavailable, granting presented nid",
+				"sid", sid, "nid", nid, "code", code, "err", lerr)
+		}
+		return false
+	}
+	// CONTESTED — reply with the verdict and TOUCH NOTHING ELSE.
+	//
+	// An empty AssignedNID means "contested, but no name could be issued"
+	// (over-long basename, exhausted suffix space). That is still a refusal the
+	// challenger must honour: we have PROVEN a different live process holds this
+	// name, so falling through would overwrite its row, clear its proxy_ready
+	// and close its running processes.
+	payload, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Lease: lease})
+	if msg.Reply != "" {
+		b.respondBytes(msg, payload)
+	}
+	if lease.AssignedNID == "" {
+		b.cfg.Logger.Warn("broker: register contested but no lease name could be issued; "+
+			"the challenger keeps its own name and does NOT take over the incumbent's row",
+			"sid", sid, "presented_nid", nid, "basename", lease.Basename,
+			"reason", code, "err", lerr)
+	} else {
+		b.cfg.Logger.Info("broker: register contested, lease assigned",
+			"sid", sid, "presented_nid", nid, "assigned_nid", lease.AssignedNID)
+	}
+	return true
+}
+
+// assignLeaseName issues the lowest free lease name for nid's basename, or the
+// refusal shape when none can be issued.
+func assignLeaseName(b *Broker, sid, basename string, now time.Time) (*proto.NodeLease, string, error) {
+	// basename is the agent's CONFIGURED name, taken verbatim — never parsed out
+	// of the presented one. See NodeRegisterReq.ConfiguredNID: a name shaped
+	// `<base>-NN` is just as likely to be a real device as a lease, so deriving
+	// the family from the string folds `gpu-02` into `gpu` and offers its clone
+	// `gpu-03`, a name in a different credential family that gpu-02's binding
+	// does not cover. (external review F2)
+	maxInst := b.cfg.MaxInstancesPerBasename
+	if maxInst <= 0 {
+		maxInst = DefaultMaxInstancesPerBasename
+	}
+	// SKIP NAMES ALREADY OFFERED. A contested register writes NOTHING (that
+	// ordering is what protects the incumbent's row), so the DB cannot know a
+	// name was just handed out. Without this, N challengers arriving together —
+	// a Deployment scaled to N — are every one of them offered `-02`, and each
+	// loser discovers the collision only by rebuilding its whole session and
+	// registering again: O(N²) connect+auth rounds with no backoff.
+	offered := func(name string) bool {
+		v, ok := b.leaseHolder.Load(leaseKey(sid, name))
+		if !ok {
+			return false
+		}
+		g, _ := v.(leaseGrant)
+		return now.Sub(g.grantedAt) < leaseGrantWindow
+	}
+	assigned, err := node.LowestFreeSuffixExcept(b.read().SQL(), sid, basename, maxInst, offered)
+	if err != nil {
+		// WE HAVE ALREADY PROVEN A DIFFERENT LIVE PROCESS HOLDS THIS NAME. So
+		// "degrade to today's behaviour" is NOT benign here: today's behaviour
+		// is registerNode + reconcileOnRegister under the incumbent's name,
+		// which zeroes its proxy_ready and closes every process row it is
+		// running. Degrading is the safe answer when we do not KNOW there is an
+		// incumbent; it is the destructive one when we do.
+		//
+		// So this returns a lease with an EMPTY AssignedNID: a refusal the agent
+		// can act on (it keeps running under the name it presented and logs
+		// loudly) that still short-circuits handleRegister before it touches
+		// anything. Refusing is also why the basename is never truncated — two
+		// distinct over-long basenames would collapse to one prefix and silently
+		// merge two unrelated device families into one lease namespace.
+		return &proto.NodeLease{Basename: basename}, leaseReasonUnavailable, err
+	}
+	// Record the OFFER so the next challenger in this burst is given a different
+	// name. It is not a grant — the instance may never come back under it — but
+	// within the window it is enough to stop N simultaneous arrivals colliding
+	// on one suffix. The marker instance id is deliberately empty: nothing may
+	// mistake an offer for a holder.
+	b.leaseHolder.Store(leaseKey(sid, assigned), leaseGrant{grantedAt: now})
+	return &proto.NodeLease{AssignedNID: assigned, Basename: basename}, "", nil
+}
+
+// probeNameInUse reports whether anyone is still subscribed under (sid, nid).
+//
+// ErrNoResponders means "no subscriber exists" — not "nobody replied" — so a
+// dead predecessor is detected instantly and without a timeout. Anything else
+// (a responder, or a timeout in a partition) is treated as in-use, which is the
+// fail-safe direction: suffixing a live device is recoverable on its next
+// restart, handing two live processes the same name is not.
+func probeNameHeldByOther(b *Broker, sid, nid, selfInstanceID string) (held, known bool) {
+	return probeNameHeldByOtherWithin(b, sid, nid, selfInstanceID, claimProbeBudget)
+}
+
+// probeNameHeldByOtherWithin is probeNameHeldByOther with an explicit budget, so
+// the background path can afford a WAN-sized one while the direct path stays
+// bounded for tests that call it straight.
+// probeAnswer is what the wire actually told us, stated WITHOUT reference to
+// who was asking.
+//
+// That distinction is the whole point of this type. "Is the name held by
+// someone OTHER than me?" is a different question for every asker, so its
+// answer cannot be cached under a key that only names (sid, nid) — replaying
+// one instance's answer to another inverts it. The incumbent's own "not a
+// stranger" would license a clone to take the bare name (two processes, one
+// forwarded subject, every exec twice), and a clone's "held by a stranger"
+// would rename the incumbent on its next reconnect and leave the row the
+// operator addresses STALE.
+//
+// So the cache stores the OBSERVATION — did anyone answer, and who said they
+// were — and each caller derives its own verdict from it.
+type probeAnswer struct {
+	answered   bool   // somebody replied inside the budget
+	responder  string // the instance id they claimed; "" if they named none
+	definitive bool   // the observation settles the question by itself
+}
+
+// heldByOther renders one asker's verdict from an objective observation.
+func (a probeAnswer) heldByOther(selfInstanceID string) (held, known bool) {
+	if !a.answered {
+		// Nobody there at all is a definite "free"; anything else (a timeout, a
+		// malformed body) is an honest UNKNOWN the caller weighs against the
+		// heartbeat clock.
+		return !a.definitive, a.definitive
+	}
+	return a.responder == "" || a.responder != selfInstanceID, a.responder != ""
+}
+
+func probeNameHeldByOtherWithin(b *Broker, sid, nid, selfInstanceID string, budget time.Duration) (held, known bool) {
+	return probeObserve(b, sid, nid, budget).heldByOther(selfInstanceID)
+}
+
+// probeObserve asks the name who holds it and reports only what came back.
+func probeObserve(b *Broker, sid, nid string, budget time.Duration) probeAnswer {
+	nc := b.nc.Load()
+	if nc == nil {
+		return probeAnswer{}
+	}
+	msg, err := nc.Request(proto.SubjCmdForwarded(sid, nid, proto.ClaimProbeVerb), nil, budget)
+	switch {
+	case errors.Is(err, nats.ErrNoResponders):
+		// Nobody is subscribed under this name at all.
+		return probeAnswer{definitive: true}
+	case err != nil:
+		// A timeout is NOT evidence either way, and saying "held" here would be
+		// wrong for a real deployment: the budget is a constant, not a function
+		// of the fleet's round-trip time, so a cross-continent agent that
+		// answers correctly in 80ms would be renamed on every reconnect. Report
+		// UNKNOWN and let the caller weigh it against the heartbeat.
+		return probeAnswer{}
+	}
+	var resp proto.ClaimProbeResp
+	if json.Unmarshal(msg.Data, &resp) != nil {
+		return probeAnswer{}
+	}
+	// The decisive case, and the reason the probe carries an identity at all:
+	// nats.go replays subscriptions BEFORE it invokes its reconnect handler, and
+	// the agent re-registers from that handler on the same connection. So the
+	// responder is very often the REGISTRANT ITSELF, and a pure interest check
+	// would rename a device every time its network blipped.
+	return probeAnswer{answered: true, responder: resp.InstanceID, definitive: true}
+}
+
 func (b *Broker) handleRegister(msg *nats.Msg) {
 	sid, nid, ok := proto.ParseSidNidFromCtrl(msg.Subject)
 	if !ok {
@@ -1433,6 +2239,18 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// pure RODB read that signs the replicated roster — so a fleet's ≤3-min refresh ticker costs
 	// ZERO raft writes / events / reconcile (D5 idle-zero-writes preserved). The session-active gate
 	// above still applies; the stale event still fires (the agent reported its cached generation).
+	// A FAREWELL comes in wearing RosterRefreshOnly (that is what makes it inert
+	// on a pre-feature broker — see releaseLeaseName), so it must be recognised
+	// BEFORE the refresh short-circuit or a current broker would answer it with
+	// a roster and never release the name.
+	//
+	// Ordinary refreshes carry ReleasingName=false and are unaffected.
+	if req.ReleasingName {
+		if replyLeaseVerdict(b, msg, sid, nid, &req) {
+			return
+		}
+	}
+
 	if req.RosterRefreshOnly {
 		resp := proto.NodeRegisterResp{OK: true}
 		resp.Roster = b.rosterForRegister(req)
@@ -1441,6 +2259,22 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		if msg.Reply != "" {
 			b.respondBytes(msg, payload)
 		}
+		return
+	}
+
+	// CLONED-CREDENTIAL LEASE. Position is load-bearing in BOTH directions:
+	//
+	//   AFTER the RosterRefreshOnly short-circuit above — a periodic refresh
+	//   carries no InstanceID and would otherwise be adjudicated as a legacy
+	//   claim roughly 20 times an hour per agent, for nothing.
+	//
+	//   STRICTLY BEFORE registerNode below — in single mode (which is what the
+	//   live fleet runs) registerNode IS the upsert, so a contested register
+	//   adjudicated after it has already overwritten the incumbent's row. That
+	//   ordering, and not any change to reconcile.go, is what stops a clone
+	//   from zeroing the incumbent's proxy_ready and from closing every process
+	//   row the incumbent is actually running.
+	if replyLeaseVerdict(b, msg, sid, nid, &req) {
 		return
 	}
 
@@ -1458,7 +2292,17 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		// downstream gate — repairProxy, the reaper's allocate loop,
 		// onlineProxyCapableNIDs, the /sub render — skips this node through
 		// the code path old non-P13 agents already exercise.
-		ProxyCapable: nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut,
+		// Q1 (cloned-credential lease): a LEASED instance is ephemeral by
+		// premise, so it must not hold a public egress port whose
+		// disappearance breaks every subscriber. Folded into the SAME
+		// expression #78 used for the opt-out, deliberately: proxy_capable is
+		// the one column every downstream gate consults — onlineNIDs, the
+		// reaper's allocate/rotate/teardown, the /sub render, proxy status —
+		// so this inherits #78's already-shipped N-1 story with zero new
+		// branches. It also makes unreachable the 1000-port band
+		// multiplication and the per-(sid,nid) proxy_bind_stalled dedup key in
+		// a table with no DELETE path.
+		ProxyCapable: nodeHasProxyCap(req.Capabilities, req.ReleaseVersion) && !req.ProxyOptOut && !req.LeasedNID,
 		// D6 §6.5 (external review F1): persist the agent's reported nats
 		// server_name into nodes.nats_server so the home bridge can resolve it at
 		// expose time. "" in production (single-node agent) → inert.
@@ -1466,7 +2310,11 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	}
 	// D9 §3 (audit #1): cluster mode routes the identity write through raft (Propose /
 	// forward) + a local liveness write; single mode is the byte-identical direct mutator.
-	if err := b.registerNode(in); err != nil {
+	// PreviousNID is a row-migration hint, not authority. Restrict it to the
+	// credential family proved by the presented/configured-name relationship
+	// before either the raft transaction or the live reconciler consumes it.
+	req.PreviousNID = trustedPreviousNID(b, sid, nid, &req)
+	if err := b.registerNode(in, req.PreviousNID, req.LocalProcesses); err != nil {
 		if errors.Is(err, node.ErrSessionMissing) {
 			b.replyErr(msg, "session_not_found",
 				fmt.Sprintf("session %q does not exist; have an owner run `tether session create %s` first", sid, sid))
@@ -1502,6 +2350,19 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 		freeOptOutProxyRowSingle(b, sid, nid)
 	} else {
 		b.proxyOptedOut.Delete(sid + "/" + nid)
+	}
+	// A LEASED instance frees any __proxy__ row standing in its name for the
+	// same reason an opted-out one does: single mode has no reaper pass, and
+	// every allocate/repair gate now skips it, so the row and its public port
+	// would otherwise outlive the ineligibility forever.
+	//
+	// Deliberately NOT folded into the branch above: the opt-out also drives the
+	// "won't vs can't" operator hint, and a leased instance is a CAN'T (the
+	// broker decided) rather than a WON'T (the operator configured). Rendering
+	// it through the opt-out hint would tell an operator to go looking for an
+	// agent.yaml key that does not exist inside a baked image.
+	if req.LeasedNID {
+		freeOptOutProxyRowSingle(b, sid, nid)
 	}
 
 	b.cfg.Logger.Info("broker: node registered",
@@ -1792,4 +2653,79 @@ func validListenHost(host string) bool {
 		}
 	}
 	return true
+}
+
+// leaseAssignedName renders a verdict for the adjudication log: the name that
+// was issued, or "" when the register was left to keep the name it asked for.
+func leaseAssignedName(l *proto.NodeLease) string {
+	if l == nil {
+		return ""
+	}
+	return l.AssignedNID
+}
+
+// configuredBasename returns the root of this agent's credential family.
+//
+// It is what the agent SAYS it was configured with, falling back to the
+// presented name when it says nothing — which is both the pre-feature case and
+// the ordinary unleased case, and in each the presented name IS the root.
+//
+// Deliberately never SplitLeaseName: that would fold a real device named
+// `gpu-02` into the `gpu` family (external review F2).
+func configuredBasename(b *Broker, sid, nid string, req *proto.NodeRegisterReq) string {
+	if req == nil || req.ConfiguredNID == "" || req.ConfiguredNID == nid {
+		return nid
+	}
+	// IT IS CLIENT-SUPPLIED, SO IT IS CHECKED AGAINST THE NAME THIS REGISTER
+	// ARRIVED UNDER.
+	//
+	// The only legitimate case where the two differ is an agent that already
+	// holds a lease: it registers as `<base>-NN` while its configured root is
+	// `<base>`. Anything else is an agent claiming membership of a credential
+	// family it did not authenticate into — and the external re-review showed
+	// what that buys: an agent holding gpu1's credential could declare
+	// ConfiguredNID "victim" and have the broker allocate victim-02,
+	// victim-03 … reserving another family's suffix space in leaseHolder,
+	// without ever being able to authenticate as one of those names.
+	//
+	// auth_callout already binds this connection to `nid`; this makes the
+	// register body agree with it instead of overriding it. On a mismatch the
+	// presented name is used, which is the pre-feature reading and cannot
+	// reach outside the family the agent actually authenticated as.
+	if base, _, leased := proto.SplitLeaseName(nid); leased && base == req.ConfiguredNID {
+		// Name shape alone is not evidence that this is a lease. A real device
+		// may be provisioned as `gpu-02`; letting that device claim configured
+		// root `gpu` crosses into a different credential family. When bindings
+		// are available, accept the relationship only when the presented name
+		// has no binding of its own and the claimed root does.
+		provisioned, known := node.ProvisionedNIDs(b.read().SQL(), sid)
+		if known && (provisioned[nid] || !provisioned[req.ConfiguredNID]) {
+			return nid
+		}
+		return req.ConfiguredNID
+	}
+	return nid
+}
+
+func trustedPreviousNID(b *Broker, sid, nid string, req *proto.NodeRegisterReq) string {
+	if req == nil || req.PreviousNID == "" {
+		return ""
+	}
+	base := configuredBasename(b, sid, nid, req)
+	// A carry is meaningful only when the current presented name is an
+	// assigned member of the proved family. In particular, an independently
+	// provisioned `gpu-02` resolves its base to itself and cannot name `gpu` as
+	// a process-row source.
+	presentedBase, _, presentedLeased := proto.SplitLeaseName(nid)
+	if !presentedLeased || presentedBase != base {
+		return ""
+	}
+	if req.PreviousNID == base {
+		return req.PreviousNID
+	}
+	previousBase, _, previousLeased := proto.SplitLeaseName(req.PreviousNID)
+	if previousLeased && previousBase == base {
+		return req.PreviousNID
+	}
+	return ""
 }

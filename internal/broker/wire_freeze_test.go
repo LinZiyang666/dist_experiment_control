@@ -116,6 +116,11 @@ var frozenPayloadKeys = map[string][]string{
 	"EvictPayload":              {"nid", "sid"},
 
 	// UNTAGGED — the Go field names below ARE the wire. See TestUntaggedPayloadsAreDeclared.
+	// Leased was briefly here, backed by migration 0019, and is GONE again: a
+	// same-proto rolling release must not add a migration (g5-plan OQ-2), and
+	// the classification it stored is derivable from the credential bindings
+	// both modes already replicate. This set shrinking is therefore a
+	// deliberate reversal, not a wire regression. (external review F1)
 	"node.RegisterInput": {"Arch", "BootID", "NID", "NatsServer", "OS", "ProtoVersion",
 		"ProxyCapable", "ReleaseVersion", "SID"},
 	"proc.Process": {"Argv", "BootID", "Cwd", "EndedAt", "ExitCode", "NID", "PID", "SID",
@@ -150,8 +155,54 @@ var frozenPayloadKeys = map[string][]string{
 	// teardown leg, so a pre-existing __proxy__ row survives until an
 	// upgraded broker leads. Freeze-on-entry: from here on a RENAME of this
 	// key is the cross-version break this test exists to catch.
-	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "local_ports", "local_processes",
-		"nid", "os", "proto_version", "proxy_opt_out", "release_version", "roster_gen",
+	// instance_id + leased_nid: cloned-credential lease, ADDITIVE (both
+	// omitempty; absent = a pre-feature agent, which the broker must treat as
+	// today's single-instance semantics, INCLUDING the clone fan-out — that is
+	// the pre-upgrade baseline, not a regression).
+	//
+	// Cross-version story, the half this test exists to police: neither key is
+	// ever read on the broker→leader hop. The forward payload is the
+	// key-frozen node.RegisterInput, and the lease verdict is decided on the
+	// ANSWERING broker in handleRegister STRICTLY BEFORE registerNode — a
+	// contested register returns without proposing anything at all, so no
+	// leader ever plans against a decoded-to-zero instance id. leased_nid
+	// folds into the existing RegisterInput.ProxyCapable expression on the
+	// same answering broker, exactly as #78's proxy_opt_out does, so it too
+	// has no key to lose on the hop.
+	//
+	// The real degradation point is an OLD ANSWERING broker dropping both keys
+	// on the agent→broker register wire: it then cannot distinguish clones and
+	// behaves as it does today. Recorded as a documented [GAP] in the plan's
+	// N-1 matrix — a broker-only upgrade cannot stop double execution anyway,
+	// because the fan-out is an unconditional client-side nc.Subscribe.
+	//
+	// Freeze-on-entry: from here on a RENAME of either key is the
+	// cross-version break this test exists to catch.
+	// previous_nid: the name adopted away from, carried for exactly ONE register
+	// so the broker recognises this agent's own running processes (their rows
+	// are filed under the old name). Read on the answering broker in
+	// reconcileOnRegister and never forwarded further, so there is no key to
+	// lose on the broker→leader hop. Absent on every ordinary register.
+	// releasing_name: a cleanly stopping agent handing its node name back, so the
+	// next process presenting the same credential is adjudicated as a first
+	// arrival instead of being suffixed for restarting. Read on the ANSWERING
+	// broker (replyLeaseVerdict short-circuits there) and never forwarded to a
+	// leader, so there is no key to lose on the broker→leader hop. Absent on
+	// every register that is not a farewell — which is all of them for a
+	// pre-feature agent, whose behaviour is therefore unchanged. Purely an
+	// optimisation: nothing depends on it arriving.
+	// configured_nid: the ROOT of this agent's credential family, stated rather
+	// than parsed out of the presented name. A name shaped `<base>-NN` is just
+	// as likely to be a real device as a lease (`gpu-01 gpu-02 gpu-03` is this
+	// repo's own example fleet), so deriving the family from the string folds a
+	// real gpu-02 into the gpu family and offers its clone a name in the WRONG
+	// credential family — one gpu-02's own binding does not cover. Absent =
+	// "the presented NID is itself the root", which is what every pre-feature
+	// and every unleased agent means. (external review F2)
+	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "configured_nid", "instance_id", "leased_nid",
+		"local_ports", "local_processes",
+		"nid", "os", "previous_nid", "proto_version", "proxy_opt_out", "release_version",
+		"releasing_name", "roster_gen",
 		"roster_refresh_only", "server_id", "upgrade_detail", "upgrade_state"},
 	// ended_at: h1 C4, ADDITIVE (omitempty pointer; a courier's pending-exit
 	// snapshot row carries the true end instant, the broker clamps it to

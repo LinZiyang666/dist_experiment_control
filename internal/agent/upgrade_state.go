@@ -91,6 +91,23 @@ type upgradeMarker struct {
 	TargetSID   string    `json:"target_sid,omitempty"`
 	TargetNID   string    `json:"target_nid,omitempty"`
 	UpgradeID   string    `json:"upgrade_id,omitempty"`
+
+	// TargetInstance is the instance LINEAGE the upgrade was started by.
+	//
+	// (TargetSID, TargetNID) alone stopped discriminating the moment one image
+	// could run twice: TargetNID is the agent.yaml basename — deliberately so,
+	// because a lease name is transient and comparing against it would strand
+	// the marker — and every instance of that image shares it. Without this
+	// field the F1 sibling guard gives the SAME verdict to every clone, so the
+	// basename holder reports another instance's rollback against a nid that
+	// was never upgraded, and ERASES the marker of the instance that actually
+	// rolled back.
+	//
+	// The value survives the re-exec through the environment (see instance.go),
+	// which is what makes it usable as the identity of an upgrade in flight.
+	// Empty on any marker written before this existed, which correctly falls
+	// back to the (sid, nid) comparison.
+	TargetInstance string `json:"target_instance,omitempty"`
 }
 
 func upgradeMarkerPath(exePath string) string {
@@ -365,7 +382,10 @@ func executeRollback(exePath string, m *upgradeMarker, reason string, logger *sl
 func realExec(exePath string) error {
 	argv := append([]string(nil), os.Args...)
 	argv[0] = exePath
-	return syscall.Exec(exePath, argv, os.Environ())
+	// execEnv, not os.Environ — see the upgrade.go re-exec site. Both rollback
+	// paths run through here, and a rollback that renamed the node would be
+	// even harder to reason about than an upgrade that did.
+	return syscall.Exec(exePath, argv, execEnv())
 }
 
 // BootUpgradeCheck runs the boot-time half of the upgrade state machine. It
@@ -427,6 +447,40 @@ func bootUpgradeCheckLocked(exePath string, logger *slog.Logger, now time.Time, 
 		return ""
 	case bootContinuePending:
 		m.BootCount++
+		// NO OWNERSHIP TAKEOVER HERE. A round-2 revision re-stamped
+		// m.TargetInstance from this arm, on the theory that reaching it proved
+		// ownership. external review F7 refuted that: a SIBLING clone shares the
+		// binary and the home, so it runs these same staged bytes and reaches
+		// this same arm — the takeover let any sibling restart steal the marker,
+		// spend the target's boot budget, and report an outcome for an upgrade
+		// it was not part of.
+		//
+		// The honest position is that a marker sitting next to a SHARED binary
+		// is host-scoped, not instance-scoped, and cannot be made
+		// instance-scoped by anything derivable here: a process lineage does not
+		// survive a supervisor restart, and everything that survives one is
+		// shared with the siblings. So ownership is anchored to the boot proof
+		// below (per-transaction, and only held by a process that actually
+		// traversed this decision), and the residual limitation is documented
+		// rather than papered over.
+		//
+		// TargetInstance is otherwise pinned to a process lineage, and a lineage
+		// only survives syscall.Exec. Any supervisor-mediated restart inside the
+		// upgrade window — a host reboot, `systemctl restart`, an OOM kill, Run
+		// returning fatally — starts the successor with a clean environment and
+		// therefore a NEW instance id. That successor then disowns the marker:
+		// no watchdog is armed, no outcome is reported, and nothing in the repo
+		// ever GCs it. The marker sits pending forever until some unrelated boot
+		// weeks later finds the deadline long past and SILENTLY ROLLS THE NODE
+		// BACK — an upgrade that looked successful (the restarted process really
+		// did report the new version) quietly undone at a moment no one connects
+		// to it.
+		//
+		// Re-stamping here is what makes the marker survive a restart the way
+		// its three sibling proofs (boot count, boot proof, running-image sha)
+		// already do, while keeping the field's real job: a SIBLING clone that
+		// never ran this transaction cannot reach this arm, so it still cannot
+		// claim the outcome.
 		if err := writeUpgradeMarker(markerPath, m); err != nil {
 			logger.Warn("agent: boot upgrade check: boot_count persist failed", "err", err)
 			return ""
@@ -498,7 +552,41 @@ func (a *Agent) runningImageSHA() (string, error) {
 // (external review F1): a shared-binary sibling with a different sid/nid must
 // neither report nor transition an upgrade that targeted someone else.
 func (a *Agent) markerTargetsThisAgent(m *upgradeMarker) bool {
-	return m.TargetSID == a.cfg.SID && m.TargetNID == a.cfg.NID
+	if m.TargetSID != a.cfg.SID || m.TargetNID != a.cfg.NID {
+		return false
+	}
+	// When the marker names an instance, only THAT instance may claim it. This
+	// is what keeps the F1 sibling guard discriminating now that one image can
+	// run several times under one basename: without it every clone answers
+	// "yes", so the first one to boot reports someone else's upgrade outcome
+	// and clears the marker belonging to the instance that actually upgraded.
+	//
+	// An empty TargetInstance is a marker written before this field existed;
+	// falling back to the (sid, nid) comparison is exactly today's behaviour.
+	if m.TargetInstance != "" {
+		if m.TargetInstance == a.instanceID {
+			return true
+		}
+		// THE BOOT PROOF IS THE OTHER ADMISSIBLE LINEAGE, and it is what keeps a
+		// legitimate upgrade from being stranded (external review F7 / round-2
+		// B7). TargetInstance pins a PROCESS lineage, which survives
+		// syscall.Exec and nothing else: a host reboot, `systemctl restart`, an
+		// OOM kill or a fatal Run inside the upgrade window starts the successor
+		// with a clean environment and a new id, and it would then disown a
+		// marker it is in fact the continuation of — no watchdog armed, no
+		// outcome reported, nothing to GC it, and some unrelated boot weeks
+		// later silently rolling the node back.
+		//
+		// The boot proof is per-TRANSACTION (the marker's own UpgradeID) and is
+		// only held by a process that actually traversed the pending-boot
+		// decision for it. It is deliberately weaker than the instance id: on a
+		// SHARED binary a sibling can also traverse it, which is the residual
+		// limitation F7 identified and which no value available here can close.
+		// It is documented as a limitation of shared-binary multi-instance
+		// deployments rather than hidden behind a comment claiming otherwise.
+		return a.upgradeBootProofID != "" && a.upgradeBootProofID == m.UpgradeID
+	}
+	return true
 }
 
 func (a *Agent) upgradeNow() time.Time {

@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
 )
@@ -79,6 +80,12 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "url_not_allowed", msg.Reply, nil)
 		return
 	}
+	if cloneFamilyUpgradeConflict(b, sid, nid) {
+		b.replyUpgradeErr(msg, "clone_family_upgrade_unsupported",
+			"remote upgrade is disabled for a credential family that has issued lease names; rebuild the shared image instead")
+		b.pubAuditCall(sid, fp, actor, "upgrade", nid, false, "clone_family_upgrade_unsupported", msg.Reply, nil)
+		return
+	}
 
 	// Forward to agent. We synchronously wait for the agent's ACK so
 	// the operator's `tether node upgrade` reports the verify+rename
@@ -120,6 +127,42 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 		"new_version", agentResp.NewVersion)
 	b.pubAuditCall(sid, fp, actor, "upgrade", nid, true, "", msg.Reply,
 		map[string]any{"url": req.URL, "sha256": strings.ToLower(req.SHA256), "new_version": agentResp.NewVersion})
+}
+
+// cloneFamilyUpgradeConflict rejects both a leased row and its configured
+// basename. In the supported shared-home deployment they may execute one
+// shared binary and marker; replacing it for either process makes a nominally
+// single-node operation mutate the whole clone family, and a sibling restart
+// can consume the target's pending boot proof. A historical lease row keeps
+// the family conservative: the broker cannot prove a stopped sibling will not
+// restart during the upgrade window.
+func cloneFamilyUpgradeConflict(b *Broker, sid, target string) bool {
+	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+	all, err := node.List(b.read().SQL())
+	if err != nil {
+		// An upgrade replaces an executable. If the authority cannot be read,
+		// availability is the safe sacrifice: do not guess that this target has
+		// an isolated upgrade domain.
+		return true
+	}
+	for _, n := range all {
+		if n.SID != sid {
+			continue
+		}
+		base, _, shaped := proto.SplitLeaseName(n.NID)
+		if !shaped || bindingsKnown && provisioned[n.NID] {
+			continue
+		}
+		// With no auth-callout bindings, shape is not proof that n is leased.
+		// It is nevertheless proof that an isolated binary cannot be proven,
+		// so upgrade takes the conservative (possibly availability-reducing)
+		// answer. The ordinary node-list classifier remains non-destructive and
+		// therefore keeps its opposite fallback.
+		if target == n.NID || target == base {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Broker) replyUpgradeErr(msg *nats.Msg, code, detail string) {

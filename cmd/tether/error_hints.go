@@ -47,11 +47,12 @@ var brokerCodeHints = map[string]string{
 	"transfer_budget_exceeded": "the transfer did not finish inside the broker's budget (derived from the file size and the slowest link tether promises to cover). The agent may be fine — check the link, or split the file; `tether expose` + rsync is the escape hatch for very large or very slow transfers.",
 	"agent_malformed_resp":     "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
 	// Upgrade
-	"url_not_allowed":               "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
-	"url_not_allowed_local":         "the agent re-checks the URL against its OWN allowlist, and that URL isn't on it; set the agent's `--upgrade-url-allow` flag or the `upgrade.url_allow` list in its agent.yaml (opening the broker's allowlist alone is not enough).",
-	"sha256_invalid":                "SHA256 must be 64 lowercase hex chars; double-check the value.",
-	"sha256_mismatch":               "the downloaded tarball's SHA256 doesn't match what you supplied; redownload and re-run.",
-	"proto_bump_requires_reinstall": "the agent's proto version differs from the broker's; this needs a full reinstall (architecture J.3), not `node upgrade`.",
+	"url_not_allowed":                  "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
+	"url_not_allowed_local":            "the agent re-checks the URL against its OWN allowlist, and that URL isn't on it; set the agent's `--upgrade-url-allow` flag or the `upgrade.url_allow` list in its agent.yaml (opening the broker's allowlist alone is not enough).",
+	"sha256_invalid":                   "SHA256 must be 64 lowercase hex chars; double-check the value.",
+	"sha256_mismatch":                  "the downloaded tarball's SHA256 doesn't match what you supplied; redownload and re-run.",
+	"proto_bump_requires_reinstall":    "the agent's proto version differs from the broker's; this needs a full reinstall (architecture J.3), not `node upgrade`.",
+	"clone_family_upgrade_unsupported": "remote upgrade is disabled for cloned-credential families because siblings may share one binary and rollback marker; rebuild the source image and restart the instances.",
 	// Expose
 	"name_taken":         "another expose with that name already exists in this session; pick another --name or `tether expose rm --name <X>` first.",
 	"port_exhausted":     "the broker has no free public port in its 14000-14999 band; ask the operator to free an old expose.",
@@ -188,9 +189,10 @@ var brokerCodeExitClasses = map[string]int{
 	// fleet on it (configUpgradeCodes). upgrade_in_progress is its temporal opposite — a prior upgrade on
 	// THIS node is still inside its register deadline; it self-resolves (commit or rollback) within that
 	// bound, which is the definition of the retry class.
-	"smoke_failed":        exitUsage,
-	"upgrade_in_progress": exitTransient,
-	"version_skew":        exitUsage, // B6 A3: reinstall the joiner on a matching release
+	"smoke_failed":                     exitUsage,
+	"upgrade_in_progress":              exitTransient,
+	"clone_family_upgrade_unsupported": exitUsage,
+	"version_skew":                     exitUsage, // B6 A3: reinstall the joiner on a matching release
 	// R8a P1: the control plane committed the rehome but the agents have not confirmed the new
 	// home yet. This is EX_TEMPFAIL, not a tether bug: the broker keeps re-delivering, so
 	// re-running the verb is the correct response. Crucially it is NOT 0 — `cluster drain`

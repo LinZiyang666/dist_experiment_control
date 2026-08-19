@@ -1232,7 +1232,8 @@ SSH 上去 `wget && systemctl restart` 既慢又容易漏。这个命令把"分�
 
 ```
 tether node upgrade <nid> --url https://... --sha256 <hex64>      # 单台
-tether node upgrade --all  --url https://... --sha256 <hex64>     # session 内全量 ONLINE
+tether node upgrade --all  --url https://... --sha256 <hex64>     # session 内全量 ONLINE 的**固定身份设备**
+                                                                  # （克隆凭据族整体拒绝远程升级；重建镜像后重启）
 ```
 
 flag：
@@ -1257,6 +1258,10 @@ flag：
   → **保留旧二进制**到 `<二进制路径>.prev` → 写升级 marker（pending，记录目标 sid/nid）→ 原子替换自身
   → `syscall.Exec` 原地重启（PID 不变）。全程持有二进制目录的跨进程 flock——
   **同宿主共享该二进制的多个 agent 是一个升级域**，同一时刻只有一个在途升级。
+- **克隆凭据族不进入上述升级域**：只要该 family 已产生租约行，broker 同时拒绝 basename
+  与 `<basename>-NN` 的远程升级（`clone_family_upgrade_unsupported`）。共享 home 的克隆可能
+  共用一个二进制和 marker，所谓“只升级其中一个”会改动整个 family，并让 sibling restart
+  消耗目标进程的 boot proof；唯一可靠路径是重建源镜像并重启实例。
 - 新二进制重连后跑 G.1 reconcile（保留进程清单 / 端口分配，OFFLINE → ONLINE）；
   **register 成功即"提交"**（marker → committed）。
 - **自动回退**：新二进制起不来（启动 3 次仍失败）或 120s 内 register 不成 ⇒ agent 自己把
@@ -1573,6 +1578,7 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `sha256_invalid`                | sha256 不是 64 位小写 hex | 用 `sha256sum` 重新算 |
 | `sha256_mismatch`               | 下载的 tarball 与 sha256 不符 | 重传 release / 重算 sha256 |
 | `proto_bump_requires_reinstall` | 跨 proto 升级 | 必须 `install.sh --role agent` 重装，不能 upgrade |
+| `clone_family_upgrade_unsupported` | 目标属于曾产生租约名的克隆凭据族；无法证明其二进制/marker 是实例私有 | 重建源镜像并重启该 family，不要远程升级 basename 或租约名 |
 
 ### 9.4 expose 类
 
@@ -1773,8 +1779,33 @@ CLI 据此映射退出类 + 提示。
 
 **Q: 我能在一台机器上同时跑多个 agent 吗？**
 A: 能。每个 agent 用不同 `--session` + `--nid`，nkey 在 `~/.tether/agent/<sid>/keys/`
-分目录隔离。同 sid 同 nid 同时跑两次会被 broker 拒（`actor_invalid` /
-`provisioning conflict`）。
+分目录隔离。
+
+**同 sid 同 nid 同时跑两次不会被拒。** 本条此前写作「会被 broker 拒
+（`actor_invalid` / `provisioning conflict`）」——**那是错的，从来没有代码实现它**。
+持有同一份凭证的两个进程都会通过 auth_callout（这是凭证模型的设计意图），
+broker 用**租约**来消歧：先到者持有你配置的那个 nid，后到者拿到
+`<nid>-02`、`-03`……并在 `tether node ls` 里多显示一行（`KIND` 列标 `leased`）。
+`tether exec <nid>-02 -- …` 直接命中那一个实例。
+
+这正是「同一个虚拟机/容器镜像被同时启动多份」的场景：镜像里烘焙一份凭证即可，
+**不需要给每个实例做任何手工配置**。后缀名从不落盘，所以任何实例重启后
+都会重新竞争原名 —— 独占设备因此永远保持原名不变。
+
+**租约实例与普通设备的差别（外审 F13：此处原写「使用方式完全照旧」，不实）**
+—— exec / run / ps / expose / transfer / 事件都照常工作，以下几条不是：
+
+| 差别 | 说明 | 怎么办 |
+|---|---|---|
+| **名字会变** | 后缀不落盘，所以重启后重新竞争。原名空着就拿回原名；被别人占着就换一个后缀 | 别把 `<nid>-02` 写进脚本。要固定地址就给那台机器一个自己的 `--nid` 和 PIN，它就是普通设备 |
+| **proxy 不可用** | 租约实例不参与 proxy（`proxy status` 的 `ready_reason` 写 `leased_instance`）。一个镜像的 N 份克隆各自建出口既无意义也会互相抢端口 | 需要 proxy 出口就用固定身份的设备 |
+| **远程 `node upgrade` 被拒** | `--all` 跳过租约行；显式点名租约名或其 basename 也会返回 `clone_family_upgrade_unsupported`。共享 home 的克隆可能共用二进制与回退 marker，不存在可靠的“只升级一个实例”边界 | 重建源镜像并重启实例 |
+| **`expose` 不跨重启保留** | 共享 home（同镜像的克隆常共用一份 `~/.tether`）下，端口状态归**持有原名的那一个**；租约实例不写它 | 重启后重新 `expose` |
+| **`admin evict <nid>-02` 会被拒** | 租约名没有自己的凭证可撤销，撤销广播也按**配置名**匹配，对它无效 | 撤销整族凭证用 `evict <配置名>`；只想停一个实例，去那台机器上停 |
+| **不会被"提升"** | 原名持有者下线后，已在跑的租约实例不会自动改回原名 | 重启该实例，它会重新竞争到原名 |
+
+集群与单机模式都会把实例采纳租约前已在跑的进程行迁移到新名，
+因此 `tether ps <nid>-02` 可继续看到该实例的活进程。
 
 **Q: 把 PIN 公开了怎么办？**
 A: `tether session rm <sid>` 把会话标 DELETING（旧 PIN 全部失效），然后

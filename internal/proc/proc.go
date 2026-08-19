@@ -353,3 +353,26 @@ func scanProcessRow(s scanner) (*Process, error) {
 	}
 	return &p, nil
 }
+
+// Refile moves one RUNNING process row to a different node name.
+//
+// It exists for lease adoption, which renames a LIVE agent: the processes it
+// manages keep running, but their rows are filed under the name it had before.
+// Carrying that history forward with a "the old name is also mine" predicate is
+// not enough and not safe — the old name may already belong to ANOTHER live
+// instance, and a predicate cannot tell whose row it is looking at. So the
+// agent re-presents its own pids on its first register under the new name, and
+// each one that it genuinely re-presents is MOVED here.
+//
+// Moving, rather than remembering, is what bounds this to a single hop: after
+// the move the rows are ordinary rows of the new name, so every later register
+// reconciles them without any memory of the rename at all.
+//
+// Scoped to (sid, pid) and to rows still filed under `from`, so it cannot touch
+// a row another instance has since re-filed.
+func Refile(db *sql.DB, sid, pid, from, to string) error {
+	_, err := db.Exec(
+		`UPDATE processes SET nid = ? WHERE sid = ? AND pid = ? AND nid = ? AND status = 'RUNNING'`,
+		to, sid, pid, from)
+	return err
+}

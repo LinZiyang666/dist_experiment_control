@@ -53,6 +53,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/backoff"
@@ -919,9 +920,22 @@ func (s *Server) Close() {
 // broker has authorized us to expose, plus one supervisor goroutine per
 // port that re-dials with capped backoff on session loss (see supervise).
 type Client struct {
-	brokerAddr      string
-	sid             string
-	nid             string
+	brokerAddr string
+	sid        string
+	// nid is the name presented on the REGISTER line. It is settable because a
+	// cloned-credential instance learns its routing name from the broker's
+	// register reply, which happens strictly AFTER this client is constructed
+	// (cmd/tether builds the adapter before agent.New, before any connect).
+	// Without a seam here, an instance leased `foo-02` would still REGISTER on
+	// the tunnel as `foo`, tunnelTokenLookup would match the basename's
+	// allocation row, and the install — keyed on the public port alone — would
+	// evict the incumbent's live session.
+	//
+	// atomic because supervise/redial goroutines read it off the caller's
+	// goroutine.
+	nid atomic.Pointer[string]
+	// nidGen fences slow Opens against a rename. See SetNID and Open.
+	nidGen          atomic.Uint64
 	localPortLookup LocalPortLookup
 	logger          *slog.Logger
 
@@ -957,16 +971,114 @@ type clientSession struct {
 
 // NewClient returns an agent-side tunnel client.
 func NewClient(brokerAddr, sid, nid string, lookup LocalPortLookup, logger *slog.Logger) *Client {
-	return &Client{
+	c := &Client{
 		brokerAddr:      brokerAddr,
 		sid:             sid,
-		nid:             nid,
 		localPortLookup: lookup,
 		logger:          logger,
 		backoffBase:     500 * time.Millisecond,
 		backoffMax:      30 * time.Second,
 		sessions:        map[int]*clientSession{},
 	}
+	c.nid.Store(&nid)
+	return c
+}
+
+// SetNID updates the name this client presents on the REGISTER line.
+//
+// Called when a cloned-credential instance adopts a broker-assigned lease name.
+// It is safe to call between sessions; an in-flight REGISTER already holds the
+// value it read, and the agent only adopts a name during a session rebuild, so
+// no dial observes a half-changed identity.
+func (c *Client) SetNID(nid string) {
+	prev := c.nidValue()
+	c.nid.Store(&nid)
+	// BUMP THE GENERATION BEFORE ANYTHING ELSE.
+	//
+	// Open reads the nid, then dials and completes a REGISTER handshake — all
+	// outside c.mu, because it is slow. A rename landing inside that window
+	// leaves an Open that already told the server it is the OLD name, and which
+	// then installs its session into the map the rename just emptied. The
+	// process goes on bridging a port it authorized under a name it no longer
+	// holds, which is the very fan-out this rename exists to end.
+	//
+	// The generation is the fence: Open samples it up front and re-checks it
+	// under the lock before installing. (external review F6)
+	c.nidGen.Add(1)
+	if prev == "" || prev == nid {
+		return
+	}
+	// RETIRE EVERY SESSION HELD UNDER THE PREVIOUS NAME.
+	//
+	// Changing the name means this process is no longer the holder of the name
+	// those sessions were authorized under — their allocations belong to
+	// whoever holds it now. Leaving them running would keep this process
+	// bridging another node's public ports, and the tunnel server's session map
+	// is keyed on the public port ALONE, so the incumbent could not take them
+	// back except opportunistically, on the next transport drop.
+	//
+	// Retiring here is not a data-plane regression for the retiring side: an
+	// instance that has just been told it is not the basename holder has no
+	// claim to those ports, and it will be issued its own if it exposes any.
+	c.mu.Lock()
+	retired := c.sessions
+	c.sessions = map[int]*clientSession{}
+	c.mu.Unlock()
+	closers := make([]func(), 0, len(retired))
+	for _, sess := range retired {
+		// CANCEL INLINE, CLOSE OFF-GOROUTINE.
+		//
+		// The sessions are already fenced out of c.sessions by the map swap
+		// above, so cancelling is enough to stop them being used. The Close
+		// calls are NOT bounded: tls.Conn.Close takes the connection's write
+		// lock before it can set a deadline, so a parked write on a blackholed
+		// socket blocks for the kernel's retransmit time.
+		//
+		// This runs synchronously from adoptRoutingNID — in one caller BEFORE
+		// the session finalizer is invoked, and in the other AFTER `rebuilding`
+		// has been latched. Blocking here would therefore stall the very
+		// teardown ladder gotcha #72 exists to bound, and in the second case
+		// would leave `rebuilding` latched forever: every later reconnect
+		// dropped, the finalizer never invoked, the node permanently dead with
+		// no escalation. That is the defect #72 documented, reintroduced
+		// outside the ladder built for it.
+		sess.cancel()
+		// EMIT THE DOWN EDGE. external review F6: retiring silently left every
+		// mirror of this port's health latched at the last value it saw —
+		// proxyTunnelUp / ProxyBound stayed true for a bridge that is being torn
+		// down, so the agent reported a working exit on a dead tunnel. The hook
+		// contract is one edge per transition, and this IS a transition.
+		c.notifyState(sess.publicPort, false)
+		conn, ysess := sess.conn, sess.yamuxSess
+		// BOUNDED, AND ONE GOROUTINE FOR THE WHOLE RETIREMENT rather than one
+		// per session. Close on a blackholed socket parks for the kernel's
+		// retransmit time (that is why it is off the caller's path at all), so
+		// an unbounded fan-out here is a goroutine and fd leak proportional to
+		// how many ports the instance happened to be serving.
+		closers = append(closers, func() {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if ysess != nil {
+				_ = ysess.Close()
+			}
+		})
+	}
+	if len(closers) > 0 {
+		go func() {
+			for _, fn := range closers {
+				fn()
+			}
+		}()
+	}
+}
+
+// nidValue reads the current REGISTER identity.
+func (c *Client) nidValue() string {
+	if p := c.nid.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // SetSessionStateHook installs a callback fired (off any lock) whenever a
@@ -1033,6 +1145,9 @@ func (c *Client) OpenHome(publicPort, localPort int, token, brokerAddr string, e
 	if c.ctx == nil {
 		return errors.New("tunnel client: Start not called")
 	}
+	// Sample the rename generation BEFORE the REGISTER handshake reads the nid,
+	// so the check under the lock below covers the whole dial window.
+	openGen := c.nidGen.Load()
 	// D6 §7.7/R-22: never dial a NAMED home (non-empty brokerAddr) insecurely.
 	// A clustered expose with no pins yet (e.g. a state.json replay before the
 	// register reply re-delivers them) defers — the caller retries when pins
@@ -1048,6 +1163,18 @@ func (c *Client) OpenHome(publicPort, localPort int, token, brokerAddr string, e
 	sessCtx, cancel := context.WithCancel(c.ctx)
 
 	c.mu.Lock()
+	// THE RENAME FENCE (external review F6). This Open told the server which
+	// name it was during a REGISTER that happened outside the lock; if the name
+	// has changed since, that handshake is void and installing the session would
+	// keep this process bridging a port authorized under a name it no longer
+	// holds. Discard it exactly like a stale-epoch Open below.
+	if c.nidGen.Load() != openGen {
+		c.mu.Unlock()
+		cancel()
+		_ = conn.Close()
+		_ = yamuxSess.Close()
+		return nil
+	}
 	// Audit shard 01 F2: between Start's cleanup goroutine running
 	// (c.ctx already canceled) and an in-flight Open inserting into
 	// c.sessions, we'd leak the new session forever. Re-check ctx
@@ -1192,7 +1319,7 @@ func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token, bro
 	defer close(hsDone)
 
 	// D6 §7.2(b): 6-field REGISTER carrying this expose's home epoch (0 in N=1).
-	line := fmt.Sprintf("REGISTER %s %s %d %s %d\n", c.sid, c.nid, publicPort, token, epoch)
+	line := fmt.Sprintf("REGISTER %s %s %d %s %d\n", c.sid, c.nidValue(), publicPort, token, epoch)
 	if _, err := conn.Write([]byte(line)); err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("tunnel client: write REGISTER: %w", err)

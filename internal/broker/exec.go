@@ -245,11 +245,40 @@ func (b *Broker) handleNodeListReq(msg *nats.Msg) {
 		b.replyJSON(msg, proto.NodeListResp{Code: "store_error", Error: err.Error()})
 		return
 	}
+	// One scan of this session's credential bindings, so the Leased verdict below
+	// costs no per-row query.
+	//
+	// FAIL CLOSED: when the binding set is unusable — the query failed, or the
+	// session has none at all, which is the steady state on a broker running
+	// without auth_callout — NOTHING is reported leased. The other direction
+	// would mark every `<x>-NN` device ephemeral and silently drop it from
+	// `node upgrade --all`, and `gpu-01 gpu-02 gpu-03` is this repo's own
+	// example fleet.
+	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+
 	out := make([]proto.NodeListEntry, 0, len(all))
 	for _, n := range all {
 		if n.SID != sid {
 			continue
 		}
+		// THE DISTINGUISHING FACT IS CREDENTIAL-SHAPED, NOT NAME-SHAPED, and it
+		// needs no column of its own.
+		//
+		// A real device — including one the operator named `gpu-02` — reaches
+		// PIN bootstrap and owns an agent_provisioning row. A leased instance
+		// never does: it is admitted by the suffix fallback against its
+		// BASENAME's fingerprint, and its name is not persisted anywhere.
+		//
+		// This inference was briefly replaced by a stored `nodes.leased` column,
+		// which was WRONG TWICE over: it required a migration, and a same-proto
+		// rolling release must not add one (G5 OQ-2 — an un-migrated follower
+		// fails to Apply a register command naming an unknown column), and it
+		// was only needed because the suffix fallback was preempting PIN
+		// bootstrap and denying real `<base>-NN` devices a binding. Fixing that
+		// preemption (external review F9) restores this test's precision and
+		// removes the schema change entirely.
+		_, _, looksLeased := proto.SplitLeaseName(n.NID)
+		leased := bindingsKnown && looksLeased && !provisioned[n.NID]
 		out = append(out, proto.NodeListEntry{
 			NID:             n.NID,
 			Status:          n.Status,
@@ -257,6 +286,7 @@ func (b *Broker) handleNodeListReq(msg *nats.Msg) {
 			BootID:          n.BootID,
 			ReleaseVersion:  n.ReleaseVersion,
 			ProtoVersion:    n.ProtoVersion,
+			Leased:          leased,
 		})
 	}
 	b.replyJSON(msg, proto.NodeListResp{Nodes: out})
@@ -476,4 +506,38 @@ func (b *Broker) pubAuditProc(sid, kind, nid, pid string, argv []string, exitCod
 	if err := b.publishAudit(proto.SubjAuditProc(sid), payload); err != nil {
 		b.cfg.Logger.Warn("broker: audit.proc pub", "err", err, "sid", sid, "pid", pid)
 	}
+}
+
+// leasedNIDsForSession answers "which of this session's node names are leases?"
+// — once, from the credential bindings, for every caller that needs it.
+//
+// It exists because the question was being answered independently in three
+// places and they disagreed (external review F12): node ls consulted the
+// bindings, proxy status parsed the name, and the allocator did a third thing.
+// A device the operator named `gpu-02` was therefore a real device to one
+// subsystem and an ephemeral clone to another.
+//
+// FAIL CLOSED, same as the node-list path: when the binding set is unusable —
+// the query failed, or the session has none, which is the steady state on a
+// broker with no auth_callout — NOTHING is reported leased. Marking a real
+// device ephemeral is the destructive direction.
+func leasedNIDsForSession(b *Broker, sid string) map[string]bool {
+	out := map[string]bool{}
+	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+	if !bindingsKnown {
+		return out
+	}
+	all, err := node.List(b.read().SQL())
+	if err != nil {
+		return out
+	}
+	for _, n := range all {
+		if n.SID != sid {
+			continue
+		}
+		if _, _, looksLeased := proto.SplitLeaseName(n.NID); looksLeased && !provisioned[n.NID] {
+			out[n.NID] = true
+		}
+	}
+	return out
 }

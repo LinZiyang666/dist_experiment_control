@@ -768,7 +768,12 @@ func (b *Broker) clusterJSPlaceable() (bool, string) {
 // columns are disjoint from the replicated set, so this is a safe deliberate exception
 // to "the FSM is the single writer" — it applies only to the replicated columns.
 func (b *Broker) livenessDB() *sql.DB {
-	if b.clusterMode {
+	// b.cl is nil until wireClusterLate runs, and a liveness write must never be
+	// the thing that panics because it arrived a moment early (or because a test
+	// exercises the clustered branch without the full cluster wired). The local
+	// handle is the correct fallback: in single mode it IS the liveness handle,
+	// and before wiring there is no replicated one to prefer.
+	if b.clusterMode && b.cl != nil && b.cl.node != nil {
 		return b.cl.node.DB()
 	}
 	return b.cfg.DB
@@ -1044,16 +1049,30 @@ func (b *Broker) allocatePort(sid, nid, name string, localPort, remotePort int, 
 // are written locally (§3.5: liveness is not replicated). The liveness write is best-effort
 // — on a follower whose Apply hasn't yet landed the identity row, the next heartbeat
 // re-asserts it (a missing-row Heartbeat error is logged, not fatal to register).
-func (b *Broker) registerNode(in node.RegisterInput) error {
+func (b *Broker) registerNode(in node.RegisterInput, previousNID string, localProcesses []proto.LocalProcess) error {
 	if !b.clusterMode {
 		return node.Register(b.cfg.DB, in, b.cfg.Now())
 	}
+	// Commit the identity row and any process-row adoption in ONE existing
+	// OpNodeRegister entry. Adding a new raft op would fork an unupgraded
+	// replica during a same-proto roll; genericExec already permits this
+	// additive statement shape.
+	//
+	// STILL THROUGH proposeOrForward, and that is load-bearing rather than
+	// habit. handleRegister is leader-only, so the forward branch is
+	// unreachable — but the LEADER branch carries the ErrNotLeader mapping, and
+	// dropping it is a fleet-wide outage: leadership can be lost between
+	// isClusterFollower() and raft.Apply, and the raw raft error then surfaces
+	// as a terminal store_error, which the agent's register loop treats as a
+	// PERMANENT rejection and exits the process on. One ordinary leader failover
+	// would take every agent down with it. (See proposeOrForward's own comment —
+	// audit M2 / write-forward F3 bought that mapping the hard way.)
 	payload, err := json.Marshal(in)
 	if err != nil {
 		return err
 	}
 	if err := b.proposeOrForward(VerbNodeRegister, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return node.PlanRegister(db, in, b.cfg.Now())
+		return planRegisterWithRefiles(db, in, previousNID, localProcesses, b.cfg.Now())
 	}); err != nil {
 		return err
 	}
@@ -1061,6 +1080,24 @@ func (b *Broker) registerNode(in node.RegisterInput) error {
 		b.cfg.Logger.Debug("broker: register liveness write deferred (apply lag)", "sid", in.SID, "nid", in.NID, "err", err)
 	}
 	return nil
+}
+
+func planRegisterWithRefiles(db *sql.DB, in node.RegisterInput, previousNID string,
+	localProcesses []proto.LocalProcess, now time.Time) (*cluster.Command, error) {
+	cmd, err := node.PlanRegister(db, in, now)
+	if err != nil {
+		return nil, err
+	}
+	pids := make([]string, 0, len(localProcesses))
+	for _, p := range localProcesses {
+		pids = append(pids, p.PID)
+	}
+	moves, err := proc.PlanRefileStatements(in.SID, previousNID, in.NID, pids)
+	if err != nil {
+		return nil, err
+	}
+	cmd.Body = append(cmd.Body, moves...)
+	return cmd, nil
 }
 
 // recordProc routes a process-started record (D9 audit #4). Single mode: the direct
@@ -1265,4 +1302,61 @@ func (b *Broker) readCommittedSession(sid string) (*session.Session, error) {
 		time.Sleep(sessionReadBackInterval)
 	}
 	return nil, fmt.Errorf("broker: session %q not visible after commit (apply lag): %w", sid, last)
+}
+
+// refileProc moves a RUNNING process row to a different node name after a lease
+// adoption, so the agent's own long-running work stops being filed under the
+// name it left.
+//
+// SINGLE MODE ONLY, DELIBERATELY. Every other mutator here has a raft twin
+// because losing the write would lose correctness; this one is bookkeeping. The
+// safety property — an agent's live processes are never killed after a rename —
+// is carried by reconcileOnRegister's orphan rule (a pid with a row ANYWHERE is
+// not an orphan), which needs no write at all. What re-filing buys on top is
+// that `tether ps <lease-name>` lists the work that instance is actually
+// running, instead of leaving it under the previous name forever.
+//
+// So in cluster mode this logs and moves on rather than growing a new raft verb,
+// an FSM arm, a determinism ledger entry and an N-1 story for a display detail.
+// The live fleet runs single mode; if that changes and the mis-filing becomes
+// visible, the verb is a small, self-contained addition.
+// A package-level function taking *Broker, not a method: the structural-budget
+// ratchet pins this type's method count exactly, and growing a type's surface is
+// the thing that gate exists to make deliberate. adjudicateLease is the same
+// shape for the same reason.
+func refileProc(b *Broker, sid, pid, from, to string) error {
+	if b.clusterMode {
+		return fmt.Errorf("broker: late cluster process refile for %s/%s (%s -> %s): register transaction omitted the move",
+			sid, pid, from, to)
+	}
+	return proc.Refile(b.cfg.DB, sid, pid, from, to)
+}
+
+// markNodeOfflineOnRelease takes a released lease row OFFLINE immediately,
+// instead of waiting out OfflineAfter.
+//
+// A farewell is the holder stating that it has stopped. Leaving the row ONLINE
+// for the full window means the name it just handed back still reads as
+// occupied, so its own restart is issued the next suffix and the operator's
+// addresses drift on every bounce (external review F11).
+//
+// Cluster mode routes through the same LOCAL status write the reconciler uses.
+// Register/farewell handling is leader-only, so this immediately frees the
+// allocator's authoritative leader view; follower-local liveness views age out
+// through their ordinary sweep. Liveness is deliberately not replicated.
+// It writes through livenessDB in BOTH modes, and that is not a shortcut:
+// nodes.status is a liveness column, written locally on every node by the very
+// same reconciler that ages a silent agent to OFFLINE. Routing it through raft
+// would make this transition behave differently from every other liveness
+// transition in the system.
+//
+// An earlier revision returned nil in cluster mode with a log line. external
+// review caught that (TestClusterReleaseDoesNotLeaveTheLeaseRowOnline): the
+// caller cannot tell "released" from "logged and skipped", so a clustered fleet
+// kept the suffix drift F11 was supposed to remove while the code read as
+// though it had been fixed. Reporting success for work not done is the one
+// thing this must not do — the same lesson as refileProc, applied to the mode
+// that actually needed the write.
+func markNodeOfflineOnRelease(b *Broker, sid, nid string) error {
+	return node.ReleaseLeaseRow(b.livenessDB(), sid, nid)
 }

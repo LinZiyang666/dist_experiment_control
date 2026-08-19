@@ -54,3 +54,5 @@
 95-broker-selfheal	GREEN	0	-	-	95-broker-selfheal
 96-mid-flight-chaos	INCOMPLETE	5	-	#57 transfer-audit-durability + #58-split-home — product fix SHIPPED in R16 (hermetic pins), deploy-tier proof OWED (in-sim 1 GiB interruption not constructable) structural; B/C/B0/D6b/F arms uncovered; #71 (minority-commit under -j6, under investigation, NOT banded)	96-mid-flight-chaos
 97-soak-cycles	GREEN	0	-	-	97-soak-cycles
+83-cloned-image-instances	GREEN	0	-	-	83-cloned-image-instances
+84-shared-home-instances	GREEN	0	-	-	84-shared-home-instances

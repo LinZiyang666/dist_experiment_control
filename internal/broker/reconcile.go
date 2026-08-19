@@ -198,6 +198,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 		agentByPID[lp.PID] = lp
 	}
 
+	adopted := adoptRowsCarriedAcrossARename(b, sid, nid, req, procs, agentByPID)
 	for _, p := range procs {
 		if p.NID != nid {
 			continue
@@ -309,8 +310,26 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// running but the broker has no record of (or that we just
 	// flagged as PID-reuse above) → orphan. Architecture G.1: v1
 	// directs the agent to kill (SIGTERM+5s+SIGKILL).
+	// The fail-closed gate counts rows THIS name owns, plus the ones just
+	// carried across the rename. It must not be satisfied by a row that merely
+	// sits under the previous name: that name's rows may belong to another
+	// instance entirely, and "somebody has history here" is then true for a nid
+	// that has none — which is precisely the evidence the gate exists to demand
+	// before ordering a kill.
+	sawAnyRow := adopted > 0 || anyRowMatches(procs, nid)
+	knownPID := livePIDsByRow(procs, agentByPID, req.BootID)
 	for pid, lp := range agentByPID {
 		if lp.State != "running" {
+			continue
+		}
+		if knownPID[pid] {
+			b.cfg.Logger.Warn("broker: pid is filed under another node name; not an orphan",
+				"sid", sid, "nid", nid, "pid", pid)
+			continue
+		}
+		if !sawAnyRow {
+			b.cfg.Logger.Warn("broker: declining to orphan-kill on a nid with no process history",
+				"sid", sid, "nid", nid, "pid", pid)
 			continue
 		}
 		dropProcesses = append(dropProcesses, pid)
@@ -318,48 +337,12 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	}
 
 	// ---- ports -----------------------------------------------------
-	portRows, err := port.ListBySession(b.cfg.DB, sid)
-	if err != nil {
-		b.cfg.Logger.Warn("broker: reconcileOnRegister list ports", "err", err, "sid", sid)
+	keep, revoke, ok := reconcilePortsOnRegister(b, sid, nid, req, now)
+	if !ok {
 		// Port half of the same fail-closed rule — see reconcileReadFailure.
 		return accepted, reconciled, nil, nil, dropProcesses
 	}
-	portByHash := map[string]*port.Allocation{}
-	for i := range portRows {
-		if portRows[i].NID != nid {
-			continue
-		}
-		portByHash[portRows[i].TokenHash] = &portRows[i]
-	}
-	for _, lp := range req.LocalPorts {
-		alloc, ok := portByHash[lp.TokenHash]
-		switch {
-		case !ok:
-			// Agent claims a tunnel the broker has no record of → orphan.
-			revokePorts = append(revokePorts, lp.Port)
-			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
-		case alloc.Port != lp.Port:
-			// Token matches but port reassigned (shouldn't happen in
-			// v1 — token rotates with port — defensive). Drop.
-			revokePorts = append(revokePorts, lp.Port)
-			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
-		case alloc.State == port.StateAllocated:
-			keepPorts = append(keepPorts, alloc.Port)
-		default:
-			// State is REVOKED or FREED — broker decided to drop while
-			// agent was offline. Tell agent to tear it down now.
-			revokePorts = append(revokePorts, lp.Port)
-			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
-		}
-	}
-
-	// Ports the broker has ALLOCATED for this node but the agent didn't
-	// re-present (state.json lost / never wrote): leave them ALLOCATED.
-	// The standard 15min OFFLINE→REVOKED reconciler will catch them on
-	// the normal timeline. v1 doesn't proactively REVOKE on register
-	// because the more common case is "agent restarted before
-	// state.json was first written" — punishing that with revocation
-	// would force operators to re-expose by hand on every restart.
+	keepPorts, revokePorts = keep, revoke
 
 	return
 }
@@ -410,6 +393,24 @@ func retainPendingExits(lps []proto.LocalProcess) []string {
 // fails. Missing data on either side → returns false (preserve the
 // pre-triple accept path: no false-positive kills when the agent or
 // the SQLite row predates the triple capture, e.g. exec children).
+// anyRowMatches reports whether ANY process row is filed under this name.
+//
+// It gates the orphan kill, and the reason is fail-closed: with no rows at all
+// the broker cannot tell "these pids are orphans" from "I have simply never
+// seen this name before" — and the second reading is exactly what a
+// freshly-leased instance looks like. Ordering a kill on that evidence destroys
+// live work irreversibly, while declining to kill merely leaves rows the next
+// register reconciles. It is also the belt for PreviousNID: an agent too old to
+// send that field still does not get its processes killed.
+func anyRowMatches(procs []proc.Process, nid string) bool {
+	for _, p := range procs {
+		if p.NID == nid {
+			return true
+		}
+	}
+	return false
+}
+
 func pidReused(agentBootID, dbBootID string, agentTicks, dbTicks int64) bool {
 	if agentBootID == "" || dbBootID == "" {
 		return false
@@ -418,4 +419,144 @@ func pidReused(agentBootID, dbBootID string, agentTicks, dbTicks int64) bool {
 		return false
 	}
 	return agentBootID != dbBootID || agentTicks != dbTicks
+}
+
+// livePIDsByRow reports which of the agent's re-presented pids the broker
+// already has a row for.
+
+// An ORPHAN is a pid with NO ROW ANYWHERE — not a pid whose row is filed
+// under another name.
+//
+// The two are easy to conflate and the difference is destructive. After a
+// lease adoption an agent's own long-running processes may still be filed
+// under the name it left, and the carry-across only rides the first register
+// (PreviousNID is consumed once). A NATS blip later, that agent re-presents
+// the same live pids with no PreviousNID: under a name-scoped test they are
+// strangers, and because a leased instance is a full citizen there is
+// usually some row under its lease name, so the fail-closed gate is open and
+// the broker orders the operator's work killed.
+//
+// A row existing elsewhere means the broker HAS seen this process; what it
+// has is a bookkeeping question about which name owns it, and the answer to
+// a bookkeeping question is never SIGKILL. Genuinely unknown pids — the case
+// the orphan arm exists for — still have no row at all and are still killed.
+//
+// PID-REUSE IS THE ONE EXCEPTION, and it is not an exception to the rule so
+// much as a case where the row is about a DIFFERENT process. G.1 detects
+// that the stored row and the agent's report describe two OS processes
+// sharing one tether ULID; the old row is closed and the NEW process is
+// deliberately re-added here to be killed. Its pid has a row, but not a row
+// about it — so it is deliberately left OUT of the result.
+func livePIDsByRow(procs []proc.Process, agentByPID map[string]proto.LocalProcess, bootID string) map[string]bool {
+	known := make(map[string]bool, len(procs))
+	for _, p := range procs {
+		if p.Status != proc.StateRunning && p.Status != proc.StateLost {
+			continue
+		}
+		if lp, reported := agentByPID[p.PID]; reported &&
+			pidReused(bootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
+			continue
+		}
+		known[p.PID] = true
+	}
+	return known
+}
+
+// adoptRowsCarriedAcrossARename moves the process rows an agent carries with it
+// through a lease adoption, and reports how many it took.
+//
+// OWNERSHIP IS THE CURRENT NAME. The previous name is only a place to LOOK FOR
+// rows this agent re-presents — never a claim on rows it does not.
+//
+// Treating previousNID as ownership is a remote kill: after a rename the old
+// name typically belongs to ANOTHER live instance (that is why this one was
+// renamed), and every RUNNING row of that instance which this agent does not
+// list would read as "gone" and be closed with ExitMark{-1}. One rename then
+// marks a healthy sibling's processes EXITED while they are still running, and
+// the sibling's own next register sees them as orphans and SIGKILLs the
+// operator's work.
+//
+// MOVING, NOT REMEMBERING, is what makes this work for every later register
+// too. A predicate only ever rescues rows on the FIRST register after adoption
+// (PreviousNID is consumed once); the rows themselves never change name, so the
+// second register would see the agent's own live processes as pids with no row
+// — orphans — and order it to kill them.
+func adoptRowsCarriedAcrossARename(b *Broker, sid, nid string, req proto.NodeRegisterReq,
+	procs []proc.Process, agentByPID map[string]proto.LocalProcess) int {
+	if req.PreviousNID == "" {
+		return 0
+	}
+	adopted := 0
+	for _, p := range procs {
+		if p.NID != req.PreviousNID {
+			continue
+		}
+		if _, rePresented := agentByPID[p.PID]; !rePresented {
+			continue
+		}
+		if err := refileProc(b, sid, p.PID, req.PreviousNID, nid); err != nil {
+			b.cfg.Logger.Warn("broker: could not re-file an adopted process row",
+				"err", err, "sid", sid, "pid", p.PID, "from", req.PreviousNID, "to", nid)
+			continue
+		}
+		adopted++
+		delete(agentByPID, p.PID)
+	}
+	return adopted
+}
+
+// reconcilePortsOnRegister classifies the tunnels an agent re-presents against
+// the port rows the broker still backs, returning the keep/revoke directives.
+//
+// ok=false means the authority could not be READ, which is never the same as
+// "the agent holds nothing" — see reconcileReadFailure for why an empty answer
+// is itself a destructive claim.
+// A package-level function taking *Broker, not a method: the structural-budget
+// ratchet pins this type's method count exactly. Same shape, same reason, as
+// adjudicateLease and refileProc.
+func reconcilePortsOnRegister(b *Broker, sid, nid string, req proto.NodeRegisterReq, now time.Time) (
+	keepPorts []int, revokePorts []int, ok bool,
+) {
+	portRows, err := port.ListBySession(b.cfg.DB, sid)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: reconcileOnRegister list ports", "err", err, "sid", sid)
+		return nil, nil, false
+	}
+	portByHash := map[string]*port.Allocation{}
+	for i := range portRows {
+		if portRows[i].NID != nid {
+			continue
+		}
+		portByHash[portRows[i].TokenHash] = &portRows[i]
+	}
+	for _, lp := range req.LocalPorts {
+		alloc, ok := portByHash[lp.TokenHash]
+		switch {
+		case !ok:
+			// Agent claims a tunnel the broker has no record of → orphan.
+			revokePorts = append(revokePorts, lp.Port)
+			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
+		case alloc.Port != lp.Port:
+			// Token matches but port reassigned (shouldn't happen in
+			// v1 — token rotates with port — defensive). Drop.
+			revokePorts = append(revokePorts, lp.Port)
+			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
+		case alloc.State == port.StateAllocated:
+			keepPorts = append(keepPorts, alloc.Port)
+		default:
+			// State is REVOKED or FREED — broker decided to drop while
+			// agent was offline. Tell agent to tear it down now.
+			revokePorts = append(revokePorts, lp.Port)
+			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
+		}
+	}
+
+	// Ports the broker has ALLOCATED for this node but the agent didn't
+	// re-present (state.json lost / never wrote): leave them ALLOCATED.
+	// The standard 15min OFFLINE→REVOKED reconciler will catch them on
+	// the normal timeline. v1 doesn't proactively REVOKE on register
+	// because the more common case is "agent restarted before
+	// state.json was first written" — punishing that with revocation
+	// would force operators to re-expose by hand on every restart.
+	return keepPorts, revokePorts, true
 }

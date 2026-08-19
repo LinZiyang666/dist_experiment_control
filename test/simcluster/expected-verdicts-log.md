@@ -369,3 +369,34 @@ ROUND-4 R4-F3 (2026-07-23): the #58 cross-home GC deploy-tier gap is now booked 
 - **batch**: `R13`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 R13: the PERMANENT goroutine NOT-COVERED is RETIRED — admin runtime .goroutines (runtime.NumGoroutine, the in-process truth, not /proc Threads) enables a real cross-process leak gate: load(6-cycle soak)→quiesce→FLOOR returns to the pre-load baseline within GOR_TOL. Contract FIXED in the drill header (tol=2*NPROC+16, 3+3 floor samples, GOR_QUIESCE=SOAK_SETTLE). r13d GREEN pass=43 (brk1 floor 76→77, tol 192 on the 88-core host). Was GREEN (stable both runs)
+
+## 83-cloned-image-instances
+
+- **batch**: `cloned-credential-instances`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
+
+PRODUCT-RED RECORDED, then GREEN. A drill that has only ever been seen green proves nothing, so both readings were taken on the same host, same image build, minutes apart. Against **pre-increment code (HEAD cdce494)**: pass=12 fail=4 — B1 (the clone never becomes a second row), B2b/B2c (ONE `exec` produced TWO start rows and TWO exit rows: the live-fleet double-execution itself), B3 (`node_not_found` — a cloned instance is unaddressable). Against the increment: **pass=16 fail=0**. The four RED arms are exactly the four the increment exists to fix, which is the property that makes this drill an oracle rather than a ritual. It also earned its keep mid-development: after all three hermetic gates were green (`make test` rc=0, `e2e-parallel` ALL PASS, `lint` rc=0) it caught B1/B2b/B2c/B3 again on an intermediate revision — the incumbent's register→subscribe turnaround on a loaded container host is ~2s, and `leaseGrantWindow` had been shrunk to 1s while fixing an unrelated hermetic red. Every hermetic test registers and subscribes inside one fast process, so none of them can see that window at all. See docs/reviews/cloned-credential-instances-review.md §3e.
+
+## 84-shared-home-instances
+
+- **batch**: `cloned-credential-instances` _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
+
+ADDED IN RESPONSE TO EXTERNAL REVIEW F14. Drill 83 copies a home between containers, which reproduces
+the CREDENTIAL sharing but not the reference deployment's actual shape — on the live fleet ~/.tether is
+an NFS mount, so the instances of one cloned image write ONE state.json and ONE upgrade marker. 83 was
+registered GREEN while that highest-risk form had no deploy-tier oracle at all. This drill is that
+oracle: `up --shared-agent-home` mounts a single named volume as `/home/sim` on every agent, and
+the first SETUP assertion checks both the `.tether` directory and `.local/bin/tether` device/inode
+pair on both containers. A false green can no longer come from sharing only state while silently
+leaving the binary private.
+
+First run: **pass=17 assert_fail=0 product_red=0**, and the arms that matter all held on genuinely
+shared storage — two distinct rows (incumbent keeps its name, the second is leased `-02`), ONE start
+row and ONE exit row for one `exec`, the leased instance separately addressable, and the incumbent's
+persisted port token SURVIVING the leased instance's arrival (a leased instance must not write the file
+that belongs to the basename holder).
+
+Final external-review rerun closes the former S6 gap instead of asserting ownership that the topology
+cannot provide: remote upgrade is now refused for both the leased row and its basename once a clone
+family exists. The drill checks both refusals with the stable `clone_family_upgrade_unsupported` code,
+before any artifact download. Expected verdict is therefore GREEN; the supported upgrade path for a
+clone family is rebuilding the source image and restarting its instances.

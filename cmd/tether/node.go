@@ -103,7 +103,13 @@ func newNodeLsCmd() *cobra.Command {
 			}
 			now := time.Now()
 			tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-			_, _ = fmt.Fprintln(tw, "NODE\tSTATUS\tHEARTBEAT\tPROTO\tRELEASE")
+			// KIND is what tells an operator which of these rows is a device and
+			// which is a transient instance the broker named (external review
+			// F13). The JSON has carried `leased` from the start; the table an
+			// operator actually reads did not, so the one visible difference
+			// between "your machine" and "a clone that will be gone by
+			// lunchtime" was a suffix they had to know to look for.
+			_, _ = fmt.Fprintln(tw, "NODE\tKIND\tSTATUS\tHEARTBEAT\tPROTO\tRELEASE")
 			for _, n := range shown {
 				age := "-"
 				if !n.LastHeartbeatAt.IsZero() {
@@ -113,8 +119,12 @@ func newNodeLsCmd() *cobra.Command {
 				if release == "" {
 					release = "-"
 				}
-				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
-					n.NID, n.Status, age, n.ProtoVersion, release)
+				kind := "device"
+				if n.Leased {
+					kind = "leased"
+				}
+				_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
+					n.NID, kind, n.Status, age, n.ProtoVersion, release)
 			}
 			if len(shown) == 0 {
 				_, _ = fmt.Fprintln(tw, "(no nodes)")
@@ -200,9 +210,18 @@ or rolls back, the remaining nodes are left untouched.`, proto.SubjectPrefix),
 
 			targets := args
 			if all {
-				targets, err = listOnlineNIDs(cmd.Context(), nc, sid, id.PublicKey)
+				var skippedLeased int
+				targets, skippedLeased, err = listOnlineNIDs(cmd.Context(), nc, sid, id.PublicKey)
 				if err != nil {
 					return err
+				}
+				if skippedLeased > 0 {
+					// Say it out loud: a silent exclusion reads as "the fleet
+					// was upgraded" when part of it deliberately was not.
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+						"skipping %d instance(s) running under an assigned lease name "+
+							"(remote upgrade is disabled for clone families; rebuild the shared image instead)\n",
+						skippedLeased)
 				}
 				if len(targets) == 0 {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "(no ONLINE nodes in session)")
@@ -634,27 +653,48 @@ func isConfigError(err error) bool {
 // inference: a fresh agent that registered but never exec'd
 // shows up here AND can be upgrade target, which the older
 // ps-based heuristic missed.
-func listOnlineNIDs(ctx context.Context, nc *nats.Conn, sid, actor string) ([]string, error) {
+// It also reports how many ONLINE rows were EXCLUDED for running under an
+// assigned lease name, so the caller can say so out loud rather than silently
+// upgrading a smaller fleet than the operator expects.
+func listOnlineNIDs(ctx context.Context, nc *nats.Conn, sid, actor string) ([]string, int, error) {
 	body, _ := json.Marshal(proto.NodeListReq{})
 	respCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	respMsg, err := nc.RequestWithContext(respCtx,
 		proto.SubjCtrlNodeList(actor, sid), body)
 	if err != nil {
-		return nil, fmt.Errorf("upgrade --all: node.list lookup: %w", err)
+		return nil, 0, fmt.Errorf("upgrade --all: node.list lookup: %w", err)
 	}
 	var nl proto.NodeListResp
 	if err := json.Unmarshal(respMsg.Data, &nl); err != nil {
-		return nil, fmt.Errorf("upgrade --all: node.list decode: %w", err)
+		return nil, 0, fmt.Errorf("upgrade --all: node.list decode: %w", err)
 	}
 	if nl.Code != "" {
-		return nil, fmt.Errorf("upgrade --all: node.list rejected: %s %s", nl.Code, nl.Error)
+		return nil, 0, fmt.Errorf("upgrade --all: node.list rejected: %s %s", nl.Code, nl.Error)
 	}
 	var out []string
+	var skippedLeased int
 	for _, n := range nl.Nodes {
-		if n.Status == "ONLINE" {
-			out = append(out, n.NID)
+		if n.Status != "ONLINE" {
+			continue
 		}
+		// Q4: a LEASED instance is excluded from the fleet fan-out.
+		//
+		// Two concrete hazards, not a preference. (1) Upgrading one is
+		// meaningless: it runs the binary baked into its image and reverts on
+		// its next restart. (2) Targets are sorted lexicographically and
+		// targets[0] is the canary that gates the entire fleet — a leased
+		// instance can sort first, and if its pod recycles inside the wait
+		// budget the whole rollout aborts having upgraded nothing.
+		//
+		// Explicit upgrades of the leased row and its basename are refused too:
+		// shared-home clones may share one binary and rollback marker, so there is
+		// no honest per-instance remote-upgrade boundary.
+		if n.Leased {
+			skippedLeased++
+			continue
+		}
+		out = append(out, n.NID)
 	}
-	return out, nil
+	return out, skippedLeased, nil
 }

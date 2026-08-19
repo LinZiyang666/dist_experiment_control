@@ -338,6 +338,57 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin, clientIP
 		}
 		return nil
 	case errors.Is(err, agentprov.ErrNotProvisioned):
+		// SUFFIX FALLBACK (cloned-credential lease).
+		//
+		// A contested register hands an agent a lease name (`<basename>-NN`),
+		// which it adopts by reconnecting under that name. There is no
+		// agent_provisioning row for a lease name — the credential is bound to
+		// the BASENAME, one row for the whole clone family — so without this
+		// arm the reconnect is denied, and connectNATS treats an initial auth
+		// failure as FATAL: every clone would crash-loop at RestartSec=5.
+		//
+		// It creates no new trust edge. The lease is honoured ONLY for the
+		// fingerprint that already owns the basename, which is the same
+		// credential that would have been accepted under the basename anyway.
+		// It is a read, never a write, so the connect path keeps today's cost
+		// and failure model — and the strict ValidateNID above still applies,
+		// so nothing widens the auth-plane identifier space.
+		// A SUPPLIED PIN MEANS "I AM A REAL DEVICE", and it outranks this arm.
+		//
+		// external review F9/F2. Nothing in the NAME can distinguish a lease
+		// from a machine the operator deliberately called gpu-02, so the
+		// distinguishing act is the operator's: a lease is adopted by
+		// reconnecting with NO pin (the agent has none to give — it was handed a
+		// name, not a credential), while provisioning a real device is exactly
+		// the act of presenting one.
+		//
+		// Preempting bootstrap here was the root of a whole family of defects:
+		// the real gpu-02 never acquired an agent_provisioning row of its own,
+		// so every downstream test of "is this a lease?" — node ls, proxy
+		// status, `upgrade --all`, and the name allocator — misread it as
+		// ephemeral, and the allocator eventually handed a live machine's name
+		// to a passing clone. It also silently discarded a PIN the operator had
+		// correctly supplied, which is its own surprise.
+		//
+		// Ordering, not a new check: a lease reconnect carries no pin and still
+		// lands in the arm below.
+		if base, _, leased := proto.SplitLeaseName(nid); leased && pin == "" {
+			if bound, lerr := agentprov.Lookup(h.DB, sid, base); lerr == nil && bound == fp {
+				active, aerr := session.IsActive(h.DB, sid)
+				if aerr != nil {
+					return fmt.Errorf("active check: %w", aerr)
+				}
+				if !active {
+					return fmt.Errorf("session %q not active", sid)
+				}
+				// Same local-replica fail-closed rule as the already-provisioned
+				// path: a node that lost timely leader contact must not authorize.
+				if h.fenced() {
+					return ErrFenced
+				}
+				return nil
+			}
+		}
 		// fall through to PIN-bootstrap below
 	default:
 		return fmt.Errorf("provisioning lookup: %w", err)

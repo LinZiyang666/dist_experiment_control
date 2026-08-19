@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/LinZiyang666/tether/internal/proto"
 )
@@ -92,7 +93,44 @@ type StateFile struct {
 type stateStore struct {
 	mu   sync.Mutex
 	path string
+
+	// detached marks a store belonging to an instance that is running under a
+	// broker-assigned LEASE name rather than its configured basename.
+	//
+	// WHY THIS EXISTS. state.json is keyed by (home, sid) and by nothing else,
+	// so every instance born from one image addresses the SAME file — on the
+	// reference deployment ~/.tether is a shared NFS mount and it is literally
+	// one inode. The rows in it describe whoever holds the BASENAME: its port
+	// tokens are valid bearer credentials for that node's allocations.
+	//
+	// A leased instance therefore must neither read it (it would present another
+	// node's tokens as its own at register, and be answered with RevokePorts)
+	// nor write it (RevokePorts pruning, a proxy teardown persist, or an expose
+	// would mutate the incumbent's LIVE state). Detaching makes the store a
+	// no-op in both directions instead of scattering "am I leased" checks across
+	// every call site, where the next one added would silently miss the rule.
+	//
+	// A leased instance losing its local state costs nothing: it is ephemeral by
+	// premise, and the lease name is never persisted, so it re-competes for the
+	// basename on its next restart anyway.
+	detached atomic.Bool
 }
+
+// detach switches this store to no-op mode. See stateStore.detached.
+func (s *stateStore) detach() { s.detached.Store(true) }
+
+// reattach makes the store live again, for an instance that has returned to its
+// configured basename.
+//
+// detach() is right while an instance holds an ASSIGNED name: the file belongs
+// to whoever holds the basename, and on the reference deployment ~/.tether is a
+// shared NFS mount, so writing there would corrupt the incumbent's view of its
+// own ports. But falling back to the basename (dropLease) makes this process
+// the legitimate owner of that file again. Leaving it detached gives the device
+// a store that silently swallows every write and returns nothing on every read:
+// exposes survive nothing, and a restart replays no ports at all — for a device
+// that is now, by definition, an ordinary single-instance agent.
+func (s *stateStore) reattach() { s.detached.Store(false) }
 
 // newStateStore returns a store rooted at home/agent/<sid>/state.json.
 // The file is not touched until the first AddPort / RemovePort call.
@@ -111,6 +149,9 @@ func (s *stateStore) load() (*StateFile, error) {
 }
 
 func (s *stateStore) loadLocked() (*StateFile, error) {
+	if s.detached.Load() {
+		return &StateFile{}, nil
+	}
 	return parseStateBytes(os.ReadFile(s.path))
 }
 
@@ -122,6 +163,9 @@ func (s *stateStore) loadLocked() (*StateFile, error) {
 // SetProxy/load are not poisoned (review B1). It is read-only and eventually
 // consistent — exactly what a register snapshot needs.
 func (s *stateStore) loadNoLock() (*StateFile, error) {
+	if s.detached.Load() {
+		return &StateFile{}, nil
+	}
 	return parseStateBytes(os.ReadFile(s.path))
 }
 
@@ -256,6 +300,13 @@ func (s *stateStore) GetRosterCache() (*RosterCache, error) {
 // of the raw tunnel tokens, so a post-rename crash must not surface an
 // empty or partial file). 0700 dir, 0600 file per K.1 permission rules.
 func (s *stateStore) saveLocked(sf *StateFile) error {
+	// The single write choke point, which is why the detach check lives here:
+	// every mutator funnels through it, so a mutator added later cannot forget
+	// the rule. A detached store belongs to a leased instance, and that file
+	// describes the basename holder — on a shared home, the same inode.
+	if s.detached.Load() {
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return fmt.Errorf("agent state: mkdir: %w", err)
 	}

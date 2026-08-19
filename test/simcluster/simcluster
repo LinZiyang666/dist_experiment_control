@@ -97,12 +97,16 @@ _provision_node() {
 # left as dead code with a false "kept for grow" rationale. Internal review round-2 MINOR-4.)
 
 cmd_up() {
-    _brokers=1; _agents=0; _ctl=0; _capstore=""
+    _brokers=1; _agents=0; _ctl=0; _capstore=""; _shared_home=""
     while [ $# -gt 0 ]; do case "$1" in
         --brokers) _brokers=$2; shift 2;;
         --agents)  _agents=$2;  shift 2;;
         --ctl)     _ctl=$2;     shift 2;;
         --cap-store) _capstore=$2; shift 2;;   # #21: cap broker data filesystem via a small tmpfs (e.g. 1g)
+        # Every agent shares ONE /home/sim, reproducing the reference
+        # deployment where the instances of a cloned image sit on one NFS home
+        # (external review F14). Off by default; only drill 84 asks for it.
+        --shared-agent-home) _shared_home=1; shift;;
         *) die "up: unknown arg $1";;
     esac; done
     ensure_net
@@ -113,9 +117,15 @@ cmd_up() {
     # parent still gives deterministic statfs and consumes no host-global loop devices (§9 OQ-5).
     _brk_extra=""
     [ -n "$_capstore" ] && _brk_extra="--sim-lib-tmpfs $_capstore"
+    # --shared-agent-home: every agent gets the SAME /home/sim volume,
+    # reproducing the reference deployment where the instances of one cloned
+    # image share an NFS home (external review F14). Off by default.
+    _agt_extra=""
+    [ -n "$_shared_home" ] && _agt_extra="--sim-shared-home $(vol_shared_home)"
     # V4: PHASE 1 — launch every container first (docker run -d returns immediately). shellcheck disable=SC2086
     _i=1; while [ "$_i" -le "$_brokers" ]; do _start_node broker "brk$_i" $_brk_extra; _i=$((_i+1)); done
-    _i=1; while [ "$_i" -le "$_agents" ];  do _start_node agent  "agt$_i"; _i=$((_i+1)); done
+    # shellcheck disable=SC2086
+    _i=1; while [ "$_i" -le "$_agents" ];  do _start_node agent  "agt$_i" $_agt_extra; _i=$((_i+1)); done
     _i=1; while [ "$_i" -le "$_ctl" ];     do _start_node ctl    "ctl$_i"; _i=$((_i+1)); done
     # V4: PHASE 2 — provision every node CONCURRENTLY (wait_sysd + install.sh), each into its own log so
     # the retry-once diagnostic survives interleaving, then fail `up` if ANY node failed (a leaked
@@ -624,6 +634,11 @@ cmd_down() {
 
 cmd_nuke() {
     for n in $(list_nodes); do [ -n "$n" ] && rm_node "$n" --vols; done
+    # The shared agent home (up --shared-agent-home) belongs to the INSTANCE, not
+    # to any one node, so rm_node --vols above never reaps it. Leaving it behind
+    # would carry one drill's credentials and state.json into the next run and
+    # let a shared-home oracle pass for the wrong reason.
+    d volume rm "$(vol_shared_home)" >/dev/null 2>&1 || true
     d network rm "$(net_name)" >/dev/null 2>&1 || true
     rm -rf "${SECRETS_STASH:-$HERE/secrets}/$INSTANCE" 2>/dev/null || true
     # S0-backup-vault (G-C / S7, lib/vault.sh): the vault deliberately survives `rm_node --vols` (that is

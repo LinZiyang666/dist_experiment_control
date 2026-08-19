@@ -24,6 +24,7 @@ CapsResp.OK	json:"ok"	bool
 CertPins.Current	json:"current,omitempty"	string
 CertPins.Previous	json:"previous,omitempty"	string
 CertPins.ValidUntil	json:"valid_until,omitempty"	*time.Time
+ClaimProbeResp.InstanceID	json:"instance_id,omitempty"	string
 ClusterGrowReq.GrowEpoch	json:"grow_epoch,omitempty"	string
 ClusterGrowReq.IssuedAt	json:"issued_at"	string
 ClusterGrowReq.JoinBundle	json:"join_bundle,omitempty"	string
@@ -167,8 +168,11 @@ LocalProcess.RC	json:"rc,omitempty"	*int
 LocalProcess.StartTimeTicks	json:"start_time_ticks,omitempty"	int64
 LocalProcess.StartedAt	json:"started_at,omitempty"	time.Time
 LocalProcess.State	json:"state"	string
+NodeLease.AssignedNID	json:"assigned_nid"	string
+NodeLease.Basename	json:"basename,omitempty"	string
 NodeListEntry.BootID	json:"boot_id,omitempty"	string
 NodeListEntry.LastHeartbeatAt	json:"last_heartbeat_at"	time.Time
+NodeListEntry.Leased	json:"leased,omitempty"	bool
 NodeListEntry.NID	json:"nid"	string
 NodeListEntry.ProtoVersion	json:"proto_version,omitempty"	int
 NodeListEntry.ReleaseVersion	json:"release_version,omitempty"	string
@@ -179,13 +183,18 @@ NodeListResp.Nodes	json:"nodes"	[]NodeListEntry
 NodeRegisterReq.Arch	json:"arch"	string
 NodeRegisterReq.BootID	json:"boot_id,omitempty"	string
 NodeRegisterReq.Capabilities	json:"capabilities,omitempty"	[]string
+NodeRegisterReq.ConfiguredNID	json:"configured_nid,omitempty"	string
+NodeRegisterReq.InstanceID	json:"instance_id,omitempty"	string
+NodeRegisterReq.LeasedNID	json:"leased_nid,omitempty"	bool
 NodeRegisterReq.LocalPorts	json:"local_ports,omitempty"	[]LocalPort
 NodeRegisterReq.LocalProcesses	json:"local_processes,omitempty"	[]LocalProcess
 NodeRegisterReq.NID	json:"nid"	string
 NodeRegisterReq.OS	json:"os"	string
+NodeRegisterReq.PreviousNID	json:"previous_nid,omitempty"	string
 NodeRegisterReq.ProtoVersion	json:"proto_version"	int
 NodeRegisterReq.ProxyOptOut	json:"proxy_opt_out,omitempty"	bool
 NodeRegisterReq.ReleaseVersion	json:"release_version"	string
+NodeRegisterReq.ReleasingName	json:"releasing_name,omitempty"	bool
 NodeRegisterReq.RosterGen	json:"roster_gen,omitempty"	uint64
 NodeRegisterReq.RosterRefreshOnly	json:"roster_refresh_only,omitempty"	bool
 NodeRegisterReq.ServerID	json:"server_id,omitempty"	string
@@ -197,6 +206,7 @@ NodeRegisterResp.DropProcesses	json:"drop_processes,omitempty"	[]string
 NodeRegisterResp.Error	json:"error,omitempty"	string
 NodeRegisterResp.Home	json:"home,omitempty"	*HomeAssignment
 NodeRegisterResp.KeepPorts	json:"keep_ports,omitempty"	[]int
+NodeRegisterResp.Lease	json:"lease,omitempty"	*NodeLease
 NodeRegisterResp.OK	json:"ok"	bool
 NodeRegisterResp.Proxy	json:"proxy,omitempty"	*ProxyDirective
 NodeRegisterResp.ReconciledProcesses	json:"reconciled_processes,omitempty"	[]ReconciledProc

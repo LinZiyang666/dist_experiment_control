@@ -57,6 +57,17 @@ func (a *TunnelExposeAdapter) Start(ctx context.Context) {
 	a.client.Start(ctx)
 }
 
+// SetNID updates the name presented on the tunnel REGISTER line.
+//
+// The adapter is constructed in cmd/tether BEFORE agent.New and before any
+// NATS connect, so it is born holding the agent.yaml basename. A
+// cloned-credential instance only learns its routing name from the broker's
+// register reply, and without this seam it would keep REGISTERing on the
+// tunnel as the basename: tunnelTokenLookup would then match the basename's
+// allocation row and the install — keyed on the public port alone — would
+// evict the incumbent's live session.
+func (a *TunnelExposeAdapter) SetNID(nid string) { a.client.SetNID(nid) }
+
 // SetSessionStateHook forwards a data-plane up/down callback to the tunnel
 // client. The agent wires this (in agent.New) to publish proxy ready/unready
 // so /sub tracks real liveness. Pass-through: policy (the proxy-port filter)

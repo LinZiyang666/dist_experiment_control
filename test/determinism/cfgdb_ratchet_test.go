@@ -65,18 +65,22 @@ var cfgDBBaseline = map[string]int{
 	"cluster_roster.go:buildSignedRoster":    2,
 	"clusterwrite.go:allocatePort":           3,
 	"clusterwrite.go:createSession":          1,
-	"clusterwrite.go:dropSession":            1,
-	"clusterwrite.go:freePortAllocation":     1,
-	"clusterwrite.go:livenessDB":             1,
-	"clusterwrite.go:markProcExited":         1,
-	"clusterwrite.go:readCommittedSession":   1,
-	"clusterwrite.go:recordProc":             1,
-	"clusterwrite.go:registerNode":           1,
-	"clusterwrite.go:revokePortAllocation":   1,
-	"clusterwrite.go:tombstoneSession":       1,
-	"clusterwrite.go:wireClusterLate":        6,
-	"dbrole.go:read":                         1,
-	"dbrole.go:singleWriter":                 1,
+	// refileProc: single-mode-only re-file of an adopted process row. Cluster
+	// mode returns early (see the function) rather than growing a raft verb for
+	// a display-level fix, so this site is unreachable there.
+	"clusterwrite.go:refileProc":           1,
+	"clusterwrite.go:dropSession":          1,
+	"clusterwrite.go:freePortAllocation":   1,
+	"clusterwrite.go:livenessDB":           1,
+	"clusterwrite.go:markProcExited":       1,
+	"clusterwrite.go:readCommittedSession": 1,
+	"clusterwrite.go:recordProc":           1,
+	"clusterwrite.go:registerNode":         1,
+	"clusterwrite.go:revokePortAllocation": 1,
+	"clusterwrite.go:tombstoneSession":     1,
+	"clusterwrite.go:wireClusterLate":      6,
+	"dbrole.go:read":                       1,
+	"dbrole.go:singleWriter":               1,
 	// Lowered from 3 / 5 when ps and node.list moved onto admitCtrl (plan §15.2). The ratchet
 	// requires this in the SAME change as the conversion — that is its working mechanism.
 	"exec.go:handleNodeListReq":                          1,
@@ -119,14 +123,17 @@ var cfgDBBaseline = map[string]int{
 	"proxy_reconcile.go:reconcileProxySession":           2,
 	"proxy_reconcile.go:reconcileProxyTeardown":          1, // -1: inline read → b.read()
 	"proxy_reconcile.go:rehomeProxy":                     1,
-	"reconcile.go:reconcileOnRegister":                   2,
-	"roster_stale.go:maybeEmitRosterStale":               1,
-	"sessions.go:handleSessionList":                      2,
-	"sessions.go:handleSessionRm":                        1,
-	"topology_reconcile.go:buildTopologyInputs":          1,
-	"topology_reconcile.go:reconcileTopologyOnce":        1,
-	"transfer.go:transferGate":                           3,
-	"tunnel_reconcile.go:reconcileTunnelSessions":        1,
+	// -1: the port half moved out to reconcilePortsOnRegister (below), which
+	// took its port.ListBySession read with it.
+	"reconcile.go:reconcileOnRegister":            1,
+	"reconcile.go:reconcilePortsOnRegister":       1,
+	"roster_stale.go:maybeEmitRosterStale":        1,
+	"sessions.go:handleSessionList":               2,
+	"sessions.go:handleSessionRm":                 1,
+	"topology_reconcile.go:buildTopologyInputs":   1,
+	"topology_reconcile.go:reconcileTopologyOnce": 1,
+	"transfer.go:transferGate":                    3,
+	"tunnel_reconcile.go:reconcileTunnelSessions": 1,
 }
 
 // cfgDBBaselineTotal is asserted separately so a wholesale table rewrite still has to move a
@@ -141,7 +148,7 @@ var cfgDBBaseline = map[string]int{
 // false: 25 sites consumed the handle INLINE (b.cfg.DB.Query(`SELECT …`) right there, never passing
 // it on), and those become structurally unable to write, because readDB has no Exec/Begin at all.
 // Those 25 are what moved 144 → 119. The remaining 119 are the domain-function calls, and they stay.
-const cfgDBBaselineTotal = 118 // -1: h1 A1 moved handlePsReq's ports read onto b.read()
+const cfgDBBaselineTotal = 119 // +1: refileProc (single-mode re-file of an adopted proc row); markNodeOfflineOnRelease now goes through livenessDB in both modes
 
 func TestCfgDBDirectAccessRatchet(t *testing.T) {
 	got, files := scanCfgDBSites(t)

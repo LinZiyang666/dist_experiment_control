@@ -191,8 +191,27 @@ func (a *Agent) finalizeConn(parent context.Context, nc *nats.Conn, tracker *con
 
 	// S3 — the real close, off the recovery path.
 	done := make(chan struct{})
+	closeIntent := intent
 	go func() {
 		defer close(done)
+		// The farewell goes INSIDE this goroutine, under the same budget as the
+		// close.
+		//
+		// It was briefly on the caller's side, and that reintroduced exactly the
+		// hang S2/S3 exist to prevent: nc.Publish takes nc.mu, and on a
+		// RECONNECTING conn doReconnect holds that mutex across a dial with no
+		// deadline of its own. A stopping agent then blocked indefinitely on a
+		// courtesy message — gotcha #72's shape, on the shutdown path, where the
+		// whole point of the ladder is that a stop can never be held hostage.
+		// Here the select below bounds it like everything else, and the
+		// escalation fires if it wedges.
+		//
+		// Only on a real stop: a rebuild keeps the same process and the same
+		// claim, so releasing there would invite a straggler clone to take the
+		// name from a still-running agent.
+		if closeIntent == teardownShutdown {
+			releaseLeaseName(a, nc)
+		}
 		// nc.mu-touching cleanups first (subscription teardown before the close), all inside the
 		// same budget — see addBoundedCleanup.
 		for _, fn := range cleanups {
@@ -235,13 +254,14 @@ func (a *Agent) finalizeConn(parent context.Context, nc *nats.Conn, tracker *con
 	// we are deliberately NOT pretending otherwise — the process is about to be replaced or exit.
 	// Parent shutdown wins over an earlier redial callback's rebuild request: otherwise a
 	// systemctl stop racing this 20s ladder can self-exec and resurrect the daemon it is stopping.
-	if intent == teardownRebuild && parent != nil && parent.Err() != nil {
-		intent = teardownShutdown
+	escalationIntent := intent
+	if escalationIntent == teardownRebuild && parent != nil && parent.Err() != nil {
+		escalationIntent = teardownShutdown
 	}
 	a.cfg.Logger.Error("agent: NATS teardown WEDGED past its budget and poison grace; escalating",
 		"close_budget", closeBudget.String(), "poison_grace", poisonGrace.String(),
-		"intent", intentName(intent))
-	a.escalateWedgedTeardown(intent)
+		"intent", intentName(escalationIntent))
+	a.escalateWedgedTeardown(escalationIntent)
 }
 
 func intentName(i teardownIntent) string {

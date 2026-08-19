@@ -527,7 +527,7 @@ func (a *Agent) pubTransferEv(nc *nats.Conn, kind, verb string, req *proto.PushP
 		Tier: tier, Bucket: req.Bucket, Path: req.Path,
 		Bytes: bytes, DurationMs: dur.Milliseconds(),
 	})
-	subj := proto.SubjEvTransfer(a.cfg.SID, a.cfg.NID, req.TransferID, kind)
+	subj := proto.SubjEvTransfer(a.cfg.SID, nidOf(a), req.TransferID, kind)
 	if err := nc.Publish(subj, payload); err != nil {
 		a.cfg.Logger.Warn("agent: ev.transfer pub", "err", err, "subj", subj)
 	}
@@ -547,7 +547,7 @@ func (a *Agent) pubTransferEvFailed(nc *nats.Conn, verb string, req *proto.PushP
 		Tier: tier, Bucket: req.Bucket, Path: req.Path,
 		Code: code, Error: errMsg, DurationMs: dur.Milliseconds(),
 	})
-	subj := proto.SubjEvTransfer(a.cfg.SID, a.cfg.NID, req.TransferID, "failed")
+	subj := proto.SubjEvTransfer(a.cfg.SID, nidOf(a), req.TransferID, "failed")
 	if err := nc.Publish(subj, payload); err != nil {
 		a.cfg.Logger.Warn("agent: ev.transfer failed pub", "err", err, "subj", subj)
 	}

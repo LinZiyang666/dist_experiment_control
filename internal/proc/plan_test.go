@@ -102,6 +102,45 @@ func TestPlanGCExitedSelectsExitedOnly(t *testing.T) {
 	}
 }
 
+func TestPlanRefileStatementsMoveOnlyRunningRowsDeterministically(t *testing.T) {
+	db := gcTestDB(t)
+	if _, err := db.Exec(`INSERT INTO nodes(sid,nid,status) VALUES('s1','n2','ONLINE')`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	seedGCProc(t, db, "p-b", "RUNNING", now, nil)
+	seedGCProc(t, db, "p-a", "RUNNING", now, nil)
+	seedGCProc(t, db, "p-exited", "EXITED", now, now)
+
+	stmts, err := PlanRefileStatements("s1", "n1", "n2", []string{"p-b", "p-a", "p-b", "p-exited"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stmts) != 3 || !strings.Contains(stmts[0].SQL, "'p-a'") ||
+		!strings.Contains(stmts[1].SQL, "'p-b'") {
+		t.Fatalf("refile statements are not deduplicated and pid-sorted: %+v", stmts)
+	}
+	if err := cluster.ExecCommand(db, cluster.NewCommand(cluster.OpNodeRegister, stmts...)); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []string{"p-a", "p-b"} {
+		var nid string
+		if err := db.QueryRow(`SELECT nid FROM processes WHERE pid=?`, pid).Scan(&nid); err != nil {
+			t.Fatal(err)
+		}
+		if nid != "n2" {
+			t.Fatalf("running row %s stayed under %s", pid, nid)
+		}
+	}
+	var exitedNID string
+	if err := db.QueryRow(`SELECT nid FROM processes WHERE pid='p-exited'`).Scan(&exitedNID); err != nil {
+		t.Fatal(err)
+	}
+	if exitedNID != "n1" {
+		t.Fatalf("terminal history was refiled from n1 to %s", exitedNID)
+	}
+}
+
 // TestPlanGCExitedLegacyLocalZoneText documents the BOUNDED best-effort
 // contract for pre-h1 heterogeneous ended_at text (plan critique-1): a legacy
 // G.1 row baked with a raw local-zone String() ("… +0800 CST m=+…") compares

@@ -149,6 +149,9 @@ func toSSKeys(keys []proto.ProxyKey) []ssproxy.Key {
 // the agent run context (anchors the SS server lifetime). nc is used to ACK
 // readiness. A nil directive means "ensure proxy off".
 func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto.ProxyDirective) {
+	if leasedInstanceRefusesProxy(a, d) {
+		return
+	}
 	p := a.ensureProxyRuntime()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -618,7 +621,7 @@ func (a *Agent) pubProxyReady(nc *nats.Conn, ready bool) {
 	if ready {
 		kind = "ready"
 	}
-	_ = nc.Publish(proto.SubjEvNodeProxyReady(a.cfg.SID, a.cfg.NID, kind), nil)
+	_ = nc.Publish(proto.SubjEvNodeProxyReady(a.cfg.SID, nidOf(a), kind), nil)
 }
 
 // handleProxyKeysForwarded applies one live keyset push. seq is the arrival
@@ -682,6 +685,67 @@ func (a *Agent) onNATSReconnect(nc *nats.Conn) {
 		a.cfg.Logger.Warn("agent: re-register on reconnect failed", "err", err)
 		return
 	}
+	// A CONTESTED reply is NOT a successful register, and this is the second of
+	// the agent's two register sites — the one that runs on every nats.go
+	// reconnect. Treating it as success here would be worse than missing the
+	// rename: the reply carries no AcceptedProcesses, so courier.onRegisterSuccess
+	// would settle every pending proc exit as delivered, and applyReconciliation
+	// would act on empty directive arrays. Hand it to the rebuild path instead
+	// and return without touching anything.
+	if lease := resp.Lease; lease != nil {
+		if acceptableLeaseName(a, lease.AssignedNID) {
+			requestLeaseRebuild(a, lease.AssignedNID)
+			return
+		}
+		// A REFUSAL MUST STILL RETIRE THIS CONNECTION. external review F3.
+		//
+		// Logging and returning was the worst of both worlds. nats.go replays
+		// every subscription BEFORE it invokes this handler, so by the time the
+		// verdict arrives this process is ALREADY subscribed to the incumbent's
+		// forwarded subject — and the broker deliberately did not register it,
+		// did not reconcile it, and gave it no ownership. It sits there
+		// consuming the incumbent's exec/run/expose/upgrade traffic: the double
+		// execution this whole increment exists to remove, reached by the one
+		// path where the agent was told in so many words that the name is not
+		// its own.
+		//
+		// So tear the session down. requestLeaseRebuild with an EMPTY name is
+		// the "drop the connection and re-compete for the configured name"
+		// signal — the same machinery as an accepted rename, minus the rename.
+		// The Run loop's backoff bounds how fast that re-competition can spin.
+		refusals, wait, giveUp := recordLeaseRefusal(a)
+		a.cfg.Logger.Warn("agent: refused an unusable lease verdict; retiring this session so the "+
+			"replayed subscriptions cannot keep serving a name this process does not hold",
+			"sid", a.cfg.SID, "configured_nid", a.cfg.NID, "offered_nid", lease.AssignedNID,
+			"consecutive_refusals", refusals, "backoff", wait.String(), "giving_up", giveUp)
+		if giveUp {
+			// SAY WHAT THE OPERATOR HAS TO DO. Only capacity clears this: another
+			// instance exiting, or MaxInstancesPerBasename raised on the broker.
+			a.cfg.Logger.Error("agent: giving up on competing for a name — every verdict so far has "+
+				"been unusable, which means the suffix space for this credential is full. This "+
+				"instance stays running but will NOT appear in `node ls`. Free an instance, or "+
+				"raise the broker's max instances per basename, then restart this agent.",
+				"sid", a.cfg.SID, "configured_nid", a.cfg.NID, "refusals", refusals)
+		}
+		// RETIRE FIRST, WAIT AFTERWARDS — including on the give-up path.
+		//
+		// external review F3, and the ordering matters more than the waiting.
+		// nats.go replayed this connection's subscriptions before invoking the
+		// handler, so right now this process is subscribed to a forwarded
+		// subject the broker has just told it it does not own. Sleeping before
+		// the teardown leaves that subscription serving the incumbent's traffic
+		// for the whole backoff, and "give up" without a teardown leaves it
+		// there FOREVER — the unbounded form of the very defect F3 is about.
+		//
+		// So the retirement is unconditional and immediate. The backoff is
+		// carried on the agent and spent by the Run loop before it dials again
+		// (see leaseRefusalWait), which is where "re-compete more slowly"
+		// actually belongs.
+		requestLeaseRebuild(a, "")
+		return
+	}
+	// A real register means a name was granted: the refusal streak is over.
+	resetLeaseRefusals(a)
 	a.courier.onRegisterSuccess(resp)
 	a.applyReconciliation(ctx, resp)
 	// #78: a fresh NATS session invalidates the dial-failure run — the old

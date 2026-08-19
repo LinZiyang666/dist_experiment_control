@@ -57,9 +57,39 @@ main-noncli-code-lines cmd/tether 1200
 # no earlier value to compare against. Values are code lines rounded DOWN to 2000 so ordinary commits are
 # invisible and only crossing a boundary is an event. -update-structural-budget refuses to admit a new
 # over-budget entity on its own (see GI-4), which is why these were typed here by hand.
+#
+# RAISED ONCE by the cloned-credential-instance increment, DELIBERATELY and with
+# a repayment plan. external review F16 was right that the raise landed with no
+# explanation at all, which is exactly the failure mode this ratchet exists to
+# prevent: the friction IS the gate, and a silent bump spends it for nothing.
+#
+# internal/broker 14000 -> 16000: lease adjudication and holder lifecycle
+# (adjudicateLease, leaseProbe/probeCache, assignLeaseName, the farewell arm).
+# Written as package-level functions taking *Broker so the type-methods
+# dimension stayed put — which keeps the TYPE small but not the PACKAGE, and is
+# precisely the blind spot this fourth dimension was added to cover.
+#
+# internal/agent 4000 -> 6000: instance.go (identity lineage, lease
+# adoption/refusal, claim-probe, farewell) plus the external review's F3/F17
+# work — retiring a session on an unusable verdict, and the bounded backoff and
+# terminal state that stop a refused instance re-competing at connect speed. It
+# reaches into Agent's private state (routingNID, leaseAdoptions, stateStore,
+# the expose adapter), so extracting it today means exporting that state —
+# trading a size ratchet for a wider API surface, which is the worse debt.
+#
+# (This entry moved twice during review: it crossed the boundary, came back when
+# F7 removed the boot-shim takeover and its id memo, and crossed again with the
+# refusal backoff. Both moves went through this file by hand, which is the
+# ratchet working rather than the ratchet being edited around.)
+#
+# DEBT CEILING AND REPAYMENT: neither entry may rise again for this feature. The repayment is a genuine `internal/lease` package owning
+# adjudication + holder lifecycle on BOTH sides, which becomes tractable once
+# the agent-side state it needs is behind an interface. Booked as a follow-up
+# leaf, not as "someday": the next increment that touches lease adjudication
+# does it first.
 pkg-code-lines cmd/tether 10000
-pkg-code-lines internal/agent 4000
-pkg-code-lines internal/broker 14000
+pkg-code-lines internal/agent 6000
+pkg-code-lines internal/broker 16000
 pkg-code-lines internal/cluster 2000
 pkg-code-lines internal/clusteroffline 2000
 pkg-files cmd/tether 56

@@ -15,6 +15,10 @@ net_name()  { printf 'sim-%s' "$INSTANCE"; }
 ctr_name()  { printf 'sim-%s-%s' "$INSTANCE" "$1"; }
 vol_etc()   { printf 'sim-%s-%s-etc' "$INSTANCE" "$1"; }
 vol_lib()   { printf 'sim-%s-%s-lib' "$INSTANCE" "$1"; }
+# vol_shared_home is ONE volume for the whole instance, mounted as
+# /home/sim on every agent when `up --shared-agent-home` is given. See
+# run_node's --sim-shared-home.
+vol_shared_home() { printf 'sim-%s-sharedhome' "$INSTANCE"; }
 
 ensure_net() {
     assert_host_dns_says_no
@@ -86,11 +90,29 @@ run_node() {
         _rn_lib_mount=$2
         shift 2
     fi
+    # --sim-shared-home <volname>: mount ONE named volume as /home/sim on
+    # several containers at once, so two agents genuinely see the same home,
+    # including both .tether state and .local/bin/tether.
+    #
+    # This is the reference deployment's shape, not a convenience: on the live
+    # fleet ~/.tether turned out to be an NFS mount shared by the instances of a
+    # cloned image, so state.json and the upgrade marker are ONE file two
+    # processes write. A drill that copies a home directory into separate storage
+    # (drill 83's tar) reproduces the credentials but not that sharing, and the
+    # sharing is where the interesting failures live. (external review F14)
+    _rn_shared_home=""
+    if [ "${1:-}" = "--sim-shared-home" ]; then
+        _rn_shared_home=$2
+        shift 2
+    fi
     ensure_net
     if [ -n "$_rn_lib_mount" ]; then
         set -- --tmpfs "/var/lib/tether:size=$_rn_lib_mount" "$@"
     else
         set -- -v "$(vol_lib "$_rn_node"):/var/lib/tether" "$@"
+    fi
+    if [ -n "$_rn_shared_home" ]; then
+        set -- -v "${_rn_shared_home}:/home/sim" "$@"
     fi
     run d run -d \
         --name "$(ctr_name "$_rn_node")" --hostname "$_rn_node" \

@@ -374,8 +374,25 @@ ctl <subcommand> <node> [args...]
 
 ### 7.5 Node 命名规则
 
-- agent 启动时自报（CLI flag 或 YAML 配置）。
-- 在 **本 session 内唯一**；冲突时 controllerd 拒绝注册。
+- agent 启动时自报 basename（CLI flag 或 YAML 配置）。
+- **nid 是本 session 内的一个「槽位」名，槽位的占用是一份租约，不是排他的注册。**
+  历史上本节写作「在本 session 内唯一；冲突时 controllerd 拒绝注册」——
+  **那个拒绝从未被任何代码实现**（`node.Register` 一直是 UPSERT），
+  并且在同凭证镜像被多份启动的场景下它也不该被实现：持有凭证的 agent 就是合法 agent，
+  应当能进入车队（见 §9.3 的凭证模型）。
+- **同一时刻一个槽位只有一个持有者。** 当同凭证的多个实例并存时：
+  先到者持有 basename，其余各获得一个 `<basename>-NN`（零填充两位）的**租约名**。
+  租约名是普通的合法 nid，**寻址方式**与任何一台设备相同（exec / run / ps / expose /
+  transfer / 事件均照常）。**但它不是一台设备**，以下差别是设计的一部分而非缺陷，
+  且必须对使用者可见（外审 F13：此处原写「完全相同」，与实现不符）：
+  名字随重启变动、不参与 proxy、不能使用远程 `node upgrade`（含 basename 与租约名；必须重建共享镜像）、不保留跨重启的 expose、
+  不能用 `admin evict` 撤销（它没有自己的凭证）、原名空出后不会自动提升。
+  完整的运维对照表见 `docs/usage.md` 的克隆凭证 FAQ。
+- **租约名从不持久化**：agent 永远以 agent.yaml 的 basename 启动，
+  因此任何被后缀的实例在下次重启时都会重新竞争 basename（自愈）。
+- **真实身份是每「进程运行」一个的 instance id**，由 agent 用 `crypto/rand` 生成、
+  绝不落盘、绝不派生自任何机器信息（machine-id / DMI / MAC / boot_id / IP / hostname 一概不读）。
+  它只用于 broker 区分实例与裁决租约，**不是隔离边界，也不是身份认证**。
 - 一期不支持改名（如需改，先 `kick` 再重新注册）。
 
 ### 7.6 NATS 主题规划（待架构文档细化）

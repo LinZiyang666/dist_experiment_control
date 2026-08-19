@@ -65,11 +65,17 @@ func TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses(t *testing.T) {
 	}
 	defer nc.Close()
 
-	got, err := listOnlineNIDs(context.Background(), nc, "lab", pub)
+	got, skippedLeased, err := listOnlineNIDs(context.Background(), nc, "lab", pub)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0] != "lab-1" {
 		t.Fatalf("upgrade --all should include ONLINE nodes even before any process has run; got %v", got)
+	}
+	// origin: docs/reviews/cloned-credential-instances-plan.md Q4 — a plain
+	// basename must never be counted as an excluded lease, or a single-agent
+	// fleet would print a spurious "skipping N instances" line.
+	if skippedLeased != 0 {
+		t.Fatalf("a non-leased node must not be reported as skipped; got %d", skippedLeased)
 	}
 }

@@ -309,6 +309,58 @@ type procRec struct {
 type Agent struct {
 	cfg Config
 
+	// instanceID identifies THIS RUN of the agent process (see instance.go).
+	// Immutable for the process; carried across syscall.Exec through the
+	// environment so an upgrade does not read as a new instance.
+	instanceID string
+
+	// routingNID is the name this agent currently registers, subscribes and
+	// publishes under. It starts as cfg.NID (the agent.yaml basename) and
+	// changes only when the broker assigns a lease because another live
+	// instance already holds the basename.
+	//
+	// THE NAME IS IMMUTABLE FOR THE LIFETIME OF A *nats.Conn. nats.go is
+	// configured with MaxReconnects(-1), so it replays subscriptions on their
+	// ORIGINAL subjects and re-sends the stored CONNECT name on every
+	// reconnect — an in-place rename would therefore revert silently on the
+	// first network blip, leaving the agent publishing under one name and
+	// subscribed under another. A name change is expressible ONLY as a full
+	// session rebuild, which is why adoption returns rebuild=true rather than
+	// mutating anything live. It is an atomic.Pointer rather than a plain
+	// field because it is read from several goroutines between sessions.
+	routingNID atomic.Pointer[string]
+
+	// leaseAdoptions bounds how many times this process will accept a new
+	// routing name. Each adoption rebuilds the session, so an unbounded count
+	// lets a flapping broker spin the loop at hundreds of rebuilds per second.
+	leaseAdoptions atomic.Int32
+
+	// leaseRefusals counts consecutive verdicts this process could not use — an
+	// empty assignment (the suffix space is full) or a name outside its own
+	// family. Each one retires the session, so without a bound the agent
+	// re-competes as fast as it can connect. See leaseRefusalBackoff.
+	leaseRefusals atomic.Int32
+
+	// leaseRefusalUntil is the instant before which this process must not dial
+	// again after an unusable lease verdict, as UnixNano. Set by the refusal
+	// path AFTER it has already retired the session, and spent by the Run loop:
+	// retirement is immediate, re-competition is what backs off. See
+	// leaseRefusalBackoff.
+	leaseRefusalUntil atomic.Int64
+
+	// leaseRefusalTerminal stops the session loop after the refusal budget is
+	// exhausted. The process remains alive for diagnosis, but does not keep
+	// reconnecting after announcing that a restart or more suffix capacity is
+	// required.
+	leaseRefusalTerminal atomic.Bool
+
+	// previousNID carries the name this agent registered under just before
+	// adopting a lease, for exactly ONE register. The broker needs it to
+	// recognise the agent's own running processes, whose rows are filed under
+	// the old name — without it they arrive as orphans and it orders them
+	// killed. Consumed (swapped to nil) when the register payload is built.
+	previousNID atomic.Pointer[string]
+
 	// procs tracks live `tether run` PTY sessions by pid. Used by the
 	// kill verb to look up the right session to signal AND by the
 	// register snapshot to report (PID, started_at, start_time_ticks)
@@ -660,8 +712,19 @@ func New(cfg Config) (*Agent, error) {
 	if bootProofID == "" {
 		bootProofID = currentUpgradeBootProof()
 	}
+	// Mint (or adopt, across a re-exec) this process run's instance id. A
+	// failure here is not fatal: an empty id simply means the broker treats
+	// this agent exactly as a pre-feature one, which is today's behaviour. An
+	// agent that refused to start because a random source hiccuped would be a
+	// strictly worse outcome than one that runs without lease arbitration.
+	instanceID, err := mintInstanceID()
+	if err != nil {
+		cfg.Logger.Warn("agent: could not mint an instance id; lease arbitration disabled for this run", "err", err)
+		instanceID = ""
+	}
 	a := &Agent{
 		cfg:                      cfg,
+		instanceID:               instanceID,
 		upgradeBootProofID:       bootProofID,
 		procs:                    map[string]*procRec{},
 		execChildren:             map[string]*os.Process{},
@@ -734,6 +797,28 @@ func New(cfg Config) (*Agent, error) {
 	if setter, ok := cfg.ExposeAdapter.(sessionStateHookSetter); ok {
 		setter.SetSessionStateHook(a.onTunnelSessionState)
 	}
+	// Restore a lease name adopted before a re-exec. `node upgrade` replaces
+	// the process image in place, so an instance that was already running under
+	// an assigned name must come back under that same name rather than
+	// re-contesting for its basename — otherwise every upgrade of a leased
+	// instance would shuffle names.
+	// The restored name must be a lease OF THIS AGENT'S OWN BASENAME. The
+	// variable exists for exactly one purpose — carry a name this process
+	// already adopted across its own re-exec — so the only legal values are the
+	// basename and `<basename>-NN`. Accepting any nid-shaped string would let a
+	// stray environment variable move an agent onto an unrelated device's name.
+	restored := strings.TrimSpace(os.Getenv(routingNIDEnv))
+	// Consumed for the same reason as the instance id: a managed child must not
+	// inherit it. See mintInstanceID.
+	_ = os.Unsetenv(routingNIDEnv)
+	if restored != "" && acceptableLeaseName(a, restored) {
+		// RESUME, not adopt: this lineage already held the name before the
+		// re-exec, so there is no rename here and nothing to carry across one.
+		// See resumeRoutingNID for what adopting would have claimed and whose
+		// processes it would have closed.
+		resumeRoutingNID(a, restored)
+	}
+	setExecLineage(a.instanceID, nidOf(a))
 	return a, nil
 }
 
@@ -796,6 +881,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 		if !rebuild || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Spend any backoff owed for an unusable lease verdict BEFORE dialling
+		// again. The session that met the verdict is already gone by now — the
+		// refusal path retires immediately — so this delays only the
+		// re-competition, which is the part that could otherwise spin at connect
+		// speed across every clone in an image. (external review F3/F17)
+		if !awaitLeaseRefusalBackoff(ctx, a) {
 			return ctx.Err()
 		}
 		a.cfg.Logger.Info("agent: rebuilding NATS session on the freshest roster")
@@ -898,6 +991,14 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 		cancelRun()
 		return false, err
 	}
+	// A lease verdict terminates this register; the reasoning lives with the
+	// code, on applyLeaseVerdict. Position matters here: returning BEFORE the
+	// subscribe below is what stops a refused instance ever installing a
+	// subscription on the contested name.
+	if applyLeaseVerdict(a, resp.Lease) {
+		cancelRun()
+		return true, nil
+	}
 	// h1 C4: the register reply settles the courier's replay channel (pending
 	// exits ride the snapshot; clearance per onRegisterSuccess's rules).
 	a.courier.onRegisterSuccess(resp)
@@ -925,7 +1026,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	subFwd, err := nc.Subscribe(
 		// Wildcard over verbs; derive the subject from the SSOT builder so the
 		// version prefix is never hardcoded (tether.v2.* after the D0 flip).
-		proto.SubjCmdForwarded(a.cfg.SID, a.cfg.NID, "*"),
+		proto.SubjCmdForwarded(a.cfg.SID, nidOf(a), "*"),
 		func(msg *nats.Msg) {
 			// round-2 F4: count the callback from the moment it STARTS, before
 			// dispatchForwarded — so a callback preempted before it spawns a
@@ -1023,12 +1124,9 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// just told us to drop.
 	a.applyReconciliation(runCtx, resp)
 
-	// Re-establish reverse-TCP proxies for any port_tokens still in
-	// state.json (architecture F.6: agent restart → tunnel client
-	// rebuilds proxies from state.json + presents token; broker
-	// reconciles via the token_hash already in port_allocations).
-	// No-op when state store or adapter is absent.
-	a.replayPortsFromState()
+	// Re-establish reverse-TCP proxies from state.json (architecture F.6), with
+	// the cloned-credential lease gate; the reasoning lives on the function.
+	replayPortsUnlessLeased(a)
 
 	// P13: converge the embedded SS proxy to the broker's directive (nil
 	// when the session's proxy switch is off → ensures it's torn down).
@@ -1111,25 +1209,45 @@ const agentProxyDialTimeout = 10 * time.Second
 // Backoff reuses the same RegisterRetry knobs as register-retry — a single
 // pair of dials governs all transient-NATS-interaction backoff in v1.
 func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
-	connOpts := a.buildConnOptions()
-	// Proxy-aware dial. Injected here (the single connect call site) rather than
-	// in buildConnOptions, which has two returns and no merge point — so both
-	// the anonymous and nkey branches are covered. No-op when no proxy env set.
-	popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
+	// buildOpts is a CLOSURE rather than a value computed once, because the
+	// CONNECT name is baked into these options (nats.Name(cli.AgentName(sid,
+	// nidOf(a)))) and the routing name can change mid-loop: an auth denial under
+	// an assigned lease name drops the lease and retries as the basename. With
+	// the options frozen above the loop, that retry would re-present the very
+	// name auth_callout just refused — the degrade would be inert and a broker
+	// rollback would still kill every leased agent.
+	buildOpts := func() ([]nats.Option, error) {
+		o := a.buildConnOptions()
+		// Proxy-aware dial. Injected here (the single connect call site) rather
+		// than in buildConnOptions, which has two returns and no merge point —
+		// so both the anonymous and nkey branches are covered. No-op when no
+		// proxy env set.
+		popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
+		if perr != nil {
+			return nil, perr
+		}
+		o = append(o, popts...)
+		// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
+		// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
+		// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
+		// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
+		o = append(o, a.trackerDialOption(ctx, o))
+		return o, nil
+	}
+	connOpts, perr := buildOpts()
 	if perr != nil {
 		return nil, perr
 	}
-	connOpts = append(connOpts, popts...)
-	// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
-	// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
-	// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
-	// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
-	connOpts = append(connOpts, a.trackerDialOption(ctx, connOpts))
 	// #48: a ONE-SHOT host to skip on the FIRST dial (the just-silent island broker). Consumed
 	// here so a later rebuild for an unrelated reason is unaffected; dropped after attempt 1 so a
 	// momentarily-unreachable survivor falls back to the full pool rather than locking out forever.
 	avoid := a.takeAvoidHost()
 	backoff := a.cfg.RegisterRetryInitial
+	// firstDeniedNID remembers the identity auth refused BEFORE any lease drop,
+	// so the terminal hint can name it. Without it the hint names the basename
+	// the retry fell back to, and an operator following its `admin evict`
+	// advice would delete the provisioning row a healthy incumbent depends on.
+	var firstDeniedNID string
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1156,6 +1274,41 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		// retry forever. Surface the message to the operator so they
 		// know what to fix instead of silently flapping.
 		if isAuthFailure(err) {
+			// A DENIAL UNDER AN ASSIGNED LEASE NAME IS RECOVERABLE — drop the
+			// lease and retry as the basename instead of dying.
+			//
+			// A lease name has no agent_provisioning row by design; only a
+			// broker carrying the suffix fallback admits it. So a rollback, or
+			// one un-upgraded member of the cluster-wide auth_callout queue
+			// group, denies it. Without this the agent would re-present the
+			// same rejected name forever, and because an auth denial is FATAL
+			// here, Run would return and the process would exit — turning a
+			// broker rollback into a fleet-wide agent kill instead of a
+			// degrade back to today's behaviour.
+			if nidOf(a) != a.cfg.NID {
+				denied := nidOf(a)
+				if firstDeniedNID == "" {
+					firstDeniedNID = denied
+				}
+				dropLease(a)
+				// REBUILD THE OPTIONS. The CONNECT name is baked into them, so
+				// without this the retry re-presents the name that was just
+				// refused and the degrade is inert.
+				if rebuilt, rerr := buildOpts(); rerr == nil {
+					connOpts = rebuilt
+				}
+				a.cfg.Logger.Warn("agent: auth denied under the assigned lease name; retrying as the configured basename",
+					"sid", a.cfg.SID, "denied_nid", denied, "basename", a.cfg.NID, "err", err)
+				continue
+			}
+			// Name the identity that was ACTUALLY refused. After a lease drop
+			// that is not necessarily cfg.NID, and the hint below tells the
+			// operator to `admin evict` it — evicting the basename would delete
+			// the provisioning row the healthy incumbent depends on.
+			deniedNID := firstDeniedNID
+			if deniedNID == "" {
+				deniedNID = nidOf(a)
+			}
 			return nil, fmt.Errorf("agent: NATS auth_callout rejected (%w)\n"+
 				"  the broker accepted the connection but its auth_callout said no. Likely:\n"+
 				"    - first run AND PIN is wrong       -> double-check --pin matches session pin\n"+
@@ -1166,7 +1319,7 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 				"      -> on broker host: `sudo tether admin sessions` to check\n"+
 				"    - your agent was evicted (see sys.events; check broker.err)\n"+
 				"  for the exact deny reason, ask the broker operator to grep /var/log/tether/broker.err for this nkey",
-				err, a.cfg.SID, a.cfg.NID)
+				err, a.cfg.SID, deniedNID)
 		}
 		a.cfg.Logger.Warn("agent: NATS connect failed; retrying",
 			"attempt", attempt, "err", err, "next_backoff", backoff)
@@ -1206,13 +1359,34 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 	req := proto.NodeRegisterReq{
 		ProtoVersion:   proto.ProtoVersion,
 		ReleaseVersion: proto.ReleaseVersion,
-		NID:            a.cfg.NID,
+		NID:            nidOf(a),
 		OS:             runtime.GOOS,
 		Arch:           runtime.GOARCH,
 		BootID:         readBootID(),
 		LocalProcesses: procs,
 		LocalPorts:     ports,
 		Capabilities:   []string{proto.CapProxyV1}, // P13: this build implements proxy-v1
+		// InstanceID identifies THIS process run so the broker can tell an
+		// incumbent reconnecting from a second process presenting the same
+		// baked credential. A non-empty value IS the capability advertisement —
+		// deliberately NOT a second Capabilities token, which would change the
+		// register body of every single-agent device for no benefit.
+		InstanceID: a.instanceID,
+		// LeasedNID tells the broker we are running under an assigned lease
+		// name rather than our configured basename; it folds into the existing
+		// nodes.proxy_capable expression so an ephemeral instance never holds a
+		// public egress port.
+		LeasedNID: nidOf(a) != a.cfg.NID,
+		// Consumed with Swap: it is only meaningful on the FIRST register after
+		// an adoption. Carrying it further would let a much later register claim
+		// processes under a name this agent no longer has any relationship to.
+		PreviousNID: previousNIDOnce(a),
+		// The root of this agent's credential family, stated rather than left to
+		// be parsed out of NID. Without it the broker folds a device the
+		// operator named `gpu-02` into the `gpu` family and offers its clone
+		// `gpu-03` — a name in a different family that this agent's binding does
+		// not cover. (external review F2)
+		ConfiguredNID: a.cfg.NID,
 		// D6 §6.5: self-report the DETERMINISTIC nats server_name we are connected
 		// to (NOT the volatile NUID) so the leader can bridge it to a home broker.
 		// "" on a single-node bus → inert. ConnectedServerName reflects the actual
@@ -1234,7 +1408,7 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 	if err != nil {
 		return proto.NodeRegisterResp{}, fmt.Errorf("agent: marshal register: %w", err)
 	}
-	subject := proto.SubjNodeRegister(a.cfg.SID, a.cfg.NID)
+	subject := proto.SubjNodeRegister(a.cfg.SID, nidOf(a))
 
 	backoff := a.cfg.RegisterRetryInitial
 	for attempt := 1; ; attempt++ {
@@ -1263,7 +1437,20 @@ func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegister
 				// promote a pending marker to committed / clear the terminal
 				// record this very register delivered. Mutex-racing the
 				// deadline watchdog — the loser of that race no-ops.
-				a.commitUpgradeAfterRegister(req.UpgradeState)
+				//
+				// A CONTESTED REPLY IS NOT A REGISTER. external review F4: it
+				// carries OK, but by construction it did NOT register — no
+				// registerNode, no reconcile, no AcceptedProcesses — it is a
+				// verdict telling this agent to come back under another name.
+				// Committing on it disarms the rollback watchdog before the
+				// agent has proved it can run: if the assigned name then fails
+				// to authenticate or rebuild, the node is permanently offline on
+				// a binary that was never health-checked, and `node upgrade`
+				// reported success. The real register under the assigned name is
+				// moments away and commits then.
+				if resp.Lease == nil {
+					a.commitUpgradeAfterRegister(req.UpgradeState)
+				}
 				return resp, nil
 			case resp.Code == proto.CodeLeaderUnavailable:
 				// audit M2 / write-forward F3: a leadership race (raft failover / election) is
@@ -1414,6 +1601,21 @@ func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
 	procs = append(procs, a.courier.pendingExitSnapshot()...)
 
 	var ports []proto.LocalPort
+	// AN INSTANCE RUNNING UNDER A LEASE OWNS NOTHING IN state.json.
+	//
+	// That file describes whoever holds the BASENAME. Its port tokens are valid
+	// bearer credentials for THAT node's allocations, so reporting them here as
+	// our own would make the broker compare them against a nid that never owned
+	// them, conclude they are stale, and answer with RevokePorts — which the
+	// agent applies by pruning state.json. On the reference deployment
+	// ~/.tether is a SHARED NFS mount (one inode, both instances), so that
+	// prune would delete the basename holder's LIVE port rows.
+	//
+	// Reporting an empty set is also the honest answer: a leased instance has
+	// no allocations until it exposes something under its own name.
+	if nidOf(a) != a.cfg.NID {
+		return procs, nil
+	}
 	if sf, ok := a.loadStateBounded("register snapshot"); ok {
 		ports = make([]proto.LocalPort, 0, len(sf.PortTokens)+1)
 		for _, p := range sf.PortTokens {
@@ -1779,7 +1981,7 @@ func (a *Agent) killOrphanProcess(ctx context.Context, pid string) {
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
-	subject := proto.SubjNodeHeartbeat(a.cfg.SID, a.cfg.NID)
+	subject := proto.SubjNodeHeartbeat(a.cfg.SID, nidOf(a))
 	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -1856,7 +2058,7 @@ func (a *Agent) buildConnOptions() []nats.Option {
 		// format, so a misconfigured prod broker (auth_callout ON,
 		// Identity nil) fails CONNECT immediately rather than landing
 		// on an unintended role.
-		opts = append(opts, nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, a.cfg.NID)))
+		opts = append(opts, nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, nidOf(a))))
 		return opts
 	}
 
@@ -1871,7 +2073,14 @@ func (a *Agent) buildConnOptions() []nats.Option {
 		return kp.Sign(nonce)
 	}
 	opts = append(opts,
-		nats.Name(cli.AgentName(a.cfg.SID, a.cfg.NID)),
+		// The CONNECT name carries the ROUTING name: auth_callout mints
+		// PermissionsForAgent from exactly this string, so an instance running
+		// under a lease must present the lease name or its JWT would grant the
+		// basename's subjects instead of its own. The three-field grammar is
+		// unchanged — a fourth segment would fold into parseRole's SplitN and
+		// be rejected by ValidateNID on any older broker, turning a rolling
+		// upgrade into a hard auth denial.
+		nats.Name(cli.AgentName(a.cfg.SID, nidOf(a))),
 		nats.Nkey(id.PublicKey, sigCB),
 	)
 	if a.cfg.PIN != "" {
