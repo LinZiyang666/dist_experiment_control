@@ -61,3 +61,47 @@
 ## 最终判定
 
 外审修复后的版本满足当前 requirements、集群兼容与 simcluster 验证契约，**Pass**。没有遗留重大问题需要阻断发布；上面列出的事项均是已披露的产品限制或后续工程建议。
+
+---
+
+# 主进程补做：X4 那条路径的 failover 守卫
+
+终审回复里我留了一条自陈的缺口：X4 改的那条路径（cluster 模式下 register 与进程行迁移的原子提交）
+**没有真实 leader failover 的测试覆盖**——我发现并修掉了它引入的 fleet 级回归，但那个修复本身
+只有编译和单元测试保证。缺口现已补上：`internal/broker/register_leadership_loss_test.go`。
+
+## 守卫怎么造这个场景
+
+不 mock。起一个真 raft 节点（bootstrap 成 leader），再给它 `AddVoter` 一个**不存在**的 peer——
+集群变成 2 节点、只有 1 个可达，于是它失去多数并下台。这是真实的失去 quorum，不是注入的错误值。
+
+断言的是**错误的类别**而非文本：`errors.Is(err, cluster.ErrForwardNotLeader)`，
+并额外断言原始 raft 错误没有泄漏上来。因为 agent 的 register 循环对这两类的反应是
+「重试」与「退出进程」——一次常规选举的代价差别是一个节点还是整个车队。
+
+**变异验证**：把 `proposeOrForward` 换回 X4 的裸 `Propose`，守卫立刻变红并打印
+`node is not the leader (*errors.errorString), which is NOT the retriable sentinel`。
+它确实抓得住那个回归。
+
+## 补测过程中发现的第二件事
+
+写 fixture 时 panic 在 `Forwarder.forward` 上——因为 leader 一旦下台，`registerNode`
+走的是 **forward 分支**。这说明 X4 丢掉的不只是错误映射：**裸 `Propose` 根本没有 forward 分支**，
+所以 leader 在 `isClusterFollower()` 与 `raft.Apply` 之间下台时，register 会直接失败，
+而不是被转交给新任 leader。恢复 `proposeOrForward` 同时修好了这两半，
+守卫现在接一个真实但无人应答的 forwarder，把「转发出去、拿不到答复、仍然返回可重试」这条路径也钉住。
+
+## 同轮补的第二个守卫
+
+`TestAdoptedProcessMovesRideTheRegisterCommand` 钉 X4 的另一半正确性：
+迁移语句必须与 identity 行**同乘一条 `OpNodeRegister`**（未升级的副本不认识别的 op），
+且语句顺序**确定**——raft 在每个副本上重放，靠 map 迭代顺序会让副本分叉。
+
+## 复跑
+
+```
+make test / e2e-parallel / lint / gates   全 rc=0
+drill lint                                rc=0
+drill 83  GREEN 16/16 · drill 84  GREEN 19/19
+新守卫 -race                              无 data race
+```
