@@ -68,7 +68,7 @@ func TestLeasedInstanceRefusesProxyDirectivesAndNeverTouchesTheSharedFootprint(t
 	clone.runCtx = context.Background()
 
 	// Exactly what a single-mode broker replies to this register today.
-	clone.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	clone.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14001, Token: "clone-token", Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 1, Epoch: 1,
 	})

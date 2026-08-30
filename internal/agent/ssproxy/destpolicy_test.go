@@ -34,7 +34,7 @@ func TestDestinationPolicyBlocksPrivateTargets(t *testing.T) {
 	}()
 
 	dialOnce := func(srv *Server) {
-		port, err := srv.Start(context.Background(), 0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
+		port, err := srv.Start(0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -106,7 +106,7 @@ func TestExternalReviewDestinationPolicyPinsValidatedDNSResult(t *testing.T) {
 
 	srv := New(nil)
 	srv.DenyPrivateDestinations()
-	port, err := srv.Start(context.Background(), 0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
+	port, err := srv.Start(0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +139,82 @@ func TestExternalReviewDestinationPolicyPinsValidatedDNSResult(t *testing.T) {
 	}
 }
 
+// origin: proxy-lifecycle external review F1
+// Stop is the server-lifetime boundary, so it must cancel a destination lookup that was
+// started by one of its handlers. Closing the accepted socket cannot interrupt net.LookupIP:
+// without an operation-scoped cancellation signal, Stop waits for the resolver's own timeout
+// while the agent holds proxyRuntime.mu.
+func TestStopCancelsInFlightDestinationResolution(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	oldResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+				return nil, context.Canceled
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	defer func() { net.DefaultResolver = oldResolver }()
+
+	srv := New(nil)
+	srv.DenyPrivateDestinations()
+	port, err := srv.Start(0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hs := encryptedTargetHandshake(
+		t,
+		"alice-psk",
+		net.JoinHostPort("resolver-stall.invalid", "443"),
+		bytes.Repeat([]byte{0x33}, saltSize),
+	)
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write(hs); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		srv.Stop()
+		t.Fatal("destination lookup did not start; test never reached the cancellation boundary")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+		close(release)
+	case <-time.After(500 * time.Millisecond):
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Stop remained stuck after the resolver fixture was released")
+		}
+		t.Fatal("Stop waited for an in-flight DNS lookup instead of cancelling it; in the agent this " +
+			"wait occurs under proxyRuntime.mu and can suppress heartbeats until the resolver times out")
+	}
+}
+
 func TestExternalReviewDestinationPolicyBlocksNonPublicRanges(t *testing.T) {
 	srv := New(nil)
 	srv.DenyPrivateDestinations()
@@ -155,7 +231,7 @@ func TestExternalReviewDestinationPolicyBlocksNonPublicRanges(t *testing.T) {
 		"5f00::1",                // SRv6 SID space.
 		"::ffff:169.254.169.254", // IPv4-mapped metadata address.
 	} {
-		if srv.destAllowed(host) {
+		if srv.destAllowed(context.Background(), host) {
 			t.Errorf("internet-only destination policy allowed non-public address %s", host)
 		}
 	}

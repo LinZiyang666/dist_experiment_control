@@ -2,7 +2,6 @@ package ssproxy
 
 import (
 	"bytes"
-	"context"
 	"net"
 	"strconv"
 	"testing"
@@ -31,7 +30,7 @@ func TestExternalReviewRejectsReplayedClientSalt(t *testing.T) {
 	}()
 
 	srv := New(nil)
-	port, err := srv.Start(context.Background(), 0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
+	port, err := srv.Start(0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
 	if err != nil {
 		t.Fatal(err)
 	}

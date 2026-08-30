@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"sync"
 	"testing"
 	"time"
@@ -32,7 +31,7 @@ func TestExternalReviewProxyWithoutTunnelDoesNotAckReady(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a.applyProxyDirective(context.Background(), nc, &proto.ProxyDirective{
+	a.applyProxyDirective(nc, &proto.ProxyDirective{
 		Enabled:    true,
 		PublicPort: 14000,
 		Token:      "token",

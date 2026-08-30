@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -41,7 +43,39 @@ type proxyRuntime struct {
 	// set, applyProxyDirective accepts an exact-equal full (token-bearing)
 	// directive — the authoritative reconnect resync — to rebuild, even though it
 	// isn't strictly newer. Cleared on any successful (re)build or disable.
+	//
+	// It is ALSO a fence on the proxy-lifecycle `refootprint` hatch, and that use is
+	// load-bearing. origin: proxy-lifecycle internal review MAJOR (security lane).
+	// refootprint rebuilds a non-serving runtime from its footprint at an equal pair
+	// WITHOUT requiring a token — which in the fail-closed state would re-open an exit
+	// that F7 says may only come back on a token-bearing authoritative directive. The
+	// only other thing standing in the way would be the footprint wipe, and that wipe is
+	// `_ = a.stateStore.SetProxy(nil)` with the error discarded: the same
+	// disk-write-as-a-fence hole ⚠R2 rejects. fail-closed does not set
+	// authoritativelyOff (it is a LOCAL decision, not the operator's), so that latch does
+	// not cover this path — this one does.
 	needsReestablish bool
+
+	// agentExiting (proxy-lifecycle) latches in stopProxyOnRunExit so a fail-closed timer
+	// that fires concurrently with agent shutdown cannot wipe the persisted footprint.
+	// time.Timer.Stop() does NOT join an AfterFunc that has already started running, so
+	// cancelFailClosed alone is not enough: failClosedFire could take p.mu after the exit
+	// teardown and run its clearPersist teardown, leaving the node with no footprint to
+	// bootstrap from on the next start.
+	agentExiting bool
+
+	// authoritativelyOff (proxy-lifecycle ⚠R2) latches when the BROKER told us to stop
+	// (the !d.Enabled arm), as opposed to a local fail-closed teardown. While set, the
+	// refootprint escape hatch below refuses to rebuild at an equal pair, so an exit the
+	// operator switched off can never be resurrected by a tokenless keyset push.
+	//
+	// It is IN MEMORY on purpose. The obvious fence — "an authoritative OFF wipes the
+	// persisted footprint, so there is nothing to bootstrap from" — rests on
+	// `_ = a.stateStore.SetProxy(nil)`, whose error is discarded, and on
+	// loadProxyStateSafe, which likewise swallows read errors. One failed disk write
+	// would turn that fence into a hole. A process restart needs no latch: there is no
+	// live SS server to resurrect, and the broker re-states the authoritative pair.
+	authoritativelyOff bool
 
 	// dial + lastFail (#78) are the FIRST-DIAL backoff for the proxy tunnel.
 	// The broker's heartbeat convergence loop re-pushes the directive every
@@ -64,6 +98,13 @@ type proxyRuntime struct {
 	// process, then at Debug — an old broker re-pushes every 5s and a 5s
 	// Info line would just move the flood from the broker's log to ours.
 	optOutAnnounced bool
+
+	// corpseWarnAnnounced (proxy-lifecycle) is the reap path's OWN once-then-Debug latch.
+	// It is deliberately NOT configWarnAnnounced: sharing that one-shot would let the
+	// "found stopped, rebuilding" line consume it and demote the "no persisted footprint"
+	// warning that follows when the rebuild cannot proceed — hiding the failure behind the
+	// announcement of the attempt. Cleared on a successful start, like its sibling.
+	corpseWarnAnnounced bool
 
 	// configWarnAnnounced (#78 review Mi3): the two config-wound arms of
 	// applyProxyDirective — a nil ExposeAdapter (`--tunnel-addr ""` debug
@@ -106,8 +147,21 @@ func (a *Agent) ensureProxyRuntime() *proxyRuntime {
 }
 
 // proxyGenEpoch returns the agent's last-applied (generation, epoch) ordering
-// pair, or (0,0) when not serving. Reported in the heartbeat so the broker can
-// detect a generation mismatch even at an equal epoch (round-4 F2).
+// pair, or (0,0) when there is no server at all. Reported in the heartbeat so the
+// broker can detect a generation mismatch even at an equal epoch (round-4 F2).
+//
+// This deliberately tests `p.srv == nil` and NOT servingLocked(), unlike proxyBound
+// right below it. The two answer different questions: this one is ORDERING ("which
+// directive pair did I last apply"), proxyBound is LIVENESS ("am I serving"). Making
+// a stopped-but-present server report (0,0) here would be actively harmful: the
+// broker only pushes an authoritative OFF to a node whose reported epoch is > 0
+// (repairProxy, internal/broker/proxy.go), so a corpse reporting (0,0) would never
+// receive the OFF — and the corpse reap runs on the directive path, so a node that
+// receives no directives never gets reaped either. That is a deadlock, and reporting
+// the true pair alongside ProxyBound=false is both honest and self-healing: the
+// broker sees "applied epoch N, not serving" and has every repair path available.
+//
+// origin: 2026-08-21 weilandserver incident (docs/reviews/proxy-lifecycle-plan.md ⚠R1).
 func (a *Agent) proxyGenEpoch() (gen, epoch int64) {
 	p := a.proxy
 	if p == nil {
@@ -121,16 +175,49 @@ func (a *Agent) proxyGenEpoch() (gen, epoch int64) {
 	return p.gen, p.epoch
 }
 
+// servingLocked reports whether this runtime has an SS server that can ACTUALLY serve.
+// Caller holds p.mu.
+//
+// origin: 2026-08-21 weilandserver incident (docs/reviews/proxy-lifecycle-plan.md). The
+// runtime used a bare `p.srv != nil` as its serving predicate, and a STOPPED server
+// satisfies it — which is how the node advertised a READY exit with no listener behind it
+// for 7h40m. A pointer answers "do I have one", never "does it work". Every site that asks
+// the SERVING question must use this; sites that ask the ORDERING question (which directive
+// pair did I last apply) must not — see proxyGenEpoch.
+func (p *proxyRuntime) servingLocked() bool {
+	return p.srv != nil && p.srv.Serving()
+}
+
 // proxyBound (C5) reports whether the embedded SS proxy is currently serving — the heartbeat's
 // ProxyBound flag, from which each cluster broker writes its own liveness proxy_ready (the cross-broker
 // convergence signal). False when proxy is off / not yet bound.
+//
+// SCOPE: this flag is read ONLY in cluster mode (internal/broker/broker.go gates the ProxyBound
+// branch on b.clusterMode and returns; single mode falls through to repairProxy, which never
+// looks at it). Making it honest therefore fixes the READY lie on CLUSTER brokers. On a SINGLE
+// broker, proxy_ready is driven entirely by the agent's own pubProxyReady calls.
+//
+// CORRECTION — origin: proxy-lifecycle EXTERNAL review F4. An earlier version of this comment
+// claimed single mode had its own exit edge, reasoning that "the broker still believes
+// ready=true, so repairProxy's !ready suppression does not fire, so the keyset push arrives".
+// That is WRONG, and it was my error, not the reviewers': repairProxy never reaches that
+// suppression guard, because the CONVERGENCE-FIRST arm above it returns as soon as
+// `on && ready && agentGen == brokerGen && agentEpoch == epoch` — which is exactly a corpse's
+// report (proxy_ready still true in the DB, and proxyGenEpoch reports the real pair while
+// p.srv is non-nil). Three internal-review lanes found this and I dismissed all three on the
+// strength of the misreading.
+//
+// What actually closes it now is reapProxyCorpseOnHeartbeat: the reap runs BEFORE the report,
+// so a corpse is nil'd and this heartbeat carries ProxyBound=false AND (0,0) — a combination
+// neither early return matches, so the repair push goes out. The edge exists in both modes; in
+// single mode it is the heartbeat that supplies it, not the directive path.
 func (a *Agent) proxyBound() bool {
 	p := a.proxy
 	if p == nil {
 		return false
 	}
 	p.mu.Lock()
-	srvUp := p.srv != nil
+	srvUp := p.servingLocked()
 	p.mu.Unlock()
 	// M2: bound == SS server up AND the reverse tunnel live. A pure tunnel drop (srv still up, home
 	// alive) must report unready so a cluster broker does NOT resurrect proxy_ready over a dead tunnel.
@@ -145,16 +232,26 @@ func toSSKeys(keys []proto.ProxyKey) []ssproxy.Key {
 	return out
 }
 
-// applyProxyDirective converges the local SS proxy to the directive. ctx is
-// the agent run context (anchors the SS server lifetime). nc is used to ACK
-// readiness. A nil directive means "ensure proxy off".
-func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto.ProxyDirective) {
+// applyProxyDirective converges the local SS proxy to the directive. nc is used
+// to ACK readiness. A nil directive means "ensure proxy off".
+//
+// It deliberately takes NO context. origin: 2026-08-21 weilandserver incident
+// (docs/reviews/proxy-lifecycle-plan.md). The parameter used to carry the session's
+// runCtx down into ssproxy.Server.Start, which made a control-plane session rebuild
+// silently kill the data plane; the SS server's lifetime is now owned exclusively by
+// Stop(). Do not reintroduce a ctx parameter here to "anchor" the server -- that is
+// the bug, not a convenience.
+func (a *Agent) applyProxyDirective(nc *nats.Conn, d *proto.ProxyDirective) {
 	if leasedInstanceRefusesProxy(a, d) {
 		return
 	}
 	p := a.ensureProxyRuntime()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if proxyRefusedDuringShutdown(a, p) {
+		return
+	}
 
 	// F4: a nil directive is the proxy-OFF *register* representation (kept nil
 	// for byte-identity). It carries no epoch and so cannot be ordered against
@@ -173,6 +270,12 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 		refuseProxyDirectiveOptedOut(a, nc, p, d)
 		return
 	}
+
+	// Reap a corpse BEFORE anything below reads p.srv, restoring the invariant the rest
+	// of this function was written against: `p.srv != nil` implies it can actually serve.
+	// Extracted (not inlined) to keep this dispatcher off the god-function detector, the
+	// same reason refuseProxyDirectiveOptedOut lives outside.
+	reapProxyCorpseLocked(a, p, nc)
 
 	// C5: the proxy HOME rides a SEPARATE epoch axis (d.Home.Epoch) from the keyset (d.Epoch). A
 	// home failover re-points the home WITHOUT bumping the keyset, so a rehome directive carries the
@@ -264,6 +367,20 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 	reestablish := p.needsReestablish && d.Enabled && d.Token != "" &&
 		d.Generation == p.gen && d.Epoch == p.epoch
 
+	// proxy-lifecycle: the same escape hatch for a runtime that stopped serving WITHOUT a
+	// fail-closed (the head reap above just cleared a corpse, or a start failed). The broker's
+	// steady-state push is keyset-only at the UNCHANGED pair, so without this the drop guard
+	// below would reject the very directive that could rebuild us and the node would stay dark
+	// until an operator ran a session-wide `proxy off/on`. That is exactly the 7h40m outage.
+	//
+	// Why this cannot resurrect a switched-off exit: it accepts ONLY the exact last-applied
+	// pair (never a lower one), requires d.Enabled, and is refused outright once
+	// authoritativelyOff is latched by an authoritative OFF. Unlike `reestablish` it does not
+	// require a token, because the whole point is that the broker is NOT minting one.
+	// Both latch terms are load-bearing fences, documented on their field declarations.
+	refootprint := d.Enabled && !p.authoritativelyOff && !p.needsReestablish && !p.servingLocked() &&
+		d.Generation == p.gen && d.Epoch == p.epoch
+
 	// Round-3 ordering: drop a directive that is NOT strictly newer than the
 	// last SUCCESSFULLY-applied (gen, epoch). This single check covers ALL
 	// sources — register reply, live push, heartbeat repair — so a stale
@@ -271,7 +388,7 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 	// generation restore (lower epoch) still converges. NOTE: the pair is
 	// recorded only on SUCCESS below, so a transient start failure does not
 	// advance it (the retry directive is still "newer" → F3 retry works).
-	if !reestablish && !portRebuild && !proxyNewer(d.Generation, d.Epoch, p.gen, p.epoch) {
+	if !reestablish && !portRebuild && !refootprint && !proxyNewer(d.Generation, d.Epoch, p.gen, p.epoch) {
 		a.cfg.Logger.Debug("agent: dropping stale proxy directive",
 			"dir_gen", d.Generation, "dir_epoch", d.Epoch, "applied_gen", p.gen, "applied_epoch", p.epoch)
 		return
@@ -282,6 +399,11 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 		p.gen = d.Generation
 		p.epoch = d.Epoch
 		p.needsReestablish = false
+		// proxy-lifecycle ⚠R2: latch the AUTHORITATIVE off. This is the arm that must
+		// fence the refootprint rebuild; a fail-closed teardown (failClosedFire) uses
+		// the same clearPersist=true teardown but is a LOCAL decision and deliberately
+		// does NOT latch here — it sets needsReestablish so the broker can rebuild it.
+		p.authoritativelyOff = true
 		return
 	}
 
@@ -292,40 +414,107 @@ func (a *Agent) applyProxyDirective(ctx context.Context, nc *nats.Conn, d *proto
 		// Full (re)establish: a fresh tunnel token was minted. Tear down any
 		// existing server/tunnel (without an unready flap) and rebuild.
 		a.proxyTeardownLocked(p, nc, false)
-		a.proxyStartLocked(ctx, nc, p, d.PublicPort, 0, d.Token, d.Generation, d.Epoch, keys, d.Home)
+		a.proxyStartLocked(nc, p, d.PublicPort, 0, d.Token, d.Generation, d.Epoch, keys, d.Home)
 
-	case p.srv == nil:
-		// Keyset-only push but no running server (e.g. fresh boot reconnect-
-		// keep, a sub change before the full directive, or a transient-start
-		// retry). Bootstrap from the persisted footprint if we have one;
-		// otherwise wait for a full directive.
-		ps := a.loadProxyStateSafe()
-		if ps == nil || ps.PublicPort == 0 || ps.Token == "" {
-			logConfigWarnOnce(a, p, "agent: proxy keyset push with no server and no persisted footprint; awaiting full directive")
-			return
-		}
-		// C5: prefer the directive's Home (has cert pins); else replay the persisted home (no pins →
-		// the dial defers until a register reply re-delivers them, like a clustered expose).
-		home := d.Home
-		if home == nil && ps.HomeBrokerAddr != "" {
-			home = &proto.HomeDirective{BrokerAddr: ps.HomeBrokerAddr, Epoch: ps.HomeEpoch}
-		}
-		a.proxyStartLocked(ctx, nc, p, ps.PublicPort, ps.LocalPort, ps.Token, d.Generation, d.Epoch, keys, home)
+	case !p.servingLocked():
+		// Keyset-only push but no LIVE server (fresh boot reconnect-keep, a sub change
+		// before the full directive, a transient-start retry, or a corpse the head reap
+		// above just cleared). Bootstrap from the persisted footprint.
+		bootstrapProxyFromFootprintLocked(a, p, nc, d, keys)
 
 	default:
-		// Running server: swap the key set and advance the applied pair.
-		if err := p.srv.SetKeys(keys); err != nil {
+		applyProxyKeysetLocked(a, p, nc, d, keys)
+	}
+}
+
+// reapProxyCorpseLocked (proxy-lifecycle) clears a runtime whose SS server exists but
+// can no longer serve, so the caller's next arm rebuilds it. Caller holds p.mu.
+//
+// origin: 2026-08-21 weilandserver incident. A session rebuild cancelled the ctx the SS
+// server was (wrongly) anchored to; the server latched closed while p.srv kept pointing
+// at it. Every subsequent keyset push took the "running server" arm, failed SetKeys, and
+// returned — 5416 times over 7.5 hours, with the broker advertising the node READY the
+// whole time. Everything needed to self-heal was already present (the persisted footprint
+// was intact, and the srv==nil arm knows how to bootstrap from it); the ONLY missing piece
+// was setting the dead pointer back to nil.
+//
+// This function is unconditional-on-CAUSE, but on its own it is not unconditional-on-EDGE: it
+// only runs when something calls it. Called from applyProxyDirective it covers every cause that
+// produces a directive; called from reapProxyCorpseOnHeartbeat it covers the rest (an accept
+// loop that died by itself produces no directive, and on a single broker none would ever come —
+// external review F4). An earlier version of this comment claimed cause-independence outright;
+// that over-claimed, because the edge was missing.
+//
+// clearPersist=false: the footprint is what the rebuild reads. Wiping it here would turn a
+// recoverable corpse into a permanently dark node, which is the failure this closes.
+func reapProxyCorpseLocked(a *Agent, p *proxyRuntime, nc *nats.Conn) {
+	if p.srv == nil || p.srv.Serving() {
+		return
+	}
+	// once-then-Debug, on its OWN latch. The broker re-pushes every ~5s, so a per-push WARN
+	// here would recreate the 5416-line flood this increment exists to end (#78 / #75
+	// disk-fill) — but sharing configWarnAnnounced with logConfigWarnOnce would let THIS
+	// message consume the one-shot and silently demote the "no persisted footprint" warning
+	// that fires immediately afterwards when the rebuild cannot proceed. The operator would
+	// then see "found stopped, rebuilding" and never the line saying it did not.
+	// origin: proxy-lifecycle internal review MAJOR (discipline lane).
+	if !p.corpseWarnAnnounced {
+		p.corpseWarnAnnounced = true
+		a.cfg.Logger.Warn("agent: embedded proxy server found stopped; rebuilding from persisted footprint")
+	} else {
+		a.cfg.Logger.Debug("agent: embedded proxy server found stopped; rebuilding from persisted footprint")
+	}
+	a.proxyTeardownLocked(p, nc, false)
+	a.pubProxyReady(nc, false)
+}
+
+// bootstrapProxyFromFootprintLocked (proxy-lifecycle) is the keyset-only arm: rebuild the SS
+// server + tunnel from the persisted footprint. Extracted from applyProxyDirective's switch so
+// the dispatcher stays under the god-function detector (same reason as
+// refuseProxyDirectiveOptedOut). Caller holds p.mu.
+func bootstrapProxyFromFootprintLocked(a *Agent, p *proxyRuntime, nc *nats.Conn, d *proto.ProxyDirective, keys []ssproxy.Key) {
+	ps := a.loadProxyStateSafe()
+	if ps == nil || ps.PublicPort == 0 || ps.Token == "" {
+		logConfigWarnOnce(a, p, "agent: proxy keyset push with no server and no persisted footprint; awaiting full directive")
+		return
+	}
+	// C5: prefer the directive's Home (has cert pins); else replay the persisted home (no pins →
+	// the dial defers until a register reply re-delivers them, like a clustered expose).
+	home := d.Home
+	if home == nil && ps.HomeBrokerAddr != "" {
+		home = &proto.HomeDirective{BrokerAddr: ps.HomeBrokerAddr, Epoch: ps.HomeEpoch}
+	}
+	a.proxyStartLocked(nc, p, ps.PublicPort, ps.LocalPort, ps.Token, d.Generation, d.Epoch, keys, home)
+}
+
+// applyProxyKeysetLocked (proxy-lifecycle) is the running-server arm: swap the key set and
+// advance the applied pair. Caller holds p.mu.
+//
+// A SetKeys failure is TERMINAL, not transient: ssproxy.Server is single-use, so ErrStopped
+// means "this object is spent" and no amount of re-pushing will make it take keys. The
+// pre-fix code logged a WARN and returned, which is what let a dead server sit in the runtime
+// forever. Reap and rebuild in the SAME call so the unready window is one push wide — long
+// enough to be honest, short enough not to accumulate the three consecutive unready
+// observations that trigger the cluster reaper's port-rotating rehome dwell.
+func applyProxyKeysetLocked(a *Agent, p *proxyRuntime, nc *nats.Conn, d *proto.ProxyDirective, keys []ssproxy.Key) {
+	if err := p.srv.SetKeys(keys); err != nil {
+		if !errors.Is(err, ssproxy.ErrStopped) {
+			// No non-ErrStopped error is reachable from SetKeys today; if one ever is, it is a
+			// new failure mode that must be understood before being auto-healed.
 			a.cfg.Logger.Warn("agent: proxy SetKeys", "err", err)
 			return
 		}
-		p.gen = d.Generation
-		p.epoch = d.Epoch
-		a.persistProxyEpochLocked(p)
-		// M3: re-ACK readiness — a node whose first ready publish was lost (or
-		// whose proxy_ready was cleared by an OFFLINE flap) is otherwise stuck
-		// out of /sub forever despite serving correctly.
-		a.pubProxyReady(nc, true)
+		reapProxyCorpseLocked(a, p, nc)
+		bootstrapProxyFromFootprintLocked(a, p, nc, d, keys)
+		return
 	}
+	p.gen = d.Generation
+	p.epoch = d.Epoch
+	a.persistProxyEpochLocked(p)
+	// M3: re-ACK readiness — a node whose first ready publish was lost (or
+	// whose proxy_ready was cleared by an OFFLINE flap) is otherwise stuck
+	// out of /sub forever despite serving correctly.
+	a.pubProxyReady(nc, true)
 }
 
 // refuseProxyDirectiveOptedOut (#78) is the opted-out arm of applyProxyDirective,
@@ -345,7 +534,7 @@ func refuseProxyDirectiveOptedOut(a *Agent, nc *nats.Conn, p *proxyRuntime, d *p
 	}
 }
 
-func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRuntime,
+func (a *Agent) proxyStartLocked(nc *nats.Conn, p *proxyRuntime,
 	publicPort, wantLocal int, token string, gen, epoch int64, keys []ssproxy.Key, home *proto.HomeDirective) {
 
 	homeAddr, homeEpoch := "", int64(0)
@@ -358,13 +547,21 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	// retry of the identity that just failed; anything the broker minted
 	// fresh (proxy off/on bumps epoch, a reaper rotation changes port+token,
 	// a rehome bumps homeEpoch) bypasses immediately, so no operator action
-	// ever waits out a backoff window. While held: no SS server, no dial, no
-	// ACK — the node simply stays unready until the next push after Due.
+	// ever waits out a backoff window. While held: no SS server and no dial. The
+	// node is ACKed UNREADY (proxy-lifecycle S7) rather than left silent — the
+	// previous wording promised "no ACK … the node simply stays unready", but
+	// nothing published that, so a stale ready could linger in the broker for the
+	// whole backoff window.
 	id := proxyDialID{gen: gen, epoch: epoch, port: publicPort, token: token, homeEpoch: homeEpoch}
 	now := proxyNow(a)
 	if p.dial != nil && id == p.lastFail && !p.dial.Due(now) {
 		a.cfg.Logger.Debug("agent: proxy dial backoff active; retry deferred",
 			"public_port", publicPort, "fails", p.dial.Fails())
+		// proxy-lifecycle: the comment above promises "the node simply stays unready",
+		// but nothing published that. Staying silent lets a stale ready linger in the
+		// broker for the whole backoff window — the same lie this increment closes
+		// elsewhere. pubProxyReady is cheap and idempotent.
+		a.pubProxyReady(nc, false)
 		return
 	}
 	if p.dial != nil && id != p.lastFail {
@@ -393,7 +590,28 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	if !a.cfg.ProxyAllowPrivateDestinations {
 		srv.DenyPrivateDestinations()
 	}
-	lp, err := srv.Start(ctx, wantLocal, keys)
+	lp, err := srv.Start(wantLocal, keys)
+	if err != nil && wantLocal != 0 && errors.Is(err, syscall.EADDRINUSE) {
+		// The persisted local port is taken — retry ONCE on an OS-chosen port.
+		//
+		// origin: proxy-lifecycle external review F3. The footprint replays the local port the
+		// SS listener happened to get last time, but that port is an implementation detail
+		// between the listener and the tunnel adapter: the PUBLIC port, the token and the home
+		// are all unchanged by picking a different one. Before this, a corpse whose old local
+		// port had been taken by anything else (including a predecessor that outlived the reap)
+		// failed to rebuild, went dark, and stayed dark — the retry then hit the #78 dial
+		// backoff and slowed down, so the only way out was the session-wide `proxy off/on`
+		// this whole increment exists to avoid.
+		//
+		// Deliberately NARROW: only when a specific port was requested, and only for
+		// EADDRINUSE. Any other listen error (EACCES, EMFILE, …) still fails closed — those
+		// are not fixed by choosing a different port, and papering over them would hide a real
+		// fault. Retrying on the SAME Server is safe: a failed Start leaves ln nil and closed
+		// false, so nothing was consumed by the attempt.
+		a.cfg.Logger.Warn("agent: persisted proxy local port in use; retrying on an OS-chosen port",
+			"wanted_local_port", wantLocal, "public_port", publicPort)
+		lp, err = srv.Start(0, keys)
+	}
 	if err != nil {
 		proxyDialFailedLocked(a, p, id, "ssproxy_start", err)
 		a.proxyFailCleanupLocked(p, nc)
@@ -439,6 +657,7 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	p.dial = nil
 	p.lastFail = proxyDialID{}
 	p.configWarnAnnounced = false // review Mi3: a healthy start re-arms the config-wound WARN
+	p.corpseWarnAnnounced = false // and the corpse-reap WARN, so a LATER corpse is announced again
 	p.srv = srv
 	p.publicPort = publicPort
 	p.localPort = lp
@@ -447,8 +666,9 @@ func (a *Agent) proxyStartLocked(ctx context.Context, nc *nats.Conn, p *proxyRun
 	p.epoch = epoch
 	p.homeAddr = homeAddr
 	p.homeEpoch = homeEpoch
-	p.needsReestablish = false  // rebuilt — clear the fail-closed resync flag (F7)
-	a.proxyTunnelUp.Store(true) // M2: tunnel just opened — ProxyBound now reflects a live tunnel
+	p.needsReestablish = false   // rebuilt — clear the fail-closed resync flag (F7)
+	p.authoritativelyOff = false // serving again under an authoritative ENABLE (proxy-lifecycle ⚠R2)
+	a.proxyTunnelUp.Store(true)  // M2: tunnel just opened — ProxyBound now reflects a live tunnel
 	a.pubProxyReady(nc, true)
 	a.cfg.Logger.Info("agent: proxy enabled", "public_port", publicPort, "local_port", lp, "keys", len(keys))
 }
@@ -635,17 +855,16 @@ func (a *Agent) handleProxyKeysForwarded(nc *nats.Conn, msg *nats.Msg, seq int64
 		a.cfg.Logger.Warn("agent: proxy-keys parse", "err", err)
 		return
 	}
-	ctx := a.loadRunCtx()
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// No ctx is fetched here any more: applyProxyDirective takes none, because the SS server's
+	// lifetime must not be bound to a session-scoped context (proxy-lifecycle; the 2026-08-21
+	// weilandserver incident). This function previously loaded runCtx purely to pass it down.
 	a.proxyApplyMu.Lock()
 	defer a.proxyApplyMu.Unlock()
 	if seq <= a.lastAppliedPushSeq {
 		return // an out-of-order goroutine for an older push; already superseded
 	}
 	a.lastAppliedPushSeq = seq
-	a.applyProxyDirective(ctx, nc, &d)
+	a.applyProxyDirective(nc, &d)
 }
 
 // proxyTokenName is the reserved state.json/port name for the proxy tunnel.
@@ -754,12 +973,20 @@ func (a *Agent) onNATSReconnect(nc *nats.Conn) {
 	// when nothing changed broker-side, which the identity gate would
 	// otherwise still be suppressing.
 	resetProxyDialBackoff(a)
-	a.applyProxyDirective(ctx, nc, resp.Proxy)
+	a.applyProxyDirective(nc, resp.Proxy)
 	// M3: re-ACK readiness if we are serving (covers a lost first ACK or a
 	// proxy_ready cleared while we were partitioned).
+	//
+	// This MUST use servingLocked, not `p.srv != nil`. origin: proxy-lifecycle internal
+	// review, MAJOR raised independently by four lanes — the first cut of this increment
+	// converted proxyBound and left this site on the pointer check, which is the SAME
+	// "READY lie" the whole increment exists to end, just on the reconnect path. It is
+	// reachable: applyProxyDirective returns EARLY without reaping when the directive is
+	// nil (the proxy-OFF register representation), so a corpse survives to this line and
+	// would be re-advertised as a live exit.
 	if p := a.proxy; p != nil {
 		p.mu.Lock()
-		serving := p.srv != nil
+		serving := p.servingLocked()
 		p.mu.Unlock()
 		if serving {
 			a.pubProxyReady(nc, true)
@@ -803,12 +1030,31 @@ func (a *Agent) failClosedFire() {
 	a.flcMu.Lock()
 	a.flcTimer = nil
 	a.flcMu.Unlock()
+	p := a.proxy
+	if p == nil {
+		return
+	}
+	// proxy-lifecycle: Timer.Stop() in cancelFailClosed does NOT join an AfterFunc that is
+	// already running, so this can reach here DURING agent shutdown and wipe the footprint the
+	// next start needs. stopProxyOnRunExit latches agentExiting under this same mutex.
+	//
+	// The check and the teardown MUST be one critical section. origin: proxy-lifecycle internal
+	// review, BLOCKER (concurrency + statemachine lanes, independently). The first cut of this
+	// read the latch under one p.mu acquisition, dropped the lock to log, then re-took it to tear
+	// down — so the ENTIRE exit path fit in the gap: the AfterFunc reads agentExiting==false,
+	// Run's defer latches it and tears down keeping the footprint, then the AfterFunc resumes and
+	// runs the clearPersist teardown anyway. That is precisely the window this latch exists to
+	// close, reintroduced by the shape of its own implementation. The log now happens under the
+	// lock, which is the price of atomicity here and is bounded (one Warn, no I/O on the hot path).
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.agentExiting {
+		return
+	}
 	a.cfg.Logger.Warn("agent: fail-closed — NATS partitioned past grace, stopping embedded proxy")
 	// Direct teardown (not via applyProxyDirective, whose nil path is now a
 	// no-op): stop SS, drop the tunnel, clear the footprint. A reconnect
 	// re-establishes from a fresh broker directive.
-	p := a.proxy
-	p.mu.Lock()
 	a.proxyTeardownLocked(p, nil, true)
 	// round-6 F7: this was a LOCAL fail-closed teardown, NOT an authoritative OFF.
 	// The applied (gen,epoch) is retained (so a stale lower enable still can't
@@ -816,5 +1062,75 @@ func (a *Agent) failClosedFire() {
 	// pair; mark that we need to accept that exact-equal full directive to rebuild
 	// (see applyProxyDirective), instead of dropping it as not-strictly-newer.
 	p.needsReestablish = true
-	p.mu.Unlock()
+}
+
+// stopProxyOnRunExit stops the embedded SS server when the agent itself exits.
+//
+// origin: 2026-08-21 weilandserver incident (docs/reviews/proxy-lifecycle-plan.md).
+// The SS server used to be anchored to the per-session runCtx, which meant agent exit
+// stopped it for free — and also meant every SESSION REBUILD stopped it, which is the
+// bug. Removing that anchor makes agent-exit teardown something we now have to say out
+// loud. This is the fourth and last member of the CLOSED set of things that may stop the
+// SS server; the other three are: an authoritative proxy OFF (the !d.Enabled arm of
+// applyProxyDirective), a fail-closed fire after ProxyFailClosedGrace (failClosedFire),
+// and a teardown-then-rebuild (the d.Token != "" arm). A session rebuild is deliberately
+// NOT on that list.
+//
+// clearPersist=false: an ordinary restart must still find its footprint and re-bootstrap.
+// nil nc: by the time Run's defers run the connection is drained, and publishing readiness
+// on a dead conn is pointless — proxyTeardownLocked tolerates a nil conn.
+func stopProxyOnRunExit(a *Agent) {
+	p := a.proxy
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.agentExiting = true
+	a.proxyTeardownLocked(p, nil, false)
+}
+
+// proxyRefusedDuringShutdown reports whether Run's exit teardown has already latched, in which
+// case no directive may build anything. Caller holds p.mu.
+//
+// origin: proxy-lifecycle internal review MAJOR (statemachine lane). Removing the SS server's
+// ctx anchor also removed the implicit "everything dies with the process context" cleanup, so a
+// directive still in flight when Run returns could start a server that NOTHING will ever stop:
+// the exit teardown has already run, and all four legitimate stoppers require a live agent.
+//
+// Extracted rather than inlined so applyProxyDirective stays off the god-function detector —
+// maintidx counts comment lines inside the body, and this explanation is the point.
+func proxyRefusedDuringShutdown(a *Agent, p *proxyRuntime) bool {
+	if !p.agentExiting {
+		return false
+	}
+	a.cfg.Logger.Debug("agent: ignoring proxy directive during shutdown")
+	return true
+}
+
+// reapProxyCorpseOnHeartbeat is the cause-INDEPENDENT recovery edge: it takes p.mu and reaps a
+// server that has stopped serving for ANY reason, not just the ones that happen to produce a
+// directive.
+//
+// origin: proxy-lifecycle external review F4. The directive-entry reap only fires when a
+// directive arrives, which ties recovery to the control plane having something to say. An
+// accept loop that exits on a non-temporary error produces no such event, and on a single
+// broker the heartbeat cannot supply one either while the node still reports itself converged.
+// Running the reap here breaks that: it publishes unready and nils p.srv, so the very next
+// heartbeat reports (0,0) + ProxyBound=false, which is a state neither of repairProxy's early
+// returns matches — the broker then pushes the keyset that rebuilds us.
+//
+// Cheap by construction: the common case is one mutex acquisition and one Serving() call, both
+// uncontended, once per heartbeat interval.
+func reapProxyCorpseOnHeartbeat(a *Agent, nc *nats.Conn) {
+	p := a.proxy
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.agentExiting {
+		return
+	}
+	reapProxyCorpseLocked(a, p, nc)
 }

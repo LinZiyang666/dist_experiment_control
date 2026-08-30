@@ -5,6 +5,7 @@
 > tether 操作细节请参考 `docs/usage.md`（使用者）、`docs/broker-ops.md`（broker 运维）、`docs/cluster.md`（集群 HA）。
 >
 > 更新记录：2026-08-13 增补 §2.5 weilandserver（自给自足 server+client 节点）与 §2.6 未配置节点。
+> 2026-08-20 weilandserver 获得**直连公网入口** `ziyanglin.com:23100-23199`（交换机 NAT），对外暴露的优先级规则见 §4.0，实测记录见 §2.5.1。
 
 ---
 
@@ -28,7 +29,8 @@
           │
           │                              +---------------------------------+
           └──────── policy 调用 ────────►| weilandserver (server + client) |
-                                         | NAT 后, 无公网 IP, 4090 48G     |
+                                         | ziyanglin.com:23100-23199 直连   |
+                                         | (交换机 NAT; 4090 48G)           |
                                          | 本机自带 LIBERO 模拟环境        |
                                          | → 可单机闭环, 见 §2.5           |
                                          +---------------------------------+
@@ -152,7 +154,7 @@ GPU 备注：8 张 GTX 1080 单卡仅 8 GiB 显存，**不适合**跑 pi0.5 推�
 | 项 | 值 |
 |---|---|
 | **角色** | server + client（两个角色都能担；本机闭环时 client → `127.0.0.1:<port>`） |
-| **公网 IP** | 无（NAT 后；LAN `192.168.0.200`）。对外服务一律 `tether expose`（现役 `wls-srv`→`:8000`、`wls-ssh`→`:22`） |
+| **公网 IP** | **有（2026-08-20 起）**：`ziyanglin.com` → `140.177.159.24`，交换机 NAT 转发 **TCP 23100-23199**，**1:1 映射**（公网 `:23150` → 本机 `:23150`）。LAN `192.168.0.200` / `192.168.20.200`。该段之外仍走 `tether expose`（现役 `wls-ssh`→`:22`）。详见 §2.5.1 |
 | **OS** | Ubuntu 24.04.4 LTS |
 | **CPU** | 2 × Intel Xeon E5-2696 v4 @ 2.20 GHz，2 socket × 22 core × 2 thread = **88 logical CPU** |
 | **内存** | **251 GiB** |
@@ -166,6 +168,26 @@ GPU 备注：8 张 GTX 1080 单卡仅 8 GiB 显存，**不适合**跑 pi0.5 推�
 | **conda** | `/home/weiland/miniconda3/bin/conda`（26.5.3） |
 | **tether agent** | 用户态进程 `tether agent --session lab --nid weilandserver`（非 systemd 服务） |
 | **tmux 会话前缀** | `srv0`, `srv1`, `srv2`, …（现役还有 `sml*` / `sm*` / `acts*` 系列 sidecar 会话，来自 ablation 实验） |
+
+**⚠ GPU 稳定性（2026-08-20 实测判定，必读）**：这张 48G 改装 4090 在**出厂功率/频率下不稳定**——gpu_burn 600s 判 `FAULTY`：冷卡拉满载后的 **28–62 s 爬坡窗口**内产生 4,069 万个**静默计算错误**（67–71 °C，非过热，零 Xid 零报错），窗口外干净。同一不稳定曾以 `Xid 31 MMU Fault @ 0x0` 形态三次打死推理 server（都在起流量后 ~3 min）。**缓解（已验证）**：
+
+**⚠ 已废弃的旧缓解**：降功率+锁频（`-pl 350` + `-lgc`）只能救稳态 GEMM，救不了推理负载（降压状态下推理照崩两次），不要再用。
+
+**✅ 现行缓解（同日六轮实验验证）：保温协议。** 判定依据：冷启动 ≤36 °C 满带宽负载 **3/3 全灭**（40.7M 错误 / 2.1M 错误 / 静默算死挂起——第三种死法只有 `proc'd` 计数冻结可见，`errors: 0` 是僵尸读数）；起温 ≥44 °C **2/2 全过**。故障 = 冷态陡热爬坡 × 满带宽显存流量两条件叠加；单独任一不触发。
+
+**强制规程（本卡跑任何 GPU 负载前必须遵守）**：
+
+1. **实验/负载启动前**，先起保温脚本并确认 `engage` 后温度 ≥50 °C：
+   ```bash
+   tmux new -s keepwarm -d "cd /home/weiland/openpi && /home/weiland/.local/bin/uv run python /home/weiland/gtp_logs/gpu_keepwarm.py 2>&1 | tee -a /home/weiland/gtp_logs/keepwarm.log"
+   ```
+2. **保温脚本是常驻服务，不随实验结束关闭**（owner 裁定 2026-08-20：该缺陷与具体实验无关，任何冷态起满载的负载都会撞上，后续其它工作同样依赖它）。实验中途重启 conductor/server 的窗口正是最危险的冷却窗口，更不能停。只有明确要让卡彻底冷下来时（送修 / 拆机 / 长期停用）才 `tmux kill-session -t keepwarm`。
+   ⚠ **重启后不会自动恢复**：tmux 会话随重启消失，而冷启动恰恰是最危险的窗口。物理或软重启之后的**第一件事**就是重挂保温并确认 ≥50 °C，之后才允许起任何 GPU 负载。
+3. 脚本设计（`/home/weiland/gtp_logs/gpu_keepwarm.py`，v6 定稿）：**纯恒温器,温度是唯一输入**（owner 裁定 2026-08-20：不看进程/利用率——轻负载进程也可能让温度跌破线,那时就该并行加热；对重负载的不干扰由物理保证:重负载自己把温度顶在介入线上,保温自然休眠）。常驻 **~432 MiB**（2×1536² fp32 张量 ~18 MB + 钳制的 cuBLAS workspace + 不可避免的 CUDA context，实测 `nvidia-smi` 432 MiB）；恒温带 **54 °C 介入 / 62 °C 完全让出**（零 kernel）；≤60 °C 近带区**紧轮询**（~0.5 s）——负载骤停后结温 2 秒自由落体 10 °C,常规轮询接不住（v1 实测谷值擦到 44 线）；实测 25 循环谷值 50–53 °C,距安全线 6 °C 余量。
+4. **wedge 后软重启不可靠**：GPU 卡死后 `systemctl reboot` 可能被 D 状态进程 + GSP RPC 串行超时（每个 75 s）钉死在半关机态（2026-08-20 实测一次，节点 OFFLINE 但不重启，需物理按键）。规程：软重启下发 5 分钟未回 ONLINE = 关机挂死，直接物理重启；物理断电复位对 GSP 反而更彻底。
+5. 判 gpu_burn 结果必须看三件套：`errors` + **`proc'd` 是否持续推进** + 终判行——只看 errors 会被静默挂死骗过（2026-08-20 实测被骗一次）。
+
+判定与全部日志：`weiland-wsl:/mnt/c/Users/lzy66/Downloads/gtp_logs/`（送修报告 `REPAIR_REPORT.md`）+ 本机 `/home/weiland/gpu_fault_reports/`、`/home/weiland/gtp_logs/`。**该卡在送修前不承担要求结果可信的正式实验**（静默算错前科 + 当日退化轨迹）。
 
 **GPU 备注**：4090 是**独占卡**（util 与 memory 都是真实信号，不像 jupyter 系列共享卡只能看 `memory.free`）。
 显存 48 GiB 可同时驻多个 pi0.5 server + 若干小模型 sidecar；起新负载前照例先 `nvidia-smi` 查 `memory.free`。
@@ -226,6 +248,39 @@ tether exec weilandserver -- bash -lc '
 - 验收状态：2026-08-13 已跑通 1-ep 端到端 smoke（libero_spatial task 0 → 本机 `:8000` pi0.5 server，
   `success=true`），GPU EGL 渲染 256×256 正常。
 
+#### 2.5.1 直连公网入口 `ziyanglin.com:23100-23199`（2026-08-20 起，**优先于 tether expose**）
+
+交换机把公网 **TCP 23100-23199** 段 NAT 到 weilandserver，**1:1 映射**：公网 `:23150` 打到本机 `:23150`。
+
+**与 `tether expose` 的关键差别**：`expose` 能把**任意**本地端口映到 broker 分配的端口；直连段**不做端口转换**，
+所以**服务必须自己监听在 23100-23199 之内**。把 server 起在 `:8000` 再指望公网 `:23100` 能连上，是连不通的。
+
+**ufw 是必经的一道**（2026-08-20 实测踩过）：本机 ufw 默认 `deny (incoming)`，原白名单只有 22/8000/8080 且都限
+`192.168.0.0/16`。交换机映射正确、路由通、服务在听，但**入站被 ufw 丢弃**，现象是纯超时、listener 侧零连接、
+而本机 `127.0.0.1` 自连正常。已加常驻规则：
+
+```bash
+sudo ufw allow 23100:23199/tcp comment "public range via ziyanglin.com switch NAT"
+# 校验：ufw status | grep 23100
+```
+
+**实测记录（2026-08-20）**：
+
+| 探测 | 来源 | 结果 |
+|---|---|---|
+| `ziyanglin.com:23100` | timan107（真外网，入站源 IP `192.17.58.207`） | ✅ 通 |
+| `ziyanglin.com:23199` | timan107 | ✅ 通（区间上界） |
+| `ziyanglin.com:23200` | timan107 | ✅ 被拒（区间外，证明规则有边界） |
+| `ziyanglin.com:23100` | 本机 WSL | ✅ 通（源 IP 显示为 `140.177.159.24`，同 NAT hairpin 回环） |
+
+出口 IP 自证：weilandserver 上 `curl ifconfig.me` 返回 `140.177.159.24`，与 `ziyanglin.com` 解析一致 ⇒ 该公网 IP 确实落在本机。
+
+⚠ **该段无任何鉴权**。与 `tether expose` 同理（见 §4 注意事项），但直连段暴露面更大——它不经 broker、
+不受 session 成员资格约束，任何人扫到端口即可连。pi0.5 推理 server 本身**没有** token/TLS，
+把它起在这个段上等于对公网开放推理算力。敏感服务要么自带鉴权，要么继续走 `tether expose`。
+
+---
+
 ### 2.6 已入网但未配置 openpi 的节点
 
 下列节点已在 tether session `lab` 内在线，但**没有 openpi repo / 环境**，用前需要先部署：
@@ -276,10 +331,23 @@ tether exec weilandserver -- bash -lc '
 
 ---
 
-## 4. tether 公网暴露快速参考
+## 4. 对外暴露端口 —— 快速参考
 
-broker 在 pc732（`weiland.top` → 155.98.36.32）。前两台（timan107 / jupyter）要对外提供服务
-（debug HTTP、Jupyter、远程客户端连推理端口等）时，通过 tether 反向隧道打到 broker 公网端口：
+### 4.0 优先级规则（2026-08-20 起）
+
+对外暴露一个端口时，**按此顺序取**：
+
+1. **weilandserver → 优先用直连段 `ziyanglin.com:23100-23199`**（§2.5.1）。少一跳 broker 转发、
+   不占 broker 端口池、不受 yamux keepalive 长 idle 断流影响。前提：服务能监听在该段内（1:1 映射，不做端口转换）。
+2. **该段被占满 / 服务无法改监听端口 / 其它节点** → 退回 `tether expose`（下方 §4.1）。
+3. 有独立公网 IP 的节点（a100）→ 直连，两者都不用。
+
+查该段当前占用：`tether exec weilandserver -- bash -lc 'ss -tln | grep -E ":231[0-9][0-9]"'`
+
+### 4.1 `tether expose` 反向隧道
+
+broker 在 pc732（`weiland.top` → 155.98.36.32）。timan107 / jupyter 系列，以及 weilandserver 上
+无法落进 23100-23199 的服务，通过 tether 反向隧道打到 broker 公网端口：
 
 ```bash
 # 把 timan107 上的某个端口暴露到公网（broker=pc732/weiland.top）

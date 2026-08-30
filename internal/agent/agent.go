@@ -863,6 +863,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	// fires fireRedial on a returned Run (and could perturb a NumGoroutine/fd leak-gate poll).
 	defer a.stopRedialWatchdog()
 	defer a.cancelFailClosed()
+	// proxy-lifecycle: the SS server no longer hangs from any ctx, so agent exit must stop
+	// it explicitly. Registered AFTER cancelFailClosed so it runs BEFORE it (defers are
+	// LIFO): it latches agentExiting, which is what makes a fail-closed AfterFunc already
+	// in flight a no-op instead of a footprint-wiping race.
+	defer stopProxyOnRunExit(a)
 	for {
 		rebuild, err := a.session(ctx)
 		// The dying session's defers have run (conn drained, subs gone); allow the next
@@ -1134,7 +1139,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// onNATSReconnect — the register reply re-delivers the same identity,
 	// which the backoff gate would otherwise still suppress).
 	resetProxyDialBackoff(a)
-	a.applyProxyDirective(runCtx, nc, resp.Proxy)
+	a.applyProxyDirective(nc, resp.Proxy)
 
 	// C1 §D-4: pull a fresh signed roster on a jittered cadence (roster-only register → no raft
 	// write on the broker) so an online agent converges on a new broker set ≤5min. Bound to this
@@ -1990,6 +1995,22 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 			a.cfg.Logger.Info("agent: shutting down")
 			return ctx.Err()
 		case t := <-ticker.C:
+			// Reap a dead SS server BEFORE reporting, so the heartbeat carries the truth and
+			// the broker gets an edge it can act on.
+			//
+			// origin: proxy-lifecycle external review F4. Reaping only at the directive entry
+			// covers a session rebuild (a new register reply arrives) but NOT an accept loop
+			// that died on its own — fd exhaustion, say. In that case nothing produces a
+			// directive, and on a SINGLE broker nothing ever will: repairProxy's
+			// CONVERGENCE-FIRST arm returns immediately while the node reports `on && ready &&
+			// the exact applied pair`, which a corpse does (proxy_ready is still true in the DB
+			// and proxyGenEpoch reports the real pair while p.srv is non-nil). I asserted the
+			// opposite during internal review — I read Fix D's suppression guard and missed the
+			// earlier return above it — and that mistake is what let three reviewers' finding be
+			// dismissed. Reaping here is the edge: it nils p.srv, so this heartbeat publishes
+			// unready AND (0,0), neither early return holds, and the keyset push that rebuilds
+			// us finally goes out.
+			reapProxyCorpseOnHeartbeat(a, nc)
 			pgen, pepoch := a.proxyGenEpoch()
 			payload, _ := json.Marshal(proto.HeartbeatPayload{
 				Ts: t.UTC(), ProxyGeneration: pgen, ProxyEpoch: pepoch, ProxyBound: a.proxyBound(),

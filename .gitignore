@@ -82,3 +82,11 @@ Thumbs.db
 # finite TTL), separate agent/operator authority, and transport confidentiality — and then it
 # belongs in its own increment with its own review, not carried along by an unrelated batch.
 /tools/rescue.py
+
+# Dated editor/manual backups (docs/devices.md.bak.20260820 and friends).
+#
+# origin: proxy-lifecycle external review F7. One of these was byte-identical to the committed
+# file, carried no audit value, and was swept into the index by a `git add -A`. The pattern is
+# specific on purpose: `*.bak` alone would also hide a deliberate, reviewed artefact someone
+# means to commit, whereas a DATE-stamped one is always a "just in case" copy.
+*.bak.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]

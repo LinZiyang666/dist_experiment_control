@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -22,7 +21,7 @@ import (
 // TestExternalReviewStaleRegisterReplyCannotOverrideNewerPush.)
 func TestExternalReviewLowerEpochConvergesAfterBrokerRestore(t *testing.T) {
 	a := newProxyTestAgent(t)
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled:    true,
 		PublicPort: 14000,
 		Token:      "token",
@@ -30,7 +29,7 @@ func TestExternalReviewLowerEpochConvergesAfterBrokerRestore(t *testing.T) {
 		Generation: 100,
 		Epoch:      5,
 	})
-	defer a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	defer a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled:    false,
 		Generation: 300,
 		Epoch:      6,
@@ -38,7 +37,7 @@ func TestExternalReviewLowerEpochConvergesAfterBrokerRestore(t *testing.T) {
 
 	// Restore = a NEWER broker incarnation (Generation 200 > 100) whose epoch
 	// rewound to 2. The agent must apply it despite the lower epoch.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled:    true,
 		Keys:       []proto.ProxyKey{{SubID: "restored", Secret: "restored-secret"}},
 		Generation: 200,
@@ -81,7 +80,7 @@ func TestExternalReviewTransientProxyStartFailureCanRecover(t *testing.T) {
 	a := newProxyTestAgent(t)
 	a.cfg.ExposeAdapter = adapter
 
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled:    true,
 		PublicPort: 14000,
 		Token:      "token",
@@ -94,7 +93,7 @@ func TestExternalReviewTransientProxyStartFailureCanRecover(t *testing.T) {
 
 	// This is what enableProxy/bumpAndPushKeyset sends once the allocation
 	// already exists: no raw token is available in the broker DB.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true,
 		Keys:    []proto.ProxyKey{{SubID: "alice", Secret: "alice-secret"}},
 		Epoch:   2,
@@ -124,7 +123,7 @@ func TestExternalReviewStaleRegisterReplyCannotOverrideNewerPush(t *testing.T) {
 		Keys:       []proto.ProxyKey{{SubID: "old", Secret: "old-secret"}},
 		Epoch:      1,
 	}
-	a.applyProxyDirective(context.Background(), nil, staleRegister)
+	a.applyProxyDirective(nil, staleRegister)
 	if !runningSrv(a) {
 		t.Fatal("precondition: epoch-1 register directive did not start the proxy")
 	}
@@ -137,7 +136,7 @@ func TestExternalReviewStaleRegisterReplyCannotOverrideNewerPush(t *testing.T) {
 
 	// A reconnect register reply was computed while ON at epoch 1, then its
 	// goroutine resumes after the epoch-2 OFF. Register replies carry no seq.
-	a.applyProxyDirective(context.Background(), nil, staleRegister)
+	a.applyProxyDirective(nil, staleRegister)
 
 	p := a.ensureProxyRuntime()
 	p.mu.Lock()

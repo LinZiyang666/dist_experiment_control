@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -21,7 +20,7 @@ func TestExternalReviewFailClosedReconnectCanReapplyCurrentDirective(t *testing.
 		Generation: 100,
 		Epoch:      5,
 	}
-	a.applyProxyDirective(context.Background(), nil, directive)
+	a.applyProxyDirective(nil, directive)
 	if !runningSrv(a) {
 		t.Fatal("precondition: proxy should be serving")
 	}
@@ -31,7 +30,7 @@ func TestExternalReviewFailClosedReconnectCanReapplyCurrentDirective(t *testing.
 		t.Fatalf("fail-closed teardown left proxy serving")
 	}
 
-	a.applyProxyDirective(context.Background(), nil, directive)
+	a.applyProxyDirective(nil, directive)
 	if !runningSrv(a) {
 		t.Fatalf("authoritative reconnect directive at the current pair was dropped after fail-closed teardown")
 	}
@@ -55,7 +54,7 @@ func TestExternalReviewDuplicateCurrentDirectiveReacksReady(t *testing.T) {
 		Generation: 100,
 		Epoch:      5,
 	}
-	a.applyProxyDirective(context.Background(), nc, directive)
+	a.applyProxyDirective(nc, directive)
 
 	ready := make(chan *nats.Msg, 1)
 	sub, err := nc.ChanSubscribe(proto.SubjEvNodeProxyReady(a.cfg.SID, a.cfg.NID, "ready"), ready)
@@ -70,7 +69,7 @@ func TestExternalReviewDuplicateCurrentDirectiveReacksReady(t *testing.T) {
 	// Models broker readiness state being cleared/lost while the proxy is still
 	// serving. The broker's convergence loop re-sends the same authoritative
 	// pair; the agent must re-ACK rather than drop before pubProxyReady.
-	a.applyProxyDirective(context.Background(), nc, directive)
+	a.applyProxyDirective(nc, directive)
 	select {
 	case <-ready:
 	case <-time.After(500 * time.Millisecond):

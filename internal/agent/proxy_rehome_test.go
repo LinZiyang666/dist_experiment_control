@@ -54,7 +54,7 @@ func TestC5ProxyBoundReflectsTunnelLiveness(t *testing.T) {
 	if a.proxyBound() {
 		t.Fatal("not serving yet → ProxyBound must be false")
 	}
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: ssproxy.Cipher,
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "cccccccccccccccc"}}, Epoch: 1,
 	})
@@ -94,7 +94,7 @@ func TestC5ProxyRehomeSuccessRestoresProxyBound(t *testing.T) {
 	a := newC5ProxyAgent(t, adapter)
 
 	// Serving, tunnel live.
-	a.applyProxyDirective(context.Background(), nil, c5FullDirective(14000, 1))
+	a.applyProxyDirective(nil, c5FullDirective(14000, 1))
 	if a.proxy == nil || a.proxy.srv == nil {
 		t.Fatal("server should be running after a full enable")
 	}
@@ -110,7 +110,7 @@ func TestC5ProxyRehomeSuccessRestoresProxyBound(t *testing.T) {
 	}
 
 	// The rehome to the surviving broker SUCCEEDS: ApplyHome returns nil AND HasSession is true.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: ssproxy.Cipher,
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "cccccccccccccccc"}}, Epoch: 1,
 		Home: &proto.HomeDirective{PublicPort: 14000, BrokerAddr: "home-2", Epoch: 2, CertPins: proto.CertPins{Current: "pin2"}},
@@ -129,13 +129,13 @@ func TestC5ProxyRehomeSuccessRestoresProxyBound(t *testing.T) {
 func TestC5ProxyRehomeScopedByPort(t *testing.T) {
 	adapter := newFakeHomeAdapter(func(int, int64, int) error { return nil })
 	a := newC5ProxyAgent(t, adapter)
-	a.applyProxyDirective(context.Background(), nil, c5FullDirective(14000, 0))
+	a.applyProxyDirective(nil, c5FullDirective(14000, 0))
 	if a.proxy == nil || a.proxy.srv == nil {
 		t.Fatal("server should be running")
 	}
 	callsBefore := adapter.calls
 	// A STALE rehome for a different port (14001), higher epoch — must be scoped out.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, Keys: []proto.ProxyKey{{SubID: "s0", Secret: "cccccccccccccccc"}}, Epoch: 1,
 		Home: &proto.HomeDirective{PublicPort: 14001, BrokerAddr: "stale", Epoch: 5, CertPins: proto.CertPins{Current: "p"}},
 	})
@@ -176,7 +176,7 @@ func TestC5ProxyRehomeAbsentSessionUnreadyAndNoFalseAdvance(t *testing.T) {
 	adapter := newFakeHomeAdapter(func(int, int64, int) error { return nil }) // ApplyHome "succeeds"
 	adapter.checkSessions = true
 	a := newC5ProxyAgent(t, adapter)
-	a.applyProxyDirective(context.Background(), nc, c5FullDirective(14000, 0)) // establish → "ready"
+	a.applyProxyDirective(nc, c5FullDirective(14000, 0)) // establish → "ready"
 	if a.proxy == nil || a.proxy.srv == nil {
 		t.Fatal("server should be running")
 	}
@@ -185,7 +185,7 @@ func TestC5ProxyRehomeAbsentSessionUnreadyAndNoFalseAdvance(t *testing.T) {
 	adapter.hasSession[14000] = false
 	adapter.mu.Unlock()
 	// A newer Home for the SAME port arrives; ApplyHome no-ops (session absent) but returns nil.
-	a.applyProxyDirective(context.Background(), nc, &proto.ProxyDirective{
+	a.applyProxyDirective(nc, &proto.ProxyDirective{
 		Enabled: true, Keys: []proto.ProxyKey{{SubID: "s0", Secret: "cccccccccccccccc"}}, Epoch: 1,
 		Home: &proto.HomeDirective{PublicPort: 14000, BrokerAddr: "home-2", Epoch: 1, CertPins: proto.CertPins{Current: "p2"}},
 	})

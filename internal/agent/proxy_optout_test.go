@@ -59,7 +59,7 @@ func TestProxyOptOutIgnoresDirectives(t *testing.T) {
 
 	// A full token-bearing directive — the strongest possible instruction —
 	// must build nothing and dial nothing.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 1, Epoch: 1,
 	})
@@ -71,7 +71,7 @@ func TestProxyOptOutIgnoresDirectives(t *testing.T) {
 	}
 	// Repeated pushes (an old broker's 5s repair loop) stay no-ops.
 	for i := 0; i < 5; i++ {
-		a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+		a.applyProxyDirective(nil, &proto.ProxyDirective{
 			Enabled: true, Cipher: "chacha20-ietf-poly1305",
 			Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 1, Epoch: int64(2 + i),
 		})
@@ -80,7 +80,7 @@ func TestProxyOptOutIgnoresDirectives(t *testing.T) {
 		t.Fatalf("keyset re-pushes made %d dials on an opted-out agent", got)
 	}
 	// A disable push is equally inert (nothing is running).
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{Enabled: false, Epoch: 99})
+	a.applyProxyDirective(nil, &proto.ProxyDirective{Enabled: false, Epoch: 99})
 	if a.proxy.srv != nil {
 		t.Fatal("disable on an opted-out agent should be a no-op")
 	}

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"testing"
 
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -37,11 +36,11 @@ func TestProxyNewerLexicographic(t *testing.T) {
 func TestStaleEnableDroppedAfterDisableTeardown(t *testing.T) {
 	a := newProxyTestAgent(t)
 	// Apply enable (gen 100, epoch 5) then an authoritative disable (gen 100, epoch 6).
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 100, Epoch: 5,
 	})
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: false, Generation: 100, Epoch: 6,
 	})
 	if runningSrv(a) {
@@ -49,7 +48,7 @@ func TestStaleEnableDroppedAfterDisableTeardown(t *testing.T) {
 	}
 	// A LATE stale enable at the OLD pair (gen 100, epoch 5) must be DROPPED —
 	// the applied pair is retained at (100,6), so this is not newer.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 100, Epoch: 5,
 	})

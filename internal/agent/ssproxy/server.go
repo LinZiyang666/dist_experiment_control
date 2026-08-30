@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,19 @@ type keyEntry struct {
 	master []byte
 }
 
+// ErrStopped is returned by SetKeys (and by Start) once the server has been
+// stopped. A Server is SINGLE-USE: shutdown latches `closed` one way and there is
+// no restart -- callers rebuild by constructing a fresh New().
+//
+// origin: 2026-08-21 weilandserver incident. The agent treated the stopped error as
+// an ignorable transient, logged a WARN and returned, so a keyset push arriving at a
+// dead server did nothing 5416 times over 7.5 hours. It is a TERMINAL signal meaning
+// "this object is spent; build another one", and it is a typed sentinel so callers can
+// act on it with errors.Is instead of matching a string. The message text is preserved
+// verbatim from the pre-fix fmt.Errorf so operator greps and the simcluster log oracle
+// keep matching historical logs.
+var ErrStopped = errors.New("ssproxy: server stopped")
+
 // Server is the embedded Shadowsocks AEAD server. It binds 127.0.0.1 only
 // and is reachable from the public internet exclusively via the broker's
 // yamux tunnel. Safe for concurrent use; all methods are idempotent where
@@ -47,12 +61,35 @@ type Server struct {
 	ln        net.Listener
 	localPort int
 	keys      []*keyEntry                      // copy-on-write snapshot
-	allConns  map[net.Conn]struct{}            // every accepted conn (closed by Stop)
+	allConns  map[net.Conn]struct{}            // every conn this server owns -- accepted AND upstream (closed by Stop; see handleConn)
 	keyConns  map[string]map[net.Conn]struct{} // keyID -> live conns (force-close on revoke)
 	saltSeen  map[string]*saltRing             // keyID -> bounded seen-salt filter (F11 replay)
-	ctx       context.Context
-	cancel    context.CancelFunc
 	closed    bool
+	// acceptExited latches when the accept loop returns. It exists so Serving can
+	// answer "am I able to serve?" rather than "was I once started": an accept loop
+	// that died on a non-temporary listener error leaves closed==false and ln!=nil,
+	// and without this the server would still claim to be serving.
+	acceptExited bool
+
+	// stopCtx/stopCancel are the server's OWN operation-scoped cancellation, created in
+	// Start and cancelled in shutdown. They are what let Stop interrupt a handler that is
+	// blocked in DNS resolution or an upstream dial.
+	//
+	// origin: proxy-lifecycle external review F1/F5. The first cut of this increment banned
+	// context from the package outright, having concluded from the incident that "ctx is the
+	// problem". That conflated two different things. What killed the data plane was a ctx
+	// whose lifetime was owned by the CALLER (the agent's per-session runCtx): cancelling it
+	// meant "your session ended", and the server wrongly took that as "you should die".
+	// Cancellation the server creates for ITSELF has the opposite property — it can only fire
+	// when this server is being stopped, which is exactly when the in-flight lookup should be
+	// abandoned. Banning it left `Stop` waiting on the system resolver (no deadline at all;
+	// resolv.conf-bound, typically 30s) while the agent held proxyRuntime.mu, which can
+	// starve heartbeats and cross the broker's rehome dwell into a public-port rotation.
+	//
+	// The invariant is therefore "no CALLER-OWNED context reaches this type", not "no
+	// context exists here" — and it is enforced by Start's signature, not by an import ban.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 
 	// allowPrivate governs the destination policy (round-6 F12). The library
 	// DEFAULT (New) is permissive so in-process tests can target loopback; the
@@ -203,19 +240,23 @@ func blockedIP(ip net.IP) bool {
 // fail — the authoritative defense against DNS rebinding is the dialer Control
 // callback (dialTarget), which validates the ACTUAL IP being connected, closing
 // the resolve-then-redial TOCTOU (round-7 F1).
-func (s *Server) destAllowed(host string) bool {
+// It takes a ctx so a Stop() can abandon the lookup: net.LookupIP has no deadline of any
+// kind and is bounded only by resolv.conf (typically ~30s), which used to make Stop() wait
+// that long while the agent held proxyRuntime.mu (external review F1). The ctx is always the
+// server's OWN (see opContext), never a caller's.
+func (s *Server) destAllowed(ctx context.Context, host string) bool {
 	if s.allowPrivateNow() {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return !blockedIP(ip)
 	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addrs) == 0 {
 		return false
 	}
-	for _, ip := range ips {
-		if blockedIP(ip) {
+	for _, a := range addrs {
+		if blockedIP(a.IP) {
 			return false
 		}
 	}
@@ -227,7 +268,9 @@ func (s *Server) destAllowed(host string) bool {
 // connect time, so the IP actually dialed is the IP validated — a rebinding
 // resolver that returns a public answer to the precheck and a loopback answer to
 // the dial is rejected here (round-7 F1).
-func (s *Server) dialTarget(target string) (net.Conn, error) {
+// It takes a ctx for the same reason destAllowed does: Dialer.Timeout bounds a dial at 10s,
+// but a Stop() must not have to wait out even that while proxyRuntime.mu is held.
+func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error) {
 	d := net.Dialer{Timeout: dialTimeout}
 	if !s.allowPrivateNow() {
 		d.Control = func(_, address string, _ syscall.RawConn) error {
@@ -241,21 +284,40 @@ func (s *Server) dialTarget(target string) (net.Conn, error) {
 			return nil
 		}
 	}
-	return d.Dial("tcp", target)
+	return d.DialContext(ctx, "tcp", target)
 }
 
 // Start binds 127.0.0.1:wantLocalPort (wantLocalPort == 0 => OS-chosen free
-// port), installs the initial key set, and runs the accept loop anchored to
-// ctx. Returns the bound local port. Calling Start twice is a no-op that
-// returns the already-bound port.
-func (s *Server) Start(ctx context.Context, wantLocalPort int, keys []Key) (int, error) {
+// port), installs the initial key set, and runs the accept loop. Returns the
+// bound local port. Calling Start twice is a no-op that returns the
+// already-bound port.
+//
+// Start takes NO context, and that is load-bearing rather than incidental.
+// origin: 2026-08-21 weilandserver incident (docs/reviews/proxy-lifecycle-plan.md).
+// This server used to be anchored to whatever ctx its caller held, which in the
+// agent was the PER-SESSION runCtx (internal/agent/agent.go:920, rewritten every
+// session). A control-plane session rebuild therefore killed the data plane, and
+// the corpse was never rebuilt: the node advertised a READY exit with no listener
+// behind it for 7h40m. Handing this object no ctx at all is what makes the set of
+// things that can stop it a CLOSED, greppable list -- Stop() and nothing else --
+// instead of "whoever happens to hold that ctx". The four legitimate callers of
+// Stop are enumerated on stopProxyOnRunExit in internal/agent/proxy.go.
+func (s *Server) Start(wantLocalPort int, keys []Key) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// ORDER MATTERS: the stopped check precedes the already-bound early return.
+	//
+	// origin: proxy-lifecycle plan A1. shutdown() closes s.ln but deliberately does NOT nil it
+	// (Serving reads it, and a nil'd listener would make a stopped server indistinguishable from a
+	// never-started one). With the early return first, calling Start on a STOPPED server returned
+	// (s.localPort, nil) -- a SUCCESS handing back a dead listener. That was unreachable only
+	// because proxyStartLocked always constructs a fresh ssproxy.New(); this increment adds rebuild
+	// paths that reach it, so the order is now part of the contract, not an accident.
+	if s.closed {
+		return 0, fmt.Errorf("%w: cannot restart (construct a new Server)", ErrStopped)
+	}
 	if s.ln != nil {
 		return s.localPort, nil
-	}
-	if s.closed {
-		return 0, fmt.Errorf("ssproxy: server already stopped")
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", wantLocalPort))
 	if err != nil {
@@ -278,18 +340,66 @@ func (s *Server) Start(ctx context.Context, wantLocalPort int, keys []Key) (int,
 	s.allConns = map[net.Conn]struct{}{}
 	s.keyConns = map[string]map[net.Conn]struct{}{}
 	s.setKeysLocked(keys)
-	s.ctx, s.cancel = context.WithCancel(ctx)
+	// ctx-root: this server's own lifetime root. Deliberately NOT derived from any caller
+	// context — see the stopCtx field comment. shutdown() cancels it, which is what makes an
+	// in-flight resolve/dial abandonable and Stop() genuinely bounded.
+	s.stopCtx, s.stopCancel = context.WithCancel(context.Background())
 	s.wg.Add(1)
 	go s.acceptLoop(ln)
-	// ctx-watch goroutine: tracked by wg (calls shutdown, NOT Stop, so it
-	// never waits on the WaitGroup it belongs to).
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		<-s.ctx.Done()
-		s.shutdown()
-	}()
 	return s.localPort, nil
+}
+
+// opContext returns the server's own cancellation context for one in-flight operation.
+// Before Start (or in a Server built by a test that never started) it degrades to a
+// background context, so callers never have to nil-check.
+func (s *Server) opContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopCtx == nil {
+		// ctx-root: unstarted server; there is nothing to cancel yet.
+		return context.Background()
+	}
+	return s.stopCtx
+}
+
+// Serving reports whether this server is actually able to serve traffic right
+// now: bound, not stopped, and its accept loop still running.
+//
+// origin: 2026-08-21 weilandserver incident. The agent used `p.srv != nil` as its
+// "am I serving?" predicate, which a STOPPED server satisfies -- that is precisely
+// how a dead exit was advertised as READY for 7h40m. A pointer answers "do I have
+// one", never "does it work"; this method answers the second question and is the
+// only thing callers may use to decide readiness.
+//
+// SetKeys reports ErrStopped for the `closed` case ONLY. It does NOT report the
+// acceptExited case — an accept loop that died on a non-temporary listener error
+// leaves closed==false, so SetKeys succeeds while nothing is accepting. That is
+// precisely the corpse cause SetKeys cannot see, so a caller deciding readiness
+// must consult THIS method and not infer liveness from SetKeys returning nil.
+// (Internal review caught the earlier wording here claiming the two conditions
+// coincide; they do not, and the difference is the one corpse cause left.)
+func (s *Server) Serving() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ln != nil && !s.closed && !s.acceptExited
+}
+
+// closeListenerForTest closes ONLY the listener, leaving `closed` false — reproducing an accept
+// loop that died on a non-temporary error while the server still believes it is open. That state
+// is invisible to SetKeys (which only consults `closed`) and is exactly what the acceptExited
+// latch exists to catch, so it needs to be constructible from a test.
+//
+// UNEXPORTED on purpose. origin: proxy-lifecycle external review F6 — the first cut exported it
+// as CloseListenerForTest, which put a `ForTest` method on the production API surface and let any
+// caller manufacture the anomalous closed==false && acceptExited==true state. The test that needs
+// it lives in this package, so package scope is sufficient and the surface stays honest.
+func (s *Server) closeListenerForTest() {
+	s.mu.Lock()
+	ln := s.ln
+	s.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
 }
 
 // LocalPort returns the bound port, or 0 if not started.
@@ -305,7 +415,7 @@ func (s *Server) SetKeys(keys []Key) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return fmt.Errorf("ssproxy: server stopped")
+		return ErrStopped
 	}
 	s.setKeysLocked(keys)
 	return nil
@@ -346,9 +456,15 @@ func (s *Server) Stop() {
 	s.wg.Wait()
 }
 
-// shutdown closes the listener + every live conn and cancels ctx, WITHOUT
-// waiting on the WaitGroup — so it is safe to call from a wg-tracked goroutine
-// (the ctx-watch goroutine) as well as from Stop.
+// shutdown closes the listener + every live conn (accepted AND upstream), WITHOUT
+// waiting on the WaitGroup. Stop is shutdown + wg.Wait; keeping the two separate
+// means a caller that must not block can still tear the listeners down.
+//
+// The previous wording described cancelling a ctx and being callable "from the
+// ctx-watch goroutine". Both are gone: proxy-lifecycle removed this type's context
+// entirely, and with it that goroutine. A comment describing deleted machinery is
+// worse than no comment — it sends the next reader looking for a cancellation path
+// that does not exist.
 func (s *Server) shutdown() {
 	s.mu.Lock()
 	if s.closed {
@@ -356,8 +472,12 @@ func (s *Server) shutdown() {
 		return
 	}
 	s.closed = true
-	if s.cancel != nil {
-		s.cancel()
+	// Cancel BEFORE closing sockets: a handler blocked in LookupIPAddr or DialContext is
+	// unreachable by closing the accepted conn, and this is the only thing that frees it.
+	// Without it Stop() waits out the system resolver while the agent holds proxyRuntime.mu
+	// (external review F1).
+	if s.stopCancel != nil {
+		s.stopCancel()
 	}
 	if s.ln != nil {
 		_ = s.ln.Close()
@@ -370,6 +490,16 @@ func (s *Server) shutdown() {
 
 func (s *Server) acceptLoop(ln net.Listener) {
 	defer s.wg.Done()
+	// Latch that the loop is gone so Serving stops claiming this server can take
+	// traffic. Accept can return a non-temporary error (fd exhaustion, the listener
+	// closed under us) while `closed` is still false, and without this latch the
+	// server would keep reporting itself healthy with nobody listening -- the exact
+	// shape of the incident this increment exists to close.
+	defer func() {
+		s.mu.Lock()
+		s.acceptExited = true
+		s.mu.Unlock()
+	}()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -438,6 +568,22 @@ func (s *Server) bindKeyConn(keyID string, c net.Conn) bool {
 	}
 	set[c] = struct{}{}
 	return true
+}
+
+// unbindKeyConn removes one conn from its key's live set. Without it a long-lived server
+// would accumulate an entry per completed relay in keyConns (the same class of leak the
+// allConns untrack closes), and a revoke would walk conns that are already gone.
+func (s *Server) unbindKeyConn(keyID string, c net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	set := s.keyConns[keyID]
+	if set == nil {
+		return
+	}
+	delete(set, c)
+	if len(set) == 0 {
+		delete(s.keyConns, keyID)
+	}
 }
 
 func (s *Server) snapshotKeys() []*keyEntry {
@@ -528,18 +674,68 @@ func (s *Server) handleConn(c net.Conn) {
 
 	// round-6 F12 / round-7 F1,F2: destination policy. Fast-fail precheck, then
 	// dialTarget validates the ACTUAL connected IP (closes the rebinding TOCTOU).
+	// One server-owned context covers BOTH pre-track blocking spans (resolve + dial), so a
+	// concurrent Stop() abandons them instead of waiting them out (external review F1).
+	opCtx := s.opContext()
 	host, _, splitErr := net.SplitHostPort(target)
-	if splitErr != nil || !s.destAllowed(host) {
+	if splitErr != nil || !s.destAllowed(opCtx, host) {
 		s.logger.Warn("ssproxy: blocked non-public destination", "target", target)
 		return
 	}
 
-	remote, err := s.dialTarget(target)
+	remote, err := s.dialTarget(opCtx, target)
 	if err != nil {
 		s.logger.Debug("ssproxy: dial target failed", "target", target, "err", err)
 		return
 	}
 	defer func() { _ = remote.Close() }()
+	// Track the UPSTREAM conn too, so shutdown() can close it.
+	//
+	// origin: proxy-lifecycle plan A2 (bounded teardown; same family as gotcha #72).
+	// allConns used to hold only ACCEPTED conns, so shutdown closed the client side and
+	// left this one open -- and relay's wg.Wait() needs BOTH directions to finish, while
+	// io.Copy(w, remote) sits blocked in remote.Read(). An upstream that does not answer
+	// the half-close therefore hung Stop() indefinitely, and Stop() is called while
+	// holding the agent's p.mu (internal/agent/proxy.go proxyTeardownLocked) -- one idle
+	// upstream could wedge the whole proxy runtime. This increment makes rebuild paths
+	// far more reachable, so an unbounded Stop is no longer a latent risk.
+	//
+	// If the server is ALREADY shutting down, trackConn returns false: close immediately
+	// rather than starting a relay nobody will tear down.
+	if !s.trackConn(remote) {
+		return
+	}
+	defer s.untrackConn(remote)
+
+	// Bind the UPSTREAM to the SAME key as the accepted conn, so a hard revoke closes BOTH
+	// halves atomically.
+	//
+	// origin: proxy-lifecycle external review F2. keyConns held only the subscriber side, so
+	// SetKeys' revoke closed the accepted socket and left the upstream blocked in
+	// relay's remote->client copy. The DATA-plane guarantee still held (the subscriber's
+	// socket was gone), but the RESOURCE contract did not: handler goroutine, both map
+	// entries and both fds survived until the whole server stopped. An authorised key could
+	// pre-open many silent upstreams and have them outlive its own revocation.
+	//
+	// bindKeyConn re-checks that the key is still active, so a key revoked DURING the dial
+	// never reaches a relay: the bind fails and the deferred Close reclaims the upstream
+	// immediately.
+	//
+	// SCOPE, stated precisely because the earlier wording over-claimed (external rereview R2):
+	// this does NOT prevent the outbound connect itself. The dial's context is the SERVER's
+	// (cancelled by Stop), not the key's, so a revoke arriving while the resolver or the TCP
+	// handshake is in flight can still let that one connect COMPLETE before the bind rejects
+	// it. What is guaranteed is narrower and is the part that matters for the revoke contract:
+	// no relay is started for a dead credential, and the socket is reclaimed at once rather
+	// than surviving until the whole server stops. Making revocation cancel in-flight dials
+	// would need a per-key/per-session cancellable context; that is a deliberate non-goal here
+	// (it would put a caller-shaped lifetime back into this type's hot path), and if the hard
+	// revoke contract is ever tightened to "no outbound side effects after revoke" it should be
+	// its own increment.
+	if !s.bindKeyConn(chosenID, remote) {
+		return
+	}
+	defer s.unbindKeyConn(chosenID, remote)
 
 	// Response direction: fresh salt + subkey, written before any payload.
 	wsalt := make([]byte, saltSize)

@@ -149,6 +149,7 @@
   | CLI 表面 golden | `cmd/tether/command_tree_inventory_test.go` | 命令/flag/Hidden 位漂移即红 |
   | 泄漏门 | `test/concurrency/helpers_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak** |
   | docs 布局 | `test/architecture/docs_layout_test.go` | 已跟踪的过程产物（`*-plan/review/tasklist/roadmap.md`）不许留在 `docs/` 顶层——§3 step 7 那条曾整条无闸门 |
+  | 数据面生命周期 | `test/architecture/dataplane_lifetime_test.go` | ①`internal/agent/ssproxy` 非测试文件不得 import `context`；②`applyProxyDirective`/`proxyStartLocked` 不得再收 ctx 参数；③`Run` 必须接线 `defer stopProxyOnRunExit`。**控制面 ctx 绑数据面对象生命周期**曾让一次普通 NATS session 重建杀死活着的 SS 出口 7h40m（gotcha #80）；三条都是那条不变量的机械形式，第③条补的是"去掉 ctx 锚点后 agent 退出不再自动停它" |
   | simcluster 日志 oracle | `test/architecture/simcluster_log_oracle_test.go` | drill 只许经 `drills/lib/logs.sh` **一份**映射读四条流（broker slog／broker panic／agent slog／agent panic）；调用 helper 必须 source（漏 source 是 runtime not-found，`bash -n` 看不见）；例外进**精确计数**的递减账本。h1 挪了两条流，十来个各自内联的 drill 同时开始把**健康的产品报成失败**——这是本 harness 最坏的输出 |
   | 闸门清单自对账 | `test/architecture/gate_registry_test.go` | ① 本表点到的位置必须真在 `make gates` 里跑；② `.golangci.yml` 的函数名账本里每个名字必须还存在（死豁免会被报出）|
 

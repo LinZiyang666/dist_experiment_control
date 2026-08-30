@@ -831,6 +831,144 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **对「双向切换」结论的修正**：分析里曾说"降下来最硬的缺口是 N=1 带死 voter 无在线清理"——**在 v0.5.0
   这已不成立**，force-single finalize retry 补上了这条在线路径。
 
+### #80 — agent 的 SS proxy server 锚在 per-session `runCtx` 上：一次 NATS session 重建即杀死数据面，且**永不重建**（真实生产事故，已修）
+
+> **来源 = 生产车队，非 simcluster drill。** 2026-08-21 weilandserver 现场诊断。
+> plan 见 `docs/reviews/proxy-lifecycle-plan.md`，内审见 `-review.md`，外审见 `-external-review.md`。
+> 本条同时是 **#33 的候选归因**（见下）。
+>
+> **结论口径（外审 F7 订正）**：首版本条把结论写成"已修，次生缺陷一并修复"，当时**外审的四个 Major 尚未闭合**，
+> 那个措辞越界了。现在的准确表述是：**原始 session-context 根因已修**（去 ctx 锚 + corpse 收割 + 停止者闭集），
+> **外审 F1–F4 已在同一增量内修复并各有反例测试转绿**：
+> F1 = `Stop` 无法取消 in-flight DNS（server 自有 `stopCtx`，见下）；F2 = hard revoke 漏关 upstream 半边；
+> F3 = 持久化 `LocalPort` 冲突使自愈永久变暗；F4 = single-broker 非重连 corpse 无自愈边。
+> **仍未闭合**：`Stop` 在 `p.mu` 下的**总**上界（取消已到位，但 teardown 预算未做成显式契约）；
+> 以及 #33 的归因仍是 **CANDIDATE**——转 FIXED 需重跑 drill 73 并见 STRANDED 臂消失。
+
+- **现象（生产实测）**：`tether proxy status` 报 `weilandserver ONLINE READY=true`、对外广告出口 `linziyang.top:14004`，
+  而该主机 **`ss -tlnp` 下 agent 进程零 listener**，持续 **7 小时 40 分**。每个被 `/sub` 导到该出口的订阅者必然连接失败。
+  `agent.log` 里 `agent: proxy SetKeys err="ssproxy: server stopped"` **5416 条**（每 5s 一条，4.3 MB），从未自愈。
+  唯一恢复手段是 session 级 `tether proxy off && tether proxy on --yes`——它**重排了全部 8 个节点的公网端口**并强制
+  订阅者重拉配置。对"一个节点的 SS 死了"而言这个爆炸半径是荒谬的。
+- **根因链（逐条对照源码验证）**：
+  1. `proxyStartLocked` 把调用方 ctx 交给 SS server（`internal/agent/proxy.go` 的 `srv.Start`），该 ctx 一路来自
+     `applyProxyDirective` 的参数 = `session()` 的 **`runCtx`**，而 `internal/agent/agent.go` 的注释本身就写着
+     *"the C1 session loop **REWRITES runCtx every session**"*。
+  2. NATS stuck-disconnect → `fireRedial`（`internal/agent/roster.go`，`redialAfter = 20s`）→ session 重建 → `cancelRun()`。
+  3. ssproxy 的 ctx-watch goroutine 收到 `ctx.Done()` → `shutdown()` → `closed = true`，listener 关闭。
+  4. agent 侧 `p.srv` **仍指向这具尸体**（`proxyRuntime` 跨 session 存活，无人清理）。
+  5. 新 session 的 register 回包是 **keyset-only（无 Token）**——这是**正确的 broker 行为**
+     （`internal/broker/proxy.go`：*"Token empty → agent reuses its persisted token"*）。broker 没有做错任何事。
+  6. `applyProxyDirective` 因 `p.srv != nil` 走 `default:` 分支 → `SetKeys` 撞 `closed` → **只 WARN 然后 return**。
+     且 exact-equal re-ACK 分支（`d.Enabled && p.srv != nil && 同 pair`）会**主动 `pubProxyReady(nc, true)`**
+     ——**"假 READY" 是 agent 亲口宣告的**，不是 broker 猜的。
+- **两条独立的次生缺陷（同一诊断中发现，一并修复）**：
+  (a) `ssproxy.Server.Start` 的 `if s.ln != nil` 早退排在 `if s.closed` **之前**，而 `shutdown()` 关闭 listener 却**不置 nil**
+  → 对已停止 server 调 `Start` 返回 `(oldPort, nil)`，**假成功 + 死 listener**；
+  (b) `Stop()` **无界**：`allConns` 只含 accepted 连接，upstream 不在其中，而 `relay` 的 `wg.Wait()` 需双向 copy 都结束
+  → upstream 不响应 half-close 即无限期挂住，**且 `Stop()` 是持 `p.mu` 调用的**（与 gotcha #72 同族）。
+- **策略层面的意义**：`armFailClosed` 的 `ProxyFailClosedGrace`（默认 15 min）本是 SS server 的**既定** teardown 策略
+  （分区超过宽限才停，防被吊销订阅者继续 egress）。runCtx 耦合让一次普通 session 重建在 ~20s 内就杀掉 SS——
+  **这条 15 分钟宽限在该路径上等同死代码**。控制面事件在拆毁策略明确规定它不该拆的数据面。
+- **修法**：SS server **不接受任何 ctx**（移除 `Start` 的参数），使停止者集合成为闭合可 grep 的四项清单
+  （权威 OFF / fail-closed / teardown-then-rebuild / agent 退出）；corpse 在 directive 入口被收割并从持久 footprint 重建；
+  `SetKeys` 的 `ErrStopped` 从"可忽略瞬时错误"改判为终态信号。闸门见 `test/architecture/dataplane_lifetime_test.go`。
+- **flip**：本条已修；回归由 `internal/agent/proxy_lifetime_test.go` 的停止者闭集表钉住。
+
+> **#33 的候选归因（不宣称闭合）**：#33 记录的是"proxy exit 的 home broker 被杀后，控制面报 rehomed+ready 但 SS 数据面
+> 是黑洞，**per-run 或自动恢复或需手动 `proxy off; proxy on`**，根因未归因"。本条的机制与之**逐项吻合**：home broker 被杀
+> → 其同机 nats-server 一并死 → agent 的 NATS 连接断 → session 重建 → runCtx cancel → SS 成 corpse → `proxy off/on`
+> 是唯一 mint token-bearing directive 的路径（故恰是那个 workaround）；而"有的 run 自动恢复、有的不恢复"也解释得通——
+> 取决于该 run 里 agent 是否真的经历了 session 重建（连在别的 broker 上的 agent 不会）。
+> **标 CANDIDATE 而非 FIXED**：#33 的**首个**根因假说已被撤回过一次（round-5 订正），且 #33 的观测里含 SS 腿超时等
+> 无法单独归因到具体层的现象。要转 FIXED 需在修复后重跑 `drills/73-proxy-cluster-ha.sh` 并见到 STRANDED 臂消失。
+
+### #81 — spawnsafe 的 mount health `stHealthy` 无 TTL、永不失效 ⇒「先健康、后挂掉」的 NFS 永远不被剔出 `$PATH`，整套 remote-fs 保护静默退化成"只剩有界超时"
+
+> **来源 = 生产车队，非 simcluster drill。** 2026-08-29 timan107 现场诊断（agent 0.5.0，UIUC CS 机房）。
+> **OPEN，未修。** 这是 v0.3.3 `remote-fs-resilience` 增量（`docs/reviews/remote-fs-resilience-plan.md`）
+> 在**真实长寿命 agent** 上的结构性缺口：该增量的全部 hermetic 单测与 OQ-2 spike 都只覆盖
+> **「挂载在第一次探测时就已经死」**，从未覆盖**「探测时活、之后才死」**。
+
+- **现象（生产实测）**：timan107 的 `/shared`（autofs direct 之上的 nfs4 overmount，
+  `czhai-storage-01.cs.illinois.edu` / `128.174.136.29`）挂死后——
+  - `tether exec timan107 nvidia-smi` → `remote_fs_spawn_timeout`（2.1s）；`tether run` 同；
+  - **`--safe` 同样无效**：`tether exec --safe timan107 -- nvidia-smi` 仍是 `remote_fs_spawn_timeout`；
+  - 绝对路径**照常可用**：`tether exec timan107 -- /usr/bin/nvidia-smi` 正常出结果；
+  - **一条 `[tether agent] remote-fs: dropped N unresponsive network $PATH dir(s)` 警告都没有**
+    ⇒ `sanitizePATH` 一个目录都没剔 ⇒ `outage=false`，子进程继承的仍是中毒 PATH（远端 `bash -c` 自己
+    查 `timeout` 就 D 住，实测在该机留下多个 D 态 bash）。
+  - agent 的 `$PATH` 前两项正是 `/shared/nas/data/m1/zixuans8/miniconda3/{bin,condabin}`。
+- **判定归属的实测三角（均在活体上跑）**：
+
+  | 命令 | 耗时 | 说明 |
+  |---|---|---|
+  | `exec -- echo ok` | **2.14s** → `remote_fs_spawn_timeout` | 命中 `boundedResolveInDirs` 的 `probeTimeout`(2s)——它**真的**去 stat 了 `/shared/.../echo` |
+  | `exec -- /shared/.../python -V` | **30.18s** → `remote_fs_spawn_timeout` | 走到 `startBounded` 的 30s execve 看门狗 ⇒ `pathOnDeadMount()` **零延迟返回 false**（没有那 2s 探测）⇒ `/shared` 被判**活的** |
+  | 并发 `stat`/`statfs` 逐个 PATH 目录（6s 后看谁还活着） | 只有 `/shared*` 两项 HANG | 死的确实是 `/shared`；`/home/zixuans8`（另一台 NFS）健康 |
+
+- **机理（逐条对源码核实）**：
+  1. **分类是对的**：`/proc/self/mountinfo` 第 55 行 autofs `/shared`、第 58 行 nfs4 `/shared`（overmount），
+     `mountForPath`（`internal/spawnsafe/spawnsafe.go:486-500`）的 `>=`（外审 F11）正确取到**后者**
+     ⇒ `kindRemoteProbe`，不是 autofs 那条已知边界。
+  2. **洞在 health 状态机是单向的**：`mountHealthy`（`spawnsafe.go:552-554`）
+     `if h.state == stHealthy { return true }` —— **无 TTL、无再验证**。函数注释自述
+     "sticky（dead 永不重探）+ self-healing（迟到的成功翻回 healthy）"，**只设计了 dead→healthy**；
+     `stHealthy` 同样是**终态**。`spawnsafe.go:540` 的 self-heal drain 也被 `h.state != stHealthy` 挡在门外。
+  3. `applyMounts`（`spawnsafe.go:374-405`）在 mountinfo 变动时按 **signature 相同则原样继承**旧判定；
+     `/shared` 恰因挂死而**无法被 autofs umount**，signature 恒定 ⇒ 继承链永不断。
+  4. 于是：agent 进程活了很久（PID 984969，比当日新 PID 小约 10^6），期间**每一次** exec 都探测过
+     `/shared` 并缓存 **healthy**；NFS 是**后来**才死的 ⇒ 该判定在进程生命周期内**永不重探**。
+  5. `--safe`（`requestedSafe=true`）只绕过 `bootHangable` 短路、强制 `refreshIfChanged()` 重读挂载表，
+     **不作废已缓存的 health 判定** ⇒ `docs/usage.md §7.7`「手动强制」承诺的逃生口在本场景下**结构上无效**。
+- **净效果**：保护静默退化成"只剩有界超时"——不剔 PATH、不走 local fallback、不发 `Warn`、不给
+  `remote_fs_unhealthy` / `_unsafe_cwd` 的**快速失败**（见 #82），只剩 2s / 30s 两条死线把"永久卡"换成
+  "必然失败"。**用户视角就是"那个 NFS 修复没起效"。**
+- **为什么现有测试与 drill 全都够不到**：`internal/spawnsafe/spawnsafe_test.go` 的用例全是
+  **"探测即死"**（fake probe 首次即返回 false）；OQ-2 的 `62-remote-fs-safe` FUSE spike 同样是
+  **先挂载 → 再 SIGSTOP → 才 exec**。**没有任何一条覆盖 healthy→dead 的时序**——这个转换从未被测过。
+- **怎么修（建议，未实施）**：
+  - **最省成本且自纠正**：`remote_fs_spawn_timeout` 本身就是"某条 healthy 判定已过期"的**证据**——
+    在发生 spawn timeout（`boundedResolveInDirs` 或 `startBounded` 任一）时把所有 hangable mount 的
+    `stHealthy` 降回 `stUnprobed`，下一次 spawn 自动重探即自愈。**稳态零开销**（健康机器永不触发）。
+  - 可选叠加：healthy 判定加 TTL（如 30–60s），仍走既有 single-flight + 有界探针；dead 保持 sticky
+    （重探死挂载 = 再泄一个 D 态线程，那条设计是对的）。
+  - `--safe` 应额外**强制作废 healthy 判定**，否则文档承诺的手动逃生口名不副实。
+  - `docs/usage.md §7.7`「已知边界」补一条：现在只写了"启动后**新挂**的网络盘不检测"，
+    没写"启动时健康、**之后才挂掉**的旧挂载同样不检测"——后者才是生产上真正会发生的那个。
+- **现场绕过（不改代码即可用）**：绝对路径 `tether exec <node> -- /usr/bin/nvidia-smi`；需要 shell 时
+  `-- /usr/bin/env PATH=/usr/bin:/bin /bin/bash -c '...'`（否则子进程继承中毒 PATH）；
+  **重启 agent 才是真正恢复**（新进程首探即命中死挂载 → 2s 判死 → 剔出 PATH → 相对命令恢复可用）。
+- **钉住它的测试（待补，均需变异验证）**：
+  hermetic —— `spawnsafe` 单测加一条 fake probe **首次 true、之后 false** 的用例，断言一次 spawn timeout
+  之后的下一次 `Prepare` 会 `Outage=true` 且剔除该目录（不加修复必须红）。
+  deploy-tier —— `62-remote-fs-safe` 增一臂：**先跑一次成功的 exec 把 healthy 灌进缓存**，再 SIGSTOP
+  hangfs daemon，然后断言相对 argv[0] 的 exec 仍能成功，而不是 `remote_fs_spawn_timeout`。
+
+### #82 — `exec --cwd <死挂载>` 在 #81 的 stale-healthy 态下不快速失败，且其后 agent 失联（CANDIDATE，未归因）
+
+> **来源 = 生产车队。** 2026-08-29 timan107，与 #81 同一次诊断。**OPEN，根因未归因**——本条只登记可复现的
+> 观测与时间相关性，**不宣称因果**。
+
+- **现象**：在 #81 的 stale-healthy 态下跑 `tether exec --cwd /shared/nas timan107 -- /bin/echo hi`：
+  - **没有**返回 `remote_fs_unsafe_cwd`——`Prepare` 的 lexical 快速失败因 `pathOnDeadMount(cwd)` 拿到
+    stale-healthy 而不触发。**这一半是 #81 的直接后果，机理清楚。**
+  - 也**没有**在 `startBounded` 的 30s 看门狗回 `remote_fs_spawn_timeout`；而同一台机同一批实验里，
+    `exec -- /shared/.../python` **确实**在 30.18s 正常回了该错，所以看门狗本身当时是活的。
+  - ctl 侧 90s 超时后，该节点在 broker 上转 **OFFLINE 并持续未回**（timan107 无 sudo / 无 systemd 自启，
+    靠 NFS `.bashrc` 登录自启，故不会自愈，需跳板重拉）。
+- **未归因的部分**：`cmd.Dir` 落在死挂载上时 chdir 发生在 **fork 之后的子进程**里，父进程阻塞在读
+  status pipe 上，`startBounded` 本应 30s 后放弃并回 `ErrSpawnTimeout`——这次没回。是看门狗在 `--cwd`
+  路径上没接上、还是 agent 另有他因退出（该机在诊断**之前**就已积压 `find` 与多个 `-bash` 的 D 态进程），
+  **现有证据不足以断言**。
+- **值得注意的先例**：OQ-2 的 spike 结论已写明「**mode:off-WITHOUT-safe 的遗留裸挂死**会驱使 agent 对死挂载做
+  **无界** chdir/exec……会 wedge agent」，并据此把该臂定格 NOT-COVERED、留给隔离宿主。本次是**同一风险在
+  生产上被观察到**，而且**不是** mode:off ——是 #81 让 `auto` 模式退化成了等价于 off。
+- **复现前提**：必须先造出 #81 的 stale-healthy 态（长寿命 agent + 探测时健康、之后才挂掉的网络盘），
+  所以它**不能**在现有 `62-remote-fs-safe`（先挂载后 SIGSTOP）里复现——同 #81 的"为什么现有测试够不到"。
+- **下一步**：先修 #81；修完后本条前一半会自动消失，再单独复核 `--cwd` 路径的 30s 看门狗是否真的接上。
+  **复现请用隔离宿主 + hangfs，不要在共享/生产机器上跑**（OQ-2 的定格理由依然成立）。
+
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 
 编号保持全局连续；下列条目已了结，正文已剥离归档。

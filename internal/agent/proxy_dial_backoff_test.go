@@ -97,7 +97,7 @@ func (h *backoffHarness) advance(d time.Duration) {
 
 // pushFull delivers a token-bearing directive (the broker's first full push).
 func (h *backoffHarness) pushFull(gen, epoch int64, port int, token string) {
-	h.a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	h.a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: port, Token: token, Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: gen, Epoch: epoch,
 	})
@@ -107,7 +107,7 @@ func (h *backoffHarness) pushFull(gen, epoch int64, port int, token string) {
 // re-sends every heartbeat — port=0, token="" — bootstrapping from the
 // persisted footprint).
 func (h *backoffHarness) pushKeys(gen, epoch int64) {
-	h.a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	h.a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: gen, Epoch: epoch,
 	})
@@ -252,7 +252,7 @@ func TestProxyDialBackoffResetOnSuccessAndReconnect(t *testing.T) {
 		// Break it again: teardown via authoritative OFF, re-enable, fail once —
 		// the next retry must be due after Base (5s), not the old deep window.
 		h.adapter.setHealthy(false)
-		h.a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{Enabled: false, Generation: 1, Epoch: 5})
+		h.a.applyProxyDirective(nil, &proto.ProxyDirective{Enabled: false, Generation: 1, Epoch: 5})
 		h.pushFull(1, 6, 14000, "tok3")
 		base := h.adapter.count()
 		h.advance(5 * time.Second)

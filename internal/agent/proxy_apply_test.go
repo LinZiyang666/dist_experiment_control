@@ -43,7 +43,7 @@ func TestApplyProxyDirectiveConcurrent(t *testing.T) {
 	a := newProxyTestAgent(t)
 
 	// Initial full directive starts the SS server (nil ExposeAdapter → no tunnel).
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: "chacha20-ietf-poly1305",
 		Keys:  []proto.ProxyKey{{SubID: "s0", Secret: "p0"}},
 		Epoch: 1,
@@ -59,7 +59,7 @@ func TestApplyProxyDirectiveConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 1; i <= 30; i++ {
 				// Keyset-only deltas with monotonic-ish epochs (out-of-order across goroutines).
-				a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+				a.applyProxyDirective(nil, &proto.ProxyDirective{
 					Enabled: true,
 					Keys:    []proto.ProxyKey{{SubID: "s0", Secret: "p0"}, {SubID: "s1", Secret: "p1"}},
 					Epoch:   int64(g*100 + i),
@@ -72,11 +72,11 @@ func TestApplyProxyDirectiveConcurrent(t *testing.T) {
 	// A keyset push that arrives while running but with no server (after a
 	// teardown) must not panic. First disable (newer pair), then a keyset-only
 	// delta that's newer still.
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{Enabled: false, Generation: 1 << 30})
+	a.applyProxyDirective(nil, &proto.ProxyDirective{Enabled: false, Generation: 1 << 30})
 	if a.proxy.srv != nil {
 		t.Fatal("server should be stopped after disable")
 	}
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Generation: 1 << 31, Epoch: 9999,
 	})
 	// No persisted footprint + keyset-only → stays stopped (awaits full directive).
@@ -99,7 +99,7 @@ func runningSrv(a *Agent) bool {
 func TestFailClosedTearsDownAfterGrace(t *testing.T) {
 	a := newProxyTestAgent(t)
 	a.cfg.ProxyFailClosedGrace = 60 * time.Millisecond
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Epoch: 1,
 	})
@@ -120,7 +120,7 @@ func TestFailClosedTearsDownAfterGrace(t *testing.T) {
 func TestFailClosedCancelledByReconnect(t *testing.T) {
 	a := newProxyTestAgent(t)
 	a.cfg.ProxyFailClosedGrace = 200 * time.Millisecond
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "tok", Cipher: "chacha20-ietf-poly1305",
 		Keys: []proto.ProxyKey{{SubID: "s0", Secret: "p0"}}, Epoch: 1,
 	})
@@ -130,7 +130,7 @@ func TestFailClosedCancelledByReconnect(t *testing.T) {
 	if !runningSrv(a) {
 		t.Fatal("a reconnect within the window must keep the SS server running")
 	}
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{Enabled: false, Epoch: 1 << 30}) // cleanup
+	a.applyProxyDirective(nil, &proto.ProxyDirective{Enabled: false, Epoch: 1 << 30}) // cleanup
 }
 
 // Round-2 F2: out-of-order LIVE PUSHES are de-duplicated by arrival sequence
@@ -162,7 +162,7 @@ func TestProxyPushSequenceOrdersOutOfOrderGoroutines(t *testing.T) {
 	if gotEpoch != 6 {
 		t.Fatalf("a reordered older push was applied: epoch=%d want 6", gotEpoch)
 	}
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{Enabled: false, Epoch: 1 << 30})
+	a.applyProxyDirective(nil, &proto.ProxyDirective{Enabled: false, Epoch: 1 << 30})
 }
 
 // Round-2 F4 (production fix): once Run sets proxyDraining, dispatchForwarded

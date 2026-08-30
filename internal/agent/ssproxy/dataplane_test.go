@@ -33,7 +33,7 @@ func TestDataPlaneSSOverTunnelRoundTrip(t *testing.T) {
 
 	// Agent: embedded SS server on a loopback port.
 	srv := New(nil)
-	localSS, err := srv.Start(context.Background(), 0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
+	localSS, err := srv.Start(0, []Key{{KeyID: "alice", Secret: "alice-psk"}})
 	if err != nil {
 		t.Fatal(err)
 	}

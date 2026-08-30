@@ -18,7 +18,7 @@ import (
 // newly enabled proxy down.
 func TestExternalReviewStaleNilRegisterReplyDoesNotOverrideEnable(t *testing.T) {
 	a := newProxyTestAgent(t)
-	a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled:    true,
 		PublicPort: 14000,
 		Token:      "new-token",
@@ -26,7 +26,7 @@ func TestExternalReviewStaleNilRegisterReplyDoesNotOverrideEnable(t *testing.T) 
 		Keys:       []proto.ProxyKey{{SubID: "alice", Secret: "alice-psk"}},
 		Epoch:      2,
 	})
-	defer a.applyProxyDirective(context.Background(), nil, &proto.ProxyDirective{
+	defer a.applyProxyDirective(nil, &proto.ProxyDirective{
 		Enabled: false,
 		Epoch:   3,
 	})
@@ -36,7 +36,7 @@ func TestExternalReviewStaleNilRegisterReplyDoesNotOverrideEnable(t *testing.T) 
 	}
 
 	// nil is the proxy-OFF register representation and carries no epoch.
-	a.applyProxyDirective(context.Background(), nil, nil)
+	a.applyProxyDirective(nil, nil)
 	if !runningSrv(a) {
 		t.Fatal("stale proxy-OFF register reply tore down a newer epoch-2 enable")
 	}
@@ -120,7 +120,7 @@ func TestExternalReviewFailedProxyRebuildPublishesUnready(t *testing.T) {
 	}
 	a.runCtx = context.Background()
 
-	a.applyProxyDirective(context.Background(), nc, &proto.ProxyDirective{
+	a.applyProxyDirective(nc, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14000, Token: "token-1",
 		Keys: []proto.ProxyKey{{SubID: "alice", Secret: "alice-psk"}}, Epoch: 1,
 	})
@@ -138,7 +138,7 @@ func TestExternalReviewFailedProxyRebuildPublishesUnready(t *testing.T) {
 
 	// A fresh token forces a full rebuild. The injected second AddProxy fails
 	// after the old server has already been stopped.
-	a.applyProxyDirective(context.Background(), nc, &proto.ProxyDirective{
+	a.applyProxyDirective(nc, &proto.ProxyDirective{
 		Enabled: true, PublicPort: 14001, Token: "token-2",
 		Keys: []proto.ProxyKey{{SubID: "alice", Secret: "alice-psk"}}, Epoch: 2,
 	})
