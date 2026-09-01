@@ -113,7 +113,9 @@ sim_agent_slog_grep() {
 # 71-expose-rehome-failover depend on empty≠zero, so a missing file must print
 # nothing rather than a confident "0 matches".
 sim_agent_slog_count() {
-    dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; f=/home/sim/.tether/agent/\${SID:-lab}/agent.log; [ -f \"\$f\" ] || exit 0; tail -c +\$(( ${3:-0} + 1 )) \"\$f\" 2>/dev/null | grep -cE '$2'" 2>/dev/null | tr -d '\r' | tail -1
+    _sasc_cursor=${3:-0}
+    case "$_sasc_cursor" in ''|*[!0-9]*) return 2 ;; esac
+    dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; f=/home/sim/.tether/agent/\${SID:-lab}/agent.log; [ -f \"\$f\" ] || exit 0; tail -c +\$(( $_sasc_cursor + 1 )) \"\$f\" 2>/dev/null | grep -cE '$2'" 2>/dev/null | tr -d '\r' | tail -1
 }
 
 # sim_agent_slog_tail <node> [lines] — diagnostics.
@@ -125,4 +127,18 @@ sim_agent_slog_tail() {
 # (dup2'd fd 2). Separate from the slog reader on purpose.
 sim_agent_panic_sink() {
     dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; grep -qE '$2' /home/sim/.tether/agent/\${SID:-lab}/agent.boot.err 2>/dev/null"
+}
+
+# sim_agent_slog_since <node> <cursor> [max-lines] — the agent slog written AFTER <cursor>,
+# capped at max-lines (default 200). Added for drill 62's Arm 1S evidence dumps: a plain
+# tail is not bounded to the command being diagnosed, and because the agent restarts
+# between arms (and appends to the same file) a tail can be entirely post-restart lines
+# while the window under investigation scrolls off. Same one-mapping rule as the readers
+# above — drills must not reach into the slog path themselves.
+sim_agent_slog_since() {
+    _sass_cursor=${2:-0}
+    _sass_lines=${3:-200}
+    case "$_sass_cursor" in ''|*[!0-9]*) return 2 ;; esac
+    case "$_sass_lines" in ''|*[!0-9]*) return 2 ;; esac
+    dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; f=/home/sim/.tether/agent/\${SID:-lab}/agent.log; [ -f \"\$f\" ] || exit 0; tail -c +\$(( $_sass_cursor + 1 )) \"\$f\" 2>/dev/null | head -n $_sass_lines"
 }

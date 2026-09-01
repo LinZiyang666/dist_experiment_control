@@ -258,3 +258,36 @@ func TestRunFailureMessageSplitsCodeFromDetail(t *testing.T) {
 		})
 	}
 }
+
+// TestRunFailureReasons_spawnTimeoutTellsUserToRetry pins the user-visible half of
+// the gotcha #81 fix.
+//
+// The agent now expires its cached mount-health verdicts when a spawn stalls, so the
+// same command run again re-probes and drops the dead $PATH dir. That behaviour is
+// worthless if nobody knows to retry — and before the fix retrying was genuinely
+// pointless, so the habit people learned is "this node is broken, give up". docs
+// rot and few operators read them mid-incident; this hint string is what they
+// actually see, which is why the advice is pinned here and not only in usage.md.
+//
+// origin: docs/deploy-tier-gotchas.md #81 (timan107, 2026-08-29)
+func TestRunFailureReasons_spawnTimeoutTellsUserToRetry(t *testing.T) {
+	hint, ok := runFailureReasons["remote_fs_spawn_timeout"]
+	if !ok {
+		t.Fatal("remote_fs_spawn_timeout lost its hint")
+	}
+	for _, want := range []string{"again", "--safe"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint must tell the operator to %q; got %q", want, hint)
+		}
+	}
+	// Retrying is now useful, but the honest limit still has to be stated: if the
+	// binary itself lives on the dead mount, no number of retries helps.
+	if !strings.Contains(hint, "no retry can help") {
+		t.Errorf("hint must keep the honest limit about binaries on the dead mount; got %q", hint)
+	}
+	// Exit class must stay transient — "retry works" and "exit non-transient" would
+	// be contradictory advice to any wrapper script reading the code.
+	if got := brokerCodeExitClasses["remote_fs_spawn_timeout"]; got != exitTransient {
+		t.Errorf("remote_fs_spawn_timeout exit class %d, want exitTransient (%d)", got, exitTransient)
+	}
+}

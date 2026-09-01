@@ -886,9 +886,106 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 ### #81 — spawnsafe 的 mount health `stHealthy` 无 TTL、永不失效 ⇒「先健康、后挂掉」的 NFS 永远不被剔出 `$PATH`，整套 remote-fs 保护静默退化成"只剩有界超时"
 
 > **来源 = 生产车队，非 simcluster drill。** 2026-08-29 timan107 现场诊断（agent 0.5.0，UIUC CS 机房）。
-> **OPEN，未修。** 这是 v0.3.3 `remote-fs-resilience` 增量（`docs/reviews/remote-fs-resilience-plan.md`）
-> 在**真实长寿命 agent** 上的结构性缺口：该增量的全部 hermetic 单测与 OQ-2 spike 都只覆盖
-> **「挂载在第一次探测时就已经死」**，从未覆盖**「探测时活、之后才死」**。
+> **✅ FIXED（2026-09-01 第二次外审：根因闭合 + deploy-tier 3 次独立实例稳定）**；plan
+> `docs/reviews/remote-fs-stale-health-plan.md`，内审 `-review.md`，外审 `-external-review.md`。
+>
+> 历史上曾因 drill 62 Arm 1S 的间歇 `rc=124` 降回 verification-blocked；以下保留归因过程。
+>
+> **2026-08-31 取证后的订正。** 把每条命令拆成 **oracle A（控制面是否交出终态）** 与
+> **oracle B（产品码对不对）** 之后，11 次独立运行的结论是：
+> **两条连续的挂死挂载 `exec` 中，间歇性地有一条在 45s 内拿不到终态，位置在 1S-2 与 1S-3 之间游移。**
+> 每一次红都落在 **oracle A**（控制面侧），而证据显示
+> 「游标之后 agent 记录的 exec 行数 = 1」——**agent 收到了请求并记了日志，ctl 什么都没收到**。
+> 此前所有把它描述成「healthy→dead 恢复路径复现红灯」的归因**都指错了地方**：一条命令只有一个断言时，
+> 「控制面没交出终态」与「产品码不对」在观测上不可分。（中途我一度断言「红的是 1S-2」——那也是从单次
+> 运行过度概括，装上两臂仪表后位置又变回 1S-3；一并记在这里，因为这正是**样本量不足就下结论**的复发形态。）
+>
+> **现在精确的未决问题（独立于 #81 的修复本身）**：*对挂死挂载发起的 ctl `exec`，agent 已记录收到请求，
+> 但 ctl 有时 45s 内拿不到任何终态，尽管 agent 自己的 execve 看门狗只有 30s。*
+> 归属未定（agent 回包路径 / broker / ctl / harness），**未猜、未改产品码**。
+>
+> **2026-09-01 第二次外审订正。** 三层仪表的首次独立运行再次在 1S-3 得到 rc=124；agent 游标后有
+> 一条 request-start 记录。返修脚本虽声称「C 只在 B 成立时断言」，实际 A/B/C 三个 `assert_ok` 无条件
+> 顺序执行，因此同一次 transport 红又制造了一条 C 产品红；B 的宽泛 `agent: exec` 还会匹配前一请求的
+> 延迟 watchdog warning。现已改为：A/B 分别落盘成功标记，C 只有在 A+B 均成立时才执行；B 只匹配
+> `msg="agent: exec" ... pid=` 的 request-start 且必须恰好一条。ledger signature 也已与实际断言标题校准。
+>
+> **最终产品根因与处置。** 在第二条请求挂起窗口向 agent 发 SIGQUIT，goroutine dump 显示：第一条被 watchdog
+> 「放弃」的直接 `cmd.Start` 仍停在 Go runtime 无法完成 stop-the-world 的位置；第二条在编码 error reply 时
+> 触发 GC，GC 等该线程，遂把 heartbeat、timer 与 NATS 回包一起冻住，直到 FUSE 恢复。`go cmd.Start()` 加
+> timeout 只界定调用者等待，**不等于隔离 Go runtime**。现由 `internal/spawnexec` re-exec 本地当前二进制；
+> agent/PTY owner 等待可取消 pipe 握手，exec 与 run 共用此边界，helper 私有环境标记不会传给目标。
+>
+> **2026-09-01 外审事故与二次订正。** 第一版 helper 又在 helper 内调用 `exec.Cmd.Start`，即每次风险启动保留
+> 一个完整 Go helper，再 fork 一个可能卡在 execve 的子进程；agent 重启会重置进程内 wedge 计数，却不会清掉
+> D-state 孤儿。外审裸跑测试/模拟时最终遗留 **5,789 个 `exe`、合计约 307 GiB RSS**，耗尽 251 GiB 主机内存与
+> 8 GiB swap，触发 global OOM，连锁杀死共享 tmux、推理 replica 与 `agent.test`。这不是单进程 heap leak，而是
+> **跨 agent 生命周期的进程/内存泄漏**。修正后 helper 自身直接 `syscall.Exec`（目标 PID 必须等于 helper PID，
+> 回归测试钉住），不再二次 fork；status fd 与抽象 AF_UNIX 槽均为 CLOEXEC，成功 exec 即释放，卡在 cwd/execve
+> 则继续占槽。64 个内核槽跨 agent 重启生效，封住进程内 Policy ceiling 无法覆盖的孤儿累积；继承环境和显式
+> RPC env 都剥离私有 mode key。另一个放大器是 `/proc/self/exe` 在 Go 测试里指向当前 `*.test`：第一版只给
+> 三个已知包手写 `TestMain`，未接线的 CLI/E2E 测试会递归执行整套测试。现由 `internal/spawnexec.init` 对所有
+> 链接者统一、早期分派，门禁反向禁止把责任重新散回各包的 `TestMain`；`make gates` 直接运行该包。
+>
+> 当前源码重建镜像后，drill 62 三次全新隔离实例均为
+> `INCOMPLETE pass=41 assert_fail=0 product_red=0 not_covered=1`；唯一 gap 是独立 OQ-2 true-D 专用硬件臂。
+> #81 临时 band 已删除，后续任何 A/B/C 红均重新成为无条件 deviation。故转 FIXED。
+>
+> **方法论教训（第二条，与 (d) 同族）**：第一版取证代码自己是坏的——用全局变量在 `assert_ok` 的
+> 子 shell 里传状态（丢失）、dash 的 `printf` 把 `--` 开头的 format 当选项（截断证据），产出过一轮
+> **5/5 假红**。现已改为走文件，且 **oracle A 在 rc 缺失时也红**：harness 坏掉必须自曝，不能冒充产品判决。
+>
+> ⚠ 下文"机理"三条里的 `spawnsafe.go:NNN` 行号指的是**修复前**（2026-08-29）的树，属事故取证，不追溯改。
+> 这是 v0.3.3 `remote-fs-resilience` 增量在**真实长寿命 agent** 上的结构性缺口：该增量的全部 hermetic
+> 单测与 OQ-2 spike 都只覆盖**「挂载在第一次探测时就已经死」**，从未覆盖**「探测时活、之后才死」**。
+
+> **修法摘要**：健康判定不再是终态。两条失效路径——**证据驱动**（`boundedResolveInDirs` 与
+> `RunStartWithCleanup` 的超时分支、`--safe`、agent 的 Home 有界读超时，共 4 个调用点）+ **惰性 TTL**
+> （`DefaultHealthTTL = 5 min`）；作废动作是**换一个全新的 `mountHealth` 指针**（不是原地重置——原地重置
+> 会 close-of-closed panic，且掉队 launcher 的 `state == stUnprobed` 守卫会拒绝降级新纪元）。
+> **dead 仍绝对 sticky**。零 wire 改动、零新 `agent.yaml` 键 ⇒ **回滚是纯二进制回滚**。
+> 闸门：`test/architecture/spawn_stall_evidence_test.go`（铸造点精确账本**双向**enforce + 必须在同一死线臂内
+> + **路径敏感**的支配检查：作废必须在到达每个 return 的每条路径上都已**同步**执行（`go`/`defer` 不算，
+> 遇 `goto`/label 直接 fail-closed），且能带着 `p.mu` 到达作废调用即红（分支不一致按持有处理，
+> 复合语句 initializer 按执行顺序处理，限 `internal/spawnsafe`）；五个外审/复审反例 + 15 例同族正负控制钉住）；行为守卫在
+> `internal/spawnsafe/spawnsafe_test.go` 与 `internal/agent/remotefs_test.go`。
+>
+> **变异验证的诚实说明（内审 F-2 订正）**：初稿写「13 条…每条都做过变异验证」，这句话当时**不成立**。
+> 内审查实三件事：(i) 变异是按 `-run` **正则分组**跑的，`TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup`
+> 的红其实来自同组的另一条；(ii) 该测试的 `close(stop)` 排在 worker 之前，invalidator 只跑 0–3 圈
+> （113µs–1.39ms vs worker 的 12.5–15.6ms），几乎没有 churn 可言；(iii) 它对「`invalidateHealthy` 整体
+> 变空操作」也绿——即对它命名的那件事零断言。三条都已修（**逐条单测**、把 `close(stop)` 移到 worker 之后、
+> 按**探测次数**断言"重新武装真的发生了"），并补了确定性白盒守卫
+> `TestMountHealthy_reArmReplacesGenerationPointer` 把这个设计决策从并发调度里解耦出来。
+> **现在的记录是：每条守卫都用它自己声称能抓的那个缺陷、逐条单独跑过，红绿两向都验过。**
+> 教训写在这里而不是只写在 review 里：**按正则分组跑变异会互相掩蔽**，这是一种可复发的方法论错误。
+
+> **正文订正（本轮查实，写在这里而不是改冻结的 plan）**：
+> - **(a) 当年否掉 TTL 的推理没错，错在它的适用范围没被继续追问。** `remote-fs-resilience-plan.md` §B
+>   的原话是：「rejects a plain ~5s TTL, which re-issues a fresh `statfs` against a **still-dead** mount
+>   every window and leaks one D-state goroutine **per window**」。注意 **still-dead** 这个限定词——
+>   那句话对它的指称对象（一个**连 dead 判定也重探**的 plain TTL）**是真的**，本批并不推翻它。
+>   本批做的是换一个指称对象：TTL **只作用于 healthy 判定**，dead 依旧绝对 sticky。在这个约束下泄漏画像
+>   完全不同——每个 (挂载, 代) 最多泄一个：重探要么在时返回（零泄漏），要么超时 ⇒ 判死 ⇒ 永不重探；
+>   要泄第二个必须先回到 healthy，而那要求前一个被放弃的 statfs 已经返回。
+>   **教训不是"当年推理错了"，而是"一条正确的否决被当成了对整个方案族的否决"。**
+>   （本条初稿写成「当年否掉 TTL 的理由是假命题」，删掉了 still-dead 这个承重限定词，属歪曲转述；
+>   内审 F-22 订正。）
+> - **(b) 单靠 spawn-timeout 证据修不了两类零证据负载**，所以必须叠 TTL：① **显式 argv[0] + 本地 cwd**
+>   （`exec -- /bin/bash -c …`）不进 `boundedResolveInDirs`、execve 秒成，agent 侧零超时，卡死的是它拉起来的
+>   **子进程**——这正是 107 上那几个 D 态 bash 的形态；② **wedge ceiling 打满**时两个看门狗都在 select
+>   **之前**早退，任何超时分支都不执行。
+> - **(c) `[GAP]` 登记**：`outage=true` 全链路（childEnv PATH 重写 / PWD 注入 / cwd→safe_dir / fallback PATH /
+>   dropped 横幅）在部署层**从未跑过一次**——现有 62 的断言全部发生在 `sanitizePATH` **之前**。要覆盖它得给
+>   `drills/lib/agentyaml.sh` 加 `remotefspath:` token，而 `agent_provision_yaml` 有 **36 处调用 / 20 个文件**
+>   的契约面，该走独立增量。**本次修复会让这条码路第一次在现网点亮**，上线按 plan §7 R1 分级（weilandserver
+>   → 单台 timan → 全车队）。
+> - **(d) 变异轮的实测教训（三条恒等式，两轮才抓完）**：`TestApplyMounts_carryOverPreservesHealthyFreshness`
+>   与 `TestPrepare_slowMountFalseDemotionSelfHealsWithinOneCommand` 初版都是**恒等式**——前者因 churn 期间
+>   时钟不走、"刷新 decidedAt"写进去的是同一个值；后者因 `decidedAt` 已被判死那一步盖成非零值，而测试全程
+>   冻结时钟。这两条由主进程的变异轮抓出。第三条 `TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup`
+>   **躲过了那一轮**，由内审抓出——因为主进程按 `-run` 正则**分组**跑变异，它的"红"来自同组的另一条测试。
+>   与 memory 里「批次 B 真实翻车」同形，但多了一条新教训：**分组跑变异会互相掩蔽，必须逐条单测**。
 
 - **现象（生产实测）**：timan107 的 `/shared`（autofs direct 之上的 nfs4 overmount，
   `czhai-storage-01.cs.illinois.edu` / `128.174.136.29`）挂死后——
@@ -947,8 +1044,41 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 
 ### #82 — `exec --cwd <死挂载>` 在 #81 的 stale-healthy 态下不快速失败，且其后 agent 失联（CANDIDATE，未归因）
 
-> **来源 = 生产车队。** 2026-08-29 timan107，与 #81 同一次诊断。**OPEN，根因未归因**——本条只登记可复现的
+> **来源 = 生产车队。** 2026-08-29 timan107，与 #81 同一次诊断。**仍 OPEN，根因未归因**——本条只登记可复现的
 > 观测与时间相关性，**不宣称因果**。
+
+> **⬆ 2026-08-30 更新（#81 修复批）**：**前半段的频率从 O(命令数) 降到 O(1)，但没有被消灭。**
+> 精确说法：在同一个 healthy→dead 窗口里，**第一条** `exec --cwd <死挂载>` 仍会被 stale-healthy 放行、
+> 仍付一次 30s execve 看门狗、仍 fork 出一个 pre-execve D 态子进程；此后该判定被证据/TTL/`--safe` 作废，
+> 后续命令才在 `Prepare` 的 lexical 检查处快速失败为 `remote_fs_unsafe_cwd`。
+> 两半都钉住了：`TestPrepare_cwdOnStaleHealthyMountFailsFastOnceInvalidated` 的**控制断言**明确断言
+> stale-healthy 期间那次放行仍然发生，`TestPrepare_safeInvalidatesBeforeCwdCheck` 断言 `--safe` 能让
+> **第一条**就快速失败。
+> （早先这里写的是"前半段已消失"——那与它自己援引的那条测试的控制断言矛盾，也违反本批 plan §7 R13
+> 「不要在 gotcha 里宣称 #82 已解决」。内审 F-10 订正。）
+> **后半段（agent 转 S 态停止处理消息）仍 OPEN、不修**，理由与新证据如下。
+>
+> **本轮排除的三条假说（都由读源码证伪，写在这里让下一个人不必重走）**：
+> - **假说 A「`--cwd` 路径没接上 30s 看门狗」— 证伪。** `internal/agent/exec.go` 的 `startBounded` 在
+>   `decision.Active` 下包住 `cmd.Start`，与是否设 `cmd.Dir` 无关；`cmd.Dir` 在更早的 `buildExecCmd` 就已设好；
+>   `run.go` 的 `RunStartWithCleanup` 同理。（本轮还把 exec 侧的 `startBounded` 收敛进
+>   `spawnsafe.RunStartWithCleanup`，两条 spawn 路径现在共用同一个看门狗。）
+> - **假说 B「一条卡死的 exec head-of-line block 了订阅的消息循环」— 证伪。** `exec.go` 每个 forwarded verb
+>   都以 `go a.handleXForwarded(...)` 独立派发。
+> - **假说 D「wedge slot 耗尽」— 弱，否决。** 槽位耗尽在两处都是**第一行 return**，产生的是立即返回的
+>   `too_many_wedged_spawns`，不是沉默；解释不了「没有任何返回」。
+>
+> **假说 C（本轮新查出，最强的一条，只登记不修）**：`internal/agent/state.go` 的**写**路径无死线且**持锁**——
+> `AddPort` / `UpdatePortHome` / `RemovePort` / `SetProxy` / `SetRosterCache` 全在 `s.mu` 下调用无界的
+> `saveLocked`；只有**读**被做成有界 + 单飞。Home 落在死挂载上的一次写会**永久持有 `s.mu`**，此后每个
+> `load()` / `GetProxy()` / `GetRosterCache()` 全部堵在它后面——这与「原 agent 进程 S 态活着但停止处理消息」
+> 比任何其它候选都吻合，且 `roster.go` 的 `SetRosterCache` 提供了一条不需要用户操作就能触发的路径。
+> **这是假说不是结论**：timan107 的 Home 是 `/home/zixuans8`，当时实测**健康**，所以要成立需要该 NFS 后来也
+> 出问题、或另有写路径落在 `/shared`。**下一个增量必须先验证再动手。** 这条源码事实（与 #82 是否归因无关）
+> 已补进 `docs/usage.md §7.7` 的已知边界。
+>
+> **两个 pre-execve D 态 fork 子进程**（cmdline 仍是父进程 argv、etime 与那条命令吻合）依然**无解释、无修复**。
+> 复现定格不变：隔离宿主 + hangfs，不要在共享/生产机器上跑。
 
 - **现象**：在 #81 的 stale-healthy 态下跑 `tether exec --cwd /shared/nas timan107 -- /bin/echo hi`：
   - **没有**返回 `remote_fs_unsafe_cwd`——`Prepare` 的 lexical 快速失败因 `pathOnDeadMount(cwd)` 拿到

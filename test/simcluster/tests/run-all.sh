@@ -8,7 +8,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RC=0
-for t in poll-reentrancy-test verdict-contract-test validate-verdicts validate-verdicts-selftest deviation-report-test poll-mode-test dns-preflight-test simcluster-accel-external-review-test simcluster-accel-external-rereview-test simcluster-accel-final-review-test lint-drills lint-install ledger-crosscheck r9d-nonvacuity teardown-recovery-nonvacuity-test kept-sites-selftest; do
+for t in poll-reentrancy-test verdict-contract-test validate-verdicts validate-verdicts-selftest deviation-report-test poll-mode-test dns-preflight-test simcluster-accel-external-review-test simcluster-accel-external-rereview-test simcluster-accel-final-review-test remote-fs-oracle-contract-test lint-drills lint-install ledger-crosscheck r9d-nonvacuity teardown-recovery-nonvacuity-test kept-sites-selftest; do
     printf '%-24s ' "$t"
     if out=$(sh "$HERE/$t.sh" 2>&1); then printf 'PASS\n'
     else printf 'FAIL\n'; printf '%s\n' "$out" | tail -5 | sed 's/^/    /'; RC=1; fi

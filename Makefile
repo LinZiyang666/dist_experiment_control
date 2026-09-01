@@ -262,7 +262,7 @@ nats-dev:
 # every gate did not run it. The reconciliation is now itself a gate: test/architecture's
 # TestGatesTargetCoversEveryGateCLAUDEMdNames fails if the two lists drift again.
 gates: vet-tags
-	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/ ./internal/proto/
+	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/ ./internal/proto/ ./internal/spawnexec/
 	$(MAKE) lint
 
 tidy:

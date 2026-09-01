@@ -305,7 +305,7 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 	// `tether run --safe gpu-01 -- bash`. A trailing `--safe` is sent to the
 	// remote argv, not parsed here.
 	cmd.Flags().BoolVar(&safe, "safe", false,
-		"hung-mount-safe spawn: resolve argv[0] against a PATH sanitized of unresponsive network mounts; fail fast instead of hanging")
+		"hung-mount-safe spawn: re-probe mount health (discarding cached verdicts), resolve argv[0] against a PATH sanitized of unresponsive network mounts, and fail fast instead of hanging")
 	// Audit shard 04 F12: same as exec — stop cobra parsing the
 	// remote command's flags as ours.
 	cmd.Flags().SetInterspersed(false)

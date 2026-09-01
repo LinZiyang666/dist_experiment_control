@@ -154,7 +154,7 @@ remote command, not parsed here, and the safe-spawn lifeline silently no-ops.
 	// `tether exec --safe gpu-01 -- whoami`. A trailing `--safe` is sent to the
 	// remote argv, not parsed here.
 	cmd.Flags().BoolVar(&safe, "safe", false,
-		"hung-mount-safe spawn: resolve argv[0] against a PATH sanitized of unresponsive network mounts; fail fast instead of hanging")
+		"hung-mount-safe spawn: re-probe mount health (discarding cached verdicts), resolve argv[0] against a PATH sanitized of unresponsive network mounts, and fail fast instead of hanging")
 	// Audit shard 04 F12: without this, `tether exec node1 ls -la`
 	// fails with "unknown shorthand flag 'l'" because cobra parses
 	// the remote command's flags as ours. SetInterspersed(false)

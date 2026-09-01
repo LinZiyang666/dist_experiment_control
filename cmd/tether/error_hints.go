@@ -226,7 +226,10 @@ var brokerCodeExitClasses = map[string]int{
 	"cluster_not_ready":       exitTransient, // the cluster is still converging
 	"remote_fs_unhealthy":     exitTransient, // spawnsafe: the path lives on a wedged mount; heals when the mount does
 	"remote_fs_spawn_timeout": exitTransient, // spawnsafe: the bounded stat gave up; the slot is released on fs recovery
-	"too_many_wedged_spawns":  exitTransient, // spawnsafe: slot exhaustion, self-clearing (spawnsafe.go:812-814)
+	// Anchored on the FUNCTIONS, not on line numbers: the previous form pointed at
+	// spawnsafe.go:812-814, which drifted onto unrelated comment text the first time the
+	// file grew. A stale pointer in an incident-time hint is worse than none.
+	"too_many_wedged_spawns": exitTransient, // spawnsafe: slot exhaustion, self-clearing (the TryAcquireSpawnSlot early return in boundedResolveInDirs / RunStartWithCleanup)
 
 	// operator-action-required (a human must change something) -> 64
 	"name_required":         exitUsage,
@@ -389,10 +392,15 @@ var runFailureReasons = map[string]string{
 	"json_parse":    "the agent couldn't parse our run request — tether bug, please report.",
 	// remote-fs-resilience (docs/reviews/remote-fs-resilience-plan.md): the
 	// agent refused/abandoned the spawn because a network filesystem is wedged.
-	"remote_fs_unhealthy":     "argv[0] is on an unresponsive network mount (NFS/CIFS/...); use a binary on local disk, or --cwd a local dir.",
-	"remote_fs_unsafe_cwd":    "the requested --cwd is on an unresponsive network mount; pick a local working directory.",
-	"remote_fs_not_found":     "argv[0] was not found in the network-safe PATH (its dir may be on a wedged mount); use an absolute local path.",
-	"remote_fs_spawn_timeout": "fork/exec stalled (likely a hung network mount under argv[0] or cwd) and was abandoned; the binary/data may live on dead NFS.",
+	"remote_fs_unhealthy":  "argv[0] is on an unresponsive network mount (NFS/CIFS/...); use a binary on local disk, or --cwd a local dir.",
+	"remote_fs_unsafe_cwd": "the requested --cwd is on an unresponsive network mount; pick a local working directory.",
+	"remote_fs_not_found":  "argv[0] was not found in the network-safe PATH (its dir may be on a wedged mount); use an absolute local path.",
+	// The retry advice is the user-visible half of the #81 fix: this timeout makes
+	// the agent expire the mount-health verdicts it had cached, so the SAME command
+	// run again re-probes and drops the dead $PATH dir. Before that fix re-running
+	// was pointless — it failed identically forever — so "just run it again" has to
+	// be stated here, not only in usage.md, because this string is what people read.
+	"remote_fs_spawn_timeout": "fork/exec stalled (likely a hung network mount under argv[0] or cwd) and was abandoned; the agent just expired its cached mount-health verdicts, so run the same command again to re-probe and drop the dead $PATH dir (--safe forces it immediately). If the binary or data itself lives on the dead mount, no retry can help.",
 	"too_many_wedged_spawns":  "too many spawns are already wedged on a hung filesystem; wait for the mount to recover (or restart the agent).",
 }
 

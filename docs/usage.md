@@ -701,7 +701,7 @@ flag：
 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 | `--cwd`     | (空 = agent 端默认目录) | 远端进程的工作目录 |
 | `--timeout` | `10m`              | 整次命令最长时间（含流式输出），超时返回 `timed out after ...` |
-| `--safe` | false | 在 agent 端用去掉疑似挂死网络挂载的 PATH 解析 argv[0]，避免 NFS/CIFS 卡死；必须写在 `<nid>` 之前 |
+| `--safe` | false | 在 agent 端**强制作废已缓存的挂载健康判定、立即重探**，再用去掉挂死网络挂载的 PATH 解析 argv[0]，避免 NFS/CIFS 卡死；成本是 per-call（最坏 `probe_timeout` × 被咨询的健康网络挂载数），详见 §7.7；必须写在 `<nid>` 之前 |
 
 注：`--` 是可选分隔符（cobra 自动剥离）；`tether exec <nid> ls -la` 与
 `tether exec <nid> -- ls -la` 等价，因为 `SetInterspersed(false)` 已让 `-la`
@@ -746,7 +746,7 @@ flag：
 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 | `--cwd` | (空 = agent 端默认目录) | 远端 PTY 进程的工作目录 |
-| `--safe` | false | 与 `exec --safe` 相同，先避开疑似挂死网络挂载再解析 argv[0]；必须写在 `<nid>` 之前 |
+| `--safe` | false | 与 `exec --safe` 相同：**强制作废已缓存的挂载健康判定并立即重探**，再避开挂死网络挂载解析 argv[0]；必须写在 `<nid>` 之前 |
 | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续启动交互进程；只确认本次风险 |
 
 非 tty 调用（如 `tether run nid -- bash <<<EOF ... EOF`）时 SIGINT 转成
@@ -1471,14 +1471,37 @@ agent 检测到某网络挂载无响应时，会**把该挂载的目录从 `$PAT
   - `remote_fs_unsafe_cwd` —— `--cwd` 指向死挂载;
   - `remote_fs_spawn_timeout` —— fork/exec 卡死被放弃（二进制/数据可能真在死 NFS 上）。
 
+**挂载"先健康、后挂掉"怎么办（本版本起）**：agent 对每个网络挂载缓存一个健康判定。
+**该判定不再是终态**——两条路让它失效：
+
+- **证据驱动（主路径）**：一次 `remote_fs_spawn_timeout` 本身就证明某条缓存的"这块盘是好的"
+  已经过期（活着的盘不会把 stat 或 execve 卡住）。agent 立刻作废这些判定，**原样重跑同一条命令**
+  就会重探、判死、把那个目录剔出 `$PATH`。
+- **TTL 兜底**：健康判定最多 5 分钟过期一次。它覆盖的是**完全不产生证据**的负载——比如只用绝对路径
+  argv[0]（`exec -- /bin/bash -c ...`）：这类命令自己跑得好好的，卡死的是它拉起来的子进程，
+  agent 侧一个超时都看不到。
+
+**代价（明说）**：命中该挂载的**第一条**命令仍然会付一次失败（解析 2s，或 execve 30s）。
+要跳过这一次，用 `--safe`。**判死的挂载不会被重探**（重探一个挂死的盘＝再泄一个杀不掉的
+D 态线程），但它那次被放弃的 statfs 若后来返回成功，判定会自动翻回健康。
+
 **手动强制**（即便 agent 设了 `mode: off`）：`tether exec --safe <node> -- ...`、
 `tether run --safe <node> -- ...`。注意 `--safe` 必须放在 node 前面（`exec`/`run`
-把 node 之后的 flag 当远程命令的参数）。
+把 node 之后的 flag 当远程命令的参数）。`--safe` 除了绕过 `mode: off` 与本地机短路，还会
+**强制作废已缓存的健康判定并立即重探**——所以它是"我知道那块盘刚出事，别再用旧判定"的那个开关。
+它同样不重探已判死的挂载。**成本是 per-call 而非 per-process**：一次 `--safe` 最坏付
+`probe_timeout` × 被咨询的健康网络挂载数，脚本里循环 `--safe` 每条都付一遍。
+
+**误判了怎么办**：一块**健康但慢**的盘可能被判死（探测超过 `probe_timeout` 就当它死）。
+它会随那次迟到的 statfs 返回而自动翻回健康，通常一条命令内恢复；若你的盘常态就慢，调大
+`agent.yaml` 的 `remote_fs.probe_timeout`（既有键，无需新配置）。
 
 **做不到的事（诚实说明）**：如果命令的**二进制或数据本身就在挂死的 NFS 上**，没有任何
 办法能跑它（内核 D 状态、不可杀）——safe 模式只能保住"不碰那块盘"的命令，并让其余
 快速失败。根治仍是：**把 agent 装在本地盘**（`HOME=/srv/local/<user>/...`，见 §2 安装），
 这样网络盘挂了 agent 与本地命令都不受影响。
+**注意区分**：命中死盘的**第一条**命令失败，不等于"做不到"——那一次失败正是 agent 在重新学；
+重跑一次（或加 `--safe`）就能把两者分开：能跑通说明只是判定过期，仍然失败才是真的在死盘上。
 
 **降级注意**：`agent.yaml` 里写了 `remote_fs:` 块后，若要把 agent **降级回 v0.3.3 之前**的
 二进制，必须先删掉该块——老二进制用 `KnownFields` 严格解析，遇到未知顶层键会拒绝启动
@@ -1487,13 +1510,19 @@ agent 检测到某网络挂载无响应时，会**把该挂载的目录从 `$PAT
 **已知边界（明确契约，非 bug）**：
 - **启动后新挂载**：`auto` 模式只在**启动时**判定本机有无网络挂载;启动时全本地的 agent,
   生命周期内**不会**检测启动后新挂的网络盘(为保证本地机零开销)。需要让这种 agent 也防护,
-  用显式 `tether exec/run --safe`(每次都重新探测挂载),或重启 agent。
+  用显式 `tether exec/run --safe`(强制重读挂载表**并作废已缓存的健康判定**),或重启 agent。
+  ——注意这一条说的是**启动时一块网络盘都没有**的机器;"启动时有、后来才挂掉"的那种不在此列,
+  见上文"挂载先健康、后挂掉怎么办"(那曾是 gotcha #81，本版本已修)。
 - **autofs**:未触发的 autofs 挂载**不**当作死挂载、也不主动探测(否则会破坏健康机的首次
   自动挂载),但会启用有界 argv0 解析和启动窗口看门狗。若 automount 目标真死了,返回
   `remote_fs_spawn_timeout`,不是永久卡。
 - **网络盘上的 `~/.tether`(state.json)**:Component I 只把**重连时的读**做了有界降级,保住
   agent 在线 + run/exec 防护;但 `expose`/`proxy` 的**写**(改 state.json)在网络 Home 挂死时
-  仍会阻塞该次操作。**网络 Home 是 best-effort**,强烈建议把 agent 装在本地盘(`HOME=/srv/local/...`)。
+  仍会阻塞该次操作。**比"阻塞该次操作"更糟的一点(2026-08-30 核实,此前未写)**:那些写路径
+  (`AddPort`/`UpdatePortHome`/`RemovePort`/`SetProxy`/`SetRosterCache`)是**持着状态锁**去做
+  无界写的,所以一次落在死盘上的写会**永久持锁**,此后每一次状态**读**都堵在它后面——
+  不只是那一次操作坏掉。**网络 Home 是 best-effort**,强烈建议把 agent 装在本地盘
+  (`HOME=/srv/local/...`)。
 
 ---
 

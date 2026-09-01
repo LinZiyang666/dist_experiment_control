@@ -35,7 +35,7 @@
 52-credential-rotation	GREEN	0	ASSERT-FAIL@#69@sig:retire-not-leader	#69	52-credential-rotation
 60-user-journey	GREEN	0	-	-	60-user-journey
 61-transfer-edges	GREEN	0	-	-	61-transfer-edges
-62-remote-fs-safe	INCOMPLETE	1	-	OQ-2	62-remote-fs-safe
+62-remote-fs-safe	INCOMPLETE	1	-	OQ-2 (true-D NOT-COVERED; independent of the now-closed #81 stale-health/GC-stop path)	62-remote-fs-safe
 67-transient-js-refusal	INCOMPLETE	1	-	#67	67-transient-js-refusal
 70-expose-journey	GREEN	0	-	-	70-expose-journey
 71-expose-rehome-failover	INCOMPLETE	1	-	71-G/F topology + #29 (crash-strand / non-tunnel-home data-plane gap) (raw-sys.events #30 CLOSED via admin events)	71-expose-rehome-failover

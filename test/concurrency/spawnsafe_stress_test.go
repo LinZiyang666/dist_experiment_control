@@ -42,12 +42,30 @@ func TestSpawnsafePolicy_concurrentGenSwap(t *testing.T) {
 		return genA, nil
 	}
 	// Probe flaps healthy/unhealthy to drive the sticky/self-heal transitions.
+	// Every fourth probe is also SLOW-but-healthy: it answers true only after the
+	// deadline, so the launcher demotes it and a later drain heals it. That
+	// oscillation is the only state in which a healthy verdict can be re-armed
+	// while a probe from the previous generation is still landing — i.e. the state
+	// gotcha #81's fix introduced (origin: docs/deploy-tier-gotchas.md #81).
 	var probes atomic.Int64
-	probe := func(string) bool { return probes.Add(1)%2 == 0 }
+	probe := func(string) bool {
+		n := probes.Add(1)
+		if n%4 == 0 {
+			time.Sleep(8 * time.Millisecond) // outlives ProbeTimeout below
+			return true
+		}
+		return n%2 == 0
+	}
+
+	// The health TTL is driven by an injected clock rather than wall time so the
+	// re-validation path is exercised deterministically at this test's timescale.
+	var clockNS atomic.Int64
+	clockNS.Store(time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC).UnixNano())
+	now := func() time.Time { return time.Unix(0, clockNS.Load()) }
 
 	p, err := spawnsafe.New(spawnsafe.Config{
 		Mode: spawnsafe.ModeAuto, ProbeTimeout: 5 * time.Millisecond, WedgeCeiling: 8,
-		MountSource: src, Probe: probe,
+		HealthTTL: time.Minute, MountSource: src, Probe: probe, Now: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -55,6 +73,34 @@ func TestSpawnsafePolicy_concurrentGenSwap(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() { // clock driver: steps across the TTL so T11 re-arms mid-flight
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				clockNS.Add(int64(20 * time.Second))
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() { // evidence-driven invalidation, concurrent with everything else
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				p.InvalidateHealthy()
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
 
 	wg.Add(1)
 	go func() { // mount-table flipper (generation churn)
@@ -90,5 +136,16 @@ func TestSpawnsafePolicy_concurrentGenSwap(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+
+	// Every wedge slot must come back. Polled rather than asserted outright: an
+	// abandoned start releases its slot from the reaper goroutine, so a bare check
+	// here would be a race against a correct implementation.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && p.WedgedCount() != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := p.WedgedCount(); n != 0 {
+		t.Errorf("wedged=%d after the storm, want 0: slots are not being released", n)
+	}
 	assertNoGoroutineLeak(t, "spawnsafe concurrent gen-swap", before)
 }

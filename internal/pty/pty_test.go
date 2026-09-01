@@ -63,6 +63,35 @@ func TestStartCapturesEcho(t *testing.T) {
 	}
 }
 
+func TestStartResolvedPathUsesIsolatedHelper(t *testing.T) {
+	s, err := Allocate(80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.Start([]string{"sh", "-c", "echo helper-pty"}, nil, "", "/bin/sh"); err != nil {
+		t.Fatal(err)
+	}
+	out := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, s.Master)
+		out <- buf.String()
+	}()
+	if exit, err := s.Wait(); err != nil || exit != 0 {
+		t.Fatalf("Wait exit=%d err=%v", exit, err)
+	}
+	select {
+	case got := <-out:
+		if !strings.Contains(got, "helper-pty") {
+			t.Fatalf("PTY output=%q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper PTY output did not drain")
+	}
+}
+
 func TestSignalDeliversSIGINTToProcessGroup(t *testing.T) {
 	s, err := Allocate(80, 24)
 	if err != nil {

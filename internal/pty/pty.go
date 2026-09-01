@@ -28,6 +28,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/LinZiyang666/tether/internal/spawnexec"
 	cpty "github.com/creack/pty"
 )
 
@@ -42,11 +43,12 @@ import (
 type Session struct {
 	Master *os.File // agent reads/writes raw bytes here
 
-	mu      sync.Mutex
-	slave   *os.File  // bound to the child's stdio at exec time, then closed in parent
-	cmd     *exec.Cmd // populated by Start
-	started bool      // set when Start begins: it now OWNS the slave fd lifecycle
-	closed  bool      // set by Close; Start that resumes after Close cleans up + bails
+	mu          sync.Mutex
+	slave       *os.File  // bound to the child's stdio at exec time, then closed in parent
+	cmd         *exec.Cmd // populated by Start
+	cancelStart func()    // closes a helper handshake blocked on target exec
+	started     bool      // set when Start begins: it now OWNS the slave fd lifecycle
+	closed      bool      // set by Close; Start that resumes after Close cleans up + bails
 }
 
 // Allocate creates a fresh PTY pair sized to (cols, rows) but does NOT
@@ -121,20 +123,48 @@ func (s *Session) Start(argv []string, env []string, cwd string, resolvedPath st
 	if env != nil {
 		cmd.Env = env
 	}
-	cmd.Stdin = slave
-	cmd.Stdout = slave
-	cmd.Stderr = slave
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	var handshake *spawnexec.Handshake
+	if resolvedPath != "" {
+		var err error
+		cmd, handshake, err = spawnexec.Prepare(cmd)
+		if err != nil {
+			s.mu.Lock()
+			_ = slave.Close()
+			s.slave = nil
+			s.mu.Unlock()
+			return fmt.Errorf("pty: prepare spawn helper: %w", err)
+		}
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  true,
 		Setctty: true,
 	}
+	s.mu.Lock()
+	s.cmd = cmd
+	if handshake != nil {
+		s.cancelStart = handshake.Cancel
+	}
+	s.mu.Unlock()
 	// cmd.Start runs WITHOUT the lock so a D-state execve cannot wedge Close.
-	if err := cmd.Start(); err != nil {
+	start := cmd.Start
+	if handshake != nil {
+		start = func() error { return handshake.Start(cmd) }
+	}
+	if err := start(); err != nil {
 		// Drop our owned slave fd (Close skipped it because started==true).
 		s.mu.Lock()
 		_ = slave.Close()
 		s.slave = nil
+		s.cancelStart = nil
+		closedDuringStart := s.closed
 		s.mu.Unlock()
+		// A watchdog Close cancels only the handshake. Keep waiting for the
+		// helper itself so the caller's wedge slot continues to account for the
+		// abandoned target until the kernel operation really returns.
+		if closedDuringStart && cmd.Process != nil {
+			_ = cmd.Wait()
+		}
 		return fmt.Errorf("pty: start child: %w", err)
 	}
 	// Drop the parent-side slave fd now that cmd.Start has dup'd it into the
@@ -143,7 +173,7 @@ func (s *Session) Start(argv []string, env []string, cwd string, resolvedPath st
 	s.mu.Lock()
 	_ = slave.Close()
 	s.slave = nil
-	s.cmd = cmd
+	s.cancelStart = nil
 	closedDuringStart := s.closed
 	s.mu.Unlock()
 	if closedDuringStart {
@@ -297,6 +327,9 @@ func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	if s.cancelStart != nil {
+		s.cancelStart()
+	}
 	var firstErr error
 	if s.Master != nil {
 		if err := s.Master.Close(); err != nil && firstErr == nil {

@@ -360,6 +360,85 @@ func TestBoundedHomeRead_singleFlightAbandon(t *testing.T) {
 	assertAgentGoroutinesReturn(t, before)
 }
 
+// TestBoundedHomeRead_stallExpiresCachedMountHealth pins the fourth evidence site of
+// the gotcha #81 fix, and it is the one nothing else can reach.
+//
+// A stalled state.json read proves the same thing a stalled spawn proves: a mount the
+// agent still believes is healthy is not. This site matters more than its size suggests
+// — it is the only trigger that fires with nobody running a command, so on an idle agent
+// it is the whole self-healing story.
+//
+// The architecture gate structurally cannot cover it (that gate enumerates sites that
+// MINT a spawn-timeout sentinel; this branch returns `(nil, false)` and mints nothing),
+// and the pre-existing TestBoundedHomeRead_singleFlightAbandon builds its agent with a
+// mounts table of just "/ ext4" — no hangable mount at all, so the invalidation is a
+// no-op there by construction. Deleting the call was therefore invisible to the entire
+// suite; that is what this test fixes.
+//
+// origin: docs/reviews/remote-fs-stale-health-review.md F-1
+func TestBoundedHomeRead_stallExpiresCachedMountHealth(t *testing.T) {
+	var probes int32
+	var dead atomic.Bool
+	a, err := New(Config{
+		NATSURL:              "nats://127.0.0.1:4222",
+		SID:                  "lab",
+		NID:                  "lab-1",
+		RemoteFSProbeTimeout: 60 * time.Millisecond,
+		RemoteFSMountSource: func() ([]byte, error) {
+			return fakeMountinfo([2]string{"/nfs", "nfs4"}, [2]string{"/", "ext4"}), nil
+		},
+		RemoteFSProbe: func(string) bool {
+			atomic.AddInt32(&probes, 1)
+			return !dead.Load()
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	before := runtime.NumGoroutine()
+
+	const lookupPATH = "/nfs/bin:/usr/bin"
+	env := []string{"PATH=" + lookupPATH}
+
+	// Seed the healthy verdict the way an ordinary command would.
+	d, err := a.spawnPolicy.Prepare([]string{"echo"}, "", lookupPATH, env, false)
+	if err != nil {
+		t.Fatalf("seed prepare: %v", err)
+	}
+	if d.Outage {
+		t.Fatal("healthy mount must not read as an outage")
+	}
+	if n := atomic.LoadInt32(&probes); n != 1 {
+		t.Fatalf("probe count %d after seeding, want 1", n)
+	}
+
+	// The mount dies. Nothing spawns anything; the only symptom is that the agent's own
+	// Home read stalls.
+	dead.Store(true)
+	release := make(chan struct{})
+	if _, ok := a.boundedHomeRead(func() (*StateFile, error) { <-release; return &StateFile{}, nil }, "wedge"); ok {
+		t.Fatal("a blocking Home read must degrade, not succeed")
+	}
+
+	// THE assertion: that stall must have expired the cached verdict, so the next
+	// command re-probes and drops the dead dir. The health TTL is 5 minutes and this
+	// test runs in milliseconds, so a pass here can only come from the invalidation.
+	d, err = a.spawnPolicy.Prepare([]string{"echo"}, "", lookupPATH, env, false)
+	if err != nil {
+		t.Fatalf("post-stall prepare: %v", err)
+	}
+	if n := atomic.LoadInt32(&probes); n != 2 {
+		t.Fatalf("probe count %d after the stalled Home read, want 2: the stall did not "+
+			"expire the cached mount-health verdict", n)
+	}
+	if !d.Outage {
+		t.Fatal("the dead $PATH dir must be dropped after the stall re-probed the mount")
+	}
+
+	close(release)
+	assertAgentGoroutinesReturn(t, before)
+}
+
 // TestStateStore_loadNoLockIsLockFree pins review B1's core: loadNoLock must NOT
 // acquire stateStore.mu, so an abandoned (D-hung) read cannot poison every
 // later AddPort/RemovePort/SetProxy. We hold the mutex and require loadNoLock to

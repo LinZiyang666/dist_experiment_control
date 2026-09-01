@@ -234,7 +234,17 @@ stable across both runs
 
 - **batch**: `R15`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
-R2 predicted change (pre-enumerated in r2-plan §2)
+2026-08-31 (remote-fs stale-health): Arm 1S added — the stale-healthy transition (mount judged healthy
+FIRST, dies AFTER), which is the production shape #81 was reported from and which Arm 1 structurally
+cannot reach. Each of its two abs-argv0 commands carries THREE oracles: A = did ctl receive a terminal
+state, B = did the broker forward and the agent log this request start, C = is the product code expected.
+C runs only when A and B both hold; otherwise an upstream failure cannot be duplicated as a product red.
+The split exists because earlier one- and two-layer forms repeatedly blamed the wrong owner. A SIGQUIT
+dump finally attributed the missing terminal state to a direct `cmd.Start` abandoned outside a GC
+safepoint: the next stop-the-world froze heartbeat, timer and NATS together. Safe exec/run now launch the
+risky target in a local re-exec helper and wait on a cancellable pipe. Three fresh-image isolated runs
+were stable at `INCOMPLETE pass=41 assert_fail=0 product_red=0`, with only OQ-2 true-D remaining; #81 is
+closed and its temporary band removed. R2 predicted change (pre-enumerated in r2-plan §2)
 
 ## 67-transient-js-refusal
 

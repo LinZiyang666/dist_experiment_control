@@ -1569,6 +1569,11 @@ func (a *Agent) boundedHomeRead(loadFn func() (*StateFile, error), why string) (
 		}
 		return r.sf, true
 	case <-time.After(a.spawnPolicy.ProbeTimeout()):
+		// A stalled Home read is the same class of evidence as a stalled spawn: some
+		// mount we still believe is healthy is not. Expire the cached verdicts so the
+		// next exec/run re-probes and sanitizes $PATH (gotcha #81) instead of trusting
+		// a verdict this very timeout just disproved.
+		a.spawnPolicy.InvalidateHealthy()
 		// Abandon. homeReadInFlight stays set until the read returns (recovery),
 		// so concurrent/subsequent reconnects degrade instead of piling up.
 		a.cfg.Logger.Warn("agent: state.json read stalled on a network Home; "+

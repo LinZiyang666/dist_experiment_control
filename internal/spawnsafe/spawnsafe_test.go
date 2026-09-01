@@ -122,6 +122,70 @@ func (f *fakeProbe) count(mp string) int {
 	return f.calls[mp]
 }
 
+// setVerdict / setBlocking change what a mount answers from NOW ON. They model a
+// mount whose real liveness changed under a running policy — the healthy→dead
+// transition that #81 turned out to live in and that nothing in this package had
+// ever exercised (every pre-#81 case was "dead at first probe").
+//
+// Deliberately NOT a per-call script: the number of probes is itself the thing
+// under test (single-flight held? invalidation fired?), so binding assertions to
+// a call index would make those tests unable to fail for the right reason.
+//
+// After New, mutate ONLY through these; writing f.ret / f.block directly races
+// with a probe goroutine already in flight (the pre-existing cases all write
+// before New, which is why they need no change).
+func (f *fakeProbe) setVerdict(mp string, healthy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.block, mp)
+	f.ret[mp] = healthy
+}
+
+func (f *fakeProbe) setBlocking(mp string, ch chan bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.block[mp] = ch
+}
+
+// waitCount polls until mp has been probed n times, so tests never race a probe
+// goroutine that has been launched but not yet recorded.
+func (f *fakeProbe) waitCount(t *testing.T, mp string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.count(mp) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("probe count for %s = %d, want >= %d", mp, f.count(mp), n)
+}
+
+// fakeClock is the injected time source for the health TTL. Concurrency-safe
+// because the stress cases advance it from a different goroutine than the one
+// reading it; a plain field would make -race red on something unrelated to the
+// invariant under test.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
 // assertGoroutinesReturn polls until the goroutine count drops back near a
 // baseline, proving abandoned/probe goroutines were released (the repo uses a
 // count-based leak check, not goleak — see test/concurrency/helpers_test.go).
@@ -833,6 +897,26 @@ func TestNew_rejectsBadConfig(t *testing.T) {
 	if _, err := New(Config{SafeDir: "relative/x", MountSource: local}); err == nil {
 		t.Error("relative safe_dir must fail New")
 	}
+	if _, err := New(Config{HealthTTL: -1, MountSource: local}); err == nil {
+		t.Error("negative HealthTTL must fail New")
+	}
+	// Config errors may only name knobs an operator can actually set. HealthTTL has no
+	// agent.yaml surface (this batch stays key-free so rollback is a pure binary swap),
+	// so spelling it like one would send someone hunting for a key that does not exist.
+	for _, c := range []Config{
+		{WedgeCeiling: -1, MountSource: local},
+		{ProbeTimeout: -1, MountSource: local},
+		{SafeDir: "relative/x", MountSource: local},
+		{HealthTTL: -1, MountSource: local},
+	} {
+		_, err := New(c)
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "remote_fs.health_ttl") {
+			t.Errorf("config error names a non-existent agent.yaml key: %v", err)
+		}
+	}
 	// Network-mount override ⇒ rejected, never stored.
 	p := mustNew(t, Config{
 		Mode: ModeAuto, SafeDir: "/nfsmnt/sub",
@@ -859,5 +943,830 @@ func TestParseMode(t *testing.T) {
 		if !c.err && got != c.want {
 			t.Errorf("ParseMode(%q)=%v want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// --- stale-healthy re-validation (gotcha #81) --------------------------------
+//
+// Everything below covers the healthy→dead transition. Before this batch the
+// package had 25 cases and every one of them made the mount dead at its FIRST
+// probe, so the terminal-stHealthy bug was invisible to all of them.
+
+// staleFixture is the timan107 shape: a hangable mount that is healthy when first
+// probed, holding the first two entries of the agent's $PATH.
+type staleFixture struct {
+	clock  *fakeClock
+	probe  *fakeProbe
+	policy *Policy
+	// resolved counts boundedResolveInDirs entries; blockResolve, when non-nil,
+	// makes resolution outlast the deadline (a wedged stat inside a $PATH dir).
+	// It is mutex-guarded because boundedResolveInDirs reads it from the resolver
+	// goroutine it abandons, which outlives the call that set it.
+	resolved     int32
+	mu           sync.Mutex
+	blockResolve chan struct{}
+}
+
+func (f *staleFixture) setResolveBlock(ch chan struct{}) {
+	f.mu.Lock()
+	f.blockResolve = ch
+	f.mu.Unlock()
+}
+
+func (f *staleFixture) resolveBlock() chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.blockResolve
+}
+
+const staleMount = "/shared"
+const stalePATH = "/shared/bin:/usr/bin"
+
+func newStaleFixture(t *testing.T, ttl time.Duration, probeTimeout time.Duration) *staleFixture {
+	t.Helper()
+	f := &staleFixture{clock: newFakeClock(), probe: newFakeProbe()}
+	f.policy = mustNew(t, Config{
+		Mode:         ModeAuto,
+		ProbeTimeout: probeTimeout,
+		HealthTTL:    ttl,
+		MountSource:  mountSrc([2]string{staleMount, "nfs4"}, [2]string{"/", "ext4"}),
+		Probe:        f.probe.fn,
+		Now:          f.clock.now,
+		Resolver: func(name string, dirs []string) (string, bool) {
+			atomic.AddInt32(&f.resolved, 1)
+			if ch := f.resolveBlock(); ch != nil {
+				<-ch
+			}
+			return "/usr/bin/" + name, true
+		},
+	})
+	return f
+}
+
+func (f *staleFixture) prepare(t *testing.T, argv []string, cwd string, safe bool) (Decision, error) {
+	t.Helper()
+	return f.policy.Prepare(argv, cwd, stalePATH, []string{"PATH=" + stalePATH}, safe)
+}
+
+// TestPrepare_staleHealthyMountDroppedAfterSpawnTimeout is the head-line case: it
+// replays timan107 end to end and asserts the agent now learns from the timeout.
+//
+// The clock never advances, so a pass here is the EVIDENCE path alone — the TTL
+// cannot quietly rescue it.
+//
+// origin: docs/deploy-tier-gotchas.md #81 (timan107, 2026-08-29)
+func TestPrepare_staleHealthyMountDroppedAfterSpawnTimeout(t *testing.T) {
+	f := newStaleFixture(t, time.Hour, 40*time.Millisecond)
+
+	// (1) Mount alive: the verdict gets cached, nothing is dropped, and — the
+	// detail that made #81 so hard to see — no warning is emitted at all.
+	d, err := f.prepare(t, []string{"echo"}, "", false)
+	if err != nil {
+		t.Fatalf("healthy prepare: %v", err)
+	}
+	if d.Outage || d.Warn != "" {
+		t.Fatalf("healthy mount must not look like an outage: outage=%v warn=%q", d.Outage, d.Warn)
+	}
+
+	// (2) The mount dies. Resolution now wedges inside /shared/bin, exactly as the
+	// 2.14s remote_fs_spawn_timeout did on timan107.
+	f.probe.setVerdict(staleMount, false)
+	block := make(chan struct{})
+	f.setResolveBlock(block)
+	_, err = f.prepare(t, []string{"echo"}, "", false)
+	var fe *FSError
+	if !errors.As(err, &fe) || fe.Code != ReasonSpawnTimeout {
+		t.Fatalf("wedged resolution: got %v, want %s", err, ReasonSpawnTimeout)
+	}
+	f.setResolveBlock(nil)
+	close(block) // let the abandoned resolver goroutine exit
+
+	// (3) THE assertion. Before this fix the healthy verdict was terminal, so this
+	// call was byte-identical to (1) forever. It must now re-probe and drop the dir.
+	d, err = f.prepare(t, []string{"echo"}, "", false)
+	if err != nil {
+		t.Fatalf("post-evidence prepare: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("a spawn timeout must expire the cached healthy verdict; got outage=false (this is the #81 bug)")
+	}
+	if !strings.Contains(d.Warn, "/shared/bin") {
+		t.Errorf("warn must name the dropped dir, got %q", d.Warn)
+	}
+	if got := envGet(d.Env, "PATH"); strings.Contains(got, "/shared/bin") {
+		t.Errorf("child PATH still contains the dead dir: %q", got)
+	}
+}
+
+// TestPrepare_staleHealthyRevalidatesViaBlockingProbe forces the re-probe through
+// the launcher's TIMEOUT branch rather than a fast false.
+//
+// This is the branch production actually takes — a statfs on a wedged hard mount
+// D-hangs, it does not return false — and it is the branch where an in-place
+// re-arm would either panic on close-of-closed or have its demotion refused by
+// the launcher's `state == stUnprobed` guard.
+//
+// origin: docs/deploy-tier-gotchas.md #81 (timan107, 2026-08-29)
+func TestPrepare_staleHealthyRevalidatesViaBlockingProbe(t *testing.T) {
+	before := runtime.NumGoroutine()
+	f := newStaleFixture(t, time.Hour, 40*time.Millisecond)
+	stuck := make(chan bool)
+	released := false
+	defer func() {
+		if !released {
+			close(stuck)
+		}
+		assertGoroutinesReturn(t, before)
+	}()
+
+	if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("healthy prepare: d=%+v err=%v", d, err)
+	}
+
+	// The mount wedges: from here every statfs blocks forever.
+	f.probe.setBlocking(staleMount, stuck)
+
+	block := make(chan struct{})
+	f.setResolveBlock(block)
+	if _, err := f.prepare(t, []string{"echo"}, "", false); err == nil {
+		t.Fatal("wedged resolution must fail")
+	}
+	f.setResolveBlock(nil)
+	close(block)
+
+	d, err := f.prepare(t, []string{"echo"}, "", false)
+	if err != nil {
+		t.Fatalf("post-evidence prepare: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("re-probe through the launcher timeout branch must demote the mount")
+	}
+	f.probe.waitCount(t, staleMount, 2)
+	close(stuck)
+	released = true
+}
+
+// TestMountHealthy_healthyVerdictExpiresAfterTTL pins both halves of T11: the
+// verdict does expire, and within the TTL the fast path stays truly zero-syscall.
+func TestMountHealthy_healthyVerdictExpiresAfterTTL(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 40*time.Millisecond)
+
+	if !f.policy.mountHealthy(staleMount) {
+		t.Fatal("first probe should report healthy")
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("probe count %d after first consult, want 1", c)
+	}
+
+	f.clock.advance(ttl - time.Nanosecond)
+	for i := 0; i < 50; i++ {
+		if !f.policy.mountHealthy(staleMount) {
+			t.Fatalf("consult %d inside the TTL must use the cached verdict", i)
+		}
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("probe count %d after 50 consults inside the TTL, want 1 (the fast path regressed)", c)
+	}
+
+	f.clock.advance(time.Nanosecond)
+	f.probe.setVerdict(staleMount, false)
+	if f.policy.mountHealthy(staleMount) {
+		t.Fatal("verdict must be re-probed once the TTL elapsed")
+	}
+	if c := f.probe.count(staleMount); c != 2 {
+		t.Fatalf("probe count %d after expiry, want exactly 2", c)
+	}
+}
+
+// TestMountHealthy_deadVerdictStaysStickyThroughTTLAndInvalidation is the
+// mechanical form of the hard constraint: re-probing a dead mount would leak
+// another permanent D-state thread, and probes take no wedge slot, so a widened
+// re-validation guard is strictly worse than the bug it would be fixing.
+//
+// probeTimeout is microseconds on purpose: a widened guard must show up as a
+// probe count, not as a test that times out somewhere else.
+func TestMountHealthy_deadVerdictStaysStickyThroughTTLAndInvalidation(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 200*time.Microsecond)
+	f.probe.setVerdict(staleMount, false)
+
+	if f.policy.mountHealthy(staleMount) {
+		t.Fatal("want dead")
+	}
+	for i := 0; i < 3; i++ {
+		f.clock.advance(10 * ttl)
+		f.policy.InvalidateHealthy()
+		for j := 0; j < 100; j++ {
+			if f.policy.mountHealthy(staleMount) {
+				t.Fatal("a dead verdict must never flip without a late probe success")
+			}
+		}
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("dead mount was re-probed %d times; sticky-dead is a hard constraint", c)
+	}
+}
+
+// TestMountHealthy_reprobeNeverDoublesInFlightProbes is the only real guard on the
+// D-state thread budget, and its setting matters: it must be a SLOW-BUT-HEALTHY
+// mount oscillating, not a dead one. On a dead mount the sticky branch returns
+// before any re-arm can happen, so the mutation this test claims to catch would be
+// unreachable there and the test would be an identity.
+func TestMountHealthy_reprobeNeverDoublesInFlightProbes(t *testing.T) {
+	before := runtime.NumGoroutine()
+	f := newStaleFixture(t, time.Hour, 30*time.Millisecond)
+	slow := make(chan bool, 4)
+	f.probe.setBlocking(staleMount, slow)
+	defer func() {
+		close(slow)
+		assertGoroutinesReturn(t, before)
+	}()
+
+	// Probe outlives the deadline ⇒ demoted, its goroutine still in flight.
+	if f.policy.mountHealthy(staleMount) {
+		t.Fatal("a probe that misses the deadline must read as dead for now")
+	}
+	// It returns healthy late ⇒ self-heal back to stHealthy (T7).
+	slow <- true
+	healed := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if f.policy.mountHealthy(staleMount) {
+			healed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !healed {
+		t.Fatal("late probe success must self-heal the mount")
+	}
+	probesAfterHeal := f.probe.count(staleMount)
+
+	// Now hammer it: one invalidation plus 200 concurrent consults must produce
+	// exactly ONE new probe, not one per consult.
+	f.policy.InvalidateHealthy()
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); f.policy.mountHealthy(staleMount) }()
+	}
+	wg.Wait()
+	if got := f.probe.count(staleMount) - probesAfterHeal; got != 1 {
+		t.Fatalf("re-arm launched %d probes for 200 consults, want exactly 1 (single-flight broke ⇒ unbounded D-state threads)", got)
+	}
+}
+
+// TestMountHealthy_reArmReplacesGenerationPointer is the DETERMINISTIC guard on the
+// design decision that re-arming replaces the *mountHealth rather than resetting it
+// in place. Its concurrent sibling below can only catch that by winning a race; this
+// one cannot miss.
+//
+// origin: docs/reviews/remote-fs-stale-health-review.md F-2 (the internal review found
+// the concurrent test alone was an identity test)
+func TestMountHealthy_reArmReplacesGenerationPointer(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 40*time.Millisecond)
+
+	seed := func() *mountHealth {
+		t.Helper()
+		if !f.policy.mountHealthy(staleMount) {
+			t.Fatal("want healthy")
+		}
+		f.policy.mu.Lock()
+		defer f.policy.mu.Unlock()
+		return f.policy.health[staleMount]
+	}
+	current := func() *mountHealth {
+		f.policy.mu.Lock()
+		defer f.policy.mu.Unlock()
+		return f.policy.health[staleMount]
+	}
+	// An orphaned generation must keep its own verdict: a late launcher writing into
+	// it is exactly what must NOT reach the live entry.
+	assertOrphaned := func(old *mountHealth, via string) {
+		t.Helper()
+		f.policy.mu.Lock()
+		defer f.policy.mu.Unlock()
+		if old.state != stHealthy || !old.launched {
+			t.Errorf("%s: the orphaned generation was mutated (state=%d launched=%v); "+
+				"a stale launcher must write to a struct nobody reads, not to the live one",
+				via, old.state, old.launched)
+		}
+	}
+
+	// T10 — evidence-driven invalidation.
+	old := seed()
+	f.policy.InvalidateHealthy()
+	if current() == old {
+		t.Fatal("T10 re-armed IN PLACE: the generation pointer must be REPLACED " +
+			"(in-place reset lets a late launcher demote the fresh generation, and " +
+			"close-of-closed on a swapped done channel panics the agent)")
+	}
+	assertOrphaned(old, "T10")
+
+	// T11 — the same obligation on the TTL path.
+	old = seed()
+	f.clock.advance(ttl)
+	if !f.policy.mountHealthy(staleMount) { // consult drives the TTL re-arm
+		t.Fatal("want healthy after the TTL re-probe")
+	}
+	if current() == old {
+		t.Fatal("T11 re-armed IN PLACE: same obligation as T10")
+	}
+	assertOrphaned(old, "T11")
+}
+
+// TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup runs the three-way race
+// the re-arm design exists to make impossible: a launcher waking up against a
+// generation that was replaced while it waited.
+//
+// In-place re-arm fails here two different ways — close-of-closed on the swapped
+// done channel, or a stale launcher writing sticky-dead over a fresh generation.
+// Historical precedent (external review F6) needed -count=1000 to surface a
+// cousin of this, hence the repetitions.
+//
+// TWO THINGS THIS TEST GOT WRONG THE FIRST TIME (internal review F-2, both measured):
+//   - `close(stop)` sat before the consult workers' Wait, so the invalidator ran for
+//     ~1ms against 13ms of consults — 0-3 re-arms total. There was almost no churn to
+//     survive. The workers now have their own WaitGroup and the invalidator is stopped
+//     only after they finish.
+//   - Nothing asserted that churn HAPPENED, so the test stayed green even with
+//     invalidateHealthy replaced by a no-op — it degenerated into "hammer mountHealthy".
+//     The rearms counter below closes that.
+//
+// The probe blocks briefly so launchers actually reach their `time.After` arm; with an
+// instantly-returning probe the "stale launcher" state this test is named for was never
+// entered at all.
+func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
+	before := runtime.NumGoroutine()
+	f := newStaleFixture(t, time.Hour, 2*time.Millisecond)
+	slow := make(chan bool, 512)
+	f.probe.setBlocking(staleMount, slow)
+	// The feeder OWNS slow, including its close: having the deferred cleanup close it
+	// too raced with an in-flight send (found by -race on the first run).
+	feeding := make(chan struct{})
+	feedDone := make(chan struct{})
+	go func() { // keep answering "healthy, but slowly"
+		defer close(feedDone)
+		for {
+			select {
+			case <-feeding:
+				close(slow) // release any probe still parked, with ok=false
+				return
+			case slow <- true:
+			}
+		}
+	}()
+	defer func() {
+		close(feeding)
+		<-feedDone
+		assertGoroutinesReturn(t, before)
+	}()
+
+	stop := make(chan struct{})
+	var invalidator, workers sync.WaitGroup
+	var rearms int64
+	invalidator.Add(1)
+	go func() {
+		defer invalidator.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				f.policy.InvalidateHealthy()
+				atomic.AddInt64(&rearms, 1)
+			}
+		}
+	}()
+	for i := 0; i < 16; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for j := 0; j < 200; j++ {
+				f.policy.mountHealthy(staleMount)
+			}
+		}()
+	}
+	workers.Wait() // the invalidator must outlive the consults, not the reverse
+	close(stop)
+	invalidator.Wait()
+
+	if n := atomic.LoadInt64(&rearms); n < 100 {
+		t.Fatalf("only %d invalidation passes ran against 3200 consults — there was no churn "+
+			"to survive, so a pass here proves nothing", n)
+	}
+	// Counting CALLS is not enough: a no-op invalidateHealthy still increments that
+	// counter, which is how this test stayed green with the whole function neutered.
+	// Probes are the observable proof that generations were really replaced — a mount
+	// that is never re-armed is probed exactly once, for its whole life.
+	if c := f.probe.count(staleMount); c < 5 {
+		t.Fatalf("mount was probed %d times across %d invalidation passes: the passes did not "+
+			"actually re-arm anything, so this test is not exercising re-arm at all", c, atomic.LoadInt64(&rearms))
+	}
+	// A healthy mount must never end up stuck dead just because generations were
+	// churning underneath the launchers.
+	f.clock.advance(2 * time.Hour)
+	if !f.policy.mountHealthy(staleMount) {
+		t.Fatal("healthy mount was demoted by re-arm churn alone")
+	}
+}
+
+// TestPrepare_safeForcesRevalidation pins the product promise in usage.md §7.7.
+// --safe used to refresh only the mount TABLE, which on timan107 was already
+// correct — so --safe behaved exactly like no flag, which is what the field
+// report said.
+func TestPrepare_safeForcesRevalidation(t *testing.T) {
+	f := newStaleFixture(t, time.Hour, 40*time.Millisecond)
+
+	if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("healthy prepare: d=%+v err=%v", d, err)
+	}
+	f.probe.setVerdict(staleMount, false)
+
+	// Control: without --safe and without evidence, the cached verdict stands.
+	// (If this ever fails, someone made every spawn re-probe.)
+	if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("ordinary prepare must keep using the cached verdict: d=%+v err=%v", d, err)
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("probe count %d without --safe, want 1", c)
+	}
+
+	d, err := f.prepare(t, []string{"echo"}, "", true)
+	if err != nil {
+		t.Fatalf("--safe prepare: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("--safe must expire cached healthy verdicts and re-probe")
+	}
+	if c := f.probe.count(staleMount); c != 2 {
+		t.Fatalf("probe count %d after --safe, want 2", c)
+	}
+
+	// --safe must not resurrect a dead mount either (sticky-dead is unconditional).
+	if _, err := f.prepare(t, []string{"echo"}, "", true); err != nil {
+		t.Fatalf("second --safe prepare: %v", err)
+	}
+	if c := f.probe.count(staleMount); c != 2 {
+		t.Fatalf("--safe re-probed a dead mount (count %d); sticky-dead must hold", c)
+	}
+}
+
+// TestPrepare_safeInvalidatesBeforeCwdCheck pins the ORDER, which is load-bearing and
+// was unguarded: moving the --safe invalidation below the lexical cwd check left every
+// existing test green while silently removing the escape hatch it exists to provide.
+//
+// pathOnDeadMount only re-probes an entry that is stUnprobed, so unless the verdict is
+// expired FIRST, the very first `--safe --cwd <stale-healthy dead mount>` sails past the
+// lexical check and pays the full 30s execve watchdog instead of failing fast.
+//
+// origin: docs/reviews/remote-fs-stale-health-review.md F-3
+func TestPrepare_safeInvalidatesBeforeCwdCheck(t *testing.T) {
+	f := newStaleFixture(t, time.Hour, 40*time.Millisecond)
+
+	if _, err := f.prepare(t, []string{"true"}, "", false); err != nil {
+		t.Fatalf("seed healthy: %v", err)
+	}
+	f.probe.setVerdict(staleMount, false)
+
+	// Clock frozen and no stall anywhere: --safe is the ONLY thing that can expire the
+	// verdict here, so this is a clean test of the flag rather than of the TTL.
+	resolvedBefore := atomic.LoadInt32(&f.resolved)
+	_, err := f.prepare(t, []string{"true"}, staleMount+"/nas", true)
+	var fe *FSError
+	if !errors.As(err, &fe) || fe.Code != ReasonUnsafeCwd {
+		t.Fatalf("first --safe with a dead cwd: got %v, want %s", err, ReasonUnsafeCwd)
+	}
+	if n := atomic.LoadInt32(&f.resolved) - resolvedBefore; n != 0 {
+		t.Errorf("cwd fail-fast must precede argv[0] resolution; resolution ran %d times", n)
+	}
+}
+
+// TestRunStartWithCleanup_reapsBeforeReleasingTheWedgeSlot is the equivalence guard the
+// plan made a hard prerequisite for collapsing the agent's duplicate watchdog into this
+// one (plan §-1 OQ-1). The ordering it pins — reap the abandoned child, THEN free the
+// slot — is what stops a long outage from handing out slots faster than wedged spawns
+// are reclaimed; swapping the two lines leaves every other test in the tree green.
+//
+// origin: docs/reviews/remote-fs-stale-health-review.md F-7
+func TestRunStartWithCleanup_reapsBeforeReleasingTheWedgeSlot(t *testing.T) {
+	p := mustNew(t, Config{
+		Mode:         ModeAuto,
+		WedgeCeiling: 1,
+		MountSource:  mountSrc([2]string{"/", "ext4"}),
+		Probe:        newFakeProbe().fn,
+	})
+	release := make(chan struct{})
+	seen := make(chan int, 1)
+	err := p.RunStartWithCleanup(
+		func() error { <-release; return nil },
+		20*time.Millisecond,
+		nil,
+		func(error) { seen <- p.WedgedCount() },
+	)
+	if !errors.Is(err, ErrSpawnTimeout) {
+		t.Fatalf("want spawn timeout, got %v", err)
+	}
+	close(release)
+	select {
+	case got := <-seen:
+		if got != 1 {
+			t.Errorf("reapOnReturn saw WedgedCount=%d, want 1: the slot must still be held "+
+				"while the abandoned child is reaped, not released first", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reapOnReturn never ran after the abandoned start returned")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && p.WedgedCount() != 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if p.WedgedCount() != 0 {
+		t.Error("wedge slot was never released after the abandoned start returned")
+	}
+}
+
+// TestPrepare_explicitArgv0WorkloadHealsOnlyViaTTL is the assertion the whole
+// "evidence alone is not enough" adjudication rests on.
+//
+// An explicit, LOCAL argv[0] never enters boundedResolveInDirs and execve's
+// instantly, so the agent sees no stall whatsoever — yet sanitizePATH still
+// consulted the stale verdict and handed the child a poisoned PATH. Without the
+// TTL this workload stays broken forever, which is why the plan rejected an
+// evidence-only fix.
+func TestPrepare_explicitArgv0WorkloadHealsOnlyViaTTL(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 40*time.Millisecond)
+
+	if d, err := f.prepare(t, []string{"/bin/echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("healthy prepare: d=%+v err=%v", d, err)
+	}
+	f.probe.setVerdict(staleMount, false)
+
+	for i := 0; i < 20; i++ {
+		d, err := f.prepare(t, []string{"/bin/echo"}, "", false)
+		if err != nil {
+			t.Fatalf("prepare %d: %v", i, err)
+		}
+		if d.Outage {
+			t.Fatalf("prepare %d unexpectedly produced evidence; this workload is supposed to be silent", i)
+		}
+	}
+	if n := atomic.LoadInt32(&f.resolved); n != 0 {
+		t.Fatalf("explicit argv[0] entered resolution %d times; the zero-evidence premise is wrong", n)
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("probe count %d: nothing should have triggered a re-probe yet", c)
+	}
+
+	f.clock.advance(ttl)
+	d, err := f.prepare(t, []string{"/bin/echo"}, "", false)
+	if err != nil {
+		t.Fatalf("post-TTL prepare: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("with no evidence available, only the TTL can heal this workload — it did not")
+	}
+	if got := envGet(d.Env, "PATH"); strings.Contains(got, "/shared/bin") {
+		t.Errorf("child PATH still poisoned after the TTL rescue: %q", got)
+	}
+}
+
+// TestPrepare_wedgeCeilingSaturatedStillDropsDeadPathDirs covers the second
+// zero-evidence state: at the ceiling both watchdogs early-return BEFORE their
+// select, so no timeout branch ever runs and no evidence is ever produced. Probes
+// take no wedge slot, so re-validation itself still works — but only the TTL can
+// trigger it.
+func TestPrepare_wedgeCeilingSaturatedStillDropsDeadPathDirs(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 40*time.Millisecond)
+	f.policy.wedgeCeiling = 1
+
+	if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("healthy prepare: d=%+v err=%v", d, err)
+	}
+	f.probe.setVerdict(staleMount, false)
+
+	// Saturate the ceiling with one abandoned start.
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	if err := f.policy.RunStart(func() error { <-release; return nil }, 20*time.Millisecond); !errors.Is(err, ErrSpawnTimeout) {
+		t.Fatalf("want spawn timeout to occupy the slot, got %v", err)
+	}
+	// That abandoned start is itself evidence: it must have expired the cached
+	// healthy verdict, so the next consult re-probes instead of answering from
+	// cache. Observed as the probe count, not via Prepare — at the ceiling Prepare
+	// returns an error before a Decision is ever built.
+	f.probe.setVerdict(staleMount, true)
+	if !f.policy.mountHealthy(staleMount) {
+		t.Fatal("mount reports dead; cannot set up the ceiling case")
+	}
+	if c := f.probe.count(staleMount); c != 2 {
+		t.Fatalf("probe count %d: the abandoned start did not expire the cached healthy verdict", c)
+	}
+
+	// Now the state under test: cached-healthy, mount dead, no wedge slots left.
+	f.probe.setVerdict(staleMount, false)
+	probesBefore := f.probe.count(staleMount)
+	_, err := f.prepare(t, []string{"echo"}, "", false)
+	var fe *FSError
+	if !errors.As(err, &fe) || fe.Code != ReasonTooManyWedged {
+		t.Fatalf("at the ceiling want %s, got %v", ReasonTooManyWedged, err)
+	}
+	if c := f.probe.count(staleMount); c != probesBefore {
+		t.Fatalf("ceiling path re-probed (%d→%d); it is supposed to be evidence-free", probesBefore, c)
+	}
+
+	// Only the TTL gets us out of here — probes take no wedge slot, so
+	// re-validation still works even with every slot held.
+	f.clock.advance(ttl)
+	if f.policy.mountHealthy(staleMount) {
+		t.Fatal("TTL must still re-validate while the ceiling is saturated")
+	}
+	if c := f.probe.count(staleMount); c != probesBefore+1 {
+		t.Fatalf("probe count %d after TTL expiry at the ceiling, want %d", c, probesBefore+1)
+	}
+
+	// And the point of re-validating: once a slot frees up, the dead dir is actually
+	// dropped. Without this the test's name outran its assertions — it proved the
+	// re-probe happened but never that anything came of it (internal review F-23).
+	close(release)
+	released = true
+	releaseDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(releaseDeadline) && f.policy.WedgedCount() != 0 {
+		time.Sleep(time.Millisecond)
+	}
+	d, err := f.prepare(t, []string{"echo"}, "", false)
+	if err != nil {
+		t.Fatalf("prepare after the ceiling cleared: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("the dead dir must be dropped once a slot frees up")
+	}
+	if got := envGet(d.Env, "PATH"); strings.Contains(got, "/shared/bin") {
+		t.Errorf("child PATH still contains the dead dir: %q", got)
+	}
+}
+
+// TestApplyMounts_carryOverPreservesHealthyFreshness pins that the TTL survives
+// mount-table churn. Refreshing decidedAt in the carry-over would renew it forever
+// on a busy multi-user box — and #81's own mechanism (3) is precisely a verdict
+// riding an unchanged signature across generations.
+func TestApplyMounts_carryOverPreservesHealthyFreshness(t *testing.T) {
+	const ttl = time.Minute
+	clock := newFakeClock()
+	probe := newFakeProbe()
+	var gen int32
+	p := mustNew(t, Config{
+		Mode:         ModeAuto,
+		ProbeTimeout: 40 * time.Millisecond,
+		HealthTTL:    ttl,
+		Probe:        probe.fn,
+		Now:          clock.now,
+		MountSource: func() ([]byte, error) {
+			// The mount under test never changes; an unrelated bind mount churns.
+			n := atomic.LoadInt32(&gen)
+			return fakeMountinfo(
+				[2]string{staleMount, "nfs4"},
+				[2]string{"/", "ext4"},
+				[2]string{fmt.Sprintf("/tmp/bind%d", n), "ext4"},
+			), nil
+		},
+	})
+
+	if !p.mountHealthy(staleMount) {
+		t.Fatal("want healthy")
+	}
+	// Time has to pass DURING the churn. With a frozen clock a carry-over that
+	// wrongly restamps decidedAt writes back the same instant it already held, so
+	// the bug would be invisible here — this test was an identity until the
+	// mutation run caught it.
+	for i := 1; i <= 12; i++ {
+		clock.advance(ttl / 4)
+		atomic.StoreInt32(&gen, int32(i))
+		p.refreshIfChanged()
+	}
+	if c := probe.count(staleMount); c != 1 {
+		t.Fatalf("churn alone re-probed (%d); that is the F4 regression shape", c)
+	}
+
+	probe.setVerdict(staleMount, false)
+	if p.mountHealthy(staleMount) {
+		t.Fatal("a carried-over verdict must still expire; the churn renewed its decidedAt")
+	}
+	if c := probe.count(staleMount); c != 2 {
+		t.Fatalf("probe count %d, want 2 (one re-probe after the carried-over verdict expired)", c)
+	}
+}
+
+// TestPrepare_slowMountFalseDemotionSelfHealsWithinOneCommand bounds the cost of a
+// false demotion: a healthy-but-slow mount can be demoted, but the late probe
+// success must restore it AND restamp its freshness. Without the restamp the mount
+// comes back already expired and is re-probed on the very next consult.
+func TestPrepare_slowMountFalseDemotionSelfHealsWithinOneCommand(t *testing.T) {
+	before := runtime.NumGoroutine()
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 30*time.Millisecond)
+	slow := make(chan bool, 2)
+	f.probe.setBlocking(staleMount, slow)
+	defer func() {
+		close(slow)
+		assertGoroutinesReturn(t, before)
+	}()
+
+	d, err := f.prepare(t, []string{"echo"}, "", false)
+	if err != nil {
+		t.Fatalf("prepare over a slow mount: %v", err)
+	}
+	if !d.Outage {
+		t.Fatal("a probe that misses its deadline must demote for now (that is the safe direction)")
+	}
+
+	// The outage lasts longer than a TTL before the statfs finally answers. This
+	// is what makes the restamp observable: a healed verdict that kept the
+	// demotion's timestamp is already older than the TTL the instant it is
+	// restored, so the very next consult re-arms and re-probes it. With a frozen
+	// clock both versions look identical (found by the mutation run).
+	f.clock.advance(2 * ttl)
+	slow <- true // the statfs finally answers: the mount was alive all along
+	restored := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		dd, err := f.prepare(t, []string{"echo"}, "", false)
+		if err == nil && !dd.Outage {
+			restored = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !restored {
+		t.Fatal("late probe success must restore the mount within one command")
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("probe count %d after self-heal, want 1: the healed verdict was born expired (decidedAt not restamped)", c)
+	}
+}
+
+// TestPrepare_cwdOnStaleHealthyMountFailsFastOnceInvalidated is gotcha #82's first
+// half — the part that is a straight consequence of #81 and disappears with it.
+// Asserted rather than asserted-in-prose, so "it heals automatically" stops being
+// something each review round has to re-derive.
+//
+// origin: docs/deploy-tier-gotchas.md #82 (timan107, 2026-08-29)
+func TestPrepare_cwdOnStaleHealthyMountFailsFastOnceInvalidated(t *testing.T) {
+	f := newStaleFixture(t, time.Hour, 40*time.Millisecond)
+
+	if _, err := f.prepare(t, []string{"echo"}, "", false); err != nil {
+		t.Fatalf("healthy prepare: %v", err)
+	}
+	f.probe.setVerdict(staleMount, false)
+
+	// Stale-healthy: the lexical cwd check consults the cached verdict and lets a
+	// chdir into a dead mount through — which is where the 30s watchdog and the
+	// pre-execve D-state children came from.
+	if _, err := f.prepare(t, []string{"true"}, staleMount+"/nas", false); err != nil {
+		t.Fatalf("while still stale-healthy the cwd check cannot fire: %v", err)
+	}
+
+	f.policy.InvalidateHealthy()
+	resolvedBefore := atomic.LoadInt32(&f.resolved)
+	_, err := f.prepare(t, []string{"true"}, staleMount+"/nas", false)
+	var fe *FSError
+	if !errors.As(err, &fe) || fe.Code != ReasonUnsafeCwd {
+		t.Fatalf("dead cwd must fail fast: got %v, want %s", err, ReasonUnsafeCwd)
+	}
+	if n := atomic.LoadInt32(&f.resolved) - resolvedBefore; n != 0 {
+		t.Errorf("cwd fail-fast must precede argv[0] resolution, but resolution ran %d times", n)
+	}
+}
+
+// TestPrepare_healthyHangableMountZeroProbesWithinTTL is the steady-state cost
+// guard. TestPrepare_localMachineZeroSyscallPerSpawn does NOT cover this: it
+// counts mountinfo reads, and nothing added here reads mountinfo — a re-validation
+// accidentally made unconditional would keep that test green while probing on
+// every single spawn.
+func TestPrepare_healthyHangableMountZeroProbesWithinTTL(t *testing.T) {
+	const ttl = time.Minute
+	f := newStaleFixture(t, ttl, 40*time.Millisecond)
+
+	for i := 0; i < 50; i++ {
+		if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+			t.Fatalf("prepare %d: d=%+v err=%v", i, d, err)
+		}
+	}
+	if c := f.probe.count(staleMount); c != 1 {
+		t.Fatalf("50 spawns inside the TTL cost %d probes, want 1", c)
+	}
+	f.clock.advance(ttl)
+	if d, err := f.prepare(t, []string{"echo"}, "", false); err != nil || d.Outage {
+		t.Fatalf("post-TTL prepare on a still-healthy mount: d=%+v err=%v", d, err)
+	}
+	if c := f.probe.count(staleMount); c != 2 {
+		t.Fatalf("probe count %d after one TTL, want exactly 2", c)
 	}
 }

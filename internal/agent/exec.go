@@ -15,6 +15,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/spawnexec"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/nats-io/nats.go"
 )
@@ -164,6 +165,18 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 	if len(req.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(req.Stdin)
 	}
+	var handshake *spawnexec.Handshake
+	if decision.Active {
+		// Do not abandon a direct cmd.Start goroutine: a target execve stalled in
+		// the kernel can leave that goroutine unable to reach a GC safepoint and
+		// freeze the entire agent at the next stop-the-world. The local helper
+		// execs quickly; only its independent runtime touches the risky target.
+		cmd, handshake, err = spawnexec.Prepare(cmd)
+		if err != nil {
+			return -1, err
+		}
+		setExecProcGroup(cmd) // helper is the target subtree's group leader
+	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -182,15 +195,24 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 	// leaked unbounded over a long outage (review M4).
 	if decision.Active {
 		err := a.startBounded(
-			cmd.Start,
-			func() { _ = stdoutPipe.Close(); _ = stderrPipe.Close() }, // reclaim read fds on abandon
+			func() error { return handshake.Start(cmd) },
+			func() {
+				handshake.Cancel()
+				_ = stdoutPipe.Close()
+				_ = stderrPipe.Close()
+			},
 			func(startErr error) {
-				if startErr == nil {
-					_ = cmd.Wait() // reap child + close write fds when execve recovers
+				if cmd.Process != nil {
+					_ = cmd.Wait() // reap helper/target when the wedged target exec recovers
 				}
 			},
 		)
 		if err != nil {
+			// The run side has logged this since v0.3.3 (run.go); exec had nothing,
+			// so timan107's 30s spawn timeouts left no trace at all in agent.log and
+			// gotcha #81 had to be attributed entirely from the ctl side.
+			a.cfg.Logger.Warn("agent: exec spawn bounded-start failed",
+				"pid", pid, "argv0", req.Argv[0], "cwd", req.Cwd, "err", err)
 			return -1, err
 		}
 		if decision.Warn != "" {
@@ -368,34 +390,24 @@ func (a *Agent) execBaseEnv(req *proto.ExecReq) []string {
 }
 
 // startBounded runs start (a cmd.Start) under the safe-mode spawn-window
-// deadline. On a D-state execve hang past the deadline it abandons the start
-// goroutine, invokes onAbandon (close the pipe read ends, reclaiming those fds
-// immediately), and once the execve eventually returns invokes reapOnReturn with
-// its error (cmd.Wait on success, closing the write ends + reaping the orphaned
-// child) — so no fds leak unbounded over a long outage (review M4). The wedge
-// slot is held until the abandoned start finally returns. Returns
-// spawnsafe.ErrSpawnTimeout on abandon, ErrTooManyWedged at the ceiling. The
-// callbacks are injectable so the abandon/reap accounting is hermetically
-// testable without a real D-state execve.
+// deadline. Contract (abandon → onAbandon → late reapOnReturn → slot release, and
+// why each step exists) lives on spawnsafe.RunStartWithCleanup; this is a thin
+// binding of the agent's configured deadline to it.
+//
+// It used to be a second, line-for-line copy of that watchdog. That duplication is
+// how gotcha #81's fix nearly shipped incomplete: the healthy-verdict invalidation
+// has to hang off EVERY execve watchdog, and a second copy is a second place to
+// forget it — the same shape as the internal/tunnel fence that took three review
+// rounds to find in three different kill paths. Collapsing leaves exactly two
+// mint sites for ErrSpawnTimeout, both inside spawnsafe, which is what lets
+// test/architecture/spawn_stall_evidence_test.go pin them by exact count.
+//
+// The wrapper stays (rather than inlining the policy call at both use sites)
+// because it binds a.spawnTimeout() in one place and keeps the injectable
+// callbacks that make abandon/reap accounting hermetically testable without a
+// real D-state execve.
 func (a *Agent) startBounded(start func() error, onAbandon func(), reapOnReturn func(error)) error {
-	if !a.spawnPolicy.TryAcquireSpawnSlot() {
-		return spawnsafe.ErrTooManyWedged
-	}
-	done := make(chan error, 1)
-	go func() { done <- start() }()
-	select {
-	case err := <-done:
-		a.spawnPolicy.ReleaseSpawnSlot()
-		return err
-	case <-time.After(a.spawnTimeout()):
-		onAbandon()
-		go func() {
-			err := <-done
-			reapOnReturn(err)
-			a.spawnPolicy.ReleaseSpawnSlot()
-		}()
-		return spawnsafe.ErrSpawnTimeout
-	}
+	return a.spawnPolicy.RunStartWithCleanup(start, a.spawnTimeout(), onAbandon, reapOnReturn)
 }
 
 // remoteFSFailReason maps a spawnsafe fail-fast / watchdog error to its wire

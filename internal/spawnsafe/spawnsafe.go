@@ -69,6 +69,30 @@ func ParseMode(s string) (Mode, error) {
 const (
 	DefaultProbeTimeout = 2 * time.Second
 	DefaultWedgeCeiling = 64
+
+	// DefaultHealthTTL bounds how long a HEALTHY verdict is trusted without
+	// re-validation. It is the backstop for the two ZERO-EVIDENCE workloads
+	// that the evidence-driven invalidation (see invalidateHealthy) structurally
+	// cannot see:
+	//
+	//   (a) explicit argv[0] + local cwd (`exec -- /bin/bash -c ...`): Prepare's
+	//       explicit branch never enters boundedResolveInDirs, and /bin/bash
+	//       execve's instantly — so the agent produces no stall at all, while
+	//       sanitizePATH still consulted the stale-healthy verdict and handed the
+	//       CHILD a poisoned PATH. That child is the one that D-hangs. This is the
+	//       exact shape of the D-state bash processes found on timan107.
+	//   (b) wedge ceiling saturated: boundedResolveInDirs / RunStartWithCleanup
+	//       early-return BEFORE their select, so no timeout branch ever runs.
+	//
+	// Five minutes, not thirty seconds: evidence covers every path that actually
+	// stalls and heals it within one command, so the TTL only serves workloads
+	// that are NOT currently broken — buying them faster healing at the price of
+	// an order of magnitude more false-demotion dice rolls for everyone else is
+	// the wrong trade (plan §-1 OQ-2).
+	//
+	// A DEAD verdict is never re-probed and the TTL does not apply to it: see the
+	// D-state thread budget argument on mountHealth.
+	DefaultHealthTTL = 5 * time.Minute
 )
 
 // MountSource returns the raw bytes of the mount table (real impl reads
@@ -145,11 +169,52 @@ const (
 // retained after a timeout so a late success can self-heal a sticky-dead mount.
 // done is closed by the launcher once the first verdict is decided, so concurrent
 // joiners wake immediately instead of each blocking a full probeTimeout (review m9).
+//
+// A struct is ONE GENERATION of one mountpoint's verdict. Re-validating a healthy
+// mount REPLACES the pointer (p.health[mp] = &mountHealth{}) — it never resets
+// this struct in place. Two failure modes make in-place reset wrong. Both were
+// found by the round-1 adversarial critics rather than by reasoning, and both are
+// stated in the SUBJUNCTIVE on purpose: they describe what in-place reset would do,
+// not defects that exist here. (The first of them was disarmed in the same commit
+// that introduced this design — the launcher now closes its captured local, not the
+// field — so reading it as a present-tense fact would send the next reader looking
+// for a bug that is not there.)
+//
+//   - a launcher that closed the FIELD h.done rather than the local it captured
+//     would hit close-of-closed the moment a reset swapped in a fresh channel;
+//   - the launcher's timeout branch is guarded by `state == stUnprobed`, so a
+//     late-waking launcher from the OLD generation would refuse to demote a
+//     re-armed entry — the fix would silently not fix anything.
+//
+// Both are pinned: TestMountHealthy_reArmReplacesGenerationPointer deterministically,
+// TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup under churn.
+//
+// Two invariants carry the whole correctness argument. They are load-bearing:
+//
+//	INV-1  h.result == nil  ⟺  this struct's probe goroutine has provably exited.
+//	       result is set to nil only after a value was received from it; the
+//	       timeout branch deliberately KEEPS result because the goroutine may
+//	       still be in D-state.
+//	INV-2  state == stHealthy  ⇒  result == nil.
+//	       The only two writes of stHealthy both nil out result in the same
+//	       critical section; the timeout branch never writes stHealthy.
+//
+// INV-2 is why the re-validation guard is exactly `state == stHealthy` and
+// nothing more: that one term ALREADY implies "no probe is in flight", so an
+// additional `result == nil` conjunct would be a clause that can never be false.
+// Do not add it back — three independent round-1 drafts hung their whole
+// D-state-thread argument on that tautology, which would have shipped two
+// identity tests. `state == stHealthy` is the load-bearing half; it is also what
+// keeps a DEAD verdict sticky, so widening it re-probes dead mounts and leaks an
+// unbounded number of D-state threads (probes do NOT take a wedge slot).
 type mountHealth struct {
 	state    int8
 	launched bool
 	result   chan bool
 	done     chan struct{}
+	// decidedAt is when a PROBE last decided state. It drives the TTL only; it is
+	// deliberately NOT refreshed by applyMounts' carry-over (see the note there).
+	decidedAt time.Time
 }
 
 // Policy is the per-agent spawn-safety engine. Construct with New; safe for
@@ -157,6 +222,7 @@ type mountHealth struct {
 type Policy struct {
 	mode         Mode
 	probeTimeout time.Duration
+	healthTTL    time.Duration
 	wedgeCeiling int
 	safeDir      string
 	safeDirCfg   string
@@ -164,6 +230,7 @@ type Policy struct {
 
 	mountSrc MountSource
 	probe    ProbeFn
+	now      func() time.Time                                // nil ⇒ time.Now (test seam)
 	resolver func(name string, dirs []string) (string, bool) // nil ⇒ resolveInDirs (test seam)
 
 	bootHangable bool // hasHangable at New time; immutable (review m7 fast path)
@@ -183,10 +250,12 @@ type Config struct {
 	SafeDir      string        // "" ⇒ os.TempDir()
 	ProbeTimeout time.Duration // 0 ⇒ DefaultProbeTimeout
 	WedgeCeiling int           // 0 ⇒ DefaultWedgeCeiling
+	HealthTTL    time.Duration // 0 ⇒ DefaultHealthTTL
 
 	// Seams; nil ⇒ real implementations.
 	MountSource MountSource
 	Probe       ProbeFn
+	Now         func() time.Time                                // clock seam for the health TTL
 	Resolver    func(name string, dirs []string) (string, bool) // argv[0] resolution (test seam)
 }
 
@@ -203,21 +272,33 @@ func New(cfg Config) (*Policy, error) {
 	if cfg.ProbeTimeout < 0 {
 		return nil, fmt.Errorf("remote_fs.probe_timeout: must not be negative")
 	}
+	if cfg.HealthTTL < 0 {
+		// NOT spelled as an agent.yaml key: unlike probe_timeout / wedge_ceiling /
+		// safe_dir, HealthTTL is a test seam with no yaml surface, and naming a key
+		// that does not exist sends an operator hunting for a knob they cannot set
+		// (plan §7 R12 keeps this batch key-free so rollback stays a pure binary swap).
+		return nil, fmt.Errorf("spawnsafe.Config.HealthTTL: must not be negative")
+	}
 	if sd := strings.TrimSpace(cfg.SafeDir); sd != "" && !filepath.IsAbs(sd) {
 		return nil, fmt.Errorf("remote_fs.safe_dir: must be an absolute path (got %q)", sd)
 	}
 	p := &Policy{
 		mode:         cfg.Mode,
 		probeTimeout: cfg.ProbeTimeout,
+		healthTTL:    cfg.HealthTTL,
 		wedgeCeiling: cfg.WedgeCeiling,
 		safeDirCfg:   cfg.SafeDir,
 		mountSrc:     cfg.MountSource,
 		probe:        cfg.Probe,
+		now:          cfg.Now,
 		resolver:     cfg.Resolver,
 		health:       map[string]*mountHealth{},
 	}
 	if p.probeTimeout <= 0 {
 		p.probeTimeout = DefaultProbeTimeout
+	}
+	if p.healthTTL <= 0 {
+		p.healthTTL = DefaultHealthTTL
 	}
 	if p.wedgeCeiling <= 0 {
 		p.wedgeCeiling = DefaultWedgeCeiling
@@ -227,6 +308,9 @@ func New(cfg Config) (*Policy, error) {
 	}
 	if p.probe == nil {
 		p.probe = realProbe
+	}
+	if p.now == nil {
+		p.now = time.Now
 	}
 	// Snapshot FIRST (procfs, never hangs) — before any path is touched (F3).
 	p.snapshot()
@@ -378,6 +462,19 @@ func (p *Policy) refreshIfChanged() {
 // single-flight state, so the next spawn launched a fresh permanent probe →
 // O(generations) D-state threads under churn. Only changed/removed mounts lose
 // their cached health.
+//
+// This is NOT where a stale healthy verdict expires — that is mountHealthy's T10/T11.
+// Three things follow, and each has been gotten wrong at least once:
+//   - Do not loosen the signature carry-over to "fix" stale health. That is the
+//     F4 regression's exact shape: unrelated bind/container churn would discard a
+//     dead mount's single-flight state and launch a fresh permanent probe each
+//     generation.
+//   - The carried-over pointer keeps its decidedAt, deliberately. Refreshing it
+//     here would let unrelated mount churn renew the TTL forever, which on a busy
+//     multi-user box is continuous.
+//   - Mount-table change is a bad trigger for re-probing anyway: a wedged mount
+//     cannot be unmounted, so its mountinfo line is the MOST stable one on the
+//     box. The trigger correlates inversely with the failure.
 func (p *Policy) applyMounts(mounts []mountEntry, gen string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -526,9 +623,46 @@ func (p *Policy) pathOnDeadMount(path string) bool {
 }
 
 // mountHealthy returns the liveness of a probe-able hangable mountpoint:
-// single-flight (one probe goroutine ever per mount until a generation change),
-// sticky (a dead verdict is never re-probed), and self-healing (a late success
-// from the outstanding goroutine flips the verdict back to healthy).
+// single-flight (at most ONE probe goroutine per mountpoint generation), sticky
+// for a DEAD verdict (never re-probed — see the budget argument below), and
+// self-healing (a late success from the outstanding goroutine flips a dead
+// verdict back to healthy).
+//
+// A HEALTHY verdict is NOT terminal. Before this fix it was, with no TTL and no
+// re-validation, so a mount that was alive at first probe and died later was
+// trusted for the process lifetime: the whole feature silently degraded to "two
+// deadlines and nothing else" while the dead $PATH dir was never dropped
+// (gotcha #81; timan107 ran 18 days that way). Two things expire it now:
+//
+//	T10  invalidateHealthy() — evidence: something actually stalled, so some
+//	     cached healthy verdict is provably wrong. Cheap, targeted, self-correcting.
+//	T11  the TTL below — backstop for workloads that produce NO evidence at all
+//	     (see DefaultHealthTTL).
+//
+// Both re-arm by REPLACING the *mountHealth (never resetting in place — see the
+// two fuses documented on mountHealth), so the fresh generation starts at
+// stUnprobed and the ordinary launcher path re-probes it.
+//
+// D-STATE THREAD BUDGET (the hard constraint this design has to earn). Both bounds
+// are per (mountpoint, GENERATION), not per mountpoint for all time — a mountinfo
+// signature change legitimately drops the entry and lets a fresh generation probe
+// again, which is the pre-existing F4 behaviour and is not changed here:
+//   - Instantaneous: a probe is launched only from the !launched branch of a
+//     fresh struct, and by INV-2 a healthy entry has no probe in flight when it
+//     is replaced ⇒ at most ONE probe goroutine per generation at any instant,
+//     exactly as before this change.
+//   - Lifetime: a re-probe either returns (goroutine exits, nothing leaked) or
+//     times out ⇒ stUnhealthy ⇒ sticky ⇒ never re-probed. Leaking a SECOND
+//     abandoned probe within one generation requires first returning to stHealthy,
+//     which requires the first abandoned statfs to have returned. ⇒ steady state is
+//     ≤1 abandoned probe per live generation.
+//
+// What this does NOT bound: a mount that is remounted repeatedly while dead would
+// get a new generation each time. That is the same exposure the feature has had
+// since v0.3.3, and a wedged mount is precisely the one that cannot be unmounted.
+//
+// Probes deliberately do NOT take a wedge slot: 64 stuck spawns must never be
+// able to starve the one probe that would teach the agent its mount died.
 func (p *Policy) mountHealthy(mp string) bool {
 	p.mu.Lock()
 	h := p.health[mp]
@@ -546,8 +680,20 @@ func (p *Policy) mountHealthy(mp string) bool {
 			} else {
 				h.state = stUnhealthy
 			}
+			// Stamp the self-healed verdict too: without this a mount that just
+			// came back would be born already-expired and re-probed immediately.
+			h.decidedAt = p.now()
 		default:
 		}
+	}
+	// T11 — a healthy verdict older than the TTL is re-armed (new generation) and
+	// falls through to the launcher path below. Guarded on stHealthy alone: by
+	// INV-2 that already means no probe is in flight, and it is what keeps a DEAD
+	// verdict out of here (widening it re-probes dead mounts ⇒ unbounded D-state
+	// threads, strictly worse than the bug being fixed).
+	if h.state == stHealthy && p.now().Sub(h.decidedAt) >= p.healthTTL {
+		h = &mountHealth{}
+		p.health[mp] = h
 	}
 	if h.state == stHealthy {
 		p.mu.Unlock()
@@ -588,7 +734,19 @@ func (p *Policy) mountHealthy(mp string) bool {
 	}
 
 	// Launcher: wait for the probe verdict or the deadline, set state, and close
-	// `done` exactly once to release joiners.
+	// this generation's `done` exactly once to release joiners.
+	//
+	// `h` and `done` are THIS generation's struct/channel, captured above. A T10/T11
+	// re-arm may have swapped p.health[mp] to a fresh struct while we waited; writing
+	// through the captured `h` then lands on an orphaned struct that nobody reads,
+	// which is exactly right — a stale launcher must not be able to stamp its verdict
+	// onto the new generation. Closing the captured `done` (NOT h.done, which used to
+	// be read as a field here) is what makes that safe: re-arming can never make this
+	// close hit a channel some other generation already closed.
+	//
+	// Cost, accepted: a joiner already parked on the old generation gets one verdict
+	// from the pre-invalidation epoch — at most one spawn decided on stale data. The
+	// alternative (re-entering mountHealthy) risks lock re-entrancy, which is worse.
 	select {
 	case ok := <-ch:
 		p.mu.Lock()
@@ -600,21 +758,77 @@ func (p *Policy) mountHealthy(mp string) bool {
 		} else {
 			h.state = stUnhealthy
 		}
+		h.decidedAt = p.now()
 		s := h.state
-		close(h.done)
+		close(done)
 		p.mu.Unlock()
 		return s == stHealthy
 	case <-time.After(timeout):
 		p.mu.Lock()
 		if h.state == stUnprobed {
 			h.state = stUnhealthy // mark dead; retain h.result for self-heal
+			h.decidedAt = p.now()
 		}
 		s := h.state
-		close(h.done)
+		close(done)
 		p.mu.Unlock()
 		return s == stHealthy
 	}
 }
+
+// invalidateHealthy expires every cached HEALTHY verdict so the next consult
+// re-probes. It is the evidence-driven half of the #81 fix: a spawn that stalled
+// past its deadline IS the proof that some cached "this mount is fine" is stale,
+// because a live mount does not wedge a stat or an execve.
+//
+// GLOBAL, not per-mount, and that is a deliberate trade rather than an oversight: the
+// evidence says "something stalled", and the stall carries no way to say WHICH mount
+// did it — a wedged resolution walked several $PATH dirs, and a wedged execve names a
+// path we already believed was fine. Expiring one healthy verdict is O(1) memory and
+// costs at most one extra statfs the next time that mount is consulted (microseconds
+// when it is alive), so over-expiring is cheap while under-expiring is the bug.
+//
+// Deliberately narrow, and each clause is load-bearing:
+//   - Only stHealthy entries are touched. stUnhealthy is sticky (re-probing a dead
+//     mount leaks another permanent D-state thread) and stUnprobed has nothing to
+//     expire.
+//   - No probe is launched here. This is O(#mounts) pure memory under p.mu, which
+//     is why it is safe to call from a watchdog's timeout branch.
+//
+// Call sites, and what actually pins each — the architecture gate covers the two that
+// mint a spawn-timeout sentinel and nothing else, so do not read it as covering all
+// four:
+//   - boundedResolveInDirs, timeout branch — argv[0] resolution wedged.
+//     Pinned by the gate (mint site) + TestPrepare_staleHealthyMountDroppedAfterSpawnTimeout.
+//   - RunStartWithCleanup, timeout branch — execve wedged (the only execve watchdog
+//     in the process after exec.go's duplicate collapsed into it).
+//     Pinned by the gate (mint site) + TestPrepare_wedgeCeilingSaturatedStillDropsDeadPathDirs.
+//   - Prepare, when the caller passed --safe — the documented manual override.
+//     Pinned by TestPrepare_safeForcesRevalidation (that it happens) and
+//     TestPrepare_safeInvalidatesBeforeCwdCheck (that it happens BEFORE the cwd check).
+//     Not visible to the gate: no sentinel is minted here.
+//   - Agent.boundedHomeRead's timeout — a wedged state.json read is the same evidence,
+//     and the only trigger that fires with nobody running a command.
+//     Pinned by TestBoundedHomeRead_stallExpiresCachedMountHealth in internal/agent.
+//     Not visible to the gate either: that branch returns (nil,false) and mints nothing.
+//
+// MUST NOT be called while p.mu is held — notably from mountHealthy, whose timeout
+// branch takes p.mu immediately after. p.mu is not reentrant, so such a call deadlocks
+// every spawn on the agent. The gate checks lock domination (not just the function
+// name), because extracting a helper defeated the name check while still deadlocking.
+func (p *Policy) invalidateHealthy() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for mp, h := range p.health {
+		if h != nil && h.state == stHealthy {
+			p.health[mp] = &mountHealth{}
+		}
+	}
+}
+
+// InvalidateHealthy is invalidateHealthy for callers outside the package (the
+// agent's own bounded-read watchdog). See invalidateHealthy for the contract.
+func (p *Policy) InvalidateHealthy() { p.invalidateHealthy() }
 
 // Decision is the result of Prepare.
 //
@@ -697,6 +911,14 @@ func (p *Policy) Prepare(argv []string, cwd, lookupPATH string, childEnv []strin
 		return Decision{}, nil
 	}
 	p.refreshIfChanged()
+	if requestedSafe {
+		// --safe is documented (usage.md §7.7) as the manual override for a wedged
+		// mount. Refreshing the mount TABLE was never enough: on timan107 the table
+		// was already correct and it was the cached HEALTHY verdict that was wrong,
+		// so --safe behaved identically to no flag at all. Expire them here, before
+		// the cwd/argv[0] checks below consult any of them.
+		p.invalidateHealthy()
+	}
 	p.mu.Lock()
 	hangable := p.hasHangable
 	p.mu.Unlock()
@@ -837,6 +1059,11 @@ func (p *Policy) boundedResolveInDirs(name string, dirs []string) (string, error
 		}
 		return r.path, nil
 	case <-time.After(p.probeTimeout):
+		// Evidence: resolution wedged, so some dir we walked is on a mount whose
+		// cached healthy verdict is stale. Expire them before returning, so the
+		// NEXT command re-probes and drops the dead dir instead of repeating this
+		// timeout forever (gotcha #81).
+		p.invalidateHealthy()
 		return "", &FSError{Code: ReasonSpawnTimeout, Detail: name}
 	}
 }
@@ -882,14 +1109,6 @@ func (p *Policy) SafeDir() string {
 // it as the deadline for bounding its own Home reads (Component I).
 func (p *Policy) ProbeTimeout() time.Duration { return p.probeTimeout }
 
-// IsPathDead reports whether an absolute path is backed by a dead hangable
-// mount. Exposed for the agent-liveness guard (Component I): the agent checks
-// its own Home before a blocking state.json read.
-func (p *Policy) IsPathDead(path string) bool {
-	p.refreshIfChanged()
-	return p.pathOnDeadMount(path)
-}
-
 // IsHangablePath reports whether a path is backed by ANY hangable mount
 // (regardless of current health). Used at New() to decide whether to guard the
 // agent's Home reads at all.
@@ -931,6 +1150,10 @@ func (p *Policy) RunStartWithCleanup(
 		p.ReleaseSpawnSlot()
 		return err
 	case <-time.After(timeout):
+		// Evidence: the execve itself wedged (argv[0] or cwd is on a mount we still
+		// believe is healthy). Expire cached healthy verdicts BEFORE onAbandon so the
+		// next spawn re-probes — see invalidateHealthy.
+		p.invalidateHealthy()
 		if onAbandon != nil {
 			onAbandon()
 		}
@@ -949,10 +1172,15 @@ func (p *Policy) RunStartWithCleanup(
 // TryAcquireSpawnSlot reserves one of the bounded concurrent-spawn slots,
 // returning false at the wedge ceiling. Pair every true with exactly one
 // ReleaseSpawnSlot — immediately on an in-time start, or from the reaper when an
-// abandoned start finally returns (so a recovered mount frees the slot). Callers
-// that must clean up resources on abandon (close exec pipes, Wait the child)
-// manage their own goroutine with these primitives instead of RunStart (review
-// M4: RunStart cannot close a caller's StdoutPipe/StderrPipe).
+// abandoned start finally returns (so a recovered mount frees the slot).
+//
+// Callers that must clean up resources on abandon (close exec pipes, Wait the
+// child) use RunStartWithCleanup, NOT these primitives directly. The older advice
+// here — "manage your own goroutine, RunStart cannot close a caller's
+// StdoutPipe/StderrPipe" — predates RunStartWithCleanup and is what led the agent
+// to grow a second, line-for-line copy of the watchdog; that copy is exactly where
+// gotcha #81's invalidation hook would have been forgotten. These primitives are
+// now only for callers doing something neither watchdog models (boundedTouch).
 func (p *Policy) TryAcquireSpawnSlot() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
