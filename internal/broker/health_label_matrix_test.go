@@ -21,7 +21,7 @@ func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
 
-// c6_test.go — C6 status-naming + homes-readiness invariants (the load-bearing pure logic).
+// health_label_matrix_test.go (formerly c6_test.go) — C6 status-naming + homes-readiness invariants (the load-bearing pure logic).
 
 // origin: c6_test.go (renamed in B6) — docs/reviews/c6-plan.md, docs/reviews/c6-review.md
 func TestHealthLabelMatrix(t *testing.T) {

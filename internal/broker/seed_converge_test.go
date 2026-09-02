@@ -7,7 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g3_seed_converge_test.go — G3 #1 pure-function tests for the seed auto-derive/converge helpers
+// seed_converge_test.go (formerly g3_seed_converge_test.go) — G3 #1 pure-function tests for the seed auto-derive/converge helpers
 // (DeriveSeedEndpoints / seedSetEqual / seedHostsMatchAnyBroker). No NATS/DB — adversarial table cases
 // pinning the load-bearing invariants: path preservation, nats:// refusal, undialable skip, deterministic
 // order (change-gate fuel), the 8-cap keeping VOTERs, and the host-match clobber guard.

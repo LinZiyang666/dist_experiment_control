@@ -8,6 +8,17 @@
 // phase (broker config, agent config, auth_callout wiring, custom
 // startBroker timings) — only the truly identical primitives live
 // here.
+//
+// THE IMPORT-CYCLE RULE (docs/testing-standards.md §七; docs/reviews/test-system-overhaul-plan.md
+// §2.3). This package MUST NOT import internal/broker, internal/agent or internal/session — ever.
+// Fourteen `package broker` tests, seven `package agent` tests and internal/session's own test
+// import THIS package; the first import back is a cycle and the build dies. That is why
+// "only the truly identical primitives live here" is a hard boundary, not a preference, and why
+// sixteen copies of seedSession / startBroker / startAgent grew in the phase suites: the shared
+// place could not hold anything that touches the product. Anything that needs a product package
+// goes to test/stackharness (its header carries the same argument from the other side; it may
+// import anything and may only be imported from tests). test/architecture/layering_test.go's
+// internal/testharness row is the mechanical half of this rule.
 package testharness
 
 import (

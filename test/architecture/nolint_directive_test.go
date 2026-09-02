@@ -138,6 +138,8 @@ func enabledLinters(t *testing.T, root string) map[string]bool {
 //     show that suppression strength held. What it does is force any change to the enabled set to be typed
 //     here too, in the same commit, where a human is looking at it. That is the same bargain every ledger
 //     in this repo makes, and it is worth stating rather than overselling.
+//
+// gate-control: TestEnabledLinterSetIsParsedNotAssumed
 func TestEnabledLinterSetIsParsedNotAssumed(t *testing.T) {
 	root := repoRoot(t)
 	b, err := os.ReadFile(filepath.Join(root, ".golangci.yml"))

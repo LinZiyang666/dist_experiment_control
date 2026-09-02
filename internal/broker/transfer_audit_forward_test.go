@@ -9,6 +9,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 func d8AuditRec(kind string) schema.AuditTransfer {
@@ -76,11 +77,9 @@ func TestD8TransferAuditForwardLeakGate(t *testing.T) {
 		b.emitTransferAudit(d8AuditRec("start"))
 	}
 	b.WaitTransferAudit()
-	for i := 0; i < 50; i++ {
-		if runtime.NumGoroutine() <= before {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("transfer-audit forward goroutines leaked: before=%d after=%d", before, runtime.NumGoroutine())
+	// The shared leak gate (internal/testharness/leakgate.go) replaces the inline poll this test used
+	// to carry: same tolerance derivation, one implementation, and visible to
+	// test/determinism/leak_assert_shape_test.go — which now checks that the 20-round loop above
+	// really exercises the subject. origin: docs/reviews/test-system-overhaul-plan.md B5 (D3).
+	testharness.AssertNoGoroutineLeak(t, "transfer-audit forward", before)
 }

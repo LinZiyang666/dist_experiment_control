@@ -12,7 +12,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// r14_session_idempotent_test.go — Q4 (docs/reviews/r6-findings.md): in a cluster a session create
+// session_idempotent_test.go (formerly r14_session_idempotent_test.go) — Q4 (docs/reviews/r6-findings.md): in a cluster a session create
 // routes through raft; the write can COMMIT on the leader but the caller's replica lags on read-back
 // under a partition, and reporting that as a failure (rc=70) left `session create` structurally
 // unable to go green. The fix: once proposeOrForward has committed the write, a read-back timeout is

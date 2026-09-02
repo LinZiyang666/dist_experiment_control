@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// g4_harvest_fallback_test.go (G4 #3) — the FIRST standalone→clustered grow renders clustered over a live
+// harvest_fallback_test.go (formerly g4_harvest_fallback_test.go; G4 #3) — the FIRST standalone→clustered grow renders clustered over a live
 // conf that still has NO cluster{} block, so ClusterMTLS() has nothing to harvest and BuildMergedConf
 // hard-fails today. When the caller (the reconciler) supplies the routes-mTLS identity explicitly (from the
 // secrets dir), BuildMergedConf must SKIP the harvest and render a complete clustered conf.

@@ -10,6 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // alertFake is a controllable alertClusterReader for the reconcile-loop branch tests.
@@ -207,17 +208,17 @@ func TestD8AlertReconcileRunCancels(t *testing.T) {
 	var n int
 	r := newReconciler(db, &alertFake{leader: false, voters: 3}, nil, &n)
 	before := runtime.NumGoroutine()
-	ctx, cancel := context.WithCancel(context.Background())
-	go r.Run(ctx)
-	time.Sleep(60 * time.Millisecond) // let it tick at least once
-	cancel()
-	for i := 0; i < 50; i++ {
-		if runtime.NumGoroutine() <= before {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Five start/cancel rounds, not one: the shared gate's ±2 tolerance would swallow a
+	// per-Run leak of one goroutine at a single exercise (test/determinism/leak_assert_shape_test.go
+	// header for the arithmetic). The inline poll this test used to carry was invisible to that
+	// gate. origin: docs/reviews/test-system-overhaul-plan.md B5 (D3).
+	for round := 0; round < 5; round++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.Run(ctx)
+		time.Sleep(60 * time.Millisecond) // let it tick at least once
+		cancel()
 	}
-	t.Fatalf("reconciler Run goroutine did not exit on ctx cancel (before=%d after=%d)", before, runtime.NumGoroutine())
+	testharness.AssertNoGoroutineLeak(t, "alert reconciler Run", before)
 }
 
 // TestD8SignalDiskAlertInert pins the build-and-prove invariant: with no alert sink attached

@@ -17,7 +17,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// g4_grow_trigger_test.go (G4 §B) — the account-signed grow trigger is a cluster-admin auth surface (a verify
+// grow_trigger_test.go (formerly g4_grow_trigger_test.go; G4 §B) — the account-signed grow trigger is a cluster-admin auth surface (a verify
 // bug = a bypass), so the signature / target / replay / dispatch gates are pinned exhaustively, mirroring the
 // G5 upgrade-trigger tests.
 

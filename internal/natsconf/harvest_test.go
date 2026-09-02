@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// c3_harvest_test.go (C3 Stage-C fixes B1/B3/M1) — the SUCCESS path the original C3 never exercised:
+// harvest_test.go (formerly c3_harvest_test.go; C3 Stage-C fixes B1/B3/M1) — the SUCCESS path the original C3 never exercised:
 // BuildMergedConf must harvest the routes-mTLS identity + the http monitor from the LIVE conf so the
 // reconciler (which carries no cert paths) renders a COMPLETE conf, and Preflight must fail-closed on
 // an unrecognized cluster/authorization subkey (auth_callout.xkey) now that the block is auto-regenerated.

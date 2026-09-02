@@ -36,7 +36,7 @@ func TestG7FoldProxyHomeCountsEmpty(t *testing.T) {
 	}
 }
 
-// g7_remote_test.go — G7b #16: lock the ctl --remote exit-code contract (0/2/3, never 1), especially
+// remote_test.go (formerly g7_remote_test.go) — G7b #16: lock the ctl --remote exit-code contract (0/2/3, never 1), especially
 // exit 3 under force_single, so a monitor can catch an emergency by exit code. The exit-3 chain is
 // ALREADY wired at HEAD (cluster_health.go stamps ForceSingleActive → summarizeClusterHealth →
 // ctlExitCode returns 3); this is a verify-and-lock regression, not a reimplementation. The 2026-06-29

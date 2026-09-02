@@ -12,7 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// g5_roster_consistency_test.go — round3 B1 companion: the version-agnostic responder↔roster consistency
+// roster_consistency_test.go (formerly g5_roster_consistency_test.go) — round3 B1 companion: the version-agnostic responder↔roster consistency
 // check must REJECT a responder absent from the roster (the reviewer's regression), but must NOT
 // over-refuse a responder the roster KNOWS (e.g. a pre-G5 learner answering health) — only voters are
 // rolled, learners are simply not in the plan.

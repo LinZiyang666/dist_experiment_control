@@ -2,7 +2,7 @@ package broker
 
 import "testing"
 
-// megaaudit_test.go — regression pins for the C1–C8 mega-audit MAJOR fixes in internal/broker.
+// proxysub_broadcast_test.go (formerly megaaudit_test.go) — regression pins for the C1–C8 mega-audit MAJOR fixes in internal/broker.
 
 // TestMegaAuditMAJ2ProxySubCreateRevokeAreBroadcast: the C5 proxy sub create/revoke leaves are leader-
 // only writes and MUST be classified broadcast (so a ≥2-node cluster reaches the leader, not a silent

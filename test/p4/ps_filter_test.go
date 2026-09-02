@@ -23,7 +23,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -61,9 +61,7 @@ func seedProc(t *testing.T, db *sql.DB, pid, sid, nid, status string, startedAt 
 // column is mandatory for the broker's ps gate).
 func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, fp, "test-pin-hash", time.Now().UTC()); err != nil {
-		t.Fatalf("session.Create(%q): %v", sid, err)
-	}
+	stackharness.SeedSession(t, db, sid, fp)
 }
 
 // psWith sends a single PsReq with the given body and returns the

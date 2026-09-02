@@ -265,6 +265,89 @@ func TestBuildTagsAreReconciled(t *testing.T) {
 // TestBuildTagsReconcilerIsNonVacuous proves the two directions above can actually fail. Without it a
 // green TestBuildTagsAreReconciled could mean either "the lists agree" or "the parser found nothing" —
 // and the parser finding nothing is exactly the shape of the bug this file exists to prevent.
+//
+// This file was invisible to gate_standards_test.go until 2026-09-01: CLAUDE.md's row named
+// `make vet-tags` and no `_test.go` path, so the meta-gate never asked it for an anchor (internal
+// review, gates verifier). The row now names this file, and this is its control.
+//
+// gate-control: TestBuildTagsReconcilerIsNonVacuous
+// integrationTagExceptions: files gated by an `_integration` tag that live OUTSIDE the tag's own
+// test/<dir>. Site-keyed, with a reason; an entry naming a file that no longer exists reddens.
+var integrationTagExceptions = map[string]string{
+	"internal/broker/phasefluidity_lifecycle_test.go": "phasefluidity_integration: the failed-join lifecycle " +
+		"drill needs package broker internals and has no test/<dir> of its own; it is run by " +
+		"TestPhaseFluidityMatrix with its own -run filter.",
+}
+
+// integrationTagExceptionsCap pins the exception table both ways (internal review L1-F8): the exact
+// file count below constrains it only indirectly, and a second exception could ride in under an
+// unchanged count if a gated file moved at the same time.
+const integrationTagExceptionsCap = 1
+
+// integrationTaggedFileCount pins the number of `_integration`-gated files. Exact, TLS-pairing style:
+// adding a gated file anywhere reddens this even when it is in the right directory, so the author
+// reads this test and confirms the placement rule before bumping the number.
+const integrationTaggedFileCount = 23
+
+// TestIntegrationTagsAreLocalToTheirSuiteDir: every file behind an `<x>_integration` build tag lives in
+// ONE test/<dir> per tag (or in the exception ledger). This is the precondition the matrix
+// de-duplication relies on: `go list` proved the shared internal packages compile identically under
+// every tag TODAY (docs/reviews/test-system-overhaul-plan.md §-1 F4), and this is what keeps that
+// true — a `//go:build d5_integration` file dropped into internal/proc would make D5's broker binary
+// differ from D4's without any other gate noticing.
+// origin: docs/reviews/test-system-overhaul-plan.md B4 (architecture A2).
+func TestIntegrationTagsAreLocalToTheirSuiteDir(t *testing.T) {
+	root := repoRoot(t)
+	if n := len(integrationTagExceptions); n != integrationTagExceptionsCap {
+		t.Errorf("integrationTagExceptions has %d entries, cap says %d — move the cap in the same change, with the reason", n, integrationTagExceptionsCap)
+	}
+	inTree := treeBuildTags(t, root)
+	seenException := map[string]bool{}
+	total := 0
+	var bad []string
+	for tag, files := range inTree {
+		if !strings.HasSuffix(tag, "_integration") {
+			continue
+		}
+		homes := map[string]bool{}
+		for _, f := range files {
+			total++
+			f = filepath.ToSlash(f)
+			if _, ok := integrationTagExceptions[f]; ok {
+				seenException[f] = true
+				continue
+			}
+			parts := strings.Split(f, "/")
+			if len(parts) < 3 || parts[0] != "test" {
+				bad = append(bad, tag+": "+f+" (not under test/<dir>/)")
+				continue
+			}
+			homes[parts[1]] = true
+		}
+		if len(homes) > 1 {
+			var hs []string
+			for h := range homes {
+				hs = append(hs, h)
+			}
+			sort.Strings(hs)
+			bad = append(bad, tag+": gated files span "+strings.Join(hs, ", ")+" — one tag, one suite directory")
+		}
+	}
+	sort.Strings(bad)
+	if len(bad) > 0 {
+		t.Errorf("%d build-tag locality violation(s):\n  %s", len(bad), strings.Join(bad, "\n  "))
+	}
+	for f := range integrationTagExceptions {
+		if !seenException[f] {
+			t.Errorf("integrationTagExceptions names %s, which is no longer an _integration-gated file — delete the entry", f)
+		}
+	}
+	if total != integrationTaggedFileCount {
+		t.Errorf("%d files are gated by an _integration tag; this test pins %d. If you added one, confirm it "+
+			"lives in its tag's own test/<dir>/ and update the constant in the same commit.", total, integrationTaggedFileCount)
+	}
+}
+
 func TestBuildTagsReconcilerIsNonVacuous(t *testing.T) {
 	root := repoRoot(t)
 

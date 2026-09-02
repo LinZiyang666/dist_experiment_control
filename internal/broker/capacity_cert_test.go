@@ -8,7 +8,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// b5_capacity_cert_test.go — reviewer-added (B5 cert-capacity-correctness lens). The
+// capacity_cert_test.go (formerly b5_capacity_cert_test.go) — reviewer-added (B5 cert-capacity-correctness lens). The
 // pre-existing TestB5CertExpiryAdvisory only exercises the PURE advisory helper. These
 // drive the full StatusReport round-trip on a real single-node raft: the cert literal
 // (LitTime, time.String() format) survives the sql.NullTime scan, capacity is self-row

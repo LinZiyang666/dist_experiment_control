@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// g3_forcesingle_converge_test.go — G3 #1 Stage-C M3: online force-single must converge the published
+// forcesingle_converge_test.go (formerly g3_forcesingle_converge_test.go) — G3 #1 Stage-C M3: online force-single must converge the published
 // seeds to the survivor after pruning the abandoned peer. Drives the real arm→commit path (fsTestBackend).
 func TestForceSingleOnlineConvergesSeeds(t *testing.T) {
 	b, n := fsTestBackend(t, "brk-a", "brk-b", "127.0.0.1:1") // peer dead on all probed ports

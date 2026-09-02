@@ -37,10 +37,14 @@ func subscribeClaimProbeAs(t *testing.T, url, sid, nid, instanceID string) *nats
 //
 // The "nobody is subscribed" observation is objective and correctly cached —
 // but it is true only until the register it just authorised installs its own
-// subscription, which happens milliseconds later. probeTTL keeps it for 10s,
-// leaseGrantWindow only covers the first 1s, so for ~9s every clone that
-// presents the same name reads "free" out of the cache and is handed the bare
-// name while the incumbent it would collide with is live and answering.
+// subscription, which happens milliseconds later. probeTTL keeps it for 10s;
+// leaseGrantWindow (= leaseSubscribeSettle, 5s since review round 2 widened it
+// from 1s) covers only the first part of that, so for the remainder of probeTTL
+// every clone that presents the same name reads "free" out of the cache and is
+// handed the bare name while the incumbent it would collide with is live and
+// answering. That remainder — [leaseGrantWindow, probeTTL) — is B5 in
+// docs/reviews/cloned-credential-instances-review-round2.md and is NOT what
+// this test exercises (see the 1.1s comment below).
 func TestGrantInvalidatesTheFreeObservationThatAuthorisedIt(t *testing.T) {
 	b, _, url := leaseBrokerWithBus(t)
 
@@ -57,7 +61,13 @@ func TestGrantInvalidatesTheFreeObservationThatAuthorisedIt(t *testing.T) {
 	// subscription and starts answering claim-probe.
 	subscribeClaimProbeAs(t, url, "lab", "gpu1", testInstanceA)
 
-	// A clone starts 1.1s later — past leaseGrantWindow, deep inside probeTTL.
+	// A clone starts 1.1s later — INSIDE leaseGrantWindow (5s), with the cached
+	// {nobody subscribed} observation still fresh. This line used to say "past
+	// leaseGrantWindow": it was written when the window was 1s and was not
+	// updated when round 2 widened the window, so for six weeks the comment
+	// described a branch the test had stopped taking. What refuses the bare
+	// name at 1.1s is the grant window, not the probe; this test pins the
+	// IN-window branch. origin: docs/reviews/test-system-overhaul-plan.md B0.
 	later := time.Now().UTC().Add(1100 * time.Millisecond)
 	lease, code, err := adjudicateLease(b, "lab", "gpu1", &proto.NodeRegisterReq{InstanceID: testInstanceB}, later)
 	if code == leaseReasonProbePending {
@@ -78,6 +88,20 @@ func TestGrantInvalidatesTheFreeObservationThatAuthorisedIt(t *testing.T) {
 // rules the cache for a further probeTTL. Here the stale write erases the fact
 // that the incumbent answered, and the silence rule then reads a live agent as
 // dead.
+//
+// WHAT THIS TEST PINS TODAY, MEASURED 2026-09-01 (test-system overhaul, internal review L6-F1 /
+// L5-F11). The sentence above describes the defect this test was written against. The product's
+// answer to it was TWO changes: (1) the background probe RE-CHECKS silence before recording it
+// (broker.go, "RE-CHECK SILENCE BEFORE RECORDING IT"); (2) it refuses to clobber a cache entry
+// younger than its own start ("DO NOT CLOBBER A NEWER OBSERVATION"). This test proves (1): the
+// recheck sees A2 and the cache says "held by A2". It does NOT prove (2): with the younger-
+// observation guard disabled (mutated to never fire), this test, the lease model's six scenarios
+// and its 40×12 random walk all stay green — because under single-flight probeInFlight the only
+// writer of the cache is the background probe itself, an inline definitive answer is deliberately
+// NOT cached, and a second background probe cannot start until the first has stored. There is no
+// path today on which a younger entry exists when the guard runs; it is defensive, and its G1
+// mutation (plan §4 B3 ②) is recorded as NOT caught. If that ever changes — a second cache writer
+// — this paragraph is the first thing to delete, and the mutation is the test to write.
 func TestBackgroundProbeMustNotOverwriteANewerObservation(t *testing.T) {
 	b, _, url := leaseBrokerWithBus(t)
 	seedBeat(t, b, "gpu1", 0)

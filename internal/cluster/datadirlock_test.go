@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// datadirlock_round7_test.go — round-7 external review: AcquireDataDirLock followed a tether.lock symlink
+// datadirlock_test.go (formerly datadirlock_round7_test.go) — round-7 external review: AcquireDataDirLock followed a tether.lock symlink
 // and then f.Chown'd the TARGET as root, letting the unprivileged tether account take ownership of any file
 // via the runbook's `sudo … recovery` (local privilege escalation). These pin the boundary beyond the
 // reviewer's own regression (which covers the symlink case).

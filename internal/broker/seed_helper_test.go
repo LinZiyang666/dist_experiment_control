@@ -10,7 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g3_seed_helper_test.go — G3 #1 DB-backed tests for deriveAndConvergeSeedsFromRoster on a single-node
+// seed_helper_test.go (formerly g3_seed_helper_test.go) — G3 #1 DB-backed tests for deriveAndConvergeSeedsFromRoster on a single-node
 // raft (make test). Pins: first-publish-stays-manual, the deterministic change-gate (no needless
 // seed_generation bump), bootstrap read-back preservation, shrink convergence (a stale endpoint drops +
 // gen bumps), the host-match clobber guard (an operator VIP set is left alone), and the empty-set floor

@@ -388,3 +388,44 @@ func TestHandleWildcardAgentRoleDenied(t *testing.T) {
 		t.Fatal("tether-agent:*:* must be denied")
 	}
 }
+
+// FuzzParseRole drives the connection-name classifier with arbitrary names.
+//
+// The name is CLIENT-CONTROLLED (ensureAgentProvisioned's own comment says so): whatever comes back
+// from parseRole is what the auth flow trusts before re-validating. The invariants are the ones the
+// callers assume without checking — an agent role always carries a non-empty sid AND nid, an
+// activated CLI a non-empty sid, unknown carries nothing — plus a rebuild: the classified role and
+// fields reproduce the exact input, so no name maps to a role it does not literally spell.
+// origin: docs/reviews/test-system-overhaul-plan.md B2 (infra I7).
+func FuzzParseRole(f *testing.F) {
+	for _, s := range []string{
+		"tether-cli", "tether-cli:lab", "tether-cli:",
+		"tether-agent:lab:gpu1", "tether-agent:lab:", "tether-agent::gpu1", "tether-agent:lab",
+		"tether-agent:lab:gpu1:extra", "tether-agent:", "", "x", "tether-cli:lab:extra",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, name string) {
+		r, sid, nid := parseRole(name)
+		switch r {
+		case roleUnknown:
+			if sid != "" || nid != "" {
+				t.Fatalf("roleUnknown for %q carried sid=%q nid=%q", name, sid, nid)
+			}
+		case roleCtlUnactivated:
+			if name != "tether-cli" || sid != "" || nid != "" {
+				t.Fatalf("roleCtlUnactivated for %q (sid=%q nid=%q)", name, sid, nid)
+			}
+		case roleCtlActivated:
+			if sid == "" || nid != "" || "tether-cli:"+sid != name {
+				t.Fatalf("roleCtlActivated for %q does not rebuild: sid=%q nid=%q", name, sid, nid)
+			}
+		case roleAgent:
+			if sid == "" || nid == "" || "tether-agent:"+sid+":"+nid != name {
+				t.Fatalf("roleAgent for %q does not rebuild: sid=%q nid=%q", name, sid, nid)
+			}
+		default:
+			t.Fatalf("parseRole(%q) returned an unknown role %d", name, r)
+		}
+	})
+}

@@ -40,6 +40,7 @@ func TestAgentCrashGetsMarkedOFFLINE(t *testing.T) {
 	// "Crash" the agent (clean cancel + drain — the closest we get
 	// without sending an actual SIGKILL to ourselves).
 	ah.Stop()
+	proveInjected(t, "agent stopped (heartbeat frozen)", agentHeartbeatFrozen(t, db, "lab", "n1"))
 
 	// Broker config in startBrokerExplicit: OfflineAfter=900ms,
 	// ReconcileInterval=50ms. So we should see OFFLINE within ~1s of
@@ -76,6 +77,7 @@ func TestAgentRestartReconcilesONLINE(t *testing.T) {
 	ah1 := startAgentExplicit(t, url, "lab", "n1")
 	testharness.WaitNodeOnline(t, db, "lab", "n1", 3*time.Second)
 	ah1.Stop()
+	proveInjected(t, "agent stopped (heartbeat frozen)", agentHeartbeatFrozen(t, db, "lab", "n1"))
 
 	// Wait for OFFLINE first so we know the recovery isn't just a
 	// "never noticed it died" no-op.
@@ -138,6 +140,7 @@ func TestAgentCrashWithRunningProcDerivesLOSTThenReconciles(t *testing.T) {
 
 	// Crash agent.
 	ah1.Stop()
+	proveInjected(t, "agent stopped (heartbeat frozen)", agentHeartbeatFrozen(t, db, "lab", "n1"))
 	if !testharness.WaitFor(t, 5*time.Second, 50*time.Millisecond, func() bool {
 		var st string
 		_ = db.QueryRow(

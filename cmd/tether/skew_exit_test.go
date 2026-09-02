@@ -7,7 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 )
 
-// b6_skew_exit_test.go — B6 A3: the CLI maps a version_skew admin code to exit 64 (operator
+// skew_exit_test.go (formerly b6_skew_exit_test.go) — B6 A3: the CLI maps a version_skew admin code to exit 64 (operator
 // fixes it by reinstalling the joiner on a matching release), not exit 70 (internal).
 func TestVersionSkewMapsToExitUsage(t *testing.T) {
 	if got := brokerCodeExitClass(adminsock.CodeVersionSkew); got != exitUsage {

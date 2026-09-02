@@ -14,9 +14,16 @@ on:
   # the order of weeks, not hours, so a nightly re-run of it mostly re-proves yesterday's answer.
   #
   # It is not free either: measured at 42m22s on a 2-core host (one worker, 99 units back-to-back).
-  # At 38 pushes to main in the last 30 days, the old "schedule OR push to main" trigger came to
-  # ~1300 min/month for e2e alone, against a 2000 min/month free allowance also feeding build-test
-  # and lint on every push. Weekly + on tags + manual is ~150 min/month plus releases.
+  #
+  # ECONOMICS, RESTATED 2026-09-01 (the previous paragraph's premises had both expired). This
+  # repository is PUBLIC (`gh repo view --json visibility`), so standard-runner minutes are not
+  # metered against the 2000 min/month allowance the earlier text cited; and main saw 8 commits in
+  # the last 30 days (`git log --since='30 days ago' --format=%h main | wc -l`), not 38. A
+  # push-to-main e2e would therefore cost ~340 min/month of free minutes, not ~1300 metered ones.
+  # The trigger set is nevertheless kept as is: cost was never the load-bearing half of the argument.
+  # The local hard gate already runs the full matrix on every commit; CI's copy exists to re-prove
+  # the ENVIRONMENT, and the environment changes on the order of weeks. Re-derive both numbers before
+  # citing them — the point of writing the commands is that the next reader can.
   #
   # Monday 02:30 UTC: after the weekend, before the week's work lands on top of a stale answer.
   schedule:
@@ -54,6 +61,12 @@ jobs:
           # alongside the release workflow.
           [ "$(echo "$out" | head -n1)" = "tether v0.0.0-dev (proto v2)" ]
       - run: make test
+      # The simcluster HERMETIC gate set (no docker, no server). Its own header says "a gate nobody
+      # runs is a gate that does not exist" — and until 2026-09-01 nothing in Makefile or CI called
+      # it; it was red on a clean tree and nobody knew. ~2 min: five poll/deviation scripts wait on
+      # real timers. test/architecture/simcluster_gate_set_test.go reconciles its loop against the
+      # directory, so a new script cannot be added without joining the set.
+      - run: sh test/simcluster/tests/run-all.sh
 
   lint:
     runs-on: ubuntu-latest
@@ -89,12 +102,16 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # `ubuntu-latest` has 2 physical cores, so the runner seats ONE worker and the 99 units run
-    # back-to-back. Measured on a 2-core-restricted host: 42m22s, ALL PASS. The round's own deadline
-    # is derived from that shape (1h39m at one worker) and is the thing that should fire first; this
-    # job-level cap only exists so a hung RUNNER cannot burn the 6-hour GitHub default. Do not lower
-    # it to "make CI faster" — it would kill a healthy round mid-suite, which is exactly the failure
-    # this whole change was made to stop misreporting.
+    # `ubuntu-latest` has 2 physical cores, so the runner seats ONE worker and every unit runs
+    # back-to-back. Measured on a 2-core-restricted host before de-duplication: 42m22s, ALL PASS. The
+    # round's own deadline is derived from the unit count at one worker and is the thing that should
+    # fire first — the unit count is deliberately NOT written here: it moves with every matrix and
+    # every fold (an earlier figure stood in this comment for weeks after it stopped being true, and
+    # a replacement figure was wrong on the day it was written — external review F5). Reproduce it:
+    #   go run ./test/e2e/parallel -split -shards 8 -dry-run -workers 1 | grep -E 'units:|deadline'
+    # This job-level cap only exists so a hung RUNNER cannot burn the 6-hour GitHub default. Do not
+    # lower it to "make CI faster" — it would kill a healthy round mid-suite, which is exactly the
+    # failure this whole change was made to stop misreporting.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -103,3 +120,70 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: make e2e-parallel
+
+  # WEEKLY FUZZ. `make fuzz` discovers every Fuzz target and runs each for FUZZTIME; a crasher that
+  # go test writes under testdata/fuzz is uploaded so it can be committed as a regression seed
+  # (docs/testing-standards.md G7). Never on push or pull_request: a fuzz run is non-deterministic,
+  # and a red that re-running cannot reproduce is the one thing a per-commit gate must never emit.
+  # `make test` already replays every target's seeds and committed corpus deterministically on every
+  # push; this job is the mutation half. ~30 targets × 60s ≈ 30 min plus compile, on free minutes.
+  # test/architecture/ci_workflow_test.go pins that this job cannot acquire a push/PR trigger.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make fuzz FUZZTIME=60s
+      # Named for what it holds: the whole testdata/fuzz tree, i.e. the committed corpus PLUS any
+      # crasher this run wrote (the crasher is the new file; `git status` in the download tells
+      # which). `fuzz-crashers` was a lie by omission — the 23 committed SOCKS5 seeds were always in it.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-testdata
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
+
+  # RELEASE WAITS FOR THE GATES. Until 2026-09-01 this step lived in release.yml, a separate workflow
+  # that fired on the tag push and ran goreleaser immediately — while the e2e job above said, in its
+  # own comment, that a release is "the single moment where 'it passed on the maintainer's box' is not
+  # good enough". Two workflows cannot see each other, so that sentence was a declaration nobody
+  # checked (the same shape test/architecture/gate_registry_test.go m24 caught in the Makefile).
+  #
+  # Now publishing is a job in THIS workflow with `needs` on all three gates: a red matrix on the tag
+  # means no artifact. On a 2-core runner that is ~42 min between tag and release; the escape hatch is
+  # re-running the workflow, never bypassing it. test/architecture/ci_workflow_test.go pins the needs
+  # list, that no other workflow file publishes, that every job it needs still runs on a tag push,
+  # that `on: push` carries no ref filter that would stop tags from starting the workflow at all, and
+  # that none of the four jobs can be short-circuited with always() / !cancelled() / continue-on-error.
+  #
+  # PUSH ONLY. The condition names the event as well as the ref: a `workflow_dispatch` run selected
+  # against an existing tag in the Actions UI also satisfies the tag-ref half of the condition, and
+  # release.yml never had that path (it triggered on `push: tags:` alone). Re-running a FAILED tag
+  # run keeps event_name == push, so the escape hatch above still works; a dispatch on a tag runs the
+  # gates and publishes nothing.
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build-test, lint, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean --config build/goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

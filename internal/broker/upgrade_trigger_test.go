@@ -14,7 +14,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g5_upgrade_trigger_test.go — G5 #13 W2b: the account-signed remote-trigger is the security crux (a verify
+// upgrade_trigger_test.go (formerly g5_upgrade_trigger_test.go) — G5 #13 W2b: the account-signed remote-trigger is the security crux (a verify
 // bug = a cluster-admin auth bypass), so the signature / target / replay / tamper / wrong-account gates are
 // pinned exhaustively here.
 

@@ -2004,9 +2004,12 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether_darwin_arm64
 
 - 公开 GitHub Release 见
   `https://github.com/LinZiyang666/dist_experiment_control/releases`。
-- 发布流水线：`git tag vX.Y.Z && git push --tags` 触发
-  `.github/workflows/release.yml`，由 goreleaser 出 4 个平台的 tarball +
-  `install.sh` + `SHA256SUMS` 上传 Release。
+- 发布流水线：`git tag vX.Y.Z && git push --tags` 触发 `.github/workflows/ci.yml`；
+  其中的 `release` job `needs` build-test / lint / e2e 三闸，**三闸全绿后**才由 goreleaser
+  出 4 个平台的 tarball + `install.sh` + `SHA256SUMS` 上传 Release（2 核 runner 上 tag→release
+  约 42 分钟）。任一闸红则没有 artifact；逃生口是**重跑该次 workflow run**，不是绕过——
+  对着已有 tag 手动 `workflow_dispatch` 只跑闸门、不发布。2026-09-01 前发布走独立的
+  `release.yml`，在 tag 上直接 goreleaser、看不见 e2e，已删除。
 - `install.sh` 在 `--version` 缺省时嗅探 `releases/latest` 的 301 重定向自动
   锁到最新 tag；`--source-base` 指向私有镜像时跳过嗅探。
 - ProtoVersion bump（wire 协议不兼容）走 §8.3 全量重装，不能用

@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// g2_ghost_test.go (G2 #12-B) — membership-aware RemoveNode ghost passthrough: a roster row in a
+// ghost_test.go (formerly g2_ghost_test.go; G2 #12-B) — membership-aware RemoveNode ghost passthrough: a roster row in a
 // non-removable phase (a stale VOTER after force-single) that is ABSENT from the committed raft config is
 // a force-single ghost and MUST be deletable online (the live racknerd pc732 deadlock), while a genuinely
 // IN-CONFIG live VOTER must STILL hit the anti-fork phase-gate refusal.

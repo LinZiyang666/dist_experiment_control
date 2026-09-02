@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
 )
 
-// b6_folds_test.go — B6 OPS#4 cheap folds (make test): the /metrics stream-replica gauge
+// folds_test.go (formerly b6_folds_test.go) — B6 OPS#4 cheap folds (make test): the /metrics stream-replica gauge
 // (omitted when not observed) and the computeHealth disk/ports DEGRADE band (self-row only).
 
 // origin: b6_folds_test.go (renamed in B6) — docs/reviews/b6-plan.md, docs/reviews/b6-review.md

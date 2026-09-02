@@ -11,7 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// g5_reexec_test.go — G5 #13 W3: the co-located-agent re-exec-only leg. sha256OfFile is the on-disk
+// reexec_test.go (formerly g5_reexec_test.go) — G5 #13 W3: the co-located-agent re-exec-only leg. sha256OfFile is the on-disk
 // binary verification the ReExecOnly path uses to refuse re-execing a stale/unstaged image. The full
 // forwarded-handler path (reply + real syscall.Exec) is exercised by the N=3 sim drill.
 func TestSha256OfFile(t *testing.T) {

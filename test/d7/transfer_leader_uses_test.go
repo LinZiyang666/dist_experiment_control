@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// external_review_test.go contains reviewer regressions for D7 contracts that are
+// transfer_leader_uses_test.go (formerly external_review_test.go) contains reviewer regressions for D7 contracts that are
 // advertised by the architecture/plan but not implemented by the current tree.
 
 // moduleRoot and readFile used to live in regression_test.go alongside the layering guards. Those

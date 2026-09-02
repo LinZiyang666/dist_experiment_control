@@ -37,9 +37,13 @@ var (
 	// A rule's own path scope. origin: external review M4 — the register lookup must honour it.
 	golangciPathLineRe = regexp.MustCompile(`^- path: (.+)$`)
 	makeGoTestPkgsRe   = regexp.MustCompile(`(?m)^\tgo test ((?:\./[^\s]+\s*)+)$`)
-	claudeGatePathRe   = regexp.MustCompile("`((?:test|cmd|internal)/[A-Za-z0-9_/.-]+)`")
-	funcDeclNameRe     = regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?([A-Za-z_][A-Za-z0-9_]*)`)
-	identRe            = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// A shell gate set run as its own recipe line (`\tsh test/simcluster/tests/run-all.sh`). Covered by
+	// EXACT path, never by directory: the table names the script, and a directory prefix would let any
+	// other script under tests/ claim to be run. origin: docs/reviews/test-system-overhaul-plan.md B1.
+	makeShLineRe     = regexp.MustCompile(`(?m)^\tsh (test/\S+)$`)
+	claudeGatePathRe = regexp.MustCompile("`((?:test|cmd|internal)/[A-Za-z0-9_/.-]+)`")
+	funcDeclNameRe   = regexp.MustCompile(`(?m)^func (?:\([^)]*\) )?([A-Za-z_][A-Za-z0-9_]*)`)
+	identRe          = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // TestGolangciNameRegistersNameLiveFunctions is m3's reverse assertion: every function named in an
@@ -245,6 +249,9 @@ func TestGatesTargetCoversEveryGateCLAUDEMdNames(t *testing.T) {
 	}
 	if len(covered) < 4 {
 		t.Fatalf("parsed only %d packages from the gates recipe — parser broken", len(covered))
+	}
+	for _, m := range makeShLineRe.FindAllStringSubmatch(recipe, -1) {
+		covered = append(covered, strings.TrimSuffix(m[1], "/"))
 	}
 
 	claude, err := os.ReadFile(filepath.Join(root, "CLAUDE.md"))

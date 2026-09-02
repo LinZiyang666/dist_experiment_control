@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// g4_withhold_test.go (G4 #3/#10/#4) — the FIRST standalone→clustered grow: with a secrets dir the render
+// reconcile_withhold_test.go (formerly g4_withhold_test.go; G4 #3/#10/#4) — the FIRST standalone→clustered grow: with a secrets dir the render
 // now SUCCEEDS (no harvest hard-fail), but the reconciler must WITHHOLD the swap (ActionAwaitingClusteredCutover)
 // so a SIGHUP never crosses the destructive cutover; only `cluster add` performs the coordinated restart.
 

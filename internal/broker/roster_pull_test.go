@@ -13,7 +13,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// g3_roster_pull_test.go — G3 #17 改法二 broker responder: a ctl on the live conn pulls the signed
+// roster_pull_test.go (formerly g3_roster_pull_test.go) — G3 #17 改法二 broker responder: a ctl on the live conn pulls the signed
 // manifest from the connected broker (SubjCtrlClusterRoster). It serves the pre-signed manifestBytes()
 // cache (no per-request sign) and stays silent in single mode (ErrNoResponders → ctl falls back).
 

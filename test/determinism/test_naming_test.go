@@ -326,10 +326,10 @@ func isProcessNamedFunc(name string) bool {
 	return true
 }
 
-var testFuncDeclRe = regexp.MustCompile(`(?m)^func ((?:Test|Benchmark|Fuzz)[A-Za-z0-9_]*)\s*\(`)
-
 // TestNoNewProcessNamedTestFunctions freezes function names the same way the file gate freezes
-// filenames, with the same draining ledger and the same reverse assertion.
+// filenames, with the same draining ledger and the same reverse assertion. Declarations are found
+// by testFuncDecls (test_inventory_test.go) — a parser, not the line-anchored regex the first
+// version used, which read `func Test…(` inside raw-string samples as declarations.
 func TestNoNewProcessNamedTestFunctions(t *testing.T) {
 	root := repoRoot(t)
 
@@ -358,8 +358,13 @@ func TestNoNewProcessNamedTestFunctions(t *testing.T) {
 			return rlerr
 		}
 		rel = filepath.ToSlash(rel)
-		for _, m := range testFuncDeclRe.FindAllStringSubmatch(string(src), -1) {
-			name := m[1]
+		// Parsed, not regex-scanned: shared with the inventory gate (testFuncDecls) so a declaration
+		// inside a string literal cannot enter this ledger either — internal review L1-F1.
+		names, perr := testFuncDecls(rel, src)
+		if perr != nil {
+			return perr
+		}
+		for _, name := range names {
 			if !isProcessNamedFunc(name) {
 				continue
 			}
@@ -439,6 +444,102 @@ func TestNoNewProcessNamedTestFunctions(t *testing.T) {
 			"process-named test function:\n  %s\n\n"+
 			"Delete them in the same commit as the rename — that is how this ledger drains.",
 			len(stale), strings.Join(stale, "\n  "))
+	}
+}
+
+// testFileHeaderNameRe matches the first comment line that names a test file: `// x_test.go — ...`.
+var testFileHeaderNameRe = regexp.MustCompile(`^// ([A-Za-z0-9_]+_test\.go)\b`)
+
+// headerNamedFile returns the file name the first header line (within the first headerScanLines
+// lines) claims, or "" if the file has no such header. Shared with the self-check.
+func headerNamedFile(src string) string {
+	lines := strings.SplitN(src, "\n", headerScanLines+1)
+	if len(lines) > headerScanLines {
+		lines = lines[:headerScanLines]
+	}
+	for _, l := range lines {
+		if m := testFileHeaderNameRe.FindStringSubmatch(l); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+const headerScanLines = 40
+
+// TestTestFileHeaderNamesItself: a test file whose header comment names a file must name THIS file.
+//
+// The 158-file rename that drained legacy_process_named_list.go changed file names and left the
+// first line of 59 of them saying the old one — `// g3_seed_helper_test.go — ...` at the top of
+// seed_helper_test.go. A header is the first thing the next reader sees, and a header naming a file
+// that does not exist sends them grepping for it. The 59 were corrected by hand on 2026-09-01 with
+// the old name kept as `(formerly …)` so the batch provenance survives; this gate keeps the count at
+// zero. No ledger: a header is a one-token edit, and there is nothing to drain.
+// origin: docs/reviews/test-system-overhaul-plan.md B4 (quality Q6).
+//
+// gate-control: TestTestFileHeaderPredicateSeesTheShapes
+func TestTestFileHeaderNamesItself(t *testing.T) {
+	root := repoRoot(t)
+	var offenders []string
+	scanned := 0
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		scanned++
+		if named := headerNamedFile(string(src)); named != "" && named != d.Name() {
+			rel, _ := filepath.Rel(root, p)
+			offenders = append(offenders, filepath.ToSlash(rel)+": header says "+named)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if scanned < 500 {
+		t.Fatalf("scanned only %d _test.go files — the walk is not seeing the tree", scanned)
+	}
+	sort.Strings(offenders)
+	if len(offenders) > 0 {
+		t.Errorf("%d test file(s) carry a header naming a DIFFERENT file:\n  %s\n\n"+
+			"Change the header's file name to this file's basename; keep the old name as "+
+			"`(formerly old_test.go)` if it carries batch provenance.", len(offenders), strings.Join(offenders, "\n  "))
+	}
+}
+
+// TestTestFileHeaderPredicateSeesTheShapes is the G2b self-check (the live tree's success state is
+// zero offenders, so the shapes are synthetic).
+func TestTestFileHeaderPredicateSeesTheShapes(t *testing.T) {
+	cases := []struct{ src, want string }{
+		{"package x\n\n// roster_test.go — guards\n", "roster_test.go"},
+		{"package x\n\n// roster_test.go (formerly b7_roster_test.go) — guards\n", "roster_test.go"},
+		{"package x\n\nimport \"testing\"\n\n// b7_roster_test.go — guards\n", "b7_roster_test.go"},
+		{"// origin: b7_roster_test.go (renamed) — history\n// roster_test.go — guards\n", "roster_test.go"}, // origin lines do not count
+		{"package x\n// no header here\n", ""},
+		{"package x\n// roster_test.gopher is not a file name\n", ""},
+	}
+	for i, c := range cases {
+		if got := headerNamedFile(c.src); got != c.want {
+			t.Errorf("case %d: headerNamedFile = %q, want %q", i, got, c.want)
+		}
+	}
+	deep := strings.Repeat("// filler\n", headerScanLines) + "// late_test.go — beyond the scan window\n"
+	if got := headerNamedFile(deep); got != "" {
+		t.Errorf("a header past line %d must not count (got %q)", headerScanLines, got)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// d7_membership_test.go — D7 §8.1 cheap unit tests (make test): Plan/applier join-PoP
+// membership_test.go (formerly d7_membership_test.go) — D7 §8.1 cheap unit tests (make test): Plan/applier join-PoP
 // (forged → errAppliedRejected poison-skip, valid → exec), phase-predecessor CAS
 // no-op, removal only on terminal phases, migration 0013 columns. The multi-node
 // forged-sig-read-on-FOLLOWER drill is gated d7_integration (test/d7 TestD7Matrix).

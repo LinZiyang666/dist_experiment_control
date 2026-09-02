@@ -28,6 +28,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -60,9 +61,7 @@ const testPINHash = "test-pin-hash"
 
 func seedSession(t *testing.T, db *sql.DB, sid, ownerFP string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, ownerFP, testPINHash, time.Now().UTC()); err != nil {
-		t.Fatalf("session.Create: %v", err)
-	}
+	stackharness.SeedSession(t, db, sid, ownerFP)
 }
 
 // seedSessionWithPIN seeds with a real argon2id hash so JoinWithPIN

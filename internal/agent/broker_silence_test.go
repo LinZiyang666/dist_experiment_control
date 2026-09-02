@@ -13,7 +13,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// r14_broker_silence_test.go — #48 (docs/reviews/r6-findings.md): after a broker is retired the
+// broker_silence_test.go (formerly r14_broker_silence_test.go) — #48 (docs/reviews/r6-findings.md): after a broker is retired the
 // agent stays connected to its still-running nats-server (the disconnect never comes) while the
 // retired broker answers nothing (handleRegister early-returns on isClusterFollower). Neither the
 // "current broker is leaving" roster edge (needs a reply) nor the disconnect-armed redial watchdog

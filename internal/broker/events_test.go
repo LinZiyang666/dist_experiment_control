@@ -15,7 +15,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// r30_events_test.go (#30) — task 2: cluster-mode proxy sub create/revoke must emit the operator-facing
+// events_test.go (formerly r30_events_test.go; #30) — task 2: cluster-mode proxy sub create/revoke must emit the operator-facing
 // sys.events{type:proxy_keyset_changed}. The single-mode path emits it (via pushCurrentKeyset); the
 // cluster path bumped the keyset epoch through Raft but never surfaced the event (drill 73's "cluster-
 // mode revoke's ABSENT proxy_keyset_changed"). These tests drive the REAL cluster handlers on a live

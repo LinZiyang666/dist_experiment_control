@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// g2_decluster_test.go (G2 #20 BLOCKER regression) — the offline de-cluster render MUST harvest THIS
+// decluster_test.go (formerly g2_decluster_test.go; G2 #20 BLOCKER regression) — the offline de-cluster render MUST harvest THIS
 // survivor's broker nkey from its cluster_nodes row, NOT via own.AuthIdentity() (which returns "" for a
 // multi-user clustered conf — the only shape that ever needs de-clustering). A regression to AuthIdentity
 // refuses every real N>=2 de-cluster, leaving the operator one restart from the exit-70 crash-loop #20

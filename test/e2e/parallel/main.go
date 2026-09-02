@@ -35,8 +35,11 @@ func main() {
 		noAvoidBusy = flag.Bool("no-avoid-busy", false, "do not exclude cores already carrying a foreign workload")
 		shards      = flag.Int("shards", 0, "split the dominant packages into N name-based shards (0 = off)")
 		split       = flag.Bool("split", false, "schedule one unit PER PACKAGE instead of per matrix (lowers the max(matrix) ceiling)")
+		shuffle     = flag.String("shuffle", "", "pass -shuffle=<off|on|N> to every go test invocation: as a flag on parsed units, through GOFLAGS for whole-matrix units so their forked go test children get it too (docs/testing-standards.md T4 flake hunting; the seed is in each unit's output)")
+		dedupe      = flag.Bool("dedupe", true, "fold package units whose go list build closure is byte-identical across matrices (proved per run; see dedupe.go); -dedupe=false runs every matrix's list verbatim")
 	)
 	flag.Parse()
+	shuffleMode = *shuffle
 
 	topo, err := discoverTopology()
 	if err != nil {
@@ -85,6 +88,39 @@ func main() {
 		if len(units) == 0 {
 			fatal("no units matched %q", *runRe)
 		}
+		// De-duplication runs BEFORE the coverage self-check on purpose: if folding ever emptied a
+		// matrix (every unit of it kept under another matrix's name), the self-check below is what
+		// must say so, rather than the runner quietly reporting one matrix fewer.
+		var foldNotes []foldNote
+		if *dedupe {
+			before := len(units)
+			units, foldNotes, err = dedupeUnits(units, goListClosureHash)
+			if err != nil {
+				fatal("dedupe: %v", err)
+			}
+			folded, apart := 0, 0
+			for _, n := range foldNotes {
+				if n.reason == "" {
+					folded++
+				} else {
+					apart++
+				}
+			}
+			fmt.Printf("dedupe: %d -> %d unit(s); %d fold(s), each proved by an identical go list closure; %d candidate group(s) kept apart:\n",
+				before, len(units), folded, apart)
+			for _, n := range foldNotes {
+				if n.reason == "" {
+					fmt.Printf("  %s  <= %s  [closure %s]\n", n.kept, strings.Join(n.dropped, ", "), n.hash)
+				} else {
+					fmt.Printf("  %s  kept apart: %s\n", n.kept, n.reason)
+				}
+			}
+			// A hasher that fails on EVERY candidate group is indistinguishable from a tree with no
+			// duplicates unless someone says so: this is that someone.
+			if folded == 0 && apart > 0 {
+				fmt.Printf("  WARNING: no group folded — if go list is failing, dedupe is silently off (see reasons above)\n")
+			}
+		}
 		// Coverage self-check. Split mode adds a source-parsing layer between the
 		// matrices and what actually runs, and a parser that silently misses a
 		// matrix produces a fast, green, INCOMPLETE run — strictly worse than
@@ -109,10 +145,9 @@ func main() {
 			if lerr != nil {
 				fatal("coverage self-check: list tests: %v", lerr)
 			}
-			covered := map[string]bool{}
-			for _, u := range units {
-				covered[u.matrix] = true
-			}
+			// A matrix folded away entirely is still represented (its work runs once under another
+			// matrix's name); coveredMatrices counts the fold notes so a correct fold cannot block the gate.
+			covered := coveredMatrices(units, foldNotes)
 			var uncovered []string
 			for _, d := range declared {
 				if !covered[d] {
@@ -407,7 +442,16 @@ func runRound(ctx context.Context, plan []assignment, heavy *assignment, tests [
 var numactlOnce sync.Once
 var numactlOK bool
 
+// shuffleMode is -shuffle, published for pinnedCommand (the flag itself is a local of main).
+var shuffleMode string
+
 func pinnedCommand(ctx context.Context, a assignment, goArgs []string) *exec.Cmd {
+	// -shuffle rides directly after `test` so it is a go-test flag, not a package or a test-binary
+	// argument, whatever shape the caller assembled. origin: docs/reviews/test-system-overhaul-plan.md
+	// B4 (distributed D5, reduced to pass-through).
+	if shuffleMode != "" && len(goArgs) > 0 && goArgs[0] == "test" {
+		goArgs = append([]string{"test", "-shuffle=" + shuffleMode}, goArgs[1:]...)
+	}
 	numactlOnce.Do(func() {
 		_, err := exec.LookPath("numactl")
 		numactlOK = err == nil
@@ -451,7 +495,13 @@ func runUnit(ctx context.Context, a assignment, u unit) result {
 		goArgs = u.goTestArgs()
 	}
 	cmd := pinnedCommand(ctx, a, goArgs)
-	cmd.Env = append(os.Environ(), "GOMAXPROCS="+itoa(a.procs))
+	env := append(os.Environ(), "GOMAXPROCS="+itoa(a.procs))
+	if u.isWhole() {
+		// The outer -shuffle flag does not reach the `go test` children a whole matrix forks;
+		// GOFLAGS does (dedupe.go: wholeUnitEnv).
+		env = wholeUnitEnv(env, shuffleMode)
+	}
+	cmd.Env = env
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

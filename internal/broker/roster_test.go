@@ -13,7 +13,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// b7_roster_test.go — B7 DOC#3 byte-equivalence guards (the plan's TWO required tests):
+// roster_test.go (formerly b7_roster_test.go) — B7 DOC#3 byte-equivalence guards (the plan's TWO required tests):
 // (1) construction-site inertness — rosterForRegister returns nil when selfID=="" (single broker),
 // (2) marshal-omits-key — a nil Roster pointer omits the "roster" key entirely.
 

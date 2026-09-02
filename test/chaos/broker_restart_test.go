@@ -63,6 +63,7 @@ func TestBrokerRestartSQLiteWALRecovery(t *testing.T) {
 	}
 
 	bh1.Stop()
+	proveInjected(t, "broker stopped (no responder on ctrl subject)", brokerSilent(nc))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -205,6 +206,12 @@ func TestBrokerRestartConvergesONLINEAfterReconnect(t *testing.T) {
 	// Bounce the broker (NATS stays up so the agent's underlying
 	// nats.Conn just keeps going).
 	bh1.Stop()
+	probe, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proveInjected(t, "broker stopped (no responder on ctrl subject)", brokerSilent(probe))
+	probe.Close()
 
 	// Without anyone to handle heartbeats, the broker's boot reconcile
 	// would mark the node OFFLINE on the next start — but actually the

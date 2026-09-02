@@ -3,6 +3,9 @@ package cluster
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -287,4 +290,181 @@ func mustMetaOK(t *testing.T, f *fsm, key string) (string, bool) {
 	}
 	t.Fatalf("meta %q: %v", key, err)
 	return "", false
+}
+
+// projectFSM is the state an FSM is judged by: the WHOLE cluster_meta table and the WHOLE
+// cluster_reqid_ledger. The ledger is state — a restored FSM must still dedup a ReqID committed
+// before the cut — and a projection of five keys could not see it lost (internal review L2-F3).
+func projectFSM(t *testing.T, f *fsm) string {
+	t.Helper()
+	var sb strings.Builder
+	rows, err := f.db.Query(`SELECT key, value FROM cluster_meta ORDER BY key`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&sb, "meta %s=%s\n", k, v)
+	}
+	_ = rows.Close()
+	rows, err = f.db.Query(`SELECT req_id, raft_index FROM cluster_reqid_ledger ORDER BY req_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		var idx int64
+		if err := rows.Scan(&id, &idx); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&sb, "ledger %s@%d\n", id, idx)
+	}
+	_ = rows.Close()
+	return sb.String()
+}
+
+// restoreFromSnapshotOf snapshots `a` at `index` through a real InmemSnapshotStore round trip and
+// restores it into a fresh FSM.
+func restoreFromSnapshotOf(t *testing.T, a *fsm, index uint64) *fsm {
+	t.Helper()
+	snap, err := a.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	store := raft.NewInmemSnapshotStore()
+	_, trans := raft.NewInmemTransport("")
+	sink, err := store.Create(raft.SnapshotVersionMax, index, 1, raft.Configuration{}, 0, trans)
+	if err != nil {
+		t.Fatalf("Create sink: %v", err)
+	}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close: %v", err)
+	}
+	_, rc, err := store.Open(sink.ID())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	b, _ := freshFSM(t, t.TempDir())
+	if err := b.Restore(rc); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := mustApplied(t, b); got != index {
+		t.Fatalf("B after restore: applied_index=%d want %d", got, index)
+	}
+	return b
+}
+
+// TestFSM_SnapshotRestoreReplayEquivalence: for a seeded random command sequence, an FSM that applied
+// every entry, an FSM restored from a snapshot taken at a random cut and then fed the remainder, and
+// the first FSM after being fed EVERYTHING again (the raft re-delivery shape) must all project to the
+// same state and the same applied_index. The table tests above pin one re-apply and one poison entry;
+// this is the same invariant over sequences nobody wrote down.
+//
+// THREE ENTRY FAMILIES, because applyCommand has three mutually exclusive paths and a sequence of
+// plain sets reaches one: (1) set — with or without a ReqID; (2) dedup — a committed-but-ack-lost
+// retry: an OLD ReqID at a NEW index, which must skip the op and still advance the cursor
+// (appliedDedup), on both FSMs, on either side of the cut; (3) poison — an undecodable entry that
+// advances the cursor as a no-op. The first version generated family (1) only, with no ReqIDs, so
+// a snapshot that lost the dedup ledger projected identically (internal review L2-F3). The
+// generator's G2 floor (every family ≥ 20 times across the seeds) is asserted at the end.
+// origin: docs/reviews/test-system-overhaul-plan.md B5 (distributed D7).
+func TestFSM_SnapshotRestoreReplayEquivalence(t *testing.T) {
+	keys := []string{"t:a", "t:b", "t:c", "t:d", "t:e"}
+	families := map[string]int{}
+	for seed := int64(1); seed <= 30; seed++ {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			r := rand.New(rand.NewSource(seed))
+			n := 8 + r.Intn(12)
+			var logs []*raft.Log
+			var reqIDs []string
+			for i := 0; i < n; i++ {
+				idx := uint64(i + 2) // indices start at 2 (the table tests' convention)
+				switch p := r.Intn(10); {
+				case p == 0:
+					families["poison"]++
+					logs = append(logs, &raft.Log{Index: idx, Term: 1, Type: raft.LogCommand, Data: []byte("not-a-valid-command")})
+				case p < 4 && len(reqIDs) > 0:
+					families["dedup"]++
+					c := metaCmd(t, keys[r.Intn(len(keys))], fmt.Sprintf("retry%d-%d", seed, i))
+					c.ReqID = reqIDs[r.Intn(len(reqIDs))] // a committed-but-ack-lost retry at a NEW index
+					logs = append(logs, logCmd(t, idx, 1, c))
+				default:
+					families["set"]++
+					c := metaCmd(t, keys[r.Intn(len(keys))], fmt.Sprintf("v%d-%d", seed, i))
+					if r.Intn(2) == 0 {
+						c.ReqID = fmt.Sprintf("%08x%08x", seed, i) // the minted key shape: lowercase hex
+						reqIDs = append(reqIDs, c.ReqID)
+					}
+					logs = append(logs, logCmd(t, idx, 1, c))
+				}
+			}
+			cut := 1 + r.Intn(n-1) // snapshot after `cut` entries; at least one before and one after
+
+			a, _ := freshFSM(t, t.TempDir())
+			var b *fsm
+			for i, l := range logs {
+				if _, isErr := a.Apply(l).(error); isErr {
+					t.Fatalf("A: apply @%d returned an error", l.Index)
+				}
+				if i+1 == cut {
+					b = restoreFromSnapshotOf(t, a, l.Index)
+				}
+			}
+			for _, l := range logs[cut:] {
+				if _, isErr := b.Apply(l).(error); isErr {
+					t.Fatalf("B: apply @%d returned an error", l.Index)
+				}
+			}
+			before := projectFSM(t, a)
+			// Re-deliver EVERY entry to A, including the last one (index == applied_index — the
+			// boundary a `<` instead of `<=` in the FSM's short-circuit would re-run; the first
+			// version re-delivered only the prefix and that mutation stayed green). Dedup and poison
+			// entries included: the index-skip runs before either.
+			reapplies := a.reapplyCount.Load()
+			for _, l := range logs {
+				if _, ok := a.Apply(l).(appliedNoOp); !ok {
+					t.Fatalf("A: re-delivered @%d was not appliedNoOp", l.Index)
+				}
+			}
+			if got := a.reapplyCount.Load() - reapplies; got != uint64(n) {
+				t.Fatalf("reapplyCount moved by %d, want %d", got, n)
+			}
+			if after := projectFSM(t, a); after != before {
+				t.Fatalf("re-delivery changed A:\n%s\n--\n%s", before, after)
+			}
+			if pa, pb := projectFSM(t, a), projectFSM(t, b); pa != pb {
+				t.Fatalf("projection differs after snapshot/restore at cut %d:\nA:\n%s\nB:\n%s", cut, pa, pb)
+			}
+			if mustApplied(t, a) != mustApplied(t, b) || mustApplied(t, a) != uint64(n+1) {
+				t.Fatalf("applied_index: A=%d B=%d want %d", mustApplied(t, a), mustApplied(t, b), n+1)
+			}
+			// The ledger is state: a restored FSM must still dedup a ReqID committed BEFORE the cut.
+			for _, l := range logs[:cut] {
+				c, err := decodeCommand(l.Data)
+				if err != nil || c.ReqID == "" {
+					continue
+				}
+				retry := metaCmd(t, "t:z", "after-restore")
+				retry.ReqID = c.ReqID
+				if _, ok := b.Apply(logCmd(t, uint64(n+2), 1, retry)).(appliedDedup); !ok {
+					t.Fatalf("B lost the dedup ledger across Snapshot/Restore: ReqID %s (committed @%d, before the cut) was re-run", c.ReqID, l.Index)
+				}
+				if _, ok := mustMetaOK(t, b, "t:z"); ok {
+					t.Fatal("the deduped retry wrote its op")
+				}
+				break
+			}
+		})
+	}
+	for _, fam := range []string{"set", "dedup", "poison"} { // G2: the generator must reach every family
+		if families[fam] < 20 {
+			t.Fatalf("family %q reached only %d times across 30 seeds: %v", fam, families[fam], families)
+		}
+	}
 }

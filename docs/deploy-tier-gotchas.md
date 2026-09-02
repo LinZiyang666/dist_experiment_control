@@ -831,7 +831,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **对「双向切换」结论的修正**：分析里曾说"降下来最硬的缺口是 N=1 带死 voter 无在线清理"——**在 v0.5.0
   这已不成立**，force-single finalize retry 补上了这条在线路径。
 
-### #80 — agent 的 SS proxy server 锚在 per-session `runCtx` 上：一次 NATS session 重建即杀死数据面，且**永不重建**（真实生产事故，已修）
+### #80 — agent 的 SS proxy server 锚在 per-session `runCtx` 上：一次 NATS session 重建即杀死数据面，且**永不重建**（真实生产事故，已修复）
 
 > **来源 = 生产车队，非 simcluster drill。** 2026-08-21 weilandserver 现场诊断。
 > plan 见 `docs/reviews/proxy-lifecycle-plan.md`，内审见 `-review.md`，外审见 `-external-review.md`。

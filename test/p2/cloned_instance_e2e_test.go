@@ -211,14 +211,17 @@ func TestRestartedInstanceReclaimsItsNameRatherThanBeingSuffixed(t *testing.T) {
 	waitForNodeCount(t, db, "lab", 1, 5*time.Second)
 
 	// Stop it and bring it back well inside LeaseGrace, so the heartbeat clock
-	// ALONE would call this contested — the probe is what must save it.
+	// ALONE would call this contested.
 	//
-	// The pause models a real process restart: systemd's RestartSec is 5s, and
-	// even a bare re-exec costs more than this. It is deliberately LONGER than
-	// leaseGrantWindow, which exists only to cover the milliseconds between a
-	// grant and that agent installing its subscription — a window that must
-	// never be wide enough to swallow a restart, or a durable device gets
-	// renamed for restarting.
+	// WHICH BRANCH THIS PINS — corrected 2026-09-01. This comment used to say the pause is
+	// "deliberately LONGER than leaseGrantWindow"; it was written when the window was 1s and
+	// stood unchanged for six weeks after cloned-credential review round 2 widened the window to
+	// 5s. At 1.2s the restart lands INSIDE the grant window, where what keeps the name is the
+	// farewell the dying agent sent (a released holder does not block its successor) — not the
+	// interest probe. That is a legitimate path (a restart that beats systemd's RestartSec) and
+	// it stays pinned here; the past-the-window path, where only the probe can save the name, is
+	// TestRestartedInstanceReclaimsItsNameAfterTheGrantWindow below.
+	// sleep-fixture: the restart gap IS the fixture; it must stay below broker.LeaseGrantWindow().
 	stop()
 	time.Sleep(1200 * time.Millisecond)
 	stop2 := cloneStartAgent(t, url, "lab", "durable")
@@ -233,4 +236,53 @@ func TestRestartedInstanceReclaimsItsNameRatherThanBeingSuffixed(t *testing.T) {
 			"This is the case a clock-only rule gets wrong: the dead predecessor's heartbeat is "+
 			"only a second old, but its subscription is already gone.", got)
 	}
+}
+
+// TestRestartedInstanceReclaimsItsNameAfterTheGrantWindow is the other half of the restart case:
+// the successor comes back AFTER leaseGrantWindow has expired, so the in-memory holder no longer
+// shields the name and the broker must ASK — and the interest probe, finding the dead predecessor's
+// subscription gone, must hand the bare name back. This is the branch drill 83 exercised on real
+// hosts and no hermetic test covered: every existing restart test came back inside the window.
+//
+// The gap is expressed in the constant (broker.LeaseGrantWindow() + 1s), not a literal, so it
+// cannot go stale the way the 1200ms comment above did (docs/testing-standards.md T7). It costs
+// ~6s of wall clock; that is the price of the only hermetic test of this branch.
+// origin: docs/reviews/test-system-overhaul-plan.md B3 (§-1 F6).
+func TestRestartedInstanceReclaimsItsNameAfterTheGrantWindow(t *testing.T) {
+	url := startNATS(t)
+	db := openDB(t)
+	defer cloneStartBroker(t, url, db)()
+
+	stop := cloneStartAgent(t, url, "lab", "durable")
+	waitForNodeCount(t, db, "lab", 1, 5*time.Second)
+
+	stop()
+	beatBefore := lastHeartbeat(t, db, "lab", "durable")
+	// sleep-fixture: past the grant window by a full second so the holder shield is provably
+	// expired and the probe is the only thing that can reclaim the name.
+	time.Sleep(broker.LeaseGrantWindow() + time.Second)
+	stop2 := cloneStartAgent(t, url, "lab", "durable")
+	defer stop2()
+
+	// Wait for the restarted agent to have REGISTERED — visible either as a second row (suffixed:
+	// the failure this test exists for) or as the durable row's heartbeat moving (bare) — instead
+	// of sleeping a hand-calibrated 1500ms (internal review N-2; docs/testing-standards.md T7).
+	testharness.WaitFor(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		return len(nodeNIDs(t, db, "lab")) > 1 || lastHeartbeat(t, db, "lab", "durable") != beatBefore
+	})
+	got := nodeNIDs(t, db, "lab")
+	if len(got) != 1 || got[0] != "durable" {
+		t.Fatalf("a restart past leaseGrantWindow must reclaim the same name via the probe, not be "+
+			"suffixed; got %v", got)
+	}
+}
+
+// lastHeartbeat reads the node's last_heartbeat_at as stored ("" when the row is absent).
+func lastHeartbeat(t *testing.T, db *sql.DB, sid, nid string) string {
+	t.Helper()
+	var at sql.NullString
+	if err := db.QueryRow(`SELECT last_heartbeat_at FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&at); err != nil && err != sql.ErrNoRows {
+		t.Fatal(err)
+	}
+	return at.String
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// r10_boot_gate_test.go — the internal half of R10 P2/P4.
+// boot_gate_test.go (formerly r10_boot_gate_test.go) — the internal half of R10 P2/P4.
 //
 // P2's chain ends at a predicate that lives in this package and is unexported. cmd/tether proves
 // "restore --config makes DetectClusterMode say CLUSTER"; this file proves the other half — that a

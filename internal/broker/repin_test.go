@@ -7,7 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// r11_repin_test.go (R11 #63) — establishes, from source, the ACTUAL tunnel-cert re-pin mechanism,
+// repin_test.go (formerly r11_repin_test.go; R11 #63) — establishes, from source, the ACTUAL tunnel-cert re-pin mechanism,
 // and pins the residual R6 could not resolve.
 //
 // FINDING (source-grounded): rotate-tunnel-cert updates the roster's cert_fp but does NOT bump the

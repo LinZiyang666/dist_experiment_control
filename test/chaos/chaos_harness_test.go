@@ -20,6 +20,8 @@ import (
 	"database/sql"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -27,8 +29,10 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/broker"
-	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 )
@@ -98,9 +102,7 @@ func startNATSOnPort(t *testing.T, port int) (url string, stop func()) {
 // uniqueness (caller MUST pass a fresh sid per test).
 func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, fp, "test-pin-hash", time.Now().UTC()); err != nil {
-		t.Fatalf("session.Create: %v", err)
-	}
+	stackharness.SeedSession(t, db, sid, fp)
 }
 
 // brokerHandle bundles a running broker with its stop function so tests
@@ -228,4 +230,59 @@ func startAgentExplicitCfg(t *testing.T, cfg agent.Config) *agentHandle {
 func withTestDeadline(t *testing.T, d time.Duration) (context.Context, context.CancelFunc) {
 	t.Helper()
 	return context.WithTimeout(context.Background(), d)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Injection proofs. A chaos test injects a failure and asserts the product's reaction; if the
+// injection silently did not happen (a chmod under root, a NATS stop that raced a reconnect, an
+// agent Stop that returned before the process died) the reaction is asserted against a healthy
+// system and the test is green for the wrong reason. Each injection therefore proves itself before
+// the reaction is examined. origin: docs/reviews/test-system-overhaul-plan.md B5 (distributed D10).
+
+// proveInjected fails the test loudly when an injection cannot be observed to have taken effect.
+func proveInjected(t *testing.T, what string, observed bool) {
+	t.Helper()
+	if !observed {
+		t.Fatalf("injection not proven: %s — the assertion that follows would be about a healthy system", what)
+	}
+}
+
+// natsUnreachable reports whether a fresh connection to url is refused (the NATS-stopped proof).
+func natsUnreachable(url string) bool {
+	nc, err := nats.Connect(url, nats.Timeout(300*time.Millisecond), nats.RetryOnFailedConnect(false))
+	if err != nil {
+		return true
+	}
+	nc.Close()
+	return false
+}
+
+// brokerSilent reports whether a control request on nc gets no responder (the broker-stopped proof).
+func brokerSilent(nc *nats.Conn) bool {
+	_, err := nc.Request(proto.SubjCtrlSessionList("SHA256:probe"), []byte(`{}`), 500*time.Millisecond)
+	return err != nil
+}
+
+// agentHeartbeatFrozen reports whether the node's last_heartbeat_at has gone STALE — its age reaches
+// three heartbeat intervals — inside a bounded wait (the agent-stopped proof).
+//
+// Age, not equality. The first version compared two reads 350ms apart and called them frozen if
+// equal. agentHandle.Stop waits for Run to return, but the agent's last heartbeat is still in
+// flight through NATS → broker handler → node.Heartbeat when Stop returns, so the first read could
+// land before that write and the second after it: two different values, "injection not proven",
+// a flake the proof itself manufactured — in a suite that now runs under -race in the matrix
+// (internal review L2-F5). A live agent never lets the age reach three intervals; a stopped one
+// reaches it within the wait no matter where the last write landed.
+func agentHeartbeatFrozen(t *testing.T, db *sql.DB, sid, nid string) bool {
+	t.Helper()
+	const interval = 100 * time.Millisecond // startAgentExplicit's HeartbeatInterval
+	return testharness.WaitFor(t, 2*time.Second, 50*time.Millisecond, func() bool {
+		age, exists, err := node.HeartbeatAge(db, sid, nid, time.Now().UTC())
+		return err == nil && exists && age > 3*interval
+	})
+}
+
+// dirUnwritable reports whether creating a file in dir fails (the read-only-directory proof).
+func dirUnwritable(dir string) bool {
+	return os.WriteFile(filepath.Join(dir, ".probe"), []byte("x"), 0o600) != nil
 }

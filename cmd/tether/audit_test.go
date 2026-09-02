@@ -8,7 +8,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g1g7_audit_test.go — the G1–G7 cross-cutting audit's ctl-side pins.
+// audit_test.go (formerly g1g7_audit_test.go) — the G1–G7 cross-cutting audit's ctl-side pins.
 
 // TestResolveJoinOp pins the A4 audit fix: the join-op resolver must distinguish a TRANSPORT error
 // (→ surface it so driveAdd HALTs with a retry hint) from a genuine absence (node_unknown → "", a fresh

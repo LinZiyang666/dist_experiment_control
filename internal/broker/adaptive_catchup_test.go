@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// g4_adaptive_catchup_test.go (G4 #7) — the catch-up deadline must scale with the command-domain DB size so a
+// adaptive_catchup_test.go (formerly g4_adaptive_catchup_test.go; G4 #7) — the catch-up deadline must scale with the command-domain DB size so a
 // large/slow-but-healthy joiner is not false-BLOCKED, while a genuinely dead one still hits the max clamp.
 
 func TestAdaptiveCatchupDeadline_InvariantsHold(t *testing.T) {

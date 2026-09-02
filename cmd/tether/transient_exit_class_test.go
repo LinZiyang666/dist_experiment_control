@@ -7,7 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 )
 
-// megaaudit_test.go — regression pins for the C1–C8 mega-audit MAJOR fixes that live in cmd/tether.
+// transient_exit_class_test.go (formerly megaaudit_test.go) — regression pins for the C1–C8 mega-audit MAJOR fixes that live in cmd/tether.
 
 // TestMegaAuditMAJ7ProxyQuorumCodesTransient: C5 proxy quorum-loss codes are self-healing transients
 // (exit 75), not unclassified tether bugs (exit 70); ha_policy_invalid is operator usage (64).

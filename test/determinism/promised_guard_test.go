@@ -70,7 +70,6 @@ var legacyMissingGuards = map[string]struct{}{
 	"TestPINLargeInputCurrentBehavior":                            {},
 	"TestReadyzBands":                                             {},
 	"TestRenewLeaseRereolvesTheLeaderEveryCall":                   {},
-	"TestReviewReadmeIsReleaseCurrent":                            {},
 	"TestSettleReturnsForceSingleImmediately":                     {},
 	"TestSettleReturnsQuorumLostImmediately":                      {},
 	"TestUpgradeHomesConvergedOpIsWireStable":                     {},

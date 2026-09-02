@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// b6_incident_test.go — B6 OPS#12: the export-incident assembler's secret-scrub + allowlist
+// export_roster_allowlist_test.go (formerly b6_incident_test.go) — B6 OPS#12: the export-incident assembler's secret-scrub + allowlist
 // projection (make test). Tests the pure helpers (no live node needed): a seeded DB with PoP
 // material must never appear in the projected roster, and the audit Body denylist must redact
 // secret-shaped keys.

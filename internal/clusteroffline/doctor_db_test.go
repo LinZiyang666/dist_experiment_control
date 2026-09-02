@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// r10_doctor_db_test.go — R10 P5 (#50): "the gatekeeper was lying".
+// doctor_db_test.go (formerly r10_doctor_db_test.go) — R10 P5 (#50): "the gatekeeper was lying".
 //
 // `cluster doctor --offline --db <nonexistent>` reported 0 FATAL and exited 0, because the db check
 // was `storage.OpenReadOnly(...)` and nothing more — and `database/sql`'s Open is LAZY: it never

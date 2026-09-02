@@ -2,7 +2,7 @@ package broker
 
 import "testing"
 
-// g7_auto_rebalance_test.go — G7a #18: the pure debounce arm. Adversarial cases for the return-dwell,
+// auto_rebalance_test.go (formerly g7_auto_rebalance_test.go) — G7a #18: the pure debounce arm. Adversarial cases for the return-dwell,
 // flap-cancel, gate-defer, and cooldown semantics — no DB/raft, so the oscillation logic is pinned here.
 
 // alwaysUp / neverUp are stillUp predicates.

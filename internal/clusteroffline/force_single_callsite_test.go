@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// force_single_callsite_round6_test.go — round-6 self-review, test-adequacy lane.
+// force_single_callsite_test.go (formerly force_single_callsite_round6_test.go) — round-6 self-review, test-adequacy lane.
 //
 // The round-5 external report's central criticism of the PREVIOUS remediation was that its fixes could be
 // deleted wholesale with the suite still green. My round-5 tests then committed the same sin: they only

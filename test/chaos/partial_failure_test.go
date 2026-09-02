@@ -266,6 +266,11 @@ func TestRegisterRejectedAfterTombstone(t *testing.T) {
 	if err := session.Tombstone(db, "lab", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	stillActive, err := session.IsActive(db, "lab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proveInjected(t, "session tombstoned (no longer ACTIVE)", !stillActive)
 
 	nc, err := nats.Connect(url)
 	if err != nil {

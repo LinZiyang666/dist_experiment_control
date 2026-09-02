@@ -1600,7 +1600,7 @@ func leaseProbe(b *Broker, sid, nid string, now time.Time) (v probeVerdict, ok b
 	startedAt := now
 	go func() {
 		defer b.probeInFlight.Delete(key)
-		a := probeObserve(b, sid, nid, backgroundProbeBudget)
+		a := probeObserve(b, sid, nid, effectiveBackgroundProbeBudget())
 		// RE-CHECK SILENCE BEFORE RECORDING IT.
 		//
 		// This probe may have spent three seconds, and "nobody answered" is a
@@ -1629,15 +1629,41 @@ func leaseProbe(b *Broker, sid, nid string, now time.Time) (v probeVerdict, ok b
 		// Timestamp order is the whole test: keep whichever observation is
 		// younger. Losing this write costs nothing — the next register probes
 		// again.
+		//
+		// DEFENSIVE, NOT REACHABLE TODAY (measured 2026-09-01, test-system overhaul internal
+		// review L6-F1). Under single-flight probeInFlight the only writer of this cache is this
+		// goroutine: an inline definitive answer is deliberately not cached (above), and a second
+		// background probe cannot start before this one has stored and released the key. So no
+		// path exists on which `prev` is younger than `startedAt`, and disabling this guard reddens
+		// nothing — not lease_probe_staleness_test.go (whose header says which of the two defences
+		// it really pins), not the lease model. It stays because it is cheap and because the day a
+		// second cache writer appears it becomes the only thing between that writer and the silence
+		// rule; that day, write the test that reddens without it.
 		if prev, ok := b.probeCache.Load(key); ok {
 			if pv, _ := prev.(probeVerdict); pv.at.After(startedAt) {
 				return
 			}
 		}
-		b.probeCache.Store(key, probeVerdict{answer: a, at: time.Now().UTC()})
+		// b.now(), not time.Now: leaseProbe judges this verdict's freshness with the `now` its
+		// CALLER passes (`now.Sub(cached.at) < probeTTL`), and that `now` is the injected clock.
+		// Stamping the cache with the wall clock was the one place the lease path mixed two
+		// clocks — harmless in production (both are the wall clock) and fatal to any test that
+		// drives the state machine with an injected one: a verdict stamped "now" by the wall
+		// looks arbitrarily old or arbitrarily fresh to a fake clock. origin:
+		// docs/reviews/test-system-overhaul-plan.md B3 (distributed D1). (The first version
+		// added a package-level brokerNow with the same body as the existing (*Broker).now —
+		// two readers of one invariant; internal review L3-F3.)
+		b.probeCache.Store(key, probeVerdict{answer: a, at: b.now().UTC()})
 	}()
 	return probeVerdict{}, false
 }
+
+// LeaseGrantWindow is the read-only accessor for leaseGrantWindow, exported so cross-package tests
+// can calibrate against the constant instead of a literal that goes stale when the constant moves
+// (test/p2 slept 1200ms "deliberately LONGER than leaseGrantWindow" for six weeks after the window
+// became 5s; docs/testing-standards.md T7). Not configuration: there is no setter and never will be
+// — the window's value is argued in the comment above leaseSubscribeSettle.
+func LeaseGrantWindow() time.Duration { return leaseGrantWindow }
 
 // leaseGrant is what leaseHolder stores: WHO was granted a name and WHEN.
 //
@@ -1991,7 +2017,7 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 		return true
 	}
 
-	lease, code, lerr := adjudicateLease(b, sid, nid, req, time.Now().UTC())
+	lease, code, lerr := adjudicateLease(b, sid, nid, req, b.now().UTC())
 	// Say WHY, every time a name is adjudicated to anything other than "keep it".
 	//
 	// A device that silently turns into gpu1-02 is the single most confusing
@@ -2132,6 +2158,28 @@ func probeNameHeldByOther(b *Broker, sid, nid, selfInstanceID string) (held, kno
 //
 // So the cache stores the OBSERVATION — did anyone answer, and who said they
 // were — and each caller derives its own verdict from it.
+// backgroundProbeBudgetOverride is a TEST SEAM and nothing else: when non-zero it replaces
+// backgroundProbeBudget for every background probe launched after it is set. Production never
+// touches it. It exists so the lease model's random walk can afford a SILENT subscriber (the one
+// event that forces the background probe, the verdict cache and the silence rule — the three
+// places review round 2's B5 and gotcha #72 live in): at the real 3s budget that event costs 3s a
+// step and was excluded from the walk, which left those three paths reachable only by two
+// hand-written scenarios. docs/reviews/test-system-overhaul-plan.md B3 named this seam as the
+// fallback; internal review L2-F1 measured that without it the walk ran the background probe zero
+// times in 480 steps.
+//
+// Atomic, not a plain var: a background-probe goroutine leaked by an earlier test can still be
+// reading the budget when the next test's Cleanup writes it back, and the race detector would be
+// right to say so.
+var backgroundProbeBudgetOverride atomic.Int64
+
+func effectiveBackgroundProbeBudget() time.Duration {
+	if d := backgroundProbeBudgetOverride.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return backgroundProbeBudget
+}
+
 type probeAnswer struct {
 	answered   bool   // somebody replied inside the budget
 	responder  string // the instance id they claimed; "" if they named none

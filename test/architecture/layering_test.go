@@ -33,6 +33,59 @@ import (
 // test/determinism/lint_skeleton_test.go. It is already in the right place and carries its own
 // self-check; S3 §5 explicitly said to leave it and point at it from here, which this comment does.
 
+// TestStackharnessIsImportedOnlyFromTests is the REVERSE direction the table below cannot express:
+// test/stackharness may import product packages (that is why it exists — see its header), so
+// nothing that ships may import it back. Any non-test .go file under cmd/ or internal/ naming it is
+// red; and, G2, at least one _test.go must import it or the rule guards nothing.
+// origin: docs/reviews/test-system-overhaul-plan.md B5 (§2.3).
+func TestStackharnessIsImportedOnlyFromTests(t *testing.T) {
+	root := repoRoot(t)
+	const imp = `"github.com/LinZiyang666/tether/test/stackharness"`
+	var offenders []string
+	importers := 0
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		if !strings.Contains(string(src), imp) {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		if strings.HasSuffix(p, "_test.go") || strings.HasPrefix(rel, "test/") {
+			importers++
+			return nil
+		}
+		offenders = append(offenders, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(offenders) > 0 {
+		t.Errorf("%d shipping file(s) import test/stackharness:\n  %s\n\nIt pulls product packages in the "+
+			"other direction and is test scaffolding by construction.", len(offenders), strings.Join(offenders, "\n  "))
+	}
+	if importers < 8 {
+		t.Fatalf("only %d test file(s) import test/stackharness — the eight absorbed seedSession forwarders "+
+			"should, so either they moved or this scan is blind", importers)
+	}
+}
+
 // layerRule is one package's boundary.
 //
 // requiredTransitive is not decoration: it is the per-row self-check. `go list -deps` returning an
@@ -50,6 +103,22 @@ type layerRule struct {
 const modPrefix = "github.com/LinZiyang666/tether/"
 
 var layerRules = []layerRule{
+	{
+		pkg: modPrefix + "internal/testharness",
+		why: "harness cycle rule (harness.go header; docs/testing-standards.md §七): fourteen package-broker " +
+			"tests, seven package-agent tests and session's own test import testharness, so one import back " +
+			"from it is a build-breaking cycle. Product-dependent primitives live in test/stackharness. " +
+			"Internal review L5-F5: the rule was prose in the plan and in no header; now it is both.",
+		bannedTransitive: []string{
+			modPrefix + "internal/broker",
+			modPrefix + "internal/agent",
+			modPrefix + "internal/session",
+		},
+		requiredTransitive: []string{
+			modPrefix + "internal/storage",
+			"github.com/nats-io/nats-server/v2/server",
+		},
+	},
 	{
 		pkg: modPrefix + "internal/cluster",
 		why: "L-2: raft stays confined and NATS-free. The audit publisher (which needs NATS) lives in " +
@@ -327,6 +396,10 @@ var originalUnion = map[string][]string{
 	},
 	"internal/clusteroffline": {"github.com/hashicorp/raft"},
 	"internal/broker":         {"github.com/hashicorp/raft"},
+	// Added 2026-09-01 (test-system overhaul, internal review L5-F5), inherited from no deleted file:
+	// the rule lived only in prose (plan §2.3) until then. Empty on purpose — the receipt records
+	// what the four regression files asserted, and they asserted nothing about testharness.
+	"internal/testharness": {},
 }
 
 func TestLayeringRulesAreWellFormed(t *testing.T) {

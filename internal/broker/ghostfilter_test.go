@@ -6,7 +6,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/clusternodes"
 )
 
-// g2_ghostfilter_test.go (G2 #12-C) — filterGhostPeers is the MIGRATION GUARD (the plan's highest-risk
+// ghostfilter_test.go (formerly g2_ghostfilter_test.go; G2 #12-C) — filterGhostPeers is the MIGRATION GUARD (the plan's highest-risk
 // item): the topology reconciler must drop a mesh-phase roster row that is ABSENT from the committed raft
 // config (a force-single ghost, e.g. the live racknerd pc732: phase=VOTER yet moved out of raft) BEFORE it
 // widens len(Peers) and makes the reconciler render a CLUSTERED conf that clobbers a hand-de-clustered

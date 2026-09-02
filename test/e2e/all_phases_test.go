@@ -24,6 +24,30 @@
 // to profile the matrix finds the same 940 and repeats the same investigation. If it is ever revisited,
 // the thing to check FIRST is whether the -tags sets actually select the same files.
 //
+// REVISITED 2026-09-01 (docs/reviews/test-system-overhaul-plan.md §0 A8). The paragraph above is kept
+// as written because it is the registered reasoning of its time; what follows is what checking it
+// found. The -tags sets do NOT select different files for the shared packages: D1–D4 pass no -tags at
+// all (see their exec.Command calls below), and for every d*_integration tag in ALL_TEST_TAGS (d5–d9;
+// NOT phasefluidity_integration — see two paragraphs down) the build closure of internal/cluster,
+// internal/broker, internal/proc and test/cluster is byte-identical to the untagged one. Reproduce
+// (the numbers are deliberately NOT written here — they rot; the commands do not):
+//
+//	for t in "" d5_integration d6_integration d7_integration d8_integration d9_integration; do
+//	  go list -deps -test ${t:+-tags $t} \
+//	    -f '{{.ImportPath}} {{.GoFiles}} {{.Imports}}' ./internal/cluster | sort | md5sum
+//	done
+//	# (-test emits the `pkg [pkg.test]` variants, whose GoFiles already include the _test.go files,
+//	#  so GoFiles + Imports over the -deps closure IS the build identity.)
+//	grep -rl 'go:build.*_integration' internal/ cmd/ | grep -v _test.go | wc -l    # 0
+//	grep -c '^func Test' internal/cluster/*_test.go | awk -F: '{s+=$2} END {print s}'   # ×4 extra runs
+//
+// The one tag that DOES change a shared package's file set is phasefluidity_integration (it adds
+// internal/broker/phasefluidity_lifecycle_test.go), which is why de-duplication cannot be a static
+// list of "known-identical" pairs: it has to be proved per run from the go list closure, and the
+// parallel runner is the only place that can do that without touching this file. This file's package
+// lists are NOT edited to de-duplicate — deleting a glob here is silent (see the B5 note on
+// TestD3Matrix), and `make e2e-one T=TestD5Matrix` must keep meaning the whole D5 surface.
+//
 //   - a hang or long e2e in one phase doesn't drag the others —
 //     each subtest is its own subprocess with its own timeout;
 //   - failures bubble up with the phase name in t.Run output, so
@@ -205,13 +229,58 @@ func TestProxyDialMatrix(t *testing.T) {
 func TestD1Matrix(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
-	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "240s",
-		"./internal/cluster/...", "./test/cluster/...")
+	// internal/clusteroffline joined 2026-09-01: it starts real raft nodes in seven tests and was
+	// in no -race matrix at all (test/e2e/parallel/inventory_test.go's attribution check would
+	// have said so, had it existed). The -timeout moved 240s → 300s with it: clusteroffline alone
+	// measures ~81s under -race on the maintainer's 44-core box (`go test -race -count=1
+	// ./internal/clusteroffline/`), and the old budget was sized for the other two packages.
+	// origin: docs/reviews/test-system-overhaul-plan.md B6.
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./internal/cluster/...", "./internal/clusteroffline/...", "./test/cluster/...")
 	cmd.Dir = repoRoot
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("d1 matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
+// TestChaosMatrix runs test/chaos under -race. The 22 chaos tests carry no build tag, so they run in
+// `make test` — but WITHOUT -race, and they are the tests that bounce NATS, kill brokers and crash
+// agents mid-flight: docs/testing-standards.md T6's whole point. Nothing ran them under -race until
+// 2026-09-01. origin: docs/reviews/test-system-overhaul-plan.md B6 (§-1 F12).
+func TestChaosMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./test/chaos/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("chaos matrix failed: %v\n--- output ---\n%s", err, buf.String())
+	}
+}
+
+// TestLeakRiskMatrix runs the leak-risky packages that no other matrix runs WHOLE under -race:
+// internal/agent (imports internal/tunnel and internal/pty; 257 tests) and internal/tunnel (yamux;
+// 43 tests). TestRemoteFSMatrix and TestProxyTunnelReconnectMatrix run both — through `-run`
+// filters that select 14 and 12 of those tests, and agent's one leak-gate test
+// (TestWedgedTeardownRepeatsWithoutLeaking) was outside both. The runner's attribution gate
+// (test/e2e/parallel/inventory_test.go) called that "covered" until 2026-09-01 on the strength of a
+// hand-written map; it now accepts only a parsed unit with -race and no -run, which is what this
+// is. ~30s on the maintainer's box. origin: test-system-overhaul internal review L1-F2 / L4-F2 /
+// L6-F3.
+func TestLeakRiskMatrix(t *testing.T) {
+	_, thisFile, _, _ := runtime.Caller(0)
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout", "300s",
+		"./internal/agent/...", "./internal/tunnel/...")
+	cmd.Dir = repoRoot
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("leak-risk matrix failed: %v\n--- output ---\n%s", err, buf.String())
 	}
 }
 

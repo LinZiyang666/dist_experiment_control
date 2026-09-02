@@ -10,7 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g4_external_review_fixes_test.go — adversarial regressions for the G4 external-review fixes (B1/B2/M1/M2/M3).
+// admin_status_rejects_test.go (formerly g4_external_review_fixes_test.go) — adversarial regressions for the G4 external-review fixes (B1/B2/M1/M2/M3).
 // The end-to-end path is a deploy-tier drill (network-coupled), so each fix's DECISION is extracted into a pure
 // predicate and pinned here — a hermetic guard that survives without a live cluster.
 

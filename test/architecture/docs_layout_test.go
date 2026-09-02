@@ -79,6 +79,7 @@ func TestDocsTopLevelHoldsNoProcessArtifacts(t *testing.T) {
 
 // TestProcessArtifactPatternRecognisesTheRealShapes is the companion. The pattern above decides what gets
 // moved, so its false positives block legitimate baselines and its false negatives are the sediment.
+// gate-control: TestProcessArtifactPatternRecognisesTheRealShapes
 func TestProcessArtifactPatternRecognisesTheRealShapes(t *testing.T) {
 	mustMatch := []string{
 		"line2-plan.md", "line2-review.md", "batch-a-roadmap.md", "b6-tasklist.md",

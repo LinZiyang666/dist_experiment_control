@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// g1g7_audit_nats_test.go — the audit fixes whose regression guards need a live NATS harness
+// audit_nats_test.go (formerly g1g7_audit_nats_test.go) — the audit fixes whose regression guards need a live NATS harness
 // (buildUpgradeNodes / driveAdd). Reuses the g5 external-review harness (startCLIExternalReviewNATS,
 // cliExternalAccount, mustSub).
 

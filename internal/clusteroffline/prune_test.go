@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// g2_prune_test.go (G2 #12) — pruneRosterPeers is the OFFLINE force-single roster prune: a direct-SQL
+// prune_test.go (formerly g2_prune_test.go; G2 #12) — pruneRosterPeers is the OFFLINE force-single roster prune: a direct-SQL
 // DELETE of the abandoned peers + a monotone bump of both generation counters, the daemon-down equivalent
 // of cluster.PlanClusterNodePrune, so the offline path leaves the SAME {self}-only cluster_nodes state as
 // the online path (parity) and the survivor's next signed roster advances (agents converge to N=1).

@@ -19,6 +19,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -35,9 +36,7 @@ func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserP
 
 func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, fp, "test-pin-hash", time.Now().UTC()); err != nil {
-		t.Fatalf("session.Create: %v", err)
-	}
+	stackharness.SeedSession(t, db, sid, fp)
 }
 
 func startBroker(t *testing.T, url string, db *sql.DB) func() {

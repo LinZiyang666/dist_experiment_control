@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// g3_seed_offline_test.go — G3 #1 offline drop-only seed convergence. pruneRosterPeers now also drops the
+// seed_offline_test.go (formerly g3_seed_offline_test.go) — G3 #1 offline drop-only seed convergence. pruneRosterPeers now also drops the
 // departed peers' client endpoints from the published seeds (in the SAME txn) + MAX-floor bumps
 // seed_generation, so the offline force-single path leaves the SAME converged client view as the online
 // path. Invariants pinned: drop-departed, VIP preservation (a non-peer host is kept), empty-set floor

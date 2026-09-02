@@ -10,6 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/agentprov"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/test/clusterharness"
 	"github.com/hashicorp/raft"
 )
 
@@ -82,46 +83,34 @@ func TestD3FollowerPINWriteStaleReplicaReturnsNotLeader_Review(t *testing.T) {
 	// call, and the whole observe-then-act sequence is retried when it moved.
 	// A test that instead accepted ErrSessionMissing "because leadership may have
 	// changed" would assert nothing at all.
+	//
+	// That observe → act → re-observe → retry loop was hand-written here first; it is now
+	// clusterharness.WithLeader (the T3 primitive), which binds fn to whichever node leads NOW and
+	// retries — discarding fn's RESULT, not its side effects — if that node no longer leads when fn
+	// returns. What that proves is exactly two readings: the node led before fn and leads after it.
+	// It does not rule out an A→B→A move inside fn (no term is compared), so in this two-node
+	// cluster the other node was "a follower at both readings", not "a follower throughout"; the
+	// hand-written loop proved no more (external review, suggestion 1). fn here is idempotent under
+	// retry: the seed is an upsert and the proposal is what is being measured. This test is the
+	// primitive's first suite caller (test/determinism/leader_premise_test.go keeps it that way).
+	probes := make([]clusterharness.LeaderProbe, len(nodes))
+	for i, n := range nodes {
+		probes[i] = n
+	}
 	var err error
-	const attempts = 5
-	for attempt := 1; ; attempt++ {
-		leaderIdx := -1
-		if !waitForCond(10*time.Second, func() bool {
-			for i, n := range nodes {
-				if n.IsLeader() {
-					leaderIdx = i
-					return true
-				}
-			}
-			return false
-		}) {
-			t.Fatal("no leader elected")
-		}
+	retries, werr := clusterharness.WithLeader(t, probes, 10*time.Second, func(leaderIdx int) error {
 		followerIdx := 1 - leaderIdx
-
 		// Model a bounded-stale follower: the leader already has the session, but this
 		// follower has not applied that session row yet.
 		seedSession(t, filepath.Join(dirs[leaderIdx], "state.db"), "lab", "test-pin")
 		_, fp := freshClient(t)
-
-		if nodes[followerIdx].IsLeader() {
-			if attempt == attempts {
-				t.Fatalf("leadership kept moving across %d attempts; cannot establish a stable follower", attempts)
-			}
-			continue
-		}
 		err = nodes[followerIdx].Propose(func(db *sql.DB) (*cluster.Command, error) {
 			return agentprov.PlanProvisionWithPIN(db, "lab", "lab-1", fp, "test-pin", auth.VerifyPIN, time.Now())
 		})
-		if nodes[followerIdx].IsLeader() {
-			// It became the leader while we were proposing, so whatever came back
-			// says nothing about follower behaviour. Not a pass, not a failure.
-			if attempt == attempts {
-				t.Fatalf("target became leader mid-Propose on all %d attempts", attempts)
-			}
-			continue
-		}
-		break
+		return nil
+	})
+	if werr != nil {
+		t.Fatalf("could not evaluate the follower PIN write against a stable leader (%d retr(y/ies)): %v", retries, werr)
 	}
 	if !cluster.IsNotLeader(err) {
 		t.Fatalf("follower PIN write must classify as transient not_leader before local Plan business errors; got %T %v", err, err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
@@ -834,4 +836,40 @@ func TestRestoreRefusesAppliedIndexMismatch(t *testing.T) {
 		t.Fatalf("error should name the applied_index mismatch, got %v", err)
 	}
 	assertNoDBInstalled(t, dbPath)
+}
+
+// TestRestoredNodeRepeatedStartStopDoesNotLeakGoroutines: a raft node brought up on a restored data
+// dir and shut down again must return every goroutine it started — five times, because the shared
+// leak gate's ±2 tolerance cannot see a one-per-round leak at a single round
+// (test/determinism/leak_assert_shape_test.go). This package starts raft nodes in seven tests and,
+// until 2026-09-01, asserted nothing about what they left behind.
+// origin: docs/reviews/test-system-overhaul-plan.md B5 (distributed D3).
+func TestRestoredNodeRepeatedStartStopDoesNotLeakGoroutines(t *testing.T) {
+	bundleDir, secretsDir, selfID := buildClusterBundle(t)
+	dataDir, dbPath := freshTarget(t)
+	const raftAddr = "10.0.0.1:7400"
+	if _, err := clusteroffline.RestoreFromBackup(clusteroffline.RestoreOptions{
+		BundleDir: bundleDir, DataDir: dataDir, DBPath: dbPath, SecretsDir: secretsDir, ConfirmNodeID: selfID,
+	}); err != nil {
+		t.Fatalf("RestoreFromBackup: %v", err)
+	}
+	before := runtime.NumGoroutine()
+	for round := 0; round < 5; round++ {
+		_, trans := raft.NewInmemTransport(raft.ServerAddress(raftAddr))
+		n, err := cluster.New(cluster.Config{
+			LocalID: raft.ServerID(selfID), DataDir: dataDir, DBPath: dbPath,
+			Transport: trans, ApplyTimeout: 30 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("round %d: cluster.New: %v", round, err)
+		}
+		if err := n.WaitForLeader(5 * time.Second); err != nil {
+			t.Fatalf("round %d: wait leader: %v", round, err)
+		}
+		if err := n.Shutdown(); err != nil {
+			t.Fatalf("round %d: Shutdown: %v", round, err)
+		}
+		_ = trans.Close()
+	}
+	testharness.AssertNoGoroutineLeak(t, "restored raft node start/stop", before)
 }

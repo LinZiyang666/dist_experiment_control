@@ -7,7 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g7_proxy_home_test.go — G7a #2: the DEFAULT `proxy status` view (non---cluster) must label each exit
+// proxy_home_test.go (formerly g7_proxy_home_test.go) — G7a #2: the DEFAULT `proxy status` view (non---cluster) must label each exit
 // with its OWN home broker's public_host (where /sub points subscribers), not the answering broker's
 // host, and must gate the vended port+host on the home's health so it agrees with the /sub render.
 // Pre-G7a, proxyStatusNodes unconditionally used publicHostFor() (the answering broker) and never even

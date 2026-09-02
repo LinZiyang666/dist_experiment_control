@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// r14_force_single_yes_test.go — #36 (docs/reviews/r6-findings.md): the OFFLINE force-single --yes
+// force_single_yes_test.go (formerly r14_force_single_yes_test.go) — #36 (docs/reviews/r6-findings.md): the OFFLINE force-single --yes
 // is rejected by the Tier-2 rejector, but the ONLINE arm diverged — it returned before reaching the
 // rejector, so `force-single --online --yes` skipped the unattended-forbidden gate. The fix routes
 // the online arm through the SAME rejector; the TTY-typed node_id confirm inside is untouched.

@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// r11_rotate_cert_test.go (R11 P11/#56) — rotate-tunnel-cert is a SELF-ONLY verb. On a FOLLOWER it
+// rotate_cert_test.go (formerly r11_rotate_cert_test.go; R11 P11/#56) — rotate-tunnel-cert is a SELF-ONLY verb. On a FOLLOWER it
 // must NOT get the generic mutating-verb leader-redirect ("re-run on the leader host"); it must get
 // the self-only guidance ("this IS the target broker but it is a FOLLOWER — transfer leadership to it
 // first"). Sending an operator to the leader host to rotate a follower's cert is a dead end (#56's

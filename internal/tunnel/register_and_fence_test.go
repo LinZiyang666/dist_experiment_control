@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -429,4 +430,56 @@ func mustLeaf(t *testing.T) *x509.Certificate {
 		t.Fatalf("parse leaf: %v", err)
 	}
 	return leaf
+}
+
+// FuzzParseRegisterLine drives the hand-written v2 REGISTER grammar with arbitrary lines.
+//
+// The line comes off the wire from the AGENT — an authenticated peer, but a peer, and the parser is
+// six hand-indexed fields on strings.Split. Two properties, no oracle needed:
+//
+//   - never panic (an out-of-range index on a 5-field line is exactly the bug a length check exists
+//     to prevent, and exactly the bug that survives if someone "simplifies" the check away);
+//   - accepted ⇒ round trip: formatting the parsed tuple with the writer's own format string and
+//     parsing again yields the same tuple. Parsing is syntax-only (an empty sid between two spaces
+//     is accepted here and rejected by proto.ValidateSID at the caller); the round trip pins that
+//     what the parser reads is what the writer meant, field for field.
+//
+// origin: docs/reviews/test-system-overhaul-plan.md B2 (infra I7) — the wire parsers that a peer
+// controls had zero fuzz coverage while 22 fuzzers exercised encoding/json.
+func FuzzParseRegisterLine(f *testing.F) {
+	for _, s := range []string{
+		"REGISTER lab gpu1 14000 tok 7\n",
+		"REGISTER lab gpu1 14000 tok 7\r\n",
+		"REGISTER lab gpu1 14000 tok\n",                      // 5 fields (pre-D6 grammar): rejected
+		"REGISTER lab gpu1 14000 tok 7 extra\n",              // 7 fields: rejected
+		"REGISTER lab gpu1 port tok 7\n",                     // non-numeric port
+		"REGISTER lab gpu1 14000 tok -1\n",                   // negative epoch
+		"REGISTER lab gpu1 14000 tok 99999999999999999999\n", // epoch overflows int64
+		"REGISTER  gpu1 14000 tok 7\n",                       // empty sid: syntax accepts, caller validates
+		"register lab gpu1 14000 tok 7\n",                    // verb is case-sensitive
+		"", "REGISTER", "\n", " REGISTER lab gpu1 1 t 0\n",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, line string) {
+		sid, nid, port, token, epoch, ok := parseRegisterLine(line)
+		if !ok {
+			return
+		}
+		if epoch < 0 {
+			t.Fatalf("accepted a negative epoch %d from %q", epoch, line)
+		}
+		// The PORT is deliberately NOT range-checked here: parseRegisterLine reads it with Atoi and
+		// accepts -1 and 99999, and that is the parser's contract today. Safety does not depend on
+		// it — the caller looks the (sid, nid, port, tokenHash, epoch) tuple up in tokenLookup and a
+		// port that matches no row is DENY (register_and_fence_test.go's fence tests). Adding a
+		// [1, 65535] check is a product decision, not an oracle's; it is recorded, not asserted
+		// (test-system overhaul internal review L2-F11).
+		re := fmt.Sprintf("REGISTER %s %s %d %s %d\n", sid, nid, port, token, epoch)
+		sid2, nid2, port2, token2, epoch2, ok2 := parseRegisterLine(re)
+		if !ok2 || sid2 != sid || nid2 != nid || port2 != port || token2 != token || epoch2 != epoch {
+			t.Fatalf("round trip drifted:\n  in   %q\n  got  (%q %q %d %q %d)\n  re   %q\n  back (%q %q %d %q %d ok=%v)",
+				line, sid, nid, port, token, epoch, re, sid2, nid2, port2, token2, epoch2, ok2)
+		}
+	})
 }

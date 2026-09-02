@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// r10_runbook_dr_test.go — R10 D2: the disaster-recovery runbook is a CONTRACT, so pin it.
+// runbook_dr_test.go (formerly r10_runbook_dr_test.go) — R10 D2: the disaster-recovery runbook is a CONTRACT, so pin it.
 //
 // R10 P2's finding was not "restore is missing a flag" — it was that docs/cluster-runbook.md §5.2
 // was STRUCTURALLY IMPOSSIBLE TO EXECUTE: an operator who followed it verbatim after a total-loss

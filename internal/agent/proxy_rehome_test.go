@@ -15,7 +15,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// c5_proxy_rehome_test.go — locks the Stage-C agent-side fixes: M2 (ProxyBound reflects tunnel
+// proxy_rehome_test.go (formerly c5_proxy_rehome_test.go) — locks the Stage-C agent-side fixes: M2 (ProxyBound reflects tunnel
 // liveness, not just p.srv), N1 (rehome scoped to the current allocation's port), M4 (an ApplyHome
 // no-op on an absent tunnel session must NOT falsely advance the home epoch).
 

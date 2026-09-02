@@ -1,0 +1,80 @@
+# matrix_units_golden.txt — every unit test/e2e/all_phases_test.go declares, as the parallel runner
+# parses it: matrix|pkg|tags|race|run|extra, plus one `<whole>|lit=` line per package pattern / -run value /
+# phase inside each unparsed (whole) matrix. Maintained by test/e2e/parallel/inventory_test.go. Only GROWS:
+#   new unit          -> go test ./test/e2e/parallel/ -run TestMatrixUnitInventoryOnlyGrows -update-matrix-inventory
+#   removed / changed -> hand-edit the line and say why in the commit message. Deleting a glob in
+#                        all_phases_test.go is silent everywhere else (its own B5 note); here it is red.
+TestAllPhases|<whole matrix: unparsed shape>
+TestAllPhases|<whole>|lit=./test/
+TestAllPhases|<whole>|lit=phase p1
+TestAllPhases|<whole>|lit=phase p10
+TestAllPhases|<whole>|lit=phase p13
+TestAllPhases|<whole>|lit=phase p2
+TestAllPhases|<whole>|lit=phase p3
+TestAllPhases|<whole>|lit=phase p4
+TestAllPhases|<whole>|lit=phase p5
+TestAllPhases|<whole>|lit=phase p6
+TestAllPhases|<whole>|lit=phase p7
+TestAllPhases|<whole>|lit=phase p8
+TestAllPhases|<whole>|lit=phase p9
+TestChaosMatrix|./test/chaos/...|tags=|race=true|run=""|extra=""
+TestD1Matrix|./internal/cluster/...|tags=|race=true|run=""|extra=""
+TestD1Matrix|./internal/clusteroffline/...|tags=|race=true|run=""|extra=""
+TestD1Matrix|./test/cluster/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/agentprov/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/cluster/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/node/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/port/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/proc/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./internal/session/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./test/cluster/...|tags=|race=true|run=""|extra=""
+TestD2Matrix|./test/determinism/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./internal/auth/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./internal/authcallout/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./internal/cluster/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./internal/natsconf/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./internal/proto/...|tags=|race=true|run=""|extra=""
+TestD3Matrix|./test/d3/...|tags=|race=true|run=""|extra=""
+TestD4Matrix|./internal/broker/...|tags=|race=true|run=""|extra=""
+TestD4Matrix|./internal/cluster/...|tags=|race=true|run=""|extra=""
+TestD4Matrix|./internal/proc/...|tags=|race=true|run=""|extra=""
+TestD4Matrix|./internal/storage/...|tags=|race=true|run=""|extra=""
+TestD4Matrix|./test/d4/...|tags=|race=true|run=""|extra=""
+TestD5Matrix|./internal/broker/...|tags=d5_integration|race=true|run=""|extra=""
+TestD5Matrix|./internal/cluster/...|tags=d5_integration|race=true|run=""|extra=""
+TestD5Matrix|./internal/jsstream/...|tags=d5_integration|race=true|run=""|extra=""
+TestD5Matrix|./internal/proc/...|tags=d5_integration|race=true|run=""|extra=""
+TestD5Matrix|./test/d5/...|tags=d5_integration|race=true|run=""|extra=""
+TestD6Matrix|./test/d6/...|tags=d6_integration|race=true|run=""|extra=""
+TestD7Matrix|./test/d7/...|tags=d7_integration|race=true|run=""|extra=""
+TestD8Matrix|./test/d8/...|tags=d8_integration|race=true|run=""|extra=""
+TestD9Matrix|./test/d9/...|tags=d9_integration|race=true|run=""|extra=""
+TestLeakRiskMatrix|./internal/agent/...|tags=|race=true|run=""|extra=""
+TestLeakRiskMatrix|./internal/tunnel/...|tags=|race=true|run=""|extra=""
+TestPhaseFluidityMatrix|./internal/broker/...|tags=phasefluidity_integration|race=true|run="TestPhaseFluidityLifecycle"|extra=""
+TestProxyDialMatrix|<whole matrix: unparsed shape>
+TestProxyDialMatrix|<whole>|lit=./internal/proxydial/...
+TestProxyDialMatrix|<whole>|lit=./test/proxydial/...
+TestProxyTunnelReconnectMatrix|<whole matrix: unparsed shape>
+TestProxyTunnelReconnectMatrix|<whole>|lit=-run FalseOnlineRecoversAfterTunnelDrop|DisableDuringTunnelDropStaysDown
+TestProxyTunnelReconnectMatrix|<whole>|lit=-run ProxyReadinessHook
+TestProxyTunnelReconnectMatrix|<whole>|lit=-run Reconnect|Deny
+TestProxyTunnelReconnectMatrix|<whole>|lit=-run TunnelTokenLookup|RepairProxy
+TestProxyTunnelReconnectMatrix|<whole>|lit=./internal/agent/...
+TestProxyTunnelReconnectMatrix|<whole>|lit=./internal/broker/...
+TestProxyTunnelReconnectMatrix|<whole>|lit=./internal/tunnel/...
+TestProxyTunnelReconnectMatrix|<whole>|lit=./test/p13/...
+TestRemoteFSMatrix|<whole matrix: unparsed shape>
+TestRemoteFSMatrix|<whole>|lit=-run RemoteFS|AgentYAML_remoteFS|ParseOptDuration|SafeFlagOrdering
+TestRemoteFSMatrix|<whole>|lit=-run RemoteFS|BuildExecCmd|BoundedHomeRead|StateStore_loadNoLock|StartBounded|ReplayPortsFromState|AgentNew_rejectsBadRemoteFSMode|SafeField|SafeReqRoundTrips
+TestRemoteFSMatrix|<whole>|lit=-run Spawnsafe|Leak|FDStable
+TestRemoteFSMatrix|<whole>|lit=./cmd/tether/...
+TestRemoteFSMatrix|<whole>|lit=./internal/agent/...
+TestRemoteFSMatrix|<whole>|lit=./internal/proto/...
+TestRemoteFSMatrix|<whole>|lit=./internal/pty/...
+TestRemoteFSMatrix|<whole>|lit=./internal/spawnsafe/...
+TestRemoteFSMatrix|<whole>|lit=./test/concurrency/...
+TestRemoteFSMatrix|<whole>|lit=./test/p4/...
+TestTransferDefaultsMatrix|<whole matrix: unparsed shape>
+TestTransferDefaultsMatrix|<whole>|lit=-run TestTransfer_TierA_OpenByDefault|TestTransfer_TierB_OpenByDefault|TestTransfer_TierA_OffSwitchDisables
+TestTransferDefaultsMatrix|<whole>|lit=./test/cli_e2e/...

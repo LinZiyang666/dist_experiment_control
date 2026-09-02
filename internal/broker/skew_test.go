@@ -8,7 +8,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// b6_skew_test.go — B6 A3 version-skew gate (make test): a proto-mismatched joiner is rejected
+// skew_test.go (formerly b6_skew_test.go) — B6 A3 version-skew gate (make test): a proto-mismatched joiner is rejected
 // with Code=version_skew BEFORE the single-use nonce is claimed, so the operator can retry the
 // same token after reinstalling the joiner. Only an exact proto+release match is allowed; missing
 // declarations fail closed and the matching path runs end-to-end in the gated test/d7 AddNode drill.

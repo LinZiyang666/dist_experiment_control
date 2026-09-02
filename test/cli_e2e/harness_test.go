@@ -21,8 +21,8 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/broker"
-	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -40,9 +40,7 @@ func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserP
 // (Go test packages can't cross-import).
 func seedSession(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, fp, "test-pin-hash", time.Now().UTC()); err != nil {
-		t.Fatalf("session.Create(%s): %v", sid, err)
-	}
+	stackharness.SeedSession(t, db, sid, fp)
 }
 
 // brokerOpts mutates a broker.Config before broker.New is called.

@@ -43,6 +43,13 @@ import (
 //     had to fix by hand, in three files.
 //  2. No drill inlines a stream location outside logs.sh, except the entries in
 //     the shrink-only ledger below.
+//
+// Both checks are pure functions over a drill's text (simCallsHelperWithoutSource,
+// simInlinedStreamLines) so the gate-control can feed them synthetic drills — the
+// positive/negative table plan B4 asked for and the first landing skipped
+// (internal review L5-F9 / L6-F8).
+//
+// gate-control: TestSimclusterLogOraclePredicatesSeeTheShapes
 const (
 	simDrillsDir = "test/simcluster/drills"
 	simLogsLib   = "test/simcluster/drills/lib/logs.sh"
@@ -89,17 +96,36 @@ var simInlineLedger = map[string]struct {
 	"50-backup-restore.sh":        {1, "agent-journal diagnostic beside the slog tail, both dumped"},
 }
 
+// simCallsHelperWithoutSource is check (1) as a pure predicate: the drill calls a sim_*log helper
+// and never sources logs.sh.
+func simCallsHelperWithoutSource(body string) bool {
+	return simHelperCallRe.MatchString(body) && !strings.Contains(body, `drills/lib/logs.sh"`)
+}
+
+// simInlinedStreamLines is check (2)'s counter as a pure function: the number of NON-COMMENT lines
+// that name a stream location directly. Comments describe the mapping; they do not depend on it.
+// The whole point of the h1 headnotes is to explain WHERE each stream lives, and a gate that forbade
+// saying so would delete the documentation it depends on.
+func simInlinedStreamLines(body string) int {
+	got := 0
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if simInlinedStreamRe.MatchString(line) {
+			got++
+		}
+	}
+	return got
+}
+
 // TestSimclusterDrillsSourceLogOracle is check (1): a drill calling a helper it
 // never sourced fails at RUNTIME with command-not-found, mid-drill, and reads
 // as a product failure.
 func TestSimclusterDrillsSourceLogOracle(t *testing.T) {
 	root := repoRoot(t)
 	for _, path := range simDrillFiles(t, root) {
-		body := readFileString(t, path)
-		if !simHelperCallRe.MatchString(body) {
-			continue
-		}
-		if !strings.Contains(body, `drills/lib/logs.sh"`) {
+		if simCallsHelperWithoutSource(readFileString(t, path)) {
 			t.Errorf("%s calls a sim_*log helper but never sources drills/lib/logs.sh — "+
 				"that is a RUNTIME command-not-found (bash -n cannot see it), and a drill that dies "+
 				"mid-oracle reads as a product failure",
@@ -116,19 +142,7 @@ func TestSimclusterLogStreamsHaveOneMapping(t *testing.T) {
 
 	for _, path := range simDrillFiles(t, root) {
 		base := filepath.Base(path)
-		got := 0
-		for _, line := range strings.Split(readFileString(t, path), "\n") {
-			// Comments describe the mapping; they do not depend on it. The whole
-			// point of the h1 headnotes is to explain WHERE each stream lives,
-			// and a gate that forbade saying so would delete the documentation
-			// it depends on.
-			if strings.HasPrefix(strings.TrimSpace(line), "#") {
-				continue
-			}
-			if simInlinedStreamRe.MatchString(line) {
-				got++
-			}
-		}
+		got := simInlinedStreamLines(readFileString(t, path))
 		entry, booked := simInlineLedger[base]
 		if booked {
 			seen[base] = true
@@ -207,4 +221,31 @@ func readFileString(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestSimclusterLogOraclePredicatesSeeTheShapes is the gate-control: synthetic drill text through
+// the two predicates the gate uses — a drill that inlines a stream, one that reads through the
+// library, a comment that merely describes the mapping, and the sourced / unsourced helper call.
+func TestSimclusterLogOraclePredicatesSeeTheShapes(t *testing.T) {
+	inlined := "#!/bin/bash\n# broker slog lives in /var/log/tether/broker.log (a comment: fine)\n" +
+		"ssh node1 tail -n 50 /var/log/tether/broker.log | grep -q reconciled\n" +
+		"journalctl -u tether-agent --since -5m | grep -c panic\n"
+	if got := simInlinedStreamLines(inlined); got != 2 {
+		t.Fatalf("inlined stream lines: got %d, want 2 (the comment must not count)", got)
+	}
+	viaLibrary := "#!/bin/bash\n. \"$HERE/lib/logs.sh\"\nsim_broker_slog node1 | grep -q reconciled\n"
+	if got := simInlinedStreamLines(viaLibrary); got != 0 {
+		t.Fatalf("a drill reading through logs.sh must inline nothing, got %d", got)
+	}
+	unsourced := "#!/bin/bash\nsim_agent_slog node1 | grep -q started\n"
+	if !simCallsHelperWithoutSource(unsourced) {
+		t.Fatal("a helper call with no `source …drills/lib/logs.sh\"` must be reported")
+	}
+	sourced := "#!/bin/bash\nsource \"$HERE/drills/lib/logs.sh\"\nsim_agent_slog node1 | grep -q started\n"
+	if simCallsHelperWithoutSource(sourced) {
+		t.Fatal("a sourced helper call must not be reported")
+	}
+	if simCallsHelperWithoutSource("#!/bin/bash\necho no helper here\n") {
+		t.Fatal("a drill with no helper call has nothing to source")
+	}
 }

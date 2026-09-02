@@ -16,7 +16,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// r8_home_delivery_test.go (R8a P1) — the batch's one-vote-veto invariant.
+// home_delivery_test.go (formerly r8_home_delivery_test.go; R8a P1) — the batch's one-vote-veto invariant.
 //
 //	Delivery of a home change must NOT be conditional on the peer producing any event.
 //

@@ -9,7 +9,7 @@ LDFLAGS           := -s -w -X $(PKG)/internal/proto.ReleaseVersion=$(VERSION)
 # targeted Go version"). go.mod is at Go 1.25 because nats-io/jwt/v2 needs it.
 GOLANGCI_VERSION  ?= v2.5.0
 
-.PHONY: all build test e2e-one lint tools tidy clean nats-server-install nats-dev e2e-parallel vet-tags gates
+.PHONY: all build test e2e-one lint tools tidy clean nats-server-install nats-dev e2e-parallel vet-tags gates fuzz
 
 all: build
 
@@ -52,6 +52,39 @@ vet-tags:
 
 test: vet-tags
 	go test ./...
+
+# `make fuzz` — every Fuzz target, FUZZTIME each (default 60s), one `go test -fuzz` invocation per
+# target because -fuzz accepts exactly one matching function per package. Targets are DISCOVERED
+# (`go test -list '^Fuzz'` over every package), never listed here: a list would be a second ledger
+# that rots the day someone adds a fuzzer. `make test` still replays every target's seeds and its
+# testdata/fuzz corpus; this is the mutation half that has no home in a deterministic gate
+# (docs/testing-standards.md G7). Narrow with FUZZ='^FuzzParseRegisterLine$'. Not piped: the first
+# non-zero exit ends the loop and IS the exit code.
+#
+# DISCOVERY IS FAIL-CLOSED. The first version ran `go test -list … 2>/dev/null` inside a `for` word
+# list, where a non-zero exit is ignored by `set -e` and the compile error was thrown away: a package
+# whose tests do not compile was silently skipped, and a tree with zero Fuzz targets (or a FUZZ
+# pattern matching none) exited 0 — a green weekly fuzz job that fuzzed nothing. Now every -list
+# failure is fatal and the number of targets actually run must reach FUZZ_MIN: 28 when FUZZ is the
+# default (29 targets on 2026-09-01), 1 when FUZZ narrows. origin: internal review L1-F3 / L3-F4.
+# origin: docs/reviews/test-system-overhaul-plan.md B2 — 23 fuzzers existed and nothing ran them.
+FUZZTIME ?= 60s
+FUZZ     ?= .
+ifeq ($(FUZZ),.)
+FUZZ_MIN ?= 28
+else
+FUZZ_MIN ?= 1
+endif
+fuzz:
+	@set -e; n=0; for pkg in $$(go list ./...); do \
+	  list=$$(go test -run '^$$' -list '^Fuzz' $$pkg) || { echo "make fuzz: go test -list failed for $$pkg" >&2; exit 1; }; \
+	  for fn in $$(printf '%s\n' "$$list" | grep '^Fuzz' | grep -E '$(FUZZ)' || true); do \
+	    n=$$((n+1)); echo "== $$pkg $$fn ($(FUZZTIME))"; \
+	    go test -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) $$pkg; \
+	  done; \
+	done; \
+	echo "make fuzz: ran $$n target(s)"; \
+	[ "$$n" -ge $(FUZZ_MIN) ] || { echo "make fuzz: only $$n target(s) matched FUZZ='$(FUZZ)' (floor FUZZ_MIN=$(FUZZ_MIN)) — discovery is broken or the targets are gone" >&2; exit 1; }
 
 # P11 / architecture line 2141: P2-P10 e2e suites are the regression net for cross-phase
 # behavior. THE GATE IS `make e2e-parallel`. Green there means done; do not re-run serially to
@@ -261,8 +294,13 @@ nats-dev:
 # gate table -- which lists the NumGoroutine+fd leak gate as a gate, while the target that claims to run
 # every gate did not run it. The reconciliation is now itself a gate: test/architecture's
 # TestGatesTargetCoversEveryGateCLAUDEMdNames fails if the two lists drift again.
+# The `sh` line is the simcluster HERMETIC gate set (no docker, no server; ~2 min, mostly five scripts
+# waiting on real poll timers). It is here because until 2026-09-01 nothing ran it — its own header
+# says "a gate nobody runs is a gate that does not exist" — and it was red on a clean tree. Not piped:
+# a pipe would hand `make` tail's exit code (CLAUDE.md §5, the false-all-green incident).
 gates: vet-tags
-	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/ ./internal/proto/ ./internal/spawnexec/
+	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/ ./internal/proto/ ./internal/spawnexec/ ./test/e2e/parallel/ ./test/stackharness/
+	sh test/simcluster/tests/run-all.sh
 	$(MAKE) lint
 
 tidy:

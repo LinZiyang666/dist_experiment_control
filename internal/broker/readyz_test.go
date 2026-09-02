@@ -10,7 +10,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// b7_readyz_test.go — Audit TEST-MAJOR-1: the /readyz cluster-mode predicate (the B5 no-silent-fork
+// readyz_test.go (formerly b7_readyz_test.go) — Audit TEST-MAJOR-1: the /readyz cluster-mode predicate (the B5 no-silent-fork
 // LB guard) was untested. Bring up a real single-voter Node + a seeded phase DB and exercise the
 // bands: leader+VOTER+in-config → ready; CATCHING_UP → 503.
 func TestMetricsReadyClusterBands(t *testing.T) {

@@ -47,6 +47,7 @@ func TestSQLiteOpenFailsCleanlyOnReadOnlyDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+	proveInjected(t, "directory is read-only", dirUnwritable(roDir))
 
 	dbPath := filepath.Join(roDir, "state.db")
 	_, err := storage.Open("file:" + dbPath)
@@ -104,6 +105,7 @@ func TestAdminSockStartFailsOnReadOnlyParent(t *testing.T) {
 	// adminsock.New takes a socket path; the parent (`<roDir>/admin`)
 	// will be created mode 0700 by Start. The MkdirAll under a 0500
 	// parent should fail.
+	proveInjected(t, "directory is read-only", dirUnwritable(roDir))
 	srv := adminsock.New(filepath.Join(roDir, "admin", "admin.sock"), adminsock.Backend{
 		DB: openDB(t),
 	})

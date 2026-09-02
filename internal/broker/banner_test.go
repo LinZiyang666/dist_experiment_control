@@ -10,7 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// g2_banner_test.go (G2 #20) — the DATA-PLANE-DEGRADED banner is the ANTI-SILENT-FAILURE guard: after
+// banner_test.go (formerly g2_banner_test.go; G2 #20) — the DATA-PLANE-DEGRADED banner is the ANTI-SILENT-FAILURE guard: after
 // force-single, a survivor whose on-disk nats.conf still carries a cluster{} block wedges JetStream at 503
 // SILENTLY (the alert path itself rides JetStream — this is what let racknerd rot for days). StatusReport
 // must surface it OUT-OF-BAND on the banner, keyed on the LIVE conf, and be BEST-EFFORT (a missing /

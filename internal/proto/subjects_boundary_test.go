@@ -329,3 +329,115 @@ func TestSubjectInjectionViaSubjCmdBy(t *testing.T) {
 		}
 	}
 }
+
+// FuzzSubjectParseBuildFixpoint drives every hand-written subject parser with arbitrary strings.
+//
+// Subjects arrive from NATS; the `by.<actor>` segment is nkey-proven, but everything else is a
+// dot-split with hand-indexed segments (see ParseCmdBy's index comment). The property is the
+// FIXPOINT: whenever a parser accepts a subject, rebuilding it from the parsed fields with the
+// matching Subj* constructor must reproduce the input byte for byte. A parser that accepts a
+// 12-segment subject as if it had 11, or that swaps two segments, cannot satisfy this — and a
+// constructor that drifts from its parser reddens here before it drifts on the wire.
+// origin: docs/reviews/test-system-overhaul-plan.md B2 (infra I7).
+func FuzzSubjectParseBuildFixpoint(f *testing.F) {
+	for _, s := range []string{
+		SubjCtrlTransferFinalize(validActor, "lab", "t1"),
+		SubjCtrlTransferFinalize(validActor, "lab", "t1") + ".extra", // 12 segments: must be rejected
+		SubjEvTransfer("lab", "gpu1", "t1", "done"),
+		SubjEvTransfer("lab", "gpu1", "t1", "done") + ".extra",
+		SubjEvProc("lab", "gpu1", "42", "exit") + ".extra",
+		SubjEvProc("lab", "gpu1", "42", "exit"),
+		SubjCmdBy("lab", validActor, "gpu1", "exec"),
+		SubjCmdBy("lab", validActor, "gpu1", "exec") + ".extra", // 12 segments: must be rejected
+		SubjCtrlBy(validActor, "caps.req"),
+		SubjNodeRegister("lab", "gpu1"),
+		SubjNodeHeartbeat("lab", "gpu1"),
+		SubjCtrlProxySet(validActor, "lab"),
+		SubjCtrlProxyStatus(validActor, "lab"),
+		SubjCtrlProxySubCreate(validActor, "lab"),
+		SubjCtrlProxySubRevoke(validActor, "lab"),
+		"tether.v1.s.lab.cmd.by." + validActor + ".node.gpu1.exec.req", // wrong version token
+		"tether.v2.s.lab.cmd.by..node.gpu1.exec.req",                   // empty actor
+		"tether.v2.s.lab.ev.node.*.proc.42.exit",                       // wildcard nid: the fixpoint alone would accept it
+		"tether.v2.s.>.cmd.by." + validActor + ".node.gpu1.exec.req",   // wildcard sid
+		"", "tether", "tether.v2.", "....",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, subject string) {
+		// noWild is the SECOND oracle. The fixpoint alone is blind to a deleted Validate* call: the
+		// Subj* constructors embed their fields verbatim, so a parser that accepts sid="*" rebuilds
+		// the input byte for byte and the fixpoint holds. For every segment the parser CLAIMS to
+		// validate (sid, nid, actor — the calls in subjects.go), acceptance must imply non-empty
+		// and wildcard-free. Segments the parsers do not validate today (verb, pid, kind, id) are
+		// deliberately not asserted: making them a contract is a product decision
+		// (test-system overhaul internal review L2-F6).
+		noWild := func(parser string, fields ...string) {
+			t.Helper()
+			for _, f := range fields {
+				if f == "" || strings.ContainsAny(f, "*>") {
+					t.Fatalf("%s accepted %q with an empty or wildcard validated segment %q", parser, subject, f)
+				}
+			}
+		}
+		if actor, sid, id, ok := ParseTransferFinalize(subject); ok {
+			noWild("ParseTransferFinalize", actor, sid)
+			if got := SubjCtrlTransferFinalize(actor, sid, id); got != subject {
+				t.Fatalf("ParseTransferFinalize fixpoint: %q -> %q", subject, got)
+			}
+		}
+		if sid, nid, id, kind, ok := ParseEvTransfer(subject); ok {
+			noWild("ParseEvTransfer", sid, nid)
+			if got := SubjEvTransfer(sid, nid, id, kind); got != subject {
+				t.Fatalf("ParseEvTransfer fixpoint: %q -> %q", subject, got)
+			}
+		}
+		if sid, nid, pid, kind, ok := ParseEvProc(subject); ok {
+			noWild("ParseEvProc", sid, nid)
+			if got := SubjEvProc(sid, nid, pid, kind); got != subject {
+				t.Fatalf("ParseEvProc fixpoint: %q -> %q", subject, got)
+			}
+		}
+		if sid, actor, nid, verb, ok := ParseCmdBy(subject); ok {
+			noWild("ParseCmdBy", sid, actor, nid)
+			if got := SubjCmdBy(sid, actor, nid, verb); got != subject {
+				t.Fatalf("ParseCmdBy fixpoint: %q -> %q", subject, got)
+			}
+		}
+		if actor, leaf, ok := ParseCtrlBy(subject); ok {
+			if got := SubjCtrlBy(actor, leaf); got != subject {
+				t.Fatalf("ParseCtrlBy fixpoint: %q -> %q", subject, got)
+			}
+		}
+		if sid, nid, ok := ParseSidNidFromCtrl(subject); ok {
+			noWild("ParseSidNidFromCtrl", sid, nid)
+			// No single constructor owns this shape (register / unregister / heartbeat all match), so
+			// the fixpoint is on the segments the parser claims to have read.
+			parts := strings.Split(subject, ".")
+			if len(parts) < 8 || parts[4] != sid || parts[6] != nid {
+				t.Fatalf("ParseSidNidFromCtrl read (%q,%q) from %q, segments disagree", sid, nid, subject)
+			}
+		}
+		if actor, sid, action, ok := ParseCtrlProxy(subject); ok {
+			noWild("ParseCtrlProxy", actor, sid)
+			var got string
+			switch action {
+			case "set":
+				got = SubjCtrlProxySet(actor, sid)
+			case "status":
+				got = SubjCtrlProxyStatus(actor, sid)
+			case "sub.create":
+				got = SubjCtrlProxySubCreate(actor, sid)
+			case "sub.list":
+				got = SubjCtrlProxySubList(actor, sid)
+			case "sub.revoke":
+				got = SubjCtrlProxySubRevoke(actor, sid)
+			default:
+				t.Fatalf("ParseCtrlProxy returned an action no constructor builds: %q", action)
+			}
+			if got != subject {
+				t.Fatalf("ParseCtrlProxy fixpoint: %q -> %q", subject, got)
+			}
+		}
+	})
+}

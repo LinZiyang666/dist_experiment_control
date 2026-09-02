@@ -72,13 +72,15 @@ func TestMixedMatrix(t *testing.T) {
 // form: one command is in the matrix body and another is hidden in a local
 // helper. Looking only at the Test function body accepts the literal half and
 // silently drops the helper half.
+// origin: docs/reviews/test-system-overhaul-external-review.md F4
 func TestExternalReviewHelperCommandFallsBackWhole(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "test", "e2e")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	src := `package e2e
+	for name, src := range map[string]string{
+		"Command": `package e2e
 import (
 	"os/exec"
 	"testing"
@@ -87,16 +89,66 @@ func runDynamic(args []string) { _ = exec.Command("go", args...) }
 func TestHelperMatrix(t *testing.T) {
 	_ = exec.Command("go", "test", "-race", "./first/...")
 	runDynamic([]string{"test", "-race", "./second/..."})
-}`
-	if err := os.WriteFile(filepath.Join(dir, "all_phases_test.go"), []byte(src), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	units, unparsed, err := splitMatrices(root)
-	if err != nil {
-		t.Fatalf("split: %v", err)
-	}
-	if len(units) != 0 || len(unparsed) != 1 || unparsed[0] != "TestHelperMatrix" {
-		t.Fatalf("helper command must force whole fallback; units=%+v unparsed=%v", units, unparsed)
+	}`,
+		"CommandContext": `package e2e
+import (
+	"context"
+	"os/exec"
+	"testing"
+)
+func runDynamic(ctx context.Context, args []string) { _ = exec.CommandContext(ctx, "go", args...) }
+func TestHelperMatrix(t *testing.T) {
+	_ = exec.Command("go", "test", "-race", "./first/...")
+	runDynamic(context.Background(), []string{"test", "-race", "./second/..."})
+}`,
+		"CommandAlias": `package e2e
+import (
+	"os/exec"
+	"testing"
+)
+var command = exec.Command
+func runDynamic(args []string) { _ = command("go", args...) }
+func TestHelperMatrix(t *testing.T) {
+	_ = exec.Command("go", "test", "-race", "./first/...")
+	runDynamic([]string{"test", "-race", "./second/..."})
+}`,
+		"TransitiveAlias": `package e2e
+import (
+	"os/exec"
+	"testing"
+)
+var command = exec.Command
+var command2 = command
+func runDynamic(args []string) { _ = command2("go", args...) }
+func TestHelperMatrix(t *testing.T) {
+	_ = exec.Command("go", "test", "-race", "./first/...")
+	runDynamic([]string{"test", "-race", "./second/..."})
+}`,
+		"EscapedAlias": `package e2e
+import (
+	"os/exec"
+	"testing"
+)
+var command = exec.Command
+func apply(fn any, args ...string) {}
+func runDynamic(args []string) { apply(command, args...) }
+func TestHelperMatrix(t *testing.T) {
+	_ = exec.Command("go", "test", "-race", "./first/...")
+	runDynamic([]string{"test", "-race", "./second/..."})
+}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(dir, "all_phases_test.go"), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			units, unparsed, err := splitMatrices(root)
+			if err != nil {
+				t.Fatalf("split: %v", err)
+			}
+			if len(units) != 0 || len(unparsed) != 1 || unparsed[0] != "TestHelperMatrix" {
+				t.Fatalf("helper command must force whole fallback; units=%+v unparsed=%v", units, unparsed)
+			}
+		})
 	}
 }
 

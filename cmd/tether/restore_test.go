@@ -22,7 +22,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// r10_restore_test.go — R10 P2 / P4 / #53, asserted END-TO-END through the real cobra command.
+// restore_test.go (formerly r10_restore_test.go) — R10 P2 / P4 / #53, asserted END-TO-END through the real cobra command.
 //
 // Why end-to-end and not a unit test on applyClusterSeam: this repo has been bitten THREE times by
 // "half-wiring" — a capability that compiles, has tests, passes `go vet`, passes `make lint`, and is

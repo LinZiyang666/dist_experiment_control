@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// g2_prune_test.go (G2 #12) — PlanClusterNodePrune is the force-single / ghost-removal delete: it DELETEs
+// prune_test.go (formerly g2_prune_test.go; G2 #12) — PlanClusterNodePrune is the force-single / ghost-removal delete: it DELETEs
 // roster rows by node_id UNCONDITIONALLY (any phase), bumping BOTH generations (a prune is a roster change
 // AND a mesh leave), change-gated so a re-prune of absent rows is an idempotent no-op. The caller proves
 // the node is out of the committed raft config, so the delete cannot fork quorum.

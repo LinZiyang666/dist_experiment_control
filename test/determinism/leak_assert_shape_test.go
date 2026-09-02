@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -127,22 +128,25 @@ var singleExerciseExemptions = map[string]string{}
 var leakExerciseAnchors = map[string]string{
 	// origin: gotcha #72 — the anchor is the ladder itself: a loop that merely dialt sockets would
 	// prove nothing about whether a WEDGED teardown leaks its closer goroutine and socket.
-	"internal/agent/conn_teardown_leak_test.go:TestWedgedTeardownRepeatsWithoutLeaking":             "Do",
-	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectChurnNoGoroutineLeak":              "DropTransport",
-	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectVsConcurrentOpenSamePort":          "Open",
-	"test/concurrency/goroutine_leak_rounds_test.go:TestAdminsockRepeatedStartCloseNoGoroutineLeak": "Start",
-	"test/concurrency/goroutine_leak_rounds_test.go:TestAgentRepeatedRunNoGoroutineLeak":            "runOnce",
-	"test/concurrency/goroutine_leak_rounds_test.go:TestTunnelServerRepeatedCloseNoGoroutineLeak":   "Start",
-	"test/concurrency/goroutine_leak_test.go:TestAdminsockServerCloseNoGoroutineLeak":               "Start",
-	"test/concurrency/goroutine_leak_test.go:TestAgentRunCancelNoGoroutineLeak":                     "Run",
-	"test/concurrency/goroutine_leak_test.go:TestBrokerImmediateCancelNoGoroutineLeak":              "Run",
-	"test/concurrency/goroutine_leak_test.go:TestBrokerRepeatedRunNoGoroutineLeak":                  "startBrokerNoTunnel",
-	"test/concurrency/goroutine_leak_test.go:TestBrokerRunCancelNoGoroutineLeak":                    "startBrokerNoTunnel",
-	"test/concurrency/goroutine_leak_test.go:TestTunnelServerCloseNoGoroutineLeak":                  "Start",
-	"test/concurrency/goroutine_leak_test.go:TestTunnelServerCloseWithActiveSessionNoLeak":          "Open",
-	"test/concurrency/spawnsafe_stress_test.go:TestSpawnsafePolicy_concurrentGenSwap":               "Prepare",
-	"test/d4/forward_test.go:TestD4ForwardChurnNoGoroutineLeak":                                     "Forward",
-	"test/d5/publisher_test.go:TestD5RunPublishesAndNoLeak":                                         "Run",
+	"internal/agent/conn_teardown_leak_test.go:TestWedgedTeardownRepeatsWithoutLeaking":              "Do",
+	"internal/broker/alert_reconcile_test.go:TestD8AlertReconcileRunCancels":                         "Run",
+	"internal/broker/transfer_audit_forward_test.go:TestD8TransferAuditForwardLeakGate":              "emitTransferAudit",
+	"internal/clusteroffline/restore_test.go:TestRestoredNodeRepeatedStartStopDoesNotLeakGoroutines": "New",
+	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectChurnNoGoroutineLeak":               "DropTransport",
+	"internal/tunnel/tunnel_reconnect_test.go:TestTunnelReconnectVsConcurrentOpenSamePort":           "Open",
+	"test/concurrency/goroutine_leak_rounds_test.go:TestAdminsockRepeatedStartCloseNoGoroutineLeak":  "Start",
+	"test/concurrency/goroutine_leak_rounds_test.go:TestAgentRepeatedRunNoGoroutineLeak":             "runOnce",
+	"test/concurrency/goroutine_leak_rounds_test.go:TestTunnelServerRepeatedCloseNoGoroutineLeak":    "Start",
+	"test/concurrency/goroutine_leak_test.go:TestAdminsockServerCloseNoGoroutineLeak":                "Start",
+	"test/concurrency/goroutine_leak_test.go:TestAgentRunCancelNoGoroutineLeak":                      "Run",
+	"test/concurrency/goroutine_leak_test.go:TestBrokerImmediateCancelNoGoroutineLeak":               "Run",
+	"test/concurrency/goroutine_leak_test.go:TestBrokerRepeatedRunNoGoroutineLeak":                   "startBrokerNoTunnel",
+	"test/concurrency/goroutine_leak_test.go:TestBrokerRunCancelNoGoroutineLeak":                     "startBrokerNoTunnel",
+	"test/concurrency/goroutine_leak_test.go:TestTunnelServerCloseNoGoroutineLeak":                   "Start",
+	"test/concurrency/goroutine_leak_test.go:TestTunnelServerCloseWithActiveSessionNoLeak":           "Open",
+	"test/concurrency/spawnsafe_stress_test.go:TestSpawnsafePolicy_concurrentGenSwap":                "Prepare",
+	"test/d4/forward_test.go:TestD4ForwardChurnNoGoroutineLeak":                                      "Forward",
+	"test/d5/publisher_test.go:TestD5RunPublishesAndNoLeak":                                          "Run",
 }
 
 func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
@@ -215,6 +219,200 @@ func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
 // This is not hypothetical bookkeeping: the list's only historical entry keyed a HELPER
 // (internal/cluster/transport_test.go:waitGoroutineBaseline) while the scan only ever iterates Test*
 // functions, so it could never match. It read as a considered exemption for two batches.
+// leakGuardNames are the identifiers that count as "this package has a goroutine leak guard at all"
+// for TestLeakGateCoversRiskyPackages. It is leakAssertHelpers PLUS waitGoroutineBaseline: the shape
+// gate above deliberately excludes waitGoroutineBaseline because it is a ceiling, not an
+// exercise-N-times assertion — but as a COVERAGE question ("does internal/cluster have anything that
+// fails when goroutines do not return after Shutdown?") it is exactly that thing, and it is what
+// transport_test.go relies on. Two gates, two questions, two lists.
+var leakGuardNames = map[string]bool{
+	"assertNoGoroutineLeak": true, "assertNoFDLeak": true,
+	"AssertNoGoroutineLeak": true, "AssertNoFDLeak": true,
+	"pollGoroutinesAtMost": true, "waitGoroutineBaseline": true,
+}
+
+// riskyImportPaths are the imports that make a package a leak risk: a raft node, a tunnel, a PTY
+// or a yamux session each own goroutines that outlive the call that created them.
+var riskyImportPaths = []string{
+	`"github.com/hashicorp/raft"`,
+	`"github.com/hashicorp/yamux"`,
+	`"github.com/LinZiyang666/tether/internal/tunnel"`,
+	`"github.com/LinZiyang666/tether/internal/pty"`,
+}
+
+// leakCoverageExceptions: risky packages allowed to have no leak guard, each with a reason. Empty on
+// the day the gate landed: internal/broker gained two shared-helper assertions (converted from inline
+// polls), internal/clusteroffline gained a five-round restart test, internal/cluster is covered by
+// waitGoroutineBaseline, internal/agent and internal/tunnel already had shared-helper assertions.
+var leakCoverageExceptions = map[string]string{}
+
+// leakCoverageExceptionsCap pins the table both ways (internal review L1-F8). Package-keyed: an
+// entry covers every future test in that package, which is why the cap moves only with a reason.
+const leakCoverageExceptionsCap = 0
+
+// TestLeakGateCoversRiskyPackages: every production package that imports a risky dependency has at
+// least one test file calling a leak guard. CLAUDE.md §5 says "触碰隧道/PTY/reconcile/传输/Raft 必须带
+// -race + 泄漏门"; on 2026-09-01 three of the five packages that import those things (broker, cluster
+// as counted by the shape gate, clusteroffline) had no call the gate could see. The rule was prose.
+// origin: docs/reviews/test-system-overhaul-plan.md B5 (distributed D3).
+//
+// gate-control: TestLeakCoveragePredicateSeesTheShapes
+func TestLeakGateCoversRiskyPackages(t *testing.T) {
+	root := repoRoot(t)
+	if n := len(leakCoverageExceptions); n != leakCoverageExceptionsCap {
+		t.Errorf("leakCoverageExceptions has %d entries, cap says %d — move the cap in the same change, with the reason", n, leakCoverageExceptionsCap)
+	}
+	risky := map[string]bool{}
+	guarded := map[string]bool{}
+	for _, top := range []string{"cmd", "internal"} {
+		err := filepath.WalkDir(filepath.Join(root, top), func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if n := d.Name(); n == "testdata" || n == "vendor" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(p, ".go") {
+				return nil
+			}
+			src, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return rerr
+			}
+			rel, _ := filepath.Rel(root, filepath.Dir(p))
+			pkg := filepath.ToSlash(rel)
+			if strings.HasSuffix(p, "_test.go") {
+				if leakGuardCalled(string(src)) {
+					guarded[pkg] = true
+				}
+				return nil
+			}
+			if importsAnyRisky(string(src)) {
+				risky[pkg] = true
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", top, err)
+		}
+	}
+	if len(risky) < 4 {
+		t.Fatalf("only %d risky package(s) found (%v) — the import scan has gone blind", len(risky), risky)
+	}
+	var uncovered []string
+	for pkg := range risky {
+		if guarded[pkg] {
+			continue
+		}
+		if _, ok := leakCoverageExceptions[pkg]; ok {
+			continue
+		}
+		uncovered = append(uncovered, pkg)
+	}
+	sort.Strings(uncovered)
+	if len(uncovered) > 0 {
+		t.Errorf("%d package(s) import raft/yamux/tunnel/pty but no test in them calls a leak guard:\n  %s\n\n"+
+			"Add a leak assertion (internal/testharness.AssertNoGoroutineLeak, in a >=5-round exercise loop) "+
+			"to a test that starts and stops the thing, or register the package in leakCoverageExceptions "+
+			"WITH a reason.", len(uncovered), strings.Join(uncovered, "\n  "))
+	}
+	for pkg := range leakCoverageExceptions {
+		if !risky[pkg] {
+			t.Errorf("leakCoverageExceptions names %s, which imports nothing risky — delete the entry", pkg)
+		}
+		if guarded[pkg] {
+			t.Errorf("leakCoverageExceptions names %s, which now has a leak guard — delete the entry", pkg)
+		}
+	}
+}
+
+func importsAnyRisky(src string) bool {
+	for _, imp := range riskyImportPaths {
+		if strings.Contains(src, imp) {
+			return true
+		}
+	}
+	return false
+}
+
+// leakGuardCalled reports whether some `Test*` function in src calls a leak guard — inside the
+// test's own body (closures included), never in a helper. The first version accepted a call
+// anywhere in the file, so a guard parked in a helper nobody calls, or in a test-shaped function
+// with a lower-case tail, counted as coverage (internal review L1-F10). Reachability inside the
+// test body (an `if false`) is not judged: that is a lie of a different kind, and a reviewer's.
+func leakGuardCalled(src string) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, 0)
+	if err != nil {
+		return false
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Recv != nil || fd.Body == nil || !isTestFuncName(fd.Name.Name) || !strings.HasPrefix(fd.Name.Name, "Test") {
+			continue
+		}
+		found := false
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				if leakGuardNames[fn.Name] {
+					found = true
+				}
+			case *ast.SelectorExpr:
+				if leakGuardNames[fn.Sel.Name] {
+					found = true
+				}
+			}
+			return !found
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLeakCoveragePredicateSeesTheShapes(t *testing.T) {
+	if !importsAnyRisky("package x\nimport \"github.com/hashicorp/raft\"\n") {
+		t.Fatal("raft import not seen as risky")
+	}
+	if importsAnyRisky("package x\nimport \"github.com/hashicorp/go-hclog\"\n") {
+		t.Fatal("unrelated import read as risky")
+	}
+	for _, src := range []string{
+		"package x\nfunc TestA(t *testing.T) { testharness.AssertNoGoroutineLeak(t, \"a\", 0) }\n",
+		"package x\nfunc TestB(t *testing.T) { assertNoFDLeak(t, \"b\", 0, 0) }\n",
+		"package x\nfunc TestC(t *testing.T) { waitGoroutineBaseline(t, 0, 0) }\n",
+	} {
+		if !leakGuardCalled(src) {
+			t.Fatalf("guard call not seen in %q", src)
+		}
+	}
+	if leakGuardCalled("package x\nfunc TestD(t *testing.T) { _ = runtime.NumGoroutine() }\n") {
+		t.Fatal("a bare NumGoroutine read is not a guard")
+	}
+	// Coverage is a property of TESTS: a guard in a helper nobody calls, or in a function whose name
+	// go test would not run, is not coverage (internal review L1-F10).
+	for _, src := range []string{
+		"package x\nfunc leakCheck(t *testing.T) { testharness.AssertNoGoroutineLeak(t, \"a\", 0) }\nfunc TestE(t *testing.T) {}\n",
+		"package x\nfunc Testify(t *testing.T) { testharness.AssertNoGoroutineLeak(t, \"a\", 0) }\n",
+	} {
+		if leakGuardCalled(src) {
+			t.Fatalf("a guard outside a Test body counted as coverage: %q", src)
+		}
+	}
+	// …but a guard inside a closure within the test body is the test's own call.
+	if !leakGuardCalled("package x\nfunc TestF(t *testing.T) { t.Cleanup(func() { assertNoFDLeak(t, \"f\", 0, 0) }) }\n") {
+		t.Fatal("a guard in a closure inside the test body must count")
+	}
+}
+
 func TestSingleExerciseExemptionsAreLiveAndSiteScoped(t *testing.T) {
 	root := repoRoot(t)
 

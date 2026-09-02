@@ -13,7 +13,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
-// g5_upgrade_test.go — G5 #13/#14 W4: the testable orchestrator cores. The live drive loop (signed
+// upgrade_test.go (formerly g5_upgrade_test.go) — G5 #13/#14 W4: the testable orchestrator cores. The live drive loop (signed
 // triggers over NATS + converge waits) is exercised by the N=3 sim drill; here we pin the dry-run plan
 // render and — critically — that the ctl signer produces a signature the broker verifier accepts.
 

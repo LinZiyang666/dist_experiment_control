@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/storage"
 )
 
-// ops11_test.go — B6 OPS#11 recover→manifest emit + init→consume round-trip (make test).
+// recover_emit_manifest_test.go (formerly ops11_test.go) — B6 OPS#11 recover→manifest emit + init→consume round-trip (make test).
 
 // seedRecoverableNode builds a DataDir (with raft/) + a DB carrying a self VOTER row whose
 // cert_fp == the secrets dir's live tunnel fp, plus an extra peer. Returns the paths + fp.

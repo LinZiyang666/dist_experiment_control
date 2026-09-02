@@ -3,6 +3,8 @@ package port
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -639,3 +641,243 @@ func TestListBySessionFilteredLiveRowsSurviveLimit(t *testing.T) {
 		t.Fatalf("CountBySession(all)=%d, want %d", total, 3+600+550)
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Property test: the allocator under seeded random operation sequences.
+//
+// Every table test above pins one path. The allocator's invariants are about SEQUENCES — a port
+// freed and re-taken, a name reused after revoke, GC racing a fresh allocation — and the tables cover
+// the sequences somebody thought of. A seeded generator writes the rest; the invariants say what must
+// hold after every step. The band is eight ports wide so exhaustion, reuse and GC all happen
+// constantly instead of never. origin: docs/reviews/test-system-overhaul-plan.md B5 (distributed D6).
+//
+// Invariants (checked after every operation against the model the test keeps alongside the DB):
+//   I1  every ALLOCATED row has a distinct port inside the band;
+//   I2  (sid, name) is unique among ALLOCATED rows;
+//   I3  a successful auto allocation returns the LOWEST port in the band not ALLOCATED beforehand,
+//       and fails with ErrPortExhausted exactly when none is free;
+//   I4  after GCTerminated(cutoff): no FREED/REVOKED row whose end of life is before cutoff remains,
+//       every one at or after cutoff remains, and ALLOCATED rows are untouched.
+
+// portModelRow is one allocation as the model tracks it — keyed by TOKEN HASH, the identity that
+// survives port reuse. port_allocations keeps history rows (migration 0003): one port may hold a
+// FREED row, a REVOKED row and one ALLOCATED row at the same time, and ListBySession returns them
+// all. A model keyed by port — the first version — saw only the newest row per port and could not
+// notice a GC that spared, or wrongly deleted, a shadowed one; nor could its one-way "model ⊆ DB"
+// check see a Free that returned nil and changed nothing (internal review L2-F2 / L2-F10). The
+// comparison is now an exact two-way multiset over token hashes.
+type portModelRow struct {
+	port  int
+	name  string
+	state State
+	eol   time.Time // revoked_at for FREED/REVOKED
+}
+
+func TestAllocationInvariantsUnderRandomOperations(t *testing.T) {
+	const sequences, steps = 120, 40 // plan wrote 200×40; 120 keeps the package under 6s and reaches every path (see hits)
+	const bandLow, bandHigh = 14000, 14007
+	// More names than ports (10 vs 8), or the band can never fill and I3's exhaustion arm is never
+	// exercised — the generator self-check caught exactly that on its first run.
+	names := []string{"jupyter", "tb", "ssh", "vnc", "api", "grafana", "mlflow", "ray", "code", "db"}
+	// hits is the G2 self-check, counted by the REAL walk — not by a shadow replay of the RNG that
+	// would silently fall out of step the day someone adds an Intn (internal review L2-F7). Every
+	// path the invariants are about must be reached, or they were checked against sequences that
+	// never exercised them. Subtests run sequentially, so the map needs no lock.
+	hits := map[string]int{}
+	for seed := int64(1); seed <= sequences; seed++ {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			db := openDB(t)
+			seedSessionAndNode(t, db, "lab", "lab-1")
+			r := rand.New(rand.NewSource(seed))
+			clock := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			cfg := &Config{BandLow: bandLow, BandHigh: bandHigh, Now: func() time.Time { return clock }}
+			model := map[string]portModelRow{} // token hash -> row
+			liveOnPort := func(p int) (string, bool) {
+				for th, row := range model {
+					if row.state == StateAllocated && row.port == p {
+						return th, true
+					}
+				}
+				return "", false
+			}
+			anyRowOnPort := func(p int) bool {
+				for _, row := range model {
+					if row.port == p {
+						return true
+					}
+				}
+				return false
+			}
+			allocatedName := func(name string) bool {
+				for _, row := range model {
+					if row.state == StateAllocated && row.name == name {
+						return true
+					}
+				}
+				return false
+			}
+			lowestFree := func() int {
+				for p := bandLow; p <= bandHigh; p++ {
+					if _, live := liveOnPort(p); !live {
+						return p
+					}
+				}
+				return 0
+			}
+			// compare is the exact two-way check: every model row is in the DB with the same port and
+			// state, every DB row is known to the model, and the DB's ALLOCATED rows satisfy I1/I2.
+			compare := func(step int, what string) {
+				t.Helper()
+				rows, err := ListBySession(db, "lab")
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := map[string]Allocation{}
+				seenPort := map[int]bool{}
+				seenName := map[string]bool{}
+				for _, a := range rows {
+					if _, dup := got[a.TokenHash]; dup {
+						t.Fatalf("step %d %s: token hash %s appears twice", step, what, a.TokenHash)
+					}
+					got[a.TokenHash] = a
+					if a.State != StateAllocated {
+						continue
+					}
+					if a.Port < bandLow || a.Port > bandHigh || seenPort[a.Port] {
+						t.Fatalf("step %d %s: I1 violated: ALLOCATED port %d (band %d-%d, dup=%v)", step, what, a.Port, bandLow, bandHigh, seenPort[a.Port])
+					}
+					seenPort[a.Port] = true
+					if seenName[a.Name] {
+						t.Fatalf("step %d %s: I2 violated: name %q ALLOCATED twice", step, what, a.Name)
+					}
+					seenName[a.Name] = true
+				}
+				for th, row := range model {
+					a, ok := got[th]
+					if !ok || a.State != row.state || a.Port != row.port || a.Name != row.name {
+						t.Fatalf("step %d %s: model row %s (port %d %s %q) vs DB (present=%v port=%d state=%q name=%q)", step, what, th, row.port, row.state, row.name, ok, a.Port, a.State, a.Name)
+					}
+					// End of life is part of "exact": a terminated row carries the clock at which it
+					// was freed/revoked, and GC's cutoff is judged against it — a wrong revoked_at
+					// would only show up indirectly through a later GC (external review suggestion 5).
+					switch {
+					case row.state == StateAllocated && a.RevokedAt != nil:
+						t.Fatalf("step %d %s: ALLOCATED row %s carries revoked_at %v", step, what, th, *a.RevokedAt)
+					case row.state != StateAllocated && (a.RevokedAt == nil || !a.RevokedAt.Equal(row.eol)):
+						t.Fatalf("step %d %s: %s row %s revoked_at=%v, model end of life %v", step, what, row.state, th, a.RevokedAt, row.eol)
+					}
+				}
+				for th, a := range got {
+					if _, ok := model[th]; !ok {
+						t.Fatalf("step %d %s: DB row %s (port %d %s) unknown to the model — a shadowed history row survived GC, or a state moved behind the model", step, what, th, a.Port, a.State)
+					}
+				}
+			}
+			for step := 0; step < steps; step++ {
+				clock = clock.Add(time.Duration(1+r.Intn(60)) * time.Second)
+				switch op := r.Intn(100); {
+				case op < 40: // auto allocate
+					name := names[r.Intn(len(names))]
+					want := lowestFree()
+					a, err := Allocate(db, "lab", "lab-1", name, 9000+r.Intn(100), 0, "SHA256:owner", false, cfg)
+					switch {
+					case allocatedName(name):
+						hits["name-collision"]++
+						if !errors.Is(err, ErrNameTaken) {
+							t.Fatalf("step %d: allocate %q while ALLOCATED: err=%v want ErrNameTaken", step, name, err)
+						}
+					case want == 0:
+						hits["exhaustion"]++
+						if !errors.Is(err, ErrPortExhausted) {
+							t.Fatalf("step %d: I3 violated: band full but Allocate returned %v (port %v)", step, err, a)
+						}
+					default:
+						hits["allocate"]++
+						if err != nil {
+							t.Fatalf("step %d: auto allocate: %v", step, err)
+						}
+						if a.Port != want {
+							t.Fatalf("step %d: I3 violated: got port %d, lowest free was %d", step, a.Port, want)
+						}
+						if anyRowOnPort(a.Port) {
+							hits["reuse-after-terminate"]++ // a history row is now shadowed by a live one
+						}
+						if _, dup := model[a.TokenHash]; dup || a.TokenHash == "" {
+							t.Fatalf("step %d: Allocate returned token hash %q, which the model already holds (or is empty)", step, a.TokenHash)
+						}
+						model[a.TokenHash] = portModelRow{port: a.Port, name: name, state: StateAllocated}
+					}
+					compare(step, "allocate")
+				case op < 55: // free a random band port
+					p := bandLow + r.Intn(bandHigh-bandLow+1)
+					err := Free(db, p, clock)
+					th, live := liveOnPort(p)
+					switch {
+					case !anyRowOnPort(p):
+						if !errors.Is(err, ErrNotFound) {
+							t.Fatalf("step %d: free of never-allocated %d: %v", step, p, err)
+						}
+					case live:
+						hits["terminate"]++
+						if err != nil {
+							t.Fatalf("step %d: free %d: %v", step, p, err)
+						}
+						row := model[th]
+						model[th] = portModelRow{port: row.port, name: row.name, state: StateFreed, eol: clock}
+					default:
+						if err != nil { // freeing a terminated row is a no-op, not an error
+							t.Fatalf("step %d: free of terminated %d: %v", step, p, err)
+						}
+					}
+					compare(step, "free")
+				case op < 65: // revoke
+					p := bandLow + r.Intn(bandHigh-bandLow+1)
+					err := Revoke(db, p, clock)
+					th, live := liveOnPort(p)
+					switch {
+					case !anyRowOnPort(p):
+						if !errors.Is(err, ErrNotFound) {
+							t.Fatalf("step %d: revoke of never-allocated %d: %v", step, p, err)
+						}
+					case live:
+						hits["terminate"]++
+						if err != nil {
+							t.Fatalf("step %d: revoke %d: %v", step, p, err)
+						}
+						row := model[th]
+						model[th] = portModelRow{port: row.port, name: row.name, state: StateRevoked, eol: clock}
+					default:
+						if err != nil {
+							t.Fatalf("step %d: revoke of terminated %d: %v", step, p, err)
+						}
+					}
+					compare(step, "revoke")
+				default: // GC with a cutoff somewhere in the recent past
+					cutoff := clock.Add(-time.Duration(r.Intn(180)) * time.Second)
+					if _, err := GCTerminated(db, cutoff); err != nil {
+						t.Fatal(err)
+					}
+					for th, row := range model {
+						if row.state != StateAllocated && row.eol.Before(cutoff) {
+							delete(model, th) // I4: end of life before cutoff ⇒ gone; at or after ⇒ kept (compare)
+							hits["gc-deleted"]++
+						}
+					}
+					compare(step, "gc")
+				}
+			}
+		})
+	}
+	for _, k := range []string{"allocate", "name-collision", "exhaustion", "reuse-after-terminate", "terminate", "gc-deleted"} {
+		if hits[k] < 10 {
+			t.Fatalf("the walk reached %q only %d times across %dx%d steps — the invariants were checked against sequences that do not exercise it: %v",
+				k, hits[k], sequences, steps, hits)
+		}
+	}
+}
+
+// The generator's G2 self-check lives INSIDE TestAllocationInvariantsUnderRandomOperations (the
+// `hits` floor at its end). A separate "reaches every path" test used to replay the RNG in a shadow
+// model and count what it WOULD have done; that is a second walk kept in lock-step by hand, and it
+// counts emissions, not effects (internal review L2-F7). It was deleted on 2026-09-01 and its line
+// hand-removed from test/determinism/testdata/test_function_inventory.txt.

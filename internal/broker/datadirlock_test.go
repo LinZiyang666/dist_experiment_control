@@ -11,7 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// datadirlock_round6_test.go — round-6 self-review, test-adequacy lane.
+// datadirlock_test.go (formerly datadirlock_round6_test.go) — round-6 self-review, test-adequacy lane.
 //
 // The round-5 B3 fix (Broker.Run holds ${ClusterDataDir}/tether.lock for its process lifetime) shipped with
 // ZERO coverage at its real entry point: the whole hunk in Run could be deleted and `make test` stayed green.

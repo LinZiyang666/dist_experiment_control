@@ -116,7 +116,8 @@
      raft FSM 的 `Apply`（那里 ctx 取消会破坏确定性，见 `.golangci.yml` 设计约束 3）。
   其余每一处都该接上游的 ctx。**新增站点必须在那一行写明落在哪一类**——
   `// ctx-root: 后台 loop 起点` 或 `// ctx-none: nats.go MsgHandler 无 ctx`。
-  存量 39 处不追溯标注（S3 只要求从此刻起），但改到那一行时顺手补。
+  存量站点在 `test/architecture/legacy_ctx_background_sites.go` 的递减账本里（2026-09-01 落门时 40 处），
+  改到那一行时补标注并删账本行——"顺手补"曾经只是一句话，六周里站点从 39 涨到 44、补了 1 处。
 - **文件与注释纪律**：
   - **文件按职责命名，不按开发过程事件命名**——生产文件与测试文件同此规矩
     （`alert_gate.go` 不是 `d8_alerts.go`；`tunnel_fence_test.go` 不是 `p13_external_review_round6_test.go`）。
@@ -139,21 +140,32 @@
   | 分层规则表 | `test/architecture/layering_test.go` | 谁不许 import 谁（单表，加规则=加一行）；带 `originalUnion` 收据，四份被删的 regression 文件的每条子句都可机械反查 |
   | TLS 配对门 | `test/architecture/tls_verify_pairing_test.go` | `InsecureSkipVerify:true` 必须配 `VerifyPeerCertificate`／`VerifyConnection`，或进带理由的账本；**站点数精确钉死**（今天 4），新增一处即使本身合规也变红——就是要逼人去读 |
   | nolint 指令自检 | `test/architecture/nolint_directive_test.go` | 每条 `//nolint` 必须点名一个**本仓真启用**的 linter（点名未启用的 linter 等于什么都没抑制，却读作「这是已知情的例外」）|
-  | build-tag 编译闸 | `make vet-tags` + 自检 | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账** |
-  | 命名冻结 | `test/determinism/test_naming_test.go` | 测试文件名／测试函数名／生产文件名（见 §3 step 5b） |
-  | 确定性 lint | `test/determinism/` | raft Apply 可达性、版本字面量 SSOT、docs wire 版本（扫描面含 `test/simcluster/README.md`）、时序守卫、`// origin:` 指向真实文档、promised-guard（注释里点名的测试必须存在，含 `[deleted]`/`[example]` 标记的上限与诚实性守卫）|
+  | build-tag 编译闸 | `make vet-tags` + `test/architecture/build_tags_test.go` | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账**；**tag 局部性**：`_integration` tag 门控的文件只许落在自己的 `test/<dir>`（例外账本 1 条：`internal/broker/phasefluidity_lifecycle_test.go`），门控文件总数**精确钉死**（今天 23）——这是矩阵去重「共享包在各 tag 下闭包全等」前提的守卫，往 `internal/proc` 放一个 `//go:build d5_integration` 文件会让 D5 的二进制与 D4 不同而无人察觉 |
+  | T3 前提 | `test/determinism/leader_premise_test.go` + `legacy_leader_premise_sites.go` | 测试里裸读 `.IsLeader()` / `.State() == raft.Leader`——不在**身份已证明**的轮询 helper 的谓词闭包里（外部原语按 import 路径信任：`clusterharness.WaitForCond`/`WithLeader`、`testharness.WaitFor`；本包 helper 须由 `verifiedPollingHelpers` 从其实现证明"deadline 循环里反复求值谓词或转发给已证明原语"，同名一次性 shadow 不算——外审复审 R1）、也不是**body 只等待**的循环条件（body 里任何赋值/发送/业务调用/非 continue 分支都算对刚读到的 premise 行动——外审 F2 + R1）——即红，除非在 `path: func` 递减账本；helper 是 `test/clusterharness.WithLeader`（观测→行动→再观测，移动即整段重来；`test/d3` 的 follower PIN 写是第一个调用方）。「观测领导权然后假设它不变」是 parallel-flake-rootcause 根因 2，第二次被修错两回 |
+  | 命名冻结 | `test/determinism/test_naming_test.go` | 测试文件名／测试函数名／生产文件名（见 §3 step 5b）；**文件首注释里的文件名必须等于 basename**（158 文件改名后 59 个头还写着旧名，2026-09-01 逐个改正为 `x_test.go (formerly old_test.go)`，此后账本为 0） |
+  | test tree 地图 | `test/architecture/test_layout_map_test.go` | `test/README.md` 的目录表与 `test/` 顶层目录**双向对账**；表里点名的矩阵函数与 build tag 必须真实存在；`p*/d*` 目录冻结为**精确集合 18**（不迁不增，新目录按主题命名；裁决见 plan §0 A2） |
+  | ctx 站点冻结 | `test/architecture/ctx_background_ledger_test.go` + `legacy_ctx_background_sites.go` | 生产源每处 `context.Background()` 要么同行/上一行带 `ctx-root:`/`ctx-none:`，要么在 `path: func` 递减账本（初值 40）。上面那条"存量 39 处改到那一行时顺手补"是没有机制的承诺：从 39 涨到 44、只补了 1 处 |
+  | 闸门标准 | `test/architecture/gate_standards_test.go` + `legacy_gates_without_controls.go` | 本表点名的每个门文件必须有 `// gate-control: TestXxx` 锚点指向**同文件**的正负控制测试（G1 的薄机械形式），否则在递减账本（初值 13）；每本 `legacy*` 账本必须登记键单位 ∈ {file, site, promise}（G3） |
+  | 就绪 sleep 冻结 | `test/determinism/sleep_barrier_test.go` + `legacy_sleep_barriers.go` | `startBroker*/startAgent*/seedSession*` 函数体内的裸 `time.Sleep` 屏障（不含轮询循环、func literal）冻结在 `path: func` 账本（初值 19）；`// sleep-fixture: <理由>` 豁免；替换目标是测试真正依赖的可观测量（`WaitNodeOnline` / 对 broker subject 的短超时 `nc.Request`），**不是** `WaitConnect` |
+  | 测试身份清单 | `test/determinism/test_inventory_test.go` + `testdata/` | 每个 Test/Fuzz/Benchmark 函数以 `path: Name` 记入**只增不减**的 golden；`-update-test-inventory` 只追加、拒删——删/改名测试必须手改 golden 并在 commit message 写理由。**测试代码重构没有测试保护**：layering 四合一曾丢一整行 + 一条子句仍全绿、promised-guard 一装上抓到 34 条死承诺、runner 曾静默少跑 11 个套件——这份清单是所有后续测试重构（harness 吸收、矩阵去重、fuzz 目标）的前置收据（`docs/testing-standards.md §六`） |
+  | 确定性 lint | `test/determinism/`（时序守卫在 `test/determinism/raft_timing_guard_test.go`） | raft Apply 可达性、版本字面量 SSOT、docs wire 版本（扫描面含 `test/simcluster/README.md`）、时序守卫（raft 计时门识别**复合字面量与赋值两种形式**——第一版只看 `KeyValueExpr`，`internal/cluster/prevote_test.go` 与 `transport_test.go` 共六处亚秒赋值从未被看见，现已豁免登记；**产品计时 sleep 门**：同一测试函数里既引用 `leaseGrantWindow/probeTTL/DefaultLeaseGrace…` 又 `time.Sleep(纯字面量)` 即红——`leaseGrantWindow` 从 1s 改 5s 后两处按旧值标定的注释六周没人发现）、`// origin:` 指向真实文档、promised-guard（注释里点名的测试必须存在，含 `[deleted]`/`[example]` 标记的上限与诚实性守卫）|
   | 枚举 switch 的 `default:` | `test/determinism/enum_switch_default_test.go` | 15 个自有枚举家族：`default:` 只在**每个成员都被列举**时允许——`exhaustive` 的 `default-signifies-exhaustive:true` 让一个裸 `default:` 永久瞎掉该 switch（实测：注入 batch-C 那个 doctor 缺陷，加 default 后零报告）。`TestEnumFamiliesCoverEveryIotaEnum` 反向对账，防止家族表退回 3/15 |
   | wire 错误码 ↔ exit class | `cmd/tether/` 4 处 | 每个码都有归类，不静默退 70；**双向**（含表键反查发射点） |
   | ACL ↔ 订阅表 | `internal/auth/acl_reconcile_test.go` | 双向：无订阅者的授权、无授权的订阅都报 |
   | wire 字段清单 append-only | `internal/proto/wire_inventory_test.go` + `testdata/` | N-1 窗口的机械半（requirements §6.7 / architecture §21.2）：每个导出消息结构的 {字段名, tag, 类型} 只增不删不改；updater 拒绝收缩——收缩是纪元决策，必须手改账本并在 commit message 写明理由 |
   | CLI 表面 golden | `cmd/tether/command_tree_inventory_test.go` | 命令/flag/Hidden 位漂移即红 |
-  | 泄漏门 | `test/concurrency/helpers_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak** |
+  | 泄漏门 | `test/concurrency/helpers_test.go` + `test/determinism/leak_assert_shape_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak**；断言形状（≥5 轮 exercise，`leakExerciseAnchors` 表钉住每条断言在循环里的那个调用）；**风险包覆盖闸**（`TestLeakGateCoversRiskyPackages`：非测试文件 import raft/yamux/tunnel/pty 的包必须有 `Test*` 函数体内直接调用共享泄漏 helper——死 helper 里的调用不算；例外表带 cap）；`-race` 归属由「矩阵单元清单」行守 |
+  | seedSession 收据 | `test/stackharness/seed_test.go` | 8 个单机套件的 `seedSession` 必须仍是转发器（`absorbedSeedSession` 表 + 反向断言）；`test/stackharness` 只许被 `_test.go` / `test/` 树 import（layering 反向扫描）。它在 `make gates` 里真跑——2026-09-01 前只在 `make test` 里 |
   | docs 布局 | `test/architecture/docs_layout_test.go` | 已跟踪的过程产物（`*-plan/review/tasklist/roadmap.md`）不许留在 `docs/` 顶层——§3 step 7 那条曾整条无闸门 |
   | 数据面生命周期 | `test/architecture/dataplane_lifetime_test.go` | ①`internal/agent/ssproxy` 非测试文件不得 import `context`；②`applyProxyDirective`/`proxyStartLocked` 不得再收 ctx 参数；③`Run` 必须接线 `defer stopProxyOnRunExit`。**控制面 ctx 绑数据面对象生命周期**曾让一次普通 NATS session 重建杀死活着的 SS 出口 7h40m（gotcha #80）；三条都是那条不变量的机械形式，第③条补的是"去掉 ctx 锚点后 agent 退出不再自动停它" |
   | simcluster 日志 oracle | `test/architecture/simcluster_log_oracle_test.go` | drill 只许经 `drills/lib/logs.sh` **一份**映射读四条流（broker slog／broker panic／agent slog／agent panic）；调用 helper 必须 source（漏 source 是 runtime not-found，`bash -n` 看不见）；例外进**精确计数**的递减账本。h1 挪了两条流，十来个各自内联的 drill 同时开始把**健康的产品报成失败**——这是本 harness 最坏的输出 |
   | spawn 停滞证据 | `test/architecture/spawn_stall_evidence_test.go` | `remote_fs_spawn_timeout` / `too_many_wedged_spawns` 的**铸造点**（`&FSError{Code:…}`、`return Err…`、`fmt.Errorf("%w",Err…)`；不含声明／`errors.Is`／分类返回）必须逐字等于精确账本（今天 4 条），且账本**双向** enforce（给 ceiling 站点接线＝静默反转裁决，同样变红）；标 wired 的两条，作废必须**在到达该 return 的每条路径上都已同步执行**（路径敏感；`go`/`defer`/func literal 均不算，**遇 `goto`/label 直接 fail-closed 不再分析**——臂内提前 return、裸 `go` 语句、`goto` 绕过都曾被记成 wired，外审 F2 + 复审 RR-F1）；**锁支配检查**（限 `internal/spawnsafe`）——能带着 `p.mu` 到达作废调用即红，分支不一致按**持有**处理，复合语句 initializer 按 Go 顺序处理；函数同时有 Policy lock+invalidation 时，`goto`/label 或 deferred invalidation 直接 fail-closed（条件 Unlock、if-init Lock、goto 绕 Unlock、LIFO defer 作废均曾漏掉确定性死锁）。同族正负控制在 `TestSpawnStallEvidenceGateControlFlowFamilies` 及外审反例。**healthy 判定曾是终态**，agent 活 18 天后整套 remote-fs 保护静默退化成只剩两条死线（gotcha #81）。⚠ 它**够不到**第四个证据站点 `boundedHomeRead`（那里不铸造任何哨兵），那条由 `internal/agent/remotefs_test.go` 的行为守卫钉住——闸门文件头已如实登记 |
   | spawn runtime 隔离 | `test/architecture/spawn_exec_isolation_test.go` + `internal/spawnexec`（由 `make gates` 直接运行） | safe exec 与 PTY run 的风险目标不得在 agent runtime 内直接 `cmd.Start`；必须经 `/proc/self/exe` helper + 可取消握手。dispatch 必须由 `internal/spawnexec.init` **对所有链接者统一执行**，不得要求各测试包手写 `TestMain`（漏一个就递归执行整个 `*.test`）。helper **只能原地 `syscall.Exec`，禁止再 `cmd.Start`/fork 目标**；私有 mode env 必须从继承与显式 child env 双向剥离；CLOEXEC 内核租约把跨 agent 重启遗留的 pre-exec helper 全局限制为 64。直接 goroutine+timeout 会冻结 agent runtime；漏 TestMain + helper 内二次 fork 曾让 5,789 个 `exe` 累积到约 307 GiB RSS、触发主机 global OOM（#81 / 2026-09-01 外审事故） |
-  | 闸门清单自对账 | `test/architecture/gate_registry_test.go` | ① 本表点到的位置必须真在 `make gates` 里跑；② `.golangci.yml` 的函数名账本里每个名字必须还存在（死豁免会被报出）|
+  | hermetic 闸集 | `test/simcluster/tests/run-all.sh` + `test/architecture/simcluster_gate_set_test.go` | simcluster 的 hermetic 自检集（verdict 契约、expected-verdicts、lint-drills / lint-install、ledger-crosscheck、r9d / teardown 非空性、kept-sites…）作为 `make gates` 的一行与 CI build-test 的一步**真跑**（约 2 分钟，5 个 poll 类脚本在等真计时器）；`tests/*.sh` 与 run-all.sh 的循环**双向对账**（漏网脚本、点名不存在的脚本都红），脚本按 shebang 调用。2026-09-01 接线时它已在干净树上红了（gotcha #80 标题写"已修"、门的闭合词表只认"已修复"）、漏了 3 个脚本、其中 1 个是 bash-only 而旧循环一律用 `sh` 调用——即使列进去也跑不起来——"a gate nobody runs is a gate that does not exist"是它自己头注释里的话 |
+  | CI 发布链 | `test/architecture/ci_workflow_test.go` | release job 必须 `needs` build-test / lint / e2e 三闸、只在 `refs/tags/v` 上跑、带 job 级 `contents: write`；**没有任何 workflow 在 ci.yml 之外发布**（`release.yml` 曾在 tag 上直接 goreleaser、与 e2e 互不可见，"发布时本机过了不够"是一条无人检查的声明）；fuzz job 必须无人值守可达（schedule + cron）且**绝不**挂在 push / PR / tag 上（非确定性红灯会训练人重跑到绿） |
+  | fuzz 语料预算 | `test/architecture/fuzz_corpus_test.go` | 提交的 `testdata/fuzz/<Fuzz*>/` 每目录 ≤64 文件、全仓 ≤256KiB、首行必须是 `go test fuzz v1`（没有头的文件被工具链静默忽略）。`-fuzz` 只把 **crasher** 写进 testdata，interesting 语料在 `$GOCACHE/fuzz`——三份独立草案都把机制写错，见 `docs/testing-standards.md G7` |
+  | 矩阵单元清单 | `test/e2e/parallel/inventory_test.go` + `testdata/` | `all_phases_test.go` 声明的每个单元 `(matrix, pkg, tags, race, run)` 记入**只增不减**的 golden（删 glob 在 all_phases 里是静默的——它自己的 B5 note 承认；在这里是红）；**唯一 `go test` 入口**（test/e2e 之外任何 `_test.go` fork `go test` 即红）；**-race 归属**（import raft/yamux/tunnel/pty 的包必须被某个 -race 矩阵跑到；2026-09-01 前 `internal/clusteroffline` 起 raft 七次却不在任何矩阵，`test/chaos` 22 个测试从未跑过 -race）。runner 的 `-dedupe`（默认开）按**运行时 `go list -race` 闭包 hash 全等**折叠重复单元（cluster ×5、proc ×3、broker ×2、test/cluster ×2 → 各 1），不等即不折、`go list` 出错即不折，**两种「不折」都打印理由**（hasher 全坏与「没有重复」在收据上必须可区分）；whole 矩阵（5 个 helper 形状）的每个包字面量／`-run` 值／phase 也进 golden（第一版对它们完全不透明，内审 L4-F1）；矩阵源**只为 -race 归属加包**（D1 +clusteroffline 并 240s→300s、新增 `TestChaosMatrix`／`TestLeakRiskMatrix`），**不为去重改** |
+  | 闸门清单自对账 | `test/architecture/gate_registry_test.go` | ① 本表点到的位置必须真在 `make gates` 里跑（`go test` 包按目录前缀、`sh <script>` 行按精确路径）；② `.golangci.yml` 的函数名账本里每个名字必须还存在（死豁免会被报出）|
 
   - **改闸门本身走同一流程**：动 `.golangci.yml`、任何 golden、任何递减账本**等同于改不变量**，
     必须在 commit message 里写明「为什么这个预算该放宽」。golden 只许往收紧方向自动更新——
@@ -161,12 +173,20 @@
   - **豁免必须自带过期压力**：`//nolint` 必须指名 linter 并带一句理由；问题修好后悬空的指令会报错。
     递减账本里已不存在的条目同样使门变红——**只许减不许增的账本才不会腐化成永久豁免**。
   - **改了闸门自身时跑 `make gates`** 做一次集中自检。它以 `vet-tags` 开头（否则整套 tag 门控套件
-    连「能不能编译」都没人验）、以 `make lint` 收尾（配置本身就是闸门）。
+    连「能不能编译」都没人验）、中间一行 `sh test/simcluster/tests/run-all.sh`（hermetic 闸集，约 2 分钟，
+    2026-09-01 前无人调用且在干净树上是红的）、以 `make lint` 收尾（配置本身就是闸门）。基线 **1m31s**（run-all.sh 接线前）
+    → **3m32s**（2026-09-01 接线后实测：其中 run-all.sh ≈2 min 是 hermetic 闸集本身、`test/e2e/parallel` ≈5s、本增量的新 Go 门合计 <10s），
+    每加一道 Go 门都该在 plan 里写它的边际秒数。
     ⚠ golangci-lint 有**全局锁**，第二个同参数调用**不是排队等待、而是直接 rc=3 失败**，
     所以 `make gates` 不得与另一个 lint 并行（审查 workflow 里 lint 要收敛到单个 agent）。
 - **测试纪律**：
   - **按需测试，非必要不跑全量**：迭代时只跑碰过的那块——`go test ./test/pX/...`、
     `go test -tags dN_integration -race ./test/dN/`、`go test ./internal/broker/ ./internal/cluster/`。
+    改了**手写解析器**（wire 行、AEAD 分帧、subject、invite、连接名）就顺手
+    `make fuzz FUZZ='^FuzzXxx$' FUZZTIME=30s`。**fuzz 三态**：种子与已提交语料在 `make test` 里确定性回放；
+    变异在 CI 每周一跑（`fuzz` job）与按需 `make fuzz`；**绝不**进 push / PR 闸——
+    fuzz 证明的是"不崩"不是"算对了"，且它的红不可复现。判断该不该 fuzz 一段代码只问一句：这段解析逻辑是自己写的，
+    还是标准库写的（`internal/proto` 的 22 个 JSON fuzzer 测的是 `encoding/json`，2026-09-01 前唯一有价值的 fuzz 是 SOCKS5 那一个）。
   - **全矩阵闸门只有一个：`make e2e-parallel`**（约 3–4 min）。**并行全绿即通过，不得再串行"复核一遍"。**
     **全量串行的 target 已从 Makefile 删除**——不是弃用，是拿掉了，因为存在的 target 就会有人跑。
     串行唯一合法用途是**定位并行报出的那一个**：`make e2e-one T=TestD5Matrix`（`T` 强制、无 "all" 模式）。

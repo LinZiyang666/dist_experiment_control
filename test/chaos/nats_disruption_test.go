@@ -143,6 +143,7 @@ func TestAgentReconnectsThroughNATSBounce(t *testing.T) {
 	// Drop the stub conn so it doesn't try to re-bind on the same
 	// fd; we'll create a fresh one after the relaunch.
 	stub.Close()
+	proveInjected(t, "NATS stopped (connect refused)", natsUnreachable(url))
 
 	// While NATS is down, the agent goroutine must NOT exit. If it
 	// does, the panic / unhandled error would have been the regression.
@@ -223,6 +224,7 @@ func TestCtlExecBoundedWhenNATSDiesMidExec(t *testing.T) {
 	// Sit briefly so the request is definitely in flight, then kill NATS.
 	time.Sleep(50 * time.Millisecond)
 	stopNATS()
+	proveInjected(t, "NATS stopped (connect refused)", natsUnreachable(url))
 
 	select {
 	case err := <-doneCh:

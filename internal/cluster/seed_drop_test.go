@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// g3_seed_drop_test.go — G3 #1 offline drop-only pure function (SeedEndpointsDropHosts). Adversarial
+// seed_drop_test.go (formerly g3_seed_drop_test.go) — G3 #1 offline drop-only pure function (SeedEndpointsDropHosts). Adversarial
 // table: departed hosts drop (port-stripped so wss://h:443 and tls://h drop together), VIP/LB hosts that
 // are not departed are kept, and a no-match input is returned unchanged (the caller change-gates on it).
 

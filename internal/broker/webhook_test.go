@@ -16,7 +16,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// b6_webhook_test.go — B6 OPS#2 alert webhook (make test): URL validation, non-blocking
+// webhook_test.go (formerly b6_webhook_test.go) — B6 OPS#2 alert webhook (make test): URL validation, non-blocking
 // queue-full drop, and the COMMITTED-delta seam (idle→0 POST, raise→1, clear→1, leadership
 // flap→0 + no re-fire of already-active alerts).
 

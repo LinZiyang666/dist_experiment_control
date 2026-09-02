@@ -34,6 +34,14 @@ type unit struct {
 	runFilter string // -run regexp when this unit is one shard of a package
 	baseArgs  []string
 	hasRun    bool // baseArgs already contains the matrix's original -run
+	// extra is the normalised set of pass-through flags that change what a run MEANS without
+	// changing the package or the -run selection: -short, -failfast, -v (testing.Verbose() is
+	// branched on in the tree), -count=N (N != 1). Sorted and space-joined so it is comparable. It
+	// is part of the inventory key and of the dedupe group key: a -short unit and a full unit of
+	// the same package are different work, and the first version of both keys could not see the
+	// difference (internal review L4-F4; external review suggestion 2 for -v; no matrix passes
+	// these today, which is exactly when a key should learn about them).
+	extra string
 }
 
 // splitMatrices reads all_phases_test.go and turns each D-matrix into one unit
@@ -46,12 +54,24 @@ type unit struct {
 // by internal/broker, so the whole parallel run is pinned at ~4m48s no matter
 // how many cores are idle — max(matrix), not sum(work), is the ceiling.
 //
-// De-duplicating those repeats is NOT what this does, and deliberately so: the
-// matrices build the same package under different tags (d3_integration,
-// d5_integration, none), so "the same package" is not the same binary. The
-// quality audit already proposed de-duplication and it was rejected for exactly
-// that reason. Splitting is the safe half: identical work, more units to
-// schedule.
+// De-duplicating those repeats is NOT what splitting does. Splitting is the
+// safe half: identical work, more units to schedule.
+//
+// The reason de-duplication was once refused here was WRONG, and the wrong
+// version of this comment stood for six weeks: it said the matrices build the
+// same package "under different tags (d3_integration, d5_integration, none), so
+// 'the same package' is not the same binary". Measured on 2026-09-01: D1–D4
+// pass no -tags at all (all_phases_test.go), `d3_integration` has never existed
+// in the Makefile's ALL_TEST_TAGS, and for internal/cluster, internal/broker,
+// internal/proc and test/cluster the `go list -deps -test` closure (every
+// package variant's GoFiles + Imports; the `[pkg.test]` variants carry the
+// _test.go files) hashes IDENTICAL with and without d5_integration — no
+// production file in the tree carries an `_integration` build constraint. The only tag that DOES change a shared package's file set is
+// phasefluidity_integration (it adds internal/broker/phasefluidity_lifecycle_test.go),
+// which is exactly why a static "these are the same" table would be wrong on
+// its first run: de-duplication, if done, must prove build identity AT RUN TIME
+// from the go list closure and keep both units whenever the closures differ.
+// origin: docs/reviews/test-system-overhaul-plan.md §0 A8 / §-1 F4.
 //
 // Parsing the source rather than hardcoding the lists means a new matrix, or a
 // package added to an existing one, is picked up automatically. A matrix whose
@@ -72,6 +92,134 @@ func splitMatrices(root string) ([]unit, []string, error) {
 			funcs[fd.Name.Name] = fd
 		}
 	}
+	// WHAT COUNTS AS "MAY EXEC" — every spelling of os/exec's constructors, resolved from the file
+	// rather than assumed (external review F4: the first version recognised the two literal tokens
+	// `exec.Command` and nothing else, so a helper using exec.CommandContext, or calling through a
+	// function-value alias `var command = exec.Command`, was invisible — and an invisible helper
+	// command in a matrix whose Test body ALSO had a parseable command let the splitter accept the
+	// half it could see, `unparsed=[]`, and the coverage self-check had nothing to compare against).
+	//   - `<execName>.Command(…)` and `<execName>.CommandContext(…)`, where execName is the file's
+	//     local name for "os/exec" (an alias import does not hide it);
+	//   - a call through any identifier bound to one of those constructors anywhere in the file
+	//     (`var command = exec.Command`, `command := exec.CommandContext`, `command = …`);
+	//   - and, FAIL-CLOSED, if a constructor is used as a VALUE in any other way (passed as an
+	//     argument, stored in a struct, returned) the data flow is beyond this scanner and every
+	//     helper is assumed to exec — the matrix goes whole.
+	execName := ""
+	dotExec := false
+	for _, imp := range f.Imports {
+		if p, err := strconv.Unquote(imp.Path.Value); err == nil && p == "os/exec" {
+			execName = "exec"
+			if imp.Name != nil {
+				if imp.Name.Name == "." {
+					dotExec = true
+					execName = ""
+				} else {
+					execName = imp.Name.Name
+				}
+			}
+		}
+	}
+	isExecCtor := func(e ast.Expr) bool {
+		if id, ok := e.(*ast.Ident); ok {
+			return dotExec && (id.Name == "Command" || id.Name == "CommandContext")
+		}
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok || (sel.Sel.Name != "Command" && sel.Sel.Name != "CommandContext") {
+			return false
+		}
+		id, ok := sel.X.(*ast.Ident)
+		return ok && execName != "" && id.Name == execName
+	}
+	aliases := map[string]bool{} // identifiers bound to an exec constructor value
+	isDerived := func(e ast.Expr) bool {
+		if isExecCtor(e) {
+			return true
+		}
+		id, ok := e.(*ast.Ident)
+		return ok && aliases[id.Name]
+	}
+	// Alias propagation is a data-flow closure, not a single source pass: command2 := command must
+	// be indistinguishable from command := exec.Command (external rereview R3).
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.AssignStmt:
+				for i, rhs := range v.Rhs {
+					if !isDerived(rhs) || i >= len(v.Lhs) {
+						continue
+					}
+					if id, ok := v.Lhs[i].(*ast.Ident); ok && id.Name != "_" && !aliases[id.Name] {
+						aliases[id.Name] = true
+						changed = true
+					}
+				}
+			case *ast.ValueSpec:
+				for i, val := range v.Values {
+					if isDerived(val) && i < len(v.Names) && v.Names[i].Name != "_" && !aliases[v.Names[i].Name] {
+						aliases[v.Names[i].Name] = true
+						changed = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	execEscapes := false // a constructor/alias used as a value we cannot follow
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.AssignStmt:
+			for i, rhs := range v.Rhs {
+				if !isDerived(rhs) {
+					continue
+				}
+				if i >= len(v.Lhs) {
+					execEscapes = true
+					continue
+				}
+				if id, ok := v.Lhs[i].(*ast.Ident); !ok || (id.Name != "_" && !aliases[id.Name]) {
+					execEscapes = true
+				}
+			}
+		case *ast.ValueSpec:
+			for i, val := range v.Values {
+				if isDerived(val) && (i >= len(v.Names) || (v.Names[i].Name != "_" && !aliases[v.Names[i].Name])) {
+					execEscapes = true
+				}
+			}
+		case *ast.CallExpr:
+			for _, a := range v.Args {
+				if isDerived(a) {
+					execEscapes = true
+				}
+			}
+		case *ast.CompositeLit:
+			for _, e := range v.Elts {
+				if kv, ok := e.(*ast.KeyValueExpr); ok {
+					e = kv.Value
+				}
+				if isDerived(e) {
+					execEscapes = true
+				}
+			}
+		case *ast.ReturnStmt:
+			for _, result := range v.Results {
+				if isDerived(result) {
+					execEscapes = true
+				}
+			}
+		}
+		return true
+	})
+	// isExecCall reports whether a call constructs an exec.Cmd by any spelling this scanner knows.
+	isExecCall := func(call *ast.CallExpr) bool {
+		if isExecCtor(call.Fun) {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		return ok && aliases[id.Name]
+	}
 	// A command hidden in a same-file helper cannot be safely combined with
 	// units parsed from the Test body: the helper may be dynamic or called in a
 	// loop. Treat the entire matrix as unparsed instead of guessing how many
@@ -81,6 +229,9 @@ func splitMatrices(root string) ([]unit, []string, error) {
 		fd := funcs[name]
 		if fd == nil || visiting[name] {
 			return false
+		}
+		if execEscapes {
+			return true // fail-closed: a constructor value we could not follow may be called here
 		}
 		visiting[name] = true
 		defer delete(visiting, name)
@@ -93,11 +244,9 @@ func splitMatrices(root string) ([]unit, []string, error) {
 			if !ok {
 				return true
 			}
-			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Command" {
-				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "exec" {
-					found = true
-					return false
-				}
+			if isExecCall(call) {
+				found = true
+				return false
 			}
 			if id, ok := call.Fun.(*ast.Ident); ok && helperMayExec(id.Name, visiting) {
 				found = true
@@ -114,6 +263,12 @@ func splitMatrices(root string) ([]unit, []string, error) {
 			continue
 		}
 		name := fd.Name.Name
+		if execEscapes {
+			// Once constructor data flow leaves the shapes above, no Test in this file can be
+			// proven complete. Whole fallback is deliberately file-wide and fail-closed.
+			unparsed = append(unparsed, name)
+			continue
+		}
 		// External review B2. `found` used to be one bool for the whole function,
 		// so a matrix with two commands — one parseable, one dynamic — set it on
 		// the first and ran only that half, silently. Counting is the fix: units
@@ -127,16 +282,19 @@ func splitMatrices(root string) ([]unit, []string, error) {
 			if !ok {
 				return true
 			}
-			if id, ok := call.Fun.(*ast.Ident); ok && id.Name != name &&
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name != name && !aliases[id.Name] &&
 				helperMayExec(id.Name, map[string]bool{name: true}) {
 				targets++
 				return true
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Command" {
+			if !isExecCall(call) {
 				return true
 			}
-			if id, ok := sel.X.(*ast.Ident); !ok || id.Name != "exec" {
+			// Only the plain `<exec>.Command(literal…)` spelling is parsed into units. A
+			// CommandContext or an alias call is a target this parser does not read — counted,
+			// not parsed, so the matrix goes whole rather than half (external review F4).
+			if sel, isSel := call.Fun.(*ast.SelectorExpr); !isSel || !isExecCtor(sel) || sel.Sel.Name != "Command" {
+				targets++
 				return true
 			}
 			// Non-literal arguments become a placeholder rather than being
@@ -210,6 +368,7 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 	var pkgs []string
 	base := []string{"test"}
 	hasCount := false
+	var extra []string
 	for i := 2; i < len(args); i++ {
 		if args[i] == placeholderArg {
 			return nil
@@ -219,7 +378,11 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 			race = true
 			base = append(base, a)
 		case a == "-v" || a == "-short" || a == "-failfast":
+			// -v is in the key too: it is not only output — test/p4/ps_perf_test.go branches on
+			// testing.Verbose(), so a matrix that adds -v runs a different path (external review,
+			// suggestion 2). Anything that can change what a test DOES is execution semantics.
 			base = append(base, a)
+			extra = append(extra, a)
 		case a == "-count" || a == "-tags" || a == "-timeout" || a == "-run":
 			if i+1 >= len(args) || args[i+1] == placeholderArg {
 				return nil
@@ -229,6 +392,9 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 			switch a {
 			case "-count":
 				hasCount = true
+				if v != "1" {
+					extra = append(extra, "-count="+v)
+				}
 			case "-tags":
 				tags = v
 			case "-timeout":
@@ -240,6 +406,9 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 		case strings.HasPrefix(a, "-count="):
 			hasCount = true
 			base = append(base, a)
+			if a != "-count=1" {
+				extra = append(extra, a)
+			}
 		case strings.HasPrefix(a, "-tags="):
 			tags = strings.TrimPrefix(a, "-tags=")
 			base = append(base, a)
@@ -268,6 +437,7 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 		timeo = "300s"
 		base = append(base, "-timeout", timeo)
 	}
+	sort.Strings(extra)
 	out := make([]unit, 0, len(pkgs))
 	for _, p := range pkgs {
 		short := strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/...")
@@ -276,6 +446,7 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 			runFilter: runf,
 			baseArgs:  append([]string(nil), base...),
 			hasRun:    runf != "",
+			extra:     strings.Join(extra, " "),
 			name:      strings.TrimSuffix(strings.TrimPrefix(matrix, "Test"), "Matrix") + ":" + short,
 		})
 	}

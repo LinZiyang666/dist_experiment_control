@@ -12,7 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// g3_ctl_pull_test.go — G3 #17 改法二 ctl side: fetchManifestOverNATS pulls the signed manifest from the
+// ctl_pull_test.go (formerly g3_ctl_pull_test.go) — G3 #17 改法二 ctl side: fetchManifestOverNATS pulls the signed manifest from the
 // connected broker on the live conn, and returns nil (→ HTTP fallback) when no broker answers for this
 // actor, so an old broker without the responder degrades gracefully instead of erroring.
 func TestG3FetchManifestOverNATS(t *testing.T) {

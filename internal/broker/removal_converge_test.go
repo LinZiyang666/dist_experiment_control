@@ -8,7 +8,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// g3_removal_converge_test.go — G3 #1 Stage-C M1: `cluster recovery node remove` (RemoveNode/removeGhost)
+// removal_converge_test.go (formerly g3_removal_converge_test.go) — G3 #1 Stage-C M1: `cluster recovery node remove` (RemoveNode/removeGhost)
 // must ALSO converge the published seeds — on a single-voter force-single cluster no later leadership edge
 // fires the backstop, so this operator-finalizer is the ONLY convergence trigger after the ghost clears.
 // (Reuses the g2_ghost_test.go harness: proposeCmd + d7SingleNode + d7JoinInput.)

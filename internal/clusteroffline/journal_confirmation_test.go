@@ -9,7 +9,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
-// force_single_round5_test.go — regressions for external review round-5 B1/B2/B3.
+// journal_confirmation_test.go (formerly force_single_round5_test.go) — regressions for external review round-5 B1/B2/B3.
 // Each test FAILS if its fix is reverted (that is the point: round-5 M-lane proved five earlier "fixes"
 // could be deleted wholesale with the suite still green).
 
