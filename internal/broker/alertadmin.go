@@ -25,6 +25,16 @@ import (
 // human note; a megabyte string is malformed input, not a store failure → bad_request.
 const maxAlertTextLen = 4096
 
+// maxAlertDedupKeyLen caps a dedup key specifically, well below maxAlertTextLen.
+//
+// origin: prerelease audit broker-cluster-ops/L3-F2. The cluster ACK responder checked
+// only that the key was non-empty, so any actor allowed to publish on the ack subject
+// could put an arbitrarily large, arbitrarily shaped string into a raft command — and a
+// raft command is replicated to every broker and replayed on every restore, forever. A
+// dedup key is a short machine-generated identifier (kind, node, a label), not free
+// text; 256 bytes is roomy for every key this system mints.
+const maxAlertDedupKeyLen = 256
+
 // validAlertText mirrors the LitText bake constraints (reject NUL + non-UTF-8) plus a length
 // cap, so a malformed message/label/key is rejected as bad_request BEFORE Propose — the Propose
 // closure then only ever sees clean input and PlanAlert* cannot fail on LitText (which would
@@ -71,6 +81,16 @@ func (b *clusterAdminBackend) handleAlertRaise(req adminsock.Request) adminsock.
 	if req.AlertLabel != "" {
 		key = cluster.DedupKeyNode(cluster.AlertKindManual, req.AlertLabel)
 	}
+	// CAP THE KEY THIS MINTS, not just the label it is minted from — origin: prerelease
+	// audit round 2, G-6. The label is validated against maxAlertTextLen (4096) and the
+	// ACK responder rejects any dedup_key over maxAlertDedupKeyLen (256), so every label
+	// between those two numbers produced an alert that could be raised and then never
+	// acked. Validating the minted key closes it at the only place that knows both the
+	// label and the key shape, and the message names --label because that is the input
+	// the operator actually controls.
+	if err := validAlertText("dedup_key (derived from --label)", key, maxAlertDedupKeyLen); err != nil {
+		return bad(err.Error() + " — shorten --label")
+	}
 	now := b.admin.now()
 	id := newAlertID(key, now)
 	var alreadyActive bool
@@ -96,7 +116,11 @@ func (b *clusterAdminBackend) handleAlertClear(req adminsock.Request) adminsock.
 	if req.AlertDedupKey == "" {
 		return adminsock.Response{Op: op, Error: `alert clear: a dedup_key is required (e.g. "manual" or "manual:<label>")`, Code: adminsock.CodeBadRequest}
 	}
-	if err := validAlertText("dedup_key", req.AlertDedupKey, maxAlertTextLen); err != nil {
+	// maxAlertDedupKeyLen, matching the raise path above and the ACK responder — round 2,
+	// G-6. A dedup key is a short machine-minted identifier everywhere else in this file;
+	// letting `clear` accept a 4096-byte one meant the three surfaces that handle the same
+	// value disagreed about what it is.
+	if err := validAlertText("dedup_key", req.AlertDedupKey, maxAlertDedupKeyLen); err != nil {
 		return adminsock.Response{Op: op, Error: err.Error(), Code: adminsock.CodeBadRequest}
 	}
 	now := b.admin.now()

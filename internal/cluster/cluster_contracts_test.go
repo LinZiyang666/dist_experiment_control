@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/hashicorp/raft"
@@ -49,5 +50,51 @@ func TestNode_SnapshotForJoinSwallowsNothingNew(t *testing.T) {
 	mustApply(t, n, "t:x", "1")
 	if err := n.SnapshotForJoin(); err != nil {
 		t.Fatalf("SnapshotForJoin after an op must succeed: %v", err)
+	}
+}
+
+// TestIsNotLeaderRecognizesEveryUncommittedWriteError pins the SEMANTIC predicate
+// behind IsNotLeader: every raft error that means "this write was not committed by
+// a leader, retry" must be recognized, and errors that do NOT mean that must not be.
+//
+// origin: prerelease audit broker-cluster-write/L3-F1 (+ its verifier's second
+// sentinel). The negative half is load-bearing in its own right: it pins the
+// boundary against the opposite over-correction, "make every raft error retriable".
+// ErrRaftShutdown is the canonical thing that must stay non-retriable — this
+// process is going away, so a caller looping on it would spin forever.
+func TestIsNotLeaderRecognizesEveryUncommittedWriteError(t *testing.T) {
+	retriable := []error{
+		raft.ErrNotLeader,
+		raft.ErrLeadershipLost,
+		// A drain / retire / transfer-leader rejects EVERY Apply with this while
+		// the old leader still reports State()==Leader. Falling through the
+		// predicate makes handleRegister answer store_error, which the agent's
+		// register loop treats as authoritative and EXITS the process on.
+		raft.ErrLeadershipTransferInProgress,
+		// The log never entered applyCh, so it was definitely not committed.
+		raft.ErrEnqueueTimeout,
+	}
+	for _, err := range retriable {
+		if !IsNotLeader(err) {
+			t.Errorf("IsNotLeader(%v) = false; a write that was not committed by a leader "+
+				"must be retriable, else the broker answers store_error and the agent exits", err)
+		}
+		// Wrapped, because every real call site sees it through fmt.Errorf("%w").
+		if !IsNotLeader(fmt.Errorf("cluster: apply: %w", err)) {
+			t.Errorf("IsNotLeader(wrapped %v) = false; call sites always see it wrapped", err)
+		}
+	}
+	notRetriable := []error{
+		raft.ErrRaftShutdown, // retrying inside a dying process is meaningless
+		errors.New("unrelated"),
+	}
+	for _, err := range notRetriable {
+		if IsNotLeader(err) {
+			t.Errorf("IsNotLeader(%v) = true; the predicate must not swallow errors that are "+
+				"NOT 'uncommitted, retry' — that would turn a fatal condition into an infinite loop", err)
+		}
+	}
+	if IsNotLeader(nil) {
+		t.Error("IsNotLeader(nil) = true")
 	}
 }

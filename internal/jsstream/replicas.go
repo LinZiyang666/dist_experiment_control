@@ -68,6 +68,16 @@ type StreamReplicaState struct {
 	// is all a NEW (empty) asset needs.
 	Assigned   int // peers the JS meta has assigned to the raft group (Current NOT required)
 	Configured int // the stream's configured Replicas (the raise may not have landed yet)
+
+	// CaughtUpServers names the NATS servers whose replica of this stream is CURRENT and
+	// not offline — the same set Actual counts, but identified rather than tallied.
+	//
+	// origin: prerelease audit round 2, G-1. The retire readiness gate asked "is Actual
+	// at least the post-removal target" without knowing WHERE those replicas live, so a
+	// caught-up replica sitting on the node about to be removed counted toward the floor
+	// it was supposed to survive. A tally cannot answer "how many of these survive if I
+	// remove that one"; a set can. Additive and does not participate in Ready.
+	CaughtUpServers []string
 }
 
 // AssignedReplicas computes how many peers the JS META has ASSIGNED to a stream's raft group and are
@@ -174,4 +184,53 @@ func IsMetaGroupNotReady(err error) bool {
 		}
 	}
 	return false
+}
+
+// CaughtUpPeersExcluding counts the CAUGHT-UP replicas of a stream that do NOT live on
+// the named NATS server — i.e. how many would survive that server being removed.
+//
+// origin: prerelease audit round 2, G-1. The retire readiness gate asked "is Actual >=
+// the post-removal target" while discarding the node it was being asked about, so a
+// caught-up replica living ON the node about to be removed counted toward the floor it
+// was supposed to survive. With three voters and one lagging peer, a stream at Actual=2
+// passed a target of 2 and dropped to 1 the moment the retire completed.
+//
+// leaderServer is info.Cluster.Leader — the replica ActualReplicas counts as the
+// implicit "1". Excluding by NATS server NAME (not raft node id) because that is what
+// StreamInfo carries; the caller maps its node id through cluster_nodes.nats_server_id.
+//
+// An empty excludeServer counts everything, i.e. it degrades to ActualReplicas.
+func CaughtUpServersOf(info *jetstream.StreamInfo) []string {
+	if info == nil || info.Cluster == nil {
+		return nil
+	}
+	var out []string
+	if info.Cluster.Leader != "" {
+		out = append(out, info.Cluster.Leader)
+	}
+	for _, p := range info.Cluster.Replicas {
+		if p == nil || !p.Current || p.Offline {
+			continue
+		}
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+// SurvivorsExcluding counts how many of a stream's caught-up replicas would remain if
+// `server` were removed. See CaughtUpServers for why a tally alone cannot answer this.
+//
+// An UNIDENTIFIED placement (no cluster info, or a leader the server did not name) is
+// counted as NOT surviving: a retire gate must err toward refusing.
+func SurvivorsExcluding(s StreamReplicaState, server string) int {
+	if server == "" {
+		return len(s.CaughtUpServers)
+	}
+	n := 0
+	for _, name := range s.CaughtUpServers {
+		if name != server {
+			n++
+		}
+	}
+	return n
 }

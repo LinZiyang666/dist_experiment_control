@@ -33,6 +33,13 @@ const (
 	OpMemberJoin        OpType = "MemberJoin"
 	OpNodeRegister      OpType = "NodeRegister" // identity columns only; liveness is leader-local (§3.5)
 	OpNodeEvict         OpType = "NodeEvict"    // adminsock evict: DELETE nodes + agent_provisioning
+	// OpSessionCreatorSet is the replicated write of the `session create` admission
+	// table. It has to go through raft for the ordinary reason every other admin write
+	// does — in cluster mode the FSM is the SOLE SQLite writer — and for one specific to
+	// it: an fp admitted on one broker must be admitted on all of them, or which broker
+	// a ctl happens to reach decides whether it may create a session.
+	// origin: prerelease audit round 2.
+	OpSessionCreatorSet OpType = "SessionCreatorSet"
 	OpProcCreate        OpType = "ProcCreate"
 	OpProcMarkExited    OpType = "ProcMarkExited"
 	OpReconcileBatch    OpType = "ReconcileBatch"
@@ -349,6 +356,7 @@ var knownOps = map[OpType]bool{
 	OpMemberJoin:          true,
 	OpNodeRegister:        true,
 	OpNodeEvict:           true,
+	OpSessionCreatorSet:   true,
 	OpProcCreate:          true,
 	OpProcMarkExited:      true,
 	OpProcGC:              true,
@@ -407,4 +415,22 @@ func KnownOpsForDocs() map[OpType]bool {
 // (review F5). Self-describing: a future binary that drops the ops reports false.
 func HasPhaseFluidityOps() bool {
 	return knownOps[OpClusterNodeReaddr] && knownOps[OpClusterNodeRoute]
+}
+
+// HasSessionCreatorOps reports whether THIS binary's knownOps includes the session-create
+// admission write (OpSessionCreatorSet). Same contract and same reason as
+// HasPhaseFluidityOps above: a broker advertises it in its health report so the leader can
+// refuse an admission change while any voter would poison-skip it.
+//
+// origin: prerelease audit increment 2 internal review — reported by six lanes
+// (adminsock-cli/L10-F1, repo-invariants/F1, n1-quadrants/L3-F1, raft-op/F1,
+// ops-upgrade/L16-F2, admission-enforcement/L9-F2). The op shipped with no gate at all,
+// on a §5 claim that an unknown op is fail-stop. It is not: decodeCommand poison-SKIPS
+// it, so the leader's SQLite gets the row and an older follower's does not — and unlike
+// the phase-fluidity ops, this one is a SECURITY POLICY table. The two halves fail in
+// opposite directions and both are bad: a skipped ALLOW means an operator's `session-allow`
+// silently does not take on that replica, and a skipped DENY means a revoked fingerprint
+// keeps creating sessions there.
+func HasSessionCreatorOps() bool {
+	return knownOps[OpSessionCreatorSet]
 }

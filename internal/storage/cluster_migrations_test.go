@@ -551,6 +551,8 @@ func TestClusterMigrations_MigrationOrderContiguous(t *testing.T) {
 		"0015_cluster_operations.sql", "0016_proxy_cluster.sql",
 		"0017_port_alloc_last_rehome.sql",
 		"0018_alerts_kind_proxy_bind_stalled.sql",
+		// origin: prerelease audit round 2 — session-create admission control.
+		"0019_session_creators.sql",
 	}
 	got := migrationNames(t)
 	if len(got) != len(want) {

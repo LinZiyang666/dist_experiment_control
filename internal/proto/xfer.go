@@ -1,6 +1,9 @@
 package proto
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // xfer.go (batch C / C2) — the SHARED tier sizing and the transfer time budget.
 //
@@ -164,4 +167,25 @@ func itoa64(n int64) string {
 		return "-" + string(b)
 	}
 	return string(b)
+}
+
+// SameRelease reports whether two release-version strings name the same release.
+//
+// origin: prerelease audit deploy-release-docs/DRD-F2 + DRD-F3. Five sites compared
+// version strings with ==, and the two ends of the fleet do not agree on the "v"
+// prefix: a goreleaser build reports "v0.5.1" while a source build reports "0.5.1", and
+// `tether node upgrade --to-version` is typed by a human who may write either. Every
+// one of those comparisons is a CONFIRMATION check — "did the node come back on the
+// version we asked for" — so a false negative reports a successful upgrade as
+// unconfirmed, and `--all` treats that as a canary failure and leaves the rest of the
+// fleet untouched.
+//
+// Both sides are trimmed, not one. Normalising only the operator's input was considered
+// and rejected: a fleet whose agents genuinely self-report a "v" prefix would go from
+// matching to not matching, which is the same defect aimed at a different deployment.
+//
+// This is a COMPARISON helper only. What goes on the wire stays the bare string the
+// caller supplied, so an older broker sees exactly what it saw before.
+func SameRelease(a, b string) bool {
+	return strings.TrimPrefix(a, "v") == strings.TrimPrefix(b, "v")
 }

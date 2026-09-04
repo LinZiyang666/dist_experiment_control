@@ -46,6 +46,10 @@ func TestB4AlertRaisePoisonSafe(t *testing.T) {
 		{"non-utf8-message", adminsock.Request{Op: adminsock.OpClusterAlertRaise, AlertKind: "manual", AlertSeverity: "severe", AlertMessage: "\xff\xfe"}},
 		{"huge-message", adminsock.Request{Op: adminsock.OpClusterAlertRaise, AlertKind: "manual", AlertSeverity: "severe", AlertMessage: strings.Repeat("x", maxAlertTextLen+1)}},
 		{"nul-label", adminsock.Request{Op: adminsock.OpClusterAlertRaise, AlertKind: "manual", AlertSeverity: "severe", AlertMessage: "ok", AlertLabel: "l\x00"}},
+		// origin: prerelease audit round 2, G-6 — a label that is legal as TEXT but mints
+		// a dedup_key wider than the ack responder accepts. The alert would raise and
+		// then be permanently un-ackable.
+		{"label-mints-an-unackable-key", adminsock.Request{Op: adminsock.OpClusterAlertRaise, AlertKind: "manual", AlertSeverity: "severe", AlertMessage: "ok", AlertLabel: strings.Repeat("x", maxAlertDedupKeyLen+1)}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -72,13 +72,22 @@ import (
 //
 // Transport (SR-8): the broker sends ONE push PER DIRECTIVE to the agent's per-node
 // forwarded-command subject (verb "home"), each carrying a fresh SINGLE-USE ack token as
-// its Reply (a child of the broker's _INBOX wildcard subscription). Agents are already
-// granted Sub on `cmd.node.<nid>.*.req.forwarded` and Pub on `_INBOX.>`
+// its Reply (a child of the broker's own reply-inbox subscription). Agents are already
+// granted Sub on `cmd.node.<nid>.*.req.forwarded` and Pub on BOTH inbox roots
 // (internal/auth/permissions.go), so this needs no ACL change and no new subject builder.
-// The per-directive token is what keeps the ack UNFORGEABLE across sessions even though it
-// rides the shared _INBOX bus that every agent may Sub: a token is disclosed only when its
-// OWN port is acked, and is consumed at that instant, so a disclosed token names only an
-// already-converged port and authorizes nothing. Publishing (not Request-ing) keeps the
+//
+// THE DISCLOSURE THIS DEFENDS AGAINST IS NOW WINDOW-BOUNDED, and the defence is kept
+// anyway — origin: prerelease audit increment 2 internal review, disjointness/L2-F2 ≡
+// n1-quadrants/L3-F7 ≡ broker-self-inbox/IMPACT-F1. The broker's inbox lives under
+// auth.InboxRoot, which an UPGRADED agent has no Sub grant for at all; only a pre-cutover
+// agent still holds `Sub _INBOX.>`, and even that does not reach the broker's subtree.
+// So "every agent may Sub the bus this ack rides" — which the comments here asserted
+// three times as a live fact — is false for an upgraded fleet and was the premise the
+// single-use design was justified by.
+//
+// The per-directive single-use token stays, and not out of caution: it is what makes the
+// ack unforgeable ACROSS SESSIONS regardless of who can read the bus, and it is the only
+// part of this that does not depend on an ACL being right. Publishing (not Request-ing) keeps the
 // pass non-blocking: a slow or islanded agent can never stall the broker's single ticker.
 
 // homeDeliveryVerb is the forwarded-command verb carrying a proto.HomeAssignment
@@ -200,7 +209,12 @@ func (b *Broker) now() time.Time {
 // dispatches the handler), so the repo's NumGoroutine/fd leak gate sees a constant.
 func (b *Broker) subscribeHomeAcks(nc *nats.Conn) (*nats.Subscription, error) {
 	hd := b.homeDelivery()
-	inbox := nats.NewInbox()
+	// nc.NewInbox(), not the package-level nats.NewInbox() — origin: prerelease audit
+	// round 2. The package helper ignores this connection's CustomInboxPrefix, so the
+	// reply would land in the shallow shared space that every pre-cutover client is
+	// granted, rather than in the broker's own subtree. cmd/tether/alert_gate.go carries
+	// the same note for the same reason.
+	inbox := nc.NewInbox()
 	// Wildcard on the token children (inbox.<token>): one long-lived subscription, no
 	// goroutine of our own, so the leak gate still sees a constant — while the reply
 	// subject a push carries is a fresh single-use child that only the OWNING agent is
@@ -277,9 +291,12 @@ func (b *Broker) pruneHomeOutstanding(now time.Time) {
 // on a token THIS broker issued (the reply subject's final segment) and names the ONE
 // port that token carried. Each token is minted PER DIRECTIVE and consumed on its first
 // ack (single-use). The security rests on that, NOT on the token staying secret: the
-// ack rides the broker _INBOX, which every agent may `Sub _INBOX.>`, so a token IS
-// disclosed on the shared bus the instant its port is acked — but by then it is already
-// consumed and named only that one (now-converged) port, so a disclosed token authorizes
+// ack rides the broker's reply inbox. An upgraded agent cannot subscribe there at all
+// (auth.InboxRoot is not in its grant); a pre-cutover one could once read the shared
+// `_INBOX` but not the broker's subtree either. The design holds even under the stronger
+// assumption it was written for — that a token IS disclosed the instant its port is acked
+// — because by then it is already consumed and named only that one (now-converged) port,
+// so a disclosed token authorizes
 // nothing (a forged ack for any OTHER port carries a DIFFERENT, still-secret token this
 // attacker never saw). The applied epoch is advanced to min(ISSUED, acked) — capped at
 // issued so a tampered high epoch cannot inflate it, and no higher than the agent's
@@ -366,9 +383,13 @@ func (b *Broker) homeDeliveryStats() (pushes uint64) {
 //
 // SR-8 (external re-review): ONE single-use token PER DIRECTIVE, delivered as a
 // SEPARATE single-directive push — NOT one token for the whole assignment. The ack
-// travels back on the broker's _INBOX, and EVERY agent (any session) is granted
-// `Sub _INBOX.>` (auth/permissions.go), so a token is DISCLOSED on the shared bus the
-// moment its port is acked. A token shared across a multi-port push would then let a
+// travels back on the broker's reply inbox. This paragraph used to say EVERY agent is
+// granted `Sub _INBOX.>` and therefore sees the token the moment its port is acked; that
+// is no longer true of an upgraded agent (see the SR-8 note at the top of this file), but
+// the argument is kept in its ORIGINAL, stronger form on purpose — it does not depend on
+// the ACL, and an argument that survives its premise being weakened is the one to keep.
+// Read the next sentences as "even if a token were disclosed the moment its port is
+// acked". A token shared across a multi-port push would then let a
 // disclosed (already-acked) token authorize a forged ack for a still-un-acked SIBLING
 // port — cross-session false convergence that bypasses the drain/retire/upgrade rc
 // gate. A per-directive token is consumed by its own single ack, so a token is only

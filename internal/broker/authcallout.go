@@ -30,22 +30,27 @@ type AuthCalloutConfig struct {
 // connectOpts builds the nats.Options the broker uses for its own
 // connection. With auth_callout enabled, the broker presents its
 // pre-configured nkey credential.
-func (b *Broker) brokerConnectOptions() ([]nats.Option, error) {
+//
+// It returns the broker's own public key alongside the options, empty when there is no
+// auth_callout credential to derive one from. The caller needs it because the private
+// inbox is no longer a plain option append — it is a connect-and-probe (natsinbox.Connect),
+// and only the caller owns the dial.
+func (b *Broker) brokerConnectOptions() ([]nats.Option, string, error) {
 	opts := []nats.Option{
 		nats.Name("tetherd"),
 		nats.MaxReconnects(-1),
 	}
 	if b.cfg.AuthCallout == nil {
-		return opts, nil
+		return opts, "", nil
 	}
 	pub, err := nkeys.FromSeed(b.cfg.AuthCallout.BrokerNkeySeed)
 	if err != nil {
-		return nil, fmt.Errorf("broker: parse own nkey seed: %w", err)
+		return nil, "", fmt.Errorf("broker: parse own nkey seed: %w", err)
 	}
 	pubKey, err := pub.PublicKey()
 	pub.Wipe()
 	if err != nil {
-		return nil, fmt.Errorf("broker: derive own pub: %w", err)
+		return nil, "", fmt.Errorf("broker: derive own pub: %w", err)
 	}
 	seed := append([]byte(nil), b.cfg.AuthCallout.BrokerNkeySeed...)
 	sigCB := func(nonce []byte) ([]byte, error) {
@@ -57,7 +62,34 @@ func (b *Broker) brokerConnectOptions() ([]nats.Option, error) {
 		return kp.Sign(nonce)
 	}
 	opts = append(opts, nats.Nkey(pubKey, sigCB))
-	return opts, nil
+	// THE BROKER GETS A PRIVATE REPLY INBOX TOO — origin: prerelease audit round 2.
+	//
+	// This was missed when the per-identity inbox landed: only ctl and agent set it, so
+	// every reply to a broker-originated request (expose forwards, upgrade dispatch, the
+	// cluster.apply forward) went to `_INBOX.<nuid>` in the shared space — which every
+	// agent on the deployment could subscribe to. The broker is the principal with the
+	// most to leak and it was the one still publishing into the commons.
+	//
+	// WHERE THE BROKER'S GRANT COMES FROM, and why the caller probes. Unlike ctl and
+	// agent — whose grants auth_callout mints fresh on every CONNECT — the broker
+	// authenticates as a STATIC `users:` entry in nats.conf and bypasses the callout
+	// entirely (it is in auth_callout.auth_users). So its reach over auth.InboxRoot is
+	// whatever that FILE says:
+	//
+	//   - a single broker's conf is hand-written per broker-ops §3.4 and carries no
+	//     permissions block at all → unrestricted → works, no operator action;
+	//   - a clustered broker's conf is rendered by natsconf.Render from
+	//     PermissionsForBroker and re-rendered by the topology reconciler → works once
+	//     that pass runs, which is long before any client upgrades;
+	//   - a broker whose conf WAS rendered and then went force-single is the gap: the
+	//     file is frozen with the old list and nothing re-renders it
+	//     (topology_reconcile.go returns early when b.cl is nil).
+	//
+	// That last case is why the dial goes through natsinbox.Connect instead of appending
+	// these options here. A refused inbox subscription would otherwise make every
+	// broker-originated reply vanish with no diagnostic; instead the broker falls back to
+	// the shared space and SAYS SO, which is a line an operator can act on.
+	return opts, pubKey, nil
 }
 
 // installAuthCallout subscribes to $SYS.REQ.USER.AUTH on the broker's
@@ -86,8 +118,16 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 	// bypass raft). Route the PIN provision/join writes through the leader (Propose-local /
 	// follower-forward) via the D4 seams. The forwarder was built in Run before this call.
 	if b.clusterMode {
-		h.ProvisionAgentWrite = NewProvisionSeam(b.cl.node, b.cl.forwarder)
-		h.JoinMemberWrite = NewJoinSeam(b.cl.node, b.cl.forwarder)
+		// PUBLISH THE BUDGETED VERIFIER BEFORE THE SEAMS USE IT. Both clustered PIN paths
+		// must run Argon2 through the process-wide ceiling of whichever broker actually
+		// spends the CPU: the leader-local branch takes it as an argument here, and the
+		// FORWARDED branch — whose responder was subscribed earlier in the cluster bring-up,
+		// before this handler existed — reads it back through b.leaderPINVerify.
+		// origin: prerelease audit external review M-1.
+		verifyPIN := h.VerifyPINWithBudget
+		b.leaderPINVerify.Store(&verifyPIN)
+		h.ProvisionAgentWrite = NewProvisionSeam(b.cl.node, b.cl.forwarder, verifyPIN)
+		h.JoinMemberWrite = NewJoinSeam(b.cl.node, b.cl.forwarder, verifyPIN)
 		h.LeaderContactStale = b.cl.node.LeaderContactStale
 		// batch B / B3: make the seam-nil fallbacks fail CLOSED. Until now this `if` was the
 		// entire enforcement of "clustered ⇒ both seams wired"; a third write path added with its
@@ -124,4 +164,23 @@ func (b *Broker) installAuthCallout(nc *nats.Conn) (*nats.Subscription, error) {
 	}
 	b.cfg.Logger.Info("broker: auth_callout active")
 	return sub, nil
+}
+
+// verifyPINOnLeader is forwardDeps.verifyPIN for the cluster.apply responder: the budgeted
+// Argon2 verifier of the auth_callout handler running in THIS process, resolved at call
+// time because the responder is subscribed before that handler is built.
+//
+// A nil load means a forwarded PIN write arrived before (or without) the handler being
+// installed. That refusal is retriable and costs one join attempt; running Argon2 anyway
+// would restore exactly the unmetered CPU oracle this plumbing removes.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count EXACTLY, and it caught the 286th on the first run.
+// origin: prerelease audit external review M-1.
+func verifyPINOnLeader(b *Broker, pin, hash string) error {
+	fn := b.leaderPINVerify.Load()
+	if fn == nil {
+		return errPINVerifierUnwired
+	}
+	return (*fn)(pin, hash)
 }

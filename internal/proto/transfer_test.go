@@ -232,3 +232,50 @@ func newTransferOf(v any) any {
 	}
 	panic("newTransferOf: unknown type")
 }
+
+// origin: prerelease audit deploy-release-docs/DRD-F2 + DRD-F3.
+//
+// Five sites compared release strings with ==, and the two ends of a fleet do not agree
+// on the "v" prefix: goreleaser stamps it, a source build does not, and
+// `--to-version` is typed by a human who may write either. Every one of those
+// comparisons is a CONFIRMATION check, so a false negative reports a successful upgrade
+// as unconfirmed — and `--all` treats an unconfirmed canary as a failure and leaves the
+// rest of the fleet on the old version.
+func TestSameReleaseIgnoresOnlyTheVPrefix(t *testing.T) {
+	same := [][2]string{
+		{"v0.5.1", "0.5.1"},
+		{"0.5.1", "v0.5.1"},
+		{"v0.5.1", "v0.5.1"},
+		{"0.5.1", "0.5.1"},
+		{"", ""},
+	}
+	for _, p := range same {
+		if !SameRelease(p[0], p[1]) {
+			t.Errorf("SameRelease(%q, %q) = false; these name the same release, and reporting "+
+				"otherwise turns a completed upgrade into an unconfirmed one — which `--all` "+
+				"treats as a canary failure", p[0], p[1])
+		}
+	}
+
+	// BOTH sides are normalised, not one. Trimming only the operator's input would take a
+	// fleet whose agents genuinely self-report a "v" from matching to not matching.
+	if !SameRelease("v1.2.3", "1.2.3") || !SameRelease("1.2.3", "v1.2.3") {
+		t.Error("normalisation is one-sided")
+	}
+
+	different := [][2]string{
+		{"v0.5.1", "v0.5.2"},
+		{"0.5.1", "0.5.10"},
+		{"v0.5.1", ""},
+		{"", "0.5.1"},
+		// Only the LEADING v, and only one of them: a version that is genuinely
+		// different must stay different.
+		{"vv0.5.1", "0.5.1"},
+	}
+	for _, p := range different {
+		if SameRelease(p[0], p[1]) {
+			t.Errorf("SameRelease(%q, %q) = true; these are different releases, and treating them "+
+				"as equal would report an upgrade that did NOT happen as committed", p[0], p[1])
+		}
+	}
+}

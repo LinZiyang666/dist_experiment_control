@@ -303,3 +303,73 @@ func TestD7RecoverDumpExistsRefusesWipe(t *testing.T) {
 		t.Fatalf("tether.db was wiped despite the dump failing: %v", err)
 	}
 }
+
+// origin: prerelease audit round 2, CC-2.
+//
+// THE FORENSIC DUMP MUST NOT BE A CREDENTIAL STORE.
+//
+// dumpDivergent writes every user table verbatim, and proxy_subscribers.psk is
+// documented in migration 0006 as a "base64 Shadowsocks password (recoverable)" — so
+// before the §3 MINOR sweep the dump was a plaintext copy of every subscriber's live
+// proxy password. The file is 0600, but its whole purpose is to be KEPT: the operator is
+// told to hold it as forensics before a destructive recover, and the runbook has them
+// copy it off the box.
+//
+// The sweep added redactSecretColumns and nothing tested it — so the redaction could be
+// dropped and the dump would silently go back to being a password file with every gate
+// green. This drives the real Recover path, not the helper, because the helper being
+// correct is not the property that matters.
+func TestTheForensicDumpRedactsLiveCredentials(t *testing.T) {
+	dataDir, dbPath := mustDataDir(t)
+	seedDB(t, dbPath)
+
+	const secret = "S3cr3tSubscriberPassword"
+	db, err := storage.OpenWAL("file:" + dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	seedProxySubscriber(t, db, secret)
+	_ = db.Close()
+
+	dump := filepath.Join(t.TempDir(), "divergent.json")
+	if _, err := Recover(RecoverOptions{DataDir: dataDir, DBPath: dbPath, DumpPath: dump}); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	body, err := os.ReadFile(dump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), secret) {
+		t.Fatalf("the forensic dump contains a subscriber's live proxy password verbatim.\n\n"+
+			"The operator is told to KEEP this file and the runbook has them copy it off the "+
+			"box. A recovery artefact that doubles as a credential store outlives every "+
+			"rotation anybody remembers to do.\n\ndump:\n%s", string(body))
+	}
+	// The ROW and the FACT that the column had a value must survive — that is the whole
+	// forensic question ("what did this divergent node hold"). Only the usable value goes.
+	if !strings.Contains(string(body), "proxy_subscribers") {
+		t.Error("the proxy_subscribers table is missing from the dump entirely; redaction must " +
+			"remove the credential, not the evidence")
+	}
+	if !strings.Contains(string(body), "redacted") {
+		t.Error("the redacted column left no marker, so a reader cannot tell an absent value " +
+			"from a withheld one")
+	}
+}
+
+// seedProxySubscriber inserts one live subscription row, whose psk column migration 0006
+// documents as a recoverable Shadowsocks password.
+func seedProxySubscriber(t *testing.T, db *sql.DB, psk string) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash) VALUES('lab','lab','SHA256:o','h')`,
+	); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO proxy_subscribers(sid,sub_id,name,token_hash,psk,cipher,created_by_fp) `+
+			`VALUES('lab','sub-1','alice','SHA256:tok',?,'2022-blake3-aes-256-gcm','SHA256:o')`, psk,
+	); err != nil {
+		t.Fatalf("seed proxy_subscribers: %v", err)
+	}
+}

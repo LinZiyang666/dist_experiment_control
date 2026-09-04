@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // reconcile_lock_lease_test.go (R7b) — the lease mechanism, from both ends.
@@ -652,5 +653,57 @@ func TestUpgradeLockClearUsesTheExistingPath(t *testing.T) {
 	}
 	if !strings.Contains(cmd.Body[0].SQL, cluster.MetaKeyUpgradeActive) {
 		t.Fatalf("the pass's clear must target the roll-lock marker; rendered: %s", cmd.Body[0].SQL)
+	}
+}
+
+// origin: prerelease audit round 2, H-2.
+//
+// upgradeActive AND upgradeLockHeld ARE DIFFERENT QUESTIONS, and the acquire
+// preflight was asking the wrong one.
+//
+//   - upgradeActive: "is the cluster mid-roll" — what fences `cluster join` /
+//     `cluster retire`, and it must stay TRUE across a HALT, because a partial
+//     roll is exactly when a membership change must not cross a restart.
+//   - upgradeLockHeld: "is a roll still DRIVING" — what excludes another roll.
+//
+// Using the first for the second is what made a HALTed roll's own marker refuse
+// the re-run its HALT message instructs the operator to perform, and block the
+// emergency `--to-version <older>` rollback with it.
+func TestTheAcquirePreflightAsksWhetherARollIsStillDriving(t *testing.T) {
+	db := testharness.OpenDB(t)
+	at := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+	setUpgradeMarker(t, db, at)
+
+	if !upgradeLockHeld(db, at.Add(time.Minute)) {
+		t.Fatal("a roll that acquired a minute ago is not seen as holding its own lock")
+	}
+	if !upgradeActive(db) {
+		t.Fatal("premise broken: the marker is not set")
+	}
+
+	// The holder stopped renewing (a HALT, a kill -9, a snapped SSH).
+	past := at.Add(cluster.LockLeaseTTL + time.Minute)
+	if upgradeLockHeld(db, past) {
+		t.Fatal("a roll that stopped renewing is still reported as holding the lock.\n\n" +
+			"The operator was told to `fix and re-run to resume`; the re-run is then refused " +
+			"for the whole lease TTL plus a reap interval — and so is the rollback they reach " +
+			"for while the fleet sits mixed-version.")
+	}
+	// ...and the MEMBERSHIP fence is untouched by that.
+	if !upgradeActive(db) {
+		t.Fatal("an expired lease also unfenced join/retire.\n\n" +
+			"The partial-roll fence is the whole reason a HALT keeps the marker instead of " +
+			"releasing the lock, and it must outlive the lease that only excludes other rolls.")
+	}
+
+	// FAIL CLOSED: a marker whose lease cannot be evaluated is HELD. That is a
+	// pre-R7b lock, which never expires on its own by design.
+	if _, err := db.Exec(`DELETE FROM cluster_meta WHERE key=?`, cluster.MetaKeyUpgradeLease); err != nil {
+		t.Fatal(err)
+	}
+	if !upgradeLockHeld(db, past.Add(100*cluster.LockLeaseTTL)) {
+		t.Fatal("a marker with NO lease was treated as expired.\n\n" +
+			"That is what a lock acquired by an older broker looks like, and lock_lease.go's " +
+			"contract is that it never expires by itself — `tether cluster unlock` is the out.")
 	}
 }

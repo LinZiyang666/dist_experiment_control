@@ -32,12 +32,14 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/LinZiyang666/tether/internal/httplisten"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/natsconf"
+	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -388,6 +390,25 @@ type Broker struct {
 	// Run before the loop; a few tests inject their own server post-Run for the data-plane drills).
 	tunnelSrv atomic.Pointer[tunnel.Server]
 
+	// leaderPINVerify is the auth_callout handler's budgeted Argon2 verifier, published
+	// here by installAuthCallout so the CLUSTER FORWARD responder can reach it.
+	//
+	// WHY A LATE-BOUND POINTER AND NOT A PARAMETER. SubscribeClusterApply is wired inside
+	// the cluster bring-up, which runs BEFORE installAuthCallout builds the handler (the
+	// seams need the forwarder, which that bring-up creates). So at subscribe time there is
+	// no handler to hand over. The subscription is live before the store completes, hence
+	// atomic; and a load that comes back nil FAILS THE WRITE CLOSED rather than falling back
+	// to the unbudgeted auth.VerifyPIN — see errPINVerifierUnwired.
+	//
+	// origin: prerelease audit external review M-1.
+	leaderPINVerify atomic.Pointer[func(pin, hash string) error]
+
+	// creatorsSeeded latches once this broker has SEEN the session-creator backfill
+	// marker committed, so the retry pass stops paying for a read it already knows the
+	// answer to. It is an optimisation only — correctness lives in the marker row, which
+	// is what survives a restart. origin: prerelease audit external review M-2.
+	creatorsSeeded atomic.Bool
+
 	// js is the JetStream context this broker uses for audit publish
 	// + history/events stream management. Non-nil only when the
 	// underlying nats-server has JetStream enabled. When nil the
@@ -395,7 +416,27 @@ type Broker struct {
 	// keeps existing tests / dev setups (no -js) working without
 	// changes; a JetStream-enabled deployment activates the P7
 	// upgrade automatically.
-	js jetstream.JetStream
+	// jsp holds the JetStream handle behind an atomic pointer.
+	//
+	// origin: prerelease audit broker-core/BC-F2, adjudicated in the plan and — until
+	// round 2 caught it — never implemented. It was a plain interface field, written in
+	// Run AFTER every subscription was installed and after installAuthCallout, while
+	// publishAudit / handleSessionCreate / pubSysEvent read it on NATS dispatch
+	// goroutines. That is a data race by the Go memory model, not a theoretical one: a
+	// fleet reconnecting into a restarted broker lands squarely in the window. The mild
+	// outcome is an event silently taking the core-publish fallback and never reaching
+	// the events stream; the sharp one is a torn interface read (type word set, data word
+	// nil) and a nil dereference that takes the control plane down.
+	//
+	// The comparison that settles it: `nc` and `tunnelSrv` in this same struct are
+	// atomic.Pointer for word-for-word the same reason. `js` was simply missed.
+	//
+	// STORED ONLY AFTER EnsureEventsStream SUCCEEDS. Publishing to a stream that does not
+	// exist yet returns ErrNoStreamResponse, and pubSysEvent only Warns — it does not
+	// fall back — so an event published in that window is lost outright. Moving the
+	// assignment earlier without the ensure would widen that window from microseconds to
+	// the whole subscription install.
+	jsp atomic.Pointer[jsHandle]
 
 	// admin is the local-only Unix-socket admin server. Non-nil
 	// only when Config.AdminSocketPath is set. Started after JS so
@@ -585,6 +626,18 @@ type Broker struct {
 	// must NEVER be cited to soften #58 / drill 96 (only the per-transfer-owner refinement retires the gap).
 	xferUnreapableBuckets atomic.Int64
 
+	// xferReapSkipped / xferReapSkippedAt count the orphan-reap passes that bailed out
+	// before scanning anything, and stamp the most recent one.
+	//
+	// origin: prerelease audit broker-transfer/BT-F3. The reviewer proposed moving the
+	// xferUnreapableBuckets Store into a defer so it "stayed honest" on a skipped pass;
+	// that is worse, not better — the early-exit paths would write 0, i.e. report "no
+	// unreapable buckets" precisely when the reaper has stopped looking. A frozen gauge
+	// is at least the last thing that was actually measured. These two carry the
+	// skipped-ness instead, so the two facts stay separable.
+	xferReapSkipped   atomic.Int64
+	xferReapSkippedAt atomic.Int64
+
 	// reExecRequested (G5 #13) is set by RequestReExec so serve.go, AFTER Run's ordered shutdown returns,
 	// re-execs the (freshly-staged) on-disk binary in place (PID-preserving; immune to the #23 clean-exit
 	// trap). reloadTrigger is the run-context cancel serve.go injects so RequestReExec unwinds Run through
@@ -725,7 +778,7 @@ func (b *Broker) publishOnConn(subject string, payload []byte) error {
 }
 
 // publishAudit pubs an audit message. With JetStream available
-// (b.js != nil) the message goes through js.Publish so it lands in
+// (brokerJS(b) != nil) the message goes through js.Publish so it lands in
 // the history-<sid> stream with at-least-once delivery + ACK.
 // Without JetStream falls back to core publish, matching P4-P6
 // behavior verbatim — that path is best-effort and lossy on
@@ -738,10 +791,10 @@ func (b *Broker) publishAudit(subject string, payload []byte) error {
 	if auditTapForTest != nil {
 		auditTapForTest(subject, payload)
 	}
-	if b.js != nil {
+	if brokerJS(b) != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_, err := b.js.Publish(ctx, subject, payload)
+		_, err := brokerJS(b).Publish(ctx, subject, payload)
 		return err
 	}
 	nc := b.nc.Load()
@@ -749,6 +802,41 @@ func (b *Broker) publishAudit(subject string, payload []byte) error {
 		return errBrokerNotConnected
 	}
 	return nc.Publish(subject, payload)
+}
+
+// publishAuditDeduped is publishAudit with a JetStream idempotency key.
+//
+// origin: prerelease audit round 2, F-T2. JetStream dedups on the Nats-Msg-Id header and
+// never on payload bytes, so "the content is deterministic" is not by itself a
+// duplicate-suppression argument — a caller that replays a byte-identical record through
+// publishAudit gets a second copy. Callers that may legitimately re-emit the SAME record
+// after a crash must supply the key.
+//
+// The core-NATS fallback carries no dedup at all; that is unchanged and is why the only
+// caller treats a JetStream-less broker as "cannot commit".
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func publishAuditDeduped(b *Broker, subject string, payload []byte, msgID string) error {
+	if auditTapForTest != nil {
+		auditTapForTest(subject, payload)
+	}
+	js := brokerJS(b)
+	if js == nil {
+		return errBrokerNotConnected
+	}
+	// Bounded by the same 2s budget publishAudit uses.
+	// ctx-none: its caller commitSyntheticTransferTerminal takes no ctx — it runs off the ledger scan, not a request
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// PublishMsg with an EXPLICIT header rather than js.Publish + WithMsgID: the option form
+	// is a closure over an unexported struct, so the id it carries is invisible to any test
+	// double — and "both the first publish and the crash replay use the SAME id" is the
+	// entire correctness argument here (external review M-3). A header a fake can read is
+	// what makes that argument checkable instead of asserted.
+	msg := &nats.Msg{Subject: subject, Data: payload, Header: nats.Header{}}
+	msg.Header.Set(jetstream.MsgIDHeader, msgID)
+	_, err := js.PublishMsg(ctx, msg)
+	return err
 }
 
 var errBrokerNotConnected = errBrokerSentinel("broker: not connected")
@@ -954,11 +1042,29 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	connOpts, err := b.brokerConnectOptions()
+	connOpts, ownPubKey, err := b.brokerConnectOptions()
 	if err != nil {
 		return err
 	}
-	nc, err := nats.Connect(b.cfg.NATSURL, connOpts...)
+	var nc *nats.Conn
+	if ownPubKey == "" {
+		nc, err = nats.Connect(b.cfg.NATSURL, connOpts...)
+	} else {
+		var sharedInbox bool
+		nc, sharedInbox, err = natsinbox.Connect(b.cfg.NATSURL, ownPubKey, connOpts)
+		if err == nil && sharedInbox {
+			// The one failure mode brokerConnectOptions enumerates that an operator has
+			// to fix by hand: a conf that was rendered while clustered and then frozen by
+			// force-single. Loud on purpose — the broker still works, so nothing else
+			// will ever complain, and what is lost is the confidentiality of every reply
+			// the broker receives.
+			b.cfg.Logger.Error("broker: this nats.conf does not grant the broker its private reply inbox; "+
+				"falling back to the SHARED inbox space, where every agent on this deployment can read "+
+				"the broker's replies. Re-render nats.conf (cluster natsconf) so the broker's static "+
+				"users: entry carries the current PermissionsForBroker, then restart",
+				"inbox_root", auth.InboxRoot)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("broker: NATS connect: %w", err)
 	}
@@ -1180,82 +1286,40 @@ func (b *Broker) Run(ctx context.Context) error {
 	// already firing requests at us. AccountInfo is the cheapest call
 	// that distinguishes "JS enabled" from "JS not present" (just
 	// "jetstream.New(nc)" itself never errors — it's purely client-
-	// side scaffolding). When the probe fails we keep b.js == nil and
+	// side scaffolding). When the probe fails we keep brokerJS(b) == nil and
 	// audit publishes fall back to core publish (P4-P6 behavior).
-	if js, err := jetstream.New(nc); err == nil {
-		probeCtx, cancelProbe := context.WithTimeout(ctx, 1*time.Second)
-		_, infoErr := js.AccountInfo(probeCtx)
-		cancelProbe()
-		if infoErr == nil {
-			b.js = js
-			b.cfg.Logger.Info("broker: JetStream enabled")
-			ensureCtx, ensureCancel := context.WithTimeout(ctx, 5*time.Second)
-			if err := jsstream.EnsureEventsStream(ensureCtx, js, jsstream.ReplicasSingle); err != nil {
-				ensureCancel()
-				return fmt.Errorf("broker: ensure events stream: %w", err)
-			}
-			ensureCancel()
-			if err := b.reconcileHistoryStreamsOnBoot(ctx); err != nil {
-				b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", err)
-			}
-			// file-transfer-plan §Object bucket lifecycle G.2 —
-			// reap leftover OBJ_xfer-* streams from a previous crash.
-			if n, err := b.reconcileXferObjects(ctx); err != nil {
-				b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", err)
-			} else if n > 0 {
-				b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
-			}
-		} else {
-			b.cfg.Logger.Debug("broker: JetStream not available; audit falls back to core publish",
-				"err", infoErr)
-		}
+	// A FAILED ENSURE IS TRANSIENT IN CLUSTER MODE TOO — origin: prerelease audit external
+	// review R2-M3. The bounded wait below only ever covered "JetStream did not answer
+	// AccountInfo at all". If AccountInfo succeeded but EnsureEventsStream failed — a 5s
+	// deadline, a meta placement that has not settled, a momentary server error — Run
+	// returned here, BEFORE the wait, and the crash loop came straight back through a
+	// different door. Single mode keeps its contract: there an ensure failure against an
+	// answering JetStream is a real problem and still fatal.
+	jsBootErr := enableJetStream(ctx, b, nc)
+	if jsBootErr != nil && !b.clusterMode {
+		return jsBootErr
+	}
+
+	// IN CLUSTER MODE A MISSED PROBE IS FATAL, so give a TRANSIENT miss a bounded chance to
+	// become a hit rather than exiting into a systemd restart loop. See
+	// waitForClusteredJetStream. Single mode is untouched: there a miss degrades to core
+	// publish, so there is nothing to wait for.
+	if b.clusterMode && brokerJS(b) == nil {
+		jsBootErr = waitForClusteredJetStream(ctx, b, nc, jsBootErr)
 	}
 
 	// D9 cutover late wiring: attach the D8 sinks, subscribe the cluster responders,
 	// and start the leader-gated audit-publisher + alert-reconciler loops. After the JS
-	// probe (the loops need b.js) and the NATS connect (nc).
+	// probe (the loops need brokerJS(b)) and the NATS connect (nc).
 	if b.clusterMode {
-		if b.js == nil {
-			// ACTIONABLE error (v0.4.4): the bare "enable JetStream" message cost a multi-step incident
-			// diagnosis. The usual cause is a lone N=1 broker whose nats.conf still carries a `cluster{}`
-			// block — a single node cannot form the clustered JetStream meta quorum, so JS never comes up
-			// and the broker crash-loops with no self-recovery. Name the real remedy (de-cluster to
-			// standalone) vs. the N>=2 mesh-not-formed case.
-			voters, verr := b.cl.node.NumVoters()
-			if verr == nil && voters <= 1 {
-				return n1ClusteredJetStreamFatal()
+		if brokerJS(b) == nil {
+			// The last transient error, when there was one, is the difference between "the
+			// mesh never formed" and "JetStream answered but would not create the stream" —
+			// two different operator actions, and the diagnostic alone cannot tell them apart.
+			if jsBootErr != nil {
+				return fmt.Errorf("%w (last JetStream boot error: %v)", clusteredJetStreamDiagnostic(b), jsBootErr)
 			}
-			// G2 #10: voters>=2 but no JetStream at boot is the force-single-EJECTED trap — this node's
-			// on-disk raft config still lists {this, peer(s)} (voters>=2), but a survivor may have
-			// force-singled to {survivor} WITHOUT it, so clustered JS can never reach quorum-of-2 and the
-			// broker crash-loops (exit 70). Ejection is NOT locally provable (no quorum; peers unreachable
-			// by design), so emit a RANKED DIFFERENTIAL (transient-mesh vs ejected) from the local raft
-			// config only — never a hard assertion — and point at the crash-loop stop + rejoin runbook.
-			if verr == nil && voters >= 2 {
-				if cfg, cerr := b.cl.node.RaftConfiguration(); cerr == nil {
-					var peers []string
-					for _, s := range cfg {
-						if s.NodeID != b.selfID {
-							peers = append(peers, s.NodeID)
-						}
-					}
-					if len(peers) > 0 {
-						return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE at boot with "+
-							"voters=%d — this node's on-disk raft config still lists peer(s) %v, yet clustered JetStream cannot "+
-							"reach quorum. TWO likely causes: (1) TRANSIENT — the NATS routes mesh is not yet formed / peers are "+
-							"down (verify routes in /etc/tether/nats.d/nats.conf and that peers are up; JS self-heals once quorum "+
-							"returns); or (2) EJECTED — a survivor ran force-single WITHOUT this node, orphaning it (a restart will "+
-							"NOT self-heal). STOP the crash-loop now: systemctl stop tether-broker. Confirm which on a survivor via "+
-							"`tether cluster status --remote`; if this node was force-singled out, WIPE its stale raft state and "+
-							"rejoin: `tether cluster recovery rejoin prepare --self-id %s --dump-divergent <file>`, then `tether "+
-							"cluster join approve` from the leader (see docs/cluster-runbook.md)", voters, peers, b.selfID)
-					}
-				}
-			}
-			return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE (voters=%d) — the "+
-				"NATS routes mesh is likely not formed (clustered JetStream meta needs quorum). Verify the routes "+
-				"in /etc/tether/nats.d/nats.conf and that peer brokers are reachable; see `tether cluster status` / "+
-				"`tether cluster doctor`", voters)
+			return clusteredJetStreamDiagnostic(b)
 		}
 		if err := b.wireClusterLate(ctx, nc); err != nil {
 			return err
@@ -1272,7 +1336,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// emission itself can land in the events stream.
 	b.pubSysEvent("tetherd_restarted", map[string]any{
 		"nats":      b.cfg.NATSURL,
-		"jetstream": b.js != nil,
+		"jetstream": brokerJS(b) != nil,
 	})
 
 	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
@@ -1326,6 +1390,10 @@ func (b *Broker) Run(ctx context.Context) error {
 			// D9 round-2 BLOCKER: route `admin evict` through raft (else the direct tx hits
 			// the RODB handle and fails). Single mode leaves EvictWrite nil (direct tx).
 			backend.EvictWrite = b.evictNode
+			// Same seam, same reason — the admission table is replicated too.
+			backend.SessionCreatorWrite = func(fp, addedBy, note string, allow bool) error {
+				return setSessionCreator(b, fp, addedBy, note, allow)
+			}
 			// batch B / B3: make a missing EvictWrite fail CLOSED instead of silently taking the
 			// single-mode direct tx. Set LAST, alongside the seam — internal/broker's
 			// TestAdminBackendClusterModeIsWiredBesideTheSeam asserts they stay together.
@@ -1349,12 +1417,23 @@ func (b *Broker) Run(ctx context.Context) error {
 	// (joinerBrokerUpLocal → OpClusterStatus): a joiner restarted mid-grow that is merely still finalizing
 	// would be misread as "not up in cluster mode" and the grow would HALT at the start-joiner boundary.
 	// Observed on the deploy tier (drill 42 returning-node re-grow) when this ran before the socket.
-	if b.clusterMode {
-		if n, ferr := b.finalizeStrandedXfers(ctx); ferr != nil {
-			b.cfg.Logger.Warn("broker: eager stranded-transfer finalize on boot", "err", ferr)
-		} else if n > 0 {
-			b.cfg.Logger.Info("broker: eagerly finalized stranded in-flight transfers on boot (#57)", "count", n)
-		}
+	//
+	// NOT GATED ON clusterMode — origin: prerelease audit round 2, F-T7. It was, and
+	// that made the crash-loop case this block exists for unreachable on exactly the
+	// deployment #57 had just been extended to: batch F made synthesis work on a single
+	// broker (commitSyntheticTransferTerminal's single-mode branch) and the ledger root
+	// falls back to the DB's directory when no ClusterDataDir is set, so a lone broker
+	// really does accumulate stranded rows — and then only the periodic pass, anchored at
+	// start+XferReapInterval, would ever close them. A broker crash-looping faster than
+	// that interval closed none, forever, which is the whole reason for finalizing here.
+	//
+	// finalizeStrandedXfers is a no-op when there is no ledger dir at all (an in-memory
+	// test broker), so the added call costs nothing on the shapes that have nothing to
+	// finalize.
+	if n, ferr := b.finalizeStrandedXfers(ctx); ferr != nil {
+		b.cfg.Logger.Warn("broker: eager stranded-transfer finalize on boot", "err", ferr)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: eagerly finalized stranded in-flight transfers on boot (#57)", "count", n)
 	}
 
 	// G.2 step ① — recompute node states from persisted
@@ -1373,6 +1452,16 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	if revoked := b.reconcilePorts(bootNow); revoked > 0 {
 		b.cfg.Logger.Info("broker: boot port revocations", "count", revoked)
+	}
+	// The one-shot session-create admission backfill (migration 0019's INSERT…SELECT used
+	// to do this, wrongly — see that file). Runs here rather than in the migration because
+	// session_creators is replicated state and the decision has to be made ONCE, by one
+	// writer, not re-derived by every node at every restart.
+	if n, err := seedSessionCreators(b, bootNow); err != nil {
+		b.cfg.Logger.Warn("broker: session-creator upgrade backfill", "err", err)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: grandfathered existing session owners into the session-create "+
+			"allow-list", "count", n)
 	}
 	if closed := b.reconcileTunnelSessions(); closed > 0 {
 		b.cfg.Logger.Info("broker: boot stale tunnel proxies closed", "count", closed)
@@ -1973,21 +2062,56 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 	// is handing the name back. Forget who held it so the next process to present
 	// this credential is adjudicated as a first arrival and keeps the bare name.
 	//
-	// Deliberately does NOT touch the nodes row: liveness stays the heartbeat's
-	// job, and rewriting status here would race the ordinary OFFLINE sweep.
-	// Deliberately not authenticated beyond the register subject's own ACL
-	// either — the worst a forged farewell can do is discard a cache entry that
-	// the interest probe and the heartbeat clock immediately reconstruct.
+	// THE COMMENT BELOW USED TO SAY the worst a forged farewell can do is discard a
+	// cache entry the probe and the heartbeat clock immediately reconstruct. That
+	// stopped being true the moment external review F11 added the row write further
+	// down, and it stayed in the file describing a system that no longer existed
+	// (prerelease audit broker-core/BC-F3). A farewell now takes a nodes row OFFLINE,
+	// which is a real, remotely-triggerable effect on somebody ELSE's live agent, so
+	// the holder rule the comment two lines further down already claimed — "only the
+	// CURRENT holder may release" — has to actually govern all three effects and not
+	// just the in-memory flag.
+	//
+	// Liveness is still the heartbeat's job for a CONFIGURED device; see the
+	// server-side lease test below for why the client's own say-so is not enough to
+	// decide which kind of row this is.
 	if req.ReleasingName && req.InstanceID != "" {
+		// mayRelease answers "is this sender the party entitled to release this
+		// name". A COLD MAP MUST STILL PASS: after a broker restart or a leader
+		// election nothing is recorded, and refusing there would mean the first
+		// clean exit after every restart could not release its own row — which is
+		// F11's suffix drift re-entering through a different door.
+		//
+		// BUT "no record" IS NOT "no evidence" — origin: round 2, E2. A bare
+		// default-true made the holder check above unenforced for the entire
+		// window after every restart, re-exec or leader election, which is not a
+		// rare corner: `broker upgrade` re-execs the process on every roll. In
+		// that window a sibling clone's farewell still landed all three effects
+		// on a live incumbent. The map is cold; the FLEET is not. Ask it.
+		var mayRelease bool
 		if v, ok := b.leaseHolder.Load(leaseKey(sid, nid)); ok {
-			// Only the CURRENT holder may release: a straggler clone saying
-			// goodbye must not hand away the name its sibling now holds.
-			if g, _ := v.(leaseGrant); g.instanceID == req.InstanceID {
+			g, _ := v.(leaseGrant)
+			mayRelease = g.instanceID == req.InstanceID
+			if mayRelease {
 				// FLAG, do not delete — see leaseGrant.released.
 				g.released = true
 				b.leaseHolder.Store(leaseKey(sid, nid), g)
 			}
+		} else {
+			mayRelease = !liveHolderContradicts(b, sid, nid, req.InstanceID)
 		}
+		if !mayRelease {
+			// A straggler clone saying goodbye for a name its sibling now holds.
+			// Answer OK — it IS leaving, and telling it otherwise would only make
+			// it retry — but change nothing on the incumbent's behalf.
+			b.cfg.Logger.Warn("broker: ignoring a farewell from a non-holder instance",
+				"sid", sid, "nid", nid, "from_instance", req.InstanceID)
+			b.replyJSON(msg, proto.NodeRegisterResp{OK: true})
+			return true
+		}
+		// Inside the holder check on purpose: invalidating the probe evidence is
+		// cheap for the sender and expensive for everyone else (every subsequent
+		// register has to re-probe), so it is a DoS surface in its own right.
 		b.probeCache.Delete(leaseKey(sid, nid))
 		// TAKE THE ROW OFFLINE TOO, or the name is not actually released.
 		//
@@ -2004,10 +2128,38 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 		// configured device's row is not ours to take offline on a farewell —
 		// its liveness is the heartbeat's business). The write is scoped to the
 		// row and idempotent.
-		if _, _, isLease := proto.SplitLeaseName(nid); isLease && req.LeasedNID {
-			if err := markNodeOfflineOnRelease(b, sid, nid); err != nil {
-				b.cfg.Logger.Warn("broker: could not take a released lease row offline",
-					"err", err, "sid", sid, "nid", nid)
+		//
+		// SERVER-SIDE LEASE TEST, not the client's flag (prerelease audit
+		// broker-core/BC-F1 + BC-F3, one patch because F1's fix is what makes F3
+		// reachable from an ordinary path).
+		//
+		// The gate used to read `isLease && req.LeasedNID`, and the agent's one and
+		// only farewell construction never set LeasedNID — so the whole branch was
+		// dead in production and F11's fix, which this comment describes, was never
+		// running. The agent side is corrected too (instance.go), but it CANNOT be the
+		// fix on its own: leases shipped in v0.5.1, so every agent already in the
+		// field sends a farewell without that field, and trusting it would mean the
+		// broker stays broken until the last agent is upgraded.
+		//
+		// `known && provisioned[nid]` means the row belongs to a CONFIGURED device
+		// with its own binding — never ours to take offline on a farewell. Absence of
+		// a binding is the authoritative "this is a lease", the same predicate
+		// configuredBasename already uses. When agent_provisioning cannot be read at
+		// all we fall back to the client's flag, which is strictly better than
+		// treating an unreadable table as proof of anything.
+		if _, _, isLease := proto.SplitLeaseName(nid); isLease {
+			// readable, not "non-empty" — origin: round 2, E1. A readable-but-empty
+			// agent_provisioning means NOTHING on this deployment is a configured device,
+			// so a suffixed name is certainly a lease. Treating that as "cannot read" fell
+			// back to the client's flag, which is precisely what BC-F1 established cannot
+			// repair a fielded fleet.
+			provisioned, readable := node.ProvisionedNIDs(b.read().SQL(), sid)
+			leaseRow := (readable && !provisioned[nid]) || (!readable && req.LeasedNID)
+			if leaseRow {
+				if err := markNodeOfflineOnRelease(b, sid, nid); err != nil {
+					b.cfg.Logger.Warn("broker: could not take a released lease row offline",
+						"err", err, "sid", sid, "nid", nid)
+				}
 			}
 		}
 		// Stop here. Falling through would run the ordinary register and stamp a
@@ -2232,6 +2384,32 @@ func probeObserve(b *Broker, sid, nid string, budget time.Duration) probeAnswer 
 	return probeAnswer{answered: true, responder: resp.InstanceID, definitive: true}
 }
 
+// liveHolderContradicts settles the cold-map half of "may this sender release
+// this name" with evidence rather than with a default. origin: round 2, E2.
+//
+// It answers true ONLY on a positive contradiction: a live process under this
+// name answered the claim probe and named a DIFFERENT instance. Every other
+// outcome — nobody subscribed, the probe timed out, the responder is the sender
+// itself, either side carries no instance id — leaves the release permitted,
+// which is byte-for-byte today's behaviour. So this can only ever tighten, never
+// break TestAFarewellStillReleasesWhenTheHolderMapIsCold: a departing agent that
+// has already dropped its subscription draws ErrNoResponders, and one that has
+// not answers with its own id.
+//
+// Deliberately the INLINE grace and not the background budget. A farewell is the
+// exit path — the sender is not waiting on the reply for anything it will do —
+// and this runs on the serial register handler, so every millisecond here is
+// head-of-line latency for some other node's register. A live local incumbent
+// replies in one hop, far inside the grace; a cross-continent one may not, and
+// the resulting UNKNOWN correctly means "no evidence", not "no holder".
+func liveHolderContradicts(b *Broker, sid, nid, sender string) bool {
+	if sender == "" {
+		return false
+	}
+	a := probeObserve(b, sid, nid, inlineProbeGrace)
+	return a.answered && a.responder != "" && a.responder != sender
+}
+
 func (b *Broker) handleRegister(msg *nats.Msg) {
 	sid, nid, ok := proto.ParseSidNidFromCtrl(msg.Subject)
 	if !ok {
@@ -2448,6 +2626,8 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// per-node proxy directive (join/reconnect path). Nil otherwise, so a
 	// proxy-off reply stays byte-identical to pre-P13.
 	resp.Proxy = b.proxyDirectiveForRegister(sid, nid, req)
+
+	withholdSharedInboxSecrets(b, &resp, msg.Reply, sid, nid)
 
 	// D6 §7.4: attach per-expose home directives so a reconnecting agent rehomes
 	// any expose whose home was re-pointed by the leader. Self-gating — nil in
@@ -2746,8 +2926,11 @@ func configuredBasename(b *Broker, sid, nid string, req *proto.NodeRegisterReq) 
 		// root `gpu` crosses into a different credential family. When bindings
 		// are available, accept the relationship only when the presented name
 		// has no binding of its own and the claimed root does.
-		provisioned, known := node.ProvisionedNIDs(b.read().SQL(), sid)
-		if known && (provisioned[nid] || !provisioned[req.ConfiguredNID]) {
+		// len(provisioned) > 0, NOT the readable flag: this call site has always meant
+		// "are there bindings to reason about at all", and E1's contract fix changed what
+		// the second return says. Spelled out here so the two sites cannot drift again.
+		provisioned, readable := node.ProvisionedNIDs(b.read().SQL(), sid)
+		if readable && len(provisioned) > 0 && (provisioned[nid] || !provisioned[req.ConfiguredNID]) {
 			return nid
 		}
 		return req.ConfiguredNID
@@ -2776,4 +2959,296 @@ func trustedPreviousNID(b *Broker, sid, nid string, req *proto.NodeRegisterReq) 
 		return req.PreviousNID
 	}
 	return ""
+}
+
+// jsHandle boxes the JetStream interface so it can live in an atomic.Pointer. A nil
+// pointer means "JetStream is not available", which is the same signal the old nil
+// interface carried.
+type jsHandle struct{ js jetstream.JetStream }
+
+// brokerJS returns the live JetStream handle, or nil when JetStream is unavailable.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly (the same reason replyLeaseVerdict is one).
+func brokerJS(b *Broker) jetstream.JetStream {
+	if h := b.jsp.Load(); h != nil {
+		return h.js
+	}
+	return nil
+}
+
+// setBrokerJS publishes the handle. Passing nil clears it.
+func setBrokerJS(b *Broker, js jetstream.JetStream) {
+	if js == nil {
+		b.jsp.Store(nil)
+		return
+	}
+	b.jsp.Store(&jsHandle{js: js})
+}
+
+// withholdSharedInboxSecrets strips the credential-bearing directive from a register reply
+// that is about to be published into the SHARED inbox space.
+//
+// origin: prerelease audit external review B-1. ProxyDirective carries the raw tunnel
+// Token and every subscriber's Shadowsocks PSK, and the N-1 compatibility grant
+// (auth.LegacyInboxAllow) makes `_INBOX.>` readable by any connection that simply declines
+// to send auth.InboxCapableMarker — no credential, no membership, a freshly minted nkey is
+// enough. Those secrets do not rotate, so the disclosure would outlive the window.
+//
+// The register still SUCCEEDS. That is the load-bearing half: a refusal would keep the node
+// from ever reaching ONLINE, and `tether node upgrade` — the one command that fixes this —
+// travels the control plane, so refusing would strand a pre-cutover fleet with no in-band
+// upgrade path. Only the proxy/expose data plane is withheld, and it returns on the next
+// register once the agent asks on a private inbox.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count exactly. It is also extracted rather than inlined because
+// handleRegister is one maintidx point below the god-function threshold, and this block is
+// what pushed it over — the gate's whole purpose is that an eleventh god function requires
+// a deliberate edit, so the right answer to it firing is a name, not an exemption.
+func withholdSharedInboxSecrets(b *Broker, resp *proto.NodeRegisterResp, reply, sid, nid string) {
+	if resp.Proxy == nil || auth.IsPrivateInboxSubject(reply) {
+		return
+	}
+	resp.Proxy = nil
+	resp.Code = proto.CodeLegacyInboxNoSecrets
+	// WARN, not Debug: this is the operator's only signal that a node's data plane is
+	// degraded and why, and the remedy is theirs to run. The reply subject is logged
+	// because it IS the evidence — an `_INBOX.` prefix is what says this agent predates
+	// the per-identity inbox.
+	b.cfg.Logger.Warn("broker: withheld the proxy directive from a shared-inbox register — "+
+		"its tunnel token and subscriber PSKs would be readable by any connection on this "+
+		"deployment; the node is ONLINE and controllable, upgrade it to restore expose/proxy",
+		"sid", sid, "nid", nid, "reply", reply)
+}
+
+// clusteredJetStreamBootWait bounds how long a CLUSTERED broker waits at boot for JetStream
+// to become available before treating its absence as fatal.
+//
+// Bounded, not unbounded, because the same absence has two causes and only one of them
+// recovers: a mesh that has not formed yet self-heals, and a node that a survivor
+// force-singled out never will. An unbounded wait would hide the second behind a process
+// that looks alive but serves nothing — worse than the crash loop, because at least the
+// crash loop is visible in `systemctl status`.
+// VARS, NOT CONSTS, ONLY so the unit test can shrink them — the same reason and the same
+// shape as authcallout's pinGlobalPerSecond/pinGlobalBurst. Nothing in production writes
+// them; a 90-second test would otherwise be the reason this behaviour goes untested.
+var (
+	// WHAT THE BOUND IS FOR. The defect it replaced was a crash loop: exit 70, systemd
+	// revives after 2s, forever, with the diagnosis arriving only in a log nobody correlates
+	// (measured NRestarts 137). What fixes that is being BOUNDED and SAYING WHY — hence the
+	// per-attempt progress line below, which is what actually lets an observer tell a broker
+	// that is waiting from one that has hung.
+	//
+	// A CORRECTION WORTH KEEPING, because the wrong version of it was briefly written here
+	// and acted on. This was cut to 30s on the theory that 90s "collided head-on" with drill
+	// 95's `poll_until 90` for a new `broker: ready` line — a broker that waits 90s without
+	// printing ready would consume the whole budget of whoever is watching. That story is
+	// wrong, and the deploy-tier logs say so: drill 95 kills tether-broker, NOT nats-server,
+	// so JetStream is never absent and this wait is NEVER ENTERED there. Measured on a quiet
+	// host: SIGKILL 16:27:43 -> `broker: ready` 16:27:45.787, i.e. 2.8s end to end, with zero
+	// "still waiting for JetStream" lines in the whole run. The red that prompted the change
+	// was concurrent load on the drill host (a full `go test` and three stale drill instances
+	// running alongside), not this constant — 95 is GREEN at both values once the host is
+	// quiet. So the value goes back to the one chosen with R2-M3's reasoning and validated by
+	// the §9 drill evidence, and the guard below now pins the property that is actually true
+	// (the wait is observable) rather than a ratio derived from a collision that does not
+	// happen.
+	clusteredJetStreamBootWait  = 90 * time.Second
+	clusteredJetStreamBootRetry = 2 * time.Second
+)
+
+// enableJetStream probes JetStream once and, on success, publishes the handle and runs the
+// boot reconciles. A missed probe is NOT an error: single mode degrades to core publish
+// (P4-P6 behaviour), and cluster mode decides what to do about it at its own gate.
+//
+// It returns an error only for a failure that is not "JetStream is not there" — today just
+// the events-stream ensure, which is a real problem with a JetStream that IS answering.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count exactly.
+func enableJetStream(ctx context.Context, b *Broker, nc *nats.Conn) error {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		// jetstream.New is purely client-side scaffolding and does no I/O, so this is
+		// unreachable in practice. It degrades to "no JetStream" — byte-for-byte the outcome
+		// the previous `if js, err := jetstream.New(nc); err == nil { … }` shape produced by
+		// simply skipping the block. Making it a boot failure would be a behaviour change:
+		// single mode is supposed to fall back to core publish, and cluster mode already has
+		// its own actionable fatal at the brokerJS(b)==nil gate.
+		// (Logging the error is also what keeps nilerr quiet without a //nolint: the error is
+		// consumed, not swallowed.)
+		b.cfg.Logger.Debug("broker: JetStream client scaffolding unavailable", "err", err)
+		return nil
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 1*time.Second)
+	_, infoErr := js.AccountInfo(probeCtx)
+	cancelProbe()
+	if infoErr != nil {
+		b.cfg.Logger.Debug("broker: JetStream not available; audit falls back to core publish",
+			"err", infoErr)
+		return nil
+	}
+	// PUBLISHED ONLY AFTER THE EVENTS STREAM EXISTS.
+	//
+	// origin: prerelease audit broker-core/BC-F2. Storing the handle first opens a window in
+	// which publishAudit takes the JetStream path against a stream that has not been created
+	// yet: the publish returns ErrNoStreamResponse and pubSysEvent only Warns — it does not
+	// fall back to core publish — so the event is lost outright rather than degraded.
+	// Ordering the store after the ensure costs nothing and removes the window entirely.
+	ensureCtx, ensureCancel := context.WithTimeout(ctx, 5*time.Second)
+	if eerr := jsstream.EnsureEventsStream(ensureCtx, js, jsstream.ReplicasSingle); eerr != nil {
+		ensureCancel()
+		return fmt.Errorf("broker: ensure events stream: %w", eerr)
+	}
+	ensureCancel()
+	setBrokerJS(b, js)
+	b.cfg.Logger.Info("broker: JetStream enabled")
+	if rerr := b.reconcileHistoryStreamsOnBoot(ctx); rerr != nil {
+		b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", rerr)
+	}
+	// file-transfer-plan §Object bucket lifecycle G.2 — reap leftover OBJ_xfer-* streams
+	// from a previous crash.
+	if n, rerr := b.reconcileXferObjects(ctx); rerr != nil {
+		b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", rerr)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
+	}
+	return nil
+}
+
+// waitForClusteredJetStream retries the boot probe until JetStream answers or the budget
+// runs out. It reports nothing: the caller's existing gate reads brokerJS(b) and produces
+// the actionable fatal if this did not help.
+//
+// origin: prerelease audit external review follow-up, found by the deploy tier. The boot
+// path probed JetStream EXACTLY ONCE with a 1s timeout while cluster mode treats a miss as
+// FATAL, so a meta quorum that reformed a few seconds late made the broker exit 70, systemd
+// revive it under Restart=always, and the two loop forever. Drill 95 measured NRestarts
+// reaching 137 with the ready line never printed again — and the fatal's own text says the
+// case is TRANSIENT and "JS self-heals once quorum returns" while telling the operator to
+// `systemctl stop` the service. A product that can name its own transient state has to wait
+// for it rather than hand the operator a crash loop and call that a diagnosis.
+//
+// WHAT MADE IT VISIBLE, and why the fix is not "pin the old server": the regression arrived
+// with a nats-server pin bump (v2.10.22 -> v2.14.5), under which the N=2 meta quorum reforms
+// more slowly after a broker SIGKILL. The pin went back, but the single-shot probe was the
+// real defect — any loaded host, slow route mesh, or rolling restart reaches it on ANY
+// server version. Two separable causes, both closed.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count exactly.
+// lastErr is the error the first attempt produced (nil when JetStream simply did not
+// answer). It is carried through and returned so the caller's fatal can name it: "the mesh
+// never formed" and "JetStream answered but would not create the stream" are different
+// operator actions, and the ranked differential alone cannot distinguish them.
+//
+// EVERY error inside the loop is treated as transient — origin: R2-M3. The first version
+// returned on an ensure failure, which meant the one bounded retry covered only the
+// "AccountInfo does not answer" shape and left "answers, but the stream will not ensure"
+// exiting immediately. Both are the same situation from the operator's chair: a cluster
+// that is still settling. The bound is what keeps this honest; inside the bound there is no
+// reason to prefer one transient over another.
+func waitForClusteredJetStream(ctx context.Context, b *Broker, nc *nats.Conn, lastErr error) error {
+	// THE DIAGNOSIS IS PRINTED NOW, not only if the wait runs out. It is what tells the
+	// operator whether waiting can possibly help — a mesh that has not formed self-heals, a
+	// force-singled-out node never will — and those call for opposite actions. Emitting it
+	// only with the fatal delivered the advice exactly when it had stopped being useful.
+	b.cfg.Logger.Warn("broker: JetStream is not available yet; waiting before treating it as fatal",
+		"budget", clusteredJetStreamBootWait, "diagnosis", clusteredJetStreamDiagnostic(b))
+	deadline := b.cfg.Now().Add(clusteredJetStreamBootWait)
+	for {
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(clusteredJetStreamBootRetry):
+		}
+		// SAY SOMETHING ON EVERY ATTEMPT. A silent wait is indistinguishable from a hang to
+		// anything watching the process, and "the broker went quiet for 30 seconds" is exactly
+		// what an operator escalates. The remaining budget is in the line so the reader can
+		// tell how much patience the process still has.
+		b.cfg.Logger.Info("broker: still waiting for JetStream",
+			"remaining", time.Until(deadline).Truncate(time.Second))
+		if err := enableJetStream(ctx, b, nc); err != nil {
+			// KEEP GOING. An ensure failure against an answering JetStream is exactly the
+			// "cluster is still settling" case this budget exists for; returning here is what
+			// R2-M3 found still exiting into the crash loop. Remember it for the diagnosis.
+			lastErr = err
+			b.cfg.Logger.Warn("broker: JetStream boot retry", "err", err)
+		} else if brokerJS(b) != nil {
+			b.cfg.Logger.Info("broker: JetStream became available during the boot wait")
+			return nil
+		}
+		if !b.cfg.Now().Before(deadline) {
+			b.cfg.Logger.Warn("broker: JetStream did not become available within the boot budget",
+				"budget", clusteredJetStreamBootWait, "last_err", lastErr)
+			return lastErr
+		}
+	}
+}
+
+// clusteredJetStreamDiagnostic is the ACTIONABLE error a clustered broker dies with when
+// JetStream never became available, and — since the boot wait — also the WARN it prints the
+// moment it starts waiting.
+//
+// ACTIONABLE (v0.4.4): the bare "enable JetStream" message cost a multi-step incident
+// diagnosis. The usual cause is a lone N=1 broker whose nats.conf still carries a
+// `cluster{}` block — a single node cannot form the clustered JetStream meta quorum, so JS
+// never comes up. Name the real remedy (de-cluster to standalone) vs. the N>=2
+// mesh-not-formed case.
+//
+// EXTRACTED so the operator sees it WHILE the broker waits, not only 90 seconds later when
+// it gives up. That is not cosmetic: the diagnosis is what tells them whether waiting can
+// possibly help (a mesh that has not formed) or cannot (force-singled out), and the two
+// call for opposite actions. Emitting it only at the fatal meant the advice arrived exactly
+// when it had stopped being useful.
+// origin: prerelease audit external review follow-up (deploy tier).
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count exactly.
+func clusteredJetStreamDiagnostic(b *Broker) error {
+	// NIL-SAFE ON PURPOSE. Production reaches this only with the cluster runtime wired, but
+	// a DIAGNOSTIC that can panic takes the process down with a stack trace instead of the
+	// actionable sentence it exists to print — strictly worse than the condition it
+	// describes, and reached exactly when things are already going wrong.
+	if b.cl == nil || b.cl.node == nil {
+		return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE and the " +
+			"cluster runtime is not wired, so the usual voters/peers differential cannot be computed. " +
+			"Verify the routes in /etc/tether/nats.d/nats.conf and that peer brokers are reachable")
+	}
+	voters, verr := b.cl.node.NumVoters()
+	if verr == nil && voters <= 1 {
+		return n1ClusteredJetStreamFatal()
+	}
+	// G2 #10: voters>=2 but no JetStream at boot is the force-single-EJECTED trap — this
+	// node's on-disk raft config still lists {this, peer(s)} (voters>=2), but a survivor may
+	// have force-singled to {survivor} WITHOUT it, so clustered JS can never reach
+	// quorum-of-2. Ejection is NOT locally provable (no quorum; peers unreachable by
+	// design), so emit a RANKED DIFFERENTIAL (transient-mesh vs ejected) from the local raft
+	// config only — never a hard assertion — and point at the rejoin runbook.
+	if verr == nil && voters >= 2 {
+		if cfg, cerr := b.cl.node.RaftConfiguration(); cerr == nil {
+			var peers []string
+			for _, s := range cfg {
+				if s.NodeID != b.selfID {
+					peers = append(peers, s.NodeID)
+				}
+			}
+			if len(peers) > 0 {
+				return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE at boot with "+
+					"voters=%d — this node's on-disk raft config still lists peer(s) %v, yet clustered JetStream cannot "+
+					"reach quorum. TWO likely causes: (1) TRANSIENT — the NATS routes mesh is not yet formed / peers are "+
+					"down (verify routes in /etc/tether/nats.d/nats.conf and that peers are up; JS self-heals once quorum "+
+					"returns); or (2) EJECTED — a survivor ran force-single WITHOUT this node, orphaning it (a restart will "+
+					"NOT self-heal). STOP the crash-loop now: systemctl stop tether-broker. Confirm which on a survivor via "+
+					"`tether cluster status --remote`; if this node was force-singled out, WIPE its stale raft state and "+
+					"rejoin: `tether cluster recovery rejoin prepare --self-id %s --dump-divergent <file>`, then `tether "+
+					"cluster join approve` from the leader (see docs/cluster-runbook.md)", voters, peers, b.selfID)
+			}
+		}
+	}
+	return fmt.Errorf("broker: cluster mode requires JetStream, but it is UNAVAILABLE (voters=%d) — the "+
+		"NATS routes mesh is likely not formed (clustered JetStream meta needs quorum). Verify the routes "+
+		"in /etc/tether/nats.d/nats.conf and that peer brokers are reachable; see `tether cluster status` / "+
+		"`tether cluster doctor`", voters)
 }

@@ -2,9 +2,11 @@ package d3_test
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,12 +81,37 @@ func signedAgentReq(t *testing.T, clientPub, sid, nid, pin string) string {
 	rc.UserNkey = ephPub
 	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
 	rc.ConnectOptions = jwt.ConnectOptions{Name: "tether-agent:" + sid + ":" + nid, Nkey: clientPub, Token: pin}
+	// The nonce and the client's signature over it, exactly as nats-server forwards them
+	// when a client presented `sig` on CONNECT. Every real tether dial signs, so a
+	// hand-built request that does not is not "a simpler version of the same thing" — it
+	// is a shape no client produces, and the handler denies it at the identity check
+	// before reaching whatever this test is about.
+	// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1.
+	kp, ok := d3ClientKeys[clientPub]
+	if !ok {
+		t.Fatalf("no seed registered for client nkey %q; mint it with freshClient", clientPub)
+	}
+	nonce := "d3-nonce-" + nid
+	sig, err := kp.Sign([]byte(nonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.ClientInformation.Nonce = nonce
+	rc.ConnectOptions.SignedNonce = base64.RawURLEncoding.EncodeToString(sig)
 	tok, err := rc.Encode(serverKp)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return tok
 }
+
+// d3ClientKeys keeps the private half of every client nkey freshClient mints, so
+// signedAgentReq can sign a nonce for it. Guarded by d3ClientKeysMu because table tests
+// in this package run subtests in parallel.
+var (
+	d3ClientKeysMu sync.Mutex
+	d3ClientKeys   = map[string]nkeys.KeyPair{}
+)
 
 func mustDecodeResp(t *testing.T, respJWT string) *jwt.AuthorizationResponseClaims {
 	t.Helper()
@@ -99,7 +126,11 @@ func freshClient(t *testing.T) (pub, fp string) {
 	t.Helper()
 	kp, _ := nkeys.CreateUser()
 	pub, _ = kp.PublicKey()
-	kp.Wipe()
+	// NOT Wiped: signedAgentReq needs the private half to sign the server nonce, the way
+	// a real client does. See d3ClientKeys.
+	d3ClientKeysMu.Lock()
+	d3ClientKeys[pub] = kp
+	d3ClientKeysMu.Unlock()
 	fp, err := auth.FingerprintFromActor(pub)
 	if err != nil {
 		t.Fatal(err)

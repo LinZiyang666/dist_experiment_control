@@ -31,8 +31,13 @@ func extractBrokerYAMLTemplate(t *testing.T) string {
 	lines := strings.Split(string(body), "\n")
 	start := -1
 	for i, ln := range lines {
-		if strings.Contains(ln, `cat > "$ETC_DIR/broker.yaml" <<EOF`) {
-			start = i + 1
+		// The write now goes through config_dest, which sets CONFIG_DEST rather than
+		// naming the path inline (prerelease audit DRD-F1 — an existing broker.yaml is
+		// kept and the new content lands as broker.yaml.new). The marker is the
+		// config_dest call, which still names the file; the heredoc opener one line
+		// below no longer does.
+		if strings.Contains(ln, `config_dest "$ETC_DIR/broker.yaml"`) {
+			start = i + 2 // skip the `cat > "$CONFIG_DEST" <<EOF` line
 			break
 		}
 	}

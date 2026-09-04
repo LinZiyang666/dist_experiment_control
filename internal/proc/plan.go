@@ -3,6 +3,7 @@ package proc
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -69,16 +70,34 @@ func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 // carries the pid (a leader-side decision before proposing); an existing
 // non-RUNNING row yields the idempotent UPDATE (WHERE status='RUNNING' makes Apply
 // a no-op), matching MarkExited's RowsAffected==0 path. `when` is baked RAW.
-func PlanMarkExited(db *sql.DB, pid string, exitCode int, when time.Time) (*cluster.Command, error) {
+//
+// sid FENCES THE PLAN THE SAME WAY MarkExited FENCES THE DIRECT WRITE — see the long
+// comment there. Both the existence decision and the baked UPDATE are scoped, so the
+// cluster path and the single-node path refuse exactly the same set of writes; a fence
+// that held on only one of them would be no fence at all, because which one runs is a
+// deployment property the attacker gets to choose by picking a broker.
+//
+// AN EMPTY sid IS REFUSED (ErrUnscopedExit). It used to be an N-1 escape hatch that
+// reproduced the old unscoped predicate, on the reasoning that only a peer broker inside
+// the cluster's mTLS/system-account boundary can present one. That is true and it is not
+// enough: see ErrUnscopedExit for why a trusted transport does not make the payload
+// trustworthy, and for why refusing is both the only available fix and a self-healing
+// one. Nothing on THIS release ever produces an empty sid — exec.go takes it from the
+// SUBJECT, which NATS ACLs pin to the publisher's own session.
+func PlanMarkExited(db *sql.DB, pid, sid string, exitCode int, when time.Time) (*cluster.Command, error) {
+	if sid == "" {
+		return nil, ErrUnscopedExit
+	}
 	var any int
-	switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=?`, pid).Scan(&any); err {
-	case nil:
-	case sql.ErrNoRows:
+	err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=? AND sid=?`, pid, sid).Scan(&any)
+	switch {
+	case err == nil:
+	case errors.Is(err, sql.ErrNoRows):
 		return nil, ErrNotFound
 	default:
 		return nil, fmt.Errorf("proc: plan mark exited lookup: %w", err)
 	}
-	sql, err := markExitedSQL(pid, exitCode, when)
+	sql, err := markExitedSQL(pid, sid, exitCode, when)
 	if err != nil {
 		return nil, err
 	}
@@ -124,14 +143,28 @@ func PlanRefileStatements(sid, from, to string, pids []string) ([]cluster.Statem
 // markExitedSQL is the ONE canonical renderer for a MarkExited UPDATE, shared by
 // PlanMarkExited (single exit) and PlanReconcileBatch (G.1 reconcile) so the two
 // paths cannot drift into byte-different SQL (d2-plan §2).
-func markExitedSQL(pid string, exitCode int, when time.Time) (string, error) {
+// AN EMPTY sid IS REFUSED HERE TOO, and the redundancy is the point: this renderer is
+// the last place the unscoped predicate could come back. Both callers already reject one
+// (PlanMarkExited explicitly, PlanReconcileBatch because it renders a batch that is
+// scoped to one session by construction), so this branch is unreachable today — which is
+// exactly the condition under which a future caller would add a third path, pass "",
+// and get a fleet-wide UPDATE with every existing test still green.
+// origin: prerelease audit external review B-2.
+func markExitedSQL(pid, sid string, exitCode int, when time.Time) (string, error) {
+	if sid == "" {
+		return "", ErrUnscopedExit
+	}
 	pidLit, err := cluster.LitText(pid)
 	if err != nil {
 		return "", fmt.Errorf("proc: mark exited literal: %w", err)
 	}
+	sidLit, err := cluster.LitText(sid)
+	if err != nil {
+		return "", fmt.Errorf("proc: mark exited sid literal: %w", err)
+	}
 	return `UPDATE processes SET status='EXITED', exit_code=` + cluster.LitInt(int64(exitCode)) +
 		`, ended_at=` + cluster.LitTime(when) +
-		` WHERE pid=` + pidLit + ` AND status='RUNNING'`, nil
+		` WHERE pid=` + pidLit + ` AND sid=` + sidLit + ` AND status='RUNNING'`, nil
 }
 
 // ExitMark is one resolved G.1 reconcile decision: a process to transition to
@@ -205,7 +238,7 @@ func PlanReconcileBatch(in ReconcileBatchInput) (*cluster.Command, error) {
 	sort.Slice(marks, func(i, j int) bool { return marks[i].PID < marks[j].PID })
 	stmts := make([]cluster.Statement, len(marks))
 	for i, m := range marks {
-		sql, err := markExitedSQL(m.PID, m.ExitCode, m.When)
+		sql, err := markExitedSQL(m.PID, in.SID, m.ExitCode, m.When)
 		if err != nil {
 			return nil, err
 		}

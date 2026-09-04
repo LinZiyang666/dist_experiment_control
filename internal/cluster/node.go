@@ -176,6 +176,7 @@ func New(cfg Config) (*Node, error) {
 		dbPath:   cfg.DBPath,
 		appliers: defaultAppliers(),
 		logger:   logger,
+		localID:  string(cfg.LocalID),
 	}
 	rc := raftConfig(cfg)
 
@@ -311,14 +312,48 @@ func orDur(v, def time.Duration) time.Duration {
 	return def
 }
 
-// IsNotLeader reports whether err is the raft "not the leader" family
-// (raft.ErrNotLeader / raft.ErrLeadershipLost) that Apply/Propose surface
-// unwrapped on a follower or a just-deposed leader. It is the seam-building
-// primitive the broker/D9 uses to translate a Propose failure into the
-// raft-free authcallout.ErrNotLeader sentinel (architecture L-2 keeps raft out of
-// authcallout): `if cluster.IsNotLeader(err) { return authcallout.ErrNotLeader }`.
+// IsNotLeader reports whether err means "THIS WRITE WAS NOT COMMITTED BY A LEADER,
+// retry" — a SEMANTIC predicate, deliberately not an enumeration of two sentinels.
+// It is the seam-building primitive the broker/D9 uses to translate a Propose
+// failure into the raft-free authcallout.ErrNotLeader sentinel (architecture L-2
+// keeps raft out of authcallout): `if cluster.IsNotLeader(err) { return
+// authcallout.ErrNotLeader }`.
+//
+// WHY THE PREDICATE IS SEMANTIC AND NOT A LIST. origin: pre-release audit
+// broker-cluster-write/L3-F1 (+ the verifier's second sentinel). It used to name
+// exactly ErrNotLeader and ErrLeadershipLost, and the two raft errors below fell
+// through it into `store_error` — which handleRegister answers verbatim and the
+// agent's register loop treats as an AUTHORITATIVE REJECT: internal/agent's Run
+// returns, the process exits non-zero, and the unit is Type=simple with systemd's
+// default KillMode=control-group, so the restart takes every workload in the
+// agent's cgroup with it. A routine `cluster drain` is exactly the moment the whole
+// fleet is re-registering. That is the cloned-credential X4 regression shape (a
+// dropped ErrNotLeader mapping) with a different trigger, which is why the fix is a
+// predicate about MEANING rather than one more name on a list.
+//
+// DELIBERATELY NOT INCLUDED, so the list is not read as "incomplete":
+//   - raft.ErrRaftShutdown — this process is going away; retrying inside it is
+//     meaningless, and calling it retriable would spin a doomed loop.
+//   - raft.ErrAbortedByRestore — unreachable here: tether never calls
+//     Raft.Restore (`grep -rn "\.Restore(" internal/` finds only fsm.Restore,
+//     which is raft calling US).
 func IsNotLeader(err error) bool {
-	return errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost)
+	return errors.Is(err, raft.ErrNotLeader) ||
+		errors.Is(err, raft.ErrLeadershipLost) ||
+		// A `cluster drain` / `retire` / `transfer-leader` makes raft reject EVERY
+		// Apply with this for up to ElectionTimeout while the OLD leader still
+		// reports State()==Leader. (raft@v1.7.3 leaderLoop rejects queued applies while
+		// a transfer is in flight; the earlier citation of raft.go:693-695 was wrong —
+		// that arm is the transfer-vs-transfer rejection, not the Apply path. round 2,
+		// H-5.) It carries no Unwrap relation to the two above,
+		// so errors.Is could not have seen it.
+		errors.Is(err, raft.ErrLeadershipTransferInProgress) ||
+		// The log never entered applyCh at all (raft@v1.7.3 api.go:845-851), so it
+		// was DEFINITELY not committed — the least ambiguous retriable error raft
+		// has. Reachable whenever the raft main thread stalls past applyTimeout
+		// (10s): fsync stalls, snapshot installs, disk pressure — the very state
+		// this cluster already raises disk_pressure for.
+		errors.Is(err, raft.ErrEnqueueTimeout)
 }
 
 // ErrForwardNotLeader is the raft-free sentinel a broker-side forwarder (§4.1 D4,
@@ -547,6 +582,7 @@ func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
 		dbPath:   n.cfg.DBPath,
 		appliers: defaultAppliers(),
 		logger:   n.logger,
+		localID:  string(n.cfg.LocalID),
 	}
 	rc := raftConfig(n.cfg)
 	// RecoverCluster performs NO network IO (the transport only feeds snapshot peer-encode) → a throwaway

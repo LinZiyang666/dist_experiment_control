@@ -17,6 +17,20 @@ type SessionCreateResp struct {
 	OwnerFP   string    `json:"owner_fp"`
 	CreatedAt time.Time `json:"created_at"`
 	Error     string    `json:"error,omitempty"`
+	// Code is the STABLE identifier for the refusal, separate from the human sentence in
+	// Error. Additive omitempty: an older broker omits it and the ctl falls back to the
+	// leading token of Error, which is how every code on this message has been carried
+	// until now.
+	//
+	// origin: prerelease audit increment 2 internal review, reported by five lanes
+	// (admission-enforcement/L9-F7, admission-product/L8-F8, adminsock-cli/L10-F5,
+	// empirical n1-interop/F2 and targeted-suites/F2). This message had no Code, so
+	// cmd/tether passed the whole Error string as BOTH the code and the message: the
+	// exit-class table never matched, every refusal exited 70 — which docs/usage.md §9.13
+	// defines as "back off and retry" — and the sentence was printed to the user twice.
+	// The new `not_allowed` refusal made that visible because it is PERMANENT: an
+	// automation retrying it retries forever.
+	Code string `json:"code,omitempty"`
 }
 
 // NodeRegisterReq — agent pub on ctrl.s.<S>.node.<N>.register.req.
@@ -1137,9 +1151,16 @@ type PushPrepareReq struct {
 	Force      bool   `json:"force,omitempty"`       // overwrite existing regular file
 	Tier       string `json:"tier"`                  // "a" | "b" — chosen by ctl, validated by agent
 	InlineData []byte `json:"inline_data,omitempty"` // tier A only (base64 over JSON)
-	Bucket     string `json:"bucket,omitempty"`      // tier B only; broker-assigned
-	ObjectKey  string `json:"object_key,omitempty"`  // tier B only; broker-assigned
-	ChunkSize  int    `json:"chunk_size,omitempty"`  // tier B hint
+	// Bucket / ObjectKey are BROKER-ASSIGNED and any ctl-supplied value is
+	// DISCARDED — the same rule as ActorFP below. handlePushReq clears both before
+	// the tier-b arm refills them, because the tracker serialises per bucket by
+	// plain string compare with no session in it, so a client-chosen bucket name is
+	// a cross-session denial of service (prerelease audit broker-transfer/BT-F2).
+	// NOTE this does NOT apply to TransferCommitReq's fields of the same names:
+	// there they are ctl-supplied and required.
+	Bucket    string `json:"bucket,omitempty"`     // tier B only; broker-assigned, ctl value discarded
+	ObjectKey string `json:"object_key,omitempty"` // tier B only; broker-assigned, ctl value discarded
+	ChunkSize int    `json:"chunk_size,omitempty"` // tier B hint
 
 	// ActorFP — broker-stamped at forward time (same convention as ExecReq.ActorFP).
 	// ctl-supplied value is discarded.

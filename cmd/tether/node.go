@@ -433,7 +433,22 @@ func waitForUpgradeCommit(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid, ne
 	// as a canary failure and leaves the fleet untouched. Same-tag fleet
 	// reinstalls are done node-by-node until a wire-level registration
 	// generation exists (recorded as the long-term fix).
-	if newVersion != "" && newVersion == startRelease {
+	// proto.SameRelease, and the POLARITY HERE IS THE OPPOSITE of the sites that comment
+	// was written for — origin: prerelease audit round 2, K-F12. Everywhere else
+	// SameRelease widens an "already at target, skip" test, where a false NEGATIVE means
+	// redundant work. At this one it widens a REFUSAL, so widening produces MORE
+	// UNCONFIRMED verdicts, and the pasted claim that it "prevents reporting a successful
+	// upgrade as unconfirmed" reads exactly backwards.
+	//
+	// It is still right, for a reason that has to be stated rather than inherited:
+	// `v0.5.1` and `0.5.1` ARE the same release, so a node reporting one when the ctl
+	// asked for the other really is a same-tag re-push with no re-register proof — the
+	// case this branch exists to refuse. A `==` comparison would have called them
+	// different releases and gone on to wait for a re-register that cannot be
+	// distinguished from the old row, which is the hollow COMMITTED the paragraph above
+	// describes. So SameRelease turns a WRONG confirmation into an honest refusal; it does
+	// not turn a refusal into a confirmation. (DRD-F2/F3 converted the family.)
+	if newVersion != "" && proto.SameRelease(newVersion, startRelease) {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 			"⚠ %s: node already reports %s — a same-tag re-push cannot be confirmed via release change.\n"+
 				"  UNCONFIRMED: staged + smoke passed, but re-register proof is unavailable; verify via the\n"+
@@ -477,12 +492,15 @@ func waitForUpgradeCommit(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid, ne
 			continue
 		}
 		if newVersion != "" {
-			if entry.ReleaseVersion == newVersion {
+			if proto.SameRelease(entry.ReleaseVersion, newVersion) {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 					"✔ %s: registered as %s — upgrade COMMITTED\n", nid, entry.ReleaseVersion)
 				return nil
 			}
-		} else if startRelease != "" && entry.ReleaseVersion != "" && entry.ReleaseVersion != startRelease {
+			// SameRelease — origin: prerelease audit round 2, the K-F* sweep's gate. A
+			// v-prefix difference alone is NOT a release change, and reading it as one
+			// mints a hollow COMMITTED for a host that never moved.
+		} else if startRelease != "" && entry.ReleaseVersion != "" && !proto.SameRelease(entry.ReleaseVersion, startRelease) {
 			// The legacy fallback is meaningful ONLY against a known non-empty
 			// baseline (external review F4): with startRelease=="", every
 			// ordinary stale ONLINE row is "different" on the first poll and

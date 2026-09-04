@@ -9,6 +9,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/proxysub"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -33,7 +34,14 @@ func proxyTestBroker(t *testing.T) (*nats.Conn, string /*ownerPub*/, string /*si
 	t.Cleanup(cancel)
 	go func() { _ = b.Run(ctx) }()
 	waitNATSReady(t, url)
-	nc, err := nats.Connect(url)
+	// DIAL LIKE A POST-CUTOVER CLIENT. Production ctl/agent connections carry the
+	// per-identity inbox prefix (internal/natsinbox.InboxConnectOptions), and since
+	// external review B-1 the broker will not put a credential-bearing directive into any
+	// other reply space — so a test that dialled with nats.go's default `_INBOX` would be
+	// exercising the DEGRADED path while claiming to test the normal one, and every
+	// assertion about a minted proxy directive would fail for a reason unrelated to what
+	// it is checking.
+	nc, err := nats.Connect(url, nats.CustomInboxPrefix(auth.InboxPrefixFor(ownerPub)))
 	if err != nil {
 		t.Fatal(err)
 	}

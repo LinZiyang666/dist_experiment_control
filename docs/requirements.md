@@ -194,7 +194,28 @@
 
 | 命令 | 语义 | 权限 |
 |---|---|---|
-| `ctl session create <name>` | 创建，自动设 owner = 自己 pubkey，要求交互输入 PIN | 任意身份 |
+| `ctl session create <name>` | 创建，自动设 owner = 自己 pubkey，要求交互输入 PIN | **已准入的指纹**（见下） |
+
+> **`session create` 的准入（发布前审计 round 2）**：此前这一格写的是「任意身份」，而 handler 里
+> **确实没有任何准入检查**——控制面按设计在公网上，所以任何持语法合法 nkey 的连接都能命名一个
+> session、成为其 owner，并据此铸出 activated-member 与（用它自己刚设的 PIN）agent 两套权限模板。
+> 结果是本文档与审计中每一处把「activated member / provisioned agent」当作可信主体的推理，
+> 谈论的其实是整个互联网。
+>
+> 现在只有 `session_creators` 表里的指纹可以创建。**升级零动作**：broker 启动后由 **leader** 经 raft
+> 做一次性回填，把每个已拥有 session 的 owner 指纹纳入，marker 与数据行在**同一条 raft entry** 里。
+> （外审 m-2 订正：此处原写「migration 0019 自动纳入」，与实现相反——0019 只建**空表**。那不是措辞
+> 问题：按原文，运维无从判断回填是否发生过，也看不出标准滚动升级会漏掉它，而漏掉正是外审 M-2。
+> 回填不能放在 migration 里的三条理由见 `0019_session_creators.sql` 与
+> `docs/distributed-broker-architecture.md` §5。）回填是**level-triggered** 的：它注册为 leader-only
+> 的 reconcile pass，谁持有 leadership 谁就一直问「做完了吗」直到 marker 提交，因此一次瞬态 Propose
+> 失败或一次 followers-first/leader-last 的滚动顺序都不会让它永久落空。**marker 提交之前**，broker 对
+> 「已经拥有 session 的 owner」放行（fail-safe grandfather，只此一类，陌生身份照常拒绝）；marker 落地
+> 之后，表是唯一权威——所以被 `--remove` 撤销过的 owner 不会被这条过渡规则复活。
+> **全新 broker 从空表开始**，运维在 broker 主机上用
+> `tether admin session-allow <fp>` 准入第一个人——它在 root-only 0600 的 admin socket 上，
+> 因为「准入一个指纹」是运行 broker 的人的动作；放到控制面上就需要它自己的准入规则，递归得有个头。
+> 加入**已存在**的 session 仍然是 PIN 的事，不受此表影响。
 | `ctl session list` | 列出可见 session | 任意身份 |
 | `ctl session login <name>` | 首次用 PIN 挑战通过后加 pubkey 到 allowed_pubkeys；之后免 PIN | 任意身份 |
 | `ctl session switch <name>` | 切换当前活跃 session | member+ |
@@ -328,6 +349,62 @@
   保持**精确相等硬拒**。它准入的是运维正在添置的**新机器**——重装即匹配，拒绝不会卡住任何已部署
   节点的回滚；而放行会让 FSM schema 迁移在混 release 集群里 fail-stop（外审 B3 论证，见
   `internal/broker/clusterstatus.go` versionSkewRefusal）。窗口条款管的是**在线互通**，不管集群成员准入。
+
+- **本 release 的 N-1 例外恰好一条，且是内容级而非凭据级**（外审 B-1 订正——此处原写「没有 N-1
+  例外」，与本条自己末尾登记的长寿凭据泄漏直接矛盾；那条矛盾正是外审判 Fail 的两条 Blocker 之一）。
+  例外的确切范围与本 release 为它做的事见本条末尾「窗口内的残留」。先说被**撤销**的那条旧例外
+  （ctl 的 `_INBOX` 回复空间）：
+  它成立的前提是「legacy 授权必然是新方案授权的超集」，而那只在私有 inbox 位于 legacy 通配符
+  **之内**时为真。私有 inbox 现在有自己的**顶层根** `_TINBOX.<a>.<b>`（`auth.InboxRoot`），
+  legacy 授权退回朴素的 `allow _INBOX.>`——两个空间在**第一段**就不相交，不依赖任何 allow/deny 算术。
+  于是「声称自己是旧版」拿到的不是更多权限，而是**另一块**空间，里面只有旧二进制自己放进去的流量；
+  自报版本因此可以安全地由客户端在 CONNECT 里声明（`auth.InboxCapableMarker`，走 `Username`）。
+
+  **中间那版设计（前缀留在 `_INBOX` 内、靠 `deny _INBOX.*.*.>` 兜底）是错的，写在这里以免重犯**：
+  那条 deny 由 nats-server **惰性**装载，而触发判据在 v2.12→v2.14 之间从 `subjectIsSubsetMatch`
+  改成了 `SubjectsCollide`。在旧判据下，订阅 `_INBOX.<受害者哈希>.>` 从不触发装载，该受害者的每一条
+  四段私有回复都照常投递。实测：2.10.22 / 2.11.0 / 2.11.9 / 2.12.0 **全部泄漏**，2.14.0 才兜住——
+  而 `scripts/install.sh` 当时 pin 的正是 2.10.22。**在 `_INBOX.` 之内、服务端 < 2.14 时这个性质
+  做不到**：旧客户端的请求多路复用器必须要三段通配授权，而任何三段通配授权都同时准入
+  `_INBOX.<字面量>.>`。分开的根把它变成主题空间的性质，与服务端版本无关。
+  （「测的服务端 ≠ 发的服务端」这个根因由 `test/architecture/nats_server_pin_test.go` 机械钉住。）
+
+  **代价，如实记账**：`{旧 broker × 新 ctl/agent}` 这一格——旧 broker 只铸 `Sub _INBOX.>`，
+  新客户端订 `_TINBOX.…` 会被**拒绝**（响亮的 permissions violation，不是静默）。
+  `internal/natsinbox.Connect` 因此在连上后自探一次自己的 inbox，被拒就退回浅前缀重连，
+  于是四个混配象限一格不丢。实测见 `test/d3/inbox_isolation_acl_test.go` 的
+  `TestLegacyGrantCannotReachAModernInbox` 与
+  `TestAClientFallsBackToTheSharedInboxAgainstAPreCutoverBroker`（都跑真 nats-server）。
+
+  **窗口内的残留，以及本 release 为它做了什么**（外审 B-1 改写）。先说不能含糊的那一半：共享空间的
+  窃听者**不需要任何凭据**——一条当场生成、从未被准入、不是任何 session 成员的匿名 nkey 就够了，因为
+  legacy 授权是靠 CONNECT 里**自报**拿到的，而攻击者「自报是旧版」只需要**不发** `InboxCapableMarker`。
+  这一点无法用 ACL 收窄：旧客户端在连上**之后**才自选随机回复主题，而 per-connection 权限在 CONNECT
+  时就发完了，没有任何静态授权能表达「只准收你自己那条」。
+
+  所以本 release 不去收窄授权，而是**让长寿凭据不再进入那个空间**。`internal/auth.IsPrivateInboxSubject`
+  是判据（白名单：只认 `_TINBOX.` 根），两个铸造点据此改写：
+
+  - **agent register reply**：回复主题不在私有根时，`NodeRegisterResp.Proxy` 整个省略（它带
+    `Token` 原始 tunnel token 与 `Keys[].Secret` 全部 subscriber PSK），并回 `OK=true` +
+    `Code=legacy_inbox_no_secrets`。**注册仍然成功**——节点照常 ONLINE，控制面（含 `tether node
+    upgrade`，也就是修好它的那条命令）全部可用，只有 proxy/expose 数据面挂起，agent 升级后下一次
+    注册经 `_TINBOX` 就正常拿到。直接拒绝注册是更简单的代码和更坏的结果：它会让整队 agent 失去
+    带内升级路径，与「从 v0.5.0 起必须可有序升级」直接冲突。
+  - **`proxy sub create` 的 `/sub` URL**：同判据。subscriber 照常创建，但 URL（内含 bearer token）
+    不下发，回 `Code=legacy_inbox_no_secrets` 并告知升级 ctl 后 `proxy sub revoke` 重建——**已经在共享
+    总线上出现过的 token 不应该再发一次**。
+
+  剩下的、**本 release 明确承认的 N-1 安全例外**（不是「没有例外」）：尚未升级的 ctl / agent，其
+  **非凭据**回复内容仍在 `_INBOX` 里、对任何声称旧版的连接可读——`tether exec` 的 stdout/stderr、
+  各类 ls 输出都在此列。这**就是 N-1 窗口这个承诺的内涵**（你不可能既继续服务一个把 inbox 放在共享
+  空间的二进制，又让它的回复对共享空间不可见）。它与上面那条的区别是：这些内容**随会话消失**，
+  而 tunnel token / PSK 不会——那才是必须在本版堵死、不能推给下一个 release 的原因。
+
+  **存量部署的一次性动作**：v0.5.0 及更早的 broker 会把 tunnel token 与 PSK 发进共享 `_INBOX`，
+  升到本版**不会**让已经泄漏的旧值失效。因此升级后应轮换一次：`tether proxy off` / `proxy on`
+  重铸 keyset 与 token（见 `docs/broker-ops.md`）。这是运维动作而非代码路径，故记在此处而不是
+  登记成一条未实现的后续项。
 
 ---
 

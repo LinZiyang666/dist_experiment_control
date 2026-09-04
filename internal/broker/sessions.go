@@ -37,6 +37,48 @@ func (b *Broker) handleSessionCreate(msg *nats.Msg) {
 		return
 	}
 
+	// ADMISSION, AND IT COMES BEFORE EVERYTHING ELSE.
+	//
+	// origin: prerelease audit round 2. This handler used to have none at all: a
+	// syntactically valid nkey was the entire test, so anybody reachable on the public
+	// control plane could name a session, become its owner, and from there mint the
+	// activated-member template — and, with the PIN they had just chosen, the AGENT
+	// template too. Every argument in this audit of the form "an activated member is an
+	// authorized principal" was therefore an argument about the internet.
+	//
+	// BEFORE HashPIN on purpose. argon2id costs the broker 0.15-0.3s of the single
+	// serialized callout goroutine and 64 MiB, and this call site was never charged
+	// against the process-wide ceiling that internal/authcallout added for exactly that
+	// reason — so an unadmitted caller could burn broker CPU by the request. Refusing
+	// first means the work is only ever done for somebody allowed to ask for it.
+	//
+	// A READ ERROR REFUSES. A broker that cannot read its own policy table must not be
+	// mistaken for a broker whose table is empty.
+	allowed, aerr := session.MayCreateSession(b.read().SQL(), fp)
+	if aerr != nil {
+		b.cfg.Logger.Error("broker: cannot read the session-creator allow-list", "err", aerr, "fp", fp)
+		b.replyJSON(msg, proto.SessionCreateResp{Code: "store_error", Error: "store_error"})
+		return
+	}
+	if !allowed {
+		// Debug, not Warn — origin: prerelease audit increment 2 internal review,
+		// admission-enforcement/L9-F8 ≡ red-team/REFUTE-F2. This refusal is reachable by
+		// anyone on the internet with a freshly minted nkey and is not rate-limited, so a
+		// Warn per attempt is an anonymous log amplifier: the attacker chooses the volume,
+		// and the lines that matter get buried under it. The refusal itself is the
+		// control; the log line is not.
+		b.cfg.Logger.Debug("broker: refused session create from an unadmitted identity",
+			"fp", fp, "actor", actor)
+		b.replyJSON(msg, proto.SessionCreateResp{
+			Code: "not_allowed",
+			Error: "this identity may not create sessions on this broker.\n" +
+				"  your fingerprint: " + fp + "\n" +
+				"  an operator admits it ON THE BROKER HOST with:\n" +
+				"      sudo tether admin session-allow " + fp,
+		})
+		return
+	}
+
 	var req proto.SessionCreateReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		b.replyJSON(msg, proto.SessionCreateResp{Error: "json_parse: " + err.Error()})
@@ -68,9 +110,9 @@ func (b *Broker) handleSessionCreate(msg *nats.Msg) {
 	// before any audit pub can land. Best-effort: if EnsureHistory
 	// fails the session itself is still created (SQLite committed)
 	// — the boot reconciler will retry on next broker start.
-	if b.js != nil {
+	if brokerJS(b) != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if err := jsstream.EnsureHistoryStream(ctx, b.js, s.SID, jsstream.ReplicasSingle); err != nil {
+		if err := jsstream.EnsureHistoryStream(ctx, brokerJS(b), s.SID, jsstream.ReplicasSingle); err != nil {
 			b.cfg.Logger.Warn("broker: ensure history stream on create",
 				"sid", s.SID, "err", err)
 		}

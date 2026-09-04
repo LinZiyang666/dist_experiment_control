@@ -116,6 +116,12 @@ type ClusterHealthResp struct {
 	// decodeCommand-poison the replicated entry (advance applied_index, skip the SQL), forking its
 	// replica. Additive omitempty: an older broker omits it (false ⇒ treated as NOT capable, fail-closed).
 	PhaseFluidityOps bool `json:"phase_fluidity_ops,omitempty"`
+	// SessionCreatorOps: this broker's binary advertises support for the session-create
+	// admission write (OpSessionCreatorSet). Same mechanism and same fail-closed default as
+	// PhaseFluidityOps above; see cluster.HasSessionCreatorOps for why this op needed a gate
+	// of its own. Additive omitempty: a broker that predates the op omits it, which reads as
+	// false — refuse — which is the correct answer for exactly that broker.
+	SessionCreatorOps bool `json:"session_creator_ops,omitempty"`
 	// AccountNkPub / AccountNkReported (batch B, B4, schema v6) are this broker's auth_callout ACCOUNT
 	// public key — the key it signs every auth_callout response JWT with — and a flag saying it
 	// answered at all.

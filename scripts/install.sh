@@ -48,6 +48,20 @@ PREFIX=""
 SKIP_DOWNLOAD=0
 UNINSTALL=0
 NO_ENABLE=0
+# FORCE_CONFIG=1 lets a re-run overwrite configuration files that already exist. Default 0.
+#
+# origin: prerelease audit deploy-release-docs/DRD-F1 + DRD-F5. A bare re-run used to
+# rewrite broker.yaml, the Caddyfile, nats.d/nats.conf and the unit files
+# unconditionally, so "just re-run install.sh to upgrade" — which the docs suggested —
+# silently reverted every local change: the `broker.cluster` block that makes a node a
+# cluster member, an operator's auth_callout edits, a hand-tuned Caddy site. The node
+# came back up healthy-looking and no longer part of its cluster.
+#
+# The fix is NOT to preserve everything unconditionally: a release that has to correct a
+# unit file (the way G1 #23 shipped `Restart=always`) relies on the rewrite to reach
+# existing machines. So an existing file is kept, the NEW content is written beside it as
+# `<file>.new`, and the banner lists every one of them so an operator can diff and decide.
+FORCE_CONFIG=0
 
 usage() {
     # UNQUOTED heredoc ON PURPOSE: ${VERSION} below must interpolate so --help shows the
@@ -77,6 +91,7 @@ Common:
   --dry-run
   --skip-download
   --uninstall
+  --force-config      overwrite existing config/unit files instead of writing <file>.new beside them
 EOF
 }
 
@@ -93,6 +108,7 @@ while [ $# -gt 0 ]; do
         --source-base)   SOURCE_BASE="$2";   shift 2 ;;
         --prefix)        PREFIX="$2";        shift 2 ;;
         --dry-run)       DRY_RUN=1;          shift ;;
+        --force-config)  FORCE_CONFIG=1;     shift ;;
         --skip-download) SKIP_DOWNLOAD=1;    shift ;;
         --no-enable)     NO_ENABLE=1;        shift ;;
         --uninstall)     UNINSTALL=1;        shift ;;
@@ -114,6 +130,102 @@ fi
 # -- common helpers --------------------------------------------------------
 
 log() { printf '%s\n' "$*"; }
+
+# KEPT_CONFIGS accumulates every file this run declined to overwrite, so the closing
+# banner can list them in one place instead of leaving the operator to notice a `.new`
+# file some other day.
+KEPT_CONFIGS=""
+
+# KEPT_ANY survives report_kept_configs' clear, because the ✔ banners are printed
+# AFTER that report and still have to know not to claim a file was written.
+# origin: prerelease audit round 2, C7.
+KEPT_ANY=0
+
+# config_dest decides where a generated config should actually be written and puts the
+# answer in CONFIG_DEST: the real path when the file does not exist yet or
+# --force-config was given, `<path>.new` otherwise. A kept file is recorded for the
+# banner.
+#
+# IT SETS A VARIABLE RATHER THAN ECHOING, deliberately. `$(config_dest …)` would run it
+# in a SUBSHELL, so every KEPT_CONFIGS append would be discarded the moment the
+# substitution finished and the banner would report nothing — while the file-keeping
+# itself still worked, which is the worst combination: the protection happens and the
+# operator is never told.
+#
+# origin: prerelease audit deploy-release-docs/DRD-F1 + DRD-F5. See FORCE_CONFIG above
+# for why "keep it AND write the new one beside it" rather than either extreme.
+config_dest() {
+    _cd_path="$1"
+    if [ "$FORCE_CONFIG" -eq 1 ] || [ ! -e "$_cd_path" ]; then
+        CONFIG_DEST="$_cd_path"
+        # A `.new` left by an EARLIER kept re-run is now stale: this run is about to
+        # write that same generated content to the real path, so the sidecar no longer
+        # holds anything the operator has not got.
+        #
+        # origin: prerelease audit round 2, K-F9. Nothing ever removed a .new, and the
+        # report's own closing line — "delete the ones you have decided against, or the
+        # next run's report is the only thing telling them apart from the current
+        # config" — became false the moment --force-config existed: the file that was
+        # supposed to be the DIFFERENCE from the live config now duplicated it, and the
+        # next report would not mention it at all (nothing was kept), so there was
+        # nothing left to tell them apart.
+        if [ "$DRY_RUN" -eq 0 ] && [ -e "${_cd_path}.new" ]; then
+            rm -f "${_cd_path}.new"
+            log "  - removed the superseded ${_cd_path}.new (its content is now the live file)"
+        fi
+        return 0
+    fi
+    KEPT_CONFIGS="${KEPT_CONFIGS}${_cd_path}
+"
+    KEPT_ANY=1
+    CONFIG_DEST="${_cd_path}.new"
+}
+
+# dryrun_config_policy states what a real run would do to files that ALREADY EXIST.
+#
+# origin: prerelease audit round 2, K-F11. The policy used to be spelled out inline at
+# each write block, so a broker dry-run printed it three times, and it was unconditional
+# — announcing that config "would be KEPT" on a clean host that has none. Callers gate it
+# on there being something to keep.
+dryrun_config_policy() {
+    if [ "$FORCE_CONFIG" -eq 1 ]; then
+        log "  + (dry-run) --force-config: an EXISTING config/unit file would be OVERWRITTEN"
+    else
+        log "  + (dry-run) an EXISTING config/unit file would be KEPT; new content as <file>.new"
+    fi
+}
+
+# report_kept_configs prints the summary, ONCE. It clears the list afterwards so a
+# second call is a no-op — the report is emitted before the success banner AND before
+# any step that can die(), and those two points can both be reached in one run.
+# banner_kept_caveat qualifies a ✔ line that would otherwise claim a file this run
+# did not write. origin: prerelease audit round 2, C7.
+#
+# The ✔ banners are QUOTED heredocs on purpose (nothing in them may expand under
+# root), so the caveat cannot be interpolated into them and is printed as its own
+# line instead. Silent on a run that kept nothing.
+banner_kept_caveat() {
+    [ "$KEPT_ANY" -eq 1 ] || return 0
+    log "  ⚠ …except the files listed above as KEPT: those were NOT written by this run."
+    log "    What is installed there is your previous content; the new content is in <file>.new."
+}
+
+report_kept_configs() {
+    [ -n "$KEPT_CONFIGS" ] || return 0
+    log ""
+    log "  ⚠ EXISTING CONFIG KEPT — this run did NOT overwrite the following, and wrote the new"
+    log "    content beside each one as <file>.new so you can diff before deciding:"
+    printf '%s' "$KEPT_CONFIGS" | while IFS= read -r _kc; do
+        [ -n "$_kc" ] || continue
+        log "      $_kc  →  ${_kc}.new"
+    done
+    log "    A bare re-run used to overwrite these, which silently reverted local edits —"
+    log "    including the broker.cluster block that makes this node a cluster member."
+    log "    Re-run with --force-config to take the new content as-is."
+    log "    Nothing removes a .new file: delete the ones you have decided against, or the"
+    log "    next run's report is the only thing telling them apart from the current config."
+    KEPT_CONFIGS=""
+}
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 run() {
@@ -362,7 +474,8 @@ install_agent() {
     if [ "$DRY_RUN" -eq 0 ]; then
         # UNQUOTED heredoc ON PURPOSE: expands $BROKER_URL/$SESSION/$NID/$TUNNEL_ADDR into
         # the config. The commented allow_roots block below is literal — no $ in it.
-        cat > "$SESSION_DIR/agent.yaml" <<EOF
+        config_dest "$SESSION_DIR/agent.yaml"
+        cat > "$CONFIG_DEST" <<EOF
 broker_url: $BROKER_URL
 session: $SESSION
 nid: $NID
@@ -398,19 +511,30 @@ tunnel_addr: $TUNNEL_ADDR
 # proxy:
 #   participate: false
 EOF
-        chmod 600 "$SESSION_DIR/agent.yaml"
+        # 600 on the .new file too: it can carry the same secrets as the real one.
+        chmod 600 "$CONFIG_DEST"
     else
         log "  + (dry-run) write $SESSION_DIR/agent.yaml"
+        if [ -e "$SESSION_DIR/agent.yaml" ]; then
+            dryrun_config_policy
+        fi
     fi
 
     # UNQUOTED heredoc ON PURPOSE: the next-steps banner must show the operator their real
     # paths/ids — $BIN_DIR, $SESSION_DIR, $SESSION, $NID, ${PIN:+ --pin $PIN}. Note the
     # trailing `\\` on the setsid line is also unquoted-heredoc-sensitive: it renders as one
     # backslash (a shell line continuation the operator can paste), which is the intent.
+    # BEFORE the ✔ block, not after it.
+    #
+    # origin: prerelease audit round 2, K-F7 and CC-5. The success banner says "agent
+    # config written", which is FALSE on a re-run that kept an existing file — and the
+    # kept-config report used to print after it, where an operator who has already read a
+    # ✔ does not look. Report first, then claim success.
+    report_kept_configs
     cat <<EOF
 
 ✔ tether installed to $BIN_DIR/tether
-✔ agent config written to $SESSION_DIR/agent.yaml
+✔ agent config: $SESSION_DIR/agent.yaml
 
 To start the agent now (architecture K.1; install.sh does NOT start anything):
     setsid nohup $BIN_DIR/tether agent --session $SESSION --nid $NID${PIN:+ --pin $PIN} \\
@@ -426,12 +550,41 @@ For auto-start across logins (optional):
     $BIN_DIR/tether agent --install-user-service --session $SESSION --nid $NID
     # generates ~/.config/systemd/user/tether-agent@$SESSION.service
 EOF
+    # The parenthetical this replaced ("see the note above…") was on the agent ✔ line
+    # only, and the broker half had nothing at all — round 2, C7. One helper, both
+    # halves, and it names what is actually on disk instead of pointing at a note.
+    banner_kept_caveat
+    report_kept_configs
 }
 
+# ~/.tether IS NOT THE AGENT'S DIRECTORY. It is this user's whole tether identity.
+#
+# origin: prerelease audit deploy-release-docs/#48. Uninstalling one agent deleted
+# ~/.tether wholesale, which takes keys/default.nk with it — the ctl private key. That
+# key cannot be regenerated: it is the owner fingerprint on every session this user
+# created, so losing it orphans all of them, not just the one being uninstalled. The
+# comparison that settles it is right below: uninstall_ctl deliberately does not touch
+# this directory at all.
+#
+# With --session, remove only that session's subtree. Without one, the whole-tree
+# removal is kept — an operator who asks for it may genuinely want it — but it is no
+# longer silent.
 uninstall_agent() {
     BIN_DIR="${PREFIX:-$HOME/.local/bin}"
     log "tether uninstall (role=agent)"
     run "rm -f '$BIN_DIR/tether'"
+    if [ -n "$SESSION" ]; then
+        run "rm -rf '$HOME/.tether/agent/$SESSION'"
+        log "  ✔ removed $BIN_DIR/tether and ~/.tether/agent/$SESSION"
+        log "    (kept ~/.tether — it holds keys/default.nk, this user's ctl identity)"
+        return 0
+    fi
+    log ""
+    log "  ⚠ REMOVING ALL OF ~/.tether, including keys/default.nk — this user's ctl private key."
+    log "    That key cannot be regenerated. It is the owner fingerprint on every session this"
+    log "    user created, so every one of them is orphaned, not just this agent's."
+    log "    Pass --session <sid> to remove only one agent's directory instead."
+    log ""
     run "rm -rf '$HOME/.tether'"
     log "  ✔ removed $BIN_DIR/tether and ~/.tether"
 }
@@ -519,7 +672,38 @@ uninstall_ctl() {
 # on a --no-enable run or a systemd-less host where enable was skipped —
 # claiming it there would resurrect #76 on exactly the environment-guard path.
 ENABLED_UNITS=0
+
+# host_systemd_is_the_target reports whether this run may mutate the SERVICE MANAGER.
+#
+# origin: prerelease audit external review M-4. TETHER_INSTALL_ROOT was described as
+# making the whole broker install hermetic, and it redirects every FILE — but
+# `systemctl daemon-reload/enable` and `systemctl disable` are not files. They were
+# still issued against the host, so a "hermetic" install under a temp root could enable
+# the host's own same-named units, and a redirected uninstall could disable the real
+# nats-server / tether-broker / caddy at boot. Files staying inside the root does not
+# make a systemctl side effect hermetic.
+#
+# The existing real-install helper always appended --no-enable, which is exactly why no
+# test saw the install half; the uninstall half had no live-systemd coverage at all.
+#
+# Used SYMMETRICALLY by enable_broker_units and the uninstall path — an asymmetric guard
+# is how the install side got fixed once before while uninstall kept writing to the host.
+host_systemd_is_the_target() {
+    [ -z "${TETHER_INSTALL_ROOT:-}" ]
+}
+
+# log_would_run_systemctl records the service-manager call this run deliberately did not
+# make. Deliberately NOT phrased as "(dry-run) systemctl …": that prefix is the shape a
+# real preview takes, and a seam run must be distinguishable from one.
+log_would_run_systemctl() {
+    log "  + TETHER_INSTALL_ROOT: host service manager NOT touched (would have run: $*)"
+}
+
 enable_broker_units() {
+    if ! host_systemd_is_the_target; then
+        log_would_run_systemctl "systemctl daemon-reload && systemctl enable nats-server tether-broker caddy"
+        return 0
+    fi
     if [ "$NO_ENABLE" -eq 1 ]; then
         log "  + --no-enable: units left disabled; enable later with: systemctl enable --now nats-server tether-broker caddy"
         return 0
@@ -552,7 +736,10 @@ enable_broker_units() {
 # TETHER_JOURNALD_ROOT is a TEST-ONLY seam (hermetic tests point it at a
 # tmpdir); production always resolves /etc/systemd.
 write_journald_dropin() {
-    _jroot="${TETHER_JOURNALD_ROOT:-/etc/systemd}"
+    # TETHER_INSTALL_ROOT (round 2, G2/K-F10) redirects it too, so ONE variable makes
+    # a whole broker install hermetic. The dedicated TETHER_JOURNALD_ROOT still wins —
+    # tests that only need this one file keep pointing it wherever they like.
+    _jroot="${TETHER_JOURNALD_ROOT:-${TETHER_INSTALL_ROOT:-}/etc/systemd}"
     _dropin_dir="$_jroot/journald.conf.d"
     _dropin="$_dropin_dir/60-tether.conf"
     # review F3 OWNERSHIP: our file is identified by a stable MARKER on its
@@ -644,15 +831,40 @@ install_broker() {
     [ "$OS" = "darwin" ] && die "--role broker is not supported on macOS (only --role ctl is); broker requires a Linux host"
     log "tether install (role=broker, version=$VERSION, os=$OS, arch=$ARCH, domain=$DOMAIN)"
 
-    BIN_DIR="${PREFIX:-/usr/local/bin}"
-    ETC_DIR="/etc/tether"
-    LIB_DIR="/var/lib/tether"
-    LOG_DIR="/var/log/tether"
-    RUN_DIR="/var/run/tether"
-    SYSTEMD_DIR="/etc/systemd/system"
+    # TETHER_INSTALL_ROOT is a TEST SEAM, and it is here because the alternative was
+    # shipping the BLOCKER's own role with no coverage at all.
+    #
+    # origin: prerelease audit round 2, G2 / K-F10 / CC-5. B4 — a bare re-run silently
+    # reverting an operator's config — is about the BROKER role: broker.yaml, the
+    # Caddyfile, nats.d/nats.conf and the unit files. Every guard written for it
+    # exercised `--role agent`, which lands under $HOME, because these five paths are
+    # absolute and a test cannot write to them. So reverting the preservation on the two
+    # files B4 actually names left the whole suite green.
+    #
+    # It prefixes the SYSTEM directories only. It does not change what is written, in
+    # what order, or under what conditions — a test using it exercises the same code the
+    # real install runs. It is announced LOUDLY, because a root-prefixed install that
+    # looked like a real one would be far worse than no seam.
+    if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+        log "  ⚠ TETHER_INSTALL_ROOT=$TETHER_INSTALL_ROOT — system paths are being REDIRECTED under it."
+        log "    This is a TEST SEAM. A broker installed this way is NOT installed on this host."
+    fi
+    BIN_DIR="${PREFIX:-${TETHER_INSTALL_ROOT:-}/usr/local/bin}"
+    ETC_DIR="${TETHER_INSTALL_ROOT:-}/etc/tether"
+    LIB_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether"
+    LOG_DIR="${TETHER_INSTALL_ROOT:-}/var/log/tether"
+    RUN_DIR="${TETHER_INSTALL_ROOT:-}/var/run/tether"
+    SYSTEMD_DIR="${TETHER_INSTALL_ROOT:-}/etc/systemd/system"
 
     # System user — installs.sh does not run it; we just create it.
-    if [ "$DRY_RUN" -eq 0 ] && ! id -u tether >/dev/null 2>&1; then
+    #
+    # Skipped under the TEST SEAM: creating a system account is a mutation of the HOST,
+    # not of the redirected tree, and it is the one step that cannot be made harmless by
+    # a path prefix. What the seam exists to exercise — which config files get written,
+    # kept, or written as .new — happens entirely below this point and is unaffected.
+    if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+        log "  + (test seam) skip useradd tether — a redirected install must not touch the host's accounts"
+    elif [ "$DRY_RUN" -eq 0 ] && ! id -u tether >/dev/null 2>&1; then
         run "useradd --system --home-dir '$LIB_DIR' --shell /usr/sbin/nologin tether"
     else
         log "  + (skip) useradd tether"
@@ -664,7 +876,14 @@ install_broker() {
     # daemon can't open SQLite, write JetStream files, or bind
     # admin.sock. install -d sets ownership + mode in one atomic
     # call (cleaner than mkdir + chmod + chown chain).
-    if [ "$DRY_RUN" -eq 0 ]; then
+    if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+        # Same reasoning as useradd above: there is no `tether` user to own these under
+        # the seam. Create them with the same MODES so anything asserting on permissions
+        # still sees the real ones; only the ownership is the caller's.
+        install -d -m 0750 "$LIB_DIR" "$LOG_DIR"
+        install -d -m 0700 "$RUN_DIR"
+        install -d -m 0750 "$ETC_DIR/nats.d"
+    elif [ "$DRY_RUN" -eq 0 ]; then
         install -d -o tether -g tether -m 0750 "$LIB_DIR" "$LOG_DIR"
         install -d -o tether -g tether -m 0700 "$RUN_DIR"
         # G1 #22: the C3 topology reconciler runs User=tether and atomically rewrites its
@@ -703,7 +922,8 @@ install_broker() {
         # UNQUOTED heredoc ON PURPOSE: expands $DOMAIN, $ACME_EMAIL, $RUN_DIR, $LIB_DIR and
         # $ETC_DIR — including inside the commented-out `cluster:` block, so an operator who
         # uncomments it gets real paths rather than literal variable names.
-        cat > "$ETC_DIR/broker.yaml" <<EOF
+        config_dest "$ETC_DIR/broker.yaml"
+        cat > "$CONFIG_DEST" <<EOF
 broker:
   domain: $DOMAIN
   public_host: $DOMAIN
@@ -744,9 +964,10 @@ broker:
   #   nats_conf_path: /etc/tether/nats.d/nats.conf   # C3 reconciler target (tether-owned dir, #22; empty opts out)
   #   nats_server_bin: nats-server      # C3 reconciler -t dry-run + --signal reload binary
 EOF
-        chmod 644 "$ETC_DIR/broker.yaml"
+        chmod 644 "$CONFIG_DEST"
     else
         log "  + (dry-run) write $ETC_DIR/broker.yaml"
+        dryrun_config_policy
     fi
 
     # Caddyfile (TLS termination + reverse proxy to NATS WebSocket).
@@ -758,7 +979,8 @@ EOF
         # UNQUOTED heredoc ON PURPOSE: expands $ACME_EMAIL and $DOMAIN. The { } are Caddyfile
         # block syntax, not shell — they pass through untouched. No Caddy {placeholder} is used
         # here; if one is ever added it needs no escaping either (only $ and ` are shell-active).
-        cat > "$ETC_DIR/Caddyfile" <<EOF
+        config_dest "$ETC_DIR/Caddyfile"
+        cat > "$CONFIG_DEST" <<EOF
 {
     email $ACME_EMAIL
 }
@@ -772,14 +994,20 @@ $DOMAIN:443 {
     }
 }
 EOF
-        chmod 644 "$ETC_DIR/Caddyfile"
+        chmod 644 "$CONFIG_DEST"
     else
         log "  + (dry-run) write $ETC_DIR/Caddyfile"
+        dryrun_config_policy
     fi
 
     # systemd units — generated + (by default) ENABLED for boot, NEVER
     # started (K.0 §2 as amended for #76; --no-enable opts out).
     write_systemd_units "$SYSTEMD_DIR" "$BIN_DIR" "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+    # Reported HERE, before enable_broker_units, because that function has two documented
+    # die() paths — and with `set -eu` a die between the config writes and the end of the
+    # installer swallowed the whole kept-config report (round 2, K-F8). The operator most
+    # needs to know a unit file was kept in exactly the run where enabling then failed.
+    report_kept_configs
     enable_broker_units
     write_journald_dropin
 
@@ -824,6 +1052,7 @@ takes the fleet offline (#76):
     sudo systemctl enable --now nats-server tether-broker caddy
 EOF
     fi
+    banner_kept_caveat
     if [ "${WROTE_JOURNALD_DROPIN:-0}" -eq 1 ]; then
         cat <<'EOF'
 
@@ -832,6 +1061,7 @@ next reboot, or immediately after:
     sudo systemctl restart systemd-journald
 EOF
     fi
+    report_kept_configs
 }
 
 ### Sidecar binary installs ##############################################
@@ -846,7 +1076,7 @@ EOF
 # changes. Architecture J.5 keeps tetherd upgrades manual; sidecar
 # upgrades are also manual and bundled with each tether release.
 
-NATS_SERVER_VERSION="${TETHER_NATS_SERVER_VERSION:-v2.10.22}"
+NATS_SERVER_VERSION="${TETHER_NATS_SERVER_VERSION:-v2.14.6}"
 CADDY_VERSION="${TETHER_CADDY_VERSION:-2.7.6}"
 
 install_nats_server() {
@@ -855,9 +1085,30 @@ install_nats_server() {
         log "  + (skip) nats-server install"
         return 0
     fi
+    # RETROFIT AN EXISTING HOST, don't skip it.
+    #
+    # origin: prerelease audit increment 2 internal review, ops-upgrade/L16-F1 + L16-F6.
+    # This used to return early whenever a nats-server binary existed, on any version.
+    # The effect was that no server-side fix could ever reach a machine that had been
+    # installed once: the fleet sat on the version of its FIRST install forever, while
+    # every test in this repo measured go.mod's much newer embedded server. That gap is
+    # not hypothetical — it is recorded as an incident in docs/reviews/INDEX.md
+    # (2026-08-06), and it hid a real ACL escape for a whole release.
+    #
+    # Replacing the binary does NOT restart the service: nats-server keeps running from
+    # the inode it opened, so the new version takes effect at the operator's next
+    # restart. Saying so is the point — a silent swap would leave `nats-server --version`
+    # and the running process disagreeing with no explanation.
     if [ -x "$bin/nats-server" ]; then
-        log "  + nats-server already present at $bin/nats-server (skip)"
-        return 0
+        have="$("$bin/nats-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        want="${NATS_SERVER_VERSION#v}"
+        if [ "$have" = "$want" ]; then
+            log "  + nats-server already at ${NATS_SERVER_VERSION} (skip)"
+            return 0
+        fi
+        log "  ! nats-server at $bin/nats-server is ${have:-unknown}, this release pins ${NATS_SERVER_VERSION}"
+        log "    replacing it; RESTART nats-server afterwards for the new binary to take effect"
+        NATS_RETROFIT_FROM="${have:-unknown}"
     fi
     case "$ARCH" in amd64) na="amd64" ;; arm64) na="arm64" ;; *) die "nats arch $ARCH" ;; esac
     case "$OS"   in linux) no="linux" ;;  darwin) no="darwin" ;;  *) die "nats os $OS" ;; esac
@@ -873,9 +1124,19 @@ install_nats_server() {
     [ -n "$expect" ] || die "no sha256 for ${name}.tar.gz in NATS SHA256SUMS"
     verify_sha "$tmp/nats.tgz" "$expect"
     tar -xzf "$tmp/nats.tgz" -C "$tmp"
-    install -m 0755 "$tmp/${name}/nats-server" "$bin/nats-server"
+    # install(1) truncates in place, which fails with ETXTBSY against a RUNNING binary.
+    # Stage beside the target and rename: rename is atomic and legal while the old inode
+    # is still executing, which is exactly the retrofit case above.
+    install -m 0755 "$tmp/${name}/nats-server" "$bin/.nats-server.new" \
+      || die "stage nats-server into $bin failed"
+    mv -f "$bin/.nats-server.new" "$bin/nats-server" || die "install nats-server into $bin failed"
     rm -rf "$tmp"; trap - EXIT
-    log "  ✔ installed $bin/nats-server (${NATS_SERVER_VERSION})"
+    if [ -n "${NATS_RETROFIT_FROM:-}" ]; then
+        log "  ✔ replaced $bin/nats-server (${NATS_RETROFIT_FROM} -> ${NATS_SERVER_VERSION})"
+        log "    ACTION REQUIRED: sudo systemctl restart nats-server"
+    else
+        log "  ✔ installed $bin/nats-server (${NATS_SERVER_VERSION})"
+    fi
 }
 
 install_caddy() {
@@ -911,6 +1172,7 @@ write_systemd_units() {
     sysd="$1"; bin="$2"; etc="$3"; lib="$4"; log_dir="$5"
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  + (dry-run) write $sysd/{nats-server,tether-broker,caddy}.service + $etc/nats.d/nats.conf"
+        dryrun_config_policy
         return 0
     fi
 
@@ -922,7 +1184,8 @@ write_systemd_units() {
     # the broker process, internal WS on 8222 for Caddy to terminate
     # TLS in front of.
     # UNQUOTED heredoc ON PURPOSE: expands $lib into jetstream store_dir. Nothing else expands.
-    cat > "$etc/nats.d/nats.conf" <<EOF
+    config_dest "$etc/nats.d/nats.conf"
+    cat > "$CONFIG_DEST" <<EOF
 # tether nats-server config (generated by install.sh)
 host: "127.0.0.1"
 port: 4222
@@ -937,13 +1200,14 @@ websocket {
   no_tls: true
 }
 EOF
-    chmod 644 "$etc/nats.d/nats.conf"
+    chmod 644 "$CONFIG_DEST"
 
     # UNQUOTED heredoc ON PURPOSE: ExecStart needs $bin and $etc. Because it is unquoted, the
     # comment prose below is shell-active too — P9: the backticks that once wrapped 'cluster add'
     # were run as a command substitution BY ROOT, printing "cluster: not found" and silently
     # deleting those two words from the installed unit. Prose in this body uses single quotes.
-    cat > "$sysd/nats-server.service" <<EOF
+    config_dest "$sysd/nats-server.service"
+    cat > "$CONFIG_DEST" <<EOF
 [Unit]
 Description=NATS message broker (tether)
 After=network-online.target
@@ -964,11 +1228,12 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$sysd/nats-server.service"
+    chmod 644 "$CONFIG_DEST"
 
     # UNQUOTED heredoc ON PURPOSE: expands $bin, $etc and $log_dir. The G1 #23 prose below is
     # shell-active as well (see P9 on the unit above) — keep it free of backticks and $(…).
-    cat > "$sysd/tether-broker.service" <<EOF
+    config_dest "$sysd/tether-broker.service"
+    cat > "$CONFIG_DEST" <<EOF
 [Unit]
 Description=tether broker daemon
 After=nats-server.service
@@ -1006,10 +1271,11 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$sysd/tether-broker.service"
+    chmod 644 "$CONFIG_DEST"
 
     # UNQUOTED heredoc ON PURPOSE: expands $bin and $etc into ExecStart.
-    cat > "$sysd/caddy.service" <<EOF
+    config_dest "$sysd/caddy.service"
+    cat > "$CONFIG_DEST" <<EOF
 [Unit]
 Description=Caddy (TLS termination for tether NATS WSS)
 After=network-online.target
@@ -1023,11 +1289,19 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$sysd/caddy.service"
+    chmod 644 "$CONFIG_DEST"
 }
 
 uninstall_broker() {
-    BIN_DIR="${PREFIX:-/usr/local/bin}"
+    # The SAME path resolution install_broker uses, including the TETHER_INSTALL_ROOT
+    # test seam — an uninstall that removed real system files while the matching install
+    # wrote into a redirected tree would be the worst possible asymmetry.
+    BIN_DIR="${PREFIX:-${TETHER_INSTALL_ROOT:-}/usr/local/bin}"
+    ETC_DIR="${TETHER_INSTALL_ROOT:-}/etc/tether"
+    LIB_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether"
+    LOG_DIR="${TETHER_INSTALL_ROOT:-}/var/log/tether"
+    RUN_DIR="${TETHER_INSTALL_ROOT:-}/var/run/tether"
+    SYSTEMD_DIR="${TETHER_INSTALL_ROOT:-}/etc/systemd/system"
     log "tether uninstall (role=broker)"
     # #76 symmetry: disable BEFORE removing the unit files, so no dangling
     # wants/ symlinks survive (this also cleans up after a manual
@@ -1037,25 +1311,40 @@ uninstall_broker() {
     # systemd-less host the disable is skipped, so explicitly rm the boot
     # symlinks too or they dangle after the unit files go, and the closing
     # log must not claim "disabled".
+    # external review M-4: the seam guard is checked FIRST and symmetrically with the
+    # install half. A redirected uninstall that ran `systemctl disable` would stop the
+    # HOST's real nats-server / tether-broker / caddy from starting at boot — the worst
+    # possible outcome for a flag documented as a test seam. The wants/ symlinks under
+    # $SYSTEMD_DIR are inside the root, so the hand-removal branch below is the correct
+    # (and sufficient) cleanup there.
     _DISABLED=0
-    if [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+    if ! host_systemd_is_the_target; then
+        log_would_run_systemctl "systemctl disable nats-server tether-broker caddy"
+        for u in nats-server tether-broker caddy; do
+            run "rm -f '$SYSTEMD_DIR/multi-user.target.wants/$u.service'"
+        done
+    elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
         run "systemctl disable nats-server tether-broker caddy 2>/dev/null || true"
         _DISABLED=1
     else
         # No systemd to run `disable`: drop the wants/ symlinks by hand so the
         # unit removal below does not leave them dangling.
         for u in nats-server tether-broker caddy; do
-            run "rm -f /etc/systemd/system/multi-user.target.wants/$u.service"
+            run "rm -f '$SYSTEMD_DIR/multi-user.target.wants/$u.service'"
         done
     fi
     for u in nats-server tether-broker caddy; do
-        run "rm -f /etc/systemd/system/$u.service"
+        # ...and the `.new` sidecar a kept re-run may have written beside it. origin:
+        # prerelease audit round 2, K-F9: uninstall removed the unit and left its .new
+        # behind forever, so a host that had ever been re-installed kept three orphan
+        # files that no later run ever mentions again.
+        run "rm -f '$SYSTEMD_DIR/$u.service' '$SYSTEMD_DIR/$u.service.new'"
     done
     # #77 symmetry (review F3): remove the journald drop-in ONLY if it carries
     # our ownership marker — a same-name operator/site-policy file that merely
     # collided on the path must survive uninstall. Path is not proof; the
     # first-line marker is.
-    _u_dropin="${TETHER_JOURNALD_ROOT:-/etc/systemd}/journald.conf.d/60-tether.conf"
+    _u_dropin="${TETHER_JOURNALD_ROOT:-${TETHER_INSTALL_ROOT:-}/etc/systemd}/journald.conf.d/60-tether.conf"
     _u_marker='# managed-by: tether-install.sh (#77 journald cap)'
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  + (dry-run) remove $_u_dropin (only if it carries the tether ownership marker)"
@@ -1066,14 +1355,36 @@ uninstall_broker() {
     else
         log "  ! $_u_dropin exists but is NOT tether-owned (no marker) — left in place"
     fi
-    if [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+    if ! host_systemd_is_the_target; then
+        # external review M-4: nothing the host's systemd knows about changed, so there is
+        # nothing for it to reload.
+        log_would_run_systemctl "systemctl daemon-reload"
+    elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
         # Best-effort: a daemon-reload refreshes systemd's view after the unit
         # files went; it is cleanup, not correctness. Tolerate failure (e.g. a
         # non-root/no-polkit context) so uninstall's file removals still stand.
         run "systemctl daemon-reload 2>/dev/null || true"
     fi
     run "rm -f '$BIN_DIR/tether'"
-    run "rm -rf /etc/tether /var/lib/tether /var/log/tether /var/run/tether"
+    # THE SAME WARNING THE AGENT SIBLING GOT, for a larger deletion.
+    #
+    # origin: prerelease audit round 2, K-F13. B7's principle — never delete something
+    # irreplaceable without saying so — was applied to uninstall_agent in this very change
+    # and not here, where /var/lib/tether holds the SQLite state, the raft data dir and the
+    # secrets dir (the cluster CA and this node's tunnel key). Losing the secrets dir means
+    # this node can never rejoin its cluster under the same identity.
+    log ""
+    log "  ⚠ REMOVING $LIB_DIR — the SQLite state, the raft data dir and the secrets"
+    log "    dir (cluster CA + this node's tunnel key). The secrets cannot be regenerated:"
+    log "    without them this node cannot rejoin its cluster under the same identity."
+    log "    Take a backup first if this is not a decommission: tether cluster backup --offline"
+    log ""
+    # THE VARIABLES, NOT THE LITERALS. These were four hardcoded absolute paths, which
+    # was merely redundant until TETHER_INSTALL_ROOT existed (round 2, G2) and then
+    # became dangerous: a redirected uninstall would have rm -rf'd the REAL /etc/tether
+    # and /var/lib/tether — the SQLite state, the raft dir and the unregenerable secrets
+    # — on a host whose matching install had touched none of them.
+    run "rm -rf '$ETC_DIR' '$LIB_DIR' '$LOG_DIR' '$RUN_DIR'"
     if [ "$_DISABLED" -eq 1 ]; then
         log "  ✔ removed broker files (systemd units disabled+removed, journald drop-in, /etc/tether, /var/{lib,log,run}/tether)"
     else

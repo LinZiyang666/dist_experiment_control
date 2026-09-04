@@ -51,8 +51,16 @@ curl -fsSL https://github.com/LinZiyang666/dist_experiment_control/releases/late
 ```
 
 写入：
-- `/usr/local/bin/{tether, nats-server, caddy}`（nats-server v2.10.22, caddy v2.7.6，
+- `/usr/local/bin/{tether, nats-server, caddy}`（nats-server v2.14.6, caddy v2.7.6，
   逐个 sha256 校验后落地）
+  - **存量主机会被 retrofit**：install.sh 重跑时会比对 `nats-server --version`，
+    版本不符就**替换二进制并要求你重启** `nats-server`（它此前是「已存在即跳过」，
+    于是任何服务端侧修复都到不了现网——现网因此在一个版本上停了整整一个 release）。
+    替换用 rename 而非原地截断，所以对正在运行的进程是安全的；新二进制在下次重启才生效。
+  - **为什么 pin 必须保持在 v2.14.6**：公网 WebSocket 面不能发布已知受影响且已退出上游支持窗口的
+    服务端。此前 drill `50-backup-restore` / `95-broker-selfheal` 在升级后暴露的根因不是新版 NATS，
+    而是 broker 启动期只探测 JetStream 一次、瞬态未就绪就进入 systemd crash loop。该路径现已改成
+    有界等待，并在 v2.14.6 上复跑两条 drill 为 GREEN；不得用降级服务端替代 boot wait 修复。
 - `/etc/tether/{broker.yaml, Caddyfile}`
 - `/etc/systemd/system/{nats-server, tether-broker, caddy}.service`
   （#76:默认已 `systemctl enable`——仅建开机 symlink,**不启动**;`--no-enable` 退出）
@@ -76,7 +84,8 @@ sudo systemctl status nats-server tether-broker caddy
 ```
 
 > **存量装机 retrofit(#76/#77)**:老版 install.sh 装的 broker(如 2026-08 前的现网)没有上面两项默认。
-> **不要**在存量机上重跑 install.sh(会覆写 broker.yaml/Caddyfile);一次性手动补齐:
+> 重跑 install.sh 本身是安全的(自 2026-09-02 起它保留既有 broker.yaml/Caddyfile,新内容写成 `<file>.new`),
+> 但**不要**带 `--force-config`——那会覆写这两个文件。手动补齐更直接:
 >
 > ```bash
 > sudo systemctl enable nats-server tether-broker caddy
@@ -100,6 +109,30 @@ sudo systemctl status nats-server tether-broker caddy
 `broker.upgrade.url_allow` 的内置默认值已经包含本仓库的 GitHub release 前缀，
 开箱即可 `tether node upgrade`；要自托管镜像才需要改 `broker.yaml` 或
 `--upgrade-url-allow` 覆盖。auth_callout 启用见 §3.4。
+
+> **⚠ 全新 broker 还差最后一步：准入第一个使用者。**
+>
+> `session create` 需要调用者的指纹在准入表里，而**全新 broker 的准入表是
+> 空的**——不做这一步，第一个用户会被拒（退出码 77，`not_allowed`），而
+> broker 本身一切正常。
+>
+> ```bash
+> # 使用者在自己的机器上（离线，不需要连 broker）：
+> tether whoami
+> #   fingerprint: SHA256:…
+> #   public key:  U…
+>
+> # 你在 broker 主机上：
+> sudo tether admin session-allow SHA256:…
+> sudo tether admin session-allow --list        # 确认
+> ```
+>
+> 使用者不跑 `whoami` 也行：他直接 `tether session create` 被拒时，那条
+> 拒绝文案里就带着他自己的指纹和这条命令。详见 §5.20。
+>
+> **从旧版升级的存量 broker 不需要做这一步**：broker 启动时会一次性把每个
+> 已经拥有 session 的 owner 指纹自动纳入准入表（经 raft，只做一次，所以后
+> 续升级不会复活你撤销过的指纹）。
 
 ### 2.4 install.sh flag 全集
 
@@ -442,6 +475,9 @@ tether admin audit <sid> [-n 50]            # 审计尾部 N 条
 tether admin events [-n 50] [--since 1h] [--kind proxy_keyset_changed] [--json]  # sys.events 运维事件流
 tether admin evict <sid> <nid>              # 强制踢
 tether admin runtime [--json]               # 本进程 runtime 自省（goroutines/threads/fds/rss/uptime + reconciler last-tick）
+tether admin session-allow <fp>             # 准入一个指纹，使其可以 session create
+tether admin session-allow --list           # 看当前准入表
+tether admin session-allow --remove <fp>    # 撤销（不删该指纹已有的 session）
 ```
 
 各子命令含义：
@@ -454,6 +490,7 @@ tether admin runtime [--json]               # 本进程 runtime 自省（gorouti
 | `admin events` | 读 broker 的 H.1 `events` 流（**运维契约事件流** sys.events）：`session_created`/`session_destroyed`、`member_joined`、`agent_registered`/`agent_evicted`、`agent_roster_stale`、`disk_pressure`、`tetherd_restarted`，以及拓扑/迁移类 `proxy_*`（含 `proxy_keyset_changed`）/`nats_topology_*`/`home_reassign_*`/`grow_cutover_*`。**member 能 subscribe sys.events，但 operator（broker 主机 root、无 NATS 成员凭据）此前没有任何读命令**——这个动词就是那个 reader，走同一 root-only 0600 admin socket。读的是**持久化流**（保留 30d/1GiB），故 `--since` 能翻历史、`--kind` 能只看某类。载荷**永不含 secret**（生产者手搭 allow-list 标量 map）。 | "集群刚发了哪些拓扑/告警/迁移事件"、排查 rehome/proxy 变更、disk_pressure 复盘、离线取证。 |
 | `admin evict <sid> <nid>` | 强制把指定 (sid, nid) 从 broker 移除：删 `agent_provisioning` 行 + `nodes` 行 + 广播 `sys.events{type:agent_evicted}`。 | agent 失控 / 机器换主 / nkey 泄漏要立即吊销。 |
 | `admin runtime` | 读**活着的 broker 进程自身**的 runtime：`goroutines`（`runtime.NumGoroutine()` 进程内真值）、`threads`（threadcreate profile：**累计**创建过的 OS 线程/M 数，单调不回落——是高水位而非当前存活数）、`open_fds`、`rss`、`uptime`，以及每个周期 reconciler 的 `last_tick`。**只读本进程 + R7 注册表**，不碰 DB / raft / leadership，单机与集群、leader 与 follower 都能答。 | 诊断**活 broker 上的 goroutine / fd 泄漏**（隔一段时间连采两次、看计数是否单调爬升）；诊断**卡死的 reconciler**（某 pass 的 `last_tick` 不再前进）。现网车队出过泄漏/崩溃事故、而此前生产二进制**零自省面**——这个动词就是补它。 |
+| `admin session-allow` | **谁可以 `session create`** 的准入表。`<fp>` 准入、`--remove` 撤销、`--list` 查看。指纹形如 `SHA256:…`，由使用者的 `tether whoami` 给出——他们跑 `session create` 被拒时那条文案里也有。**撤销不会删除该指纹已有的 session**（撤销「能建」不等于删除别人的工作）。重复准入是幂等的，且**不会**改写原有的 `--note`（会明说）。集群模式下这条写入走 raft，所以在任一 broker 上执行都对全体生效；混版集群里若有 voter 的二进制还不认识这条 op，命令会**拒绝**而不是写出一份只在部分副本生效的策略。 | **全新 broker 的第一步**：装完之后准入表是空的，第一个使用者必须在这里放行一次，否则他 `session create` 会被拒（退出码 77）。升级到本版的**存量部署不需要任何动作**：broker 启动时会一次性把每个已拥有 session 的 owner 指纹自动纳入。此外用于吊销：某人离职 / 某台机器的 nkey 泄漏时，撤销它继续开新 session 的能力。 |
 
 > **为什么用 `goroutines` 不用 `/proc/<pid>/status` 的 `Threads`**：`Threads` 是 OS 线程数（M），10k 个泄漏的 goroutine 若都 park 住，**线程数纹丝不动**——拿 `Threads` 当 goroutine 代理会在进程漏 goroutine 时报一个平坦的假计数。两者从各自来源分别上报，正是为了让运维看到它们背离。
 >
@@ -705,9 +742,13 @@ curl -fsS "https://$DOMAIN/sub/<任一已签发 token>"   # 应回 Clash YAML
 # 同时确认 wss://$DOMAIN/nats 仍能 upgrade（ctl 还能正常连）
 ```
 
-省事也可以直接重跑 `install.sh --role broker --domain ... --acme-email ...`
-重写 `broker.yaml` + `Caddyfile`（它幂等、不动 SQLite/JetStream 数据），但会覆盖
-你对这两个文件做过的任何手改，谨慎。
+⛔ **不要为了省事直接重跑 `install.sh` 来改配置。** 自 2026-09-02 发布前审计（DRD-F1）起，
+重跑**不再覆盖**已存在的 `broker.yaml` / `Caddyfile` / `nats.d/nats.conf` / 各 `*.service`：
+它会保留原文件、把新内容写成 `<file>.new`，并在结尾横幅里逐条列出，供你 `diff` 后自行决定。
+需要按新模板整体覆盖时，显式加 `--force-config`。
+
+这条改动的由来值得记住：此前裸重跑会**无条件重写** `broker.yaml`，把 `broker.cluster` 整块抹掉，
+该 broker 重启后退回单机模式、静默脱离集群——机器看起来完全健康。
 
 ### 8.6 G1 部署面加固迁移（#22 nats.conf 迁址 / #23 Restart drop-in / #6 offline-op 属主 / #24 证书 SAN）
 
@@ -737,10 +778,14 @@ sudo systemd-run --collect systemctl restart nats-server
 **然后再升级 tether 二进制**（默认路径同步迁到 `nats.d/`）。**关键顺序**：conf 迁址 + broker.yaml 补
 `nats_conf_path` 必须在升级二进制**之前**完成——二进制升级把代码默认从旧路径翻到 `nats.d/`，若届时 conf
 还在旧址且 broker.yaml 无显式行，reconciler 会指向不存在的路径。
-**⛔ 切勿在 clustered 成员上裸重跑 `install.sh`**：它**无条件覆盖** `broker.yaml`（抹掉整个
+**⛔ 切勿在任何"已按 §3.4 启用 auth_callout 或已入集群"的 broker 上裸重跑 `install.sh --force-config`**：
+那会用 standalone 模板覆盖 `broker.yaml`（抹掉整个
 `broker.cluster.{data_dir,raft_addr,secrets_dir,nats_conf_path}` 块 → 该成员重启退回**单机模式**、脱离集群，
 比 nats.conf 被覆盖更严重的 R3 静默去集群化）、覆盖 `Caddyfile`、并用 standalone 模板覆盖 clustered
 nats.conf，且不 daemon-reload。
+
+不带 `--force-config` 的重跑现在是安全的（DRD-F1）：既有文件被保留，新模板落到 `<file>.new`。
+把适用范围从"clustered 成员"放宽到上面这句，是因为 auth_callout 的手工配置同样只存在于被覆盖的那份 conf 里。
 
 **#23 — broker 丢 nats 连接后不再永久停摆（unit drop-in）**。旧版 `tether-broker.service` 是
 `Restart=on-failure`，而 broker 在某些 nats-loss 路径上 clean-exit(0)（`serve.go` 把 `context.Canceled` 当
@@ -799,8 +844,8 @@ h1 改了三样运维可见的东西：日志 sink、`port_allocations`/`process
 后 agent**（新 agent 的 proc-event ACK 需要新 broker 才有人应答；旧 broker 只会让 agent
 降级回老行为，但没必要制造这段噪声）。
 
-**在已有部署上（例如 racknerd）逐步做，别重跑 install.sh**——它会覆盖你手工维护的
-`cluster:` 段。手工执行：
+**在已有部署上（例如 racknerd）逐步做**。重跑 install.sh 不再覆盖你手工维护的 `cluster:` 段
+（它会保留原文件、把新模板写成 `broker.yaml.new`），但带 `--force-config` 会。手工执行：
 
 1. **确认 journald 持久化**（新 unit 把 panic 交给它）：
    `mkdir -p /var/log/journal && systemctl restart systemd-journald`，
@@ -832,6 +877,48 @@ port_allocations 24 小时（常量，无配置项）。
 新的 FSM op（`ProcGC`/`PortGC`）与新告警种类在旧 broker 上都是未知的。
 
 ---
+
+### 8.9 升到本版后轮换一次 tunnel token / 订阅 PSK（存量部署，一次性）
+
+**只对 v0.5.0 及更早升上来的部署适用；全新部署不需要。**
+
+v0.5.0 及更早的 broker 把 agent register reply 发进共享 `_INBOX`，而那个空间对任何
+**自称旧版**的连接可读——不需要凭据，一条当场生成、从未被准入、不是任何 session 成员的
+nkey 就够了（自报走 CONNECT 的 `Username`，攻击者只要**不发**那个标记）。reply 里带的是
+`ProxyDirective{Token, Keys[].Secret}`：原始 tunnel token 加**全部**订阅者的 Shadowsocks PSK。
+
+本版起这些秘密不再进入共享空间（回复主题不在 `_TINBOX.` 根就整段省略，见 requirements §6.7），
+**但升级不会让已经泄漏出去的旧值失效**——它们是长寿凭据，全仓没有一处会自动轮换。所以升完
+broker 后，对每个开了 proxy 的 session 做一次：
+
+**次序是有意的，不能重排**（外审 R2-B1 订正——本节此前写的是 `off` → `on` → 再逐个 revoke，
+那个次序有一段窗口会把**旧 PSK 重新启用**）：
+
+```bash
+# ① 关掉数据面。注意：off/on 并不重铸 subscriber keyset——PSK 存在 subscriber 行里，
+#    只有 revoke 才作废它；此前本节声称 off 会「作废当前 keyset」，那是错的。
+tether proxy off -s <sid>
+
+# ② 仍在 OFF 状态下，逐个作废全部旧 subscriber。这一步才是真正让旧 PSK 与
+#    /sub bearer token 失效的动作。
+tether proxy sub ls -s <sid>
+tether proxy sub revoke -s <sid> --name <each>
+
+# ③ 现在才开。此时 keyset 是空的，tunnel token 重铸，没有任何旧值可被重新启用。
+tether proxy on -s <sid>
+
+# ④ 只从**已升级**的 ctl 重建订阅者——旧 ctl 收不到 /sub URL（本版起被 withheld），
+#    这正是设计：一个已经在共享总线上出现过的 token 不该再发一次。
+tether proxy sub create -s <sid> --name <each>
+```
+
+**为什么不能先 `on` 再 revoke**：`enableProxy` 与 cluster reaper 读的是 `activeProxyKeys`，
+也就是**当前仍然存在的 subscriber 行**。在它们被 revoke 之前 `on` 一次，等于把那批旧 PSK
+当作新 keyset 重新下发一遍——泄漏过的凭据于是又活了一段，直到最后一条 revoke 完成。
+
+⚠ `proxy off` 会**中断该 session 的数据面**直到 ④ 完成，所以挑窗口做。
+⚠ 未升级的 agent 在这之后拿不到新 token（这正是本版的设计：秘密不进共享空间），
+表现为 expose/proxy 挂起而**控制面照常**——先 `tether node upgrade <nid>`，再让它重新注册。
 
 ## 9. 错误码与故障排查（broker 侧）
 
@@ -925,4 +1012,3 @@ admin: dial /var/run/tether/admin.sock: connect: permission denied
 分布式 HA 额外只在 broker 私网/安全组内放行 `6222/tcp` 和 `7400/tcp`，不对公网开放。
 
 ---
-

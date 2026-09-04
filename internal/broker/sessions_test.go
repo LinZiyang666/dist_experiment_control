@@ -2,7 +2,9 @@ package broker
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"github.com/LinZiyang666/tether/internal/session"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +16,7 @@ import (
 
 // runBrokerForSessions starts the broker against fresh NATS+DB, returning a
 // connected nats.Conn the test can use for requests + a stop func.
-func runBrokerForSessions(t *testing.T) (*nats.Conn, func()) {
+func runBrokerForSessions(t *testing.T) (*nats.Conn, *sql.DB, func()) {
 	t.Helper()
 	url := startNATS(t)
 	db := openDB(t)
@@ -58,7 +60,7 @@ func runBrokerForSessions(t *testing.T) (*nats.Conn, func()) {
 			t.Fatal("broker did not exit")
 		}
 	}
-	return nc, stop
+	return nc, db, stop
 }
 
 // freshUserActor creates a fresh user nkey and returns the actor token (U…).
@@ -75,10 +77,33 @@ func freshUserActor(t *testing.T) string {
 	return pub
 }
 
-func TestHandleSessionCreateHappyPath(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
-	defer stop()
+// admittedActor is freshUserActor plus admission to create sessions.
+//
+// origin: prerelease audit round 2. `session create` now requires the caller's
+// fingerprint to be in session_creators, so a test about SESSION MECHANICS has to say
+// which identity the operator admitted — the same sentence a real deployment says with
+// `tether admin session-allow`.
+//
+// Deliberately NOT folded into the harness as a blanket "admit everybody": that would
+// switch the gate off for every test in the package, which is how a control ends up
+// asserting nothing. Admission is one line, and it is one line the reader can see.
+func admittedActor(t *testing.T, db *sql.DB) string {
+	t.Helper()
 	actor := freshUserActor(t)
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.AllowCreator(db, fp, "test", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return actor
+}
+
+func TestHandleSessionCreateHappyPath(t *testing.T) {
+	nc, db, stop := runBrokerForSessions(t)
+	defer stop()
+	actor := admittedActor(t, db)
 
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "123456"})
 	msg, err := nc.Request(proto.SubjCtrlSessionCreate(actor), body, 2*time.Second)
@@ -96,9 +121,9 @@ func TestHandleSessionCreateHappyPath(t *testing.T) {
 }
 
 func TestHandleSessionCreateRejectsBadPayloads(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
+	nc, db, stop := runBrokerForSessions(t)
 	defer stop()
-	actor := freshUserActor(t)
+	actor := admittedActor(t, db)
 
 	cases := []struct {
 		name    string
@@ -153,9 +178,9 @@ func TestHandleSessionCreateRejectsBadPayloads(t *testing.T) {
 }
 
 func TestHandleSessionCreateRejectsDuplicate(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
+	nc, db, stop := runBrokerForSessions(t)
 	defer stop()
-	actor := freshUserActor(t)
+	actor := admittedActor(t, db)
 
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "x"})
 	if _, err := nc.Request(proto.SubjCtrlSessionCreate(actor), body, 2*time.Second); err != nil {
@@ -170,9 +195,9 @@ func TestHandleSessionCreateRejectsDuplicate(t *testing.T) {
 }
 
 func TestHandleSessionListReturnsOnlyMine(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
+	nc, db, stop := runBrokerForSessions(t)
 	defer stop()
-	a, b := freshUserActor(t), freshUserActor(t)
+	a, b := admittedActor(t, db), admittedActor(t, db)
 
 	for _, x := range []struct{ actor, name string }{{a, "alpha"}, {b, "beta"}} {
 		body, _ := json.Marshal(proto.SessionCreateReq{Name: x.name, PIN: "x"})
@@ -193,9 +218,9 @@ func TestHandleSessionListReturnsOnlyMine(t *testing.T) {
 }
 
 func TestHandleSessionRmOwnerOnly(t *testing.T) {
-	nc, stop := runBrokerForSessions(t)
+	nc, db, stop := runBrokerForSessions(t)
 	defer stop()
-	owner, intruder := freshUserActor(t), freshUserActor(t)
+	owner, intruder := admittedActor(t, db), freshUserActor(t)
 
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "x"})
 	_, _ = nc.Request(proto.SubjCtrlSessionCreate(owner), body, 2*time.Second)

@@ -5,6 +5,7 @@ tether admin events	flags: --json --kind --n --since --socket
 tether admin evict	flags: --socket
 tether admin nodes	flags: --json --socket
 tether admin runtime	flags: --json --socket
+tether admin session-allow	flags: --list --note --remove --socket
 tether admin sessions	flags: --json --socket
 tether agent	flags: --install-user-service --log-file --log-json --log-level --nats-url --nid --pin --session --tunnel-addr --uninstall --upgrade-url-allow
 tether agent config	flags:
@@ -95,3 +96,4 @@ tether session create	flags: --home --nats-url --pin
 tether session ls	flags: --home --json --nats-url
 tether session rm	flags: --ack-alerts --home --nats-url
 tether version	flags:
+tether whoami	flags: --home --json

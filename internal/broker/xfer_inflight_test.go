@@ -10,8 +10,12 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // strandedEntry is a data-bearing tier-B transfer whose home crashed > timeout+slack ago.
@@ -204,18 +208,59 @@ func TestXferInflightTerminalDropsLedger(t *testing.T) {
 	}
 }
 
-// TestXferInflightNoLedgerWithoutClusterDataDir pins that single-broker mode (ClusterDataDir unset) writes
-// NO ledger — its audit publish is best-effort by design, and #57's durable ledger is cluster-mode only.
-func TestXferInflightNoLedgerWithoutClusterDataDir(t *testing.T) {
+// TestXferInflightNoLedgerWithoutAnyDurableRoot pins the ONE remaining no-ledger shape:
+// a broker with neither a ClusterDataDir nor a DBPath has nowhere durable to hang the
+// ledger off, so it writes none and finalizes nothing.
+//
+// THIS TEST USED TO SAY SOMETHING ELSE, and what it said became false — origin:
+// prerelease audit round 2, F-T5. Its name pointed at the ClusterDataDir case alone and
+// its comment read "single-broker mode (ClusterDataDir unset) writes NO ledger … #57's
+// durable ledger is cluster-mode only". (The old name is deliberately not written out
+// here: the promised-guard gate reads a Test* identifier in a comment as a claim that
+// such a test exists, and it no longer does.)
+// Batch F extended #57 to single brokers on purpose: xferLedgerSubdir falls back to the
+// DB's own directory, and commitSyntheticTransferTerminal grew a single-mode branch. So a
+// real single broker DOES keep a ledger now, and the old test kept passing — it had only
+// ever exercised a Config with no DBPath either — while its name and prose told the next
+// reader the opposite of what production does. That is worse than no test: it is a
+// confident wrong answer sitting next to the code.
+func TestXferInflightNoLedgerWithoutAnyDurableRoot(t *testing.T) {
 	b := &Broker{transfers: newTransferTracker()}
-	b.cfg = Config{Logger: silentLogger(), Now: time.Now} // no ClusterDataDir
+	b.cfg = Config{Logger: silentLogger(), Now: time.Now} // no ClusterDataDir, no DBPath
 	if d := b.xferInflightDir(); d != "" {
-		t.Fatalf("no ClusterDataDir ⇒ no ledger dir, got %q", d)
+		t.Fatalf("nothing durable to anchor a ledger to ⇒ no ledger dir, got %q", d)
 	}
 	b.writeXferInflight(&transferEntry{transferID: "x", sid: "s", tier: "b", startedAt: time.Now()})
 	n, err := b.finalizeStrandedXfers(context.Background())
 	if err != nil || n != 0 {
-		t.Fatalf("single-broker mode: no ledger, no finalize (n=%d err=%v)", n, err)
+		t.Fatalf("no ledger root: no ledger, no finalize (n=%d err=%v)", n, err)
+	}
+}
+
+// origin: prerelease audit round 2, F-T5.
+//
+// THE HALF THE OLD TEST'S NAME DENIED: a SINGLE broker — no ClusterDataDir, but a real
+// database on disk — keeps a ledger, anchored beside its DB. Without this, the only
+// statement in the suite about single-broker ledgers was the false one.
+func TestASingleBrokerKeepsItsLedgerBesideTheDatabase(t *testing.T) {
+	dir := t.TempDir()
+	b := &Broker{transfers: newTransferTracker()}
+	b.cfg = Config{Logger: silentLogger(), Now: time.Now, DBPath: filepath.Join(dir, "tether.db")}
+
+	want := filepath.Join(dir, "xfer-inflight")
+	if got := b.xferInflightDir(); got != want {
+		t.Fatalf("single-broker ledger dir = %q, want %q.\n\n"+
+			"#57 was extended to single brokers in batch F — synthesis has its own single-mode "+
+			"commit path — and a synthesis with no ledger to read has nothing to synthesize FROM.",
+			got, want)
+	}
+	e := &transferEntry{transferID: "tid-single", sid: "lab", nid: "n1", verb: "pull", tier: "b",
+		bucket: "xfer-lab", path: "/tmp/f", startedAt: time.Now()}
+	b.writeXferInflight(e)
+	if _, err := os.Stat(filepath.Join(want, xferInflightFilename("tid-single"))); err != nil {
+		t.Fatalf("a single broker wrote no in-flight row: %v.\n\n"+
+			"Its transfers then dangle as start rows with no terminal after a crash, which is "+
+			"precisely the #57 shape.", err)
 	}
 }
 
@@ -406,5 +451,94 @@ func TestXferFallbackLedgerStateMatrix(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(b.xferTerminalOutboxDir(), xferInflightFilename(tid))); !os.IsNotExist(err) {
 		t.Fatalf("the outbox row outlived the committed terminal (stat err: %v)", err)
+	}
+}
+
+// syntheticTerminal is the record #57 derives from a stranded in-flight row.
+func syntheticTerminal() schema.AuditTransfer {
+	return schema.AuditTransfer{
+		V: 1, Kind: "transfer", Verb: "pull",
+		Ts:         time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC),
+		Session:    "lab",
+		Node:       "node1",
+		TransferID: "tid-synth",
+		Tier:       "b",
+		Bucket:     "xfer-lab",
+		Path:       "/tmp/f",
+		Code:       "home_broker_restart",
+	}
+}
+
+// origin: prerelease audit round 2, G10 + F-T2 + F-T8.
+//
+// THE SINGLE-MODE COMMIT PATH, EXERCISED RATHER THAN ARGUED.
+//
+// #57's synthesis was inert on single brokers until this branch was added — the
+// forward sink is only ever attached by the cluster's AttachTransferAuditSink — and
+// the branch shipped with its safety argument written down and never run. Two things
+// have to hold and neither is obvious from reading it:
+//
+//   - a REPLAY of the same pass must not write a second terminal. The justification
+//     was originally "the record is byte-deterministic and JetStream collapses
+//     duplicates", which is simply false — JetStream dedups on the Nats-Msg-Id header
+//     and never on payload bytes (F-T2). What makes it safe is the content-derived
+//     id, and that is what this asserts.
+//   - a commit that did not happen must report false, or the caller deletes the only
+//     record the terminal could ever be rebuilt from (F-T8).
+func TestSingleModeSyntheticTerminalCommitsOnceAndOnlyWhenDurable(t *testing.T) {
+	url := testharness.StartJSNATS(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	if err := jsstream.EnsureHistoryStream(ctx, js, "lab", 1); err != nil {
+		t.Fatalf("history stream: %v", err)
+	}
+
+	b := &Broker{}
+	b.cfg.Logger = silentLogger()
+	rec := syntheticTerminal()
+
+	// F-T8: NO JetStream attached yet. The publish cannot be durable, so the commit
+	// must report false — the caller unlinks the ledger row on true, and that row is
+	// the only input a terminal can ever be derived from.
+	if b.commitSyntheticTransferTerminal(rec) {
+		t.Fatal("a single-mode commit reported SUCCESS with no JetStream attached.\n\n" +
+			"The caller deletes the in-flight ledger row on true. There is then neither a terminal " +
+			"nor anything left to synthesize one from, and the transfer is permanently unauditable " +
+			"— which the function's own doc comment says must never happen.")
+	}
+
+	setBrokerJS(b, js)
+	if !b.commitSyntheticTransferTerminal(rec) {
+		t.Fatal("a single-mode commit with JetStream attached reported failure")
+	}
+	// THE REPLAY. Same pass, same record — an ordinary consequence of a commit whose
+	// ledger unlink did not land, or of two finalize passes overlapping.
+	if !b.commitSyntheticTransferTerminal(rec) {
+		t.Fatal("the replay reported failure; a duplicate-collapsed publish is a SUCCESS, and " +
+			"reporting otherwise retains a ledger row forever")
+	}
+
+	st, err := js.Stream(ctx, jsstream.HistoryStreamName("lab"))
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	info, err := st.Info(ctx)
+	if err != nil {
+		t.Fatalf("stream info: %v", err)
+	}
+	if got := info.State.Msgs; got != 1 {
+		t.Fatalf("the stream holds %d terminal(s) for ONE transfer, want exactly 1.\n\n"+
+			"Two means the replay wrote a second audit record for a transfer that ended once. "+
+			"JetStream dedups on the Nats-Msg-Id header and NEVER on payload bytes, so a "+
+			"byte-identical publish with no header is simply a second message — which is what "+
+			"the branch's original safety argument assumed would not happen.", got)
 	}
 }

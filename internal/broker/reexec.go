@@ -51,7 +51,8 @@ func (b *Broker) ReExecRequested() bool { return b.reExecRequested.Load() }
 // drain. Dispatched BEFORE the leader gate (a to-be-restarted broker must NOT be the leader).
 func (b *clusterAdminBackend) handleBrokerUpgradeReload(req adminsock.Request) adminsock.Response {
 	op := req.Op
-	if req.ToVersion != "" && proto.ReleaseVersion == req.ToVersion {
+	// proto.SameRelease: the two ends disagree on the leading "v" (goreleaser stamps it, a source build does not), and this is a CONFIRMATION check — a false negative reports a successful upgrade as unconfirmed (prerelease audit DRD-F2/F3).
+	if req.ToVersion != "" && proto.SameRelease(proto.ReleaseVersion, req.ToVersion) {
 		return adminsock.Response{Op: op, OK: true, AlreadyAtVersion: true}
 	}
 	if b.admin != nil && b.admin.node != nil && b.admin.node.IsLeader() {

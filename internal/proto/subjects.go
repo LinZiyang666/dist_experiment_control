@@ -206,6 +206,48 @@ func SubjPtyIn(sid, pid string) string {
 func SubjPtyResize(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.resize", SubjectPrefix, sid, pid)
 }
+
+// NODE-SCOPED `.in` / `.resize` — origin: prerelease audit round 2, I-F6.
+//
+// The session-scoped forms above are a SESSION wildcard, and every agent in the session
+// subscribes to them. So every agent receives a copy of every other node's raw keystroke
+// stream and drops it on the pid lookup. That stream is not metadata: it is whatever the
+// operator types into an interactive program, which on this fleet demonstrably includes
+// passwords typed at a jump host.
+//
+// The `.ka` analogy the intake's comment draws does not carry — a keepalive is an empty
+// beat, `.in` has a payload.
+//
+// ADDITIVE, and both ends must move for it to help. See PtyNodeHeader for how a new ctl
+// keeps an OLD agent working without a new agent processing the same keystroke twice.
+func SubjPtyInNode(sid, nid, pid string) string {
+	return fmt.Sprintf("%s.s.%s.node.%s.pty.%s.in", SubjectPrefix, sid, nid, pid)
+}
+func SubjPtyResizeNode(sid, nid, pid string) string {
+	return fmt.Sprintf("%s.s.%s.node.%s.pty.%s.resize", SubjectPrefix, sid, nid, pid)
+}
+
+// PtyNodeHeader marks a LEGACY-subject pty message that also went out on the
+// node-scoped subject. origin: prerelease audit round 2, I-F6.
+//
+// It is what makes the transition N-1 safe in BOTH directions, which neither subject
+// alone can be:
+//
+//	old ctl → new agent   no header; the legacy subscription handles it, as today.
+//	new ctl → old agent   the legacy copy arrives and is processed; the old agent has
+//	                      never heard of the header and ignores it.
+//	new ctl → new agent   BOTH copies arrive. The node-scoped one is processed; the
+//	                      legacy one carries this header and is DROPPED, so a keystroke
+//	                      is never delivered twice.
+//
+// Dropping on the header rather than on "did I also get a node-scoped copy" is
+// deliberate: the two subscriptions have no ordering guarantee between them, and a
+// keystroke stream cannot be de-duplicated after the fact.
+//
+// It is NOT a security control — a client could omit it — and it does not need to be:
+// omitting it costs the sender nothing but a double keystroke on its own session.
+const PtyNodeHeader = "Tether-Pty-Node"
+
 func SubjPtyAttach(sid, pid string) string {
 	return fmt.Sprintf("%s.s.%s.pty.%s.attach", SubjectPrefix, sid, pid)
 }

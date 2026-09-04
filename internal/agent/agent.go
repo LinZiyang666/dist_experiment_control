@@ -38,7 +38,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/proxydial"
@@ -590,6 +592,34 @@ type Agent struct {
 	// dying conn cannot re-subscribe on it (no double-dispatch). Cleared by Run after
 	// the dying session fully tears down.
 	rebuilding atomic.Bool
+
+	// sessionGen counts OPTION BUILDS, and every build's handler closures capture the
+	// generation they belong to so they can compare it against the current one before
+	// acting.
+	//
+	// Not "once per session" — that sentence was in this comment and was false (round 2,
+	// AC-7/C11): connectNATS calls buildOpts a second time inside the SAME session when a
+	// lease degrade forces the CONNECT name to change. The correctness argument survives
+	// the correction, and is in fact simpler: whatever the current build is, every
+	// closure from an EARLIER one declines. A retry that rebuilds options retires its own
+	// previous attempt's callbacks, which is what you want — that attempt failed.
+	//
+	// origin: prerelease audit agent-conn/AC-F2. `rebuilding` is only true DURING a
+	// rebuild; once Run clears it, a callback still queued on a RETIRED connection is
+	// indistinguishable from one on the live connection, and it re-registers and
+	// re-subscribes on a socket nobody is reading. The reviewer proposed remembering the
+	// retired *nats.Conn in a single pointer, which loses the older one whenever two
+	// retirements land close together. A generation counter has no ABA case, needs no
+	// reference to a dead connection, and each closure already has a natural place to
+	// hold its own value.
+	sessionGen atomic.Uint64
+
+	// sharedInboxLogged keeps the "this broker is older than me" line to ONE per
+	// process. connectNATS is a retry loop over a reconnecting daemon, so the condition
+	// it reports — a broker that predates auth.InboxRoot — is stable for as long as that
+	// broker is, and repeating it once per dial would bury everything else in the log.
+	sharedInboxLogged atomic.Bool
+
 	// rebuildRequested is set by the redial watchdog so the session loop returns
 	// rebuild=true (a fresh dial pool) rather than treating the close as a shutdown.
 	rebuildRequested atomic.Bool
@@ -605,6 +635,25 @@ type Agent struct {
 	// (a separate goroutine) can unblock heartbeatLoop to force the rebuild.
 	sessCancelMu sync.Mutex
 	sessCancel   context.CancelFunc
+
+	// everAuthed latches once this process has completed a NATS authentication at
+	// least once. It is what separates "this credential is wrong" from "the broker
+	// could not answer right now" on a path where nats-server gives both the SAME
+	// wire text.
+	//
+	// origin: prerelease audit proto-auth-acl (verifier-found). nats-server collapses
+	// an auth_callout TIMEOUT and a missing callout responder into the identical
+	// `Authorization Violation` that a wrong PIN produces (server/auth_callout.go's
+	// timeout arm reaches client.authViolation like every other denial). isAuthFailure
+	// matches on that text and connectNATS treats it as terminal — correct for a first
+	// connect, catastrophic afterwards: Run is `for { a.session(ctx) }`, and session()
+	// starts with connectNATS, so a stuck-reconnect rebuild that lands in a broker
+	// restart / election / saturated-callout window ends the process. The unit is
+	// Type=simple with Restart=on-failure and NO KillMode override, so systemd's
+	// default KillMode=control-group kills everything else in the agent's cgroup on
+	// the way — the operator's running experiments. A two-second callout hiccup must
+	// not be able to do that.
+	everAuthed atomic.Bool
 
 	// avoidHostMu/avoidHost (#48) is a ONE-SHOT dial-pool exclusion set by the broker-silence
 	// escape: when the current broker goes silent (a retired-broker NATS island) the roster
@@ -1055,7 +1104,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// budgeted closer goroutine, so poisoning bounds it like the close itself.
 	fin.addBoundedCleanup(func() { _ = subFwd.Unsubscribe() })
 
-	if err := a.startCtlLiveness(runCtx, nc, fin); err != nil {
+	if err := startSessionIntakes(runCtx, a, nc, fin); err != nil {
 		cancelRun()
 		return false, err
 	}
@@ -1221,7 +1270,18 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 	// the options frozen above the loop, that retry would re-present the very
 	// name auth_callout just refused — the degrade would be inert and a broker
 	// rollback would still kill every leased agent.
-	buildOpts := func() ([]nats.Option, error) {
+	//
+	// It returns TWO option sets. `live` is the one a real session is built from.
+	// `probe` is for the throwaway attribution dials below and is deliberately
+	// NOT the same slice — origin: prerelease audit round 2, AC-5. Dialling a
+	// probe with the live set installed this session's DisconnectErr/Reconnect
+	// callbacks at the CURRENT generation, so the generation guard could not
+	// help: a probe connection dropped by a restarting broker armed
+	// armFailClosed() and armRedialWatchdog() on behalf of a connection the
+	// agent had already thrown away, and session() clears the watchdog BEFORE
+	// connectNATS and never after — so that watchdog survived into the healthy
+	// session this call was about to establish and could fire fireRedial on it.
+	buildOpts := func() (live []nats.Option, probe []nats.Option, err error) {
 		o := a.buildConnOptions()
 		// Proxy-aware dial. Injected here (the single connect call site) rather
 		// than in buildConnOptions, which has two returns and no merge point —
@@ -1229,17 +1289,28 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		// proxy env set.
 		popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
 		if perr != nil {
-			return nil, perr
+			return nil, nil, perr
 		}
 		o = append(o, popts...)
+		// Derived BEFORE the tracker is appended, so the probe keeps the
+		// proxy-aware dialer (it must still reach the same servers by the same
+		// route) but does NOT share this session's connTracker — a probe's raw
+		// net.Conn has no business in the set a session teardown poisons.
+		probe = probeConnOptions(o)
 		// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
 		// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
 		// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
 		// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
-		o = append(o, a.trackerDialOption(ctx, o))
-		return o, nil
+		//
+		// Copied into its OWN slice rather than appended onto `o`: probe was derived from
+		// o a moment ago, and an append into o's spare capacity would put the tracker in a
+		// slice the probe set may share.
+		live = make([]nats.Option, 0, len(o)+1)
+		live = append(live, o...)
+		live = append(live, a.trackerDialOption(ctx, o))
+		return live, probe, nil
 	}
-	connOpts, perr := buildOpts()
+	connOpts, probeOpts, perr := buildOpts()
 	if perr != nil {
 		return nil, perr
 	}
@@ -1253,6 +1324,11 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 	// the retry fell back to, and an operator following its `admin evict`
 	// advice would delete the provisioning row a healthy incumbent depends on.
 	var firstDeniedNID string
+	// leaseDenials counts CONSECUTIVE auth denials seen under an assigned lease
+	// name by a process that had already authenticated. See the degrade arm below
+	// (round 2, AC-2): it is what separates a broker rollback, which denies
+	// forever, from a rolling restart, which denies for a few seconds.
+	var leaseDenials int
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1266,8 +1342,33 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		if attempt == 1 && avoid != "" {
 			dial = excludeHostFromDial(dial, avoid)
 		}
-		nc, err := nats.Connect(dial, connOpts...)
+		nc, err := dialAgentNATS(a, dial, connOpts)
+		if err != nil {
+			// ATTRIBUTE A POOL-WIDE FAILURE, because nats.Connect flattens it.
+			//
+			// origin: prerelease audit agent-conn/AC-F3. With more than one URL in the
+			// pool, nats.go reports the LAST error it saw — usually ErrNoServers — even
+			// when one of the servers answered with an authorization violation. The lease
+			// degrade below is gated on isAuthFailure, so a denial hidden behind
+			// ErrNoServers left a leased agent re-presenting the refused name forever.
+			//
+			// The re-dial costs nothing on the healthy path: it only runs once the pooled
+			// connect has ALREADY failed, and only when the pool has more than one entry.
+			//
+			// The reviewer's alternative — drop the lease after N consecutive failures of
+			// any kind — was rejected: an ordinary network outage would trigger it, and
+			// dropLease re-attaches the state store, which on the shared home directory
+			// this feature exists for hands a clone write access to the incumbent's
+			// state.json. That is the accident buildLocalSnapshot's comment describes.
+			if aerr := attributeDialFailure(dial, err, probeOpts, a.cfg.Logger); aerr != nil {
+				err = aerr
+			}
+		}
 		if err == nil {
+			// This process has now proved its credential is accepted. Any LATER
+			// denial is therefore ambiguous, and the ambiguity is resolved in favour
+			// of staying alive — see everAuthed.
+			a.everAuthed.Store(true)
 			if attempt > 1 {
 				a.cfg.Logger.Info("agent: NATS connect succeeded after retry",
 					"attempts", attempt)
@@ -1295,15 +1396,82 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 				if firstDeniedNID == "" {
 					firstDeniedNID = denied
 				}
+				// THE SAME AMBIGUITY RULE AS THE ARM BELOW, applied to the arm
+				// that runs FIRST. origin: prerelease audit round 2, AC-2.
+				//
+				// "A denial after this process authenticated is ambiguous"
+				// governed the die-or-retry decision but not its sibling, and
+				// this one is the more dangerous of the two: dropLease
+				// re-attaches the state store and retargets the tunnel adapter
+				// at the basename. On the shared/NFS home directory the lease
+				// feature exists for, that hands this clone write access to the
+				// INCUMBENT's state.json and points its tunnel at a REGISTER
+				// line the incumbent owns — the accident buildLocalSnapshot's
+				// comment describes. AC-F3 widened what counts as an auth
+				// denial at the same time, so the trigger got easier to pull.
+				//
+				// A whole-cluster restart or a rolling `cluster upgrade` makes
+				// every broker answer `Authorization Violation` for a few
+				// seconds (buildConnOptions' own IgnoreAuthErrorAbort comment
+				// documents exactly this), and the old code degraded on the
+				// FIRST one.
+				//
+				// Not gated on everAuthed outright — that would make the degrade
+				// inert in the very case it was written for, since an agent that
+				// holds a lease necessarily authenticated to get it. What
+				// separates a rollback from a restart is PERSISTENCE, so spend a
+				// few retries first: a transient denial clears well inside them
+				// and a genuine rollback keeps denying and still degrades.
+				if a.everAuthed.Load() && leaseDenials < leaseDegradeAfterDenials {
+					leaseDenials++
+					a.cfg.Logger.Warn("agent: auth denied under the assigned lease name, but this process had already authenticated; "+
+						"retrying before degrading, because dropping the lease re-attaches the state store and retargets the tunnel",
+						"sid", a.cfg.SID, "nid", denied, "denials", leaseDenials,
+						"degrade_after", leaseDegradeAfterDenials, "err", err)
+					if werr := waitBackoff(ctx, &backoff, a.cfg.RegisterRetryMax); werr != nil {
+						return nil, werr
+					}
+					continue
+				}
 				dropLease(a)
 				// REBUILD THE OPTIONS. The CONNECT name is baked into them, so
 				// without this the retry re-presents the name that was just
 				// refused and the degrade is inert.
-				if rebuilt, rerr := buildOpts(); rerr == nil {
-					connOpts = rebuilt
+				//
+				// BOTH sets, not just the live one: the probe options carry the
+				// same CONNECT name, so a stale probe set would attribute the
+				// NEXT failure by re-presenting the name that was already
+				// refused — and report a denial that says nothing about the
+				// basename the retry is actually using.
+				if rebuilt, rebuiltProbe, rerr := buildOpts(); rerr == nil {
+					connOpts, probeOpts = rebuilt, rebuiltProbe
 				}
 				a.cfg.Logger.Warn("agent: auth denied under the assigned lease name; retrying as the configured basename",
-					"sid", a.cfg.SID, "denied_nid", denied, "basename", a.cfg.NID, "err", err)
+					"sid", a.cfg.SID, "denied_nid", denied, "basename", a.cfg.NID, "dial", dial, "err", err)
+				continue
+			}
+			// A DENIAL AFTER THIS PROCESS ALREADY AUTHENTICATED IS NOT A CREDENTIAL
+			// PROBLEM — treat it as transient and keep the workloads alive.
+			//
+			// nats-server answers an auth_callout timeout, a missing callout
+			// responder and a wrong PIN with the SAME `Authorization Violation`
+			// string, so this branch cannot tell them apart by text. But it can tell
+			// them apart by history: a credential that authenticated once does not
+			// spontaneously become wrong, while a broker restart, an election, or a
+			// saturated callout queue all produce exactly this. Dying here ends the
+			// process, and systemd's default KillMode=control-group then takes the
+			// operator's running experiments with it. A genuinely revoked binding
+			// still fails — loudly, every retry — it just no longer kills work on the
+			// way out. The first-connect case (everAuthed false) is unchanged: that
+			// one really is a credential problem and must fail fast and loud.
+			if a.everAuthed.Load() {
+				a.cfg.Logger.Warn("agent: auth denied AFTER this process had already authenticated; "+
+					"treating as TRANSIENT (broker restarting / callout timeout / election) rather than "+
+					"exiting, which would take this unit's cgroup — including running workloads — with it",
+					"sid", a.cfg.SID, "nid", nidOf(a), "attempt", attempt, "err", err)
+				if werr := waitBackoff(ctx, &backoff, a.cfg.RegisterRetryMax); werr != nil {
+					return nil, werr
+				}
 				continue
 			}
 			// Name the identity that was ACTUALLY refused. After a lease drop
@@ -1329,18 +1497,36 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 		a.cfg.Logger.Warn("agent: NATS connect failed; retrying",
 			"attempt", attempt, "err", err, "next_backoff", backoff)
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < a.cfg.RegisterRetryMax {
-			backoff *= 2
-			if backoff > a.cfg.RegisterRetryMax {
-				backoff = a.cfg.RegisterRetryMax
-			}
+		if werr := waitBackoff(ctx, &backoff, a.cfg.RegisterRetryMax); werr != nil {
+			return nil, werr
 		}
 	}
+}
+
+// waitBackoff sleeps out one retry interval and doubles it, capped at max.
+//
+// Extracted from connectNATS' three identical copies — origin: prerelease audit round
+// 2. AC-2 added a fourth wait site and pushed the function's maintainability index to
+// 18; the repo's precedent for that (the `session` intake grouping) is to EXTRACT rather
+// than add an exemption, because a maintidx exemption is permanent and an extraction is
+// the thing the number was asking for.
+//
+// The pointer is the point: every caller's next wait must be longer than this one, and
+// three hand-written copies of "double it unless it is already at the cap" is exactly
+// the shape where one of them quietly stops doubling.
+func waitBackoff(ctx context.Context, backoff *time.Duration, max time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(*backoff):
+	}
+	if *backoff < max {
+		*backoff *= 2
+		if *backoff > max {
+			*backoff = max
+		}
+	}
+	return nil
 }
 
 // register loops, retrying on transient failures (no responders / per-attempt
@@ -2034,8 +2220,18 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 // It returns no error: every path here appends to a slice, and the (always-nil) error it used to
 // return made three call sites write handling for a failure that could not happen.
 func (a *Agent) buildConnOptions() []nats.Option {
+	// The generation THIS session's callbacks belong to. Captured by value, so a
+	// callback fired on a connection built by an earlier session compares its own
+	// (stale) number against the current one and declines — see sessionGen.
+	gen := a.sessionGen.Add(1)
 	opts := []nats.Option{
 		nats.MaxReconnects(-1),
+		// origin: prerelease audit agent-conn/AC-F1. Without this, nats.go delivers
+		// disconnect/close callbacks AFTER Close() returns, so a session teardown could
+		// still arm the fail-closed countdown and the redial watchdog on behalf of a
+		// connection the agent has already finished with — scheduling work for a session
+		// that no longer exists.
+		nats.NoCallbacksAfterClientClose(),
 		// A reconnect can race a rolling NATS/broker restart: nats-server may accept CONNECT while
 		// the auth_callout responder is not subscribed yet and return an authorization violation.
 		// nats.go aborts reconnect after seeing the same auth error twice unless this option is set,
@@ -2058,6 +2254,14 @@ func (a *Agent) buildConnOptions() []nats.Option {
 			if a.rebuilding.Load() {
 				return
 			}
+			// AC-F2: and the same is true AFTER the rebuild finishes. `rebuilding` is
+			// cleared by Run as soon as the dying session tears down, so a callback that
+			// arrives one moment later looks exactly like a live one. Comparing the
+			// generation this closure was built for against the current session settles it
+			// without keeping a dead connection alive to compare pointers against.
+			if a.sessionGen.Load() != gen {
+				return
+			}
 			a.stopRedialWatchdog() // a successful reconnect means we are NOT stuck
 			// audit xx-concurrency F4: single-flight — drop a reconnect that arrives while a
 			// prior onNATSReconnect is still running so a flapping link cannot fan out unbounded
@@ -2073,6 +2277,11 @@ func (a *Agent) buildConnOptions() []nats.Option {
 		// B1 fail-closed: arm the SS-teardown countdown on disconnect. C1 §D-1 L3: also arm the
 		// stuck-reconnect watchdog so a dead boot pool triggers a rebuild on the freshest roster.
 		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+			// AC-F2, same reasoning as the reconnect handler: a retired session's
+			// disconnect must not arm this session's countdown or watchdog.
+			if a.sessionGen.Load() != gen {
+				return
+			}
 			a.armFailClosed()
 			a.armRedialWatchdog()
 		}),
@@ -2108,11 +2317,63 @@ func (a *Agent) buildConnOptions() []nats.Option {
 		// upgrade into a hard auth denial.
 		nats.Name(cli.AgentName(a.cfg.SID, nidOf(a))),
 		nats.Nkey(id.PublicKey, sigCB),
+		// THE PRIVATE REPLY INBOX IS NOT SET HERE — see auth.InboxPrefixFor. The register
+		// reply carries the tunnel token and every subscriber PSK, so it must not land on
+		// a subject every other connection on the account may subscribe to
+		// (origin: prerelease audit proto-auth-acl/L1-F1) — but the inbox now lives under
+		// its own top-level root, which a PRE-CUTOVER broker grants no reach to at all.
+		// So the options are added at the DIAL, by natsinbox.Connect, which probes once
+		// and falls back to the shared space when the broker is older than this agent.
+		// That is the {old broker × new agent} quadrant, and on a real fleet it is what a
+		// broker rollback looks like from six already-upgraded machines.
 	)
 	if a.cfg.PIN != "" {
 		opts = append(opts, nats.Token(a.cfg.PIN))
 	}
 	return opts
+}
+
+// dialAgentNATS is the agent's one dial, adding the private reply inbox and falling
+// back to the shared pre-cutover space when the broker on the other end will not grant
+// it. See natsinbox.Connect for why the probe costs one round trip and no timing
+// assumption.
+//
+// A package-level function taking *Agent rather than a method: the structural-budget
+// ratchet pins this type's method count exactly, and a helper that exists only to keep
+// one call site readable is not worth spending that budget on.
+//
+// The anonymous branch (no Identity — TETHER_DEV_NO_AUTH / P2 demos) has no nkey, so its
+// prefix is derived from (sid, nid) instead. It gets NO probe and no fallback: there is no
+// auth_callout in that mode — an anonymous connection could not pass one — so there is no
+// grant to be refused.
+//
+// IT STILL USES THE PRIVATE ROOT, and that is deliberate. Since external review B-1 the
+// broker withholds credential-bearing payloads from any reply subject outside
+// auth.InboxRoot, and the alternative — exempting the fence when auth_callout is off —
+// would hang a security property on a configuration flag. Keeping every tether client's
+// replies under the same root makes the fence a uniform invariant with no exception to
+// remember, at the cost of one option on a code path that has no ACLs anyway.
+func dialAgentNATS(a *Agent, dial string, opts []nats.Option) (*nats.Conn, error) {
+	if a.cfg.Identity == nil {
+		// InboxConnectOptions, NOT a bare nats.CustomInboxPrefix: the prefix and the
+		// CONNECT marker are one unit, and the pairing gate is right to refuse them
+		// separately even here. There is no probe and no fallback on this branch — an
+		// anonymous connection could not pass an auth_callout, so no grant can be refused.
+		return nats.Connect(dial,
+			append(opts, natsinbox.InboxConnectOptions("anon:"+a.cfg.SID+"/"+nidOf(a))...)...)
+	}
+	nc, sharedInbox, err := natsinbox.Connect(dial, a.cfg.Identity.PublicKey, opts)
+	if err != nil {
+		return nil, err
+	}
+	if sharedInbox && a.sharedInboxLogged.CompareAndSwap(false, true) {
+		a.cfg.Logger.Warn("agent: this broker predates per-identity reply inboxes; "+
+			"falling back to the shared inbox space until it is upgraded. Replies to this agent — "+
+			"including its register reply, which carries the tunnel token and every subscriber PSK — "+
+			"are readable by any other connection on this deployment until then",
+			"inbox_root", auth.InboxRoot)
+	}
+	return nc, nil
 }
 
 // isAuthFailure detects nats-server auth-rejection messages. These come
@@ -2135,6 +2396,121 @@ func isAuthFailure(err error) bool {
 		}
 	}
 	return false
+}
+
+// attributeDialFailure re-dials each URL of a MULTI-URL pool separately, once, to find
+// out whether any of them actually refused the credential.
+//
+// It returns the auth error when one is found, and nil otherwise (leaving the caller's
+// original error in place). nats.Connect's pooled error is the last one it happened to
+// see, so a genuine authorization violation on one server is routinely reported as
+// ErrNoServers — and every decision downstream that asks "was this an auth failure"
+// then answers no.
+//
+// ONLY on an already-failed pooled connect, and only when there is more than one URL:
+// the healthy path never reaches it, and a single-URL pool has nothing to disambiguate.
+//
+// THE GATE IS "not already an auth error", NOT "is ErrNoServers" — origin:
+// prerelease audit round 2, AC-1. The first version keyed on ErrNoServers and
+// carried a `// already attributed` comment that was simply false for every
+// other error. nats.go only rewrites the pooled error to ErrNoServers when the
+// last dial failed with "connection refused" (nats.go@v1.52.0 connect()); the
+// ordinary down-broker outcome — host unreachable, firewall DROP, partition —
+// is `i/o timeout`, and on that the function returned nil on its first line and
+// the denial stayed hidden exactly as it was before AC-F3. It was also
+// order-dependent: the same fleet attributed correctly or not depending on
+// where in the pool the denying broker happened to sit.
+//
+// `opts` must be the PROBE option set (probeConnOptions), never the live one.
+func attributeDialFailure(dial string, poolErr error, opts []nats.Option, log *slog.Logger) error {
+	if isAuthFailure(poolErr) {
+		return nil // already attributed: the pooled error IS the denial
+	}
+	urls := strings.Split(dial, ",")
+	if len(urls) < 2 {
+		return nil
+	}
+	// BOUNDED, and it says so when it truncates. Each probe that reaches a live
+	// broker costs a full auth_callout decision — an argon2id verify against the
+	// broker's process-wide PIN budget — so an agent flapping against a large
+	// roster must not turn one failed connect into an unbounded fan-out of them.
+	if len(urls) > maxAttributionProbes {
+		log.Warn("agent: attributing a pooled dial failure over only the first brokers of a larger pool",
+			"probed", maxAttributionProbes, "pool", len(urls),
+			"why", "each probe costs the broker a full auth decision")
+		urls = urls[:maxAttributionProbes]
+	}
+	for _, u := range urls {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		nc, err := nats.Connect(u, opts...)
+		if err == nil {
+			// It works in isolation; nothing to attribute. Close it rather than
+			// returning it — the caller's retry owns connection construction.
+			nc.Close()
+			continue
+		}
+		if isAuthFailure(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// leaseDegradeAfterDenials is how many consecutive auth denials an
+// already-authenticated process absorbs under its assigned lease name before it
+// gives the name up. origin: prerelease audit round 2, AC-2.
+//
+// Sized against the two things it has to tell apart. A rolling `cluster upgrade`
+// or a whole-cluster restart leaves the auth_callout responder unsubscribed for
+// a few seconds; with RegisterRetryInitial doubling per attempt, three denials
+// already span more than that. A rollback to a broker without the suffix
+// fallback denies every retry forever, so it reaches the fourth and degrades.
+const leaseDegradeAfterDenials = 3
+
+// maxAttributionProbes caps how many pool entries one failed connect will
+// re-dial to attribute the failure. origin: prerelease audit round 2, AC-5.
+const maxAttributionProbes = 4
+
+// attributeProbeTimeout bounds a single attribution dial. Short on purpose: the
+// question is only "does THIS server refuse the credential", and a server that
+// cannot answer that inside the timeout is exactly the unreachable case the
+// caller already knows about.
+const attributeProbeTimeout = 3 * time.Second
+
+// probeConnOptions derives a THROWAWAY option set from a live one.
+// origin: prerelease audit round 2, AC-5.
+//
+// nats.Option values are applied in order and later ones overwrite earlier
+// ones, so appending is how a field is un-set. Four things must go:
+//
+//   - the lifecycle callbacks, because they close over this session's
+//     generation and would run armFailClosed / armRedialWatchdog on behalf of a
+//     connection nobody will ever use;
+//   - reconnection, because a probe that succeeds is closed immediately and a
+//     probe that fails must report that, not retry into the background;
+//   - RetryOnFailedConnect, for the same reason — it turns "refused" into a
+//     connection object that reports its error later, which is precisely the
+//     signal this probe exists to read synchronously;
+//   - the connect timeout is shortened, since one failed pooled connect now
+//     costs several of these in series.
+//
+// The identity options are deliberately KEPT. An attribution probe that does
+// not present the credential proves nothing about whether the credential is
+// refused, which is the only question being asked.
+func probeConnOptions(live []nats.Option) []nats.Option {
+	o := append([]nats.Option(nil), live...)
+	return append(o,
+		nats.ReconnectHandler(nil),
+		nats.DisconnectErrHandler(nil),
+		nats.ClosedHandler(nil),
+		nats.DiscoveredServersHandler(nil),
+		nats.NoReconnect(),
+		nats.RetryOnFailedConnect(false),
+		nats.Timeout(attributeProbeTimeout),
+	)
 }
 
 // readBootID returns the Linux per-boot UUID, or "" on non-Linux / error.

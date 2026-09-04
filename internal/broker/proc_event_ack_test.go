@@ -314,3 +314,127 @@ func TestRegisterReconcileReadFailureRetainsExitAndIssuesNoDirectives(t *testing
 			reconciled, keepPorts, revokePorts, dropProcesses)
 	}
 }
+
+// seedForeignSession adds a second session with a node, so a test can publish on
+// a subject its own credential legally owns while probing another session's pids.
+func (h *procAckHarness) seedForeignSession(t *testing.T, sid, nid string) {
+	t.Helper()
+	if _, err := h.db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash) VALUES(?,?,'SHA256:o2','h2')`, sid, sid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO nodes(sid,nid,status) VALUES(?,?,'ONLINE')`, sid, nid); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// roundTripAs is roundTrip on an arbitrary session's own legal subject.
+func (h *procAckHarness) roundTripAs(t *testing.T, sid, nid, pid, kind string, body any) *proto.ProcEventAck {
+	t.Helper()
+	payload, _ := json.Marshal(body)
+	subj := proto.SubjEvProc(sid, nid, pid, kind)
+	reply := "ack.inbox." + sid + "." + pid + "." + kind
+	inbox, err := h.nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.nc.PublishRequest(subj, reply, payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.nc.Flush()
+	msg, err := h.sub.NextMsg(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.b.handleProcEvent(msg)
+	ackMsg, err := inbox.NextMsg(3 * time.Second)
+	if err != nil {
+		t.Fatalf("no ack arrived for %s/%s/%s: %v", sid, pid, kind, err)
+	}
+	var ack proto.ProcEventAck
+	if err := json.Unmarshal(ackMsg.Data, &ack); err != nil {
+		t.Fatal(err)
+	}
+	return &ack
+}
+
+// origin: prerelease audit round 2, E3.
+//
+// THE ACK MUST NOT ANSWER "DOES THIS PID EXIST SOMEWHERE ELSE".
+//
+// proc.MarkExited's fence is sid-scoped so a foreign pid and an unknown one are
+// the same answer, and its comment says so. handleProcEvent then defeated it
+// before it was reached: both audit-dedup pre-reads called the UNSCOPED proc.Get,
+// so a member of session `other`, publishing on its OWN legal subject with no
+// write of any kind, read pid-existence straight out of the ack code.
+//
+// The EXIT arm is the one that can be closed completely, and this pins it: with
+// the pre-read scoped, a foreign EXITED pid and a pid that exists nowhere both
+// reach the fenced writer and both come back `unknown_pid`.
+func TestTheExitAckCannotTellAForeignPidFromAnUnknownOne(t *testing.T) {
+	h := newProcAckHarness(t)
+	h.seedForeignSession(t, "other", "other-1")
+
+	// A real, EXITED process in session `lab`.
+	started := proto.ProcStartedEvent{PID: "victim1", Argv: []string{"train"}, StartedAt: time.Now().UTC(), StartedByFP: "SHA256:u"}
+	if ack := h.roundTrip(t, "victim1", "started", started, true); !ack.OK || ack.Code != "recorded" {
+		t.Fatalf("seed started ack = %+v, want OK/recorded", ack)
+	}
+	if ack := h.roundTrip(t, "victim1", "exit", proto.ProcExitEvent{PID: "victim1", ExitCode: 0, EndedAt: time.Now().UTC()}, true); !ack.OK {
+		t.Fatalf("seed exit ack = %+v", ack)
+	}
+
+	exit := proto.ProcExitEvent{ExitCode: 0, EndedAt: time.Now().UTC()}
+	foreign := h.roundTripAs(t, "other", "other-1", "victim1", "exit", exit)
+	unknown := h.roundTripAs(t, "other", "other-1", "nosuchpid00", "exit", exit)
+
+	if foreign.Code == "already_exited" {
+		t.Fatalf("the ack for ANOTHER session's exited pid is %q.\n\n"+
+			"That is a cross-session pid-existence oracle reachable from a legal subject with "+
+			"no write at all — and it contradicts the fence one frame below, which would have "+
+			"answered unknown_pid.", foreign.Code)
+	}
+	if foreign.Code != unknown.Code || foreign.OK != unknown.OK {
+		t.Fatalf("a foreign exited pid acks %+v while a pid that exists nowhere acks %+v.\n\n"+
+			"Any difference here is the oracle; proc.MarkExited's sid fence exists precisely so "+
+			"these two are the same answer.", foreign, unknown)
+	}
+}
+
+// origin: prerelease audit round 2, E3.
+//
+// The STARTED arm's half. The read-only oracle is closed — a foreign pid no longer
+// short-circuits to `already_recorded`, which was the cheap, repeatable, no-side-effect
+// probe. What remains is structural and is named honestly in proc.go: processes.pid is a
+// GLOBAL primary key, so a caller willing to actually attempt the insert still learns
+// existence from whether it succeeds. Closing that is a re-keying migration, not a
+// predicate, and this test pins the part that WAS fixed.
+func TestTheStartedAckNoLongerShortCircuitsOnForeignPids(t *testing.T) {
+	h := newProcAckHarness(t)
+	h.seedForeignSession(t, "other", "other-1")
+
+	started := proto.ProcStartedEvent{PID: "victim2", Argv: []string{"train"}, StartedAt: time.Now().UTC(), StartedByFP: "SHA256:u"}
+	if ack := h.roundTrip(t, "victim2", "started", started, true); !ack.OK || ack.Code != "recorded" {
+		t.Fatalf("seed started ack = %+v, want OK/recorded", ack)
+	}
+	before := h.audits.Load()
+
+	probe := proto.ProcStartedEvent{Argv: []string{"probe"}, StartedAt: time.Now().UTC(), StartedByFP: "SHA256:attacker"}
+	foreign := h.roundTripAs(t, "other", "other-1", "victim2", "started", probe)
+	if foreign.Code == "already_recorded" {
+		t.Fatalf("the ack for ANOTHER session's running pid is %q — the unscoped pre-read is back, "+
+			"and with it a free cross-session pid-existence oracle", foreign.Code)
+	}
+	// AND NOTHING OF THE VICTIM'S WAS TOUCHED: no audit, and the row still belongs
+	// to `lab`. The disclosure was always the point here, but a probe that also
+	// re-homed the row would be far worse.
+	if got := h.audits.Load(); got != before {
+		t.Errorf("a foreign started event published %d audit record(s)", got-before)
+	}
+	var owner string
+	if err := h.db.QueryRow(`SELECT sid FROM processes WHERE pid='victim2'`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "lab" {
+		t.Fatalf("the victim's process row is now owned by %q", owner)
+	}
+}

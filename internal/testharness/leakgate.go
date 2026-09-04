@@ -90,10 +90,28 @@ func AssertNoGoroutineLeak(t *testing.T, label string, before int) {
 // descriptor, and if the goroutine that owned it came from a pool the goroutine count returns to
 // baseline while the fd does not. test/d4's copy of this helper carried that explanation and it is
 // carried here verbatim in substance rather than dropped as a duplicate comment.
+// FDCountUnmeasurable is what FDCount returns on a platform with no /proc/self/fd.
+//
+// FDCountFailed is what it returns when the platform HAS one and the read still failed —
+// which on Linux is overwhelmingly "out of file descriptors", because ReadDir needs one.
+// The two must not be the same value: the first means "cannot judge", the second means
+// "the thing this gate exists to detect is happening right now".
+const (
+	FDCountUnmeasurable = -1
+	FDCountFailed       = -2
+)
+
 func FDCount() int {
 	entries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
-		return -1
+		// origin: prerelease audit, §3 MINOR sweep. This returned -1 for BOTH cases and
+		// AssertNoFDLeak treated any negative as "unmeasurable, pass" — so the gate
+		// reported PASS in the one condition it was built to catch. Opening a directory
+		// requires a descriptor; a process that has run out cannot read /proc/self/fd.
+		if _, serr := os.Stat("/proc/self"); serr == nil {
+			return FDCountFailed
+		}
+		return FDCountUnmeasurable
 	}
 	return len(entries)
 }
@@ -110,13 +128,25 @@ func FDCount() int {
 // failing, so a suite that runs on both Linux and macOS keeps one code path.
 func AssertNoFDLeak(t *testing.T, label string, before, tolerance int) {
 	t.Helper()
+	if before == FDCountFailed {
+		t.Errorf("%s: could not count file descriptors even though /proc/self exists — the most "+
+			"likely cause is that the process is OUT of them, which is the condition this gate "+
+			"exists to detect", label)
+		return
+	}
 	if before < 0 {
 		return // unmeasurable on this platform
 	}
 	var last int
 	for i := 0; i < goroutineLeakPollAttempts; i++ {
 		last = FDCount()
-		if last < 0 || last-before <= tolerance {
+		if last == FDCountFailed {
+			t.Errorf("%s: file-descriptor count became unreadable mid-test (before=%d). On Linux "+
+				"that means the process ran out of descriptors — a PASS here would be the gate "+
+				"reporting success at the exact moment it should fire", label, before)
+			return
+		}
+		if last == FDCountUnmeasurable || last-before <= tolerance {
 			return
 		}
 		time.Sleep(goroutineLeakPollInterval)

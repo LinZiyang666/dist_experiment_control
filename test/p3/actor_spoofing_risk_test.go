@@ -26,7 +26,7 @@ func TestForgedActorCannotTombstoneVictimSession(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "owner-pin")
 
 	// Attacker is a member of *some other session* (or none at all). We

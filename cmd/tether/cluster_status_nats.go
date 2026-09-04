@@ -195,7 +195,7 @@ func clusterStatusRemote(cmd *cobra.Command, home, natsURL string, asJSON bool) 
 		return err
 	}
 	defer nc.Close()
-	s := summarizeClusterHealth(probeClusterHealth(nc, id.PublicKey))
+	s := summarizeClusterHealth(probeClusterHealthAdvisory(nc, id.PublicKey))
 	renderCtlStatus(cmd.OutOrStdout(), s, asJSON)
 	// Close explicitly before exiting: os.Exit skips deferred calls, and nc.Close() is the flush that
 	// gets anything still buffered onto the wire. This path only reads, so nothing is known to be
@@ -294,6 +294,6 @@ func clusterStatusHomesRemote(cmd *cobra.Command, home, natsURL string, asJSON b
 		return err
 	}
 	defer nc.Close()
-	renderHomesRemote(cmd.OutOrStdout(), foldProxyHomeCounts(probeClusterHealth(nc, id.PublicKey)), asJSON)
+	renderHomesRemote(cmd.OutOrStdout(), foldProxyHomeCounts(probeClusterHealthAdvisory(nc, id.PublicKey)), asJSON)
 	return nil
 }

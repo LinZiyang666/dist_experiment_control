@@ -1091,6 +1091,13 @@ type AtomicWrite struct {
 	dstPath string
 	parent  string
 	done    bool
+
+	// carryMode is the destination's existing permission bits, captured at OPEN time
+	// (while the destination is known to exist and be regular) and applied at COMMIT
+	// time. origin: prerelease audit round 2, I-F4 — see NewAtomicWrite's comment for
+	// why the two must be separated.
+	carryMode     os.FileMode
+	haveCarryMode bool
 }
 
 func (w *AtomicWrite) Abort() {
@@ -1148,10 +1155,52 @@ func OpenForWriteAtomic(vp *ValidatedPath, randSuffix string) (*os.File, *Atomic
 		_ = unix.Close(dirFD)
 		return nil, nil, pathErr("io_error", "open %s: invalid file descriptor", tmpPath)
 	}
-	return f, &AtomicWrite{
+
+	// CARRY THE EXISTING FILE'S PERMISSION BITS ONTO THE REPLACEMENT.
+	//
+	// origin: prerelease audit agent-transfer/L3-F1. An atomic replace creates the tmp
+	// at 0600 and renames it over the destination, so `push --force` onto an existing
+	// file silently reset its mode: a 0755 script became non-executable, a 0644 config
+	// became unreadable to the group that had been reading it. The operator asked to
+	// replace the CONTENT.
+	//
+	// Done HERE, on the fd, and not by name after the rename. This function is the one
+	// place that holds the parent dirFD, the destination name and a still-open handle at
+	// the same time, so fstatat-then-fchmod has nothing to race against; a path-based
+	// chmod after the rename is a TOCTOU window on a directory the caller does not
+	// control.
+	//
+	// MASKED TO 0o777, deliberately not 0o7777: setuid, setgid and the sticky bit are
+	// properties of the file that WAS there, and re-applying them to bytes that just
+	// arrived over the network would be handing an uploader whatever privilege the old
+	// file carried.
+	//
+	// HONEST LIMIT: this restores the mode, NOT the owner. A root agent replacing a file
+	// owned by another user still ends up with a root-owned file, because fchown needs
+	// privileges the agent may not have and silently guessing is worse than leaving the
+	// ownership visible. A no-force push cannot hit either case: linkat refuses when the
+	// destination exists.
+	// CAPTURED HERE, APPLIED AT COMMIT — origin: prerelease audit round 2, I-F4. The
+	// first version chmod-ed the tmp right here, i.e. BEFORE a single byte of content had
+	// been written. For the whole duration of a multi-gigabyte transfer a
+	// group- or world-writable file therefore sat in the destination directory under a
+	// predictable name, and because the sha256 is computed over the STREAM and not over
+	// the file, bytes substituted in that window commit as verified. Carrying the mode
+	// forward and setting it at rename time preserves the property the fix is for
+	// (the operator's 0755 script stays executable) without opening the window.
+	//
+	// The READ stays here: this is where the destination is known to exist, and after the
+	// rename it is gone.
+	w := &AtomicWrite{
 		dirFD: dirFD, tmpName: tmpName, dstName: base,
 		tmpPath: tmpPath, dstPath: vp.Abs, parent: parent,
-	}, nil
+	}
+	var dst unix.Stat_t
+	if serr := unix.Fstatat(dirFD, base, &dst, unix.AT_SYMLINK_NOFOLLOW); serr == nil &&
+		unixModeIsRegular(uint32(dst.Mode)) {
+		w.carryMode, w.haveCarryMode = os.FileMode(dst.Mode&0o777), true
+	}
+	return f, w, nil
 }
 
 // RenameForWriteAtomic commits a populated tmp. No-force uses linkat as
@@ -1164,6 +1213,16 @@ func RenameForWriteAtomic(vp *ValidatedPath, pending *AtomicWrite, force bool) e
 	if same, err := dirFDStillNamesPath(pending.dirFD, pending.parent); err != nil || !same {
 		return pathErr("path_race",
 			"%s: parent changed before commit (same=%v err=%v)", vp.Abs, same, err)
+	}
+	// Apply the carried mode to the TMP, immediately before it becomes the destination
+	// (round 2, I-F4). Fchmodat against the pinned dirFD and our own tmp name — not a
+	// path-based chmod after the rename, which would be a TOCTOU window on a directory
+	// the caller does not control, and which is why the original put this on the fd.
+	//
+	// Not fatal if it fails: the CONTENT is what the operator asked for, and a filesystem
+	// that refuses the chmod is not a reason to fail the transfer.
+	if pending.haveCarryMode {
+		_ = unix.Fchmodat(pending.dirFD, pending.tmpName, uint32(pending.carryMode), 0)
 	}
 	if force {
 		if err := unix.Renameat(

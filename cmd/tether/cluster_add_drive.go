@@ -54,7 +54,10 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	if serr := routeCertSANPreflight(jp.SecretsDir, jp.NatsRoute); serr != nil {
 		return haltAdd(webhook, "preflight", jp.Joiner, serr)
 	}
-	votersBefore := countVoters(nc, actor)
+	votersBefore, verr := countVoters(nc, actor)
+	if verr != nil {
+		return haltAdd(webhook, "preflight", jp.Joiner, verr)
+	}
 	_, _ = fmt.Fprintf(out, "cluster add %s → cluster (leader=%s, voters=%d)\n", jp.Joiner, leader, votersBefore)
 
 	if dryRun {
@@ -636,19 +639,28 @@ failed:
 
 // --- cluster-health readers ----------------------------------------------------------------------------
 
-func countVoters(nc *nats.Conn, actor string) int {
+// A PROBE THAT COULD NOT BE MADE IS AN ERROR, not zero voters — origin: increment 2
+// internal review, pairing-sweep/IMPACT-F1. `cluster add` prints this count to the
+// operator and uses it to decide whether the existing cluster is a former-N1, so a
+// silent 0 makes a healthy three-voter cluster look empty at exactly the moment a
+// membership change is about to start.
+func countVoters(nc *nats.Conn, actor string) (int, error) {
+	replies, err := probeClusterHealth(nc, actor)
+	if err != nil {
+		return 0, fmt.Errorf("count voters: %w", err)
+	}
 	n := 0
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range replies {
 		if h.IsVoter {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 // formerSoleVoter returns the single existing VOTER that is NOT the joiner (the former-N1), or "".
 func formerSoleVoter(nc *nats.Conn, actor, joiner string) string {
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
 		if h.IsVoter && h.NodeID != "" && h.NodeID != joiner {
 			return h.NodeID
 		}
@@ -831,7 +843,7 @@ func resetJoinerJSStore(out interface{ Write([]byte) (int, error) }, jp joinerPa
 }
 
 func joinerIsVoter(nc *nats.Conn, actor, joiner string) bool {
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
 		if h.NodeID == joiner && h.IsVoter {
 			return true
 		}

@@ -508,6 +508,66 @@ func (r ReplicaReport) AllAtTarget() bool {
 	return true
 }
 
+// replicaReportAllAtLeast is AllAtTarget asked against a DIFFERENT target than the one
+// the observation was taken with. Same fail-closed contract: an unobserved or empty set
+// is never "ready".
+//
+// origin: prerelease audit broker-cluster-ops/#15. Retire's readiness gate asked
+// "is every stream at the target implied by the CURRENT voter count", and that
+// question cannot be answered yes when the reason you are retiring is that a voter is
+// already down: three voters means a target of 3, a dead voter means an actual of 2,
+// and the gate refuses forever. Retiring a dead voter — the case the runbook documents
+// and the one operators actually hit — was structurally impossible.
+//
+// The right question is the one the runbook already promises: will every stream STILL
+// be at target once this node is gone. That is ReplicasFor(voters-1), and it is
+// strictly weaker only in the direction that matters. 3->2 retiring a live node:
+// target 2, actual 3, passes. 3->2 retiring a dead one: target 2, actual 2, passes
+// (it used to deadlock). Three voters with TWO dead: target 2, actual 1, still refused
+// — no conservatism was traded away.
+//
+// A package-level function, not a method on ReplicaReport: the structural-budget
+// ratchet pins type method counts.
+func replicaReportAllAtLeast(r ReplicaReport, target int) bool {
+	if !r.Observed || len(r.Streams) == 0 {
+		return false
+	}
+	if target < 1 {
+		target = 1
+	}
+	for _, s := range r.Streams {
+		if s.Actual < target {
+			return false
+		}
+	}
+	return true
+}
+
+// replicaReportSurvivesRemoval reports whether EVERY observed stream would still hold at
+// least `target` caught-up replicas once `server` is gone.
+//
+// origin: prerelease audit round 2, G-1. replicaReportAllAtLeast answers the same shape of
+// question with a tally, which cannot express "excluding that one". Same fail-closed
+// contract: an unobserved or empty set is never ready, and a stream whose placement the
+// server did not report contributes no survivors.
+//
+// A package-level function, not a method on ReplicaReport: the structural-budget ratchet
+// pins type method counts.
+func replicaReportSurvivesRemoval(r ReplicaReport, server string, target int) bool {
+	if !r.Observed || len(r.Streams) == 0 {
+		return false
+	}
+	if target < 1 {
+		target = 1
+	}
+	for _, s := range r.Streams {
+		if jsstream.SurvivorsExcluding(s, server) < target {
+			return false
+		}
+	}
+	return true
+}
+
 // Degraded reports whether the cluster observed at least one under-replicated stream
 // (R-19): the signal D8b will later raise as replication_degraded.
 func (r ReplicaReport) Degraded() bool {

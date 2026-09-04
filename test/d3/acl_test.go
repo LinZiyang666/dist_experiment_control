@@ -50,12 +50,29 @@ func connectCLIWithErrCapture(t *testing.T, url string) (*nats.Conn, func() erro
 		t.Fatalf("CLI connect: %v", err)
 	}
 	t.Cleanup(func() { nc.Close() })
+	cliActors.Store(nc, pub)
 	getErr := func() error {
 		mu.Lock()
 		defer mu.Unlock()
 		return lastErr
 	}
 	return nc, getErr
+}
+
+// cliActors remembers which nkey each test CLI connected with, so a caller can name a
+// subject that connection is genuinely granted without threading the key through five
+// call sites. origin: prerelease audit round 2 — the positive control below used to
+// publish to `_INBOX.<anything>`, which was only "allowed" because the anonymous
+// template carried a surplus Pub grant on the whole reply space.
+var cliActors sync.Map
+
+func cliActorOf(t *testing.T, nc *nats.Conn) string {
+	t.Helper()
+	v, ok := cliActors.Load(nc)
+	if !ok {
+		t.Fatal("this connection was not built by connectCLIWithErrCapture")
+	}
+	return v.(string)
 }
 
 // TestD3RF1ApplyACL: the broker nkey may pub/sub cluster.apply.* (positive,
@@ -90,7 +107,13 @@ func TestD3RF1ApplyACL(t *testing.T) {
 
 	// Positive control (§13.8): the SAME connection can pub an ALLOWED subject —
 	// proves the deny below is subject-scoped, not a dead/unauthorized connection.
-	if err := cli.Publish("_INBOX.d3probe", []byte("ok")); err != nil {
+	//
+	// A SUBJECT THE CTL GENUINELY NEEDS, not `_INBOX.<anything>` — origin: prerelease
+	// audit round 2. This used the reply space as a convenient "something allowed",
+	// which quietly made it the only thing asserting that anonymous clients may publish
+	// into every connection's inbox. They may not, and they never needed to: a ctl names
+	// its inbox in the reply FIELD and publishes to the service subject.
+	if err := cli.Publish("tether.v2.ctrl.by."+cliActorOf(t, cli)+".session.list.req", []byte("ok")); err != nil {
 		t.Fatalf("allowed-subject publish failed: %v", err)
 	}
 	_ = cli.Flush()

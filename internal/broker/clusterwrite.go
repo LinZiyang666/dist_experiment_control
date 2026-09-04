@@ -293,7 +293,7 @@ func tunnelCertMatchesPinned(gotFP string, self *clusternodes.HomeNode, now time
 
 // wireClusterLate attaches the D8 write/forward sinks, subscribes the cluster
 // responders, and starts the leader-gated loops. It runs AFTER the NATS connect + JS
-// probe (the loops need b.js). The loops are tied to ctx (Run's context) so a cancel
+// probe (the loops need brokerJS(b)). The loops are tied to ctx (Run's context) so a cancel
 // stops them; step 5 adds the explicit ordered shutdown (drain forwards before
 // nc.Drain, unsubscribe responders, node.Shutdown).
 func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
@@ -330,7 +330,10 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D4 write-forward responder + D8b health/alert responders. Each stays silent on a
 	// follower (the leader answers); collected for ordered unsubscribe.
 	subscribers := []func() (*nats.Subscription, error){
-		func() (*nats.Subscription, error) { return SubscribeClusterApply(nc, node, b.cfg.Now, b.cfg.Logger) },
+		func() (*nats.Subscription, error) {
+			return SubscribeClusterApply(nc, node, b.cfg.Now, b.cfg.Logger,
+				func(pin, hash string) error { return verifyPINOnLeader(b, pin, hash) })
+		},
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterHealth(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty, b.cfg.Logger)
@@ -362,7 +365,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// D5 audit publisher (re-derivable post-commit publish + JS replica reconfig) +
 	// D8b alert reconciler (leader-gated raise/clear). Both leader-gated internally.
 	pub := NewAuditPublisher(AuditPublisherConfig{
-		Node: node, JS: b.js, Now: b.cfg.Now, Logger: b.cfg.Logger,
+		Node: node, JS: brokerJS(b), Now: b.cfg.Now, Logger: b.cfg.Logger,
 		// B7 per-iteration liveness. The closure resolves b.cl.loops lazily: the set is assigned before
 		// the goroutine that will call this is started, so the goroutine-start edge publishes it.
 		Beat: func() { b.cl.loops.Beat("audit-publisher") },
@@ -370,7 +373,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 			return listSessionsByState(b.cfg.DB, "ACTIVE")
 		},
 		XferState: func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error) {
-			return XferReplicaState(ctx, b.js, sid, target)
+			return XferReplicaState(ctx, brokerJS(b), sid, target)
 		},
 		// audit M5: a no-stream publish error is a permanent loss only when the session is no
 		// longer ACTIVE (rm'd / DELETING — its history stream was deleted by finalizeSessionRm);
@@ -511,10 +514,20 @@ func (b *Broker) clusterCaughtUp(nodeID string, barrier uint64) (bool, error) {
 }
 
 // clusterStreamsReady is the production stream-readiness gate (external-review F1): retire is
-// refused unless EVERY JS stream is at its target replica count (ReplicaReport.AllAtTarget is
-// fail-closed — an incomplete observation reports NOT ready). nodeID is unused (the predicate
-// is cluster-wide: a stream below target means retiring ANY node risks losing a replica).
-func (b *Broker) clusterStreamsReady(string) (bool, error) {
+// refused unless every JS stream would STILL be at its target replica count once the node being
+// retired is gone. Fail-closed throughout — an incomplete observation reports NOT ready. nodeID is
+// unused (the predicate is cluster-wide: a stream below target means retiring ANY node risks
+// losing a replica).
+//
+// POST-REMOVAL TARGET, NOT CURRENT TARGET (prerelease audit broker-cluster-ops/#15). This used to
+// ask AllAtTarget, i.e. "is every stream at the target implied by the CURRENT voter count". With a
+// voter already down that question has no yes: 3 voters imply a target of 3, the dead one means an
+// actual of 2, and retire is refused on every tick forever. Retiring a dead voter is the case
+// cluster-runbook.md §2 documents and the case operators actually reach this gate for, and it was
+// structurally impossible. Asking about the post-removal target is the question the runbook was
+// already describing, and it stays fail-closed for the situations that should fail: two dead voters
+// out of three still gives actual 1 against target 2, and is still refused.
+func (b *Broker) clusterStreamsReady(nodeID string) (bool, error) {
 	ap := b.cl.auditPub.Load()
 	if ap == nil {
 		// Fail-closed, consistent with AllAtTarget's own contract: an
@@ -533,7 +546,47 @@ func (b *Broker) clusterStreamsReady(string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return rep.AllAtTarget(), nil
+	// The post-removal voter count. An unreadable count is NOT an excuse to relax the
+	// gate — fall back to the observation's own target, which is the stricter question.
+	nv, nerr := b.cl.node.NumVoters()
+	if nerr != nil || nv <= 1 {
+		return rep.AllAtTarget(), nil
+	}
+	// WHICH node is being retired matters, and this gate used to throw it away.
+	//
+	// origin: prerelease audit round 2, G-1. Asking "is Actual >= the post-removal
+	// target" while ignoring nodeID counts a caught-up replica living ON the node about
+	// to be removed toward the floor it is supposed to survive: three voters, one lagging
+	// peer, a stream at Actual=2 passes a target of 2 and drops to 1 the instant the
+	// retire completes. The comment claiming "no conservatism was traded away" was wrong.
+	//
+	// An unresolvable server name means we cannot attribute placement, so we fall back to
+	// the STRICTER pre-removal question rather than guess.
+	server := natsServerIDFor(b, nodeID)
+	if server == "" {
+		return rep.AllAtTarget(), nil
+	}
+	return replicaReportSurvivesRemoval(rep, server, jsstream.ReplicasFor(nv-1)), nil
+}
+
+// natsServerIDFor maps a raft node id to the NATS server name StreamInfo reports, via the
+// replicated roster column that exists for exactly this bridge. Empty when unknown.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func natsServerIDFor(b *Broker, nodeID string) string {
+	if nodeID == "" {
+		return ""
+	}
+	var s sql.NullString
+	if err := b.read().SQL().QueryRow(
+		`SELECT nats_server_id FROM cluster_nodes WHERE node_id=?`, nodeID).Scan(&s); err != nil {
+		return ""
+	}
+	if !s.Valid {
+		return ""
+	}
+	return s.String
 }
 
 // observeStreamCountForBudget is how many streams the next ObserveReplicas is expected to enumerate.
@@ -722,7 +775,7 @@ func (b *Broker) clusterJSPlaceable() (bool, string) {
 	defer cancel()
 	// Cheap gate first: the events stream's CONFIGURED/ASSIGNED counts. It costs 2 round trips and
 	// rejects the common "the replica raise has not landed yet" case without touching the meta.
-	st, oerr := jsstream.CollectStreamState(ctx, b.js, jsstream.EventsStreamName, target)
+	st, oerr := jsstream.CollectStreamState(ctx, brokerJS(b), jsstream.EventsStreamName, target)
 	if ok, detail := jsPlaceableFrom(target, st, oerr); !ok {
 		return false, detail
 	}
@@ -732,7 +785,7 @@ func (b *Broker) clusterJSPlaceable() (bool, string) {
 	// an EMPTY stream created at the target factor and immediately deleted: it asks the meta the exact
 	// question the CLI's contract promises an answer to, and because it carries no data it introduces
 	// none of the byte-copy wait that gating on catch-up would.
-	if err := jsstream.ProbeMetaCanPlace(ctx, b.js, target, b.cfg.Logger); err != nil {
+	if err := jsstream.ProbeMetaCanPlace(ctx, brokerJS(b), target, b.cfg.Logger); err != nil {
 		return false, "the JS meta refused to assign an empty memory-backed canary at the target replica " +
 			"factor (this measures META ASSIGNMENT, not disk budget for file/object stores): " + err.Error()
 	}
@@ -956,7 +1009,7 @@ func (b *Broker) createSession(sid, fp, pinHash string) (*session.Session, error
 		return nil, err
 	}
 	if err := b.proposeOrForward(VerbSessionCreate, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return session.PlanCreate(db, sid, sid, fp, pinHash, b.cfg.Now())
+		return planAuthorizedSessionCreate(db, sid, fp, pinHash, b.cfg.Now())
 	}); err != nil {
 		// NOT committed (leadership lost, forward failed) or a genuine ErrAlreadyExists (the name is
 		// already taken) — surface it. A duplicate MUST still be rejected here: the D9 cluster tests
@@ -983,6 +1036,23 @@ func (b *Broker) createSession(sid, fp, pinHash string) (*session.Session, error
 		SID: sid, Name: sid, OwnerPubkeyFP: fp,
 		State: session.StateActive, CreatedAt: b.cfg.Now(),
 	}, nil
+}
+
+// planAuthorizedSessionCreate is the single authoritative session-create planner.
+// Both leader-local and forwarded writes decide admission from the leader's committed
+// DB immediately before constructing the raft command. An origin-side check is only an
+// early refusal: a creator can be revoked after that read and before this closure runs.
+func planAuthorizedSessionCreate(
+	db *sql.DB, name, fp, pinHash string, now time.Time,
+) (*cluster.Command, error) {
+	allowed, err := session.MayCreateSession(db, fp)
+	if err != nil {
+		return nil, fmt.Errorf("session create: read the creator allow-list: %w", err)
+	}
+	if !allowed {
+		return nil, session.ErrNotAllowedToCreate
+	}
+	return session.PlanCreate(db, name, name, fp, pinHash, now)
 }
 
 // allocatePort routes an expose allocation (D9 audit #6). Single mode: the direct
@@ -1205,16 +1275,34 @@ func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
 // markProcExited routes a process EXIT (D9 round-1 BLOCKER: exec.go's proc.exit + the
 // reconcile missed-exit path). Single mode: the direct mutator. Cluster mode: PlanMarkExited
 // via Propose/forward (the WHERE status='RUNNING' guard makes a forwarder retry idempotent).
-func (b *Broker) markProcExited(pid string, exitCode int, when time.Time) error {
+//
+// sid IS NOT OPTIONAL FOR ANY CALLER IN THIS REPO. Every call site has it in hand
+// already: exec.go parses it out of the subject, reconcileOnRegister is called with it.
+// It rides the forward payload so the LEADER applies the same fence the single-node
+// writer does; a fence that only held on the mode the attacker did not happen to hit
+// would not be one.
+//
+// TWO WRITERS, NAMED SEPARATELY — origin: prerelease audit round 2, L-F3. This used to
+// say "see proc.MarkExited for what it fences", which names the SINGLE-mode function
+// while the paragraph is about the cluster path. They are different functions with the
+// same fence: proc.MarkExited (below, single) and proc.PlanMarkExited (via the leader,
+// cluster). Pointing a reader at the one that is not on the path being described is how
+// a fence gets audited once and believed twice.
+//
+// It is also not an unconditional guarantee, and the old wording read like one. What the
+// code guarantees is that THIS function always sends the sid; that the leader USES it is
+// a property of cluster_forward.go's VerbProcMarkExited handler, and the two are only
+// held together by TestAForwardedProcExitCarriesTheSessionFence, which drives both.
+func (b *Broker) markProcExited(pid, sid string, exitCode int, when time.Time) error {
 	if !b.clusterMode {
-		return proc.MarkExited(b.cfg.DB, pid, exitCode, when)
+		return proc.MarkExited(b.cfg.DB, pid, sid, exitCode, when)
 	}
-	payload, err := json.Marshal(ProcMarkExitedPayload{Pid: pid, ExitCode: exitCode, EndedAt: when})
+	payload, err := json.Marshal(ProcMarkExitedPayload{Pid: pid, Sid: sid, ExitCode: exitCode, EndedAt: when})
 	if err != nil {
 		return err
 	}
 	return b.proposeOrForward(VerbProcMarkExited, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return proc.PlanMarkExited(db, pid, exitCode, when)
+		return proc.PlanMarkExited(db, pid, sid, exitCode, when)
 	})
 }
 
@@ -1272,6 +1360,109 @@ func (b *Broker) evictNode(sid, nid string) error {
 	})
 }
 
+// setSessionCreator routes an admission-table write. Same shape and same reason as
+// evictNode above: the adminsock wires it only in cluster mode, single mode leaves the
+// seam nil and writes directly. origin: prerelease audit round 2.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly, and it caught this one on the way in.
+func setSessionCreator(b *Broker, fp, addedBy, note string, allow bool) error {
+	if !b.clusterMode || b.cl == nil {
+		return fmt.Errorf("broker: setSessionCreator is cluster-mode only (single mode writes directly)")
+	}
+	// MIXED-VERSION GATE BEFORE THE PROPOSE. A voter whose binary predates
+	// OpSessionCreatorSet does not fail-stop on it — decodeCommand poison-SKIPS it, so the
+	// entry advances applied_index without running the SQL and that replica's admission
+	// table silently diverges from the leader's. For a policy table that means an
+	// operator's `session-allow` reports success while one broker keeps refusing the
+	// fingerprint, or a `--remove` leaves it able to create sessions wherever a ctl lands.
+	// origin: prerelease audit increment 2 internal review — six lanes.
+	if b.cl.admin != nil {
+		verb := "session-allow " + fp
+		if !allow {
+			verb = "session-allow --remove " + fp
+		}
+		if err := assertAllVotersSupportSessionCreatorOps(b.cl.admin, verb); err != nil {
+			return err
+		}
+	}
+	now := b.cfg.Now()
+	payload, err := json.Marshal(SessionCreatorPayload{FP: fp, AddedBy: addedBy, Note: note, Allow: allow})
+	if err != nil {
+		return err
+	}
+	return b.proposeOrForward(VerbSessionCreatorSet, "", payload, func(*sql.DB) (*cluster.Command, error) {
+		return session.PlanSetCreator(fp, addedBy, note, allow, now)
+	})
+}
+
+// seedSessionCreators runs the ONE-SHOT upgrade backfill: every fingerprint that already
+// owns a session is admitted to create sessions, so an existing deployment keeps working
+// across the upgrade that introduced admission control. Returns how many were admitted.
+//
+// origin: prerelease audit increment 2 internal review. This was an INSERT…SELECT inside
+// migration 0019; see that file for the three ways that was wrong. The properties this
+// form has and that one did not:
+//
+//   - ONCE. The cluster_meta marker is written in the same transaction (single mode) or
+//     the same raft entry (cluster mode) as the rows, so a later upgrade, a re-run
+//     migration, or installing an older snapshot cannot re-derive the table and undo a
+//     revocation.
+//   - ONE WRITER. In cluster mode only the leader proposes, and every replica learns the
+//     result through the log instead of computing its own from local state at its own
+//     restart time.
+//   - LEADERLESS IS NOT AN ERROR. A follower simply returns; the leader does it, and every
+//     follower gets it replicated. A broker that boots while an election is in progress
+//     tries again on its next boot, which is why the marker rather than a timer is what
+//     stops it.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func seedSessionCreators(b *Broker, now time.Time) (int, error) {
+	db := b.read().SQL()
+	seeded, err := session.CreatorsSeeded(db)
+	if err != nil {
+		return 0, err
+	}
+	if seeded {
+		return 0, nil
+	}
+	fps, err := session.OwnersNeedingAdmission(db)
+	if err != nil {
+		return 0, err
+	}
+	if !b.clusterMode || b.cl == nil {
+		return len(fps), session.SeedCreatorsLocally(db, fps, now)
+	}
+	// Cluster mode: the leader proposes, followers wait for the log. Not forwarded —
+	// unlike an operator's `session-allow`, nothing is waiting on this and every broker
+	// re-checks it on its own next boot, so a forward would only add a way for N brokers
+	// to race the same backfill through the leader.
+	if !b.cl.node.IsLeader() {
+		return 0, nil
+	}
+	// The same mixed-version gate an operator's admission write goes through: a voter that
+	// would poison-skip the op must not be handed a backfill either.
+	if b.cl.admin != nil {
+		if err := assertAllVotersSupportSessionCreatorOps(b.cl.admin, "session-creator upgrade backfill"); err != nil {
+			return 0, err
+		}
+	}
+	// The plan closure re-reads the marker under the leader's applyMu: between the check
+	// above and this point another broker's proposal may have committed the backfill
+	// already, and a nil command is Propose's documented no-op.
+	if err := b.cl.node.Propose(func(planDB *sql.DB) (*cluster.Command, error) {
+		already, cerr := session.CreatorsSeeded(planDB)
+		if cerr != nil || already {
+			return nil, cerr
+		}
+		return session.PlanSeedCreators(fps, now)
+	}); err != nil {
+		return 0, err
+	}
+	return len(fps), nil
+}
+
 // sessionReadBack bounds how long readCommittedSession tries to fetch a just-committed session
 // row back (for the authoritative leader-baked created_at) before giving up.
 //
@@ -1324,9 +1515,9 @@ func (b *Broker) readCommittedSession(sid string) (*session.Session, error) {
 // ratchet pins this type's method count exactly, and growing a type's surface is
 // the thing that gate exists to make deliberate. adjudicateLease is the same
 // shape for the same reason.
-func refileProc(b *Broker, sid, pid, from, to string) error {
+func refileProc(b *Broker, sid, pid, from, to string) (bool, error) {
 	if b.clusterMode {
-		return fmt.Errorf("broker: late cluster process refile for %s/%s (%s -> %s): register transaction omitted the move",
+		return false, fmt.Errorf("broker: late cluster process refile for %s/%s (%s -> %s): register transaction omitted the move",
 			sid, pid, from, to)
 	}
 	return proc.Refile(b.cfg.DB, sid, pid, from, to)

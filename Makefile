@@ -257,7 +257,7 @@ tools:
 # nats-server is a development-time dependency (only needed to manually exercise
 # `tether serve` against a real broker; the Go test suite uses an embedded
 # server via nats-server/v2/test and does NOT need this binary).
-NATS_SERVER_VERSION ?= v2.10.22
+NATS_SERVER_VERSION ?= v2.14.6
 
 nats-server-install:
 	go install github.com/nats-io/nats-server/v2@$(NATS_SERVER_VERSION)

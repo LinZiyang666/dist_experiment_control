@@ -31,6 +31,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -411,14 +412,34 @@ func normalizeRestoreStaging(stagePath, selfID, raftAddr string) (int64, error) 
 }
 
 // copyFileSync copies src to dst (O_EXCL was already cleared by the caller) and fsyncs dst.
+//
+// BOTH ends carry O_NOFOLLOW, and that is a privilege boundary rather than hygiene.
+//
+// origin: prerelease audit, §3 MINOR sweep. This runs under `sudo tether cluster recovery
+// restore`, i.e. as ROOT, and both paths live in the tether-writable data dir. Without
+// O_NOFOLLOW a symlink planted at the staging path makes root O_TRUNC and rewrite whatever
+// it points at — /etc/shadow, a unit file, another service's database. journal.go sealed
+// exactly this primitive at exactly this directory in round 6; the restore stager was
+// left open.
+//
+// ELOOP is translated rather than passed through: "too many levels of symbolic links" on a
+// path the operator did not think was a symlink is not an error message, it is a puzzle.
 func copyFileSync(src, dst string) error {
-	in, err := os.Open(src)
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("clusteroffline: %s is a SYMLINK — refusing to read through it; "+
+				"remove it and inspect why it is there", src)
+		}
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("clusteroffline: %s is a SYMLINK — refusing to write through it as root; "+
+				"remove it and inspect why it is there", dst)
+		}
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {

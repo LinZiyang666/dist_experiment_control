@@ -58,9 +58,12 @@ func correlateBrokerVersions(brokers map[string]brokerDaemon, agentRelease map[s
 		av, ok := agentRelease[row.AgentNID]
 		row.AgentVer = orQ(av) // C7: orQ already maps a missing/empty release ("" when !ok) to "?" — no separate !ok branch needed
 		// Skew: both sides KNOWN and different. Two "?" (both unknown) is not a skew claim.
-		row.Skew = d.BrokerVer != "" && ok && av != "" && d.BrokerVer != av
+		// SameRelease on both — origin: prerelease audit round 2, K-F6. This is the table
+		// an operator READS to decide whether a host is upgraded, so a "v" on one side and
+		// not the other reported a false skew and withheld a true WholeHostAt.
+		row.Skew = d.BrokerVer != "" && ok && av != "" && !proto.SameRelease(d.BrokerVer, av)
 		if target != "" {
-			row.WholeHostAt = d.BrokerVer == target && ok && av == target
+			row.WholeHostAt = proto.SameRelease(d.BrokerVer, target) && ok && proto.SameRelease(av, target)
 		}
 		out = append(out, row)
 	}
@@ -84,7 +87,7 @@ func renderNodeLsBrokers(cmd *cobra.Command, nc *nats.Conn, actor string, nodes 
 		agentRelease[n.NID] = n.ReleaseVersion
 	}
 	brokers := map[string]brokerDaemon{}
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
 		if h.NodeID != "" {
 			brokers[h.NodeID] = brokerDaemon{BrokerVer: h.ReleaseVersion, ColocatedAgentNID: h.ColocatedAgentNID}
 		}

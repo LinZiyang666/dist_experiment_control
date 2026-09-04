@@ -48,6 +48,24 @@ type Process struct {
 var (
 	// ErrNotFound is returned by Get / MarkExited when the pid doesn't exist.
 	ErrNotFound = errors.New("proc: not found")
+
+	// ErrUnscopedExit is the refusal of an exit report that carries no session.
+	//
+	// origin: prerelease audit external review B-2. The forwarded path used to render
+	// the pre-fence `WHERE pid=?` predicate for an empty sid, justified by "only a peer
+	// broker inside the mTLS/system-account boundary can present one". That reasoned
+	// about the TRANSPORT and not about where the DATA came from: an N-1 broker's own
+	// input is an agent-published exit whose PID the agent chose, and the old binary
+	// drops the subject's sid when it forwards. The old broker is a legitimate peer, so
+	// the new leader cannot tell that confused-deputy request from a trustworthy
+	// unscoped write — and one session's agent could retire another session's process.
+	//
+	// There is no fix that keeps the write: the old payload carries no session evidence
+	// at all, and the old binary cannot be made to add any. So the exit is REFUSED. The
+	// cost is bounded and self-healing — reconcileOnRegister compares the broker's
+	// RUNNING rows against the agent's live pid list on every register, so a refused
+	// exit is corrected at the agent's next reconnect rather than lost.
+	ErrUnscopedExit = errors.New("proc: exit report carries no session")
 	// ErrNodeMissing is returned by Insert when the (sid, nid) FK target
 	// doesn't exist (i.e. the agent isn't registered yet).
 	ErrNodeMissing = errors.New("proc: target node does not exist")
@@ -141,13 +159,49 @@ func nullableInt64(v int64) any {
 }
 
 // MarkExited transitions pid to EXITED with the given exit code. Returns
-// ErrNotFound if pid doesn't exist.
-func MarkExited(db *sql.DB, pid string, exitCode int, when time.Time) error {
+// ErrNotFound if pid doesn't exist IN sid.
+//
+// THE sid PREDICATE IS A SECURITY FENCE, not a convenience filter.
+//
+// origin: prerelease audit broker-core #27, raised to BLOCKER by the main process.
+// The predicate used to be `WHERE pid=? AND status='RUNNING'` — no sid, no nid — while
+// the only thing that reaches it from the network is an agent publishing
+// ev.<sid>.proc.exit. PIDs are ULIDs and appear in `tether ps` output, so a member of
+// session A could publish, on its OWN legal subject, an exit for session B's pid and
+// choose its exit code. That is a cross-session write escape, and it does not stop at
+// a wrong row: the victim's next register finds no RUNNING row for a process that IS
+// running, so G.1 reconcile classifies it as an orphan and the agent SIGTERMs then
+// SIGKILLs the operator's live job.
+//
+// WHY sid AND NOT (sid, nid). A lease rename moves a node's identity while its
+// processes keep running; the refile UPDATE (PlanRefileStatements) is itself keyed
+// `WHERE sid=? AND pid=? AND nid=?`, so nid legitimately changes underneath a live
+// process and an exit arriving mid-rename would be rejected by a (sid,nid) fence.
+// sid never changes for a row, so it fences without breaking anything.
+//
+// The check costs NOTHING: it is a narrowing of an UPDATE predicate the statement
+// already had, on a column already in the row.
+func MarkExited(db *sql.DB, pid, sid string, exitCode int, when time.Time) error {
+	// FAIL CLOSED ON A MISSING sid, loudly, rather than degrading to the predicate
+	// this fence replaced.
+	//
+	// PlanMarkExited has an N-1 escape hatch for an empty sid because a broker on the
+	// previous release forwards without the field. THIS writer has no such caller: it
+	// runs only in single mode, where nothing is forwarded and every call site
+	// (exec.go, reconcileOnRegister) has the sid in hand. So an empty sid here can
+	// only be a future call site that forgot to pass one — and the failure mode of
+	// silently accepting it is that the fence disappears for that path while every
+	// test in exit_session_fence_test.go still passes, because they all pass a sid.
+	if sid == "" {
+		return fmt.Errorf("proc: mark exited: empty sid — this writer is single-mode only and all of " +
+			"its call sites have the session; the empty-sid N-1 hatch exists ONLY on the forwarded " +
+			"cluster path (PlanMarkExited)")
+	}
 	res, err := db.Exec(`
 		UPDATE processes
 		SET status='EXITED', exit_code=?, ended_at=?
-		WHERE pid=? AND status='RUNNING'
-	`, exitCode, when, pid)
+		WHERE pid=? AND sid=? AND status='RUNNING'
+	`, exitCode, when, pid, sid)
 	if err != nil {
 		return fmt.Errorf("proc: mark exited: %w", err)
 	}
@@ -159,8 +213,27 @@ func MarkExited(db *sql.DB, pid string, exitCode int, when time.Time) error {
 		// SQLite still says RUNNING but audit.proc{exit} got
 		// published. Surface non-ErrNoRows errors so the caller
 		// knows the row is in an unknown state.
+		//
+		// The existence probe is sid-scoped TOO, and that is load-bearing rather than
+		// symmetry: an unscoped probe would find the victim's row, conclude "already
+		// EXITED, idempotent no-op" and return nil — reporting SUCCESS to the very
+		// caller the UPDATE predicate just refused, which in exec.go publishes an
+		// audit.proc{exit} for a process that is still running. Scoped, a foreign pid
+		// is indistinguishable from an unknown one: ErrNotFound, no audit, and the
+		// caller's terminal ack tells the sender nothing about whether the pid exists.
+		//
+		// THAT LAST SENTENCE IS ABOUT THIS FUNCTION, and round 2 (E3) caught it being
+		// read as a claim about the SYSTEM. It was not true of the system: the only
+		// caller, handleProcEvent, answered its ack from an UNSCOPED pre-read that ran
+		// before this code was ever reached, so the indistinguishability this comment
+		// establishes was handed straight back one frame up. Both pre-reads are scoped
+		// now (GetInSession). What is NOT closed, and cannot be here, is that
+		// processes.pid is a GLOBAL primary key: a forged `started` for a pid that
+		// exists in another session fails its INSERT where an unused pid succeeds, so
+		// pid-existence remains observable to a caller willing to write. Closing that
+		// means re-keying the table on (sid, pid) — a migration, not a predicate.
 		var any int
-		switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=?`, pid).Scan(&any); {
+		switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=? AND sid=?`, pid, sid).Scan(&any); {
 		case errors.Is(err, sql.ErrNoRows):
 			return ErrNotFound
 		case err != nil:
@@ -171,7 +244,39 @@ func MarkExited(db *sql.DB, pid string, exitCode int, when time.Time) error {
 	return nil
 }
 
-// Get returns the row for pid. ErrNotFound when absent.
+// GetInSession returns the row for pid WITHIN sid, or ErrNotFound.
+//
+// origin: prerelease audit round 2, E3. MarkExited's existence probe above is
+// sid-scoped so that "somebody else's pid" and "no such pid" are indistinguishable
+// to a caller, and the comment there says exactly that. It was only true of the
+// WRITE. Both of the broker's audit-dedup pre-reads (internal/broker/exec.go)
+// called the UNSCOPED Get first and answered from it, so a member of session
+// `other` could publish on its own legal `ev.other.other-1.<pid>.started` subject
+// and read the ack: `already_recorded` for a pid that exists in ANY session,
+// `recorded` / `node_missing` for one that exists nowhere. That is a complete
+// cross-session pid-existence oracle over precisely the pids the fence was added
+// to hide, and it needed no write at all.
+//
+// A separate constructor rather than a parameter on Get: Get's remaining callers
+// are storage-level tests that legitimately want "the row, whatever session it is
+// in", and folding the two would make every one of them assert something weaker
+// than it does today.
+func GetInSession(db *sql.DB, sid, pid string) (*Process, error) {
+	row := db.QueryRow(`
+		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
+		       started_by_fp, boot_id, start_time_ticks
+		FROM processes
+		WHERE pid = ? AND sid = ?
+	`, pid, sid)
+	return scanProcess(row)
+}
+
+// Get returns the row for pid, IGNORING which session owns it.
+//
+// Not for request handling: answering a request from this makes the reply an
+// existence oracle across every session on the broker (round 2, E3). A handler
+// that has a sid — and every one of them does, it is in the subject — wants
+// GetInSession.
 func Get(db *sql.DB, pid string) (*Process, error) {
 	row := db.QueryRow(`
 		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
@@ -370,9 +475,30 @@ func scanProcessRow(s scanner) (*Process, error) {
 //
 // Scoped to (sid, pid) and to rows still filed under `from`, so it cannot touch
 // a row another instance has since re-filed.
-func Refile(db *sql.DB, sid, pid, from, to string) error {
-	_, err := db.Exec(
+// It reports whether a row actually MOVED. A nil error alone does not mean it did:
+// the predicate is four-way (sid, pid, from-nid, RUNNING) and any of them can fail to
+// match — the row was already refiled by a concurrent register, it exited between the
+// read and this write, or the caller's `from` is stale. SQLite calls all of those a
+// perfectly successful zero-row UPDATE.
+//
+// origin: prerelease audit broker-proc/L3-F1. The caller counted every nil return as an
+// adopted row, and that count is what satisfies reconcileOnRegister's `sawAnyRow` gate —
+// the fail-closed check that refuses to orphan-kill on a node name with no process
+// history. A phantom adoption defeats the one gate standing between a stale rename and
+// SIGKILL on the operator's running work, so "did it move" has to be an ANSWER, not an
+// inference from the absence of an error.
+func Refile(db *sql.DB, sid, pid, from, to string) (bool, error) {
+	res, err := db.Exec(
 		`UPDATE processes SET nid = ? WHERE sid = ? AND pid = ? AND nid = ? AND status = 'RUNNING'`,
 		to, sid, pid, from)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, aerr := res.RowsAffected()
+	if aerr != nil {
+		// Cannot tell. Report NOT moved: the caller's only use of a true is to
+		// unlock a kill, so an unknown must never read as evidence.
+		return false, fmt.Errorf("proc: refile rows affected: %w", aerr)
+	}
+	return n > 0, nil
 }

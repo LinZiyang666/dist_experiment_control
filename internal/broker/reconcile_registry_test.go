@@ -492,6 +492,14 @@ func TestCoreReconcilePassesAreRegisteredAsSpecified(t *testing.T) {
 		// OWN interval field, deliberately not a reuse of GrowLockReapInterval — one field with two
 		// meanings is the defect batch B spent a phase removing.
 		{Name: "drain-marker", Interval: 30 * time.Second, Authority: leader},
+		// external review M-2: the session-create admission backfill was a BOOT-ONLY
+		// attempt, and a followers-first/leader-last rolling upgrade gives every node a
+		// boot at which it is not the leader — so no node ever ran it and the allow-list
+		// stayed empty on a fleet that had been creating sessions for months. Its presence
+		// in THIS list is the mechanical form of "it is level-triggered now": delete the
+		// pass and the regression is a red line here, not a silent return to boot-only.
+		// Leader, for the same amplification reason as `ports`.
+		{Name: "session-creator-seed", Interval: time.Second, Authority: leader},
 		// B7 deliberately did NOT add leader-maintenance / proxy-reap passes here. Both available
 		// shapes are regressions and the reasoning is recorded at the top of this file's production
 		// counterpart (reconcile_registry.go, "WHY THE TWO LEADER DUTIES STAYED OUT"). If a future

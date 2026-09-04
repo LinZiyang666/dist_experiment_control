@@ -154,3 +154,91 @@ func TestOriginDocRefRecognisesTheRealShapes(t *testing.T) {
 		}
 	}
 }
+
+// prereleaseAuditAnchor matches `prerelease audit <lane>/<ID>` on an `// origin:` line.
+// The lane is documentation for the reader; the ID is what has to resolve.
+var prereleaseAuditAnchor = regexp.MustCompile(`prerelease audit [a-z0-9-]+/([A-Za-z0-9-]+)`)
+
+// origin: prerelease audit round 2, C10.
+//
+// AN ANCHOR THAT RESOLVES TO NOTHING IS WORSE THAN NO ANCHOR.
+//
+// The gate above only checks `docs/....md` paths, and the 175 anchors this audit
+// added carry no path — they name a lane and a finding id. So none of them were
+// checked by anything, and round 2 found ids that appeared in no document at all:
+// a reader who greps for `cli-serve-agent-cluster/L4-F1` finds the one comment that
+// mentions it and learns nothing, having spent the lookup.
+//
+// The plan is the index (its §8 lists the ids added during implementation), so this
+// is the same contract as the doc-path half: if you write the line, it must be true.
+func TestPrereleaseAuditAnchorsResolve(t *testing.T) {
+	root := repoRoot(t)
+	index := ""
+	for _, name := range []string{
+		"docs/reviews/prerelease-audit-plan.md",
+		"docs/reviews/prerelease-audit-review.md",
+	} {
+		body, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			// The audit documents are archived together with the code they
+			// describe. Absent, there is nothing to reconcile against — say so
+			// rather than passing silently.
+			t.Skipf("%s is not present; the anchor index cannot be checked", name)
+		}
+		index += string(body)
+	}
+
+	seen := map[string]bool{}
+	var dead []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		src, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		for i, line := range strings.Split(string(src), "\n") {
+			if !strings.Contains(line, "origin:") {
+				continue
+			}
+			for _, m := range prereleaseAuditAnchor.FindAllStringSubmatch(line, -1) {
+				id := m[1]
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				if !strings.Contains(index, id) {
+					dead = append(dead, fmt.Sprintf("%s:%d cites %s", rel, i+1, id))
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(seen) == 0 {
+		t.Skip("no prerelease-audit anchors in the tree")
+	}
+	sort.Strings(dead)
+	if len(dead) > 0 {
+		t.Fatalf("%d prerelease-audit anchor id(s) resolve to nothing in the audit documents:\n  %s\n\n"+
+			"Add the id to docs/reviews/prerelease-audit-plan.md §8 with a one-line summary. An "+
+			"anchor exists so a reader can find out WHY a line is the way it is; one that leads "+
+			"nowhere costs them the lookup and pays back nothing.",
+			len(dead), strings.Join(dead, "\n  "))
+	}
+}

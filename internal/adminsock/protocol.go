@@ -44,6 +44,19 @@ const (
 	// maps (rehome_events.go), so the reader relays only what the producers already keep secret-free.
 	OpEvents = "events"
 
+	// OpSessionAllow / OpSessionDeny / OpSessionCreators (prerelease audit round 2)
+	// administer WHO MAY CREATE A SESSION. handleSessionCreate used to admit anybody
+	// reachable on the public control plane, which made "activated member" and
+	// "provisioned agent" mean nothing.
+	//
+	// ON THE ADMIN SOCKET, not over NATS, and that placement is the point: the socket is
+	// root-only 0600 on the broker host, so admitting a fingerprint is an act of the
+	// person who runs the broker. Putting it on the control plane would need its own
+	// admission rule and the recursion has to stop somewhere.
+	OpSessionAllow    = "session_allow"
+	OpSessionDeny     = "session_deny"
+	OpSessionCreators = "session_creators"
+
 	// D7 §8.1 cluster admin verbs. They are routed to Backend.Cluster (a
 	// ClusterAdminBackend); when that is nil (production until the D9 cutover) the
 	// server replies "cluster mode not enabled". A non-leader broker replies with
@@ -187,6 +200,10 @@ type Request struct {
 	// Evict args
 	NID string `json:"nid,omitempty"`
 
+	// Session-creator admission args (prerelease audit round 2).
+	FP   string `json:"fp,omitempty"`   // SHA256:… fingerprint to admit / remove
+	Note string `json:"note,omitempty"` // free text an operator can attach
+
 	// D7 cluster args (all omitempty; byte-compatible with the original 4 ops).
 	NodeID    string `json:"node_id,omitempty"`
 	NodePub   string `json:"node_pub,omitempty"`   // node-identity pubkey the operator typed
@@ -278,6 +295,9 @@ type Response struct {
 	// channel drops momentarily as the broker restarts); AlreadyAtVersion = idempotent no-op skip.
 	Reloading        bool `json:"reloading,omitempty"`
 	AlreadyAtVersion bool `json:"already_at_version,omitempty"`
+
+	// Creators is the session-create allow-list (OpSessionCreators). prerelease audit round 2.
+	Creators []CreatorEntry `json:"creators,omitempty"`
 
 	Sessions []SessionEntry `json:"sessions,omitempty"`
 	Nodes    []NodeEntry    `json:"nodes,omitempty"`
@@ -900,4 +920,12 @@ func InconsistencyDetail(reason string) string {
 		return "roster phase and the committed raft configuration disagree — run `tether cluster status` " +
 			"and, if a live node is missing from raft, `tether cluster recovery node remove <id> --manual`"
 	}
+}
+
+// CreatorEntry is one admitted session-creator fingerprint. prerelease audit round 2.
+type CreatorEntry struct {
+	FP      string `json:"fp"`
+	AddedAt string `json:"added_at"`
+	AddedBy string `json:"added_by"`
+	Note    string `json:"note,omitempty"`
 }

@@ -225,7 +225,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 					// round-2 MINOR: on a close error STILL re-add the reused PID as an orphan
 					// (the kill is independent of the old row's close) — preserving the pre-D9
 					// swallow-and-schedule behavior; only the audit is gated on success.
-					if err := b.markProcExited(p.PID, -1, now); err != nil {
+					if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
 						b.cfg.Logger.Warn("broker: reconcile pid-reuse close", "err", err, "pid", p.PID)
 						// Deliberately NOT added to `accepted` (contrast the two
 						// F1 sites below): this pid is being re-treated as an
@@ -254,7 +254,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 					rc = *lp.RC
 				}
 				when := exitStamp(lp, now)
-				if err := b.markProcExited(p.PID, rc, when); err != nil {
+				if err := b.markProcExited(p.PID, sid, rc, when); err != nil {
 					b.cfg.Logger.Warn("broker: reconcile mark exited", "err", err, "pid", p.PID)
 					// origin: h1 external review F1 (Blocker). A bare `continue`
 					// left this pid in NEITHER response set, and the agent's
@@ -278,7 +278,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 			default:
 				// Unknown state from agent — treat as missed-exit so we
 				// don't leave the row stuck RUNNING forever.
-				if err := b.markProcExited(p.PID, -1, now); err != nil {
+				if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
 					b.cfg.Logger.Warn("broker: reconcile unknown-state close", "err", err, "pid", p.PID)
 					// Same F1 reasoning as the "exited" branch above: the write
 					// failed, the row is still RUNNING, so report it as accepted
@@ -295,7 +295,7 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 			// Broker thinks RUNNING/LOST but agent didn't list it →
 			// missed-exit. Architecture G.1: rc=-1, audit.proc{kind:
 			// reconciled_closed}.
-			if err := b.markProcExited(p.PID, -1, now); err != nil {
+			if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
 				b.cfg.Logger.Warn("broker: reconcile missed-exit", "err", err, "pid", p.PID)
 				continue
 			}
@@ -487,20 +487,39 @@ func adoptRowsCarriedAcrossARename(b *Broker, sid, nid string, req proto.NodeReg
 		return 0
 	}
 	adopted := 0
-	for _, p := range procs {
+	// BY INDEX, because a successful move has to be reflected in the slice the rest of
+	// reconcileOnRegister reads. The row now belongs to `nid`, and the ordinary
+	// same-name arm below is exactly the treatment it should get — including the
+	// PID-reuse check, which an adopted row needs as much as any other. Leaving the
+	// slice saying PreviousNID made the row invisible for a whole register cycle and
+	// forced this function to compensate by deleting the pid from agentByPID, i.e. by
+	// hiding it from the orphan pass rather than by accounting for it.
+	for i := range procs {
+		p := &procs[i]
 		if p.NID != req.PreviousNID {
 			continue
 		}
 		if _, rePresented := agentByPID[p.PID]; !rePresented {
 			continue
 		}
-		if err := refileProc(b, sid, p.PID, req.PreviousNID, nid); err != nil {
+		moved, err := refileProc(b, sid, p.PID, req.PreviousNID, nid)
+		if err != nil {
 			b.cfg.Logger.Warn("broker: could not re-file an adopted process row",
 				"err", err, "sid", sid, "pid", p.PID, "from", req.PreviousNID, "to", nid)
 			continue
 		}
+		if !moved {
+			// A zero-row UPDATE, reported as success by SQLite. Counting it would
+			// hand `sawAnyRow` evidence of history this name does not have. The pid
+			// stays in agentByPID on purpose: its row is still in `procs` under the
+			// old name, so livePIDsByRow keeps it out of the orphan pass by the
+			// honest route — a row that exists — instead of by deletion.
+			b.cfg.Logger.Warn("broker: adopted process row did not move (already refiled, exited, or stale previous name)",
+				"sid", sid, "pid", p.PID, "from", req.PreviousNID, "to", nid)
+			continue
+		}
+		p.NID = nid
 		adopted++
-		delete(agentByPID, p.PID)
 	}
 	return adopted
 }

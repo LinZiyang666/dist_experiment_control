@@ -95,6 +95,9 @@ func clusterHealthResponder(nc *nats.Conn, node *cluster.Node, db *sql.DB, now f
 			CommandVer:         cluster.CommandVersion(),      // G5 #13: three-axis rolling-upgrade gate (proto+command+ops)
 			ColocatedAgentNID:  colocatedAgentNID,             // G5 #19: dual-version correlation ("" ⇒ CLI (assumed) fallback)
 			PhaseFluidityOps:   cluster.HasPhaseFluidityOps(), // F5: advertise capability for the v0.4.2 readdr/route ops
+			// increment 2 internal review: same for the admission-table write, which the
+			// leader gates on before proposing a `session-allow` / `--remove`.
+			SessionCreatorOps: cluster.HasSessionCreatorOps(),
 		}
 		// C3 §2.7: a C3 broker ALWAYS reports topology (TopoReported=true), even at gen 0, so the
 		// HEALTHY-HA gate can distinguish "reporting + behind" from "not reporting (old broker)".
@@ -215,6 +218,16 @@ func SubscribeAlertAck(nc *nats.Conn, fwd *Forwarder, logger *slog.Logger) (*nat
 			respondLogged(logger, nc, msg, []byte("error: bad request"))
 			return
 		}
+		// VALIDATE BEFORE FORWARDING. origin: prerelease audit broker-cluster-ops/L3-F2.
+		// Non-empty was the only check, and what sits downstream is a raft Propose:
+		// whatever arrives here is replicated to every broker and replayed on every
+		// restore. The manual-alert admin path has validated its own text since it was
+		// written; this path, which is reachable over NATS rather than over the admin
+		// socket, had not.
+		if verr := validAlertText("dedup_key", req.DedupKey, maxAlertDedupKeyLen); verr != nil {
+			respondLogged(logger, nc, msg, []byte("error: "+verr.Error()))
+			return
+		}
 		payload, err := json.Marshal(AlertAckPayload{DedupKey: req.DedupKey, AckedBy: actor})
 		if err != nil {
 			respondLogged(logger, nc, msg, []byte("error: marshal"))
@@ -242,6 +255,34 @@ func upgradeActive(db *sql.DB) bool {
 	var one int
 	err := db.QueryRow(`SELECT 1 FROM cluster_meta WHERE key=? LIMIT 1`, cluster.MetaKeyUpgradeActive).Scan(&one)
 	return err == nil
+}
+
+// upgradeLockHeld answers the narrower question "is a roll still DRIVING", which
+// is different from upgradeActive's "is the cluster mid-roll". origin: prerelease
+// audit round 2, H-2.
+//
+// Both readings are needed and they are not interchangeable:
+//
+//   - `cluster join` / `cluster retire` must be fenced for as long as the cluster
+//     sits in a partial-roll state, whether or not anyone is still driving it —
+//     that is upgradeActive, and it is deliberately unchanged.
+//   - A new roll must be excluded only by a roll that is still alive. Using the
+//     existence check for THAT made a HALTed roll's own marker refuse the re-run
+//     its HALT message instructs the operator to perform, and blocked the
+//     emergency `--to-version <older>` rollback for the whole lease TTL.
+//
+// Fail closed on anything unknown: LeaseExpired already returns false for an
+// absent lease (a pre-R7b lock never expires by design), and a read error is
+// treated as held.
+func upgradeLockHeld(db *sql.DB, now time.Time) bool {
+	if !upgradeActive(db) {
+		return false
+	}
+	expired, err := cluster.LeaseExpired(db, cluster.MetaKeyUpgradeLease, now)
+	if err != nil {
+		return true
+	}
+	return !expired
 }
 
 // growActiveJoiner returns the joiner node_id a `cluster add` grow holds the cluster_grow_active marker for

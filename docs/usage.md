@@ -175,7 +175,11 @@ loginctl enable-linger $USER     # 用户登出后仍保活
 # agent
 systemctl --user disable --now tether-agent@lab.service 2>/dev/null
 ~/.local/bin/tether agent --uninstall --session lab
-rm -rf ~/.tether
+# 只删这一个 session 的目录。⚠ 不要用 `rm -rf ~/.tether`：那会连
+# ~/.tether/keys/default.nk 一起删掉，那是**本用户的 ctl 私钥**，无法再生成，
+# 一删就把该身份创建过的每一个 session 都孤儿化（不只是这个 agent 的）。
+# install.sh --uninstall --role agent --session lab 现在也只删这一棵子树。
+rm -rf ~/.tether/agent/lab
 rm -f ~/.local/bin/tether
 
 # broker
@@ -566,6 +570,26 @@ tether session rm <sid> [--ack-alerts]      # tombstone：ACTIVE → DELETING（
 `01HABCXYZ...`），把调用者注册为 owner，同时把 sid 写进本机
 `current_session` 自动激活。`--pin` 必填且**只能由 owner 在创建时
 设定**，之后无法修改 PIN（要换 PIN 只能 `session rm` 重建）。
+
+> **⚠ 你的指纹必须先被准入。** `session create` 是全流程里唯一需要 broker
+> 运维**事先**放行你的动作——其余一切（join、exec、expose…）都由 PIN 与
+> session 成员关系决定。没被准入时你会得到：
+>
+> ```
+> session create: this identity may not create sessions on this broker.
+>   your fingerprint: SHA256:…
+>   an operator admits it ON THE BROKER HOST with:
+>       sudo tether admin session-allow SHA256:…
+> ```
+>
+> 把那一行指纹发给运维即可；也可以随时用 `tether whoami` 自己查（离线，
+> 不需要连 broker）。退出码是 **77（EX_NOPERM）**，不是 70——这是**永久**
+> 拒绝，自动化重试没有意义，直到有人在 broker 主机上放行你。
+>
+> **升级不需要任何动作**：升级到本版时，每个**已经拥有 session** 的
+> owner 指纹会被 broker 在启动时一次性自动纳入。只有**全新** broker 从空
+> 表开始，第一个使用者需要运维放行一次。运维侧见
+> [`broker-ops.md`](broker-ops.md) §5.20。
 
 **`session ls` 是什么**：列出当前 nkey 身份**有权访问**的所有 session
 （owner 或 member 都算）。输出含状态（ACTIVE / DELETING）、角色
@@ -1569,6 +1593,11 @@ agent 内部步骤：
 `internal/proto/version.go` 里的 `ProtoVersion` 是 wire 协议版本。bump 后
 新 broker 不接受旧 agent（`proto_bump_requires_reinstall`）：必须先在每台 agent
 上重跑 `install.sh --role agent` 或人工 `cp` 同版本 tether 二进制，再启 broker。
+
+> **重跑 `install.sh --role agent` 不会覆盖已存在的 `agent.yaml`**（2026-09-02 发布前审计 DRD-F5）：
+> 原文件保留，新内容写成 `agent.yaml.new`，结尾横幅列出。**刻意不自动合并**——`agent.yaml` 是严格解析，
+> 新版本引入的键会让一个可能被回滚的旧二进制直接拒绝启动。需要按新模板整体覆盖时加 `--force-config`。
+
 **`tether node upgrade` 不能跨 proto** —— upgrade 设计成只在同 proto 内的 patch
 升级里安全。
 
@@ -1606,7 +1635,7 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `url_not_allowed_local`         | agent 本地 allowlist 拒绝 | 检查 agent 的 `--upgrade-url-allow`（默认与 broker 同步，覆盖时小心） |
 | `sha256_invalid`                | sha256 不是 64 位小写 hex | 用 `sha256sum` 重新算 |
 | `sha256_mismatch`               | 下载的 tarball 与 sha256 不符 | 重传 release / 重算 sha256 |
-| `proto_bump_requires_reinstall` | 跨 proto 升级 | 必须 `install.sh --role agent` 重装，不能 upgrade |
+| `proto_bump_requires_reinstall` | 跨 proto 升级 | 必须 `install.sh --role agent` 重装，不能 upgrade（重跑保留既有 `agent.yaml`，新内容写成 `.new`；见 §8.3） |
 | `clone_family_upgrade_unsupported` | 目标属于曾产生租约名的克隆凭据族；无法证明其二进制/marker 是实例私有 | 重建源镜像并重启该 family，不要远程升级 basename 或租约名 |
 
 ### 9.4 expose 类
@@ -1720,7 +1749,13 @@ language version 1.23 is lower than the targeted Go version 1.25
   毒化宽限后仍不返回（gotcha #72 的升级处置）。两种来路——关停场景直接退 91；rebuild 场景先尝试
   原地 self-exec，**self-exec 也失败且无待提交升级**时退 91。监控看到 91 = 「teardown 卡死」，
   应连同 agent journal（`teardown WEDGED`）与 `node ls --json` 一起留档，见 §9.9。
-- `exec` / `run` **透传远端进程退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器；判别靠"你跑的是哪个命令"，不是值。所以"77=权限"仅限 broker-RPC 命令。
+- `exec` / `run` 在**远端进程真的跑起来**时**透传其退出码**（任意 `0..255`，含 64/69/70/77/128+），不入分类器。
+
+  **但 broker 拒绝时不是**（round 2 C8/J6 订正）：本节此前写"判别靠\"你跑的是哪个命令\"，所以 77=权限仅限
+  broker-RPC 命令"——这句话在 `execFailureMessage` 改为走 `classifyExit`（为了让 `exec` 与 `run` 对同一条
+  拒绝给出同一个码）之后就不再成立了。一次**从未到达进程**的 `exec` 现在会按本表退 64/69/75/77。
+  两者仍可区分，只是**不靠命令名**：透传码是远端进程自己选的码、stderr 上没有 tether 的解释；
+  分类码一定带一行 `exec: <说明> (<broker 码>)`。
 
 **健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。
 **唯一的成文例外是 `reply_too_large`（h1 A2）**：它也退 `70`，但重试必然再次失败——broker 每次都会

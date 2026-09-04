@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/authcallout"
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -251,10 +252,14 @@ func TestLeaderLocalProvisionAndJoinAttemptsAreCounted(t *testing.T) {
 
 	// Missing sessions make both Plans deterministically reject. The business outcome is not this
 	// test's concern; a rejected authoritative attempt must still contribute exactly one `error`.
-	_ = NewProvisionSeam(n, fwd)(
+	// The seams now REQUIRE a budgeted verifier (external review M-1) and refuse without
+	// one, so this metrics test supplies a real handler's. The Plans still reject on the
+	// missing session before Argon2 runs, which is what keeps the attempt counted.
+	verifyPIN := (&authcallout.Handler{Now: time.Now}).VerifyPINWithBudget
+	_ = NewProvisionSeam(n, fwd, verifyPIN)(
 		"missing-provision-session", "node-1", "SHA256:fp", "bad-pin", time.Now(),
 	)
-	_ = NewJoinSeam(n, fwd)(
+	_ = NewJoinSeam(n, fwd, verifyPIN)(
 		"missing-join-session", "SHA256:fp", "bad-pin", time.Now(),
 	)
 

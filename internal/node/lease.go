@@ -180,7 +180,13 @@ func ProvisionedNIDs(db *sql.DB, sid string) (map[string]bool, bool) {
 	if rows.Err() != nil {
 		return nil, false
 	}
-	return out, len(out) > 0
+	// TRUE MEANS "THE TABLE WAS READ", not "the table had rows".
+	//
+	// origin: prerelease audit round 2, E1. This returned len(out) > 0, so a readable but
+	// EMPTY agent_provisioning was indistinguishable from a failed read — and the lease
+	// gate in replyLeaseVerdict, whose whole point is to stop trusting the client's flag,
+	// silently fell back to trusting it again on exactly that input.
+	return out, true
 }
 
 // HeartbeatAge returns how long ago (sid, nid) last heartbeat, and whether a

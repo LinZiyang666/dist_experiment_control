@@ -406,7 +406,7 @@ func TestClusterJSPlaceableProbe(t *testing.T) {
 		n, _ := d7SingleNode(t, "solo")
 		b := &Broker{cfg: Config{Logger: silentLogger(), Now: time.Now}}
 		b.cl = &clusterRuntime{node: n}
-		b.js = nil // a JS call would nil-panic; reaching one is the failure this asserts against
+		setBrokerJS(b, nil) // a JS call would nil-panic; reaching one is the failure this asserts against
 		ok, detail := b.clusterJSPlaceable()
 		if !ok || detail != "" {
 			t.Fatalf("a single-voter cluster has nothing to place and must short-circuit BEFORE touching "+

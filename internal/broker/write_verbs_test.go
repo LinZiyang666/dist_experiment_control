@@ -62,6 +62,7 @@ func verbValueOf(t *testing.T, name string) string {
 		"VerbNodeRegister": VerbNodeRegister, "VerbProcInsert": VerbProcInsert,
 		"VerbProcMarkExited": VerbProcMarkExited, "VerbSessionTombstone": VerbSessionTombstone,
 		"VerbSessionDrop": VerbSessionDrop, "VerbNodeEvict": VerbNodeEvict,
+		"VerbSessionCreatorSet": VerbSessionCreatorSet,
 	}[name]
 	if !ok {
 		t.Fatalf("verb constant %s is not bound in this test — add it (and to frozenForwardVerbs)", name)
@@ -115,7 +116,7 @@ func TestReqIDGateRunsBeforeTheTable(t *testing.T) {
 // TestUnknownVerbErrorIsByteStable pins the operator-facing string. It travels back through the
 // forward reply and, for the alert-ack path (cluster_health.go), straight to a terminal.
 func TestUnknownVerbErrorIsByteStable(t *testing.T) {
-	err := dispatchForward(nil, nil, forwardEnvelope{Verb: "no-such-verb"})
+	err := dispatchForward(nil, nil, forwardDeps{}, forwardEnvelope{Verb: "no-such-verb"})
 	if err == nil {
 		t.Fatal("an unknown verb must be an error")
 	}
@@ -132,7 +133,7 @@ func TestUnknownVerbErrorIsByteStable(t *testing.T) {
 // unknown verb. Otherwise an attacker probing verb names learns which ones exist by the error they
 // get back.
 func TestReqIDRejectionPrecedesUnknownVerb(t *testing.T) {
-	err := dispatchForward(nil, nil, forwardEnvelope{Verb: "no-such-verb", ReqID: "forged"})
+	err := dispatchForward(nil, nil, forwardDeps{}, forwardEnvelope{Verb: "no-such-verb", ReqID: "forged"})
 	if err == nil {
 		t.Fatal("a non-empty ReqID on a non-allow-listed verb must be rejected")
 	}

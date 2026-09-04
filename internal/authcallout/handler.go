@@ -3,7 +3,9 @@
 //
 // Flow on each NATS CONNECT:
 //
-//  1. NATS server has already verified the client's nkey signature.
+//  1. THIS HANDLER verifies the client's nkey signature over the server nonce —
+//     see verifyClientNkey. Step 1 used to read "NATS server has already verified
+//     the client's nkey signature", and that was false in the one mode tether runs.
 //  2. NATS publishes a signed AuthorizationRequestClaims JWT to
 //     `$SYS.REQ.USER.AUTH`.
 //  3. This handler decodes it, decides the permission template, and
@@ -22,6 +24,7 @@ package authcallout
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -212,6 +215,11 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 	if clientNkey == "" || !nkeys.IsValidPublicUserKey(clientNkey) {
 		return h.deny(req, "client must present a user nkey on CONNECT")
 	}
+	// PROVE THE NKEY BELONGS TO THIS CONNECTION. Everything below treats clientNkey as
+	// an identity; until this line it is a string the connecting party typed.
+	if err := verifyClientNkey(clientNkey, req.ClientInformation.Nonce, req.ConnectOptions.SignedNonce); err != nil {
+		return h.deny(req, "nkey identity: "+err.Error())
+	}
 
 	fp, err := auth.FingerprintFromActor(clientNkey)
 	if err != nil {
@@ -223,17 +231,33 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 	// (nkey / name / token) are NOT trusted for this — see ratelimit.go.
 	clientIP := req.ClientInformation.Host
 
+	// legacyInbox: this connection did NOT present auth.InboxCapableMarker, so it is a
+	// binary from before the per-identity inbox and needs the shallow compatibility
+	// space instead of a deep subtree. origin: prerelease audit round 2, A-F1.
+	//
+	// SELF-REPORTED ON PURPOSE. There is no trustworthy version signal at CONNECT time
+	// and there does not need to be: the two spaces are DISJOINT (auth.LegacyInboxAllow),
+	// so a caller who lies about being old reaches only traffic that pre-cutover binaries
+	// put in the shallow space themselves. Lying in the other direction reaches only a
+	// subtree derived from the liar's own nkey. Neither claim touches a modern client's
+	// replies.
+	//
+	// This replaced a lookup of the release the agent reported on its last register,
+	// which fails toward the legacy grant on a first-ever join — precisely a stranger's
+	// state — and which had no ctl-side equivalent at all.
+	legacyInbox := req.ConnectOptions.Username != auth.InboxCapableMarker
+
 	role, sid, nid := parseRole(req.ConnectOptions.Name)
 	switch role {
 	case roleCtlUnactivated:
-		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey))
+		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey, legacyInbox))
 	case roleCtlActivated:
 		if err := h.ensureMember(sid, fp, req.ConnectOptions.Token, clientIP); err != nil {
 			h.Logger.Info("authcallout: ctl deny", "actor", clientNkey, "sid", sid, "err", err)
 			return h.deny(req, err.Error())
 		}
 		h.Logger.Info("authcallout: ctl allow", "actor", clientNkey, "sid", sid)
-		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid))
+		return h.allow(req, jwtSubject, auth.PermissionsForActivatedMember(clientNkey, sid, legacyInbox))
 	case roleAgent:
 		if err := h.ensureAgentProvisioned(sid, nid, clientNkey, fp, req.ConnectOptions.Token, clientIP); err != nil {
 			h.Logger.Info("authcallout: agent deny",
@@ -242,7 +266,18 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 		}
 		h.Logger.Info("authcallout: agent allow",
 			"actor", clientNkey, "sid", sid, "nid", nid)
-		return h.allow(req, jwtSubject, auth.PermissionsForAgent(sid, nid))
+		// The compatibility `_INBOX.>` grant is decided from `legacyInbox` above — i.e.
+		// from what this connection SAYS about itself, not from any register row.
+		//
+		// This comment used to claim the opposite ("decided HERE, from the register row,
+		// and never from anything the connecting party says"), which was a description of
+		// a lookup that had already been deleted — origin: prerelease audit increment 2
+		// internal review, doc-truth/L12-F6. Self-reporting is safe here for a reason that
+		// has nothing to do with trusting the claim: the two inbox ROOTS are disjoint
+		// (auth.InboxRoot vs `_INBOX`), so claiming to be old buys a DIFFERENT space
+		// rather than a larger one. See auth.InboxCapableMarker.
+		return h.allow(req, jwtSubject,
+			auth.PermissionsForAgent(sid, nid, clientNkey, legacyInbox))
 	case roleUnknown:
 		// Named explicitly (origin: line-2 review IDG-3). The default below already denies, so the
 		// behaviour is unchanged — but with only a default, exhaustive goes blind on this switch, and a
@@ -422,9 +457,15 @@ func (h *Handler) ensureAgentProvisioned(sid, nid, clientNkey, fp, pin, clientIP
 			return ErrSeamNotWired
 		}
 		provision = func(sid, nid, fp, pin string, now time.Time) error {
-			return agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, now)
+			return agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, h.VerifyPINWithBudget, now)
 		}
 	}
+	// The process-wide argon2 ceiling is charged by VerifyPINWithBudget, i.e. at the moment
+	// argon2 actually runs — see that function. It used to be charged HERE, and that was
+	// wrong for the same reason the seam check is above it: ProvisionWithPIN refuses a
+	// nonexistent session (ErrSessionMissing) BEFORE reaching the verifier, so a stranger
+	// naming random sids drained the whole budget at zero CPU cost and denied every real
+	// bootstrap (round 2, A-F3).
 	switch err := provision(sid, nid, fp, pin, h.Now()); {
 	case err == nil:
 		h.emit("member_joined", map[string]any{
@@ -496,9 +537,10 @@ func (h *Handler) ensureMember(sid, fp, pin, clientIP string) error {
 			return ErrSeamNotWired
 		}
 		join = func(sid, fp, pin string, now time.Time) error {
-			return session.JoinWithPIN(h.DB, sid, fp, pin, auth.VerifyPIN, now)
+			return session.JoinWithPIN(h.DB, sid, fp, pin, h.VerifyPINWithBudget, now)
 		}
 	}
+	// Charged by VerifyPINWithBudget, same as the agent path — see A-F3 above.
 	if err := join(sid, fp, pin, h.Now()); err != nil {
 		if isNotLeader(err) {
 			return ErrNotLeader // transient — never false-allow (D3-R3)
@@ -514,17 +556,44 @@ func (h *Handler) ensureMember(sid, fp, pin, clientIP string) error {
 	return nil
 }
 
-// pinRateLimited reports whether clientIP is currently over its E.6 PIN-attempt
-// budget. An empty IP (nats-server did not stamp a peer address — not something
-// a client can force) fails OPEN: we would rather never throttle real joiners on
-// a missing address than collapse the whole fleet into one shared bucket. The
-// realistic brute-force path always carries a real peer IP.
+// pinRateLimited reports whether a PIN verify is currently refused. It answers for TWO
+// budgets, and a refusal here does NOT necessarily mean this source misbehaved:
+//
+//   - the PROCESS-WIDE argon2 ceiling, checked first and regardless of address. This one
+//     is about the broker's own CPU, so a refusal means the broker is saturated, not
+//     that the caller did anything wrong.
+//   - clientIP's E.6 per-source PIN-attempt budget, the anti-brute-force control.
+//
+// An empty IP (nats-server did not stamp a peer address — not something a client can
+// force) skips only the SECOND check: we would rather never throttle real joiners on a
+// missing address than collapse the whole fleet into one shared bucket. It does not
+// skip the first — the process-wide ceiling has nothing to do with who is calling.
+//
+// origin: prerelease audit round 2, C3. This doc described the per-IP budget as the only
+// one and promised a blanket fail-OPEN on an empty address, both of which the commit
+// that added the process-wide ceiling had already made false.
 func (h *Handler) pinRateLimited(clientIP string) bool {
+	// The PROCESS-wide argon2 ceiling applies even when no peer address was
+	// stamped. origin: prerelease audit proto-auth-acl/L1-F3 — the per-IP bucket
+	// answers "is this source brute-forcing", and an absent IP legitimately means
+	// "cannot answer that, so do not punish". The global bucket answers a different
+	// question — "is this broker about to spend 0.15-0.3s of its single serialized
+	// callout goroutine" — and that one has an answer regardless of who is asking.
+	if h.pinLimiterFor().globalBlocked(h.Now()) {
+		return true
+	}
 	if clientIP == "" {
 		return false
 	}
 	return h.pinLimiterFor().blocked(clientIP, h.Now())
 }
+
+// spendPINBudget IS GONE — origin: prerelease audit external review R2-M1. It charged the
+// process-wide budget in its own critical section, separate from the globalBlocked read
+// that decided whether to charge at all, and that gap admitted 64 concurrent callers
+// against a ceiling of one. VerifyPINWithBudget now takes the token and the decision in a
+// single pinRateLimiter.tryTakeGlobal, so there is nothing left for a spend-only helper to
+// do — and no way for a future caller to spend without checking.
 
 // recordPINFailure charges one unit of clientIP's E.6 budget for a genuine
 // Argon2 reject. No-op on an empty IP (see pinRateLimited).
@@ -578,9 +647,115 @@ func (h *Handler) allow(req *jwt.AuthorizationRequestClaims, userPub string, per
 	return out, nil
 }
 
+// verifyClientNkey proves that the connecting party holds the private half of the nkey
+// it presented, by checking its signature over the nonce the server issued.
+//
+// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1 ≡
+// red-team/RED-TEAM-REFUTE-F1, found by two lanes and reproduced end to end against a
+// real nats-server + this handler.
+//
+// NOBODY ELSE DOES THIS. It is natural to assume the server has already checked the
+// signature by the time a callout runs — this package's own doc comment said so for
+// three releases — but in conf mode nats-server only verifies an nkey it has a STATIC
+// `users:` entry for. server/auth.go bails out at `nkey, ok = s.nkeys[c.opts.Nkey]; if
+// !ok { return false }` BEFORE reaching its Verify branch, and the deferred callout hop
+// then forwards `ConnectOptions.Nkey` exactly as the client typed it
+// (server/auth_callout.go fillConnectOpts). Every tether principal except the broker
+// itself is callout-authenticated, so the entire identity model rests on this function.
+//
+// WHAT WAS REACHABLE WITHOUT IT. `clientNkey` is the actor in every permission template:
+// it pins the `ctrl.by.<actor>` publish grants and it derives auth.InboxPrefixFor's
+// private subtree. And the fingerprint the session-create allow-list is keyed on is
+// computed from it. So knowing a victim's PUBLIC key — which sys.events hands to any
+// session member in session_created{actor} — was enough to connect as that victim, read
+// its private inbox (register replies carry the tunnel token and every subscriber PSK),
+// and pass the admission check as that victim. The signature was never checked, so any
+// bytes at all would do.
+//
+// NOT AN N-1 BREAK. All four production dial sites already sign: internal/cli's
+// ConnectNATSWithNkey, the completion transport, the agent, and the broker's own
+// connection. A client that signs has always sent `sig`, and nats-server fills
+// ClientInformation.Nonce whenever `sig` is present (verified on v2.10.22 and v2.14.0),
+// so the material has always been on the request — nothing here asks a client for
+// anything it does not already send.
+//
+// EMPTY IS A REFUSAL, NOT AN EXEMPTION. A missing nonce or signature means the client
+// did not authenticate as an nkey holder, which is exactly the case this exists to
+// reject. It must not fall through to a permissive template: an empty jwt.Permissions is
+// UNRESTRICTED in nats-server (c.perms stays nil), so failing open here would be worse
+// than the hole it closes.
+func verifyClientNkey(pubKey, nonce, signedNonce string) error {
+	if nonce == "" || signedNonce == "" {
+		return errors.New("no signature over the server nonce")
+	}
+	// Same decode order as nats-server's own check (server/auth.go): raw-url first,
+	// standard base64 as a fallback. A client library that picks the other encoding must
+	// not be rejected here when the server itself would have accepted it.
+	sig, err := base64.RawURLEncoding.DecodeString(signedNonce)
+	if err != nil {
+		if sig, err = base64.StdEncoding.DecodeString(signedNonce); err != nil {
+			return errors.New("signature is not valid base64")
+		}
+	}
+	kp, err := nkeys.FromPublicKey(pubKey)
+	if err != nil {
+		return fmt.Errorf("public key: %w", err)
+	}
+	if err := kp.Verify([]byte(nonce), sig); err != nil {
+		return errors.New("signature does not verify against the presented nkey")
+	}
+	return nil
+}
+
 func (h *Handler) deny(req *jwt.AuthorizationRequestClaims, reason string) (string, error) {
 	resp := jwt.NewAuthorizationResponseClaims(req.UserNkey)
 	resp.Audience = req.Server.ID
 	resp.Error = reason
 	return resp.Encode(h.AccountKp)
+}
+
+// VerifyPINWithBudget is auth.VerifyPIN with the process-wide argon2 ceiling charged
+// against it — at the moment the memory-hard work actually happens, and nowhere else.
+//
+// origin: prerelease audit round 2, A-F3. The charge used to sit at the call site,
+// before provision()/join(), which looks equivalent and is not: both refuse a
+// nonexistent session, an already-provisioned nid, or an unwired seam BEFORE they ever
+// reach a verifier. So a stranger publishing joins for random session names spent one
+// token of a 10-token bucket per request at zero CPU cost to the broker, and once the
+// bucket was empty every genuine agent bootstrap and every PIN member join was refused
+// — the exact denial the ceiling exists to prevent, delivered by the ceiling.
+//
+// Charging here also makes the ceiling mean what its name says: it bounds argon2, so it
+// is charged if and only if argon2 runs. Correct PIN or wrong PIN both cost the same
+// 0.15-0.3s of the single serialized callout goroutine, which is why the charge cannot
+// be based on failures (that is the separate per-IP brute-force budget).
+//
+// In cluster mode the write seams run the verify ON THE LEADER, which charges its own
+// budget there. That is right: the ceiling bounds the CPU of whichever broker actually
+// spends it.
+//
+// THERE IS EXACTLY ONE VERIFIER NOW, and the disappearance of the second one is the fix.
+//
+// origin: prerelease audit external review R2-M1. This used to be a pair —
+// `chargedVerifyPIN` (spend only, for the single path whose Handle had already checked) and
+// `VerifyPINWithBudget` (check, then delegate here to spend). Splitting "may I?" from "I am
+// taking it" across two critical sections is a TOCTOU by construction: with burst=1 and 64
+// concurrent callers, all 64 read the same last token before any of them consumed it and
+// all 64 entered Argon2. The measured result was 64/64 admitted against a ceiling of one.
+//
+// A single atomic try-spend removes the window AND the distinction that created it: taking
+// the token IS the check, so there is no longer a caller who is allowed to skip half of it.
+// The single path still consumes exactly one unit per verify, as before.
+func (h *Handler) VerifyPINWithBudget(pin, phc string) error {
+	// NIL-SAFE CLOCK: this runs deep inside ProvisionWithPIN's transaction on the
+	// auth-callout goroutine, where a nil func value is a panic in a nats.go MsgHandler —
+	// i.e. the whole broker — which is far worse than a clock that falls back to time.Now.
+	now := time.Now
+	if h.Now != nil {
+		now = h.Now
+	}
+	if !h.pinLimiterFor().tryTakeGlobal(now()) {
+		return ErrPINRateLimited
+	}
+	return auth.VerifyPIN(pin, phc)
 }

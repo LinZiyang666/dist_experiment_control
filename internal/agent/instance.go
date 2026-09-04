@@ -708,6 +708,13 @@ func releaseLeaseName(a *Agent, nc *nats.Conn) {
 		InstanceID:        a.instanceID,
 		ReleasingName:     true,
 		RosterRefreshOnly: true,
+		// origin: prerelease audit broker-core/BC-F1. This field was never set here,
+		// which made the broker's release-the-row branch dead code in production for
+		// the whole v0.5.1 line. It is the SECONDARY half of the fix — the broker now
+		// decides from agent_provisioning and only consults this when that table
+		// cannot be read — because a field only new agents send cannot repair a fleet
+		// of old ones. Additive and omitempty, so an N-1 broker ignores it.
+		LeasedNID: nidOf(a) != a.cfg.NID,
 	})
 	if err != nil {
 		return

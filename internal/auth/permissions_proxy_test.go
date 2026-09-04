@@ -9,7 +9,7 @@ import (
 // allow-list, each pinned to this actor + sid (no wildcard). Guards against an
 // accidental drop that would silently break the feature.
 func TestActivatedMemberHasProxyLiterals(t *testing.T) {
-	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	perms := PermissionsForActivatedMember(sampleActor, "lab", false)
 	want := []string{
 		subjectPrefix + ".ctrl.by." + sampleActor + ".s.lab.proxy.set.req",
 		subjectPrefix + ".ctrl.by." + sampleActor + ".s.lab.proxy.status.req",
@@ -27,7 +27,7 @@ func TestActivatedMemberHasProxyLiterals(t *testing.T) {
 // The unactivated template must NOT carry any proxy subject (proxy is a
 // per-session operation; you must activate a session first).
 func TestUnactivatedHasNoProxy(t *testing.T) {
-	perms := PermissionsForUnactivated(sampleActor)
+	perms := PermissionsForUnactivated(sampleActor, false)
 	for _, a := range append(append([]string{}, perms.Pub.Allow...), perms.Sub.Allow...) {
 		if strings.Contains(a, ".proxy.") {
 			t.Errorf("unactivated template must not reference proxy: %q", a)
@@ -43,8 +43,8 @@ func TestCtlCannotReachProxyKeysPush(t *testing.T) {
 		name      string
 		pub, subL []string
 	}{
-		{"unactivated", PermissionsForUnactivated(sampleActor).Pub.Allow, PermissionsForUnactivated(sampleActor).Sub.Allow},
-		{"activated", PermissionsForActivatedMember(sampleActor, "lab").Pub.Allow, PermissionsForActivatedMember(sampleActor, "lab").Sub.Allow},
+		{"unactivated", PermissionsForUnactivated(sampleActor, false).Pub.Allow, PermissionsForUnactivated(sampleActor, false).Sub.Allow},
+		{"activated", PermissionsForActivatedMember(sampleActor, "lab", false).Pub.Allow, PermissionsForActivatedMember(sampleActor, "lab", false).Sub.Allow},
 	}
 	for _, c := range ctl {
 		for _, a := range append(append([]string{}, c.pub...), c.subL...) {

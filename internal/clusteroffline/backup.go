@@ -13,10 +13,12 @@ package clusteroffline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
@@ -61,12 +63,49 @@ func OfflineBackup(opts BackupOptions) (result *BackupResult, err error) {
 		return nil, fmt.Errorf("clusteroffline: source DB %q not found: %w", opts.DBPath, statErr)
 	}
 
-	// (1) live-daemon interlock — refuse a backup while the DB may be written.
 	dataDir := opts.DataDir
 	if dataDir == "" {
 		dataDir = filepath.Dir(opts.DBPath)
 	}
+
+	// (1) live-daemon interlock FIRST — it is the diagnosis an operator can act on.
+	//
+	// A running broker holds the data-dir lock for its whole lifetime, so if the flock
+	// came first it would answer first, and it would answer with
+	// "resource temporarily unavailable" — which names neither the broker nor the fix.
+	// The interlock names both. origin: prerelease audit round 2, CC-6; the first
+	// version of this hunk had the two in the other order and a comment asserting this
+	// one.
 	if err := checkNoLiveDaemon(dataDir, opts.DBPath); err != nil {
+		return nil, err
+	}
+
+	// (2) flock — bar a CONCURRENT OFFLINE TOOL.
+	//
+	// origin: prerelease audit, §3 MINOR sweep. Every other offline operation in this
+	// package takes this lock; the backup was the one that did not. The live-daemon
+	// interlock above is a different question and does not answer this one: with the
+	// daemon stopped, a `recovery restore` and a `backup` both pass their daemon probes
+	// and then run against the same file. The restore swaps the DB out from under the
+	// backup's copy, and the resulting bundle is a mix of two databases — with a
+	// manifest built from the copy, so it describes itself as consistent.
+	//
+	// A READ-ONLY SOURCE IS ALLOWED THROUGH, deliberately. Taking the lock CREATES a
+	// file, so a backup of a read-only mount or of a filesystem snapshot — a normal DR
+	// practice, and one that used to work — would otherwise start failing for a reason
+	// that has nothing to do with the backup. Letting it through is not fail-open here:
+	// what the lock guards against is another offline tool MUTATING the source, and
+	// every one of those (restore, init, force-single) writes. A source we cannot write
+	// is a source none of them can be running against either.
+	release, err := cluster.AcquireDataDirLock(dataDir)
+	switch {
+	case err == nil:
+		defer release()
+	case errors.Is(err, syscall.EROFS):
+		opts.Logger.Warn("clusteroffline: backup source is on a read-only filesystem; proceeding "+
+			"without the data-dir lock (no offline tool can be mutating a source it cannot write)",
+			"data_dir", dataDir)
+	default:
 		return nil, err
 	}
 

@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/session"
 )
 
 // Backend is everything the server needs from the broker. Decoupled
@@ -50,6 +52,16 @@ type Backend struct {
 	// instead of the direct tx on DB (which is the READ-ONLY FSM handle in cluster mode).
 	// nil ⇒ single mode: handleEvict does the direct tx (byte-identical to pre-D9).
 	EvictWrite func(sid, nid string) error
+
+	// SessionCreatorWrite is the CLUSTER-MODE seam for the `session create` admission
+	// table, mirroring EvictWrite: nil in single mode (the handler writes directly),
+	// wired to a raft router in cluster mode. origin: prerelease audit round 2.
+	//
+	// It must exist for two reasons, and the second is the one specific to this table:
+	// the FSM is the sole SQLite writer in cluster mode, AND an fp admitted on one broker
+	// has to be admitted on all of them, or which broker a ctl reaches decides whether it
+	// may create a session.
+	SessionCreatorWrite func(fp, addedBy, note string, allow bool) error
 
 	// ClusterMode makes a nil EvictWrite FAIL CLOSED instead of falling through to the direct tx
 	// (batch B, B3). It is the exact counterpart of authcallout.Handler.ClusterMode; see that field
@@ -290,6 +302,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.handleEvict(req)
 	case OpRuntime:
 		return s.handleRuntime()
+	case OpSessionAllow, OpSessionDeny, OpSessionCreators:
+		return s.handleSessionCreators(req)
 	default:
 		if clusterOps[req.Op] {
 			if s.backend.Cluster == nil {
@@ -547,5 +561,120 @@ func (s *Server) now() time.Time {
 func (s *Server) warn(msg string, kv ...any) {
 	if s.backend.Logger != nil {
 		s.backend.Logger.Warn(msg, kv...)
+	}
+}
+
+// handleSessionCreators administers WHO MAY CREATE A SESSION.
+//
+// origin: prerelease audit round 2. handleSessionCreate had no admission control, so
+// anybody reachable on the public control plane could name a session, become its owner,
+// and mint both the activated-member and (with the PIN they had just chosen) the AGENT
+// permission template.
+//
+// It lives on the admin socket rather than on the control plane deliberately: the socket
+// is root-only 0600 on the broker host, so admitting a fingerprint is an act of whoever
+// runs the broker. Putting it on NATS would need its own admission rule, and the
+// recursion has to stop somewhere.
+func (s *Server) handleSessionCreators(req Request) Response {
+	if s.backend.DB == nil {
+		return Response{Op: req.Op, Error: "no database", Code: CodeBadRequest}
+	}
+	now := time.Now()
+	if s.backend.Now != nil {
+		now = s.backend.Now()
+	}
+	switch req.Op {
+	case OpSessionCreators:
+		list, err := session.ListCreators(s.backend.DB)
+		if err != nil {
+			return Response{Op: req.Op, Error: err.Error(), Code: CodeStoreError}
+		}
+		out := make([]CreatorEntry, 0, len(list))
+		for _, c := range list {
+			out = append(out, CreatorEntry{
+				FP: c.FP, AddedAt: c.AddedAt.UTC().Format(time.RFC3339),
+				AddedBy: c.AddedBy, Note: c.Note,
+			})
+		}
+		return Response{Op: req.Op, OK: true, Creators: out}
+	case OpSessionAllow, OpSessionDeny:
+		if req.FP == "" {
+			return Response{Op: req.Op, Error: "fp required", Code: CodeBadRequest}
+		}
+		// A FINGERPRINT THAT CANNOT MATCH IS A BAD REQUEST, not a row. The allow-list is
+		// only ever consulted by exact match against auth.FingerprintFromActor's output,
+		// so a typo or a paste of the abbreviated OWNER column from `admin sessions` is an
+		// entry that will never match anything — while the operator has been told
+		// "admitted" and `--list` shows them the string they were both looking at.
+		// origin: prerelease audit increment 2 internal review, four lanes.
+		if !auth.ValidFingerprint(req.FP) {
+			return Response{Op: req.Op, Code: CodeBadRequest, Error: "not a fingerprint: " + req.FP +
+				" (expected SHA256:<43 base64 chars>, as printed by `tether whoami` or by the " +
+				"refusal a user gets from `tether session create`)"}
+		}
+		allow := req.Op == OpSessionAllow
+		if s.backend.SessionCreatorWrite != nil {
+			// Cluster mode: through raft, so every broker sees the same allow-list.
+			if err := s.backend.SessionCreatorWrite(req.FP, "admin", req.Note, allow); err != nil {
+				return Response{Op: req.Op, Error: err.Error(), Code: CodeStoreError}
+			}
+			if !allow {
+				// A REPLICATED DELETE CANNOT SAY WHETHER IT DELETED ANYTHING, and it must
+				// not pretend to. The single-mode arm below distinguishes "removed" from
+				// "was not there"; through raft the Plan bakes an unconditional DELETE and
+				// the row count belongs to whichever replica applied it. Reporting
+				// "removed <fp>" here made a typo look like a successful revocation, and
+				// made the confirmation an operator gets MODE-DEPENDENT — the one thing a
+				// safety verb must not be. origin: increment 2 internal review,
+				// adminsock-cli/L10-F3 ≡ admission-product/L8-F6 ≡ raft-op/EXPLOIT-F4.
+				return Response{Op: req.Op, OK: true,
+					Error: "replicated: the fingerprint is not in the allow-list on any broker " +
+						"(this path cannot report whether it was there before — check with --list)"}
+			}
+			return Response{Op: req.Op, OK: true}
+		}
+		// FAIL CLOSED, exactly as OpEvict does above and for the same reason: clustered
+		// but the seam is absent means falling through would write the read-only FSM
+		// handle, or — with a write handle — put a SECURITY POLICY row outside raft, where
+		// it applies on one broker and not the others.
+		// origin: increment 2 internal review, adminsock-cli/L10-F2 ≡ repo-invariants/F2
+		// ≡ raft-op/F7 ≡ empirical targeted-suites/F1.
+		if s.backend.ClusterMode {
+			if s.backend.Logger != nil {
+				s.backend.Logger.Error("adminsock: SessionCreatorWrite seam is not wired in cluster "+
+					"mode — refusing rather than writing the read-only FSM handle directly",
+					"seam", "SessionCreatorWrite", "fp", req.FP, "allow", allow)
+			}
+			return Response{Op: req.Op, Code: CodeStoreError, Error: "session-allow is unavailable: " +
+				"this broker is clustered but its raft admission path is not wired (broker wiring " +
+				"bug, not a bad request) — refusing rather than writing an un-replicated policy row"}
+		}
+		if allow {
+			added, aerr := session.AllowCreator(s.backend.DB, req.FP, "admin", req.Note, now)
+			if aerr != nil {
+				return Response{Op: req.Op, Error: aerr.Error(), Code: CodeStoreError}
+			}
+			if !added {
+				// Already admitted. Say so rather than "admitted": re-admitting keeps the
+				// ORIGINAL added_by/note by design, so a --note passed here was ignored
+				// and the operator must not be left thinking it took.
+				return Response{Op: req.Op, OK: true,
+					Error: "already in the allow-list (unchanged; a --note here was not applied — " +
+						"remove and re-add to rewrite it)"}
+			}
+			return Response{Op: req.Op, OK: true}
+		}
+		removed, err := session.DenyCreator(s.backend.DB, req.FP)
+		if err != nil {
+			return Response{Op: req.Op, Error: err.Error(), Code: CodeStoreError}
+		}
+		if !removed {
+			// NOT an error: an operator making sure an fp is gone should be able to run
+			// this twice without having to interpret a failure.
+			return Response{Op: req.Op, OK: true, Error: "no such fingerprint in the allow-list"}
+		}
+		return Response{Op: req.Op, OK: true}
+	default:
+		return Response{Op: req.Op, Error: "unknown op: " + req.Op, Code: CodeBadRequest}
 	}
 }

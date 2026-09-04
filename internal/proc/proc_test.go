@@ -94,7 +94,7 @@ func TestMarkExitedTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	end := time.Now().UTC().Truncate(time.Second)
-	if err := MarkExited(db, "01abcdefghij", 0, end); err != nil {
+	if err := MarkExited(db, "01abcdefghij", "lab", 0, end); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := Get(db, "01abcdefghij")
@@ -108,14 +108,14 @@ func TestMarkExitedTransitions(t *testing.T) {
 		t.Errorf("ended_at: got %v want %v", p.EndedAt, end)
 	}
 	// Idempotent: marking again is a no-op (no error).
-	if err := MarkExited(db, "01abcdefghij", 1, end.Add(time.Second)); err != nil {
+	if err := MarkExited(db, "01abcdefghij", "lab", 1, end.Add(time.Second)); err != nil {
 		t.Errorf("second MarkExited: %v", err)
 	}
 }
 
 func TestMarkExitedRejectsUnknown(t *testing.T) {
 	db := openDB(t)
-	if err := MarkExited(db, "ghost", 0, time.Now()); !errors.Is(err, ErrNotFound) {
+	if err := MarkExited(db, "ghost", "lab", 0, time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -506,4 +506,57 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// origin: prerelease audit broker-proc/L3-F1.
+//
+// Refile used to return only an error, and a zero-row UPDATE is not an error in
+// SQL. Its caller (adoptRowsCarriedAcrossARename) read the nil as "moved" and
+// incremented the count that satisfies reconcileOnRegister's sawAnyRow gate — the
+// fail-closed check that refuses to orphan-kill on a node name with no process
+// history. So a move that did not happen unlocked SIGKILL on live work.
+//
+// The table walks every way the four-part predicate can miss, because they are not
+// hypothetical: a concurrent register refiles the row first, an exit lands between
+// the caller's SELECT and this UPDATE, or the caller's `from` is a stale name.
+func TestRefileReportsWhetherARowActuallyMoved(t *testing.T) {
+	cases := []struct {
+		name           string
+		sid, pid, from string
+		exitFirst      bool
+		wantMoved      bool
+	}{
+		{name: "the row is there", sid: "lab", pid: "01abcdefghij", from: "lab-1", wantMoved: true},
+		{name: "wrong from-nid", sid: "lab", pid: "01abcdefghij", from: "lab-9", wantMoved: false},
+		{name: "wrong session", sid: "nope", pid: "01abcdefghij", from: "lab-1", wantMoved: false},
+		{name: "unknown pid", sid: "lab", pid: "01nosuchproc", from: "lab-1", wantMoved: false},
+		{name: "already exited", sid: "lab", pid: "01abcdefghij", from: "lab-1", exitFirst: true, wantMoved: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openDB(t)
+			if _, err := db.Exec(`INSERT INTO nodes(sid, nid, status) VALUES ('lab','lab-2','ONLINE')`); err != nil {
+				t.Fatal(err)
+			}
+			if err := Insert(db, sample()); err != nil {
+				t.Fatal(err)
+			}
+			if tc.exitFirst {
+				if err := MarkExited(db, "01abcdefghij", "lab", 0, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			moved, err := Refile(db, tc.sid, tc.pid, tc.from, "lab-2")
+			if err != nil {
+				t.Fatalf("Refile: %v", err)
+			}
+			if moved != tc.wantMoved {
+				t.Fatalf("Refile reported moved=%v, want %v.\n\n"+
+					"A zero-row UPDATE is a successful UPDATE in SQL. The caller turns a true into "+
+					"evidence that a node name has process history, and that evidence is what "+
+					"unlocks orphan-SIGKILL — so 'did it move' has to be measured, not inferred "+
+					"from the absence of an error.", moved, tc.wantMoved)
+			}
+		})
+	}
 }

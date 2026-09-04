@@ -18,6 +18,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"github.com/LinZiyang666/tether/internal/session"
 	"math/big"
 	"net"
 	"os"
@@ -151,7 +152,42 @@ type d9Broker struct {
 // startD9Broker seeds+bootstraps a fresh single-voter cluster DB (InitFromExisting),
 // then starts a broker in cluster mode against an embedded JetStream NATS server. It
 // blocks until Run signals ready. selfID is the node_id (== raft ServerID).
-func startD9Broker(t *testing.T, selfID string) *d9Broker {
+// d9AdmittedActor mints an identity and returns it together with a pre-init seed that
+// admits it to create sessions.
+//
+// origin: prerelease audit round 2. `session create` now requires the caller's
+// fingerprint in session_creators. Seeding it BEFORE InitFromExisting is not a test
+// shortcut — it is the migrated-broker shape: migration 0019 admits every fingerprint
+// that already owned a session, and those rows live in the grow-ready snapshot exactly
+// like every other pre-existing app row this harness seeds that way.
+func d9AdmittedActor(t *testing.T) (string, func(*testing.T, string)) {
+	t.Helper()
+	seed, err := auth.GenerateUserSeed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := auth.PublicKeyFromSeed(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return actor, func(t *testing.T, dbPath string) {
+		t.Helper()
+		db, err := storage.Open(dbPath)
+		if err != nil {
+			t.Fatalf("open db to admit a creator: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := session.AllowCreator(db, fp, "migration", "d9 harness", time.Now()); err != nil {
+			t.Fatalf("admit creator: %v", err)
+		}
+	}
+}
+
+func startD9Broker(t *testing.T, selfID string, seed ...func(*testing.T, string)) *d9Broker {
 	t.Helper()
 	natsOpts := natstest.DefaultTestOptions
 	natsOpts.Port = -1
@@ -159,7 +195,7 @@ func startD9Broker(t *testing.T, selfID string) *d9Broker {
 	natsOpts.StoreDir = t.TempDir()
 	ns := natstest.RunServer(&natsOpts)
 	t.Cleanup(ns.Shutdown)
-	h, _ := startD9BrokerOn(t, selfID, newD9CA(t), ns.ClientURL())
+	h, _ := startD9BrokerOn(t, selfID, newD9CA(t), ns.ClientURL(), seed...)
 	h.nats = ns
 	return h
 }
@@ -240,7 +276,7 @@ func startD9BrokerOn(t *testing.T, selfID string, ca *d9CA, natsURL string, seed
 // route certs chain to it). Both bootstrap {self} via InitFromExisting; the caller then
 // joins B to A via the leader's ClusterAdmin (the §8.1 two-phase add). Returns A, B, B's
 // node_id, and B's raft address.
-func startD9Pair(t *testing.T) (a, b *d9Broker, bID, bRaftAddr string) {
+func startD9Pair(t *testing.T, seed ...func(*testing.T, string)) (a, b *d9Broker, bID, bRaftAddr string) {
 	t.Helper()
 	ca := newD9CA(t)
 	natsOpts := natstest.DefaultTestOptions
@@ -250,9 +286,9 @@ func startD9Pair(t *testing.T) (a, b *d9Broker, bID, bRaftAddr string) {
 	ns := natstest.RunServer(&natsOpts)
 	t.Cleanup(ns.Shutdown)
 
-	a, _ = startD9BrokerOn(t, "d9-A", ca, ns.ClientURL())
+	a, _ = startD9BrokerOn(t, "d9-A", ca, ns.ClientURL(), seed...)
 	a.nats = ns
-	b, bRaftAddr = startD9BrokerOn(t, "d9-B", ca, ns.ClientURL())
+	b, bRaftAddr = startD9BrokerOn(t, "d9-B", ca, ns.ClientURL(), seed...)
 	b.nats = ns
 	return a, b, "d9-B", bRaftAddr
 }

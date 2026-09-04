@@ -17,11 +17,21 @@ import (
 // (classifyExit, called only from the main() sink).
 //
 // Reserved ranges that DO NOT come from this taxonomy (documented so the values never collide):
+//
 //   - 0..3 are the `cluster status` HEALTH codes, emitted ONLY by that command (it os.Exit()s
 //     directly with rep.ExitCode and never reaches the main sink).
+//
 //   - exec/run pass the REMOTE process's exit code through (os.Exit(chunk.ExitCode), any value
-//     0..255) — they also never reach the sink. The disambiguator there is WHICH command you ran,
-//     not the value, so "77 == permission" is scoped to broker-RPC commands.
+//     0..255) when the remote process ACTUALLY RAN. The disambiguator there is WHICH command you
+//     ran, not the value.
+//
+//     BUT NOT WHEN THE BROKER REFUSED THEM — origin: prerelease audit round 2, C8/J6. This
+//     paragraph used to end "so 77 == permission is scoped to broker-RPC commands", and that
+//     stopped being true when execFailureMessage started routing exec's refusals through
+//     classifyExit so exec and run would agree. An exec that never reached a process now exits
+//     64/69/75/77 from THIS taxonomy. The two cases are still distinguishable, just not by the
+//     command: a passed-through code is a code the remote process chose, and a classified one
+//     arrives with a `exec: ...` message on stderr naming the broker's refusal.
 //
 // Compatibility: 0 still means success, so existing `$? != 0` scripts are unaffected; only the
 // SPECIFIC nonzero value becomes more informative.

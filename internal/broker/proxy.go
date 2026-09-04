@@ -30,6 +30,19 @@ import (
 // Secrets (SS PSKs, tunnel tokens) reach agents ONLY via the register reply
 // _INBOX and the per-(sid,nid) proxy-keys.req.forwarded push — NEVER over
 // sys.events (member-readable). sys.events carries secret-free nudges only.
+//
+// CORRECTION (prerelease audit proto-auth-acl/L1-F1): the sentence above used to
+// carry an implicit claim — that the register-reply _INBOX is a SAFER channel than
+// sys.events — and that claim was false. Every client template granted a bare
+// `Sub "_INBOX.>"`, so the reply inbox was readable by any connection on the
+// account, including one holding no credential at all. It is safe NOW because
+// auth_callout grants each UPGRADED connection only its own subtree under
+// auth.InboxRoot (`_TINBOX.<a>.<b>`, from auth.InboxPrefixFor) and clients set the
+// matching prefix through natsinbox.InboxConnectOptions. A connection that predates
+// that still holds `_INBOX.>` for the length of the N-1 window, so during it the old
+// sentence remains true of pre-cutover peers — see requirements §6.7. The
+// distinction the sentence draws is real, but it is a property of that fix, not of
+// _INBOX itself — do not read it as "reply inboxes are private by construction".
 
 // proxyErr replies a generic {code,error} body. All proxy resp types share the
 // Code/Error JSON fields, so this is safe regardless of which RPC the ctl sent.
@@ -285,9 +298,10 @@ func (b *Broker) proxySubCreate(nc *nats.Conn, sid, fp, actor string, msg *nats.
 		return
 	}
 	b.pushCurrentKeyset(nc, sid, epoch)
-	// The raw token leaves the broker exactly once, here.
-	b.pubAuditCall(sid, fp, actor, "proxy.sub.create", "", true, "", msg.Reply, map[string]any{"name": req.Name, "sub_id": s.SubID})
-	b.replyJSON(msg, proto.ProxySubCreateResp{OK: true, Name: req.Name, SubURL: b.subURL(s.Token)})
+	resp := proxySubCreateReply(b, sid, req.Name, s.Token, msg.Reply)
+	b.pubAuditCall(sid, fp, actor, "proxy.sub.create", "", true, resp.Code,
+		msg.Reply, map[string]any{"name": req.Name, "sub_id": s.SubID})
+	b.replyJSON(msg, resp)
 }
 
 func (b *Broker) proxySubRevoke(nc *nats.Conn, sid, fp, actor string, msg *nats.Msg) {
@@ -1177,4 +1191,41 @@ func validSubName(name string) bool {
 		}
 	}
 	return true
+}
+
+// proxySubCreateReply builds the `proxy sub create` reply, WITHHOLDING the bearer URL when
+// the reply space is one other connections can read.
+//
+// THE ONLY PLACE `ProxySubCreateResp.SubURL` IS EVER SET, and that is the point.
+//
+// origin: prerelease audit external review R2-B1. The fence went in on `proxySubCreate`
+// (single mode) alone, while cluster mode dispatches to a DIFFERENT handler
+// (handleProxySubCreateCluster) which kept replying `SubURL: b.subURL(rawToken)`
+// unconditionally. The test written alongside the first fix only ever constructed a
+// single-mode broker, so it never executed the branch that a clustered deployment — the
+// one with the larger blast radius — actually runs. Two handlers for one decision is how
+// a fix covers half a product; one helper is how it stops.
+//
+// The raw token leaves the broker exactly once, here, so this is exactly once that it must
+// not enter a readable space. A ctl on the shared `_INBOX` still gets the subscriber
+// CREATED (it is live, its PSK is in the keyset) — only the URL is withheld, because handing
+// it over would disclose the bearer token to anyone holding a freshly minted nkey. The
+// recovery is a revoke + re-create from an upgraded ctl, and that is the honest one: a token
+// that has already appeared on the shared bus should not be handed out a second time.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet pins
+// this type's method count exactly.
+func proxySubCreateReply(b *Broker, sid, name, rawToken, reply string) proto.ProxySubCreateResp {
+	if auth.IsPrivateInboxSubject(reply) {
+		return proto.ProxySubCreateResp{OK: true, Name: name, SubURL: b.subURL(rawToken)}
+	}
+	b.cfg.Logger.Warn("broker: withheld a /sub URL from a shared-inbox request — the bearer "+
+		"token would be readable by any connection on this deployment; upgrade the ctl and "+
+		"re-create the subscriber", "sid", sid, "name", name, "reply", reply)
+	return proto.ProxySubCreateResp{
+		OK: true, Name: name, Code: proto.CodeLegacyInboxNoSecrets,
+		Error: "the subscriber was created, but its URL contains a bearer token and this " +
+			"client is receiving replies on the shared inbox, where any connection could " +
+			"read it. Upgrade tether on this machine, then `proxy sub revoke` and re-create.",
+	}
 }

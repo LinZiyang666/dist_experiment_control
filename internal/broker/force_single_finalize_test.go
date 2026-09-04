@@ -98,7 +98,7 @@ func TestOperatorAbortIsEnumIndependent(t *testing.T) {
 //
 // Mutation: move the finalize early-return below clearOpAttempts — reddens.
 func TestConfirmOpRefusesFinalizeWithoutClearingItsBudget(t *testing.T) {
-	a := &ClusterAdmin{opAttempts: map[string]int{"op-fs": 4}}
+	a := &ClusterAdmin{opAttempts: map[opAttemptKey]int{{opID: "op-fs", step: "prune"}: 4}}
 	err := a.confirmOpKindGuard(&cluster.Operation{
 		OpID: "op-fs", Kind: cluster.OpKindForceSingleFinalize, OpState: cluster.OpStateFSPrunePending,
 	})
@@ -108,7 +108,7 @@ func TestConfirmOpRefusesFinalizeWithoutClearingItsBudget(t *testing.T) {
 	if !strings.Contains(err.Error(), "cluster ops show") {
 		t.Errorf("the refusal should point at the command that DOES tell the operator something (%q)", err)
 	}
-	if got := a.opAttempts["op-fs"]; got != 4 {
+	if got := a.opAttempts[opAttemptKey{opID: "op-fs", step: "prune"}]; got != 4 {
 		t.Fatalf("the guard itself mutated the retry budget (attempts %d, want 4)", got)
 	}
 }

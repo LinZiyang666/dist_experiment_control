@@ -220,6 +220,31 @@ func (s *Session) Wait() (int, error) {
 // SetSize ioctl(TIOCSWINSZ)'s the PTY master so the child sees a real
 // SIGWINCH (kernel delivers it because the child is the PTY's session
 // leader, see Start's SysProcAttr).
+// WriteInput writes keystrokes to the master, reading the field under s.mu exactly as
+// SetSize does. origin: prerelease audit round 2, I-F5.
+//
+// The `.in` callback used to read `sess.Master` directly, with procsMu already released
+// by ptySessionFor — so it raced Close()'s `s.Master = nil` write. That race is not
+// hypothetical: it is the one Hangup() forty lines below goes out of its way to avoid,
+// closing the master IN PLACE and leaving the field non-nil, under a comment that names
+// run.go's `.in` callback as the reason. The workaround was applied to one writer of the
+// field and not to the other.
+//
+// The lock is NOT held across the Write. A pty master write blocks when the child is not
+// reading and the buffer is full, and Close() takes the same mutex — holding it here
+// would let a stalled interactive program wedge session teardown. Reading the pointer
+// under the lock is all that is needed: os.File serializes its own Write against Close,
+// and a write to an already-closed file returns ErrClosed.
+func (s *Session) WriteInput(p []byte) (int, error) {
+	s.mu.Lock()
+	master := s.Master
+	s.mu.Unlock()
+	if master == nil {
+		return 0, fmt.Errorf("pty: master closed")
+	}
+	return master.Write(p)
+}
+
 func (s *Session) SetSize(cols, rows int) error {
 	s.mu.Lock()
 	master := s.Master

@@ -419,7 +419,11 @@ func TestRestoreNextStepsFreshBoxIsAnHonestTwoStep(t *testing.T) {
 		"is MISSING",
 		"CANNOT run yet",
 		"FIRST create the base conf",
-		"Do NOT re-run install.sh now",
+		// origin: prerelease audit round 2, K-F4. This used to pin "Do NOT re-run
+		// install.sh now", a sentence made false by the same release that taught
+		// install.sh to KEEP existing config. What the operator must be warned off is
+		// the flag that still overwrites, so that is what the guard pins.
+		"--force-config",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("fresh-box next-steps must be an honest two-step; missing %q\n%s", want, stdout)

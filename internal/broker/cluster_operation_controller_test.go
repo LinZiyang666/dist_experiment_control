@@ -3,6 +3,7 @@ package broker
 import (
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -270,5 +271,66 @@ func TestC4DriveNoOpOnEmpty(t *testing.T) {
 	after, _ := n.AppliedIndex()
 	if after != before {
 		t.Fatalf("driving zero operations must write nothing: applied %d -> %d", before, after)
+	}
+}
+
+// origin: prerelease audit round 2, G-5.
+//
+// THE RETRY BUDGET IS PER STEP, because its own contract is "consecutive failures of a
+// retried side-effect".
+//
+// C4-M8 introduced it with ONE call site, where a per-op key and a per-step key are the
+// same thing. Batch G widened it to nine sites spanning the whole join and retire
+// ladders and did not widen the four RESET points, so the number silently changed
+// meaning: not "this step keeps failing" but "this op has failed five times anywhere".
+// An operation that lost one AddNonvoter, one seed converge, one lock release and one
+// AddVoter — every one of which succeeded on the next tick and moved the op FORWARD —
+// was one flake away from BLOCKED, reported against whichever step happened to be fifth.
+func TestTheRetryBudgetCountsFailuresPerStepNotPerOperation(t *testing.T) {
+	n, _ := d7SingleNode(t, "br-1")
+	a := &ClusterAdmin{node: n, logger: silentLogger(), now: time.Now}
+	op := &cluster.Operation{OpID: "op-1", Kind: cluster.OpKindJoin, OpState: cluster.OpStateJoinProofVerified}
+
+	// Four DIFFERENT steps each fail once — the shape of a flaky cluster, not of a
+	// wedged one. opMaxAttempts is 5, so a per-op counter would already be at 4.
+	for _, step := range []string{
+		"AddNonvoter", "converge client seeds after join", "release cluster-add grow lock", "AddVoter (promote)",
+	} {
+		a.blockAfterAttempts(op, step, errors.New("transient"))
+	}
+	for _, step := range []string{
+		"AddNonvoter", "converge client seeds after join", "release cluster-add grow lock", "AddVoter (promote)",
+	} {
+		if got := a.opAttempts[opAttemptKey{opID: "op-1", step: step}]; got != 1 {
+			t.Fatalf("step %q has %d recorded failures, want 1 — the counter is not per step", step, got)
+		}
+	}
+	// A fifth distinct step failing once must STILL not exhaust anything.
+	a.blockAfterAttempts(op, "read topology generation", errors.New("transient"))
+	for k, n := range a.opAttempts {
+		if n >= opMaxAttempts {
+			t.Fatalf("step %q reached the %d-attempt ceiling after ONE failure.\n\n"+
+				"Five different steps failing once each is a flaky cluster, and each of them "+
+				"succeeded on retry and moved the op forward. Blocking there tells an operator to "+
+				"go fix a step that is not broken.", k.step, opMaxAttempts)
+		}
+	}
+
+	// ...while a step that really is wedged still reaches the ceiling.
+	for i := 0; i < opMaxAttempts; i++ {
+		a.blockAfterAttempts(op, "AddNonvoter", errors.New("wedged"))
+	}
+	if got := a.opAttempts[opAttemptKey{opID: "op-1", step: "AddNonvoter"}]; got < opMaxAttempts {
+		t.Fatalf("a genuinely wedged step recorded only %d failures, want >= %d — the bound is gone",
+			got, opMaxAttempts)
+	}
+
+	// And a clear forgets EVERY step of the op, not just one.
+	a.clearOpAttempts("op-1")
+	if len(a.opAttempts) != 0 {
+		t.Fatalf("clearOpAttempts left %d step counter(s) behind: %v.\n\n"+
+			"They are keyed by (op, step) now, so deleting a single key would leave an operation "+
+			"an operator just confirmed carrying the budget it had already spent.",
+			len(a.opAttempts), a.opAttempts)
 	}
 }

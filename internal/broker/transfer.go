@@ -39,6 +39,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/xferaudit"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -176,14 +177,68 @@ func xferReserveFor(sessions, replicas int) int64 {
 // `too_many_in_flight` so callers get a clean error instead of silent
 // slowdown. Audit shard P11 F2.
 //
-// batch C: the MEMORY bound above is unchanged, but the EXHAUSTION WINDOW is not. This comment used
-// to derive the bound from a "5-min Tier-B timeout"; with a size-derived budget an entry can now live
-// up to proto.XferTierBMaxBudget (35m08s), so a client declaring the maximum size and then sending
-// nothing holds a slot ~6.8x longer than before. That is accepted rather than defended against: only
-// a session MEMBER can reach this path, and a member already has unrestricted `run`/`exec` (per the
-// documented boundary in docs/usage.md), so a member wanting to exhaust a broker has far more direct
-// options. Recording the changed window matters more than the (unchanged) byte count.
+// batch C: the EXHAUSTION WINDOW changed. This comment used to derive the bound from a "5-min Tier-B
+// timeout"; with a size-derived budget an entry can now live up to proto.XferTierBMaxBudget (35m08s),
+// so a client declaring the maximum size and then sending nothing holds a slot ~6.8x longer than
+// before. That is accepted rather than defended against: only a session MEMBER can reach this path,
+// and a member already has unrestricted `run`/`exec` (per the documented boundary in docs/usage.md),
+// so a member wanting to exhaust a broker has far more direct options.
+//
+// 2026-09-02 prerelease audit (BT-F5) CORRECTS THE PARAGRAPH ABOVE, which twice asserted the byte
+// count was "unchanged" and therefore still ~200 KiB. It was not: the per-entry size depended on
+// strings the broker accepted at any length. The bound below is what makes the arithmetic true, and
+// it is now enforced rather than assumed.
 const transferTrackerMaxEntries = 1024
+
+// transferIDMaxLen / transferPathMaxLen / transferSHA256Len bound the three strings a
+// transfer request hands the broker to KEEP.
+//
+// origin: prerelease audit broker-transfer/BT-F5. The comment on
+// transferTrackerMaxEntries above derives a ~200 KiB memory bound from
+// "1024 entries * ~200 bytes/entry", and re-derived it during batch C as "the
+// (unchanged) byte count". It was never true: path and transfer_id arrive verbatim on
+// the wire and the broker checked only that they were NON-EMPTY, so one request could
+// carry up to max_payload and the real bound was 1024 * max_payload.
+//
+// The cost is not only resident bytes. Wherever a ledger directory resolves — which
+// since #57 is single-broker installs too, not only cluster mode (round 2, F-T6) —
+// every put() writes the same
+// strings to disk through temp+write+fsync+rename+fsync(dir), and push.req / pull.req
+// are plain nats.go callbacks with no goroutine wrapper, so the whole broker's
+// transfer path is serialized behind that fsync. A large payload is therefore
+// head-of-line blocking for every other transfer, not just memory.
+//
+// The values are generous on purpose — they are a sanity CEILING, not a policy. 4096
+// is the longest path any supported filesystem accepts (PATH_MAX), 128 comfortably
+// holds a ULID or a UUID, and a hex SHA-256 is 64 characters.
+//
+// The digest is bounded by its maximum, NOT required to be exactly 64. Bounding
+// memory is this gate's whole job; whether the digest is the RIGHT one is decided by
+// the receiver, which recomputes it over the delivered bytes and refuses on mismatch.
+// Adding a format contract here would reject requests the receiver would have caught
+// anyway, and would do it in a place no one would think to look.
+const (
+	transferPathMaxLen   = 4096
+	transferIDMaxLen     = 128
+	transferSHA256MaxLen = 64
+)
+
+// transferRequestBounds validates the three unbounded-by-default strings. It returns
+// the request_invalid detail, or "" when the request is within bounds. Shared by the
+// push and pull handlers because the tracker they both feed is one map: bounding only
+// one of them would leave the bound unreached.
+func transferRequestBounds(transferID, path, sha string) string {
+	if len(transferID) > transferIDMaxLen {
+		return fmt.Sprintf("transfer_id length %d > %d", len(transferID), transferIDMaxLen)
+	}
+	if len(path) > transferPathMaxLen {
+		return fmt.Sprintf("path length %d > %d", len(path), transferPathMaxLen)
+	}
+	if len(sha) > transferSHA256MaxLen {
+		return fmt.Sprintf("sha256 length %d > %d", len(sha), transferSHA256MaxLen)
+	}
+	return ""
+}
 
 // xferRecentlyReapedTTL bounds how long the tracker remembers that it reaped a transfer id. Long
 // enough for the receiver's real completion to arrive after a watchdog fire (that is the whole point
@@ -354,8 +409,8 @@ type xferStoreLimits struct {
 
 func xferStoreLimitsFor(ctx context.Context, b *Broker) xferStoreLimits {
 	var limits xferStoreLimits
-	if b.js != nil {
-		if info, err := b.js.AccountInfo(ctx); err == nil && info.Limits.MaxStore > 0 {
+	if brokerJS(b) != nil {
+		if info, err := brokerJS(b).AccountInfo(ctx); err == nil && info.Limits.MaxStore > 0 {
 			limits.account = info.Limits.MaxStore
 		}
 	}
@@ -527,7 +582,7 @@ func xferPayloadLimit(bucketMax int64, used uint64) int64 {
 // does not cache). The too-small refusal is short-circuited by the CALLER (provisionXferBucket) and
 // never reaches here — the sizeErr parameter that used to re-check it was dead and was removed.
 func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, targetReplicas int, maxBytes int64) (string, int64, error) {
-	if b.js == nil {
+	if brokerJS(b) == nil {
 		return "", 0, fmt.Errorf("jetstream_unavailable")
 	}
 	bucket := proto.XferBucketName(sid)
@@ -543,8 +598,8 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 	//
 	// Only an authoritative not-found reaches create. A timeout or leader error is retried by the
 	// bounded provisioning loop; treating it as absence would issue a misleading create request.
-	if stream, err := b.js.Stream(ctx, xferBackingStream(sid)); err == nil {
-		if err := raiseXferReplicas(ctx, b.js, bucket, targetReplicas); err != nil {
+	if stream, err := brokerJS(b).Stream(ctx, xferBackingStream(sid)); err == nil {
+		if err := raiseXferReplicas(ctx, brokerJS(b), bucket, targetReplicas); err != nil {
 			return "", 0, err
 		}
 		si, err := stream.Info(ctx)
@@ -563,16 +618,16 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 		Storage:  jetstream.FileStorage,
 		Replicas: targetReplicas, // D5 §6.4/§9: replicasFor(nVoters); live callers pass jsstream.ReplicasSingle
 	}
-	if _, err := b.js.CreateObjectStore(ctx, cfg); err != nil {
+	if _, err := brokerJS(b).CreateObjectStore(ctx, cfg); err != nil {
 		if errors.Is(err, jetstream.ErrBucketExists) ||
 			errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
 			// Exists: RAISE-ONLY reconcile toward target (D5 §9, R-18). Idempotent +
 			// retriable on a not-yet-ready meta-group (ErrMetaGroupNotReady). Still reachable when
 			// the lookup above failed transiently and the bucket really does exist.
-			if err := raiseXferReplicas(ctx, b.js, bucket, targetReplicas); err != nil {
+			if err := raiseXferReplicas(ctx, brokerJS(b), bucket, targetReplicas); err != nil {
 				return "", 0, err
 			}
-			stream, serr := b.js.Stream(ctx, xferBackingStream(sid))
+			stream, serr := brokerJS(b).Stream(ctx, xferBackingStream(sid))
 			if serr != nil {
 				return "", 0, fmt.Errorf("xfer bucket info after create race %s: %w", bucket, serr)
 			}
@@ -604,10 +659,10 @@ const jsErrCodeStorageExceeded = 10047
 // computed must add nothing rather than guess.
 func (b *Broker) xferStoreAccounting(ctx context.Context, err error, want int64) string {
 	var apiErr *jetstream.APIError
-	if !errors.As(err, &apiErr) || apiErr.ErrorCode != jsErrCodeStorageExceeded || b.js == nil {
+	if !errors.As(err, &apiErr) || apiErr.ErrorCode != jsErrCodeStorageExceeded || brokerJS(b) == nil {
 		return ""
 	}
-	info, ierr := b.js.AccountInfo(ctx)
+	info, ierr := brokerJS(b).AccountInfo(ctx)
 	if ierr != nil || info == nil {
 		return ""
 	}
@@ -693,7 +748,7 @@ func (b *Broker) convergeOversizedXferBucket(ctx context.Context, sid, bucket st
 	cfg := objectStoreConfigFromStream(bucket, info.Config)
 	cfg.MaxBytes = target
 	cfg.Replicas = replicas
-	if _, err := b.js.UpdateObjectStore(ctx, cfg); err != nil {
+	if _, err := brokerJS(b).UpdateObjectStore(ctx, cfg); err != nil {
 		b.cfg.Logger.Warn("broker: xfer bucket shrink failed (continuing with the existing bucket)",
 			"sid", sid, "bucket", bucket, "current_max_bytes", cur, "target", target, "err", err)
 		return
@@ -715,10 +770,10 @@ func (b *Broker) convergeOversizedXferBucket(ctx context.Context, sid, bucket st
 // authorize needless shrink. The comparison is account-only because both operands must use the same
 // replica-weighted units. Unknown/unlimited limits fail closed toward leaving operator config alone.
 func (b *Broker) xferAccountIsOverCommitted(ctx context.Context) bool {
-	if b.js == nil {
+	if brokerJS(b) == nil {
 		return false
 	}
-	info, err := b.js.AccountInfo(ctx)
+	info, err := brokerJS(b).AccountInfo(ctx)
 	if err != nil || info == nil || info.Limits.MaxStore <= 0 {
 		return false
 	}
@@ -820,10 +875,10 @@ func XferReplicaState(ctx context.Context, js jetstream.JetStream, sid string, t
 // bucket. Missing-object is OK (idempotent). The bucket itself
 // survives — it's per-session, not per-transfer.
 func (b *Broker) deleteXferObject(ctx context.Context, sid, transferID string) error {
-	if b.js == nil || transferID == "" {
+	if brokerJS(b) == nil || transferID == "" {
 		return nil
 	}
-	store, err := b.js.ObjectStore(ctx, proto.XferBucketName(sid))
+	store, err := brokerJS(b).ObjectStore(ctx, proto.XferBucketName(sid))
 	if err != nil {
 		if errors.Is(err, jetstream.ErrBucketNotFound) ||
 			errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -861,6 +916,18 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 	ctx, cancel := context.WithCancel(parent)
 	d := watchdogBudget(e)
 	go func() {
+		// defer, not a call after the select, so that EVERY exit releases the child
+		// context — including the two early returns below and any added later.
+		//
+		// origin: prerelease audit broker-transfer/BT-F1. The comment at the
+		// finalizeTransfer call below used to say cancelling here is a no-op. That is
+		// true of closing ctx.Done() and false of the thing that actually leaks: a
+		// child context stays in its PARENT's children map until it is cancelled, and
+		// the parent here is b.runCtx, which lives as long as the broker process. So
+		// every timed-out transfer left a cancelCtx that nothing could ever collect.
+		// cancel is idempotent, so this does not conflict with entry.cancel being
+		// called elsewhere on the ordinary paths.
+		defer cancel()
 		t := time.NewTimer(d)
 		defer t.Stop()
 		select {
@@ -891,7 +958,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			Bucket: ent.bucket, DurationMs: msSince(ent.startedAt, b.cfg.Now()),
 			Code:  code,
 			Error: fmt.Sprintf("broker watchdog: no %s finalization within %s", ent.verb, d),
-		}, false) // false: the watchdog owns entry.cancel; calling it here is a no-op
+		}, false) // false: the watchdog owns entry.cancel — see the deferred cancel above
 		b.cfg.Logger.Warn("broker: transfer watchdog fired",
 			"transfer_id", ent.transferID, "verb", ent.verb, "tier", ent.tier,
 			"code", code)
@@ -915,12 +982,39 @@ func msSince(t0, t1 time.Time) int64 {
 // warning but don't abort the surrounding handler — losing one audit
 // row is preferable to flapping a successful transfer because
 // JetStream momentarily glitched.
+// WITH A CONTENT-DERIVED Nats-Msg-Id, which is what makes the recovery replay in
+// replayStagedTerminal safe. origin: prerelease audit external review M-3.
+//
+// The FIRST publish and the crash-recovery REPLAY of the same terminal must carry the
+// SAME dedup id, or the two cannot be collapsed and single mode is left choosing between
+// a duplicate terminal (which corrupts the record — no consumer can tell which of two
+// contradictory outcomes is true) and never replaying at all (which is what the code did:
+// it RETAINED the ledger row forever, so a transfer whose outcome was decided just before
+// the crash got no terminal at all and the ledger grew without bound).
+//
+// commitSyntheticTransferTerminal already derived exactly this id for its own single-mode
+// publish; having only ONE of the two paths dedup was the whole of the residual, because
+// the id has to match the OTHER publish to be worth anything.
 func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
 	payload, err := json.Marshal(rec)
 	if err != nil {
 		return
 	}
-	if err := b.publishAudit(proto.SubjAuditTransfer(rec.Session), payload); err != nil {
+	msgID, ierr := xferaudit.TransferRecordReqID(rec)
+	if ierr != nil {
+		// Unreachable in practice — it marshals the same record json.Marshal just accepted.
+		// If it ever happens, publish UNDEDUPED rather than dropping the row: losing an
+		// audit terminal is worse than a possible duplicate, and the replay path refuses to
+		// act without an id of its own, so nothing downstream is misled.
+		b.cfg.Logger.Warn("broker: audit.transfer dedup id",
+			"err", ierr, "sid", rec.Session, "tid", rec.TransferID)
+		if perr := b.publishAudit(proto.SubjAuditTransfer(rec.Session), payload); perr != nil {
+			b.cfg.Logger.Warn("broker: audit.transfer pub",
+				"err", perr, "sid", rec.Session, "tid", rec.TransferID)
+		}
+		return
+	}
+	if err := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Session), payload, msgID); err != nil {
 		b.cfg.Logger.Warn("broker: audit.transfer pub",
 			"err", err, "sid", rec.Session, "tid", rec.TransferID)
 	}
@@ -1032,10 +1126,30 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 			fmt.Sprintf("transfer_id=%q path=%q tier=%q", req.TransferID, req.Path, req.Tier))
 		return
 	}
+	if detail := transferRequestBounds(req.TransferID, req.Path, req.SHA256); detail != "" {
+		b.replyPushErr(msg, "request_invalid", detail)
+		return
+	}
 	if req.Tier != "a" && req.Tier != "b" {
 		b.replyPushErr(msg, "tier_invalid", req.Tier)
 		return
 	}
+	// BROKER-ASSIGNED FIELDS ARE DISCARDED, whatever the client sent — the same
+	// discipline as req.ActorFP below, and for a stronger reason.
+	//
+	// origin: prerelease audit broker-transfer/BT-F2. Only the tier-b arm overwrote
+	// these, so on a tier-a push they were the ctl's own strings, and they are not
+	// decoration: tracker.put serialises per BUCKET by plain string compare with no
+	// session in it, and activeOBJStreams derives the busy set from the same string.
+	// A member of session A could therefore name session B's bucket and (1) make
+	// every tier-b push and pull in B fail with too_many_in_flight, (2) keep B's
+	// OBJ_xfer bucket permanently "busy" so it is never reaped and never shrunk, and
+	// (3) write B's bucket name into A's audit and durable ledger rows.
+	//
+	// Placed here — after tier_invalid, before the tier-b arm refills them — because
+	// the ordering IS the contract: clear first, then let the broker assign.
+	req.Bucket = ""
+	req.ObjectKey = ""
 	if req.Size < 0 {
 		b.replyPushErr(msg, "request_invalid", fmt.Sprintf("size=%d must be non-negative", req.Size))
 		return
@@ -1062,7 +1176,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	// forwarding (plan §Tier B push state machine step 2). Per-transfer
 	// scoping happens via ObjectKey = TransferID.
 	if req.Tier == "b" {
-		if b.js == nil {
+		if brokerJS(b) == nil {
 			b.replyPushErr(msg, "jetstream_unavailable", xferNoJetStreamMsg)
 			return
 		}
@@ -1182,6 +1296,10 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPullErr(msg, "json_parse", err.Error())
 		return
 	}
+	if detail := transferRequestBounds(req.TransferID, req.Path, ""); detail != "" {
+		b.replyPullErr(msg, "request_invalid", detail)
+		return
+	}
 	if req.TransferID == "" || req.Path == "" {
 		b.replyPullErr(msg, "request_invalid",
 			fmt.Sprintf("transfer_id=%q path=%q", req.TransferID, req.Path))
@@ -1199,7 +1317,7 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	// tier A vs B itself, so there is no admission size to check here (tooLarge is unreachable).
 	bucket := ""
 	bucketPayloadMax := int64(0)
-	if b.js != nil {
+	if brokerJS(b) != nil {
 		var perr *xferProvisionErr
 		bucket, bucketPayloadMax, _, perr = provisionXferBucketWithLimit(b.runCtx, b, sid, 0)
 		if perr != nil {
@@ -1568,7 +1686,7 @@ func (b *Broker) handleCapsReq(msg *nats.Msg) {
 
 	resp := proto.CapsResp{
 		OK:             true,
-		JetStreamReady: b.js != nil,
+		JetStreamReady: brokerJS(b) != nil,
 		BrokerRelease:  proto.ReleaseVersion,
 		BrokerProto:    proto.ProtoVersion,
 	}

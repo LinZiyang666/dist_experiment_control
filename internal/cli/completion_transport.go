@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"os"
 	"path/filepath"
 	"time"
@@ -139,6 +140,12 @@ func (t *natsTransport) dial(ctx context.Context, name string) (*nats.Conn, erro
 				nats.MaxReconnects(0),
 				nats.NoEcho(),
 				nats.Nkey(pubKey, sigCB),
+				// origin: prerelease audit round 2, A-F2. This is a SECOND production
+				// connection builder — it does not go through internal/cli's shared one —
+				// and it was missed when the derived inbox prefix landed. Under the
+				// tightened templates a connection that does not set it subscribes outside
+				// its grant, so every session-name shell completion silently returned
+				// nothing: no error, no output, just a tab key that stopped working.
 			}
 			// Proxy-aware dial; pass the completion budget so a ctx-cancel can't
 			// leave a dial goroutine lingering past the tab-completion deadline.
@@ -147,7 +154,13 @@ func (t *natsTransport) dial(ctx context.Context, name string) (*nats.Conn, erro
 				return nil, err
 			}
 			opts = append(opts, popts...)
-			return nats.Connect(t.cctx.NATSURL, opts...)
+			// natsinbox.Connect, not a bare option append: the private inbox lives under
+			// its own root now, so an OLDER broker grants no reach to it and the probe is
+			// what turns "tab completion silently returns nothing" — the exact symptom
+			// A-F2 above describes — into a fallback. The dial timeout carried in opts
+			// bounds the probe too, so the tab-completion budget still holds.
+			nc, _, cerr := natsinbox.Connect(t.cctx.NATSURL, pubKey, opts)
+			return nc, cerr
 		}
 	}
 

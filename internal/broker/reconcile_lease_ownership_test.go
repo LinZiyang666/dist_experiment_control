@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/testharness"
 )
@@ -130,5 +131,97 @@ func TestSecondRegisterAfterAdoptionDoesNotKillPreAdoptionProcesses(t *testing.T
 	}
 	if st, _ := procStatus(t, db, "p1"); st != "RUNNING" {
 		t.Errorf("p1 row is %s", st)
+	}
+}
+
+// origin: prerelease audit broker-proc/L3-F1.
+//
+// A REFILE THAT MOVED NOTHING MUST NOT COUNT AS AN ADOPTION.
+//
+// adoptRowsCarriedAcrossARename returns the number of rows it carried across the
+// rename, and reconcileOnRegister feeds that number straight into sawAnyRow — the
+// fail-closed gate that refuses to order an orphan-kill on a node name with no
+// process history. The refile itself is `UPDATE ... WHERE sid AND pid AND nid AND
+// status='RUNNING'`, and SQL calls a zero-row UPDATE a success, so the old code
+// counted a move that never happened. One phantom adoption is all it takes: the
+// gate opens and every other pid the agent reports is ordered SIGKILLed.
+//
+// The staging is deterministic rather than a race, and it is the real interleaving:
+// procs is a SNAPSHOT read before the refile, so the test hands the function a
+// snapshot that says RUNNING while the row in the DB has since exited — exactly
+// what a proc.exit arriving between the SELECT and the UPDATE produces.
+func TestAPhantomRefileIsNotCountedAsAnAdoptedRow(t *testing.T) {
+	b, db := leaseReconcileBroker(t)
+	seedRunningProc(t, db, "p1", "gpu1")
+
+	// The snapshot the caller would have taken.
+	procs, err := proc.ListBySessionFiltered(db, "lab", proc.ListBySessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(procs) != 1 || procs[0].NID != "gpu1" {
+		t.Fatalf("fixture: %+v", procs)
+	}
+
+	// ...and the exit that lands before the refile runs.
+	if err := proc.MarkExited(db, "p1", "lab", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	agentByPID := map[string]proto.LocalProcess{"p1": {PID: "p1", State: "running"}}
+	adopted := adoptRowsCarriedAcrossARename(b, "lab", "gpu1-02",
+		proto.NodeRegisterReq{PreviousNID: "gpu1"}, procs, agentByPID)
+
+	if adopted != 0 {
+		t.Errorf("adopted=%d after a refile that moved no row.\n\n"+
+			"That count IS the sawAnyRow evidence. Claiming history for a node name that has "+
+			"none opens the fail-closed orphan gate, and what comes through it is SIGTERM+SIGKILL "+
+			"on the operator's running work.", adopted)
+	}
+	if _, still := agentByPID["p1"]; !still {
+		t.Error("the pid was removed from agentByPID even though its row did not move.\n\n" +
+			"Deleting it hides the pid from the orphan pass instead of accounting for it. The row " +
+			"is still in procs under the old name, so livePIDsByRow already protects it by the " +
+			"honest route — a row that exists.")
+	}
+}
+
+// origin: prerelease audit broker-proc/L3-F1.
+//
+// A REAL adoption must update the snapshot, not just the database.
+//
+// The rest of reconcileOnRegister reads `procs`, so a row that moved on disk while
+// the slice still says PreviousNID stays invisible for a whole register cycle —
+// which is why the old code had to compensate by deleting the pid from agentByPID.
+// Once the slice is corrected the row simply takes the ordinary same-name path,
+// PID-reuse check included.
+func TestAnAdoptedRowIsVisibleToTheRestOfReconcileImmediately(t *testing.T) {
+	b, db := leaseReconcileBroker(t)
+	seedRunningProc(t, db, "p1", "gpu1")
+
+	procs, err := proc.ListBySessionFiltered(db, "lab", proc.ListBySessionOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentByPID := map[string]proto.LocalProcess{"p1": {PID: "p1", State: "running"}}
+	adopted := adoptRowsCarriedAcrossARename(b, "lab", "gpu1-02",
+		proto.NodeRegisterReq{PreviousNID: "gpu1"}, procs, agentByPID)
+
+	if adopted != 1 {
+		t.Fatalf("adopted=%d, want 1 — the row was RUNNING under the previous name and the agent "+
+			"re-presented it", adopted)
+	}
+	if procs[0].NID != "gpu1-02" {
+		t.Errorf("the snapshot still says nid=%q after a successful adoption.\n\n"+
+			"Everything downstream reads this slice. Left stale, the adopted row is skipped by the "+
+			"same-name arm for a full cycle and the only thing keeping its pid out of the orphan "+
+			"pass is a deletion from agentByPID — bookkeeping by concealment.", procs[0].NID)
+	}
+	var nid string
+	if err := db.QueryRow(`SELECT nid FROM processes WHERE pid='p1'`).Scan(&nid); err != nil {
+		t.Fatal(err)
+	}
+	if nid != "gpu1-02" {
+		t.Errorf("row nid=%q on disk, want gpu1-02", nid)
 	}
 }

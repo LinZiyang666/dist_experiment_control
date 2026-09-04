@@ -3,6 +3,7 @@ package natsconf
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -156,5 +157,97 @@ func TestMoveAsideJSStoreRejectsNonDirectoryStorePath(t *testing.T) {
 	}
 	if moved != "" {
 		t.Fatalf("the invalid store path was not moved, but the function reported backup %q", moved)
+	}
+}
+
+// origin: prerelease audit round 2, G6 (the guard) and cli-serve-agent-cluster/L4-F1
+// (the defect it closes).
+//
+// A CLIENT BIND MUST NOT VANISH IN A RENDER.
+//
+// Render omits the bind when Config.ClientListen is empty, and nats-server then
+// defaults to 0.0.0.0:4222 — so a broker whose conf bound clients to a private
+// address silently becomes PUBLICLY bound, on a file `nats-server -t` accepts, so
+// the DryRun gate waves it through. Three of the five assembly paths reach
+// BuildMergedConf without an explicit ClientListen: the topology reconciler's loop
+// and the grow cutover among them.
+//
+// Round 2's objection was not that the guard is wrong but that nothing exercised it,
+// and by construction nothing could: every existing test threads own.ClientListen()
+// into the Config, which is precisely the case the guard lets through.
+func TestARenderThatDropsTheClientBindIsRefused(t *testing.T) {
+	own, err := Preflight(writeConf(t, reconcileStandaloneConf))
+	if err != nil {
+		t.Fatalf("fixture must preflight clean: %v", err)
+	}
+	if own.ClientListen() == "" {
+		t.Fatal("premise broken: the fixture conf declares no client bind, so this test cannot " +
+			"tell a dropped bind from an absent one")
+	}
+	base := Config{
+		Local: Broker{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+		Peers: []Broker{
+			{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+			{ServerName: "brk-b", NkeyPub: "UBUSNKEYB", RouteURL: "nats://10.0.0.2:6222"},
+		},
+		AccountIssuer: "ABROKERACCOUNTPUB",
+		JSStoreDir:    own.JSStoreDir(),
+	}
+	// The first-grow fallback, exactly as TestSecretsDirFallbackRendersThroughTheSharedHelper
+	// drives it: without it the render is refused by the routes-mTLS harvest long before it
+	// reaches the client-bind check this test is about.
+	base.ApplySecretsDirIdentity("/etc/tether/secrets", "nats://10.0.0.1:6222")
+
+	// ClientListen deliberately left empty — what an assembly path that forgot to
+	// carry it forward produces.
+	dropped := base
+	if _, err := BuildMergedConf(own, dropped); err == nil {
+		t.Fatal("a render carrying NO client listen was accepted over a conf that binds one.\n\n" +
+			"nats-server defaults the missing bind to 0.0.0.0:4222, so a broker bound to a private " +
+			"address is silently re-bound to every interface — and `nats-server -t` accepts the " +
+			"file, so the DryRun gate cannot catch it either.")
+	} else if !strings.Contains(err.Error(), "client listen") {
+		t.Fatalf("refused, but for some other reason: %v", err)
+	}
+
+	// The POSITIVE control: carrying it forward must still render.
+	kept := base
+	kept.ClientListen = own.ClientListen()
+	if _, err := BuildMergedConf(own, kept); err != nil {
+		t.Fatalf("a render that DOES carry the client bind was refused: %v", err)
+	}
+}
+
+// origin: prerelease audit round 2, G6.
+//
+// The other half of the predicate, and the reason it is not simply "ClientListen must
+// be non-empty": a fixture that declares no client bind has none to preserve, and
+// failing it would break every conf that only carries routes or auth_callout.
+func TestARenderWithNoClientBindToPreserveIsStillAccepted(t *testing.T) {
+	const noBindConf = `server_name: "brk-a"
+jetstream {
+  store_dir: "/var/lib/tether/js"
+}
+`
+	own, err := Preflight(writeConf(t, noBindConf))
+	if err != nil {
+		t.Fatalf("fixture must preflight clean: %v", err)
+	}
+	if own.ClientListen() != "" {
+		t.Fatalf("premise broken: this fixture was supposed to declare no client bind, got %q",
+			own.ClientListen())
+	}
+	cfg := Config{
+		Local: Broker{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+		Peers: []Broker{
+			{ServerName: "brk-a", NkeyPub: "UBUSNKEYA", RouteURL: "nats://10.0.0.1:6222"},
+			{ServerName: "brk-b", NkeyPub: "UBUSNKEYB", RouteURL: "nats://10.0.0.2:6222"},
+		},
+		AccountIssuer: "ABROKERACCOUNTPUB",
+		JSStoreDir:    own.JSStoreDir(),
+	}
+	cfg.ApplySecretsDirIdentity("/etc/tether/secrets", "nats://10.0.0.1:6222")
+	if _, err := BuildMergedConf(own, cfg); err != nil {
+		t.Fatalf("a conf with NO client bind to preserve was refused for not preserving one: %v", err)
 	}
 }

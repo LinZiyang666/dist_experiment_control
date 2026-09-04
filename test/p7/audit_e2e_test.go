@@ -230,6 +230,12 @@ func TestSessionRmDeletesStreamAndCascades(t *testing.T) {
 	url := startJSNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
+	// origin: prerelease audit round 2 — `session create` now requires an admitted
+	// fingerprint, the same sentence a real deployment says with
+	// `tether admin session-allow`.
+	if _, err := session.AllowCreator(db, fp, "test", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	defer startBroker(t, url, db)()
 

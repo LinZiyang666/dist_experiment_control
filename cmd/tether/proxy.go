@@ -107,7 +107,7 @@ func newProxyOnCmd(natsURL, home *string) *cobra.Command {
 			}
 			if !yes {
 				if !confirmProxyOn(cmd) {
-					return fmt.Errorf("aborted (pass --yes to skip the prompt)")
+					return usageErr("aborted (pass --yes to skip the prompt)")
 				}
 			}
 			body, _ := json.Marshal(proto.ProxySetReq{Enabled: true, HAPolicy: haPolicy})

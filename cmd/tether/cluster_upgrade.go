@@ -196,7 +196,12 @@ func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPu
 	for _, n := range nlResp.Nodes {
 		agentRelease[n.NID] = n.ReleaseVersion
 	}
-	replies := probeClusterHealth(nc, actor)
+	replies, err := probeClusterHealth(nc, actor)
+	if err != nil {
+		// Distinct from "nobody answered": the roll planner has learned nothing at all,
+		// and the message below would send an operator to look at brokers that are fine.
+		return nil, unavailErr("could not ask the cluster for its health: %v", err)
+	}
 	if len(replies) == 0 {
 		return nil, unavailErr("no broker answered the cluster-health probe (single broker, or brokers unreachable) — nothing to roll")
 	}
@@ -360,8 +365,18 @@ func fetchUpgradeRosterWithRetry(ctx context.Context, nc *nats.Conn, actor strin
 // upgradeLockHeld probes cluster-health and reports whether ANY broker still advertises the cluster-scoped
 // roll lock (External-review round2 B1). Used by the no-op re-run path to detect a stale lock left by a
 // prior roll whose release-lock did not confirm.
+//
+// A PROBE THAT COULD NOT BE MADE REPORTS "held", not "clear" — origin: increment 2
+// internal review, pairing-sweep/IMPACT-F1. The caller's only reaction to `true` is to
+// TELL THE OPERATOR the lock may be stale and how to clear it; its reaction to `false` is
+// to print "nothing to do" while membership may still be blocked. Between a spurious
+// warning and a silent block, the warning is the one an operator can act on.
 func upgradeLockHeld(nc *nats.Conn, actor string) bool {
-	for _, h := range probeClusterHealth(nc, actor) {
+	replies, err := probeClusterHealth(nc, actor)
+	if err != nil {
+		return true
+	}
+	for _, h := range replies {
 		if h.UpgradeLockActive {
 			return true
 		}

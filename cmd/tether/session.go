@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -59,12 +60,17 @@ func newSessionCmd() *cobra.Command {
 				return err
 			}
 			if resp.Error != "" {
-				// SessionCreateResp doesn't carry a separate Code; the
-				// architecture-stable identifier is buried in Error
-				// itself. Pass it through brokerErrorMessage anyway —
-				// known prefixes like "session_already_exists" still
-				// match the hint table.
-				return brokerErrorMessage("session create", resp.Error, resp.Error)
+				// resp.Code is the stable identifier; an older broker omits it, and for
+				// those this message has always carried the code as the leading token of
+				// Error ("json_parse: …", "pin_invalid: …"). Fall back to that rather than
+				// passing the whole sentence as the code — which is what this did, so the
+				// exit-class table never matched and the sentence was printed twice.
+				// origin: prerelease audit increment 2 internal review, five lanes.
+				code := resp.Code
+				if code == "" {
+					code, _, _ = strings.Cut(resp.Error, ": ")
+				}
+				return brokerErrorMessage("session create", code, resp.Error)
 			}
 			if err := cli.WriteCurrentSession(home, resp.SID); err != nil {
 				return fmt.Errorf("write current_session: %w", err)

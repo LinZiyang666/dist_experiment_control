@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nkeys"
 )
 
@@ -106,6 +107,35 @@ func PlanClusterNodeUpsert(in ClusterNodeUpsertInput) (*Command, error) {
 	msg := JoinSignBytes(in.NodeID, in.NodeIdentPub, in.JoinNonce)
 	if verr := auth.VerifySignature(in.NodeIdentPub, msg, sig); verr != nil {
 		return nil, fmt.Errorf("cluster: plan node-upsert: join PoP did not verify: %w", verr)
+	}
+
+	// THE ADMISSION PATH VALIDATES WHAT THE REWRITE PATHS VALIDATE.
+	//
+	// origin: prerelease audit cluster-fsm/L3-F2. Each of these three columns has a
+	// dedicated rewrite planner further down this same file that validates it and says in
+	// its own comment what happens if it does not — a garbage route renders a broken
+	// cluster{} block on every replica, a garbage nkey breaks every replica's
+	// `nats-server -t`, a garbage raft_addr desynchronises status and the liveness probe.
+	// The path that puts the FIRST value into those columns checked none of them. A node
+	// therefore had to be admitted before its own values could be validated, which is the
+	// wrong way round.
+	//
+	// Fail-closed and leader-local, like the PoP check above: a malformed admission never
+	// reaches the log, so no replica ever has to decide what to do with it.
+	if verr := proto.ValidateClusterNodeID(in.NodeID); verr != nil {
+		return nil, fmt.Errorf("cluster: plan node-upsert: %w", verr)
+	}
+	if verr := ValidateBareNatsRoute(in.NatsRoute); verr != nil {
+		return nil, fmt.Errorf("cluster: plan node-upsert: %w", verr)
+	}
+	if _, _, verr := net.SplitHostPort(in.RaftAddr); verr != nil {
+		return nil, fmt.Errorf("cluster: plan node-upsert: invalid raft addr %q: %w", in.RaftAddr, verr)
+	}
+	// bus_nkey_pub is EMPTY-PRESERVE on the conflict path below (an idempotent grow-retry
+	// may carry an empty bundle), so an empty value is legal here and only a non-empty one
+	// has to be a real key.
+	if in.BusNkey != "" && !nkeys.IsValidPublicUserKey(in.BusNkey) {
+		return nil, fmt.Errorf("cluster: plan node-upsert: bus nkey is not a valid NATS user public key")
 	}
 
 	lits, err := LitTextAll(in.NodeID, in.Name, in.NodeIdentPub, in.NatsServerID,
@@ -399,12 +429,63 @@ const MetaKeyUpgradeActive = "cluster_upgrade_active"
 // concurrent callbacks can both pass the read before either commits — so the mutex is enforced HERE, at
 // the replicated write: Raft serializes the two commands and the second one's guard sees the first's
 // marker and no-ops. The caller read-backs the marker after Propose and refuses on a no-op acquire.
+// UPGRADE ALSO EXCLUDES UPGRADE, not just grow.
+//
+// origin: prerelease audit cluster-fsm/L3-F3. The guard was `NOT growMarkerExists()`
+// alone. markerAcquireStmts is INSERT-OR-IGNORE followed by an UPDATE, so when an
+// upgrade marker was already present the UPDATE fired and simply overwrote the
+// timestamp: a second `cluster upgrade` "acquired" a lock the first one was holding.
+// Both rolls' read-backs then returned true, because upgradeActive() only asks whether
+// the key exists. The grow lock had been given exactly this treatment by external
+// review H1/M1; the upgrade lock was left behind.
+//
+// The guard is `held by OTHER`, not `exists` — see upgradeMarkerHeldByOther for why an
+// existence guard breaks the lock's own lease in the same transaction.
+//
+// SELF-RETRY BY IDENTITY IS STILL REFUSED, and that part is a deliberate trade rather
+// than an oversight. Distinguishing "me again" from "somebody else" needs a holder
+// identity, and this protocol has none: ClusterUpgradeReq carries no roll id, and
+// CanonicalUpgradeReqBytes is a fixed concatenation, so adding one to the SIGNED bytes
+// would make a new ctl's signature fail on every not-yet-upgraded broker — which is
+// precisely the mixed-version window a rolling upgrade is. (The audit's adjudication
+// assumed a roll id existed. It does not.)
+//
+// SELF-RETRY BY LIVENESS IS NOT — origin: prerelease audit round 2, H-2. The
+// version of this comment that shipped said an interrupted roll's operator
+// "resolves it by waiting out the lease or calling release-lock", while the HALT
+// this function's caller prints says "fix and re-run to resume" and the doc
+// comment on driveUpgrade promised the re-run self-heals. Two of those three were
+// false. The guard is now lease-aware, which needs no identity at all: a holder
+// that is still driving renews every LockLeaseRenewInterval and is refused exactly
+// as before, and one that has stopped is not holding anything. A HALTing
+// orchestrator additionally stamps its lease expired on the way out
+// (PlanExpireUpgradeLease), so the promised re-run is admitted immediately rather
+// than after a 15-minute TTL — which also unblocks the emergency rollback an
+// operator reaches for while the fleet sits mixed-version.
 func PlanSetUpgradeActive(now time.Time) (*Command, error) {
 	valLit := MustLitText(now.UTC().Format(time.RFC3339Nano))
-	guard := `NOT ` + growMarkerExists()
+	nowLit := MustLitText(now.UTC().Format(time.RFC3339Nano))
+	guard := `NOT ` + growMarkerExists() + ` AND NOT ` + upgradeMarkerHeldByOther(valLit, nowLit)
 	stmts := markerAcquireStmts(MetaKeyUpgradeActive, valLit, guard)
 	stmts = append(stmts, leaseAcquireStmts(MetaKeyUpgradeLease, now.Add(LockLeaseTTL), guard)...)
 	return NewCommand(OpClusterMetaSet, stmts...), nil
+}
+
+// UpgradeMarkerValue returns the raw upgrade marker value, or "" when no marker is set.
+// The acquirer reads it back to prove the marker it sees is the one IT wrote — an
+// existence check cannot tell "I acquired it" from "somebody else already had it".
+func UpgradeMarkerValue(db *sql.DB) string {
+	var v string
+	if err := db.QueryRow(`SELECT value FROM cluster_meta WHERE key=?`, MetaKeyUpgradeActive).Scan(&v); err != nil {
+		return ""
+	}
+	return v
+}
+
+// UpgradeMarkerStamp renders the marker value a PlanSetUpgradeActive(now) would write,
+// so the acquirer can compare without duplicating the format string.
+func UpgradeMarkerStamp(now time.Time) string {
+	return now.UTC().Format(time.RFC3339Nano)
 }
 
 func PlanClearUpgradeActive() (*Command, error) {

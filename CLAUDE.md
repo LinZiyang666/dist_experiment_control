@@ -100,7 +100,17 @@
 ## 5. 编码与测试约定
 
 - **语言**：团队讨论用中文；**代码 / 标识符 / 注释 / commit / 日志 / 错误串一律英文**。
-- **Go-only**：`CGO_ENABLED=0` 静态二进制；工具链锁 **Go 1.25**（由 `nats-io/jwt/v2 ≥ v2.8.1` 拉高，**升级依赖前必验 go directive**）。
+- **Go-only**：`CGO_ENABLED=0` 静态二进制；`go` directive **1.26.0**，`toolchain` **显式钉在 go.mod**
+  （今天 `go1.26.8`）。**升级依赖前必验 go directive**——这条不是版本上限，是**变更控制**：
+  directive 一直是被依赖顶上来的**下限**（先由 `nats-io/jwt/v2 ≥ v2.8.1` 顶到 1.25，
+  再由 `golang.org/x/crypto ≥ v0.56.0` 顶到 1.26），规则要挡的是**无声**漂移。
+  实测教训：一次 `go get golang.org/x/crypto@v0.56.0` 就静默把 directive 抬了一个 minor
+  **并删掉了 `toolchain` 行**——所以每次依赖升级后都要回看 go.mod 头四行。
+  **`toolchain` 行是必需的，不是可选优化**：`go` directive 只是最低要求，没有 toolchain 行时
+  发布二进制用的是**构建者碰巧装的那个** Go。本仓曾因此用 `go1.25.0`（该 minor 的首发版、零补丁）
+  编译发布产物，`govulncheck` 报出 **31 条可达**标准库漏洞（`net/http`/`crypto/tls`/`crypto/x509`
+  全在公网面上），而 go.mod 看上去毫无问题。下限由
+  `test/architecture/nats_server_security_floor_test.go` 机械守住（同一文件也守 nats-server 的下限）。
 - **不变量**：控制面/数据面分离、auth_callout nkey 身份、G.1/G.2 reconcile、proto wire 版本一致性、session ACL 隔离、port 分配带 …。
   **按 §1 权威链取尺**（外审 R6 订正：这里原写"以 `architecture.md` 为准…都以它为尺"，与 §1"第 3 层不作为实现依据"直接冲突）——
   集群面/v2 的不变量以 `distributed-broker-architecture.md` + `deploy-tier-gotchas.md`（第 2 层）为准；
@@ -142,6 +152,8 @@
   | nolint 指令自检 | `test/architecture/nolint_directive_test.go` | 每条 `//nolint` 必须点名一个**本仓真启用**的 linter（点名未启用的 linter 等于什么都没抑制，却读作「这是已知情的例外」）|
   | build-tag 编译闸 | `make vet-tags` + `test/architecture/build_tags_test.go` | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账**；**tag 局部性**：`_integration` tag 门控的文件只许落在自己的 `test/<dir>`（例外账本 1 条：`internal/broker/phasefluidity_lifecycle_test.go`），门控文件总数**精确钉死**（今天 23）——这是矩阵去重「共享包在各 tag 下闭包全等」前提的守卫，往 `internal/proc` 放一个 `//go:build d5_integration` 文件会让 D5 的二进制与 D4 不同而无人察觉 |
   | T3 前提 | `test/determinism/leader_premise_test.go` + `legacy_leader_premise_sites.go` | 测试里裸读 `.IsLeader()` / `.State() == raft.Leader`——不在**身份已证明**的轮询 helper 的谓词闭包里（外部原语按 import 路径信任：`clusterharness.WaitForCond`/`WithLeader`、`testharness.WaitFor`；本包 helper 须由 `verifiedPollingHelpers` 从其实现证明"deadline 循环里反复求值谓词或转发给已证明原语"，同名一次性 shadow 不算——外审复审 R1）、也不是**body 只等待**的循环条件（body 里任何赋值/发送/业务调用/非 continue 分支都算对刚读到的 premise 行动——外审 F2 + R1）——即红，除非在 `path: func` 递减账本；helper 是 `test/clusterharness.WithLeader`（观测→行动→再观测，移动即整段重来；`test/d3` 的 follower PIN 写是第一个调用方）。「观测领导权然后假设它不变」是 parallel-flake-rootcause 根因 2，第二次被修错两回 |
+  | inbox 配对 | `test/architecture/inbox_prefix_pairing_test.go` | **三件事**:①私有 inbox 前缀与 CONNECT 标记(`auth.InboxCapableMarker`)只许由 `internal/natsinbox` 的那**一个** helper 设置;②**helper 自己必须两半都设**——第一版只有①,于是从 helper 里删掉标记那一行,`make gates` 全绿而每个升级过的客户端静默退回共享 inbox;③标记的**读**方只许是账本里那两个文件(声明处 + callout),死条目即红。扫描按**选择器名**匹配(别名/点导入/`nats.Options{InboxPrefix:}`/字段直写都看得见),第一版只认 `nats.` 前缀。半接线的失败态是**响亮的**(SUB 被拒 + `-ERR` + 服务端日志 + nats.go 异步错误)——四处文档曾写成"静默超时无线索",而那条假前提正是"用源码门而不用运行时自检"的理由;`natsinbox.Connect` 现在两者都做。`completion_transport.go` 已经因为这条规则的弱化版漏过一次,shell 补全静默返回空 |
+  | 测的服务端 == 发的服务端 | `test/architecture/nats_server_pin_test.go` | `go.mod`(`make test` 链接的嵌入式 server)/`scripts/install.sh`(运维主机上真跑的二进制)/`Makefile` 三处 nats-server 版本必须逐字相等;`test/simcluster/lib/stage.sh` 必须继续从 install.sh **单源**读取而不是自己写死。这两者曾差四个 minor(测 v2.14.0 / 发 v2.10.22),`docs/reviews/INDEX.md` 2026-08-06 已记过一次同类事故,第二次是 `_INBOX` 隔离:它押在 `deny` 上,而 deny 的装载判据在 v2.12→v2.14 之间从 `subjectIsSubsetMatch` 改成 `SubjectsCollide`,于是**在现网跑的每个版本上 deny 从未被装载**。install.sh 也不再"已存在即跳过"——按版本比对后 rename 替换并要求重启 |
   | 命名冻结 | `test/determinism/test_naming_test.go` | 测试文件名／测试函数名／生产文件名（见 §3 step 5b）；**文件首注释里的文件名必须等于 basename**（158 文件改名后 59 个头还写着旧名，2026-09-01 逐个改正为 `x_test.go (formerly old_test.go)`，此后账本为 0） |
   | test tree 地图 | `test/architecture/test_layout_map_test.go` | `test/README.md` 的目录表与 `test/` 顶层目录**双向对账**；表里点名的矩阵函数与 build tag 必须真实存在；`p*/d*` 目录冻结为**精确集合 18**（不迁不增，新目录按主题命名；裁决见 plan §0 A2） |
   | ctx 站点冻结 | `test/architecture/ctx_background_ledger_test.go` + `legacy_ctx_background_sites.go` | 生产源每处 `context.Background()` 要么同行/上一行带 `ctx-root:`/`ctx-none:`，要么在 `path: func` 递减账本（初值 40）。上面那条"存量 39 处改到那一行时顺手补"是没有机制的承诺：从 39 涨到 44、只补了 1 处 |

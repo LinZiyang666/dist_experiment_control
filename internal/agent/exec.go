@@ -202,9 +202,7 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 				_ = stderrPipe.Close()
 			},
 			func(startErr error) {
-				if cmd.Process != nil {
-					_ = cmd.Wait() // reap helper/target when the wedged target exec recovers
-				}
+				reapAbandonedExecChild(a, cmd, startErr)
 			},
 		)
 		if err != nil {
@@ -274,10 +272,41 @@ func (a *Agent) streamPipe(wg *sync.WaitGroup, nc *nats.Conn, r io.ReadCloser, r
 	}
 }
 
+// liveConn resolves the connection a reply should actually go out on.
+//
+// h1 C1: a lifecycle chunk rides the CURRENT conn — after a mid-run conn rebuild the
+// captured spawn conn is closed and the chunk (like the old exit publish) would
+// silently vanish. Fall back to the captured conn only when no current conn exists
+// (tests that never store ncBox).
+//
+// origin: prerelease audit agent-exec/L3-F1. run.go had this reasoning and applied it
+// to exactly one publish; exec's chunks — started, exit, error, and every stdout and
+// stderr chunk — all rode the conn captured when the child was spawned. A rebuild
+// therefore silenced a running `tether exec` completely, and the caller saw a command
+// that produced no output and never exited.
+//
+// WHAT THIS DOES NOT PROMISE, so nobody reads more into it than it says: chunks are
+// not buffered across a rebuild. Whatever the old conn had accepted but not yet
+// flushed is gone, so output can have a HOLE at the switchover even though the stream
+// resumes. Resolving per chunk means the stream resumes at all; it does not mean it is
+// complete. Callers that need completeness have the exit code and the process rows.
+//
+// A package-level function taking *Agent, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func liveConn(a *Agent, captured *nats.Conn) *nats.Conn {
+	if cur := a.ncBox.Load(); cur != nil {
+		return cur
+	}
+	return captured
+}
+
 func (a *Agent) replyChunk(nc *nats.Conn, replyTo string, c proto.ExecChunk) {
 	if replyTo == "" {
 		return
 	}
+	// Resolved HERE, so every caller — including streamPipe's per-chunk loop — is
+	// covered by construction rather than by each one remembering.
+	nc = liveConn(a, nc)
 	payload, err := json.Marshal(c)
 	if err != nil {
 		// Programming error — our own types should always marshal.
@@ -406,6 +435,58 @@ func (a *Agent) execBaseEnv(req *proto.ExecReq) []string {
 // because it binds a.spawnTimeout() in one place and keeps the injectable
 // callbacks that make abandon/reap accounting hermetically testable without a
 // real D-state execve.
+
+// reapAbandonedExecChild ends a child whose spawn window we already gave up on.
+//
+// origin: prerelease audit agent-exec/L3-F3. This used to be a bare cmd.Wait(). Waiting
+// reaps the process table entry, which is what the fd-leak review asked for, but it does
+// nothing about the process: the handler has ALREADY answered
+// remote_fs_spawn_timeout and nobody is reading the child's output or will ever report
+// its exit, yet it keeps running, holding the mount it wedged on and consuming the
+// resources the abandon was supposed to reclaim. On a remote filesystem that recovers
+// minutes later, the wait itself blocks that whole time.
+//
+// SIGKILL to the process GROUP, mirroring the PTY path's
+// KillAndWaitAfterAbandonedStart (internal/pty). exec children get their own group
+// (setExecProcGroup), so the negative pid reaches the child's own descendants and
+// nothing else.
+//
+// THE GUARD IS `cmd.Process == nil`, AND ONLY THAT.
+//
+// origin: prerelease audit round 2, I-F1. The first version also returned early on a
+// non-nil startErr, reasoning that "Start itself failed, so os/exec has already cleaned
+// up". That reasoning describes a case this function is almost never called in. The
+// abandon path runs onAbandon FIRST, and exec's onAbandon calls handshake.Cancel() and
+// closes both pipes — so when the wedged execve finally returns it returns an ERROR, and
+// the early return skipped the only path that actually occurs. The child stayed alive,
+// holding the mount it wedged on, and the wedge slot was released immediately because
+// reapOnReturn returned without waiting — disarming the too_many_wedged_spawns ceiling
+// that is supposed to bound exactly this situation.
+//
+// A failed cmd.Start() leaves cmd.Process nil, so the one case the startErr check was
+// reaching for is already covered by the pointer check — and covered correctly, because
+// it tests the thing that matters (is there a process) rather than a proxy for it.
+//
+// Reading cmd.ProcessState is race-free here: the caller reaches this only after
+// receiving the start result over a channel, which supplies the happens-before edge.
+//
+// A package-level function taking *Agent, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func reapAbandonedExecChild(a *Agent, cmd *exec.Cmd, startErr error) {
+	_ = startErr // deliberately unused — see above
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if cmd.ProcessState != nil {
+		return // already reaped by whoever observed the exit
+	}
+	pid := cmd.Process.Pid
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		a.cfg.Logger.Warn("agent: kill abandoned exec child group", "pid", pid, "err", err)
+	}
+	_ = cmd.Wait()
+}
+
 func (a *Agent) startBounded(start func() error, onAbandon func(), reapOnReturn func(error)) error {
 	return a.spawnPolicy.RunStartWithCleanup(start, a.spawnTimeout(), onAbandon, reapOnReturn)
 }

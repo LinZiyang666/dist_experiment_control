@@ -125,10 +125,20 @@ type ClusterAdmin struct {
 	homeDeliverFn func(sid, nid string)
 
 	// opAttempts (C4-M8) is the leader-local bounded-retry counter for an operation's failing
-	// side-effect (keyed by op_id) → BLOCKED after opMaxAttempts. Reset on a leadership change (the new
-	// leader re-counts from 0).
+	// side-effect → BLOCKED after opMaxAttempts. Reset on a leadership change (the new leader
+	// re-counts from 0).
+	//
+	// KEYED BY (op, STEP), not by op alone — origin: prerelease audit round 2, G-5. The
+	// counter's own doc says "consecutive failures of a retried side-effect", and while it
+	// had one call site that was true of a per-op key. Batch G widened it to nine sites
+	// spanning the whole join/retire ladder without widening the RESET points, so the
+	// number stopped meaning "this step keeps failing" and started meaning "this op has
+	// failed five times ANYWHERE". A join that lost one AddNonvoter, one seed converge, one
+	// lock release, one AddVoter and one topology read — each of which succeeded on the
+	// next tick and moved the op FORWARD — was then BLOCKED on the fifth, with a message
+	// naming whichever step happened to be last.
 	opAttemptsMu sync.Mutex
-	opAttempts   map[string]int
+	opAttempts   map[opAttemptKey]int
 
 	// prepareTunnelCertRotate, when set by the production broker, verifies that the
 	// target fingerprint is present on disk and returns a commit callback that hot-swaps

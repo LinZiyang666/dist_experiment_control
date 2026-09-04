@@ -246,6 +246,73 @@ func leaseRenewStmts(leaseKey, exists string, expiry time.Time) []Statement {
 	}
 }
 
+// upgradeMarkerHeldByOther renders "an upgrade marker exists whose value is NOT the one
+// this acquire is writing" — the exact mirror of growMarkerHeldByOther.
+//
+// origin: prerelease audit cluster-fsm/L3-F3. The obvious guard, `NOT
+// upgradeMarkerExists()`, is WRONG here and the lease tests caught it immediately: the
+// four statements of an acquire run in one transaction and each one re-evaluates the
+// guard, so the marker's own INSERT makes an existence-based guard false for the lease
+// statements that follow it. The lock would be born marker-without-lease, which is the
+// never-expires bucket the lease work exists to remove. "Held by other" stays true
+// through our own write, exactly as it does for grow.
+//
+// AND IT IS LEASE-AWARE — origin: prerelease audit round 2, H-2. A lock is not
+// "held" by a holder that stopped renewing it; that is the entire meaning of
+// making it a lease. Before this, a HALTed roll's own marker refused the re-run
+// the HALT message tells the operator to perform ("fix and re-run to resume"),
+// for LockLeaseTTL plus a reap interval — and the same refusal blocked the
+// emergency `--to-version <older>` rollback, which is the path an operator
+// reaches for while the fleet sits mixed-version.
+//
+// A LIVE competitor is unaffected: it renews every LockLeaseRenewInterval, so
+// its lease is never in the past while it drives, and the H1 mutual exclusion
+// this guard exists for still holds.
+//
+// FAIL-CLOSED IN EVERY UNKNOWN. The escape is phrased as "NOT EXISTS a lease
+// that is definitively in the past", so an absent lease row (a pre-R7b lock),
+// an unparseable one (julianday returns NULL, and NULL is not < anything) and a
+// missing marker all leave the predicate saying HELD. Only a lease that parses
+// and has expired opens the door. Comparing the RFC3339Nano strings directly
+// would have been wrong: the format trims trailing zeros in the fraction, so
+// ".9Z" sorts AFTER ".91Z" lexicographically.
+// PARENTHESISED AS A WHOLE, because every caller writes `NOT ` + this. SQL binds
+// NOT tighter than AND, so an unbracketed two-conjunct body would reach the FSM as
+// `(NOT marker-held) AND (NOT lease-expired)` — which is not a weaker guard but a
+// stricter one: it would refuse precisely the expired-lease re-run this change
+// exists to admit, while still passing every pre-existing exclusion test.
+func upgradeMarkerHeldByOther(valLit, nowLit string) string {
+	return `(EXISTS (SELECT 1 FROM cluster_meta WHERE key=` + MustLitText(MetaKeyUpgradeActive) +
+		` AND value != ` + valLit + `)` +
+		` AND NOT ` + upgradeLeaseDefinitelyExpired(nowLit) + `)`
+}
+
+// upgradeLeaseDefinitelyExpired renders "a parseable upgrade lease exists and it
+// is in the past". Everything else — no row, unreadable value — is false, which
+// is what makes every caller fail closed.
+func upgradeLeaseDefinitelyExpired(nowLit string) string {
+	return `EXISTS (SELECT 1 FROM cluster_meta WHERE key=` + MustLitText(MetaKeyUpgradeLease) +
+		` AND julianday(value) IS NOT NULL AND julianday(value) < julianday(` + nowLit + `))`
+}
+
+// PlanExpireUpgradeLease stamps the roll lock's lease as already expired without
+// touching the marker. origin: prerelease audit round 2, H-2.
+//
+// It is what a HALTing orchestrator says on its way out: "I have stopped
+// driving." The MARKER deliberately stays, so `cluster join` / `cluster retire`
+// remain fenced while the cluster sits in a partial-roll state — that fence is
+// the reason a HALT does not simply release the lock. What it releases is the
+// roll's exclusion against ANOTHER ROLL, which is precisely the re-run the HALT
+// message promises. Without this the promise was only true after LockLeaseTTL.
+//
+// Guarded on the marker still existing, for the same reason PlanRenewUpgradeLease
+// is: a late call from an orchestrator that has already released must not create
+// a lease row against a lock nobody holds.
+func PlanExpireUpgradeLease(now time.Time) (*Command, error) {
+	return NewCommand(OpClusterMetaSet,
+		leaseRenewStmts(MetaKeyUpgradeLease, upgradeMarkerExists(), now.Add(-time.Second))...), nil
+}
+
 // upgradeMarkerExists / growMarkerOwnedBy are the ownership predicates a renewal
 // is gated on. A renewal that could run without them would resurrect a lock the
 // orchestrator already released — a keeper goroutine that outlives its command by

@@ -95,11 +95,17 @@ func TestD9GrowFromMigratedLeader(t *testing.T) {
 	}
 	seed, _ := auth.GenerateUserSeed()
 	pub, _ := auth.PublicKeyFromSeed(seed)
+	// A REAL user public key for the bus nkey: the admission planner now validates a
+	// non-empty one the same way PlanClusterBusNkeySet always has (prerelease audit
+	// cluster-fsm/L3-F2), so a placeholder would test the validator instead of the
+	// grow-cutover path this test is about.
+	busSeed, _ := auth.GenerateUserSeed()
+	busPub, _ := auth.PublicKeyFromSeed(busSeed)
 	sig, _ := auth.SignWithSeed(seed, cluster.JoinSignBytes(bID, pub, nonce))
 	in := cluster.ClusterNodeUpsertInput{
 		NodeID: bID, Name: bID, NodeIdentPub: pub, NatsServerID: "tether-" + bID,
-		RaftAddr: bRaft, NatsRoute: "nats://x", TunnelAddr: "x:7000", PublicHost: "h",
-		CertFP: "sha256:ab", BusNkey: "UBUSB", JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig), Now: time.Now(),
+		RaftAddr: bRaft, NatsRoute: "nats://10.9.9.9:6222", TunnelAddr: "x:7000", PublicHost: "h",
+		CertFP: "sha256:ab", BusNkey: busPub, JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig), Now: time.Now(),
 	}
 	caughtUp := func(barrier uint64) (bool, error) { return b.b.AppliedIndexForTest() >= barrier, nil }
 	// A FK panic in B's apply path (the v0.4.3 crash class) would kill B's Run and surface as an AddNode

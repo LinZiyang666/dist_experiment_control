@@ -49,15 +49,15 @@ func fsTestBackend(t *testing.T, selfID, peerID, peerRaftAddr string) (*clusterA
 	}
 	admin := NewClusterAdmin(n, nil)
 	// self row: AddVoter(self) is idempotent on the bootstrapped single node; raft_addr == selfID.
-	selfIn := d7JoinInput(t, selfID, selfID)
+	selfIn := d7JoinInput(t, selfID, selfID+":7400")
 	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }
-	if err := admin.AddNode(selfIn, selfID, caughtUp, 5*time.Second); err != nil {
+	if err := admin.AddNode(selfIn, selfID+":7400", caughtUp, 5*time.Second); err != nil {
 		t.Fatalf("AddNode self: %v", err)
 	}
 	// peer row: a node-upsert (PENDING; no AddVoter), with controllable addrs. The join PoP signs only
 	// (node_id, pub, nonce), so overriding the addrs after d7JoinInput does NOT invalidate the sig.
 	peerIn := d7JoinInput(t, peerID, peerRaftAddr)
-	peerIn.NatsRoute = "127.0.0.1:1" // refused instantly (port 1 not listening) — fast "dead"
+	peerIn.NatsRoute = "nats://127.0.0.1:1" // refused instantly (port 1 not listening) — fast "dead"
 	peerIn.TunnelAddr = "127.0.0.1:1"
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(peerIn) }); err != nil {
 		t.Fatalf("insert peer row: %v", err)

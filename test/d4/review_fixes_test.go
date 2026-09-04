@@ -40,7 +40,7 @@ func TestD4ForwardedBadPINMapsInvalidPINAndEmitsPinFailed(t *testing.T) {
 		DB: openReadHandle(t, c.dbPaths[fi]), AccountKp: c.acctKp, Now: time.Now,
 		EmitEvent: func(kind string, _ map[string]any) { events = append(events, kind) },
 	}
-	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], c.forwarder(fi))
+	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], c.forwarder(fi), h.VerifyPINWithBudget)
 
 	out, err := h.Handle(signedAgentReq(t, clientPub, "lab", "lab-1", "WRONG-pin"))
 	if err != nil {
@@ -252,7 +252,7 @@ func TestD4MemberJoinForwardedFollowerReachesLeader(t *testing.T) {
 	}
 	clientPub, fp := freshClient(t)
 	h := &authcallout.Handler{DB: openReadHandle(t, c.dbPaths[fi]), AccountKp: c.acctKp, Now: time.Now}
-	h.JoinMemberWrite = broker.NewJoinSeam(c.nodes[fi], c.forwarder(fi))
+	h.JoinMemberWrite = broker.NewJoinSeam(c.nodes[fi], c.forwarder(fi), h.VerifyPINWithBudget)
 
 	out, err := h.Handle(signedCliReq(t, clientPub, "lab", "test-pin"))
 	if err != nil {

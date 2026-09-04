@@ -9,12 +9,15 @@ package d4_test
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/authcallout"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -233,7 +236,12 @@ func startCluster4(t *testing.T, n int) *cluster4 {
 		}
 		t.Cleanup(func() { nc.Close() })
 		conns[i] = nc
-		if _, err := broker.SubscribeClusterApply(nc, nodes[i], time.Now, nil); err != nil {
+		// Each node responds with ITS OWN budgeted Argon2 verifier: a forwarded PIN write
+		// runs the verify on the leader, and the process-wide ceiling it charges must be
+		// that broker's (external review M-1). A nil verifier here would make every
+		// forwarded provision/join in this suite fail closed.
+		verifyPIN := (&authcallout.Handler{Now: time.Now}).VerifyPINWithBudget
+		if _, err := broker.SubscribeClusterApply(nc, nodes[i], time.Now, nil, verifyPIN); err != nil {
 			t.Fatalf("cluster.apply responder %d: %v", i, err)
 		}
 		_ = nc.Flush()
@@ -312,11 +320,52 @@ func seedNode(t *testing.T, dbPath, sid, nid string) {
 	}
 }
 
+// d4ClientKeys keeps the private half of every client nkey freshClient mints, so the
+// request builders below can sign the server nonce the way a real client does.
+//
+// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1.
+// auth_callout now verifies that signature — nats-server does not do it for a key it has
+// no static user for, which made ConnectOptions.Nkey a field anyone could type. A
+// hand-built request without a signature is therefore not "a simpler version of the same
+// thing": it is a shape no client produces, and the handler denies it at the identity
+// check before reaching whatever the test is about.
+//
+// test/d3 carries the same twelve lines for the same reason. Deliberately duplicated
+// rather than hoisted into a shared package: the two suites are independent by design,
+// and a shared test helper between them would be a new coupling introduced to save a
+// dozen lines.
+var (
+	d4ClientKeysMu sync.Mutex
+	d4ClientKeys   = map[string]nkeys.KeyPair{}
+)
+
+// signNonceInto stamps a fresh nonce and this client's signature over it, exactly as
+// nats-server does when a client presented `sig` on CONNECT.
+func signNonceInto(t *testing.T, rc *jwt.AuthorizationRequestClaims, clientPub string) {
+	t.Helper()
+	d4ClientKeysMu.Lock()
+	kp, ok := d4ClientKeys[clientPub]
+	d4ClientKeysMu.Unlock()
+	if !ok {
+		t.Fatalf("no seed registered for client nkey %q; mint it with freshClient", clientPub)
+	}
+	nonce := "d4-nonce-" + clientPub[:8]
+	sig, err := kp.Sign([]byte(nonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.ClientInformation.Nonce = nonce
+	rc.ConnectOptions.SignedNonce = base64.RawURLEncoding.EncodeToString(sig)
+}
+
 func freshClient(t *testing.T) (pub, fp string) {
 	t.Helper()
 	kp, _ := nkeys.CreateUser()
 	pub, _ = kp.PublicKey()
-	kp.Wipe()
+	// NOT Wiped: the request builders need the private half to sign the nonce.
+	d4ClientKeysMu.Lock()
+	d4ClientKeys[pub] = kp
+	d4ClientKeysMu.Unlock()
 	fp, err := auth.FingerprintFromActor(pub)
 	if err != nil {
 		t.Fatal(err)
@@ -335,6 +384,7 @@ func signedAgentReq(t *testing.T, clientPub, sid, nid, pin string) string {
 	rc.UserNkey = ephPub
 	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
 	rc.ConnectOptions = jwt.ConnectOptions{Name: "tether-agent:" + sid + ":" + nid, Nkey: clientPub, Token: pin}
+	signNonceInto(t, rc, clientPub)
 	tok, err := rc.Encode(serverKp)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +406,7 @@ func signedCliReq(t *testing.T, clientPub, sid, pin string) string {
 	rc.UserNkey = ephPub
 	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
 	rc.ConnectOptions = jwt.ConnectOptions{Name: "tether-cli:" + sid, Nkey: clientPub, Token: pin}
+	signNonceInto(t, rc, clientPub)
 	tok, err := rc.Encode(serverKp)
 	if err != nil {
 		t.Fatal(err)

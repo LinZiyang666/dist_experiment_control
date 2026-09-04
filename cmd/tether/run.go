@@ -216,9 +216,18 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			// unarmed and behave as before, no false positives.
 			startRunWatchdog(ctxRun, nc, sid, nid, lifecycleCh)
 
-			// stdin → pty.<pid>.in
+			// stdin → pty.<pid>.in, on BOTH the node-scoped subject and the legacy
+			// session-scoped one. origin: prerelease audit round 2, I-F6.
+			//
+			// The legacy copy carries proto.PtyNodeHeader, which an upgraded agent uses
+			// to drop it (it has already taken the node-scoped copy) and which an OLD
+			// agent has never heard of and ignores. That is what makes publishing to both
+			// safe: without the header a new ctl + new agent would write every keystroke
+			// twice, and with only the node-scoped subject a new ctl could not drive an
+			// agent that has not been upgraded yet.
 			if isTTY {
-				go pumpStdinToBus(ctxRun, nc, proto.SubjPtyIn(sid, pid), os.Stdin)
+				go pumpStdinToBus(ctxRun, nc,
+					proto.SubjPtyInNode(sid, nid, pid), proto.SubjPtyIn(sid, pid), os.Stdin)
 			}
 
 			// h1 D2: keepalive beat → pty.<pid>.ka. Runs regardless of isTTY
@@ -233,7 +242,8 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			winchCh := make(chan os.Signal, 1)
 			signal.Notify(winchCh, syscall.SIGWINCH)
 			defer signal.Stop(winchCh)
-			go pumpWinchToBus(ctxRun, nc, proto.SubjPtyResize(sid, pid), winchCh)
+			go pumpWinchToBus(ctxRun, nc,
+				proto.SubjPtyResizeNode(sid, nid, pid), proto.SubjPtyResize(sid, pid), winchCh)
 
 			// Local Ctrl-C → kill.req {SIGINT}. We can't observe Ctrl-C as
 			// a SIGINT signal here because raw mode delivers ^C as a byte
@@ -344,7 +354,20 @@ func enterRawMode() (restore func(), isTTY bool) {
 	return func() { _ = term.Restore(fd, old) }, true
 }
 
-func pumpStdinToBus(ctx context.Context, nc *nats.Conn, subj string, src io.Reader) {
+// publishPtyBoth sends one pty payload on the node-scoped subject and, for an agent that
+// predates it, on the legacy session-scoped one — the legacy copy marked with
+// proto.PtyNodeHeader so an upgraded agent drops it instead of acting on it twice.
+// origin: prerelease audit round 2, I-F6.
+func publishPtyBoth(nc *nats.Conn, nodeSubj, legacySubj string, payload []byte) {
+	_ = nc.Publish(nodeSubj, payload)
+	_ = nc.PublishMsg(&nats.Msg{
+		Subject: legacySubj,
+		Header:  nats.Header{proto.PtyNodeHeader: []string{"1"}},
+		Data:    payload,
+	})
+}
+
+func pumpStdinToBus(ctx context.Context, nc *nats.Conn, nodeSubj, legacySubj string, src io.Reader) {
 	buf := make([]byte, 4*1024)
 	for {
 		// Bounded read with cancel: best-effort, since os.Stdin doesn't
@@ -359,7 +382,7 @@ func pumpStdinToBus(ctx context.Context, nc *nats.Conn, subj string, src io.Read
 		if n > 0 {
 			b := make([]byte, n)
 			copy(b, buf[:n])
-			_ = nc.Publish(subj, b)
+			publishPtyBoth(nc, nodeSubj, legacySubj, b)
 			// Force the keystroke to the wire instead of letting
 			// nats.go's internal flusher batch it. On a high-RTT
 			// WSS link the operator otherwise types into a black
@@ -403,7 +426,7 @@ func pumpKeepaliveToBus(ctx context.Context, nc *nats.Conn, subj string) {
 	}
 }
 
-func pumpWinchToBus(ctx context.Context, nc *nats.Conn, subj string, ch <-chan os.Signal) {
+func pumpWinchToBus(ctx context.Context, nc *nats.Conn, nodeSubj, legacySubj string, ch <-chan os.Signal) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -411,7 +434,7 @@ func pumpWinchToBus(ctx context.Context, nc *nats.Conn, subj string, ch <-chan o
 		case <-ch:
 			cols, rows := terminalSize()
 			body, _ := json.Marshal(proto.PtyResizeEvent{Cols: cols, Rows: rows})
-			_ = nc.Publish(subj, body)
+			publishPtyBoth(nc, nodeSubj, legacySubj, body)
 		}
 	}
 }

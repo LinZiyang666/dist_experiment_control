@@ -96,6 +96,11 @@ assert_ok "init brk1 (standalone → N=1 cluster)"  "$SIM" init brk1
 assert_ok "N=1 leader floor (leader=brk1)"        sh -c "\"$SIM\" exec brk1 -- sh -c 'tether cluster status --json' | jq -e '.leader_id==\"brk1\" and (.health==\"DEGRADED\" or .health==\"HEALTHY_HA\")' >/dev/null"
 
 # ── identities: A owns lab, B owns ops (distinct $TETHER_HOME = distinct nkey = distinct tenant) ──────
+# The property that makes them distinct TENANTS is the same one that makes them distinct CREATORS:
+# one nkey per $TETHER_HOME. So each owner needs its own admission on the fresh broker — T is not
+# admitted here on purpose, because T only ever JOINS with a PIN, which admission does not gate.
+assert_ok "operator admits A as a session creator"  admit_creator brk1 ctl1 sim HOME=/home/sim "TETHER_HOME=/home/sim/.tether-A"
+assert_ok "operator admits B as a session creator"  admit_creator brk1 ctl1 sim HOME=/home/sim "TETHER_HOME=/home/sim/.tether-B"
 assert_ok "A creates session lab"                 CTLH A session create "$SID_A" --pin "$PIN_A" --nats-url "$NURL"
 assert_ok "A activates lab (--broker persists broker_url)" CTLH A login -s "$SID_A" --pin "$PIN_A" --broker "$NURL"
 assert_ok "B creates session ops"                 CTLH B session create "$SID_B" --pin "$PIN_B" --nats-url "$NURL"

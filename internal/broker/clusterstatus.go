@@ -1197,7 +1197,12 @@ func versionSkewRefusal(joinerProto int, joinerRelease, nodeID string, log *slog
 			MissingField:   "release version",
 		}
 	}
-	if joinerRelease != proto.ReleaseVersion {
+	// SameRelease — origin: prerelease audit round 2, the K-F* sweep's gate. requirements
+	// §6.7's join exemption requires the same RELEASE, and "v0.5.1" and "0.5.1" are the
+	// same release: a joiner built from source was refused admission to a cluster of
+	// goreleaser-built brokers running identical code, with a message telling the
+	// operator their releases differ.
+	if !proto.SameRelease(joinerRelease, proto.ReleaseVersion) {
 		logSkew(log, "cluster add: REFUSED — joiner release differs from this broker (requirements §6.7 join-gate exemption: membership admission requires an exact release match)",
 			"node_id", nodeID, "joiner_release", joinerRelease, "this_release", proto.ReleaseVersion)
 		return &ErrJoinVersionSkew{JoinerRelease: joinerRelease, ClusterRelease: proto.ReleaseVersion}

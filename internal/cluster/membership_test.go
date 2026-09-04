@@ -105,7 +105,12 @@ func TestD7UpsertEmptyReadmitPreservesIdentity(t *testing.T) {
 	// (1) admit with a GOOD bus_nkey + cert_fp.
 	nonce1 := "nonce-good"
 	in1 := d7UpsertInput(node, pub, nonce1, d7Sign(t, seed, JoinSignBytes(node, pub, nonce1)))
-	in1.BusNkey = "UGOODBUSNKEY"
+	// A REAL user public key: the admission planner now validates a non-empty bus_nkey
+	// the same way PlanClusterBusNkeySet always has (prerelease audit cluster-fsm/L3-F2),
+	// so a placeholder here would test the validator instead of the empty-preserve rule
+	// this test is about.
+	_, goodBusNkey := d7GenKey(t)
+	in1.BusNkey = goodBusNkey
 	in1.CertFP = "sha256:goodfp"
 	cmd1, err := PlanClusterNodeUpsert(in1)
 	if err != nil {
@@ -114,8 +119,8 @@ func TestD7UpsertEmptyReadmitPreservesIdentity(t *testing.T) {
 	if _, ok := d7Apply(t, f, 1, cmd1).(appliedOK); !ok {
 		t.Fatal("admit: want appliedOK")
 	}
-	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != "UGOODBUSNKEY" {
-		t.Fatalf("after admit bus_nkey_pub=%q, want UGOODBUSNKEY", bn)
+	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != goodBusNkey {
+		t.Fatalf("after admit bus_nkey_pub=%q, want %q", bn, goodBusNkey)
 	}
 
 	// (2) re-admit (still PENDING → the DO UPDATE fires) carrying an EMPTY bundle.
@@ -132,8 +137,8 @@ func TestD7UpsertEmptyReadmitPreservesIdentity(t *testing.T) {
 	}
 
 	// (3) the good values must be PRESERVED, not clobbered to ''.
-	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != "UGOODBUSNKEY" {
-		t.Fatalf("empty re-admit CLOBBERED bus_nkey_pub to %q — must preserve UGOODBUSNKEY (re-arms the deadlock)", bn)
+	if bn := d7Col(t, f, node, "bus_nkey_pub"); bn != goodBusNkey {
+		t.Fatalf("empty re-admit CLOBBERED bus_nkey_pub to %q — must preserve the admitted key (re-arms the deadlock)", bn)
 	}
 	if fp := d7Col(t, f, node, "cert_fp"); fp != "sha256:goodfp" {
 		t.Fatalf("empty re-admit CLOBBERED cert_fp to %q — must preserve sha256:goodfp (re-arms the crash-loop)", fp)
@@ -396,5 +401,309 @@ func TestD7Migration0013Columns(t *testing.T) {
 		if !have[c] {
 			t.Errorf("migration 0013 missing column %q", c)
 		}
+	}
+}
+
+// origin: prerelease audit cluster-fsm/L3-F2.
+//
+// THE ADMISSION PATH VALIDATES WHAT THE REWRITE PATHS VALIDATE.
+//
+// Each of nats_route, raft_addr and bus_nkey_pub has a dedicated rewrite planner in
+// membership_ops.go that validates it and states in its own comment what breaks when it
+// does not: a garbage route renders a broken cluster{} block on every replica, a garbage
+// nkey breaks every replica's `nats-server -t`, a garbage raft_addr desynchronises
+// status and the :7400 liveness probe. The planner that writes those columns for the
+// FIRST time checked none of them, so a node had to be admitted before its own values
+// could be validated.
+func TestUpsertRefusesTheValuesItsRewritePlannersRefuse(t *testing.T) {
+	seed, pub := d7GenKey(t)
+	const node = "n-valid"
+	nonce := "nonce-1"
+	sig := d7Sign(t, seed, JoinSignBytes(node, pub, nonce))
+	_, goodNkey := d7GenKey(t)
+
+	base := func() ClusterNodeUpsertInput {
+		in := d7UpsertInput(node, pub, nonce, sig)
+		in.BusNkey = goodNkey
+		return in
+	}
+
+	// The fixture itself must be admissible, or every negative case below is vacuous.
+	if _, err := PlanClusterNodeUpsert(base()); err != nil {
+		t.Fatalf("the well-formed fixture was refused: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*ClusterNodeUpsertInput)
+		mention string
+	}{
+		{"route with no scheme", func(in *ClusterNodeUpsertInput) { in.NatsRoute = "10.0.0.9:6222" }, "nats route"},
+		{"route carrying credentials", func(in *ClusterNodeUpsertInput) {
+			in.NatsRoute = "nats://user:pw@10.0.0.9:6222"
+		}, "credentials"},
+		{"raft addr with no port", func(in *ClusterNodeUpsertInput) { in.RaftAddr = "brk-b" }, "raft addr"},
+		{"bus nkey that is not a key", func(in *ClusterNodeUpsertInput) { in.BusNkey = "UNOTAREALKEY" }, "bus nkey"},
+		{"node id that is not a node id", func(in *ClusterNodeUpsertInput) { in.NodeID = "Not A Node" }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base()
+			tc.mutate(&in)
+			// The node-id case has to re-sign, or it would be refused by the PoP check
+			// instead and prove nothing about the id validator.
+			if in.NodeID != node {
+				in.JoinNonce = "nonce-2"
+				in.JoinSigHex = d7Sign(t, seed, JoinSignBytes(in.NodeID, pub, in.JoinNonce))
+			}
+			_, err := PlanClusterNodeUpsert(in)
+			if err == nil {
+				t.Fatalf("the admission planner accepted %s.\n\n"+
+					"The rewrite planner for this very column refuses it. Admitting it means the "+
+					"cluster carries a value that can only be corrected by a later operation, and "+
+					"every replica has to live with it in the meantime.", tc.name)
+			}
+			if tc.mention != "" && !strings.Contains(err.Error(), tc.mention) {
+				t.Errorf("refusal %q does not name the offending field (%q)", err, tc.mention)
+			}
+		})
+	}
+
+	// An EMPTY bus nkey stays legal: the conflict path is empty-PRESERVE on purpose, so
+	// an idempotent grow-retry carrying an empty bundle must still be admissible.
+	in := base()
+	in.BusNkey = ""
+	if _, err := PlanClusterNodeUpsert(in); err != nil {
+		t.Fatalf("an empty bus nkey must remain legal (the ON CONFLICT path is empty-preserving): %v", err)
+	}
+}
+
+// origin: prerelease audit cluster-fsm/L3-F3.
+//
+// TWO CONCURRENT ROLLS MUST NOT BOTH HOLD THE UPGRADE LOCK.
+//
+// markerAcquireStmts is INSERT-OR-IGNORE then UPDATE, and the guard was `NOT
+// growMarkerExists()` alone — so when an upgrade marker was already present the UPDATE
+// fired and overwrote the timestamp. A second `cluster upgrade` "acquired" a lock the
+// first was holding, and both read-backs returned true because upgradeActive() only
+// asks whether the key exists. The grow lock had been given exactly this treatment by
+// external review H1/M1; this one was left behind.
+//
+// The lock is what keeps join/retire from crossing a rolling restart, so two holders
+// means the second roll runs its whole second half with no lock at all.
+func TestASecondRollCannotTakeTheUpgradeLockFromTheFirst(t *testing.T) {
+	f, _ := freshFSM(t, t.TempDir())
+	first := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+
+	cmd, err := PlanSetUpgradeActive(first)
+	if err != nil {
+		t.Fatalf("plan first acquire: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 1, cmd).(appliedOK); !ok {
+		t.Fatal("first acquire: want appliedOK")
+	}
+	if got := UpgradeMarkerValue(f.db); got != UpgradeMarkerStamp(first) {
+		t.Fatalf("after the first acquire the marker is %q, want %q", got, UpgradeMarkerStamp(first))
+	}
+	// The lease MUST land in the same command. A marker with no lease is the
+	// never-expires bucket, and it is exactly what an existence-shaped guard produces:
+	// the marker's own INSERT makes the guard false for the lease statements behind it.
+	var lease string
+	if err := f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key=?`, MetaKeyUpgradeLease).Scan(&lease); err != nil {
+		t.Fatalf("the acquire did not stamp a lease (%v) — the lock would never expire, and an "+
+			"interrupted roll would fence join/retire permanently", err)
+	}
+
+	// A SECOND roll acquires with its own stamp. It must change nothing.
+	cmd2, err := PlanSetUpgradeActive(second)
+	if err != nil {
+		t.Fatalf("plan second acquire: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 2, cmd2).(appliedOK); !ok {
+		t.Fatal("second acquire: want appliedOK (a refused acquire is a no-op, not an error)")
+	}
+	if got := UpgradeMarkerValue(f.db); got != UpgradeMarkerStamp(first) {
+		t.Fatalf("the second roll overwrote the marker: %q, want the FIRST roll's %q.\n\n"+
+			"The acquirer proves it won by comparing the marker value against the stamp it "+
+			"proposed. If a second roll can overwrite that value, both rolls read back their own "+
+			"stamp and both believe they hold a topology-stable window.",
+			got, UpgradeMarkerStamp(first))
+	}
+	var lease2 string
+	if err := f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key=?`, MetaKeyUpgradeLease).Scan(&lease2); err != nil {
+		t.Fatalf("the refused acquire destroyed the holder's lease: %v", err)
+	}
+	if lease2 != lease {
+		t.Errorf("the refused acquire extended the holder's lease from %q to %q — a second roll "+
+			"must not be able to keep the first one's lock alive", lease, lease2)
+	}
+}
+
+// upgradeLeaseOf reads the roll lock's lease, or "" when there is none.
+func upgradeLeaseOf(t *testing.T, f *fsm) string {
+	t.Helper()
+	var v string
+	if err := f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key=?`, MetaKeyUpgradeLease).Scan(&v); err != nil {
+		return ""
+	}
+	return v
+}
+
+// acquireUpgradeAt proposes an acquire stamped `at` and reports whether it WON —
+// which, as the acquirer itself determines, means the marker now holds its stamp.
+func acquireUpgradeAt(t *testing.T, f *fsm, idx uint64, at time.Time) bool {
+	t.Helper()
+	cmd, err := PlanSetUpgradeActive(at)
+	if err != nil {
+		t.Fatalf("plan acquire: %v", err)
+	}
+	if _, ok := d7Apply(t, f, idx, cmd).(appliedOK); !ok {
+		t.Fatal("acquire: want appliedOK (a refused acquire is a no-op, not an error)")
+	}
+	return UpgradeMarkerValue(f.db) == UpgradeMarkerStamp(at)
+}
+
+// origin: prerelease audit round 2, H-2.
+//
+// A LOCK NOBODY IS RENEWING IS NOT HELD.
+//
+// L3-F3 made the acquire refuse a marker it does not own, which is right against a
+// LIVE competitor and wrong against the operator's own interrupted roll: a HALT
+// deliberately leaves the marker set, so `cluster upgrade` re-run — the recovery
+// its own HALT message instructs — was refused for LockLeaseTTL plus a reap
+// interval, and so was the emergency `--to-version <older>` rollback an operator
+// reaches for while the fleet sits mixed-version.
+//
+// The fix needs no holder identity (the protocol has none, and adding a roll id to
+// CanonicalUpgradeReqBytes would break every not-yet-upgraded verifier mid-roll):
+// a roll that is still driving renews every LockLeaseRenewInterval, so its lease is
+// never in the past.
+func TestAnExpiredLeaseStopsBlockingTheNextRoll(t *testing.T) {
+	f, _ := freshFSM(t, t.TempDir())
+	first := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+
+	if !acquireUpgradeAt(t, f, 1, first) {
+		t.Fatal("the first acquire did not win an unheld lock")
+	}
+	// A LIVE holder is still exclusive: one renew interval in, its lease has
+	// plenty left and a second roll must be refused.
+	if acquireUpgradeAt(t, f, 2, first.Add(LockLeaseRenewInterval)) {
+		t.Fatal("a second roll took the lock from a holder whose lease was still live.\n\n" +
+			"That is the H1 mutual exclusion: two rolls would each believe they own a " +
+			"topology-stable window, and join/retire could cross a rolling restart.")
+	}
+	// Past the TTL the holder has demonstrably stopped renewing.
+	if !acquireUpgradeAt(t, f, 3, first.Add(LockLeaseTTL+time.Minute)) {
+		t.Fatal("a re-run was refused by the lease of a roll that stopped renewing.\n\n" +
+			"A HALT leaves the marker set on purpose, so this is the ordinary recovery path — " +
+			"`cluster upgrade` HALTs, the operator fixes the cause and re-runs, and the roll's " +
+			"own abandoned marker refuses it. The emergency rollback is blocked the same way.")
+	}
+	// AND THE MEMBERSHIP FENCE SURVIVES: what the re-run may take is the
+	// roll-versus-roll exclusion, never the partial-roll fence on join/retire.
+	if UpgradeMarkerValue(f.db) == "" {
+		t.Fatal("the upgrade marker is gone — `cluster join`/`cluster retire` would now be " +
+			"admitted while the cluster sits mid-roll")
+	}
+}
+
+// origin: prerelease audit round 2, H-2.
+//
+// FAIL CLOSED ON EVERY UNKNOWN. A marker with no lease is a lock acquired by a
+// pre-R7b broker, and lock_lease.go's own contract is that it NEVER expires on its
+// own — `tether cluster unlock` is the out. An unparseable lease is the same case
+// arrived at differently. Either must keep blocking, or an upgrade during exactly
+// the mixed-version window this whole mechanism serves would steal a live lock.
+func TestAnUnexpirableLeaseKeepsBlockingTheNextRoll(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		corrupt func(t *testing.T, f *fsm)
+	}{
+		{"no lease row at all (a pre-R7b lock)", func(t *testing.T, f *fsm) {
+			if _, err := f.db.Exec(`DELETE FROM cluster_meta WHERE key=?`, MetaKeyUpgradeLease); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"an unparseable expiry", func(t *testing.T, f *fsm) {
+			if _, err := f.db.Exec(`UPDATE cluster_meta SET value='not-a-time' WHERE key=?`, MetaKeyUpgradeLease); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _ := freshFSM(t, t.TempDir())
+			first := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+			if !acquireUpgradeAt(t, f, 1, first) {
+				t.Fatal("the first acquire did not win an unheld lock")
+			}
+			tc.corrupt(t, f)
+
+			// Far past any TTL: only a lease that PARSES and has expired may open the door.
+			if acquireUpgradeAt(t, f, 2, first.Add(100*LockLeaseTTL)) {
+				t.Fatal("a second roll took a lock whose lease could not be evaluated.\n\n" +
+					"An unreadable lease is not evidence the holder is dead. Reading it as " +
+					"expiry hands the lock away during a mixed-version roll — the one window " +
+					"where a pre-R7b broker's marker is exactly what is on disk.")
+			}
+		})
+	}
+}
+
+// origin: prerelease audit round 2, H-2.
+//
+// THE ORCHESTRATOR CAN HAND THE LEASE BACK EXPLICITLY, so the re-run its HALT
+// message promises does not have to wait out a 15-minute TTL. The MARKER must
+// survive: the partial-roll fence on join/retire is the reason a HALT does not
+// simply release the lock, and giving that up here would trade one bug for a worse
+// one.
+func TestExpiringTheLeaseAdmitsARerunButKeepsTheMembershipFence(t *testing.T) {
+	f, _ := freshFSM(t, t.TempDir())
+	first := time.Date(2026, 9, 2, 3, 0, 0, 0, time.UTC)
+	if !acquireUpgradeAt(t, f, 1, first) {
+		t.Fatal("the first acquire did not win an unheld lock")
+	}
+	before := upgradeLeaseOf(t, f)
+
+	cmd, err := PlanExpireUpgradeLease(first.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("plan expire: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 2, cmd).(appliedOK); !ok {
+		t.Fatal("expire-lease: want appliedOK")
+	}
+	if after := upgradeLeaseOf(t, f); after == before {
+		t.Fatalf("the lease was not moved (still %q) — a HALTing orchestrator could not hand it back", after)
+	}
+	if UpgradeMarkerValue(f.db) != UpgradeMarkerStamp(first) {
+		t.Fatal("expiring the lease also dropped the MARKER.\n\n" +
+			"That unfences `cluster join`/`cluster retire` across a partial roll, which is the " +
+			"exact hazard the lock exists for — and it is why a HALT keeps the marker instead " +
+			"of releasing the lock outright.")
+	}
+
+	// Seconds later, not fifteen minutes: the whole point.
+	if !acquireUpgradeAt(t, f, 3, first.Add(2*time.Minute)) {
+		t.Fatal("the re-run was still refused after the previous roll handed its lease back")
+	}
+
+	// A LATE hand-back from an orchestrator that already released must not
+	// resurrect anything — leaseRenewStmts is guarded on the marker existing.
+	clear, err := PlanClearUpgradeActive()
+	if err != nil {
+		t.Fatalf("plan clear: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 4, clear).(appliedOK); !ok {
+		t.Fatal("release: want appliedOK")
+	}
+	late, err := PlanExpireUpgradeLease(first.Add(3 * time.Minute))
+	if err != nil {
+		t.Fatalf("plan late expire: %v", err)
+	}
+	if _, ok := d7Apply(t, f, 5, late).(appliedOK); !ok {
+		t.Fatal("late expire-lease: want appliedOK")
+	}
+	if got := upgradeLeaseOf(t, f); got != "" {
+		t.Fatalf("a late hand-back created a lease row (%q) against a released lock", got)
 	}
 }

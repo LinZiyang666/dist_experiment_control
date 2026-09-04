@@ -521,7 +521,7 @@ func seedProcFixture(t *testing.T, db *sql.DB) {
 		if err := proc.Insert(db, p); err != nil {
 			t.Fatal(err)
 		}
-		if err := proc.MarkExited(db, pid, 0, passEpoch.Add(-endedAgo)); err != nil {
+		if err := proc.MarkExited(db, pid, "gc", 0, passEpoch.Add(-endedAgo)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1211,7 +1211,7 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 	clk := newFakeClock(passEpoch)
 	db := passTestDB(t)
 	b := passBroker(t, db, clk)
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 
 	ctx := context.Background()
@@ -1349,7 +1349,7 @@ func TestXferCrossHomeGCSkipsBusyBucket(t *testing.T) {
 
 	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
 	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now, XferCrossHomeReapAge: time.Nanosecond}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = 0
 
@@ -1396,7 +1396,7 @@ func TestXferCrossHomeGCReapsSplitHome(t *testing.T) {
 
 	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
 	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now, XferCrossHomeReapAge: time.Nanosecond}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = 0 // any non-deleted object is aged garbage for the gauge
 
@@ -1468,7 +1468,7 @@ func TestXferUnreapableBucketCounter(t *testing.T) {
 
 	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
 	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = 0 // any non-deleted object is "aged garbage" for this test
 
@@ -1541,7 +1541,7 @@ func TestXferUnreapableBucketSkipsFreshObjects(t *testing.T) {
 
 	b := &Broker{transfers: newTransferTracker(), selfID: "node-A"}
 	b.cfg = Config{DB: db, Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = time.Hour // shield fresh objects (real wall-clock ModTime)
 
@@ -1580,7 +1580,7 @@ func TestAdminEventsTailTruncatesAtScanCap(t *testing.T) {
 
 	b := &Broker{}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 
 	total := eventsMaxScan + 10
@@ -1679,7 +1679,7 @@ func TestXferReapShieldsFreshObjects(t *testing.T) {
 
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{DB: passTestDB(t), Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = time.Hour // production shields fresh in-flight objects
 
@@ -1754,7 +1754,7 @@ func TestXferReapAfterRestartPreservesLedgerBackedLiveObject(t *testing.T) {
 		Now:            func() time.Time { return now.Add(xferReapMinObjectAge + time.Minute) },
 		ClusterDataDir: t.TempDir(),
 	}
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 	b.xferReapMinAge = xferReapMinObjectAge
 	seedHomedNode(t, db, "restart-live", "agent-1", "srv-A", "node-A")
@@ -1822,7 +1822,7 @@ func TestXferOrphanReapHomePartition(t *testing.T) {
 	db := passTestDB(t)
 	b := passBroker(t, db, clk)
 	b.selfID = "node-A" // non-empty ⇒ homeOwnsXferBucket takes its REAL query path
-	b.js = js
+	setBrokerJS(b, js)
 	b.nc.Store(nc)
 
 	// sess-A is homed HERE (node-A); sess-B is homed to node-B (a different broker).

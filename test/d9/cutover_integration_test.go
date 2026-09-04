@@ -36,15 +36,14 @@ func TestD9Matrix(t *testing.T) {
 // left tombstoned). Single-mode is byte-identical (the routers fall through to the direct
 // mutators), so this also guards the cluster branch specifically.
 func testSessionRmCascadeRoutesThroughRaft(t *testing.T) {
-	h := startD9Broker(t, "d9-node-rm")
+	actor, admit := d9AdmittedActor(t)
+	h := startD9Broker(t, "d9-node-rm", admit)
 	waitLeader(t, h)
 	nc, err := nats.Connect(h.url)
 	if err != nil {
 		t.Fatalf("nats connect: %v", err)
 	}
 	defer nc.Close()
-	seed, _ := auth.GenerateUserSeed()
-	actor, _ := auth.PublicKeyFromSeed(seed)
 
 	create := func() proto.SessionCreateResp {
 		body, _ := json.Marshal(proto.SessionCreateReq{Name: "rmtest", PIN: "123456"})
@@ -84,7 +83,8 @@ func testSessionRmCascadeRoutesThroughRaft(t *testing.T) {
 // grow are the automated halves of the §13.12 drill; the full kill-the-leader failover is the
 // staged operator drill in docs/cluster-runbook.md).
 func testTwoBrokerJoinReplicates(t *testing.T) {
-	a, b, bID, bRaft := startD9Pair(t)
+	actor, admit := d9AdmittedActor(t)
+	a, b, bID, bRaft := startD9Pair(t, admit)
 	waitLeader(t, a) // A leads its initial {A} cluster
 
 	admin := a.b.ClusterAdminForTest()
@@ -109,7 +109,7 @@ func testTwoBrokerJoinReplicates(t *testing.T) {
 	}
 	in := cluster.ClusterNodeUpsertInput{
 		NodeID: bID, Name: bID, NodeIdentPub: pub, NatsServerID: "tether-" + bID,
-		RaftAddr: bRaft, NatsRoute: "nats://x", TunnelAddr: "x:7000", PublicHost: "h",
+		RaftAddr: bRaft, NatsRoute: "nats://10.9.9.9:6222", TunnelAddr: "x:7000", PublicHost: "h",
 		CertFP: "sha256:ab", JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig), Now: time.Now(),
 	}
 	caughtUp := func(barrier uint64) (bool, error) { return b.b.AppliedIndexForTest() >= barrier, nil }
@@ -143,8 +143,6 @@ func testTwoBrokerJoinReplicates(t *testing.T) {
 		t.Fatalf("nats connect: %v", ncErr)
 	}
 	defer nc.Close()
-	wseed, _ := auth.GenerateUserSeed()
-	actor, _ := auth.PublicKeyFromSeed(wseed)
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "fwd", PIN: "123456"})
 	msg, reqErr := nc.Request(proto.SubjCtrlSessionCreate(actor), body, 8*time.Second)
 	if reqErr != nil {
@@ -196,7 +194,8 @@ func testClusterModeConstructsAndLeads(t *testing.T) {
 // non-empty SID + no error in the reply means the Propose committed AND the read-back saw
 // the committed row (the DB is now FSM-authoritative, not direct-written).
 func testSessionCreateRoutesThroughRaft(t *testing.T) {
-	h := startD9Broker(t, "d9-node-B")
+	actor, admit := d9AdmittedActor(t)
+	h := startD9Broker(t, "d9-node-B", admit)
 	waitLeader(t, h)
 
 	nc, err := nats.Connect(h.url)
@@ -204,15 +203,6 @@ func testSessionCreateRoutesThroughRaft(t *testing.T) {
 		t.Fatalf("nats connect: %v", err)
 	}
 	defer nc.Close()
-
-	seed, err := auth.GenerateUserSeed()
-	if err != nil {
-		t.Fatal(err)
-	}
-	actor, err := auth.PublicKeyFromSeed(seed)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "123456"})
 	msg, err := nc.Request(proto.SubjCtrlSessionCreate(actor), body, 8*time.Second)

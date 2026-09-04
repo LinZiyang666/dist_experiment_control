@@ -24,6 +24,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/LinZiyang666/tether/internal/agent"
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/proxysub"
@@ -141,7 +142,12 @@ func TestProxySubscriptionE2E(t *testing.T) {
 	}()
 	testharness.WaitNodeOnline(t, db, "lab", "lab-1", 3*time.Second)
 
-	nc, err := nats.Connect(url)
+	// DIAL LIKE A POST-CUTOVER CTL. Since external review B-1 the broker withholds
+	// credential-bearing payloads (here: the /sub URL's bearer token) from any reply space
+	// other connections can read, so a ctl on nats.go's default `_INBOX` exercises the
+	// DEGRADED path. Production ctl connections carry this prefix
+	// (internal/natsinbox.InboxConnectOptions).
+	nc, err := nats.Connect(url, nats.CustomInboxPrefix(auth.InboxPrefixFor(ownerPub)))
 	if err != nil {
 		t.Fatal(err)
 	}

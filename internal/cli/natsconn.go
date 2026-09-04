@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"os"
 	"time"
 
@@ -67,7 +68,25 @@ func ConnectNATSWithNkey(url string, id *Identity, opts ...nats.Option) (*nats.C
 		return nil, err
 	}
 	all = append(all, popts...)
-	return nats.Connect(url, all...)
+	if os.Getenv(DevNoAuthEnv) != "" {
+		// No nkey, so no identity to derive a private inbox from.
+		return nats.Connect(url, all...)
+	}
+	// PRIVATE reply inbox, plus the CONNECT marker that tells the callout to grant it
+	// instead of the shared pre-cutover `_INBOX.>`. auth_callout derives the same prefix
+	// from this connection's nkey, so replies — exec output, the print-once /sub token —
+	// are no longer readable by every other connection on the account.
+	// origin: prerelease audit proto-auth-acl/L1-F1.
+	//
+	// natsinbox.Connect rather than a bare option append, because the inbox now lives
+	// under its own root and a PRE-CUTOVER broker grants no reach to it at all. Against
+	// one of those this probes once and falls back to the shared space, which is the
+	// {old broker × new ctl} rollback quadrant. Silence here is deliberate: a ctl prints
+	// command output, and a line about inbox roots on every command against an older
+	// broker would be noise the user cannot act on. The agent, which is long-lived and
+	// whose operator CAN act on it, logs it.
+	nc, _, err := natsinbox.Connect(url, id.PublicKey, all)
+	return nc, err
 }
 
 // ResolveNATSURLFromHome implements the broker-URL precedence chain

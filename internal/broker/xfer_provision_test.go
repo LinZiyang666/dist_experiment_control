@@ -71,7 +71,7 @@ func TestSizingStallDoesNotConsumeCreateBudget(t *testing.T) {
 	js := &stallJS{accountInfoBlocks: true, createBudget: make(chan time.Duration, 1)}
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 
 	// Written RED-first against the pre-fix sequence (one shared 5s ctx across both round trips),
 	// where the create was handed an ALREADY-EXPIRED context (-4ms observed). It now drives the
@@ -167,7 +167,7 @@ func TestXferProvisionPermanentMakesExactlyOneAttempt(t *testing.T) {
 	js := &countingJS{err: errors.New("replicas > 1 not supported in non-clustered mode")}
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 
 	start := time.Now()
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
@@ -194,7 +194,7 @@ func TestXferProvisionRetriesTransientWithinBudget(t *testing.T) {
 	js := &countingJS{err: context.DeadlineExceeded}
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 
 	start := time.Now()
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
@@ -223,7 +223,7 @@ func TestXferProvisionSucceedsOnRetry(t *testing.T) {
 	js := &countingJS{err: context.DeadlineExceeded, succeedFrom: 2}
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
 	if perr != nil {
@@ -240,7 +240,7 @@ func TestXferProvisionSizingRefusalMakesZeroAttempts(t *testing.T) {
 	js := &countingJS{maxStore: 1024} // far below the events/history reserve + floor
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 
 	_, tooLarge, perr := b.provisionXferBucket(context.Background(), "sess", 0)
 	if tooLarge != nil {
@@ -265,6 +265,24 @@ type countingJS struct {
 	succeedFrom int   // 1-based attempt from which the create succeeds; 0 = never
 	maxStore    int64 // AccountInfo.Limits.MaxStore; 0 => unlimited => statfs fallback
 	creates     int
+}
+
+// Publish accepts and discards. The embedded interface is nil, so without this any
+// test that drives a push to COMPLETION segfaults inside publishAudit rather than
+// failing its assertion — see TestATierAPushCannotNameAnotherSessionsBucket, the
+// first test here that gets that far.
+func (c *countingJS) Publish(context.Context, string, []byte, ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	return &jetstream.PubAck{Stream: "test", Sequence: 1}, nil
+}
+
+// PublishMsg, for the same reason and by the same route: publishAuditDeduped moved from
+// Publish+WithMsgID to PublishMsg when the transfer terminal gained a content-derived
+// dedup id (external review M-3), and the comment above turned out to be exactly right
+// about what happens next — the same test segfaulted inside the same call, one method
+// over. A double that implements half of an embedded interface fails this way every time
+// the production side reaches for the other half.
+func (c *countingJS) PublishMsg(context.Context, *nats.Msg, ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	return &jetstream.PubAck{Stream: "test", Sequence: 1}, nil
 }
 
 func (c *countingJS) AccountInfo(context.Context) (*jetstream.AccountInfo, error) {
@@ -299,7 +317,7 @@ func pushWiringBroker(t *testing.T, js jetstream.JetStream) (*nats.Conn, string,
 		t.Fatal(err)
 	}
 	b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), Now: time.Now}, transfers: newTransferTracker()}
-	b.js = js
+	setBrokerJS(b, js)
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatal(err)
@@ -357,7 +375,7 @@ func TestPushHandlerRepliesTransientCodeOnStall(t *testing.T) {
 // value. The optimistic client path now lands here, so this message must be real.
 func TestPushHandlerNilJetStreamHasRealProse(t *testing.T) {
 	nc, actor, b := pushWiringBroker(t, nil)
-	b.js = nil
+	setBrokerJS(b, nil)
 
 	subj := proto.SubjCmdBy("lab", actor, "lab-1", "push")
 	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) { b.handlePushReq(nc, msg) })
@@ -407,4 +425,77 @@ func (c *countingJS) Stream(context.Context, string) (jetstream.Stream, error) {
 // its job: it announced that the code under test began calling something new.)
 func (s *stallJS) Stream(context.Context, string) (jetstream.Stream, error) {
 	return nil, jetstream.ErrStreamNotFound
+}
+
+// origin: prerelease audit broker-transfer/BT-F2.
+//
+// A CLIENT MAY NOT NAME THE BUCKET.
+//
+// Only the tier-b arm overwrote Bucket/ObjectKey, so on a tier-A push they were the
+// ctl's own strings and went straight into the tracker entry, the durable ledger and
+// the audit row. The tracker serialises per BUCKET by plain string compare with no
+// session in it, and activeOBJStreams derives the reaper's busy set from the same
+// string, so a member of session A naming session B's bucket could
+//
+//  1. make every tier-B push and pull in session B fail with too_many_in_flight,
+//  2. keep B's OBJ_xfer bucket permanently "busy" so it is never reaped or shrunk,
+//  3. write B's bucket name into A's audit and durable ledger rows.
+//
+// Driven through the real handler over real NATS on purpose: the defect was in the
+// handler's field discipline, so a unit test of the tracker would have passed
+// throughout.
+func TestATierAPushCannotNameAnotherSessionsBucket(t *testing.T) {
+	nc, actor, b := pushWiringBroker(t, &countingJS{})
+	// A tier-A push runs to completion and arms the watchdog, which parents its
+	// context on runCtx. Run sets that; this fixture stops short of Run, so the
+	// other tests in this file never reach it.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b.runCtx = ctx
+
+	subj := proto.SubjCmdBy("lab", actor, "lab-1", "push")
+	sub, err := nc.Subscribe(subj, func(msg *nats.Msg) { b.handlePushReq(nc, msg) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A perfectly ordinary tier-A push, except that it names the VICTIM's bucket.
+	payload := []byte("hello")
+	body, _ := json.Marshal(proto.PushPrepareReq{
+		TransferID: "tid-forge", Path: "note.txt", Tier: "a",
+		Size: int64(len(payload)), InlineData: payload, SHA256: "deadbeef",
+		Bucket: "xfer-victim", ObjectKey: "anything",
+	})
+	// The broker forwards a tier-A push to the AGENT carrying the ctl's own reply
+	// inbox, so the agent answers the ctl directly. There is no agent here, so the
+	// server's no-responders status comes back to us — AFTER the handler has done the
+	// part under test (validate, scrub the broker-assigned fields, take a tracker
+	// slot, arm the watchdog). Any OTHER error means the handler refused earlier than
+	// that and the assertions below would be vacuous.
+	_, rerr := nc.Request(subj, body, 30*time.Second)
+	if rerr != nil && !errors.Is(rerr, nats.ErrNoResponders) {
+		t.Fatalf("push prepare: %v", rerr)
+	}
+	if b.transfers.get("tid-forge") == nil {
+		t.Fatal("the handler refused the push before taking a tracker slot, so this test would " +
+			"prove nothing about which bucket the slot carries")
+	}
+
+	if _, busy := b.transfers.activeOBJStreams()["OBJ_xfer-victim"]; busy {
+		t.Error("a tier-A push made the victim session's bucket look BUSY.\n\n" +
+			"The orphan reaper skips busy buckets, so the victim's tier-B garbage is never " +
+			"reclaimed and the bucket is never shrunk — for as long as an attacker keeps " +
+			"re-arming it. This is the small-disk-fill class, reachable by any member of any " +
+			"other session.")
+	}
+	if e := b.transfers.get("tid-forge"); e != nil && e.bucket != "" {
+		t.Errorf("the tracker entry kept the client-supplied bucket %q.\n\n"+
+			"put() serialises per bucket by plain string compare with no session in it, so this "+
+			"entry alone makes every tier-B push and pull in the victim session fail with "+
+			"too_many_in_flight.", e.bucket)
+	}
 }

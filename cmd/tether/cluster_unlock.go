@@ -74,7 +74,14 @@ func (v lockView) live(now time.Time) bool { return v.leased && now.Before(v.exp
 // CONFIRMED unfenced must not read "nobody answered" as "no locks held".
 func probeLocks(nc *nats.Conn, actor string) (upgrade, grow lockView, responders int) {
 	upgrade.name, grow.name = "upgrade", "grow"
-	replies := probeClusterHealth(nc, actor)
+	// A probe that could not be MADE reports zero responders, which this verb already
+	// treats as "membership not confirmed unfenced" and refuses to return rc=0 for. That
+	// is the correct handling, and it is now reached for the right reason rather than by
+	// the collapse the doc comment above describes.
+	replies, err := probeClusterHealth(nc, actor)
+	if err != nil {
+		return upgrade, grow, 0
+	}
 	responders = len(replies)
 	for _, h := range replies {
 		if h.UpgradeLockActive {

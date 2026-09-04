@@ -14,6 +14,7 @@ package p3_test
 import (
 	"context"
 	"database/sql"
+	"github.com/LinZiyang666/tether/internal/session"
 	"log/slog"
 	"os"
 	"testing"
@@ -192,6 +193,29 @@ func freshIdentity(t *testing.T) *cli.Identity {
 	t.Helper()
 	id, err := cli.EnsureIdentity(t.TempDir())
 	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// admittedIdentity is freshIdentity plus admission to create sessions.
+//
+// origin: prerelease audit round 2. `session create` used to admit anybody who could
+// reach the control plane — the public internet by design — so a stranger became an
+// owner, and from there an activated member and (with the PIN they had just chosen) a
+// provisioned agent. It now requires the caller's fingerprint in session_creators, and a
+// test about session mechanics has to name the identity the operator admitted.
+//
+// Per-test on purpose: admitting everything inside the harness would switch the gate off
+// for the whole suite.
+func admittedIdentity(t *testing.T, db *sql.DB) *cli.Identity {
+	t.Helper()
+	id := freshIdentity(t)
+	fp, err := auth.FingerprintFromActor(id.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.AllowCreator(db, fp, "test", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	return id

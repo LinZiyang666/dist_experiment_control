@@ -101,8 +101,12 @@ assert_ok       "J-G.3c-4 default node ls no longer lists agt2"                 
 "$SIM" exec agt2 -- systemctl start tether-agent >/dev/null 2>&1 || true
 
 # ── J2: node ls real columns (ONLINE + int PROTO + non-empty RELEASE) ────────────────────────────────
-assert_ok "J2 node ls columns: agt1 ONLINE, PROTO int, RELEASE non-empty" \
-    sh -c "\"$SIM\" ctl -- node ls | grep -qE '^agt1[[:space:]]+ONLINE[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]'"
+# KIND (device|leased) was inserted between NODE and STATUS by 1e9d32a (2026-08-19) and this row —
+# whose whole job is to pin the REAL column layout — was never updated, so it had been unable to
+# match since. The fix ADDS the column rather than relaxing the pattern: a shape assertion that
+# tolerates the shape changing is not a shape assertion.
+assert_ok "J2 node ls columns: agt1 KIND, ONLINE, PROTO int, RELEASE non-empty" \
+    sh -c "\"$SIM\" ctl -- node ls | grep -qE '^agt1[[:space:]]+(device|leased)[[:space:]]+ONLINE[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]'"
 
 # ── J3-J7: exec (exit 0 / exact non-zero / stream / --cwd / signal→128) ──────────────────────────────
 assert_ok "J3 exec exit-0 passthrough"                                 "$SIM" ctl -- exec agt1 -- true

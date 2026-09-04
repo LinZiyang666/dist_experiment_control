@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,7 +235,7 @@ func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
 	})
 
 	// Inside the budget: protected, even with an EMPTY tracker (the restart shape).
-	atThreeMin, err := b.ledgerProtectedObjects(now.Add(3 * time.Minute))
+	atThreeMin, _, err := b.ledgerProtectedObjects(now.Add(3 * time.Minute))
 	if err != nil {
 		t.Fatalf("ledgerProtectedObjects: %v", err)
 	}
@@ -245,7 +247,7 @@ func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
 
 	// Past budget+slack: no longer protected, or a genuinely stranded object would be immortal.
 	past := now.Add(proto.XferBudget("b", proto.XferMaxBytes, proto.XferPushLegs) + xferStrandedSlack + time.Minute)
-	if got, _ := b.ledgerProtectedObjects(past); got["xfer-s1/tid-big"] {
+	if got, _, _ := b.ledgerProtectedObjects(past); got["xfer-s1/tid-big"] {
 		t.Error("an object past its own budget plus slack is still protected — real garbage would never " +
 			"be reclaimed, which is the failure this reaper exists to prevent")
 	}
@@ -261,7 +263,7 @@ func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
 	}); !ok {
 		t.Fatal("stage terminal did not persist")
 	}
-	if got, _ := b.ledgerProtectedObjects(now.Add(time.Second)); got["xfer-s1/tid-done"] {
+	if got, _, _ := b.ledgerProtectedObjects(now.Add(time.Second)); got["xfer-s1/tid-done"] {
 		t.Error("a row carrying a decided terminal still protects its object")
 	}
 }
@@ -293,8 +295,12 @@ func TestHomeReapIsNotSizeAware(t *testing.T) {
 			return true
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		// 5 args since the EXTERNAL-review B2 fix threaded the durable-ledger protection set through.
-		if !ok || sel.Sel.Name != "reapBucketObjects" || len(call.Args) != 5 {
+		// 6 args: EXTERNAL-review B2 threaded the durable-ledger protection set through, and the
+		// 2026-09-02 prerelease audit (BT-F3) added the unreadable-row set beside it. The arity is
+		// asserted rather than ignored so that a signature change forces someone to re-read THIS
+		// scanner — the self-check below turns a silent zero-match into a loud failure, which is the
+		// only reason the N15 decision it pins is still being checked at all.
+		if !ok || sel.Sel.Name != "reapBucketObjects" || len(call.Args) != 6 {
 			return true
 		}
 		flag, ok := call.Args[3].(*ast.Ident)
@@ -326,5 +332,185 @@ func TestHomeReapIsNotSizeAware(t *testing.T) {
 		t.Errorf("the CROSS-HOME GC must pass sizeAware=true (got %v) — it deletes another home's "+
 			"objects, and since the watchdog became size-derived a single global floor can no longer "+
 			"bound \"still live over there\"", sizeAware)
+	}
+}
+
+// origin: prerelease audit broker-transfer/BT-F3.
+//
+// ONE UNREADABLE ROW MUST NOT STOP RECLAMATION FOR EVERYONE, FOREVER.
+//
+// ledgerProtectedObjects used to fold "some row would not parse" into its error, and
+// reconcileXferObjects skipped the entire pass on any error. Unreadable rows are
+// PERMANENT — forEachLedgerRecord renames them to .corrupt and nothing ever deletes
+// those — so a single corrupt row, belonging to any session, disabled orphan
+// reclamation for every session for the life of the deployment. That is the
+// "small disk fills up with immortal tier-B garbage" failure this sweep exists to
+// prevent, delivered by the guard instead of by the thing it guards.
+func TestAnUnreadableLedgerRowProtectsOnlyItsOwnObject(t *testing.T) {
+	now := time.Now().UTC()
+	b := &Broker{transfers: newTransferTracker()}
+	b.cfg = Config{Logger: silentLogger(), Now: func() time.Time { return now }, ClusterDataDir: t.TempDir()}
+
+	// A healthy row, well past its budget: reapable.
+	b.writeXferInflight(&transferEntry{
+		transferID: "tid-old", sid: "s1", nid: "n1", verb: "push", tier: "b",
+		bucket: "xfer-s1", path: "/dst", size: 1024, startedAt: now.Add(-time.Hour),
+	})
+	// A row that cannot be parsed at all.
+	dir := b.xferInflightDir()
+	if err := os.WriteFile(filepath.Join(dir, xferInflightFilename("tid-corrupt")), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	protected, unresolved, err := b.ledgerProtectedObjects(now)
+	if err != nil {
+		t.Fatalf("an unreadable ROW must not be reported as a pass-level error: %v.\n\n"+
+			"The caller skips the whole sweep on an error, and this row will still be unreadable "+
+			"on every future pass, so that is a permanent shutdown of orphan reclamation.", err)
+	}
+	if len(unresolved) != 1 {
+		t.Fatalf("unresolved=%v, want exactly the one corrupt row.\n\n"+
+			"The set is what the reaper fails closed on, per object. Too few and a live object is "+
+			"deleted; too many and reclamation stalls for objects we CAN account for.", unresolved)
+	}
+	if !unresolved[xferInflightFilename("tid-corrupt")] {
+		t.Errorf("the unresolved set does not name the corrupt row: %v", unresolved)
+	}
+	if protected["xfer-s1/tid-old"] {
+		t.Error("an aged, readable row was reported protected — the corrupt row's failure leaked " +
+			"into a decision about a different object")
+	}
+}
+
+// origin: prerelease audit broker-transfer/BT-F4.
+//
+// A YOUNG PROCESS MUST NOT REAP A PREVIOUS INCARNATION'S LIVE OBJECT.
+//
+// The home reap's 2-minute grace is protected by the per-bucket busy re-read, which
+// only sees transfers THIS process started. After a restart the tracker is empty, so
+// a 2-GiB tier-B push three minutes into its 35m08s budget was deleted out from under
+// the agent reading it. The floor therefore falls back toward the ordinary grace as
+// the process ages, and is fully retired once this incarnation has been up for a whole
+// maximum budget — at which point no object can belong to an earlier one.
+//
+// Deliberately NOT size-aware: that would reopen permanent decision N15, which
+// TestHomeReapIsNotSizeAware pins in the AST, and would give a 2-GiB object a
+// ~32-minute floor in buckets sized for one max object plus margin.
+func TestTheHomeReapFloorShrinksAsTheProcessAges(t *testing.T) {
+	const grace = 2 * time.Minute
+	cases := []struct {
+		name   string
+		uptime time.Duration
+		want   time.Duration
+	}{
+		{"just booted: the full budget", 0, proto.XferTierBMaxBudget},
+		{"halfway", proto.XferTierBMaxBudget / 2, proto.XferTierBMaxBudget / 2},
+		{"one full budget of uptime: back to the ordinary grace", proto.XferTierBMaxBudget, grace},
+		{"long-running", 24 * time.Hour, grace},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := xferObjectReapFloor(grace, false, proto.XferMaxBytes, tc.uptime)
+			if got != tc.want {
+				t.Fatalf("floor=%v, want %v at uptime %v.\n\n"+
+					"Too small and a restart deletes a live object mid-transfer; too large and "+
+					"orphan garbage lingers on exactly the small-disk brokers this sweep protects.",
+					got, tc.want, tc.uptime)
+			}
+		})
+	}
+
+	// The floor must be SIZE-INDEPENDENT on this path, or N15 is reopened by accident.
+	small := xferObjectReapFloor(grace, false, 1, 0)
+	large := xferObjectReapFloor(grace, false, proto.XferMaxBytes, 0)
+	if small != large {
+		t.Errorf("the home-reap floor varies with object size (%v vs %v).\n\n"+
+			"That is exactly what permanent decision N15 forbids, and it is why the protection is "+
+			"keyed on process uptime instead.", small, large)
+	}
+
+	// The cross-home GC keeps its size-derived extension, untouched.
+	if aware := xferObjectReapFloor(grace, true, proto.XferMaxBytes, 24*time.Hour); aware <= grace {
+		t.Errorf("the cross-home floor lost its size extension: %v", aware)
+	}
+
+	// minAge<=0 is the zero-value test broker's "reap everything now" and must stay so
+	// however young the process is.
+	if now := xferObjectReapFloor(0, false, proto.XferMaxBytes, 0); now > 0 {
+		t.Errorf("a zero minAge grew a floor of %v; the prompt-reap semantics are gone", now)
+	}
+}
+
+// origin: prerelease audit broker-transfer/#57.
+//
+// THE SINGLE BROKER HAS A LEDGER. It used to have none, because the directory was
+// derived from ClusterDataDir alone and install.sh renders a production broker.yaml
+// with data_dir commented out. Two things silently followed on every single-broker
+// deployment: a restart could never finalize a stranded transfer, and the reaper's
+// protected set was always empty — which it reads as "nobody owns any of this".
+func TestTheLedgerDirectoryFallsBackToTheDatabaseDirectory(t *testing.T) {
+	if got := xferLedgerSubdir("/data/cluster", "/var/lib/tether/tether.db", "xfer-inflight"); got != "/data/cluster/xfer-inflight" {
+		t.Errorf("an explicit data_dir must win: %q", got)
+	}
+	if got := xferLedgerSubdir("", "/var/lib/tether/tether.db", "xfer-inflight"); got != "/var/lib/tether/xfer-inflight" {
+		t.Errorf("with no data_dir the ledger must fall back beside the database, got %q.\n\n"+
+			"Returning \"\" here is what switched the whole of #57 off on the deployment shape it "+
+			"was written for, while the dangling audit start row it prevents is just as permanent "+
+			"there: publishAudit writes to JetStream whenever brokerJS(b) is non-nil.", got)
+	}
+	if got := xferLedgerSubdir("", "", "xfer-inflight"); got != "" {
+		t.Errorf("with nothing durable to hang it off the answer must stay empty, got %q", got)
+	}
+}
+
+// origin: prerelease audit broker-transfer/BT-F5.
+//
+// THE TRACKER'S MEMORY BOUND HAS TO BE ENFORCED, NOT ASSERTED.
+//
+// transferTrackerMaxEntries' comment derived "~200 KiB" from 1024 entries at ~200
+// bytes each, and re-derived it during batch C as "the (unchanged) byte count". Both
+// were false: path and transfer_id arrive verbatim on the wire and were only checked
+// for non-emptiness, so one request could carry up to max_payload and the real bound
+// was 1024 * max_payload. In cluster mode each of those strings is also written to
+// disk with two fsyncs, on a handler that has no goroutine wrapper — so an oversized
+// payload is head-of-line blocking for every transfer on the broker, not just memory.
+func TestTransferRequestStringsAreBounded(t *testing.T) {
+	long := func(n int) string { return strings.Repeat("x", n) }
+	cases := []struct {
+		name              string
+		id, path, sha     string
+		wantRejectMention string // "" means the request must be ACCEPTED
+	}{
+		{name: "ordinary request", id: "01hxxxxxxxxxxxxxxxxxxxxxxx", path: "/home/u/data.bin", sha: long(64)},
+		{name: "path at the ceiling", id: "t", path: long(transferPathMaxLen), sha: ""},
+		{name: "id at the ceiling", id: long(transferIDMaxLen), path: "/x", sha: ""},
+		{name: "oversized path", id: "t", path: long(transferPathMaxLen + 1), sha: "", wantRejectMention: "path length"},
+		{name: "oversized id", id: long(transferIDMaxLen + 1), path: "/x", sha: "", wantRejectMention: "transfer_id length"},
+		{name: "oversized digest", id: "t", path: "/x", sha: long(transferSHA256MaxLen + 1), wantRejectMention: "sha256 length"},
+		// A short digest is NOT this gate's business: the receiver recomputes the
+		// digest over the delivered bytes and refuses on mismatch. Rejecting it here
+		// would invent a format contract in a place nobody would look for one.
+		{name: "short digest passes; the receiver decides", id: "t", path: "/x", sha: "deadbeef"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transferRequestBounds(tc.id, tc.path, tc.sha)
+			if tc.wantRejectMention == "" {
+				if got != "" {
+					t.Fatalf("a legitimate request was refused: %s", got)
+				}
+				return
+			}
+			if got == "" {
+				t.Fatalf("a %d-byte field was accepted.\n\n"+
+					"The tracker holds 1024 entries; unbounded strings make its memory ceiling "+
+					"1024 * max_payload instead of the ~200 KiB its own comment claims, and in "+
+					"cluster mode each one is fsynced twice on a serialized handler.",
+					max(len(tc.id), max(len(tc.path), len(tc.sha))))
+			}
+			if !strings.Contains(got, tc.wantRejectMention) {
+				t.Errorf("refusal %q does not name the offending field (%q)", got, tc.wantRejectMention)
+			}
+		})
 	}
 }

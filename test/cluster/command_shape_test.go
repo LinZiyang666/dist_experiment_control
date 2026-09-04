@@ -65,7 +65,7 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd, err = proc.PlanMarkExited(db, p.PID, 0, now)
+	cmd, err = proc.PlanMarkExited(db, p.PID, p.SID, 0, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,11 @@ func TestD2RealOpsDoNotUseStatementArgs_Review(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd, err = proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: []proc.ExitMark{{PID: p.PID, ExitCode: -1, When: now}}})
+	// SID is REQUIRED since external review B-2: markExitedSQL refuses to render an
+	// unscoped `WHERE pid=?`, which is the predicate that let one session retire another
+	// session's process. Production reconcile is per-session and always has it.
+	cmd, err = proc.PlanReconcileBatch(proc.ReconcileBatchInput{
+		SID: "lab", Marks: []proc.ExitMark{{PID: p.PID, ExitCode: -1, When: now}}})
 	if err != nil {
 		t.Fatal(err)
 	}

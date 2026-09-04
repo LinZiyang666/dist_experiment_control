@@ -12,6 +12,7 @@
 package brokermetrics
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/LinZiyang666/tether/internal/httplisten"
@@ -199,9 +200,33 @@ func Handler(snap func() Snapshot, ready func() (bool, string)) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		defer func() { _ = recover() }() // a snapshot panic must not crash the broker process
+		var panicked any
+		// A snapshot panic must not crash the broker process — but it must not be reported
+		// as a healthy scrape either.
+		//
+		// origin: prerelease audit, §3 MINOR sweep. The bare recover swallowed the panic
+		// AFTER the 200 header had been written, so Prometheus received 200 with a body
+		// that was empty or cut off mid-metric. Every alert built on those series then
+		// evaluates against "no data" instead of firing, which is the worst possible
+		// failure for a monitoring surface: it fails OPEN and looks fine.
+		//
+		// Render into a buffer first. A panic then happens BEFORE any header is written,
+		// so the handler can answer 500 — a scrape failure Prometheus reports as `up 0`.
+		var buf bytes.Buffer
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicked = r
+				}
+			}()
+			Render(&buf, snap())
+		}()
+		if panicked != nil {
+			http.Error(w, "metrics snapshot failed", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		Render(w, snap())
+		_, _ = w.Write(buf.Bytes())
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

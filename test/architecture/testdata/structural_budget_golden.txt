@@ -87,12 +87,30 @@ main-noncli-code-lines cmd/tether 1200
 # the agent-side state it needs is behind an interface. Booked as a follow-up
 # leaf, not as "someday": the next increment that touches lease adjudication
 # does it first.
-pkg-code-lines cmd/tether 10000
+# cmd/tether 10000 -> 12000 and 56 -> 57 files: prerelease audit increment 2 internal
+# review. The +1 file is whoami.go, a command `tether admin session-allow --help` already
+# told operators to run and that did not exist — in the release whose headline change is
+# that a fingerprint must be ADMITTED before it can create a session, so every fresh
+# deployment began with an instruction that does not work. It is 68 lines including its
+# doc comment.
+#
+# The line budget crossing a 2000 quantum is NOT that file. cmd/tether was already within
+# 60 lines of the boundary (this review's repo-invariants lane said so before any of these
+# edits), and the crossing is the sum of whoami.go plus the comments this round added to
+# alert_gate.go, session.go, admin.go and error_hints.go — the health probe's error
+# return, the exit-class split, the qualified-outcome output, and the reasons for each.
+# The comments are the asset; the quantum is what makes crossing it visible.
+#
+# DEBT CEILING: neither cmd/tether entry may rise again for CLI prose. The next increment
+# that adds a cmd/tether command splits the alert/cluster-drive helpers out of this
+# package first — they are the non-CLI half that the main-noncli-code-lines row above is
+# separately holding at 1200, and they are why the package is this size.
+pkg-code-lines cmd/tether 12000
 pkg-code-lines internal/agent 6000
 pkg-code-lines internal/broker 16000
 pkg-code-lines internal/cluster 2000
 pkg-code-lines internal/clusteroffline 2000
-pkg-files cmd/tether 56
+pkg-files cmd/tether 57
 pkg-files internal/broker 70
 pkg-files internal/cluster 32
 type-methods internal/agent.Agent 127

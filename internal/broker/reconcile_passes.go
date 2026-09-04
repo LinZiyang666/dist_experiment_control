@@ -10,6 +10,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/session"
 )
 
 // h1 B1 GC bounds. gcChunkRows caps the keyset baked into ONE raft entry
@@ -346,4 +347,62 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// predicates the refactor roadmap proposed would each break something. Idempotent path:
 	// cluster.PlanClusterDrainSet(node, nil), the same command AbortDrain and the retire ladder use.
 	r.register("drain-marker", b.cfg.DrainMarkerReapInterval, authorityLeader, b.reconcileDrainMarkers)
+
+	// --- the one-shot session-create admission backfill, RETRIED UNTIL IT COMMITS ---
+	//
+	// origin: prerelease audit external review M-2. The backfill also runs once in Run,
+	// and for a while that was the ONLY place it ran, on the reasoning that "a broker that
+	// boots while an election is in progress tries again on its next boot". A rolling
+	// upgrade has no next boot: it is followers-first/leader-last, so every new broker
+	// starts while the OLD leader is still serving and returns early, and the final step
+	// transfers leadership to an already-running new follower before restarting the old
+	// leader — which comes back as a follower and skips it too. Nothing was left to retry,
+	// so the marker and the rows never appeared on any node.
+	//
+	// As a PASS it is level-triggered instead: whoever holds leadership keeps answering
+	// "is this done yet?" until the marker is committed, which also covers a transient
+	// Propose failure without needing a restart. Once seeded it is a single indexed read
+	// per tick, and the latch below skips even that.
+	//
+	// Leader-only for the same reason `ports` is: the decision is leader-local and the
+	// result reaches every replica through the log, so N brokers re-deciding it would be
+	// pure amplification.
+	//
+	// Idempotent path: seedSessionCreators re-reads the marker inside the Propose closure
+	// under the leader's applyMu, and a nil command is Propose's documented no-op.
+	r.register("session-creator-seed", b.cfg.ReconcileInterval, authorityLeader,
+		func(_ context.Context, now time.Time) error { return seedCreatorsPass(b, now) })
+}
+
+// seedCreatorsPass is the body of the session-creator-seed reconcile pass.
+//
+// Extracted rather than inlined for the reason the maintidx gate exists: this block took
+// registerCoreReconcilePasses past the god-function threshold, and the gate's whole value
+// is that an eleventh god function needs a deliberate edit — so the answer is a name, not
+// a new exemption. A package-level function taking *Broker, not a method, because the
+// structural-budget ratchet pins this type's method count exactly.
+//
+// origin: prerelease audit external review M-2.
+func seedCreatorsPass(b *Broker, now time.Time) error {
+	if b.creatorsSeeded.Load() {
+		return nil
+	}
+	if seeded, err := session.CreatorsSeeded(b.read().SQL()); err == nil && seeded {
+		b.creatorsSeeded.Store(true)
+		return nil
+	}
+	n, err := seedSessionCreators(b, now)
+	if err != nil {
+		// LOG AND CONTINUE, like the node-states pass: returning the error would earn this
+		// pass exponential backoff, and the one situation it exists for — a cluster that is
+		// mid-upgrade and briefly cannot satisfy the mixed-version capability gate — is
+		// exactly when backing off is wrong.
+		b.cfg.Logger.Warn("broker: session-creator upgrade backfill", "err", err)
+		return nil
+	}
+	if n > 0 {
+		b.cfg.Logger.Info("broker: grandfathered existing session owners into the "+
+			"session-create allow-list", "count", n)
+	}
+	return nil
 }

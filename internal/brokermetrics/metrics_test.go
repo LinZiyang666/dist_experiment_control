@@ -135,3 +135,45 @@ func TestEscapeLabel(t *testing.T) {
 		t.Errorf("escapeLabel = %q, want %q", got, `a\\b\"c\nd`)
 	}
 }
+
+// origin: prerelease audit round 2, CC-2.
+//
+// A METRICS HANDLER THAT PANICS MUST FAIL THE SCRAPE, NOT REPORT SUCCESS.
+//
+// The §3 MINOR sweep changed this from a bare recover — which swallowed the panic AFTER
+// the 200 header had been written, so Prometheus got 200 with an empty or truncated body
+// — to render-into-a-buffer-then-answer. Nothing tested it. That matters more than the
+// usual missing-test case: the failure mode it fixes is a monitoring surface failing
+// OPEN. Every alert built on these series evaluates against "no data" and stays quiet,
+// which looks exactly like a healthy fleet.
+func TestAPanickingSnapshotFailsTheScrapeInsteadOfReturning200(t *testing.T) {
+	h := Handler(func() Snapshot { panic("snapshot exploded") }, func() (bool, string) { return true, "" })
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("a panicking snapshot answered %d, want 500.\n\n"+
+			"Prometheus reads any 2xx as a successful scrape, so an empty or truncated body "+
+			"becomes 'no data' rather than `up 0` — and every alert built on these series stops "+
+			"firing while the fleet looks fine.", rec.Code)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "tether_") {
+		t.Errorf("the 500 body carries partial metrics (%q); a scrape must be all or nothing", body)
+	}
+}
+
+// origin: prerelease audit round 2, CC-2.
+//
+// The positive control, without which the assertion above is satisfied by a handler that
+// 500s unconditionally.
+func TestAHealthySnapshotStillScrapes(t *testing.T) {
+	h := Handler(func() Snapshot { return Snapshot{} }, func() (bool, string) { return true, "" })
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a healthy scrape answered %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "tether_") {
+		t.Fatalf("a healthy scrape returned no tether_ series:\n%s", rec.Body.String())
+	}
+}

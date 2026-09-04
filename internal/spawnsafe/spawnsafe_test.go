@@ -1299,8 +1299,8 @@ func TestMountHealthy_reArmReplacesGenerationPointer(t *testing.T) {
 // entered at all.
 func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 	before := runtime.NumGoroutine()
-	f := newStaleFixture(t, time.Hour, 2*time.Millisecond)
-	slow := make(chan bool, 512)
+	f := newStaleFixture(t, time.Hour, 20*time.Millisecond)
+	slow := make(chan bool)
 	f.probe.setBlocking(staleMount, slow)
 	// The feeder OWNS slow, including its close: having the deferred cleanup close it
 	// too raced with an in-flight send (found by -race on the first run).
@@ -1312,6 +1312,12 @@ func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 			select {
 			case <-feeding:
 				close(slow) // release any probe still parked, with ok=false
+				return
+			case <-time.After(250 * time.Microsecond):
+			}
+			select {
+			case <-feeding:
+				close(slow)
 				return
 			case slow <- true:
 			}
@@ -1334,9 +1340,23 @@ func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				f.policy.InvalidateHealthy()
-				atomic.AddInt64(&rearms, 1)
 			}
+
+			// Count real generation replacements, not calls that happened while
+			// the only live generation was still unprobed. A healthy generation
+			// cannot change until this goroutine invalidates it (the fake clock is
+			// fixed and every probe returns true), so the check and call form a
+			// reliable test handshake without adding a production-only hook.
+			f.policy.mu.Lock()
+			h := f.policy.health[staleMount]
+			healthy := h != nil && h.state == stHealthy
+			f.policy.mu.Unlock()
+			if !healthy {
+				runtime.Gosched()
+				continue
+			}
+			f.policy.InvalidateHealthy()
+			atomic.AddInt64(&rearms, 1)
 		}
 	}()
 	for i := 0; i < 16; i++ {
@@ -1352,17 +1372,17 @@ func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 	close(stop)
 	invalidator.Wait()
 
-	if n := atomic.LoadInt64(&rearms); n < 100 {
-		t.Fatalf("only %d invalidation passes ran against 3200 consults — there was no churn "+
+	if n := atomic.LoadInt64(&rearms); n < 5 {
+		t.Fatalf("only %d healthy generations were re-armed against 3200 consults — there was no churn "+
 			"to survive, so a pass here proves nothing", n)
 	}
-	// Counting CALLS is not enough: a no-op invalidateHealthy still increments that
-	// counter, which is how this test stayed green with the whole function neutered.
-	// Probes are the observable proof that generations were really replaced — a mount
-	// that is never re-armed is probed exactly once, for its whole life.
-	if c := f.probe.count(staleMount); c < 5 {
-		t.Fatalf("mount was probed %d times across %d invalidation passes: the passes did not "+
-			"actually re-arm anything, so this test is not exercising re-arm at all", c, atomic.LoadInt64(&rearms))
+	// Probes are the observable proof that those generations were really replaced. At
+	// most the final re-arm can be left without a following consult, so the initial
+	// probe plus the completed re-arms must keep the count at least this high. This
+	// also makes replacing InvalidateHealthy with a no-op fail loudly.
+	if n, c := atomic.LoadInt64(&rearms), int64(f.probe.count(staleMount)); c < n {
+		t.Fatalf("mount was probed %d times across %d real re-arms: generation replacement "+
+			"did not drive a fresh probe", c, n)
 	}
 	// A healthy mount must never end up stuck dead just because generations were
 	// churning underneath the launchers.

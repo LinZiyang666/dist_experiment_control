@@ -27,9 +27,8 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	// External-review B2: take a cluster-scoped roll lock (idempotent UPSERT in replicated cluster_meta) so a
 	// concurrent `cluster join`/`cluster retire` cannot cross the rolling restart. The marker is replicated
 	// state, so it survives the leadership transfers the roll itself triggers. We release it ONLY on clean
-	// completion — a HALT/cancel deliberately LEAVES it held so membership stays blocked while the cluster
-	// sits in a partial-roll state; a re-run (forward OR rollback) re-acquires (UPSERT) and eventually
-	// releases, so the lock self-heals via the documented "fix and re-run" recovery.
+	// completion — a HALT/cancel deliberately LEAVES the MARKER held so membership stays blocked while the
+	// cluster sits in a partial-roll state.
 	//
 	// R7b: the lock is now LEASED. The paragraph above described a lock that a HALT left held forever —
 	// "fix and re-run" is only a self-heal while `plan.Upgrades() > 0`, and back then an agentless host had
@@ -40,6 +39,15 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	// renewing for as long as it is driving, and when it stops (HALT, kill -9, snapped SSH) the reaper
 	// on the leader releases the lock
 	// within one reap interval after LockLeaseTTL. `tether cluster unlock` is the impatient operator's out.
+	//
+	// WHAT A RE-RUN ACTUALLY MEETS — origin: prerelease audit round 2, H-2. The first
+	// paragraph above used to end "a re-run re-acquires (UPSERT) and eventually releases, so
+	// the lock self-heals via the documented fix-and-re-run recovery", and that stopped being
+	// true when L3-F3 made the acquire refuse a marker it does not own: a re-run was then
+	// REFUSED, for LockLeaseTTL plus a reap interval, with a message telling the operator to
+	// re-run. The acquire is lease-aware now, and the deferred expire below hands the lease
+	// back the moment this process gives up — so the re-run really is admitted immediately,
+	// and so is the emergency `--to-version <older>` rollback.
 	{
 		leader, lerr := currentLeader(ctx, nc, actor)
 		if lerr != nil {
@@ -57,7 +65,28 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	// path on which the operator walks away and the lock must decay on its own.
 	keeper := startLockKeeper(ctx, "upgrade", upgradeLeaseRenewInterval,
 		func(rctx context.Context) (bool, error) { return renewUpgradeLease(rctx, nc, actor, seed) }, out)
-	defer keeper.Stop()
+	// SAY SO ON THE WAY OUT. origin: prerelease audit round 2, H-2.
+	//
+	// Stopping the renewals is what eventually expires the lease, but "eventually"
+	// is LockLeaseTTL — 15 minutes during which the re-run this function's own HALT
+	// message instructs the operator to perform was REFUSED, and so was the
+	// emergency rollback. An orchestrator that is walking away can simply say so,
+	// and then the next roll is admitted at once.
+	//
+	// The MARKER is untouched: membership stays fenced across the partial roll.
+	// Only the roll-versus-roll exclusion is given up, which is the one this
+	// process is no longer entitled to hold.
+	//
+	// Best-effort and idempotent — a pre-existing broker answers "unknown op" and
+	// the lease simply times out as it did before. `released` is set on the clean
+	// path, where the whole lock is dropped and there is nothing left to expire.
+	released := false
+	defer func() {
+		keeper.Stop()
+		if !released {
+			expireUpgradeLockLease(ctx, nc, actor, seed, out)
+		}
+	}()
 
 	canaryChecked := false
 	for _, s := range plan.Steps {
@@ -104,7 +133,11 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 		// broker-only halfway through its own step.
 		if s.BrokerOnly {
 			_, _ = fmt.Fprintf(out, "  (no co-located agent on %s — broker-only host, nothing else to re-exec)\n", s.NodeID)
-		} else if av, ok := agentVersionOf(ctx, nc, actor, sid, s.NodeID); ok && av == toVersion {
+			// SameRelease — origin: prerelease audit round 2, K-F3. waitAgentVersion 200
+			// lines below was converted and this was not, so the comment above claiming the
+			// re-run is idempotent was false for a v-prefixed --to-version: the skip never
+			// fired and every re-run re-execed every agent.
+		} else if av, ok := agentVersionOf(ctx, nc, actor, sid, s.NodeID); ok && proto.SameRelease(av, toVersion) {
 			_, _ = fmt.Fprintf(out, "  (agent already at %s)\n", toVersion)
 		} else {
 			_, _ = fmt.Fprintf(out, "→ re-exec %s's co-located agent into %s\n", s.NodeID, toVersion)
@@ -144,6 +177,7 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	if err := waitHomesConverged(ctx, nc, actor, seed, out); err != nil {
 		keeper.Stop()
 		releaseUpgradeLock(ctx, nc, actor, seed, out)
+		released = true
 		notifyUpgrade(webhook, "halt", map[string]any{"to_version": toVersion, "error": err.Error()})
 		return err
 	}
@@ -153,6 +187,7 @@ func driveUpgrade(cmd *cobra.Command, nc *nats.Conn, actor, sid string, seed []b
 	keeper.Stop()
 	// External-review B2: clean completion → release the cluster-scoped roll lock so membership resumes.
 	releaseUpgradeLock(ctx, nc, actor, seed, out)
+	released = true
 	// R7b: a roll that lost its lock partway through was NOT serialized against other membership changes,
 	// even though every host reached the target. That is not an rc=0 outcome.
 	if keeper.Lost() {
@@ -223,12 +258,39 @@ func releaseUpgradeLock(ctx context.Context, nc *nats.Conn, actor string, seed [
 
 func haltUpgrade(webhook, node string, err error) error {
 	notifyUpgrade(webhook, "halt", map[string]any{"node": node, "error": err.Error()})
-	return unavailErr("cluster upgrade HALTED at %s: %v (the cluster is left in a safe partial state; fix and re-run to resume)", node, err)
+	// "fix and re-run to resume" is a PROMISE, and round 2 (H-2) found it had been
+	// false since the acquire started refusing a marker it does not own. It is
+	// true again — driveUpgrade hands the lock's lease back on every exit path
+	// that did not release it outright — so the wording stays.
+	return unavailErr("cluster upgrade HALTED at %s: %v (the cluster is left in a safe partial state; "+
+		"membership changes stay fenced until a roll completes; fix and re-run to resume)", node, err)
+}
+
+// expireUpgradeLockLease tells the leader this orchestrator has stopped driving,
+// WITHOUT releasing the lock. origin: prerelease audit round 2, H-2.
+//
+// Best-effort by construction and silent on the happy path: the only thing it
+// buys is not waiting out LockLeaseTTL, and every failure mode — no leader, an
+// older broker that does not know the op — degrades to exactly the pre-H-2
+// behaviour. It is deliberately NOT reported as a warning: an operator reading a
+// HALT does not need a second scary line about an optimisation that did not fire.
+func expireUpgradeLockLease(ctx context.Context, nc *nats.Conn, actor string, seed []byte, out io.Writer) {
+	leader, err := currentLeader(ctx, nc, actor)
+	if err != nil {
+		return
+	}
+	resp, err := sendUpgradeTrigger(ctx, nc, actor, seed,
+		&proto.ClusterUpgradeReq{Op: "expire-lock-lease", TargetNode: leader})
+	if err != nil || resp == nil || !resp.OK {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "  upgrade lock lease handed back — a re-run (or a rollback) can start immediately; "+
+		"`cluster join`/`cluster retire` stay fenced until a roll completes.\n")
 }
 
 // currentLeader re-resolves the writable leader from a fresh health probe.
 func currentLeader(ctx context.Context, nc *nats.Conn, actor string) (string, error) {
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
 		if h.WritableLeaderConfirmed && h.NodeID != "" {
 			return h.NodeID, nil
 		}
@@ -254,7 +316,7 @@ func waitVersion(ctx context.Context, nc *nats.Conn, actor, node, version string
 		var leaderApplied, nodeApplied uint64
 		var nodeVer string
 		var haveLeader, haveNode, nodeVoter, nodeStale bool
-		for _, h := range probeClusterHealth(nc, actor) {
+		for _, h := range probeClusterHealthAdvisory(nc, actor) {
 			if h.WritableLeaderConfirmed && h.AppliedIndex >= leaderApplied {
 				leaderApplied, haveLeader = h.AppliedIndex, true
 			}
@@ -268,7 +330,7 @@ func waitVersion(ctx context.Context, nc *nats.Conn, actor, node, version string
 		// it done would dip quorum when the NEXT voter restarts. (Stream-replica readiness is not in the
 		// health reply; it is a documented follow-up — the applied-lag + voter + reachable gate is the
 		// achievable-over-NATS subset of the plan's barrier.)
-		if !haveNode || nodeVer != version || !nodeVoter || nodeStale {
+		if !haveNode || !proto.SameRelease(nodeVer, version) || !nodeVoter || nodeStale {
 			return false
 		}
 		return haveLeader && leaderApplied <= nodeApplied+maxAppliedLag
@@ -280,7 +342,7 @@ func waitVersion(ctx context.Context, nc *nats.Conn, actor, node, version string
 // agent's ReleaseVersion. Returns ("", false) if the agent is not (yet) visible.
 func agentVersionOf(ctx context.Context, nc *nats.Conn, actor, sid, brokerNode string) (string, bool) {
 	agentNID := brokerNode
-	for _, h := range probeClusterHealth(nc, actor) {
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
 		if h.NodeID == brokerNode && h.ColocatedAgentNID != "" {
 			agentNID = h.ColocatedAgentNID
 			break
@@ -309,7 +371,8 @@ func agentVersionOf(ctx context.Context, nc *nats.Conn, actor, sid, brokerNode s
 func waitAgentVersion(ctx context.Context, nc *nats.Conn, actor, sid, brokerNode, version string) error {
 	return pollUntil(ctx, upgradeConvergeTimeout, func() bool {
 		v, ok := agentVersionOf(ctx, nc, actor, sid, brokerNode)
-		return ok && v == version
+		// proto.SameRelease: the two ends disagree on the leading "v" (goreleaser stamps it, a source build does not), and this is a CONFIRMATION check — a false negative reports a successful upgrade as unconfirmed (prerelease audit DRD-F2/F3).
+		return ok && proto.SameRelease(v, version)
 	}, fmt.Sprintf("%s's co-located agent did not re-register at %s within %s", brokerNode, version, upgradeConvergeTimeout))
 }
 
@@ -317,7 +380,16 @@ func waitAgentVersion(ctx context.Context, nc *nats.Conn, actor, sid, brokerNode
 // version than an un-upgraded voter — a commandVersion bump POISONs the log per-replica, so it must be a
 // flag-day reinstall, never a rolling upgrade.
 func canaryCommandVerCheck(ctx context.Context, nc *nats.Conn, actor, canary string, out io.Writer) error {
-	replies := probeClusterHealth(nc, actor)
+	replies, err := probeClusterHealth(nc, actor)
+	if err != nil {
+		// HALT rather than "don't false-halt". The `return nil` below is justified by
+		// "the canary is not visible this instant, and the converge wait already gated
+		// version" — reasoning that assumes the probe WORKED and simply found nothing.
+		// A probe that could not be made supports no such conclusion, and what this
+		// function guards is a command-version mismatch that poisons the raft log
+		// per-replica. origin: increment 2 internal review, pairing-sweep/IMPACT-F1.
+		return fmt.Errorf("canary command-version check: could not ask the cluster: %w", err)
+	}
 	var canaryCmd int
 	found := false
 	for _, h := range replies {

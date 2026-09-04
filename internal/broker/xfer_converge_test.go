@@ -120,7 +120,7 @@ const gib = int64(1024 * 1024 * 1024)
 func convergeBroker(js jetstream.JetStream) *Broker {
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg.Logger = silentLogger()
-	b.js = js
+	setBrokerJS(b, js)
 	return b
 }
 
@@ -511,7 +511,7 @@ func TestConvergenceIsInertWithoutATracker(t *testing.T) {
 	js := &convergeJS{maxStore: uint64(9 * gib), reserved: uint64(10 * gib), existing: streamInfo(8*gib, 0)}
 	b := &Broker{} // no tracker, no logger
 	b.cfg.Logger = silentLogger()
-	b.js = js
+	setBrokerJS(b, js)
 
 	if _, _, err := ensureXferBucketSizedWithLimit(context.Background(), b, "lab", 1, 2*gib); err != nil {
 		t.Fatalf("ensure returned %v", err)

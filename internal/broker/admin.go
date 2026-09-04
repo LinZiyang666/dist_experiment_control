@@ -27,7 +27,7 @@ import (
 // cleanup) and matches `tether history -n N` semantics: "the most
 // recent N regardless of subject filter".
 func (b *Broker) adminAuditTail(ctx context.Context, sid string, n int) ([]adminsock.AuditEntry, error) {
-	if b.js == nil {
+	if brokerJS(b) == nil {
 		return nil, fmt.Errorf("history_unavailable: broker has no JetStream")
 	}
 	if n <= 0 {
@@ -38,7 +38,7 @@ func (b *Broker) adminAuditTail(ctx context.Context, sid string, n int) ([]admin
 	}
 
 	streamName := jsstream.HistoryStreamName(sid)
-	stream, err := b.js.Stream(ctx, streamName)
+	stream, err := brokerJS(b).Stream(ctx, streamName)
 	if err != nil {
 		return nil, fmt.Errorf("history_unavailable: %w", err)
 	}
@@ -118,7 +118,7 @@ const adminTailMaxN = eventsMaxScan
 // tail. Truncation is NOT an error (a partial answer with a marker beats breaking every busy-stream
 // script), so err stays nil in the truncated case.
 func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration, kind string) ([]adminsock.AuditEntry, bool, error) {
-	if b.js == nil {
+	if brokerJS(b) == nil {
 		return nil, false, fmt.Errorf("events_unavailable: broker has no JetStream")
 	}
 	if n <= 0 {
@@ -128,7 +128,7 @@ func (b *Broker) adminEventsTail(ctx context.Context, n int, since time.Duration
 		n = adminTailMaxN // L1: clamp before `make([]…, 0, n)` — an operator typo must not size the alloc
 	}
 
-	stream, err := b.js.Stream(ctx, jsstream.EventsStreamName)
+	stream, err := brokerJS(b).Stream(ctx, jsstream.EventsStreamName)
 	if err != nil {
 		return nil, false, fmt.Errorf("events_unavailable: %w", err)
 	}

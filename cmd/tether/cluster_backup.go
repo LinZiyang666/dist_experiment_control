@@ -273,7 +273,9 @@ func printRestoreNextSteps(cmd *cobra.Command, res *clusteroffline.RestoreResult
 				"     JetStream store_dir), so it CANNOT run yet. FIRST create the base conf:\n"+
 				"       a. restore it from your config backup, or write the minimal stock conf (host/port +\n"+
 				"          jetstream.store_dir + websocket — the one scripts/install.sh renders).\n"+
-				"          Do NOT re-run install.sh now: it OVERWRITES broker.yaml AND nats.conf and removes the\n"+
+				"          A bare re-run of install.sh is safe as of this release — it KEEPS an existing\n"+
+				"          broker.yaml and nats.conf and writes the new content beside them as <file>.new.\n"+
+				"          Do NOT pass --force-config here: that overwrites both and removes the\n"+
 				"          broker.cluster seam this restore just applied.\n"+
 				"       b. THEN render this node's lone-voter conf:\n", natsConfPath)
 		}

@@ -62,7 +62,7 @@ func (b *blockingJS) observed() []time.Duration {
 func newProvisionBroker(js jetstream.JetStream) *Broker {
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
-	b.js = js
+	setBrokerJS(b, js)
 	return b
 }
 

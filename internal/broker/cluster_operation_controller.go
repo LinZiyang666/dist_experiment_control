@@ -925,12 +925,13 @@ func (a *ClusterAdmin) commandDomainDBBytes() (int64, error) {
 // re-issuing the side-effect every tick forever (C4-M8). The counter is leader-local (reset on a
 // leadership change is fine — the new leader re-counts from 0).
 func (a *ClusterAdmin) blockAfterAttempts(op *cluster.Operation, what string, stepErr error) {
+	key := opAttemptKey{opID: op.OpID, step: what}
 	a.opAttemptsMu.Lock()
 	if a.opAttempts == nil {
-		a.opAttempts = map[string]int{}
+		a.opAttempts = map[opAttemptKey]int{}
 	}
-	a.opAttempts[op.OpID]++
-	n := a.opAttempts[op.OpID]
+	a.opAttempts[key]++
+	n := a.opAttempts[key]
 	a.opAttemptsMu.Unlock()
 	if n >= opMaxAttempts {
 		_ = a.transition(op, cluster.OpStateBlocked, false,
@@ -940,9 +941,73 @@ func (a *ClusterAdmin) blockAfterAttempts(op *cluster.Operation, what string, st
 	a.recordOpError(op, fmt.Errorf("%s (attempt %d/%d): %w", what, n, opMaxAttempts, stepErr))
 }
 
+// blockNow routes an op straight to BLOCKED without spending attempts.
+//
+// origin: prerelease audit broker-cluster-ops/L-BCO-F1, verifier correction (2). Some
+// step failures are DETERMINISTIC TERMINAL STATES, not transient ones: a rebuild-OFF
+// expose row does not disappear because we asked again, and a second eligible VOTER
+// does not grow because we waited. Running those through blockAfterAttempts means five
+// pointless re-issues of a side effect that cannot succeed before the operator is told
+// anything actionable. Blocking immediately, with the error verbatim, is both faster and
+// more honest.
+//
+// The cost is SMALL in wall-clock and that is not the argument: the controller ticks
+// every observeTickInterval (5s), so opMaxAttempts is about 25 seconds, not the "fifty
+// minutes" an earlier version of this comment asserted (round 2, G-4). The argument is
+// that re-issuing a side effect whose outcome cannot change is noise in the op's
+// last_error and delay in front of a human.
+// A package-level function taking *ClusterAdmin, not a method: the structural-budget
+// ratchet pins this type's method count exactly, and it caught both of these on the
+// way in.
+func blockNow(a *ClusterAdmin, op *cluster.Operation, what string, stepErr error) {
+	_ = a.transition(op, cluster.OpStateBlocked, false,
+		fmt.Sprintf("%s: %v — this will not change on its own; fix it, then `cluster ops confirm %s` to retry or `cluster ops abort %s`",
+			what, stepErr, op.OpID, op.OpID), nil)
+}
+
+// retireStepFailed is the ONE routing decision for every step failure inside
+// driveRetire.
+//
+// origin: prerelease audit broker-cluster-ops/L-BCO-F1. Eight sites in driveRetire
+// called recordOpError and returned. recordOpError is non-terminal FOREVER and does
+// not touch the attempt counter, so any of them could hold the whole membership plane
+// (assertNoActiveOp fences every other cluster operation behind the in-flight one)
+// with nothing but a last_error line to show for it. driveJoin's AddVoter had been
+// bounded for exactly this reason; its mirror image here, RemoveServer, had not — and
+// RemoveServer is the irreversible one.
+//
+// Deterministic causes block at once; everything else gets opMaxAttempts and then
+// BLOCKED, which is a NONZERO terminal that `cluster retire --wait` reports and
+// `cluster ops confirm/abort` can act on.
+func retireStepFailed(a *ClusterAdmin, op *cluster.Operation, what string, stepErr error) {
+	var rebuildOff *ErrRebuildOffExposes
+	if errors.As(stepErr, &rebuildOff) || errors.Is(stepErr, ErrNoMigrationTarget) {
+		blockNow(a, op, what, stepErr)
+		return
+	}
+	a.blockAfterAttempts(op, what, stepErr)
+}
+
+// opAttemptKey identifies ONE step of ONE operation. origin: prerelease audit round 2,
+// G-5 — see the field's doc in clusteradmin.go for why the step has to be part of it.
+//
+// `step` is the same `what` string blockAfterAttempts already puts in the operator-facing
+// message, so the counter and the message can never disagree about which step is failing.
+type opAttemptKey struct {
+	opID string
+	step string
+}
+
+// clearOpAttempts forgets EVERY step's counter for one operation — the op has made
+// progress an operator confirmed, or reached a terminal state, so nothing it accumulated
+// is "consecutive" any more.
 func (a *ClusterAdmin) clearOpAttempts(opID string) {
 	a.opAttemptsMu.Lock()
-	delete(a.opAttempts, opID)
+	for k := range a.opAttempts {
+		if k.opID == opID {
+			delete(a.opAttempts, k)
+		}
+	}
 	a.opAttemptsMu.Unlock()
 }
 
@@ -963,7 +1028,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 			d := a.now().Add(opCatchupTimeout)
 			return cluster.PlanClusterDrainSet(op.TargetNode, &d)
 		}); err != nil {
-			a.recordOpError(op, fmt.Errorf("raise broker_draining: %w", err))
+			retireStepFailed(a, op, "raise broker_draining", err)
 			return
 		}
 		_ = a.transition(op, cluster.OpStateRehomeExposes, false, "", nil)
@@ -973,7 +1038,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		// reads the DURABLE convergence set, because migrateExposes' list self-destructs on
 		// the second tick (see pendingRetireConvergence / CRIT-1).
 		if err := a.migrateExposes(op.TargetNode); err != nil {
-			a.recordOpError(op, fmt.Errorf("migrate exposes: %w", err)) // rebuild-OFF refusal surfaces here, loud
+			retireStepFailed(a, op, "migrate exposes", err) // a rebuild-OFF refusal blocks at once, loud
 			return
 		}
 		// R8a P1 — the retire verb's rc-semantics gate. `cluster retire` is the
@@ -1007,7 +1072,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		since, _ := parseClusterTime(op.CreatedAt)
 		pending, perr := a.pendingRetireConvergence(op.TargetNode, since)
 		if perr != nil {
-			a.recordOpError(op, fmt.Errorf("check data-plane convergence: %w", perr))
+			retireStepFailed(a, op, "check data-plane convergence", perr)
 			return
 		}
 		if len(pending) > 0 {
@@ -1025,7 +1090,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		}
 		if sub.phase == phaseVoter {
 			if err := a.setPhase(op.TargetNode, phaseDraining, []string{phaseVoter}, ""); err != nil {
-				a.recordOpError(op, fmt.Errorf("phase->DRAINING: %w", err))
+				retireStepFailed(a, op, "phase->DRAINING", err)
 				return
 			}
 		}
@@ -1040,7 +1105,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		// unverifiable stream posture is the one outcome this gate exists to stop.
 		ready, err := a.streamsReady(op.TargetNode)
 		if err != nil {
-			a.recordOpError(op, fmt.Errorf("stream readiness: %w", err))
+			retireStepFailed(a, op, "stream readiness", err)
 			return
 		}
 		if !ready {
@@ -1059,7 +1124,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 				return
 			}
 			if err := a.transferLeadershipOff(op.TargetNode); err != nil {
-				a.recordOpError(op, fmt.Errorf("transfer leadership off: %w", err))
+				retireStepFailed(a, op, "transfer leadership off", err)
 				return
 			}
 			// We just shed leadership; the NEW leader's controller resumes from here.
@@ -1088,13 +1153,13 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 		}
 		if sub.phase == phaseDraining {
 			if err := a.setPhase(op.TargetNode, phaseRetiring, []string{phaseDraining}, ""); err != nil {
-				a.recordOpError(op, fmt.Errorf("phase->RETIRING: %w", err))
+				retireStepFailed(a, op, "phase->RETIRING", err)
 				return
 			}
 		}
 		if sub.inRaft {
 			if err := a.node.RemoveServer(op.TargetNode); err != nil {
-				a.recordOpError(op, fmt.Errorf("raft RemoveServer: %w", err))
+				retireStepFailed(a, op, "raft RemoveServer", err)
 				return
 			}
 		}
@@ -1102,7 +1167,7 @@ func (a *ClusterAdmin) driveRetire(op *cluster.Operation, sub substrate) {
 			if err := a.node.Propose(func(*sql.DB) (*cluster.Command, error) {
 				return cluster.PlanClusterNodeRemove(op.TargetNode, a.now())
 			}); err != nil {
-				a.recordOpError(op, fmt.Errorf("roster delete: %w", err))
+				retireStepFailed(a, op, "roster delete", err)
 				return
 			}
 		}

@@ -410,3 +410,38 @@ cannot provide: remote upgrade is now refused for both the leased row and its ba
 family exists. The drill checks both refusals with the stable `clone_family_upgrade_unsupported` code,
 before any artifact download. Expected verdict is therefore GREEN; the supported upgrade path for a
 clone family is rebuilding the source image and restarting its instances.
+
+## 2026-09-03 — 六条「HEAD 就红」的登记表过期项（发布前审计 deploy-tier 复跑）
+
+**这一节故意不改 `expected-verdicts.tsv`。** 下面六条在跑全量 sweep 时偏离登记表，经 HEAD 基线
+复跑证实**在增量 2 之前就已经是红的**——即它们是**登记表过期**，不是回归。表上次校准是 2026-08-19
+的 `cloned-credential-instances` 批次，此后没有人跑过全量。
+
+| drill | 现状 | HEAD 基线 | 首个失败 |
+|---|---|---|---|
+| `30-rolling-upgrade` | ASSERT-FAIL | ASSERT-FAIL | PHASE-1 CONTINUITY（写探针命中失败签名） |
+| `52-credential-rotation` | ASSERT-FAIL | ASSERT-FAIL | A8d broker slog 的 pin-mismatch 拒绝行 |
+| `60-user-journey` | ASSERT-FAIL | ASSERT-FAIL | J-G.3c-2 首次 post-login `node ls -a` |
+| `67-transient-js-refusal` | INFRA-ABORT | INFRA-ABORT | （abort，无 verdict 行） |
+| `81-admin-evict-session-rm` | ASSERT-FAIL | ASSERT-FAIL | B3 重连被拒但**不是**期望的那个理由 |
+| `94-agent-reconcile` | ASSERT-FAIL | ASSERT-FAIL | B3-timeout 孤儿进程未被 KILL |
+
+**为什么不把 `expected` 改成 ASSERT-FAIL 让表变干净**：那等于把六个**未经分诊**的红永久祝福掉。
+一条登记为 expected 的红就不再是信号——它连偏离都不算，下一个人看到的是一片安静。simcluster 的
+Mandate 是「如实暴露缺陷，绝不替 tether 弥补」，把红写进期望正是最省事的那种弥补。所以它们继续
+以 DEVIATION 的形式响着，直到有人真的去分诊。
+
+**分诊时的两条已知线索**（本轮顺手取到的，不构成结论）：
+
+- `81` 的 agent 打印了正常启动横幅后 rc=70 退出，stdout 里**没有**认证拒绝——它的 slog 落在
+  log sink 文件（`~/.tether/agent/<sid>/agent.log`）里，而 drill grep 的是 stdout。
+  若属实，这是 drill 的取证面问题而非产品问题。
+- `30` 的 PHASE-1 命中已由 watcher 抓到 scene：命中瞬间 **leader 未换届、HEALTHY-HA、三节点全
+  VOTER、LAG=0、TOPO 收敛**——不符合 gotcha #66 的 leader-hop 机理，是 #66 条目里外审样本 #4
+  记的那个**已登记未定性**的 phase-1 形态。**scene 记了失败行的行号却没记内容**
+  （`first failure-signature line: 14:WRITEFAIL`），而探针日志随容器销毁——
+  这正是该形态被反复目击却始终无法定性的原因，watcher 的取证面值得补。
+
+**方法论**（值得记住的那一条）：**过期的登记表长得跟回归一模一样**。区分二者的唯一办法是拿基线
+commit 建 git worktree、用基线源码烘镜像、跑基线的 drill——不能靠读表，也不能靠推理改动面。
+本轮正是这么把 8 条偏离拆成「6 条过期 + 2 条真回归」的。

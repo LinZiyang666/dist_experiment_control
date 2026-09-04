@@ -59,7 +59,8 @@ func callSessionRm(t *testing.T, nc *nats.Conn, actor, sid string) proto.Session
 func TestSessionFullLifecycle(t *testing.T) {
 	url := startNATS(t)
 	db := openDB(t)
-	pub, _ := freshUserPub(t)
+	pub, fp := freshUserPub(t)
+	admitCreator(t, db, fp)
 
 	defer startBroker(t, url, db)()
 
@@ -126,7 +127,8 @@ func TestSessionFullLifecycle(t *testing.T) {
 func TestSessionCreateDuplicateNameFails(t *testing.T) {
 	url := startNATS(t)
 	db := openDB(t)
-	pub, _ := freshUserPub(t)
+	pub, fp := freshUserPub(t)
+	admitCreator(t, db, fp)
 
 	defer startBroker(t, url, db)()
 
@@ -151,8 +153,10 @@ func TestSessionCreateDuplicateNameFails(t *testing.T) {
 func TestSessionRmThenRecreateSameSID(t *testing.T) {
 	url := startNATS(t)
 	db := openDB(t)
-	ownerA, _ := freshUserPub(t)
-	ownerB, _ := freshUserPub(t)
+	ownerA, fpA := freshUserPub(t)
+	ownerB, fpB := freshUserPub(t)
+	admitCreator(t, db, fpA)
+	admitCreator(t, db, fpB)
 
 	defer startBroker(t, url, db)()
 	nc := connect(t, url)
@@ -254,6 +258,7 @@ func TestSessionListIncludesDeletingState(t *testing.T) {
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
+	admitCreator(t, db, fp)
 
 	seedSession(t, db, "alive", fp)
 	seedSession(t, db, "doomed", fp)

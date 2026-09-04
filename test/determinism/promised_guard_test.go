@@ -381,10 +381,19 @@ func TestNotAPromiseMarkersAreBoundedAndHonest(t *testing.T) {
 		}
 	}
 
-	// The cap. 9 today: 3 in layering_test.go's prose, 5 synthetic controls in test_naming_test.go, and 1
+	// The cap. 10 today: 3 in layering_test.go's prose, 5 synthetic controls in test_naming_test.go, 1
 	// in legacyMissingGuards above (the Y3 promise's identifier, written out at last — that comment had
 	// twice ended in "the identifier is deliberately not written here", a note about a name with the name
-	// withheld).
+	// withheld), and 1 in internal/proc/exit_session_fence_test.go.
+	//
+	// THE TENTH, and why it earns its place rather than dodging a promise. External review B-2 inverted
+	// a test that had asserted the vulnerability as a requirement, which necessarily renamed it. Its doc
+	// now explains what the old assertion was and why its premise was wrong — and that explanation is
+	// worth nothing to someone who arrives holding the OLD name, from a frozen review report or a stale
+	// `git log -S`, unless the old name is written here to be grepped. This is the case the paragraph
+	// below calls legitimate: "a map of deleted test names is only useful if it spells them". It does not
+	// belong in data, because there is no set of them to reconcile — it is one rename, explained once, at
+	// the site that replaced it.
 	//
 	// It went 15 -> 16 -> 6. The drop is the mechanism working: layering_test.go's TEST-NAME MAP was 10
 	// marked names in a comment, and the closure verification found 8 of them FABRICATED — a suppression
@@ -395,7 +404,7 @@ func TestNotAPromiseMarkersAreBoundedAndHonest(t *testing.T) {
 	//
 	// That is the general lesson worth keeping: needing a marker is usually a sign the claim belongs in
 	// data where something can check it, not in prose where only a human can.
-	const notAPromiseMarkerCap = 9
+	const notAPromiseMarkerCap = 10
 	if markers > notAPromiseMarkerCap {
 		t.Errorf("%d [deleted]/[example] markers, cap is %d.\n\n"+
 			"Each one silences the promised-guard check for its line. That is sometimes right — a map of "+

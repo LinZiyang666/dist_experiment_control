@@ -972,3 +972,129 @@ func TestOpenForReadAtomic_TOCTOU_RegularSwapArm(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// origin: prerelease audit round 2, I-F7 / G9 (the missing coverage) and I-F4 (the
+// window the coverage then exposed).
+//
+// A --force PUSH REPLACES THE CONTENT, NOT THE PERMISSIONS.
+//
+// An atomic replace creates its tmp at 0600 and renames it over the destination, so
+// before agent-transfer/L3-F1 a `push --force` silently reset the destination's mode: a
+// 0755 script stopped being executable, a 0644 config stopped being readable to the
+// group that had been reading it. The operator asked to replace the bytes.
+//
+// That fix shipped with no test on either side of the wire, which is exactly how its
+// sibling (the tier-B pull path, I-F3) shipped one-path-only and passed all four gates.
+func TestAForcedOverwriteKeepsTheDestinationsMode(t *testing.T) {
+	root := t.TempDir()
+	dst := filepath.Join(root, "deploy.sh")
+	if err := os.WriteFile(dst, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// umask can strip bits from the WriteFile above; set them explicitly.
+	if err := os.Chmod(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vp, err := ValidateForWrite(dst, CanonAllowRoots([]string{root}), modeNarrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, pending, err := OpenForWriteAtomic(vp, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THE WINDOW, asserted while it is open — origin: round 2, I-F4. The chmod used to
+	// run right here, at open time, so the still-empty tmp carried the destination's
+	// permissive mode for the entire duration of the transfer. It sits in the
+	// destination directory under a name derived from the request, and the sha256 is
+	// computed over the STREAM rather than over the file, so bytes substituted in this
+	// window commit as verified.
+	tmpFI, err := os.Stat(pending.tmpPath)
+	if err != nil {
+		t.Fatalf("stat the in-flight tmp: %v", err)
+	}
+	if perm := tmpFI.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("the in-flight tmp is mode %o — group/other can write it while the transfer runs.\n\n"+
+			"The destination's mode must be applied at COMMIT, not at open: until the rename "+
+			"this file is not the destination, it is an attacker-writable staging area whose "+
+			"content the stream hash cannot vouch for.", perm)
+	}
+
+	if _, err := f.Write([]byte("#!/bin/sh\necho new\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameForWriteAtomic(vp, pending, true); err != nil {
+		t.Fatalf("force rename: %v", err)
+	}
+
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Fatalf("after a --force overwrite the destination is mode %o, want 755.\n\n"+
+			"The operator asked to replace the CONTENT. A script that stops being executable, "+
+			"or a config that stops being group-readable, is a second change they did not ask "+
+			"for and will find out about from whatever breaks next.", got)
+	}
+	body, _ := os.ReadFile(dst)
+	if !strings.Contains(string(body), "new") {
+		t.Fatalf("the content was not replaced: %q", body)
+	}
+}
+
+// origin: prerelease audit round 2, I-F7 / G9.
+//
+// THE SETUID/SETGID DROP IS DELIBERATE, and it is the half most likely to be "fixed"
+// by someone widening the mask to 0o7777 to make mode preservation "complete".
+//
+// Re-applying setuid to bytes that just arrived over the network hands whoever pushed
+// them whatever privilege the old file carried. Losing the bit is visible and
+// recoverable; keeping it is a privilege escalation with a transfer as its vector.
+func TestAForcedOverwriteDropsSetuidAndSetgid(t *testing.T) {
+	root := t.TempDir()
+	dst := filepath.Join(root, "helper")
+	if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// os.ModeSetuid, NOT the octal 0o4000: Go's FileMode is not the Unix mode word, and
+	// os.Chmod(dst, 0o4755) sets permission bits 0755 and silently nothing else — which
+	// made the first version of this test skip itself every run.
+	if err := os.Chmod(dst, 0o755|os.ModeSetuid); err != nil {
+		t.Skipf("this filesystem will not hold a setuid bit: %v", err)
+	}
+	if fi, serr := os.Stat(dst); serr != nil || fi.Mode()&os.ModeSetuid == 0 {
+		t.Skip("this filesystem dropped the setuid bit on write; the drop cannot be observed here")
+	}
+
+	vp, err := ValidateForWrite(dst, CanonAllowRoots([]string{root}), modeNarrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, pending, err := OpenForWriteAtomic(vp, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("new"))
+	_ = f.Close()
+	if err := RenameForWriteAtomic(vp, pending, true); err != nil {
+		t.Fatalf("force rename: %v", err)
+	}
+
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		t.Fatalf("the replacement kept setuid/setgid (mode %v).\n\n"+
+			"Those bits are a property of the file that WAS there. Carrying them onto content "+
+			"that arrived over a transfer gives the uploader that file's privilege.", fi.Mode())
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Errorf("the ordinary permission bits were not carried: %o, want 755", got)
+	}
+}

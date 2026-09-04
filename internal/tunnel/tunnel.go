@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -114,6 +115,117 @@ type TokenLookup func(sid, nid string, port int, tokenHash string, epoch int64) 
 // the broker registered us for, return which local port to dial. The
 // agent backs this by its in-memory copy of state.json port_tokens.
 type LocalPortLookup func(publicPort int) (int, error)
+
+// Limits on the UNAUTHENTICATED half of the control listener. Everything here
+// runs BEFORE tokenLookup, on a socket the deployment guide tells operators to
+// open to the public internet (docs/broker-ops.md: "公网放行 443 + 7000 +
+// 14000-14999"), so each of these is a bound on what a stranger can make this
+// process do.
+//
+// origin: prerelease audit broker-dataplane/BDP-F1..F3 + the main process's own
+// MP-1. The file already knew this listener was hostile — the regLog damper below
+// calls it "the ONE unauthenticated internet-triggerable log site" and names the
+// 2026-08-11 disk-fill — but the bound it grew was on LOG VOLUME only. Bytes,
+// goroutines and map entries had none.
+const (
+	// maxRegisterLine caps the REGISTER line. The worst LEGAL line is 146 bytes:
+	// "REGISTER " (9) + sid (<=32) + nid (<=32) + port (<=5) + token (43, base64url
+	// of 32 bytes from port.genToken) + epoch (<=20) + 4 separators + "\n". 512 is
+	// >3x that and still refuses the unbounded read.
+	//
+	// bufio.Reader.ReadString has NO ceiling: collectFragments accumulates 4 KiB
+	// fragments with bytes.Clone and joins them, so the peak is ~2x the line and the
+	// line is whatever the attacker sends inside the 5s read deadline — a deadline
+	// bounds TIME, not BYTES. Measured: feeding 200 MiB without a newline yields a
+	// 200 MiB string and 406 MiB of allocation, per connection.
+	maxRegisterLine = 512
+
+	// maxRegisterHandshakes caps concurrent pre-authorization handshakes PROCESS-WIDE.
+	// Every accepted conn costs a goroutine, an fd and a tls.Conn's buffers until it is
+	// either denied or installed; without a cap a stranger converts connection rate
+	// directly into broker memory and fd pressure.
+	//
+	// origin: prerelease audit round 2, CC-6's sibling CC-3. This was 256 and it was the
+	// ONLY ceiling, which made it a cheaper attack than the one it replaced: the slot is
+	// taken in acceptLoop BEFORE the goroutine starts, the listener is TLS so the
+	// handshake does not happen until the first read inside handleAgent, and that read
+	// carries a 5s deadline — so a peer that completes a bare TCP connect and then sends
+	// nothing holds a slot for five seconds at a cost of one socket. 256 idle sockets
+	// against a listener the deployment guide tells operators to expose to the public
+	// internet kept it permanently saturated, and every agent reconnect and every
+	// `tether expose` in the fleet failed with a bare EOF while the broker looked
+	// healthy. Trading a memory-pressure DoS for a cheaper availability DoS is not a fix.
+	//
+	// The process-wide number is now an ABSOLUTE bound on goroutines and fds, sized
+	// against the fd budget rather than against a fleet. What stops one source from
+	// monopolising it is maxRegisterHandshakesPerIP below.
+	maxRegisterHandshakes = 1024
+
+	// maxRegisterHandshakesPerIP caps concurrent pre-authorization handshakes from ONE
+	// source address, which is the half that actually preserves availability: a single
+	// attacker — or a single misbehaving agent in a reconnect storm — can occupy at most
+	// this many slots, so the rest of the budget stays available to everyone else.
+	//
+	// SIZING, and what it does NOT buy.
+	//
+	// The tunnel opens one control connection PER EXPOSED PORT, and the port band is 1000
+	// wide (port.DefaultPortBandLow), so one host legitimately re-dials as many
+	// connections as it holds exposes when a broker restarts. A first attempt at 8 was
+	// derived from a wrong model of that and broke the repo's own 50-client stress test
+	// immediately. 128 covers any realistic single host — and a host past it degrades to
+	// a retry, not a refusal, because the agent's dial loop already backs off.
+	//
+	// What this buys: one source can hold at most 1/8 of the process-wide budget, so the
+	// single-attacker case CC-3 describes — 256 idle sockets locking the whole fleet out
+	// — costs 8x more and still leaves 7/8 of the budget for everyone else.
+	//
+	// What it does NOT buy, stated so nobody reads more into it: a flood from many
+	// addresses still saturates the global ceiling. That is a firewall and connection-rate
+	// problem, not something a per-connection accounting map can solve, and pretending
+	// otherwise here would be the same mistake as the original 256.
+	maxRegisterHandshakesPerIP = 128
+
+	// registerWriteBudget bounds the writes on the unauthenticated half (the TLS
+	// handshake's own writes, every DENY, and the OK). Without it a peer that never
+	// reads — a zero-window socket, or the half-open link #78 documents — parks the
+	// handler in the kernel's retransmit path with nothing able to interrupt it.
+	// MUST be cleared before yamux takes over: a deadline is an absolute instant, so
+	// leaving it set would fail every tunnel write 5 seconds later.
+	registerWriteBudget = 5 * time.Second
+)
+
+// yamuxLogger routes yamux's own logging into slog instead of a bare fd 2.
+//
+// origin: prerelease audit broker-dataplane (verifier-found). yamux.DefaultConfig
+// sets LogOutput: os.Stderr, and both mux constructors passed nil. Those lines are
+// emitted PER FRAME and do not terminate the session ("Discarding data for stream",
+// "frame for missing stream" — normal noise whenever a stream is reset, which the
+// __proxy__ workload does constantly). On the broker they land in journald, outside
+// the broker.log an operator reads and outside h1's in-process size cap; on the
+// AGENT they land in the panic sink, whose ceiling is applied only at open time —
+// so a long-running process can crowd out the stack trace the sink exists to keep.
+// cmd/tether/agent_logsink.go states the invariant this violated: "no tether code
+// does" scribble unboundedly on fd 2.
+//
+// Debug level is deliberate: this is torn-stream noise, so at the default level it
+// writes nothing at all, and `--log-level debug` gets it back — strictly better
+// than today's "cannot be turned off and lands where nobody looks".
+// muxConfig returns yamux's defaults with logging redirected to l. yamux.VerifyConfig
+// requires exactly one of Logger/LogOutput, so LogOutput must be nil'd.
+func muxConfig(l *slog.Logger) *yamux.Config {
+	c := yamux.DefaultConfig()
+	c.LogOutput = nil
+	c.Logger = log.New(yamuxWriter{l}, "", 0)
+	return c
+}
+
+// yamuxWriter adapts slog to the *log.Logger yamux.Config.Logger expects.
+type yamuxWriter struct{ l *slog.Logger }
+
+func (w yamuxWriter) Write(p []byte) (int, error) {
+	w.l.Debug(strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
 
 // Server is the broker side of the tunnel. Owns the control listener
 // (`:7000`) plus one public listener per registered (agent, port).
@@ -187,6 +299,14 @@ type Server struct {
 	// injection via SetRegLogClockForTest — Recover's anti-flap floor needs
 	// a controllable clock to be assertable.
 	regLogNow func() time.Time
+
+	// hsPerIP counts IN-FLIGHT pre-authorization handshakes per source address, so one
+	// address cannot consume the process-wide ceiling (round 2, CC-3). Entries are
+	// deleted on the way down, so the map holds at most one key per address with a live
+	// handshake — an unbounded scan of source addresses cannot grow it, because a
+	// refused connection never gets a key and a completed one removes its own.
+	hsMu    sync.Mutex
+	hsPerIP map[string]int
 }
 
 // SessionInfo is the stable identity of an installed public proxy listener.
@@ -335,10 +455,28 @@ func (s *Server) serverTLSConfig() (*tls.Config, error) {
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
+	// handshakes bounds concurrent PRE-AUTHORIZATION handlers (BDP-F1's second half):
+	// without it an unauthenticated peer turns connection rate straight into
+	// goroutines and fds. A conn that cannot get a slot is closed immediately rather
+	// than queued, so the cap is a real ceiling and not a delay.
+	handshakes := make(chan struct{}, maxRegisterHandshakes)
+	// delay is the net/http-shaped accept backoff. origin: BDP-F3 — Go's poll.FD.Accept
+	// retries EINTR/EAGAIN/ECONNABORTED but NOT EMFILE/ENFILE, so on fd exhaustion the
+	// old `Warn; continue` became a full-speed spin: one core pinned (starving raft and
+	// NATS goroutines on a 1-2 core VPS) and the 150 MiB of rotated log history
+	// overwritten within seconds, destroying the evidence of the incident in progress.
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			// A closed listener is terminal, and it must be checked INDEPENDENTLY of
+			// s.closed: today Close() sets that flag first, but with a backoff in place
+			// any future path that closes this listener without going through
+			// Server.Close would otherwise become a permanent once-per-second spin.
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			// Listener closed by Close() (Close closes ln + sets
@@ -350,15 +488,128 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			if done {
 				return
 			}
-			s.logger.Warn("tunnel server: accept", "err", err)
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else {
+				delay *= 2
+			}
+			if delay > time.Second {
+				delay = time.Second
+			}
+			s.logger.Warn("tunnel server: accept", "err", err, "retry_in", delay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			continue
+		}
+		delay = 0
+		// PER-SOURCE FIRST, so one address cannot consume the process-wide budget and
+		// lock the fleet out — see maxRegisterHandshakesPerIP. Refused either way
+		// WITHOUT completing the TLS handshake: answering would cost exactly the work
+		// the ceiling exists to refuse.
+		host := remoteHostOf(conn)
+		if !s.acquireHandshakeSlotForIP(host) {
+			s.registerHandshakeRefused(conn, "per_ip")
+			_ = conn.Close()
+			continue
+		}
+		select {
+		case handshakes <- struct{}{}:
+		default:
+			// At the process-wide ceiling: refuse without spending a goroutine on it.
+			s.releaseHandshakeSlotForIP(host)
+			s.registerHandshakeRefused(conn, "global")
+			_ = conn.Close()
 			continue
 		}
 		s.wg.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, h string) {
 			defer s.wg.Done()
+			defer func() { <-handshakes }()
+			defer s.releaseHandshakeSlotForIP(h)
 			s.handleAgent(ctx, c)
-		}(conn)
+		}(conn, host)
 	}
+}
+
+// remoteHostOf is the source address a handshake is accounted to. A conn whose
+// RemoteAddr cannot be parsed accounts to "" — one shared bucket, which is the
+// conservative direction: an unattributable peer competes with other unattributable
+// peers rather than getting an unmetered slot.
+func remoteHostOf(conn net.Conn) string {
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// acquireHandshakeSlotForIP takes one of host's maxRegisterHandshakesPerIP slots,
+// reporting whether it got one. Paired with releaseHandshakeSlotForIP on EVERY exit
+// path — including the global-ceiling refusal, which acquires this one first.
+func (s *Server) acquireHandshakeSlotForIP(host string) bool {
+	s.hsMu.Lock()
+	defer s.hsMu.Unlock()
+	if s.hsPerIP == nil {
+		s.hsPerIP = map[string]int{}
+	}
+	if s.hsPerIP[host] >= maxRegisterHandshakesPerIP {
+		return false
+	}
+	s.hsPerIP[host]++
+	return true
+}
+
+// releaseHandshakeSlotForIP returns a slot and DELETES the key at zero — the same
+// delete-on-zero discipline releaseInflightLocked uses, and for the same reason: a
+// counter left at 0 is a permanent map entry keyed by something the peer chose.
+func (s *Server) releaseHandshakeSlotForIP(host string) {
+	s.hsMu.Lock()
+	defer s.hsMu.Unlock()
+	if s.hsPerIP[host] <= 1 {
+		delete(s.hsPerIP, host)
+		return
+	}
+	s.hsPerIP[host]--
+}
+
+// registerHandshakeRefused logs a refused-at-the-ceiling connection through the
+// SAME damper as the read failures below — this site is reachable by an
+// unauthenticated flood, so an undamped line here would be the log flood the
+// damper exists to prevent, arriving through a different door.
+//
+// `which` distinguishes the per-IP ceiling from the process-wide one, because they
+// mean different things to an operator: the first is one source misbehaving, the
+// second is the whole listener saturated.
+func (s *Server) registerHandshakeRefused(conn net.Conn, which string) {
+	remote := remoteHostOf(conn)
+	// A DEDICATED damper class per ceiling, not registerReadFailed's.
+	//
+	// origin: prerelease audit round 2, C6. Routing this through registerReadFailed was
+	// wrong twice: regLogClass has a fixed {eof, timeout, other} taxonomy so a fresh
+	// sentinel collapses into "other" and shares a bucket with genuine read failures,
+	// and the line it produced said "read REGISTER" when no REGISTER was ever read —
+	// the connection was refused before the TLS handshake.
+	class := "handshake_ceiling_" + which
+	s.regLogMu.Lock()
+	now := s.regLogNowTime()
+	t := s.regLogTracker(class)
+	logNow, suppressed := t.FailReaffirm(now, class)
+	fails := t.Fails()
+	s.regLogMu.Unlock()
+	if logNow {
+		s.logger.Warn("tunnel server: refused a control connection at the handshake ceiling",
+			"ceiling", which, "remote", remote, "suppressed_since_last", suppressed)
+		return
+	}
+	s.logger.Debug("tunnel server: handshake ceiling refusal (suppressed repeat)",
+		"ceiling", which, "remote", remote, "fails", fails)
 }
 
 // regLogClasses is the fixed, coarse REGISTER-read failure taxonomy (review
@@ -435,6 +686,39 @@ func (s *Server) registerReadFailed(conn net.Conn, err error) {
 	}
 }
 
+// registerDenied logs an authentication refusal through the SAME damper the read
+// failures use, so a flood of denials costs one line per Cap window instead of one per
+// connection. The reason a refusal deserves the damper and not silence: a legitimate
+// agent whose token was rotated hits this branch, and an operator needs to see it.
+//
+// The damper is keyed on a fixed class rather than on anything from the wire — keying it
+// on sid would give an attacker a fresh bucket per made-up session, which is the damper
+// paying for the attack instead of bounding it.
+func (s *Server) registerDenied(conn net.Conn, sid, nid string, port int, epoch int64, err error) {
+	const class = "denied"
+	remote := ""
+	if addr := conn.RemoteAddr(); addr != nil {
+		remote = addr.String()
+		if host, _, splitErr := net.SplitHostPort(remote); splitErr == nil {
+			remote = host
+		}
+	}
+	s.regLogMu.Lock()
+	now := s.regLogNowTime()
+	t := s.regLogTracker(class)
+	logNow, suppressed := t.FailReaffirm(now, class)
+	fails := t.Fails()
+	s.regLogMu.Unlock()
+	if logNow {
+		s.logger.Info("tunnel server: REGISTER denied",
+			"sid", sid, "nid", nid, "port", port, "epoch", epoch, "err", err,
+			"remote", remote, "suppressed_since_last", suppressed)
+		return
+	}
+	s.logger.Debug("tunnel server: REGISTER denied (suppressed repeat)",
+		"sid", sid, "nid", nid, "err", err, "remote", remote, "fails", fails)
+}
+
 // registerReadOK (#78) ends every class's read-failure run on the first
 // AUTHORIZED REGISTER (called after tokenLookup succeeds — review M2: an
 // unauthenticated garbage line that merely parses must NOT fake a recovery
@@ -467,18 +751,63 @@ func (s *Server) registerReadOK() {
 // public-port acceptor. One goroutine per agent control conn (= per
 // public port).
 func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
+	// ctx must be able to interrupt a stuck Write/Read before yamux takes over, or
+	// Close's wg.Wait has no bound at all. The client side of this same file already
+	// does exactly this and says why (dialAndRegister's hsDone watcher); the server
+	// side never did, so Close's "Bound by the per-session cancellation above; can't
+	// run forever" was false for any handler that had not yet installed a session —
+	// per-session cancellation cannot reach a handler that has no serverSession yet.
+	hsDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-hsDone:
+		}
+	}()
+	defer close(hsDone)
+
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	br := bufio.NewReader(conn)
-	line, err := br.ReadString('\n')
+	_ = conn.SetWriteDeadline(time.Now().Add(registerWriteBudget))
+	// NewReaderSize + ReadSlice, NOT ReadString: the buffer IS the ceiling. A line
+	// that does not fit returns bufio.ErrBufferFull, which we hand to the existing
+	// damped failure path rather than minting a new DENY reason — that keeps this
+	// call site byte-identical for the source-text gate in
+	// register_log_damping_test.go (TestHandleAgentWiresTheDamper) and costs the
+	// prober no new information.
+	br := bufio.NewReaderSize(conn, maxRegisterLine)
+	lineB, err := br.ReadSlice('\n')
 	if err != nil {
 		s.registerReadFailed(conn, err)
 		_ = conn.Close()
 		return
 	}
+	// Copy off the reader's buffer. parseRegisterLine returns strings.Split
+	// sub-slices, which alias whatever the reader holds; the copy is <=512 bytes and
+	// makes the retained keys independent of it.
+	line := string(lineB)
 	_ = conn.SetReadDeadline(time.Time{})
 
 	sid, nid, port, token, epoch, ok := parseRegisterLine(line)
 	if !ok {
+		_, _ = conn.Write([]byte("DENY malformed_register\n"))
+		_ = conn.Close()
+		return
+	}
+	// VALIDATE BEFORE TOUCHING ANY MAP OR ANY LOG LINE.
+	//
+	// origin: prerelease audit — main process MP-1(b)/(c). parseRegisterLine only
+	// splits into 6 fields and range-checks port/epoch; sid and nid arrive from an
+	// unauthenticated peer completely unconstrained. Everything below this point
+	// either keys a long-lived map on them (fenceKey / inflightBySID) or prints them
+	// (the DENY log), so an unvalidated pair is both a permanent allocation and an
+	// unbounded log field. The fuzz seed for this parser has said "empty sid: syntax
+	// accepts, caller validates" since it was written — this is the caller finally
+	// doing it. Every legitimate REGISTER already satisfies these: an agent refuses
+	// to start on an invalid sid/nid (internal/agent.New) and auth_callout refuses to
+	// admit one (internal/authcallout), and a lease name `<base>-NN` is inside
+	// ValidateNID's budget by construction (proto.MaxLeaseBasenameLen).
+	if proto.ValidateSID(sid) != nil || proto.ValidateNID(nid) != nil {
 		_, _ = conn.Write([]byte("DENY malformed_register\n"))
 		_ = conn.Close()
 		return
@@ -502,16 +831,21 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		s.inflightBySID[sid]--
-		s.inflightByAllocation[fenceKey]--
-		s.maybePruneSessionLocked(sid)
-		s.maybePruneAllocationLocked(fenceKey)
+		s.releaseInflightLocked(sid, fenceKey)
 		s.mu.Unlock()
 	}()
 
 	if err := s.tokenLookup(sid, nid, port, tokenHash, epoch); err != nil {
-		s.logger.Info("tunnel server: REGISTER denied",
-			"sid", sid, "nid", nid, "port", port, "epoch", epoch, "err", err)
+		// THROUGH THE DAMPER, like every other line on this listener.
+		//
+		// origin: prerelease audit, main-process MP-1 leg (c), completed. The identifier
+		// validation added earlier bounds what these fields can CONTAIN; it does nothing
+		// about how OFTEN the line is written. :7000 must be reachable from the public
+		// internet (a NAT-ed agent dials it), the TLS is self-signed so anyone completes
+		// the handshake, and this branch is one Info line per rejected connection. That
+		// is the shape of gotcha #78 — a disk filled by an unthrottled log line on this
+		// very listener — reproduced one function further down.
+		s.registerDenied(conn, sid, nid, port, epoch, err)
 		_, _ = conn.Write([]byte("DENY " + err.Error() + "\n"))
 		_ = conn.Close()
 		return
@@ -559,7 +893,11 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	yamuxSess, err := yamux.Server(conn, nil)
+	// The write budget covered the unauthenticated half; yamux has its own
+	// ConnectionWriteTimeout and a live tunnel must not inherit an absolute
+	// deadline from the handshake.
+	_ = conn.SetWriteDeadline(time.Time{})
+	yamuxSess, err := yamux.Server(conn, muxConfig(s.logger))
 	if err != nil {
 		s.logger.Warn("tunnel server: yamux server", "err", err)
 		_ = publicLn.Close()
@@ -816,6 +1154,36 @@ func (s *Server) fenceSnapLocked(port int, sid string, fenceKey sessionFenceKey)
 // dimension, and call sites read better spelling out `s.closed || changed`.
 func (s *Server) fenceChangedLocked(snap fenceSnap, port int, sid string, fenceKey sessionFenceKey) bool {
 	return s.fenceSnapLocked(port, sid, fenceKey) != snap
+}
+
+// releaseInflightLocked drops one in-flight REGISTER's bookkeeping, DELETING the
+// key when the count reaches zero. Caller holds s.mu.
+//
+// origin: prerelease audit broker-dataplane/BDP-F2 (reproduced by the main process:
+// 200 unauthenticated REGISTERs left 200 permanent entries in each map). `m[k]--`
+// writes 0 back, it does not remove the key, and the two pruners below can only fire
+// for a sid ForgetSession has marked forgotten or an allocation CloseProxyIf has
+// closed — neither is ever true for a session that never existed. So every denied
+// probe from a stranger used to leave two entries behind for the life of the
+// process.
+//
+// Deleting at zero is EXACTLY equivalent to the old bookkeeping for the fence: both
+// pruners read a missing key as 0, which still satisfies their `<= 0` test, so the
+// round-2 / round-5 / round-6 fence invariants are untouched. Order matters — decrement
+// (or delete) first, then let the pruners run.
+func (s *Server) releaseInflightLocked(sid string, key sessionFenceKey) {
+	if n := s.inflightBySID[sid] - 1; n > 0 {
+		s.inflightBySID[sid] = n
+	} else {
+		delete(s.inflightBySID, sid)
+	}
+	if n := s.inflightByAllocation[key] - 1; n > 0 {
+		s.inflightByAllocation[key] = n
+	} else {
+		delete(s.inflightByAllocation, key)
+	}
+	s.maybePruneSessionLocked(sid)
+	s.maybePruneAllocationLocked(key)
 }
 
 // maybePruneSessionLocked deletes a forgotten session's kill-gen bookkeeping
@@ -1339,7 +1707,7 @@ func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token, bro
 		return nil, nil, &DenyError{Reason: reason}
 	}
 
-	yamuxSess, err := yamux.Client(conn, nil)
+	yamuxSess, err := yamux.Client(conn, muxConfig(c.logger))
 	if err != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("tunnel client: yamux client: %w", err)

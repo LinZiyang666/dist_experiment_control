@@ -18,7 +18,11 @@ assert_ok  "init brk1 (standalone → N=1 cluster)"    "$SIM" init brk1
 assert_ok  "N=1 healthy floor (leader + DEGRADED)"   sh -c "\"$SIM\" ctl -- >/dev/null 2>&1; \"$SIM\" exec brk1 -- sh -c 'tether cluster status --json' | jq -e '.leader_id==\"brk1\" and (.health==\"DEGRADED\" or .health==\"HEALTHY_HA\") and .exit_code==1' >/dev/null"
 assert_ok  "session $SID + ctl login"                "$SIM" session "$SID" --pin "$PIN"
 assert_ok  "agent-join agt1"                         "$SIM" agent-join agt1 --session "$SID" --pin "$PIN"
-assert_ok  "node ls lists agt1 ONLINE"               sh -c "\"$SIM\" ctl -- node ls | grep -qE 'agt1[[:space:]]+ONLINE'"
+# The KIND column (device|leased) sits between NODE and STATUS since 1e9d32a (2026-08-19), so
+# "agt1 followed by whitespace then ONLINE" can no longer match anything. Naming KIND rather than
+# loosening to `.*ONLINE` keeps the assertion able to see a column reordering — and a device that
+# shows up as `leased` is a real defect this row should still be able to fail on.
+assert_ok  "node ls lists agt1 ONLINE"               sh -c "\"$SIM\" ctl -- node ls | grep -qE '^agt1[[:space:]]+(device|leased)[[:space:]]+ONLINE'"
 
 # --- push/pull round-trip: tier-A (inline ≤8 MiB) + tier-B (JetStream Object Store >8 MiB) ---
 assert_ok  "seed tier-A (1 KiB) + tier-B (20 MiB) files on ctl" \

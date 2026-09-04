@@ -51,6 +51,21 @@ type fsm struct {
 	appliers map[OpType]Applier
 	logger   *slog.Logger
 
+	// localID is THIS node's raft ServerID, carried so that restoreFrom does not have to
+	// learn it from the very database it is about to overwrite.
+	//
+	// origin: prerelease audit cluster-fsm/L3-F1. The identity was read out of the live
+	// DB immediately before the in-place restore, with the error discarded, and written
+	// back after. A crash or a failed Exec anywhere in that window left the LEADER's id
+	// in the joiner's cluster_meta — and the next InstallSnapshot attempt re-read it from
+	// there and faithfully "preserved" it, so the mistake was self-confirming and retries
+	// cemented it. The next restart then brought the joiner up under the leader's raft
+	// ServerID: two servers, one id, split brain.
+	//
+	// Empty is a legal value and falls back to the old read-from-the-DB behaviour, so a
+	// construction site that has no id to give is no worse off than before.
+	localID string
+
 	// reapplyCount counts entries short-circuited as verified no-ops (§3.7
 	// invariant #2), so the kill-9 matrix can assert the idempotent-skip path
 	// actually fired (non-vacuity). Atomic; read by tests.

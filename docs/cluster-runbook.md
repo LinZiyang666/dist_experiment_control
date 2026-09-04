@@ -43,6 +43,29 @@ need this file at all — single-broker is the fully supported default (see usag
 Admission is **two-phase**: the joining node prepares a self-signed join bundle
 (carrying its node identity + raft/nats/tunnel addresses), then the leader approves it.
 
+> **PREREQUISITE ON A FRESH DEPLOYMENT — you need a ctl session before you can grow.**
+>
+> `tether cluster add` (and `cluster unlock`, `cluster upgrade`, `cluster seeds show --remote`,
+> `cluster status --remote`) all need an **active ctl identity** — they refuse with
+> `no active session — run 'tether login -s <sid>' first`. Since the session-create admission
+> table landed, getting that session on a **brand-new** broker takes one operator step first,
+> because the allow-list starts EMPTY:
+>
+> ```bash
+> tether whoami                                   # on YOUR machine → SHA256:…
+> sudo tether admin session-allow SHA256:…        # on the BROKER host (root-only admin socket)
+> tether session create ops --pin ……              # now this works
+> tether login -s ops
+> ```
+>
+> **An upgraded deployment needs none of this** — the broker grandfathers every fingerprint that
+> already owns a session (see `docs/broker-ops.md` §5.20 and requirements §6.7).
+>
+> This paragraph exists because the ordering constraint was real and undocumented: the deploy-tier
+> drill suite went 0/43 GREEN on the increment that introduced admission, and every single failure
+> traced back to it. `broker-ops.md` covered "the first USER creates a session"; nothing said that
+> **cluster lifecycle operations are behind the same door**.
+
 ### 1.0 FIRST make the leader grow-ready — rebind a loopback advertise (v0.4.2; ONLINE, NOT force-single)
 
 A broker migrated by `cluster init --from-existing` advertises whatever `broker.cluster.raft_addr`

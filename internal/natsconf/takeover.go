@@ -107,6 +107,25 @@ func BuildMergedConf(own *Ownership, cfg Config) (string, error) {
 			"in-flight transfers offline while `nats-server -t` still accepts the file). Add an explicit " +
 			"`jetstream { store_dir: … }` to the conf, then retry")
 	}
+	// THE SAME SHAPE AS BUG-1 ABOVE, for the client listen address.
+	//
+	// origin: prerelease audit cli-serve-agent-cluster/L4-F1. An empty ClientListen makes
+	// Render omit the bind, and nats-server then defaults to 0.0.0.0:4222 — a conf that
+	// was bound to a private address silently becomes publicly bound, and
+	// `nats-server -t` accepts it, so the DryRun gate waves it through exactly as it did
+	// for the missing JetStream block. One of the five assembly paths (the manual
+	// takeover, cmd/tether/cluster_natsconf.go) already refused this; the automated ones
+	// — the topology reconciler's loop and the grow cutover — did not.
+	//
+	// The predicate is "the LIVE conf declares a client bind and the render would drop
+	// it". When the live conf declares none either, "" stays legal: a fixture that only
+	// exercises routes or auth_callout has no client bind to preserve and must not be
+	// failed for it.
+	if own != nil && own.ClientListen() != "" && cfg.ClientListen == "" {
+		return "", fmt.Errorf("natsconf: the live conf binds clients on %q but the render carries no "+
+			"client listen — refusing to emit a conf that would default-bind 0.0.0.0:4222 (a surprise "+
+			"public-bind change that `nats-server -t` accepts)", own.ClientListen())
+	}
 	rendered, err := Render(cfg)
 	if err != nil {
 		return "", fmt.Errorf("natsconf: render cluster conf: %w", err)

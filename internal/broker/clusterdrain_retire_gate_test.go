@@ -1,6 +1,10 @@
 package broker
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"strings"
 	"testing"
 
@@ -80,5 +84,62 @@ func TestDrainWithoutRetireIsNotRefusedByTheRetireGate(t *testing.T) {
 
 	if !crossedTheGate {
 		t.Error("a non-retire drain did not get past the retire gate")
+	}
+}
+
+// origin: prerelease audit broker-cluster-ops/L-BCO-F2.
+//
+// THE PHASE BUMP MUST PRECEDE THE CONVERGENCE WAIT.
+//
+// By the time Drain reaches the wait it has already done two replicated, side-effecting
+// things: raised the broker_draining marker and re-homed the node's exposes. Waiting
+// first meant a drain whose data plane did not converge returned with the node still
+// phase=VOTER — the least consistent state available, and one with NO self-healer,
+// because reconcile_drain_marker deliberately leaves a raised marker alone. The next
+// operator sees a node that reads as a healthy voter whose exposes have moved off it.
+//
+// Moving the bump earlier also helps the wait it precedes: a DRAINING node drops out of
+// migrateExposes' target query and out of resolveHomeForAgent, so exposes cannot be
+// handed back to the node being drained while we wait for them to move off it.
+//
+// A SOURCE-ORDER assertion, and the honest reason why: reproducing the failure
+// behaviourally needs a live multi-node cluster with an agent that never acks, which is
+// a deploy-tier drill rather than a unit test. What can be pinned here is the ordering
+// itself, which is the whole of the fix and is exactly what a future edit would undo.
+func TestDrainBumpsThePhaseBeforeWaitingForConvergence(t *testing.T) {
+	src, err := os.ReadFile("clusterdrain.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	fset := token.NewFileSet()
+	f, perr := parser.ParseFile(fset, "clusterdrain.go", src, 0)
+	if perr != nil {
+		t.Fatalf("parse: %v", perr)
+	}
+
+	var body string
+	for _, d := range f.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Recv == nil || fn.Name.Name != "DrainNode" {
+			continue
+		}
+		body = string(src[fset.Position(fn.Body.Pos()).Offset:fset.Position(fn.Body.End()).Offset])
+	}
+	if body == "" {
+		t.Fatal("SELF-CHECK FAILED: (*ClusterAdmin).DrainNode not found in clusterdrain.go — this guard " +
+			"is scanning for a function that no longer exists, so it can never report anything")
+	}
+
+	phaseAt := strings.Index(body, "a.setPhase(nodeID, phaseDraining")
+	waitAt := strings.Index(body, "a.awaitHomeConvergence(")
+	if phaseAt < 0 || waitAt < 0 {
+		t.Fatalf("SELF-CHECK FAILED: the scanner no longer matches DrainNode's real shape "+
+			"(setPhase found=%v, awaitHomeConvergence found=%v)", phaseAt >= 0, waitAt >= 0)
+	}
+	if phaseAt > waitAt {
+		t.Fatal("DrainNode waits for data-plane convergence BEFORE bumping the phase to DRAINING.\n\n" +
+			"A drain that times out then leaves the node marked draining and its exposes re-homed, " +
+			"but still phase=VOTER — and nothing converges that: reconcile_drain_marker leaves a " +
+			"raised marker alone by design. Bump first; the wait's rc semantics are unchanged.")
 	}
 }

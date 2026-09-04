@@ -583,7 +583,7 @@ func newClusterDrainCmd(socketPath *string) *cobra.Command {
 					"WARNING: after this op the cluster has %d voters, quorum=%d, tolerates %d failures.\n",
 					p.Voters, p.Quorum, p.FaultTolerance)
 				if !confirmTypedNodeID(cmd, node, "", false, "") { // never-escapable: F==0 destroys fault tolerance
-					return fmt.Errorf("aborted (type the node_id to confirm an F==0 drain; --yes is not accepted)")
+					return usageErr("aborted (type the node_id to confirm an F==0 drain; --yes is not accepted)")
 				}
 				req.Confirmed = true
 				resp, err = callAdmin(*socketPath, req)
@@ -631,7 +631,7 @@ func newClusterRemoveCmd(socketPath *string) *cobra.Command {
 			// remove is the ONLY machine-confirm-escapable typed-confirm (reversible: re-add with
 			// `cluster join`). The escape needs BOTH --confirm-node-id AND the env to equal the id.
 			if !confirmTypedNodeID(cmd, args[0], "", true, confirmNodeID) {
-				return fmt.Errorf("aborted (type the node_id to confirm, or pass --confirm-node-id + %s for unattended use)", machineConfirmEnv)
+				return usageErr("aborted (type the node_id to confirm, or pass --confirm-node-id + %s for unattended use)", machineConfirmEnv)
 			}
 			resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpClusterRemove, NodeID: args[0], Force: force})
 			if err != nil {
@@ -857,7 +857,7 @@ func newClusterInitCmd() *cobra.Command {
 			if !confirmTypedNodeID(cmd, selfID,
 				"CONSEQUENCE: one-way v1→v2 migration of this broker's DB in place; rollback = restore tether.db.bak.",
 				true, confirmNodeID) {
-				return fmt.Errorf("cluster init: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
+				return usageErr("cluster init: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
 			}
 			var initErr error
 			if fromManifest != "" {

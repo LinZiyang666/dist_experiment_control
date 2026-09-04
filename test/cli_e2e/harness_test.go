@@ -15,6 +15,7 @@ package cli_e2e_test
 import (
 	"context"
 	"database/sql"
+	"github.com/LinZiyang666/tether/internal/session"
 	"log/slog"
 	"testing"
 	"time"
@@ -33,6 +34,24 @@ func startNATS(t *testing.T) string              { return testharness.StartNATS(
 func openDB(t *testing.T) *sql.DB                { return testharness.OpenDB(t) }
 func silentLog() *slog.Logger                    { return testharness.SilentLog() }
 func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserPub(t) }
+
+// admitCreator lets fp run `session create`.
+//
+// origin: prerelease audit round 2. `session create` used to admit anybody who could
+// reach the control plane, which is the public internet by design; it now requires the
+// caller's fingerprint to be in session_creators. A test about SESSION MECHANICS has to
+// say which identity the operator admitted — the same sentence a real deployment says
+// with `tether admin session-allow`.
+//
+// Deliberately per-test rather than folded into startBroker: admitting everybody in the
+// harness would switch the gate off for the whole suite, which is how a control ends up
+// asserting nothing.
+func admitCreator(t *testing.T, db *sql.DB, fp string) {
+	t.Helper()
+	if _, err := session.AllowCreator(db, fp, "test", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // seedSession inserts an ACTIVE session row owned by fp. Mirrors the
 // helper used by every per-phase suite — copy-pasted here rather than

@@ -15,7 +15,7 @@ func TestAuthCalloutRejectsWildcardAgentRole(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "owner-pin")
 
 	attacker := freshIdentity(t)
@@ -49,7 +49,7 @@ func TestAuthCalloutRejectsUnprovisionedAgentRole(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "owner-pin")
 
 	attacker := freshIdentity(t)

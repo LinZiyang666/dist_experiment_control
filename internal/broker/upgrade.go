@@ -137,7 +137,11 @@ func (b *Broker) handleUpgradeReq(nc *nats.Conn, msg *nats.Msg) {
 // the family conservative: the broker cannot prove a stopped sibling will not
 // restart during the upgrade window.
 func cloneFamilyUpgradeConflict(b *Broker, sid, target string) bool {
-	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+	// len(provisioned) > 0, not the readable flag: this site means "are there bindings to
+	// reason about at all". E1 (round 2) changed what the second return says — it is now
+	// "the table was read" — so the intent is spelled out rather than inherited.
+	provisioned, provReadable := node.ProvisionedNIDs(b.read().SQL(), sid)
+	bindingsKnown := provReadable && len(provisioned) > 0
 	all, err := node.List(b.read().SQL())
 	if err != nil {
 		// An upgrade replaces an executable. If the authority cannot be read,

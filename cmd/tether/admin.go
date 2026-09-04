@@ -37,6 +37,7 @@ with read+write access to the socket file (mode 0600 — typically the
 	root.AddCommand(newAdminEventsCmd(&socketPath))
 	root.AddCommand(newAdminEvictCmd(&socketPath))
 	root.AddCommand(newAdminRuntimeCmd(&socketPath))
+	root.AddCommand(newAdminSessionAllowCmd(&socketPath))
 	return root
 }
 
@@ -482,4 +483,111 @@ func humaneAge(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
+}
+
+// newAdminSessionAllowCmd administers WHO MAY CREATE A SESSION.
+//
+// origin: prerelease audit round 2. `session create` used to admit anybody who could
+// reach the control plane — which is the public internet by design — so becoming an
+// "activated member", and from there a provisioned agent, cost a stranger two requests.
+//
+// On the ADMIN SOCKET, which is root-only 0600 on the broker host: admitting a
+// fingerprint is an act of whoever runs the broker. On upgrade every fingerprint that
+// already owns a session is admitted automatically — ONCE, by the broker at boot
+// (seedSessionCreators), not by the migration, which is why a later upgrade cannot
+// resurrect a revocation. So no existing deployment needs operator action; a FRESH broker
+// starts empty and the first user is admitted here.
+func newAdminSessionAllowCmd(socketPath *string) *cobra.Command {
+	var list, remove bool
+	var note string
+	cmd := &cobra.Command{
+		Use:   "session-allow [<fingerprint>]",
+		Short: "Admit (or remove, or list) the identities allowed to create sessions",
+		Long: `Only an admitted fingerprint may run 'tether session create'.
+
+A user finds their own fingerprint with 'tether whoami' — and a user who tries
+'tether session create' without being admitted is told it in the refusal, so
+either way the string to paste here comes from them.
+
+On upgrade every fingerprint that already owned a session was admitted
+automatically, so an existing deployment needs nothing. A FRESH broker starts
+with an EMPTY list: admit the first operator here, on the broker host.
+
+Removing a fingerprint does NOT touch the sessions it already owns — revoking
+the ability to create is not the same as deleting somebody's work.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// FLAG COMBINATIONS THAT DO NOTHING ARE USAGE ERRORS, not silent no-ops —
+			// origin: increment 2 internal review, adminsock-cli/L10-F8. `--list --remove`
+			// listed, and `--remove --note x` removed and dropped the note; in both cases
+			// the operator's intent was half-executed without a word.
+			if list && (remove || note != "") {
+				return usageErr("admin session-allow --list takes neither --remove nor --note")
+			}
+			if remove && note != "" {
+				return usageErr("admin session-allow --remove takes no --note (nothing survives the removal to carry it)")
+			}
+			switch {
+			case list:
+				if len(args) != 0 {
+					return usageErr("admin session-allow --list takes no fingerprint")
+				}
+				resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpSessionCreators})
+				if err != nil {
+					return err
+				}
+				if resp.Error != "" {
+					return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+				}
+				out := cmd.OutOrStdout()
+				if len(resp.Creators) == 0 {
+					_, _ = fmt.Fprintln(out, "no identity may create a session on this broker.\n"+
+						"Admit one with: tether admin session-allow <fingerprint>")
+					return nil
+				}
+				for _, c := range resp.Creators {
+					_, _ = fmt.Fprintf(out, "%s  added_at=%s by=%s", c.FP, c.AddedAt, c.AddedBy)
+					if c.Note != "" {
+						_, _ = fmt.Fprintf(out, "  note=%q", c.Note)
+					}
+					_, _ = fmt.Fprintln(out)
+				}
+				return nil
+			case len(args) != 1:
+				return usageErr("admin session-allow needs a fingerprint (or --list)")
+			}
+			op := adminsock.OpSessionAllow
+			if remove {
+				op = adminsock.OpSessionDeny
+			}
+			resp, err := callAdmin(*socketPath, adminsock.Request{Op: op, FP: args[0], Note: note})
+			if err != nil {
+				return err
+			}
+			if !resp.OK {
+				return fmt.Errorf("admin: broker rejected: %s", resp.Error)
+			}
+			// A QUALIFIED OUTCOME LEADS, it does not follow. The broker sets Error while
+			// OK when it cannot honestly say "admitted"/"removed" — the fingerprint was
+			// already there, or a replicated DELETE cannot report whether it deleted
+			// anything. Printing "removed <fp>" and then a parenthetical that contradicts
+			// it reads as success with a footnote, which is how a typo looked like a
+			// revocation. origin: prerelease audit increment 2 internal review,
+			// adminsock-cli/L10-F3 ≡ admission-product/L8-F6 ≡ admission-enforcement/L9-F9.
+			if resp.Error != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", args[0], resp.Error)
+				return nil
+			}
+			verb := "admitted"
+			if remove {
+				verb = "removed"
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", verb, args[0])
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&list, "list", false, "list the admitted fingerprints")
+	cmd.Flags().BoolVar(&remove, "remove", false, "remove the fingerprint instead of admitting it")
+	cmd.Flags().StringVar(&note, "note", "", "free text recorded alongside the admission")
+	return cmd
 }

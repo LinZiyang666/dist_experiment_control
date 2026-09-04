@@ -343,10 +343,22 @@ NATS `req/reply` 基于 pub/sub 约定实现：请求方在消息头带 `reply-t
 
 | 做法 | reply subject | 可否被第三方订阅 | 复杂度 |
 |---|---|---|---|
-| **inbox（选定）** | `_INBOX.<rand>.<rand>`，SDK 自动生成 | 否（随机 token） | 零配置 |
+| **inbox（选定）** | `_INBOX.<per-identity>.<rand>.<rand>`，SDK 自动生成 + 按连接 nkey 派生的前缀 | 否（**靠 ACL**，不是靠随机性——见下方订正） | 零配置 |
 | 显式 `*.reply.<req-id>` | 固定规则，可预测 | 是 | 需手动管理 req-id 与权限子树 |
 
 **选 inbox**。审计由 **tetherd 单边** 主动写 `audit.*` 流（权威、结构化，agent 不 pub `audit.*`；见 C.1 规则 4），不需要第三方旁听 reply；同 session 队友看彼此动作靠订 `ev.*`。reply 的唯一消费者 = 请求方自己。
+
+> **订正（2026-09-02 发布前审计 proto-auth-acl/L1-F1 ≡ broker-proxy-http/L3-F1）**：上表「可否被第三方订阅：否（随机 token）」
+> **曾经是错的**，而且这一条错误支撑了别处的设计判断（`internal/broker/proxy.go` 曾据此把 register 回包
+> 当作比 `sys.events` 更安全的通道）。随机 subject **不是**访问控制：NATS 的 `canSubscribe` 是纯 sublist 匹配，
+> 对 `_INBOX` 没有任何特殊处理，而三个客户端权限模板当时都授予**裸 `Sub "_INBOX.>"`**，
+> 且全部主体同处一个 account。于是任何一个连接——包括只需自铸 nkey、无 PIN 无成员身份的未激活 ctl——
+> 都能订阅整个回包空间，读到别人的 tunnel token、全部订阅者 PSK、只打印一次的 `/sub` bearer token，
+> 以及所有 `tether exec` 的输出。
+>
+> 现在为真，但成立的理由**换了**：auth_callout 只授予每个连接**自己那棵** `_INBOX.<tok>` 子树
+> （`auth.InboxPrefixFor`，从该连接的 nkey 派生、无法冒充），客户端设置对应的 `nats.CustomInboxPrefix`。
+> 保护来自 **ACL**，不来自随机性。读这张表的人不要再把"reply inbox 天然私密"当作前提。
 
 ### B.5 标识符字符集
 
@@ -845,7 +857,7 @@ owner 查成员表找到 B 的 FP
 | broker VPS 内核沦陷 | 同上 |
 | 本地私钥文件权限弱（`0644`） | 启动时 warning，不强制 |
 | FP 枚举 / 时序攻击 | 不做恒定时间查询；FP = SHA256 输出，搜索空间 2²⁵⁶ 无意义 |
-| PIN 暴力 | **主防线 = 记忆硬 argon2id**（每次验证 64 MiB / t=3，见 `internal/auth/pin.go`）——攻击吞吐受内存带宽约束，与速率计数无关；PIN 为 ASCII 可打印、无长度上限（`ValidPIN`），非平凡 PIN 天文级安全。**辅以**每 IP 速率限制，语义为 **per-broker**：每 broker、每 IP、每分钟 ≤ 10 次；auth_callout 用 queue-group 分发（§6.2），N-broker 集群单一 IP 的有效上限 ≈ **N×10/min**。不做账户锁定。集群一致的全局计数需在**未认证 connect 路径**上引入分布式写（raft/JS/leader RPC）——那是更差的 DoS 放大面，v1 明确不做（外审 H2 裁决；实现见 `internal/authcallout/ratelimit.go`）。 |
+| PIN 暴力 | **主防线 = 记忆硬 argon2id**（每次验证 64 MiB / t=3，见 `internal/auth/pin.go`）——攻击吞吐受内存带宽约束，与速率计数无关；PIN 为 ASCII 可打印、无长度上限（`ValidPIN`），非平凡 PIN 天文级安全。**辅以**每 IP 速率限制，语义为 **per-broker**：每 broker、每 IP、每分钟 ≤ 10 次；auth_callout 用 queue-group 分发（§6.2），N-broker 集群单一 IP 的有效上限 ≈ **N×10/min**。不做账户锁定。集群一致的全局计数需在**未认证 connect 路径**上引入分布式写（raft/JS/leader RPC）——那是更差的 DoS 放大面，v1 明确不做（外审 H2 裁决；实现见 `internal/authcallout/ratelimit.go`）。**⚠ 「记忆硬 = 不需要吞吐限制」这半句已被推翻**（发布前审计 A-F3 / round 2 C9）：argon2 的记忆硬性约束的是**攻击者**每次猜测的成本，不是**被攻击的 broker** 每次验证的成本——64 MiB × t=3 对防守方同样是 0.15–0.3 s CPU 与 64 MiB 常驻，所以它是一条放大比极高的 DoS 通道，而 per-IP 限流对分布式来源无效。同一文件因此另加了**进程级 argon2 并发/速率上限**（`internal/authcallout/handler.go` 的 PIN 预算）。本表格保留 v1 当时的论证原文，是为了记住它错在哪里。 |
 
 v2+ 候选：recovery code、双 owner、tetherd 进程沙箱、mTLS 双向认证、审计签名。
 

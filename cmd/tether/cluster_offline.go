@@ -224,7 +224,7 @@ confirm (and the split-brain consequence is shown at the prompt).`,
 			if !confirmTypedNodeID(cmd, selfID,
 				"CONSEQUENCE: no HA + no integrity until you recover; if ANY listed peer is alive (merely partitioned) this SPLITS THE BRAIN into two divergent timelines.",
 				false, "") { // never-escapable: an env var is not "attended" for a brain-split-capable op
-				return fmt.Errorf("aborted (type this node's id to confirm; --yes is never accepted)")
+				return usageErr("aborted (type this node's id to confirm; --yes is never accepted)")
 			}
 			abandoned, err := clusteroffline.ForceSingle(clusteroffline.ForceSingleOptions{
 				DataDir: dataDir, DBPath: dbPath, SelfID: selfID, SelfRaftAddr: selfAddr, ConfirmedDead: confirmDead,
@@ -383,7 +383,7 @@ func runForceSingleOnline(cmd *cobra.Command, socket, selfID string, confirmDead
 	if !confirmTypedNodeID(cmd, confirmTarget,
 		"CONSEQUENCE: no HA + no integrity until you recover; if ANY listed peer is alive (merely partitioned) this SPLITS THE BRAIN into two divergent timelines.",
 		false, "") {
-		return fmt.Errorf("aborted (type this node's id to confirm; --yes is never accepted)")
+		return usageErr("aborted (type this node's id to confirm; --yes is never accepted)")
 	}
 	commit, err := callAdmin(socket, adminsock.Request{
 		Op: adminsock.OpClusterForceSingleCommit, NodeID: confirmTarget, ArmToken: arm.ForceSingle.ArmToken, ConfirmPeersDead: confirmDead,
@@ -515,7 +515,7 @@ The SQLite DB is preserved (the snapshot is a copy); only the raft log is compac
 			if !confirmTypedNodeID(cmd, selfID,
 				"CONSEQUENCE: rewrites the raft log (snapshot + compaction). The SQLite DB is preserved; only the raft log is compacted.",
 				true, confirmNodeID) {
-				return fmt.Errorf("resnapshot: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
+				return usageErr("resnapshot: aborted (type this node's id to confirm, or pass --confirm-node-id + $%s for unattended use)", machineConfirmEnv)
 			}
 			if err := clusteroffline.Resnapshot(clusteroffline.ResnapshotOptions{
 				DataDir: dataDir, DBPath: dbPath, SelfID: selfID, SelfRaftAddr: selfAddr, AcceptAuditLoss: acceptAuditLoss,
@@ -566,7 +566,7 @@ func newClusterRecoverCmd() *cobra.Command {
 			// Confirm on the node_id (B3): typing a fixed word gives zero protection
 			// against running recover against the wrong --data-dir/--db.
 			if !confirmTypedNodeID(cmd, selfID, "", false, "") { // never-escapable
-				return fmt.Errorf("aborted (type the node_id to confirm; --yes is never accepted)")
+				return usageErr("aborted (type the node_id to confirm; --yes is never accepted)")
 			}
 			n, err := clusteroffline.Recover(clusteroffline.RecoverOptions{
 				DataDir: dataDir, DBPath: dbPath, DumpPath: dumpPath,

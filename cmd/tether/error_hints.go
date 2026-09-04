@@ -94,6 +94,12 @@ var brokerCodeHints = map[string]string{
 var brokerCodeExitClasses = map[string]int{
 	// permission / ownership / membership
 	"not_owner": exitNoPerm, "not_owner_or_creator": exitNoPerm, "not_a_member": exitNoPerm,
+	// `session create` from a fingerprint the operator has not admitted. PERMANENT until a
+	// human runs `tether admin session-allow` on the broker host, so it must not land on
+	// the unclassified 70 that docs/usage.md §9.13 tells automation to retry with backoff —
+	// an automation retrying this retries forever. origin: prerelease audit increment 2
+	// internal review, five lanes.
+	"not_allowed": exitNoPerm,
 	// positively transient (self-healing) -> retry-later
 	"agent_no_responders": exitTransient, "leader_unavailable": exitTransient,
 	// batch C: a budget overrun is retry-able — the same file on a faster link, or a smaller file,
@@ -146,6 +152,15 @@ var brokerCodeExitClasses = map[string]int{
 	// not `node upgrade`" was the one instructing monitors to retry it forever.
 	// Two names for one operator action get one class.
 	"proto_bump_requires_reinstall": exitUsage,
+	// The same family, for the same reason: THIS MACHINE'S BINARY is the thing that has to
+	// change. The broker withheld a credential because this client receives its replies on
+	// the shared `_INBOX`, where any connection can read them; retrying from the same
+	// binary produces the identical refusal forever, so the unclassified 70 that
+	// docs/usage.md §9.13 tells automation to retry would be a retry loop with no exit.
+	// The operation itself SUCCEEDED (the subscriber exists, the node registered) — what is
+	// missing is the secret, which is why the remedy is an upgrade and not a re-run.
+	// origin: prerelease audit external review B-1.
+	"legacy_inbox_no_secrets": exitUsage,
 	// adminsock cluster codes (Item 4 sets these on the wire; the CLI maps them here).
 	// `already_voter` used to be classified here too. It was removed by line-2 D1's reverse
 	// reconciliation: nothing has ever emitted it. B2 item 4 declared the code speculatively, and the
@@ -434,15 +449,32 @@ func runFailureMessage(reason string) error {
 // hint when the chunk carries a remote_fs_* / too_many_wedged_spawns reason code
 // (the chunk is "<code>" or "<code>: <detail>"). Review m3 — exec gets the same
 // guidance run already surfaces via runFailureMessage, instead of a raw code.
+//
+// origin: prerelease audit cli-ctl/CLI-F1. This returned a BARE error, so classifyExit
+// had nothing to key on and every broker or agent refusal of `tether exec` came out as
+// 70. docs/usage.md §9.13 defines 70 as "back off and retry", so exec was telling
+// automation to retry not_a_member (a permission decision), node_offline (needs a human
+// to start an agent) and argv_required (a malformed request) — none of which a retry
+// can ever fix. The IDENTICAL refusal through `tether run` was already classified
+// correctly by runFailureMessage; the two readers of the same wire shape simply
+// disagreed. The operator-visible text is unchanged; only the class is added.
 func execFailureMessage(chunkErr string) error {
 	code := chunkErr
 	if i := strings.IndexByte(chunkErr, ':'); i >= 0 {
 		code = chunkErr[:i]
 	}
-	if hint := runFailureReasons[strings.TrimSpace(code)]; hint != "" {
-		return fmt.Errorf("exec: %s (%s)", hint, chunkErr)
+	// TrimSpace AFTER the split, not before: " store_error: detail" must key on
+	// "store_error", and trimming the whole string first leaves the space after the
+	// colon inside the code.
+	code = strings.TrimSpace(code)
+	class := brokerCodeExitClass(code)
+	if hint := runFailureReasons[code]; hint != "" {
+		return &ExitError{Class: class, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
 	}
-	return fmt.Errorf("exec: %s", chunkErr)
+	if hint := brokerCodeHints[code]; hint != "" {
+		return &ExitError{Class: class, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
+	}
+	return &ExitError{Class: class, Err: fmt.Errorf("exec: %s", chunkErr)}
 }
 
 func stripPrefix(s, prefix string) (string, bool) {

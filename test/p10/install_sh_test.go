@@ -133,7 +133,9 @@ func TestInstallShAgentSkipDownloadWritesYAML(t *testing.T) {
 		"--nid", "lab-1",
 		"--skip-download",
 	)
-	if !strings.Contains(out, "agent config written to") {
+	// The banner no longer says "written to" unconditionally: on a re-run that KEEPS an
+	// existing file nothing was written, and claiming otherwise was round 2's K-F7.
+	if !strings.Contains(out, "agent config:") {
 		t.Errorf("missing next-step banner; got:\n%s", out)
 	}
 	yaml := filepath.Join(home, ".tether", "agent", "lab", "agent.yaml")
@@ -479,8 +481,16 @@ func TestInstallShBrokerUninstallSymmetry(t *testing.T) {
 	if !strings.Contains(out, "journald.conf.d/60-tether.conf") {
 		t.Errorf("uninstall must remove the journald drop-in; got:\n%s", out)
 	}
-	if !strings.Contains(out, "rm -f /etc/systemd/system/tether-broker.service") {
+	// The path is now QUOTED and carries its `.new` sidecar — round 2, K-F9 (clean up
+	// the orphan) and G2 (resolve through $SYSTEMD_DIR so a redirected uninstall cannot
+	// delete a real broker's files). Assert both halves rather than a prefix, so the
+	// sidecar removal cannot be dropped without this noticing.
+	if !strings.Contains(out, "rm -f '/etc/systemd/system/tether-broker.service'") {
 		t.Errorf("uninstall must remove the unit files; got:\n%s", out)
+	}
+	if !strings.Contains(out, "'/etc/systemd/system/tether-broker.service.new'") {
+		t.Errorf("uninstall must also remove the unit's .new sidecar, or a host that was ever "+
+			"re-installed keeps an orphan no later run mentions; got:\n%s", out)
 	}
 	// review Mi7: dry-run uninstall previews the disable host-INDEPENDENTLY
 	// (the systemd probe is skipped under --dry-run).

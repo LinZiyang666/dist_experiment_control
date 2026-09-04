@@ -911,6 +911,7 @@ func dumpDivergent(dbPath, dumpPath string) (int, error) {
 			return 0, fmt.Errorf("dump table %s: %w", tbl, err)
 		}
 		total += len(rows)
+		redactSecretColumns(rows)
 		if err := enc.Encode(map[string]any{"table": tbl, "rows": rows}); err != nil {
 			return 0, fmt.Errorf("encode dump %s: %w", tbl, err)
 		}
@@ -933,6 +934,39 @@ func dumpDivergent(dbPath, dumpPath string) (int, error) {
 		return 0, fmt.Errorf("dump did not persist (size=%d, err=%v)", sizeOf(st), err)
 	}
 	return total, nil
+}
+
+// secretDumpColumns are the columns whose VALUE is a live credential rather than a
+// record of one. They are replaced in the forensic dump.
+//
+// origin: prerelease audit, §3 MINOR sweep. dumpDivergent writes every user table
+// verbatim, and proxy_subscribers.psk is documented in migration 0006 as "base64
+// Shadowsocks password (recoverable)" — so the dump is a plaintext copy of every
+// subscriber's live proxy password. The file is 0600, but its whole purpose is to be
+// KEPT: the operator is told to hold it as forensics before a destructive recover, and
+// the runbook has them copy it off the box. A recovery artefact should not be a secret
+// store.
+//
+// The row is still there, and so is the fact that the column had a value — which is all
+// the forensic question ("what did this divergent node hold") actually needs. What is
+// removed is the ability to USE it.
+//
+// Hashes are deliberately NOT redacted: token_hash and pin_hash are already one-way, and
+// their presence is exactly the kind of thing a forensic reader compares across nodes.
+var secretDumpColumns = map[string]bool{
+	"psk": true,
+}
+
+// redactSecretColumns replaces credential VALUES in place, leaving a marker so the reader
+// knows something was withheld rather than absent.
+func redactSecretColumns(rows []map[string]any) {
+	for _, row := range rows {
+		for col := range row {
+			if secretDumpColumns[col] && row[col] != nil {
+				row[col] = "[redacted: a live credential, withheld from the forensic dump]"
+			}
+		}
+	}
 }
 
 func sizeOf(st os.FileInfo) int64 {

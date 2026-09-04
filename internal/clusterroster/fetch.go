@@ -26,6 +26,12 @@ const (
 )
 
 // FetchManifest GETs + JSON-parses a ClusterManifest from an http(s) URL. limit<=0 ⇒ 1 MiB cap.
+// sharedFetchTransport is the process-wide Transport every manifest fetch uses. Its
+// connection pool is the point: reusing it is what stops each call from leaving an idle
+// connection behind. Proxy settings still come from the environment, per call, exactly as
+// before.
+var sharedFetchTransport = &http.Transport{Proxy: http.ProxyFromEnvironment}
+
 func FetchManifest(ctx context.Context, rawURL string, limit int64) (*proto.ClusterManifest, error) {
 	if limit <= 0 {
 		limit = defaultManifestLimit
@@ -33,9 +39,18 @@ func FetchManifest(ctx context.Context, rawURL string, limit int64) (*proto.Clus
 	if err := requireHTTPScheme(rawURL); err != nil {
 		return nil, err
 	}
+	// ONE Transport for the process, not one per call.
+	//
+	// origin: prerelease audit, §3 MINOR sweep. A fresh http.Transport per call keeps its
+	// own idle-connection pool and its own goroutines, and nothing ever called
+	// CloseIdleConnections — so each fetch left an idle keep-alive connection to the
+	// broker behind it, held until the server closed it. The agent's cold-start path
+	// retries this on a loop, which turns a slow bootstrap into a pile of sockets and is
+	// exactly the shape the repo's fd-leak gate exists to catch (it does not cover this
+	// package).
 	client := &http.Client{
 		Timeout:   defaultFetchTimeout,
-		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
+		Transport: sharedFetchTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxFetchRedirects {
 				return fmt.Errorf("clusterroster: too many redirects (>%d)", maxFetchRedirects)

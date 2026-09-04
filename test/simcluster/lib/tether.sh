@@ -16,6 +16,47 @@ tctl() {
 # sctl <node> <systemctl args...> : systemctl inside a node container.
 sctl() { _sc_n=$1; shift; dexec "$_sc_n" -- systemctl "$@"; }
 
+# admit_creator <broker> <node> <user> [ENV=VAL ...] : the DOCUMENTED first-deployment step.
+#
+# A FRESH broker's session_creators table is EMPTY, and `session create` is refused (exit 77,
+# code not_allowed) until an operator admits the caller's fingerprint ON THE BROKER HOST.
+# See docs/broker-ops.md §5.20 "全新 broker 的第一步". This mirrors the real two-command
+# operator procedure and adds nothing to it: the user reads their own fingerprint with
+# `tether whoami`, the operator pastes it into `tether admin session-allow` over the
+# root-only admin socket. It is auth setup, not a lifecycle workaround.
+#
+# THE IDENTITY IS THE (user, home) PAIR, NOT THE CONTAINER. cli.DefaultHome() honours
+# $TETHER_HOME and EnsureIdentity mints a SEPARATE nkey per home, so ctl1's `sim` user has a
+# different fingerprint for every CTLH tag. Pass the SAME env assignments the later
+# `session create` will run under — admit the wrong home and you have admitted a fingerprint
+# nobody uses while the create is still refused, which reads exactly like the bug this fixes.
+#
+# `tether whoami` MINTS the identity if it does not exist yet, which is what makes this
+# usable before a probe's isolated $HOME has ever run anything.
+#
+# origin: prerelease audit increment 2, first simcluster sweep after the session-admission
+# increment — 43/43 drills red on one root cause (an empty table on every fresh broker).
+admit_creator() {
+    _ad_brk=$1; _ad_node=$2; _ad_user=$3; shift 3
+    _ad_fp=$(dexec -u "$_ad_user" "$_ad_node" -- env "$@" tether whoami --json 2>/dev/null \
+        | jq -r '.fingerprint // empty' 2>/dev/null) || _ad_fp=""
+    [ -n "$_ad_fp" ] || { err "admit_creator: no fingerprint from ${_ad_user}@${_ad_node} [$*]"; return 1; }
+    # CHECK BEFORE WRITING, because a redundant admission is NOT free. `--list` is a local DB read
+    # (adminsock OpSessionCreators -> session.ListCreators), but `session-allow` is a REPLICATED write
+    # gated by assertAllVotersSupportSessionCreatorOps, which refuses whenever any voter is
+    # unreachable. Drills legitimately re-enter this helper while the cluster is degraded on purpose —
+    # 90-alerts-lifecycle calls `$SIM session` again for its N=2 arm with a broker deliberately down —
+    # and there the no-op re-admit would be the ONLY thing that failed. Skipping the write is also
+    # what a real operator does: you do not re-admit somebody who is already on the list.
+    if dexec "$_ad_brk" -- tether admin session-allow --list 2>/dev/null | grep -qF "$_ad_fp"; then
+        log "admit: ${_ad_user}@${_ad_node} [$*] → $_ad_fp already admitted on $_ad_brk (no write)"
+        return 0
+    fi
+    dexec "$_ad_brk" -- tether admin session-allow "$_ad_fp" --note "simcluster ${_ad_user}@${_ad_node}" >/dev/null \
+        || { err "admit_creator: session-allow $_ad_fp on $_ad_brk failed"; return 1; }
+    log "admit: ${_ad_user}@${_ad_node} [$*] → $_ad_fp may create sessions (via $_ad_brk)"
+}
+
 cluster_status_json() { tctl "$1" -- cluster status --json 2>/dev/null; }
 
 # leader_node : node_id of the current raft leader (server_name == node_id). Query any running broker.

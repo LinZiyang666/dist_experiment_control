@@ -182,6 +182,12 @@ _start_write_probe() {
     # working (it comes from the cluster-health probe, which is not session-scoped), which is precisely why
     # this survived unnoticed for as long as the drill had no agent-side oracle to expose it.
     dexec ctl1 -- install -o sim -g sim -m 0755 -d "/home/sim/probe-$1" >/dev/null 2>&1 || return 1
+    # THE ISOLATED $HOME IS ALSO AN ISOLATED IDENTITY. EnsureIdentity mints a separate nkey per home,
+    # so this probe's fingerprint is NOT the one `$SIM session` admitted — without its own admission
+    # every iteration is refused (not_allowed) and the log fills with WRITEFAIL that has nothing to do
+    # with the roll. That is the same class of forged verdict the --nats-url note above guards against:
+    # a probe whose failures are all fixture-induced cannot testify about raft write availability.
+    admit_creator brk1 ctl1 sim "HOME=/home/sim/probe-$1" || return 1
     dexec ctl1 -- sh -c "nohup sh -c \"i=0; while [ \\\$i -lt 1200 ]; do runuser -u sim -- env HOME=/home/sim/probe-$1 tether session create $1wp\\\$i --pin 111111 --nats-url nats://brk1:4222 >>/tmp/wp-$1.log 2>&1 && echo WROTE-$1wp\\\$i >>/tmp/wp-$1.log || echo WRITEFAIL >>/tmp/wp-$1.log; i=\\\$((i+1)); sleep 0.3; done\" >/dev/null 2>&1 & echo ok" >/dev/null 2>&1
     # D2: start the observation-only scene watcher for this phase's window (snapshots the cluster at the
     # FIRST failure-signature hit so the HALT-window question can be adjudicated from a preserved scene).

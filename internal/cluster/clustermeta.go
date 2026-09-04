@@ -92,6 +92,7 @@ func defaultAppliers() map[OpType]Applier {
 		OpMemberJoin:         exec,
 		OpNodeRegister:       exec,
 		OpNodeEvict:          exec,
+		OpSessionCreatorSet:  exec,
 		OpProcCreate:         exec,
 		OpProcMarkExited:     exec,
 		OpProcGC:             exec, // h1 B1: keyed DELETE, terminal-state guard baked

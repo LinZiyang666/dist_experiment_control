@@ -1,6 +1,7 @@
 package authcallout
 
 import (
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"strings"
@@ -75,6 +76,7 @@ func signedRequest(t *testing.T, ephemeralPub, clientNkey, name, token string) s
 	rc.UserNkey = ephemeralPub
 	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
 	rc.ConnectOptions = jwt.ConnectOptions{Name: name, Nkey: clientNkey, Token: token}
+	signNonceInto(t, rc, clientNkey)
 	tok, err := rc.Encode(serverKp)
 	if err != nil {
 		t.Fatal(err)
@@ -82,11 +84,52 @@ func signedRequest(t *testing.T, ephemeralPub, clientNkey, name, token string) s
 	return tok
 }
 
+// testUserKeys remembers the private half of every user nkey these tests mint, so a
+// hand-built request can carry a REAL signature over the nonce.
+//
+// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1.
+// Before that finding the handler never checked the signature, so hand-built requests
+// did not need one and none of them had one. Rather than thread a keypair through 46
+// call sites, the two mint helpers register what they create and the two request
+// builders look it up — so a test that wants a valid identity keeps saying exactly what
+// it said before, and a request for an nkey nobody minted fails LOUDLY here instead of
+// quietly becoming an unsigned request that the handler then denies for the wrong reason.
+var testUserKeys sync.Map // pub string -> nkeys.KeyPair
+
+// signNonceInto stamps a fresh nonce and this client's signature over it, the way
+// nats-server does when a client presented `sig` on CONNECT (server/auth_callout.go
+// fills ClientInformation.Nonce only in that case).
+//
+// An empty clientNkey is left alone on purpose: that is a test asserting the "must
+// present a user nkey" refusal, which the handler reaches before it looks at signatures.
+func signNonceInto(t *testing.T, rc *jwt.AuthorizationRequestClaims, clientNkey string) {
+	t.Helper()
+	if clientNkey == "" {
+		return
+	}
+	v, ok := testUserKeys.Load(clientNkey)
+	if !ok {
+		t.Fatalf("no seed registered for client nkey %q.\n\n"+
+			"Mint it with freshUserPub/freshClientPub so this helper can sign the nonce for it. "+
+			"Without a signature the handler denies at the identity check and the test would be "+
+			"asserting the wrong refusal.", clientNkey)
+	}
+	kp, _ := v.(nkeys.KeyPair)
+	nonce := "nonce-" + clientNkey[:8]
+	sig, err := kp.Sign([]byte(nonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.ClientInformation.Nonce = nonce
+	rc.ConnectOptions.SignedNonce = base64.RawURLEncoding.EncodeToString(sig)
+}
+
 // freshUserPub returns the public key of a freshly-created user nkey.
 func freshUserPub(t *testing.T) string {
 	t.Helper()
 	kp, _ := nkeys.CreateUser()
 	pub, _ := kp.PublicKey()
+	testUserKeys.Store(pub, kp)
 	return pub
 }
 
@@ -210,8 +253,7 @@ func TestHandleAgentRolePINBootstrapAndRebind(t *testing.T) {
 	h, _ := freshHandler(t)
 	seedSessionWithPin(t, h, "lab", "test-pin")
 
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	// Bootstrap: with PIN.
 	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), clientPub,
@@ -343,6 +385,104 @@ type emittedEvent struct {
 	fields map[string]any
 }
 
+// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1 ≡
+// red-team/RED-TEAM-REFUTE-F1.
+//
+// THE ACTOR IN EVERY PERMISSION TEMPLATE MUST BE A PROVEN IDENTITY.
+//
+// `ConnectOptions.Nkey` is a string the connecting party types. nats-server does NOT
+// verify it for a key it has no static `users:` entry for — it forwards the nkey, the
+// nonce and the signature and leaves the check to the callout — and this package's own
+// package doc asserted the opposite for three releases. Two things rest directly on the
+// binding:
+//
+//   - auth.InboxPrefixFor(actor) is only isolation if the actor is yours. Otherwise
+//     knowing a victim's PUBLIC key (sys.events publishes it in session_created{actor})
+//     is enough to subscribe to that victim's private reply inbox, which carries agent
+//     register replies — a raw tunnel token and every subscriber PSK.
+//   - session.MayCreateSession keys on a fingerprint of the actor parsed out of the
+//     PUBLISH subject, and NATS only pins that subject to ConnectOptions.Nkey.
+//
+// So a forged nkey is simultaneously an inbox-disclosure and an admission bypass, and
+// the only place either can be stopped is here.
+func TestAConnectionCannotPresentSomebodyElsesUserNkey(t *testing.T) {
+	h, _ := freshHandler(t)
+	seedSessionWithPin(t, h, "lab", "test-pin")
+
+	victimPub := freshUserPub(t)
+	attackerKp, _ := nkeys.CreateUser()
+
+	// Positive control FIRST, so a handler that denies everything cannot pass this test:
+	// the victim itself, signing its own nonce, is allowed.
+	if reason := denyReason(t, mustHandle(t, h,
+		signedRequest(t, freshUserPub(t), victimPub, "tether-cli", ""))); reason != "" {
+		t.Fatalf("the holder of the nkey was refused: %s", reason)
+	}
+
+	forged := forgedNkeyRequest(t, victimPub, attackerKp, "tether-cli", "")
+	if reason := denyReason(t, mustHandle(t, h, forged)); reason == "" {
+		t.Fatal("a connection presenting the VICTIM's public key with an ATTACKER's signature was " +
+			"ALLOWED.\n\n" +
+			"Every grant this handler mints is scoped by ConnectOptions.Nkey: the `ctrl.by.<actor>` " +
+			"publish subjects, the private reply inbox derived by auth.InboxPrefixFor, and the " +
+			"fingerprint the session-create allow-list is keyed on. If that field is not proven, " +
+			"knowing a victim's public key — which sys.events hands to any session member — is " +
+			"enough to read its replies and to create sessions as it.")
+	}
+
+	// And an unsigned CONNECT is a refusal, not an exemption: nats-server only fills the
+	// nonce when the client sent a signature, so "no signature" is exactly the case this
+	// check exists for. It must not fall through to a permissive template — an empty
+	// jwt.Permissions is UNRESTRICTED in nats-server.
+	unsigned := unsignedNkeyRequest(t, victimPub, "tether-cli", "")
+	if reason := denyReason(t, mustHandle(t, h, unsigned)); reason == "" {
+		t.Fatal("a CONNECT carrying an nkey but NO signature over the server nonce was ALLOWED")
+	}
+}
+
+// forgedNkeyRequest builds the exact shape a real attacker sends: the victim's PUBLIC
+// key in ConnectOptions.Nkey, and a signature over the nonce made with a key the
+// attacker owns. nats-server accepts this CONNECT and forwards it verbatim.
+func forgedNkeyRequest(t *testing.T, victimPub string, attackerKp nkeys.KeyPair, name, token string) string {
+	t.Helper()
+	serverKp, _ := nkeys.CreateServer()
+	serverPub, _ := serverKp.PublicKey()
+
+	rc := jwt.NewAuthorizationRequestClaims(serverPub)
+	rc.UserNkey = freshUserPub(t)
+	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
+	rc.ConnectOptions = jwt.ConnectOptions{Name: name, Nkey: victimPub, Token: token}
+	nonce := "nonce-forged"
+	sig, err := attackerKp.Sign([]byte(nonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.ClientInformation.Nonce = nonce
+	rc.ConnectOptions.SignedNonce = base64.RawURLEncoding.EncodeToString(sig)
+	tok, err := rc.Encode(serverKp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// unsignedNkeyRequest carries an nkey and no signature at all.
+func unsignedNkeyRequest(t *testing.T, clientNkey, name, token string) string {
+	t.Helper()
+	serverKp, _ := nkeys.CreateServer()
+	serverPub, _ := serverKp.PublicKey()
+
+	rc := jwt.NewAuthorizationRequestClaims(serverPub)
+	rc.UserNkey = freshUserPub(t)
+	rc.Server = jwt.ServerID{ID: serverPub, Name: serverPub}
+	rc.ConnectOptions = jwt.ConnectOptions{Name: name, Nkey: clientNkey, Token: token}
+	tok, err := rc.Encode(serverKp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
 // A different agent identity arriving with a valid PIN to a slot already
 // taken by another fp must be denied. PIN does NOT override the existing
 // (sid,nid)→fp binding — operator must explicitly revoke first.
@@ -350,15 +490,13 @@ func TestHandleAgentRoleRejectsHijack(t *testing.T) {
 	h, _ := freshHandler(t)
 	seedSessionWithPin(t, h, "lab", "test-pin")
 
-	firstKp, _ := nkeys.CreateUser()
-	firstPub, _ := firstKp.PublicKey()
+	firstPub := freshUserPub(t)
 	if _, err := h.Handle(signedRequest(t, freshUserPub(t), firstPub,
 		"tether-agent:lab:lab-1", "test-pin")); err != nil {
 		t.Fatal(err)
 	}
 
-	hijackerKp, _ := nkeys.CreateUser()
-	hijackerPub, _ := hijackerKp.PublicKey()
+	hijackerPub := freshUserPub(t)
 	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), hijackerPub,
 		"tether-agent:lab:lab-1", "test-pin"))
 	if err != nil {

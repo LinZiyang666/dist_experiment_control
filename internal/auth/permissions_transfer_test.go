@@ -16,8 +16,8 @@ func TestNoStreamLifecycleOnObjXfer(t *testing.T) {
 		name string
 		pubs []string
 	}{
-		{"activated_member", PermissionsForActivatedMember(sampleActor, "lab").Pub.Allow},
-		{"agent", PermissionsForAgent("lab", "lab-1").Pub.Allow},
+		{"activated_member", PermissionsForActivatedMember(sampleActor, "lab", false).Pub.Allow},
+		{"agent", PermissionsForAgent("lab", "lab-1", sampleActor, true).Pub.Allow},
 	}
 	bannedVerbs := []string{"STREAM.CREATE", "STREAM.DELETE", "STREAM.PURGE", "STREAM.UPDATE"}
 	for _, tc := range cases {
@@ -42,7 +42,7 @@ func TestNoStreamLifecycleOnObjXfer(t *testing.T) {
 // bucket xfer-<sid>, so the bound sid appears as the last segment of
 // the bucket name (e.g. "OBJ_xfer-lab" or "$O.xfer-lab.M.>").
 func TestObjXferEntriesScopedToSession(t *testing.T) {
-	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	perms := PermissionsForActivatedMember(sampleActor, "lab", false)
 	check := func(label string, allows []string) {
 		for _, allow := range allows {
 			if !strings.Contains(allow, "xfer-") && !strings.Contains(allow, "OBJ_xfer-") {
@@ -65,7 +65,7 @@ func TestObjXferEntriesScopedToSession(t *testing.T) {
 
 // Caps probe must be sid+actor scoped (file-transfer-plan §Wire).
 func TestCapsProbePermissionShape(t *testing.T) {
-	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	perms := PermissionsForActivatedMember(sampleActor, "lab", false)
 	want := "tether.v2.ctrl.by." + sampleActor + ".s.lab.caps.req"
 	for _, allow := range perms.Pub.Allow {
 		if allow == want {
@@ -79,7 +79,7 @@ func TestCapsProbePermissionShape(t *testing.T) {
 // (broker enforces transfer-id ↔ actor ownership application-side).
 // Reviewer Round-4 #1 fix.
 func TestFinalizePermissionShape(t *testing.T) {
-	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	perms := PermissionsForActivatedMember(sampleActor, "lab", false)
 	want := "tether.v2.ctrl.by." + sampleActor + ".s.lab.transfer.*.finalize.req"
 	for _, allow := range perms.Pub.Allow {
 		if allow == want {
@@ -95,7 +95,7 @@ func TestFinalizePermissionShape(t *testing.T) {
 // a session-B member should never have a finalize allow under
 // `s.<otherSid>.transfer.*.finalize.req`).
 func TestActivatedMemberSidIsLockedAtMint(t *testing.T) {
-	perms := PermissionsForActivatedMember(sampleActor, "lab")
+	perms := PermissionsForActivatedMember(sampleActor, "lab", false)
 	for _, allow := range allEntries(perms) {
 		if strings.Contains(allow, ".s.") &&
 			!strings.Contains(allow, ".s.lab.") &&

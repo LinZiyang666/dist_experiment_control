@@ -260,8 +260,8 @@ func buildMultiOp(t *testing.T, useFSM bool, now time.Time, cfg *port.Config) *s
 		t.Fatalf("proc.Insert: %v", err)
 	}
 	if useFSM {
-		apply(proc.PlanMarkExited(db, pid, 0, now))
-	} else if err := proc.MarkExited(db, pid, 0, now); err != nil {
+		apply(proc.PlanMarkExited(db, pid, p.SID, 0, now))
+	} else if err := proc.MarkExited(db, pid, p.SID, 0, now); err != nil {
 		t.Fatalf("proc.MarkExited: %v", err)
 	}
 	if useFSM {
@@ -584,7 +584,9 @@ func TestReconcileBatch_TotalOrderDeterminism(t *testing.T) {
 
 	var firstSQL []string
 	for i, ord := range orders {
-		cmd, err := proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: ord})
+		// SID is REQUIRED since external review B-2 (see command_shape_test.go). The
+		// determinism property under test is unaffected: the same SID rides every order.
+		cmd, err := proc.PlanReconcileBatch(proc.ReconcileBatchInput{SID: "lab", Marks: ord})
 		if err != nil {
 			t.Fatalf("order %d: %v", i, err)
 		}
@@ -614,7 +616,13 @@ func TestReconcileBatch_TotalOrderDeterminism(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd, _ := proc.PlanReconcileBatch(proc.ReconcileBatchInput{Marks: []proc.ExitMark{c, a, b}}) // shuffled input
+	// shuffled input. The error is CHECKED: discarding it turned the B-2 refusal into a
+	// nil Command and a segfault three lines down, which is a worse way to learn that the
+	// plan was rejected than being told so.
+	cmd, perr := proc.PlanReconcileBatch(proc.ReconcileBatchInput{SID: "lab", Marks: []proc.ExitMark{c, a, b}})
+	if perr != nil {
+		t.Fatal(perr)
+	}
 	if err := cluster.ExecCommand(db, cmd); err != nil {
 		t.Fatal(err)
 	}

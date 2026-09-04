@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -49,7 +50,7 @@ const xferReapMinObjectAge = 2 * time.Minute
 // and skipped; the returned error reflects only the top-level
 // ListStreams call.
 func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
-	if b.js == nil {
+	if brokerJS(b) == nil {
 		return 0, nil
 	}
 	// audit G: a not-caught-up node's empty in-memory tracker would treat live cluster-wide objects as
@@ -78,13 +79,24 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 	// protection is an exact identity match rather than a heuristic. A ledger that cannot be read is
 	// treated as "delete nothing this pass": acting on evidence we could not read is precisely the
 	// failure this guard exists to prevent.
-	protected, lerr := b.ledgerProtectedObjects(b.now())
+	// A DIRECTORY we cannot read is transient and self-heals, so that still skips the
+	// pass. INDIVIDUAL rows we cannot read do not: they are renamed to .corrupt and
+	// nothing ever removes them, so treating them as a pass-level failure stopped
+	// reclamation permanently for every session (prerelease audit BT-F3). They are
+	// carried down instead and fail closed one object at a time.
+	protected, unresolvedRows, lerr := b.ledgerProtectedObjects(b.now())
 	if lerr != nil {
-		b.cfg.Logger.Warn("broker: xfer ledger unreadable — skipping the orphan reap this pass rather "+
-			"than deleting objects on evidence we could not read", "err", lerr)
+		b.cfg.Logger.Warn("broker: xfer ledger DIRECTORY unreadable — skipping the orphan reap this "+
+			"pass rather than deleting objects on evidence we could not read", "err", lerr)
+		b.xferReapSkipped.Add(1)
+		b.xferReapSkippedAt.Store(b.now().UnixNano())
 		return 0, nil
 	}
-	infos := b.js.ListStreams(ctx)
+	if len(unresolvedRows) > 0 {
+		b.cfg.Logger.Warn("broker: xfer ledger has unreadable row(s); the objects they name are "+
+			"protected, the rest of the sweep proceeds", "rows", len(unresolvedRows))
+	}
+	infos := brokerJS(b).ListStreams(ctx)
 	deleted := 0
 	unreapable := 0 // N-6: buckets no broker can ever reap that hold aged garbage (observability only)
 	for info := range infos.Info() {
@@ -116,7 +128,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 				// The caught-up LEADER GCs objects past the LONGER cross-home floor (only the leader, so no two
 				// brokers race; the longer floor protects a transfer still live on another home across clock skew).
 				if b.reaperMayDelete() {
-					if reaped := b.reapBucketObjects(ctx, name, b.crossHomeReapAge(), true, protected); reaped > 0 {
+					if reaped := b.reapBucketObjects(ctx, name, b.crossHomeReapAge(), true, protected, unresolvedRows); reaped > 0 {
 						deleted += reaped
 						b.cfg.Logger.Info("broker: cross-home GC reaped aged orphan xfer objects (split-home/zero-node bucket)",
 							"bucket", name, "sid", sid, "deleted", reaped)
@@ -142,7 +154,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		if _, busy := b.transfers.activeOBJStreams()[name]; busy {
 			continue
 		}
-		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge, false, protected)
+		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge, false, protected, unresolvedRows)
 		deleted += reaped
 		if reaped > 0 {
 			b.cfg.Logger.Info("broker: orphan xfer objects reaped",
@@ -155,6 +167,63 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 	return deleted, infos.Err()
 }
 
+// brokerUptime is how long this process has been serving. Zero before Run, which is
+// the conservative direction for every caller below: an unknown uptime buys an object
+// the FULL protection window rather than none.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly, and it caught this one on the way in.
+func brokerUptime(b *Broker) time.Duration {
+	if b.bootAt.IsZero() {
+		return 0
+	}
+	d := b.now().Sub(b.bootAt)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// xferObjectReapFloor is the minimum age an object must reach before this pass may
+// delete it. Pure, so the three-way interaction below can be tested without a
+// broker, a bucket or a clock.
+//
+// THE UPTIME TERM (origin: prerelease audit broker-transfer/BT-F4).
+//
+// The home-owned reap runs with a short grace (2 minutes) because the per-bucket
+// busy re-read is supposed to shield live transfers. That protection is real for a
+// transfer THIS process started — it is in the tracker, so the whole bucket is
+// skipped. It says nothing about a transfer the PREVIOUS incarnation started: after
+// a restart the tracker is empty, and on a single broker with no data_dir the ledger
+// did not exist either (see #57, now fixed), so a 2-GiB tier-B push that was 3
+// minutes into its 35m08s budget was deleted out from under the agent that was
+// reading it.
+//
+// The fix is not to make this reap size-aware. That was considered and rejected:
+// TestHomeReapIsNotSizeAware pins decision N15 in the AST, and a 2-GiB object would
+// take a ~32-minute floor while buckets are sized for one max object plus margin, so
+// the next tier-B push would be refused as too_large.
+//
+// Instead the floor falls back toward the ordinary grace as the process ages. Once
+// this incarnation has been up for a full maximum budget, no object can still belong
+// to a previous one, so the extra protection has done its job and costs nothing in
+// steady state. It is also size-INDEPENDENT, so it does not reopen N15.
+func xferObjectReapFloor(minAge time.Duration, sizeAware bool, size int64, uptime time.Duration) time.Duration {
+	floor := minAge
+	if sizeAware && floor > 0 {
+		floor += xferCrossHomeExtraFor(size)
+		return floor
+	}
+	if floor <= 0 {
+		// minAge<=0 is the zero-value test broker's "reap everything now".
+		return floor
+	}
+	if young := proto.XferTierBMaxBudget - uptime; young > floor {
+		return young
+	}
+	return floor
+}
+
 // reapBucketObjects deletes every non-deleted object in the OBJ_xfer bucket `name` older than minAge and
 // returns the count deleted. Shared by the home-owned reap (per-home grace b.xferReapMinAge) and the #58
 // leader cross-home GC (the longer crossHomeReapAge). minAge<=0 reaps everything (the zero-value test
@@ -165,9 +234,10 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 // The home-owned reap passes false — its short grace is protected by the per-bucket busy re-read
 // instead, and widening it would make orphan garbage linger on exactly the small-disk brokers this
 // sweep exists to protect.
-func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration, sizeAware bool, protected map[string]bool) (deleted int) {
+func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration, sizeAware bool,
+	protected, unresolvedRows map[string]bool) (deleted int) {
 	bucket := strings.TrimPrefix(name, "OBJ_")
-	store, err := b.js.ObjectStore(ctx, bucket)
+	store, err := brokerJS(b).ObjectStore(ctx, bucket)
 	if err != nil {
 		b.cfg.Logger.Warn("broker: open xfer bucket for reconcile", "bucket", bucket, "err", err)
 		return 0
@@ -194,10 +264,14 @@ func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time
 		if protected[bucket+"/"+obj.Name] {
 			continue
 		}
-		floor := minAge
-		if sizeAware && floor > 0 {
-			floor += xferCrossHomeExtraFor(int64(obj.Size))
+		// An object whose ledger row could not be READ is protected individually.
+		// The object name IS the transfer id at every writer, so this is the same
+		// exact identity match the protected set uses, applied to the rows whose
+		// contents we do not have (prerelease audit BT-F3).
+		if unresolvedRows[xferInflightFilename(obj.Name)] {
+			continue
 		}
+		floor := xferObjectReapFloor(minAge, sizeAware, int64(obj.Size), brokerUptime(b))
 		if floor > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < floor {
 			continue
 		}
@@ -226,7 +300,7 @@ func (b *Broker) crossHomeReapAge() time.Duration {
 // over-count on a read blip).
 func (b *Broker) xferBucketHasAgedObjects(ctx context.Context, name string) bool {
 	bucket := strings.TrimPrefix(name, "OBJ_")
-	store, err := b.js.ObjectStore(ctx, bucket)
+	store, err := brokerJS(b).ObjectStore(ctx, bucket)
 	if err != nil {
 		return false
 	}

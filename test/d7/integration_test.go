@@ -127,7 +127,12 @@ func (c *d7Cluster) joinInput(t *testing.T, i int) cluster.ClusterNodeUpsertInpu
 	// dead too.
 	return cluster.ClusterNodeUpsertInput{
 		NodeID: c.ids[i], Name: c.ids[i], NodeIdentPub: pub, NatsServerID: "tether-" + c.ids[i],
-		RaftAddr: c.ids[i], NatsRoute: "nats://127.0.0.1:1", TunnelAddr: "127.0.0.1:1", PublicHost: "h",
+		// The ROSTER's raft_addr is a replicated informational copy, not the raft
+		// transport address this in-memory fixture peers on — so it can be
+		// address-shaped without disturbing the cluster. It has to be: the roster
+		// admission planner now validates it exactly as its own rewrite planner always
+		// has (prerelease audit cluster-fsm/L3-F2).
+		RaftAddr: c.ids[i] + ":7400", NatsRoute: "nats://127.0.0.1:1", TunnelAddr: "127.0.0.1:1", PublicHost: "h",
 		CertFP: "sha256:ab", JoinNonce: nonce, JoinSigHex: hex.EncodeToString(sig), Now: time.Now(),
 	}
 }
@@ -304,7 +309,7 @@ func testD7ForgedSigOnFollower(t *testing.T) {
 	victimSig, _ := auth.SignWithSeed(victimSeed, msg)
 	advSig, _ := auth.SignWithSeed(advSeed, msg) // verifies under advPub, NOT victimPub
 	good := cluster.ClusterNodeUpsertInput{
-		NodeID: "evil", Name: "evil", NodeIdentPub: victimPub, RaftAddr: "x", PublicHost: "h", CertFP: "sha256:ab",
+		NodeID: "evil", Name: "evil", NodeIdentPub: victimPub, RaftAddr: "10.9.9.9:7400", NatsRoute: "nats://10.9.9.9:6222", PublicHost: "h", CertFP: "sha256:ab",
 		JoinNonce: nonce, JoinSigHex: hex.EncodeToString(victimSig), Now: time.Now(),
 	}
 	cmd, err := cluster.PlanClusterNodeUpsert(good)

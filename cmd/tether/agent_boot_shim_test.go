@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 // origin: upgrade-safety external review F2 — the boot-shim contract can only
@@ -128,6 +130,23 @@ func TestIsAgentDaemonInvocationBooleanForms(t *testing.T) {
 		{"false_help", []string{"tether", "agent", "--help=false"}, true},
 		{"help_subcommand", []string{"tether", "agent", "help"}, false},
 		{"version", []string{"tether", "version"}, false},
+
+		// origin: prerelease audit round 2, J2 — a subcommand BEHIND a
+		// value-taking flag. cobra's stripFlags consumes `--log-level`'s value
+		// and routes these to the subcommand, so they are not daemon boots and
+		// must not spend the upgrade's boot budget. Looking only at args[2],
+		// as the first version did, called every one of them the daemon.
+		{"subcommand_behind_a_value_flag", []string{"tether", "agent", "--log-level", "debug", "doctor"}, false},
+		{"join_behind_a_value_flag", []string{"tether", "agent", "--nid", "gpu1", "join", "INV"}, false},
+		{"config_behind_two_value_flags", []string{"tether", "agent", "--session", "lab", "--nid", "gpu1", "config"}, false},
+		// ...and the mirror image, which must stay the DAEMON: a flag VALUE
+		// that happens to read like a subcommand name.
+		{"flag_value_named_like_a_subcommand", []string{"tether", "agent", "--nid", "doctor"}, true},
+		{"attached_form_leaves_no_positional", []string{"tether", "agent", "--nid=doctor"}, true},
+		// `agent join --start` IS the daemon (round 2, J1), including when the
+		// flag sits behind another flag's value.
+		{"join_start_is_the_daemon", []string{"tether", "agent", "join", "INV", "--start"}, true},
+		{"join_start_behind_a_value_flag", []string{"tether", "agent", "--nid", "gpu1", "join", "INV", "--start"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,5 +154,43 @@ func TestIsAgentDaemonInvocationBooleanForms(t *testing.T) {
 				t.Fatalf("isAgentDaemonInvocation(%q) = %v, want %v", tc.argv, got, tc.want)
 			}
 		})
+	}
+}
+
+// origin: prerelease audit round 2, J2.
+//
+// agentValueTakingFlags is hand-kept because isAgentDaemonInvocation runs BEFORE
+// cobra parses anything — that is the whole premise of the pre-parse recognizer.
+// A hand-kept mirror of a real flag set rots, and the way it rots here is silent:
+// add a new value-taking flag to `tether agent` and the token behind its value
+// starts being read as a subcommand name, which costs the daemon a boot-budget
+// tick and makes `node upgrade` unable to commit against that launch shape (that
+// is J1, arrived at from the other direction).
+//
+// So walk the REAL command and require exact agreement in both directions.
+func TestAgentValueTakingFlagsMatchTheRealCommand(t *testing.T) {
+	real := map[string]bool{}
+	newAgentCmd().Flags().VisitAll(func(f *pflag.Flag) {
+		// A bool flag never consumes the next token; everything else does in
+		// its separated spelling. pflag reports that as NoOptDefVal.
+		if f.NoOptDefVal == "" {
+			real["--"+f.Name] = true
+		}
+	})
+	for name := range real {
+		if !agentValueTakingFlags[name] {
+			t.Errorf("`tether agent` has value-taking flag %s, which agentValueTakingFlags does not list.\n\n"+
+				"The pre-parse recognizer will not skip its value, so the token behind it reads as a "+
+				"subcommand name — and if that token happens to be doctor/join/config, the daemon "+
+				"loses the boot-budget tick a pending upgrade needs to commit.", name)
+		}
+	}
+	for name := range agentValueTakingFlags {
+		if !real[name] {
+			t.Errorf("agentValueTakingFlags lists %s, which `tether agent` no longer has as a "+
+				"value-taking flag.\n\nA stale entry makes the recognizer skip a token that is "+
+				"really a subcommand name, so `tether agent %s doctor` is misread as the daemon.",
+				name, name)
+		}
 	}
 }

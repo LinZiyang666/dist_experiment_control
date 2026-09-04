@@ -71,6 +71,8 @@ import (
 // frozenForwardVerbs maps the Go constant name to its wire value. Both halves matter:
 // the NAME so a deleted const is caught, the VALUE so a retyped one is.
 var frozenForwardVerbs = map[string]string{
+	// origin: prerelease audit round 2 — the `session create` admission table.
+	"VerbSessionCreatorSet":  "sessioncreatorset",
 	"VerbProvision":          "provision",
 	"VerbJoin":               "join",
 	"VerbReconcile":          "reconcile",
@@ -111,9 +113,19 @@ var frozenPayloadKeys = map[string][]string{
 	"BusNkeySetPayload":         {"bus_nkey_pub", "node_id"},
 	"PortMutatePayload":         {"port"},
 	"PortFreeAllocationPayload": {"name", "nid", "port", "sid", "token_hash"},
-	"ProcMarkExitedPayload":     {"ended_at", "exit_code", "pid"},
-	"SessionMutatePayload":      {"sid"},
-	"EvictPayload":              {"nid", "sid"},
+	// "sid" ADDED by the 2026-09-02 prerelease audit (broker-core #27). It is an
+	// ADDITIVE, omitempty key whose zero value is LEGAL and load-bearing: a broker on
+	// the previous release forwards without it, and proc.PlanMarkExited renders the
+	// pre-fence predicate for an empty sid so those exits still land during a rolling
+	// upgrade (requirements §6.7, the N-1 window). Nothing was renamed and nothing was
+	// removed, which is what this ledger is defending — the failure it describes (a key
+	// decoding to the zero value on the other version's leader) is here the DESIGNED
+	// behaviour, and it is safe only because the sid the fence needs originates at the
+	// agent boundary, where exec.go reads it from a subject the NATS ACL pins.
+	"ProcMarkExitedPayload": {"ended_at", "exit_code", "pid", "sid"},
+	"SessionMutatePayload":  {"sid"},
+	"EvictPayload":          {"nid", "sid"},
+	"SessionCreatorPayload": {"added_by", "allow", "fp", "note"},
 
 	// UNTAGGED — the Go field names below ARE the wire. See TestUntaggedPayloadsAreDeclared.
 	// Leased was briefly here, backed by migration 0019, and is GONE again: a
@@ -241,6 +253,7 @@ func payloadSpecimens() map[string]any {
 		"ProcMarkExitedPayload":     ProcMarkExitedPayload{},
 		"SessionMutatePayload":      SessionMutatePayload{},
 		"EvictPayload":              EvictPayload{},
+		"SessionCreatorPayload":     SessionCreatorPayload{},
 		"node.RegisterInput":        nodepkg.RegisterInput{},
 		"proc.Process":              proc.Process{},
 		"schema.AuditTransfer":      schema.AuditTransfer{},
@@ -326,6 +339,7 @@ func TestForwardVerbsAreWireFrozen(t *testing.T) {
 		"VerbSessionTombstone":   VerbSessionTombstone,
 		"VerbSessionDrop":        VerbSessionDrop,
 		"VerbNodeEvict":          VerbNodeEvict,
+		"VerbSessionCreatorSet":  VerbSessionCreatorSet,
 	}
 	for name, want := range frozenForwardVerbs {
 		got, ok := live[name]
@@ -713,10 +727,16 @@ func TestEveryForwardWrapperTypeHasAnEnvelopeSpecimen(t *testing.T) {
 //
 // It exists because the discovery above is deliberately over-broad (every unexported struct), which
 // is the right trade — a false positive costs one line here, a false negative is an unfrozen wire
-// type. The empty map is the honest state today: both unexported structs in that file ARE the wire.
-// Adding an entry is a decision with a reason attached, and the reverse check above makes a stale one
-// fail rather than quietly widen the hole.
-var offWireForwardStructs = map[string]string{}
+// type. Adding an entry is a decision with a reason attached, and the reverse check above makes a
+// stale one fail rather than quietly widen the hole.
+var offWireForwardStructs = map[string]string{
+	// forwardDeps holds a FUNC VALUE (the leader's budgeted Argon2 verifier) and is
+	// constructed locally by SubscribeClusterApply on the receiving side. It is never
+	// marshalled and could not be: a func has no JSON representation, so a change here
+	// cannot reach a peer at all, let alone in a mixed-release window.
+	// origin: prerelease audit external review M-1.
+	"forwardDeps": "leader-side collaborators (a func value); constructed locally, never marshalled",
+}
 
 // TestUntaggedPayloadsAreDeclared makes the "field name IS the wire" hazard explicit and
 // bounded. If a NEW untagged type joins the forward wire, this fails and the author has to

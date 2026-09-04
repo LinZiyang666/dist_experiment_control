@@ -321,3 +321,63 @@ func TestHangupConcurrentMasterIONoRace(t *testing.T) {
 	}
 	_, _ = s.Wait()
 }
+
+// origin: prerelease audit round 2, I-F5.
+//
+// THE `.in` WRITER MUST NOT READ s.Master WITHOUT THE LOCK.
+//
+// Hangup() closes the master IN PLACE — leaving the field non-nil — specifically so
+// that run.go's `.in` callback, which reads it unsynchronized, does not race. Close()
+// was never given that treatment: it writes `s.Master = nil` under s.mu, and the
+// callback read it without. Under -race that is a reported data race, and in production
+// it is a torn pointer read on every interactive session that ends while the user is
+// still typing.
+//
+// Run with -race (the repo's D-matrix does) — without it this test still exercises the
+// concurrency but cannot report the race itself.
+func TestWriteInputIsSafeAgainstAConcurrentClose(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		s, err := Allocate(80, 24)
+		if err != nil {
+			t.Skipf("no pty available here: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				// The error is expected once Close lands; what must not happen is a
+				// race on the field or a panic.
+				_, _ = s.WriteInput([]byte("x"))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_ = s.Close()
+		}()
+		wg.Wait()
+	}
+}
+
+// origin: prerelease audit round 2, I-F5.
+//
+// The contract WriteInput has to keep, stated separately from the race: after Close the
+// write must FAIL rather than land somewhere, and it must not panic. os.File methods are
+// nil-receiver safe, which is precisely why the old code's bug was invisible.
+func TestWriteInputFailsAfterClose(t *testing.T) {
+	s, err := Allocate(80, 24)
+	if err != nil {
+		t.Skipf("no pty available here: %v", err)
+	}
+	if _, werr := s.WriteInput([]byte("before")); werr != nil {
+		t.Fatalf("a write to a live master failed: %v", werr)
+	}
+	if cerr := s.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	if _, werr := s.WriteInput([]byte("after")); werr == nil {
+		t.Fatal("a write to a CLOSED pty master reported success.\n\n" +
+			"The caller drops the error, so a silent success means the operator's keystrokes " +
+			"vanish with no indication the session is gone.")
+	}
+}

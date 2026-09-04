@@ -77,7 +77,12 @@ func pollClusterHealth(nc *nats.Conn, subject string, window time.Duration) map[
 	if nc == nil {
 		return out
 	}
-	inbox := nats.NewInbox()
+	// nc.NewInbox(), not the package-level nats.NewInbox() — origin: prerelease audit
+	// round 2. The package helper ignores this connection's CustomInboxPrefix, so the
+	// reply would land in the shallow shared space that every pre-cutover client is
+	// granted, rather than in the broker's own subtree. cmd/tether/alert_gate.go carries
+	// the same note for the same reason.
+	inbox := nc.NewInbox()
 	sub, err := nc.SubscribeSync(inbox)
 	if err != nil {
 		return out

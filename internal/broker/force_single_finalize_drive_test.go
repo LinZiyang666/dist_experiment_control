@@ -35,7 +35,7 @@ func fsFinalizeFixture(t *testing.T, selfID string, ghosts ...string) (*ClusterA
 		t.Fatalf("AddNode self: %v", err)
 	}
 	for _, g := range ghosts {
-		in := d7JoinInput(t, g, g)
+		in := d7JoinInput(t, g, g+":7400")
 		if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(in) }); err != nil {
 			t.Fatalf("insert roster row %s: %v", g, err)
 		}
@@ -80,7 +80,7 @@ func opByID(t *testing.T, n *cluster.Node, id string) *cluster.Operation {
 func TestForceSingleGhostRowsSeesOnlyVoterRowsAbsentFromTheConfig(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
 	// A node mid-join: roster row present, NOT in the raft config, phase is a join phase.
-	joining := d7JoinInput(t, "joiner-b", "joiner-b")
+	joining := d7JoinInput(t, "joiner-b", "joiner-b:7400")
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(joining) }); err != nil {
 		t.Fatalf("insert joiner row: %v", err)
 	}

@@ -22,7 +22,7 @@ func TestSessionCreateAndOwnerCanList(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	id := freshIdentity(t)
+	id := admittedIdentity(t, db)
 	nc := ctlConnUnactivated(t, url, id)
 
 	body, _ := json.Marshal(proto.SessionCreateReq{Name: "lab", PIN: "123456"})
@@ -57,7 +57,7 @@ func TestPINJoinAcceptsCorrectPIN(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "secret")
 
 	member := freshIdentity(t)
@@ -84,7 +84,7 @@ func TestPINJoinRejectsWrongPIN(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "right-pin")
 
 	intruder := freshIdentity(t)
@@ -103,7 +103,7 @@ func TestSessionRmOwnerOnlyViaConnect(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "p")
 
 	member := freshIdentity(t)
@@ -147,7 +147,7 @@ func TestPINJoinRejectedAfterTombstone(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	owner := freshIdentity(t)
+	owner := admittedIdentity(t, db)
 	mustCreate(t, url, owner, "lab", "p")
 	mustTombstone(t, url, owner, "lab")
 

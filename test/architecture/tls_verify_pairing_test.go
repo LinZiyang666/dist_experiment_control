@@ -330,13 +330,19 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 	// the gate's success state ("no offenders") is exactly what a broken scanner reports. `found == 0` only
 	// catches TOTAL failure.
 	//
-	// The four sites, all deliberate and all read by hand during the gosec G402 review:
+	// The five sites, all deliberate and all read by hand — the first four during the gosec G402 review,
+	// the fifth during the 2026-09-02 prerelease audit:
 	//
 	//	internal/tunnel/tls.go        the N=1 unpinned fallback (ledgered) and the pinned path
 	//	internal/cluster/transport.go the raft transport's CN-only leaf, paired with verifyChainToCA
 	//	internal/tunnel/register_and_fence_test.go  a test dialling the harness's self-signed listener
+	//	internal/tunnel/register_admission_test.go  admissionTLS, the dial config for the unauthenticated-
+	//	                             admission harness. PAIRED with a VerifyConnection pinning the leaf
+	//	                             fingerprint the harness itself minted, so it took no exemption. Both
+	//	                             call sites share this one constructor deliberately: a per-call literal
+	//	                             would have added two countable sites and two places to forget the pin.
 	//
-	// Growth is the interesting direction and it FAILS here rather than being absorbed: a fifth site must
+	// Growth is the interesting direction and it FAILS here rather than being absorbed: a sixth site must
 	// be read by a person, and this line is where they are made to do it. Shrinkage fails too, because a
 	// count that is allowed to drop silently is a count that stops meaning anything the moment the
 	// scanner breaks.
@@ -359,7 +365,7 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 		}
 	}
 
-	const expectedSkipVerifySites = 4
+	const expectedSkipVerifySites = 5
 	if found != expectedSkipVerifySites {
 		t.Errorf("the scan found %d InsecureSkipVerify:true site(s), expected exactly %d.\n\n"+
 			"MORE: a new site appeared. Read it, then either pair it with VerifyPeerCertificate/"+

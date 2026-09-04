@@ -85,15 +85,15 @@ func (b *Broker) pubSysEvent(kind string, fields map[string]any) {
 // of finalizeSessionRm, and any new req gets rejected by C.1 §6 in
 // the meantime because state is still DELETING.
 func (b *Broker) finalizeSessionRm(ctx context.Context, sid string) error {
-	if b.js != nil {
-		if err := jsstream.DeleteHistoryStream(ctx, b.js, sid); err != nil {
+	if brokerJS(b) != nil {
+		if err := jsstream.DeleteHistoryStream(ctx, brokerJS(b), sid); err != nil {
 			return fmt.Errorf("phase 2: %w", err)
 		}
 		// Phase ②.5 (audit M4 / transfer F1): delete the tier-B transfer object store too.
 		// Without this the OBJ_xfer-<sid> bucket outlives the purged session row; at N>=3 a
 		// lingering bucket below target replicas permanently fails the retire gate. Idempotent
 		// (DeleteXferBucket tolerates "already gone"), so a crash-mid-rm re-run is clean.
-		if err := jsstream.DeleteXferBucket(ctx, b.js, sid); err != nil {
+		if err := jsstream.DeleteXferBucket(ctx, brokerJS(b), sid); err != nil {
 			return fmt.Errorf("phase 2.5 (xfer bucket): %w", err)
 		}
 	}
@@ -161,7 +161,7 @@ func dropSessionRows(db *sql.DB, sid string) error {
 //   - For every history-<sid> stream WITHOUT a SQLite session:
 //     DeleteHistoryStream (orphan).
 //
-// Called once from Run after JS is confirmed available. b.js MUST
+// Called once from Run after JS is confirmed available. brokerJS(b) MUST
 // be non-nil at call time. Errors are logged but not fatal — broker
 // startup succeeds even if reconcile partially fails; subsequent
 // bool ticks can complete the work.
@@ -184,7 +184,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 	for _, sid := range active {
 		activeSet[sid] = true
 		ensureCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := jsstream.EnsureHistoryStream(ensureCtx, b.js, sid, jsstream.ReplicasSingle); err != nil {
+		if err := jsstream.EnsureHistoryStream(ensureCtx, brokerJS(b), sid, jsstream.ReplicasSingle); err != nil {
 			b.cfg.Logger.Warn("broker: ensure history stream on boot",
 				"sid", sid, "err", err)
 		}
@@ -203,7 +203,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 	}
 
 	listCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	streamSIDs, err := jsstream.ListHistorySIDs(listCtx, b.js)
+	streamSIDs, err := jsstream.ListHistorySIDs(listCtx, brokerJS(b))
 	cancel()
 	if err != nil {
 		return fmt.Errorf("list history streams: %w", err)
@@ -213,7 +213,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 			continue
 		}
 		dropCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := jsstream.DeleteHistoryStream(dropCtx, b.js, sid); err != nil {
+		if err := jsstream.DeleteHistoryStream(dropCtx, brokerJS(b), sid); err != nil {
 			b.cfg.Logger.Warn("broker: orphan stream delete",
 				"sid", sid, "err", err)
 		} else {
@@ -230,7 +230,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 	// harmless (mirrors the history orphan reaper, which is likewise un-gated on home ownership
 	// because a truly-orphan stream cannot be live anywhere).
 	xferCtx, cancelX := context.WithTimeout(ctx, 3*time.Second)
-	xferStreams, xerr := jsstream.ListXferStreams(xferCtx, b.js)
+	xferStreams, xerr := jsstream.ListXferStreams(xferCtx, brokerJS(b))
 	cancelX()
 	if xerr != nil {
 		return fmt.Errorf("list xfer streams: %w", xerr)
@@ -241,7 +241,7 @@ func (b *Broker) reconcileHistoryStreamsOnBoot(ctx context.Context) error {
 			continue
 		}
 		dropCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		if err := jsstream.DeleteXferBucket(dropCtx, b.js, sid); err != nil {
+		if err := jsstream.DeleteXferBucket(dropCtx, brokerJS(b), sid); err != nil {
 			b.cfg.Logger.Warn("broker: orphan xfer bucket delete", "sid", sid, "err", err)
 		} else {
 			b.cfg.Logger.Info("broker: orphan xfer bucket deleted", "sid", sid)

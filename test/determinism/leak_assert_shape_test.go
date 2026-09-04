@@ -115,10 +115,22 @@ var leakAssertHelpers = map[string]bool{
 //
 // The key is "<repo-relative file>:<the test function's name>", and
 // TestSingleExerciseExemptionsAreLiveAndSiteScoped below fails on any entry that does not name a real
-// test function that really calls a leak helper. It is EMPTY today; the previous single entry named a
-// helper rather than a test function, so it could never match anything (see leakAssertHelpers above for
-// where that fact now lives instead).
-var singleExerciseExemptions = map[string]string{}
+// test function that really calls a leak helper. (It was empty for a while; the previous single entry
+// named a helper rather than a test function, so it could never match anything — see leakAssertHelpers
+// above for where that fact now lives instead.)
+var singleExerciseExemptions = map[string]string{
+	// origin: prerelease audit round 2, CC-2. This one is not a leak assertion at all: it
+	// is a test OF AssertNoFDLeak, driving it through a synthetic *testing.T to prove it
+	// FAILS on an FDCountFailed baseline instead of no-opping. There is no subject to
+	// exercise repeatedly — the subject IS the assertion — and looping it five times
+	// would assert the same thing five times.
+	//
+	// The gate exists because the shared fd/goroutine gate had no test of its own, which
+	// is how the §3 sweep changed its most important branch unguarded.
+	"internal/testharness/leakgate_test.go:TestAssertNoFDLeakFailsOnAnUnreadableBaseline": "" +
+		"the subject under test IS AssertNoFDLeak itself, driven through a synthetic *testing.T; " +
+		"there is no leaking resource to exercise, so a 5-round loop would repeat one assertion",
+}
 
 // leakExerciseAnchors names one load-bearing call that must occur inside the qualifying loop at every
 // live assertion site. Counting arbitrary loop bodies proved only "something iterated": an empty loop,
@@ -162,6 +174,19 @@ func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
 		}
 		scanned++
 		key := rel + ":" + fn.Name.Name
+		// THE EXEMPTION IS CHECKED FIRST — origin: prerelease audit round 2, CC-2.
+		//
+		// It used to be consulted only AFTER the anchor lookup, which made it unreachable
+		// for the class it was written for. An exemption is a claim that the site has no
+		// subject to exercise repeatedly; a site with no subject cannot name an anchor
+		// call either, so it was reported as "no site-scoped exercise anchor" and the
+		// exemption never applied. TestSingleExerciseExemptionsAreLiveAndSiteScoped still
+		// requires every entry to name a real test that really calls a leak helper, so
+		// this loosens nothing that was previously enforced — it makes an escape hatch
+		// that the gate documents actually usable.
+		if _, exempt := singleExerciseExemptions[key]; exempt {
+			return
+		}
 		anchor := leakExerciseAnchors[key]
 		if anchor == "" {
 			offenders = append(offenders, key+" (no site-scoped exercise anchor)")
@@ -169,9 +194,6 @@ func TestEveryLeakAssertionExercisesItsSubjectRepeatedly(t *testing.T) {
 		}
 		seenAnchors[key] = true
 		if qualifyingLoopBefore(fn.Body, assertPos, anchor) {
-			return
-		}
-		if _, exempt := singleExerciseExemptions[key]; exempt {
 			return
 		}
 		offenders = append(offenders, key+" (missing looped call "+anchor+")")

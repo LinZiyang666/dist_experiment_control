@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -231,34 +232,88 @@ func (f *fsm) restoreFrom(rc io.ReadCloser) error {
 	// For a same-node force-single restore the id is identical, so the re-write is a harmless no-op. This
 	// path had NO test coverage because no prior test exercised a real InstallSnapshot (the d9 2-broker
 	// join aligned via log replay at a low index instead of installing the leader's snapshot).
-	var selfID string
-	_ = f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key='self_node_id'`).Scan(&selfID)
-
-	// 4. In-place restore into the live write pool (no rename over open inode).
-	if err := restoreInPlace(context.Background(), f.db, tmpPath); err != nil {
-		return err
-	}
-
-	if selfID != "" {
-		if _, err := f.db.Exec(`INSERT INTO cluster_meta(key,value) VALUES('self_node_id',?) `+
-			`ON CONFLICT(key) DO UPDATE SET value=excluded.value`, selfID); err != nil {
-			return fmt.Errorf("cluster: restore preserve self_node_id: %w", err)
+	// THE STAGING FILE IS EDITED BEFORE IT IS INSTALLED, so that the install itself is
+	// the only step that touches the live database and there is no window between
+	// "overwritten" and "fixed up".
+	//
+	// origin: prerelease audit cluster-fsm/L3-F1. This used to read the id out of the
+	// LIVE database (with the error discarded), install the snapshot over it, and then
+	// write the id back in a separate transaction, followed by a second one stripping
+	// restore_in_progress. Anything that interrupted that sequence — a crash, one failed
+	// Exec — left the LEADER's id in the joiner's cluster_meta. The damage was
+	// self-confirming rather than transient: the leader's next InstallSnapshot re-read
+	// the id from that same live DB, found the leader's, and "preserved" it. The joiner's
+	// own identity was gone for good, and the next restart brought it up as a second
+	// server claiming the leader's raft ServerID.
+	//
+	// Prefer f.localID, which is this node's id as raft itself knows it and is not a copy
+	// of anything the restore can damage. The read from the live DB stays as a fallback
+	// for construction sites that have no id to give, and its error is now checked: an
+	// unreadable identity must not be silently downgraded to "don't preserve anything".
+	selfID := f.localID
+	if selfID == "" {
+		switch err := f.db.QueryRow(`SELECT value FROM cluster_meta WHERE key='self_node_id'`).Scan(&selfID); {
+		case err == nil, errors.Is(err, sql.ErrNoRows):
+		default:
+			return fmt.Errorf("cluster: read self_node_id before restore: %w", err)
 		}
 	}
 
-	// R16 B1: restore_in_progress is a SOURCE-NODE-LOCAL recovery flag (the daemon FATALs on it until
-	// `recovery restore` completes) — it must NEVER ride a snapshot to ANOTHER node, exactly like
-	// self_node_id above. A grow-ready snapshot is taken (correctly) BEFORE the source clears the marker
-	// (restore.go's fail-closed crash-window), so the snapshot DB carries restore_in_progress='1'. A fresh
-	// joiner that InstallSnapshots it would then FATAL (assertNoInterruptedRestore) on its NEXT restart on a
-	// restore it never ran. Strip it on every install — the source's own live DB already clears it separately.
-	if _, err := f.db.Exec(`DELETE FROM cluster_meta WHERE key='restore_in_progress'`); err != nil {
-		return fmt.Errorf("cluster: restore strip restore_in_progress: %w", err)
+	// Apply both node-local corrections to the STAGING file.
+	//
+	// restore_in_progress is a SOURCE-NODE-LOCAL recovery flag (R16 B1): the daemon FATALs
+	// on it until `recovery restore` completes, so it must never ride a snapshot to another
+	// node. A grow-ready snapshot is taken — correctly — BEFORE the source clears the
+	// marker, so the snapshot DB carries it, and a fresh joiner that installed it would
+	// FATAL on its next restart over a restore it never ran.
+	if err := prepareRestoreStaging(tmpPath, selfID); err != nil {
+		return err
+	}
+
+	// 4. In-place restore into the live write pool (no rename over open inode). After this
+	// line the live DB is already correct — there is nothing left to fix up, and so
+	// nothing left to be interrupted between.
+	if err := restoreInPlace(context.Background(), f.db, tmpPath); err != nil {
+		return err
 	}
 
 	// 5. Liveness baseline reset (§3.5 D1 amendment).
 	if err := RebuildLiveness(f.db); err != nil {
 		return err
+	}
+	return nil
+}
+
+// prepareRestoreStaging applies this node's local corrections to the staging file
+// BEFORE it is installed: stamp self_node_id (when known) and drop the source's
+// restore_in_progress marker.
+//
+// Doing it here rather than after the install is the whole of the L3-F1 fix. Both
+// statements run in ONE transaction on a file nothing else has open, so either the
+// staging file is fully corrected or the restore fails and the live DB is untouched.
+// There is no state in which the live database holds another node's identity.
+func prepareRestoreStaging(path, selfID string) error {
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		return fmt.Errorf("cluster: open restore staging: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("cluster: begin restore staging: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if selfID != "" {
+		if _, err := tx.Exec(`INSERT INTO cluster_meta(key,value) VALUES('self_node_id',?) `+
+			`ON CONFLICT(key) DO UPDATE SET value=excluded.value`, selfID); err != nil {
+			return fmt.Errorf("cluster: stage self_node_id: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM cluster_meta WHERE key='restore_in_progress'`); err != nil {
+		return fmt.Errorf("cluster: stage strip restore_in_progress: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("cluster: commit restore staging: %w", err)
 	}
 	return nil
 }

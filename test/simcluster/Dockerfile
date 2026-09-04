@@ -46,9 +46,14 @@ RUN mkdir -p /run/sshd \
     && echo 'sim:sim' | chpasswd \
     && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Baked binaries (from vendor/): production-pinned nats-server v2.10.22 (NOT go.mod's
-# embedded v2.14.0 — running what the fleet runs is the tool's justification), the tether binary, and
+# Baked binaries (from vendor/): the production-pinned nats-server, the tether binary, and
 # the nats/nk CLIs. install.sh is the REAL production installer (reused, never forked).
+#
+# NO VERSION LITERAL HERE ON PURPOSE. lib/stage.sh greps NATS_SERVER_VERSION out of
+# scripts/install.sh, so this image always bakes what the fleet installs; naming a version
+# in this comment is how the two silently diverge, and this comment DID name a stale one
+# through the whole drift that test/architecture/nats_server_pin_test.go now guards.
+# Running what the fleet runs is this tool's entire justification.
 COPY vendor/tether       /usr/local/bin/tether
 COPY vendor/nats-server  /usr/local/bin/nats-server
 COPY vendor/nats         /usr/local/bin/nats

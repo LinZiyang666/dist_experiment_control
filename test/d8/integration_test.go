@@ -40,7 +40,10 @@ func wireForwarders(t *testing.T, c *d8cluster) []*broker.Forwarder {
 	now := func() time.Time { return time.Now().UTC() }
 	fwds := make([]*broker.Forwarder, c.n)
 	for i := 0; i < c.n; i++ {
-		sub, err := broker.SubscribeClusterApply(c.conns[i], c.nodes[i], now, nil)
+		// nil PIN verifier: this harness wires only VerbAlertSignal / VerbAlertAck /
+		// VerbTransferAudit, none of which run Argon2. If a PIN verb is ever forwarded
+		// here it fails closed rather than verifying off-budget (external review M-1).
+		sub, err := broker.SubscribeClusterApply(c.conns[i], c.nodes[i], now, nil, nil)
 		if err != nil {
 			t.Fatalf("subscribe apply %d: %v", i, err)
 		}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
@@ -67,11 +68,35 @@ type xferInflightRecord struct {
 	Terminal *schema.AuditTransfer `json:"terminal,omitempty"`
 }
 
+// A SINGLE BROKER HAS A LEDGER TOO.
+//
+// origin: prerelease audit broker-transfer/#57. This used to return "" whenever
+// ClusterDataDir was unset, and scripts/install.sh renders a production broker.yaml
+// with data_dir commented out — so on every single-broker deployment (which is the
+// common one) there was no durable ledger at all. Two things silently followed: a
+// restart could never finalize a stranded transfer, and ledgerProtectedObjects
+// returned an EMPTY protected set, which the orphan reaper reads as "nobody owns
+// any of these objects".
+//
+// The DB file's directory is the right fallback because it is the one path a broker
+// always has, is always writable, and already holds the state whose loss would be
+// equally fatal.
 func (b *Broker) xferInflightDir() string {
-	if b.cfg.ClusterDataDir == "" {
+	return xferLedgerSubdir(b.cfg.ClusterDataDir, b.cfg.DBPath, "xfer-inflight")
+}
+
+// xferLedgerSubdir is the shared root resolution, extracted so both ledger
+// directories cannot drift apart and so the fallback is testable without a Broker.
+func xferLedgerSubdir(clusterDataDir, dbPath, sub string) string {
+	if clusterDataDir != "" {
+		return filepath.Join(clusterDataDir, sub)
+	}
+	if dbPath == "" {
+		// Nothing durable to hang it off — an in-memory test broker. Callers already
+		// treat "" as "no ledger".
 		return ""
 	}
-	return filepath.Join(b.cfg.ClusterDataDir, "xfer-inflight")
+	return filepath.Join(filepath.Dir(dbPath), sub)
 }
 
 // ── DURABLE PRECEDENCE OF THE TWO LEDGER DIRECTORIES (round-5 疑惑 1) ──────────────────────────────────
@@ -128,10 +153,7 @@ func (b *Broker) xferInflightDir() string {
 // survives exactly the failures that take the in-flight directory itself out. Recovery scans both and
 // replays an outbox row verbatim, identically to an in-place one.
 func (b *Broker) xferTerminalOutboxDir() string {
-	if b.cfg.ClusterDataDir == "" {
-		return ""
-	}
-	return filepath.Join(b.cfg.ClusterDataDir, "xfer-terminal-outbox")
+	return xferLedgerSubdir(b.cfg.ClusterDataDir, b.cfg.DBPath, "xfer-terminal-outbox")
 }
 
 // xferInflightFilename hashes the transfer_id into a path-safe fixed-width name so a transfer_id can never
@@ -222,15 +244,23 @@ func syncDir(dir string) error {
 }
 
 // stageXferInflightTerminal writes the DECIDED terminal record into the ledger before it is forwarded
-// (external RE-REVIEW F1). Returns false when nothing was staged (no ledger in single-broker mode, or the
-// write failed) so the caller can fall back to the pre-outbox behaviour rather than silently lose a row.
-// Returns (staged, applicable): applicable=false means this deployment keeps no ledger at all
-// (single-broker mode), which is NOT a failure; staged=false with applicable=true is a real durability
-// failure and the caller must NOT proceed to an async forward (round-3 R3-F2).
+// (external RE-REVIEW F1). Returns false when nothing was staged (no ledger dir at all, or the write
+// failed) so the caller can fall back to the pre-outbox behaviour rather than silently lose a row.
+//
+// Returns (staged, applicable). applicable=false means this deployment keeps NO ledger, which is NOT a
+// failure; staged=false with applicable=true is a real durability failure and the caller must NOT proceed
+// to an async forward (round-3 R3-F2).
+//
+// "NO LEDGER" IS NO LONGER "SINGLE-BROKER MODE" — origin: prerelease audit round 2, F-T6. Both sentences
+// above said it was, and #57's extension to single brokers made that false in the same commit that
+// relied on it: xferLedgerSubdir falls back to the DB's own directory, so a single broker with a
+// database on disk DOES keep a ledger. What reaches applicable=false today is a broker with neither a
+// ClusterDataDir nor a DBPath — an in-memory test broker. A reader auditing this function was being told,
+// in the file itself, that a state it must handle cannot arise.
 func (b *Broker) stageXferInflightTerminal(transferID string, rec schema.AuditTransfer) (staged, applicable bool) {
 	dir := b.xferInflightDir()
 	if dir == "" {
-		return false, false // no ledger in this mode — nothing to stage, nothing at risk
+		return false, false // nothing durable to anchor a ledger to — nothing to stage, nothing at risk
 	}
 	cur, err := readXferInflight(filepath.Join(dir, xferInflightFilename(transferID)))
 	if err != nil {
@@ -275,7 +305,15 @@ func (b *Broker) stageXferInflightTerminal(transferID string, rec schema.AuditTr
 func (b *Broker) writeXferInflight(e *transferEntry) {
 	dir := b.xferInflightDir()
 	if dir == "" {
-		return // non-cluster: no durable ledger (single-broker audit publish is best-effort anyway)
+		// No durable location at all — an in-memory test broker. The excuse that used
+		// to be written here ("single-broker audit publish is best-effort anyway") was
+		// FALSE and it is what kept #57 switched off in the shape it mattered most:
+		// publishAudit goes to JetStream whenever brokerJS(b) != nil, and a single broker
+		// supporting tier-B necessarily has JetStream. So a dangling start row on a
+		// single broker is exactly as permanent as on a cluster — the audit stream
+		// keeps a start that no complete or failed ever answers. Corrected by the
+		// 2026-09-02 prerelease audit together with the xferInflightDir fallback.
+		return
 	}
 	if err := b.writeLedgerRecord(dir, xferInflightRecord{
 		TransferID: e.transferID, Session: e.sid, Node: e.nid,
@@ -461,9 +499,13 @@ func (b *Broker) replayStagedTerminal(ctx context.Context, rec xferInflightRecor
 	// repairable, whereas two terminals claiming different outcomes corrupt the record itself and
 	// no consumer can tell which is true. So a staged terminal is re-emitted ONLY when we can
 	// positively establish it was NOT already committed. "Cannot verify" therefore means DROP,
-	// not replay. In production the check is always available (the ledger dir exists only in
-	// cluster mode, where b.cl is wired), so this branch costs nothing there; it is loud because
-	// reaching it means the two are out of step.
+	// not replay.
+	//
+	// The sentence that used to sit here — "in production the check is always available (the
+	// ledger dir exists only in cluster mode, where b.cl is wired)" — was the load-bearing
+	// justification for F-T1's bug, and it stopped being true when #57 gave single brokers a
+	// ledger directory. Single mode is now handled explicitly above rather than falling into
+	// the unknown branch.
 	// ROUND-3 R3-F1: only a POSITIVE "already committed" answer may drop the outbox.
 	//
 	// The previous version folded a lookup ERROR into "seen" and deleted the ledger. That is the
@@ -477,8 +519,94 @@ func (b *Broker) replayStagedTerminal(ctx context.Context, rec xferInflightRecor
 	//   committed      -> drop the outbox (nothing more to write)
 	//   NOT committed  -> replay the EXACT staged terminal (identical bytes ⇒ identical reqID)
 	//   unknown        -> RETAIN and retry on the next pass; never emit, never delete
+	// SINGLE MODE HAS NO DEDUP LEDGER TO ASK, and that is not the same as "unknown".
+	//
+	// origin: prerelease audit round 2, F-T1. The condition below used to be
+	// `serr != nil || b.cl == nil`, and on a single broker b.cl is ALWAYS nil — so this
+	// function could never do anything but retain. That was harmless while #57 was inert
+	// on single brokers; the moment the ledger directory was enabled there (round 1's
+	// #57 fix), every staged terminal became a row that is kept forever and a transfer
+	// whose outcome is never emitted. Half a feature wired is worse than none: the ledger
+	// now accumulates and nothing drains it.
+	//
+	// What single mode CAN do is exactly what commitSyntheticTransferTerminal does there:
+	// publish the EXACT staged bytes. The terminal is content-deterministic, so a replay
+	// of an already-published one collapses in JetStream's duplicate window, and the
+	// residual — one repeated terminal — is strictly better than a transfer with none.
+	if b.cl == nil {
+		// SINGLE MODE REPLAYS THE EXACT STAGED TERMINAL, deduped by content.
+		//
+		// origin: prerelease audit external review M-3. This branch used to RETAIN
+		// unconditionally, and said so for a reason that was true when it was written:
+		// replaying needed a duplicate-suppression key single mode did not have, because
+		// JetStream dedups on Nats-Msg-Id and pubAuditTransfer set none. The consequence
+		// was a permanent OPEN — a transfer that crashed between staging and publishing
+		// got NO terminal at all, and its ledger row was kept forever.
+		//
+		// pubAuditTransfer now derives the SAME content id from the same record, so the
+		// first publish and this replay are the same message to JetStream. That closes
+		// both windows with one rule instead of trading them off:
+		//
+		//   crashed BEFORE publish -> this is the only emission, and it is the right one
+		//   crashed AFTER publish  -> identical id, collapsed inside the duplicate window
+		//
+		// The "EXACTLY ONE TRUE TERMINAL" invariant that made the earlier attempt wrong is
+		// therefore preserved by the id rather than by refusing to act. UNLINK ONLY AFTER
+		// a successful publish: returning true on a failed publish is how a decided
+		// outcome would be dropped, which is worse than replaying it again next pass.
+		if rec.Terminal == nil {
+			return false // not a staged-terminal row; the caller's other dispositions apply
+		}
+		payload, merr := json.Marshal(*rec.Terminal)
+		if merr != nil {
+			b.cfg.Logger.Warn("broker: marshal staged transfer terminal for replay",
+				"err", merr, "transfer_id", rec.TransferID)
+			return false
+		}
+		msgID, ierr := xferaudit.TransferRecordReqID(*rec.Terminal)
+		if ierr != nil {
+			// No id means no way to prove a replay is not a duplicate. RETAIN — the old
+			// behaviour, now confined to the case that actually justifies it.
+			b.cfg.Logger.Warn("broker: cannot derive a dedup id for a staged transfer terminal — "+
+				"RETAINING rather than risking a second, contradictory terminal",
+				"err", ierr, "transfer_id", rec.TransferID)
+			return false
+		}
+		// ASK THE STREAM, not the clock — origin: prerelease audit external review R2-M2.
+		// The content-derived Msg-Id makes a replay idempotent only inside JetStream's
+		// duplicate window (two minutes here). A broker that crashes after the publish ack,
+		// before the unlink, and stays down longer than that comes back to a window which has
+		// forgotten the id — and writes a SECOND terminal. The audit stream still knows, and
+		// unlike the window it does not expire, so it is the thing to ask.
+		//
+		// THREE STATES, same discipline as the cluster branch below:
+		//   committed     -> drop the ledger row; the record is already correct
+		//   NOT committed -> publish the exact staged bytes
+		//   unknown       -> RETAIN and retry next pass; never emit, never delete
+		if js := brokerJS(b); js != nil {
+			switch committed, cerr := jsstream.TransferTerminalCommitted(
+				ctx, js, rec.Terminal.Session, rec.TransferID); {
+			case cerr != nil:
+				b.cfg.Logger.Warn("broker: cannot verify whether a staged transfer terminal was "+
+					"already committed — RETAINING (an unverifiable state is not evidence of absence)",
+					"err", cerr, "transfer_id", rec.TransferID)
+				return false
+			case committed:
+				b.cfg.Logger.Info("broker: staged transfer terminal was already committed to the "+
+					"audit stream; dropping the ledger row without re-publishing",
+					"transfer_id", rec.TransferID)
+				return true
+			}
+		}
+		if perr := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Terminal.Session), payload, msgID); perr != nil {
+			b.cfg.Logger.Warn("broker: single-mode staged transfer terminal replay failed (retry next pass)",
+				"err", perr, "transfer_id", rec.TransferID)
+			return false
+		}
+		return true
+	}
 	seen, serr := b.transferTerminalAlreadyCommitted(*rec.Terminal)
-	if serr != nil || b.cl == nil {
+	if serr != nil {
 		b.cfg.Logger.Warn("broker: cannot determine whether a staged transfer terminal was already committed — RETAINING the outbox for the next pass (deleting it could strand a transfer with no terminal at all)",
 			"transfer_id", rec.TransferID, "kind", rec.Terminal.Kind, "err", serr)
 		return false
@@ -612,8 +740,24 @@ func ledgerRowDisposition(in ledgerRowInputs) (ledgerDisposition, string) {
 //
 // Read errors yield an EMPTY set and are reported. The caller must treat "I could not read the
 // ledger" as "do not delete anything on evidence I do not have", never as "nothing is protected".
-func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, error) {
+// UNRESOLVED ROWS ARE PER-OBJECT EVIDENCE, NOT A CIRCUIT BREAKER.
+//
+// origin: prerelease audit broker-transfer/BT-F3. An unreadable row used to be
+// folded into the returned error, and the caller skipped the WHOLE pass on any
+// error. But an unreadable row is PERMANENT: forEachLedgerRecord renames it to
+// <hash>.json.corrupt and nothing in the repo ever deletes those, so every later
+// pass rediscovered it. One corrupt row — belonging to any session — stopped
+// orphan reclamation for EVERY session forever, which is the "tier-B garbage is
+// immortal, the small disk fills up" failure this sweep exists to prevent, caused
+// by the guard rather than by the thing it guards against.
+//
+// So the second return is the set of ledger FILENAMES that could not be read. The
+// caller protects exactly the objects those name and reaps everything else. err is
+// now reserved for a directory-level read failure, which is transient and does
+// self-heal.
+func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, map[string]bool, error) {
 	protected := map[string]bool{}
+	unresolvedNames := map[string]bool{}
 	var firstErr error
 	for _, dir := range []string{b.xferInflightDir(), b.xferTerminalOutboxDir()} {
 		if dir == "" {
@@ -638,11 +782,11 @@ func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, error) 
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if len(unresolved) > 0 && firstErr == nil {
-			firstErr = fmt.Errorf("%d unreadable ledger row(s) in %s", len(unresolved), dir)
+		for name := range unresolved {
+			unresolvedNames[name] = true
 		}
 	}
-	return protected, firstErr
+	return protected, unresolvedNames, firstErr
 }
 
 func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
@@ -817,20 +961,69 @@ func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
 	return finalized, nil
 }
 
-// commitSyntheticTransferTerminal SYNCHRONOUSLY forwards a #57 synthetic terminal to the leader and reports
-// whether it durably COMMITTED. It uses transferAuditForwardSync (fwd.Forward, error-returning) with the
-// same bounded transient-retry as the async sink, so a brief election is absorbed within the pass; a
-// persistent not_leader / permanent error returns false and the caller retains the ledger for the next pass.
-// Returns false when the sink is not yet attached (never delete the ledger on an unconfirmed emit).
+// commitSyntheticTransferTerminal emits a #57 synthetic terminal and reports whether it
+// durably COMMITTED. The caller deletes the ledger row only on true, so a false must
+// always mean "not durable yet, try again next pass".
+//
+// TWO PATHS, because a single broker has no leader to forward to:
+//
+//   - CLUSTER (transferAuditForwardSync attached): forwards to the leader with the same
+//     bounded transient-retry as the async sink, so a brief election is absorbed within
+//     the pass. A persistent not_leader or a permanent error returns false. A sink that
+//     is not attached YET (pre-wireClusterLate) also returns false — never delete a
+//     ledger on an unconfirmed emit.
+//   - SINGLE (b.cl == nil): publishes straight to the audit stream. There is no raft
+//     dedup ledger here; what makes a replay safe is that the synthetic terminal is
+//     content-deterministic, so JetStream collapses a repeat within its duplicate
+//     window. See the branch's own comment for the limits of that argument.
+//
+// origin: prerelease audit round 2, C4. This doc described only the cluster path while
+// the same commit added the single-mode branch beneath it — a branch that forwards
+// nothing, retries nothing, and returns true with no sink attached.
 func (b *Broker) commitSyntheticTransferTerminal(rec schema.AuditTransfer) bool {
 	fwd := b.transferAuditForwardSync
-	if fwd == nil {
+	if fwd == nil && b.cl != nil {
 		return false // sink not attached yet (pre-wireClusterLate) — retry next pass, never lose the ledger
 	}
 	payload, err := json.Marshal(rec)
 	if err != nil {
 		b.cfg.Logger.Warn("broker: marshal synthetic transfer terminal", "err", err, "tid", rec.TransferID)
 		return false
+	}
+	if fwd == nil {
+		// SINGLE MODE. There is no raft dedup ledger here, and requiring one is why
+		// the whole of #57 was inert on the deployment shape it was written for: the
+		// sink is only ever attached by the cluster's AttachTransferAuditSink, so a
+		// single broker could stage a synthetic terminal and never commit one.
+		//
+		// Published with a CONTENT-DERIVED Nats-Msg-Id, which is what actually makes a
+		// replay safe.
+		//
+		// origin: prerelease audit round 2, F-T2. This used to say the publish was safe
+		// because the terminal is byte-deterministic and "JetStream's own duplicate
+		// window collapses it". That is false: JetStream dedups on the Nats-Msg-Id
+		// header and NEVER on payload bytes, and publishAudit set no header — so a
+		// replay produced a SECOND identical terminal. internal/jsstream/replicas.go
+		// documents that exact fact two files over, and the repo's own recovery test
+		// caught the duplicate the moment F-T1 made single-mode replay reachable.
+		//
+		// TransferRecordReqID hashes the whole normalized record, so the id is stable
+		// across retries and distinct for a genuinely different terminal.
+		msgID, ierr := xferaudit.TransferRecordReqID(rec)
+		if ierr != nil {
+			b.cfg.Logger.Warn("broker: cannot derive a dedup id for a single-mode transfer terminal — "+
+				"retaining the ledger rather than risking a duplicate", "err", ierr, "tid", rec.TransferID)
+			return false
+		}
+		// WITH a content-derived Nats-Msg-Id. origin: round 2, F-T2 — the comment that
+		// used to justify this publish claimed JetStream collapses byte-identical
+		// payloads. It does not; it dedups on this header and publishAudit sets none.
+		if perr := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Session), payload, msgID); perr != nil {
+			b.cfg.Logger.Warn("broker: single-mode synthetic transfer terminal publish failed (retry next pass)",
+				"err", perr, "tid", rec.TransferID)
+			return false
+		}
+		return true
 	}
 	for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
 		ferr := fwd(payload)

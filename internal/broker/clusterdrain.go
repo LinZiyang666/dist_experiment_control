@@ -170,8 +170,12 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	// rc=0. The durable set re-derives the still-un-confirmed exposes from current state,
 	// so a re-run keeps waiting until the data plane genuinely follows.
 	//
-	// Ordered BEFORE the phase bump and (for retire) before RemoveServer: removing a
-	// node while exposes still point at it is the very outage this gate prevents.
+	// Ordered before RemoveServer (for retire): removing a node while exposes still point
+	// at it is the very outage this gate prevents.
+	//
+	// It is NO LONGER ordered before the phase bump — L-BCO-F2 moved setPhase(DRAINING)
+	// above the wait, and this sentence went on claiming the old order until round 2 (C5)
+	// caught it. See the setPhase block below for why the bump comes first.
 	// Fleet-wide (zero time) for the SYNCHRONOUS drain: fail-CLOSED, since a recency window would fail
 	// OPEN on a slow re-run (rows aging out ⇒ false rc=0). Drain fences no membership; its over-wait is
 	// bounded by the drain deadline (F3 scoping applies to the retire OP, which does fence).
@@ -179,13 +183,35 @@ func (a *ClusterAdmin) DrainNode(nodeID string, retire, confirmed bool, deadline
 	if err != nil {
 		return fmt.Errorf("cluster drain %s: check data-plane convergence: %w", nodeID, err)
 	}
-	if err := a.awaitHomeConvergence("drain", nodeID, pending, deadline); err != nil {
-		return err
-	}
 
-	// 3. phase VOTER -> DRAINING (the node still votes; it sheds serving load).
+	// 3. phase VOTER -> DRAINING, BEFORE the wait rather than after it.
+	//
+	// origin: prerelease audit broker-cluster-ops/L-BCO-F2. The convergence wait used
+	// to come first, and a drain that timed out therefore left the node having already
+	// had its marker raised and its exposes re-homed by raft, but still phase=VOTER.
+	// That intermediate state is the LEAST consistent one available and it has no
+	// self-healer: reconcile_drain_marker deliberately leaves a raised marker alone,
+	// so nothing converges it and the next operator sees a node that reads as a
+	// healthy voter while its exposes have moved off it.
+	//
+	// Moving the bump earlier also HELPS the wait it precedes: a DRAINING node drops
+	// out of migrateExposes' target query and out of resolveHomeForAgent, so the
+	// exposes being waited on cannot be handed back to the node being drained.
+	//
+	// The rc semantics (R8a P1) are untouched — a drain whose data plane does not
+	// converge still returns ErrDataPlaneNotConverged and still exits 75. The only
+	// thing that changed is which state the operator is left in when it does.
+	//
+	// The reviewer's alternative — a new cluster_meta key recording drain origin —
+	// was rejected: it needs its lifetime maintained in four separate places
+	// (AbortDrain, the drain success path, driveRetire's marker clear, and the
+	// reconcile orphan sweep), and those four are the exact paths this repo has
+	// already had orphaned-marker incidents on.
 	if err := a.setPhase(nodeID, phaseDraining, []string{phaseVoter}, ""); err != nil {
 		return fmt.Errorf("cluster drain %s: phase->DRAINING: %w", nodeID, err)
+	}
+	if err := a.awaitHomeConvergence("drain", nodeID, pending, deadline); err != nil {
+		return err
 	}
 	return nil
 }
@@ -461,6 +487,35 @@ func (a *ClusterAdmin) assertAllVotersSupportPhaseFluidityOps(opName string) err
 // harness): every NON-self voter must advertise PhaseFluidityOps in the live health map; an
 // unreachable (absent) or older (false) voter fails CLOSED. N=1 (<=1 voter) is always allowed.
 func checkVotersSupportPhaseFluidityOps(opName string, cfg []cluster.ServerInfo, self string, health map[string]proto.ClusterHealthResp) error {
+	return checkVotersSupportOps(opName, cfg, self, health, opCapability{
+		what:    "the v0.4.2 phase-fluidity ops",
+		fix:     "upgrade ALL voters to v0.4.2",
+		harm:    "an old voter would poison-skip the op and fork its replica",
+		present: func(hr proto.ClusterHealthResp) bool { return hr.PhaseFluidityOps },
+	})
+}
+
+// opCapability describes one replicated-op capability for checkVotersSupportOps: how to
+// read it out of a health report, and the three phrases an operator needs when it is
+// missing (what is unsupported, what to do, what would happen otherwise).
+type opCapability struct {
+	what    string
+	fix     string
+	harm    string
+	present func(proto.ClusterHealthResp) bool
+}
+
+// checkVotersSupportOps is the shared mixed-version gate: every NON-self voter must
+// advertise the capability in the live health map; an unreachable (absent) or older
+// (false) voter fails CLOSED. N=1 (<=1 voter) is always allowed.
+//
+// EXTRACTED FROM the phase-fluidity gate rather than copied — origin: prerelease audit
+// increment 2 internal review. Six lanes reported the new admission op shipping without
+// this protection, and the reason it shipped without one is that the protection existed
+// as a single-purpose function with the op's name baked into every line. The next
+// replicated op should be able to reach for this in one line, or it will not reach for it
+// at all.
+func checkVotersSupportOps(opName string, cfg []cluster.ServerInfo, self string, health map[string]proto.ClusterHealthResp, cap opCapability) error {
 	var voters []string
 	for _, s := range cfg {
 		if s.Voter {
@@ -476,13 +531,51 @@ func checkVotersSupportPhaseFluidityOps(opName string, cfg []cluster.ServerInfo,
 		}
 		hr, ok := health[v]
 		if !ok {
-			return fmt.Errorf("%s: cannot confirm voter %q supports the v0.4.2 phase-fluidity ops (unreachable) — refusing to avoid a mixed-version replica fork; upgrade ALL voters to v0.4.2 and ensure they are reachable", opName, v)
+			return fmt.Errorf("%s: cannot confirm voter %q supports %s (unreachable) — refusing to avoid a mixed-version replica fork; %s and ensure they are reachable", opName, v, cap.what, cap.fix)
 		}
-		if !hr.PhaseFluidityOps {
-			return fmt.Errorf("%s: voter %q is an older binary without the v0.4.2 phase-fluidity ops — upgrade ALL voters to v0.4.2 first (an old voter would poison-skip the op and fork its replica)", opName, v)
+		if !cap.present(hr) {
+			return fmt.Errorf("%s: voter %q is an older binary without %s — %s first (%s)", opName, v, cap.what, cap.fix, cap.harm)
 		}
 	}
 	return nil
+}
+
+// assertAllVotersSupportSessionCreatorOps is the same gate for the admission-table write.
+//
+// THE HARM IS NOT SYMMETRIC WITH THE OTHER OPS, which is why it is spelled out in the
+// message: session_creators is a security policy table, so a poison-skip does not merely
+// fork some bookkeeping. A skipped ALLOW makes `tether admin session-allow` report success
+// while that replica keeps refusing the fingerprint; a skipped DENY leaves a revoked
+// fingerprint able to create sessions on whichever broker a ctl happens to reach.
+// A package-level function taking *ClusterAdmin rather than a method: the
+// structural-budget ratchet pins this type's method count exactly, and it caught this one
+// on the way in. Same call shape, same file, one fewer method on a type that has 86.
+func assertAllVotersSupportSessionCreatorOps(a *ClusterAdmin, opName string) error {
+	cfg, err := a.node.RaftConfiguration()
+	if err != nil {
+		return fmt.Errorf("%s: read raft config: %w", opName, err)
+	}
+	var health map[string]proto.ClusterHealthResp
+	if a.healthPoll != nil {
+		health = a.healthPoll()
+	}
+	return checkVotersSupportOps(opName, cfg, a.node.SelfID(), health, sessionCreatorCapability)
+}
+
+// sessionCreatorCapability is a PACKAGE-LEVEL value, not a literal built at the call
+// site, so the gate's test exercises the same one production does.
+//
+// The first version of that test built its own copy inline. Mutating the production
+// accessor to read the WRONG health field left the test green, because the test was
+// asserting against its own duplicate — a guard that verified a copy of the thing it was
+// guarding. That is the exact shape this review round was hunting elsewhere, found in
+// the fix for it.
+var sessionCreatorCapability = opCapability{
+	what: "the session-create admission op",
+	fix:  "upgrade ALL voters to a release that has it",
+	harm: "an old voter would poison-skip the write, so this admission change would " +
+		"silently not apply there — an allow that does not take, or a revocation that does not",
+	present: func(hr proto.ClusterHealthResp) bool { return hr.SessionCreatorOps },
 }
 
 // SetRaftAddr rebinds a node's raft ADVERTISE address ONLINE — the routine replacement for

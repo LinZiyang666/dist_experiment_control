@@ -30,8 +30,7 @@ func TestD3PINSeamFollowerTransientDeny(t *testing.T) {
 		called = true
 		return ErrNotLeader // simulate this broker not being the raft leader
 	}
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	respJWT, err := h.Handle(agentReq(t, clientPub, "lab", "lab-1", "test-pin"))
 	if err != nil {
@@ -60,8 +59,7 @@ func TestD3PINSeamMemberFollowerTransientDeny(t *testing.T) {
 	h.JoinMemberWrite = func(sid, fp, pin string, now time.Time) error {
 		return ErrNotLeader
 	}
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	respJWT, err := h.Handle(signedRequest(t, freshUserPub(t), clientPub, "tether-cli:lab", "test-pin"))
 	if err != nil {
@@ -82,8 +80,7 @@ func TestD3PINSeamLeaderSucceeds(t *testing.T) {
 	h.ProvisionAgentWrite = func(sid, nid, fp, pin string, now time.Time) error {
 		return agentprov.ProvisionWithPIN(h.DB, sid, nid, fp, pin, auth.VerifyPIN, now)
 	}
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	respJWT, err := h.Handle(agentReq(t, clientPub, "lab", "lab-1", "test-pin"))
 	if err != nil {
@@ -106,8 +103,7 @@ func TestD3PINSeamPreservesTypedBusinessErrors(t *testing.T) {
 	h.ProvisionAgentWrite = func(sid, nid, fp, pin string, now time.Time) error {
 		return agentprov.ErrInvalidPIN
 	}
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	respJWT, _ := h.Handle(agentReq(t, clientPub, "lab", "lab-1", "wrong"))
 	resp, _ := jwt.DecodeAuthorizationResponseClaims(respJWT)
@@ -122,8 +118,7 @@ func TestD3PINSeamPreservesTypedBusinessErrors(t *testing.T) {
 func TestD3FailClosedDeniesAlreadyProvisioned(t *testing.T) {
 	h, _ := freshHandler(t)
 	seedSessionWithPin(t, h, "lab", "test-pin")
-	clientKp, _ := nkeys.CreateUser()
-	clientPub, _ := clientKp.PublicKey()
+	clientPub := freshUserPub(t)
 
 	// Bootstrap (direct mutator, nil seams) so the binding exists.
 	if resp, _ := jwt.DecodeAuthorizationResponseClaims(mustHandle(t, h, agentReq(t, clientPub, "lab", "lab-1", "test-pin"))); resp.Error != "" {

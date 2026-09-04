@@ -142,7 +142,14 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			return
 		}
 		// Audit-dedup pre-read (monotone: rows are never un-inserted).
-		if existing, gerr := proc.Get(b.read().SQL(), pid); gerr == nil && existing != nil {
+		//
+		// SID-SCOPED — origin: prerelease audit round 2, E3. Unscoped, this
+		// short-circuited on ANY session's row and told the sender so, which is a
+		// cross-session pid-existence oracle reachable from a legal subject with
+		// no write at all. The fence on the write path (proc.MarkExited) was
+		// already scoped and its comment claimed the indistinguishability this
+		// read was quietly handing back.
+		if existing, gerr := proc.GetInSession(b.read().SQL(), sid, pid); gerr == nil && existing != nil {
 			b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "already_recorded"})
 			return
 		}
@@ -187,12 +194,15 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			b.cfg.Logger.Warn("broker: proc.exit parse", "err", err)
 			return
 		}
-		// Audit-dedup pre-read (monotone: EXITED is terminal).
-		if existing, gerr := proc.Get(b.read().SQL(), pid); gerr == nil && existing != nil && existing.Status == proc.StateExited {
+		// Audit-dedup pre-read (monotone: EXITED is terminal). Sid-scoped for the
+		// same reason as the started arm above (round 2, E3): unscoped, this
+		// answered `already_exited` for a FOREIGN exited pid where the fenced
+		// writer one line below would have said `unknown_pid`.
+		if existing, gerr := proc.GetInSession(b.read().SQL(), sid, pid); gerr == nil && existing != nil && existing.Status == proc.StateExited {
 			b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "already_exited"})
 			return
 		}
-		if err := b.markProcExited(pid, ev.ExitCode, ev.EndedAt); err != nil {
+		if err := b.markProcExited(pid, sid, ev.ExitCode, ev.EndedAt); err != nil {
 			// Leader-committed not-found (direct in single mode; carried
 			// across the forward as kind proc_not_found in cluster mode) is
 			// the ONE terminal ack: the row was GC'd or never existed on the
@@ -254,7 +264,11 @@ func (b *Broker) handleNodeListReq(msg *nats.Msg) {
 	// would mark every `<x>-NN` device ephemeral and silently drop it from
 	// `node upgrade --all`, and `gpu-01 gpu-02 gpu-03` is this repo's own
 	// example fleet.
-	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+	// len(provisioned) > 0, not the readable flag: this site means "are there bindings to
+	// reason about at all". E1 (round 2) changed what the second return says — it is now
+	// "the table was read" — so the intent is spelled out rather than inherited.
+	provisioned, provReadable := node.ProvisionedNIDs(b.read().SQL(), sid)
+	bindingsKnown := provReadable && len(provisioned) > 0
 
 	out := make([]proto.NodeListEntry, 0, len(all))
 	for _, n := range all {
@@ -523,7 +537,11 @@ func (b *Broker) pubAuditProc(sid, kind, nid, pid string, argv []string, exitCod
 // device ephemeral is the destructive direction.
 func leasedNIDsForSession(b *Broker, sid string) map[string]bool {
 	out := map[string]bool{}
-	provisioned, bindingsKnown := node.ProvisionedNIDs(b.read().SQL(), sid)
+	// len(provisioned) > 0, not the readable flag: this site means "are there bindings to
+	// reason about at all". E1 (round 2) changed what the second return says — it is now
+	// "the table was read" — so the intent is spelled out rather than inherited.
+	provisioned, provReadable := node.ProvisionedNIDs(b.read().SQL(), sid)
+	bindingsKnown := provReadable && len(provisioned) > 0
 	if !bindingsKnown {
 		return out
 	}

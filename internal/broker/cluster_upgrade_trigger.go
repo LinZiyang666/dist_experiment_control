@@ -202,16 +202,39 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest,
 				Error: "a cluster membership operation (join/retire) is in flight — let it finish before starting a rolling upgrade"}
 		}
-		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetUpgradeActive(b.cfg.Now()) }); err != nil {
+		// L3-F3 preflight: refuse an obviously-held lock before proposing, so the common case
+		// gets a clear message. It is NOT the mutex — the replicated guard below is — because
+		// a preflight read can never be atomic with the commit that follows it.
+		//
+		// LEASE-AWARE, not a bare existence check — origin: prerelease audit
+		// round 2, H-2. A HALTed roll deliberately leaves its MARKER set so
+		// membership stays fenced, and an existence check read that marker as
+		// "another roll is running" and refused the very re-run the HALT message
+		// instructs the operator to perform. The replicated guard below now
+		// agrees; this preflight only reaches the same verdict earlier and with
+		// a better message.
+		if upgradeLockHeld(b.cl.node.RODB(), b.cfg.Now()) {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest,
+				Error: "the cluster upgrade lock is held by a roll that is still renewing it — let that " +
+					"roll finish. If it has died, its lease expires after " + cluster.LockLeaseTTL.String() +
+					" and a re-run is admitted immediately after that; `tether cluster upgrade " +
+					"release-lock` is the out for an operator who will not wait"}
+		}
+		stamp := b.cfg.Now()
+		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanSetUpgradeActive(stamp) }); err != nil {
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeNotLeader, Error: "acquire upgrade lock (run against the leader): " + err.Error()}
 		}
-		// H1: the acquire is a CONDITIONAL replicated mutex (PlanSetUpgradeActive no-ops if a grow marker is
-		// held). Read the marker back after apply — a no-op means a `cluster add` grow won the race between our
-		// preflight read and our commit, so we must NOT report a lock we do not hold. Refuse and let the operator
-		// retry rather than run a roll lockless alongside a grow.
-		if !upgradeActive(b.cl.node.RODB()) {
+		// The acquire is a CONDITIONAL replicated mutex: it no-ops if a grow marker is held OR
+		// if another roll already holds the upgrade marker. Reading the marker back for mere
+		// EXISTENCE is not enough to tell those apart from success — the marker exists in all
+		// three cases (prerelease audit cluster-fsm/L3-F3). Compare the VALUE against the
+		// stamp we just proposed: only an acquire that actually won wrote it.
+		if cluster.UpgradeMarkerValue(b.cl.node.RODB()) != cluster.UpgradeMarkerStamp(stamp) {
 			return &proto.ClusterUpgradeResp{Code: adminsock.CodeBadRequest,
-				Error: "a concurrent `cluster add` grow acquired the membership lock first — let it finish, then retry the rolling upgrade"}
+				Error: "a `cluster add` grow or another rolling upgrade acquired the membership lock first " +
+					"— let it finish, then retry. If this is YOUR interrupted roll, release it explicitly " +
+					"with `tether cluster upgrade release-lock`; otherwise it expires after " +
+					cluster.LockLeaseTTL.String()}
 		}
 		return &proto.ClusterUpgradeResp{OK: true}
 	case "renew-lock":
@@ -233,6 +256,27 @@ func (b *Broker) handleUpgradeTrigger(data []byte, now time.Time) *proto.Cluster
 		}
 		if !upgradeActive(b.cl.node.RODB()) {
 			return &proto.ClusterUpgradeResp{Code: upgradeTriggerCodeLockNotHeld, Error: "the upgrade lock is no longer held"}
+		}
+		return &proto.ClusterUpgradeResp{OK: true}
+	case "expire-lock-lease":
+		// origin: prerelease audit round 2, H-2. A HALTing orchestrator's "I have
+		// stopped driving". It stamps the lease in the past and leaves the MARKER
+		// alone, so membership stays fenced across the partial roll while another
+		// roll — the re-run the HALT message promises, or the emergency rollback —
+		// is admitted at once instead of after LockLeaseTTL.
+		//
+		// ADDITIVE ON THE WIRE: Op is part of CanonicalUpgradeReqBytes, so this
+		// value is signed like any other and a pre-existing broker answers
+		// "unknown op". The caller treats that as best-effort and falls back to
+		// waiting the lease out — i.e. exactly today's behaviour, which is why a
+		// mixed-version cluster degrades rather than breaks.
+		if b.cl == nil || b.cl.node == nil {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeClusterNotEnabled, Error: "cluster not enabled"}
+		}
+		if err := b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+			return cluster.PlanExpireUpgradeLease(b.cfg.Now())
+		}); err != nil {
+			return &proto.ClusterUpgradeResp{Code: adminsock.CodeNotLeader, Error: "expire upgrade lock lease (run against the leader): " + err.Error()}
 		}
 		return &proto.ClusterUpgradeResp{OK: true}
 	case "release-lock":

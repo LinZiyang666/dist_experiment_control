@@ -278,8 +278,22 @@ cmd_grow() {
     _sid="grow-$_j"
     _pin=246810
     log "grow: [env] ctl login on $_j (the orchestrator authenticates over NATS as a ctl)"
-    dexec -u tether "$_j" -- env HOME=/var/lib/tether tether session create "$_sid" --pin "$_pin" --nats-url "$_url" >/dev/null 2>&1 || true
-    dexec -u tether "$_j" -- env HOME=/var/lib/tether tether login -s "$_sid" --pin "$_pin" --nats-url "$_url" >/dev/null 2>&1 || die "grow: ctl login on $_j failed (auth setup)"
+    # The orchestrator's identity must be admitted on the LEADER before it may create a session —
+    # the allow-list is replicated through raft, so the leader is where the write belongs.
+    admit_creator "$_L" "$_j" tether HOME=/var/lib/tether || die "grow: admitting the orchestrator identity for $_j failed"
+    # `session create` is NOT idempotent, so a re-run of grow legitimately finds "grow-<joiner>"
+    # already there — that one outcome is benign, because `login` below is what we actually need.
+    # Everything else must be reported VERBATIM. A bare `|| true` used to swallow all of them, and
+    # the failure resurfaced one line down as "ctl login failed (auth setup)" — which sent the
+    # reader to the auth config when the truth was a refusal from the admission table. Laundering a
+    # product refusal into a different, wrong diagnosis is the exact opposite of this tool's job.
+    if ! _sc_out=$(dexec -u tether "$_j" -- env HOME=/var/lib/tether tether session create "$_sid" --pin "$_pin" --nats-url "$_url" 2>&1); then
+        printf '%s\n' "$_sc_out" | grep -q 'already_exists' \
+            || die "grow: session create '$_sid' on $_j failed: $_sc_out"
+    fi
+    if ! _lg_out=$(dexec -u tether "$_j" -- env HOME=/var/lib/tether tether login -s "$_sid" --pin "$_pin" --nats-url "$_url" 2>&1); then
+        die "grow: ctl login on $_j failed (auth setup): $_lg_out"
+    fi
 
     # ── [tether] `cluster add` invocation 1: offline init (+ broker.yaml seam), approve-join (non-blocking),
     # former-N1 clustered cutover + JS reset. It HALTs (exit 75) at the start-joiner boundary because tether
@@ -453,6 +467,11 @@ cmd_session() {
     _ctl=$(list_nodes ctl | head -1); [ -n "$_ctl" ] || die "session: no ctl node (up --ctl 1)"
     _url="nats://$_brk:4222"
     log "session: create '$_name' + ctl login on $_ctl (broker=$_url)"
+    # [env] AUTH SETUP: admit this ctl identity before it may create a session. A fresh broker's
+    # allow-list is empty by design (docs/broker-ops.md §5.20), so the real first-deployment
+    # procedure runs here too — it is not a cluster-lifecycle workaround, and it is logged so the
+    # step stays visible in every drill log instead of becoming invisible fixture magic.
+    admit_creator "$_brk" "$_ctl" sim HOME=/home/sim || die "session: admitting the ctl identity failed"
     dexec -u sim "$_ctl" -- env HOME=/home/sim tether session create "$_name" --pin "$_pin" --nats-url "$_url" || die "session create failed"
     dexec -u sim "$_ctl" -- env HOME=/home/sim tether login -s "$_name" --pin "$_pin" --nats-url "$_url" || die "ctl login failed"
     ok "session '$_name' created + ctl activated"

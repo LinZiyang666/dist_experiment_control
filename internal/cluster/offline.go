@@ -505,6 +505,7 @@ func recoverClusterToSelf(dataDir, dbPath, selfID, selfRaftAddr string, logger *
 		dbPath:   dbPath,
 		appliers: defaultAppliers(),
 		logger:   logger,
+		localID:  selfID,
 	}
 	rc := raftConfig(Config{LocalID: raft.ServerID(selfID)})
 

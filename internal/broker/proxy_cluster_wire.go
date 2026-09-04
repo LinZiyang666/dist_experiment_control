@@ -152,6 +152,11 @@ func (b *Broker) handleProxySubCreateCluster(sid, fp, actor, name string, msg *n
 	// disabled). Reaching here proves the INSERT took (a duplicate no-op returned above), so the
 	// epoch definitely advanced. Body is secret-free ({sid} only) — the minted token/PSK never here.
 	b.pubSysEvent("proxy_keyset_changed", map[string]any{"sid": sid})
-	b.pubAuditCall(sid, fp, actor, "proxy.sub.create", name, true, "", msg.Reply, nil)
-	b.replyJSON(msg, proto.ProxySubCreateResp{OK: true, Name: name, SubURL: b.subURL(rawToken)})
+	// THE SAME FENCE AS SINGLE MODE, through the SAME helper — origin: prerelease audit
+	// external review R2-B1. This handler used to reply with the bearer URL unconditionally
+	// while `proxySubCreate` next door withheld it, so the fence covered the deployment shape
+	// with the SMALLER blast radius and missed the clustered one entirely.
+	resp := proxySubCreateReply(b, sid, name, rawToken, msg.Reply)
+	b.pubAuditCall(sid, fp, actor, "proxy.sub.create", name, true, resp.Code, msg.Reply, nil)
+	b.replyJSON(msg, resp)
 }

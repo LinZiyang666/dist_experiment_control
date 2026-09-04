@@ -19,7 +19,7 @@ func TestForceSingleOnlineConvergesSeeds(t *testing.T) {
 	// tell them apart. brk-b is PENDING → the phase-guarded upsert updates it.
 	pb := d7JoinInput(t, "brk-b", "127.0.0.1:1")
 	pb.PublicHost = "brk-b.example"
-	pb.NatsRoute, pb.TunnelAddr = "127.0.0.1:1", "127.0.0.1:1"
+	pb.NatsRoute, pb.TunnelAddr = "nats://127.0.0.1:1", "127.0.0.1:1"
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(pb) }); err != nil {
 		t.Fatalf("re-upsert brk-b host: %v", err)
 	}

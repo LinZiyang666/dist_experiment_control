@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -48,11 +49,28 @@ func newSingleVoterNode(t *testing.T, id string) *cluster.Node {
 	return n
 }
 
+// admitSessionCreators establishes the production precondition for tests whose
+// subject is create idempotency/read-back rather than admission policy. Keep this
+// explicit at each call site: newLeaderBrokerForSessions is also used by the
+// authoritative-admission regression test, which must start with an empty policy.
+func admitSessionCreators(t *testing.T, n *cluster.Node, fps ...string) {
+	t.Helper()
+	now := time.Now().UTC()
+	for _, fp := range fps {
+		if err := n.Propose(func(_ *sql.DB) (*cluster.Command, error) {
+			return session.PlanSetCreator(fp, "test", "session create test fixture", true, now)
+		}); err != nil {
+			t.Fatalf("admit session creator %q: %v", fp, err)
+		}
+	}
+}
+
 // TestSessionCreateSucceedsAndDuplicateStillRejected pins the UNCHANGED contract the D9 cluster tests
 // depend on: a routed create commits, and a second create of the same name is rejected with
 // ErrAlreadyExists (proving the first committed to the FSM). Regressing this would break test/d9.
 func TestSessionCreateSucceedsAndDuplicateStillRejected(t *testing.T) {
 	b := newLeaderBrokerForSessions(t)
+	admitSessionCreators(t, b.cl.node, "fp-owner-A", "fp-owner-B")
 
 	s1, err := b.createSession("lab", "fp-owner-A", "pinhash-A")
 	if err != nil {
@@ -80,6 +98,7 @@ func TestSessionCreateSucceedsAndDuplicateStillRejected(t *testing.T) {
 // this is not a manufactured false success.
 func TestSessionCreateReportsSuccessWhenCommittedButNotYetVisible(t *testing.T) {
 	n := newSingleVoterNode(t, "node-B")
+	admitSessionCreators(t, n, "fp-owner-A")
 
 	emptyDB, err := storage.OpenWAL("file:" + filepath.Join(t.TempDir(), "empty.db"))
 	if err != nil {

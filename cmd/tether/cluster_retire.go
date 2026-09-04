@@ -45,7 +45,7 @@ func newClusterRetireCmd(socketPath *string) *cobra.Command {
 					"WARNING: retire is NOT a credential revocation — %s keeps account.nk + the cluster CA until\n"+
 						"  you rotate. You will get a guided rotation checklist + a persistent NOT-SAFE alert.\n", node)
 				if !confirmTypedNodeID(cmd, node, "", false, "") {
-					return fmt.Errorf("aborted (type the node_id to confirm; --yes is not accepted)")
+					return usageErr("aborted (type the node_id to confirm; --yes is not accepted)")
 				}
 				resp, err := callAdmin(*socketPath, adminsock.Request{Op: adminsock.OpClusterRetire, NodeID: node, Confirmed: true})
 				if err != nil {
@@ -112,7 +112,7 @@ func newClusterRetireCmd(socketPath *string) *cobra.Command {
 					"WARNING: after this retire the cluster has %d voters, quorum=%d, tolerates %d failures.\n",
 					p.Voters, p.Quorum, p.FaultTolerance)
 				if !confirmTypedNodeID(cmd, node, "", false, "") {
-					return fmt.Errorf("aborted (type the node_id to confirm an F==0 retire; --yes is not accepted)")
+					return usageErr("aborted (type the node_id to confirm an F==0 retire; --yes is not accepted)")
 				}
 				req.Confirmed = true
 				resp, err = callAdmin(*socketPath, req)

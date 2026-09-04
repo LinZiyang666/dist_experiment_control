@@ -553,3 +553,265 @@ func releaseLeasedName(t *testing.T, b *Broker, sid, nid, iid string) {
 		t.Fatal("a farewell must be handled and stop there")
 	}
 }
+
+// releaseAsTheProductDoes drives the farewell arm with EXACTLY the message the
+// agent constructs — nothing the harness knows that the product does not.
+//
+// origin: prerelease audit broker-core/BC-F1. releaseLeasedName above sets
+// LeasedNID:true, and for the whole v0.5.1 line the agent never did. The broker's
+// release-the-row gate required that field, so it was dead in production while
+// these tests were green: they asserted a message shape the product never emits.
+// This helper exists so that can never be true again silently.
+func releaseAsTheProductDoes(t *testing.T, b *Broker, sid, nid, iid string, leasedNID bool) {
+	t.Helper()
+	req := &proto.NodeRegisterReq{
+		ProtoVersion: proto.ProtoVersion, NID: nid, InstanceID: iid,
+		ReleasingName: true, RosterRefreshOnly: true, LeasedNID: leasedNID,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replyLeaseVerdict(b, &nats.Msg{Subject: proto.SubjNodeRegister(sid, nid), Data: body}, sid, nid, req) {
+		t.Fatal("a farewell must be handled and stop there")
+	}
+}
+
+func nodeStatus(t *testing.T, b *Broker, nid string) string {
+	t.Helper()
+	var st string
+	if err := b.cfg.DB.QueryRow(`SELECT status FROM nodes WHERE sid='lab' AND nid=?`, nid).Scan(&st); err != nil {
+		t.Fatalf("read status of %s: %v", nid, err)
+	}
+	return st
+}
+
+func seedProvisioning(t *testing.T, b *Broker, nid string) {
+	t.Helper()
+	if _, err := b.cfg.DB.Exec(
+		`INSERT INTO agent_provisioning(sid, nid, agent_fp, joined_at)
+		 VALUES ('lab', ?, 'SHA256:dev-'||?, ?)`, nid, nid, time.Now().UTC()); err != nil {
+		t.Fatalf("seed provisioning for %s: %v", nid, err)
+	}
+}
+
+// origin: prerelease audit broker-core/BC-F1.
+//
+// THE RELEASE MUST WORK FOR A FLEET THAT NEVER SENDS THE FLAG.
+//
+// Leases shipped in v0.5.1. Every agent already in the field builds its farewell
+// without LeasedNID, so a gate that requires it is a gate that never fires — and
+// F11's suffix drift, which the code comments describe as fixed, kept happening.
+// The broker therefore decides from agent_provisioning: a suffixed name with no
+// binding of its own IS a lease, whatever the sender says.
+func TestAFarewellReleasesTheRowWithoutTheClientSayingItIsALease(t *testing.T) {
+	b := leaseBroker(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1") // the configured device; the lease name has no binding
+
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceB, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != string(node.StateOffline) {
+		t.Fatalf("the released lease row is still %s.\n\n"+
+			"The farewell carried no LeasedNID, which is what every fielded agent sends. A gate "+
+			"that trusts the client's flag is dead code against the deployed fleet, and the name "+
+			"stays occupied for the whole OfflineAfter window so the agent's own restart is issued "+
+			"the next suffix.", got)
+	}
+}
+
+// origin: prerelease audit broker-core/BC-F1.
+//
+// The other direction, and the reason the test is authoritative rather than
+// syntactic: a CONFIGURED device's row is not ours to take offline on a farewell.
+// Its liveness is the heartbeat's business. The name here is suffix-shaped, so
+// only the agent_provisioning binding distinguishes the two cases.
+func TestAFarewellNeverTakesAConfiguredDevicesRowOffline(t *testing.T) {
+	b := leaseBroker(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1-02") // THIS suffixed name is the operator's configured nid
+
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceB, true) // even claiming to be a lease
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != "ONLINE" {
+		t.Fatalf("a configured device's row was taken %s by a farewell.\n\n"+
+			"The client asked for it, and that is exactly why the server must not ask the client: "+
+			"a row with its own agent_provisioning binding is a real device whose liveness belongs "+
+			"to the heartbeat.", got)
+	}
+}
+
+// origin: prerelease audit broker-core/BC-F3.
+//
+// A NON-HOLDER'S FAREWELL MUST NOT TOUCH THE INCUMBENT.
+//
+// Sibling clones of one image can all authenticate as <base>-NN (the auth suffix
+// fallback), so "some process that can legally publish on this register subject"
+// is NOT the same party as "the process holding this name". Before BC-F1 the
+// row write was dead code and this only cost a cache entry; with the write live,
+// a straggler's goodbye knocks the incumbent OFFLINE — which fails its admitACL
+// node-ONLINE check, drops it from /sub, and frees its name for re-issue to
+// another clone. That is the exact double-holder the whole lease feature exists
+// to prevent.
+func TestANonHolderFarewellCannotTakeTheIncumbentOffline(t *testing.T) {
+	b := leaseBroker(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1")
+	// B is the recorded holder of the lease name.
+	b.leaseHolder.Store(leaseKey("lab", "gpu1-02"), leaseGrant{instanceID: testInstanceB})
+	b.probeCache.Store(leaseKey("lab", "gpu1-02"), true)
+
+	// C — a straggler sibling — says goodbye for a name it does not hold.
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceC, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != "ONLINE" {
+		t.Fatalf("a farewell from a non-holder took the live incumbent's row %s.\n\n"+
+			"The incumbent now fails admitACL's node-ONLINE check — exec, run, kill and expose all "+
+			"refused — vanishes from /sub, and its name is re-issuable to another clone before the "+
+			"next heartbeat. Heartbeat restores ONLINE but NOT proxy_ready.", got)
+	}
+	if _, still := b.probeCache.Load(leaseKey("lab", "gpu1-02")); !still {
+		t.Error("a non-holder invalidated the probe evidence.\n\n" +
+			"Cheap to send, expensive for everyone else: every subsequent register has to re-probe, " +
+			"so an unauthorised sender can hold the name in permanent re-probe by repeating it.")
+	}
+	if v, ok := b.leaseHolder.Load(leaseKey("lab", "gpu1-02")); ok {
+		if g, _ := v.(leaseGrant); g.released {
+			t.Error("a non-holder's farewell flagged the holder's grant released")
+		}
+	}
+}
+
+// origin: prerelease audit broker-core/BC-F3, verifier note ①.
+//
+// THE COLD-MAP PASS IS LOAD-BEARING, not an oversight. After a broker restart or
+// a leader election leaseHolder is empty, and the first agent to exit cleanly is
+// then unknown to it. Refusing there would mean no row is ever released after a
+// restart — reintroducing F11's suffix drift through a different door.
+func TestAFarewellStillReleasesWhenTheHolderMapIsCold(t *testing.T) {
+	b := leaseBroker(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1")
+	// leaseHolder deliberately left empty: this broker just restarted.
+
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceB, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != string(node.StateOffline) {
+		t.Fatalf("a farewell after a broker restart left the row %s.\n\n"+
+			"Nothing is recorded in leaseHolder after a restart, so a holder check that fails "+
+			"closed here means no lease is ever released again until something re-populates the "+
+			"map — which is F11's drift with extra steps.", got)
+	}
+}
+
+// origin: prerelease audit round 2, E1.
+//
+// A READABLE-BUT-EMPTY agent_provisioning is not "I could not read the table".
+//
+// ProvisionedNIDs used to return len(out) > 0 as its second value, so an empty table was
+// indistinguishable from a failed read — and this gate, whose entire purpose is to stop
+// trusting the client's LeasedNID flag, fell straight back to trusting it on exactly that
+// input. An empty table is the STRONGEST evidence the gate can get: nothing on this
+// deployment is a configured device, so a suffix-shaped name is certainly a lease.
+func TestAnEmptyProvisioningTableStillDecidesTheLeaseServerSide(t *testing.T) {
+	b := leaseBroker(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	// Deliberately NO agent_provisioning rows at all.
+
+	// The client says nothing — the shape every fielded agent sends.
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceB, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != string(node.StateOffline) {
+		t.Fatalf("the released lease row is still %s.\n\n"+
+			"agent_provisioning was readable and empty, which means NO device on this deployment "+
+			"is configured — so a suffixed name is certainly a lease. Reading that as 'cannot "+
+			"read' hands the decision back to a client flag no fielded agent sends, which is the "+
+			"exact fallback BC-F1 established cannot repair a deployed fleet.", got)
+	}
+}
+
+// origin: prerelease audit round 2, E2.
+//
+// A COLD MAP IS NOT A BLANK CHEQUE.
+//
+// TestAFarewellStillReleasesWhenTheHolderMapIsCold above pins the other half —
+// the cold path must stay open — and the two are in tension only if "cold" is
+// read as "no evidence". It is not. The map is what THIS broker process
+// remembers; the fleet is still there to be asked. Before this, `mayRelease`
+// defaulted true whenever leaseHolder missed, so the holder check that BC-F3
+// added was unenforced for the whole window after every broker restart,
+// re-exec or leader election — and `broker upgrade` re-execs on every roll, so
+// that window is on the ordinary operational path, not a corner. Inside it a
+// sibling clone's farewell still knocked the live incumbent OFFLINE.
+func TestAColdMapStillRefusesAFarewellContradictedByTheLiveHolder(t *testing.T) {
+	b, nc, _ := leaseBrokerWithBus(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1")
+	// leaseHolder deliberately empty: this broker just re-execed under `broker upgrade`.
+
+	// B is alive under the name and answering claim-probe, exactly as a running
+	// lease-aware agent does (internal/agent, replyClaimProbe).
+	sub, err := nc.Subscribe(proto.SubjCmdForwarded("lab", "gpu1-02", proto.ClaimProbeVerb), func(m *nats.Msg) {
+		payload, merr := json.Marshal(proto.ClaimProbeResp{InstanceID: testInstanceB})
+		if merr != nil {
+			return
+		}
+		_ = m.Respond(payload)
+	})
+	if err != nil {
+		t.Fatalf("incumbent subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// C — a straggler sibling — says goodbye for a name B is holding.
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceC, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != "ONLINE" {
+		t.Fatalf("a non-holder's farewell took the live incumbent's row %s while leaseHolder was cold.\n\n"+
+			"The recorded-holder check is only half the rule: with an empty map the sender was "+
+			"trusted by default, so every broker restart re-opened the BC-F3 hole for as long as "+
+			"the incumbent's connection stayed up. The incumbent is RIGHT THERE answering "+
+			"claim-probe with a different instance id — that is a positive contradiction, not an "+
+			"absence of evidence.", got)
+	}
+}
+
+// origin: prerelease audit round 2, E2.
+//
+// The evidence rule must not fire on the sender ITSELF. An agent that is still
+// subscribed when it says goodbye answers its own probe, and reading that as a
+// contradiction would refuse every clean exit that has not yet unsubscribed —
+// which is most of them, since the farewell is published before teardown.
+func TestAHolderStillSubscribedCanReleaseItsOwnNameOnAColdMap(t *testing.T) {
+	b, nc, _ := leaseBrokerWithBus(t)
+	seedBeat(t, b, "gpu1-02", 0)
+	seedProvisioning(t, b, "gpu1")
+
+	sub, err := nc.Subscribe(proto.SubjCmdForwarded("lab", "gpu1-02", proto.ClaimProbeVerb), func(m *nats.Msg) {
+		payload, merr := json.Marshal(proto.ClaimProbeResp{InstanceID: testInstanceB})
+		if merr != nil {
+			return
+		}
+		_ = m.Respond(payload)
+	})
+	if err != nil {
+		t.Fatalf("incumbent subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	releaseAsTheProductDoes(t, b, "lab", "gpu1-02", testInstanceB, false)
+
+	if got := nodeStatus(t, b, "gpu1-02"); got != string(node.StateOffline) {
+		t.Fatalf("the holder's own farewell left its row %s.\n\n"+
+			"It answered its own claim probe — the responder id EQUALS the sender's — which is "+
+			"agreement, not contradiction. Refusing here would leave every cleanly-exiting lease "+
+			"row ONLINE for the full OfflineAfter window and re-issue the agent a fresh suffix on "+
+			"restart, which is F11's drift.", got)
+	}
+}

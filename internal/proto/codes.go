@@ -94,6 +94,27 @@ const (
 	// exception to usage.md §9.13's "retry on 70" guidance.
 	CodeReplyTooLarge = "reply_too_large"
 
+	// CodeLegacyInboxNoSecrets rides on a SUCCESSFUL register whose reply had to be
+	// stripped of its credential-bearing directive, because the requester asked for the
+	// answer on the shared `_INBOX` space rather than a per-identity inbox.
+	//
+	// origin: prerelease audit external review B-1. The N-1 compatibility grant gives
+	// `Sub _INBOX.>` to any connection that declines to send auth.InboxCapableMarker —
+	// which an attacker does simply by not sending it — so anything published there is
+	// readable by a stranger holding nothing but a fresh nkey. The register reply carries
+	// ProxyDirective{Token, Keys[].Secret}: a raw tunnel token plus every subscriber's
+	// Shadowsocks PSK. Those are LONG-LIVED and nothing in the tree rotates them, so a
+	// disclosure there does not end when the client upgrades — which is why the exposure
+	// could not be left to close itself over the N-1 window.
+	//
+	// The register still SUCCEEDS: the node comes ONLINE and the whole control plane —
+	// including `tether node upgrade`, the thing that fixes this — keeps working. Only
+	// the proxy/expose data plane is withheld, and it returns on the next register once
+	// the agent asks on a private inbox. Refusing the register outright would have been
+	// the simpler code and a worse outcome: it strands the fleet with no in-band way to
+	// upgrade it.
+	CodeLegacyInboxNoSecrets = "legacy_inbox_no_secrets"
+
 	// --- expose / public port allocation ---
 
 	CodeNameTaken        = "name_taken"

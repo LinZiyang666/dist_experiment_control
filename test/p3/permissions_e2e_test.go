@@ -21,10 +21,10 @@ func TestNATSDeniesCrossSessionEvSubscribe(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	alice := freshIdentity(t)
+	alice := admittedIdentity(t, db)
 	mustCreate(t, url, alice, "lab", "p")
 
-	bob := freshIdentity(t)
+	bob := admittedIdentity(t, db)
 	mustCreate(t, url, bob, "prod", "q")
 
 	// alice connects activated for "lab" — JWT permissions sub allow only
@@ -71,7 +71,7 @@ func TestNATSDeniesForwardedPub(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	alice := freshIdentity(t)
+	alice := admittedIdentity(t, db)
 	mustCreate(t, url, alice, "lab", "p")
 
 	errs := make(chan error, 4)
@@ -113,7 +113,7 @@ func TestNATSDeniesForgedActorPub(t *testing.T) {
 	db := openDB(t)
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
-	alice := freshIdentity(t)
+	alice := admittedIdentity(t, db)
 	mustCreate(t, url, alice, "lab", "p")
 
 	bob := freshIdentity(t)

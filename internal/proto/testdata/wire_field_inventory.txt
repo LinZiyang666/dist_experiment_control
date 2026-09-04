@@ -64,6 +64,7 @@ ClusterHealthResp.ProxyHomeCount	json:"proxy_home_count,omitempty"	int
 ClusterHealthResp.ProxyHomeReported	json:"proxy_home_reported,omitempty"	bool
 ClusterHealthResp.ReleaseVersion	json:"release_version,omitempty"	string
 ClusterHealthResp.SchemaVersion	json:"schema_version"	int
+ClusterHealthResp.SessionCreatorOps	json:"session_creator_ops,omitempty"	bool
 ClusterHealthResp.TopoAction	json:"topo_action,omitempty"	string
 ClusterHealthResp.TopoApplied	json:"topo_applied,omitempty"	uint64
 ClusterHealthResp.TopoObserved	json:"topo_observed,omitempty"	uint64
@@ -385,6 +386,7 @@ SeedBundle.SchemaVersion	json:"schema_version"	int
 SeedBundle.Sig	json:"sig"	string
 SessionCreateReq.Name	json:"name"	string
 SessionCreateReq.PIN	json:"pin,omitempty"	string
+SessionCreateResp.Code	json:"code,omitempty"	string
 SessionCreateResp.CreatedAt	json:"created_at"	time.Time
 SessionCreateResp.Error	json:"error,omitempty"	string
 SessionCreateResp.OwnerFP	json:"owner_fp"	string

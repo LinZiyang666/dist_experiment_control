@@ -25,6 +25,7 @@ package jsstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -142,15 +144,22 @@ func EnsureEventsStream(ctx context.Context, js jetstream.JetStream, targetRepli
 // before this cap matters in practice.
 func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string, targetReplicas int) error {
 	cfg := jetstream.StreamConfig{
-		Name:       HistoryStreamName(sid),
-		Subjects:   []string{historyFilterSubject(sid)},
-		Retention:  jetstream.LimitsPolicy,
-		MaxAge:     0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
-		MaxBytes:   HistoryMaxBytesPerSession,
-		Discard:    jetstream.DiscardNew,
-		Storage:    jetstream.FileStorage,
-		Replicas:   targetReplicas,   // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle
-		Duplicates: AuditDedupWindow, // D5 §6.3: dedup window for the re-derivable audit publisher's msg-ids (inert in build-and-prove production — live publishAudit sets no msg-id; MP-2)
+		Name:      HistoryStreamName(sid),
+		Subjects:  []string{historyFilterSubject(sid)},
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    0, // 0 / -1 both mean "no expiry" in nats; use 0 to be explicit
+		MaxBytes:  HistoryMaxBytesPerSession,
+		Discard:   jetstream.DiscardNew,
+		Storage:   jetstream.FileStorage,
+		Replicas:  targetReplicas, // D5 §6.4: replicasFor(nVoters); live callers pass ReplicasSingle
+		// D5 §6.3: the dedup window for the audit publisher's msg-ids. NO LONGER INERT —
+		// this said "inert in build-and-prove production: live publishAudit sets no
+		// msg-id (MP-2)", and that stopped being true when the #57 single-mode synthetic
+		// terminal started publishing with a content-derived Nats-Msg-Id (round 2, F-T2).
+		// That publish's replay-safety argument IS this window: shorten it below the
+		// finalize pass interval and a re-run of the pass writes a second terminal for
+		// one transfer.
+		Duplicates: AuditDedupWindow,
 	}
 	return ensureStream(ctx, js, cfg)
 }
@@ -301,6 +310,10 @@ func CollectStreamState(ctx context.Context, js jetstream.JetStream, name string
 		Name: name, Target: target, Actual: actual, Ready: actual >= target,
 		// G69 additive: placement evidence, distinct from catch-up. Ready is byte-unchanged.
 		Assigned: AssignedReplicas(info), Configured: info.Config.Replicas,
+		// G-1 (round 2): WHERE the caught-up replicas live, so the retire gate can ask
+		// how many survive removing a particular node instead of assuming none of them
+		// live on it.
+		CaughtUpServers: CaughtUpServersOf(info),
 	}, nil
 }
 
@@ -432,3 +445,118 @@ func ProbeMetaCanPlace(ctx context.Context, js jetstream.JetStream, targetReplic
 	}
 	return nil
 }
+
+// TransferTerminalCommitted answers, from the AUDIT STREAM ITSELF, whether a terminal for
+// this transfer is already there. It is the durable half of the recovery decision.
+//
+// origin: prerelease audit external review R2-M2. Recovery used to rely on the content
+// derived Nats-Msg-Id and JetStream's duplicate window, which this repo configures at two
+// minutes. That is a TIME bound on a question that has no time bound: a broker can crash
+// after the publish ack and before the ledger unlink, stay down for an hour, and come back
+// to replay a terminal the window has long forgotten — writing a second one. Widening the
+// window only moves that boundary; the stream is the only thing that still knows.
+//
+// THE SCAN WALKS FORWARD OVER THE AUDIT-TRANSFER SUBJECT ONLY, using the server-side
+// next-by-subject selector (`WithGetMsgSubject`). Three properties, each load-bearing:
+//
+//   - NO CONSUMER. Raw message reads create nothing on the server, so bulk recovery cannot
+//     accumulate ephemeral consumers waiting out an inactive threshold.
+//   - NO CLOCK. Nothing here compares a broker timestamp with a NATS one, so the answer
+//     does not depend on two machines agreeing about the time.
+//   - COST IS THE SESSION'S TRANSFER COUNT, not its total audit volume, and never the
+//     stream's bytes. This is the difference that matters, and the reason this walks
+//     forward-by-subject rather than backward by raw sequence. The history stream carries
+//     `audit.>` — call, proc and port records share it with transfer records — so a raw
+//     backward walk reads every message BODY of every subject, one round trip per sequence.
+//     Its early exit is this transfer's own start row, and a start row is missing exactly
+//     when audit publishing is failing (pubAuditTransfer is best-effort), which is the same
+//     condition that keeps the ledger row staged. So the degraded state re-walked the whole
+//     1 GiB stream on EVERY reap pass — inline on the reconcile goroutine, which has no
+//     per-pass deadline, stalling node-state reconciliation behind it. Filtering server-side
+//     removes the amplification instead of hoping the bad state is rare.
+//
+// A MISSING STREAM IS "NOT COMMITTED", not an error: a session whose history stream was
+// deleted has no terminal in it by construction. Every OTHER failure is returned, because
+// the caller's rule is that "cannot verify" must mean retain — never publish-and-hope, and
+// never drop.
+func TransferTerminalCommitted(
+	ctx context.Context, js jetstream.JetStream, sid, transferID string,
+) (bool, error) {
+	// ASK WHICH STREAM OWNS THE SUBJECT, do not assume HistoryStreamName. The audit subject
+	// is the contract; the stream carrying it is a deployment fact that a restore, a rename,
+	// or an operator-provisioned stream can change. Looking it up by name would answer
+	// "not committed" for a terminal that is sitting right there under another stream name —
+	// the one failure direction that produces a duplicate.
+	subject := proto.SubjAuditTransfer(sid)
+	name, err := js.StreamNameBySubject(ctx, subject)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("jsstream: find the stream carrying %s: %w", subject, err)
+	}
+	stream, err := js.Stream(ctx, name)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("jsstream: open audit stream %s: %w", name, err)
+	}
+	// BOUND THE PASS, NOT THE ANSWER. Exceeding the budget returns an error, which the
+	// caller reads as "unknown" and therefore RETAINS the ledger row for the next pass —
+	// the safe direction. A bound that answered "not committed" instead would trade a
+	// stall for the one outcome this whole function exists to prevent.
+	ctx, cancel := context.WithTimeout(ctx, transferScanBudget)
+	defer cancel()
+
+	// seq only ever increases (the server returns the FIRST record on this subject at or
+	// after seq, and the next probe starts one past it), so the walk terminates on the
+	// not-found that ends the subject. There is no decrementing unsigned counter to
+	// underflow and no way to revisit a sequence.
+	for seq := uint64(1); ; {
+		msg, getErr := stream.GetMsg(ctx, seq, jetstream.WithGetMsgSubject(subject))
+		if getErr != nil {
+			// NOT FOUND ENDS THE SCAN, and only here: it means there is no further record
+			// on this subject at or after seq — deleted sequences, purged ranges and other
+			// subjects' messages were all skipped by the server, not by us. Every other
+			// failure (including this scan's own deadline) leaves the answer unknown, and
+			// unknown must retain.
+			if errors.Is(getErr, jetstream.ErrMsgNotFound) {
+				return false, nil
+			}
+			return false, fmt.Errorf("jsstream: scan %s for %s from sequence %d: %w",
+				name, subject, seq, getErr)
+		}
+		if msg.Subject != subject {
+			// The server filtered by subject; being handed something else means the
+			// selector did not do what this function's cost argument assumes. Fail closed
+			// rather than decode a foreign record as a transfer audit.
+			return false, fmt.Errorf("jsstream: %s sequence %d is %q, not %q",
+				name, msg.Sequence, msg.Subject, subject)
+		}
+		var rec schema.AuditTransfer
+		if uerr := json.Unmarshal(msg.Data, &rec); uerr != nil {
+			// This subject is reserved for AuditTransfer and the broker is its only
+			// permitted publisher. Skipping an unreadable row would turn "cannot verify"
+			// into "not committed" and permit a duplicate terminal.
+			return false, fmt.Errorf("jsstream: decode transfer audit at %s sequence %d: %w",
+				name, msg.Sequence, uerr)
+		}
+		// EITHER TERMINAL COUNTS. The invariant is EXACTLY ONE terminal per transfer, so a
+		// committed "complete" makes a staged "failed" a contradiction to drop, not a
+		// different record to add — matching only the staged row's own kind is how a
+		// contradictory pair gets written.
+		if rec.TransferID == transferID && (rec.Kind == "complete" || rec.Kind == "failed") {
+			return true, nil
+		}
+		seq = msg.Sequence + 1
+	}
+}
+
+// transferScanBudget bounds ONE recovery scan. It is a LIVENESS bound, not a correctness
+// one: the scan runs inline on the reconcile pass, which has no deadline of its own, so an
+// unbounded scan does not merely take long — it holds up every other reconciler behind it.
+// Thirty seconds of subject-filtered reads covers a session with more transfers than any
+// real one has, and blowing through it retains the row rather than risking a second
+// terminal.
+const transferScanBudget = 30 * time.Second

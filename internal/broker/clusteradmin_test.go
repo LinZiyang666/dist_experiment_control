@@ -24,9 +24,17 @@ import (
 // reconcile, drain+retire, drain-leader transfer, force-single→recover) are gated
 // d7_integration (test/d7 TestD7Matrix).
 
+// The transport address is host:PORT shaped, not the bare node id.
+//
+// origin: prerelease audit cluster-fsm/L3-F2. The roster admission planner now validates
+// raft_addr the same way its own rewrite planner always has, and every test here fed it
+// the node id — so the whole fixture family was admitting rows whose raft_addr could
+// never have come from a real broker. An inmem transport does not care what the string
+// is; making it address-shaped costs nothing and stops the fixtures from asserting a
+// shape production cannot produce.
 func d7SingleNode(t *testing.T, id string) (*cluster.Node, string) {
 	t.Helper()
-	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id))
+	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id + ":7400"))
 	dir := t.TempDir()
 	n, err := cluster.New(cluster.Config{
 		LocalID:            raft.ServerID(id),

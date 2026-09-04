@@ -1,11 +1,60 @@
 package broker
 
 import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"testing"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/session"
 )
+
+// origin: external review 2026-09-03, clustered Argon2 budget finding.
+//
+// Handler.VerifyPINWithBudget owns the process-wide Argon2 ceiling, but cluster mode
+// moves verification into the leader's raft Plan closure. Passing auth.VerifyPIN
+// directly at that boundary makes every clustered PIN attempt bypass the ceiling.
+// This is a wiring property: authcallout's behavioural tests cannot see the verifier
+// that NewJoinSeam/NewProvisionSeam and dispatchForward select in another package.
+func TestClusterPINPlansDoNotBypassTheArgon2Budget(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "cluster_forward.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bypasses []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		callee, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || (callee.Sel.Name != "PlanJoinWithPIN" && callee.Sel.Name != "PlanProvisionWithPIN") {
+			return true
+		}
+		for _, arg := range call.Args {
+			sel, ok := arg.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			pkg, pkgOK := sel.X.(*ast.Ident)
+			if pkgOK && pkg.Name == "auth" && sel.Sel.Name == "VerifyPIN" {
+				bypasses = append(bypasses, fmt.Sprintf("%s at %s", callee.Sel.Name, fset.Position(arg.Pos())))
+			}
+		}
+		return true
+	})
+	if len(bypasses) != 0 {
+		t.Fatalf("cluster PIN verification bypasses Handler.VerifyPINWithBudget at %v; the "+
+			"process-wide Argon2 ceiling is therefore absent in cluster mode", bypasses)
+	}
+}
 
 // authcallout_wiring_test.go (batch B, B3) — the three clustered auth_callout assignments must stay
 // in ONE block.
@@ -330,4 +379,86 @@ func buildsCompositeLit(fn *ast.FuncDecl, pkg, name string) bool {
 		return true
 	})
 	return found
+}
+
+// TestClusteredPINWritesRunThroughTheSuppliedVerifier is the BEHAVIOURAL half of the
+// guard above: the AST check proves the raw verifier is gone, not that the budgeted one
+// is actually reached. Both clustered paths are exercised — the leader-local seam and the
+// forwarded dispatch — because M-1 was present on both and a fix to either alone leaves
+// the other unmetered.
+//
+// It also pins the property the ceiling's placement depends on (round 2, A-F3): a request
+// naming a session that does not exist must NOT reach Argon2, or a stranger enumerating
+// sids drains the whole budget at zero CPU cost and denies every real bootstrap.
+//
+// origin: prerelease audit external review M-1.
+func TestClusteredPINWritesRunThroughTheSuppliedVerifier(t *testing.T) {
+	n, _ := d7SingleNode(t, "pin-budget-wiring")
+	now := time.Now().UTC()
+	if err := n.Propose(func(db *sql.DB) (*cluster.Command, error) {
+		return session.PlanCreate(db, "lab", "lab", "SHA256:owner", "pin-hash", now)
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	var calls int
+	verify := func(pin, hash string) error {
+		calls++
+		return fmt.Errorf("verifier says no")
+	}
+	fwd := &Forwarder{observe: func(string, error) {}}
+	clock := func() time.Time { return now }
+
+	// --- leader-local seam ---
+	_ = NewProvisionSeam(n, fwd, verify)("lab", "n1", "SHA256:fp", "some-pin", now)
+	if calls != 1 {
+		t.Fatalf("the leader-local provision seam ran %d verifier calls, want 1 — the broker that "+
+			"spends the Argon2 CPU must be the one charged for it", calls)
+	}
+	_ = NewJoinSeam(n, fwd, verify)("lab", "SHA256:fp", "some-pin", now)
+	if calls != 2 {
+		t.Fatalf("the leader-local join seam did not use the supplied verifier (calls=%d)", calls)
+	}
+
+	// --- a nonexistent session must be rejected BEFORE the verifier ---
+	before := calls
+	_ = NewProvisionSeam(n, fwd, verify)("no-such-session", "n1", "SHA256:fp", "some-pin", now)
+	_ = NewJoinSeam(n, fwd, verify)("no-such-session", "SHA256:fp", "some-pin", now)
+	if calls != before {
+		t.Fatalf("a request naming a nonexistent session reached the verifier (%d extra calls); a "+
+			"stranger guessing sids could then drain the process-wide budget at no CPU cost to "+
+			"themselves and deny every legitimate bootstrap", calls-before)
+	}
+
+	// --- forwarded dispatch ---
+	for _, tc := range []struct {
+		verb    string
+		payload any
+	}{
+		{VerbProvision, ProvisionPayload{SID: "lab", NID: "n2", FP: "SHA256:fp", PIN: "some-pin"}},
+		{VerbJoin, JoinPayload{SID: "lab", FP: "SHA256:fp", PIN: "some-pin"}},
+	} {
+		body, err := json.Marshal(tc.payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := forwardEnvelope{Verb: tc.verb, Payload: body}
+
+		before := calls
+		_ = dispatchForward(n, clock, forwardDeps{verifyPIN: verify}, env)
+		if calls != before+1 {
+			t.Fatalf("forwarded %s did not run the supplied verifier (calls %d -> %d). A follower "+
+				"checks the ceiling and forwards; if the leader then verifies off-budget, fanning "+
+				"requests through followers is an unmetered Argon2 oracle.", tc.verb, before, calls)
+		}
+
+		// A missing verifier must FAIL CLOSED, never fall back to the unbudgeted one.
+		before = calls
+		if err := dispatchForward(n, clock, forwardDeps{}, env); !errors.Is(err, errPINVerifierUnwired) {
+			t.Fatalf("forwarded %s with no verifier returned %v, want errPINVerifierUnwired", tc.verb, err)
+		}
+		if calls != before {
+			t.Fatalf("forwarded %s verified anyway with no budget wired", tc.verb)
+		}
+	}
 }

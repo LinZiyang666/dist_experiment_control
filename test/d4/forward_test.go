@@ -38,7 +38,7 @@ func TestD4PINForwardedFollowerReachesLeader(t *testing.T) {
 	clientPub, _ := freshClient(t)
 
 	h := &authcallout.Handler{DB: openReadHandle(t, c.dbPaths[fi]), AccountKp: c.acctKp, Now: time.Now}
-	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], c.forwarder(fi))
+	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], c.forwarder(fi), h.VerifyPINWithBudget)
 
 	out, err := h.Handle(signedAgentReq(t, clientPub, "lab", "lab-1", "test-pin"))
 	if err != nil {
@@ -79,7 +79,7 @@ func TestD4PINForwardNoLeaderTransientDeny(t *testing.T) {
 	// Use a SHORT-timeout forwarder so the no-leader case fails fast.
 	fwd := broker.NewForwarder(c.conns[fi], 800*time.Millisecond)
 	h := &authcallout.Handler{DB: openReadHandle(t, c.dbPaths[fi]), AccountKp: c.acctKp, Now: time.Now}
-	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], fwd)
+	h.ProvisionAgentWrite = broker.NewProvisionSeam(c.nodes[fi], fwd, h.VerifyPINWithBudget)
 
 	out, err := h.Handle(signedAgentReq(t, clientPub, "lab", "lab-1", "test-pin"))
 	if err != nil {

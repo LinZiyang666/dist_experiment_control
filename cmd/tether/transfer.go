@@ -577,6 +577,19 @@ func finishPullTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string,
 	if copyErr == nil {
 		copyErr = f.Sync()
 	}
+	// CARRY THE DESTINATION'S MODE — the tier-B sibling of the inline path's fix.
+	//
+	// origin: prerelease audit round 2, I-F3. L3-F1 landed on writeLocalAtomic only, which
+	// is the INLINE path, so `pull --force` of anything over the 8 MiB tier-A ceiling —
+	// i.e. every large file, the case the flag exists for — still reset the destination's
+	// permission bits to 0600. AFTER the content is written and before Close, so the tmp
+	// never sits in the destination directory at a widened mode holding partial content
+	// (round 2, J8).
+	if copyErr == nil {
+		if st, serr := os.Lstat(localAbs); serr == nil && st.Mode().IsRegular() {
+			_ = f.Chmod(st.Mode().Perm())
+		}
+	}
 	closeErr := f.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmp)
@@ -650,7 +663,28 @@ func writeLocalAtomic(localAbs string, data []byte, force bool) error {
 	if err != nil {
 		return err
 	}
+	// CARRY THE EXISTING FILE'S PERMISSION BITS, symmetrically with the agent's
+	// OpenForWriteAtomic (internal/agent/transfer.go).
+	//
+	// origin: prerelease audit agent-transfer/L3-F1. The tmp is created 0600 and renamed
+	// over the destination, so `pull --force` onto an existing file silently reset its
+	// mode — a 0755 script came back non-executable. The operator asked to replace the
+	// CONTENT.
+	//
+	// Masked to 0o777, not 0o7777: setuid/setgid/sticky belong to the file that was
+	// there, and re-applying them to bytes that just arrived over the network would hand
+	// the sender whatever privilege the old file carried. Best-effort — a filesystem
+	// that refuses the chmod is not a reason to lose the transfer. Only reachable with
+	// --force: without it commitLocalTemp's link refuses an existing destination.
+	// Applied AFTER the content lands (see below), not here — round 2, J8.
 	if _, err = f.Write(data); err == nil {
+		// Widen to the destination's mode only once the bytes are in, so the tmp never
+		// sits in the destination directory at a group- or world-writable mode holding
+		// partial content (round 2, J8 — the ordering is hygiene, not a privilege fix:
+		// the mode it takes is the one the committed file will have anyway).
+		if st, serr := os.Lstat(localAbs); serr == nil && st.Mode().IsRegular() {
+			_ = f.Chmod(st.Mode().Perm())
+		}
 		err = f.Sync()
 	}
 	if closeErr := f.Close(); err == nil {

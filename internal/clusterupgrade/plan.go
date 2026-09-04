@@ -6,7 +6,11 @@
 // input (the target's axes are unknown until its binary runs).
 package clusterupgrade
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/LinZiyang666/tether/internal/proto"
+)
 
 // AgentPresence is the THREE-state co-located-agent fact for one broker host (P3).
 //
@@ -55,13 +59,18 @@ type Node struct {
 //
 // Conflating (c) with (b) is precisely the P3 defect; they are distinct inputs, not a default.
 func (n Node) AtTarget(target string) bool {
-	if target == "" || n.BrokerVer != target {
+	// proto.SameRelease: the two ends disagree on the leading "v" (goreleaser stamps it, a source build does not), and this is a CONFIRMATION check — a false negative reports a successful upgrade as unconfirmed (prerelease audit DRD-F2/F3).
+	if target == "" || !proto.SameRelease(n.BrokerVer, target) {
 		return false
 	}
 	if n.Agent == AgentAbsent {
 		return true // (c) — nothing else on this host to be stale
 	}
-	return n.AgentVer == target // (a) vs (b)
+	// SameRelease here too. origin: prerelease audit round 2, K-F1 — the broker leg one
+	// line above got it and this one did not, so every host with a co-located agent was
+	// permanently "not at target" for a v-prefixed --to-version and the roll never
+	// converged.
+	return proto.SameRelease(n.AgentVer, target) // (a) vs (b)
 }
 
 // StepKind is one roll action.

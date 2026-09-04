@@ -163,6 +163,21 @@ func (w *Writer) Write(p []byte) (int, error) {
 			}
 		}
 	}
+	// THE io.Writer CONTRACT: "Write must return a non-nil error if it returns n < len(p)."
+	//
+	// origin: prerelease audit, §3 MINOR sweep. This returned nil unconditionally. When the
+	// file write failed AND the stderr spill also failed — a full disk takes both, which is
+	// precisely when a log sink is under stress — the caller was told the whole record
+	// landed. Every wrapper above this one (log.Logger, slog's handler) believes that, so
+	// the loss is silent at every layer.
+	//
+	// The error is deliberately NOT the underlying one: by this point the record has been
+	// partially spilled and w.f has been dropped, so the useful fact for the caller is how
+	// much was lost, not which syscall failed first. The underlying error is already in
+	// noteDegradedLocked.
+	if n < len(p) {
+		return n, fmt.Errorf("logrotate: short write, %d of %d bytes landed (file sink degraded and the stderr spill also failed)", n, len(p))
+	}
 	return n, nil
 }
 

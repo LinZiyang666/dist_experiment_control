@@ -161,6 +161,24 @@ cmd/tether/
 
 > **D4 实现注（`commandVersion` 1→2 + `ReqID` 启用）**：D4 给 `OpReconcileBatch` 加 apply-inert 有序审计元组字段（§4.1 自足重导），故 `commandVersion` 升 2（与 proto v2 解耦、只管 raft-log 信封）；`Command.ReqID`（信封 `r`）从 D1 的 RESERVED+INERT 转为**活跃跨重试幂等键**，`decodeCommand` 加 charset 守（空或 hex/有界、拒 NUL/非 UTF-8）。空 ReqID = 今天行为（D1/D2 op 字节不变、不碰 ledger）。详 §4.1 D4 实现定稿。
 
+> **发布前审计 round 2 实现注（新 op `SessionCreatorSet`，Go 常量 `OpSessionCreatorSet`）**：`session create` 此前**零准入**——控制面按设计在公网上，任何持语法合法 nkey 的连接都能命名一个 session、成为其 owner，并据此铸出 activated-member 与（用它自己刚设的 PIN）agent 两套权限模板。准入表 `session_creators`（migration 0019）关掉这条链。
+>
+> - **为什么必须是 op 而不是本地写**：两个理由，第二个是这张表特有的。其一，集群模式下 FSM 是 SQLite 的**唯一写者**，`adminsock` 直写会 fork FSM。其二，**一个 fp 在 A broker 被准入、在 B broker 没有，就等于「ctl 碰巧连到哪台 broker」决定它能不能建 session」**——准入必须是复制状态。
+> - **guard/keyset 语义**：走 `genericExecApplier`。allow 是 `INSERT OR IGNORE`（重复准入幂等，且**不重写 added_by/note**，所以「谁准入的谁」不会被后来者覆盖——CLI 会明说这次没改动）；deny 是按 fp 的 `DELETE`（缺行即 no-op）。两者都只按主键 fp 作用，故 replay 确定性幂等。时间戳由 **leader** 烤成 **`cluster.LitTime`**——**不是** RFC3339Nano：`LitTime` 渲染的正是 modernc 驱动把 `time.Time` 参数写进去的那个编码，而单机模式的直写路径走的就是驱动。曾经烤成 RFC3339Nano，于是同一列里按「这台 broker 是不是集群」出现两种文本编码，破坏 §13.2/DIFF-1 等价，也让 `ListCreators` 注释里承诺的 `ORDER BY added_at` oldest-first 在混合部署里比较两套字母表。（增量 2 内审 raft-op/F4。守卫比的是 `quote(added_at)` 的**原始存储文本**——驱动在读出时会归一化，比读回值等于什么都没比。）
+> - **读侧不经 raft**：`handleSessionCreate` 用 `b.read()`（本地视图）。这是**刻意的**：准入是策略而非凭据，follower 上刚准入的 fp 慢一个 apply 是可接受的（运维重试即可），而让每次 `session create` 都做一次 leader 往返会把一个交互命令绑到 leader 可用性上。读失败（表读不出来）**拒绝**而不是当成空表——一台读不出自己策略表的 broker 没有资格准入任何人。
+> - **N-1 约束（本节此前写反了，增量 2 内审六条 finding 独立报出）**：旧 binary 在未知 op 上**不是 fail-stop**——`decodeCommand` 把它当毒丸**静默跳过**，推进 `applied_index` 而不执行 SQL。所以混版集群里一次 `session-allow` 的后果是：leader 的 `session_creators` 有这一行、旧 voter 没有，CLI 报成功，而**哪台 broker 接住 ctl 的请求由 NATS queue group 抽签决定**。对一张**安全策略表**来说这在两个方向上都坏：跳掉的 allow = 运维以为放行了而那台没放行；跳掉的 deny = 撤销过的指纹在那台上照样能建 session。因此本 op 走**混版能力门**（`cluster.HasSessionCreatorOps` → `ClusterHealthResp.SessionCreatorOps` → `assertAllVotersSupportSessionCreatorOps`），与 v0.4.2 phase-fluidity ops 同一套机制（该机制已提取为 `checkVotersSupportOps`）：任一非自身 voter 不广告该能力、或**联系不上**，写入直接**拒绝**而不是写出一份只在部分副本生效的策略。回滚仍只支持 snapshot-restore、不支持从零日志重放。**升级本身零运维动作**：由**leader** 经 raft 做一次性回填（`seedSessionCreators`）把每个已拥有 session 的 owner 指纹纳入——**不是 migration 0019**，因为一条 migration 会在每个节点、按各自重启时刻、从另一张复制表**各自派生**这张复制表（滚动升级必然分歧且永不收敛），而且它会在每次重跑时**复活被 `--remove` 撤销的指纹**（撤销刻意不删 session）。回填因此走 raft、只做一次、marker 与数据行在**同一条 raft entry** 里。
+>
+> - **它是 level-triggered 的，不是「启动时试一次」**（外审 M-2 订正——此处与代码此前都写成启动期一次性尝试）。
+>   那个形态在**标准滚动升级下必然全部落空**：顺序是 followers-first/leader-last，每台新 broker 启动时
+>   旧 leader 还在（于是 follower 分支直接返回），最后一步先把 leadership 转给**已经在跑**的新 follower
+>   再重启旧 leader，旧 leader 回来时也是 follower——没有任何一台跑过它，且没有任何东西会重试。
+>   现注册为 `authorityLeader` 的 reconcile pass（`seedCreatorsPass`），谁持有 leadership 谁就持续问
+>   「做完了吗」直到 marker 提交；这同时覆盖了一次瞬态 `Propose` 失败后的无重启自愈。
+> - **marker 提交之前的语义必须明确**，否则新 follower 会拿空表拒绝既有 owner：`MayCreateSession` 在
+>   marker 缺失时 fail-safe 地放行**已经拥有 session** 的指纹（准确等于回填将要纳入的那一集，陌生身份
+>   照常拒绝）。marker 落地后表是唯一权威——这条边界是必需的，因为撤销刻意不删 session，
+>   「owns a session」在撤销后永远为真，过渡规则若活过 marker 就会静默复活每一次撤销。
+
 > **D5 实现注（新 op `OpAuditCheckpointSet`）**：D5 注册 `OpAuditCheckpointSet`（推进复制游标 `cluster_meta.audit_published_index`，FSM 烤单调守卫 UPSERT、reuse `sqlbake.LitInt`、禁 `Args`），经 `genericExecApplier`。**不是放松 `t:` 前缀守卫**（该守卫为 §2.10 防碰撞，`ApplyMetaSet` 仍只准 `t:` 键）——这是独立 op。**不需 migration**（沿用 0009 `cluster_meta`，KV 缺省读 0 同 `applied_index`）。该 op **派生零审计**、在 publisher skip-set。详 §6.3 D5 实现裁定 + `docs/reviews/d5-plan.md`。
 
 ---

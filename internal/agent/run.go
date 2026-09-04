@@ -280,26 +280,22 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		readBootID(), startTicks, rec.startedAt)
 	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
 
-	// Two long-running subscriptions for the lifetime of the child:
-	//   .in     → write to master
-	//   .resize → ioctl on master
-	// pty.<pid>.out is a publisher (master→bus).
-	subIn, err := nc.Subscribe(proto.SubjPtyIn(a.cfg.SID, pid), func(m *nats.Msg) {
-		_, _ = sess.Master.Write(m.Data)
-	})
-	if err != nil {
-		a.cfg.Logger.Warn("agent: subscribe pty.in", "err", err, "pid", pid)
-	}
-	subResize, err := nc.Subscribe(proto.SubjPtyResize(a.cfg.SID, pid), func(m *nats.Msg) {
-		var ev proto.PtyResizeEvent
-		if err := json.Unmarshal(m.Data, &ev); err != nil {
-			return
-		}
-		_ = sess.SetSize(ev.Cols, ev.Rows)
-	})
-	if err != nil {
-		a.cfg.Logger.Warn("agent: subscribe pty.resize", "err", err, "pid", pid)
-	}
+	// .in and .resize are SESSION-scoped wildcard subscriptions installed once per NATS
+	// session (startPtyIntake), not per-run subscriptions on the spawn conn.
+	//
+	// origin: prerelease audit agent-run/L3-F2. They used to be subscribed HERE, on the
+	// conn captured when the child was spawned. A session rebuild — which rebuildOntoVoter
+	// performs for ordinary events like a drain or a roster change — closes that conn, and
+	// the interactive session went deaf: keystrokes and window resizes stopped arriving,
+	// while `.out` kept streaming, so the user saw a live terminal that ignored them.
+	// pty.<pid>.out is a publisher (master→bus) and resolves its conn per flush.
+	//
+	// The reviewer's minimal alternative — hang up the session when the ctl link drops —
+	// was rejected: it trades "invisible" for "killed". Every rebuildOntoVoter would then
+	// SIGHUP the foreground job, and a long non-tmux task would simply die.
+	//
+	// This is the same shape startCtlLiveness already uses for `pty.*.ka`, and the ACL
+	// (internal/auth/permissions.go) already grants the wildcard.
 
 	outSubj := proto.SubjPtyOut(a.cfg.SID, pid)
 	pumpDone := make(chan struct{})
@@ -328,12 +324,9 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	if subIn != nil {
-		_ = subIn.Unsubscribe()
-	}
-	if subResize != nil {
-		_ = subResize.Unsubscribe()
-	}
+	// No per-run .in/.resize subscriptions to tear down: they are session-scoped now
+	// (startPtyIntake) and the session finalizer owns them. unregisterProc is what stops
+	// this pid from being routed — ptySessionFor returns nil the moment the record goes.
 	a.unregisterProc(pid)
 	_ = sess.Close()
 
@@ -342,15 +335,11 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// EXITED + writes audit.proc{kind:exit}. Enqueued BEFORE the lifecycle
 	// chunk so delivery is already in flight when ctl reacts to exit.
 	a.courier.enqueueExit(pid, exitCode)
-	// h1 C1: the exit lifecycle chunk rides the CURRENT conn — after a mid-run
-	// conn rebuild the captured spawn conn is closed and the chunk (like the
-	// old exit publish) would silently vanish. Fall back to the captured conn
-	// only when no current conn exists (tests that never store ncBox).
-	exitConn := a.ncBox.Load()
-	if exitConn == nil {
-		exitConn = nc
-	}
-	a.replyRunChunk(exitConn, msg.Reply, proto.RunChunk{
+	// The exit lifecycle chunk rides the CURRENT conn — see liveConn (exec.go), which
+	// now carries this reasoning for both verbs. It used to live here, applied to this
+	// one publish, while exec's chunks all rode a captured conn (prerelease audit
+	// agent-exec/L3-F1).
+	a.replyRunChunk(liveConn(a, nc), msg.Reply, proto.RunChunk{
 		Kind: "exit", PID: pid, ExitCode: exitCode,
 	})
 	a.cfg.Logger.Info("agent: run exit", "pid", pid, "code", exitCode)
@@ -415,7 +404,16 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 		// Make a copy because nats.Publish may queue and reuse our buf.
 		out := make([]byte, len(pending))
 		copy(out, pending)
-		_ = nc.Publish(outSubj, out)
+		// PER FLUSH, not the conn captured at spawn.
+		//
+		// origin: prerelease audit round 2, I-F2. L3-F2 moved the INPUT direction to a
+		// session-scoped subscription and left the OUTPUT direction publishing on the
+		// spawn conn, while a comment at the call site claimed this pump "resolves its
+		// conn per flush". After a session rebuild that conn is closed, so the terminal
+		// went silent in the direction the user actually watches — and the comment said
+		// otherwise.
+		live := liveConn(a, nc)
+		_ = live.Publish(outSubj, out)
 		// Force the NATS client to push this chunk to the socket
 		// NOW. Without this, nc.Publish only queues into an in-
 		// process bufio.Writer; on a high-latency WSS link the
@@ -424,7 +422,7 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 		// shows nothing until the child closes). A small Flush
 		// timeout means: best-effort push, but never block the
 		// pump on a wedged connection.
-		_ = nc.FlushTimeout(50 * time.Millisecond)
+		_ = live.FlushTimeout(50 * time.Millisecond)
 		pending = pending[:0]
 		resetTimer()
 	}
@@ -822,6 +820,142 @@ func (a *Agent) ctlLivenessReaper(ctx context.Context) {
 			rec.sess.Hangup()
 		}
 	}
+}
+
+// startSessionIntakes wires every SESSION-scoped subscription in one place: the PTY
+// keystroke/resize intake and the ctl-liveness keepalive intake.
+//
+// They are grouped because they share the one property that matters — a subscription
+// established per RUN, on the conn captured when that run started, goes deaf the moment
+// the session is rebuilt, and a rebuild is an ordinary consequence of a drain or a
+// roster change. Keeping them together is also what keeps session() itself inside the
+// maintainability gate: two call sites there cost more than one.
+//
+// A package-level function taking *Agent: the structural-budget ratchet pins this
+// type's method count exactly.
+func startSessionIntakes(runCtx context.Context, a *Agent, nc *nats.Conn, fin *sessionFinalizer) error {
+	if err := startPtyIntake(a, nc, fin); err != nil {
+		return err
+	}
+	return a.startCtlLiveness(runCtx, nc, fin)
+}
+
+// startPtyIntake wires the SESSION-scoped `.in` and `.resize` intake: one wildcard
+// subscription each, routed to the live PTY by pid through a.procs.
+//
+// SESSION-SCOPED FOR THE SAME REASON THE KEEPALIVE INTAKE IS: per-run wiring on a
+// captured conn goes deaf the moment the session is rebuilt, and a rebuild is an
+// ordinary consequence of a drain or a roster change.
+//
+// origin: prerelease audit agent-run/L3-F2 — see the note at the spawn site for what
+// per-run subscriptions on a captured conn cost an interactive session.
+//
+// A pid with no record is silently ignored: the run has already exited, and answering
+// would mean writing to a closed master.
+//
+// A package-level function taking *Agent, not a method: the structural-budget ratchet
+// pins this type's method count exactly.
+func startPtyIntake(a *Agent, nc *nats.Conn, fin *sessionFinalizer) error {
+	pidOf := func(subject, suffix string) string {
+		parts := strings.Split(subject, ".")
+		if len(parts) < 2 || parts[len(parts)-1] != suffix {
+			return ""
+		}
+		return parts[len(parts)-2]
+	}
+	writeIn := func(m *nats.Msg) {
+		// ctx-none: nats.go MsgHandler has no ctx.
+		// WriteInput, not sess.Master.Write — origin: prerelease audit round 2,
+		// I-F5. ptySessionFor releases procsMu before returning, so reading the
+		// Master field here was unsynchronized against Close()'s `s.Master = nil`.
+		if sess := ptySessionFor(a, pidOf(m.Subject, "in")); sess != nil {
+			_, _ = sess.WriteInput(m.Data)
+		}
+	}
+	// NODE-SCOPED FIRST — origin: prerelease audit round 2, I-F6. This is the
+	// subscription that carries keystrokes on an upgraded fleet, and the server delivers
+	// it only to the agent it is addressed to.
+	subInNode, err := nc.Subscribe(
+		proto.SubjectPrefix+".s."+a.cfg.SID+".node."+nidOf(a)+".pty.*.in", writeIn)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe node-scoped pty intake: %w", err)
+	}
+	fin.addBoundedCleanup(func() { _ = subInNode.Unsubscribe() })
+
+	// THE LEGACY SESSION-SCOPED FORM, for a ctl older than the node-scoped subject.
+	// It is the fan-out I-F6 reports, kept only for the N-1 window.
+	//
+	// A message that carries PtyNodeHeader is DROPPED here: its sender also published a
+	// node-scoped copy, which the subscription above has already delivered. Without that
+	// check an upgraded ctl talking to an upgraded agent would write every keystroke
+	// twice, and a keystroke stream cannot be de-duplicated after the fact.
+	subIn, err := nc.Subscribe(
+		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.in",
+		func(m *nats.Msg) {
+			if m.Header.Get(proto.PtyNodeHeader) != "" {
+				return
+			}
+			writeIn(m)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe pty intake: %w", err)
+	}
+	fin.addBoundedCleanup(func() { _ = subIn.Unsubscribe() })
+
+	doResize := func(m *nats.Msg) {
+		// ctx-none: nats.go MsgHandler has no ctx.
+		sess := ptySessionFor(a, pidOf(m.Subject, "resize"))
+		if sess == nil {
+			return
+		}
+		var ev proto.PtyResizeEvent
+		if err := json.Unmarshal(m.Data, &ev); err != nil {
+			return
+		}
+		_ = sess.SetSize(ev.Cols, ev.Rows)
+	}
+	subResizeNode, err := nc.Subscribe(
+		proto.SubjectPrefix+".s."+a.cfg.SID+".node."+nidOf(a)+".pty.*.resize", doResize)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe node-scoped pty resize: %w", err)
+	}
+	fin.addBoundedCleanup(func() { _ = subResizeNode.Unsubscribe() })
+
+	// Legacy, same reasoning and same header drop as `.in` above. A resize IS idempotent,
+	// so a duplicate would be harmless here — the check is kept anyway so the two intakes
+	// have one shape, and so a reader does not have to work out which of them is allowed
+	// to double-deliver.
+	subResize, err := nc.Subscribe(
+		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.resize",
+		func(m *nats.Msg) {
+			if m.Header.Get(proto.PtyNodeHeader) != "" {
+				return
+			}
+			doResize(m)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("agent: subscribe pty resize: %w", err)
+	}
+	fin.addBoundedCleanup(func() { _ = subResize.Unsubscribe() })
+	return nil
+}
+
+// ptySessionFor returns the live PTY for pid, or nil when the run has ended.
+//
+// A package-level function taking *Agent, not a method: the structural-budget ratchet
+// pins this type's method count exactly, and it caught this one on the way in.
+func ptySessionFor(a *Agent, pid string) *pty.Session {
+	if pid == "" {
+		return nil
+	}
+	a.procsMu.Lock()
+	defer a.procsMu.Unlock()
+	if rec, ok := a.procs[pid]; ok && !rec.waitDone {
+		return rec.sess
+	}
+	return nil
 }
 
 // startCtlLiveness wires the h1 D intake + reaper for one session: ONE
