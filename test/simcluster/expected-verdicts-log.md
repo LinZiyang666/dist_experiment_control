@@ -445,3 +445,31 @@ Mandate 是「如实暴露缺陷，绝不替 tether 弥补」，把红写进期�
 **方法论**（值得记住的那一条）：**过期的登记表长得跟回归一模一样**。区分二者的唯一办法是拿基线
 commit 建 git worktree、用基线源码烘镜像、跑基线的 drill——不能靠读表，也不能靠推理改动面。
 本轮正是这么把 8 条偏离拆成「6 条过期 + 2 条真回归」的。
+
+## 2026-09-04 — 全量复跑：五条仍是登记表过期，第六条不是
+
+发布前审计收尾时按用户要求跑了完整 43 条（`-j6`）。上一节那六条「HEAD 就红」里，
+`52`/`60`/`67`/`81`/`94` 的**首个失败签名逐字未变**，仍是登记表过期。
+
+**`30-rolling-upgrade` 是例外，而且差点被同一个标签盖过去。** 它这次的首个失败是
+`UNLOCK-safety`，而上一节记的是 `PHASE-1 CONTINUITY`——**签名变了**。拿 `021c970` 建 worktree、
+用它自己的源码烘独立镜像 `tether-sim:base021` 单跑，基线是
+`INCOMPLETE assert_fail=0 pass=53`（干净），当前树是 `ASSERT-FAIL assert_fail=1`。所以它是
+本增量带来的差异，不是过期。
+
+追下去是**有意变更**：本轮外审 H-2 的 `PlanExpireUpgradeLease` 让 HALT 的编排者退出时主动把
+自己的租约盖成已过期、同时保留 marker（marker 继续围栏 join/retire，过期租约放行「修好后重跑」）。
+那条断言的前提「编排者刚死几秒、可能还有人在续租」正是被这次变更作废的。已把该臂改为断言新行为
+（`UNLOCK-halt-admits`），并把**不能在本 drill 构造**的另一半（活租约的拒绝 / `--force` 覆盖）
+以 `not_covered … gap` 登记，指向 `cmd/tether/cluster_unlock_test.go` 的
+`TestUnlockRefusesALiveLease` + `TestUnlockForceOverridesALiveLease`。复跑
+`INCOMPLETE assert_fail=0 pass=52`。
+
+**教训**：六条一起登记为「过期」之后，第七次看到它们时最省事的动作是整批跳过。
+**签名是唯一能拦住这个动作的东西**——它变了就必须重新拿基线跑一次，否则一条真变更会藏在
+一条已知红的后面。
+
+其余：`40`（SETUP-RED→单跑 GREEN）与 `74`（ASSERT-FAIL×2→单跑 INCOMPLETE/assert_fail=0）是
+负载敏感；`95` 三次三个样子（`D6b` / `T2c`+`T2f`+`D0` / 清空容器后 GREEN pass=44），失败全是
+wall-clock 轮询超时，证据里 `fsync_4k_ms=15.3`。`96` 的声明式缺口是 6 条而登记为 5，且**单跑同样
+是 6**——表的注记写成「`-j6` 下的 #71」不准确。以上均**未**写进 `expected-verdicts.tsv`。

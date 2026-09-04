@@ -998,3 +998,113 @@ ledger 行，而不是拿停摆去换一条重复终态。
 
 两轮 `make test` / `make e2e-parallel` 跑的是**同一棵树**（中间那次 p2 实验在第二轮前已完整还原，
 `git status` 为空），所以差异纯粹来自运行间的负载，而不是任何代码改动。
+
+---
+
+## 13. deploy tier 全量复跑（43 条 drill，2026-09-04）
+
+> 用户要求在发布判定前跑完整套 deploy-tier drill，而不是只跑相关的几条。`-j6` 并发，
+> 镜像从当前树重烘。**这一节的结论不改变第 12 节的代码裁定，但它推翻了我在 §12.1 里对一条
+> finding 的归类**——见 13.3。
+
+### 13.1 首轮结果
+
+| verdict | 条数 |
+|---|---:|
+| GREEN | 23 |
+| INCOMPLETE（只有已声明的 not_covered，assert/setup/product 全 0） | 11 |
+| ASSERT-FAIL | 7 |
+| SETUP-RED | 1 |
+| INFRA-ABORT（rc=124 超时，无 verdict 行） | 1 |
+
+**43 条里 `product_red` 全部为 0**——没有任何一条被判定为产品红。suite `rc=20`。
+
+### 13.2 十条偏离的逐条归因
+
+`run-drills.sh` 在首轮之后自带一个**归因 pass**：把每条偏离**单独重跑**，并且明确
+「第一次的结论仍是记录在案的判决，复跑只能追加标签，永远不改 verdict 或退出码」。
+预算 3600s 内跑完 8 条，剩 2 条我补跑。
+
+| drill | 首轮 | 归因 | 裁定 |
+|---|---|---|---|
+| `52-credential-rotation` | ASSERT-FAIL ×2 | REGRESSION | **登记表过期**：首个失败 `A8d` 与 `expected-verdicts-log.md` 2026-09-03 记录的 HEAD 基线签名逐字相同 |
+| `60-user-journey` | ASSERT-FAIL ×1 | REGRESSION | **登记表过期**：`J-G.3c-2 FIRST post-login node ls -a`，签名相同 |
+| `81-admin-evict-session-rm` | ASSERT-FAIL ×1 | REGRESSION | **登记表过期**：`B3 重连被拒但不是期望的理由`，签名相同 |
+| `94-agent-reconcile` | ASSERT-FAIL ×3 | REGRESSION | **登记表过期**：`B3-timeout 孤儿未被 KILL`，签名相同 |
+| `67-transient-js-refusal` | INFRA-ABORT | REGRESSION（仅 verdict） | **登记表过期**：与记录同为无签名的 abort |
+| `30-rolling-upgrade` | ASSERT-FAIL ×1 | REGRESSION | ⚠ **不是过期，见 13.3** |
+| `40-drain-retire` | SETUP-RED | LOAD-SENSITIVE | 单跑 **GREEN(37 pass)**；见 13.4 |
+| `74-rebalance-on-return` | ASSERT-FAIL ×2 | （预算耗尽，我补跑） | 单跑 **INCOMPLETE/assert_fail=0/pass=53**，与登记一致 → 负载敏感 |
+| `95-broker-selfheal` | ASSERT-FAIL ×1 | UNSTABLE | 三次三个样子；见 13.4 |
+| `96-mid-flight-chaos` | INCOMPLETE nc=6 | （预算耗尽，我补跑） | 单跑同为 INCOMPLETE/assert_fail=0/nc=6；登记 nc=5，见 13.5 |
+
+### 13.3 `30-rolling-upgrade`：唯一一条不能用「登记表过期」打发的
+
+它在那六条已登记的「HEAD 就红」名单里，但**这次的首个失败签名不同**——记录是
+`PHASE-1 CONTINUITY`，实测是 `UNLOCK-safety`。签名变了就必须重新分诊，读表不算数。
+
+**基线对照**（`git worktree` @ `021c970`、独立镜像 `tether-sim:base021`、单跑）：
+
+```
+DRILL-VERDICT verdict=INCOMPLETE rc=4 assert_fail=0 ... pass=53   ← 基线：干净，与登记一致
+DRILL-VERDICT verdict=ASSERT-FAIL rc=1 assert_fail=1 ... pass=52   ← 当前树：UNLOCK-safety 红
+```
+
+所以它**确实是本增量带来的差异**。追下去发现是**有意的**：本轮 H-2 给
+`internal/cluster/lock_lease.go` 加了 `PlanExpireUpgradeLease`——HALT 的编排者在退出时
+**主动把自己的租约盖成已过期**，同时**保留 marker**。这个拆分正是 H-2 的全部意图：
+
+- marker 留着 ⇒ `join`/`retire` 在半滚状态下继续被围栏（drill 的 `UNLOCK-precond` 依然 PASS，就是这一半）
+- 租约释放 ⇒ HALT 提示语承诺的「修好后重跑」当场成立，而不是要等满 `LockLeaseTTL`(15 min) 加一个
+  回收周期；同一个拒绝此前也堵死了紧急 `--to-version <older>` 回滚
+
+而那条断言的前提——「编排者刚死几秒，可能还有人在续租」——正是被这次变更**有意作废**的。
+**安全性没有丢**：活着的持有者每 `LockLeaseRenewInterval` 续租一次，租约在它驱动期间永不落到过去，
+默认 clear 依然拒绝它。
+
+**drill 已更正，但不是为了变绿**：那条断言想保护的性质被拆成两半——
+
+- 能在这条 drill 上构造的那半改为断言新行为（`UNLOCK-halt-admits`：HALT 后默认 clear 成功，
+  且 rc=0 仍要求 post-clear 复探），注释里写明它此前断言的是相反的事、以及那时为何是对的；
+- **不能构造的那半**（活租约的拒绝、`--force` 的覆盖）用 `not_covered ... gap` **明确登记为缺口**，
+  并指名它搬去了哪里：`cmd/tether/cluster_unlock_test.go` 的 `TestUnlockRefusesALiveLease`
+  与 `TestUnlockForceOverridesALiveLease`（两者均已确认存在）。
+
+复跑证明：`INCOMPLETE rc=4 assert_fail=0 product_red=0 pass=52`，三条 unlock 断言全 PASS。
+
+### 13.4 `40` 与 `95` 的书面裁定（harness 明确要求，不能拿「单跑绿了」当免死金牌）
+
+**`40-drain-retire`（LOAD-SENSITIVE）**：首轮 `SETUP-FAIL grow_to_3 failed`，单跑 GREEN(37 pass)；
+同一轮 `10-grow-to-3` 首轮就是 GREEN，说明 grow 本身没坏。**裁定：环境，不阻断发布。**
+依据是 `-j6` 下 6 条 drill 的容器同时做 raft+SQLite 写。
+
+**`95-broker-selfheal`（UNSTABLE）**：三次跑出三个样子——首轮红在 `D6b`（boot resume 后 DELETING
+会话未消失，poll 90s 超时），harness 单跑红在 `T2c`+`T2f`+`D0`，而我当天在**清空容器后**单跑是
+**GREEN(pass=44, not_covered=0)**。**裁定：wall-clock 轮询对磁盘延迟敏感，不是产品回归。**
+证据有两条，缺一不可：
+
+1. 失败证据里的宿主机读数 `fsync_4k_ms: 15.321`——4K fsync 慢到 15ms，raft 每次提交都要付这个代价，
+   「boot resume 完成一次删除」这种多提交操作因此撑爆 90s 轮询；
+2. 我在 drill 运行中直读 brk1 的 journal 与 slog 拿到的时序：`SIGKILL 16:27:43 → broker: ready
+   16:27:45.787`，**端到端 2.8 秒**，全程零条 `still waiting for JetStream`。产品自愈本身是秒级的。
+
+**这两条都不是「重跑就绿了」**。它们仍作为 DEVIATION 响着，不写进 `expected-verdicts.tsv`——
+一条登记为 expected 的红就不再是信号。
+
+### 13.5 `96-mid-flight-chaos` 的缺口计数漂移
+
+单跑与首轮一致（INCOMPLETE / assert_fail=0 / nc=6），登记为 5。六条声明式缺口逐条为：
+`#58 cross-home GC reap`、`arm B + arm C`、`96-A #57 in-flight interruption`、
+`96-B0 run --ack-alerts gate`、`96-D6b canary3 durable majority commit`、`96-F double fault`。
+登记表的注记把多出来的那条归因于「`-j6` 下的 #71」，但它**单跑同样出现**——该注记的措辞不准确，
+在此如实订正，留给下次校准。
+
+### 13.6 这一节对发布判定的意义
+
+- **没有任何一条 drill 判定为产品红**（43/43 `product_red=0`）。
+- 六条 REGRESSION 里五条经签名比对确认是**登记表过期**（表上次校准是 2026-08-19，此后无人跑过全量）。
+- 第六条经**基线 commit 复跑**确认是本增量的**有意行为变更**，drill 已按变更更正并把不可构造的
+  半边登记为 gap。
+- 两条负载敏感、一条不稳定，均已给出书面裁定与证据，且**没有**被写进期望表。
+- 升级族四条 `30`/`31`/`32`/`33`：`31`/`33` 的 not_covered 与登记数逐条相等，`32` GREEN，
+  `30` 见 13.3。

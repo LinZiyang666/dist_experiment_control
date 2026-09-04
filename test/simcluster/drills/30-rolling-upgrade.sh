@@ -435,11 +435,25 @@ if [ "$HALTED_ON_AGENT" = 1 ]; then
 
     # ── THE WAY OUT: `tether cluster unlock` (R7b; drill coverage owner = R9) ──
     assert_ok "UNLOCK-precond the HALTed roll LEFT the roll lock HELD (cluster_upgrade_drive.go deliberately does not release on HALT, so membership stays fenced while the cluster sits half-rolled)"  _upgrade_lock_held
-    assert_refuses "UNLOCK-safety the DEFAULT clear REFUSES a lock whose lease is still in the future — the orchestrator only died seconds ago, so from the cluster's point of view somebody may still be renewing it. Ripping it out by default would re-admit the concurrent membership change the lock exists to fence" \
-        "still being renewed|--force|lease" \
+    # origin: prerelease audit round 2, H-2 (internal/cluster/lock_lease.go, PlanExpireUpgradeLease).
+    #
+    # THIS ARM USED TO ASSERT THE OPPOSITE, and it was right to until H-2. It required the DEFAULT
+    # clear to REFUSE, on the premise that "the orchestrator only died seconds ago, so somebody may
+    # still be renewing it". A HALTing orchestrator now says the opposite out loud: on its way out it
+    # stamps its OWN lease as already expired — "I have stopped driving" — while deliberately LEAVING
+    # THE MARKER, which is exactly what UNLOCK-precond above still proves. That split is the whole
+    # point of H-2: the marker keeps join/retire fenced while the cluster sits half-rolled, and the
+    # expired lease admits the very re-run the HALT message tells the operator to perform. Before
+    # H-2 that promise only came true after LockLeaseTTL (15 min) plus a reap interval, and the
+    # emergency `--to-version <older>` rollback was blocked for just as long.
+    #
+    # THE PROPERTY THE OLD ARM PROTECTED IS NOT LOST — see the not_covered below for where it moved.
+    assert_ok "UNLOCK-halt-admits the DEFAULT clear (no --force) SUCCEEDS against a HALTed roll's lock, and CONFIRMS it: the orchestrator expired its own lease on the way out, so nothing is renewing it and 'fix and re-run to resume' is true NOW instead of after LockLeaseTTL. rc=0 still requires the post-clear re-probe (cluster_unlock.go:236,279-305 — 'probably cleared' is explicitly not good enough)" \
         _UNLOCK --upgrade --account-seed "$SEED"
-    assert_ok "UNLOCK-force --force clears the roll lock AND CONFIRMS it: rc=0 only after a post-clear re-probe finds it gone (cluster_unlock.go:236,279-305 — 'probably cleared' is explicitly not good enough)"  _UNLOCK --upgrade --force --account-seed "$SEED"
     assert_ok "UNLOCK-effect an INDEPENDENT zero-mutation re-probe now reports the roll lock NOT held"  _upgrade_lock_clear
+    not_covered "30 UNLOCK the default clear's REFUSAL of a LIVE lease, and --force's override of one" \
+"a LIVE holder renews every LockLeaseRenewInterval, so its lease is never in the past while it drives and the default clear still refuses it — but since H-2 this drill has no live-lease holder to construct one against: its only lock holder is a HALTed roll, which now expires its own lease. Killing an orchestrator mid-renew is not constructable in the sim. Pinned hermetically instead: cmd/tether/cluster_unlock_test.go TestUnlockRefusesALiveLease + TestUnlockForceOverridesALiveLease" \
+        gap
 
     # ── PHASE 2 — repair the (b) state and resume; the roll must complete whole-host ──
     assert_setup "[env] restart the DECLARED co-located agent $DECL_NID on $FIRSTHOP (repairing state (b); the roll is resumed by re-running it, which is the documented recovery)"  colocated_agent_start "$FIRSTHOP"
