@@ -225,3 +225,35 @@ func TestAnAdoptedRowIsVisibleToTheRestOfReconcileImmediately(t *testing.T) {
 		t.Errorf("row nid=%q on disk, want gpu1-02", nid)
 	}
 }
+
+// origin: simcluster-speed S2 triage (2026-09-19), drill 94 arm B — gotcha #87.
+//
+// EXITED ROWS ARE HISTORY TOO. The gate's question is "has this node name ever had process rows here";
+// the first implementation answered it from the RUNNING/LOST snapshot the reconcile loop reads, so a
+// node whose jobs had all FINISHED before a broker rollback (its rows EXITED in the restored bundle) had
+// no history in the gate's eyes, and its genuine orphan — a process the agent reports running that the
+// restored broker has never seen — survived every reconnect. Two rows here: exited-only history opens
+// the gate (the orphan is ordered dropped); a name with no rows at all keeps it closed.
+func TestOrphanGateCountsExitedRowsAsHistory(t *testing.T) {
+	b, db := leaseReconcileBroker(t)
+	// gpu1's only history: a job that finished before the (simulated) rollback.
+	seedRunningProc(t, db, "old1", "gpu1")
+	if err := proc.MarkExited(db, "old1", "lab", 0, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	// The agent reports a process the broker has no row for.
+	_, _, _, _, drop := b.reconcileOnRegister("lab", "gpu1", proto.NodeRegisterReq{
+		LocalProcesses: []proto.LocalProcess{{PID: "orphan1", State: "running"}},
+	})
+	if len(drop) != 1 || drop[0] != "orphan1" {
+		t.Fatalf("drop=%v, want [orphan1]: a node with EXITED rows HAS process history; refusing the kill here "+
+			"is how a real orphan outlives a broker rollback forever (drill 94 arm B, since 2026-08-19)", drop)
+	}
+	// Control: a name with NO rows at all — the fail-closed gate must still decline.
+	_, _, _, _, drop = b.reconcileOnRegister("lab", "gpu1-02", proto.NodeRegisterReq{
+		LocalProcesses: []proto.LocalProcess{{PID: "orphan2", State: "running"}},
+	})
+	if len(drop) != 0 {
+		t.Fatalf("drop=%v on a node name with no process history — the fail-closed gate opened without evidence", drop)
+	}
+}

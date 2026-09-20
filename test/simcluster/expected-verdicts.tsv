@@ -13,6 +13,12 @@
 #                    A banded red STILL BLOCKS; it is reported separately, never folded green.
 #   owner            open defect ids this row pins (tests/ledger-crosscheck.sh reads this)
 #   note-ref         anchor into expected-verdicts-log.md (the drill name)
+#
+#   An ARM-SPLIT drill (`# arms:` manifest) has one CHILD row per arm, keyed <drill>.<arm>: the runner
+#   judges each arm unit against its own child row. The parent row stays (every drill on disk has one)
+#   but is DERIVED — expected = the children's precedence join, nc_gap = their sum, bands `-` — and the
+#   children are written from the parent's claim ownership BEFORE the first split sweep, never from it
+#   (tests/validate-verdicts.sh rules ①–⑧; simcluster-speed plan §5.5 X4/X5/X8/X18).
 00-skeleton	GREEN	0	-	-	00-skeleton
 10-grow-to-3	GREEN	0	-	-	10-grow-to-3
 11-grow-gaps	GREEN	0	-	-	11-grow-gaps
@@ -36,12 +42,14 @@
 60-user-journey	GREEN	0	-	-	60-user-journey
 61-transfer-edges	GREEN	0	-	-	61-transfer-edges
 62-remote-fs-safe	INCOMPLETE	1	-	OQ-2 (true-D NOT-COVERED; independent of the now-closed #81 stale-health/GC-stop path)	62-remote-fs-safe
-67-transient-js-refusal	INCOMPLETE	1	-	#67	67-transient-js-refusal
+67-transient-js-refusal	INCOMPLETE	1	-	#67 (#84 fixed 2026-09-19: watchdog + bounded retry on the Put leg; the two product_red sites stay armed)	67-transient-js-refusal
 70-expose-journey	GREEN	0	-	-	70-expose-journey
 71-expose-rehome-failover	INCOMPLETE	1	-	71-G/F topology + #29 (crash-strand / non-tunnel-home data-plane gap) (raw-sys.events #30 CLOSED via admin events)	71-expose-rehome-failover
 72-proxy-subscription	GREEN	0	-	-	72-proxy-subscription
-73-proxy-cluster-ha	GREEN	0	-	#30 CLOSED (admin events); #34 not manifesting	73-proxy-cluster-ha
-74-rebalance-on-return	INCOMPLETE	-	ASSERT-FAIL@#34@sig:c-ss-preflow,ASSERT-FAIL@#67@sig:b-negctrl-create	#34 (proxy-home one-per-voter stability + auto-rebalance-on-return, CONFIRMED-open) persistent gap; #30 CLOSED (admin events); #67	74-rebalance-on-return
+73-proxy-cluster-ha	GREEN	0	-	#33 FIXED by #80 (evidence-flip 2026-09-19: 7/7 samples, REHOME arm is now the positive assertion); #30 CLOSED (admin events); #34 face 1 (constructed-spread drift) stays a first-class product_red DEVIATION when it manifests	73-proxy-cluster-ha
+74-rebalance-on-return	INCOMPLETE	-	-	#34 (proxy-home one-per-voter stability + auto-rebalance-on-return, CONFIRMED-open) persistent gap; #30 CLOSED (admin events); #67	74-rebalance-on-return
+74-rebalance-on-return.SRAB	INCOMPLETE	-	-	#34 persistent gap; #67	74-rebalance-on-return.SRAB
+74-rebalance-on-return.C	INCOMPLETE	-	-	#34 persistent gap (auto-rebalance-on-return); #30 CLOSED (admin events)	74-rebalance-on-return.C
 78-proxy-dial-backoff	INCOMPLETE	1	-	broker read-REGISTER WARN damping (#78 face ②) not deploy-tier-constructable (post-TLS WARN site); hermetic-covered	78-proxy-dial-backoff
 80-session-isolation	GREEN	0	-	-	80-session-isolation
 81-admin-evict-session-rm	GREEN	0	-	-	81-admin-evict-session-rm
@@ -52,7 +60,10 @@
 93-metrics-observability	INCOMPLETE	1	-	#42-bounded-window + webhook-raise raft-lease-jitter timing (product conditional-reset fix improves; persistent-cursor = follow-up)	93-metrics-observability
 94-agent-reconcile	GREEN	0	-	-	94-agent-reconcile
 95-broker-selfheal	GREEN	0	-	-	95-broker-selfheal
-96-mid-flight-chaos	INCOMPLETE	5	-	#57 transfer-audit-durability + #58-split-home — product fix SHIPPED in R16 (hermetic pins), deploy-tier proof OWED (in-sim 1 GiB interruption not constructable) structural; B/C/B0/D6b/F arms uncovered; #71 (minority-commit under -j6, under investigation, NOT banded)	96-mid-flight-chaos
+96-mid-flight-chaos	INCOMPLETE	7	-	#57 transfer-audit-durability + #58-split-home — product fix SHIPPED in R16 (hermetic pins), deploy-tier proof OWED (in-sim 1 GiB interruption not constructable) structural; B/C/B0/D6b arms uncovered; #71 (minority-commit: D reads the committer line on a fresh N=3 every run — pre-heal yes = #65 candidate gated on the D0f #89 premise, post-heal-only yes = #71-ambiguous; NOT banded); #88 (F4 CANDIDATE, unattributed)	96-mid-flight-chaos
+96-mid-flight-chaos.A	INCOMPLETE	4	-	#57 transfer-audit-durability + #58-split-home — deploy-tier proof OWED (in-sim 1 GiB interruption not constructable) structural; B/C (drill-level) + B0 uncovered	96-mid-flight-chaos.A
+96-mid-flight-chaos.D	INCOMPLETE	2	-	B/C (drill-level) + D6b uncovered; #71 (minority-commit: D6b reads brk1's own commit line on a fresh N=3 — the 2026-07-18 post-A world is no longer constructed; the 3 concurrent pre-heal yes of 2026-09-19 were #89 roams, now excluded by D0f)	96-mid-flight-chaos
+96-mid-flight-chaos.F	INCOMPLETE	1	-	#88 (F4: the untouched agt2 seed row closed 0.3 s after the double fault — CANDIDATE, 5/9 samples unattributed)	96-mid-flight-chaos
 97-soak-cycles	GREEN	0	-	-	97-soak-cycles
 83-cloned-image-instances	GREEN	0	-	-	83-cloned-image-instances
 84-shared-home-instances	GREEN	0	-	-	84-shared-home-instances

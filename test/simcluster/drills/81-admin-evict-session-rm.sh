@@ -37,6 +37,7 @@ set -u
 . "$HERE/lib/tether.sh"
 . "$HERE/lib/assert.sh"
 . "$HERE/drills/lib/agentyaml.sh"
+. "$HERE/drills/lib/logs.sh"   # the agent's boot stream (agent.boot.err) — B3's refusal lands there since h1 F
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 NURL="nats://brk1:4222"
@@ -101,12 +102,32 @@ assert_ok      "B2a agent daemon self-exits ≤~1s (PROCESS gone, not heartbeat 
                poll_until 10 1 "agt1 tether daemon exited" -- _daemon_gone
 assert_ok      "B2b roster row deleted (FK)" \
                poll_until 10 1 "agt1 gone from broker roster" -- _agt1_gone
-# B3 client string is AUTH-SPECIFIC (unlike the ctl §3.0 case): agent.go:1538-1553 prints "NATS auth_callout
+# B3 client string is AUTH-SPECIFIC (unlike the ctl §3.0 case): agent.go prints "NATS auth_callout
 # rejected" ONLY on an Authorization Violation; an unreachable broker → silent retry (no such message). So
 # B3 alone distinguishes an auth-deny from a network fault — no separate server-side discriminator needed.
-assert_refuses "B3 reconnect refused (provisioning gone) — agent-specific auth-callout rejection (distinguishes auth-deny from unreachable)" \
-               "auth_callout rejected|Authorization Violation" \
-               "$SIM" exec agt1 -- runuser -u sim -- env HOME=/home/sim timeout 8 tether agent --session "$SID" --nid agt1
+# WHERE THE STRING LIVES (simcluster-speed S2 triage, 2026-09-19): since h1 F the agent daemon dup2's its fd 2
+# at ~/.tether/agent/<sid>/agent.boot.err right after arming its log sink, so the fatal refusal main() prints on
+# exit lands in that BOOT stream, not in the stdout/stderr the harness captures — which is why this arm has read
+# "refused, but NOT for /auth_callout rejected|…/" on every sweep since (the 2026-09-03 stale-table note had the
+# clue). The refusal itself is unchanged; the oracle now reads the stream it goes to, through logs.sh.
+_b3_refused_for_auth() {
+    _b3_cursor=$(sim_agent_panic_cursor agt1)
+    _b3_out=$("$SIM" exec agt1 -- runuser -u sim -- env HOME=/home/sim timeout 8 tether agent --session "$SID" --nid agt1 2>&1); _b3_rc=$?
+    if [ "$_b3_rc" = 0 ]; then
+        log "81: B3 the evicted agent's reconnect SUCCEEDED (rc=0) — provisioning should be gone: $(printf '%s' "$_b3_out" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+        return 1
+    fi
+    # The reason is read from the boot stream written by THIS attempt (cursor), never from the stdout the
+    # harness captured — that carries only the banner.
+    if sim_agent_panic_sink_since agt1 'auth_callout rejected|Authorization Violation' "$_b3_cursor"; then
+        return 0
+    fi
+    log "81: B3 refused (rc=$_b3_rc) but the boot stream written by this attempt carries no auth-callout rejection; stdout tail: $(printf '%s' "$_b3_out" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+    return 1
+}
+assert_ok "B3 reconnect refused (provisioning gone) for the agent-specific auth-callout rejection, read from the agent's BOOT stream written by this attempt (distinguishes auth-deny from unreachable: an unreachable broker prints nothing and retries; a success is red too)" \
+    _b3_refused_for_auth
+
 
 # ── Arm D — evicted nkey re-join (探索→定格, INVERTED; DOC-6; re-provisions agt1 for Arm C) ────────────
 # D0: capture the evicted agent's ON-DISK identity nkey (byte) hash. It PERSISTS across evict — evict

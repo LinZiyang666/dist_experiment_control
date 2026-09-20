@@ -21,27 +21,30 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
-LEDGER="$REPO/docs/deploy-tier-gotchas.md"
-VERDICTS="$HERE/../expected-verdicts.tsv"
+# LEDGER / VERDICTS may be overridden from the environment so the selftest can run this gate against
+# synthetic ledgers (tests/ledger-crosscheck-selftest.sh); production callers set neither.
+LEDGER="${LEDGER:-$REPO/docs/deploy-tier-gotchas.md}"
+VERDICTS="${VERDICTS:-$HERE/../expected-verdicts.tsv}"
 FAIL=0
 
 [ -f "$LEDGER" ]   || { echo "ledger-crosscheck: missing $LEDGER" >&2; exit 2; }
 [ -f "$VERDICTS" ] || { echo "ledger-crosscheck: missing $VERDICTS" >&2; exit 2; }
 
-# An entry is CLOSED only if its heading block says so explicitly. Everything else is OPEN — fail-closed,
-# because the failure mode we are guarding against is a live defect quietly having no owner.
-closed_ids() {
-    awk '
-        /^### (#[0-9]+|DOC-[0-9]+)/ { id=$2; sub(/[^#A-Za-z0-9-].*/,"",id); blk="" ; cur=id; next }
-        cur != "" { blk = blk " " $0 }
-        /^### / && cur != "" { }
-        END { }
-    ' "$LEDGER" 2>/dev/null
-    # simpler + robust: a heading whose next 3 lines contain a closure marker
-    grep -A 3 -E '^### (#[0-9]+|DOC-[0-9]+)' "$LEDGER" \
-        | awk '/^### /{id=$2} /FIXED|CLOSED|已闭合|已修复|REFUTED/{if(id!="")print id}' \
-        | sort -u
-}
+# An entry's STATUS IS READ FROM ITS HEADING LINE AND NOWHERE ELSE. The ledger's convention is that the
+# `### #N — …` line carries the state in its trailing parenthesis — `（已修复，…）` / `FIXED` / `CLOSED`,
+# `（OPEN）`, `（CANDIDATE，未归因）` — and that is the only place this gate looks. The first version read
+# "the heading plus its next 3 lines" for closure and "heading or first 3 body lines" for CANDIDATE. That
+# is POSITIONAL: a cross-reference in an entry's second line ("源码 SB-96-3 已闭合行为面", "#32（CANDIDATE）")
+# carries the neighbour's word into this entry's status, and DOC-28 was in fact read as closed for months
+# on the strength of a sentence about a different thing (internal review round 1 R6-F11 — the #33 fix had
+# moved the offending text rather than hardening the read). Everything not marked closed in its heading is
+# OPEN — fail-closed, because the failure mode we guard against is a live defect quietly having no owner.
+#
+# HOW the heading is read (trailing status group, clause by clause, cross-references end their clause)
+# lives in lib/ledger.sh — the ONE reader, shared with tests/validate-verdicts.sh so the two gates cannot
+# disagree about whether a defect is closed (round-2 review R3-F2 / R3-F7).
+. "$HERE/../lib/ledger.sh"
+closed_ids() { ledger_closed_ids "$LEDGER"; }
 
 open_ids() {
     all=$(grep -oE '^### (#[0-9]+|DOC-[0-9]+)' "$LEDGER" | sed 's/^### //' | sort -u)
@@ -60,15 +63,11 @@ owned_ids() {
 }
 
 # CANDIDATE entries are, by definition, NOT yet confirmed defects — the ledger marks them
-# `[CANDIDATE]` / `候选`. Demanding a non-GREEN owner cell for an unconfirmed finding would force the
-# suite to assert something nobody has established yet, which is how a gate turns into noise and then
-# gets switched off. They are owned by the ADJUDICATION batch (R6) instead, and are reported separately
-# so they can never be silently forgotten either.
-candidate_ids() {
-    awk '/^### (#[0-9]+|DOC-[0-9]+)/{id=$2; sub(/[^#A-Za-z0-9-].*/,"",id); n=0; hdr=$0
-             if (hdr ~ /CANDIDATE|候选/) { print id; id="" ; next } ; next }
-         id != "" { n++; if (n<=3 && ($0 ~ /CANDIDATE|候选/)) { print id; id="" } }' "$LEDGER" | sort -u
-}
+# `CANDIDATE` / `候选` IN THE HEADING (same heading-only rule as closure, same reason). Demanding a
+# non-GREEN owner cell for an unconfirmed finding would force the suite to assert something nobody has
+# established yet, which is how a gate turns into noise and then gets switched off. They are owned by the
+# ADJUDICATION batch (R6) instead, and are reported separately so they can never be silently forgotten.
+candidate_ids() { ledger_candidate_ids "$LEDGER"; }
 
 # BY-DESIGN entries name no defect at all: they record a deliberate trade-off that constrains OPERATOR
 # ACTION (e.g. "N>=2 must upgrade in lockstep"), so there is nothing for a drill to catch and demanding a

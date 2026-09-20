@@ -225,6 +225,13 @@ _start_scene_watcher() {
                 {
                     echo "=== SCENE @ $(date -u +%Y-%m-%dT%H:%M:%SZ) tag=$_tag ==="
                     echo "first failure-signature line: $_hit"
+                    # The probe's `session create` writes its own error text to the same log BEFORE the
+                    # WRITEFAIL marker, so the six lines up to the hit are the only record of WHAT was
+                    # refused (not_leader vs no responders vs a timeout). A 2026-09-19 solo sample hit
+                    # WRITEFAIL at line 14 with brk1 still leader and every node reachable, and this
+                    # scene could not say why — the cluster snapshots below all read healthy.
+                    echo "--- /tmp/wp-$_tag.log, six lines up to the first hit ---"
+                    dexec ctl1 -- sh -c "head -n ${_hit%%:*} /tmp/wp-$_tag.log | tail -n 6" 2>&1 || true
                     for _b in brk1 brk2 brk3; do
                         echo "--- $_b cluster status (leader at start = $_ldr) ---"
                         dexec -u tether "$_b" -- tether cluster status 2>&1 | head -24 || true

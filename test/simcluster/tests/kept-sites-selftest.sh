@@ -46,5 +46,45 @@ else
     echo "ok   ratchet: deleting a real assertion site REDs --check"
 fi
 
+# Property 3 (plan §6.3 D-6; round-2 review R1-F2 / R3-F3): an ARM-SPLIT drill is keyed per arm. Moving a
+# site from one arm to its sibling keeps the drill total (the old, blind reading) but lowers the source
+# arm's row — and only the arm rows make that visible. The fixture: 1 shared site, 2 in A, 1 in B.
+cat > "$DRILLDIR/za-arms.sh" <<'DRILL'
+# arms: A B
+# fixture: A=N1 B=N1
+# grows: A=0 B=0
+# worst: A=60 B=60
+# forgoes: A=- B=-
+drill_begin za
+assert_setup "shared fixture" true
+case "${ARM:?}" in
+    A)
+        assert_ok "a-one" true
+        assert_ok "a-two" true
+        ;;
+    B)
+        assert_ok "b-one" true
+        ;;
+    *) setup_fail "unknown arm" ;;
+esac
+drill_end
+DRILL
+rows=$(DRILLS="$DRILLDIR" sh "$KS" | awk -F'\t' '$1 ~ /^za-arms/ { printf "%s=%s ", $1, $2 }')
+if [ "$rows" = "za-arms=4 za-arms.A=2 za-arms.B=1 za-arms._shared=1 " ]; then
+    echo "ok   arm rows: an arm-split drill reports its total plus per-arm and _shared rows"
+else
+    echo "FAIL arm rows: got '$rows', want 'za-arms=4 za-arms.A=2 za-arms.B=1 za-arms._shared=1 '" >&2
+    RC=1
+fi
+DRILLS="$DRILLDIR" sh "$KS" | grep '^za-arms' > "$TMP/arms.base"
+# Move a-two from A into B: total 4 → 4, A 2 → 1, B 1 → 2.
+awk '/a-two/ { held = $0; next } /"b-one"/ { print; print held; next } { print }' "$DRILLDIR/za-arms.sh" > "$TMP/za.tmp" && mv "$TMP/za.tmp" "$DRILLDIR/za-arms.sh"
+if DRILLS="$DRILLDIR" sh "$KS" --check "$TMP/arms.base" >/dev/null 2>&1; then
+    echo "FAIL arm rows: moving a site from arm A to arm B did NOT RED --check (the total hides the move)" >&2
+    RC=1
+else
+    echo "ok   arm rows: a site moved between arms REDs --check while the drill total is unchanged"
+fi
+
 [ "$RC" = 0 ] && echo "kept-sites-selftest: PASS" || echo "kept-sites-selftest: FAIL" >&2
 exit "$RC"

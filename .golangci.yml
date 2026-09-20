@@ -415,3 +415,17 @@ linters:
       - path: internal/broker/(broker|cluster_grow_trigger|cluster_upgrade_trigger|clusterstatus)\.go
         linters: [maintidx]
         text: "Function name: (Run|handleGrowTrigger|handleUpgradeTrigger|StatusReport),"
+      # simcluster-speed round 2 (2026-09-20): constraint 1 again, twice in one change. pushTierB sat at
+      # MI 20 and went to 19 when the #84 rationale above attemptPut was rewritten from the two-face
+      # sketch to the three faces the code actually has (round-2 review R6-6); handleExposeReq went
+      # 20 -> 19 on the #86 leader-barrier comment plus the early-exit predicate (R2-F4). In both the
+      # lines that tipped the index are the explanation of a defect next to the code that fixes it —
+      # the trade this register exists to refuse. CC 24 / 34: real decision trees (the tier-B push
+      # ladder's refusal/stall/put-error/size/commit classification; the expose request's alloc/home/
+      # forward/rollback branches), reviewed as such by round 1 and round 2.
+      - path: cmd/tether/transfer\.go
+        linters: [maintidx]
+        text: "Function name: pushTierB,"
+      - path: internal/broker/expose\.go
+        linters: [maintidx]
+        text: "Function name: handleExposeReq,"

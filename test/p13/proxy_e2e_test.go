@@ -38,7 +38,7 @@ type recordingAdapter struct {
 	removed []string
 }
 
-func (r *recordingAdapter) AddProxy(p agent.PortToken) error {
+func (r *recordingAdapter) AddProxy(_ context.Context, p agent.PortToken) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.added = append(r.added, p)

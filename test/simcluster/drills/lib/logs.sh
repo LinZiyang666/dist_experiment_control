@@ -129,6 +129,23 @@ sim_agent_panic_sink() {
     dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; grep -qE '$2' /home/sim/.tether/agent/\${SID:-lab}/agent.boot.err 2>/dev/null"
 }
 
+# sim_agent_panic_cursor <node> — byte length of the agent's boot stream (0 when absent), so a caller can
+# attribute a later match to ITS OWN daemon attempt rather than to an earlier one in the same file. The
+# boot stream is where a daemon that refuses to start says why (fd 2 is pointed there right after the log
+# sink is armed — h1 F), so a drill asserting "this reconnect was refused for reason X" reads it here, with
+# a cursor, never the process's stdout (drill 81 B3 read stdout for two weeks and saw the banner only).
+sim_agent_panic_cursor() {
+    dexec "$1" -- sh -c '. /etc/tether/agent.env 2>/dev/null; f=/home/sim/.tether/agent/${SID:-lab}/agent.boot.err; [ -f "$f" ] && wc -c < "$f" || echo 0' 2>/dev/null | tr -d '\r '
+}
+
+# sim_agent_panic_sink_since <node> <extended-regex> <cursor> — sim_agent_panic_sink restricted to the
+# bytes written after <cursor>.
+sim_agent_panic_sink_since() {
+    _saps_cursor=${3:-0}
+    case "$_saps_cursor" in ''|*[!0-9]*) return 2 ;; esac
+    dexec "$1" -- sh -c ". /etc/tether/agent.env 2>/dev/null; f=/home/sim/.tether/agent/\${SID:-lab}/agent.boot.err; [ -f \"\$f\" ] || exit 1; tail -c +\$(( $_saps_cursor + 1 )) \"\$f\" 2>/dev/null | grep -qE '$2'"
+}
+
 # sim_agent_slog_since <node> <cursor> [max-lines] — the agent slog written AFTER <cursor>,
 # capped at max-lines (default 200). Added for drill 62's Arm 1S evidence dumps: a plain
 # tail is not bounded to the command being diagnosed, and because the agent restarts

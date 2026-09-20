@@ -12,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // boot_gate_test.go (formerly r10_boot_gate_test.go) — the internal half of R10 P2/P4.
@@ -31,7 +32,7 @@ func seededClusterDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	testharness.CloseDBOnCleanup(t, db) // file-backed WAL: wait for borrowed connections before TempDir goes
 	if _, err := db.Exec(
 		`INSERT INTO cluster_nodes
 		 (node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at,join_nonce,join_sig)

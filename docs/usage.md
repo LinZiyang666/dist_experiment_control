@@ -809,6 +809,13 @@ ctl 会先检查 cluster health。看到 `quorum_lost` 或 `force_single_active`
   5s × 3）；agent 长时间停滞时 ctl 本地会先打印 "agent unreachable" 再退出，
   避免无限挂起。设为 `0` 关闭看门狗。
 
+**`run` 会话不跨 broker 重启存活**（DOC-28）：ctl 与 agent 的心跳都经由 broker 转发，
+broker 重启 / 换届 / 你用 `--nats-url` 指定的那台 broker 被杀时，心跳中断，看门狗在
+`TETHER_RUN_LIVENESS_TIMEOUT` 后合成 `agent unreachable: no heartbeat` 并**优雅终止**本地会话；
+远端 PTY 进程由 agent 的 ctl-liveness 收割器按上文的 `grace = max(6×间隔, 3 分钟)` 收回。
+这是有意设计，不是故障：重新 `tether run` 即可；需要跨 broker 重启存活的长任务请用
+`tether exec … -- bash -c 'nohup … &'`（§5.12）。
+
 ### 5.14 `tether expose` / `expose rm`
 
 **这是什么**：把 NAT 后 agent 上的某个本地端口反向打到 broker 的公网端
@@ -1025,7 +1032,7 @@ tether pull <nid>:<remote-path> <local-path> [--force] [--timeout D] [--ack-aler
 | `<local-path>` | (必填) | ctl 所在机器上的本地文件路径；push 源必须是普通文件，pull 目标可相对/绝对 |
 | `<nid>:<remote-path>` | (必填) | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
 | `--force` | false | 目标已存在时覆盖；缺省直接拒（`dst_exists` 或本地 path exists） |
-| `--timeout` | `37m08s` | ctl 等待每个阶段的上限；tier A 一般 < 30s，push tier B 由**文件大小推导**（见下），默认值为 broker 最坏预算再加 2 分钟；pull 的内部上限不随此 flag 增长 |
+| `--timeout` | 按文件大小推导（上限 `37m08s`） | ctl 等待每个阶段的上限；tier A 一般 < 30s，push tier B 由**文件大小推导**（见下）：不显式给出时取 broker 对**这个大小**的预算再加 2 分钟（12 MB → `7m`，2 GiB → `37m08s`）；显式给出的值原样生效；pull 的 tier-B 阶段在 prepare 拿到大小后同样推导 |
 | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续传输；只确认本次风险 |
 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
@@ -1058,7 +1065,38 @@ tier-B ObjectStore bucket 按 cluster replica 策略创建；传输开始后，�
 **最慢链路**，`2 ×` 是因为一次 tier-B 传输要**两次穿过 object store**（发送方 Put、
 接收方 Get），额外 1 分钟覆盖 prepare 往返、对象存储打开、校验/fsync、finalize 与事件传播。
 于是 2 GiB push 的 broker 上限预算是 `2 × 1024s + 60s = 2108s = 35m08s`；
-ctl 默认再留 2 分钟，因此是 `37m08s`。
+ctl 默认再留 2 分钟，因此 2 GiB 的每阶段上限是 `37m08s`。
+**ctl 的默认值按同一公式对本次文件大小推导**（simcluster-speed 起）：此前 flag 的文案写"由文件大小推导"，
+代码却对任何大小一律取 2 GiB 的 `37m08s`——一个 12 MB 的 push 在 JetStream 退化时会等满 37 分钟才报错
+（deploy-tier drill 67 因此撞 45 分钟超时）。现在 12 MB 取 `5min + 2min = 7m`，显式 `--timeout` 仍原样生效。
+
+**push 中途失败会立刻释放本 session 的 tier-B 槽**（simcluster-speed 起）：同一 session 的 bucket 一次只承载一个
+tier-B 传输（`too_many_in_flight`）。此前 ctl 的 `Put` 失败（例如 JetStream 暂时无 responder）后没有任何途径
+告诉 broker 它已放弃，槽位要等 watchdog 按预算回收（≥6 分钟），期间该 session 的每次 tier-B push 都被拒，且拒绝
+文案建议"换一个 transfer id"——对按 bucket 串行的槽位那是错的建议。现在 ctl 在 commit 之前的任何失败都会发
+`finalize{failed}`（与 pull 一致；commit 之后终态仍只由 agent 的 `ev.transfer` 写），拒绝文案会点名占着 bucket 的
+那个 transfer id。旧 broker 会以 `verb_mismatch` 拒绝这条 push finalize，行为退回旧版（N-1 窗口内可接受）。
+
+**push 的 `Put` 阶段带 JetStream 活性看门狗**（simcluster-speed，gotcha #84）：JetStream 失去 quorum（持有 meta/stream
+leader 的 broker 停了）时，`Put` 发出的 chunk 等不到 ack，此前会一直等到整个阶段预算耗尽（12 MB ≈ 7 分钟）才报一句裸
+`Put: nats: timeout`——没有 transient 码、没有重试提示。现在上传期间每 10 s 向该 bucket 的 backing stream 发一次
+`STREAM.INFO`（5 s 超时；只用这一个请求——它在 ctl 自己的 ACL 里，`$JS.API.INFO` 不在），**没有应答、或应答里没有
+stream leader** 都算一次失败，连续 3 次即取消上传、释放槽位，并以 `code=jetstream_not_ready`（exit 75，与 prepare 腿
+的 G67 文案同一套词）告诉你 JetStream 停止应答、稍后重试。这是**第一张脸**（`stopped answering during the upload
+(3 probes over 30s failed …)`）。**第二张脸**是**立刻拒绝**（`no responders` / `no response from stream`——stream 正在选
+leader）：这时 `Put` 会有界重试 3 次（间隔 3 s、6 s），仍不行才以同一个 `jetstream_not_ready` 码拒绝，文案里带尝试次数与
+用时（`refused 3 attempt(s) over 9s`）。**第三张脸**是"应答正常、但一个字节都没收"：探测每次都答、也有 leader，可 stream
+的 `last_seq` 连续 3 次探测（30 s）纹丝不动——那是 chunk 在 leader 选举窗里被静默丢弃（没有 NAK，`Put` 会等 ack 等到预算
+耗尽），stream 对别人已经健康、只对这一次 `Put` 不是；看门狗取消它并在同一次 push 里**重试一次**（新 `Put` 通常几百毫秒
+落地），仍不行才拒绝，文案是 `the stream accepted none of the upload for 30s (3 probes; leader present, last_seq stuck
+at N)`，再包一层 `refused N attempt(s)`。健康的 JetStream 每次探测都应答、序列号随每个 chunk 前进，看门狗不会干预慢速
+大文件。第一张脸不重试（JetStream 对这个 bucket 就是不可用，再等 30 s 也一样）。
+一次被取消的 `Put` 之后你会在 stderr 看到一行 `nats async error: … Permissions Violation for Publish to
+"$JS.API.STREAM.PURGE.OBJ_xfer-<sid>"`：那是 nats.go 试图替你清理上一代 chunk，而 bucket 的清理权在 broker（按设计拒绝）；
+残留的 chunk 由 broker 的定期 reconcile 回收（gotcha #85），不需要你做任何事。两个相关的细节：重试上传**同名对象**时，
+nats.go 在上传完成后还会试一次那个被拒的清理，看门狗要等一个 30 s 探测窗才发现 `Put` 其实已经完成——这是同名重试路径上
+多付的 30 s，不是失败；上传中途本地读盘出错（`input/output error`）会以 `object_put_failed` 上报、不会被当成 JetStream 的
+问题重试三次（round-2 review R2-F1 / R2-F3）。
 改动前这里是固定 5 分钟，而它要覆盖的是 2 GiB × 2 —— 隐含断言了 ~114 Mbit/s 的
 端到端吞吐，超时后还会**删掉正在传的对象**并写 `agent_no_responders`（归因错误：
 agent 可能一直在传，只是不够快）。现在超时写的是 `transfer_budget_exceeded`。
@@ -1647,12 +1685,14 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `local_port_invalid`| `--local` 不在 1..65535 | 检查 flag 值 |
 | `port_taken`        | `--remote-port` 指定的公网端口已被占用（有 ALLOCATED 记录） | 换端口、省略 `--remote-port` 自动选、或 `tether expose rm` 先释放 |
 | `port_out_of_band`  | `--remote-port` 不在 broker 公网带 `[14000-14999]` 内 | 选带内端口或省略该 flag 自动选 |
-| `frpc_failed`       | agent 起 tunnel 客户端失败 | 看 `~/.tether/agent/<sid>/agent.log` |
+| `frpc_failed`       | agent 起 tunnel 客户端失败（终态：拨号失败、缺 pins、token 确被撤销） | 看 `~/.tether/agent/<sid>/agent.log` |
+| `home_catching_up`  | 集群模式：这条 expose 的 home broker 还没应用到分配（raft apply 落后提交），agent 在 broker 的 5 s 窗口内重试了 3 s 仍未追上（gotcha #86） | **瞬时**，exit 75：等几秒重跑同一条命令即可；持续出现看 `tether cluster status` 的 applied_lag |
 | `tunnel_token_unknown_or_revoked` | 反向隧道 token 失效 | 重新 `tether expose`（agent 重启后 state.json 损坏可能触发） |
 
-> 注：`home_catching_up` / `try_again` 是 **agent 反向隧道 REGISTER 的 DENY reason**（broker 故障切换/瞬时
-> 存储抖动时），由 **agent 自动重试**，**不会**作为 `tether expose` 的 ctl 回复码出现；它们与
-> `leader_unavailable` 一起归在 cluster.md §9.7.1。
+> 注：`home_catching_up` / `try_again` 首先是 **agent 反向隧道 REGISTER 的 DENY reason**（broker 故障切换/瞬时
+> 存储抖动时），由 **agent 自动重试**。#86 之后 `home_catching_up` 也可能作为 `agent_rejected:home_catching_up`
+> 出现在 `tether expose` 的回复里——那是 agent 有界重试 3 s 后仍没等到 home 追上（leader 自己会先等 home 最多 3 s
+> 再转发，所以正常负载下你看不到它）。`try_again` 仍不会到达 ctl。它们与 `leader_unavailable` 一起归在 cluster.md §9.7.1。
 
 ### 9.5 PTY (`tether run`) 失败原因
 

@@ -100,6 +100,29 @@ func OpenDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// CloseDBOnCleanup registers the cleanup a FILE-BACKED test database needs: Close, then wait
+// until every borrowed connection has been physically closed. database/sql's Close refuses new
+// work and closes idle connections, but a connection a background goroutine (an agent or broker
+// still winding down) has checked out finishes its SQLite close only when it is returned — after
+// Close has already returned. When the file lives in t.TempDir() that late close races the
+// directory removal: "TempDir RemoveAll cleanup: … directory not empty", a red on a test whose
+// assertions all passed (simcluster-speed external review round 3 R3-F3, test/p2 under the full
+// suite's load). :memory: handles have nothing on disk and do not need this; an on-disk
+// `storage.Open("file:…")` / `OpenWAL` whose handle a goroutine other than the test's own may still
+// be using (a Run loop, a reconciler, an agent) does. The wait is bounded and reported, never a
+// fixed sleep, and a lingering connection is a test defect, not something to swallow.
+func CloseDBOnCleanup(t *testing.T, db *sql.DB) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close test database: %v", err)
+		}
+		if !WaitFor(t, 5*time.Second, time.Millisecond, func() bool { return db.Stats().OpenConnections == 0 }) {
+			t.Errorf("database connections still open during cleanup: %+v", db.Stats())
+		}
+	})
+}
+
 // SilentLog returns a discard logger by default. With
 // TETHER_TEST_VERBOSE set, returns a debug logger to stderr — useful
 // when chasing flakes locally.

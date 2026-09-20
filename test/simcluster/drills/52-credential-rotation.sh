@@ -163,14 +163,20 @@ _a8_stage_unpinned_leaf() {
     secrets_push_file "$INST" brk2 tunnel-cert.pem || return 1
     secrets_push_file "$INST" brk2 tunnel-key.pem || return 1
 }
-_a8_pin_mismatch_logged() { _berr brk2 80 | grep -qE 'matches neither the pinned'; }
+# WHICH STREAM (simcluster-speed S2 triage, 2026-09-19): the pin-mismatch refusal is main()'s exit error,
+# printed to the process's stderr BEFORE any logger owns the output — logs.sh's own rule puts that in the
+# broker's BOOT stream, journald since h1 (the unit used to append stderr to broker.err, which is what the
+# `_berr` slog read here was written against). Both A8d and A8e read the journal now; the assertion text
+# says "boot stream", and the 2026-09-03 stale-table entry for 52 ("A8d broker slog 的 pin-mismatch 拒绝行")
+# is attributed to this oracle, not to the product (the refusal text is byte-identical in the journal).
+_a8_pin_mismatch_logged() { sim_broker_panic_journal brk2 'matches neither the pinned'; }
 # DOC-23 (R11 P12 FIXED): the pin-mismatch fail-closed error no longer points at the unreachable
 # `rotate-tunnel-cert` (which dials an admin socket that is never up in this bricked state — wireClusterEarly
 # returns before the socket exists). It now guides a FILE-level restore of the pinned cert/key pair, then a
-# restart (tunnelCertPinMismatchError, clusterwrite.go:195-201). Assert broker.err's refusal carries the
-# file-restore guidance and NEVER names rotate-tunnel-cert.
+# restart (tunnelCertPinMismatchError, clusterwrite.go:195-201). Assert the boot stream's refusal carries the
+# file-restore guidance and NEVER names rotate-tunnel-cert (one journal sample for all five clauses).
 _a8_doc23_file_recovery() {
-    _dr=$(_berr brk2 60)
+    _dr=$(sim_broker_panic_journal_dump brk2 400)
     printf '%s' "$_dr" | grep -qiE 'matches neither the pinned' || return 1     # the refusal is present
     printf '%s' "$_dr" | grep -qiE 'FILE-level restore'         || return 1     # points at a file restore
     printf '%s' "$_dr" | grep -qiE 'tunnel-cert\.pem'           || return 1     # names the pinned cert/key
@@ -406,13 +412,13 @@ assert_ok "A8b restart brk2's broker (it must now refuse to start: the on-disk c
 assert_ok "A8c brk2's broker does NOT reach active (fail-closed, as designed)" \
     poll_until 25 3 "brk2 broker stays down" -- _brk_not_active brk2
 # The exact string, read from broker.err. "the unit failed" would swallow ANY crash as green.
-assert_ok "A8d the broker slog carries the EXACT pin-mismatch refusal (not merely 'the unit failed' — that would eat any crash as green)" \
+assert_ok "A8d the broker's BOOT stream (journald — main()'s exit error, printed before any logger exists) carries the EXACT pin-mismatch refusal (not merely 'the unit failed' — that would eat any crash as green)" \
     _a8_pin_mismatch_logged
 # DOC-23 (R11 P12 FIXED): the OLD pin-mismatch error told the operator to re-run
 # `tether cluster rotate-tunnel-cert` — UNREACHABLE in this state (wireClusterEarly returns before the
 # admin socket is created, so the command can never connect). The text now points at the ONLY real way
 # out: a FILE-level restore of the pinned tunnel-cert.pem/tunnel-key.pem, then a restart.
-assert_ok "A8e DOC-23 FIXED: the pin-mismatch refusal in the broker slog now guides FILE-level recovery ('FILE-level restore', 'put the PREVIOUS tunnel-cert.pem + tunnel-key.pem back', 'restart the broker') and NEVER points at the unreachable 'rotate-tunnel-cert' command it used to dead-end the operator with" \
+assert_ok "A8e DOC-23 FIXED: the pin-mismatch refusal in the broker's BOOT stream now guides FILE-level recovery ('FILE-level restore', 'put the PREVIOUS tunnel-cert.pem + tunnel-key.pem back', 'restart the broker') and NEVER points at the unreachable 'rotate-tunnel-cert' command it used to dead-end the operator with" \
     _a8_doc23_file_recovery
 assert_ok "A8f restore brk2's SAVED OLD leaf (pre-A8 snapshot, fp==original pin — NOT the new unpinned leaf) and bring it back; the fail-closed broker reaching active is itself proof the restored cert matches the pin (reset-failed first: StartLimitBurst=5/10s is deliberately NOT disabled)" \
     _a8_recover_brk2

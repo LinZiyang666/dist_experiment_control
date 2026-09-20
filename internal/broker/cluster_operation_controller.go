@@ -854,9 +854,16 @@ func (a *ClusterAdmin) boundCatchingUp(op *cluster.Operation) {
 	}
 	if a.now().UnixNano() > op.CatchupDeadline {
 		_ = a.transition(op, cluster.OpStateBlocked, false,
-			"catch-up exceeded the deadline — check the joining broker, then `cluster ops confirm "+op.OpID+"` to retry (or `cluster ops abort "+op.OpID+"`)", nil)
+			OpBlockedCatchupDeadlineMsg+" — check the joining broker, then `cluster ops confirm "+op.OpID+"` to retry (or `cluster ops abort "+op.OpID+"`)", nil)
 	}
 }
+
+// OpBlockedCatchupDeadlineMsg is the FIRST clause of the last_error a join op carries when boundCatchingUp
+// routed it to BLOCKED. It is exported because `cluster add`'s resume (cmd/tether resumeBlockedJoin, gotcha
+// #83) confirms exactly this BLOCKED and no other: a join blocked after AddVoter attempts were exhausted
+// is a stall of a RUNNING joiner and stays under the operator's --auto-confirm-catchup budget. Sharing the
+// constant is what keeps the two sides from drifting apart by a reworded message.
+const OpBlockedCatchupDeadlineMsg = "catch-up exceeded the deadline"
 
 // boundRehomeConvergence bounds the REHOME_EXPOSES data-plane wait (self-review high). The hold via
 // recordOpError is non-terminal FOREVER and never touches opAttempts, so a migrated expose whose agent

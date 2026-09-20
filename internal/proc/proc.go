@@ -379,6 +379,29 @@ func CountBySession(db *sql.DB, sid string, includeExited bool) (int, error) {
 	return n, nil
 }
 
+// NodeHasHistory reports whether ANY process row — running, lost or exited — has ever been filed under
+// (sid, nid). It is the evidence the broker's fail-closed orphan-kill gate asks for ("does this node name
+// have process history here", reconcile.go sawAnyRow): an EXITED row is history exactly as a RUNNING one
+// is, and the gate must not go quiet on a node whose jobs all finished before a broker rollback (gotcha
+// #87). O(1): an indexed existence probe, so the reconnect path stays bounded regardless of session age.
+//
+// It takes the smallest read interface rather than *sql.DB so the broker can hand it its
+// read-only role handle (internal/broker/dbrole.go readDB) — the cfg.DB ratchet exists to keep new
+// reads off the raw pool.
+func NodeHasHistory(db interface {
+	QueryRow(query string, args ...any) *sql.Row
+}, sid, nid string) (bool, error) {
+	var one int
+	err := db.QueryRow(`SELECT 1 FROM processes WHERE sid = ? AND nid = ? LIMIT 1`, sid, nid).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("proc: node history: %w", err)
+	}
+	return true, nil
+}
+
 // GCExited deletes EXITED rows whose ended_at is older than cutoff.
 // Returns the number of rows removed (for log lines / metrics).
 //

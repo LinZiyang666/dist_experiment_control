@@ -98,8 +98,9 @@ func TestBrokerSilenceEscapesToVoter(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A survivor voter on a distinct DIALABLE host so hasOtherDialableVoter sees an exit.
+	// Use a documentation address: this test exercises host exclusion, not external DNS.
 	roster, err := clusterroster.Build(seed, pub, 10,
-		[]proto.RosterBroker{{NodeID: "survivor", PublicHost: "survivor.example.com", Phase: proto.RosterPhaseVoter}},
+		[]proto.RosterBroker{{NodeID: "survivor", PublicHost: "203.0.113.1", Phase: proto.RosterPhaseVoter}},
 		time.Now().UTC().Format(time.RFC3339Nano),
 		time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
 	if err != nil {

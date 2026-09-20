@@ -3058,6 +3058,17 @@ var (
 	clusteredJetStreamBootRetry = 2 * time.Second
 )
 
+// ClusteredJetStreamBootWait is the read-only accessor for the boot wait above — the T7 shape
+// (LeaseGrantWindow) so a cross-package caller can derive its own budget from the constant instead
+// of restating the number. `cluster add`'s start-joiner grace is that caller: a joiner it has just
+// asked provisioning to start spends up to this long waiting for the clustered JetStream meta before
+// its admin socket answers, so a grace shorter than this HALTs a grow whose joiner is doing exactly
+// what it should. That is not hypothetical: with the fresh-grow wait removed (simcluster-speed A)
+// the 60 s resume grace expired at 90 s boot waits on a loaded host on the very first deploy-tier
+// run, brk2 sitting at CATCHING_UP/reachable:false — the old 60 s of dead time before the HALT had
+// been giving the former-N1's JetStream a head start nobody had accounted for.
+func ClusteredJetStreamBootWait() time.Duration { return clusteredJetStreamBootWait }
+
 // enableJetStream probes JetStream once and, on success, publishes the handle and runs the
 // boot reconciles. A missed probe is NOT an error: single mode degrades to core publish
 // (P4-P6 behaviour), and cluster mode decides what to do about it at its own gate.

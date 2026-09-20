@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // origin: b7_ops_test.go (renamed in B6) — B7 DOC#2: the membership-op derivation maps each phase to a
@@ -45,7 +46,7 @@ func TestDeriveClusterOpsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	testharness.CloseDBOnCleanup(t, db) // file-backed WAL: wait for borrowed connections before TempDir goes
 	ins := func(id, phase, addErr string) {
 		if _, err := db.Exec(`INSERT INTO cluster_nodes(node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at,phase_changed_at,voter_add_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, id, "p", id, "10.0.0.1:7400", "n", "t", "h", "c", phase, "2026-06-24 00:00:00 +0000 UTC", "2026-06-25 00:00:00 +0000 UTC", addErr); err != nil {

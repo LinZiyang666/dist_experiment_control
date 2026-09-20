@@ -41,6 +41,7 @@ ClusterGrowResp.Code	json:"code,omitempty"	string
 ClusterGrowResp.Error	json:"error,omitempty"	string
 ClusterGrowResp.LastError	json:"last_error,omitempty"	string
 ClusterGrowResp.MeshPeers	json:"mesh_peers,omitempty"	[]string
+ClusterGrowResp.NonvoterCommitted	json:"nonvoter_committed,omitempty"	bool
 ClusterGrowResp.OK	json:"ok,omitempty"	bool
 ClusterGrowResp.OpID	json:"op_id,omitempty"	string
 ClusterGrowResp.OpState	json:"op_state,omitempty"	string

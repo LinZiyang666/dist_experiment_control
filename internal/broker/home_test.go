@@ -82,6 +82,36 @@ func TestD6TunnelTokenLookupLadder(t *testing.T) {
 	}
 }
 
+// TestUnknownTokenIsTransientOnlyOnALaggingClusteredReplica drives tunnelTokenLookup itself — not
+// the pure predicate — with a token NO row carries. A clustered broker whose runtime cannot vouch
+// for having applied every committed command (here: cluster runtime present, node not wired ⇒
+// homeApplyLagging reads lagging) must answer the transient home_catching_up; single mode keeps
+// the terminal, anti-enumeration-collapsed answer. Disconnecting the branch at the call site
+// (`if false && missingTokenIsCatchingUp(...)`) leaves every other broker test green — round-2
+// review R4-2-F7 replayed exactly that.
+// origin: simcluster-speed review round 2 R4-2-F7 (gotcha #86 half ②)
+func TestUnknownTokenIsTransientOnlyOnALaggingClusteredReplica(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		cluster    bool
+		cl         *clusterRuntime
+		wantReason string
+	}{
+		{"single mode: terminal", false, nil, "token_unknown_or_revoked"},
+		{"cluster, runtime not wired (cannot vouch): transient", true, &clusterRuntime{}, proto.ReasonHomeCatchingUp},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db := openDB(t)
+			b := &Broker{cfg: Config{DB: db, Logger: silentLogger()}, selfID: "node-self", clusterMode: c.cluster, cl: c.cl}
+			seedHomedExpose(t, b, "lab", "lab-1", "svc", 14999, "th-known", "node-self", 1)
+			err := b.tunnelTokenLookup("lab", "lab-1", 14999, "th-nosuch", 1)
+			if err == nil || err.Error() != c.wantReason {
+				t.Fatalf("unknown token → %v, want %q", err, c.wantReason)
+			}
+		})
+	}
+}
+
 // TestD6LadderInertWhenNoSelf: with selfID=="" (production), even a homed row is
 // inert — the ladder is skipped (the seam was never attached). This is the
 // build-and-prove inertness assertion.

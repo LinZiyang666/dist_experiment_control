@@ -120,3 +120,53 @@ func TestD9PollClusterHealthScatterGather(t *testing.T) {
 		t.Error("a responding follower must NOT be broker_down")
 	}
 }
+
+// TestPollClusterHealthUntilEndsTheGatherWhenTheAnswerIsIn pins the early exit the expose barrier
+// relies on: with a responder answering at once, a 400 ms window returns as soon as `until` is
+// satisfied — not at the window (round-2 review R2-F4 measured 401 ms per cross-home expose with
+// the plain poll). The nil-until control keeps the observability poll's full-window semantics.
+// origin: simcluster-speed review round 2 R2-F4
+func TestPollClusterHealthUntilEndsTheGatherWhenTheAnswerIsIn(t *testing.T) {
+	opts := natstest.DefaultTestOptions
+	opts.Port = -1
+	ns := natstest.RunServer(&opts)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	sub, err := nc.Subscribe(proto.SubjClusterCursor, func(m *nats.Msg) {
+		b, _ := json.Marshal(proto.ClusterHealthResp{NodeID: "brk2", AppliedIndex: 42, SchemaVersion: proto.ClusterHealthSchemaVersion})
+		_ = m.Respond(b)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	const window = 400 * time.Millisecond
+	homeApplied := func(r map[string]proto.ClusterHealthResp) bool { h, ok := r["brk2"]; return ok && h.AppliedIndex >= 42 }
+
+	start := time.Now()
+	got := pollClusterHealthUntil(nc, proto.SubjClusterCursor, window, homeApplied)
+	early := time.Since(start)
+	if got["brk2"].AppliedIndex != 42 {
+		t.Fatalf("early-exit poll lost the reply: %+v", got)
+	}
+	if early >= window/2 {
+		t.Fatalf("poll with a satisfied `until` took %s; it must end well inside the %s window", early, window)
+	}
+
+	start = time.Now()
+	got = pollClusterHealth(nc, proto.SubjClusterCursor, window)
+	full := time.Since(start)
+	if got["brk2"].AppliedIndex != 42 {
+		t.Fatalf("plain poll lost the reply: %+v", got)
+	}
+	if full < window {
+		t.Fatalf("control: the plain poll returned after %s, before the %s window — the fixture cannot tell an early exit from a fast one", full, window)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/nats-io/nats-server/v2/conf"
 )
@@ -53,6 +54,71 @@ var bucketOf = map[string]Bucket{
 	"write_deadline":  TetherPassthrough,
 	"max_pending":     TetherPassthrough,
 	"max_connections": TetherPassthrough,
+	// simcluster-speed H: the server half of the client-liveness contract. install.sh writes both
+	// (see the nats.conf template); a hand-set value is preserved verbatim like the other tuning
+	// keys, subject to passthroughValueCheck below.
+	"ping_interval": TetherPassthrough,
+	"ping_max":      TetherPassthrough,
+}
+
+// passthroughValueCheck refuses the value SHAPES nats-server accepts silently-wrong or warns on.
+// It exists because these two keys are the first passthrough directives whose wrong spelling is
+// not a parse error:
+//
+//   - `ping_interval: 20` (bare integer) is read by nats-server as seconds but logged as a
+//     deprecation WARNING, and `nats-server -t` treats a config warning as a failed check — so the
+//     takeover would render a conf the reconciler's own -t gate then refuses.
+//   - `ping_interval: 2m` (unquoted) is lexed by the conf parser as the NUMBER 2 with a decimal
+//     mega suffix — 2 000 000 (measured with nats-server/v2/conf: "2m" → 2000000; only "2mb"/"2mib"
+//     give 2 097 152) — and taken as seconds: a 23-day ping interval, no warning at all.
+//   - `ping_max: "2"` (quoted) is a type error at server start.
+//
+// Only a quoted Go duration string ("20s", "1m30s") and a bare integer, respectively, survive
+// this gate; anything else is a takeover refusal that names the key and the expected shape.
+var passthroughValueCheck = map[string]func(v any) error{
+	"ping_interval": func(v any) error {
+		s, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("ping_interval must be a quoted duration string such as \"20s\" (a bare number is deprecated by nats-server and fails `-t`; an unquoted 2m is read as 2 000 000 seconds)")
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("ping_interval %q is not a duration: %w", s, err)
+		}
+		// Sign matters as much as shape (internal review round 1 R2-F2; wording corrected in round 2
+		// R2-F6 against nats-server v2.14.6 opts.go/client.go): `-t` passes both, and neither means
+		// what a reader of the file would think. ZERO is silently replaced by the server's default
+		// (2 min × 2 — setBaselineOptions), i.e. the slow dead-connection window drill 98 measures
+		// and this contract exists to replace. NEGATIVE fires the ping timer at once and repeatedly,
+		// so every client is closed as a stale connection within its first interval.
+		if d == 0 {
+			return fmt.Errorf("ping_interval %q is read by nats-server as its default (2m, the slow window this contract replaces); write the explicit value", s)
+		}
+		if d < 0 {
+			return fmt.Errorf("ping_interval %q must be positive (a negative interval fires the ping timer at once and closes every client as stale)", s)
+		}
+		return nil
+	},
+	"ping_max": func(v any) error {
+		var n int64
+		switch x := v.(type) {
+		case int:
+			n = int64(x)
+		case int64:
+			n = x
+		default:
+			return fmt.Errorf("ping_max must be a bare integer (got %T)", v)
+		}
+		// Same two shapes as ping_interval: 0 is the server default (2), negative closes every
+		// client on the first timer fire (`ping.out+1 > maxPingsOut` is true at once).
+		if n == 0 {
+			return fmt.Errorf("ping_max 0 is read by nats-server as its default (2); write the explicit value")
+		}
+		if n < 1 {
+			return fmt.Errorf("ping_max %d must be at least 1 (a negative value closes every client at its first ping timer)", n)
+		}
+		return nil
+	},
 }
 
 // jetstreamSafeSubkeys / websocketSafeSubkeys are the ONLY subkeys the takeover PRESERVES:
@@ -165,6 +231,15 @@ func Preflight(confPath string) (*Ownership, error) {
 		return nil, fmt.Errorf("natsconf: %q contains directive(s) tether does not recognize: %s — "+
 			"refusing takeover (would silently drop them); remove them or take over manually",
 			confPath, strings.Join(unknown, ", "))
+	}
+	// A recognized passthrough key whose VALUE has a shape nats-server would mis-read is refused
+	// here, before the takeover copies it into a conf tether then signs off on.
+	for key, check := range passthroughValueCheck {
+		if v, present := parsed[key]; present {
+			if err := check(v); err != nil {
+				return nil, fmt.Errorf("natsconf: %q: %w — refusing takeover; fix the directive or remove it", confPath, err)
+			}
+		}
 	}
 	sort.Slice(own.Entries, func(i, j int) bool { return own.Entries[i].Key < own.Entries[j].Key })
 	return own, nil

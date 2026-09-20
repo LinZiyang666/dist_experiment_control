@@ -291,13 +291,13 @@ func previousNIDOnce(a *Agent) string {
 // It must never fire for a basename-granted agent: the broker leaves ports it
 // was not re-presented ALLOCATED and the offline reaper never fires for an
 // online node, so a wrong skip would black-hole the port permanently.
-func replayPortsUnlessLeased(a *Agent) {
+func replayPortsUnlessLeased(ctx context.Context, a *Agent) {
 	if nidOf(a) != a.cfg.NID {
 		a.cfg.Logger.Info("agent: running under an assigned lease name; not replaying inherited port state",
 			"sid", a.cfg.SID, "basename", a.cfg.NID, "routing_nid", nidOf(a))
 		return
 	}
-	a.replayPortsFromState()
+	a.replayPortsFromState(ctx)
 }
 
 // leasedInstanceRefusesProxy reports whether this agent must ignore a proxy

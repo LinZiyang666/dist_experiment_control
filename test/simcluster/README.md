@@ -271,10 +271,68 @@ Then run the whole suite in parallel — **this is the preferred path**:
 the fix), fires every drill concurrently on its own throwaway instance, then serially re-runs any infra
 flake. A single drill by hand is still fine: `simcluster drill <name>`.
 
+### Units, arms, lanes and the contention registry (simcluster-speed, 2026-09)
+
+The runner's unit of work is a **unit**: a whole drill, or one **arm** of an arm-split drill. A drill
+declares arms in a comment-block manifest at its top (parser: `lib/manifest.sh`, ONE parser shared by
+`simcluster drill --arm`, the runner and `tests/arm-manifest-lint.sh`):
+
+```sh
+# arms: A D F
+# fixture: A=N3-live D=N3-live F=N3-live      # closed vocabulary: N1|install|N2-live|N3-live|FS-N2|N2-cap3g|grow-claim
+# grows: A=2 D=2 F=2                          # `tether cluster add` grows the arm performs (lane release count)
+# worst: A=1350 D=1500 F=800                  # declared worst case, seconds; the unit is bounded at 2×worst
+# forgoes: A=- D="71-minority-commit: post-A context no longer exists" F=-
+case "${ARM:?}" in A) … ;; D) … ;; F) … ;; *) setup_fail "unknown arm" ;; esac
+```
+
+`simcluster drill <name> --arm <A>` runs exactly one arm on instance `drill-<name>-<A>`; `drill_end`
+emits `DRILL-ARM arm=<A> of=<name>` beside the verdict line and the runner cross-checks it — the line is
+printed from the exported `ARM`, so it proves the arm the runner asked for reached `drill_end` (a swapped or
+missing line is CONTRACT-ERROR, never a verdict of record); that the arm's CODE is the branch it names is
+`arm-manifest-lint`'s R4 (case labels == manifest arms), not a runtime check. Rollup rows are keyed
+`<drill>.<arm>`; an arm-split drill also gets one `ARMS` row — the precedence join of its arms
+(ASSERT-FAIL > SETUP-RED > PRODUCT-RED > INCOMPLETE > GREEN), the summed counters, and `arms_missing`
+(arms with no verdict, reported beside the join, never folded into it: an early INFRA-ABORT can no
+longer hide a later real red). The exit code counts **drills** with a blocker, so splitting a drill never
+changes it. `expected-verdicts.tsv` carries one child row per arm (`<drill>.<arm>`, written from the
+parent's claim ownership BEFORE the first split sweep — `tests/validate-verdicts.sh` rules ①–⑧ keep
+the parent row derived: bands `-`, expected = join, nc_gap = Σ). Two levers the sweep runs under:
+
+- **per-unit ceiling** — `2 × worst`, capped by `--drill-timeout`; a unit with no `# worst:` keeps the
+  global ceiling (fail-open only in the LONGER direction). A ceiling kill is INFRA-ABORT, named by its
+  basis in the log, never retried.
+- **grow lane** — units whose CODE contains a grow token (`grow_to_3|grow_to_2|setup_forcesingle_n2|
+  "$SIM" grow`) are grow-lane units; at most `--grow-cap` (default 5) are inside their grow phase at once
+  (a unit leaves the lane when its declared `# grows:` markers are written, or when it exits; a fixture
+  with an in-unit nuke+retry — `grow_to_3` / `grow_to_2` — writes its markers itself, once, after its
+  post-check, so a retry never releases the slot early). The lane never holds the head of the queue: a
+  free job slot takes the first eligible unit in cost order, so N1 units keep flowing while the lane is
+  full. `--live-grow` (cap 0) is the CONTENTION regime; the run's regime is recorded once in
+  `regime.tsv` and copied into the rollup's `REGIME` row — `--replay` reads it back and never rewrites
+  it (a missing or invalid `regime.tsv` reads `unknown`), and refuses the regime flags outright.
+  Metadata must contain exactly one four-column row with a known mode and non-negative integer
+  cap/stagger values; truncated, conflicting or malformed records do not establish the original regime.
+
+**C1 — the contention registry (`contention-sensors.tsv`).** Every load-discovered product defect this
+suite has produced came from UNENGINEERED contention (#67 under saturation, #66 at `-j3`, 52's rc=77 at
+`-j6`, #70 whenever five grows start together). Each speed lever reduces contention, so each of those
+sensors can go dark without any drill turning red. The registry names every such sensor, the regime it
+fires under (`default` / `live-grow` / `none-after-split` / `H-dependent`) and the units that still
+sample it; an arm that stops sampling one says so in `# forgoes:`, and `tests/contention-registry-check.sh`
+reconciles both ways (ids must exist, units must resolve, a live regime must name a unit). Obligation:
+**`./run-drills.sh --live-grow` is run before a release and whenever the grow path changes** — by hand,
+like every drill here (CLAUDE.md §5: on demand, never in `go test` / CI; nothing in the repo schedules it,
+and an earlier revision of this line that said "weekly" described a mechanism that does not exist —
+round-2 review R6-2). It may mint a gotcha; it may not change an expectation — a red under `--live-grow`
+is a finding to attribute, not a band to add.
+
 **CAVEAT (grow-concurrency, INDEPENDENT of inotify).** The heaviest clustered-JetStream grow
 (`10-grow-to-3`: two grows + follower-kill) can still time out its VOTER promotion (150s) when ALL
-drills grow at the same instant — raft/JS-meta formation is timing-sensitive at peak concurrency. If it
-goes RED alone in an otherwise-green full parallel run, re-run it singly or cap with `-j`.
+drills grow at the same instant — raft/JS-meta formation is timing-sensitive at peak concurrency. The
+grow lane above bounds that by default; under `--live-grow` (or a raised `--grow-cap`) the window is
+back, deliberately — that is the #70 sensor. If it goes RED alone in an otherwise-green run, re-run it
+singly.
 
 **OQ-8 whole-suite policy (instituted from S1; CORRECTED by the S1 internal review).** `-j N` is a pure
 global concurrency throttle with **no family awareness** (`run-drills.sh:144`), and drills launch in

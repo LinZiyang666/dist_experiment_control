@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // export_roster_allowlist_test.go (formerly b6_incident_test.go) — B6 OPS#12: the export-incident assembler's secret-scrub + allowlist
@@ -22,7 +23,7 @@ func incidentTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	testharness.CloseDBOnCleanup(t, db) // file-backed WAL: wait for borrowed connections before TempDir goes
 	if _, err := db.Exec(
 		`INSERT INTO cluster_nodes
 		 (node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at,join_nonce,join_sig,voter_add_error,phase_changed_at)

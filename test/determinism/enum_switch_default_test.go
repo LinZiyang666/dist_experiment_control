@@ -68,20 +68,32 @@ var enumFamilies = map[string][]string{
 	// a non-PTY stream) must be forced through every switch rather than
 	// silently inheriting a `default:` — the whole point of the ladder is
 	// that each state maps to a DIFFERENT irreversible action.
-	"agent.reapVerdict":            {"reap"},
-	"authcallout.role":             {"role"},
-	"broker.admitRole":             {"admit"},
+	"agent.reapVerdict": {"reap"},
+	"authcallout.role":  {"role"},
+	"broker.admitRole":  {"admit"},
+	// origin: simcluster-speed external review F2. Why a creator's push{failed} was NOT claimed —
+	// committed / tier-A / already finalized / gone / not a push — each maps to a different reply
+	// (refuse with the reason, idempotent OK, verb_mismatch). A sixth reason must pick its reply in
+	// handleFinalizeReq's switch, not inherit one from a `default:`.
+	"broker.abandonRefusal":        {"abandon"},
 	"broker.cutoverAction":         {"cutover"},
 	"broker.ledgerDisposition":     {"ledgerLeave", "ledgerReplay", "ledgerSynthesize", "ledgerSite"},
 	"broker.passAuthority":         {"authority"},
 	"cli.Source":                   {"Source"},
 	"clusterupgrade.AgentPresence": {"Agent"},
 	"main.capsStatus":              {"caps"},
-	"natsconf.RenderIntent":        {"Intent"},
-	"natsconf.TopoState":           {"Topo"},
-	"spawnsafe.fsKind":             {"kind"},
-	"spawnsafe.probeState":         {"st"},
-	"spawnsafe.Mode":               {"Mode"},
+	// origin: gotcha #83 ⑤ (simcluster-speed §8.5). The two facts the start-joiner boundary reads
+	// before deciding its grace: the joiner's local nats-server state and whether a `tether serve`
+	// process exists. A fifth nats state or a third process state must be routed through
+	// joinerStartGrace deliberately — the conservative "full grace" is what a `default:` would
+	// hand it silently, and a WRONG conservative answer here is the 120 s that produced #83.
+	"main.natsLocalState":   {"natsLocal"},
+	"main.brokerProcState":  {"brokerProc"},
+	"natsconf.RenderIntent": {"Intent"},
+	"natsconf.TopoState":    {"Topo"},
+	"spawnsafe.fsKind":      {"kind"},
+	"spawnsafe.probeState":  {"st"},
+	"spawnsafe.Mode":        {"Mode"},
 }
 
 // allowedEnumDefaults are the sites where a `default:` is correct, keyed by "file:ENCLOSING FUNCTION".
@@ -384,11 +396,17 @@ func TestNoDefaultOnRepoEnumSwitch(t *testing.T) {
 		"agent.reapVerdict":        true,
 		"authcallout.role":         true,
 		"broker.admitRole":         true,
+		"broker.abandonRefusal":    true, // external review F2: handleFinalizeReq's reply selection
 		"broker.cutoverAction":     true,
 		"broker.ledgerDisposition": true,
 		"main.capsStatus":          true,
-		"natsconf.RenderIntent":    true,
-		"natsconf.TopoState":       true,
+		// gotcha #83 ⑤: the two String() switches over the start-joiner boundary's facts. Every member
+		// is enumerated and there is no default; a fifth nats state or a third process state must
+		// name its own string and its own row in joinerStartGrace's table.
+		"main.natsLocalState":   true,
+		"main.brokerProcState":  true,
+		"natsconf.RenderIntent": true,
+		"natsconf.TopoState":    true,
 	}
 	var lostCoverage, newlySwitched []string
 	for family := range enumFamilies {

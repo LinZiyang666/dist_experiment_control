@@ -135,7 +135,9 @@ func openDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	// File-backed: wait for the borrowed connections' physical close before TempDir's RemoveAll
+	// (external review round 3 R3-F3 — the reason lives on the helper).
+	testharness.CloseDBOnCleanup(t, db)
 	if _, err := db.Exec(
 		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
 		"lab", "lab", "SHA256:p2-test-owner", "p2-test-hash",

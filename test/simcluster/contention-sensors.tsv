@@ -1,0 +1,35 @@
+# contention-sensors.tsv — the REGISTRY of product findings that only show under contention / on a
+# freshly grown cluster, and which drill units still sample them (simcluster-speed plan §5.5 X26;
+# the accel plan's C1 policy, which promised this file in its acceptance #6 and never wrote it).
+#
+# WHY. Every load-discovered defect this suite has produced came from UNENGINEERED contention: #67 under
+# 7-way saturation, #66 at -j3, 52's rc=77 at -j6, #70 whenever five grows start together. Every speed
+# lever reduces contention (lanes cap concurrent grows; arms run on fresh clusters instead of after their
+# siblings; templates skip the grow entirely), so each of those sensors can go dark WITHOUT any drill
+# turning red. This file makes that visible: a drill arm that stops sampling a sensor must say so in
+# its `# forgoes:` (tests/arm-manifest-lint.sh), the sensor must exist here, and every sensor must still
+# have at least one unit that samples it in some regime — or the row says `none-after-split` out loud.
+#
+# COLUMNS (tab-separated; tests/contention-registry-check.sh validates):
+#   sensor    id, [A-Za-z0-9-]+ (a gotcha number is written without its `#`, which is this file's comment
+#             marker), unique; the first word of a drill's `# forgoes:` value must be one of these
+#   regime    default | live-grow | none-after-split | H-dependent
+#               default          sampled by the ordinary -j sweep as it runs today
+#               live-grow        sampled only when grows run uncapped (`run-drills.sh --live-grow`, by hand before a release / after a grow-path change — nothing schedules it)
+#               none-after-split no unit samples it any more — recorded, never silently dropped
+#               H-dependent      its trigger window moved with the client-liveness constants (plan §5.4)
+#   units     space-separated unit names (drill, or drill.arm once the drill has a manifest) that sample it
+#   evidence  what the sensor looks like when it fires (a signature, a README anchor, a gotcha id)
+#
+# sensor	regime	units	evidence
+70-grow-timing	live-grow	10-grow-to-3 11-grow-gaps 13-inbroker-reconcile-perm 30-rolling-upgrade 41-shrink-to-standalone 42-rejoin-returning 51-full-dr 91-client-converge 90-alerts-lifecycle 82-agent-onboarding-invite	grow_to_3 VOTER-timeout when >=5 grows start together (README CAVEAT; gotcha #70; deliberately NOT banded)
+66-leader-hop	live-grow	30-rolling-upgrade	phase-2 leader-hop write-unavailability window (gotcha #66)
+67-tierb-transient	live-grow	74-rebalance-on-return.SRAB 67-transient-js-refusal	first post-grow tier-B push refused as TRANSIENT then succeeds (gotcha #67 sub-face 4; 74 band b-negctrl-create)
+69-rc77-not-leader	default	52-credential-rotation	retire --compromised answered `not leader` during a leadership change (gotcha #69; band retire-not-leader)
+grow-attempts	live-grow	71-expose-rehome-failover 73-proxy-cluster-ha 74-rebalance-on-return.SRAB 74-rebalance-on-return.C	`GROW-ATTEMPTS: 2` — grow_to_3's retry=1 nuke+retry fired (#31 residue)
+degraded-writable-post-grow	live-grow	10-grow-to-3 11-grow-gaps 13-inbroker-reconcile-perm 30-rolling-upgrade 41-shrink-to-standalone 42-rejoin-returning 51-full-dr 91-client-converge 90-alerts-lifecycle 82-agent-onboarding-invite 71-expose-rehome-failover 73-proxy-cluster-ha 74-rebalance-on-return.SRAB 74-rebalance-on-return.C	post-grow health lingers DEGRADED-WRITABLE (config_load_time observer; README "observability gap")
+post-grow-eligibility-window	live-grow	73-proxy-cluster-ha 74-rebalance-on-return.SRAB 74-rebalance-on-return.C	non-tunnel voter becomes proxy-eligible only ≤240 s after grow (README:417-421 candidate observation gap)
+g67-first-push	live-grow	20-forcesingle-natsconf 92-js503-remote-alert 12-ghost-voter 22-forcesingle-online 42-rejoin-returning	first tier-B push right after a grow (setup_forcesingle_n2 kept site; #67 residual)
+71-minority-commit	default	96-mid-flight-chaos.D	brk1's OWN broker.log names canary3 during/after the partition (gotcha #71 / #65 committer attribution, D4b snapshot + D6b): pre-heal = #65 candidate, gated on D0f (#89 premise); first seen after heal = #71-ambiguous. Sampled on a fresh N=3 by the D arm every run — the 2026-07-18 post-A world (brk2 killed+restarted, brk1 restarted, THEN partitioned) is no longer constructed. The 3 concurrent pre-heal `yes` of 2026-09-19 (G1 cap 0 / cap 8, S2 -j6) were #89 roams, not commits (round-2 review R1-F1 / R5-F2)
+48-silence-rebuild-under-drop	H-dependent	41-shrink-to-standalone	roster-silence rebuild (#48) under a silent DROP; drill 98 no longer samples it since the client ping (H) fires first
+34-load-sensitive-homereachable	live-grow	74-rebalance-on-return.SRAB 74-rebalance-on-return.C	homeReachable flaps under load → exits re-pile on the tunnel broker (gotcha #34; band c-ss-preflow)

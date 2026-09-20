@@ -78,7 +78,7 @@ type externalReviewFailSecondAdapter struct {
 	adds int
 }
 
-func (a *externalReviewFailSecondAdapter) AddProxy(PortToken) error {
+func (a *externalReviewFailSecondAdapter) AddProxy(context.Context, PortToken) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.adds++

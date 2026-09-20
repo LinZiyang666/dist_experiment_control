@@ -14,40 +14,87 @@
 #   1399 = re-derived at HEAD (2026-07-21, this ratchet): the floor now EQUALS the live count, closing that
 #          headroom. +1 vs 1398 = drill 50 arm C's DOC-27 close (ok -> assert_ok). Quote-aware tokenizer
 #          (N-7) verified count-neutral vs the old tokenizer on all 37 drills.
+#   1610 = re-pinned at HEAD a3431a1 (2026-09-19, simcluster-speed M0): 43 rows, all at the live count, six
+#          drills that had NO row at all added (33/67/78/83/84/98 = 127 sites that were deletable without
+#          tripping anything), and the 211-site headroom the 2026-07-21 floor had grown back (drill 62
+#          24->42, 32 37->54, 93 46->63, 20 7->18 …) closed again. Same policy: the floor equals the live
+#          count on the day it is re-pinned; it is allowed to rise silently and never to fall silently.
+#          Regenerate the rows with: sh tests/kept-sites.sh
+# 32: 54 -> 62 on 2026-09-19 (simcluster-speed H-7', internal review round 1 R3-6) — an ADDITION: the client-liveness retrofit
+#     arm (kept nats.conf byte-identical on re-run, .new carries the two ping keys, KEPT report names them / names a value
+#     difference). Total 1624 -> 1632.
+# 67: 25 -> 27 on 2026-09-19 (simcluster-speed, internal review round 1 R1-F1): two product_red sites for gotcha #84
+#     (the Put-leg stall at injection, and its post-recovery face) replace the not_covered gap the first 09-19 revision
+#     had booked — plan X27 forbade exactly that laundering. Total 1621 -> 1623.
+# 74: 59 -> 62 on 2026-09-19 (simcluster-speed 74 arm split) — an ADDITION, raised so it is pinned: the C arm builds
+#     its own `reg` negative-control pre-control (C-negctrl-fixture, C-negctrl-fixture-pre) and records its own gap when
+#     that pre-control does not establish; before the split C inherited B's. Total 1610 -> 1613.
+# 96: 67 -> 68 on 2026-09-19 (simcluster-speed 96 arm split, D7 R-CTX) — an ADDITION, raised so it is pinned:
+#     the D arm re-logs the ctl into $SID before its end-state measure (D3/D4b's canary creates had moved
+#     the active session, so `node ls` answered "(no nodes)" on a healthy cluster). Total 1609 -> 1610.
+# 98: 14 -> 13 on 2026-09-19 (simcluster-speed X14) — a coverage TRADE, not a deletion: the two RECOVERY
+#     assertions ("heartbeat past the post-impact watermark" and "landed on another voter") became ONE
+#     conjunction (heartbeat past the AT-INJECTION watermark AND /connz on a survivor). Separately each half
+#     could pass on its own false positive; together they cannot. Total 1610 -> 1609.
+# 98: 13 -> 14 on 2026-09-19 (internal review round 1 R1-F3) — an ADDITION: "inject self-proof C" pins that the cut broker still
+#     holds agt1's connection at the watermark instant, closing the discovery→DROP vacuity window. Total 1623 -> 1624.
+# lib/*: added 2026-09-19 (simcluster-speed internal review round 1 R3-1) — drills/lib/setup-forcesingle.sh hosts 8 claim
+#     sites that five drills execute through setup_forcesingle_n2; until now no gate saw them. Keyed `lib/<name>` so the
+#     row can never collide with a drill. Total 1613 -> 1621.
+# 2026-09-20 round-2 review dispositions (same change): ARM ROWS — every arm-split drill now also has
+#     `<drill>.<arm>` and `<drill>._shared` rows (plan X7 / §5.5; R1-F2 / R3-F3: a claim moved between arms lowered
+#     one arm and raised its sibling while the drill total stayed put, and no gate saw it; D-6 now reds). Drill rows:
+#     67 27 -> 30 (+2 product_red duration judges, +1 not_covered one-attempt tooth), 73 49 -> 51 (hard claim + gated
+#     mechanism claim + tunnel-only gap replace the single flip assert), 96 68 -> 70 (D0f #89 premise + its D6b
+#     runtime-guard), 98 14 -> 15 (self-proof C′). Total 1632 -> 1640. Reasons: simcluster-speed-review-round2.md.
 00-skeleton	13
 10-grow-to-3	19
 11-grow-gaps	13
-12-ghost-voter	6
+12-ghost-voter	7
 13-inbroker-reconcile-perm	11
-20-forcesingle-natsconf	7
+20-forcesingle-natsconf	18
 21-smalldisk-tierb	8
-22-forcesingle-online	29
+22-forcesingle-online	32
 30-rolling-upgrade	63
 31-node-upgrade-fleet	31
-32-install-lifecycle	37
+32-install-lifecycle	62
+33-node-upgrade-success	30
 40-drain-retire	35
-41-shrink-to-standalone	28
-42-rejoin-returning	42
+41-shrink-to-standalone	31
+42-rejoin-returning	43
 43-migrate-live-data	37
 50-backup-restore	88
 51-full-dr	77
 52-credential-rotation	67
 60-user-journey	38
 61-transfer-edges	31
-62-remote-fs-safe	24
+62-remote-fs-safe	42
+67-transient-js-refusal	30
 70-expose-journey	28
 71-expose-rehome-failover	40
 72-proxy-subscription	47
-73-proxy-cluster-ha	49
-74-rebalance-on-return	58
-80-session-isolation	44
+73-proxy-cluster-ha	51
+74-rebalance-on-return	62
+74-rebalance-on-return.SRAB	30
+74-rebalance-on-return.C	23
+74-rebalance-on-return._shared	9
+78-proxy-dial-backoff	23
+80-session-isolation	46
 81-admin-evict-session-rm	40
 82-agent-onboarding-invite	35
+83-cloned-image-instances	16
+84-shared-home-instances	19
 90-alerts-lifecycle	49
-91-client-converge	36
-92-js503-remote-alert	25
-93-metrics-observability	46
+91-client-converge	37
+92-js503-remote-alert	28
+93-metrics-observability	63
 94-agent-reconcile	54
 95-broker-selfheal	45
-96-mid-flight-chaos	61
+96-mid-flight-chaos	70
+96-mid-flight-chaos.A	27
+96-mid-flight-chaos.D	25
+96-mid-flight-chaos.F	9
+96-mid-flight-chaos._shared	9
 97-soak-cycles	38
+98-stuck-redial-recovery	15
+lib/setup-forcesingle	8

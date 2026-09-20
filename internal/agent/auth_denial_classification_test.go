@@ -133,8 +133,8 @@ type leaseRetargetSpy struct {
 	retargets []string
 }
 
-func (s *leaseRetargetSpy) AddProxy(PortToken) error      { return nil }
-func (s *leaseRetargetSpy) RemoveProxy(string, int) error { return nil }
+func (s *leaseRetargetSpy) AddProxy(context.Context, PortToken) error { return nil }
+func (s *leaseRetargetSpy) RemoveProxy(string, int) error             { return nil }
 func (s *leaseRetargetSpy) SetNID(nid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

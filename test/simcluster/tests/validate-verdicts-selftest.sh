@@ -28,24 +28,33 @@ export TETHER_DRILLDIR="$RT/drills"
 
 # A minimal VALID world. Drills are numeric-prefixed so they match the validator's `[0-9]*.sh` glob (the
 # real drills are 00-skeleton.sh etc.). One band pins an OPEN defect with a DEFINED signature.
+# 95-split is an ARM-SPLIT drill (`# arms: A B`, simcluster-speed plan §5.5): its parent row is derived
+# from the two child rows (join INCOMPLETE, nc_gap 1+2, bands `-`), and B carries an arm-suffixed band.
 seed() {
     rm -f "$RT/drills"/*.sh
     : > "$RT/drills/90-d1.sh"; : > "$RT/drills/91-d2.sh"
+    printf '#!/bin/sh\n# arms: A B\n# fixture: A=N1 B=N1\n# grows: A=0 B=0\n# worst: A=60 B=60\n# forgoes: A=- B=-\ncase "${ARM:?}" in A) ;; B) ;; *) setup_fail x ;; esac\n' > "$RT/drills/95-split.sh"
     cat > "$TETHER_VERDICTS_TSV" <<'EOF'
 # drill	expected	expected_nc_gap	bands	owner	note-ref
 90-d1	GREEN	0	-	-	90-d1
 91-d2	INCOMPLETE	1	ASSERT-FAIL@#10@sig:known	#10	91-d2
+95-split	INCOMPLETE	3	-	#10 parent debt	95-split
+95-split.A	INCOMPLETE	1	-	-	95-split
+95-split.B	INCOMPLETE	2	INCOMPLETE@#10@sig:b-thing-B	#10	95-split
 EOF
     cat > "$TETHER_VERDICTS_LOG" <<'EOF'
 ## 90-d1
 ## 91-d2
   sig:known := some-error-pattern
+## 95-split
+  sig:b-thing-B := arm B pattern
+## 95-split.A
 EOF
     cat > "$TETHER_LEDGER" <<'EOF'
-### #10 an open defect
-still open.
-### #99 a closed one
-FIXED here.
+### #10 an open defect（OPEN；见 #99 已修复 的同族根因）
+still open. FIXED elsewhere is not this entry.
+### #99 a closed one（FIXED）
+the closure word is on the HEADING, the only place either ledger gate reads (lib/ledger.sh).
 EOF
 }
 run_validator() { sh "$VALIDATOR" 2>&1; }
@@ -81,6 +90,27 @@ mut "drill on disk not in table"    DRILL-UNLISTED     sh -c ': > "'"$RT"'/drill
 mut "table row with no drill"       ROW-ORPHAN         sh -c 'printf "93-d9\tGREEN\t0\t-\t-\t93-d9\n" >> "'"$TETHER_VERDICTS_TSV"'"'
 # MI7: the closed-defect / band-sig checks must NOT fail open when the ledger is missing.
 mut "missing ledger is fail-CLOSED" 'missing gotcha ledger' rm -f "$TETHER_LEDGER"
+
+# ── arm-split child rows (simcluster-speed plan §6.3 V-1…V-8) ────────────────────────────────────────
+mut "V-1 parent nc_gap != Σ children"        PARENT-NCGAP        sed -i 's|^95-split\tINCOMPLETE\t3|95-split\tINCOMPLETE\t2|' "$TETHER_VERDICTS_TSV"
+mut "V-2 parent carries a band"              PARENT-BANDS        sed -i 's|^95-split\tINCOMPLETE\t3\t-|95-split\tINCOMPLETE\t3\tINCOMPLETE@#10@sig:known|' "$TETHER_VERDICTS_TSV"
+mut "V-3 manifest arm with no child row"     ARM-CHILD-COUNT     sed -i '/^95-split\.A\t/d' "$TETHER_VERDICTS_TSV"
+mut "V-3b two rows for one arm"              ARM-CHILD-COUNT     sh -c 'printf "95-split.A\tINCOMPLETE\t1\t-\t-\t95-split\n" >> "'"$TETHER_VERDICTS_TSV"'"'
+mut "V-4 orphan child (arm not in manifest)" CHILD-ARM-UNKNOWN   sh -c 'printf "95-split.Q\tGREEN\t0\t-\t-\t95-split\n" >> "'"$TETHER_VERDICTS_TSV"'"'
+mut "V-4b child of a drill with no manifest" CHILD-NO-MANIFEST   sh -c 'printf "90-d1.A\tGREEN\t0\t-\t-\t90-d1\n" >> "'"$TETHER_VERDICTS_TSV"'"'
+mut "V-4c child of a drill not on disk"      CHILD-ORPHAN        sh -c 'printf "96-nope.A\tGREEN\t0\t-\t-\t95-split\n" >> "'"$TETHER_VERDICTS_TSV"'"'
+mut "V-5 child owner outside the parent's"   CHILD-OWNER         sed -i 's|^95-split\.B\tINCOMPLETE\t2\tINCOMPLETE@#10@sig:b-thing-B\t#10|95-split.B\tINCOMPLETE\t2\tINCOMPLETE@#10@sig:b-thing-B\t#10 #11|' "$TETHER_VERDICTS_TSV"
+mut "V-6 child nc_gap '-' with no section"   CHILD-NCGAP-DASH-NO-SECTION sh -c 'sed -i "s|^95-split\.B\tINCOMPLETE\t2|95-split.B\tINCOMPLETE\t-|; s|^95-split\tINCOMPLETE\t3|95-split\tINCOMPLETE\t-|" "'"$TETHER_VERDICTS_TSV"'"'
+mut "V-6b child '-' but parent still numeric" PARENT-NCGAP       sed -i 's|^95-split\.A\tINCOMPLETE\t1|95-split.A\tINCOMPLETE\t-|' "$TETHER_VERDICTS_TSV"
+mut "V-7 signature ERE ends with \$"         BAND-SIG-ANCHORED   sed -i 's|sig:b-thing-B := arm B pattern|sig:b-thing-B := arm B pattern$|' "$TETHER_VERDICTS_LOG"
+mut "V-7b signature ERE contains @"          BAND-SIG-AT         sed -i 's|sig:b-thing-B := arm B pattern|sig:b-thing-B := arm@B pattern|' "$TETHER_VERDICTS_LOG"
+mut "V-8 child band slug without arm suffix" CHILD-BAND-SLUG     sh -c 'sed -i "s|sig:b-thing-B|sig:b-thing|" "'"$TETHER_VERDICTS_TSV"'" "'"$TETHER_VERDICTS_LOG"'"'
+mut "V-8b one slug shared by two rows"       BAND-SLUG-SHARED    sed -i 's|^90-d1\tGREEN\t0\t-\t-|90-d1\tGREEN\t0\tASSERT-FAIL@#10@sig:known\t#10|' "$TETHER_VERDICTS_TSV"
+mut "V-9 parent expected != children join"   PARENT-JOIN         sed -i 's|^95-split\tINCOMPLETE\t3|95-split\tGREEN\t3|' "$TETHER_VERDICTS_TSV"
+# Control: the '-' child WITH its own section is accepted when the parent is '-' as well.
+seed; sed -i 's|^95-split\.A\tINCOMPLETE\t1|95-split.A\tINCOMPLETE\t-|; s|^95-split\tINCOMPLETE\t3|95-split\tINCOMPLETE\t-|' "$TETHER_VERDICTS_TSV"
+if run_validator | grep -q 'validate-verdicts: OK'; then pass "control: a '-' child with a '## 95-split.A' section and a '-' parent passes"
+else fail "control: the documented '-' child form is rejected: $(run_validator | tail -2 | tr '\n' '|')"; fi
 
 echo "────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAILS" = 0 ]; then echo "validate-verdicts-selftest: ALL PASS"; exit 0; else echo "validate-verdicts-selftest: $FAILS FAILED"; exit 1; fi

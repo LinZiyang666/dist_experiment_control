@@ -25,32 +25,59 @@ set -u
 . "$HERE/drills/lib/logs.sh"
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
-# Written recovery budget — DERIVED, not guessed (first real runs, 2026-08-02: a 90s budget passed
-# once and failed twice, i.e. it was being satisfied by luck):
+# Written recovery budget — DERIVED from the product's own liveness constants, not guessed (first real
+# runs, 2026-08-02: a 90s budget passed once and failed twice, i.e. it was being satisfied by luck).
 #
-#   detection   up to 4min. tether does NOT set nats.Options.PingInterval/MaxPingsOut, so nats.go's
-#               defaults apply (2min ping interval, 2 outstanding pings). Under a SILENT DROP there is
-#               no RST to shortcut this — the connection is only declared dead when the pings time out.
-#   redialAfter 20s, armed by DisconnectErrHandler AFTER that declaration.
-#   ladder      closeBudget 10s + poisonGrace 10s (gotcha #72 fix).
-#   reconnect   dial + register on a surviving voter, plus backoff.
+# HISTORY OF THE DETECTION TERM. Until simcluster-speed H (2026-09-19) tether set neither
+# nats.Options.PingInterval nor MaxPingsOut, so nats.go's defaults applied (2min × 2) and detection was
+# "up to 4min" — measured on the deploy tier at EXACTLY 4:00 twice (U-98: injection → the cut broker's
+# /connz dropping the client, i.e. the SERVER's own 2min×2 kill cycle), budget 330s. H made the probe
+# tether's: the agent pings every PING_INTERVAL_S and gives up after PING_MAX unanswered
+# (internal/agent AgentPingInterval / AgentMaxPingsOut), and install.sh writes the same numbers into
+# nats.conf for the server half. test/architecture/nats_ping_defaults_test.go keeps this file's
+# PING_INTERVAL_S equal to the product constant, so a product change reddens this budget instead of
+# leaving it describing a product that no longer exists (testing-standards T7).
+#
+#   detection   <= (PING_MAX+1) × PING_INTERVAL_S: nats.go declares the link dead once PING_MAX pings
+#               are outstanding, at the next interval. Under a SILENT DROP there is no RST to shortcut
+#               this — the connection is only declared dead when the pings time out.
+#   redialAfter 20s, armed by DisconnectErrHandler AFTER that declaration (internal/agent roster.go).
+#   ladder      closeBudget 10s + poisonGrace 10s (gotcha #72 fix, internal/agent conn_teardown.go).
+#   reconnect   dial + register on a surviving voter, plus backoff: a 30s allowance.
+#   ×2          load margin. The deploy host runs other tenants; a budget that is exactly the sum is
+#               the 2026-08-02 lesson again.
 #
 # The product's published ≤60s bound covers the part AFTER nats.go declares the disconnect (usage.md
 # §9.9 says so explicitly); this drill necessarily measures detection + that bound, so its budget is
-# the sum. Widening it is not inventing an SLA — the 4min term is a documented library default.
-RECOVERY_BUDGET=330
+# the sum. Nothing here is an SLA claim beyond that.
+PING_INTERVAL_S=20
+PING_MAX=2
+REDIAL_AFTER_S=20; CLOSE_BUDGET_S=10; POISON_GRACE_S=10; RECONNECT_ALLOWANCE_S=30
+RECOVERY_BUDGET=$(( 2 * ( (PING_MAX + 1) * PING_INTERVAL_S + REDIAL_AFTER_S + CLOSE_BUDGET_S + POISON_GRACE_S + RECONNECT_ALLOWANCE_S ) ))
 
 _cleanup() { fault_cleanup_all 2>/dev/null; true; }
 drill_install_traps _cleanup
 
-_hb_of() { "$SIM" ctl -- node ls --json 2>/dev/null | jq -r --arg n "$1" '.nodes[]?|select(.nid==$n)|.last_heartbeat_at' | head -1; }
+# `-a`: `node ls` without it lists ONLINE nodes only, and at the watermark instant agt1 is often already
+# STALE (its heartbeat rides the edge just cut; the G.2 sweep flips status after stale_after=5 s) — so the
+# read came back `"nodes": []` five times in 15 s and the drill died SETUP-RED at the watermark (S2 -j6 twice
+# with CUT_BROKER=brk2, round-2 re-run with brk3; the brk1 solos passed only because the read landed inside
+# the 5 s). The watermark is a heartbeat TIMESTAMP, valid whatever the status column says; ONLINE is
+# `_online`'s question, asked separately.
+_hb_of() { "$SIM" ctl -- node ls -a --json 2>/dev/null | jq -r --arg n "$1" '.nodes[]?|select(.nid==$n)|.last_heartbeat_at' | head -1; }
 _online() { "$SIM" ctl -- node ls --json 2>/dev/null | jq -e --arg n "$1" '.nodes[]?|select(.nid==$n and .status=="ONLINE")' >/dev/null 2>&1; }
 _mainpid() { "$SIM" exec agt1 -- systemctl show tether-agent -p MainPID --value 2>/dev/null; }
 _exe_of_pid() { dexec agt1 -- readlink "/proc/$1/exe" 2>/dev/null; }
 
 # heartbeat ADVANCES past a captured watermark — the one probe the #72 incident proved trustworthy
 # (PID-alive and ESTABLISHED-socket both read healthy while the node was gone).
-_hb_advanced() { _n=$(_hb_of agt1); [ -n "$_n" ] && [ "$_n" != "$HB0" ] && _online agt1; }
+_hb_advanced() { _n=$(_hb_of agt1); [ -n "$_n" ] && [ "$_n" != "$HB_INJ" ] && _online agt1; }
+# RECOVERY is a CONJUNCTION (simcluster-speed X14): the heartbeat has advanced past the watermark taken
+# AT INJECTION *and* /connz on a surviving voter holds agt1's client connection. Either half alone has
+# a false-positive: a heartbeat written through the dying link a moment after the watermark read, or a
+# TCP session that exists but never re-registered. Together they can only be true after the agent
+# re-registered THROUGH ANOTHER VOTER, which is the claim.
+_recovered_on_survivor() { _hb_advanced && _registered_on_another_voter; }
 # IMPACT proof, third and final shape (first real runs, 2026-08-02). A "heartbeat stalls" probe was
 # the wrong instrument twice over: it compared against a watermark captured BEFORE the connz discovery
 # and the three injection asserts, so the heartbeat had already advanced past it through the still
@@ -59,10 +86,10 @@ _hb_advanced() { _n=$(_hb_of agt1); [ -n "$_n" ] && [ "$_n" != "$HB0" ] && _onli
 # IS unambiguous — and comes from the same authoritative source as the baseline — is that the client
 # connection LEFT the broker we cut. If the cut had missed the live edge (both earlier mistakes),
 # /connz would still show agt1 on CUT_BROKER and this stays red.
-# IMPACT: the connection must be OBSERVED ABSENT from the cut broker — an observation error keeps
-# polling instead of passing (F5.4). On success it stamps HB_IMPACT, the post-fault watermark every
-# recovery assertion below compares against (F5.1: HB0 was captured before discovery + injection, so
-# a heartbeat written through the still-healthy link already satisfied the old check).
+# SERVER-SIDE DROP: the connection must be OBSERVED ABSENT from the cut broker — an observation error
+# keeps polling instead of passing (F5.4). Since simcluster-speed X14 this is EVIDENCE that the cut bit
+# the live edge and that the server half of the liveness probe works; it no longer gates recovery nor
+# supplies its watermark (that is taken at injection — see the parent-shell block below).
 _conn_left_cut_broker() {
     case "$(_connz_state "$CUT_BROKER")" in
         absent)  return 0 ;;
@@ -71,9 +98,9 @@ _conn_left_cut_broker() {
     esac
 }
 # Recovery is a PRODUCT fact, not a transport fact (F5.2): the heartbeat must advance past the
-# POST-IMPACT watermark (HB0, re-read in the PARENT shell right after the impact assert — see there),
-# which only happens once the agent has re-registered and its heartbeats are being recorded again.
-# connz alone would only prove that a TCP session exists.
+# AT-INJECTION watermark (HB_INJ, captured in the PARENT shell right after the injection asserts —
+# see there), which only happens once the agent has re-registered and its heartbeats are being
+# recorded again. connz alone would only prove that a TCP session exists — hence the conjunction.
 # One ABSOLUTE deadline shared by impact + recovery (F5.3): two independent full budgets meant the
 # pair could legitimately consume 2×RECOVERY_BUDGET while the drill still claimed "within the
 # written budget". _budget_left prints the seconds remaining, floored at 1.
@@ -134,6 +161,9 @@ _broker_holding_agt1() {
     done
     return 1
 }
+# The watermark precondition (R1-F3): the cut broker must still hold the live connection when HB_INJ is
+# read; `error` (unreadable /connz) is a failure, never a pass.
+_cut_still_holds_agt1() { [ "$(_connz_state "$CUT_BROKER")" = present ]; }
 # Recovery must land on a voter OTHER than the one we cut (the DROP stays armed, so the cut broker
 # cannot heal). Scans the survivors for a register logged AFTER the cut.
 # Recovery must land on a voter OTHER than the one we cut — asked of /connz, the same authoritative
@@ -177,33 +207,77 @@ assert_ok "inject self-proof A: agt1 -> $CUT_BROKER:4222 black-holes (rc 124, a 
 assert_ok "inject self-proof B: agt1 -> $SURVIVOR:4222 is STILL reachable (the cut is one edge, so a failover target exists)" \
           fault_assert_reachable agt1 "$SURVIVOR" 4222
 
-# IMPACT first (internal review F98-2): prove the cut actually bit the LIVE connection before
-# claiming a recovery. Without this the drill can pass vacuously on an edge the agent was not using —
-# which is exactly what the first two runs did, and what this arm caught both times.
-DEADLINE=$(( $(date +%s) + RECOVERY_BUDGET ))   # ONE absolute budget for impact AND recovery (F5.3)
-assert_ok "IMPACT the cut hit the LIVE connection: /connz OBSERVES agt1 absent from $CUT_BROKER (it was present at baseline; an observation error does not count)" \
-          poll_until "$(_budget_left)" 5 "agt1 connection leaves $CUT_BROKER" -- _conn_left_cut_broker
-# REFRESH THE WATERMARK IN THE PARENT SHELL (external review F5.1). HB0 was captured before the connz
-# discovery and the three injection asserts, so a heartbeat written through the still-healthy link had
-# already moved past it and the recovery poll could pass without anything recovering. Re-read it now
-# that the fault is proven to have bitten: heartbeats are stalled, so this is the last pre-recovery
-# value. It MUST be a parent-shell assignment — poll_until runs its predicate in a subshell, so a
-# refresh inside the predicate would never reach the assertions below.
-HB0=$(_hb_of agt1)
-[ -n "$HB0" ] || die "98: post-impact heartbeat watermark capture failed"
-log "98: post-impact heartbeat watermark HB0=$HB0"
+# THE WATERMARK IS TAKEN AT INJECTION, in the PARENT shell (poll_until runs predicates in a subshell,
+# so a read inside one never reaches the assertions below). History, because the order here was wrong
+# twice: HB0 above was captured before the connz discovery + the three injection asserts, so a
+# heartbeat written through the still-healthy link had already passed it (external review F5.1); the
+# fix then moved the watermark to AFTER an IMPACT poll (the cut broker's /connz dropping agt1) — which
+# was the server's own dead-client kill and, at nats-server's default 2min×2, always landed ~4min after
+# injection, comfortably BEFORE the client noticed. simcluster-speed H inverted that order: the agent
+# now declares the link dead at (PING_MAX+1)×PING_INTERVAL_S and re-registers elsewhere BEFORE the
+# server drops the old connection, so a "post-impact" watermark would be read AFTER recovery and the
+# recovery assertion would be structurally always-true (plan X14). The last heartbeat that could have
+# crossed the live link is the one at the cut; nothing can advance it afterwards except a
+# re-registration through another voter — which, ANDed with that voter's /connz, is the recovery claim.
+# The conjunction below proves "re-registered through a survivor" only if the live connection was
+# STILL on the cut broker when the watermark was taken. Between the /connz discovery above and the DROP a
+# proactive rehome / roster refresh could already have moved agt1 to a survivor; the watermark would
+# then advance through a link that was never cut, the survivor's /connz would list agt1 at once, and
+# SERVER-SIDE would pass on a connection that was never there — a GREEN with nothing recovered
+# (internal review round 1 R1-F3). Pin the precondition at the watermark instant, fail-closed on an
+# unreadable /connz.
+assert_ok "inject self-proof C: at the watermark instant $CUT_BROKER's /connz STILL holds agt1's client connection (the cut edge is the live one; a connection that had already moved to a survivor would make the recovery conjunction vacuous)" \
+          _cut_still_holds_agt1
+DEADLINE=$(( $(date +%s) + RECOVERY_BUDGET ))   # ONE absolute budget for recovery AND the server-side evidence (F5.3)
+T_INJECT=$(date +%s)
+# The watermark read is retried (5 × 3 s) and each miss is LOGGED with the ctl's own rc/stderr; a single
+# silent read cost the S2 sweep of 2026-09-19 two SETUP-REDs on this line (both with CUT_BROKER=brk2, solo
+# re-run included) with no evidence of WHY `node ls --json` came back empty. The retry is NEUTRAL for the
+# recovery predicate, not "stricter": `_hb_advanced` is an INEQUALITY against the watermark, and under a dead
+# link the heartbeat is frozen, so a read 3–15 s later returns the same value (round-2 review R1-F7 — the
+# first version's comment argued the wrong direction). What the retry window DOES re-open is self-proof C's
+# gap: a rehome landing inside those seconds would move agt1 first and hand the watermark a post-recovery
+# heartbeat. So C is RE-ASSERTED right after the read that succeeds, at the watermark instant itself.
+HB_INJ=""; _hb_try=0
+while [ -z "$HB_INJ" ] && [ "$_hb_try" -lt 5 ]; do
+    _hb_try=$((_hb_try + 1))
+    _hb_raw=$("$SIM" ctl -- node ls -a --json 2>&1); _hb_rc=$?
+    HB_INJ=$(printf '%s' "$_hb_raw" | jq -r --arg n agt1 '.nodes[]?|select(.nid==$n)|.last_heartbeat_at' 2>/dev/null | head -1)
+    case "$HB_INJ" in null) HB_INJ="" ;; esac
+    if [ -z "$HB_INJ" ]; then
+        log "98: watermark read $_hb_try/5 came back empty — node ls rc=$_hb_rc: $(printf '%s' "$_hb_raw" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-300)"
+        [ "$_hb_try" -lt 5 ] && sleep 3
+    fi
+done
+[ -n "$HB_INJ" ] || die "98: at-injection heartbeat watermark capture failed (5 reads over 15 s; see the node ls output above)"
+log "98: at-injection heartbeat watermark HB_INJ=$HB_INJ (t_inject=$T_INJECT, reads=$_hb_try)"
+# Self-proof C AT THE WATERMARK: the cut edge must still be the live one at the instant the watermark was
+# read, or the recovery conjunction below can be satisfied by a rehome that landed inside the retry window
+# (round-2 review R1-F7). Fail-closed on an unreadable /connz, like the first C.
+assert_ok "inject self-proof C′: at the watermark instant (read $_hb_try) $CUT_BROKER's /connz STILL holds agt1's client connection — the retry window did not let a rehome move agt1 before the watermark was taken" \
+          _cut_still_holds_agt1
 
-# The recovery assertion — the whole drill: heartbeat resumes THROUGH ANOTHER VOTER inside the WRITTEN
-# budget. Pre-fix, the teardown could sit in nc.Close() for ~11min with systemd reading active/running.
-# NB the DROP stays ARMED — recovery must come from failover to brk2/brk3, never from the cut healing.
-# BUDGET NOTE (internal review F98-1): the ledger's ≤60s bound is measured from the moment nats.go
-# DECLARES the disconnect (redialAfter is armed by DisconnectErrHandler). Under a silent DROP that
-# declaration waits on NATS ping timeouts, so this poll budget deliberately covers detection + the
-# bounded teardown; it is not a claim that ≤60s starts at injection.
-assert_ok "RECOVERY heartbeat advances past the POST-IMPACT watermark within the SHARED ${RECOVERY_BUDGET}s budget (DROP still armed) — proves the product re-registered, not merely that a socket exists" \
-          poll_until "$(_budget_left)" 5 "agt1 heartbeat advances past the post-impact watermark" -- _hb_advanced
-assert_ok "RECOVERY landed on ANOTHER voter: /connz OBSERVES agt1 on a voter other than $CUT_BROKER (the cut stays armed, so it cannot be a heal)" \
-          poll_until "$(_budget_left)" 5 "agt1 connection appears on a survivor" -- _registered_on_another_voter
+# The recovery assertion — the whole drill: the agent re-registers THROUGH ANOTHER VOTER inside the
+# WRITTEN budget. Pre-fix, the teardown could sit in nc.Close() for ~11min with systemd reading
+# active/running. NB the DROP stays ARMED — recovery must come from failover to brk2/brk3, never from
+# the cut healing. BUDGET NOTE (internal review F98-1): the ledger's ≤60s bound is measured from the
+# moment nats.go DECLARES the disconnect (redialAfter is armed by DisconnectErrHandler). Under a silent
+# DROP that declaration waits on the ping timeout, so this poll budget deliberately covers detection +
+# the bounded teardown; it is not a claim that ≤60s starts at injection.
+assert_ok "RECOVERY within the SHARED ${RECOVERY_BUDGET}s budget (DROP still armed): agt1's heartbeat advances past the AT-INJECTION watermark AND /connz OBSERVES agt1 on a voter other than $CUT_BROKER — both, so it can only be a re-registration through a survivor, never a socket that exists or a heartbeat that slipped through the dying link" \
+          poll_until "$(_budget_left)" 5 "agt1 re-registers on a survivor (heartbeat + /connz)" -- _recovered_on_survivor
+T_RECOVER=$(date +%s)
+log "98: recovery observed ≈$((T_RECOVER - T_INJECT))s after injection (budget ${RECOVERY_BUDGET}s; detection term $(( (PING_MAX + 1) * PING_INTERVAL_S ))s)"
+
+# SERVER-SIDE EVIDENCE (internal review F98-2, re-scoped): the cut broker must ALSO drop the dead
+# connection — that is nats.conf's ping_interval/ping_max (the server half of the same contract) doing
+# its job, and it is what proves the cut bit the LIVE edge rather than one the agent was not using
+# (the first two runs' failure mode). It is asserted, bounded by the same shared budget, but it no
+# longer gates the recovery claim: with the client half faster than the server half it may land after
+# recovery, and that ordering is the product's design, not a defect.
+assert_ok "SERVER-SIDE the cut broker $CUT_BROKER drops the dead client itself: /connz OBSERVES agt1 absent (nats.conf ping_interval×(ping_max+1); an observation error does not count)" \
+          poll_until "$(_budget_left)" 5 "agt1 connection leaves $CUT_BROKER" -- _conn_left_cut_broker
+log "98: server-side drop observed ≈$(( $(date +%s) - T_INJECT ))s after injection; closed-connection reason: $("$SIM" exec "$CUT_BROKER" -- sh -c 'curl -sf --max-time 2 "http://127.0.0.1:8223/connz?state=closed"' 2>/dev/null | jq -r --arg n "tether-agent:$SID:agt1" '[.connections[]?|select(.name==$n)|.reason] | last // "unavailable"' 2>/dev/null)"
 
 # Classify WHICH allowed path recovered (three-way, never banded silently):
 # origin: internal review F98-4 (S14) — the previous shape used `sh -c 'true'` / `[ -n "$PID1" ]`,

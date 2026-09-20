@@ -1502,16 +1502,32 @@ func (c *Client) Start(ctx context.Context) {
 // proto.CertPins{}). Kept so non-clustered callers (and existing tests) stay
 // unchanged.
 func (c *Client) Open(publicPort, localPort int, token string) error {
-	return c.OpenHome(publicPort, localPort, token, "", 0, proto.CertPins{})
+	if c.ctx == nil {
+		return errors.New("tunnel client: Start not called")
+	}
+	return c.OpenHome(c.ctx, publicPort, localPort, token, "", 0, proto.CertPins{})
 }
 
 // OpenHome establishes (or epoch-monotone replaces) a yamux session for one
 // (publicPort, token) pair against a SPECIFIC home broker (D6 §7.5), pinned by
 // certPins, at home epoch. brokerAddr "" falls back to the Client's single
 // configured addr (N=1). See the package doc / Open for the supervisor contract.
-func (c *Client) OpenHome(publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) error {
+//
+// ctx bounds THE OPEN ONLY — the wait for a dial, the REGISTER handshake and the
+// install under c.mu — never the session it installs: the session and its
+// supervisor live on the Client's Start ctx exactly as before. When ctx ends
+// mid-handshake the conn is closed and the ctx error returned; when it ends
+// between a successful REGISTER and the install, the freshly-registered transport
+// is discarded and the ctx error returned, so a caller whose deadline has passed
+// never gets a late success it already reported as a failure. The agent's
+// forwarded-expose handler passes the remaining share of its reply budget here
+// (gotcha #86 / external review F1); reconcile and boot replay pass the run ctx.
+func (c *Client) OpenHome(ctx context.Context, publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) error {
 	if c.ctx == nil {
 		return errors.New("tunnel client: Start not called")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tunnel client: Open: %w", err)
 	}
 	// Sample the rename generation BEFORE the REGISTER handshake reads the nid,
 	// so the check under the lock below covers the whole dial window.
@@ -1524,13 +1540,38 @@ func (c *Client) OpenHome(publicPort, localPort int, token, brokerAddr string, e
 	if brokerAddr != "" && certPins.Current == "" {
 		return ErrHomePinsRequired
 	}
-	conn, yamuxSess, err := c.dialAndRegister(c.ctx, publicPort, token, brokerAddr, epoch, certPins)
+	// The handshake ends when EITHER the caller's ctx or the Client's Start ctx ends: hsCtx is a
+	// child of c.ctx (Start-cancel still reaps a blocked dial) that the caller's ctx cancels too.
+	// Only the handshake sees it — the session installed below is anchored to c.ctx, not to
+	// the caller (a control-plane deadline must not become a data-plane lifetime, gotcha #80).
+	hsCtx, cancelHS := context.WithCancel(c.ctx)
+	defer cancelHS()
+	stopRelay := context.AfterFunc(ctx, cancelHS)
+	defer stopRelay()
+	conn, yamuxSess, err := c.dialAndRegister(hsCtx, publicPort, token, brokerAddr, epoch, certPins)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			// Name the caller's deadline, not the closed-conn symptom it produced ("use of closed
+			// network connection" reads as a broker fault; "context deadline exceeded" reads as
+			// what it is — the open did not finish inside the caller's budget).
+			return fmt.Errorf("tunnel client: Open: %w (%v)", cerr, err)
+		}
 		return fmt.Errorf("tunnel client: Open: %w", err)
 	}
 	sessCtx, cancel := context.WithCancel(c.ctx)
 
 	c.mu.Lock()
+	// External review F1: the caller's budget ran out between REGISTER OK and the install. Its
+	// caller has already (or is about to) report this open as failed; installing now would leave
+	// a live session for a port the broker rolled back. Discard the transport (the broker sees a
+	// session drop on a row it is deleting anyway) and return the deadline.
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		cancel()
+		_ = conn.Close()
+		_ = yamuxSess.Close()
+		return fmt.Errorf("tunnel client: Open finished after the caller's deadline: %w", err)
+	}
 	// THE RENAME FENCE (external review F6). This Open told the server which
 	// name it was during a REGISTER that happened outside the lock; if the name
 	// has changed since, that handshake is void and installing the session would
@@ -1637,8 +1678,10 @@ func (c *Client) ApplyHome(publicPort int, brokerAddr string, epoch int64, certP
 	c.mu.Unlock()
 	// OpenHome is the atomic replace (re-checks the epoch under mu, cancels the
 	// old supervisor, installs the new session + supervisor). A transient/terminal
-	// DENY surfaces to the caller for retry/handling.
-	return c.OpenHome(publicPort, localPort, token, brokerAddr, epoch, certPins)
+	// DENY surfaces to the caller for retry/handling. The rehome dial is bounded by
+	// the Client's own lifetime only: its caller (the agent's reconcile ladder)
+	// owns the retry, and nobody upstream is holding a request open for it.
+	return c.OpenHome(c.ctx, publicPort, localPort, token, brokerAddr, epoch, certPins)
 }
 
 func (c *Client) HasSession(publicPort int) bool {
@@ -1672,19 +1715,17 @@ func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token, bro
 		return nil, nil, fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
 	}
 	// Close the conn on ctx.Done until the handshake completes so a blocked
-	// Write/ReadString is interrupted by Close/Start-cancel. On the success
-	// path stopHS fires before any later ctx.Done can reach the conn; if ctx
-	// is ALREADY canceled we're shutting down, so closing the fresh conn is
-	// correct (the supervisor discards it on ctx.Err()).
-	hsDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-hsDone:
-		}
-	}()
-	defer close(hsDone)
+	// Write/ReadString is interrupted by Close/Start-cancel/the caller's open
+	// deadline. AfterFunc + stop is deterministic where a goroutine selecting on
+	// {ctx.Done, hsDone} was not: since OpenHome cancels its handshake ctx on
+	// EVERY return (external review F1), a watcher first scheduled after both
+	// channels were closed would pick a branch at random and could close the
+	// conn of a session that was just installed (re-review R2). stop() returning
+	// true means the close never started, so a completed handshake's conn is
+	// never touched; if ctx is ALREADY done the close runs at once, which is
+	// correct — the caller discards the result on ctx.Err().
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 
 	// D6 §7.2(b): 6-field REGISTER carrying this expose's home epoch (0 in N=1).
 	line := fmt.Sprintf("REGISTER %s %s %d %s %d\n", c.sid, c.nidValue(), publicPort, token, epoch)

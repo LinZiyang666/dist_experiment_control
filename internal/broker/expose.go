@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -79,6 +80,21 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 			b.cfg.Logger.Warn("tunnel: token lookup transient store error",
 				"sid", sid, "nid", nid, "port", publicPort, "err", err)
 			return fmt.Errorf("try_again")
+		}
+		// gotcha #86: "no such row" is only authoritative from a replica that has applied everything
+		// the leader committed. A follower that is behind (apply lag under load — the leader has
+		// committed the allocation, forwarded the expose, and the agent dialled here before this
+		// FSM applied it) must answer the TRANSIENT home_catching_up, exactly as the epoch ladder
+		// below does for a not-yet-applied reassign; the agent retries and the row appears. This
+		// leaks nothing: the answer is a function of this replica's own lag, never of the token
+		// (the F6 absent/mismatch/off collapse below is untouched), and a caught-up replica still
+		// says token_unknown_or_revoked. The lag is read in the COMMAND domain (homeApplyLagging):
+		// the raft-domain CaughtUp reads true while the FSM is still inside the SQLite apply, which
+		// is precisely this window (round-2 review R2-F2).
+		if missingTokenIsCatchingUp(b.clusterMode, homeApplyLagging(b.cl, b.cfg.Logger)) {
+			b.cfg.Logger.Warn("tunnel: token unknown on a replica that is still catching up — transient",
+				"sid", sid, "nid", nid, "port", publicPort)
+			return fmt.Errorf("%s", proto.ReasonHomeCatchingUp)
 		}
 		return fmt.Errorf("token_unknown_or_revoked")
 	}
@@ -145,6 +161,86 @@ func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash st
 		// epoch: allow (fall through to return nil).
 	}
 	return nil
+}
+
+// The expose home-applied barrier (gotcha #86). The budget stays well inside the ctl's 15 s expose
+// request and does not eat into ExposeForwardTimeout (it runs BEFORE the forward). One step is one
+// cursor scatter/gather window; 400 ms is enough for every broker on a LAN to answer, and 3 s covers the
+// apply lags measured under the deploy tier's contention rounds without turning a dead home into a
+// 15 s ctl timeout — a home that never answers is the ordinary "forward anyway" path.
+const (
+	exposeHomeApplyBudget = 3 * time.Second
+	exposeHomeApplyStep   = 400 * time.Millisecond
+)
+
+// missingTokenIsCatchingUp is the pure half of the gotcha-#86 deny classification: a token the local
+// store does not know is TRANSIENT (home_catching_up) only on a clustered replica that is LAGGING
+// (homeApplyLagging); single mode (the store IS the authority) and a replica that owes no committed
+// command keep the terminal answer.
+func missingTokenIsCatchingUp(clusterMode, lagging bool) bool {
+	return clusterMode && lagging
+}
+
+// homeApplyLagging answers "may this replica's store be missing a write the leader has already
+// committed?" — the #86 home-half predicate. Two readings, either one is lag:
+//
+//   - !Node.CaughtUp (raft domain): never synced with a leader, or a committed batch not yet even
+//     dispatched to the FSM (the large-replay backpressure case);
+//   - Node.CommandApplyLagging (command domain): the SQLite command cursor trails the newest
+//     committed LogCommand — the FSM is inside (or queued behind) a slow apply. This is the window
+//     #86 describes and the one the raft-domain reading cannot see (CaughtUp's HONEST LIMIT #1).
+//
+// A cluster runtime that is not wired yet, and a read error, both read as lagging: the transient
+// answer costs the agent a bounded retry, the terminal one costs a healthy expose. A package
+// function rather than a Broker method: the Broker method budget is a ratchet, and this needs
+// nothing of the broker but its runtime and its logger.
+func homeApplyLagging(cl *clusterRuntime, logger *slog.Logger) bool {
+	if cl == nil {
+		return false // single mode: the store is the authority
+	}
+	if cl.node == nil {
+		return true
+	}
+	return applyLagOf(cl.node, logger)
+}
+
+// applyLagSource is the two readings applyLagOf combines; *cluster.Node is the production source,
+// a scripted one pins the combination (expose_test.go) without a three-node cluster.
+type applyLagSource interface {
+	CaughtUp() bool
+	CommandApplyLagging() (bool, error)
+}
+
+func applyLagOf(node applyLagSource, logger *slog.Logger) bool {
+	if !node.CaughtUp() {
+		return true
+	}
+	lagging, err := node.CommandApplyLagging()
+	if err != nil {
+		logger.Warn("tunnel: command apply lag unreadable — answering transient", "err", err)
+		return true
+	}
+	return lagging
+}
+
+// awaitHomeApplied polls `poll` (a cursor scatter/gather keyed by node id) until `home` reports a
+// command-domain AppliedIndex >= need, or the budget is spent. It returns how long it waited and
+// whether the home caught up. A home missing from a poll (did not answer inside the step) simply
+// counts as not-yet; the wait is best-effort by design — the home's own home_catching_up answer
+// (homeApplyLagging, command domain since round 2) is the correctness half, this only makes the
+// common case not need it. Injected `poll` makes the ladder table-testable without NATS
+// (expose_home_barrier_test.go).
+func awaitHomeApplied(home string, need uint64, budget, step time.Duration, poll func() map[string]proto.ClusterHealthResp) (time.Duration, bool) {
+	start := time.Now()
+	for {
+		if r, ok := poll()[home]; ok && r.AppliedIndex >= need {
+			return time.Since(start), true
+		}
+		if time.Since(start) >= budget {
+			return time.Since(start), false
+		}
+		time.Sleep(step) // the real poll also gathers for one step, so ≈2 steps per iteration
+	}
 }
 
 // handleExposeReq is the broker entry point for `tether expose`.
@@ -251,6 +347,33 @@ func (b *Broker) handleExposeReq(nc *nats.Conn, msg *nats.Msg) {
 	// the COMMITTED home_broker + epoch the leader baked into the captured allocation (audit
 	// dataplane F1/F3/F7 — no re-resolve, no re-query).
 	fwdReq.Home = b.homeForExpose(alloc)
+	// gotcha #86: the agent dials the HOME the moment it receives this forward, and the home is a
+	// follower that may not have APPLIED the allocation yet (raft apply lags commit by an fsync under
+	// load). Its tunnelTokenLookup then finds no row and answers token_unknown_or_revoked — the
+	// terminal, anti-enumeration-collapsed code — so the agent gives up, replies frpc_failed, and the
+	// operator reads "the agent couldn't start the local proxy" for a race the leader created. The
+	// leader waits, bounded, until the home's command-domain AppliedIndex has reached its own (the
+	// cursor probe every broker answers); a home that does not catch up inside the budget still gets
+	// the forward (today's behaviour), and the home side now answers home_catching_up for that case.
+	if b.clusterMode && b.cl != nil && b.cl.node != nil && alloc.HomeBroker != "" && alloc.HomeBroker != b.selfNodeID() {
+		if need, aerr := b.cl.node.AppliedIndex(); aerr == nil {
+			home := alloc.HomeBroker
+			// The scatter ends the moment the HOME has answered with a current cursor: a home that
+			// applied within a millisecond costs a millisecond, not the whole step (round-2 R2-F4).
+			homeApplied := func(r map[string]proto.ClusterHealthResp) bool {
+				h, ok := r[home]
+				return ok && h.AppliedIndex >= need
+			}
+			waited, ok := awaitHomeApplied(home, need, exposeHomeApplyBudget, exposeHomeApplyStep, func() map[string]proto.ClusterHealthResp {
+				return pollClusterHealthUntil(nc, proto.SubjClusterCursor, exposeHomeApplyStep, homeApplied)
+			})
+			// Log the waits worth reading: a home that needed more than one step, or never caught up.
+			if waited > exposeHomeApplyStep || !ok {
+				b.cfg.Logger.Info("broker: expose waited for the home to apply the allocation",
+					"home", home, "need_applied", need, "waited", waited.Round(time.Millisecond), "caught_up", ok)
+			}
+		}
+	}
 	fwdBody, err := json.Marshal(&fwdReq)
 	if err != nil {
 		// roll back the allocation — no point keeping a row no agent saw

@@ -3,6 +3,7 @@ package natsconf
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -189,5 +190,53 @@ authorization {
 	}
 	if brokerNkey != "" {
 		t.Fatalf("multi-user authorization is ambiguous; broker nkey = %q, want empty", brokerNkey)
+	}
+}
+
+// origin: simcluster-speed plan §5.4 H — the server half of the client-liveness contract is two
+// passthrough keys whose WRONG spellings nats-server accepts silently or warns on, so the takeover
+// gate checks the value shape, not just the key name.
+func TestPreflightPingKeysPassthroughWithShapeCheck(t *testing.T) {
+	// Positive: the exact shape install.sh writes is preserved as passthrough, both keys.
+	own, err := Preflight(writeConf(t, installSHConf+"\nping_interval: \"20s\"\nping_max: 2\n"))
+	if err != nil {
+		t.Fatalf("install.sh's ping keys must pass the takeover: %v", err)
+	}
+	seen := map[string]Bucket{}
+	for _, e := range own.Entries {
+		seen[e.Key] = e.Bucket
+	}
+	for _, k := range []string{"ping_interval", "ping_max"} {
+		if seen[k] != TetherPassthrough {
+			t.Fatalf("%s classified %q, want %s", k, seen[k], TetherPassthrough)
+		}
+	}
+	if s, _ := own.Parsed["ping_interval"].(string); s != "20s" {
+		t.Fatalf("ping_interval parsed as %#v, want the string \"20s\"", own.Parsed["ping_interval"])
+	}
+
+	// Negatives: each wrong shape is refused, and the refusal names the key.
+	bad := []struct{ name, line, want string }{
+		{"bare integer interval (nats-server deprecation warning, fails -t)", "ping_interval: 20", "ping_interval"},
+		{"unquoted 2m (lexed as the number 2 000 000 seconds)", "ping_interval: 2m", "ping_interval"},
+		{"non-duration string", "ping_interval: \"soon\"", "ping_interval"},
+		{"quoted ping_max (type error at server start)", "ping_max: \"2\"", "ping_max"},
+		// internal review round 1 R2-F2 (-t passes these), wording per round 2 R2-F6: zero reverts to the
+		// server's slow default, negative closes every client at its first ping timer.
+		{"negative interval (closes every client)", "ping_interval: \"-20s\"", "closes every client"},
+		{"zero interval (reverts to the 2m default)", "ping_interval: \"0s\"", "default (2m"},
+		{"zero ping_max (reverts to the default 2)", "ping_max: 0", "default (2)"},
+		{"negative ping_max (closes every client)", "ping_max: -2", "closes every client"},
+	}
+	for _, c := range bad {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Preflight(writeConf(t, installSHConf+"\n"+c.line+"\n"))
+			if err == nil {
+				t.Fatalf("%s must be refused by the takeover", c.line)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("refusal must name %s, got: %v", c.want, err)
+			}
+		})
 	}
 }

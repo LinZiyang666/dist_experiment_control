@@ -39,19 +39,26 @@ SIM_ROOT="$(cd "$HERE/.." && pwd)"
 # DRILLS defaults to the real suite; overridable via env ONLY so the N-7 self-test (kept-sites-selftest.sh)
 # can point it at a scratch fixture. Production callers never set it.
 DRILLS="${DRILLS:-$SIM_ROOT/drills}"
+. "$SIM_ROOT/lib/manifest.sh"
 
-# count_sites <file> : emit the kept-site count for one drill.
+# count_sites <file> [<owner-map>] : emit the kept-site count for one drill — the total on the first line
+# and, when an owner map (`<line>\t<owner>`, lib/manifest.sh manifest_line_arms) is given, one
+# `<owner>\t<count>` line per owner that has at least one site.
 #
 # The tokenizer normalises each non-comment line by turning every shell command separator into a newline,
 # then inspects the FIRST WORD of each resulting fragment. A first word that is one of the six primitives is
 # a call site; anything else (including `#`, so trailing comments die here too) is prose or another command.
 count_sites() {
-    awk '
+    _cs_map="${2:-/dev/null}"
+    awk -v mapfile="$_cs_map" '
         BEGIN {
             split("assert_ok assert_refuses assert_setup assert_bug product_red not_covered", a, " ")
             for (i in a) K[a[i]] = 1
             n = 0
         }
+        # The owner map is read first. Matched by NAME, not by FNR==NR: an empty map (/dev/null) yields no
+        # records, so FNR==NR would stay true on the drill and swallow every line of it as map rows.
+        FILENAME == mapfile { owner[$1] = $2; next }
         /^[ \t]*#/ { next }                       # whole-line comment: never a call site
         {
             line = $0
@@ -67,23 +74,56 @@ count_sites() {
             for (i = 1; i <= m; i++) {
                 w = part[i]
                 sub(/^[ \t]*/, "", w)
-                # `then` / `else` / `do` / `!` may legally precede a command on the same fragment.
-                while (w ~ /^(then|else|do|!)[ \t]+/) sub(/^[a-z!]+[ \t]+/, "", w)
+                # `then` / `else` / `do` / `if` / `elif` / `while` / `until` / `!` may legally precede a
+                # command on the same fragment and still RUN it (`if ! assert_ok …; then`). The list is the
+                # same as in assert-identity.sh — the two tokenizers must agree on what a site is, and
+                # assert-identity is the one that turns the remaining wrapper shapes into a loud BLIND
+                # failure (internal review round 1 R3-8), so this file need not repeat that check.
+                while (w ~ /^(then|else|do|if|elif|while|until|!)[ \t]+/) sub(/^[a-z!]+[ \t]+/, "", w)
                 if (match(w, /^[A-Za-z_][A-Za-z0-9_]*/)) {
                     kw = substr(w, 1, RLENGTH)
-                    if (kw in K) n++
+                    if (kw in K) { n++; if (FNR in owner) per[owner[FNR]]++ }
                 }
             }
         }
-        END { print n + 0 }
-    ' "$1"
+        END {
+            print n + 0
+            for (o in per) printf "%s\t%d\n", o, per[o]
+        }
+    ' "$_cs_map" "$1"
 }
 
-# report : print `drill<TAB>kept_sites`, one line per drill, in stable (sorted) drill order.
+# report : print `drill<TAB>kept_sites`, one line per drill, in stable (sorted) drill order — then one
+# `lib/<name>` row per drills/lib/*.sh that hosts claim primitives. origin: simcluster-speed internal review
+# round 1 R3-1: setup-forcesingle.sh carries claims that five drills execute (setup_forcesingle_n2), and a
+# gate that scans only drills/*.sh could not see one of them swapped or deleted. The lib rows are keyed
+# `lib/…` so they can never collide with a drill name (expected-verdicts / the runner never see them).
 report() {
+    _rp_map="${TMPDIR:-/tmp}/kept-sites.map.$$"
     for f in "$DRILLS"/*.sh; do
         d=$(basename "$f" .sh)
-        printf '%s\t%s\n' "$d" "$(count_sites "$f")"
+        if ! manifest_has "$f"; then
+            printf '%s\t%s\n' "$d" "$(count_sites "$f")"
+            continue
+        fi
+        # ARM ROWS (plan X7 / §5.5; round-2 review R1-F2 / R3-F3): an arm-split drill gets its total AND
+        # one `<drill>.<arm>` row per manifest arm plus `<drill>._shared` for the sites outside the case
+        # (the fixture, the `*)` branch, drill_end). A row for an arm with no sites is printed as 0 so the
+        # baseline has a key for it: a claim moved between arms lowers one row and raises another while the
+        # total stays put, and only the lowered row makes --check red.
+        manifest_line_arms "$f" > "$_rp_map"
+        _rp_out=$(count_sites "$f" "$_rp_map")
+        printf '%s\t%s\n' "$d" "$(printf '%s\n' "$_rp_out" | head -1)"
+        for a in $(manifest_arms "$f") _shared; do
+            printf '%s.%s\t%s\n' "$d" "$a" "$(printf '%s\n' "$_rp_out" | awk -F'\t' -v a="$a" 'NR > 1 && $1 == a { print $2; f = 1 } END { if (!f) print 0 }')"
+        done
+    done
+    rm -f "$_rp_map"
+    for f in "$DRILLS"/lib/*.sh; do
+        [ -e "$f" ] || continue
+        n=$(count_sites "$f")
+        [ "$n" -gt 0 ] || continue
+        printf 'lib/%s\t%s\n' "$(basename "$f" .sh)" "$n"
     done
 }
 

@@ -147,8 +147,14 @@ fi
 assert_ok "INJECT: stop brk2's nats-server cleanly (JS quorum is lost; brk1 stays reachable; nothing is destroyed)" \
     "$SIM" exec brk2 -- sh -c 'systemctl stop nats-server'
 
+# The injected push is TIMED as well as read (round-2 review R1-F3): its judgement below is on the
+# duration first and the wording second, like the post-recovery face — a post-fix-worded refusal that sat
+# the whole 7-minute default budget (`refused 1 attempt(s) over 7m0s`) reads like a bounded refusal and
+# would otherwise pass every wording judge.
+_g67_inj_t0=$(date +%s)
 _G67_OUT=$(_g67_push g67-frozen.bin); _G67_RC=$?
-log "#67 push-while-stalled rc=$_G67_RC output: $(printf '%s' "$_G67_OUT" | tr '\n' ' ' | cut -c1-400)"
+_G67_INJ_S=$(( $(date +%s) - _g67_inj_t0 ))
+log "#67 push-while-stalled rc=$_G67_RC after ${_G67_INJ_S}s output: $(printf '%s' "$_G67_OUT" | tr '\n' ' ' | cut -c1-400)"
 
 # ── RESTORE before judging, so a judgement failure can never leave the cluster degraded ───────────
 assert_ok "RESTORE: start brk2's nats-server again" "$SIM" exec brk2 -- sh -c 'systemctl start nats-server'
@@ -161,14 +167,119 @@ assert_ok "the 2-node JS meta re-forms once the peer is back" poll_until 120 3 "
 # there was no way to tell a still-degraded cluster from a slow one. Always record the last attempt.
 _G67_AFTER=0
 _g67_after_try=0
+_G67_AFTER_FIRST_OUT=""; _G67_AFTER_FIRST_S=0
+# #84 post-recovery diagnostics (image #8 receipt, 2026-09-19): the FIRST CONTROL(after) push still sat the whole
+# --timeout 120s on the Put leg while the ctl's STREAM.INFO watchdog saw a stream leader the whole time, so
+# neither of its two halves fired; the hermetic 2-node replay of the same injection recovers in 5 s and cannot
+# show what the deploy tier does here. Sample the bucket stream's cluster block from nats-server's OWN /jsz
+# on both brokers every 5 s while the attempts run — leader, per-replica current/offline/active/lag, message
+# counts — into a host-side file that is replayed below. OBSERVATION ONLY: no assert site, cannot change a
+# verdict; a curl/jq hiccup is recorded as `error`, never laundered into a reading.
+_g67_jsz() {
+    _jz=$("$SIM" exec "$1" -- curl -sf --max-time 2 'http://127.0.0.1:8223/jsz?acc=%24G&streams=true' 2>/dev/null) || { printf 'error'; return; }
+    printf '%s' "$_jz" | jq -c --arg s "OBJ_xfer-$SID" \
+        '[.account_details[]?.stream_detail[]? | select(.name==$s)
+          | {leader: .cluster.leader, replicas: [(.cluster.replicas // [])[] | {name, current, offline, active, lag}],
+             msgs: .state.messages, first: .state.first_seq, last: .state.last_seq}] | .[0] // "no-stream"' 2>/dev/null \
+        || printf 'error'
+}
+# The ctl's own client connection as nats-server sees it (name `tether-cli:<sid>`): which broker holds
+# it, and its in/out message and pending-byte counters — a Put whose chunks never reach the stream reads
+# very differently when the counters show them leaving the client than when they show nothing sent.
+_g67_ctlconn() {
+    _cz=$("$SIM" exec "$1" -- curl -sf --max-time 2 'http://127.0.0.1:8223/connz' 2>/dev/null) || { printf 'error'; return; }
+    printf '%s' "$_cz" | jq -c --arg n "tether-cli:$SID" \
+        '[.connections[]? | select(.name==$n) | {cid, in_msgs, out_msgs, in_bytes, out_bytes, pending_bytes, subscriptions}] | if length==0 then "none" else . end' 2>/dev/null \
+        || printf 'error'
+}
+_G67_JSZ_LOG=/tmp/g67-jsz.$$.log
+_G67_AFTER_T0=$(date +%s)
+: > "$_G67_JSZ_LOG"
+(
+    # Detached (see drill 30's scene watcher for why). Bounded by the LOOP below, not by a sample count: the
+    # first version stopped after 60 samples (5 min) while 12 attempts × (120 s + 5 s) can run 25 min, so a
+    # third-attempt stall at t+6 min had no /jsz row over it (round-2 review R3-F14). The kill after the
+    # loop ends it; the drill's EXIT trap reaps it on an early die/setup_fail; a hard ceiling of 400
+    # samples (≈33 min, past the longest possible loop) keeps it from outliving a killed drill shell.
+    _n=0
+    while [ "$_n" -lt 400 ]; do
+        _n=$((_n + 1))
+        printf '%s brk1=%s brk2=%s ctl@brk1=%s ctl@brk2=%s\n' "t+$(( $(date +%s) - _G67_AFTER_T0 ))s" \
+            "$(_g67_jsz brk1)" "$(_g67_jsz brk2)" "$(_g67_ctlconn brk1)" "$(_g67_ctlconn brk2)" >> "$_G67_JSZ_LOG" 2>/dev/null
+        sleep 5
+    done
+) </dev/null >/dev/null 2>&1 &
+_G67_JSZ_PID=$!
+_g67_reap_sampler() { kill "${_G67_JSZ_PID:-}" 2>/dev/null; rm -f "${_G67_JSZ_LOG:-/nonexistent}" 2>/dev/null; true; }
+drill_install_traps _g67_reap_sampler
 while [ "$_g67_after_try" -lt 12 ]; do
     _g67_after_try=$((_g67_after_try+1))
-    _G67_AFTER_OUT=$("$SIM" ctl -- push /tmp/g67.bin agt1:/tmp/g67-after.bin 2>&1) && { _G67_AFTER=1; break; }
+    _g67_t0=$(date +%s)
+    # plan X27: the CONTROL pushes use the operator's own `--timeout 120s`; only the push-while-stalled above
+    # keeps the CLI default (it is the one sample of the default-timeout path, bounded by the unit's worst).
+    # Attempt 1 is TIMED whatever its outcome (round-2 review R1-F4): a first attempt that stalls 110 s and
+    # then lands is the same unbounded stall with a luckier ending, and the first version recorded its
+    # duration only on the failure path — so it was neither judged nor replayed.
+    if _G67_AFTER_OUT=$("$SIM" ctl -- push /tmp/g67.bin agt1:/tmp/g67-after.bin --timeout 120s 2>&1); then _g67_ok=1; else _g67_ok=0; fi
+    [ "$_g67_after_try" = 1 ] && { _G67_AFTER_FIRST_OUT=$_G67_AFTER_OUT; _G67_AFTER_FIRST_S=$(( $(date +%s) - _g67_t0 )); }
+    [ "$_g67_ok" = 1 ] && { _G67_AFTER=1; break; }
+    # Every FAILED attempt is recorded with its own elapsed time, not only the last output: on 2026-09-19
+    # (image #2, solo) attempt 1 sat for ≈425 s — the whole size-derived Put budget — AFTER the JS meta had
+    # re-formed, and attempt 2 then succeeded in 192 ms. The line above the loop only kept the winning
+    # output, so what attempt 1 was told (and whether it was a hang or a refusal) was lost with it.
+    log "#67 CONTROL(after) attempt $_g67_after_try FAILED after $(( $(date +%s) - _g67_t0 ))s: $(printf '%s' "$_G67_AFTER_OUT" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-600)"
     sleep 5
 done
-log "#67 CONTROL(after) recovered=$_G67_AFTER after $_g67_after_try attempt(s); last output: $(printf '%s' "${_G67_AFTER_OUT:-}" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-240)"
+kill "$_G67_JSZ_PID" 2>/dev/null || true
+# Replay the /jsz samples only when they carry information: more than one attempt, or a first attempt that
+# took longer than the ctl's watchdog bound (30 s) — a one-shot success needs no forensic trail.
+if [ "$_g67_after_try" -gt 1 ] || [ "${_G67_AFTER_FIRST_S:-0}" -ge 30 ]; then
+    log "#84 /jsz + /connz samples during CONTROL(after) (brk1 | brk2: leader / replicas current,offline,active,lag / msgs first..last; ctl connection counters per broker):"
+    while IFS= read -r _g67_l; do log "  jsz| $(printf '%s' "$_g67_l" | cut -c1-900)"; done < "$_G67_JSZ_LOG"
+    # nats-server's own account of the stream/raft layer over the same window (JetStream + RAFT lines only;
+    # the nats journal is not one of logs.sh's four tether streams, so reading it here is not an oracle read).
+    for _g67_b in brk1 brk2; do
+        log "#84 $_g67_b nats-server journal, JetStream/RAFT lines since the CONTROL(after) window began (last 40):"
+        "$SIM" exec "$_g67_b" -- journalctl -u nats-server --no-pager --since "@$_G67_AFTER_T0" 2>/dev/null \
+            | grep -iE 'jetstream|raft|stream|leader|catchup|snapshot|quorum|route' | tail -40 \
+            | while IFS= read -r _g67_l; do log "  $_g67_b nats| $(printf '%s' "$_g67_l" | cut -c1-260)"; done
+    done
+fi
+rm -f "$_G67_JSZ_LOG" 2>/dev/null || true
+# When recovery took more than one attempt, the broker's own account of the transfer window is the
+# only place the FIRST attempt's fate is still visible after the instance is nuked (tier-B slot, bucket,
+# finalize, JetStream readiness). Observation only; nothing here can change a verdict.
+if [ "$_g67_after_try" -gt 1 ]; then
+    log "#67 CONTROL(after) needed $_g67_after_try attempts — brk1 broker slog, transfer/JetStream lines (last 40):"
+    sim_broker_slog brk1 600 2>/dev/null | grep -iE 'transfer|tier-B|tier_b|bucket|finalize|jetstream|in.flight' | tail -40 \
+        | while IFS= read -r _g67_l; do log "  brk1| $(printf '%s' "$_g67_l" | cut -c1-240)"; done
+fi
+# The success line keeps 600 chars, not 240: the ctl's own account of a slow success (which watchdog face
+# fired, how many attempts) sits past 240 and was cut mid-word in the image #9 receipt (round-2 R5-F5).
+log "#67 CONTROL(after) recovered=$_G67_AFTER after $_g67_after_try attempt(s), first attempt ${_G67_AFTER_FIRST_S:-?}s; last output: $(printf '%s' "${_G67_AFTER_OUT:-}" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-600)"
 assert_ok "CONTROL(after): the SAME tier-B push SUCCEEDS once the peer is back, with NO operator action — this is what makes the refusal above provably transient (a real capability absence would persist)" \
     sh -c "[ '$_G67_AFTER' = 1 ]"
+# #84's post-recovery face (internal review round 1 R1-F1 (4)): on 2026-09-19 the FIRST CONTROL(after) push sat
+# ≈425 s on a JS meta that had ALREADY re-formed (poll met at 0 s) and failed with the same bare Put timeout,
+# and the second succeeded in 192 ms. If the first post-recovery attempt times out on the Put leg it is the
+# same defect seen from the other side of the outage — a stall the operator is told nothing about — not
+# "evidence". Judged only when the attempt actually ran and lost the whole --timeout (>=100 s of the 120 s),
+# so a fast refusal or a harness hiccup can never land here.
+# The judgement is on the DURATION, not on the wording (image #8 receipt): after the #84 fix the same 121 s
+# stall came back worded as `code=jetstream_not_ready … refused 1 attempt(s) over 2m0s` — honest words, but
+# the bound the watchdog promises (≈30 s) was not delivered, and a text-only predicate had let that pass.
+# The first attempt's words are kept in the message so the two faces (bare timeout / transient wording)
+# stay distinguishable in the log.
+# Both endings of a ≥100 s first attempt are judged (round-2 review R1-F4): a failure that lost the whole
+# --timeout, AND a success that took ≥100 s of it — 12 MB at the 2 MiB/s admission floor is 6 s, and the
+# ctl's ladder is bounded at ≈3×30 s + backoff, so a first attempt that lands after 100 s made its progress
+# in a stall the watchdog did not cut.
+if [ "$_g67_after_try" -gt 1 ] && [ "${_G67_AFTER_FIRST_S:-0}" -ge 100 ]; then
+    _g67_first_face=$(printf '%s' "$_G67_AFTER_FIRST_OUT" | grep -oiE 'code=[a-z_]+|Put: .{0,60}' | head -1)
+    product_red "#84 (post-recovery face) the FIRST tier-B push after the JS meta re-formed sat ${_G67_AFTER_FIRST_S}s — the whole --timeout — on the Put leg (first attempt said: '${_g67_first_face:-?}'), and the next attempt succeeded at once: the stall is not bounded by the ctl's watchdog (≈30 s) nor by the cluster's recovery, whatever the refusal is worded as"
+elif [ "$_g67_after_try" = 1 ] && [ "$_G67_AFTER" = 1 ] && [ "${_G67_AFTER_FIRST_S:-0}" -ge 100 ]; then
+    product_red "#84 (post-recovery face, slow success) the FIRST tier-B push after the JS meta re-formed SUCCEEDED but took ${_G67_AFTER_FIRST_S}s (said: '$(printf '%s' "$_G67_AFTER_FIRST_OUT" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-160)'): the ctl's watchdog promises a ≈30 s bound on a stalled Put and a 12 MB upload is seconds, so the difference was a stall that went uncut"
+fi
 
 # ── JUDGE (post-G67: this is now a GREEN REGRESSION, not a defect pin) ────────────────────────────
 # WHAT CHANGED. Before G67 this arm recorded a product_red: a transient loss of JS quorum produced a
@@ -192,6 +303,25 @@ if [ "$_G67_RC" = 0 ]; then
 elif [ "$_G67_AFTER" != 1 ]; then
     not_covered "#67 regression" \
         "the push failed while the peer was down and the identical push did NOT recover afterwards either, so the cluster did not demonstrably return to health and nothing here is attributable" gap
+elif [ "${_G67_INJ_S:-0}" -ge 150 ]; then
+    # DURATION FIRST (round-2 review R1-F3): the injected push is judged on how long it sat before any
+    # wording is read, exactly like the post-recovery face. The ctl's ladder on a quorum-less JetStream is
+    # bounded at ≈3 × 30 s probes + 3 s + 6 s backoff (+ the size-budget floor's own margin) — well under
+    # 150 s; a push that sat longer was not bounded by the watchdog, whatever it finally printed (image #8:
+    # a 121 s stall came back worded `refused 1 attempt(s) over 2m0s`, honest words, no bound delivered).
+    product_red "#84 tier-B Put on a JS that has lost quorum sat ${_G67_INJ_S}s (rc=$_G67_RC, said: '$(printf '%s' "$_G67_OUT" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-160)') — the ctl's watchdog+retry ladder promises a bound of ≈100 s and did not deliver it, whatever the refusal is worded as"
+elif printf '%s' "$_G67_OUT" | grep -qiE 'Put: .*(nats: timeout|context deadline exceeded|no responders)'; then
+    # plan X27 / internal review round 1 R1-F1: the Put-LEG stall is #67's operator-facing defect moved one
+    # leg down, NOT an unregistered face. Since 0b204b5 (RESOLVE-BEFORE-CREATE) prepare resolves the bucket
+    # locally and succeeds on a JS that has lost quorum, so the refusal face A (a)–(d) judges below can no
+    # longer be reached from this injection; what the operator is TOLD instead is a bare `Put: nats: timeout`
+    # after the whole size budget (P-b: ≈7 min for 12 MB; before P-b: 37 min) or an instant `no responders`
+    # — no transient code, no "retry shortly", no bound the operator can plan around. That is exactly the
+    # class the drill header defines, and booking it as a coverage gap (as the first 2026-09-19 revision did)
+    # was the laundering X27 forbade: a broker where every degraded-JS push sits the full budget would have
+    # matched the expectation with zero deviation.
+    _g67_put_face=$(printf '%s' "$_G67_OUT" | grep -oiE 'Put: .*(nats: timeout|context deadline exceeded|no responders)' | head -1 | cut -c1-80)
+    product_red "#84 tier-B Put on a JS that has lost quorum sits the FULL size budget (or fails instantly with no responders) and reports a bare '$_g67_put_face' — no transient code, no retry hint, no bound the operator can plan around: #67's operator-facing defect, moved from the prepare leg to the Put leg by 0b204b5 (prepare now resolves the bucket locally and succeeds without a JS round-trip, so the G67 refusal wording (a)–(d) is unreachable from this injection)"
 elif ! _g67_tierb_face "$_G67_OUT"; then
     not_covered "#67 regression" \
         "the refusal does not name any registered tier-B/JetStream face (raw text logged above) — e.g. a connection-level 'cannot reach broker' is a different failure and judging it here would over-claim" gap
@@ -209,6 +339,24 @@ else
     #     reddens THIS assertion and nothing else.
     if _g67_retry_logged; then
         _as_pass "#67 NON-VACUITY: the broker's own journal proves the bounded retry ran (not just re-worded)"
+    elif _g67_out_has 'stopped answering during the upload \([0-9]+ probes over'; then
+        # #84 fix: on the Put leg the bounded mechanism is the ctl's liveness watchdog, and its evidence is
+        # the probe count in the message itself ("N probes over Ms failed") — printed only when the
+        # watchdog actually fired. The broker never retries this leg, so the slog tooth above cannot apply.
+        _as_pass "#67/#84 NON-VACUITY: the ctl's Put-leg watchdog reports the probes it lost before cancelling (the bounded mechanism ran; a re-worded message without the watchdog carries no count)"
+    elif _g67_out_has 'is not accepting the upload \(refused ([2-9]|[1-9][0-9]+) attempt\(s\) over'; then
+        # #84 fix, the INSTANT face (image #7 receipt: `Put: nats: no responders` in 0.9 s — a leader
+        # election in progress, which the watchdog built for the STALL face never sees). The bounded
+        # mechanism here is the ctl's own Put retry (3 attempts, 3 s / 6 s apart), and its evidence is the
+        # attempt count + window in the refusal text, printed only after the retries actually ran. The
+        # count must be ≥ 2: `refused 1 attempt(s)` IS printed for a single attempt whose transient face
+        # arrived with the budget already spent (putWithJSRetry returns the refusal with attempts=1 when
+        # ctx is done), so a one-attempt refusal proves no retry ran — the first version's comment said the
+        # opposite and accepted it (round-2 review R1-F3).
+        _as_pass "#67/#84 NON-VACUITY: the ctl's Put-leg bounded retry reports ≥2 attempts before refusing (the bounded mechanism ran; a single-attempt refusal is not evidence of it)"
+    elif _g67_out_has 'is not accepting the upload \(refused 1 attempt\(s\) over'; then
+        not_covered "#67 non-vacuity tooth" \
+            "the refusal is worded as the bounded-retry face but reports ONE attempt — the transient face arrived with the ctx already spent, so no retry ran and this run cannot distinguish the bounded mechanism from wording alone (its duration was ${_G67_INJ_S:-?}s, under the 150 s stall bar)" gap
     else
         not_covered "#67 non-vacuity tooth" \
             "the refusal was worded correctly but no 'tier-B bucket provisioning retried' line was readable in brk1's broker slog, so this run cannot distinguish a real bounded retry from wording alone. NOTE the tooth deliberately does NOT accept the 'gave up' line: that one is emitted even for a PERMANENT single-attempt refusal and would pass with the retry loop deleted" gap

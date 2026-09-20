@@ -77,6 +77,27 @@ old contract, green on the new one after `./local.sh --build build`.
 
 - **batch**: `gotcha #72 fix`  _(expected/owner authoritative in expected-verdicts.tsv)_
 
+2026-09-19 simcluster-speed H / X14 (the paragraphs below this one describe the PRE-H drill and are kept as
+history): the client-liveness contract is now 20 s × 2 on BOTH halves (`internal/agent` AgentPingInterval /
+AgentMaxPingsOut; install.sh nats.conf `ping_interval "20s"` / `ping_max 2`; drill `PING_INTERVAL_S=20` /
+`PING_MAX=2`, reconciled by test/architecture/nats_ping_defaults_test.go), and the drill was RE-ORDERED
+because H inverted its causality: the agent now declares the link dead at (PING_MAX+1)×PING_INTERVAL_S and
+re-registers through a survivor BEFORE the server drops the old connection, so the old "IMPACT first, then
+RECOVERY past a post-impact watermark" was structurally always-true. Now: the heartbeat watermark HB_INJ is
+taken AT injection (after the three injection self-proofs, plus self-proof C — the cut broker still holds
+the connection at that instant, internal review round 1 R1-F3); RECOVERY = `_hb_advanced ∧
+_registered_on_another_voter` (heartbeat past HB_INJ AND a survivor's /connz lists agt1 — a conjunction, one
+half alone has a false positive); the old IMPACT became the SERVER-SIDE evidence assertion (the cut broker
+drops the dead client itself; `closed reason` logged). `RECOVERY_BUDGET = 2×((PING_MAX+1)×PING_INTERVAL_S
++ 20 + 10 + 10 + 30) = 260 s`, one shared DEADLINE for both polls (tests/teardown-recovery-nonvacuity-test.sh
+pins the order, the conjunction, the CUT_BROKER exclusion, the shared budget and the SERVER-SIDE line).
+Receipts (image #2 solo ×2): INCOMPLETE nc=1 pass=12 (13 before X14 folded two RECOVERY claims into the
+conjunction; 14 with self-proof C), RECOVERY ≈57 s / 58 s after injection, SERVER-SIDE drop ≈58 s with
+`Stale Connection`; pre-H the same injection took 4:03 / 4:00 (measured between two heartbeat timestamps,
+so "≈4 min", not "exactly 4:00"). The #48 roster-silence path is no longer sampled here (the client ping
+fires first) — registry `48-silence-rebuild-under-drop`, H-dependent. Expected row unchanged: INCOMPLETE 1
+(the #72 wss arm).
+
 Born INCOMPLETE/1 by design and honestly scoped: this is the POST-FIX bounded-teardown RECOVERY
 regression over nats:// (black-hole the connected broker's client port, assert heartbeat resumes via
 another voter within the written budget, classify the recovery path by MainPID three ways) — NOT a
@@ -103,6 +124,19 @@ connection before claiming any recovery) caught every one of them:
      up to ~4min to declare the disconnect. Budget re-derived term by term to 330s and written into
      the script. The product's published ≤60s bound covers only the part AFTER that declaration
      (usage.md §9.9), so a drill measuring detection + recovery must budget for both.
+
+2026-09-20 round-2 review (R1-F7 + the watermark SETUP-RED root cause): (1) the header sentence that justified the
+watermark retry ("a LATER watermark is strictly harder for RECOVERY to beat") argued the wrong direction — `_hb_advanced`
+is an inequality against the watermark and under a dead link the heartbeat is frozen, so a later read is neutral; what
+the retry window DID re-open was self-proof C's gap, so C is now RE-ASSERTED at the watermark instant (`C′`, +1 assert_ok,
+pass 13 → 14). (2) The S2 -j6 SETUP-REDs at the watermark (both CUT_BROKER=brk2) and the round-2 re-run's (brk3) had one
+cause, visible only because the retry now logs each miss: `node ls --json` without `-a` lists ONLINE nodes only, and at the
+watermark instant agt1 is often already STALE (its heartbeat rides the edge just cut; the G.2 sweep flips status after
+5 s) → `"nodes": []` five times in 15 s. The brk1 solos passed only because the read landed inside the 5 s. `_hb_of` and
+the watermark read now use `node ls -a` (a heartbeat timestamp is valid whatever the status column says; ONLINE is
+`_online`'s separate question). Receipt: round-2 re-run INCOMPLETE 1 pass=14, watermark on read 1, C and C′ PASS,
+RECOVERY same-PID in-process rebuild. drill-costs row 98 re-seeded from this complete run (R1-F9: the S2 row was the
+186 s SETUP-RED).
 
 ## 33-node-upgrade-success
 
@@ -218,11 +252,20 @@ R16 FLIP → INCOMPLETE (2026-07-22, deploy-tier): #GROW-ONTO-RECOVERED is FIXED
 
 r11f 2026-07-19 GREEN (pass=62). R11 CLOSED #54/#55/#56/#63/DOC-23 — B2/B3/55a/55b/55c are now POSITIVE GREEN regressions. Drill-side finish (harness transport, not product): D8a/D8c 'alert clear' routed through the broker admin socket (operator-only verb, alert.go:29-31 — ctl has no admin socket, was rc=69); D2c narrowed to the refused retire's genuine side-effects (no new retire/drain op + no credrot alert) — the old 'ops ls | grep brk2' false-failed on brk2's healthy join/done membership row once R11 fixed the admin-socket output pollution. Only intermittent non-green if it fires: D-spine #31 grow-lock (PRODUCT-RED, owner R14) / A7 runtime-guard (INCOMPLETE).
 
+2026-09-20 round-2 review (R6-7: the 2026-09-19 oracle fix was carried only in drill comments): A8d/A8e read the wrong
+STREAM. `matches neither the pinned` is written by the broker at BOOT (systemd journal, before slog opens), so the
+oracle reads `sim_broker_panic_journal brk2` and the DOC-23 file-recovery diag dumps `sim_broker_panic_journal_dump brk2
+400`; the claim texts say BOOT stream. Product text unchanged. Receipt: 52b solo GREEN pass=62 (batch21, image #13).
+
 ## 60-user-journey
 
 - **batch**: `-`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 stable across both runs
+
+2026-09-20 round-2 review (R6-7): the `_agt2_gone` oracle read the wrong COLUMN — `node ls` prints NODE KIND STATUS since
+1e9d32a (node.go:112), the regex was matching STATUS at column 2 and so never saw OFFLINE/STALE; now
+`^agt2[[:space:]]+[^[:space:]]+[[:space:]]+(OFFLINE|STALE)`. Product unchanged. Receipt: 60 solo GREEN pass=38 (batch21).
 
 ## 61-transfer-edges
 
@@ -250,7 +293,67 @@ closed and its temporary band removed. R2 predicted change (pre-enumerated in r2
 
 - **batch**: `G67+G69`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
+2026-09-19 simcluster-speed (P-a/P-b, plan §8.0/§8.2; **corrected the same day by internal review round 1
+R1-F1**): expected INCOMPLETE 1 → **PRODUCT-RED 1**, owner `#67 #84`. What P-a/P-b changed: the drill used to
+hit the runner's 2700 s ceiling (INFRA-ABORT, 2026-09-04 sweep) because a tier-B `Put` on a stalled JetStream
+waited the flat 37 min `--timeout` default; the size-derived budget bounds it at ≈7 min for 12 MB, and the ctl
+releases the per-bucket slot on the way out (P-a), so CONTROL(after) no longer sees `too_many_in_flight`. What
+comes out the other side (954 s): the push-while-stalled returns `push (tier B): Put: nats: timeout` after the
+whole budget. **The first 09-19 revision booked that as a coverage gap** ("the classifier can't name the face")
+and wrote INCOMPLETE 2 — the exact move plan X27 / §5.2 forbade ("判定分支不得把 deadline exceeded 洗成 gap"):
+a broker where every degraded-JS push sits the full budget would have matched the expectation with zero
+deviation. The review's argument holds: since 0b204b5 (RESOLVE-BEFORE-CREATE) prepare resolves the bucket
+locally and succeeds on a JS that has lost quorum, so #67's operator-facing defect (told nothing transient,
+no retry vocabulary, no bound) simply moved one leg down, to the Put; the G67 wording judges (a)–(d) are
+unreachable from this injection and pass=14 (not the calibrated 18) said so. The drill now judges it: a Put-leg
+`nats: timeout | context deadline exceeded | no responders` on the injected push is `product_red` **#84**
+(new ledger entry), and the CONTROL pushes carry X27's `--timeout 120s` (the injected push keeps the CLI
+default — the one sample of the default path). The post-recovery face is judged too: on 2026-09-19 the FIRST
+CONTROL(after) attempt sat ≈425 s on a JS meta that had already re-formed and the second succeeded in 192 ms;
+an attempt that loses the whole --timeout on the Put leg after recovery is a second #84 `product_red`, not
+"evidence". nc_gap 1 = face B (unchanged). Flips to GREEN when the product bounds a Put on a lost-quorum JS
+and says so in the error (transient code + retry hint), i.e. when #84 closes.
+
+2026-09-19, later the same day — **#84 closed, expected back to INCOMPLETE 1** (owner `#67`; the two #84
+`product_red` sites stay armed as regression pins). The product fix took four images because each receipt
+was a new fact, not the same one unfixed: image #6 — the Put watchdog (STREAM.INFO every 10 s, 3 strikes) cut
+the injected stall at 36 s and 67 read `INCOMPLETE 1 pass=18`, but CONTROL(after) attempt 1 was cut on a
+HEALTHY JS because the probe's other half (`$JS.API.INFO`) is outside the ctl's ACL and a permissions
+violation looks exactly like a dead JetStream; image #7 — probe ACL-correct, the injected push showed the
+INSTANT face (`Put: nats: no responders` in 0.9 s → bounded retry added) and the post-recovery attempt still
+sat 121 s; image #8 — injected stall cut at 30 s, non-vacuity tooth PASS, `INCOMPLETE 1 pass=18 270 s`, but
+the post-recovery attempt sat 121 s AGAIN, now worded transient (`refused 1 attempt(s) over 2m0s`) — the
+post-recovery predicate had been text-only and let it pass, so it now judges on DURATION (≥100 s, next
+attempt succeeds) whatever the wording, and the drill samples /jsz + the ctl's /connz every 5 s across the
+CONTROL(after) window. Those samples explained the third face: 285 msgs / 25 MB entered brk1 in the first
+5 s while the stream was leaderless (`leader:null`), then `leader=brk1, current=true` and `msgs`/`last_seq`
+frozen for 115 s — nats-server drops publishes to a leaderless stream without a NAK, so a Put whose whole
+burst lands in the election waits for acks that never come while every liveness probe says healthy. Image
+#9 — the watchdog also reads `last_seq` and cuts a healthy-but-frozen stream after 3 still readings
+(`stallNoProgress`, retryable): 67 `INCOMPLETE 1 pass=18` in **187 s**, CONTROL(after) recovered inside ONE
+push (the ctl's own retry, visible as the `STREAM.PURGE` permissions-violation line of the first, cut
+attempt). pass=18 is the G67 calibration; the drill's `_G67_AFTER_FIRST_S`/jsz replay stays as forensics.
+The `STREAM.PURGE` violation line itself is by design (bucket lifecycle is the broker's) — what it used to
+leave behind, chunk groups with no meta that the object reaper never sees, is #85 (broker-side chunk sweep,
+`internal/broker/transfer_reconcile.go`).
+
 G69 (2026-07-22) added a POSITIVE oracle to this drill and pass is now 18, not 17. WHY: the sub-face-4 `not_covered` gap is NOT unconditional - it fires only when the first post-grow push FAILS and the retry succeeds - and the PRE-fix baseline recorded below is itself nc_gap=1 pass=17, so 'the gap disappeared' was byte-identical to the pre-fix result and proved NOTHING (internal review G-3 caught the main process citing it as acceptance evidence). The positive oracle is checkable on EVERY run, loaded or not: after the grow, assert no `WITHOUT proving JetStream placement` degrade entry in any op timeline. Evidence: PASSED both unloaded and under 7-way saturation (the regime that originally produced '3 attempts over 8s all timed out'), with the sub-face-4 gap not firing. LIMIT: that is ONE-ARMED, not a differential - the pre-G69 arm was not built (stash-build on a 51-changed/20-new uncommitted tree). The remaining nc_gap=1 is face B, which has no deploy-tier oracle and keeps this row INCOMPLETE by construction. | face A FLIPPED PRODUCT-RED -> GREEN by G67 (2026-07-22, deploy-tier verified: verdict=INCOMPLETE rc=4 assert_fail=0 setup_red=0 product_red=0 not_covered=1 nc_gap=1 pass=17 (the face-A ARM is green; the drill is INCOMPLETE by construction, see below)). The refusal is now HONEST: `code=jetstream_not_ready ... after 3 attempt(s) over 8s: create_bucket: context deadline exceeded - ... usually transient ...`, where it used to be the terminal `code=bucket_create_failed create_bucket: context deadline exceeded` with no retry hint. NON-VACUITY TOOTH: brk1's own journal must show `tier-B bucket provisioning retried`. Internal review correction - this tooth is a not_covered, NOT an _as_fail, so deleting the bounded retry moves nc_gap 1->2 rather than turning the drill red; the BASELINE nc_gap for a healthy run is therefore recorded here as 1 (face B) and a run reporting 2 means the retry stopped running. The tooth deliberately does NOT accept the `gave up` line, which is emitted even for a PERMANENT single-attempt refusal. Two drill bugs were found and fixed by running it: (1) assertions written as `sh -c "... \$_G67_OUT ..."` silently tested the EMPTY STRING because the child shell does not inherit the variable - that produced two false FAILs and one VACUOUS PASS on the first post-fix run, and is why the checks now go through functions; (2) the first tooth accepted `retried|gave up`. History: this drill was created by G67 itself as #67's deterministic pin, and its oracle went through three versions, two forced by real runs - see docs/deploy-tier-gotchas.md #67. Verdict is INCOMPLETE, not GREEN, and deliberately so: face B of #67 has NO deploy-tier oracle (the only injection that reproduced it, SIGSTOP on the peer, was retired for producing connection-level failures that are a DIFFERENT defect), so the drill records it as a first-class nc_gap. A clean GREEN here would assert that #67 is closed when it is not.
+
+2026-09-20 round-2 review (R1-F3 / R1-F4 / R3-F14 / R5-F5; product R2-F1 / R2-F3): (1) the INJECTED push is timed and
+judged on DURATION first — ≥150 s is a product_red whatever the wording (the ladder's legitimate bound is ≈3×30 s probes +
+9 s backoff); the wording judge for a bare `Put: nats: timeout` stays as the second branch. (2) The non-vacuity tooth's
+bounded-retry branch requires `refused ≥2 attempt(s)`: `refused 1 attempt(s)` IS printed for a single attempt whose transient
+face arrived with the ctx spent, so it proved nothing — a one-attempt refusal is now its own not_covered (the tooth's old
+comment said the opposite). (3) CONTROL(after) attempt 1 is timed whatever its outcome, and a ≥100 s SUCCESS is a second
+post-recovery product_red (a 12 MB push is seconds; 100 s of it was an uncut stall). (4) The /jsz sampler runs until the
+loop ends (was 60 samples = 5 min against a 25-min loop) and is reaped by the drill's EXIT trap. (5) The success line
+keeps 600 chars. Product side: `putWithJSWatchdog.cut` now honours the Put's own result (nil = the upload was complete and
+only nats.go's ACL-denied trailing purge was cut; a non-artifact error goes to the classifier), so an existing-name retry
+no longer re-uploads three times into `jetstream_not_ready`, and a chunk-ack `no response from stream` is retried as the
+instant face instead of being laundered into 30 s no-progress windows. Receipt (image #14): injected push rc=75 after 70 s
+worded `refused ≥2 attempt(s)` (the retry actually ran), tooth PASS; CONTROL(after) recovered on attempt 2 with attempt 1 at
+1 s (an instant refusal, then success); INCOMPLETE 1 pass=19 = MATCH. Kept-sites 27 → 30, identity +2 product_red
++1 not_covered, one line reworded.
 
 ## 70-expose-journey
 
@@ -274,7 +377,41 @@ stable across both runs
 
 - **batch**: `R15`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
+simcluster-speed M0 (2026-09-19): expected GREEN 0 → **INCOMPLETE 1**, owner gains **#33**. The REHOME arm's `[#33]` line was a measure-and-record `assert_ok` whose predicate accepted BOTH outcomes (`AUTO-RECOVERED || STRANDED`) — a pass that could not fail — so the drill was GREEN while #33 stayed open with no non-GREEN owner; tests/ledger-crosscheck.sh did not notice because the ledger's own "#32 (CANDIDATE)" cross-reference sat in #33's first three lines and read as #33's status. The measurement is unchanged (and now also records which broker held the exit agent's NATS connection at the kill and after — the fact the evidence-flip protocol in docs/reviews/simcluster-speed-plan.md §0 D-P needs); it is filed as an explicit `not_covered … gap` until that protocol closes #33, at which point the line becomes the positive "auto-recovers within observed max + slack" assertion and this row returns to GREEN 0. Claim strengthened, not weakened: the drill now says out loud what it was silently accepting.
+
+simcluster-speed 2b (2026-09-19, later the same day): **the flip happened — INCOMPLETE 1 → GREEN 0, #33 FIXED (by #80)**.
+The protocol asked for the mechanism receipt, not for a run that happened to recover: 7 of 7 measurable samples
+(73r1–r4 solo, G1 cap 0 and cap 5, live-grow #2) had agt's NATS connection ON the killed broker at the kill and on a
+survivor afterwards, AUTO-RECOVERED 16–29 s after the crash with the data plane ≤1 s behind the control plane — the
+old face (control rehomed+ready, data plane dark for minutes, `proxy off/on` to recover) is #80's root cause seen
+from the exit's side (the SS server was anchored on the per-session runCtx; a crash-rehome killed it with the
+session). The REHOME `[#33]` not_covered is now `REHOME [#33 FIXED by #80]`, an assert_ok with three conjuncts on
+every run: connection was on the killed broker (`_brk_holding_agent`), the slog shows `agent: re-registered after
+reconnect` past a pre-kill cursor (nats.go reconnects inside the roster pool; the agent's own "rebuilding NATS
+session on the freshest roster" is the stuck-disconnect path and does not run here — the first flip draft asserted
+that line and went red on a healthy run), and the data plane flows within 90 s (observed max 29 s + slack; an
+observation, not an SLA). First solo of the flipped drill: GREEN pass=46. What stays loud: the #34 face-1 drift
+(constructed spread moving before the kill) is still a first-class `product_red` DEVIATION — it fired once in the
+G1 cap-8 round and now dumps the leader's proxy/rehome events + reconcile slog lines when it does.
+
 R15: R14: the QUORUM data-plane-separation THIS-RUN guard (384) was reclassified runtime-guard→gap — it fires when a rebalance-MOVED dead-homed exit fails to render+serve, i.e. the CONFIRMED product defect #33/#34 reproducing, NOT intrinsic sim non-determinism; it turns GREEN when moved-exit rendering is made deterministic in the product (matching line-381's sibling gap). Landing verdict unchanged. r9d-a/b/d=INCOMPLETE r9d-c=ASSERT-FAIL(Q-xcheck endpoint mismatch — the drills own registered exposure) — flake band unchanged. R9-D: the REHOME live-target gate no longer reports #34 drift as a broken foundation; it records product_red "#34" and SKIPS the arm (proved live by a forced-drift mutation run)
+
+2026-09-20 round-2 review (R6-4 / R3-F13 / R1-F5 / R5-F6 / R6-1): the flipped `[#33 FIXED by #80]` assert was one conjunction
+of four, two of which were not product properties. It is now TWO claims: the HARD claim `[#33 FIXED]` = AUTO-RECOVERED ∧
+≤90 s (the observed maximum with slack, an observation not an SLA); and the mechanism observation `[#33 mechanism: pool
+reconnect]` (connection was on the killed broker → moved to a survivor → `agent: re-registered after reconnect` after the
+cursor), asserted ONLY when conn==home held at kill time — that equality is a fixture correlation (allocation homes an exit
+on the agent's NATS server; `cluster rebalance proxy` moves homes without moving connections), so a run where the agent's
+NATS sat on a survivor takes the tunnel-only path and would have been a false red; it is a not_covered gap instead. The
+plan's third conjunct was misnamed: the drill asserts the nats.go RECONNECT line, not the session-rebuild line (the
+first flipped run went red on that, batch21/73flip.log), and no sample exercised #80's runCtx path — the ledger heading
+now says "symptom closed; mechanism attribution #80 = CANDIDATE". Q arm: Q-xcheck is POLLED into agreement for 60 s
+before it is asserted (3/14 samples read `vended=brk1 ≠ home=brk3` one-shot right after a leg that still served through
+the previous home; a mismatch outliving 60 s is the defect face and now transcribes `_drift_evidence`). Receipts (image
+#14): round-2 -j5 run — hard + mechanism PASS (AUTO-RECOVERED 23 s, pre=brk2 post=brk1), Q-xcheck one-shot mismatch
+(the 3rd sample, before the poll); solo re-run after the poll: GREEN pass=47 — hard + mechanism PASS (AUTO-RECOVERED
+27 s, pre=brk3 post=brk1), Q-xcheck PASS. Expected stays GREEN 0; a run whose precondition fails is a loud INCOMPLETE 1
+DEVIATION whose text says why, by design.
 
 ## 74-rebalance-on-return
 
@@ -289,6 +426,45 @@ R15: R14: the QUORUM data-plane-separation THIS-RUN guard (384) was reclassified
 - **batch**: `R15`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 R15: r1a=GREEN r1b=ASSERT-FAIL r2=INCOMPLETE — flake band
+
+2026-09-19 simcluster-speed ARM SPLIT (plan §5.6, X18/X30): two units, `74-rebalance-on-return.SRAB` (the
+manual path: SKEW-reconstruct → every exit flowing → SKEW → RETURN → A default-off → B) and
+`74-rebalance-on-return.C` (the automatic path). Until the split C ran after B on the same cluster and inherited
+B's `reg` negative-control expose; it now builds its own pre-control (`C-negctrl-fixture`, `-pre`, and its own
+gap when that does not establish). The two bands move to the arm they pin, each under an arm-suffixed slug with
+the SAME ERE for now — to be re-calibrated from each unit's first solo log (X18): `#67@b-negctrl-create` → .SRAB
+(the B negative-control create is a SRAB claim), `#34@c-ss-preflow` → .C. The parent row keeps `-` bands and `-`
+nc_gap (derived; both children are `-` because the drill's gap set was never deterministic — see the arm
+sections). The #34 persistent gap is drill-level (X8) and is counted by both arms.
+
+2026-09-20 round-2 review (R6-3 / R1-F8 / R6-14): the persistent `_gap_drill_level` text now names ONLY face 1 (the
+constructed spread drifting, 1/13 concurrent samples, unattributed; candidate mechanisms in ledger #34 incl. the M3 rotate
+re-minting the home from the agent's NATS server): the rc=64 negctrl face was #86 (fixed), and auto-rebalance-on-return DOES
+fire (C5/C7/C8/C9/C10, lg2, S2, V7 all `proxy_auto_rebalanced 0→1`), so "blocked by the #31 fire-gate" left the gap text.
+The two arm bands (`ASSERT-FAIL@#67@sig:b-negctrl-create-SRAB`, rc=70; `ASSERT-FAIL@#34@sig:c-ss-preflow-C`) were carried
+from the unsplit drill "to be re-calibrated from the first solo log" and never fired in ≥11 SRAB / ≥12 C samples; they are
+RETIRED (bands → `-`; the `sig:` definitions below stay as history). A future rc=70 or SS-preflow timeout arrives as a
+DEVIATION to attribute, not as a match to a band with no living sample. Post-split receipts (all image #10–#13, plan §8.5b):
+SRAB solos S1–S5 402/414/406/371/403 s, C solos C1–C10 (C1/C6 harness-invalid, C2–C4 #86 pre-fix, C5/C7/C8/C9/C10 INCOMPLETE
+pass=31 with `0→1`), live-grow SRAB 2/2 C 1/2, S2 -j6 and V7 -j12 one each.
+
+## 74-rebalance-on-return.SRAB
+
+  sig:b-negctrl-create-SRAB := negative-control expose reg create rc=70
+
+nc_gap `-`: this arm's gaps are all conditional on where the #34 instability bites (SKEW-reconstruct failing →
+"destructive arms THIS RUN"; B pre-flow failing → "B injection THIS RUN"; B-move / B-dp harness-stage /
+B-negctrl pre-control each have their own), so the count ranges from 1 (drill-level only, a clean run) upward
+and pinning any single value would make every other run a standing deviation. The verdict enum is pinned.
+
+## 74-rebalance-on-return.C
+
+  sig:c-ss-preflow-C := poll_until: timed out .* C pre-kill SS flows via
+
+nc_gap `-` for the same reason as SRAB: C-negctrl-fixture, C-ss-pre harness stage, C-skew-adjacent, the
+invalid-edge gap and the C-dp-when-auto-did-not-fire gap are each conditional on #34 / #31 manifesting. The
+band keeps the round-2 MAJOR-2 discipline: only a strand with the local SS client PROVEN READY matches it;
+a harness-* stage is a gap, not this ASSERT-FAIL.
 
 ## 78-proxy-dial-backoff
 
@@ -326,6 +502,12 @@ R12 flip: #25 CLOSED (per-IP PIN rate limit). Arm R rewritten to a POSITIVE regr
 
 R12 flip: #26 CLOSED (evict reaps managed OS children). C-GAP-proc → C-reap: after evict the setsid-nohup managed child is GONE from the host process table (daemon exited AND pgrep empty); C-base-proc first proves it was running. C-sysd-reap: reaps under systemd too. Was PRODUCT-RED (#26)
 
+2026-09-20 round-2 review (R6-7): B3's refusal oracle read the wrong stream — the auth_callout rejection lands in the
+agent's BOOT stream, not slog. `_b3_refused_for_auth` now takes a cursor (`sim_agent_panic_cursor agt1`), requires rc≠0 AND
+`sim_agent_panic_sink_since agt1 'auth_callout rejected|Authorization Violation' <cursor>`; the claim is one assert_ok
+(equal or stronger than the assert_refuses it replaced — the refusal is proven by the reason, not the rc alone). Receipt:
+81b solo GREEN pass=40 (batch21).
+
 ## 82-agent-onboarding-invite
 
 - **batch**: `R12`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
@@ -362,6 +544,12 @@ R15: R13 (item 4): the ONLY non-GREEN is the #42 BOUNDED observation gap (quorum
 
 R13-D6: `ps` LOST is now a REAL assertion (was an overclaim — the header/title named it but the drill only checked NODE status). A1d/e/f: agt1's exec children DERIVE LOST while agt1 is OFFLINE (storage-RUNNING row + OFFLINE owning node, exec.go:326-345) while agt2's stays RUNNING (the discriminator) — closing the RUNNING(A0d)→LOST(A1)→EXITED(A2) three-state chain. r13d GREEN pass=54. Was GREEN (stable both runs)
 
+2026-09-20 round-2 review (R6-7): 94's B3-timeout in the 2026-09-03 table was #87 (the orphan-kill fail-closed gate read a
+RUNNING/LOST snapshot as "history", so a node whose jobs had all exited never received the drop — fixed 2026-09-19,
+`proc.NodeHasHistory`). B5 reworded, not re-judged: DOC-25 closed — `agent: re-registered after reconnect` now carries
+reconciled/drop_procs/revoke_ports, and B5 reads it instead of inferring the directive from the kill line. Receipt: 94c
+solo GREEN pass=54 (batch21, image #13).
+
 ## 95-broker-selfheal
 
 - **batch**: `R13`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
@@ -371,6 +559,89 @@ R13 (item 2): 95-D was a FALSE gap (R6: _d_raft_ok hard-pinned leader=="brk1", w
 ## 96-mid-flight-chaos
 
 - **batch**: `R16`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
+
+2026-09-19 simcluster-speed ARM SPLIT (plan §5.5 "96 首拆", X5/X8/X16/X22): the drill is now three units,
+`96-mid-flight-chaos.{A,D,F}`, each on its own fresh N=3; the parent row is derived from the child rows.
+nc_gap 5 → **7**, in two steps, neither of them a new gap:
+- **5 was stale.** The 2026-09-04 sweep note already said the declared gaps were 6 (and 6 solo too); the
+  unsplit solo run on 2026-09-19 (image #2, 1151 s) is nc=6 again: `:346` #58 cross-home GC (structural),
+  `:368` arms B/C (drill-level), `:408` #57 transfer completed before the crash, `:528` B0 not refused,
+  `:678` D6b legitimate majority commit, `:745` F gated off — the cluster did not return to full health
+  within 360 s of D's heal, even solo. The sixth site is that F precondition (X16).
+- **The split moves two sites and counts one thrice.** The F precondition gap (`:745`) is structurally
+  gone — F starts from its own fixture — and its 360 s window becomes the D arm's END-STATE
+  measure-and-record (the recovery lag is logged; >360 s is a gap, as before, but on D's row). The
+  drill-level gap (`:368`) is `_gap_drill_level`, called by every arm (X8), so it counts once per arm.
+  6 − 1 (F precondition) + 2 (drill-level on D and F) = 7.
+Child rows, written from claim ownership BEFORE the first split run (X5):
+- `.A` INCOMPLETE **`-`** (see `## 96-mid-flight-chaos.A` below): #58 cross-home (structural) + drill-level
+  + the #57 branch (both of its in-sim outcomes — "audit unreadable" and "completed before the crash" —
+  are gaps; only a real #57 pin is PRODUCT-RED) + B0 (the kill's alert state has never gated `run` here)
+  = 4, plus a 5th whenever the A2 arm finds NO orphan set to reap (the vacuous-reap guard). The first
+  two samples went both ways (unsplit 96a: 444 stranded objects, 4 gaps; split 96A: 2 objects, 5 gaps),
+  so pinning either number would make every other run a standing "deviation" that trains the reader to
+  wave deviations through. The verdict enum is still pinned; only the count is two-valued.
+- `.D` INCOMPLETE **2** = drill-level + D6b (on this host the branch is "legitimate majority commit" or
+  "minority-write variant structurally unreachable"; both gaps). A 3rd gap = the end-state recovery
+  measure exceeding 360 s — a product recovery-cost observation the split exists to surface, reported as
+  a DEVIATION. `# forgoes:` names `71-minority-commit`: #71's world was the post-A cluster; the registry
+  row is `none-after-split`.
+- `.F` INCOMPLETE **1** = drill-level only; every F claim is a positive.
+Identity: two claims reworded on purpose (assert-identity baseline header, same change): D0a no longer
+says "after the #58 arm restarted it"; the F cross-arm-residue gap became the D end-state gap.
+
+**First solo receipts (2026-09-19, image #2) and what they taught:**
+- `.F` run 1: ASSERT-FAIL — F4 (agt2's held seed no longer RUNNING / a seed row closed) and F5 (no
+  `reconciled_closed` row within 120 s) with nothing but poll timeouts on record; run 2 (with the F4/F5
+  diagnostics now in the drill): INCOMPLETE nc=1 = the child row, F4/F5 PASS, agt2's seed still RUNNING by
+  pid, both agt1 seeds `reconciled_closed rc=-1`. 1/2 red, unattributed — the next red carries the tables.
+  NOT written into the expectation; a DEVIATION to attribute in the sweep.
+- `.D` runs 1–2: INCOMPLETE nc=3 — the end-state measure timed out at 360 s BOTH times, and run 2's
+  diagnostic said why: `three_voters=yes agt1_online=no agt2_online=no`, `node ls` → **"(no nodes)"**.
+  The cluster was healthy; the ctl was listing the wrong session. D3's survivor write and D4b's minority
+  write are `session create canary2/canary3`, and a `session create` moves the HOME's active-session
+  pointer (drill 30's PROBE-ISOLATION documents the same trap). `_f_precond_healthy` — the D end-state
+  measure, and BEFORE the split the F arm's 360 s precondition — polls `node ls` under that pointer, so
+  it could never see lab's agents after D3. **That is the most likely reason the old `:745` gap fired on
+  every run for months ("did not fully recover within 240 s/360 s"): the F arm was gated off by the
+  harness's own session pointer, not by tether's recovery.** Fix (D7, an added claim): re-login the ctl
+  into $SID before the measure, as D0d does before the injection. Run 3 (328 s, with D7): INCOMPLETE
+  nc=2 = the child row, and full health was back **3 s** after the D6b readback settled — the "recovery
+  lag" was the pointer, entirely. The child row stays INCOMPLETE 2 (drill-level + D6b); a 3rd gap after
+  D7 would be a real recovery lag.
+- `.A` run 1: INCOMPLETE nc=5 (the two-valued A2 leg, see `## 96-mid-flight-chaos.A`).
+Per-arm wall (solo, s): F 398 / 220, D 681 / 695 / 328 (with D7), A 333 — max 333 against the unsplit
+1151; the declared `# worst:` (A 1350, D 1500, F 800) are the pre-split estimates and will be re-seeded
+from the sweep.
+
+2026-09-20 round-2 review (R1-F1 / R5-F2 — BLOCKER; R1-F6; R6-12): the three concurrent 96.D PRODUCT-RED of 2026-09-19 (G1 cap 0,
+G1 cap 8, S2 -j6) printed `PRODUCT-RED #65` from the pre-heal committer snapshot (`brk1's OWN broker.log names canary3
+while ISOLATED? yes`); the plan and this log had filed them as "#71 sensor / LOAD-SENSITIVE" with the registry row at
+`none-after-split`. That was a mis-filing of the drill's own decisive #65 reading. Attribution: gotcha #89 — brk1's
+BROKER was not on brk1's NATS (nats.go's discovered-server pool moved it to a peer after the topology reconciler's hard
+restart of the local nats-server under load); with routes+raft cut it forwarded the ctl's create through brk2's NATS to
+the live leader, answered rc=0 in a second and logged `session created`. #65 stays REFUTED; #89 is FIXED (broker pinned to
+its configured server). The D arm now: `D0f PREMISE (#89)` asserts every broker's /connz holds exactly one loopback
+`tetherd` (red = ASSERT-FAIL), the D6b #65 judge is gated on it (premise red → runtime-guard, never a false #65), and a
+committer CENSUS over all three brokers is logged beside the snapshot. Registry: `71-minority-commit default
+96-mid-flight-chaos.D`; manifest `# forgoes: D=-`. Receipt (image #14): D0f PASS, census brk1=no brk2=yes brk3=no,
+INCOMPLETE 2 = MATCH. .A: the post-restart "no orphan manufactured" record is `runtime-guard` like the pre-restart one
+(same fact read after the restart), so nc_gap is deterministic: .A pinned INCOMPLETE 4 (round-2 run: nc_gap=4 nc_guard=1),
+parent INCOMPLETE 7 (4+2+1) — the `-` that had switched off added-gap detection is gone. .F: owner column names #88
+(an INCOMPLETE row may own a CANDIDATE; ledger-crosscheck now prints ok instead of R6-CAND); #88 status = 5/9 samples
+unattributed, see the ledger.
+
+## 96-mid-flight-chaos.A
+
+nc_gap is `-` because the A2 (#58) leg is two-valued by construction and both values are honest gaps:
+the 1 GiB in-flight pull is raced against `docker kill brk2`, and on this host it sometimes strands
+hundreds of objects (unsplit run 2026-09-19: 444 above a floor of 1 → the R4-F3 no-verdict branch, 4 gaps
+in all) and sometimes drains before the kill lands (split run 2026-09-19: 2 above 1, below the tombstone
+floor of 6 → the vacuous-reap guard records a 5th gap). Neither is a regression and neither is a pass;
+the arm cannot make the race deterministic without bandwidth-shaping the agent (ruled out in the drill
+header). The other four gaps are constant: `:346`-class #58 cross-home GC (structural), the drill-level
+B/C gap, the #57 branch (both in-sim outcomes are gaps), and B0. Expected verdict stays INCOMPLETE; a
+PRODUCT-RED here (a real #57 pin, or a #58 orphan that survives the reap) is a DEVIATION as before.
 
 ROUND-4 R4-F3 (2026-07-23): the #58 cross-home GC deploy-tier gap is now booked EXACTLY ONCE - unconditionally, in the A-arm setup. The duplicate registration under the same title in the A2 branch is DELETED, so the coverage account no longer depends on which branch the A-arm takes (a run that reaches A2 now records one fewer nc_gap than the R14/R15 counts quoted below). The gap itself is unchanged and still OPEN: a >15m run is what would close it. | ROUND-3 R3-F3 (2026-07-23): the #58 arm no longer compresses xfer_cross_home_reap_age - external review F2 clamped that production knob to >= 15m (a lower floor lets the leader delete an object still live on ANOTHER home), so a 5s value can no longer even LOAD. The FIXED/REGRESSION/SPLIT-HOME judges that depended on it are DELETED, not relocated; the arm records an unconditional not_covered instead. Only the CADENCE knob (xfer_reap_interval) is still compressed. The #57 arm now brings brk2 back and waits for the finalize-on-recovery pass BEFORE judging - the previous revision declared #57 'forever' while the crashed home was still down, so it measured the crash rather than the product's recovery and could neither certify nor refute R16/G67. | R16 (2026-07-22 deploy-tier): product_red 1→0, assert_fail 1→0, pass=38. Lane B (#57 finalize-on-recovery: node-local durable in-flight ledger + a DETERMINISTIC synthetic terminal committed BEFORE the ledger is deleted) and Lane C (#58 leader cross-home GC for a bucket no HOME can reap) both SHIPPED and are pinned HERMETICALLY. Their DEPLOY-TIER demonstration did NOT happen: the A-arm's 1 GiB tier-B upload again reached a terminal before the docker kill (the standing in-sim interruption gap), so no chunks were stranded — peak orphan count 2 vs tombstone floor 6. R16 therefore ADDED a NON-VACUITY GATE to the #58 arm: when the peak orphan count never exceeds the floor the arm records not_covered instead of banking a 'count is at the floor' PASS that would assert the reap works on a run where no reap was needed. #57/#58 stay OPEN in the ledger — the product fix is in, the deploy-tier proof is owed. Drill also fixed: the leader-side #58 knobs (xfer_reap_interval + the new xfer_cross_home_reap_age) now load via a restart that RE-ESTABLISHES brk1 as leader — the cross-home GC is leader-only, so the first attempt put the compressed knobs on a node that had just lost leadership. | R15: R15: R14 drill flips: Q3 held-foreground seeds (F0/F0b `tether exec --timeout 30m -- sleep N` HELD by tether, not `nohup sleep &` — F0c/F3/F4 now ask a real RUNNING↔EXITED question the old fixture made self-contradictory); Q4 D3 clean best-effort-success positive; D6b + COMMITTER ATTRIBUTION (reads brk1's own broker.log 'session created' line) correctly separates a queue-group MAJORITY commit from a true #65 — r14d canary3 was durable on all 3 brokers yet brk1 did NOT commit it ⇒ recorded NOT-#65 (R6's exact insight, was the old ledger's phantom '5/6 durable minority writes'). #57 is the current PRODUCT-RED driver (see owner); #58-split-home now counts under nc_gap (deterministic structural cause, NOT a PINS-LIVE leak — retires at per-transfer-owner refinement). Reclassified runtime-guard→gap: #57 dangling-audit (determinization MEASURED insufficient — 1 GiB STILL completes before the docker-kill on the 88-vCPU host; bandwidth-shaping would destabilise the cluster; hermetic-owned) + #57 audit-unreadable (audit sits on the killed home broker) + D6b minority-write (R6: isolated minority can't auth a fresh CLI connection, rc=69) + #58 split-home (drill line 447: deterministic structural cause, a defect-tied gap). A-arm payload 12MiB→1GiB (helps #58 strand orphans + sometimes catches #57 IN-FLIGHT = live PRODUCT-RED). r14d nc_guard=0 EVERY run — TERMINAL-GATE CLEAN (all 7 of 96's runtime-guards eliminated; #58-split-home now counts under nc_gap: nc_gap=5 nc_guard=0). A1e (the #57 anti-vacuity control) fixed: it ran on agt1 whose HOME broker brk2 is dead when #57 pins → a false ASSERT-FAIL; now runs on agt2 (homed on the live brk1) so #57 lands PRODUCT-RED not ASSERT-FAIL. D3(Q4) is a DETERMINISTIC POSITIVE now (best-effort-success fix killed the apply-lag non-idempotent flake — the D3 that was 60× red). F-arm (Q3 held seeds) is GATED as a gap every run: arm-D partition recovery to FULL health (brk1 re-VOTER + agt2 re-ONLINE off its just-healed home) is >360s in-sim, so the double-fault arm is not run over cross-arm residue (a pre-existing gap, NOT caused by Q3 — the held-seed fixture is sound by exec.go:192 inspection). Was UNSTABLE (flake band)
 
@@ -473,3 +744,9 @@ commit 建 git worktree、用基线源码烘镜像、跑基线的 drill——不
 负载敏感；`95` 三次三个样子（`D6b` / `T2c`+`T2f`+`D0` / 清空容器后 GREEN pass=44），失败全是
 wall-clock 轮询超时，证据里 `fsync_4k_ms=15.3`。`96` 的声明式缺口是 6 条而登记为 5，且**单跑同样
 是 6**——表的注记写成「`-j6` 下的 #71」不准确。以上均**未**写进 `expected-verdicts.tsv`。
+
+**结案（2026-09-20，simcluster-speed round-2 review R6-7 补记）**：上面两节登记的六条「登记表过期」项在
+2026-09-19 的 simcluster-speed 增量里逐条分诊完毕，处置写在各自的 `## <drill>` 段里：`52` / `60` / `81` 是 oracle
+读错了流或列（52 BOOT journal、60 KIND 列、81 agent BOOT 流 + cursor），产品文本没变，solo 全 GREEN；`94` 的 B3
+超时是产品缺陷 #87（已修）；`67` 的 CONTROL(after) 面是 #84（已修，三张脸）；`30` 是负载面（无变更）。「直到有人真的
+去分诊」——已分诊；「five remain stale」——不再成立。

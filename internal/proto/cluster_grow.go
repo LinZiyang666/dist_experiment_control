@@ -71,15 +71,23 @@ type ClusterGrowReq struct {
 
 // ClusterGrowResp is the broker's reply to a grow trigger.
 type ClusterGrowResp struct {
-	OK          bool   `json:"ok,omitempty"`
-	Code        string `json:"code,omitempty"` // reuses the adminsock Code* vocabulary
-	Error       string `json:"error,omitempty"`
-	OpID        string `json:"op_id,omitempty"`        // approve-join: the created/attached OpKindJoin op id
-	OpState     string `json:"op_state,omitempty"`     // join-status: the current op state
-	Terminal    bool   `json:"terminal,omitempty"`     // join-status: op reached SERVING/failed
-	LastError   string `json:"last_error,omitempty"`   // join-status: the op's last recorded error
-	AlreadyDone bool   `json:"already_done,omitempty"` // idempotent no-op (marker already ours / already clustered)
-	BackupPath  string `json:"backup_path,omitempty"`  // mesh-cutover: where the moved-aside JS store landed
+	OK        bool   `json:"ok,omitempty"`
+	Code      string `json:"code,omitempty"` // reuses the adminsock Code* vocabulary
+	Error     string `json:"error,omitempty"`
+	OpID      string `json:"op_id,omitempty"`      // approve-join: the created/attached OpKindJoin op id
+	OpState   string `json:"op_state,omitempty"`   // join-status: the current op state
+	Terminal  bool   `json:"terminal,omitempty"`   // join-status: op reached SERVING/failed
+	LastError string `json:"last_error,omitempty"` // join-status: the op's last recorded error
+	// NonvoterCommitted (join-status) is true once the op's timeline has passed RAFT_ADDING into
+	// CATCHING_UP, i.e. AddNonvoter committed and the joiner is in the raft configuration — the fact the
+	// orchestrator's catch-up barrier actually asks for. It stays true when the op later goes BLOCKED
+	// (catch-up deadline exceeded while the joiner's daemons were not yet started, drill 42's returning
+	// node), so a resume can tell "past AddNonvoter, needs a confirm" from "never staged". Additive and
+	// omitempty (N-1 window): an older leader never sets it, and the orchestrator then falls back to
+	// waiting for CATCHING_UP exactly as before.
+	NonvoterCommitted bool   `json:"nonvoter_committed,omitempty"`
+	AlreadyDone       bool   `json:"already_done,omitempty"` // idempotent no-op (marker already ours / already clustered)
+	BackupPath        string `json:"backup_path,omitempty"`  // mesh-cutover: where the moved-aside JS store landed
 	// MeshPeers (mesh-peers) is the route-mesh peer set from the leader's cluster_nodes, one entry per broker
 	// as "server_name,route_url,bus_nkey_pub" — the exact triple `reconcile nats --manual --peer` consumes, so
 	// the joiner can render its own clustered nats.conf (auth_callout + routes) before its broker boots.

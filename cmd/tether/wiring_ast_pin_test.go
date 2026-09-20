@@ -5,6 +5,7 @@ package main
 import (
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"strings"
 	"testing"
@@ -156,5 +157,151 @@ func TestG67ProbeWarningIsAnnouncedAtBothCallSites(t *testing.T) {
 		t.Fatalf("capsProbe.warning() is consulted %d time(s) in transfer.go, want >= 2 (push and pull). "+
 			"chooseTier now proceeds OPTIMISTICALLY to tier B whenever the probe produced no authoritative "+
 			"answer; that is only honest while the guess is announced on stderr", uses)
+	}
+}
+
+// TestTierBEntryPointsDeriveTheirPhaseTimeoutFromTheSize pins the CALL SITES of phaseTimeoutFor, the
+// same shape of hole the G67 pins above close for transferRefusalErr: TestPhaseTimeoutForDerivesFromSize
+// exercises the function, and mutation PT-3 (internal review round 1 R4-F6) showed that passing the raw
+// `timeout` flag to finishPullTierB instead of phaseTimeoutFor(cmd, pr.Size, timeout) leaves every test
+// green — the 37-minute flat budget drill 67 measured would be back on the pull side with nothing
+// noticing. The pin: the two tier-B entry points are each called exactly once, and the LAST argument of
+// each call is phaseTimeoutFor(cmd, <the size that call itself carries>, timeout) — for push the size is
+// the argument at the size position of the same pushTierB call, for pull it is `<prepare-reply>.Size`
+// where the prepare reply is the argument passed at its own position of the finishPullTierB call.
+// origin: simcluster-speed internal review round 1 R4-F6
+func TestTierBEntryPointsDeriveTheirPhaseTimeoutFromTheSize(t *testing.T) {
+	fset, f := g67ParseTransferGo(t)
+	// The positional contract, read off the two signatures:
+	//   pushTierB(cmd, nc, actor, sid, spec, transferID, localAbs, size, force, timeout)
+	//   finishPullTierB(cmd, nc, actor, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
+	want := map[string]struct {
+		nargs   int
+		sizeArg func(call *ast.CallExpr) string // the expression phaseTimeoutFor's size must equal
+	}{
+		"pushTierB": {nargs: 10, sizeArg: func(c *ast.CallExpr) string { return exprString(fset, c.Args[7]) }},
+		"finishPullTierB": {nargs: 11, sizeArg: func(c *ast.CallExpr) string {
+			return exprString(fset, c.Args[8]) + ".Size"
+		}},
+	}
+	seen := map[string]int{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		spec, ok := want[id.Name]
+		if !ok {
+			return true
+		}
+		seen[id.Name]++
+		at := fset.Position(call.Pos()).String()
+		if len(call.Args) != spec.nargs {
+			t.Fatalf("%s: %s takes %d arguments, this pin was written for %d — re-derive the positions", at, id.Name, len(call.Args), spec.nargs)
+		}
+		last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
+		if !ok {
+			t.Fatalf("%s: %s's timeout argument is %q, not a phaseTimeoutFor(...) call — the tier-B phase budget "+
+				"is the flat flag again (37 min for every size)", at, id.Name, exprString(fset, call.Args[len(call.Args)-1]))
+		}
+		if fn, ok := last.Fun.(*ast.Ident); !ok || fn.Name != "phaseTimeoutFor" || len(last.Args) != 3 {
+			t.Fatalf("%s: %s's timeout argument is %q, want phaseTimeoutFor(cmd, <size>, timeout)", at, id.Name, exprString(fset, last))
+		}
+		if got, wantSize := exprString(fset, last.Args[1]), spec.sizeArg(call); got != wantSize {
+			t.Fatalf("%s: %s derives its phase timeout from %q but transfers %q — the budget must be sized for THIS transfer", at, id.Name, got, wantSize)
+		}
+		if got := exprString(fset, last.Args[2]); got != "timeout" {
+			t.Fatalf("%s: phaseTimeoutFor's flag argument is %q, want the --timeout flag value `timeout` (an explicit flag must still win)", at, got)
+		}
+		return true
+	})
+	// Anti-vacuity: exactly one call site per verb — a second one would be a second budget to pin.
+	if seen["pushTierB"] != 1 || seen["finishPullTierB"] != 1 {
+		t.Fatalf("expected exactly one pushTierB and one finishPullTierB call site in transfer.go, found %v", seen)
+	}
+}
+
+// exprString renders an expression as source text for comparison in error messages and equality checks.
+func exprString(fset *token.FileSet, e ast.Expr) string {
+	var sb strings.Builder
+	if err := printer.Fprint(&sb, fset, e); err != nil {
+		return "<unprintable>"
+	}
+	return sb.String()
+}
+
+// TestPushTierBWiresTheWatchdogAndTheRetryLadder pins the #84 ladder at its ONLY call site (round-2
+// review R4-2-F2, the same hole class as round-1 R4-F6): inside pushTierB there is exactly one
+// putWithJSRetry call, its arguments are the production classifier and the production constants,
+// and exactly one putWithJSWatchdog call whose clocks are the production constants and whose probe
+// closure calls probeJetStreamForBucket. Handing the ladder a never-transient classifier, an
+// unreachable strike count, or a probe that is not the ACL-bounded STREAM.INFO one left every
+// hermetic test green — only drill 67 (deploy tier, on demand) would have noticed.
+// origin: simcluster-speed review round 2 R4-2-F2
+func TestPushTierBWiresTheWatchdogAndTheRetryLadder(t *testing.T) {
+	fset, f := g67ParseTransferGo(t)
+	var push *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "pushTierB" {
+			push = fd
+		}
+	}
+	if push == nil {
+		t.Fatal("pushTierB not found in transfer.go")
+	}
+	retries, watchdogs := 0, 0
+	ast.Inspect(push.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		at := fset.Position(call.Pos()).String()
+		switch id.Name {
+		case "putWithJSRetry":
+			retries++
+			want := []string{"putCtx", "attemptPut", "jetStreamUnavailableFace", "jsPutRetryAttempts", "jsPutRetryBackoff", "sleepCtx"}
+			if len(call.Args) != len(want) {
+				t.Fatalf("%s: putWithJSRetry takes %d arguments, this pin was written for %d", at, len(call.Args), len(want))
+			}
+			for i, w := range want {
+				if got := exprString(fset, call.Args[i]); got != w {
+					t.Fatalf("%s: putWithJSRetry argument %d is %q, want %q — the retry ladder is no longer driven by the production classifier/constants", at, i, got, w)
+				}
+			}
+		case "putWithJSWatchdog":
+			watchdogs++
+			if len(call.Args) != 6 {
+				t.Fatalf("%s: putWithJSWatchdog takes %d arguments, this pin was written for 6", at, len(call.Args))
+			}
+			for i, w := range map[int]string{3: "jsPutProbeInterval", 4: "jsPutProbeTimeout", 5: "jsPutProbeStrikes"} {
+				if got := exprString(fset, call.Args[i]); got != w {
+					t.Fatalf("%s: putWithJSWatchdog clock argument %d is %q, want %q", at, i, got, w)
+				}
+			}
+			probes := 0
+			ast.Inspect(call.Args[2], func(m ast.Node) bool {
+				if c, ok := m.(*ast.CallExpr); ok {
+					if fn, ok := c.Fun.(*ast.Ident); ok && fn.Name == "probeJetStreamForBucket" {
+						probes++
+					}
+				}
+				return true
+			})
+			if probes != 1 {
+				t.Fatalf("%s: putWithJSWatchdog's probe closure calls probeJetStreamForBucket %d times, want exactly 1 (the ACL-bounded STREAM.INFO probe is the only permitted one)", at, probes)
+			}
+		}
+		return true
+	})
+	if retries != 1 || watchdogs != 1 {
+		t.Fatalf("pushTierB must call putWithJSRetry once and putWithJSWatchdog once; found %d and %d", retries, watchdogs)
 	}
 }

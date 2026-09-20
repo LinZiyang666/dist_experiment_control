@@ -150,6 +150,35 @@ assert_ok "#76 --no-enable leaves the units DISABLED (the operator opted out)"  
 assert_ok "reinstall broker (default, re-enables) for the #77 + uninstall checks below"  _broker_install
 assert_ok "#76 default reinstall re-enabled the units"  _units_enabled
 
+# ── H-7′ (simcluster-speed plan X12 / §5.4; internal review round 1 R3-6): the client-liveness retrofit path.
+# An existing nats.conf is KEPT on re-run (DRD-F1 policy); a conf from before the ping keys must therefore stay
+# byte-identical while the .new beside it carries the two keys and the KEPT report names exactly those two
+# lines; a conf that carries the keys with OTHER values must be reported as a value difference, not silently
+# accepted because a `^ping_interval` line exists (R3-5). The values are read from install.sh's single
+# definition, never typed here — a hand copy is the drift this exists to catch.
+_NC=/etc/tether/nats.d/nats.conf
+_ping_iv=$(IN sh -c "sed -n 's/^NATS_PING_INTERVAL=\"\\(.*\\)\"/\\1/p' $INST" 2>/dev/null | tr -d '\r')
+_ping_mx=$(IN sh -c "sed -n 's/^NATS_PING_MAX=\\([0-9]*\\)/\\1/p' $INST" 2>/dev/null | tr -d '\r')
+[ -n "$_ping_iv" ] && [ -n "$_ping_mx" ] || setup_fail "H-7' install.sh no longer defines NATS_PING_INTERVAL / NATS_PING_MAX once"
+_strip_ping_keys() { IN sh -c "sed -i '/^ping_interval:/d; /^ping_max:/d' $_NC && ! grep -q '^ping_' $_NC"; }
+_nc_sha() { IN sha256sum "$_NC" 2>/dev/null | cut -d' ' -f1; }
+_reinstall_capture() { IN sh -c "sh $INST --role broker --skip-download --domain brkx --acme-email x@x.test" 2>&1; }
+_kept_unchanged() { [ -n "${_NC_SHA0:-}" ] && [ "$(_nc_sha)" = "$_NC_SHA0" ]; }
+_new_has_ping_keys() { IN sh -c "grep -qx 'ping_interval: \"$_ping_iv\"' $_NC.new && grep -qx 'ping_max: $_ping_mx' $_NC.new"; }
+_report_names_two_lines() { printf '%s' "$_KEPT_OUT" | grep -q 'predates the client-liveness keys' && printf '%s' "$_KEPT_OUT" | grep -q "ping_interval: \"$_ping_iv\"" && printf '%s' "$_KEPT_OUT" | grep -q "ping_max: $_ping_mx"; }
+_report_names_value_diff() { printf '%s' "$_KEPT_OUT" | grep -q 'carries ping_interval=45s' && ! printf '%s' "$_KEPT_OUT" | grep -q 'predates the client-liveness keys'; }
+assert_ok "H-7' fixture: strip the two ping keys from the installed nats.conf (a pre-liveness conf)"  _strip_ping_keys
+_NC_SHA0=$(_nc_sha)
+_KEPT_OUT=$(_reinstall_capture); _kept_rc=$?
+assert_ok "H-7' a re-run over a pre-liveness nats.conf exits 0 (KEPT, not overwritten)"  sh -c "[ '$_kept_rc' = 0 ]"
+assert_ok "H-7' the kept nats.conf is BYTE-IDENTICAL after the re-run (sha256 unchanged — the DRD-F1 keep policy holds for this file)"  _kept_unchanged
+assert_ok "H-7' the .new beside it carries exactly the two client-liveness lines in the load-bearing shapes (quoted duration, bare integer), read from install.sh's single definition"  _new_has_ping_keys
+assert_ok "H-7' the KEPT report names the two lines to merge and says the conf predates the keys (the operator merges exactly those, nothing else)"  _report_names_two_lines
+assert_ok "H-7' fixture: a nats.conf carrying the keys with OTHER values (ping_interval: \"45s\")"  IN sh -c "sed -i 's/^ping_interval:.*/ping_interval: \"45s\"/' $_NC && grep -q '^ping_interval: \"45s\"' $_NC || { printf 'ping_interval: \"45s\"\nping_max: $_ping_mx\n' >> $_NC; }"
+_KEPT_OUT=$(_reinstall_capture)
+assert_ok "H-7' the KEPT report names the VALUE difference (carries ping_interval=45s) instead of staying silent because a ping_interval line exists (R3-5)"  _report_names_value_diff
+assert_ok "H-7' cleanup: restore the shipped ping values so the checks below see the stock conf"  IN sh -c "sed -i 's/^ping_interval:.*/ping_interval: \"$_ping_iv\"/; s/^ping_max:.*/ping_max: $_ping_mx/' $_NC"
+
 # ── #77: journald size cap drop-in, value derived from THIS container's /var/log filesystem ────
 # The drill INDEPENDENTLY recomputes the expected tier from df (never trusts the product's output),
 # so a wrong derivation is caught, not rubber-stamped.

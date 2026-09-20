@@ -55,7 +55,7 @@
    被折叠成一条，所以旧数字 436 既放行未来站点又少报当下站点）、
    **生产文件名**（零账本——落门时全仓只有 1 个违规，已改名）。
    两本账本都只减不增：**账本里已不存在的条目会让门变红**，所以它们不会腐化成永久豁免。
-6. **外部审查（用户本人）**：提交给用户做最终人工外审；用户出报告 `docs/reviews/p<N>-external-review.md`，主进程评估后**在报告文件内逐条回复**并修改。**外审不过不算 done。**
+6. **外部审查（用户本人或用户指定的独立审查者）**：按 **§4.1 外审标准流程**执行，报告写入 `docs/reviews/<增量>-external-review.md`（P 序列用 `p<N>`，复审沿用该增量的轮次命名）；主进程评估后**在报告文件内逐条回复**并修改。**外审不过不算 done。**
 7. **phase 结束**：先**归档**再提交，两步都做完才算结束。
    - **归档判据（一半机械、一半是判断，两半都说清）**：`docs/` **顶层**只放**活文档**——即"下一次改代码时还会被读"的基线。
      - **机械的那半有闸门**：`test/architecture/docs_layout_test.go` 拦下任何**已跟踪**的
@@ -95,7 +95,38 @@
 |---|---|---|
 | **主进程** | 定稿 plan、编写/修改实现、采纳审查、整合测试、commit/push | — |
 | **专家**（workflow 内 agent） | 草拟 plan 建议（step1）；审查 + **新增测试**（step4） | **改实现代码**、定稿 plan、commit |
-| **外部审查**（用户本人） | 独立人工外审、出报告 | 改代码 |
+| **外部审查**（用户本人或用户指定的独立审查者） | 独立审查、建立 tasklist、新增独立测试、按需查看/运行 simcluster、出报告、收尾全部暂存 | 未经用户另行授权修改实现、commit/push |
+
+### 4.1 外审标准流程（外审/复审默认适用）
+
+用户指定你为**外部审查者**或要求**外审/复审**时，直接执行本节，无需用户重复初始化 prompt。
+你独立于主进程，以最资深测试与审查工程师的标准工作，对审查覆盖、证据和结论负责；以可能在上线后暴露的问题为审查目标。
+**内审报告、主进程回复和“已修复/全绿”声明只作线索与待证主张，必须独立核验，不能据此直接放行。**
+
+1. **先理解项目与既有审查习惯。** 阅读本文件，按 §1 权威链阅读需求、当前架构、目标及相关 `docs/`；
+   阅读本增量的 plan、历次报告与回复，以及 `docs/reviews/` 中相关外审报告/tasklist，熟悉流程和报告体例。
+   涉及测试时读取 `docs/testing-standards.md`；涉及真实部署时读取 `test/simcluster/README.md` 与对应设备/运维说明。
+2. **粗读全部修改，再先写 tasklist。** 默认范围是**暂存区外的全部修改与未跟踪文件**，以当前 index 为比较基线；
+   用户另有范围要求时从其要求。记录 HEAD、已暂存基线、未暂存/未跟踪清单；粗读 diff 与新增文件，
+   然后在 `docs/reviews/<增量>-external-review-tasklist.md` 写出尽可能丰富、与本次改动具体对应的审查面，**先落盘再逐项深入审查**。
+   按适用性覆盖：需求与目标符合性、架构不变量、调用链与状态机、协议/兼容/权限、并发/超时/重试/资源释放、
+   故障/恢复/持久化、性能与部署、测试断言和闸门有效性、删除/放宽是否丢失覆盖、文档/台账/实际行为的一致性。
+   不能把内审 finding 清单直接当成完整审查面；过程中发现新风险须追加 tasklist。
+3. **按 tasklist 独立审查与验证。** 主动寻找潜在 bug、逻辑谬误、代码异味、错误假设和未覆盖边界，
+   从实现及上下游调用链核验，并用反例、失败路径、必要的变异或独立测试验证关键主张。
+   **允许新增独立测试**，按被测职责命名并遵守 §3 step 5b 与 §5；不通过修改实现、削弱断言或改 expected 来制造通过。
+   **允许查看 simcluster server 信息，运行或添加需要 simcluster 的模拟测试**；按 §5 的按需原则选择相关场景，
+   遵守 simcluster Mandate 与资源使用约定，记录实际代码/镜像身份、命令、结果与原始证据，保护凭据。
+   已有测试全绿不代替独立审查；未执行的验证、环境受阻和推断必须如实注明。
+4. **逐项收尾后形成报告。** tasklist 每项都要有真实处置和验证结果；不适用项写理由，受阻项写缺少的条件，
+   不得将未执行项伪标完成。完成所有可执行项后，报告写入 `docs/reviews/<增量>-external-review.md`，
+   **第一行必须以 `Fail` 或 `Pass` 开头**；格式参考已有外审报告，明确范围/基线、疑惑、问题、建议、验证结果和覆盖限制。
+   finding 按严重度排列，给出精确文件/符号/行、触发前提、证据、影响和修复/回归验收建议；区分确认缺陷、待证疑惑和非阻断建议。
+   存在阻断问题或必要验证受阻、证据不足时给出 `Fail`，不能用“内审已过”代替结论。实现者须在报告内逐条回复，复审独立核验关闭情况。
+5. **审查结束后全部暂存并核验。** 重新检查范围是否漂移，确认 tasklist 与报告反映实际结果，随后执行 **`git add -A`**，
+   将被审查的代码、测试、文档及审查新增文件**全部加入暂存区**；核验无未暂存差分、无未跟踪文件，并检查完整 staged diff。
+   此步骤适用于 **Fail 和 Pass 两种结论**；暂存表示保留本轮审查快照，放行仍以报告结论为准。
+   不强制加入被忽略的凭据或运行产物；**不 commit、不 push**。用户明确要求保留不同暂存边界时，按用户要求并在报告中记明。
 
 ## 5. 编码与测试约定
 
@@ -153,6 +184,7 @@
   | build-tag 编译闸 | `make vet-tags` + `test/architecture/build_tags_test.go` | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账**；**tag 局部性**：`_integration` tag 门控的文件只许落在自己的 `test/<dir>`（例外账本 1 条：`internal/broker/phasefluidity_lifecycle_test.go`），门控文件总数**精确钉死**（今天 23）——这是矩阵去重「共享包在各 tag 下闭包全等」前提的守卫，往 `internal/proc` 放一个 `//go:build d5_integration` 文件会让 D5 的二进制与 D4 不同而无人察觉 |
   | T3 前提 | `test/determinism/leader_premise_test.go` + `legacy_leader_premise_sites.go` | 测试里裸读 `.IsLeader()` / `.State() == raft.Leader`——不在**身份已证明**的轮询 helper 的谓词闭包里（外部原语按 import 路径信任：`clusterharness.WaitForCond`/`WithLeader`、`testharness.WaitFor`；本包 helper 须由 `verifiedPollingHelpers` 从其实现证明"deadline 循环里反复求值谓词或转发给已证明原语"，同名一次性 shadow 不算——外审复审 R1）、也不是**body 只等待**的循环条件（body 里任何赋值/发送/业务调用/非 continue 分支都算对刚读到的 premise 行动——外审 F2 + R1）——即红，除非在 `path: func` 递减账本；helper 是 `test/clusterharness.WithLeader`（观测→行动→再观测，移动即整段重来；`test/d3` 的 follower PIN 写是第一个调用方）。「观测领导权然后假设它不变」是 parallel-flake-rootcause 根因 2，第二次被修错两回 |
   | inbox 配对 | `test/architecture/inbox_prefix_pairing_test.go` | **三件事**:①私有 inbox 前缀与 CONNECT 标记(`auth.InboxCapableMarker`)只许由 `internal/natsinbox` 的那**一个** helper 设置;②**helper 自己必须两半都设**——第一版只有①,于是从 helper 里删掉标记那一行,`make gates` 全绿而每个升级过的客户端静默退回共享 inbox;③标记的**读**方只许是账本里那两个文件(声明处 + callout),死条目即红。扫描按**选择器名**匹配(别名/点导入/`nats.Options{InboxPrefix:}`/字段直写都看得见),第一版只认 `nats.` 前缀。半接线的失败态是**响亮的**(SUB 被拒 + `-ERR` + 服务端日志 + nats.go 异步错误)——四处文档曾写成"静默超时无线索",而那条假前提正是"用源码门而不用运行时自检"的理由;`natsinbox.Connect` 现在两者都做。`completion_transport.go` 已经因为这条规则的弱化版漏过一次,shell 补全静默返回空 |
+  | NATS 存活探测三方一致 | `test/architecture/nats_ping_defaults_test.go` | agent 的 `AgentPingInterval/AgentMaxPingsOut`（客户端半）↔ `scripts/install.sh` 写进 nats.conf 的 `ping_interval "…"`/`ping_max`（服务端半）↔ drill 98 的 `PING_INTERVAL_S`（预算推导）必须相等；install.sh 写成裸整数/未引号 duration 时门判**盲**而非绿（natsconf 对同样形状 fail-closed）。两半各是一个 Go 常量与一段 shell heredoc，没有任何东西把它们连起来——一边"顺手调一下 keepalive"，失联检测窗就悄悄变成 runbook 与 drill 都没写的那个数（simcluster-speed H） |
   | 测的服务端 == 发的服务端 | `test/architecture/nats_server_pin_test.go` | `go.mod`(`make test` 链接的嵌入式 server)/`scripts/install.sh`(运维主机上真跑的二进制)/`Makefile` 三处 nats-server 版本必须逐字相等;`test/simcluster/lib/stage.sh` 必须继续从 install.sh **单源**读取而不是自己写死。这两者曾差四个 minor(测 v2.14.0 / 发 v2.10.22),`docs/reviews/INDEX.md` 2026-08-06 已记过一次同类事故,第二次是 `_INBOX` 隔离:它押在 `deny` 上,而 deny 的装载判据在 v2.12→v2.14 之间从 `subjectIsSubsetMatch` 改成 `SubjectsCollide`,于是**在现网跑的每个版本上 deny 从未被装载**。install.sh 也不再"已存在即跳过"——按版本比对后 rename 替换并要求重启 |
   | 命名冻结 | `test/determinism/test_naming_test.go` | 测试文件名／测试函数名／生产文件名（见 §3 step 5b）；**文件首注释里的文件名必须等于 basename**（158 文件改名后 59 个头还写着旧名，2026-09-01 逐个改正为 `x_test.go (formerly old_test.go)`，此后账本为 0） |
   | test tree 地图 | `test/architecture/test_layout_map_test.go` | `test/README.md` 的目录表与 `test/` 顶层目录**双向对账**；表里点名的矩阵函数与 build tag 必须真实存在；`p*/d*` 目录冻结为**精确集合 18**（不迁不增，新目录按主题命名；裁决见 plan §0 A2） |

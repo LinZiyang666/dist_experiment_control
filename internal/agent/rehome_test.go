@@ -42,7 +42,7 @@ func newFakeHomeAdapter(respond func(port int, epoch int64, call int) error) *fa
 }
 
 func (f *fakeHomeAdapter) Start(context.Context) {}
-func (f *fakeHomeAdapter) AddProxy(p PortToken) error {
+func (f *fakeHomeAdapter) AddProxy(_ context.Context, p PortToken) error {
 	f.mu.Lock()
 	f.addCalls++
 	f.mu.Unlock()
@@ -317,7 +317,7 @@ func TestD6ReviewDeferredReplayOpensWhenPinsArrive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a.replayPortsFromState()
+	a.replayPortsFromState(context.Background())
 	fake.mu.Lock()
 	addsAfterReplay := fake.addCalls
 	fake.mu.Unlock()

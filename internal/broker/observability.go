@@ -73,6 +73,17 @@ func decideObservabilityAlerts(selfID string, leaderApplied uint64, voters []str
 // broker-only proto.SubjClusterCursor (its broker nkey can pub there); a future member-side
 // ctl status aggregation would pass proto.SubjCtrlClusterHealth(actor).
 func pollClusterHealth(nc *nats.Conn, subject string, window time.Duration) map[string]proto.ClusterHealthResp {
+	return pollClusterHealthUntil(nc, subject, window, nil)
+}
+
+// pollClusterHealthUntil is pollClusterHealth with an early exit: after every reply `until` (when
+// non-nil) sees the replies so far, and a true ends the gather before the window closes. The
+// broadcast is a scatter, so a caller that wants ONE responder's answer — the expose barrier
+// waiting for the home's cursor — would otherwise pay the whole window on every call even when
+// the home answered in a millisecond (round-2 review R2-F4: +400 ms on every clustered
+// cross-home expose, and an "expose waited for the home" line on every one of them). The
+// observability poll passes nil: it wants every voter's reply and the window is its bound.
+func pollClusterHealthUntil(nc *nats.Conn, subject string, window time.Duration, until func(map[string]proto.ClusterHealthResp) bool) map[string]proto.ClusterHealthResp {
 	out := map[string]proto.ClusterHealthResp{}
 	if nc == nil {
 		return out
@@ -104,6 +115,9 @@ func pollClusterHealth(nc *nats.Conn, subject string, window time.Duration) map[
 		var r proto.ClusterHealthResp
 		if json.Unmarshal(msg.Data, &r) == nil && r.NodeID != "" {
 			out[r.NodeID] = r
+			if until != nil && until(out) {
+				break
+			}
 		}
 	}
 	return out

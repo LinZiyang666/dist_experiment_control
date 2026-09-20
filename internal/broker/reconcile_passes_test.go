@@ -1178,7 +1178,7 @@ func TestXferOrphanReapLiveTransferGuard(t *testing.T) {
 
 	// And once it finishes, the bucket stops being protected — otherwise the
 	// reaper could never collect anything and #58 would be "fixed" into a no-op.
-	tr.remove("t1")
+	tr.remove(tr.get("t1"))
 	if _, ok := tr.activeOBJStreams()["OBJ_xfer-lab"]; ok {
 		t.Fatal("a completed transfer must leave the exclusion set, or the reaper can never collect")
 	}
@@ -1285,7 +1285,7 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 	}
 
 	// --- drift: the transfer finishes and its object becomes collectable ---
-	b.transfers.remove("t-live")
+	b.transfers.remove(b.transfers.get("t-live"))
 	if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
 		t.Fatalf("post-completion tick: %v", err)
 	}

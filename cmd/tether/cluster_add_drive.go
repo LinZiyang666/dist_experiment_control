@@ -1,18 +1,24 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/natsconf"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -116,11 +122,17 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	defer keeper.Stop()
 
 	// P2 LOCAL OFFLINE INIT: bootstrap raft/ + apply the broker.yaml seam. Skip if raft/ already present.
+	//
+	// initRanThisInvocation is the ONE fact the start-joiner boundary (P3b) is allowed to shorten its
+	// grace on — see joinerStartGrace. It is set only by a successful runSelfInit in THIS process, never
+	// inferred from "raft/ is present now" (that is true on every resume too).
+	initRanThisInvocation := false
 	if !dirExists(jp.DataDir + "/raft") {
 		_, _ = fmt.Fprintf(out, "→ init %s (bootstrap raft/ locally)\n", jp.Joiner)
 		if err := runSelfInit(cmd, jp); err != nil {
 			return haltAdd(webhook, "init", jp.Joiner, err)
 		}
+		initRanThisInvocation = true
 	} else {
 		_, _ = fmt.Fprintf(out, "  (raft/ present — init already done)\n")
 	}
@@ -203,10 +215,47 @@ func driveAdd(cmd *cobra.Command, nc *nats.Conn, actor, sid string, accountSeed 
 	// systemctl). Liveness is on the joiner's LOCAL admin socket (we run ON the joiner; its nats health is
 	// unreachable over NATS until the mesh forms). HALT with the resume hint if not up yet — its conf is now
 	// clustered, so provisioning's start brings it up meshed.
-	if !awaitJoinerBrokerUpLocal(ctx, socketPath, jp.Joiner, out) {
+	//
+	// The grace is joinerStartGrace(initRanThisInvocation, natsState): a fresh joiner whose raft/ this very
+	// process just created cannot have a cluster-mode broker to wait for, so it HALTs at once instead of
+	// sitting out joinerBootGrace; so does a returning node whose nats-server still runs the standalone
+	// conf (provisioning has not done its half yet — gotcha #83); a resume with nats already clustered
+	// keeps the full window (that window is why drill 42's returning node stopped failing 3 runs in 4).
+	natsState, procState := natsLocalUnknown, brokerProcUnknown
+	if !initRanThisInvocation && !joinerBrokerUpLocal(socketPath) {
+		natsState = joinerNatsState(joinerNatsURL(jp.ConfigPath), 2*time.Second)
+		// 3 samples 2 s apart: longer than one RestartSec gap, far shorter than the grace it decides on.
+		procState = joinerBrokerProcess(3, 2*time.Second)
+	}
+	grace := joinerStartGrace(initRanThisInvocation, natsState, procState)
+	if !awaitJoinerBrokerUpLocal(ctx, socketPath, jp.Joiner, grace, out) {
+		if !initRanThisInvocation && grace == 0 {
+			_, _ = fmt.Fprintf(out, "  (%s: nats-server %s, tether serve process %s — nothing can come up until provisioning restarts the daemons; not waiting)\n", jp.Joiner, natsState, procState)
+		}
+		// Two different pauses. The daemons are NOT running (fresh joiner, or provisioning has not done
+		// its half): tell the operator to start them. The daemons ARE running and the broker still did
+		// not serve within the grace (simcluster-speed G1, drill 91 at 8 concurrent grows: the joiner's
+		// clustered JetStream meta group took longer than 2 min to form under load): telling the operator
+		// to `systemctl restart nats-server` there is worse than useless — it aborts the very boot being
+		// waited for. That pause names the state and asks only for a re-run.
+		booting := joinerIsBooting(initRanThisInvocation, grace, natsState, procState)
+		notifyGrow(webhook, "paused_start_joiner", map[string]any{"joiner": jp.Joiner, "daemons_running": booting})
+		if booting {
+			_, _ = fmt.Fprintf(out, "  (%s: nats-server %s, tether serve process %s — the broker is running but did not serve cluster status within %s; it is most likely still forming its clustered JetStream meta group, which is slow on a loaded host)\n", jp.Joiner, natsState, procState, grace)
+			_, _ = fmt.Fprint(out, startJoinerBootingHint(jp.Joiner))
+			return &ExitError{Class: exitTransient, Err: fmt.Errorf("RESUME: %s's broker is still booting — do not restart its daemons; re-run `tether cluster add %s` once `systemctl status tether-broker` on %s shows it serving", jp.Joiner, jp.Joiner, jp.Joiner)}
+		}
 		_, _ = fmt.Fprint(out, startJoinerHint(jp.Joiner))
-		notifyGrow(webhook, "paused_start_joiner", map[string]any{"joiner": jp.Joiner})
 		return &ExitError{Class: exitTransient, Err: fmt.Errorf("RESUME: start the joiner's daemons, then re-run `tether cluster add %s`", jp.Joiner)}
+	}
+
+	// P3c RESUME A JOIN THE BOUNDARY BLOCKED: the joiner is up (P3b just proved it), so a join op that went
+	// BLOCKED on its catch-up deadline WHILE the joiner was down is re-entered with one confirm — the
+	// documented "fix and re-run `tether cluster add`" recovery, made true. Not charged to
+	// --auto-confirm-catchup: that budget bounds stalls of a joiner that IS running and not catching up;
+	// this stall was manufactured by the boundary itself (see catchupBarrier), so it is spent here or never.
+	if err := resumeBlockedJoin(ctx, nc, actor, accountSeed, leader, opID, out); err != nil {
+		return haltAdd(webhook, "resume-blocked-join", jp.Joiner, err)
 	}
 
 	// P6 CATCH-UP + PROMOTE: the leader's driveJoin promotes the caught-up nonvoter to VOTER once the mesh + JS
@@ -279,7 +328,34 @@ func haltAdd(webhook, phase, joiner string, err error) error {
 // connects with cluster nkeys the standalone conf lacks and the grow stalls. `restart` reloads reliably whether
 // nats is running standalone or not yet up.
 func startJoinerHint(joiner string) string {
-	return fmt.Sprintf("PAUSED at start-joiner:\n  on %s:  systemctl restart nats-server && systemctl start tether-broker\n  then:   tether cluster add %s …   # resumes from here\n", joiner, joiner)
+	return fmt.Sprintf("PAUSED at start-joiner:\n  %s\n  on %s:  systemctl restart nats-server && systemctl start tether-broker\n  then:   tether cluster add %s …   # resumes from here\n", pauseKindStartDaemons, joiner, joiner)
+}
+
+// The machine-readable second line of each start-joiner pause. Both pauses share the first line
+// (`PAUSED at start-joiner:`) because provisioning already keys on it; but the two ask for OPPOSITE
+// actions, and automation that greps only the first line performs the restart the booting pause
+// forbids (round-2 review R2-F7). A tool that wants to act on the pause reads this line (the webhook
+// carries the same fact as `daemons_running`); a human reads the sentence after it.
+const (
+	pauseKindStartDaemons = "PAUSE-KIND: start-daemons"
+	pauseKindBooting      = "PAUSE-KIND: booting"
+)
+
+// startJoinerBootingHint is the OTHER pause at the same boundary: the joiner's daemons are running (nats-server
+// clustered, a `tether serve` process present) and the broker still did not serve within the grace. It keeps
+// the `PAUSED at start-joiner` signature provisioning keys on, but it must NOT repeat the restart line — a
+// `systemctl restart nats-server` against a broker that is mid clustered-JetStream-meta formation restarts the
+// boot the operator is waiting for (simcluster-speed G1, drill 91 under 8 concurrent grows).
+// joinerIsBooting decides which pause the expired boundary prints: true only when the boundary WAITED
+// (grace > 0, so the daemons looked alive) AND both facts say the joiner is running — nats-server loaded the
+// clustered conf and a `tether serve` process is present. A fresh joiner (init ran here), an unknown reading,
+// or a missing process is the ordinary "start the daemons" pause.
+func joinerIsBooting(initRan bool, grace time.Duration, nats natsLocalState, proc brokerProcState) bool {
+	return !initRan && grace > 0 && proc == brokerProcPresent && nats == natsLocalClustered
+}
+
+func startJoinerBootingHint(joiner string) string {
+	return fmt.Sprintf("PAUSED at start-joiner:\n  %s\n  %s's daemons are running; its broker is not serving cluster status yet (clustered JetStream meta still forming) — do not restart them\n  then:   tether cluster add %s …   # re-run resumes from here once the broker serves\n", pauseKindBooting, joiner, joiner)
 }
 
 // runSelfInit shells out to THIS binary's `cluster init --from-existing` (reusing the exact tested migration +
@@ -491,14 +567,78 @@ func catchupBarrier(resp *proto.ClusterGrowResp) (met bool, err error) {
 	if resp.Terminal && resp.OpState != "SERVING" {
 		return false, fmt.Errorf("ended %s before catch-up: %s", resp.OpState, resp.LastError)
 	}
+	// A join BLOCKED after it was already CATCHING_UP has passed AddNonvoter — the leader's timeline says
+	// so (NonvoterCommitted, join-status) — which is the only fact this barrier exists to establish (the
+	// cutover's R3 gate wants the committed >=2-server config). It went BLOCKED because its catch-up
+	// deadline ran out while the joiner's daemons were not started yet: on a resume of a RETURNING node
+	// (raft/ present, so the fresh-grow zero grace does not apply) the start-joiner boundary waits the
+	// whole joinerBootGrace before pausing, and provisioning only starts the daemons after the pause — the
+	// op's opCatchupTimeout (2 m) is spent entirely on a joiner that could not exist yet. Waiting here for
+	// CATCHING_UP again would wait two more minutes for a state the op will never re-enter on its own;
+	// resumeBlockedJoin re-enters it, once the joiner is actually up. An older leader never sets the field
+	// and this branch is simply never taken (the pre-existing behaviour).
+	if resp.OpState == "BLOCKED" && resp.NonvoterCommitted {
+		return true, nil
+	}
 	return false, nil
 }
 
-// waitOpCatchingUp polls join-status until the op is past AddNonvoter (CATCHING_UP / SERVING), so the former-N1
-// is in a committed >=2-server raft config before a cutover's R3 gate checks for it. A terminal non-SERVING op
-// aborts the wait immediately (catchupBarrier).
+// resumeBlockedJoin sends ONE confirm-op for a join that is BLOCKED after having committed AddNonvoter
+// (NonvoterCommitted), and nothing otherwise. It runs right after the start-joiner boundary, i.e. the first
+// point at which the joiner's broker is known to be up, which is what the op's catch-up needs. The
+// confirm re-enters the ladder at ROSTER_COMMITTED with a fresh barrier + deadline (ClusterAdmin.ConfirmOp),
+// so waitJoinServing then sees a live CATCHING_UP, not a stale BLOCKED it would have to spend
+// --auto-confirm-catchup budget on (or, with the default 0, HALT on at once).
+//
+// Any other BLOCKED (never CATCHING_UP, AddVoter attempts exhausted) is left to waitJoinServing's policy:
+// those are stalls of a running joiner, which the operator's budget governs. A lost confirm reply is
+// reported and left to waitJoinServing too (it resends on the next BLOCKED poll when a budget allows);
+// a confirm that answers a refusal is a HALT with that refusal, never a silent fall-through.
+func resumeBlockedJoin(ctx context.Context, nc *nats.Conn, actor string, seed []byte, leader, opID string, out interface{ Write([]byte) (int, error) }) error {
+	return resumeBlockedJoinWith(func(r *proto.ClusterGrowReq) (*proto.ClusterGrowResp, error) {
+		return sendGrowTrigger(ctx, nc, actor, seed, r)
+	}, leader, opID, out)
+}
+
+// resumeBlockedJoinWith is resumeBlockedJoin with the transport injected (one signed round trip per call),
+// so the decision table — not BLOCKED / BLOCKED-never-CATCHING_UP → nothing sent; BLOCKED-after-CATCHING_UP →
+// exactly one confirm; refusal → HALT; lost reply → deferred — is testable without a NATS connection.
+func resumeBlockedJoinWith(send func(*proto.ClusterGrowReq) (*proto.ClusterGrowResp, error), leader, opID string, out interface{ Write([]byte) (int, error) }) error {
+	resp, err := send(&proto.ClusterGrowReq{Op: "join-status", TargetNode: leader, OpID: opID})
+	if err != nil {
+		// A lost status reply is not a decision: waitJoinServing polls join-status again and, when a
+		// budget allows, resends the confirm itself. Swallowing it here is the documented shape.
+		return nil //nolint:nilerr // best-effort pre-check; waitJoinServing owns the retry
+	}
+	if resp == nil || !resp.OK || resp.OpState != "BLOCKED" || !resp.NonvoterCommitted {
+		return nil
+	}
+	// Only the catch-up-DEADLINE block is the boundary's doing. A join BLOCKED because AddVoter attempts
+	// were exhausted (blockAfterAttempts) is a running joiner that is not being promoted — that stall
+	// belongs to waitJoinServing's --auto-confirm-catchup policy, not to an unbudgeted resume confirm
+	// (internal review round 1 R2-F1 / R4-F7).
+	if !strings.HasPrefix(resp.LastError, broker.OpBlockedCatchupDeadlineMsg) {
+		return nil
+	}
+	_, _ = fmt.Fprintf(out, "  join op %s went BLOCKED while the joiner's daemons were still down (%s) — the joiner is up now, re-entering catch-up (resume confirm; not counted against --auto-confirm-catchup)\n", opID, resp.LastError)
+	cresp, cerr := send(&proto.ClusterGrowReq{Op: "confirm-op", TargetNode: leader, OpID: opID})
+	switch {
+	case confirmLanded(cresp, cerr):
+		return nil
+	case cerr == nil && cresp != nil && !cresp.OK && cresp.Code != growTriggerCodeNotReadyCLI:
+		return fmt.Errorf("join op %s is BLOCKED (%s) and the resume confirm was refused: %s %s — `cluster ops show %s` on the leader", opID, resp.LastError, cresp.Code, cresp.Error, opID)
+	default:
+		_, _ = fmt.Fprintf(out, "  resume confirm did not land (%s); the catch-up wait retries it\n", confirmFailDetail(cresp, cerr))
+		return nil
+	}
+}
+
+// waitOpCatchingUp polls join-status until the op is past AddNonvoter (CATCHING_UP / SERVING, or BLOCKED
+// after having been CATCHING_UP — catchupBarrier), so the former-N1 is in a committed >=2-server raft config
+// before a cutover's R3 gate checks for it. A terminal non-SERVING op aborts the wait immediately.
 func waitOpCatchingUp(ctx context.Context, nc *nats.Conn, actor string, seed []byte, leader, opID string, out interface{ Write([]byte) (int, error) }) error {
 	deadline := time.Now().Add(2 * time.Minute)
+	lastState, lastErrText := "", ""
 	for {
 		resp, err := sendGrowTrigger(ctx, nc, actor, seed, &proto.ClusterGrowReq{Op: "join-status", TargetNode: leader, OpID: opID})
 		if err == nil {
@@ -507,8 +647,16 @@ func waitOpCatchingUp(ctx context.Context, nc *nats.Conn, actor string, seed []b
 			} else if met {
 				return nil
 			}
+			if resp != nil && resp.OK {
+				lastState, lastErrText = resp.OpState, resp.LastError
+			}
 		}
 		if time.Now().After(deadline) {
+			// The message names the state the op was actually in. "did not commit AddNonvoter" over an op
+			// that was BLOCKED for a recorded reason hid drill 42's real mechanism for a whole A/B round.
+			if lastState != "" {
+				return fmt.Errorf("join op %s did not reach CATCHING_UP within 2m — last state %s (%s)", opID, lastState, lastErrText)
+			}
 			return fmt.Errorf("join op %s did not commit AddNonvoter (reach CATCHING_UP) within 2m", opID)
 		}
 		select {
@@ -532,11 +680,54 @@ func waitOpCatchingUp(ctx context.Context, nc *nats.Conn, actor string, seed []b
 // the opposite — the post-SIGKILL lost reply while systemd Restart=always revives nats — and legitimately
 // retries; the catch-up wait is its backstop. So: retry through transport errors and briefly-transient refusals
 // (R3 apply-lag can clear within a poll or two), but if the LAST attempt was still a hard refusal, return it.
+//
+// gotcha #70 (simcluster-speed): the retry ladder used to fall off its end into `return nil` — six transport
+// errors in a row were read as "the SIGKILL fired, so it must have worked" and the grow marched on to a
+// catch-up wait that could only time out, four minutes later, under a signature indistinguishable from a
+// real grow regression (`grow_to_3` VOTER timeout). A lost reply is not a confirmation. The ladder now ends
+// in ONE more probe that must answer OK or AlreadyDone; anything else HALTs here, at the cutover, with the
+// former-N1's actual state in the message — the same idempotent re-run that resumes every other HALT
+// resumes this one. Each transport error is also printed, so a grow that DID recover this way says so in
+// its own log instead of leaving the operator to infer it from a later timing anomaly.
 func cutoverBroker(ctx context.Context, nc *nats.Conn, actor string, seed []byte, target, joiner, epoch string, ack, preserve bool, out interface{ Write([]byte) (int, error) }) error {
 	req := &proto.ClusterGrowReq{Op: "mesh-cutover", TargetNode: target, JoinerNode: joiner, GrowEpoch: epoch, ResetAck: ack, PreserveData: preserve}
+	return cutoverBrokerWithPoll(ctx, func(r *proto.ClusterGrowReq) (*proto.ClusterGrowResp, error) {
+		return sendGrowTrigger(ctx, nc, actor, seed, r)
+	}, target, req, out, growConvergePoll, func() string { return formerN1HealthSummary(nc, actor, target) })
+}
+
+// formerN1HealthSummary is the one-line state of the former-N1 that the NOT-confirmed HALT carries (plan
+// §5.3 #70①: "HALT 文案含 former-N1 的状态摘要"): whether it answered the cluster-health broadcast at all,
+// and if so its leader view, writable-leader confirmation and force-single marker. Advisory and
+// best-effort — a probe that fails simply says so; it never changes the verdict.
+func formerN1HealthSummary(nc *nats.Conn, actor, target string) string {
+	if nc == nil {
+		return "health probe not attempted (no connection)"
+	}
+	for _, h := range probeClusterHealthAdvisory(nc, actor) {
+		if h.NodeID == target {
+			return fmt.Sprintf("%s answered the health probe: leader_id=%q writable_leader_confirmed=%v force_single_active=%v applied_index=%d",
+				target, h.LeaderID, h.WritableLeaderConfirmed, h.ForceSingleActive, h.AppliedIndex)
+		}
+	}
+	return target + " did NOT answer the cluster-health probe (nats down, or the broker still restarting)"
+}
+
+// cutoverAttempts is the retry ladder length BEFORE the confirming probe; cutoverBrokerWithPoll sends at
+// most cutoverAttempts+1 requests.
+const cutoverAttempts = 6
+
+// cutoverBrokerWithPoll is cutoverBroker with the transport and the inter-attempt spacing injected, so
+// the ladder's end-state rules — refusal → HALT with the refusal, silence → HALT as "not confirmed",
+// never silence → success — are table-testable without a NATS connection and without paying six
+// growConvergePoll sleeps per row. `send` is one signed mesh-cutover round trip.
+//
+// `summary` (may be nil) renders the former-N1's state for the NOT-confirmed HALT text; it is called only
+// on that path, so the table tests pass nil and the live caller pays the probe only when it matters.
+func cutoverBrokerWithPoll(ctx context.Context, send func(*proto.ClusterGrowReq) (*proto.ClusterGrowResp, error), target string, req *proto.ClusterGrowReq, out interface{ Write([]byte) (int, error) }, poll time.Duration, summary func() string) error {
 	var lastRefusal *proto.ClusterGrowResp
-	for i := 0; i < 6; i++ {
-		resp, err := sendGrowTrigger(ctx, nc, actor, seed, req)
+	for i := 0; i < cutoverAttempts; i++ {
+		resp, err := send(req)
 		if err == nil && resp != nil && (resp.OK || resp.AlreadyDone) {
 			return nil
 		}
@@ -548,17 +739,41 @@ func cutoverBroker(ctx context.Context, nc *nats.Conn, actor string, seed []byte
 		} else {
 			// Transport error: the expected post-SIGKILL lost reply (nats reviving) or the target mid-restart.
 			lastRefusal = nil
+			_, _ = fmt.Fprintf(out, "  (cutover %s: transport error, attempt %d/%d — nats reviving?: %v)\n", target, i+1, cutoverAttempts, err)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(growConvergePoll):
+		case <-time.After(poll):
 		}
 	}
 	if lastRefusal != nil {
 		return fmt.Errorf("former-N1 %s refused the cutover: %s %s", target, lastRefusal.Code, lastRefusal.Error)
 	}
-	return nil
+	// Silence all the way down. Confirm rather than assume: the target is either live-clustered by now
+	// (AlreadyDone) or it is not, and only it can say which. A caller that has already been cancelled
+	// gets its own ctx error, not a "not confirmed" verdict about a probe that never went out (internal
+	// review round 1 R2-F4).
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	resp, err := send(req)
+	if err == nil && resp != nil && (resp.OK || resp.AlreadyDone) {
+		return nil
+	}
+	if stableCutoverRefusal(resp, err) {
+		return fmt.Errorf("former-N1 %s refused the cutover: %s %s", target, resp.Code, resp.Error)
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	state := ""
+	if summary != nil {
+		state = "; " + summary()
+	}
+	return fmt.Errorf("former-N1 %s cutover NOT confirmed after %d attempts: every reply was lost (last: %v)%s; "+
+		"its nats-server may still be reviving — check `systemctl status nats-server tether-broker` on %s and re-run this command (idempotent)",
+		target, cutoverAttempts+1, err, state, target)
 }
 
 // stableCutoverRefusal reports whether a mesh-cutover attempt was an EXPLICIT broker refusal (a non-OK, non-done
@@ -688,8 +903,243 @@ func joinerBrokerUpLocal(socketPath string) bool {
 // joiner goes through — the broker serving its admin socket at the END of Run (after the cluster backend wires),
 // and, during a grow specifically, a short crash-restart cycle while its clustered JetStream still has no quorum
 // (the former-N1's nats is meshing) and the broker fail-stops on the lone-clustered-JS guard until systemd's
-// Restart=always brings it back. Both resolve in seconds; a minute is generous without hiding a real failure.
-const joinerBootGrace = 60 * time.Second
+// Restart=always brings it back.
+//
+// "Both resolve in seconds; a minute is generous" was the sentence here until simcluster-speed A, and it was
+// wrong by construction: the joiner's broker WAITS for its clustered JetStream for up to
+// broker.ClusteredJetStreamBootWait (90 s) before it serves the admin socket this probe reads, so a 60 s grace
+// could expire on a joiner that was still inside its own legitimate boot. Nobody saw it because the fresh-grow
+// invocation used to sit out the same 60 s BEFORE printing the resume hint, and that dead time gave the
+// former-N1's JetStream a head start; remove it (A) and the first deploy-tier run HALTed the resume at
+// CATCHING_UP/reachable:false on a loaded host. The grace is therefore derived from the boot wait plus one
+// systemd restart cycle of margin, never a number of its own — and it is the RESUME grace only; the fresh-grow
+// invocation gets zero (joinerStartGrace).
+var joinerBootGrace = broker.ClusteredJetStreamBootWait() + joinerBootGraceMargin
+
+// joinerBootGraceMargin covers the joiner's process start + one Restart=always cycle (RestartSec=2) around the
+// boot wait, so a joiner that fail-stopped once at the very end of its wait is still caught on the way back.
+const joinerBootGraceMargin = 30 * time.Second
+
+// joinerStartGrace is how long the start-joiner boundary waits for the joiner's broker before HALTing
+// with the resume hint. It is the WHOLE joinerBootGrace on a resume and ZERO on the invocation that ran
+// the local init — the only two cases, decided by one fact this process established itself:
+//
+//   - initRan == true: THIS process created raft/ moments ago (P2). Cluster mode is switched on by the
+//     presence of on-disk raft state (distributed-broker-architecture.md §8.3 (e); the #I1 fail-closed
+//     invariant drill 11 pins: a cluster-mode serve with no raft state refuses), so before P2 no broker
+//     on this host could have been running clustered, and adminStatusIsClustered would have answered
+//     false for any that was running single. Nothing has asked provisioning to start anything since —
+//     the resume hint is printed AFTER this decision. Waiting here waits for an event that cannot
+//     happen; measured on the deploy tier it was a flat 60 s per fresh grow (2026-09-18: invocation 1
+//     took 97 s / 80 s, 60 s of which was this window). An operator running `cluster add` by hand sat
+//     through the same minute before being told to start the daemons.
+//   - initRan == false: raft/ already existed when we started — EITHER a RESUME after provisioning
+//     started the daemons (the boot / crash-restart transient joinerBootGrace exists for, below), OR the
+//     FIRST invocation for a RETURNING node (drill 42: rejoin-prepare + `init --from-manifest` left raft/
+//     behind, nothing has been asked to start yet). The second fact tells them apart: the joiner's
+//     LOCAL nats-server. Provisioning's half of the boundary is `systemctl restart nats-server` — loading
+//     the clustered conf this invocation just rendered — and until that has happened the broker cannot
+//     mesh whatever it does (a broker restarting against the standalone conf fail-stops on cluster nkeys
+//     the conf lacks, forever). So: nats running CLUSTERED → provisioning has done its half → the full
+//     window; nats standalone or not listening → nothing can come up → zero, HALT at once with the hint.
+//     gotcha #83: the 120 s spent here on a returning node was the whole reason its join op went BLOCKED
+//     (the leader's opCatchupTimeout runs from AddNonvoter, i.e. from before this wait).
+//   - natsClustered unknown (no broker.yaml to read the nats URL from, or the INFO read failed): keep
+//     the full window — the conservative direction, and the pre-#83 behaviour.
+//
+// NOT the "render branch" (!joinerBrokerUpLocal at P5) and NOT "no join op yet": both are re-evaluated
+// on every invocation and are true mid crash-restart on a resume too, which would reintroduce the 3-in-4
+// failure the grace was added to cure. A pure function so the rule is table-testable on its own.
+//
+// The third fact is whether a `tether serve` PROCESS exists on this host at all (joinerBrokerProcess):
+// the admin socket this boundary polls is served only at the END of the broker's Run, after its
+// clustered-JetStream boot wait, so "socket not answering" cannot tell a broker still booting from no
+// broker whatsoever. A returning node whose unit was stopped for the rejoin (drill 42 stops it before
+// `rejoin prepare`) has nothing that could ever answer — and its nats-server may well still run its OLD
+// clustered conf, so the nats fact alone reads "clustered" there (measured, image #4). No process after
+// several samples (bridging systemd's RestartSec gap) → zero grace.
+func joinerStartGrace(initRan bool, nats natsLocalState, proc brokerProcState) time.Duration {
+	if initRan {
+		return 0
+	}
+	if nats == natsLocalDown || nats == natsLocalStandalone {
+		return 0
+	}
+	if proc == brokerProcAbsent {
+		return 0
+	}
+	return joinerBootGrace // nats clustered/unknown AND a broker process present/unknown
+}
+
+// brokerProcState is what joinerBrokerProcess learned about a `tether serve` process on this host.
+type brokerProcState int
+
+const (
+	brokerProcUnknown brokerProcState = iota // /proc not readable (not Linux, or no permission)
+	brokerProcAbsent                         // no `tether serve` process in any sample
+	brokerProcPresent                        // a `tether serve` process was seen in at least one sample
+)
+
+func (s brokerProcState) String() string {
+	switch s {
+	case brokerProcAbsent:
+		return "absent"
+	case brokerProcPresent:
+		return "present"
+	case brokerProcUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
+// joinerBrokerProcess scans /proc for a `tether serve` process other than this one, `samples` times
+// `gap` apart, and reports present as soon as one sample sees it. The repeated samples exist for systemd's
+// Restart=always: between a fail-stop and the revival (RestartSec=2 in install.sh's unit) there is a short
+// window with no process, and a single probe landing in it would misread a crash-looping broker as
+// absent. An unreadable /proc (non-Linux, or an unreadable procfs) is Unknown, never Absent.
+func joinerBrokerProcess(samples int, gap time.Duration) brokerProcState {
+	return joinerBrokerProcessIn("/proc", os.Getpid(), samples, gap, time.Sleep)
+}
+
+func joinerBrokerProcessIn(procRoot string, selfPID, samples int, gap time.Duration, sleep func(time.Duration)) brokerProcState {
+	if samples < 1 {
+		samples = 1
+	}
+	sawAnyProc := false
+	for i := 0; i < samples; i++ {
+		if i > 0 {
+			sleep(gap)
+		}
+		entries, err := os.ReadDir(procRoot)
+		if err != nil {
+			return brokerProcUnknown
+		}
+		for _, e := range entries {
+			pid, perr := strconv.Atoi(e.Name())
+			if perr != nil || pid == selfPID {
+				continue
+			}
+			raw, rerr := os.ReadFile(filepath.Join(procRoot, e.Name(), "cmdline"))
+			if rerr != nil {
+				continue
+			}
+			sawAnyProc = true
+			if isTetherServeArgv(bytes.Split(raw, []byte{0})) {
+				return brokerProcPresent
+			}
+		}
+	}
+	if !sawAnyProc {
+		return brokerProcUnknown // a procfs with no readable cmdlines is not evidence of anything
+	}
+	return brokerProcAbsent
+}
+
+// isTetherServeArgv recognises the broker daemon's argv: argv[0] basename `tether` (any install path)
+// and `serve` as the first non-flag argument, i.e. install.sh's `ExecStart=… tether serve --config …`.
+func isTetherServeArgv(argv [][]byte) bool {
+	if len(argv) < 2 || filepath.Base(string(argv[0])) != "tether" {
+		return false
+	}
+	for _, a := range argv[1:] {
+		s := string(a)
+		if s == "" || strings.HasPrefix(s, "-") {
+			continue
+		}
+		return s == "serve"
+	}
+	return false
+}
+
+// natsLocalState is what joinerNatsState learned about the joiner's own nats-server.
+type natsLocalState int
+
+const (
+	natsLocalUnknown    natsLocalState = iota // could not ask (no config path / no URL / read error)
+	natsLocalDown                             // nothing listening on the configured client address
+	natsLocalStandalone                       // listening, INFO carries no cluster name (standalone conf)
+	natsLocalClustered                        // listening, INFO carries a cluster name (clustered conf loaded)
+)
+
+func (s natsLocalState) String() string {
+	switch s {
+	case natsLocalDown:
+		return "down"
+	case natsLocalStandalone:
+		return "standalone"
+	case natsLocalClustered:
+		return "clustered"
+	case natsLocalUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
+// joinerNatsState reads the joiner's nats-server INFO line — the server sends it before any CONNECT, so
+// no credentials are needed — and reports whether it is up and whether it runs a CLUSTERED configuration
+// (nats-server sets INFO.cluster from the `cluster {}` block; a standalone conf has none). natsURL comes
+// from the joiner's broker.yaml (broker.nats.url, the address its own broker dials); an empty URL or an
+// unreadable answer is Unknown, never a guess.
+func joinerNatsState(natsURL string, timeout time.Duration) natsLocalState {
+	addr := natsInfoDialAddr(natsURL)
+	if addr == "" {
+		return natsLocalUnknown
+	}
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return natsLocalDown
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	line, err := bufio.NewReaderSize(conn, 64*1024).ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "INFO ") {
+		return natsLocalUnknown
+	}
+	var info struct {
+		Cluster string `json:"cluster"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "INFO "))), &info) != nil {
+		return natsLocalUnknown
+	}
+	if info.Cluster != "" {
+		return natsLocalClustered
+	}
+	return natsLocalStandalone
+}
+
+// natsInfoDialAddr turns a broker.nats.url (nats://host:port, host:port, or a comma list — the first
+// entry wins) into a dial address; "" when there is nothing usable.
+func natsInfoDialAddr(natsURL string) string {
+	first := strings.TrimSpace(strings.Split(natsURL, ",")[0])
+	if first == "" {
+		return ""
+	}
+	if !strings.Contains(first, "://") {
+		first = "nats://" + first
+	}
+	u, err := url.Parse(first)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "4222"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// joinerNatsURL is the joiner's own broker.nats.url from its broker.yaml, or "" when there is no config
+// to read (then the boundary keeps its full grace — Unknown).
+func joinerNatsURL(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	c, err := serveconf.Load(configPath)
+	if err != nil {
+		return ""
+	}
+	return c.Broker.NATS.URL
+}
 
 // awaitJoinerBrokerUpLocal polls joinerBrokerUpLocal for a bounded window instead of probing ONCE.
 //
@@ -701,12 +1151,23 @@ const joinerBootGrace = 60 * time.Second
 // grow itself was correct — the former-N1 had already been cut over and was sitting clustered-alone waiting.
 // Polling turns that transient back into what it is; a joiner that is genuinely single-mode or truly not
 // started still fails the whole window and gets the same actionable HALT.
-func awaitJoinerBrokerUpLocal(ctx context.Context, socketPath, joiner string, out interface{ Write([]byte) (int, error) }) bool {
+//
+// grace is the window (joinerStartGrace). grace <= 0 keeps the single probe and returns at once: the
+// caller has established that nothing can come up, so the honest answer is the immediate HALT.
+func awaitJoinerBrokerUpLocal(ctx context.Context, socketPath, joiner string, grace time.Duration, out interface{ Write([]byte) (int, error) }) bool {
 	if joinerBrokerUpLocal(socketPath) {
 		return true
 	}
-	_, _ = fmt.Fprintf(out, "  … waiting up to %s for %s's broker to serve cluster status (provisioning just restarted it)\n", joinerBootGrace, joiner)
-	deadline := time.Now().Add(joinerBootGrace)
+	if grace <= 0 {
+		return false
+	}
+	// The operator sees the boundary BEFORE the wait, not only after it: the old order printed "waiting
+	// up to 60s" and then, a minute later, the PAUSED block that named the command to run. The word
+	// "PAUSED" is deliberately absent here — provisioning (simcluster:311) recognises the HALT by the
+	// `PAUSED at start-joiner|RESUME` signature over the whole stdout, and an early match would blind it.
+	_, _ = fmt.Fprintf(out, "→ start-joiner boundary: if %s's daemons are not running yet, on %s: systemctl restart nats-server && systemctl start tether-broker (this command waits up to %s, then pauses with a resume hint)\n", joiner, joiner, grace)
+	_, _ = fmt.Fprintf(out, "  … waiting up to %s for %s's broker to serve cluster status (provisioning just restarted it)\n", grace, joiner)
+	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():

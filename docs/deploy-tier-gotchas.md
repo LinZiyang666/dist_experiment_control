@@ -131,10 +131,32 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   VOTER-timeout。**flip**：release 变可靠（grow 完成即 lock released）后，30 的 real roll attempt-1 不再 HALT →
   [GAP] 臂走 else（clean）→ upgrade 机制变 COVERED、翻成普通 GREEN 回归。
 
-### #33 — proxy exit crash-rehome 后 SS **数据面**恢复滞后控制面（**仅观测 + 测量，根因未归因**）
+### #33 — proxy exit crash-rehome 后 SS **数据面**恢复滞后控制面（已修复：症状 2026-09-19 以证据翻臂协议关闭；机制归因 #80 为 CANDIDATE）
 
-> 号码取 **#33**：`docs/reviews/s3-s5-plan.md:355` 已占 **#32（CANDIDATE）= rehomed-then-returned 泄漏 stale
-> public listener（double-bind）**，不同假设，避免撞号（外审 R2-M2）。
+- **状态：✅ FIXED——症状面（2026-09-19，simcluster-speed 证据翻臂协议，plan §0 D-P / §8.5b′）；机制归因「by #80」
+  是 CANDIDATE，不是收据（round-2 review R6-1 / R1-F5 / R5-F6 订正）。** 收据：11 个 AUTO-RECOVERED 样本（7 次翻臂前
+  可测样本：4 次 solo、G1 cap 0 / cap 5、live-grow #2；加 73flip2、V7、S2 与本轮的 round-2 复跑），**没有一次 STRANDED**；
+  agent 的 NATS 连接**就在被杀 broker 上**（`agt_conn_on pre==killed`）、事后在 survivor 上（`post`）、数据面
+  AUTO-RECOVERED 16–29 s、**落后控制面 ≤1 s**。
+  **观测到的机制是 nats.go 的 roster 池重连**：连接换到 survivor、agent 重注册（agt slog 在 kill 之后出现
+  `agent: re-registered after reconnect`，proxy.go onNATSReconnect），rehome 指令到达、OpenHome 重拨新 home。**没有观测到
+  session 重建**：翻臂后第一版断言写的是 `agent: rebuilding NATS session on the freshest roster`（stuck-disconnect 路径，
+  #80 的 runCtx 解耦在那条路径上才起作用），在一次健康的 AUTO-RECOVERED 25 s 样本上**直接红了**
+  （batch21/73flip.log），合取项随即改成重注册行、73flip2 GREEN pass=46。所以「本条的旧现象就是 #80 的根因从 exit 一侧看到的
+  样子」是推断：drill 73 走的 crash-rehome 路径上 nats.go 在秒级重连、runCtx 不被重写，#80 的链条（stuck-disconnect →
+  fireRedial → session 重建 → cancelRun）在这里**不运行**；七月 STRANDED 面的真正机理（readiness 抖动 / `/sub` 未渲染，
+  见下文 RUN-OBSERVED 注）没有在 #80 之前或之后的任何镜像上被重现过。要把「by #80」立成收据，需要一次 77f1d68 之前镜像的
+  73 跑出 STRANDED 并带机制行；本增量没有做。
+  **drill 73 的断言形状（round-2 R6-4 / R3-F13）**：硬断言只剩产品性质——`REHOME [#33 FIXED]` AUTO-RECOVERED ∧ ≤90 s
+  （观测最大值加 slack，**不是 SLA**）；机制观测 `[#33 mechanism: pool reconnect]`（连接曾在被杀 broker → 换到 survivor
+  → 重注册行）**只在前置条件成立时**断言——conn==home 是 fixture 相关性（分配时 home 落在 agent 的 NATS server 上，
+  `cluster rebalance proxy` 挪 home 不挪连接），前置不成立的 run 走 tunnel-only 路径（ApplyHome→OpenHome）照样恢复，
+  记 not_covered gap 而不是红。下面正文保留当时的观测与措辞史（原文不改），供下一个改 rehome 路径的人看它曾经长什么样。
+- **旧状态（2026-09-19 之前）：🟡 OPEN（未归因；simcluster-speed 增量以证据翻臂协议关闭或归因——见该 plan §0 D-P）。**
+  owner 曾是 `expected-verdicts.tsv` 73 行的显式 `not_covered`（#33 lag unbounded），2026-09-19 起。
+  （本条曾被 `tests/ledger-crosscheck.sh` 误判为"未确认的假设"而免除 owner 要求：标题下原第二行写着
+  "已占 #32（……）"，而该门的假设判定看标题后三行、匹配的是那个括号里的词——一条根因未归因的 open 缺陷
+  六周里没有任何 drill 为它挂红。那条撞号备注挪到了本条末尾。）
 
 - **现象（reproduced across valid runs）**：一个**已建立在传字节**的 proxy exit，其 HOME broker 被**杀**（quorum 保住
   2/3）后，**控制面立即恢复**——`proxy status` 的 home 从死 broker 移走 + 该 exit 达 `ready=true`——**但 SS 数据面在
@@ -161,9 +183,42 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
   `proxy off; proxy on` heal 在 2/3 fresh-establish 解耦，**不依赖** crash-rehome 恢复时序。
   **flip**：crash-rehome 后数据面稳定在 rehomed+ready 瞬间即活（不再 STRANDED）→ 该臂转成对"prompt 自动恢复"的
   正向 GREEN 断言。
+- 号码取 **#33**：`docs/reviews/s3-s5-plan.md:355` 已占 #32（一个 CANDIDATE 假设 = rehomed-then-returned 泄漏 stale
+  public listener，double-bind），不同假设，避免撞号（外审 R2-M2）。（此备注从标题下方挪到这里，理由见条目开头。）
 
-### #34 — proxy home 分布无法稳定保持 one-per-voter；非-tunnel voter 的 proxy-eligibility 不稳定；auto-rebalance-on-return 不发火（external-review round-6 硬化 74 时暴露）
+### #34 — 构造出来的 one-per-voter proxy-home 分布不能**保持**（面 1：13 个并发样本复现 1 次，未归因；OPEN）
 
+> **⬆ 2026-09-19/20 simcluster-speed 2b + round-2 review（R6-3 / R6-5 / R6-13 补记，plan §8.5b / §8.5b′ 的读数
+> 进台账）**——标题按仍然 OPEN 的那一面重写；旧标题的另外两面都已被本增量的样本推翻，见下：
+> - **三面的读数（drill 74 拆臂后 SRAB/C 各自 fresh N=3；G1 ruling cap 5）**：
+>   - **面 1（构造分布漂移）**：solo SRAB 3/3 + C 4/4（+C10）、live-grow SRAB 2/2 + C 1/2、-j6/-j12 各 1/1 都**保持**；
+>     **唯一一次复现在 G1 cap 8 的 drill 73**：两 agent 起初都在 brk1，`cluster rebalance proxy` 把 agt2 挪到 brk2、
+>     在 brk2 上传过字节，然后**漂回 brk1**（= agt2 的 NATS server）→ 73 记 PRODUCT-RED #34、REHOME 臂跳过。
+>     **未归因**；从那次起 73 在漂移点抓 `_drift_evidence`（admin events + leader slog）。候选机制两条：
+>     ① `homeReachable` 在负载下 miss → dwell → rehome（round-1 就写下的假设）；② **M3 rotate 重铸 home**
+>     （round-2 R6-13，源码级）：`reconcileProxySession` 的 M3 分支在节点 `!proxy_ready` 满 `proxyRehomeDwell` 个 tick
+>     后调 `allocateAndPushProxy`，而 `allocateAndPushProxy` 的 home 取自 `resolveHomeForAgent` = **agent 的 NATS server**
+>     （home.go:60-67）；`cluster rebalance proxy` 的 planner 挪 home 时不看 agent 连在哪，所以一个被 rebalance 挪走的
+>     exit 在 OpenHome 重拨的短暂 `!proxy_ready` 窗里就会被 rotate **铸回 agent 所连的 broker**——与 cap 8 那次
+>     "brk2 → brk1 = agt2 的 NATS server" 完全一致，也解释了为什么 73 的 12 个样本里 11 个 conn==home 都是
+>     "exit 根本没被 rebalance 挪过"。运行时未验证：下次漂移时看 events dump 里有没有 `rehome_stalled
+>     reason=target_not_ready` 紧跟 `allocated` 且 home == 该 agent 的 nats_server。
+>   - **面 2（negctrl expose create rc=64 / `agent_rejected:frpc_failed`）**：**是 #86，不是 #34、也不是 #29**
+>     （74C4 agt1 slog `broker denied REGISTER: token_unknown_or_revoked … name=reg port=14003`）；#86 已修复
+>     （leader 屏障 / home 答 home_catching_up / agent 有界重试），修后 C5/C7/C8/C9/S5 的 negctrl rc=0。
+>     2026-08-11 那段"assert_fail=2 实为 #29 家族"是同一签名的误归——两条机制可以给出同一个 rc=64（见 #86 与 [#29 续] 的互指）。
+>   - **面 3（auto-rebalance-on-return 不发火）**：**推翻**。每个有效 C 样本（C5/C7/C8/C9/C10、lg2、S2、V7）
+>     `proxy_auto_rebalanced` 都 0→1 恰好一次；旧标题里"被 #31 in-flight-op fire-gate 挡住"的故事在拆臂后的 fresh N=3
+>     上不成立（下文 2026-08-11 与 round-6 的观测保留为历史）。74C1 的 harness 判无效不是正向证据（R5-F8：那版 drill 没读
+>     `proxy_auto_rebalanced`，brk2≠0 也可能是普通 reconcile 的堆放）。
+> - **harness 侧同一时期修掉的假红（不是产品面）**：74.C 的 C-still-skewed 与 auto 早发火竞速（74C1/74C6/V7 的 `_ktgt_empty`
+>   读到 auto 已经匀过）、异步事件落地、单次读无效 → 改成"KTGT 空 **或** `proxy_auto_rebalanced` 比 skew 前基线前进"；
+>   pre-auto 快照挪到 skew 之后；rc=64 的输出与 agt slog 现在都抓（此前被 harness 吞掉，#86 就是这样才看见的）。
+> - **owner**：expected-verdicts 74 / 74.SRAB / 74.C 行的持久 gap（drill 74 `_gap_drill_level`，文本已改成只认面 1）。
+>   band `ASSERT-FAIL@#34@sig:c-ss-preflow-C` 与 SRAB 的 `@#67@sig:b-negctrl-create-SRAB` 自迁臂后**从未发火**
+>   （≥11 SRAB / ≥12 C 样本，R1-F8 / R6-14），本轮**退役**——下一次那两条签名出现时作为 DEVIATION 来归因，而不是被一条
+>   没有活样本的 band 吸掉。
+>
 > **⬆ 2026-08-11 实测复核（drill 74 on v0.5.0 源码）→ 核心多数 PASS，产品债门仍在**（`product_red=0`）：
 > `SKEW-reconstruct` 把分布重建成 1/1/1（spread==0）、**auto-rebalance-on-return 在 return edge 发火**
 > （`C-dp` 数据面 flow bytes + `C-event` `proxy_auto_rebalanced` count==1，均 PASS）——比台账原始描述改善明显。
@@ -219,6 +274,10 @@ Date: 2026-07-11（建档：S 系列首开批 S1 落地，roadmap `docs/simclust
 
 ### [#29 续] blast-radius 扩充（G-C 实测，**不发新号**；正条见上文 `### #29`）— allocate-time 的 `agent_rejected:frpc_failed` 面
 - **状态**：**LIVE-CONFIRMED（2026-07-17，drill 50 开发期 6 连跑：3 pass / 3 fail，~50%）**。
+- **⬆ 2026-09-20（round-2 review R6-5）候选归因 = #86**：同一签名（allocate 时刻 `agent_rejected:frpc_failed`、home 落在
+  follower）在 2026-09-19 被追到 agent slog 的 `broker denied REGISTER: token_unknown_or_revoked`——home 还没应用分配行
+  （#86，已修复）。本面的 ~50% 有一部分很可能就是它；两条机制都能给出这个 rc=64，凭签名分不开。50/51/52 仍用
+  `--on-broker brk1` 绕开；#86 修后需要一次不带 `--on-broker` 的跑来判定绕法能否去掉——未跑，登记为待办。
 - **新面（既有登记只写了 crash-strand，这是 allocate 时刻的另一张脸）**：N=2 集群、agt1 的 `tunnel_addr`
   指向 brk1、`expose` **不带 `--on-broker`** 时，broker 会把 home 任意分给 brk1 或 brk2；落到 brk2（agt1 的
   **非**-tunnel broker）时 **expose 当场分配失败**：
@@ -410,12 +469,16 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **单模式不变**：`session create` 单模式仍走原子 `session.Create`、重名仍 `already_exists`（无 read-back、无此失败模式）。
 - **drill 96 D3/D6 侧翻正待主进程**（首次即成功后 poll_until 应转绿）。
 
-### DOC-28 — `docs/usage.md` 未定义 `run` 会话跨 broker 重启的语义
-- **状态**：登记（drill 96 臂 B 的 NOT-COVERED 理由，源码 SB-96-3 已闭合行为面）。
+### DOC-28 — `docs/usage.md` 未定义 `run` 会话跨 broker 重启的语义（CLOSED，2026-09-19）
+- **状态**：**CLOSED（2026-09-19，simcluster-speed 内审 R6-F11 顺带）**——`docs/usage.md §5.13` 末尾补了
+  「`run` 会话不跨 broker 重启存活」一段（看门狗合成 `agent unreachable: no heartbeat` 优雅终止、agent 侧
+  ctl-liveness 收割、长任务改用 `exec … nohup`）。**此前本条被 ledger-crosscheck 误读为已闭合**：下面那句
+  「源码 SB-96-3 已闭合行为面」说的是代码行为、不是本条，而当时的门按"标题后 3 行含闭合词"判定——
+  R6-F11 把判定改成只读标题行后本条露出来，于是一并真正闭合。
 - **现象**：`run` 会话经显式 `--nats-url` 连到被杀 broker 时，watchdog 15s 合成 `agent unreachable: no heartbeat` 优雅终止（`run.go:453-456`）——这是**有意设计**（GREEN），但 usage 文档未说明。
 - **修法**：usage 补一句说明 run 跨 broker 重启 = liveness watchdog 优雅终止（可用 `TETHER_RUN_LIVENESS_TIMEOUT` 调）。
 
-### DOC-23 — 砖化态下 `rotate-tunnel-cert` 的补救提示不可达
+### DOC-23 — 砖化态下 `rotate-tunnel-cert` 的补救提示不可达（CLOSED）
 
 > **R11 修复（2026-07-19）**：pin-mismatch 文案去掉指向连不上的 `rotate-tunnel-cert`，改为 FILE-level 恢复（还原 tunnel-cert.pem/tunnel-key.pem 再重启）。CLOSED。
 - **状态**：**产品侧 FIXED（R11 P12，2026-07-19）**——错误文案已改为可达的 FILE-level 恢复。
@@ -428,7 +491,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **钉住它的**：drill 52 臂 **A8**（砖化态跑该命令 → assert_refuses「no such file|connection refused」）——产品已修，
   drill 可另加断言：错误文案指向文件恢复而非该命令。
 
-### DOC-27 — runbook §5:524 的 `cluster backup --out /var/backups/…` 示例在 stock 装机上跑不了
+### DOC-27 — runbook §5:524 的 `cluster backup --out /var/backups/…` 示例在 stock 装机上跑不了（CLOSED）
 - **状态**：**CLOSED（2026-07-21）**——runbook §5（9 处）+ `cmd/tether/cluster_backup.go` 的 `--help` 示例改用 `/var/lib/tether/backups/…`（install.sh 已建 `LIB_DIR` 且 tether 可写）+ 加 off-node caveat；drill 50 臂 C 翻为正向回归，**deploy-tier 实测 drill-50 GREEN（pass=87，0 gaps）on weilandserver**、`DOC-27 CLOSED …runs as User=tether` 断言 PASS。tsv row 50 已同步 GREEN。下文为历史立项记录（原 LIVE-CONFIRMED 2026-07-17，drill 50 臂 C）。
 - **现象**：逐字照抄 runbook `:524` 的示例 → 失败。**实测真串**（非预判）：
   `error: cluster backup: create bundle dir "/var/backups/tether-2026-07-17-799" (must not exist): mkdir /var/backups/tether-2026-07-17-799: permission denied`
@@ -523,6 +586,12 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   （AdoptDecision 的 generation 单调性使陈旧 manifest 只是「暂无更新」，onboarding 亦不依赖即时新鲜=invite 带
   inline seed）；但 `usage.md`/`cluster.md`/`broker-ops.md` **零 user-facing 说明**（与 #27 同族的 doc 缺口）。
   `82` M1/M2/C1 poll 过该窗口（诚实注记，非静默）。**修**：usage 文档化该滞后，或把它变成 82 的显式 labeled probe。
+- **DOC-25（CLOSED 2026-09-19）**：`DropProcesses` 的 directive 在 agent 的 **reconnect** 路径（`onNATSReconnect`）没有
+  `drop_procs=N` 计数日志（初连路径有），于是 drill 94 B5 只能从效果面（`agent: kill orphan pid=…`）反推 directive 到了。
+  登记于 `docs/reviews/s7-s9-plan.md:539`（94-B5 头注），此前只在 #87/#88 正文里被"提到已关"、本表没有它的地址
+  （round-2 R6-10）。关闭：`internal/agent/proxy.go` 的 `agent: re-registered after reconnect` 现在带
+  `reconciled` / `drop_procs` / `revoke_ports` 三个计数；94 B5 措辞相应改成读它；94c solo GREEN pass=54。#88 的待查方向①
+  依赖这行计数。
 
 **预登记指针（roadmap 研究期发现，未在 S1/S2 核实立项）**：
 - **DOC-1**：`usage.md §5.15` 尾段「cluster 不支持 proxy」与 C5 现实相悖的残留旧文（S4 核实）。
@@ -557,7 +626,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 
 </details>
 
-### #69 — `retire --compromised --require-credential-rotation` 不跟随 leader，把 `not leader` 直接抛给运维
+### #69 — `retire --compromised --require-credential-rotation` 不跟随 leader，把 `not leader` 直接抛给运维（OPEN · 候选产品 UX 缺陷，CANDIDATE；drill 52 以 band 钉住）
 
 - **状态：🔴 OPEN（候选产品 UX 缺陷；simcluster-accel D3 于 -j6/-j12 并发下暴露）。**
 - **现象**：并发/换届期间对**非 leader** broker 发 `tether cluster retire --compromised
@@ -572,9 +641,23 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **部署层钉住**：drill 52 以签名绑定 band `ASSERT-FAIL@#69@sig:retire-not-leader` 记录，红时归 MATCH-BAND
   （仍阻断、已归因），签名变了则回落 DEVIATION。
 
-### #70 — grow_to_3（N=3 HA 形成）在高 -j 并发下时序不稳（DELIBERATELY NOT banded）
+### #70 — grow_to_3（N=3 HA 形成）在高 -j 并发下时序不稳（OPEN；DELIBERATELY NOT banded；剩余并发面 = joiner 的 clustered-JS meta 形成时间，未归因）
 
-- **状态：🟡 OPEN（已知 sim/product 并发时序特性；simcluster-accel B1/D2 于 -j6 暴露）。**
+- **状态：🟡 OPEN（已知 sim/product 并发时序特性；simcluster-accel B1/D2 于 -j6 暴露）。** owner：expected-verdicts
+  的 drill 30 行（INCOMPLETE，owner 列点名 #70）；并发面另由 contention registry 的 `70-grow-timing` 传感器采样
+  （`--live-grow`；README 曾写"每周 + release gate"——仓库里**没有**任何机制按周跑它，drill 按需跑，这句已改成事实）。
+  round-1 曾把 CANDIDATE 写进本标题"给 ledger-crosscheck 读"，理由是"剩余并发面没有 verdict cell 拥有"——那句是假的
+  （30 行一直拥有它），而 CANDIDATE 在该门的语义是"尚未确认的缺陷"，本条的并发面是 G1 量出来的、不是猜的；那个词
+  唯一的效果是 30 行哪天转 GREEN 时让本条静默降成 R6-CAND 而不是 UNOWNED（round-2 review R6-2 / R3-F2）。已删。
+- **⬆ 2026-09-19 simcluster-speed，候选① 已修（`cmd/tether/cluster_add_drive.go` `cutoverBrokerWithPoll`）**：
+  former-N1 的 mesh-cutover 会 SIGKILL 自己的 nats-server，回复通常丢失，于是重试阶梯把 transport error 当
+  "预期的丢回复"——但阶梯**走到头后 `lastRefusal==nil` 直接 `return nil`**：六轮全静默被读成"成功"，grow 继续
+  进入只会超时的 catch-up 等待，四分钟后以与真 grow 回归无法区分的签名（`grow_to_3` VOTER timeout）死掉。这是
+  并发下 #70 形态的一条**确定性**成因（nats 复活慢于六轮时必然触发）。修：阶梯末尾**再探一次**，只有 `OK|AlreadyDone`
+  算成功，否则在 cutover 处 HALT（`cutover NOT confirmed after 7 attempts`，附 former-N1 的 health 摘要，幂等重跑），
+  每轮 transport error 打印到 grow 输出。剩余的 #70 并发面（≥5 grow 同时起时 raft/JS-meta 形成对 fsync 尾的敏感）
+  仍 OPEN，由 run-drills 的 grow lane（默认 cap 5）默认约束、`--live-grow` 在发版前 / 改 grow 路径后手动采样（registry
+  `70-grow-timing`）；G1 g 曲线的裁定见 plan §8.3。钉住：`TestCutoverBrokerNeverAssumesSuccessAfterSilence`。
 - **现象**：`grow_to_3` 的 N=3 集群形成是 SINGLE no-retry 尝试（drill 30 owns #31，故不得靠重试洗掉一次
   grow 失败）。-j6 满并发时，多个 drill 同时 grow 会饿死 raft VOTER 晋升，`grow_to_3` 偶发 RED（drill 30
   run-1、drill 96 run-2 均命中签名 `grow_to_3 (N=3 HA …`）。独跑/低 -j 时 grow 顺利完成。
@@ -586,6 +669,19 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   独跑复核。代价是 -j6 的偏离集因此不稳定（30/96 时红时不红）。
 - **真正的修复方向（另一增量）**：OQ-8 的 two-wave split——grow-heavy drills 走低 -j（serial/-j2），其余
   走高 -j。那能消除 grow flake 并让偏离集稳定，但属独立的调度增量、需自己的评审与验证。
+- **⬆ 2026-09-19 simcluster-speed G1 g 曲线（plan §8.3）——并发面第一次被量出来、而不是被猜**：13 个 grow-lane
+  单元在 `--grow-cap` 0 / 5 / 8 各一轮：grow_to_3 的 VOTER 轮询**三档零超时**、cutover 零 `NOT confirmed`、零 nuke+retry
+  （#70① + #83 ⑤′ 之后 grow 层本身不再对并发敏感）。剩下的并发面是 **joiner 的 clustered JetStream meta 形成时间**：
+  cap 8 → drill 91 的 invocation 2 在 start-joiner 边界等满 2 min，joiner 的 broker 仍未 serve（daemon 在跑、nats 已
+  clustered——**这两个状态是推断**：cap 8 的 evidence 只记了 harness 发出 restart、add2 等满 2m0s、op BLOCKED、brk2
+  `reachable:false`、leader 的 503 banner，没有记 brk2 重启后的 daemon/nats 状态，round-2 R5-F7），op 同时过 catch-up
+  期限 → BLOCKED；cap 0（13 路并发）→ drill 51 DR 后的 1→2 re-grow 命中 `#GROW-ONTO-RECOVERED` 的 regex 分支
+  （"meta 永不成形"是该分支的 canned 文案，grow 的输出当时没抓；51 现在把非 0 rc 的 grow 输出整段落盘）；cap 5 → 零。
+  裁定：runner 默认 cap 保持 5，registry `70-grow-timing` 按需 `--live-grow` 采样。**本增量修的那一半**：边界等满 grace 而
+  joiner 的 daemon 确在跑时，`cluster add` 原来打印
+  同一段 "on brk2: systemctl restart nats-server && …" ——运维照做会**打断正在成形的 meta**；现在按事实分两种 PAUSE
+  （`joinerIsBooting`：daemon 在跑 → "不要重启，等 broker serve 后重跑"；`startJoinerBootingHint`，
+  `TestStartJoinerHintSaysRestartNotStart` 5 行表）。没修的那一半是容量本身（meta 形成对负载的敏感），台账保持 OPEN。
 
 ### #71 — drill 96 于 -j6 的 heal 后 brk1 canary3 commit-success 行（OPEN，边界时序未定根）
 
@@ -601,6 +697,21 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 - **处置**：不 band；pre-heal `yes` 保持 PRODUCT-RED，pre-heal `no` + post-heal `yes` 保持
   `NOT-COVERED[gap] #71 AMBIGUOUS`，直到专用复现提供可与 heal 边界排序的 product artifact。结构不可达的
   长连接 condition Y 仍是相关覆盖缺口。
+- **⬆ 2026-09-20 round-2 review R1-F1 / R5-F2 —— 三次 pre-heal `yes`，归因为 #89，不是 #65 / #71**：拆臂后的 96.D 在
+  G1 cap 0、G1 cap 8、S2 -j6 三次并发样本里 `D4b COMMITTER SNAPSHOT … ISOLATED? yes`（brk1 自己的 broker.log 在
+  D5a heal 之前就有 `session created … canary3`，D4b 的 create 经 `--nats-url brk1:4222` **1 s 内 rc=0**），runner 首败行
+  `PRODUCT-RED #65`；solo 与其余并发样本 0/7。plan §8.3 / §8.5b′ 当时把它们记成 "#71 传感器 / LOAD-SENSITIVE"、
+  registry 写 `none-after-split`——那是把 drill 自己定义为**决定性 #65 证据**的读数改标成一个"已死的传感器"，round-2
+  BLOCKER。归因（本增量）：**brk1 的 broker 根本不在 brk1 的 NATS 上**——它在负载下被 topology reconciler 的 staggered
+  hard restart 掀掉本机 nats-server 后，经 nats.go 的 INFO 发现池重连到了 **peer 的 NATS**（#89），于是"隔离 brk1 的
+  route+raft"隔离的是一个不经 brk1 NATS 通信的进程：它把 ctl 的 create 经 brk2 的 NATS 转发给活 leader、秒回 OK、
+  在自己的 log 里写下 `session created`。这解释了 rc=0 恒成立（含 solo）、"pre-heal visible on brk1" 多数为 yes、以及
+  只有并发样本才有 brk1 的 commit 行（hard restart 是负载相关的 reload-stale 分支）。R6 当年的 "少数派认证 rc=69 50/50"
+  是同一缺陷从 callout 侧看到的样子。**处置**：#65 保持 REFUTED（那三次不是 commit）；#89 新条 FIXED（broker 钉在
+  自己配置的 server 上）；96.D 加 **D0f 前提自证**（每个 broker 的 /connz 恰有一个 loopback 的 `tetherd`，红 =
+  ASSERT-FAIL，且 D6b 的 #65 判定被它门控成 runtime-guard）、D4b 加三 broker 的 committer census；registry 行改回
+  `71-minority-commit default 96-mid-flight-chaos.D`（D 臂每次都在采样这条 commit 行，只是 2026-07-18 的 post-A 世界
+  不再构造）。#71 本身仍 OPEN——post-heal `yes` 的边界歧义没有变。
 
 ### #72 — agent 的 stuck-disconnect watchdog 在取消 session 前同步 `nc.Close()`；WSS close 卡住时 systemd 假活、节点 OFFLINE、数据面暂存
 
@@ -811,7 +922,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   agent.yaml 增 `proxy.participate: false`（或 broker 侧按连续拨失败自动摘除该节点出口）。
   彻底根治本例还需在 wsl 宿主 Windows 放行出站 :7000——但那是环境侧，产品这三条能把「刷屏爆盘」这一半消掉。
 
-### #79 — [更正：非 v0.5.0 短板] force-single 的 roster prune 失败无重试 → 永久 ghost VOTER —— **0.4.7 死结，v0.5.0 batch C 已修 ✅**
+### #79 — [更正：非 v0.5.0 短板] force-single 的 roster prune 失败无重试 → 永久 ghost VOTER —— **0.4.7 死结，v0.5.0 batch C 已修复 ✅**
 
 - **状态：✅ FIXED（v0.5.0 / batch C·C1，commit `92e01a4` `internal/broker/force_single_finalize.go`）。
   本条最初误登为 v0.5.0 open 短板——经代码核实是 0.4.7 的死结、v0.5.0 已修，更正如下。**
@@ -883,7 +994,7 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 > **标 CANDIDATE 而非 FIXED**：#33 的**首个**根因假说已被撤回过一次（round-5 订正），且 #33 的观测里含 SS 腿超时等
 > 无法单独归因到具体层的现象。要转 FIXED 需在修复后重跑 `drills/73-proxy-cluster-ha.sh` 并见到 STRANDED 臂消失。
 
-### #81 — spawnsafe 的 mount health `stHealthy` 无 TTL、永不失效 ⇒「先健康、后挂掉」的 NFS 永远不被剔出 `$PATH`，整套 remote-fs 保护静默退化成"只剩有界超时"
+### #81 — spawnsafe 的 mount health `stHealthy` 无 TTL、永不失效 ⇒「先健康、后挂掉」的 NFS 永远不被剔出 `$PATH`，整套 remote-fs 保护静默退化成"只剩有界超时"（已修复，2026-09-01）
 
 > **来源 = 生产车队，非 simcluster drill。** 2026-08-29 timan107 现场诊断（agent 0.5.0，UIUC CS 机房）。
 > **✅ FIXED（2026-09-01 第二次外审：根因闭合 + deploy-tier 3 次独立实例稳定）**；plan
@@ -1098,6 +1209,281 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   所以它**不能**在现有 `62-remote-fs-safe`（先挂载后 SIGSTOP）里复现——同 #81 的"为什么现有测试够不到"。
 - **下一步**：先修 #81；修完后本条前一半会自动消失，再单独复核 `--cwd` 路径的 30s 看门狗是否真的接上。
   **复现请用隔离宿主 + hangfs，不要在共享/生产机器上跑**（OQ-2 的定格理由依然成立）。
+
+### #83 — `cluster add` 的 start-joiner 边界等待会耗尽 join op 的 catch-up 期限，而"修好后重跑"（文档写的恢复方式）复位不了 BLOCKED 的 join（已修复，simcluster-speed）
+
+> **来源 = simcluster-speed 的 A/B 对照（2026-09-19）**：drill 42 在 `a3431a1` 基线镜像 GREEN、在增量镜像
+> 2/2 ASSERT-FAIL，首个失败签名逐字相同：F 臂 re-grow 返回节点时 `cluster add` invocation 2
+> `HALTED at await-nonvoter … did not commit AddNonvoter (reach CATCHING_UP) within 2m`，而 op 的 timeline 明明写着
+> `CATCHING_UP` → `BLOCKED: catch-up exceeded the deadline`。**是本增量引入的形态、但不是本增量引入的缺陷**——
+> 增量把 `joinerBootGrace` 从写死的 60 s 改成 `ClusteredJetStreamBootWait()+30 s`=120 s（§8.1a，修一条 60<90 的
+> 真实不一致），于是一条从来存在的死锁性时序第一次露出来。
+- **机制**：返回节点（raft/ 已存在）的 invocation 1 走完 approve-join（op 进 `CATCHING_UP`，leader 在这一刻盖上
+  `opCatchupTimeout`=2 min 的 catch-up 期限）→ render → cutover 后，在 start-joiner 边界**等满整个
+  joinerBootGrace** 才打印 PAUSE；provisioning 只在 PAUSE 之后才 `systemctl restart nats-server && start
+  tether-broker`；joiner 再花至多 90 s 等 clustered JS。基线 60 s 勉强赶在 2 min 内，120 s 必然越线：op 在 joiner
+  还没起来时就 BLOCKED。invocation 2 的 `waitOpCatchingUp` 只认 `CATCHING_UP|SERVING`，对 BLOCKED 再等 2 min 后
+  报一条**说错原因**的错（"did not commit AddNonvoter"）。运维手工操作同理：PAUSE 之后超过约 1 min 才起 daemon，
+  重跑 `cluster add` 就撞同一堵墙——HALT 文案承诺的 "fix and re-run … to resume" 对这条路径**从来不成立**。
+- **修法（零 wire 断裂）**：① `join-status` 增 additive 字段 `nonvoter_committed`（omitempty；`joinNonvoterCommitted`
+  三重见证：当前状态 ≥ `CATCHING_UP`、或 `BLOCKED` 且 last_error 以 `OpBlockedCatchupDeadlineMsg` 开头（只有
+  `boundCatchingUp` 从 CATCHING_UP 写这条）、或 timeline 出现过 `CATCHING_UP`——第一版只看 timeline，而 timeline 被
+  cap 在 32 条，长 stall 的 last_error 变更会把 CATCHING_UP 挤出去、静默退回 2 min 旧等待，内审 R2-F5）；② `catchupBarrier`
+  对 `BLOCKED ∧ nonvoter_committed` 视为已过 AddNonvoter（cutover 的 R3 门只要这一点）；③ 边界之后（joiner 已证明在线）
+  `resumeBlockedJoin` 对这种 op 发**一次** `confirm-op`（ConfirmOp 已有：join 从 ROSTER_COMMITTED 重入、带新期限）——
+  **只对 last_error 以 `OpBlockedCatchupDeadlineMsg` 开头的 BLOCKED**（AddVoter 耗尽的 BLOCKED 是跑着的 joiner 追不上，
+  留给 `--auto-confirm-catchup`，内审 R2-F1/R4-F7），不计入 `--auto-confirm-catchup`（那是
+  给"joiner 在跑却追不上"的预算，这次 stall 是边界自己制造的）；确认被拒 → HALT 带拒因；回复丢失 → 交给
+  `waitJoinServing` 的既有重发；④ `waitOpCatchingUp` 超时文案改为点名最后状态与 last_error。旧 leader 不设该字段
+  → 一切回到旧行为（N-1 四象限成立）。⑤ **边界本身不再等一个不可能来的 broker**：`joinerStartGrace(initRan, natsState)`
+  多看一个事实——joiner **本机 nats-server 的 INFO 行**（CONNECT 之前就发、无需凭据）里有没有 `cluster` 名：
+  standalone 或没在听 → provisioning 还没做它那一半（`systemctl restart nats-server` 装载刚渲染的 clustered conf），
+  broker 无论如何 mesh 不上 → grace 0、立刻 PAUSE；读不到（无 broker.yaml / 非 nats 应答）→ 全额（保守 = 旧行为）。
+  **nats 判据单独不够**（镜像 #4 实测）：返回节点的 nats-server 可能还跑着它**上一世**的 clustered conf，INFO 里有
+  cluster 名，而 broker unit 早被停掉——所以第三个事实是**本机有没有 `tether serve` 进程**（`/proc/*/cmdline`，
+  排除自身，3 次采样跨过 Restart=always 的 RestartSec 空窗；/proc 不可读 → unknown 而非 absent）：没有进程 → 没有任何
+  东西能来应答边界 → grace 0；有进程且 nats clustered → 全额（这才是 crash-restart 瞬态）。于是 sim 里返回节点的
+  invocation 1 不再吃掉 120 s，op 通常根本不会 BLOCKED；③ 留给"PAUSE 之后运维手慢"的真实场景。收据：镜像 #5 上
+  42 solo **GREEN 221 s**（基线 423 s），add1 立即 PAUSE 并打印 `nats-server clustered, tether serve process absent — not waiting`；
+  其后 G1 cap 0 / cap 5 / cap 8、lg2、S2 -j6、V7 -j12 六次并发样本 42 全部 `GREEN pass=49`（合计 7 个 GREEN 样本、零 #83
+  签名——round-1 R6-F10 的"样本随 G1/S2 累积"条件已满足，round-2 R6-11 补记）。**②③ 单独修只对 `cluster add` 自己有效**：
+  42 在镜像 #3 上 re-grow 已 GREEN，但并行的 `cluster join approve --wait`（C4-M7：见 BLOCKED 即刻 rc=75 返回）
+  仍在 op 过境 BLOCKED 时退出——那是另一个观察者看到的同一条时序，⑤ 把时序本身修掉。钉住：
+  `TestJoinerStartGraceSkipsOnlyWhenInitRan`（9 行表）、`TestJoinerNatsStateReadsTheInfoLine`（7 行表，假 listener）、`TestJoinerBrokerProcessSamplesProcfs`（合成 procfs）、
+  `TestCatchupBarrierAcceptsABlockedJoinOnlyPastAddNonvoter`、`TestResumeBlockedJoinConfirmsExactlyOnceAndOnlyPastAddNonvoter`
+  （`cmd/tether/cluster_add_drive_test.go`）、`TestGrowTriggerJoinStatusReportsNonvoterCommittedFromTheTimeline`
+  （`internal/broker/grow_trigger_test.go`）；deploy-tier 收据：42 solo 于增量镜像重跑（`docs/reviews/simcluster-speed-plan.md` §8.5）。
+- **为什么六周没人看见**：sim 的 provisioning 在 PAUSE 后几秒内就起 daemon，60 s 的边界等待恰好把 op 期限用到只剩
+  一分钟——一条"刚好够"的时序，被它上面另一条"刚好够"（60<90，§8.1a）盖住。
+
+### #84 — tier-B `Put` 在失去 quorum 的 JetStream 上坐满整个 size 预算（或瞬间 `no responders`），只报一句裸 `nats: timeout`：#67 的运维面缺陷从 prepare 腿挪到了 Put 腿（已修复，simcluster-speed；三张脸、四张镜像）
+
+> **来源 = drill 67 于 simcluster-speed 镜像 #2（2026-09-19，solo 954 s）**；由内审 round 1 R1-F1 定性（第一版把它记成
+> coverage gap，违反 plan X27）。修复用了镜像 #6 → #9 四轮，每一轮的 RED 都是一条**新事实**而不是同一条没修好——
+> 逐轮记在下面，因为下一个碰 tier-B 上传路径的人需要知道 JetStream 在失 quorum 与恢复的边缘各长什么样。
+- **机制（注入脸 × 2）**：`0b204b5`（2026-08-06 RESOLVE-BEFORE-CREATE）让 tier-B prepare 在本地解析 bucket、不再走 JS API
+  往返，于是 peer 的 nats 停掉（JS meta 失 quorum）后 prepare **成功**，push 直接进 `Put`。此后有两张脸：**stall**——`Put`
+  发出 chunk 后等 ack，等到 ctl 的 phase 预算耗尽（P-b 后 12 MB ≈ 7 min；P-b 前平的 37 min）才回 `push (tier B): Put:
+  nats: timeout`；**instant**——meta 层重新应答但 stream 无 leader 时，`Put` 自己的对象查询 0.9 s 回 `Put: nats: no
+  responders`（rc=69），或 chunk ack 的 503 让 nats.go 在两次内置重试后回 `no response from stream`。两张脸都没有
+  transient 码、没有 "retry shortly"、没有任何运维能据以安排的上界；G67 为 prepare 腿修的措辞 (a)–(d) 从这条注入够不到
+  （67 的 pass 从校准的 18 掉到 14 就是它）。hermetic 2 节点 R2 复现：peer 停后前 ≈40 s `STREAM.INFO` 超时（stall 脸），
+  之后 API 2 ms 应答但 `cluster.leader==""`、peer `offline`（instant 脸）。
+- **机制（post-recovery 脸，第三张）**：peer 回来、JS meta 已 re-form 之后，**第一条** CONTROL push 仍坐满预算（425 s / 121 s
+  / 121 s / 120 s，四次）才失败，第二条 194 ms 成功。镜像 #8 的 /jsz + /connz 采样把它钉死：ctl 的连接（brk1 cid 55）在前
+  5 s 内送进 285 条消息 / 25 MB——chunk **全部到了 leader 所在的服务器**；而 stream 在那 5 s 里 `leader==""`（选举中），
+  此后 `leader=brk1`、replica `current=true`，**`msgs`/`last_seq` 却 120 s 纹丝不动**。nats-server 对无 leader 的 stream
+  收到的 publish 是**静默丢弃、不发 NAK**，nats.go 的 async publisher 没有任何东西可重试，选举一结束 stream 对所有人都
+  健康——除了这条 Put，它等的 ack 永远不会来，直到自己的预算到期。只看"API 是否应答 + 有无 leader"的探针整程看到健康。
+- **修法**（`cmd/tether/transfer.go`，零 wire；P-a 的 abandon 路径负责释放槽位，P-b 的 size 派生预算仍是最外层上界）：
+  ① Put 跑在 `putWithJSWatchdog` 之下：每 10 s 一次该 bucket stream 的 `STREAM.INFO`（5 s 超时）——**只用这一个请求**：它在
+  ctl 的 per-session ACL 里，`$JS.API.INFO` 不在（镜像 #6：探针发 `AccountInfo`，每次都是 permissions violation，nats.go 对
+  publish 违规不让 request 失败、只让它等到超时，于是**健康** JS 上的 12 MB push 30 s 被误切）；一次应答回答两个问题：
+  **活性**（无应答、或应答无 leader 都算失败，连续 3 次 → `stallNoAnswer`，不重试——JS 就是下线了）与**进度**（应答健康
+  但 `last_seq` 连续 3 次不动 → `stallNoProgress`，上传没有落地）；在传的上传每 128 KiB 推一格 seq，2 MiB/s 的准入下限
+  下不可能整 10 s 不动，同一 session 的其他写者会遮住一条死上传——那时退回 size 预算，不比修前差。② 瞬时脸
+  （`no responders` / `no response from stream` / API 503 / 预算未尽的 `nats: timeout`）与 `stallNoProgress` 经
+  `putWithJSRetry` 有界重试 3 次（3 s / 6 s，文件回卷）再拒；两条拒绝都是 `code=jetstream_not_ready`（exit 75、G67 同一套
+  retry 词汇），文案带证据：探针数（`3 probes over 30s failed`）或尝试数 + 用时（`refused 3 attempt(s) over 9s, last: …`）——
+  drill 67 的非真空齿读的就是这两个计数。
+- **判定（drill 67，plan X27）**：注入后首条 push 若出现 `Put: .*(nats: timeout|context deadline exceeded|no responders)` →
+  `product_red #84`；恢复后首条 CONTROL push 若坐满 ≥100 s 且下一条立刻成功 → `product_red #84 (post-recovery face)`——
+  **按时长判、不看措辞**（镜像 #8 的那 121 s 措辞已经是 transient 的，文本判据放过了它）；CONTROL push 带 `--timeout 120s`，
+  注入 push 保持 CLI 默认；drill 在 CONTROL(after) 期间每 5 s 采一行 /jsz（leader / replicas / msgs / first..last）+ ctl 的
+  /connz 计数，>1 次尝试或首次 ≥30 s 时回放到 log，并转录两台 nats-server journal 的 JetStream/RAFT 行。
+- **钉住**：`TestPutWithJSWatchdogCancelsAStalledPutOnlyAfterStrikes`（活性 3 击、进度 3 击、各自的复位、put 自己的结果优先、
+  ctx 取消不是 stall）、`TestProbeJetStreamForBucketStaysInsideTheCtlACL`（真实 `PermissionsForActivatedMember` 装进嵌入式
+  server，负控制证明 fixture 真拒 `$JS.API.INFO`）、`TestProbeJetStreamForBucketRejectsALeaderlessStream`（无 leader 即失败；
+  读数随写入移动）、`TestPutWithJSRetryRetriesOnlyTheInstantJetStreamFaces`、`TestJetStreamUnavailableFaceClassifiesPutErrors`
+  （含两种 stall 的归类）。变异：去掉进度规则 / 不复位 / no-progress 不重试 / 探针不回 seq → 各红。
+- **收据**：镜像 #6 67 `INCOMPLETE 1 pass=18`（stall 脸 36 s 截住）但 CONTROL(after) 误切；#7 注入脸 instant → PRODUCT-RED，
+  post-recovery 121 s 露出；#8 注入脸 30 s 截住、(d) PASS、`INCOMPLETE 1 pass=18 270 s`，post-recovery 仍 121 s（措辞 transient）；
+  #9 见 plan §8.5c 末行。**flip**：三张脸都不再让 67 的两个 `product_red` 发火 + (a)–(d) 在 Put 腿 PASS → 本条已修复、
+  67 expected 回 `INCOMPLETE 1`，owner 列 `#67 (#84 fixed 2026-09-19: …)`——face B gap 不变；括号里的 #84 只是给读表的人的
+  注（round-2 R6-8 订正：ledger-crosscheck 只遍历 OPEN 条目，一个 FIXED 号写在 owner 列它根本不读，"为了让它看见由谁钉"
+  是假理由）。**round-2 复跑（镜像 #14，含 R2-F1/F3 的 cut 修法）**：注入脸 70 s rc=75、`refused ≥2 attempt(s)`——chunk-ack
+  的瞬时错误现在由 Put 自己的 verdict 进分类器、被有界重试到（修前它被洗成 no-progress、每次 30 s）；CONTROL(after)
+  第一次尝试 1 s；INCOMPLETE 1 pass=19。
+- **abandon 的边界（外审 F2）**：0a 为释放槽位给 creator 开的 `finalize{failed}` 通道（`claimAbandonedPush`）第一版只查
+  finalized / verb / committed，而 **tier-A push 没有 commit 阶段、`committed` 终生为 false**——合法 creator 对自己正在被
+  agent 落盘的 tier-A push 发 `finalize{failed}`，broker 接受、写 failed 审计、取消 watchdog、删 tracker，agent 随后的真终态
+  找不到 entry：审计说失败、文件仍落地。现在 claim 在同一把锁下多查 **tracked** `tier == "b"`（不看 body 的 `Tier`），
+  返回封闭枚举 `abandonRefusal`（handler 穷举无 default）：tier-A → `verb_mismatch` + 点名理由，entry / watchdog 全留；
+  audit 的 tier 只对 pull 接受 body 覆盖。钉：`TestClaimAbandonedPushOnlyBeforeCommit`（tier-A 行 + 拒后 agent 终态仍能
+  且只能 claim 一次）、`TestPushCreatorFinalizeFreesTheBucketBeforeCommit` Arm 4（真 NATS，body Tier ∈ {a,b,""} 三拒、
+  watchdog ctx 未 cancel）；变异删 tier 检查两处红。
+- **entry 身份栅栏（外审 round 3 R3-F1）**：权限检查期间旧 entry 可能被另一终结路径移除，相同 ID 随后被重新使用。
+  只按 ID claim 会让旧请求终结另一 session/actor 的新传输；相同 owner 的新传输也不能继承旧 watchdog/cleanup。
+  `claimFinalize` / `claimAbandonedPush` / `markCommitted` 现接收已验证的 entry，并在 tracker 锁内核对对象身份后修改状态；
+  主进程复核时把 `remove` 也绑到 entry，tracker 只剩 `put`（拒重复 id）与 `get`（preview）两条 by-id 路径。
+  所有 finalize、接收端事件、commit、watchdog 和 cleanup 调用方均传原 entry。钉：
+  `TestTransferContinuationDoesNotClaimAReusedID`（真实 NATS/SQLite，DB 等待期间替换 entry）与
+  `TestTransferClaimsRejectReplacedEntries`（同 owner、同字段、不同 entry 的 finalize/commit/abandon/remove 旧调用均拒绝）；
+  四个身份守卫各自单独去掉都有具名行变红。
+
+### #85 — 失败的 tier-B `Put`（取消 / 超时 / ctl 死亡）与 ctl/agent 侧的 object Delete 在 per-session bucket 里留下**没有 meta 的 chunk 组**，对象级 reaper 永远看不见（已修复，simcluster-speed）
+
+> **来源 = drill 67 于 simcluster-speed 镜像 #7/#8（2026-09-19）**：每次失败的 Put 之后 ctl 的 stderr 多一行
+> `nats async error: nats: permissions violation: Permissions Violation for Publish to "$JS.API.STREAM.PURGE.OBJ_xfer-lab"`。
+> 那一行是 nats.go `ObjectStore.Put` 的 `purgePartial()` 在按设计被 ACL 拒绝（file-transfer-plan Round-4 #3：
+> bucket 生命周期 broker 独有，ctl/agent 模板不给 `STREAM.PURGE`）。看得见的是那一行；看不见的是它拒掉的清理。
+- **机制**：nats.go 的 Put 先按 `$O.<bucket>.C.<nuid>` 发全部 chunk、最后才写 meta（`$O.<bucket>.M.<name>`）；Put 被
+  取消（#84 的 watchdog / 有界重试）、超时、或 ctl 进程死亡时 chunk 已在 stream 里而 meta 永远不会来。nats.go 自己的
+  善后是 `STREAM.PURGE` + subject filter，ctl/agent 的 ACL 拒之。P11 设计这条拒绝时 bucket 是 **per-transfer** 的，broker
+  在失败路径整桶删掉，所以"拒了也无害"成立；v0.2.2 起 bucket 是 **per-session、永不删除**的，broker 的 reaper
+  （`transfer_reconcile.go reapBucketObjects`）改为按**对象**回收——它靠 `store.List`，而没有 meta 的 chunk 组**不是对象**，
+  于是从那天起没有任何东西删过它们：每一次失败的 Put 最多留下整个文件大小的 chunk，计入 bucket 的 `MaxBytes`，
+  直到 push 被 `insufficient storage` 拒掉。ctl/agent 侧的 `store.Delete`（size-mismatch 路径、agent 完成后的删除）同形：
+  tombstone 写进去了，随后的 PURGE 被拒，chunk 留下——broker 的 `deleteXferObject` 走 admin 权限、purge 成功，但只覆盖
+  broker 自己发起的删除。
+- **修法**（`internal/broker/transfer_reconcile.go`）：`reapBucketObjects` 的对象循环之后跑 `reapOrphanChunks`——
+  `STREAM.INFO` 带 subject filter `$O.<bucket>.C.>` 取每个 chunk 组（一组一个 subject）的消息数；`store.List(ShowDeleted)`
+  取**未删除**对象引用的 NUID 集；未被引用的组，若其**最新一条** chunk 的时间早于调用方的 floor（与对象 reaper 同一个
+  `xferObjectReapFloor`：per-home grace / cross-home 追加 / 进程年龄项），按 subject `Purge`。"最新 chunk 早于 grace"
+  就是区分"被遗弃"与"在传"的判据——在传的 Put 每 60 ms 写一条 chunk（2 MiB/s 准入下限），停超过 30 s 的正在被 ctl 的
+  watchdog 取消；chunk 组不带 transfer id，所以不能像对象那样按身份保护，但调用点的 per-bucket busy skip（本机有在飞
+  transfer 即整桶跳过）与进程年龄项照旧覆盖它。`store.List` 空结果不再提前返回（空桶也可能全是孤儿 chunk）。
+  Tombstone 对象的 NUID **不算引用**（它的 chunk 本就该没了）。包级函数而非方法：结构预算钉着 Broker 的方法数。
+- **钉住**：`TestOrphanChunkGroupsArePurgedByTheBucketReap`（`internal/broker/transfer_reconcile_test.go`，真嵌入式 JS：
+  LIVE / PUT / TOMB 三种组，1 h floor 下全留、0 floor 下 PUT+TOMB 走、LIVE 的 chunk 与对象都在；删 `reapOrphanChunks`
+  调用即红）。deploy-tier：drill 67 每次失败 Put 之后 stderr 那行 PURGE violation **仍会出现**（那是 nats.go 的行为、
+  ACL 的设计），本条改变的是它之后 bucket 里剩什么。**deploy tier 上没有观测到这次回收**（round-2 R6-9 如实记）：
+  回收 floor（per-home grace / 跨 home 3× tier-B / 进程年龄项）比任何一个 drill 的窗口都长，67 的 /jsz 采样里没有一行
+  `orphan xfer chunk group purged`，也不该有；本条的闭合建立在 hermetic 测试 + 三条变异红上，deploy-tier 只观测到
+  它要修的那一半（PURGE violation 行 + chunk 组留下）。round-2 复跑中 R2-F1/F3 又给了它一个新客户：cut 之后
+  `<-done` 读到 nil 的那条路径（trailing purge 被拒）留下的旧 chunk 组，同样由它回收。
+- **为什么六周没人看见**：每次失败 Put 留下的是 bucket 里的 MaxBytes 余量，不是任何命令的输出；racknerd 小盘上
+  `insufficient storage` 的拒绝会先被读成 #58 类"桶太大"，而不是"桶里有看不见的东西"。
+
+### #86 — 集群模式下新建 expose 会与 home broker 的 raft apply 竞速：home 还没应用到分配行就收到 agent 的 REGISTER，答的是**终态** `token_unknown_or_revoked`，运维看到的是 `agent_rejected:frpc_failed`（"agent 起不了本地代理"，exit 64）（已修复，simcluster-speed 2b）
+
+> **来源 = drill 74 的臂 solo（2026-09-19，镜像 #10，Block 2b #34 协议）**：修前 8 次 solo 里 4 次（74S2、74C2、74C3、
+> 74C4——SRAB ×1、C ×3；round-2 R6-5 按日志重数，此前写的 "7 次里 3 次" 错）负对照的
+> `expose agt1 --local 8081 --name reg` 失败，rc=64；输出只有 ctl 的通用提示，把 agt1 的 agent slog 转录进 drill 之后
+> 才看到根因：`agent: ExposeAdapter.AddProxy err="tunnel adapter AddProxy: tunnel client: Open: tunnel: broker denied
+> REGISTER: token_unknown_or_revoked" name=reg port=14003`。同一 agent 的 `__proxy__` 口（14000）在 30 s 前也被同样拒过
+> 一次、10 s 后由 proxy 的重连循环自愈——expose 路径没有那个循环。此前 74 的 band `ASSERT-FAIL@#67@sig:b-negctrl-create-SRAB`
+> （rc=70 的 -j6 时代签名）说明这条线早就红过、被归到 #67；今天的脸是 rc=64、不同签名，靠证据转录才分开。
+- **机制**：leader 在 raft 上提交 port 分配（含 home_broker + epoch）后**立刻**把 `expose.forwarded` 发给 agent；agent 收到
+  即拨 home broker 的 tunnel 端口发 REGISTER；home 是 follower，其 FSM **应用**这条分配要等一次 SQLite fsync，负载下落后
+  提交若干秒；`tunnelTokenLookup` 查不到行 → 按 F6 反枚举折叠答 `token_unknown_or_revoked`——这是**终态**码（proxy off
+  的 kill switch 靠它让 agent 停止重试），agent 因而不重试、回滚 state.json、回 `frpc_failed`，broker 回滚分配、ctl 打印
+  "agent 起不了本地代理，看 agent 日志"。N=1 时 home 就是 leader、行已应用，永不发生——所以单 broker 生产从没见过。
+  D6 §7.2 的 epoch 阶梯已经为 **reassign** 的同一竞速准备了 transient 码 `home_catching_up`（"presented epoch > 本地行
+  epoch → 这个副本还没应用最新 reassign，agent 重试"），但**全新的行**没有可比的本地 epoch，落到了 not-found 分支。
+- **修法（三半，零 wire）**：① **leader 侧 home-applied 屏障**（`internal/broker/expose.go awaitHomeApplied`）：分配提交
+  后、forward 之前，若 home ≠ self，用 broker 专用的 cursor 探针（`tether.v2.cluster.cursor.req`，每个 broker 回自己的
+  command-domain AppliedIndex）等 home 的 AppliedIndex ≥ leader 自己的，步长 400 ms、预算 3 s（在 forward 之前、不吃
+  5 s 的 ExposeForwardTimeout，也远在 ctl 15 s 之内）；等不到照旧 forward（今天的行为），日志记等待时长。
+  ② **home 侧诚实分类**（`tunnelTokenLookup`）：行不存在 **且**本副本未 caught-up（`reaperCaughtUp` = Node.CaughtUp：
+  applied ≥ commit）→ 答 transient `home_catching_up`，不答终态码；caught-up 的副本与单机模式照旧终态。**round-2
+  review R2-F2 订正——"未 caught-up"要在 COMMAND 域读**：raft 域的 `Node.CaughtUp` 在 FSM 还在 SQLite apply 里面的那一刻
+  就已经读 true（raft 的 cursor 在 batch **入队** FSM 时前进、不等 `fsm.Apply` 返回——CaughtUp 自己写着的 HONEST LIMIT #1），
+  而那正是本条的窗口；所以第一版的 ② 在它为之而写的窗口里是瞎的，3 s 屏障用尽后 home 照答终态、结果退回修前的
+  `frpc_failed`（hermetic 复现：三节点 + applyCommitGate 卡住 FSM，follower `CaughtUp=true`、SQLite 落后一条）。现在
+  `internal/cluster.CommandApplyLagging`——SQLite 的 command cursor（走 RO 池：写池只有一条连接、正被 FSM 的事务占着）
+  对比本地 raft log 里最新一条已提交 LogCommand 的 index（跳过选举 noop / config 条目）——与 `!CaughtUp`（从未同步 /
+  大回放积压）**二者任一**为真即 lagging（`internal/broker/expose.go applyLagOf`）；钉住：
+  `TestCommandApplyLaggingSeesAFollowerWhoseFSMHasNotAppliedTheEntry`（同一 gate 夹具里 CaughtUp==true 且 lagging==true）、
+  `TestApplyLagReadsBothDomains`、`TestUnknownTokenIsTransientOnlyOnALaggingClusteredReplica`（调用点）。不泄露任何
+  token 信息（答案只是本副本自己的滞后的函数，F6 折叠原样保留）。③ **agent 侧有界重试**（`internal/agent/expose.go
+  addProxyWithTransientRetry`）：新 expose 的首次 AddProxy 对 transient deny（`home_catching_up` / `try_again`）每
+  250 ms 重试、预算 3 s（必须小于 broker 的 5 s forward 窗口）；预算用尽回 **`home_catching_up`** 而不是 `frpc_failed`
+  （ctl 已有该码：exit 75 + "等几秒重试"）；终态 deny / 拨号失败 / 缺 pins 照旧一次即回。
+  **预算是一个贯穿整条梯子的 deadline，不是两次调用之间的检查**（外审 F1）：第一版只在 AddProxy 返回之后看剩余预算，
+  每次调用本身不受约束——首次 REGISTER 2.6 s 答 catching_up、隔 250 ms 重试再 2.6 s 成功 = 5.45 s，每一次都在 broker
+  的 5 s 之内、总和在之外，broker 已答 `agent_no_responders` 并回滚分配，agent 却安装了 session、回了 OK，两端从此对
+  这个端口意见不一。现在 `ExposeAdapter.AddProxy(ctx, p)` 收梯子的 ctx：adapter 的 op 锁等待（channel 信号量，
+  select 于 ctx）、dial、REGISTER、安装都在它之下，`tunnel.Client.OpenHome(ctx, …)` 在 REGISTER OK 之后、安装之前再查
+  一次 ctx——deadline 已过就丢弃 transport、返回 deadline，永不迟到安装。**ctx 只约束打开，从不约束打开后的 session**
+  （session 仍锚在 tunnel client 自己的 Start ctx 上；否则就是 #80 往下挪一层）；被切断的重试若之前收到过 transient
+  deny，回复仍是 `home_catching_up`。
+- **钉住**：`TestAwaitHomeAppliedWaitsForTheHomeNoLongerThanTheBudget`（已应用不等 / 第三次探到 / 别的 broker 的 index
+  不算 / 永不追上按预算放弃）、`TestMissingTokenIsCatchingUpOnlyOnALaggingReplica`（4 行）、
+  `TestAddProxyWithTransientRetryRetriesOnlyTransientDenies`（catching-up×2 后成功 / try_again / 终态一次即回 / 拨号错
+  一次即回 / 预算耗尽有界 / 慢重试被 deadline 切且仍报 catching_up / 无先例 deny 的切断就是 deadline / 无 deadline 不重试）、
+  `TestHandleExposeForwardedAnswersInsideTheBrokersForwardWindow`（外审 F1 的 2.6 s + 2.6 s 形状，请求等恰好 5 s）、
+  `TestAddProxyGivesUpTheLockWaitAtTheCallersDeadline`、`internal/tunnel/open_deadline_test.go` 四条（切断不迟到安装 /
+  session 不随 caller ctx 死、掉线仍自愈 / 已结束的 ctx 不 dial / REGISTER OK 与安装之间 ctx 结束 ×20 无一安装）。
+  变异 H1（任意 broker 的 index 算数）/ H2（忽略 clusterMode）/ H3（永不 transient）/ A1（不重试）/ A2（终态当
+  transient）/ A3b（无预算）/ 外审 F1 的 M1–M5（删安装 fence / session 派生自握手 ctx / 忽略 caller ctx / 无界锁等待 /
+  每次调用 `WithoutCancel`）各红。deploy-tier：drill 74 两处负对照站点现在转录 agt1 slog + leader 的 proxy status；
+  收据见 plan §8.5b；F1 修后 74.SRAB solo（镜像 #15）INCOMPLETE 1 pass=36 MATCH。
+- **为什么六周没人看见**：只在 N≥2 且 home ≠ leader 时可能，且窗口是一次 fsync；sim 的 -j6 sweep 里它以 rc=70 的另一张
+  脸红过、被归到 #67（JS 瞬时不可用）——两者都"expose 刚建就失败、重试就好"，没有 agent slog 的转录分不开。
+- **与 [#29 续] 的关系（round-2 R6-5）**：[#29 续]（2026-07-17 LIVE-CONFIRMED）记的是 N=2 上 home 落到非-tunnel follower
+  时 `expose … (agent_rejected:frpc_failed)` ~50%，归因到 home.go 对非-tunnel voter 返回 nil（un-homed 回落）；本条给出的是
+  **同一签名**的另一条机制（home = follower、行未应用）。两条机制都能产出 rc=64 `frpc_failed`（un-homed 分配在等 epoch 的
+  非-home broker 上也被终态拒，expose.go:159-163），所以 2026-08-11 那次 74 的 assert_fail=2 被归到 #29 家族并不能凭签名
+  判定。**互指**：[#29 续] 里 N=2 的那一面有一部分很可能就是本条；drills 50/51/52 至今用 `--on-broker brk1` 绕开那张脸，
+  本条修后应有一次不带 `--on-broker` 的 50/51/52 跑来判定这个绕法能不能去掉——没跑，登记为待办，不假称已判。
+
+### #87 — 孤儿进程的 fail-closed 门把"进程历史"读成了 RUNNING/LOST 快照：一个作业都已退出的节点在 broker 回滚之后**永远**收不到 drop 指令，真孤儿活到进程自然结束（已修复，simcluster-speed 2b）
+
+> **来源 = simcluster-speed S2 sweep（2026-09-19）对 2026-09-03「HEAD 就红、登记表过期」六项的分诊**：drill 94 臂 B
+> （`B3-timeout the orphan was KILLED`）自 2026-08-19 起每次 sweep 都红，被记为"未分诊"。给 agent 的 reconnect 重注册
+> 日志补上计数（DOC-25：原来只有首连路径打印 `drop_procs=N`）之后一行就够了：`agent: re-registered after reconnect
+> reconciled=0 drop_procs=0 revoke_ports=1`——broker 撤销了它不认识的端口、却没有对它不认识的进程发 drop；brk1 的
+> slog 同时写着 `broker: declining to orphan-kill on a nid with no process history sid=lab nid=agt1 pid=…`。
+- **机制**：`1e9d32a`（2026-08-19，克隆凭据实例增量）给 `reconcileOnRegister` 加了 fail-closed 门 `sawAnyRow`：一个
+  node name 若在 broker 这里**没有任何进程历史**，就不对它发 orphan-kill（防止改名 / 克隆场景下按陈旧账本 SIGKILL 别人
+  的活）。门的判据从 `procs` 取——而 `procs` 是 reconcile 循环为了有界而只读 RUNNING/LOST 的那份列表（"Reading EXITED
+  rows … used to be dead weight"）。于是"历史"只剩活着的行：drill 94 的场景里 agt1 在 A 组跑过两个作业（已 EXITED、在
+  还原的 bundle 里就在），备份之后又起了一个 `tether run` 进程，broker 回滚到备份 → 这个进程它没见过、agt1 的行全是
+  EXITED → `sawAnyRow=false` → 拒杀。G.1 的孤儿收割对"作业都做完了的节点"整个失效，且在真实车队里正是最常见的形状
+  （节点空闲、broker 从备份还原）。
+- **修法**：`proc.NodeHasHistory(db, sid, nid)`（`SELECT 1 … LIMIT 1`，含 EXITED，O(1)），`sawAnyRow` 三选一：改名过继
+  的行 / RUNNING·LOST 快照里有该 nid / **任何**历史行；历史读失败 → 本次注册不发 kill（fail-closed 不变）。没有任何行的
+  名字照旧被门拦住（`TestOrphanGateCountsExitedRowsAsHistory` 的控制行）。顺手关 **DOC-25**：`agent: re-registered after
+  reconnect` 现在带 `reconciled/drop_procs/revoke_ports` 三个计数，与首连路径同形——没有它这条缺陷分诊不出来。
+- **钉住**：`TestOrphanGateCountsExitedRowsAsHistory`（`internal/broker/reconcile_lease_ownership_test.go`；变异 M1 去掉
+  历史项 / M2 把历史查询改成只看 RUNNING → 各红）；既有的三条 1e9d32a 门测试全绿（改名过继、幻影 refile 都不受影响）。
+  deploy-tier：drill 94 **GREEN pass=54**（镜像 #13；此前 ASSERT-FAIL af=3 自 2026-08-19 起）。
+- **为什么六周没人看见**：2026-08-19 登记表校准的同一天门就进了树、94 从那天起就红，2026-09-03 的复跑把它和另外五条
+  一起记成"登记表过期、未分诊"——一个注定红的 drill 不再是信号。这次分诊六条：67（#84）、52/60/81（三处 oracle 读错
+  流 / 读错列——见 plan §8.5b′）、94（本条）、30（负载面，仍 OPEN）。
+
+### #88 — drill 96 臂 F 的双故障（kill agt1 + 它的 home broker）之后，**没被碰的** agt2 的种子进程行在注入瞬间被收成 `reconciled_closed rc=-1`（CANDIDATE，未归因）
+
+> **来源 = simcluster-speed 2b（2026-09-19）**：96.F 的 `F4 THE DISCRIMINATOR`（"agt2 的那个进程仍 RUNNING、agt2 没有任何
+> 种子行被收口——reconcile 是 node-scoped 的"）solo 1/2、G1 三档 2/3、S2 -j6 及其 solo 复跑 2/2 红——**不是负载面**。
+- **证据（S2，timeline 侧车 + F4/F5 诊断）**：agt2 的控制种子 `sleep 9663` 于 02:33:29.589 起（`kind=start` 落账）；
+  F1 在 02:33:31 kill agt1 + brk2；agt2 的行在 **02:33:31.325** 被写成 `EXITED rc=-1`、history 有 `kind=reconciled_closed`
+  ——比 agt1 自己的两行（02:33:32.9）还早，距注入 <0.5 s。agt2 没有被杀、没有被重启。
+- **不成立的解释**：不是 #87 的孤儿门（那条只影响 drop，不影响 missed-exit 收口；S2 跑在 #87 之前的镜像 #11 上）；不是
+  心跳超时的 G.2 sweep（`stale_after=5s`，0.3 s 太快）；agent 侧的 register 快照（`buildLocalSnapshot`）读的是内存表
+  `a.procs`，种子已跑 2 s、应当在表里。
+- **待查方向（round 2 归因项）**：① agt2 若连在 brk2 上，brk2 死时 agt2 的重连 + 重注册落在哪个 broker、其
+  `LocalProcesses` 里有没有种子（需要 agt2 slog 的 `agent: re-registered after reconnect` 计数——DOC-25 已关，下一次
+  运行就有）；② leader 侧在 route 断开的瞬间是否对"连在死 broker 上的节点"做了整节点收口（`reconcile_passes.go` /
+  `roster_stale.go`）——那是把"broker 死了"当成"节点死了"；③ F4 的 `ps` 读的是行不是 OS 进程——若 OS 进程仍活而行被收，
+  这是 G.1 的**误收口**（比漏收更糟：`ps` 消失、运维以为它死了）。
+- **处置**：96.F 的 expected 仍 `INCOMPLETE 1`，owner 列点名 #88（round-2 R6-12：此前 owner `-`，本条在 ledger-crosscheck
+  里是 R6-CAND 而不是 ok——一个 INCOMPLETE 行可以拥有一个 CANDIDATE，链接现在机器可见）；F4 红继续以 DEVIATION 响；不 band；
+  registry 不收（不是并发面）。**状态：5/9 样本（solo 1/2、G1 2/3、S2 2/2）未归因**——round 2 没有完成归因，这是事实
+  不是承诺；上面的三个待查方向仍是下一次 F4 红时的读法。
+
+### #89 — broker 自己的 NATS 客户端在本机 nats-server 重启后**漫游到 peer 的 NATS server** 并永久留在那里（已修复，2026-09-20）
+
+- **状态：✅ FIXED（2026-09-20，simcluster-speed round-2 review 处置 R1-F1 / R5-F2 的归因产物；
+  `internal/broker/authcallout.go` `brokerConnectOptions`）。** 钉住：`TestBrokerConnectionRejoinsItsOwnServerInsteadOfRoamingToAPeer`
+  ——同一脚本跑两遍：broker 的真实选项在 A 重启后**回到 A**；修前的选项集（对照）漫游到 B **且 A 回来后也不回来**。
+  去掉 `IgnoreDiscoveredServers` 的变异红。deploy tier：96.D 的 D0f 前提自证（每个 broker 的 /connz 恰有一个 loopback
+  `tetherd`）从本轮起每次都读；漫游本身没有再在 deploy tier 上复现一次（需要负载触发 hard restart），机制由 hermetic 测试钉住。
+- **机理**：nats.go 把集群在 INFO 里广播的每台 server 加进重连池，断线时**先试池里的其它条目**；broker 连的是
+  `nats://127.0.0.1:4222`，选项只有 `Name` + `MaxReconnects(-1)`。本机 nats-server 一被掀掉——topology reconciler 对
+  不可 reload 的 route delta 做 staggered hard restart（`reconcileTopologyOnce`，负载下 reload 探针读到 stale 时触发）、
+  运维重启、升级——broker 就重连到 peer 的 NATS，**之后永不回来**（nats.go 不迁回），且**完全静默**：broker 没有任何
+  reconnect handler。
+- **后果**：① 该 broker 的本机 NATS 上没有 auth_callout 应答者、没有 ctl 队列组成员——连上那台 NATS 的客户端认证靠
+  routes 转给别的 broker，routes 一断就黑洞（R6 当年测到的"少数派认证 rc=69、50/50"就是它）；② 它的 forward / JS 调用
+  走一条本机 NATS 不在其上的网络路径，于是 **96.D 的"隔离少数派"前提三次为假**：brk1 的 route+raft 被切、broker 在 brk2
+  的 NATS 上，把 ctl 的 create 转给活 leader、秒回 rc=0、在自己 log 里写 `session created`——被 committer-attribution
+  探针读成 raft 安全违反（#65），plan 又把它记成 "#71 传感器 / LOAD-SENSITIVE"（round-2 BLOCKER）。
+- **修**：`nats.IgnoreDiscoveredServers()` + `nats.DontRandomize()`——只按配置的 URL 顺序拨、永远重试（`MaxReconnects(-1)`
+  原本就在），本机 server 一回来就重连上；加 `DisconnectErrHandler` / `ReconnectHandler` 日志（`broker: NATS reconnected
+  url=… server=…`），漫游从此不可能静默。broker 的 server 就是客户端能到达它的那台，连到别处不是韧性，是离岗。
+- **N-1**：无 wire 变更；旧 broker 继续可能漫游，直到升级。
 
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 

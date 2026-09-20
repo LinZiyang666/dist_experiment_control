@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -59,7 +60,7 @@ type failFirstProxyAdapter struct {
 	token string
 }
 
-func (a *failFirstProxyAdapter) AddProxy(p PortToken) error {
+func (a *failFirstProxyAdapter) AddProxy(_ context.Context, p PortToken) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.adds++

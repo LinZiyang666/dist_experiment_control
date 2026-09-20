@@ -648,9 +648,10 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 // among UNRESOLVABLE subscriptions in its enclosing function, so only a change inside that function —
 // which is when the exemption deserves re-reading — can move it.
 var dynamicSubscriptionExemptions = map[string]string{
-	"internal/broker/observability.go:pollClusterHealth#1": "SubscribeSync(inbox) — a per-request random " +
+	"internal/broker/observability.go:pollClusterHealthUntil#1": "SubscribeSync(inbox) — a per-request random " +
 		"_INBOX reply subject, not a served endpoint. Reply subjects are granted by NATS to the requester, " +
-		"never by the ctl permission template, so no grant can or should exist.",
+		"never by the ctl permission template, so no grant can or should exist. (The site moved from " +
+		"pollClusterHealth into its early-exit generalisation in simcluster-speed round 2, R2-F4; same subject.)",
 	"internal/broker/home_delivery.go:(*Broker).subscribeHomeAcks#1": "Subscribe(inbox+\".>\", ...) — a broker-owned " +
 		"_INBOX ack channel for agent home-delivery acknowledgements, not a ctl-served endpoint; the random " +
 		"inbox is intentionally runtime-generated and does not belong in member pub grants.",

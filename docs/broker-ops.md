@@ -194,6 +194,9 @@ broker:
     secrets_dir: /etc/tether/secrets   # cluster-ca/route/tunnel/node-ident/broker/account seeds
     # xfer 回收节奏（仅 cluster 模式；生产通常全部留空用内建默认；#75 起就地取消注释即生效，键位正确）
     # xfer_reap_interval: 5m           # #58/P10：home 权威的 orphan tier-B 对象回收周期（默认 5m；<1s 或 >24h 在 Load 期拒绝）
+    #                                  # 同一趟也清没有 meta 的 chunk 组（#85：被取消/超时的 Put、ACL 拒掉 purge 的客户端 Delete）
+    #                                  # ——日志行 "orphan xfer chunk group purged"；ctl 每次失败 push 后 stderr 那行 STREAM.PURGE
+    #                                  # permissions violation 是 nats.go 的自清理被按设计拒绝，残留由这里回收，无需运维动作
     # xfer_cross_home_reap_age: 15m    # R16 #58：LEADER 跨-home GC 的年龄下限（**只能调高，不能调低**；外审 F2：
     #                                  # 低于 tier-B 看门狗下限会让 leader 删掉另一 home 仍在用的对象——leader 看不见别人的
     #                                  # tracker）。默认派生自 3×tier-B 超时(=15m)。**没有生产调参场景**，只为 drill 压缩排程。
@@ -919,6 +922,31 @@ tether proxy sub create -s <sid> --name <each>
 ⚠ `proxy off` 会**中断该 session 的数据面**直到 ④ 完成，所以挑窗口做。
 ⚠ 未升级的 agent 在这之后拿不到新 token（这正是本版的设计：秘密不进共享空间），
 表现为 expose/proxy 挂起而**控制面照常**——先 `tether node upgrade <nid>`，再让它重新注册。
+
+### 8.10 存量 nats.conf 补两行 client-liveness 键（simcluster-speed 增量，一次性）
+
+**全新部署不需要**——install.sh 的模板已经写了。**存量 broker 主机**的 `nats.d/nats.conf`
+是 install.sh 永不覆盖的文件（§2 的 KEPT 政策），所以升级后它仍跑 nats-server 的默认
+`ping_interval 2m` / `ping_max 2`：一个链路已死但 TCP 没断的 agent，服务端要 **约 4 分钟**（deploy-tier
+drill 98 在默认值下两次实测 4:00 / 4:03）才会把它踢掉，而升级后的 agent 自己每 20 s 就 ping 一次（客户端半，
+`internal/agent`）。两半不一致不会坏，只是慢——补上服务端半让两边一致（补上后同一注入实测 **≈58 s** 踢掉，
+`closed reason: Stale Connection`）：
+
+```bash
+# ① 先升二进制（§8.4）。次序不能反：旧二进制的 config takeover 不认识这两个键，
+#    会把带它们的 conf 整个拒掉（fail-closed，与 #20/#12 那类漂移同一道门）。
+# ② 重跑 install.sh 会把带两键的新模板写到 nats.conf.new 并在 KEPT 报告里点名；
+#    或者直接手加这两行（顶层，任意位置；ping_interval 必须带引号，ping_max 必须裸整数）：
+ping_interval: "20s"
+ping_max: 2
+# ③ 先 dry-run 让 tether 的 takeover 确认它认得这份 conf，再热加载：
+sudo -u tether tether cluster reconcile nats --dry-run
+sudo nats-server --signal reload   # 或 systemctl reload nats-server
+```
+
+**回滚注意**：若要把二进制退回本版之前，**先删掉这两行再退**——旧二进制看到不认识的键会拒绝
+接管 nats.conf（reconciler 卡 STUCK、`cluster add` 在 mesh-cutover HALT）。这是有意保留的
+fail-closed：为两行 ping 键在 N-1 窗口给未知键开洞，会顺带放过真正危险的漂移。
 
 ## 9. 错误码与故障排查（broker 侧）
 

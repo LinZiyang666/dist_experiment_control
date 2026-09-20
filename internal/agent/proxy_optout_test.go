@@ -22,7 +22,7 @@ type countingProxyAdapter struct {
 	calls int
 }
 
-func (c *countingProxyAdapter) AddProxy(PortToken) error {
+func (c *countingProxyAdapter) AddProxy(context.Context, PortToken) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls++

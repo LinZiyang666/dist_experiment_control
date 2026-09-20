@@ -145,7 +145,24 @@ for b in $(data_rows | cut -f4 | grep -v '^-$' | tr ',' ' '); do
         # grep on EMPTY input returns 1 (no match, pattern OK) or 2 (malformed pattern); rc 2 = bad ERE.
         printf '' | grep -E "$ere" >/dev/null 2>&1
         [ "$?" -eq 2 ] && fail "BAND-SIG-INVALID: '$sig' ERE does not compile: $ere"
+        # simcluster-speed X18 (rule ⑦): the ERE is matched against `[err ]` lines whose text the arm
+        # split now prefixes/suffixes (unit name, arm tag), so a `$`-anchored ERE silently stops
+        # matching the day the line grows a suffix; and `@` is the band separator — an ERE containing it
+        # cannot round-trip through `<verdict>@<defect>@sig:<slug>` parsing in either direction.
+        case "$ere" in
+            *'$') fail "BAND-SIG-ANCHORED: '$sig' ERE ends with '\$' — an end anchor stops matching the moment the arm split adds a suffix to the line: $ere" ;;
+        esac
+        case "$ere" in
+            *@*) fail "BAND-SIG-AT: '$sig' ERE contains '@', the band field separator: $ere" ;;
+        esac
     fi
+done
+# simcluster-speed rule ⑧ (global half): one signature slug belongs to ONE row. A slug two rows share is
+# a band that pre-authorizes the same red in two places — after an arm split that is how a parent's band
+# quietly survives on a child it was never re-standardized for (X18: a child's band gets a NEW slug,
+# calibrated from that unit's own log).
+for slug in $(data_rows | awk -F'\t' '$4!="-"{n=split($4,b,","); for(i=1;i<=n;i++) if (match(b[i],/@sig:[A-Za-z0-9._-]+$/)) print $1"\t"substr(b[i],RSTART+5)}' | sort -u | cut -f2 | sort | uniq -d); do
+    fail "BAND-SLUG-SHARED: 'sig:$slug' is named by more than one row; a band's signature is calibrated per unit and cannot be shared"
 done
 
 # External review Major 2: a band must name a defect that EXISTS in the ledger (open), not merely one
@@ -174,9 +191,11 @@ fi
 # cannot run a rule must fail closed, not pass silently.
 [ -f "$LEDGER" ] || { fail "missing gotcha ledger $LEDGER — cannot verify bands do not pin a closed defect"; }
 if [ -f "$LEDGER" ]; then
-    # Same closure discipline as tests/ledger-crosscheck.sh: a heading is CLOSED only if it says so.
-    closed=$(grep -A 3 -E '^### (#[0-9]+|DOC-[0-9]+)' "$LEDGER" \
-        | awk '/^### /{id=$2} /FIXED|CLOSED|已闭合|已修复|REFUTED/{if(id!="")print id}' | sort -u)
+    # THE SAME closure reader as tests/ledger-crosscheck.sh — lib/ledger.sh, heading-only. The first
+    # version here still read "heading + 3 body lines" while claiming the same discipline, so the two
+    # gates could disagree about whether a band's defect was closed (round-2 review R3-F7).
+    . "$SIMDIR/lib/ledger.sh" || fail "cannot source $SIMDIR/lib/ledger.sh"
+    closed=$(ledger_closed_ids "$LEDGER")
     for b in $(data_rows | cut -f4 | grep -v '^-$' | tr ',' ' '); do
         [ -n "$b" ] || continue
         rest=${b#*@}; bid=${rest%%@*}
@@ -195,6 +214,7 @@ for f in "$DRILLDIR"/[0-9]*.sh; do
     data_rows | cut -f1 | grep -qx -- "$d" || fail "DRILL-UNLISTED: drills/$d.sh has no row in expected-verdicts.tsv"
 done
 data_rows | cut -f1 | while IFS= read -r d; do
+    case "$d" in *.*) continue ;; esac   # child rows (<drill>.<arm>) are resolved against the manifest below
     [ -f "$DRILLDIR/$d.sh" ] || printf 'ROW-ORPHAN\t%s\n' "$d"
 done > "${TMPDIR:-/tmp}/vv-orph.$$"
 while IFS= read -r r; do
@@ -202,6 +222,88 @@ while IFS= read -r r; do
     fail "$r — row present but drills/$(printf '%s' "$r" | cut -f2).sh does not exist"
 done < "${TMPDIR:-/tmp}/vv-orph.$$"
 rm -f "${TMPDIR:-/tmp}/vv-orph.$$"
+
+# ── arm-split drills: CHILD rows keyed <drill>.<arm> (simcluster-speed plan §5.5 X4/X5/X18) ─────────
+# An arm-split drill (`# arms:` manifest, lib/manifest.sh) runs as one UNIT per arm, and the runner judges
+# each unit against ITS OWN row. The parent row stays (every drill on disk has a row) but becomes DERIVED:
+# its expectation is the precedence join of its children, its nc_gap their sum, its bands `-`. The child
+# rows are written BEFORE the first split sweep, from the parent's claim ownership — never from that
+# sweep's results (X5: registering the first split run's verdicts as expectations would launder every
+# arm at once). Rules, each with an injection in tests/validate-verdicts-selftest.sh:
+#   ①  a child row's arm is one of the drill's manifest arms         CHILD-ORPHAN / CHILD-NO-MANIFEST / CHILD-ARM-UNKNOWN
+#   ②  a manifested drill has EXACTLY one child row per arm           ARM-CHILD-COUNT
+#   ③  the parent's bands are `-` (bands live on the unit they pin)   PARENT-BANDS
+#   ④  parent expected == precedence join of the children             PARENT-JOIN
+#   ⑤  parent nc_gap == Σ children; a child `-` (non-deterministic
+#      branch) needs its own `## <drill>.<arm>` section and makes
+#      the parent `-` too                                             CHILD-NCGAP-DASH-NO-SECTION / PARENT-NCGAP
+#   ⑥  a child's owner is `-` or a subset of the parent's             CHILD-OWNER
+#   ⑦  (above, per signature) no `$`-anchored / `@`-bearing ERE       BAND-SIG-ANCHORED / BAND-SIG-AT
+#   ⑧  a child's band slug carries its arm suffix; slugs are global   CHILD-BAND-SLUG / BAND-SLUG-SHARED
+. "$SIMDIR/lib/manifest.sh" || { fail "cannot source $SIMDIR/lib/manifest.sh"; }
+data_rows | cut -f1 | grep '\.' | while IFS= read -r u; do
+    d=${u%%.*}; a=${u#*.}
+    f="$DRILLDIR/$d.sh"
+    if [ ! -f "$f" ]; then printf 'CHILD-ORPHAN\t%s\n' "$u"; continue; fi
+    if ! manifest_has "$f"; then printf 'CHILD-NO-MANIFEST\t%s\n' "$u"; continue; fi
+    printf '%s\n' $(manifest_arms "$f") | grep -qx -- "$a" || printf 'CHILD-ARM-UNKNOWN\t%s\t%s\n' "$u" "$(manifest_arms "$f")"
+done > "${TMPDIR:-/tmp}/vv-child.$$"
+while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    fail "$r — child row's drill has no manifest / arm not declared in its '# arms:'"
+done < "${TMPDIR:-/tmp}/vv-child.$$"
+rm -f "${TMPDIR:-/tmp}/vv-child.$$"
+# ids in an owner cell: the defect ids it pins (the rest is prose for the reader).
+_owner_ids() { printf '%s' "$1" | grep -oE '#[0-9]+|DOC-[0-9]+' | sort -u; }
+_rank() { case "$1" in ASSERT-FAIL) echo 4 ;; SETUP-RED) echo 3 ;; PRODUCT-RED) echo 2 ;; INCOMPLETE) echo 1 ;; GREEN) echo 0 ;; *) echo 0 ;; esac; }
+_name_of_rank() { case "$1" in 4) echo ASSERT-FAIL ;; 3) echo SETUP-RED ;; 2) echo PRODUCT-RED ;; 1) echo INCOMPLETE ;; *) echo GREEN ;; esac; }
+for f in "$DRILLDIR"/[0-9]*.sh; do
+    [ -e "$f" ] || continue
+    manifest_has "$f" || continue
+    d=$(basename "$f" .sh)
+    parent=$(data_rows | awk -F'\t' -v d="$d" 'NF==6 && $1==d {print; exit}')
+    [ -n "$parent" ] || continue    # DRILL-UNLISTED already reported it
+    pexp=$(printf '%s' "$parent" | cut -f2); pnc=$(printf '%s' "$parent" | cut -f3)
+    pbands=$(printf '%s' "$parent" | cut -f4); powner=$(printf '%s' "$parent" | cut -f5)
+    [ "$pbands" = "-" ] || fail "PARENT-BANDS: $d has arms, so its bands ('$pbands') must move to the child row of the arm they pin and the parent must read '-'"
+    sum=0; dash=0; jr=0
+    for a in $(manifest_arms "$f"); do
+        u="$d.$a"
+        nrow=$(data_rows | awk -F'\t' -v u="$u" 'NF==6 && $1==u' | wc -l | tr -d ' ')
+        if [ "$nrow" != 1 ]; then fail "ARM-CHILD-COUNT: $u has $nrow row(s) in expected-verdicts.tsv; a manifested drill needs exactly one per arm (X5 — written from the parent's claim ownership BEFORE the first split sweep)"; continue; fi
+        child=$(data_rows | awk -F'\t' -v u="$u" 'NF==6 && $1==u {print; exit}')
+        cexp=$(printf '%s' "$child" | cut -f2); cnc=$(printf '%s' "$child" | cut -f3)
+        cbands=$(printf '%s' "$child" | cut -f4); cowner=$(printf '%s' "$child" | cut -f5)
+        cr=$(_rank "$cexp"); [ "$cr" -gt "$jr" ] && jr=$cr
+        if [ "$cnc" = "-" ]; then
+            dash=1
+            grep -q "^## $u\$" "$LOG" || fail "CHILD-NCGAP-DASH-NO-SECTION: $u declares nc_gap '-' (a non-deterministic branch) but expected-verdicts-log.md has no '## $u' section saying which branch and why"
+        else
+            case "$cnc" in ''|*[!0-9]*) ;; *) sum=$((sum + cnc)) ;; esac
+        fi
+        if [ "$cowner" != "-" ]; then
+            cids=$(_owner_ids "$cowner"); pids=$(_owner_ids "$powner")
+            if [ -n "$cids" ]; then
+                for id in $cids; do printf '%s\n' "$pids" | grep -qx -- "$id" || fail "CHILD-OWNER: $u owner names $id, which the parent $d owner cell ('$powner') does not — a child may only pin a subset of its parent's debt (X4)"; done
+            else
+                case "$powner" in *"$cowner"*) ;; *) fail "CHILD-OWNER: $u owner '$cowner' is neither '-' nor part of the parent's owner cell ('$powner') (X4)" ;; esac
+            fi
+        fi
+        if [ "$cbands" != "-" ]; then
+            for b in $(printf '%s' "$cbands" | tr ',' ' '); do
+                slug=$(printf '%s' "$b" | sed -n 's/.*@sig:\([A-Za-z0-9._-]*\)$/\1/p')
+                case "$slug" in *".$a"|*"-$a") ;; *) fail "CHILD-BAND-SLUG: $u band '$b' — a child's signature slug must end in its arm suffix ('.$a' or '-$a'): it is calibrated from THIS unit's log, not inherited from the parent (X18)" ;; esac
+            done
+        fi
+    done
+    jv=$(_name_of_rank "$jr")
+    [ "$pexp" = "$jv" ] || fail "PARENT-JOIN: $d expected '$pexp' but the precedence join of its children is '$jv' — the parent row is derived, change the children (or the claim) not the parent"
+    if [ "$dash" = 1 ]; then
+        [ "$pnc" = "-" ] || fail "PARENT-NCGAP: $d nc_gap '$pnc' but a child declares '-', so the parent must be '-' too"
+    else
+        [ "$pnc" = "$sum" ] || fail "PARENT-NCGAP: $d nc_gap '$pnc' != Σ children ($sum) — a drill-level gap is recorded once per arm (X8) and the parent carries the sum"
+    fi
+done
 
 n=$(data_rows | wc -l | tr -d ' ')
 if [ "$FAIL" = 0 ]; then

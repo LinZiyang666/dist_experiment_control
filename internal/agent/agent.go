@@ -1180,7 +1180,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 
 	// Re-establish reverse-TCP proxies from state.json (architecture F.6), with
 	// the cloned-credential lease gate; the reasoning lives on the function.
-	replayPortsUnlessLeased(a)
+	replayPortsUnlessLeased(runCtx, a)
 
 	// P13: converge the embedded SS proxy to the broker's directive (nil
 	// when the session's proxy switch is off → ensures it's torn down).
@@ -1208,7 +1208,10 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	return false, hbErr
 }
 
-func (a *Agent) replayPortsFromState() {
+// ctx bounds each replay open (lock wait, dial, REGISTER, install) — the session ctx, so a
+// session rebuild mid-replay abandons the dial instead of finishing it into the next session's
+// world; the sessions a successful open installs live on the tunnel client's own ctx.
+func (a *Agent) replayPortsFromState(ctx context.Context) {
 	if a.stateStore == nil || a.cfg.ExposeAdapter == nil {
 		return
 	}
@@ -1222,7 +1225,7 @@ func (a *Agent) replayPortsFromState() {
 		return
 	}
 	for _, p := range sf.PortTokens {
-		if err := a.cfg.ExposeAdapter.AddProxy(p); err != nil {
+		if err := a.cfg.ExposeAdapter.AddProxy(ctx, p); err != nil {
 			// D6 §7.7/R-22: a clustered expose (HomeBrokerAddr set) has NO cert
 			// pins on boot (pins are never persisted) → ErrHomePinsRequired. That
 			// is EXPECTED: defer — the first register reply re-delivers the home
@@ -1991,7 +1994,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 			// directive carries pins, OPEN it from state.json (LocalPort + raw token).
 			// AddProxy → OpenHome installs the session; a silent ApplyHome no-op
 			// would leave a restarted clustered expose down forever.
-			outcome, oerr := a.openHomeFromState(d)
+			outcome, oerr := a.openHomeFromState(ctx, d)
 			switch outcome {
 			case openStateUnavailable:
 				// RF1: state.json is temporarily unreadable/unparseable; NOTHING was
@@ -2011,7 +2014,7 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 			// An OPEN expose: ApplyHome rehomes (epoch>) or pure-pin-updates (epoch==)
 			// without tearing a live transport on a same-epoch reconnect.
 			if checker, ok := applier.(homeSessionChecker); ok && !checker.HasSession(d.PublicPort) {
-				outcome, oerr := a.openHomeFromState(d)
+				outcome, oerr := a.openHomeFromState(ctx, d)
 				switch outcome {
 				case openStateUnavailable:
 					return
@@ -2112,8 +2115,9 @@ const (
 // openHomeFromState opens (or replaces) an expose's tunnel from its persisted
 // PortToken (LocalPort + raw token) against the directive's home addr/epoch/pins
 // (external review F2). Used for the deferred-boot-replay path where no session
-// exists yet.
-func (a *Agent) openHomeFromState(d proto.HomeDirective) (openOutcome, error) {
+// exists yet. ctx bounds the open only (the reconcile ladder's ctx); the session
+// it installs lives on the tunnel client's ctx.
+func (a *Agent) openHomeFromState(ctx context.Context, d proto.HomeDirective) (openOutcome, error) {
 	if a.stateStore == nil || a.cfg.ExposeAdapter == nil {
 		return openPortAbsent, nil // no state/adapter — nothing to open
 	}
@@ -2126,7 +2130,7 @@ func (a *Agent) openHomeFromState(d proto.HomeDirective) (openOutcome, error) {
 			p.HomeBrokerAddr = d.BrokerAddr
 			p.Epoch = d.Epoch
 			p.CertPins = d.CertPins
-			return openedOK, a.cfg.ExposeAdapter.AddProxy(p)
+			return openedOK, a.cfg.ExposeAdapter.AddProxy(ctx, p)
 		}
 	}
 	return openPortAbsent, nil // removed from state.json — nothing to open
@@ -2213,6 +2217,19 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 	}
 }
 
+// AgentPingInterval / AgentMaxPingsOut are the agent's NATS liveness probe: a PING every interval,
+// and the connection is declared dead when that many PINGs go unanswered (nats.go: dead after
+// (MaxPingsOut+1) × interval at most, i.e. 40–60 s here). They are EXPORTED because three places
+// must agree on them and a gate reconciles them: this client half, the `ping_interval`/`ping_max`
+// the install.sh nats.conf template writes for the server half, and the deploy-tier drill (98)
+// whose recovery budget is derived from them (test/architecture/nats_ping_defaults_test.go).
+// nats.go's defaults (2 min × 2) are what these replace; the rationale is on buildConnOptions.
+// Any change here is a fleet-wide behaviour change and goes through the same review as a wire change.
+const (
+	AgentPingInterval = 20 * time.Second
+	AgentMaxPingsOut  = 2
+)
+
 // buildConnOptions assembles the nats.Options for this agent. With
 // Identity set, signs CONNECT challenges via the loaded nkey and presents
 // the auth_callout-aware Name. Without Identity, falls back to anonymous
@@ -2226,6 +2243,16 @@ func (a *Agent) buildConnOptions() []nats.Option {
 	gen := a.sessionGen.Add(1)
 	opts := []nats.Option{
 		nats.MaxReconnects(-1),
+		// Client-side liveness (simcluster-speed H). nats.go's defaults are 2 min × 2 outstanding: an
+		// agent whose broker link went silent (a NAT that dropped the mapping, a middlebox holding a
+		// half-open TCP, the DROP shape of gotcha #72) took 4–6 minutes to notice, and only then could
+		// the redial watchdog run. The whole recovery contract is bounded AFTER detection; detection was
+		// the unbounded half. 20 s × 2 declares the link dead after 40–60 s of silence, and the PING
+		// doubles as a NAT keepalive. The server half (`ping_interval`/`ping_max` in nats.conf, written
+		// by install.sh and passed through by natsconf) uses the same numbers so both ends agree —
+		// see AgentPingInterval / AgentMaxPingsOut for the values and the gate that keeps them in step.
+		nats.PingInterval(AgentPingInterval),
+		nats.MaxPingsOutstanding(AgentMaxPingsOut),
 		// origin: prerelease audit agent-conn/AC-F1. Without this, nats.go delivers
 		// disconnect/close callbacks AFTER Close() returns, so a session teardown could
 		// still arm the fail-closed countdown and the redial watchdog on behalf of a

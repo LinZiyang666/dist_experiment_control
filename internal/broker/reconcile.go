@@ -316,7 +316,20 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// instance entirely, and "somebody has history here" is then true for a nid
 	// that has none — which is precisely the evidence the gate exists to demand
 	// before ordering a kill.
-	sawAnyRow := adopted > 0 || anyRowMatches(procs, nid)
+	//
+	// gotcha #87: "history" means ANY row ever filed under this name, EXITED ones
+	// included. The first version read it off `procs`, which is the RUNNING/LOST
+	// list (the bounded read above, sized for the reconcile loop), so a node whose
+	// jobs had all finished before a broker rollback had no history in the gate's
+	// eyes and its real orphan — a process started after the restored bundle was
+	// taken — was never ordered killed (drill 94 arm B, red on every sweep since
+	// the gate landed on 2026-08-19, misfiled as "stale table"). A read failure is
+	// fail-closed: no evidence, no kill.
+	history, herr := proc.NodeHasHistory(b.read(), sid, nid)
+	if herr != nil {
+		b.cfg.Logger.Warn("broker: reconcile node history read failed — declining orphan kills this register", "sid", sid, "nid", nid, "err", herr)
+	}
+	sawAnyRow := adopted > 0 || anyRowMatches(procs, nid) || (herr == nil && history)
 	knownPID := livePIDsByRow(procs, agentByPID, req.BootID)
 	for pid, lp := range agentByPID {
 		if lp.State != "running" {

@@ -3,6 +3,7 @@ package cluster
 import (
 	"database/sql"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,5 +174,128 @@ func TestRaftAppliedIndexCatchesUpToCommitOnLeader(t *testing.T) {
 	if cmdApplied >= commit {
 		t.Fatalf("expected command-domain AppliedIndex(%d) < CommitIndex(%d) on a fresh leader (the LogNoop is "+
 			"FSM-ignored); if equal, the old gate was not actually broken — re-examine the fix", cmdApplied, commit)
+	}
+}
+
+// TestCommandApplyLaggingSeesAFollowerWhoseFSMHasNotAppliedTheEntry pins the COMMAND-domain lag
+// reading in the exact window gotcha #86 describes — raft committed, SQLite not yet committed. The
+// applyCommitGate seam holds every FSM inside Apply for one command; while it holds, each follower's
+// raft-domain CaughtUp reads TRUE (HONEST LIMIT #1: raft's cursor advances on dispatch) and
+// CommandApplyLagging reads TRUE (the DB cursor trails the newest committed command); once the gate
+// opens, lagging returns to false. The CaughtUp==true assertion is deliberate: it is the reason this
+// predicate exists, and if raft ever starts advancing its cursor on apply-return instead of
+// dispatch, this line says so.
+// origin: simcluster-speed review round 2 R2-F2 (gotcha #86 half ②)
+func TestCommandApplyLaggingSeesAFollowerWhoseFSMHasNotAppliedTheEntry(t *testing.T) {
+	ca := newTestCA(t)
+	ids := []raft.ServerID{"al-a", "al-b", "al-c"}
+	trans := make([]*raft.NetworkTransport, len(ids))
+	dirs := make([]string, len(ids))
+	servers := make([]raft.Server, len(ids))
+	for i, id := range ids {
+		tr, err := NewMTLSTransport(MTLSTransportConfig{
+			BindAddr: "127.0.0.1:0", CACert: ca.pool, Leaf: ca.leaf(t, string(id)),
+		})
+		if err != nil {
+			t.Fatalf("transport %s: %v", id, err)
+		}
+		trans[i] = tr
+		dirs[i] = t.TempDir()
+		servers[i] = raft.Server{Suffrage: raft.Voter, ID: id, Address: tr.LocalAddr()}
+	}
+	nodes := make([]*Node, len(ids))
+	for i, id := range ids {
+		n, err := New(fastMultinodeCfg(id, dirs[i], trans[i], servers))
+		if err != nil {
+			t.Fatalf("New %s: %v", id, err)
+		}
+		nodes[i] = n
+	}
+	release := make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		applyCommitGate = nil
+		if !released {
+			close(release)
+		}
+		for _, n := range nodes {
+			_ = n.Shutdown()
+		}
+	})
+	leader := waitNodeLeader(t, nodes, 6*time.Second)
+	if err := leader.Propose(func(*sql.DB) (*Command, error) { return planAuditCheckpointSet(1) }); err != nil {
+		t.Fatalf("propose 1: %v", err)
+	}
+	var followers []*Node
+	var followerDBs []string
+	for i, n := range nodes {
+		if n != leader {
+			followers = append(followers, n)
+			followerDBs = append(followerDBs, filepath.Join(dirs[i], "state.db"))
+		}
+	}
+	for _, f := range followers {
+		if !waitForCond(3*time.Second, func() bool {
+			a, _ := f.AppliedIndex()
+			return f.CommitIndex() > 0 && f.CaughtUp() && a >= 1
+		}) {
+			t.Fatalf("follower never caught up: commit=%d applied=%d", f.CommitIndex(), f.RaftAppliedIndex())
+		}
+		// Steady state: nothing owed.
+		if lag, err := f.CommandApplyLagging(); err != nil || lag {
+			t.Fatalf("caught-up follower reads lagging=%v err=%v; want false", lag, err)
+		}
+	}
+	// Arm the gate: the NEXT command's SQLite commit blocks on every node (the leader applies inside
+	// Propose; followers apply once they learn the commit index).
+	var target atomic.Uint64
+	applyCommitGate = func(index uint64) {
+		if index != target.Load() {
+			return
+		}
+		<-release // raft committed, SQLite not yet committed
+	}
+	lastBefore, _ := leader.LogLastIndex()
+	target.Store(lastBefore + 1)
+	proposed := make(chan error, 1)
+	go func() {
+		proposed <- leader.Propose(func(*sql.DB) (*Command, error) { return planAuditCheckpointSet(2) })
+	}()
+	x := target.Load()
+	for _, f := range followers {
+		if !waitForCond(3*time.Second, func() bool { return f.CommitIndex() >= x && f.RaftAppliedIndex() >= x }) {
+			t.Fatalf("follower did not learn commit %d: commit=%d raftApplied=%d", x, f.CommitIndex(), f.RaftAppliedIndex())
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // give a would-be SQLite apply every chance; it is gated
+	for i, f := range followers {
+		// An independent read-only connection: the FSM holds the write pool's one connection inside
+		// its gated txn, so AppliedIndex() through the node would block on the very lag under test.
+		if sqliteApplied := independentApplied(followerDBs[i]); sqliteApplied >= x {
+			t.Fatalf("fixture: follower %d SQLite already applied %d; the gate did not hold", i, x)
+		}
+		if !f.CaughtUp() {
+			t.Fatalf("follower %d: CaughtUp()==false inside the apply window — raft's cursor semantics changed; re-examine HONEST LIMIT #1 and this predicate's reason to exist", i)
+		}
+		lag, err := f.CommandApplyLagging()
+		if err != nil {
+			t.Fatalf("follower %d: CommandApplyLagging: %v (must not block behind the FSM's txn)", i, err)
+		}
+		if !lag {
+			t.Fatalf("follower %d: SQLite is behind committed command %d yet CommandApplyLagging says false — #86 half ② is blind again", i, x)
+		}
+	}
+	released = true
+	close(release)
+	if err := <-proposed; err != nil {
+		t.Fatalf("propose 2: %v", err)
+	}
+	for _, f := range followers {
+		if !waitForCond(3*time.Second, func() bool { a, _ := f.AppliedIndex(); return a >= x }) {
+			t.Fatal("follower never applied after release")
+		}
+		if lag, err := f.CommandApplyLagging(); err != nil || lag {
+			t.Fatalf("follower applied %d yet reads lagging=%v err=%v", x, lag, err)
+		}
 	}
 }

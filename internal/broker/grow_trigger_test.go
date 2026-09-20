@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -415,5 +416,65 @@ func TestMoveAsideJetStreamStore_ReadDirErrorFailsClosed(t *testing.T) {
 	defer func() { _ = os.Chmod(store, 0o700) }()
 	if _, err := b.moveAsideJetStreamStore(store, "epochR", false); err == nil {
 		t.Fatal("a store that cannot be enumerated must REFUSE without ack (fail-closed), not reset silently")
+	}
+}
+
+// origin: simcluster-speed A/B, drill 42 baseline-vs-image#2 (plan §8.2/§8.5). join-status must say whether
+// AddNonvoter ever committed, not merely what the current state is: a join BLOCKED on its catch-up
+// deadline was CATCHING_UP a minute earlier, and the orchestrator's barrier (cmd/tether catchupBarrier)
+// needs that fact to resume it instead of re-waiting for a state the op never re-enters. The last three
+// rows are internal review round 1 R2-F5: the timeline is capped at opTimelineCap entries, so the fact
+// must also be readable from columns a trim cannot evict — the current rung and the BLOCKED message.
+func TestGrowTriggerJoinStatusReportsNonvoterCommittedFromTheTimeline(t *testing.T) {
+	seed, _ := auth.GenerateUserSeed()
+	// A timeline that has trimmed the CATCHING_UP entry away: opTimelineCap later same-state error entries.
+	evicted := make([]adminsock.ClusterOpEvent, 0, opTimelineCap)
+	for i := 0; i < opTimelineCap; i++ {
+		evicted = append(evicted, adminsock.ClusterOpEvent{State: "BLOCKED", Note: "reason " + strconv.Itoa(i)})
+	}
+	cases := []struct {
+		name     string
+		entry    adminsock.ClusterOpEntry
+		wantFlag bool
+	}{
+		{name: "BLOCKED after CATCHING_UP", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED", LastError: "catch-up exceeded the deadline",
+			Timeline: []adminsock.ClusterOpEvent{{State: "JOIN_PROOF_VERIFIED"}, {State: "ROSTER_COMMITTED"}, {State: "RAFT_ADDING"}, {State: "CATCHING_UP"}, {State: "BLOCKED"}}}, wantFlag: true},
+		{name: "CATCHING_UP now", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "CATCHING_UP",
+			Timeline: []adminsock.ClusterOpEvent{{State: "ROSTER_COMMITTED"}, {State: "RAFT_ADDING"}, {State: "CATCHING_UP"}}}, wantFlag: true},
+		{name: "BLOCKED before AddNonvoter committed", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED", LastError: "AddNonvoter failed 3 times",
+			Timeline: []adminsock.ClusterOpEvent{{State: "ROSTER_COMMITTED"}, {State: "RAFT_ADDING"}, {State: "BLOCKED"}}}, wantFlag: false},
+		{name: "no timeline at all (legacy row)", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED"}, wantFlag: false},
+		// R2-F5: the CATCHING_UP entry has been trimmed out of the timeline.
+		{name: "BLOCKED on the catch-up deadline, CATCHING_UP evicted from the timeline", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED",
+			LastError: OpBlockedCatchupDeadlineMsg + " — check the joining broker", Timeline: evicted}, wantFlag: true},
+		{name: "BLOCKED on some other reason, CATCHING_UP evicted from the timeline", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED",
+			LastError: "AddVoter (promote) failed 3 times", Timeline: evicted}, wantFlag: false},
+		{name: "NATS_ROLLED_OUT now, no timeline", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "NATS_ROLLED_OUT"}, wantFlag: true},
+		// round-2 review R4-2-F3: the row where witness 3 (the timeline scan) ALONE decides. The op passed
+		// CATCHING_UP and went BLOCKED on the post-catch-up promote (blockAfterAttempts "AddVoter (promote)"):
+		// state is BLOCKED (witness 1 false), LastError is not the catch-up deadline (witness 2 false), and
+		// only the CATCHING_UP entry still in the timeline says AddNonvoter committed. Without it the driver
+		// waits the full opCatchupTimeout again — the pre-#83 shape for the promote-blocked case.
+		{name: "BLOCKED on promote, CATCHING_UP still in the timeline", entry: adminsock.ClusterOpEntry{OpID: "op-1", TargetEnd: "brk-b", OpState: "BLOCKED",
+			LastError: "AddVoter (promote) failed 3 times (last: raft: leadership lost)",
+			Timeline:  []adminsock.ClusterOpEvent{{State: "ROSTER_COMMITTED"}, {State: "RAFT_ADDING"}, {State: "CATCHING_UP"}, {State: "BLOCKED"}}}, wantFlag: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := newGrowTriggerTestBroker("brk-a", seed, growNow, func(r adminsock.Request) adminsock.Response {
+				if r.Op != adminsock.OpClusterOps {
+					t.Fatalf("join-status must route OpClusterOps, got %s", r.Op)
+				}
+				return adminsock.Response{OK: true, Ops: []adminsock.ClusterOpEntry{c.entry}}
+			})
+			req := &proto.ClusterGrowReq{Op: "join-status", TargetNode: "brk-a", OpID: "op-1", IssuedAt: growNow.Format(time.RFC3339)}
+			resp := b.handleGrowTrigger(signGrowReq(t, seed, req), growNow)
+			if resp == nil || !resp.OK || resp.OpState != c.entry.OpState {
+				t.Fatalf("join-status must answer the op: %+v", resp)
+			}
+			if resp.NonvoterCommitted != c.wantFlag {
+				t.Fatalf("NonvoterCommitted = %v, want %v (timeline %+v)", resp.NonvoterCommitted, c.wantFlag, c.entry.Timeline)
+			}
+		})
 	}
 }

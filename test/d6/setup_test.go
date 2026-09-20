@@ -224,7 +224,7 @@ func seedAndOpenHome(t *testing.T, db *sql.DB, cli *tunnel.Client, sid, nid, nam
 	for attempt := 0; attempt < 8; attempt++ {
 		port := freePort(t)
 		seedHomedExpose(t, db, sid, nid, name, port, localPort, token, homeNodeID, epoch)
-		err := cli.OpenHome(port, localPort, token, homeAddr, epoch, pins)
+		err := cli.OpenHome(t.Context(), port, localPort, token, homeAddr, epoch, pins)
 		if err == nil {
 			return port
 		}

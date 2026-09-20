@@ -2,7 +2,32 @@
 # 96-mid-flight-chaos — S9 / G-C. N=3: failures injected MID-FLIGHT — a tier-B transfer in flight, a real
 # network PARTITION of the leader, and a double fault (agent + its home broker together).
 # Plan: docs/reviews/s7-s9-plan.md §3.3. Expected landing: PRODUCT-RED (#57/#58 are source-certain).
-# Runtime ~22min. Topology: 3 brokers + 2 agents + 1 ctl (grow-family).
+# Topology: 3 brokers + 2 agents + 1 ctl (grow-family).
+#
+# arms: A D F
+# fixture: A=N3-live D=N3-live F=N3-live
+# grows: A=2 D=2 F=2
+# worst: A=1350 D=1500 F=800
+# forgoes: A=- D=- F=-
+#
+# ── ARMS (simcluster-speed plan §5.5, 2026-09-19) ────────────────────────────────────────────────────
+# Until 2026-09-19 the three arms ran back to back on ONE cluster: A killed and restarted brk2 and restarted
+# brk1 for the GC knobs, D then partitioned that already-bruised cluster, and F waited up to 360 s for the
+# cluster to recover from D before it could even start — the whole drill was 22 min, the longest unit of
+# the sweep, and F was gated off by arm-D residue on every loaded run (the old `:745` gap). Each arm now
+# builds its OWN fresh N=3 (`simcluster drill 96-mid-flight-chaos --arm <A|D|F>`; the runner expands the
+# drill to three units and joins their verdicts). What each arm gives up by no longer running after its
+# former siblings is declared in `# forgoes:` above and reconciled against contention-sensors.tsv:
+#   D  no longer samples #71's post-A world (the minority-commit line was only ever seen on a cluster that
+#      had just had brk2 killed+restarted and brk1 restarted) — recorded, not silently dropped;
+#   F  gives up nothing that was a claim: D's healed-partition residue was a precondition F had to WAIT OUT,
+#      never something F measured (the old F precondition comment below is kept in D, where the residue
+#      now lives as a measure-and-record end state).
+# The DRILL-LEVEL structural gap (arms B/C of the roadmap not implemented here) is counted by EVERY arm
+# through _gap_drill_level (plan X8), so no arm can land a lucky GREEN on a claim the drill does not make.
+# Per-arm worst (declared above, seconds): A 1350 — the #57 window is 390 s of DELIBERATE waiting on a
+# 5-minute product timeout and must not be cut by the unit ceiling; D 1500 — D3's 300 s JS-meta re-form
+# window + the 360 s end-state measure; F 800.
 #
 # ── TWO SOURCE-CERTAIN FINDINGS THIS DRILL EXISTS TO PIN ────────────────────────────────────────────
 # #57  The roadmap expected "the bucket watchdog cleans up + a failed audit is written". The watchdog DIES
@@ -231,6 +256,15 @@ _c3_committed_by() {
     # would truncate the match at the 'n' in 'ca-n-ary3' and false-negative — hiding a real #65.)
     dexec "$1" -- sh -c 'grep -ahF "broker: session created" /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null' 2>/dev/null | grep -q 'canary3'
 }
+# D0f (#89 premise): every broker's own nats-server hosts exactly one `tetherd` client and it comes from
+# loopback — the broker being isolated by the D arm is on the server being isolated. Read from /connz.
+_d_brokers_home() {
+    for _dbh in brk1 brk2 brk3; do
+        _dbh_j=$(dexec "$_dbh" -- sh -c "curl -s --max-time 5 'http://127.0.0.1:8223/connz?limit=4096' 2>/dev/null" 2>/dev/null)
+        printf '%s' "$_dbh_j" | jq -e '[.connections[]?|select(.name=="tetherd")] | length==1 and all(.ip=="127.0.0.1")' >/dev/null 2>&1 \
+            || { log "D0f: $_dbh /connz tetherd clients: $(printf '%s' "$_dbh_j" | jq -c '[.connections[]?|select(.name=="tetherd")|{cid,ip,port}]' 2>/dev/null | cut -c1-300)"; return 1; }
+    done
+}
 _f_agt1_online() { _pctl -- node ls --json 2>/dev/null | jq -e '.nodes[]?|select(.nid=="agt1")|select(.status=="ONLINE")' >/dev/null 2>&1; }
 _agt_online() { _pctl -- node ls --json 2>/dev/null | jq -e --arg n "$1" '.nodes[]?|select(.nid==$n)|select(.status=="ONLINE")' >/dev/null 2>&1; }
 # Q3: the two agt1 seeds are HELD FOREGROUND (see _seed_held) — tracked as `sleep 9661`/`sleep 9662`,
@@ -281,6 +315,13 @@ _f4_agt2_seed_survived() {
 }
 _f5_audit_row() { _pctl -- history --kind proc -n 100 2>/dev/null | grep -q 'kind=reconciled_closed'; }
 _f6_fresh_exec() { _pctl -- exec agt1 -- echo F6-ALIVE >/dev/null 2>&1; }
+# Full health of the N=3 + 2 agents: 3 VOTER + agt1 AND agt2 ONLINE. Was the F arm's PRECONDITION when F ran
+# after D on the same cluster (D partitioned brk1, agt2's home, so a not-yet-recovered brk1 could leave
+# agt2's control process disrupted and make F4 fail for an arm-D-residue reason rather than a G.1xG.2
+# defect). Since the arm split F starts from its own fresh fixture, and this predicate is the D arm's
+# END-STATE measure instead: how long the cluster actually takes to return to full health after the
+# partition heals is recorded (and a >360 s recovery is a gap), never waited out by another arm.
+_f_precond_healthy() { _d0_three_voters && _f_agt1_online && _agt_online agt2; }
 
 # _ensure_leader_brk1 : make brk1 the leader, idempotently. grow_to_3 inits brk1 so it is usually
 # already the leader; `transfer-leader brk1` then errors "already the leader" (exit 70). Only transfer
@@ -301,12 +342,30 @@ _cleanup() {
     done
     true
 }
+# _gap_drill_level : the DRILL-LEVEL structural gap, counted once by EVERY arm (plan X8 — a gap that belongs
+# to the drill must not depend on which arm ran, or the arms that skip it land a lucky GREEN on a claim the
+# drill as a whole does not make). ONE literal, ONE site; tests/arm-manifest-lint.sh R7 checks every branch
+# calls it.
+# NOTE (Stage-C B4): this drill implements the four load-bearing arms — A (#57/#58 tier-B mid-flight),
+# B0 (run --ack-alerts gate), D (the flagship leader partition), F (double fault). The roadmap's arm B
+# (run-PTY kill-broker → DOC-28) and arm C (expose-crash → RETURN + home_reassign_failed observation) are
+# NOT-COVERED here: arm B's behaviour (a run session over an explicit --nats-url to a killed broker times
+# out with 'agent unreachable: no heartbeat' — a documented liveness watchdog, run.go:453-456) is a
+# GREEN-by-design outcome already source-closed (SB-96-3), and arm C's data-plane crash-strand is drill
+# 71/#29's territory. No sys.events observer is set up, because nothing consumes it (a built-but-unread
+# observer would be dead setup). DOC-28 (run cross-broker-restart semantics undocumented) is recorded in
+# the ledger, not pinned by a live arm here.
+_gap_drill_level() {
+    not_covered "96 arm B (run-PTY kill-broker → DOC-28) + arm C (expose-crash RETURN + home_reassign_failed event)" \
+        "arm B's kill-broker-mid-run outcome is GREEN-by-design (run.go's 15s liveness watchdog synthesises 'agent unreachable: no heartbeat' — SB-96-3, source-closed); arm C's crash-strand data plane is drill 71/#29's territory (a cluster expose home cannot deliver to a non-tunnel broker, home.go:96-113). The rehome/home_reassign_failed event is member-readable (rehome_events.go:9-11 → SubjSysEvents) but its crash-path firing needs arm C's fixture; DOC-28 is ledger-registered" gap
+}
 
-drill_begin "96-mid-flight-chaos (N=3: tier-B mid-flight + leader partition + double fault)"
+drill_begin "96-mid-flight-chaos (N=3: tier-B mid-flight + leader partition + double fault) [arm ${ARM:-?}]"
 drill_install_traps _cleanup
 
 "$SIM" nuke >/dev/null 2>&1 || true
 
+# ── COMMON FIXTURE (every arm): a fresh N=3 with brk1 the leader, two agents, agt1 homed on brk2 ────
 assert_setup "grow_to_3 (N=3 HA)"                       grow_to_3 2 1
 assert_setup "ensure brk1 is the leader (grow inits brk1, so this is usually a no-op — a redundant transfer to self would error 70)" _ensure_leader_brk1
 # THREE HARD PRECONDITIONS. They are not conveniences: #58's reaperMayDelete()==false is guaranteed BY
@@ -322,6 +381,9 @@ assert_setup "provision agt1 agent.yaml with tunnel/NATS on brk2 (the NON-leader
     agent_provision_yaml agt1 "$SID" "$NURL" open
 assert_setup "provision agt2 agent.yaml (control, on brk1)" \
     agent_provision_yaml agt2 "$SID" "nats://brk1:4222" open
+
+case "${ARM:?}" in
+A)
 # R15 #58: shorten the home-authoritative orphan-reap cadence on the VICTIM home broker (brk2) so its
 # periodic xfer-orphan-reap pass is OBSERVABLE within the drill instead of the 5m production default. This is
 # a labeled DEPLOYMENT config knob (broker.cluster.xfer_reap_interval, Mandate ③) — it does NOT do tether's
@@ -356,17 +418,7 @@ assert_setup "R16 #58: brk1 is the leader again after the knob-loading restart (
     _ensure_leader_brk1
 assert_setup "R16 #58: PRECONDITION re-verified — leader is brk1 (post-restart)" \
     sh -c "$SIM status --json 2>/dev/null | jq -e '.leader_id==\"brk1\"' >/dev/null"
-# NOTE (Stage-C B4): this drill implements the four load-bearing arms — A (#57/#58 tier-B mid-flight),
-# B0 (run --ack-alerts gate), D (the flagship leader partition), F (double fault). The roadmap's arm B
-# (run-PTY kill-broker → DOC-28) and arm C (expose-crash → RETURN + home_reassign_failed observation) are
-# NOT-COVERED here: arm B's behaviour (a run session over an explicit --nats-url to a killed broker times
-# out with 'agent unreachable: no heartbeat' — a documented liveness watchdog, run.go:453-456) is a
-# GREEN-by-design outcome already source-closed (SB-96-3), and arm C's data-plane crash-strand is drill
-# 71/#29's territory. No sys.events observer is set up, because nothing consumes it (a built-but-unread
-# observer would be dead setup). DOC-28 (run cross-broker-restart semantics undocumented) is recorded in
-# the ledger, not pinned by a live arm here.
-not_covered "96 arm B (run-PTY kill-broker → DOC-28) + arm C (expose-crash RETURN + home_reassign_failed event)" \
-    "arm B's kill-broker-mid-run outcome is GREEN-by-design (run.go's 15s liveness watchdog synthesises 'agent unreachable: no heartbeat' — SB-96-3, source-closed); arm C's crash-strand data plane is drill 71/#29's territory (a cluster expose home cannot deliver to a non-tunnel broker, home.go:96-113). The rehome/home_reassign_failed event is member-readable (rehome_events.go:9-11 → SubjSysEvents) but its crash-path firing needs arm C's fixture; DOC-28 is ledger-registered" gap
+_gap_drill_level
 
 # ══ A — tier-B transfer killed mid-flight (#57 / #58) ═══════════════════════════════════════════════
 # 12 MiB > transferTierAMaxBytes (8 MiB, transfer.go:52) forces tier B. (The roadmap said ">1 MiB
@@ -499,7 +551,13 @@ else
         # same in-sim interruption gap #57 records), the peak count never rises above the floor and the FIXED
         # branch below would PASS having reclaimed nothing. Record that as uncovered instead of banking a
         # vacuous green — the reap/GC is pinned hermetically; this arm only claims it when it truly ran.
-        not_covered "96-A2 (#58) the A-arm produced NO orphan set this run (peak orphan count $_C_ORPHAN <= tombstone floor $_reap_floor), so neither the home-authoritative reap nor the R16 leader cross-home GC had anything to reclaim" "IN-SIM INTERRUPTION GAP (same root as 96-A/#57): the tier-B upload reached a terminal before the kill landed, so no in-flight chunks were stranded. A 'count is at the floor' PASS here would be VACUOUS — it would assert the reap works on a run where no reap was needed. The #58 mechanisms are pinned hermetically (TestXferCrossHomeGCReapsSplitHome / TestXferCrossHomeGCSkipsBusyBucket / TestXferUnreapableBucketCounter + the derivation pin); this arm claims them ONLY on a run that actually strands objects." gap
+        # Classified runtime-guard, the SAME class as the pre-restart "no orphan manufactured" record above:
+        # it is the same run-conditioned fact (the upload reached a terminal before the kill landed) read
+        # after the restart instead of before it. The first version wrote `gap` here and `runtime-guard`
+        # above, which made the A arm's nc_gap two-valued (4 or 5 by which branch the run took) and forced
+        # the parent and .A expectations to `-` — switching off the runner's added-gap detection on the
+        # drill with the most gaps (round-2 review R1-F6). One class ⇒ a deterministic count ⇒ pinnable.
+        not_covered "96-A2 (#58) the A-arm produced NO orphan set this run (peak orphan count $_C_ORPHAN <= tombstone floor $_reap_floor), so neither the home-authoritative reap nor the R16 leader cross-home GC had anything to reclaim" "IN-SIM INTERRUPTION GAP (same root as 96-A/#57): the tier-B upload reached a terminal before the kill landed, so no in-flight chunks were stranded. A 'count is at the floor' PASS here would be VACUOUS — it would assert the reap works on a run where no reap was needed. The #58 mechanisms are pinned hermetically (TestXferCrossHomeGCReapsSplitHome / TestXferCrossHomeGCSkipsBusyBucket / TestXferUnreapableBucketCounter + the derivation pin); this arm claims them ONLY on a run that actually strands objects." runtime-guard
     else
         # ROUND-3 R3-F3: the FIXED / REGRESSION / SPLIT-HOME judges that used to live here are GONE, not
         # relocated. They all rested on a compressed 5s `xfer_cross_home_reap_age`, which external review
@@ -527,22 +585,40 @@ if printf '%s' "$_B0_PLAIN" | grep -qiE 'alert|--ack-alerts|BLOCKED'; then
 else
     not_covered "96-B0 run --ack-alerts gate (inventory row 122's S9 cell)" "run was NOT refused under the alert state produced by this drill's kill (rc=$_B0_RC), so there is no gate to prove bypassing here; the semantics differ from 90's severe-banner path and need their own explore->pin" gap
 fi
+;;
 
+D)
+_gap_drill_level
 # ══ D — PARTITION THE LEADER (the flagship arm) ════════════════════════════════════════════════════
 # 5 elements: (1) baseline = 3 VOTER + a real write through brk1 + reachability; (2) observation = dexec
 # (never over the partitioned network) + each node's own admin socket; (3) boundary = 6222+7400 only,
 # 4222 DELIBERATELY left up; (4) oracle = a real write on the survivors + the ex-minority reading that
 # row back; (5) cleanup = the single EXIT trap.
-# POLL, not a bare check: the preceding #58 arm killed+restarted brk2, which must rejoin as a VOTER before
-# the partition arm's 3-VOTER baseline holds (a bare check races brk2's raft catch-up).
-assert_ok "D0a BASELINE: 3 VOTER (poll — brk2 rejoins raft after the #58 arm restarted it)" \
-    poll_until 120 5 "3 VOTER after the #58 arm" -- _d0_three_voters
+# POLL, not a bare check: the fixture's grow just promoted the last joiner, and (before the arm split) the
+# preceding #58 arm had killed+restarted brk2 — either way a bare check races raft catch-up.
+assert_ok "D0a BASELINE: 3 VOTER (poll — a bare check races the last joiner's raft catch-up)" \
+    poll_until 120 5 "3 VOTER on the fresh fixture" -- _d0_three_voters
 assert_ok "D0b BASELINE: leader is brk1" poll_until 60 3 "leader settles back to brk1" -- _leader_is_brk1
 assert_ok "D0c BASELINE: a real WRITE through brk1 succeeds (this is what must move to the survivors)" \
     "$SIM" ctl -- session create canary1 --pin 970001
 assert_ok "D0d BASELINE: switch the ctl back to $SID (R-CTX)" \
     dexec -u sim ctl1 -- env HOME=/home/sim tether login -s "$SID" --pin "$PIN" --nats-url "nats://brk1:4222"
 assert_ok "D0e BASELINE: brk2 can reach brk1's route port" fault_assert_reachable brk2 brk1 6222
+# ── D0f PREMISE (#89): the broker being isolated must be ON the NATS server being isolated ────────
+# The D arm cuts brk1's ROUTES and RAFT and leaves 4222 up, then attributes any `session created … canary3`
+# line in brk1's OWN broker.log to a minority commit (D4b/D6b). That attribution assumes brk1's broker talks
+# to the cluster through brk1's nats-server. It did not always: a broker whose local nats-server had been
+# bounced (the topology reconciler's staggered hard restart under load) reconnected — via nats.go's
+# INFO-advertised pool — to a PEER's nats-server and stayed there, so during the "partition" brk1's broker
+# rode brk2's NATS around the cut, forwarded the ctl's create to the live leader, and logged canary3 with
+# routes and raft cut: the three concurrent PRODUCT-RED #65 of 2026-09-19 (G1 cap 0 / cap 8, S2 -j6; gotcha
+# #89, fixed by pinning the broker to its configured server). This proof is read from each nats-server's
+# own /connz: exactly ONE `tetherd` client, from loopback (_d_brokers_home, defined with the D helpers
+# above the case — arm-manifest-lint R5). A miss is a real product red (#89 back), AND it makes D6b's
+# committer attribution meaningless — the #65 judge below is gated on it.
+if _d_brokers_home; then _D_PREMISE=1; else _D_PREMISE=0; fi
+assert_ok "D0f PREMISE (#89): every broker's own nats-server hosts exactly ONE tetherd client and it comes from loopback — brk1's broker IS on brk1's NATS, so the isolation below isolates the process it claims to (a broker roamed onto a peer's NATS forwarded around the cut and was read as a minority commit three times on 2026-09-19)" \
+    sh -c "[ '$_D_PREMISE' = 1 ]"
 
 D_PID0=$(dexec brk1 -- systemctl show -p MainPID --value tether-broker 2>/dev/null | tr -d '\r')
 D_NR0=$(dexec brk1 -- systemctl show -p NRestarts --value tether-broker 2>/dev/null | tr -d '\r')
@@ -620,6 +696,13 @@ assert_ok "D4c brk1 did NOT crash or restart: same MainPID, NRestarts unchanged"
 _C3_COMMIT_PREHEAL=no; _c3_committed_by brk1 && _C3_COMMIT_PREHEAL=yes
 _C3_COMMIT_PREHEAL_LINE=$(dexec brk1 -- sh -c 'grep -ahF "broker: session created" /var/log/tether/broker.log /var/log/tether/broker.err 2>/dev/null | grep canary3' 2>/dev/null | tail -1)
 log "D4b COMMITTER SNAPSHOT (pre-heal, partition STILL ARMED): brk1's OWN broker.log names canary3 while ISOLATED? $_C3_COMMIT_PREHEAL${_C3_COMMIT_PREHEAL_LINE:+ [line: $_C3_COMMIT_PREHEAL_LINE]} — yes = a genuine raft-safety violation candidate (#65); no = absent at this snapshot only (a line first seen after heal remains #71-ambiguous across the snapshot→heal boundary)"
+# Committer CENSUS across all three brokers (round-2 review R5-F2): which broker(s) logged the create names
+# the ENTRY broker that handled the ctl's request. On a run with the premise intact exactly one of brk2/brk3
+# should carry it (the survivors' leader or its forwarder); brk1 carrying it with routes cut is the #65
+# candidate ONLY when D0f held. Observation, kept beside the snapshot so a future red can be attributed
+# from the log alone (the 2026-09-19 samples had only brk1's reading).
+_c3_census=""; for _c3b in brk1 brk2 brk3; do if _c3_committed_by "$_c3b"; then _c3_census="$_c3_census $_c3b=yes"; else _c3_census="$_c3_census $_c3b=no"; fi; done
+log "D4b COMMITTER CENSUS (pre-heal): 'broker: session created … canary3' in each broker's own log:$_c3_census (D0f premise=$_D_PREMISE)"
 
 assert_ok "D5a HEAL the partition" fault_partition_off brk1
 assert_ok "D5b all three nodes converge on ONE leader (sort -u == 1)" \
@@ -656,8 +739,14 @@ log "D6b RAW ARTIFACT (canary3 = the minority's stale-leader write; D4b was: ${_
 # "5/6 durable minority writes" were exactly that — correct commits mis-attributed to brk1 by dialing). #65
 # demands that the ISOLATED MINORITY brk1 itself COMMITTED it (its own broker.log names canary3, _c3_committed_by)
 # AND it is visible via the majority after heal. Only BOTH together are a raft-safety violation.
-if { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && [ "$_C3_COMMIT_PREHEAL" = yes ]; then
-    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3 was COMMITTED BY the isolated minority brk1 WHILE STILL PARTITIONED (the pre-heal committer artifact — brk1's own broker.log named canary3 BEFORE D5a healed the partition${_C3_COMMIT_PREHEAL_LINE:+: $_C3_COMMIT_PREHEAL_LINE} — is committer attribution taken during isolation, not just a --nats-url dial and not a post-heal delayed commit) during the partition (D4b=${_D4B_REC:-n/a}, pre-heal-on-brk1=${_C3_PRE:-unknown}) AND is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's committed write must never survive (raft safety). CANDIDATE: reproduce in a dedicated single run with the full D4/D6/D6b + pre-heal committer artifact before treating it as characterised, not asserted from a chaos drill alone"
+if { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && [ "$_C3_COMMIT_PREHEAL" = yes ] && [ "$_D_PREMISE" != 1 ]; then
+    # The committer artifact is only attribution when brk1's broker was ON brk1's NATS (D0f). With the
+    # premise red the line proves the roam (#89), not a minority commit — which is exactly how the three
+    # 2026-09-19 concurrent samples were mis-read. D0f is already the red for that; do not double it as #65.
+    not_covered "96-D6b #65 NOT judgeable: brk1's own broker.log names canary3 pre-heal, but D0f found a broker off its own NATS (#89 shape) — the line is a roamed broker's forward through a peer, not committer attribution" \
+        "canary3 visible via the majority after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3, D4b=${_D4B_REC:-n/a}); the pre-heal committer line exists, but the isolation premise this attribution rests on did not hold this run (see the D0f ASSERT-FAIL). #89's fix pins the broker to its configured server; a red D0f on a fixed image is a regression to chase first" runtime-guard
+elif { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && [ "$_C3_COMMIT_PREHEAL" = yes ]; then
+    product_red "#65 a partitioned-minority stale-leader write became DURABLE: canary3 was COMMITTED BY the isolated minority brk1 WHILE STILL PARTITIONED (the pre-heal committer artifact — brk1's own broker.log named canary3 BEFORE D5a healed the partition${_C3_COMMIT_PREHEAL_LINE:+: $_C3_COMMIT_PREHEAL_LINE} — is committer attribution taken during isolation, not just a --nats-url dial and not a post-heal delayed commit; D0f proved brk1's broker was on brk1's own NATS, so this is not the #89 roam) during the partition (D4b=${_D4B_REC:-n/a}, pre-heal-on-brk1=${_C3_PRE:-unknown}) AND is visible via the MAJORITY after heal (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3) — a partitioned minority's committed write must never survive (raft safety). CANDIDATE: reproduce in a dedicated single run with the full D4/D6/D6b + pre-heal committer artifact before treating it as characterised, not asserted from a chaos drill alone"
 elif { [ "$_C3_B2" = yes ] || [ "$_C3_B3" = yes ]; } && _c3_committed_by brk1; then
     # #71 remains OPEN. The line was absent at the pre-heal snapshot and present when observed after heal,
     # but the snapshot and iptables flush are not atomic. The line could have landed in that boundary window
@@ -693,22 +782,51 @@ else
     not_covered "96-D6b minority stale-write rollback (brk1=$_C3_B1 brk2=$_C3_B2 brk3=$_C3_B3)" "canary3 (the minority's stale-leader accept, D4b=${_D4B_REC:-n/a}, PROVEN present on brk1 pre-heal) is still visible via brk1 but NOT via the majority (brk2/brk3) after heal — a truncation-lag / read-your-writes artifact on the ex-minority's local view, NOT a durable split-brain (the majority never committed it). Recorded as #65 candidate; pinning it needs dedicated investigation of whether tether acks uncommitted local appends. The durable no-split-brain direction (D6, the majority's committed write survives) is GREEN" gap
 fi
 
+# ── D END STATE — measure-and-record how long full health takes to return after the heal ──────────────
+# Before the arm split this wait was the F arm's PRECONDITION: F could only run once the cluster had FULLY
+# recovered from the partition (3 VOTER + agt1 AND agt2 ONLINE — agt2's home brk1 was the victim), and on
+# a loaded host it did not within 240 s (r14d 2026-07-20; widened to 360 s), gating the whole F arm off as a
+# cross-arm-residue gap on every such run. F now starts from its own fixture, so this residue is no longer
+# something another arm waits out — it is measured HERE, where it is produced: the elapsed time to full
+# health is recorded (the product's real post-partition recovery cost, not a SLA), and a recovery that
+# takes more than the 360 s the old gate allowed is recorded as a gap, exactly as it was before.
+#
+# R-CTX FIRST. D3's survivor write and D4b's minority write are `session create canary2/canary3`, and a
+# `session create` rewrites the ACTIVE-SESSION pointer of the HOME it runs in (the same trap drill 30
+# documents for its write-probe). The two solo D runs of 2026-09-19 both timed out here with
+# three_voters=yes and `node ls` answering "(no nodes)": the ctl was listing canary3's (empty) roster,
+# not lab's, so agt1/agt2 read as offline on a cluster that was healthy. The same artifact is the most
+# likely reason the pre-split F precondition (the old `:745` gap, "did not recover within 240 s/360 s")
+# failed on every run for months — the F arm was gated off by the ctl's session pointer, not by tether.
+# Switch back to $SID exactly as D0d did before the injection; the measure below is then about the
+# cluster. A login that fails here is itself a claim about the healed control plane, so it is asserted.
+assert_ok "D7 R-CTX: switch the ctl back to $SID after the canary2/canary3 creates moved its active session (a fresh login must work on the healed cluster; without it the end-state measure reads canary3's empty roster)" \
+    dexec -u sim ctl1 -- env HOME=/home/sim tether login -s "$SID" --pin "$PIN" --nats-url "nats://brk1:4222"
+_d_heal_t0=$(date +%s)
+if poll_until 360 5 "cluster FULLY recovered after the heal (3 VOTER + agt1 & agt2 ONLINE)" -- _f_precond_healthy; then
+    log "D END STATE: full health (3 VOTER + agt1 & agt2 ONLINE) returned $(( $(date +%s) - _d_heal_t0 ))s after the D6b readback settled — the measured post-partition recovery lag (observation, not a SLA)"
+else
+    # WHICH leg is still missing is the whole attribution: the first solo D run (2026-09-19, fresh N=3,
+    # 675 s) hit this window with the three legs unrecorded, so it could not say whether brk1 never
+    # rejoined as VOTER, agt1 never came back, or agt2 (homed on the partitioned brk1) never re-registered.
+    # Observation only, uncaptured (top-level log lines), so it cannot change the verdict.
+    log "D END STATE DIAG at 360s: three_voters=$(_d0_three_voters && echo yes || echo no) agt1_online=$(_f_agt1_online && echo yes || echo no) agt2_online=$(_agt_online agt2 && echo yes || echo no); leader as seen from brk1/brk2/brk3 = $(_leader_now brk1)/$(_leader_now brk2)/$(_leader_now brk3)"
+    _pctl -- node ls 2>&1 | while IFS= read -r _dl; do log "  node ls| $(printf '%s' "$_dl" | cut -c1-200)"; done
+    _bt brk2 -- timeout 10 tether cluster status 2>&1 | head -8 | while IFS= read -r _dl; do log "  brk2 status| $(printf '%s' "$_dl" | cut -c1-200)"; done
+    not_covered "96-D post-partition full recovery (3 VOTER + agt1 & agt2 ONLINE) not observed within 360s of the heal" "the cluster's D5b/D6 no-split-brain claims held, but full health — brk1 rejoining as VOTER AND agt2 re-registering ONLINE off its just-healed home — did not return within 360s (measured r14d 2026-07-20 at >240s on a loaded host). Before the arm split this same window gated the F arm off as cross-arm residue; it is now recorded where it is produced. Whether the lag is a product recovery cost or host load is for the timeline sidecar to say" gap
+fi
+;;
+
+F)
+_gap_drill_level
 # ══ F — double fault (G.1 x G.2 interleaved) ═══════════════════════════════════════════════════════
 # NOTE: this arm structurally CANNOT have an OS-truth leg. node_kill destroys the container, so any
 # `pgrep == 0` assertion would be guaranteed by the injection itself with tether never running a line of
 # code. An OS-truth leg exists only in 94-B, where the process really survives the injection.
-# PRECONDITION for the double-fault arm: the cluster must have FULLY recovered from arm D's partition
-# first — 3 VOTER + agt1 AND agt2 ONLINE. Arm D partitioned brk1 (agt2's home), so a not-yet-recovered
-# brk1 can leave agt2's control process disrupted, which would make F4 (agt2 STILL RUNNING) fail for an
-# arm-D-residue reason rather than a G.1xG.2 defect. If the cluster cannot get back to full health, gate
-# the whole arm not_covered (cross-arm damage, not a finding) rather than assert-fail its discriminators.
-_f_precond_healthy() { _d0_three_voters && _f_agt1_online && _agt_online agt2; }
-# 360s (was 240s): arm D partitions brk1 (agt2's home) then heals; D5b/D6 (leader converged + no split-brain)
-# recover fast, but full health — brk1 rejoining as VOTER AND agt2 re-registering ONLINE off its just-healed
-# home — legitimately takes >240s on a loaded host (measured r14d 2026-07-20: D5b/D6 PASSED but this gate
-# timed out at 240s, gating the whole F/Q3 arm every run). Widened so the double-fault arm (the Q3 held-seed
-# fixture) actually runs; if it STILL times out the arm gates as a gap (cross-arm residue), never a false pass.
-if poll_until 360 5 "cluster FULLY recovered from arm D before the double-fault (3 VOTER + agt1 & agt2 ONLINE)" -- _f_precond_healthy; then
+# The arm runs on its OWN fresh N=3 (the common fixture above): the 360 s "fully recovered from arm D"
+# precondition that used to gate it — and the cross-arm-residue gap it recorded on every loaded run — are
+# gone with the split (that recovery is now the D arm's measured end state). F0c below is still a GATE:
+# a missing control is a prerequisite failure regardless of what produced it.
 # Q3: launch the seeds HELD FOREGROUND at TOP LEVEL (not inside an assert_ok `$(...)` subshell, which would
 # reparent/hangup the backgrounded docker-exec), then assert they are RUNNING. `nohup sleep &` is gone: its
 # tracked row EXITs in 3ms, so RUNNING was structurally impossible and F0c/F4 asked an un-answerable question.
@@ -720,8 +838,8 @@ _seed_held agt2 9663
 assert_ok "F0b HELD control seed on agt2 is RUNNING — the CONTROL that must survive agt1's reconciliation untouched (foreground-held so F4's post-injection RUNNING check is non-vacuous)" \
     poll_until 30 2 "agt2's held control seed is RUNNING" -- _agt2_seed_running
 # The seeded control MUST be running right before the injection, else F4 cannot distinguish "node-scoped
-# reconciliation left it alone" from "it was already gone" — if it is not, that is an arm-D-residue setup
-# problem, not a G.1xG.2 finding.
+# reconciliation left it alone" from "it was already gone" — if it is not, that is a fixture setup problem,
+# not a G.1xG.2 finding.
 # H14: this comment promised a GATE, but the code was a plain assert_ok that recorded a RED and then ran the
 # whole arm anyway over a missing control. It is now an assert_setup: a missing control is a prerequisite
 # failure (SETUP-RED) that ABORTS, so F1-F6 can never judge a discriminator that has nothing to discriminate.
@@ -737,12 +855,23 @@ assert_ok "F3 G.1xG.2 converge: agt1's processes are reconciled to EXITED(-1)" \
     poll_until 180 5 "agt1's procs reconcile to EXITED" -- _f3_agt1_exited
 assert_ok "F4 THE DISCRIMINATOR: the EXACT pre-injection agt2 process (pid ${_F0C_PID:-?}) is STILL RUNNING and no seed row on agt2 was closed out — reconciliation is node-scoped, not a table-wide sweep. H14: this now asks a STRICTLY DIFFERENT question from the F0c gate (identity + no-terminal-row after the injection, vs 'is anything running' before it), so a sweep and an absent control can no longer produce the same signal" \
     poll_until 30 2 "agt2's recorded seed pid still running after the double-fault" -- _f4_agt2_seed_survived
+# The first solo F run (2026-09-19 — the first time this arm ran at all since the 360 s residue gate went in)
+# failed F4 and F5 with nothing but the poll timeouts on record: the predicates read `ps -a` / `history`
+# silently. Record what the tables actually held, uncaptured, so the next run can tell a table-wide
+# sweep (agt2's row flipped EXITED/LOST) from a control that vanished some other way, and an audit row
+# that never landed from one the reader could not see. Observation only; it cannot change a verdict.
+log "F4 DIAG agt2 rows (pre-injection pid ${_F0C_PID:-?}): $(_pctl -- ps -a --json 2>/dev/null | jq -c '[.processes[]?|select(.nid=="agt2")|{pid,argv:(.argv|join(" ")),status,exit_code,started_at,ended_at}]' 2>/dev/null | cut -c1-700)"
+log "F4 DIAG agt1 rows: $(_pctl -- ps -a --json 2>/dev/null | jq -c '[.processes[]?|select(.nid=="agt1")|{pid,argv:(.argv|join(" ")),status,exit_code,ended_at}]' 2>/dev/null | cut -c1-500)"
 assert_ok "F5 G.5: the audit says kind=reconciled_closed (AuditProc's kind; 'reconciled' is AuditPort's — schema/audit.go:36 vs :51)" \
     poll_until 120 3 "a reconciled_closed row for agt1" -- _f5_audit_row
+_pctl -- history --kind proc -n 40 2>&1 | tail -12 | while IFS= read -r _fl; do log "  F5 DIAG history proc| $(printf '%s' "$_fl" | cut -c1-200)"; done
 assert_ok "F6 the agent is NOT wedged: a NEW process starts and runs after the double fault" \
     poll_until 60 3 "a fresh exec works on agt1" -- _f6_fresh_exec
-else
-    not_covered "96-F double fault (agent + home broker together)" "the cluster did not fully recover from arm D's leader-partition within 240s (3 VOTER + agt1 & agt2 ONLINE), so the double-fault arm would run against arm-D residue (agt2's home brk1 was the partition victim) — a cross-arm state consequence, not a G.1xG.2 defect. The reconciliation is node-scoped-tested hermetically; #57/#58 are already pinned above. A dedicated per-arm-isolated fixture for F is owed to a follow-up" gap
-fi
+;;
+
+*)
+setup_fail "unknown arm '${ARM}' — this drill's arms are A, D, F (see its '# arms:' manifest)"
+;;
+esac
 
 drill_end

@@ -135,7 +135,9 @@ func (n *Node) RaftAppliedIndex() uint64 { return n.raft.Load().AppliedIndex() }
 // apply window. That narrower residual is RECORDED, not closed: the membership-lock reaps
 // document it (reconcile_upgrade_lock.go — a raft Barrier was rejected because Barrier().Error()
 // has no apply deadline and would hang the reconcile goroutine on a wedged FSM); the xfer/orphan
-// reaps tolerate it (home partition + ModTime grace + JS-delete-fails-without-quorum).
+// reaps tolerate it (home partition + ModTime grace + JS-delete-fails-without-quorum). A caller
+// that needs the apply window itself — "may my store be missing a committed write?" — reads
+// CommandApplyLagging below instead (gotcha #86 half ②; this predicate was blind there).
 //
 // HONEST LIMIT #2 (islanded follower): an islanded node's CommitIndex FROZE at a positive
 // value and its applied catches that frozen ceiling, so CaughtUp() still returns true on a
@@ -149,6 +151,66 @@ func (n *Node) RaftAppliedIndex() uint64 { return n.raft.Load().AppliedIndex() }
 func (n *Node) CaughtUp() bool {
 	commit := n.CommitIndex()
 	return commit > 0 && n.RaftAppliedIndex() >= commit
+}
+
+// CommandApplyLagging is the COMMAND-domain complement of CaughtUp: does a committed write exist
+// that this replica has not applied to its SQLite yet? It compares the DB's command cursor
+// (AppliedIndex: the last LogCommand the FSM committed to SQLite) with the index of the newest
+// committed LogCommand in the local raft log — same domain on both sides, so the trailing
+// election noop that makes "AppliedIndex vs CommitIndex" structurally false (see RaftAppliedIndex)
+// is skipped, not compared.
+//
+// Why it exists (gotcha #86 half ②, round-2 review R2-F2): a fresh expose's HOME is a follower that
+// may not have applied the allocation when the agent's REGISTER arrives, and its answer must then
+// be the transient home_catching_up, not the terminal token_unknown_or_revoked. The first version
+// asked CaughtUp for that — but CaughtUp is HONEST LIMIT #1 above: raft's cursor advances when the
+// batch is ENQUEUED to the FSM, so a follower whose FSM is inside a slow SQLite apply (the loaded
+// host case #86 describes) read caught-up and answered the terminal code; the home half of #86 was
+// inert in exactly the window it was written for, and only the leader's barrier held. This
+// predicate reads the DB cursor through the RO pool — the write pool has one connection, and it is
+// the FSM's, held open for the whole apply txn, so a read through it would block on the very lag it
+// is trying to observe.
+//
+// Fail directions: an empty/truncated log (everything committed is in the snapshot the FSM
+// restored) reads NOT lagging — there is no committed command this replica could still owe; an
+// I/O error is returned so the caller picks its own direction (the broker answers transient).
+// Callers that also need the never-synced case (commit == 0) combine it with !CaughtUp: a node that
+// has never heard a leader owes nothing by this evidence yet cannot vouch for a missing row either.
+func (n *Node) CommandApplyLagging() (bool, error) {
+	newest, err := n.newestCommittedCommandIndex()
+	if err != nil {
+		return false, err
+	}
+	if newest == 0 {
+		return false, nil
+	}
+	applied, err := readAppliedIndexDB(n.ro)
+	if err != nil {
+		return false, err
+	}
+	return applied < newest, nil
+}
+
+// newestCommittedCommandIndex walks back from CommitIndex over the entries the FSM never sees
+// (election noops, configuration changes) to the newest LogCommand. A poisoned command counts:
+// the FSM advances applied_index past it as a no-op, so it is a rung of the same ladder. 0 means
+// the retained log holds no committed command (fresh, or truncated below the commit by a
+// snapshot).
+func (n *Node) newestCommittedCommandIndex() (uint64, error) {
+	for idx := n.CommitIndex(); idx > 0; idx-- {
+		_, err := n.CommittedCommandAt(idx)
+		switch {
+		case err == nil, errors.Is(err, ErrLogPoison):
+			return idx, nil
+		case errors.Is(err, ErrLogNonCommand):
+			continue
+		case errors.Is(err, ErrLogTruncated):
+			return 0, nil
+		default:
+			return 0, err
+		}
+	}
+	return 0, nil
 }
 
 // CommittedCommandAt decodes the *Command at a committed raft index, reading the local

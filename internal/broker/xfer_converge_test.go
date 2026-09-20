@@ -710,7 +710,7 @@ func TestTierBIsSerializedPerSessionBucket(t *testing.T) {
 		t.Fatalf("a different session's tier-B was rejected (%s); the constraint is per BUCKET", code)
 	}
 	// And the slot frees when the first one finishes.
-	tr.remove("t1")
+	tr.remove(tr.get("t1"))
 	if code := tr.put(&transferEntry{transferID: "t5", sid: "lab", bucket: bucket, tier: "b"}); code != "" {
 		t.Fatalf("bucket still blocked after the holder was removed (%s) — the serialisation would be "+
 			"permanent, not per-transfer", code)

@@ -236,6 +236,7 @@ echo "── run-drills.sh end-to-end (real runner, synthetic drills) ───�
 if command -v bash >/dev/null 2>&1; then
     RT=$(mktemp -d); mkdir -p "$RT/drills"
     ln -sf "$SIM_ROOT/run-drills.sh" "$RT/run-drills.sh"
+    ln -sf "$SIM_ROOT/lib" "$RT/lib"    # the runner sources lib/manifest.sh (unit expansion) and refuses to run without it
     printf '#!/bin/sh\n[ "$1" = check-image ] && exit 0\n[ "$1" = drill ] || exit 9\nexec sh "$(dirname "$0")/drills/$2.sh"\n' > "$RT/simcluster"; chmod +x "$RT/simcluster"
     mkd() {
         af=0; sr=0; pr=0; nc=0
@@ -284,6 +285,24 @@ if command -v bash >/dev/null 2>&1; then
 else
     echo "  (skipped — no bash; runner needs arrays)"
 fi
+
+# ── DRILL-ARM (simcluster-speed D): drill_end names the arm it ran, and ONLY when there is one ────────
+# An arm unit's log must carry exactly one `DRILL-ARM arm=<A> of=<drill>` line for the runner's cross-check
+# (arm-aggregation-test pins the runner half); a manifest-free drill must stay byte-identical (no line).
+echo "── DRILL-ARM line ──────────────────────────────────────────────────────────────"
+_out=$(ARM=D SIM_DRILL_NAME=96-x run_drill_body 'drill_begin "t-arm"; assert_ok "one pass" true')
+_n=$(printf '%s\n' "$_out" | grep -c '^DRILL-ARM ')
+[ "$_n" = 1 ] && printf '%s\n' "$_out" | grep -qx 'DRILL-ARM arm=D of=96-x' \
+    && pass "with ARM + SIM_DRILL_NAME set: exactly one 'DRILL-ARM arm=D of=96-x' line" \
+    || fail "DRILL-ARM line wrong (count=$_n): $(printf '%s\n' "$_out" | grep '^DRILL-ARM' | tr '\n' '|')"
+printf '%s\n' "$_out" | grep -q '^DRILL-VERDICT verdict=GREEN ' || fail "the arm line must not disturb the verdict line"
+_out=$(run_drill_body 'drill_begin "t-noarm"; assert_ok "one pass" true')
+printf '%s\n' "$_out" | grep -q '^DRILL-ARM ' && fail "a manifest-free drill (no ARM) printed a DRILL-ARM line" \
+    || pass "without ARM: no DRILL-ARM line (output byte-identical to the pre-split form)"
+_out=$(ARM=D run_drill_body 'drill_begin "t-arm-noname"; assert_ok "one pass" true')
+printf '%s\n' "$_out" | grep -qx 'DRILL-ARM arm=D of=?' \
+    && pass "ARM set but no SIM_DRILL_NAME (a hand-run arm): 'of=?' — the runner rejects it as CONTRACT-ERROR rather than guessing" \
+    || fail "hand-run arm line: $(printf '%s\n' "$_out" | grep '^DRILL-ARM' | tr '\n' '|')"
 
 
 # ── M1 flight recorder: capture must NEVER be able to change a verdict ──────────────────────────────
@@ -342,6 +361,30 @@ fi
 SIM_EVIDENCE_DIR=/proc/self/no/such/place run_drill_body "$body" | grep -q '^DRILL-EVIDENCE ' \
     && fail "M1: announced DRILL-EVIDENCE with no file behind it" \
     || pass "M1: no DRILL-EVIDENCE line when nothing could be written"
+
+# (3) simcluster-speed 0b (mutation T-1): the timeline SIDECAR must leave the console byte-identical —
+#     every parsed line, not only the verdict — whether the file is set, unset, or unwritable. The
+#     DRILL-POLL-WAIT trailer carries wall=/t0= and so differs between any two runs by construction; it
+#     is masked here the same way a parser must treat it (it is the one deliberately non-stable line).
+body='drill_begin "t1-timeline"
+    assert_ok "passes" true
+    assert_ok "polls" poll_until 3 1 "quick" -- true'
+# Mask ONLY the two fields that legitimately differ between two runs (wall seconds, start epoch); every
+# other byte of the trailer must still compare equal — a mask over the whole line let a sidecar field
+# appended to DRILL-POLL-WAIT pass byte-identity unnoticed (internal review round 1 R3-9).
+_tl_mask() { sed -E 's/^(DRILL-POLL-WAIT direct_total=[0-9]+s) wall=[0-9]+s t0=[0-9]+/\1 wall=<w> t0=<t>/'; }
+tl_set=$(SIM_TIMELINE_FILE="$EV/t1.tl" SIM_EVIDENCE_DIR="$EV/ok3" run_drill_body "$body" | _tl_mask)
+tl_unset=$(SIM_EVIDENCE_DIR="$EV/ok3" run_drill_body "$body" | _tl_mask)
+tl_bad=$(SIM_TIMELINE_FILE=/proc/self/no/such/place/t1.tl SIM_EVIDENCE_DIR="$EV/ok3" run_drill_body "$body" | _tl_mask)
+if [ "$tl_set" != "$tl_unset" ] || [ "$tl_set" != "$tl_bad" ]; then fail "T-1: the timeline sidecar changed the console:
+       set:     $(printf '%s' "$tl_set" | tail -3 | tr '\n' '|')
+       unset:   $(printf '%s' "$tl_unset" | tail -3 | tr '\n' '|')
+       unwritable: $(printf '%s' "$tl_bad" | tail -3 | tr '\n' '|')"
+elif [ ! -s "$EV/t1.tl" ]; then fail "T-1: sidecar set but nothing was written to it"
+elif ! grep -q '	poll	met 0s/3s quick$' "$EV/t1.tl"; then fail "T-1: the poll inside assert_ok's captured predicate did not reach the sidecar"
+else pass "T-1: timeline sidecar leaves the console byte-identical (set / unset / unwritable) and records the captured poll"
+fi
+printf '%s\n' "$tl_set" | grep -q '^DRILL-POLL-WAIT direct_total=[0-9]*s wall=<w> t0=<t>$' || fail "T-1 control: the trailer mask matched nothing (or the trailer grew a field the mask does not know) — the comparison proves less than it claims"
 
 # (3) A GREEN drill writes nothing at all — zero cost, and no file to mislead an operator.
 out=$(SIM_EVIDENCE_DIR="$EV/g" run_drill_body 'drill_begin "m1-green"; assert_ok "ok" true')

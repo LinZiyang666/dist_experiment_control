@@ -156,3 +156,106 @@ func TestB4OnBrokerPredicateSense(t *testing.T) {
 		t.Error("a draining VOTER must NOT satisfy the --on-broker predicate")
 	}
 }
+
+// origin: simcluster-speed Block 2b, drill 74 solos (gotcha #86). The leader forwards an expose the
+// instant it committed the allocation; the assigned HOME may not have applied it yet, and the agent's
+// first REGISTER there was answered token_unknown_or_revoked — 3 of 7 solo runs on 2026-09-19. The
+// barrier below is the leader's half: wait, bounded, for the home's command-domain AppliedIndex.
+func TestAwaitHomeAppliedWaitsForTheHomeNoLongerThanTheBudget(t *testing.T) {
+	const need = uint64(40)
+	step := 5 * time.Millisecond
+	// polls returns successive scatter/gather results; after the slice is exhausted the last one repeats.
+	mk := func(polls ...map[string]proto.ClusterHealthResp) (func() map[string]proto.ClusterHealthResp, *int) {
+		calls := 0
+		return func() map[string]proto.ClusterHealthResp {
+			calls++
+			if calls <= len(polls) {
+				return polls[calls-1]
+			}
+			return polls[len(polls)-1]
+		}, &calls
+	}
+	home := func(applied uint64) map[string]proto.ClusterHealthResp {
+		return map[string]proto.ClusterHealthResp{"brk2": {NodeID: "brk2", AppliedIndex: applied}, "brk1": {NodeID: "brk1", AppliedIndex: 99}}
+	}
+	t.Run("home already applied: no wait", func(t *testing.T) {
+		poll, n := mk(home(40))
+		waited, ok := awaitHomeApplied("brk2", need, 200*time.Millisecond, step, poll)
+		if !ok || *n != 1 || waited > 50*time.Millisecond {
+			t.Fatalf("ok=%v polls=%d waited=%s, want ok after one poll with no sleep", ok, *n, waited)
+		}
+	})
+	t.Run("home catches up on the third poll", func(t *testing.T) {
+		poll, n := mk(home(38), home(39), home(40))
+		waited, ok := awaitHomeApplied("brk2", need, 500*time.Millisecond, step, poll)
+		if !ok || *n != 3 || waited < 2*step {
+			t.Fatalf("ok=%v polls=%d waited=%s, want ok on the third poll after two steps", ok, *n, waited)
+		}
+	})
+	t.Run("another broker's index never counts", func(t *testing.T) {
+		poll, _ := mk(map[string]proto.ClusterHealthResp{"brk1": {NodeID: "brk1", AppliedIndex: 99}})
+		if _, ok := awaitHomeApplied("brk2", need, 30*time.Millisecond, step, poll); ok {
+			t.Fatal("a home that never answered was reported caught up because another broker had the index")
+		}
+	})
+	t.Run("home never catches up: gives up at the budget, forward proceeds", func(t *testing.T) {
+		poll, n := mk(home(39))
+		waited, ok := awaitHomeApplied("brk2", need, 40*time.Millisecond, step, poll)
+		if ok || waited < 40*time.Millisecond || waited > 400*time.Millisecond || *n < 2 {
+			t.Fatalf("ok=%v waited=%s polls=%d, want !ok at ≈ the budget after several polls", ok, waited, *n)
+		}
+	})
+}
+
+type scriptedLagSource struct {
+	caughtUp bool
+	lagging  bool
+	err      error
+}
+
+func (s scriptedLagSource) CaughtUp() bool                     { return s.caughtUp }
+func (s scriptedLagSource) CommandApplyLagging() (bool, error) { return s.lagging, s.err }
+
+// TestApplyLagReadsBothDomains pins that the home's lag reading combines the raft-domain CaughtUp
+// with the command-domain CommandApplyLagging — the row "caught up in raft, SQLite behind" is the
+// whole point of round-2 R2-F2: dropping the command-domain term makes it green again, which is
+// exactly the blindness the fix removed.
+// origin: simcluster-speed review round 2 R2-F2 (gotcha #86 half ②)
+func TestApplyLagReadsBothDomains(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		src  scriptedLagSource
+		want bool
+	}{
+		{"never synced / dispatch backlog: lagging", scriptedLagSource{caughtUp: false}, true},
+		{"caught up in raft, SQLite current: owes nothing", scriptedLagSource{caughtUp: true, lagging: false}, false},
+		{"caught up in raft, SQLite behind the newest command: lagging", scriptedLagSource{caughtUp: true, lagging: true}, true},
+		{"lag unreadable: lagging (transient is the safe direction)", scriptedLagSource{caughtUp: true, err: errors.New("db")}, true},
+	} {
+		if got := applyLagOf(c.src, silentLogger()); got != c.want {
+			t.Fatalf("%s: lagging=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestMissingTokenIsCatchingUpOnlyOnALaggingReplica pins the pure half of #86's home side: "no such
+// token" is transient (home_catching_up) exactly when a clustered replica is lagging; single mode and
+// a replica that owes no committed command keep the terminal, anti-enumeration-collapsed answer. The
+// lag reading itself (command domain, internal/cluster.CommandApplyLagging) is pinned in
+// internal/cluster; the call site is pinned by home_test.go's unknown-token rows.
+func TestMissingTokenIsCatchingUpOnlyOnALaggingReplica(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		cluster, lagging bool
+		wantTransient    bool
+	}{
+		{"single mode, store is the authority", false, false, false},
+		{"single mode, lag flag meaningless", false, true, false},
+		{"cluster, owes nothing: terminal", true, false, false},
+		{"cluster, lagging: transient", true, true, true},
+	} {
+		if got := missingTokenIsCatchingUp(c.cluster, c.lagging); got != c.wantTransient {
+			t.Fatalf("%s: transient=%v want %v", c.name, got, c.wantTransient)
+		}
+	}
+}

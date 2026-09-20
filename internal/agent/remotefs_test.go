@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -213,8 +214,8 @@ func TestBuildExecCmd_offModeInertWithHangable(t *testing.T) {
 
 type noopExpose struct{}
 
-func (noopExpose) AddProxy(PortToken) error      { return nil }
-func (noopExpose) RemoveProxy(string, int) error { return nil }
+func (noopExpose) AddProxy(context.Context, PortToken) error { return nil }
+func (noopExpose) RemoveProxy(string, int) error             { return nil }
 
 // TestReplayPortsFromState_boundedOnWedgedHome pins review B2: the boot-path
 // state.json read (replayPortsFromState) must NOT D-hang the whole Run() loop on
@@ -247,7 +248,7 @@ func TestReplayPortsFromState_boundedOnWedgedHome(t *testing.T) {
 	a.cfg.ExposeAdapter = noopExpose{} // non-nil so replay proceeds to the read
 
 	done := make(chan struct{})
-	go func() { a.replayPortsFromState(); close(done) }()
+	go func() { a.replayPortsFromState(context.Background()); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):

@@ -10,47 +10,62 @@
 # mis-order a sweep; it can never mis-judge one. A drill ABSENT from this table sorts FIRST at maximum
 # cost, so a newly added drill can never silently become the straggler that sets the wall.
 #
-# Costs are p50 seconds. Re-seed from a sweep's rollup.tsv duration_s column (run-drills.sh records it).
-# Source: full sweep -j 6, weilandserver, 2026-07-23 10:02-10:49, image built from c6b9c9e.
+# Costs are ONE sample each (n=1; the column used to be called p50_secs, which it never was). Re-seed from a
+# sweep's rollup.tsv duration_s column (run-drills.sh records it) — from COMPLETE runs: a run that died at an
+# early assertion (a SETUP-RED at a watermark, an ASSERT-FAIL before the long phase) under-measures the unit.
+# Source: S2 full sweep -j 6 (lanes on, cap 5, --no-retry), weilandserver, 2026-09-19 21:08:04–21:36:39 (sweep phase 1719 s; the attribution pass ran to 22:10), simcluster-speed
+# image #11 (a3431a1 + the increment). One sample per UNIT (arm units of 74/96 carry their own rows); attribution
+# solo re-runs excluded. Class: short <=180, medium 181–500, long >500 (the July bands, unchanged). 78/83/84 had no
+# row before (they sorted first at max cost since they landed); the interim solo-2026-09-19 rows are replaced.
+# 2026-09-20 round-2 review R1-F9: eight S2 first-attempt rows came from NON-completing runs (98 SETUP-RED at the
+# watermark = 186 s vs ≈245 s complete; 94 191 s pre-#87 ASSERT-FAIL; 52/60/81/73/30/96.F ASSERT-FAIL first attempts).
+# Those rows are re-seeded here from the nearest COMPLETE sample on the same or a later image (batch21 solos / V7 -j12 /
+# the round-2 re-runs), noted per row. Order-only file: the effect is a slot or two.
 #
-# drill	p50_secs	class	note
-96-mid-flight-chaos	1337	long	-
-67-transient-js-refusal	777	long	-
-90-alerts-lifecycle	775	long	-
-74-rebalance-on-return	653	long	-
-41-shrink-to-standalone	572	long	-
-97-soak-cycles	568	long	-
-40-drain-retire	565	long	-
-22-forcesingle-online	477	medium	-
-51-full-dr	467	medium	-
-71-expose-rehome-failover	428	medium	-
-73-proxy-cluster-ha	419	medium	-
-93-metrics-observability	392	medium	-
-30-rolling-upgrade	378	medium	-
-91-client-converge	376	medium	-
-42-rejoin-returning	344	medium	-
-10-grow-to-3	305	medium	-
-92-js503-remote-alert	291	medium	-
-95-broker-selfheal	274	medium	-
-13-inbroker-reconcile-perm	266	medium	-
-52-credential-rotation	234	medium	-
-50-backup-restore	227	medium	-
-82-agent-onboarding-invite	196	medium	-
-20-forcesingle-natsconf	186	medium	-
-12-ghost-voter	174	short	-
-11-grow-gaps	152	short	-
-94-agent-reconcile	133	short	-
-72-proxy-subscription	108	short	-
-61-transfer-edges	88	short	-
-81-admin-evict-session-rm	69	short	-
-60-user-journey	69	short	-
-32-install-lifecycle	65	short	-
-80-session-isolation	62	short	-
-31-node-upgrade-fleet	62	short	-
-33-node-upgrade-success	540	long	measured 2026-08-02 (one rigid 120s watchdog window + ctl 150s wait + heal poll)
-98-stuck-redial-recovery	700	long	measured-ish: N=3 up/grow ≈3min + up to 4min nats.go ping detection under a silent DROP + bounded teardown + heal poll
-62-remote-fs-safe	52	short	-
-70-expose-journey	47	short	-
-43-migrate-live-data	46	short	-
-00-skeleton	38	short	-
-21-smalldisk-tierb	32	short	-
+# drill	secs	class	note
+00-skeleton	34	short	S2 -j6 2026-09-19 image #11
+10-grow-to-3	218	medium	S2 -j6 2026-09-19 image #11
+11-grow-gaps	88	short	S2 -j6 2026-09-19 image #11
+12-ghost-voter	109	short	S2 -j6 2026-09-19 image #11
+13-inbroker-reconcile-perm	168	short	S2 -j6 2026-09-19 image #11
+20-forcesingle-natsconf	189	medium	S2 -j6 2026-09-19 image #11
+21-smalldisk-tierb	29	short	S2 -j6 2026-09-19 image #11
+22-forcesingle-online	370	medium	S2 -j6 2026-09-19 image #11
+30-rolling-upgrade	263	medium	V7 -j12 2026-09-19 image #13 (complete INCOMPLETE; S2 row was a load-face ASSERT-FAIL)
+31-node-upgrade-fleet	57	short	S2 -j6 2026-09-19 image #11
+32-install-lifecycle	63	short	S2 -j6 2026-09-19 image #11
+33-node-upgrade-success	214	medium	S2 -j6 2026-09-19 image #11
+40-drain-retire	497	medium	S2 -j6 2026-09-19 image #11
+41-shrink-to-standalone	374	medium	S2 -j6 2026-09-19 image #11
+42-rejoin-returning	222	medium	S2 -j6 2026-09-19 image #11
+43-migrate-live-data	37	short	S2 -j6 2026-09-19 image #11
+50-backup-restore	166	short	S2 -j6 2026-09-19 image #11
+51-full-dr	315	medium	S2 -j6 2026-09-19 image #11
+52-credential-rotation	179	short	batch21 52b solo 2026-09-19 image #13 (complete GREEN; S2 row was an oracle ASSERT-FAIL)
+60-user-journey	59	short	batch21 60 solo 2026-09-19 image #13 (complete GREEN; S2 row was an oracle ASSERT-FAIL)
+61-transfer-edges	92	short	S2 -j6 2026-09-19 image #11
+62-remote-fs-safe	94	short	S2 -j6 2026-09-19 image #11
+67-transient-js-refusal	186	medium	S2 -j6 2026-09-19 image #11
+70-expose-journey	41	short	S2 -j6 2026-09-19 image #11
+71-expose-rehome-failover	240	medium	S2 -j6 2026-09-19 image #11
+72-proxy-subscription	85	short	S2 -j6 2026-09-19 image #11
+73-proxy-cluster-ha	328	medium	batch21 73flip2 solo 2026-09-19 image #13 (complete GREEN; S2 row was a Q-xcheck ASSERT-FAIL)
+74-rebalance-on-return.C	394	medium	S2 -j6 2026-09-19 image #11
+74-rebalance-on-return.SRAB	379	medium	S2 -j6 2026-09-19 image #11
+78-proxy-dial-backoff	296	medium	S2 -j6 2026-09-19 image #11
+80-session-isolation	60	short	S2 -j6 2026-09-19 image #11
+81-admin-evict-session-rm	62	short	batch21 81b solo 2026-09-19 image #13 (complete GREEN; S2 row was an oracle ASSERT-FAIL)
+82-agent-onboarding-invite	127	short	S2 -j6 2026-09-19 image #11
+83-cloned-image-instances	40	short	S2 -j6 2026-09-19 image #11
+84-shared-home-instances	52	short	S2 -j6 2026-09-19 image #11
+90-alerts-lifecycle	520	long	S2 -j6 2026-09-19 image #11
+91-client-converge	290	medium	S2 -j6 2026-09-19 image #11
+92-js503-remote-alert	271	medium	S2 -j6 2026-09-19 image #11
+93-metrics-observability	359	medium	S2 -j6 2026-09-19 image #11
+94-agent-reconcile	120	short	batch21 94c solo 2026-09-19 image #13 (complete GREEN; S2 row was a pre-#87 ASSERT-FAIL)
+95-broker-selfheal	214	medium	S2 -j6 2026-09-19 image #11
+96-mid-flight-chaos.A	741	long	S2 -j6 2026-09-19 image #11
+96-mid-flight-chaos.D	324	medium	S2 -j6 2026-09-19 image #11
+96-mid-flight-chaos.F	219	medium	V7 -j12 2026-09-19 image #13 (complete INCOMPLETE; S2 row was an F4 ASSERT-FAIL)
+97-soak-cycles	464	medium	S2 -j6 2026-09-19 image #11
+98-stuck-redial-recovery	245	medium	round-2 re-run 2026-09-20 image #14 (complete; S2 row was a 186 s SETUP-RED)

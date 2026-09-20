@@ -9,10 +9,26 @@ else
     _C_RED=; _C_GRN=; _C_YEL=; _C_BLU=; _C_DIM=; _C_RST=
 fi
 
-log()  { printf '%s[simcluster]%s %s\n' "$_C_BLU" "$_C_RST" "$*" >&2; }
-ok()   { printf '%s[ ok ]%s %s\n'      "$_C_GRN" "$_C_RST" "$*" >&2; }
-warn() { printf '%s[warn]%s %s\n'      "$_C_YEL" "$_C_RST" "$*" >&2; }
-err()  { printf '%s[err ]%s %s\n'      "$_C_RED" "$_C_RST" "$*" >&2; }
+# TIMELINE SIDECAR (simcluster-speed 0b). When SIM_TIMELINE_FILE is set, every log/ok/warn/err line and
+# every poll_until outcome is ALSO appended there as `<epoch>\t<kind>\t<text≤160>` — a machine-readable
+# timeline of where a drill's minutes went. It is a SIDECAR, not a prefix: the console output stays
+# byte-identical (pinned by tests/verdict-contract-test.sh), because three parsers key on these lines
+# (run-drills.sh's classifier and _first_fail_sig, the hermetic verdict tests) and a timestamp in the
+# console would break every one of them. It reaches sub-shells too: a poll_until that runs inside an
+# assert_ok's captured predicate still inherits the exported path, so the waits that the console never
+# shows (assert_ok swallows its predicate's output on success) still land in the file. Writes are
+# best-effort (`|| true`): an unwritable path must never change a verdict.
+_tl() {
+    [ -n "${SIM_TIMELINE_FILE:-}" ] || return 0
+    # The redirection sits on a COMPOUND command, not on printf: a failing `>>` is diagnosed by the shell
+    # ("cannot create …") before a same-command `2>/dev/null` takes effect, and that line would land on
+    # the console — the exact byte the sidecar promises never to add (caught by verdict-contract T-1).
+    { printf '%s\t%s\t%.160s\n' "$(date +%s)" "$1" "$2" >> "$SIM_TIMELINE_FILE"; } 2>/dev/null || true
+}
+log()  { printf '%s[simcluster]%s %s\n' "$_C_BLU" "$_C_RST" "$*" >&2; _tl log "$*"; }
+ok()   { printf '%s[ ok ]%s %s\n'      "$_C_GRN" "$_C_RST" "$*" >&2; _tl ok "$*"; }
+warn() { printf '%s[warn]%s %s\n'      "$_C_YEL" "$_C_RST" "$*" >&2; _tl warn "$*"; }
+err()  { printf '%s[err ]%s %s\n'      "$_C_RED" "$_C_RST" "$*" >&2; _tl err "$*"; }
 die()  { err "$*"; exit 1; }
 
 # run <cmd...>: echo the command dimly, then run it. Fails loudly.
@@ -105,6 +121,9 @@ _poll_impl() {
             _pu_el=$(( $(date +%s) - (_pu_end - _pu_timeout) ))
             [ "$_pu_el" -lt 0 ] && _pu_el=0
             _pu_accum "$_pu_el"
+            # The sidecar gets EVERY poll (the timeline is for adding them up); the console keeps its
+            # 5 s floor (below it the line would bury the waits that cost real time).
+            _tl poll "met ${_pu_el}s/${_pu_timeout}s ${_pu_desc}"
             # Only report waits worth reading. A poll that returns on its first sample is the common
             # case and logging it would bury the ones that cost real time.
             [ "$_pu_el" -ge 5 ] && log "poll_until: condition met after ${_pu_el}s (budget ${_pu_timeout}s): ${_pu_desc}"
@@ -118,6 +137,7 @@ _poll_impl() {
             _pu_tel=$(( $(date +%s) - (_pu_end - _pu_timeout) ))
             [ "$_pu_tel" -lt 0 ] && _pu_tel=0
             _pu_accum "$_pu_tel"
+            _tl poll "TIMEOUT ${_pu_tel}s/${_pu_timeout}s ${_pu_desc}"
             _pu_pop; return 1
         fi
         # V2 fast-start: for the first <interval> seconds sample every min(1s, interval); after that use

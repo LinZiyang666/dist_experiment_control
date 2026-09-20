@@ -125,7 +125,7 @@ func TestD6CertPinRejectsRogue(t *testing.T) {
 	seedHomedExpose(t, db, hSID, hNID, "svc", publicPort, echo, token, "node-A", 0)
 
 	cli := newAgentClient(t, homeA.addr, echo)
-	err := cli.OpenHome(publicPort, echo, token, homeA.addr, 0, proto.CertPins{Current: wrongFP})
+	err := cli.OpenHome(t.Context(), publicPort, echo, token, homeA.addr, 0, proto.CertPins{Current: wrongFP})
 	if err == nil {
 		t.Fatal("OpenHome with a mismatched pin must fail the handshake")
 	}
@@ -150,7 +150,7 @@ func TestD6CatchUpTransientEndToEnd(t *testing.T) {
 
 	cli := newAgentClient(t, homeA.addr, echo)
 	// Agent presents epoch 1; the home's row is still epoch 0 → home_catching_up.
-	err := cli.OpenHome(publicPort, echo, token, homeA.addr, 1, pinsFor(homeA))
+	err := cli.OpenHome(t.Context(), publicPort, echo, token, homeA.addr, 1, pinsFor(homeA))
 	var de *tunnel.DenyError
 	if !errors.As(err, &de) || de.Reason != proto.ReasonHomeCatchingUp {
 		t.Fatalf("want transient home_catching_up DENY, got %v", err)

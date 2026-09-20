@@ -261,6 +261,13 @@ type transferEntry struct {
 	startedAt  time.Time
 	cancel     context.CancelFunc // cancels the timeout watchdog
 	finalized  bool               // set under tracker.mu when audit complete|failed already written
+	// committed is set under tracker.mu when a push-commit has been FORWARDED to the receiver. From that
+	// moment the agent owns the terminal (its ev.transfer), so a creator-side finalize{failed} must be
+	// refused; before it, the creator is the only party that can know the upload was abandoned.
+	// origin: simcluster-speed 0a (drill 67) — a ctl whose ObjectStore.Put failed had no way to
+	// release its slot, so the per-bucket serialisation refused every later tier-B push of the session
+	// with too_many_in_flight until the watchdog reaped the entry at its full budget.
+	committed bool
 }
 
 // transferTracker is a process-wide registry. Long-lived, attached to
@@ -314,10 +321,20 @@ func (t *transferTracker) get(id string) *transferEntry {
 // armed on that id, so replacing the entry would let the stale
 // watchdog claim and reap the replacement mid-transfer.
 func (t *transferTracker) put(e *transferEntry) string {
+	code, _ := t.putWithBlocker(e)
+	return code
+}
+
+// putWithBlocker is put plus, for a per-bucket refusal, the transfer_id that holds the bucket — the
+// ONE piece of information that makes the refusal actionable. "retry shortly or use a fresh transfer
+// id" was the advice for both refusal shapes, and for the bucket shape the second half is false: the
+// slot is keyed on the bucket, so a fresh id is refused identically. An operator reading drill 67's
+// twelve refusals had no way to see that they were all waiting on the same abandoned upload.
+func (t *transferTracker) putWithBlocker(e *transferEntry) (code, blocker string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, exists := t.entries[e.transferID]; exists {
-		return "transfer_id_in_flight"
+		return "transfer_id_in_flight", e.transferID
 	}
 	// The bucket is per session and intentionally sized for one maximum object plus overhead.
 	// Serialize tier-B use of the same bucket so two valid objects cannot race into DiscardNew.
@@ -325,27 +342,49 @@ func (t *transferTracker) put(e *transferEntry) string {
 	if e.bucket != "" {
 		for _, live := range t.entries {
 			if live.bucket == e.bucket {
-				return "too_many_in_flight"
+				return "too_many_in_flight", live.transferID
 			}
 		}
 	}
 	if len(t.entries) >= transferTrackerMaxEntries {
-		return "too_many_in_flight"
+		return "too_many_in_flight", ""
 	}
 	t.entries[e.transferID] = e
-	return ""
+	return "", ""
+}
+
+// inFlightRefusalText renders the operator-facing reason for a put refusal. code is what putWithBlocker
+// returned; blocker is the holding transfer_id when the refusal is the per-bucket serialisation.
+func inFlightRefusalText(transferID, code, blocker string) string {
+	if code == "too_many_in_flight" && blocker != "" {
+		return fmt.Sprintf("transfer %s rejected (%s): another tier-B transfer %s is in flight in this session's bucket; "+
+			"wait for it to finish or be reaped at its budget — a fresh transfer id is refused the same way",
+			transferID, code, blocker)
+	}
+	return fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", transferID, code)
 }
 
 // remove deletes the entry. It used to return it; nothing ever read the result, and a returned
 // value nobody reads reads like a handle somebody is holding.
-func (t *transferTracker) remove(id string) {
+//
+// Identity-bound like the claims (external review round 3 R3-F1, main-process follow-through): only
+// the exact entry the caller holds is deleted, never whatever the id maps to now. Every production
+// remove follows a successful claim on the same entry, and a claimed entry cannot be replaced
+// (put refuses a live id), so a by-id delete was safe by a two-step argument — this makes it safe by
+// construction, and leaves put (refuses duplicates) and get (the preview) as the only by-id paths.
+func (t *transferTracker) remove(expected *transferEntry) {
+	if expected == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.entries, id)
+	if t.entries[expected.transferID] == expected {
+		delete(t.entries, expected.transferID)
+	}
 }
 
-// claimFinalize atomically marks the entry as finalized iff:
-//   - the entry exists in the map, AND
+// claimFinalize atomically marks the expected entry as finalized iff:
+//   - the map still holds that exact entry, AND
 //   - it hasn't already been finalized.
 //
 // First caller wins; later callers receive ok=false and MUST NOT write
@@ -361,18 +400,94 @@ func (t *transferTracker) remove(id string) {
 // Audit shard P11 F1: previous markFinalized + per-handler
 // `entry.finalized = false` "unclaim" pattern was racy because the
 // unclaim happened outside tracker.mu. The new contract is
-// validate-then-claim: callers do all validation against immutable
-// fields BEFORE calling claimFinalize, so there is no path that
-// claims and then needs to back out.
-func (t *transferTracker) claimFinalize(id string) (e *transferEntry, ok bool) {
+// validate-then-claim: callers validate immutable fields on expected before
+// claiming. The identity check under the lock preserves that authorization
+// even if a completed transfer's id is reused while validation is in flight.
+// It also fences stale watchdogs and cleanup callbacks out of the new entry.
+func (t *transferTracker) claimFinalize(expected *transferEntry) (e *transferEntry, ok bool) {
+	if expected == nil {
+		return nil, false
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e = t.entries[id]
-	if e == nil || e.finalized {
+	e = t.entries[expected.transferID]
+	if e != expected {
+		return nil, false
+	}
+	if e.finalized {
 		return e, false
 	}
 	e.finalized = true
 	return e, true
+}
+
+// markCommitted hands the expected push to the receiver. It reports false when the entry was
+// removed, replaced or already finalized (the watchdog won), in which case the caller must
+// not forward — the receiver would Get an object whose terminal audit is already written.
+func (t *transferTracker) markCommitted(expected *transferEntry) bool {
+	if expected == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e := t.entries[expected.transferID]
+	if e != expected || e.finalized {
+		return false
+	}
+	e.committed = true
+	return true
+}
+
+// abandonRefusal is why claimAbandonedPush did not claim: the entry is gone, already finalized (a
+// concurrent finalize / the watchdog won — the caller answers idempotent OK), not a push, a push the
+// receiver already owns (committed), or a tier-A push (never the creator's to end).
+type abandonRefusal int
+
+const (
+	abandonClaimed   abandonRefusal = iota
+	abandonNoEntry                  // the expected entry is no longer tracked (removed or replaced)
+	abandonFinalized                // someone else claimed the terminal first
+	abandonNotPush                  // a pull — claimFinalize's job
+	abandonCommitted                // the commit was forwarded; the receiver's ev.transfer is the terminal
+	abandonTierA                    // tier-A: the receiver owned the terminal from the first byte
+)
+
+// claimAbandonedPush is claimFinalize restricted to a push whose creator gave up BEFORE commit: the
+// entry must still be the validated preview, a push, TIER B, not yet committed, not yet finalized. The checks and the claim happen
+// under one lock so a push-commit racing in cannot slip between "not committed" and "finalized" —
+// whichever of markCommitted / claimAbandonedPush takes the mutex first wins, and the other sees it.
+// The refusal reason is the entry's state AS READ UNDER THAT LOCK: the caller words its reply from it,
+// and reading the flags from the preview pointer afterwards would race markCommitted's write (internal
+// review round 1 R6-F3).
+//
+// The tier is the TRACKED one (stamped from the validated push.req when the entry was created), never
+// the finalize body's: a tier-A push has no commit phase — its bytes went to the receiving agent in the
+// push.req itself, so `committed` is false for its whole life, and without this check the creator's
+// finalize{failed} claimed the terminal of a transfer the agent was in the middle of landing — audit
+// said failed, the tracker was gone, and the agent's real terminal then found no entry (external review
+// F2). Only tier B has a pre-commit window in which the creator is the only party who can know the
+// upload was abandoned.
+func (t *transferTracker) claimAbandonedPush(expected *transferEntry) (*transferEntry, abandonRefusal) {
+	if expected == nil {
+		return nil, abandonNoEntry
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e := t.entries[expected.transferID]
+	switch {
+	case e != expected:
+		return nil, abandonNoEntry
+	case e.finalized:
+		return e, abandonFinalized
+	case e.verb != "push":
+		return e, abandonNotPush
+	case e.committed:
+		return e, abandonCommitted
+	case e.tier != "b":
+		return e, abandonTierA
+	}
+	e.finalized = true
+	return e, abandonClaimed
 }
 
 // activeOBJStreams returns a snapshot of the in-flight bucket names.
@@ -935,7 +1050,7 @@ func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry)
 			return
 		case <-t.C:
 		}
-		ent, ok := b.transfers.claimFinalize(e.transferID)
+		ent, ok := b.transfers.claimFinalize(e)
 		if !ok || ent == nil {
 			return
 		}
@@ -1212,11 +1327,10 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: req.Bucket, path: req.Path, size: req.Size,
 		startedAt: b.cfg.Now(),
 	}
-	if code := b.transfers.put(entry); code != "" {
-		// Duplicate id or in-flight cap reached. Per-session bucket
+	if code, blocker := b.transfers.putWithBlocker(entry); code != "" {
+		// Duplicate id, per-bucket serialisation, or in-flight cap reached. Per-session bucket
 		// survives across transfers, so no bucket cleanup needed here.
-		b.replyPushErr(msg, code,
-			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
+		b.replyPushErr(msg, code, inFlightRefusalText(req.TransferID, code, blocker))
 		return
 	}
 	// #57 Lane B: persist the durable in-flight ledger BEFORE forwarding, so a home crash between here and a
@@ -1353,11 +1467,10 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		bucket: bucket, path: req.Path,
 		startedAt: b.cfg.Now(),
 	}
-	if code := b.transfers.put(entry); code != "" {
+	if code, blocker := b.transfers.putWithBlocker(entry); code != "" {
 		// Per-session bucket survives across transfers; nothing to
 		// reap on this rejection.
-		b.replyPullErr(msg, code,
-			fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", req.TransferID, code))
+		b.replyPullErr(msg, code, inFlightRefusalText(req.TransferID, code, blocker))
 		return
 	}
 	// #57 Lane B: durable in-flight ledger BEFORE forwarding (see handlePushReq).
@@ -1440,6 +1553,14 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 	req.ActorFP = fp
+	// Hand the terminal to the receiver BEFORE forwarding: once the agent may have seen the commit,
+	// only its ev.transfer may end this transfer (a creator finalize{failed} is refused from here on).
+	// A false return means the watchdog already reaped it — forwarding would let the agent Get an
+	// object whose failed audit is on disk, so answer the way handleEvTransfer would.
+	if !b.transfers.markCommitted(entry) {
+		b.replyCommitErr(msg, "transfer_unknown", req.TransferID)
+		return
+	}
 	body, _ := json.Marshal(&req)
 	fwd := &nats.Msg{
 		Subject: proto.SubjCmdForwarded(sid, nid, verb),
@@ -1496,7 +1617,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 			"want_nid", preview.nid, "got_nid", nid)
 		return
 	}
-	entry, claimed := b.transfers.claimFinalize(transferID)
+	entry, claimed := b.transfers.claimFinalize(preview)
 	if !claimed {
 		// Already finalized by watchdog or another caller. Don't
 		// double-write audit / double-delete the transfer object.
@@ -1520,7 +1641,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 	if entry.cancel != nil {
 		entry.cancel()
 	}
-	b.transfers.remove(transferID)
+	b.transfers.remove(entry)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 	b.cfg.Logger.Info("broker: ev.transfer handled",
 		"transfer_id", transferID, "kind", kind, "verb", entry.verb)
@@ -1531,7 +1652,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 // bucket + cancels the watchdog. Idempotent: if a watchdog or
 // finalize handler already claimed the entry, this is a no-op.
 func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
-	ent, claimed := b.transfers.claimFinalize(entry.transferID)
+	ent, claimed := b.transfers.claimFinalize(entry)
 	if !claimed || ent == nil {
 		return
 	}
@@ -1570,7 +1691,7 @@ func (b *Broker) finalizeTransfer(ent *transferEntry, rec schema.AuditTransfer, 
 	if cancelEntry && ent.cancel != nil {
 		ent.cancel()
 	}
-	b.transfers.remove(ent.transferID)
+	b.transfers.remove(ent)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 }
 
@@ -1778,12 +1899,59 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "not_owner_or_creator"})
 		return
 	}
-	if preview.verb != "pull" {
+	// Which side owns the terminal depends on the verb, the tier and the phase:
+	//   pull    — the creator (ctl) is the receiver; every finalize is its to send.
+	//   push, B — the receiver is the agent, whose ev.transfer is the terminal once the commit has been
+	//             forwarded. BEFORE commit there is no receiver in the loop, so the only party that can
+	//             know the upload was abandoned (ObjectStore.Put failed, bucket bind failed) is the
+	//             creator, and its finalize{failed} is the one signal that frees the per-bucket slot.
+	//             Without it the entry sits until the watchdog's full budget and the session's next
+	//             tier-B push is refused too_many_in_flight (drill 67 CONTROL(after), simcluster-speed
+	//             0a). A creator finalize{complete} for a push is still refused: only the agent can vouch
+	//             the file landed.
+	//   push, A — the receiver owned the terminal from the first byte: the bytes travelled inside the
+	//             push.req, there is no commit phase, and the agent's ev.transfer is the ONLY terminal.
+	//             The creator has nothing to abandon, so its finalize is refused whatever the kind
+	//             (external review F2: the first version accepted it, wrote a failed audit and dropped
+	//             the tracker while the agent was still landing the file).
+	// The tier that decides this is the TRACKED tier (claimAbandonedPush reads it under the claim
+	// lock), never fin.Tier — a request body cannot promote a tier-A push into the abandonable class.
+	var (
+		entry   *transferEntry
+		claimed bool
+	)
+	switch {
+	case preview.verb == "pull":
+		entry, claimed = b.transfers.claimFinalize(preview)
+	case preview.verb == "push" && fin.Kind == "failed":
+		var why abandonRefusal
+		entry, why = b.transfers.claimAbandonedPush(preview)
+		switch why {
+		case abandonClaimed:
+			claimed = true
+		case abandonCommitted:
+			b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+				Code: "verb_mismatch", Error: "push already committed: the receiver's ev.transfer is its terminal"})
+			return
+		case abandonTierA:
+			b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+				Code: "verb_mismatch", Error: "tier-a push: the receiving agent owns the terminal; the creator cannot abandon it"})
+			return
+		case abandonNoEntry, abandonFinalized:
+			// The preview saw OUR push; between it and the claim someone else wrote the terminal
+			// (the watchdog, a duplicate finalize) and possibly removed the entry. Idempotent OK below.
+			claimed = false
+		case abandonNotPush:
+			// Defensive verb guard; the claim also checks that this is still the validated preview.
+			b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
+				Code: "verb_mismatch", Error: "finalize.req is pull-only, or tier-b push{failed} before commit"})
+			return
+		}
+	default:
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false,
-			Code: "verb_mismatch", Error: "finalize.req is pull-only"})
+			Code: "verb_mismatch", Error: "finalize.req is pull-only, or tier-b push{failed} before commit"})
 		return
 	}
-	entry, claimed := b.transfers.claimFinalize(transferID)
 	if !claimed {
 		// Concurrent finalize won the race (duplicate from same actor,
 		// or watchdog raced us after our preview). Reply OK so the
@@ -1793,15 +1961,16 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		return
 	}
 
-	// Resolve tier. ctl-supplied body wins over the optimistic "b" we
-	// stamped at pull.req time (tier-A pulls have an empty bucket).
+	// Resolve tier. For a PULL the ctl-supplied body wins over the optimistic "b" we stamped at
+	// pull.req time (tier-A pulls have an empty bucket). A push's tier was validated at push.req and
+	// is the tracked one; the body does not get a vote (F2).
 	tier := entry.tier
-	if fin.Tier == "a" || fin.Tier == "b" {
+	if entry.verb == "pull" && (fin.Tier == "a" || fin.Tier == "b") {
 		tier = fin.Tier
 	}
 
 	rec := schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: fin.Kind, Verb: "pull",
+		V: schema.AuditSchemaVersion, Kind: fin.Kind, Verb: entry.verb,
 		Ts: b.cfg.Now(), Session: entry.sid, Node: entry.nid,
 		ActorNkey: entry.actor, ActorFp: entry.actorFP,
 		TransferID: entry.transferID, Path: entry.path,
@@ -1817,12 +1986,12 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	if entry.cancel != nil {
 		entry.cancel()
 	}
-	b.transfers.remove(transferID)
+	b.transfers.remove(entry)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 
 	b.replyFinalize(msg, proto.TransferFinalizeResp{OK: true})
-	b.cfg.Logger.Info("broker: pull finalize handled",
-		"transfer_id", transferID, "kind", fin.Kind, "tier", tier)
+	b.cfg.Logger.Info("broker: creator finalize handled",
+		"transfer_id", transferID, "verb", entry.verb, "kind", fin.Kind, "tier", tier)
 }
 
 func (b *Broker) replyFinalize(msg *nats.Msg, resp proto.TransferFinalizeResp) {

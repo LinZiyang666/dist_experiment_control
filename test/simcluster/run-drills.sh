@@ -38,11 +38,17 @@
 #   ./run-drills.sh --replay --logdir <dir>  # re-analyse an EXISTING $LOGDIR; runs nothing
 #   ./run-drills.sh --allow-product-red       # explicit owner waiver: known product defects do not fail suite
 #   ./run-drills.sh --allow-incomplete        # explicit owner waiver: coverage gaps do not fail suite
+#   ./run-drills.sh --grow-cap 8              # at most 8 units growing a cluster at once (default 5; 0 = uncapped)
+#   ./run-drills.sh --grow-stagger 30         # seconds between grow-lane launches (default 0; an experiment knob)
+#   ./run-drills.sh --live-grow               # the CONTENTION regime: grows uncapped (weekly + release gate;
+#                                             #   see contention-sensors.tsv) — a regime, never a waiver
 #   ./run-drills.sh 10-grow-to-3 20-forcesingle-natsconf   # only the named drills
+#   ./run-drills.sh 96-mid-flight-chaos.A     # one ARM of an arm-split drill (see lib/manifest.sh)
 #
-# EXIT CODE: number of unwaived non-GREEN drills after retry, saturated at 125 (0 == all green, or every
-# PRODUCT-RED/INCOMPLETE explicitly waived). The attribution pass NEVER changes it. Per-drill logs land
-# in $LOGDIR (default /tmp/simdrills).
+# EXIT CODE: number of unwaived non-GREEN DRILLS after retry, saturated at 125 (0 == all green, or every
+# PRODUCT-RED/INCOMPLETE explicitly waived). An arm-split drill blocks once however many of its arms are
+# red; an arm with no verdict (INFRA-ABORT / CONTRACT-ERROR) blocks its drill and cannot be waived. The
+# attribution pass NEVER changes it. Per-UNIT logs land in $LOGDIR (default /tmp/simdrills).
 #
 # ARTIFACTS in $LOGDIR:
 #   <drill>.log/.rc             per drill; <drill>.secs its wall cost; <drill>.attempt2.* the solo re-run
@@ -54,6 +60,17 @@
 #                               plus trailing `WAIVER-USED<TAB><flag>` rows and, after attribution,
 #                               `ATTRIBUTION<TAB><drill><TAB><label><TAB><re-run verdict>` rows (a parser
 #                               keying on field COUNT or the first column must expect these shorter rows).
+#                               simcluster-speed: the row key is a UNIT (a drill, or `<drill>.<arm>`); an
+#                               arm-split drill also gets one `ARMS<TAB><drill><TAB><joined verdict><TAB>
+#                               <arms_missing><TAB>af<TAB>sr<TAB>pr<TAB>nc<TAB>nc_gap<TAB>nc_guard<TAB>pass
+#                               <TAB><units>` row, and every sweep one `REGIME<TAB>default|live-grow|unknown
+#                               <TAB><grow cap><TAB><grow stagger>` row (copied from regime.tsv; `unknown - -`
+#                               when an older archive has none).
+#   regime.tsv                  the run's contention regime as raw metadata (same columns as the REGIME row),
+#                               written once at launch and NEVER by --replay — the rollup is rewritten by
+#                               replay, this is not, so a replay cannot re-describe the run it reads.
+#   <unit>.timeline.tsv         the timeline sidecar (lib/log.sh); read with ./timeline.sh
+#   <unit>.tmo / .grow-done     the unit's ceiling actually applied / its grow-done markers (grow lane)
 #   progress.tsv                append-only launch/done stream + a final `RUN-COMPLETE` sentinel; a reader
 #                               MUST require the sentinel before treating it as a finished result.
 #   .simdrills-owned            the ownership capability the destructive startup cleanup requires (exact
@@ -97,6 +114,21 @@ ALLOW_INCOMPLETE=0                  # fail closed unless an owner explicitly sup
 DRILL_TIMEOUT=2700                  # per-drill wall-clock ceiling, seconds. 45min is ~2x the slowest
                                     # observed drill (96/97 run 22/16min), so a trip means "wedged",
                                     # never "slow host". A tripped drill is INFRA-ABORT and NOT retried.
+# simcluster-speed E: the GROW LANE. Units whose content grows a cluster (lib/manifest.sh manifest_lane —
+# grow_to_3 / grow_to_2 / setup_forcesingle_n2 / `$SIM grow`) are throttled to GROW_CAP concurrent
+# grows, because ≥5 clusters forming at once starve raft VOTER promotion (README CAVEAT; gotcha #70)
+# and -j alone cannot bound that (the accel plan's OQ-8: `-j 6` front-loaded all five heavy grows).
+# A unit leaves the lane once it has written its declared number of grow-done markers (`# grows:`,
+# into $SIM_GROW_DONE_FILE) or exits; an undeclared unit holds its slot for its whole life
+# (conservative). 0 = uncapped = the `--live-grow` contention regime. N1-lane units are never held.
+# WHO WRITES THE MARKERS: a fixture with an in-unit nuke+retry (drills/lib/cluster.sh grow_to_3 /
+# grow_to_2) writes its declared lines ITSELF, once, after its post-check, and silences cmd_grow's
+# per-grow line for its own `$SIM grow` calls — per-grow lines kept counting across a nuke, so a retry's
+# first grow released the slot while its second was still growing (external review F4). A drill that
+# calls `$SIM grow` directly keeps cmd_grow's per-grow line.
+GROW_CAP=5
+GROW_STAGGER=0                      # seconds between grow-lane launches; an experiment knob, not a default
+LIVE_GROW=0
 INOTIFY_MIN=2048                    # cap must be >= this to run (40 containers already exhaust 128)
 INOTIFY_WANT=8192                   # value we raise it to when too low
 LOGDIR="${LOGDIR:-/tmp/simdrills}"
@@ -135,6 +167,11 @@ while [ $# -gt 0 ]; do
         --drill-timeout=*)  DRILL_TIMEOUT="${1#--drill-timeout=}"; shift ;;
         --allow-product-red) ALLOW_PRODUCT_RED=1; shift ;;
         --allow-incomplete)  ALLOW_INCOMPLETE=1; shift ;;
+        --grow-cap)         GROW_CAP="${2:?}"; REGIME_EXPLICIT=1; shift 2 ;;
+        --grow-cap=*)       GROW_CAP="${1#--grow-cap=}"; REGIME_EXPLICIT=1; shift ;;
+        --grow-stagger)     GROW_STAGGER="${2:?}"; REGIME_EXPLICIT=1; shift 2 ;;
+        --grow-stagger=*)   GROW_STAGGER="${1#--grow-stagger=}"; REGIME_EXPLICIT=1; shift ;;
+        --live-grow)        LIVE_GROW=1; REGIME_EXPLICIT=1; shift ;;
         --logdir)           LOGDIR="${2:?}"; shift 2 ;;
         --logdir=*)         LOGDIR="${1#--logdir=}"; shift ;;
         -h|--help)          usage; exit 0 ;;
@@ -146,6 +183,12 @@ done
 
 case "$JOBS"    in ''|*[!0-9]*) echo "run-drills: -j must be a non-negative integer" >&2; exit 2 ;; esac
 case "$STAGGER" in ''|*[!0-9]*) echo "run-drills: --stagger must be a non-negative integer" >&2; exit 2 ;; esac
+case "$GROW_CAP" in ''|*[!0-9]*) echo "run-drills: --grow-cap must be a non-negative integer (0 = uncapped)" >&2; exit 2 ;; esac
+case "$GROW_STAGGER" in ''|*[!0-9]*) echo "run-drills: --grow-stagger must be a non-negative integer (seconds)" >&2; exit 2 ;; esac
+# --live-grow is the CONTENTION regime (contention-sensors.tsv): grows uncapped, so the sensors that only
+# fire when several clusters form at once keep being sampled. It is a regime, recorded in the rollup —
+# never a waiver, never a change to any expectation.
+[ "$LIVE_GROW" = 1 ] && GROW_CAP=0
 # MI1: --attr-budget was unvalidated — a non-numeric value errored per re-run and evaluated falsy, so it
 # silently DISABLED the budget instead of refusing, unlike every other numeric flag here.
 case "$ATTR_BUDGET" in ''|*[!0-9]*) echo "run-drills: --attr-budget must be a non-negative integer (seconds)" >&2; exit 2 ;; esac
@@ -156,6 +199,11 @@ case "$ATTR_BUDGET" in ''|*[!0-9]*) echo "run-drills: --attr-budget must be a no
 if [ "$REPLAY" = 1 ]; then
     # Reject only an EXPLICIT --retry (RETRY=1 is also the default, which --replay silently overrides).
     [ "${RETRY_EXPLICIT:-0}" = 1 ] && { echo "run-drills: --retry cannot be combined with --replay (replay runs nothing)" >&2; exit 2; }
+    # The regime flags describe a run; a replay runs nothing, so they cannot describe this one and must
+    # not be allowed to REWRITE the archive's account of the run they are replaying (external review F5:
+    # a plain --replay turned a live-grow archive's REGIME row into `default 5 0`). The archive's own
+    # regime.tsv is the only source the REGIME row reads under --replay.
+    [ "${REGIME_EXPLICIT:-0}" = 1 ] && { echo "run-drills: --live-grow / --grow-cap / --grow-stagger cannot be combined with --replay (the archive's regime.tsv is authoritative; replay describes the run it reads, not this invocation)" >&2; exit 2; }
     RETRY=0; ATTRIBUTE=0; PREFLIGHT=0
 fi
 # 0 is rejected (not just non-numeric): `timeout 0` means "no limit", which would silently reinstate the
@@ -192,9 +240,104 @@ if [ "${#DRILLS[@]}" -eq 0 ]; then
     done
 fi
 [ "${#DRILLS[@]}" -gt 0 ] || { echo "run-drills: no drills found under $HERE/drills/" >&2; exit 2; }
+
+# ── simcluster-speed D/E: UNITS ────────────────────────────────────────────────────────────────────
+# The runner's unit of work is a UNIT: a whole drill (`10-grow-to-3`) or one ARM of an arm-split drill
+# (`96-mid-flight-chaos.A`, from the drill's `# arms:` manifest — lib/manifest.sh, ONE parser shared with
+# `simcluster drill --arm` and tests/arm-manifest-lint.sh). Everything downstream — launch, retry,
+# classification, rollup rows, expectation lookup, deviation report, attribution — keys on the unit name,
+# so a drill with no manifest is exactly the one unit it always was and nothing about it changes. A named
+# argument may be a drill (expands to all its arms) or a single `drill.arm`.
+# A missing parser is fatal, not a warning: without it every drill expands to zero units and the sweep
+# ends "ALL GREEN" over nothing (the verdict-contract harness found exactly that when it linked the
+# runner without lib/).
+. "$HERE/lib/manifest.sh" || { echo "run-drills: cannot source $HERE/lib/manifest.sh (the runner needs lib/ beside it)" >&2; exit 3; }
+declare -A UNIT_DRILL UNIT_ARM UNIT_LANE UNIT_WORST UNIT_GROWS
+UNITS=()
 for d in "${DRILLS[@]}"; do
-    [ -f "$HERE/drills/$d.sh" ] || { echo "run-drills: no such drill '$d' ($HERE/drills/$d.sh)" >&2; exit 2; }
+    base="${d%%.*}"; arm=""; [ "$base" != "$d" ] && arm="${d#*.}"
+    f="$HERE/drills/$base.sh"
+    [ -f "$f" ] || { echo "run-drills: no such drill '$base' ($f)" >&2; exit 2; }
+    if [ -n "$arm" ]; then
+        manifest_has "$f" || { echo "run-drills: '$d' names an arm but drills/$base.sh has no '# arms:' manifest" >&2; exit 2; }
+        printf '%s\n' $(manifest_arms "$f") | grep -qx -- "$arm" || { echo "run-drills: '$arm' is not an arm of $base ($(manifest_arms "$f"))" >&2; exit 2; }
+        units=("$d")
+    else
+        mapfile -t units < <(manifest_units "$f")
+    fi
+    for u in "${units[@]}"; do
+        # A unit named twice on the command line (`74 74.C`, or `one one.A` for a single-arm drill) would be
+        # launched twice into ONE log file and ONE docker instance — two `simcluster drill` runs fighting
+        # over the same containers and interleaving one log the verdict parser then reads as a duplicate
+        # DRILL-VERDICT (a CONTRACT-ERROR blamed on the drill). Collapse duplicates here (round-2 R3-F15).
+        if [ -n "${UNIT_DRILL[$u]:-}" ]; then continue; fi
+        UNIT_DRILL["$u"]="$base"
+        UNIT_ARM["$u"]="${u#"$base"}"; UNIT_ARM["$u"]="${UNIT_ARM[$u]#.}"
+        UNIT_LANE["$u"]="$(manifest_lane "$f")"
+        if [ -n "${UNIT_ARM[$u]}" ]; then
+            # The manifest's numbers are VALIDATED here, not trusted: arm-manifest-lint bounds them
+            # (worst ≥ 60, grows an integer) but the lint does not run on the sim host's checkout. A
+            # `worst: 0` would have become `timeout 0` — the unbounded hang the header says has no
+            # supported way to disable — and a non-integer aborted run_one under set -u; a `grows: 0`
+            # would have held its lane slot for life. Anything that is not a positive integer reads as
+            # "not declared", which fails open only in the LONGER direction (round-2 R3-F5 / R3-F4).
+            UNIT_WORST["$u"]="$(manifest_value "$f" worst "${UNIT_ARM[$u]}")"
+            UNIT_GROWS["$u"]="$(manifest_value "$f" grows "${UNIT_ARM[$u]}")"
+            case "${UNIT_WORST[$u]}" in ''|*[!0-9]*|0) UNIT_WORST["$u"]="" ;; esac
+            case "${UNIT_GROWS[$u]}" in ''|*[!0-9]*) UNIT_GROWS["$u"]="" ;; esac
+        else
+            UNIT_WORST["$u"]=""; UNIT_GROWS["$u"]=""
+        fi
+        UNITS+=("$u")
+    done
 done
+# LEGACY-UNIT (plan §5.5; round-2 R3-F11): a --replay of an archive that PREDATES a drill's arm split
+# holds `<drill>.log`, not `<drill>.<arm>.log`. Deriving the units from today's drills tree would look for
+# arm logs that never existed and read both arms as CONTRACT-ERROR — "malformed verdict contract" about
+# files that are not there. When every arm log is absent and the whole-drill log is present, the drill is
+# classified ONCE as a legacy unit named after the drill (no DRILL-ARM cross-check — the archive predates
+# the line — and no ARMS join), matched against the drill's PARENT row of expected-verdicts.tsv, and
+# tagged LEGACY-UNIT in the rollup so a reader knows the numbers come from a pre-split run.
+#
+# The eligibility is decided ONCE PER DRILL, over EVERY arm the manifest declares — not per unit, and not
+# over the arms that happen to be selected. An archive holding any `<drill>.<arm>.log` was written after
+# the split; a sibling arm's missing log is then a missing arm (INFRA-ABORT as a unit, +1 arms_missing on
+# the ARMS row, the drill blocks) and never a licence to read the pre-split whole-drill log in its place.
+# The first version judged each unit on its own, so `74.SRAB.log` + `74.log` and no `74.C.log` replayed
+# as SRAB=GREEN plus a LEGACY-UNIT standing in for C, arms_missing=0, exit 0 (external review F3).
+declare -A UNIT_LEGACY=()
+if [ "$REPLAY" = 1 ]; then
+    declare -A _lu_post_split=()
+    for u in "${UNITS[@]}"; do
+        base="${UNIT_DRILL[$u]}"
+        [ -n "${UNIT_ARM[$u]}" ] || continue
+        [ -n "${_lu_post_split[$base]+x}" ] && continue
+        _lu_post_split["$base"]=0
+        for _lu_arm in $(manifest_arms "$HERE/drills/$base.sh"); do
+            if [ -e "$LOGDIR/$base.$_lu_arm.log" ]; then _lu_post_split["$base"]=1; break; fi
+        done
+    done
+    _lu_keep=()
+    for u in "${UNITS[@]}"; do
+        base="${UNIT_DRILL[$u]}"
+        if [ -z "${UNIT_ARM[$u]}" ] || [ "${_lu_post_split[$base]:-0}" = 1 ] || [ ! -e "$LOGDIR/$base.log" ]; then
+            _lu_keep+=("$u"); continue
+        fi
+        if [ -z "${UNIT_LEGACY[$base]:-}" ]; then
+            UNIT_LEGACY["$base"]=1
+            UNIT_DRILL["$base"]="$base"; UNIT_ARM["$base"]=""; UNIT_LANE["$base"]="${UNIT_LANE[$u]}"
+            UNIT_WORST["$base"]=""; UNIT_GROWS["$base"]=""
+            _lu_keep+=("$base")
+            echo "run-drills: --replay — $base: no per-arm logs, whole-drill log present → LEGACY-UNIT (pre-split archive)"
+        fi
+    done
+    UNITS=("${_lu_keep[@]}")
+fi
+# From here on DRILLS holds UNITS. The name is kept because ~60 downstream sites read it as "the things
+# this sweep runs and reports", which is exactly what a unit is; renaming them all would be a diff with
+# no behaviour in it.
+DRILLS=("${UNITS[@]}")
+[ "${#DRILLS[@]}" -gt 0 ] || { echo "run-drills: the named drills expand to zero units" >&2; exit 2; }
 
 # JOBS=0 (or over-large) means "no cap" → all concurrently.
 [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS="${#DRILLS[@]}"
@@ -341,11 +484,21 @@ if [ "$REPLAY" = 0 ]; then
     fi
 fi
 if [ "$REPLAY" = 0 ]; then
-    rm -f "$LOGDIR"/*.log "$LOGDIR"/*.rc "$LOGDIR"/*.timeout "$LOGDIR"/*.secs \
+    # The three per-unit sidecars this increment added (.tmo / .grow-done / .timeline.tsv) are cleaned
+    # with the rest: a stale .grow-done from the previous sweep in the same --logdir was readable by the
+    # grow lane before the unit's own truncation, and a stale timeline pollutes forensics (round-2 R3-F10).
+    rm -f "$LOGDIR"/*.log "$LOGDIR"/*.rc "$LOGDIR"/*.timeout "$LOGDIR"/*.secs "$LOGDIR"/*.tmo \
+          "$LOGDIR"/*.grow-done "$LOGDIR"/*.timeline.tsv \
           "$LOGDIR"/*.runpid "$LOGDIR"/rollup.txt "$LOGDIR"/rollup.tsv "$LOGDIR"/progress.tsv \
-          "$LOGDIR"/host-telemetry.tsv 2>/dev/null || true
+          "$LOGDIR"/host-telemetry.tsv "$LOGDIR"/regime.tsv 2>/dev/null || true
     rm -rf "$LOGDIR"/evidence "$LOGDIR"/evidence-attempt2 2>/dev/null || true
     mkdir -p "$LOGDIR/evidence" 2>/dev/null || true; chmod 0700 "$LOGDIR/evidence" 2>/dev/null || true
+    # regime.tsv — the run's contention regime as RAW metadata, written once before anything launches and
+    # never by --replay. rollup.tsv's REGIME row is DERIVED from this file (live: same values; replay: read
+    # back), because the rollup is the one artifact replay rewrites and the regime is a fact about the run,
+    # not about whoever re-reads it (external review F5). Same columns as the REGIME row.
+    printf 'REGIME\t%s\t%s\t%s\n' "$([ "$LIVE_GROW" = 1 ] && echo live-grow || echo default)" "$GROW_CAP" "$GROW_STAGGER" >"$LOGDIR/regime.tsv" || {
+        echo "run-drills: cannot write $LOGDIR/regime.tsv" >&2; exit 9; }
 else
     # Replay must not destroy what it is analysing. Only the derived rollup is rewritten.
     rm -f "$LOGDIR"/rollup.txt "$LOGDIR"/rollup.tsv 2>/dev/null || true
@@ -369,18 +522,36 @@ if [ -t 1 ]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[
 # replay reported the regression as ALL GREEN. Writing straight to a distinct basename removes the window
 # entirely. The evidence subdir is likewise separated (MA3) so the two runs' records never commingle.
 run_one() {
-    local drill="$1" out="${2:-$1}" evsub="${3:-evidence}" t0 rc el
+    local unit="$1" out="${2:-$1}" evsub="${3:-evidence}" t0 rc el drill arm tmo
     t0=$(secs)
     progress_row launch "$out" - - "$t0"
+    # simcluster-speed D/G: a unit is a drill or one arm of it; an arm's declared `# worst:` bounds it at
+    # 2×worst (never above --drill-timeout), so a wedged 8-minute arm is an INFRA-ABORT at 16 minutes
+    # instead of 45. A unit with no declared worst keeps the global ceiling (fail-open in the LONGER
+    # direction only — the hermetic fixture drills have no manifest and must keep working unchanged).
+    drill="${UNIT_DRILL[$unit]:-$unit}"; arm="${UNIT_ARM[$unit]:-}"
+    tmo="$DRILL_TIMEOUT"
+    if [ -n "${UNIT_WORST[$unit]:-}" ] && [ "$(( 2 * UNIT_WORST[$unit] ))" -lt "$tmo" ]; then tmo=$(( 2 * UNIT_WORST[$unit] )); fi
+    printf '%s\n' "$tmo" >"$LOGDIR/$out.tmo"
     # M1: the drill's flight recorder writes here. Exported (not passed) because it must reach
     # lib/assert.sh inside `simcluster drill`, several processes down. SIM_DRILL_ID is the OUTPUT basename
     # so the evidence file agrees with what the deviation report opens for this run (B1).
-    ( export SIM_EVIDENCE_DIR="$LOGDIR/$evsub" SIM_DRILL_ID="$out"
+    # simcluster-speed 0b: the timeline sidecar (lib/log.sh _tl) lands beside the log as <out>.timeline.tsv —
+    # `<epoch>\t<kind>\t<text>` for every log/ok/warn/err line and every poll_until outcome, including
+    # the ones an assert_ok's captured predicate never shows on the console. Read with timeline.sh.
+    # SIM_GROW_DONE_FILE: cmd_grow appends one line per completed grow; the grow lane reads the count.
+    ( export SIM_EVIDENCE_DIR="$LOGDIR/$evsub" SIM_DRILL_ID="$out" SIM_TIMELINE_FILE="$LOGDIR/$out.timeline.tsv" SIM_GROW_DONE_FILE="$LOGDIR/$out.grow-done"
       mkdir -p "$LOGDIR/$evsub" 2>/dev/null
+      : >"$LOGDIR/$out.timeline.tsv" 2>/dev/null
+      : >"$LOGDIR/$out.grow-done" 2>/dev/null
       # Each drill owns a process group. A signal to the runner can then terminate timeout, simcluster,
       # the drill shell, and every grandchild atomically; killing only run_one's wrapper shell orphaned the
       # rest of the tree. The pid file is private under the 0700 logdir and removed after wait.
-      setsid timeout -k 30 "$DRILL_TIMEOUT" "$SIM" drill "$drill" >"$LOGDIR/$out.log" 2>&1 &
+      if [ -n "$arm" ]; then
+          setsid timeout -k 30 "$tmo" "$SIM" drill "$drill" --arm "$arm" >"$LOGDIR/$out.log" 2>&1 &
+      else
+          setsid timeout -k 30 "$tmo" "$SIM" drill "$drill" >"$LOGDIR/$out.log" 2>&1 &
+      fi
       _run_pg=$!
       printf '%s\n' "$_run_pg" >"$LOGDIR/$out.runpid"
       wait "$_run_pg"; _run_rc=$?
@@ -394,12 +565,12 @@ run_one() {
     if [ -f "$LOGDIR/$out.secs" ]; then el=$(( el + $(cat "$LOGDIR/$out.secs" 2>/dev/null || echo 0) )); fi
     echo "$el" >"$LOGDIR/$out.secs"
     progress_row done "$out" "$rc" "$el" "$(secs)"
-    if [ "$rc" = 124 ] || { [ "$rc" = 137 ] && [ "$(( $(secs) - t0 ))" -ge "$DRILL_TIMEOUT" ]; }; then
+    if [ "$rc" = 124 ] || { [ "$rc" = 137 ] && [ "$(( $(secs) - t0 ))" -ge "$tmo" ]; }; then
         # Marker file, not a log grep: the log of a wedged drill very often ALSO carries a flake
         # signature from an earlier step, and is_flake must not resurrect it (see is_flake).
         : >"$LOGDIR/$out.timeout"
-        printf '\n*** run-drills: KILLED BY --drill-timeout after %ss (rc=%s). The drill never reached\n*** drill_end, so it counts as INFRA-ABORT and is deliberately NOT retried — a wedge is not a\n*** flake. The tail above is the last step it made progress on; start there.\n' \
-            "$DRILL_TIMEOUT" "$rc" >>"$LOGDIR/$out.log"
+        printf '\n*** run-drills: KILLED BY the unit ceiling after %ss (rc=%s; basis: %s). The drill never reached\n*** drill_end, so it counts as INFRA-ABORT and is deliberately NOT retried — a wedge is not a\n*** flake. The tail above is the last step it made progress on; start there.\n' \
+            "$tmo" "$rc" "$([ "$tmo" = "$DRILL_TIMEOUT" ] && echo "--drill-timeout $DRILL_TIMEOUT" || echo "2 x declared worst ${UNIT_WORST[$unit]}s")" >>"$LOGDIR/$out.log"
     fi
 }
 # effective_verdict is the one strict parser for the verdict contract. It requires exactly one line, the
@@ -407,7 +578,16 @@ run_one() {
 # A missing line is an INFRA-ABORT; every malformed, duplicate, injected, or contradictory line is a
 # CONTRACT-ERROR. Contract errors are blockers and are NEVER eligible for retry.
 effective_verdict() {
-    local log="$LOGDIR/$1.log" line count v lrc af sr pr nc pass prc expected
+    local log="$LOGDIR/$1.log" line count v lrc af sr pr nc pass prc expected unit
+    # The UNIT this log belongs to: an attribution re-run's log is `<unit>.attempt2`, and the unit tables
+    # (UNIT_ARM / UNIT_DRILL) are keyed by the unit — looking them up under the attempt name skipped the
+    # DRILL-ARM cross-check for every re-run, so an arm that ran the wrong branch every time was labelled
+    # LOAD-SENSITIVE instead of REGRESSION (round-2 R3-F6).
+    unit="${1%.attempt[0-9]*}"
+    # A log that is not there at all is an INFRA fact (the unit never launched, or the archive being
+    # replayed predates a split — see the LEGACY-UNIT handling in --replay), never a CONTRACT-ERROR about a
+    # malformed verdict line nobody wrote (round-2 R3-F11).
+    [ -e "$log" ] || { printf 'INFRA-ABORT'; return; }
     count=$(grep -c '^DRILL-VERDICT\([[:space:]]\|$\)' "$log" 2>/dev/null || true)
     if [ "$count" = 0 ]; then printf 'INFRA-ABORT'; return; fi
     if [ "$count" != 1 ]; then printf 'CONTRACT-ERROR'; return; fi
@@ -419,6 +599,17 @@ effective_verdict() {
     pr=${BASH_REMATCH[5]}; nc=${BASH_REMATCH[6]}
     ncg=${BASH_REMATCH[7]}; ncw=${BASH_REMATCH[8]}; pass=${BASH_REMATCH[9]}
     prc=$(cat "$LOGDIR/$1.rc" 2>/dev/null || echo '?')
+    # simcluster-speed D: an ARM unit's log must carry exactly one `DRILL-ARM arm=<A> of=<drill>` line
+    # naming THIS unit — the drill's own statement of which branch it ran, cross-checked against what the
+    # runner asked for. A drill that ignored --arm (ran a different branch, or the whole thing) is a
+    # CONTRACT-ERROR, never a verdict of record for the arm it did not run.
+    if [ -n "${UNIT_ARM[$unit]:-}" ]; then
+        local armline armcount
+        armcount=$(grep -c '^DRILL-ARM ' "$log" 2>/dev/null || true)
+        [ "$armcount" = 1 ] || { printf 'CONTRACT-ERROR'; return; }
+        armline=$(grep '^DRILL-ARM ' "$log")
+        [ "$armline" = "DRILL-ARM arm=${UNIT_ARM[$unit]} of=${UNIT_DRILL[$unit]}" ] || { printf 'CONTRACT-ERROR'; return; }
+    fi
     case "$v" in
         GREEN)       expected=0; [ "$af" = 0 ] && [ "$sr" = 0 ] && [ "$pr" = 0 ] && [ "$nc" = 0 ] || { printf 'CONTRACT-ERROR'; return; } ;;
         ASSERT-FAIL) expected=1; [ "$af" -gt 0 ] 2>/dev/null || { printf 'CONTRACT-ERROR'; return; } ;;
@@ -744,10 +935,64 @@ run_one_serial() {
     wait "$_drill_pids" 2>/dev/null || true
     _drill_pids=""
 }
-for d in "${LAUNCH_ORDER[@]}"; do
+# simcluster-speed E: how many launched grow-lane units are still INSIDE their grow phase — running (no
+# .rc yet) and either undeclared (held for life) or short of their declared grow-done count. Read from
+# files, not from shell state, so it is exact across the backgrounded run_one subshells.
+_grow_lane_active=""
+grow_active() {
+    local n=0 u declared done
+    for u in $_grow_lane_active; do
+        [ -e "$LOGDIR/$u.rc" ] && continue
+        declared="${UNIT_GROWS[$u]:-}"
+        if [ -n "$declared" ]; then
+            # `grep -c .` PRINTS 0 and EXITS 1 on an empty file, so `|| echo 0` produced "0\n0" and the
+            # -ge below was a shell error on every scheduler tick of every unit still in its grow phase
+            # (2535 lines of `integer expression expected` in one -j12 sweep) — counted as active by
+            # accident. Keep grep's count, swallow only its exit status (round-2 R3-F4).
+            done=$(grep -c . "$LOGDIR/$u.grow-done" 2>/dev/null)
+            case "$done" in ''|*[!0-9]*) done=0 ;; esac
+            [ "$done" -ge "$declared" ] && continue
+        fi
+        n=$((n+1))
+    done
+    echo "$n"
+}
+_grow_launched=0
+# The lane must never hold the HEAD of the queue: LPT puts the grow drills first, so with the lane full
+# a strict in-order loop would leave every free job slot idle behind a grow unit while dozens of N1
+# units could run — Σ/j would become a constraint again, which is the one thing E exists to remove.
+# So each free slot takes the FIRST ELIGIBLE unit in LPT order (an N1 unit, or a grow unit when the lane
+# has room); only when every pending unit is a grow unit and the lane is full does the loop wait.
+# Order among the eligible stays LPT, so two sweeps of the same suite still launch the same way given
+# the same lane timing.
+_pending=("${LAUNCH_ORDER[@]}")
+while [ "${#_pending[@]}" -gt 0 ]; do
     if [ "$launched" -gt 0 ] && [ "$STAGGER" -gt 0 ]; then sleep "$STAGGER"; fi
     while [ "$(( $(jobs -rp | wc -l) - $(_samp_running) ))" -ge "$JOBS" ]; do sleep 2; done
-    printf '[%s] launch %-30s (%d/%d)\n' "$(date +%H:%M:%S)" "$d" "$((launched+1))" "${#DRILLS[@]}"
+    d=""
+    while [ -z "$d" ]; do
+        _i=0
+        for _c in "${_pending[@]}"; do
+            if [ "${UNIT_LANE[$_c]:-N1}" != grow ] || [ "$GROW_CAP" -le 0 ] || [ "$(grow_active)" -lt "$GROW_CAP" ]; then
+                d="$_c"; break
+            fi
+            _i=$((_i+1))
+        done
+        [ -n "$d" ] || sleep 2
+    done
+    _pending=("${_pending[@]:0:$_i}" "${_pending[@]:$((_i+1))}")
+    if [ "${UNIT_LANE[$d]:-N1}" = grow ] && [ "$GROW_CAP" -gt 0 ]; then
+        if [ "$_grow_launched" -gt 0 ] && [ "$GROW_STAGGER" -gt 0 ]; then sleep "$GROW_STAGGER"; fi
+        # Truncate the unit's grow-done marker file HERE, in the parent, before the unit joins the lane:
+        # run_one truncates it too, but inside its backgrounded subshell, and between this append and
+        # that truncation grow_active could read a previous sweep's markers and admit one grow too many
+        # (round-2 R3-F10; the startup cleanup now removes the sidecars as well, this closes the window
+        # for a --logdir reused within one process).
+        : >"$LOGDIR/$d.grow-done" 2>/dev/null
+        _grow_lane_active="$_grow_lane_active $d"; _grow_launched=$((_grow_launched+1))
+    fi
+    printf '[%s] launch %-30s (%d/%d)%s\n' "$(date +%H:%M:%S)" "$d" "$((launched+1))" "${#DRILLS[@]}" \
+        "$([ "${UNIT_LANE[$d]:-N1}" = grow ] && printf ' [grow lane %s/%s]' "$(grow_active)" "$([ "$GROW_CAP" -gt 0 ] && echo "$GROW_CAP" || echo inf)")"
     run_one "$d" &
     _drill_pids="$_drill_pids $!"
     launched=$((launched+1))
@@ -808,19 +1053,39 @@ say '\n'
 say '================================ drill summary ================================\n'
 n_green=0; n_prod=0; n_inc=0; n_setup=0; n_assert=0; n_abort=0; blockers=0
 devs=(); banded=(); bandreds=0; noexp=0
+# simcluster-speed X3: the EXIT CODE stays per-DRILL ("number of unwaived non-GREEN drills, saturated at
+# 125"). A unit that blocks marks its drill blocked; a drill blocks once however many of its arms are
+# red, and an arm with no verdict (INFRA-ABORT / CONTRACT-ERROR) blocks its drill unconditionally —
+# `arms_missing` can never be waived. The per-unit tallies below stay per unit (they are the reader's
+# counts); `blockers` is computed from the drill set after the loop.
+declare -A DRILL_BLOCKED DRILL_MISSING DRILL_UNITS DRILL_VERDICTS DRILL_CTRS
+unit_blocks() { # unit_blocks <verdict> → 0 if this verdict blocks under the current waivers
+    case "$1" in
+        GREEN) return 1 ;;
+        PRODUCT-RED) [ "$ALLOW_PRODUCT_RED" = 1 ] && return 1; return 0 ;;
+        INCOMPLETE)  [ "$ALLOW_INCOMPLETE"  = 1 ] && return 1; return 0 ;;
+        *) return 0 ;;
+    esac
+}
 for d in "${DRILLS[@]}"; do
     rc="$(cat "$LOGDIR/$d.rc" 2>/dev/null || echo '?')"
     v="$(effective_verdict "$d")"
     tag=""; for r in "${retried[@]:-}"; do [ "$r" = "$d" ] && tag=" ${C_Y}(retried)${C_0}"; done
+    [ -n "${UNIT_LEGACY[$d]:-}" ] && tag="$tag ${C_Y}(LEGACY-UNIT: pre-split archive, whole-drill log)${C_0}"
     case "$v" in
         GREEN)              col="$C_G"; n_green=$((n_green+1));   note="" ;;
-        PRODUCT-RED)        col="$C_Y"; n_prod=$((n_prod+1));     if [ "$ALLOW_PRODUCT_RED" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-product-red]${C_0}"; else blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: known product defect]${C_0}"; fi ;;
-        INCOMPLETE)         col="$C_Y"; n_inc=$((n_inc+1));       if [ "$ALLOW_INCOMPLETE" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-incomplete]${C_0}"; else blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: coverage incomplete]${C_0}"; fi ;;
-        SETUP-RED)          col="$C_R"; n_setup=$((n_setup+1));   blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: prereq/infra]${C_0}" ;;
-        ASSERT-FAIL)        col="$C_R"; n_assert=$((n_assert+1)); blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: broken invariant]${C_0}" ;;
-        CONTRACT-ERROR)     col="$C_R"; n_abort=$((n_abort+1));  blockers=$((blockers+1)); note=" ${C_R}[BLOCKER: malformed/duplicate/inconsistent verdict contract]${C_0}" ;;
-        *)                  col="$C_R"; n_abort=$((n_abort+1));   blockers=$((blockers+1)); v="INFRA-ABORT"; note=" ${C_R}[BLOCKER: aborted before drill_end — no verdict]${C_0}" ;;
+        PRODUCT-RED)        col="$C_Y"; n_prod=$((n_prod+1));     if [ "$ALLOW_PRODUCT_RED" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-product-red]${C_0}"; else note=" ${C_R}[BLOCKER: known product defect]${C_0}"; fi ;;
+        INCOMPLETE)         col="$C_Y"; n_inc=$((n_inc+1));       if [ "$ALLOW_INCOMPLETE" = 1 ]; then note=" ${C_Y}[WAIVED: --allow-incomplete]${C_0}"; else note=" ${C_R}[BLOCKER: coverage incomplete]${C_0}"; fi ;;
+        SETUP-RED)          col="$C_R"; n_setup=$((n_setup+1));   note=" ${C_R}[BLOCKER: prereq/infra]${C_0}" ;;
+        ASSERT-FAIL)        col="$C_R"; n_assert=$((n_assert+1)); note=" ${C_R}[BLOCKER: broken invariant]${C_0}" ;;
+        CONTRACT-ERROR)     col="$C_R"; n_abort=$((n_abort+1));  note=" ${C_R}[BLOCKER: malformed/duplicate/inconsistent verdict contract]${C_0}" ;;
+        *)                  col="$C_R"; n_abort=$((n_abort+1));   v="INFRA-ABORT"; note=" ${C_R}[BLOCKER: aborted before drill_end — no verdict]${C_0}" ;;
     esac
+    _dr="${UNIT_DRILL[$d]:-$d}"
+    DRILL_UNITS["$_dr"]="${DRILL_UNITS[$_dr]:-} $d"
+    DRILL_VERDICTS["$_dr"]="${DRILL_VERDICTS[$_dr]:-} $v"
+    unit_blocks "$v" && DRILL_BLOCKED["$_dr"]=1
+    case "$v" in INFRA-ABORT|CONTRACT-ERROR) DRILL_MISSING["$_dr"]=$(( ${DRILL_MISSING[$_dr]:-0} + 1 )) ;; esac
     # M3: the second axis. `match` compares this run against the recorded expectation; it NEVER changes
     # `note`, `blockers`, or the exit code above — a banded or expected red still blocks. What it buys is
     # that a reader no longer has to hand-diff 38 rows against a 60-line prose table to find the ones
@@ -845,11 +1110,74 @@ for d in "${DRILLS[@]}"; do
     say '  %s%-19s%s %-30s rc=%s  %s%s%s%s%s\n' "$col" "$v" "$C_0" "$d" "$rc" "$mcol" "$match" "$C_0" "$note" "$tag"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$d" "$v" "$rc" "$ctr" "$dur" "$att" "$fv" "$exp" "$match" >>"$ROLLUP_TSV"
+    DRILL_CTRS["$_dr"]="${DRILL_CTRS[$_dr]:-}${ctr}
+"
+done
+# simcluster-speed F: the DRILL-level join of an arm-split drill. Counters are summed across arms (a
+# CONTRACT-ERROR/INFRA-ABORT arm contributes nothing to the sum and 1 to arms_missing), and the joined
+# verdict is the same precedence lib/assert.sh applies to one drill's counters — ASSERT-FAIL > SETUP-RED >
+# PRODUCT-RED > INCOMPLETE > GREEN. `arms_missing` is reported beside the verdict, never folded into it:
+# a drill whose arm A aborted and whose arm D failed reads `ASSERT-FAIL+MISSING(1)`, not INFRA-ABORT (the
+# old shape, where an early abort hid a later real red behind it). These rows are `ARMS`-keyed short rows
+# in rollup.tsv (a parser keying on the first column must expect them, like WAIVER-USED / ATTRIBUTION).
+blockers=0
+for _dr in $(printf '%s\n' "${!DRILL_UNITS[@]}" | sort); do
+    [ -n "${DRILL_BLOCKED[$_dr]:-}" ] && blockers=$((blockers+1))
+    set -- ${DRILL_UNITS[$_dr]}
+    # An ARMS row for EVERY manifested drill, a one-arm manifest included: a consumer keying on ARMS for
+    # each arm-split drill must not miss the drill whose manifest happens to declare one arm (round-2
+    # R3-F15). A drill with no manifest (its one unit IS the drill, no arm) and a LEGACY-UNIT get none.
+    if [ "$#" -le 1 ]; then
+        [ -n "${UNIT_ARM[$1]:-}" ] || continue
+    fi
+    _af=0; _sr=0; _pr=0; _nc=0; _ng=0; _nw=0; _pa=0
+    while IFS=$'\t' read -r a b c e f g h; do
+        case "$a" in ''|-) continue ;; esac
+        _af=$((_af+a)); _sr=$((_sr+b)); _pr=$((_pr+c)); _nc=$((_nc+e)); _ng=$((_ng+f)); _nw=$((_nw+g)); _pa=$((_pa+h))
+    done <<<"${DRILL_CTRS[$_dr]}"
+    _jv=GREEN
+    if   [ "$_af" -gt 0 ]; then _jv=ASSERT-FAIL
+    elif [ "$_sr" -gt 0 ]; then _jv=SETUP-RED
+    elif [ "$_pr" -gt 0 ]; then _jv=PRODUCT-RED
+    elif [ "$_nc" -gt 0 ]; then _jv=INCOMPLETE
+    fi
+    _miss=${DRILL_MISSING[$_dr]:-0}
+    _show="$_jv"; [ "$_miss" -gt 0 ] && _show="$_jv+MISSING($_miss)"
+    say '  %s%-19s%s %-30s (arms:%s) assert_fail=%s setup_red=%s product_red=%s not_covered=%s pass=%s%s\n' \
+        "$([ "$_jv" = GREEN ] && [ "$_miss" = 0 ] && printf '%s' "$C_G" || printf '%s' "$C_R")" "$_show" "$C_0" "$_dr" \
+        "$(printf '%s' "${DRILL_VERDICTS[$_dr]}" | sed 's/^ //; s/ /,/g')" "$_af" "$_sr" "$_pr" "$_nc" "$_pa" \
+        "$([ -n "${DRILL_BLOCKED[$_dr]:-}" ] && printf ' %s[BLOCKER]%s' "$C_R" "$C_0")"
+    printf 'ARMS\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$_dr" "$_jv" "$_miss" "$_af" "$_sr" "$_pr" "$_nc" "$_ng" "$_nw" "$_pa" "$(printf '%s' "${DRILL_UNITS[$_dr]}" | sed 's/^ //')" >>"$ROLLUP_TSV"
 done
 say -- '-------------------------------------------------------------------------------\n'
-say '  %d drills: %sGREEN=%d%s  %sPRODUCT-RED=%d%s  %sINCOMPLETE=%d%s  %sSETUP-RED=%d%s  %sASSERT-FAIL=%d%s  %sINFRA-ABORT=%d%s  (%ds)\n' \
-    "${#DRILLS[@]}" "$C_G" "$n_green" "$C_0" "$C_Y" "$n_prod" "$C_0" "$C_Y" "$n_inc" "$C_0" \
+say '  %d units (%d drills): %sGREEN=%d%s  %sPRODUCT-RED=%d%s  %sINCOMPLETE=%d%s  %sSETUP-RED=%d%s  %sASSERT-FAIL=%d%s  %sINFRA-ABORT=%d%s  (%ds)\n' \
+    "${#DRILLS[@]}" "${#DRILL_UNITS[@]}" "$C_G" "$n_green" "$C_0" "$C_Y" "$n_prod" "$C_0" "$C_Y" "$n_inc" "$C_0" \
     "$C_R" "$n_setup" "$C_0" "$C_R" "$n_assert" "$C_0" "$C_R" "$n_abort" "$C_0" "$(( $(secs) - started ))"
+# simcluster-speed E: the contention regime this sweep ran under, machine-readable, so a disposition
+# can tell a default (grow-capped) sweep from a --live-grow one; see contention-sensors.tsv.
+# The values come from regime.tsv (written at launch, never by replay) — under --replay this row is the
+# ARCHIVE's regime, and an archive that predates regime.tsv is reported `unknown - -`, never as whatever
+# this invocation's defaults happen to be (external review F5). A live run reads back what it just wrote.
+_rg_mode=unknown; _rg_cap=-; _rg_stagger=-
+if [ -f "$LOGDIR/regime.tsv" ]; then
+    # A truncated or concatenated receipt cannot establish a run's regime. Validate the whole
+    # file before reading it; accepting just its mode would turn a missing cap into "uncapped".
+    if _rg_record=$(awk -F'\t' '
+        NR == 1 && NF == 4 && $1 == "REGIME" && ($2 == "default" || $2 == "live-grow") &&
+            $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { record = $0; next }
+        { invalid = 1 }
+        END { if (NR != 1 || invalid) exit 1; print record }
+    ' "$LOGDIR/regime.tsv" 2>/dev/null); then
+        IFS=$'\t' read -r _rg_key _rg_mode _rg_cap _rg_stagger <<<"$_rg_record"
+    fi
+fi
+if [ "$_rg_mode" = unknown ]; then
+    say '  regime: unknown (missing or invalid regime.tsv in %s; the replay flags say nothing about the original run)\n' "$LOGDIR"
+else
+    say '  regime: %s (grow lane cap %s, stagger %ss)\n' "$_rg_mode" "$([ "$_rg_cap" -gt 0 ] 2>/dev/null && echo "$_rg_cap" || echo uncapped)" "$_rg_stagger"
+fi
+printf 'REGIME\t%s\t%s\t%s\n' "$_rg_mode" "$_rg_cap" "$_rg_stagger" >>"$ROLLUP_TSV"
 [ "${#retried[@]}" -gt 0 ] && say '  %sretried (infra flake): %s — first-run evidence in %s/<name>.attempt1.log%s\n' "$C_Y" "${retried[*]}" "$LOGDIR" "$C_0"
 # MA4: the storage regime this sweep ran under, recorded so a later LOAD-SENSITIVE disposition has a
 # same-host baseline to reason about (the p50 is device-bound; only the tail moves under load).

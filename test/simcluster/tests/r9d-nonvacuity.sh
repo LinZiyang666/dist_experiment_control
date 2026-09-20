@@ -454,5 +454,74 @@ expect F "MUTATION B4 running image still NEW (marker written but no re-exec int
 NV_EXE=shaOLD; NV_MARKER=''
 expect F "MUTATION B4 marker unreadable → fail closed (internal review TQ-7: B3 had this arm, B4 did not)" _b4_rolled_back
 
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# simcluster-speed D-11 (round-2 review R3-F12): the ARM-SPLIT drills' new per-arm oracles, one section per
+# arm, and a reconciliation below that every `# arms:` drill has at least as many sections here as arms.
+section "drill 74 arm SRAB — _ktgt_empty / _ktgt_loaded (default-off: KTGT stays EMPTY, fail-closed on an unreadable snapshot)"
+eval "$(extract "$SIMDIR/drills/74-rebalance-on-return.sh" _ktgt_empty _ktgt_loaded)"
+KTGT=brk2
+_count_on() { printf '%s' "$NV_COUNT"; }
+NV_COUNT=0;  expect T "TRUE  _ktgt_empty when KTGT holds 0 __proxy__ homes"                              _ktgt_empty
+NV_COUNT=1;  expect F "MUTATION one home landed on KTGT → default-off 'stays empty' must RED"               _ktgt_empty
+NV_COUNT=-1; expect F "MUTATION snapshot INVALID (-1) → 'empty' must NOT pass on a failed read (fail-closed)" _ktgt_empty
+NV_COUNT=2;  expect T "TRUE  _ktgt_loaded when KTGT holds homes"                                            _ktgt_loaded
+NV_COUNT=0;  expect F "MUTATION _ktgt_loaded on an empty KTGT → RED"                                        _ktgt_loaded
+NV_COUNT=-1; expect F "MUTATION _ktgt_loaded on an invalid snapshot → RED (-1 is not 'loaded')"             _ktgt_loaded
+
+section "drill 74 arm C — _par_landed (the proxy_auto_rebalanced event count advanced past the pre-edge baseline)"
+eval "$(extract "$SIMDIR/drills/74-rebalance-on-return.sh" _par_landed)"
+_par_count() { printf '%s' "$NV_PAR"; }
+_PAR_BEFORE=0; NV_PAR=1;  expect T "TRUE  count 0 → 1 (the auto event landed)"                              _par_landed
+_PAR_BEFORE=0; NV_PAR=0;  expect F "MUTATION count unchanged → not landed"                                  _par_landed
+_PAR_BEFORE=3; NV_PAR=3;  expect F "MUTATION a pre-existing event is not a NEW one (baseline absorbs it)"    _par_landed
+_PAR_BEFORE=3; NV_PAR=4;  expect T "TRUE  baseline 3 → 4"                                                  _par_landed
+_PAR_BEFORE=0; NV_PAR='';        expect F "MUTATION events unreadable (empty) → fail closed"                 _par_landed
+_PAR_BEFORE=0; NV_PAR='null';    expect F "MUTATION jq printed null → fail closed"                          _par_landed
+_PAR_BEFORE=''; NV_PAR=5;        expect F "MUTATION baseline never captured → fail closed (no 'landed' on nothing)" _par_landed
+
+section "drill 96 arm A — _xfer_at_or_below (the OBJ_xfer count dropped to the clean baseline; unreadable = not yet)"
+eval "$(extract "$SIMDIR/drills/96-mid-flight-chaos.sh" _xfer_at_or_below)"
+_xfer_obj_count() { printf '%s' "$NV_XFER"; }
+NV_XFER=3;          expect T "TRUE  count 3 at baseline 3"                                                 _xfer_at_or_below brk1 3
+NV_XFER=2;          expect T "TRUE  count 2 below baseline 3"                                              _xfer_at_or_below brk1 3
+NV_XFER=4;          expect F "MUTATION count 4 above baseline 3 → not reaped yet"                         _xfer_at_or_below brk1 3
+NV_XFER=unreadable; expect F "MUTATION jsz unreadable → not yet (never 'reaped' on a failed read)"        _xfer_at_or_below brk1 3
+NV_XFER='';         expect F "MUTATION empty → not yet"                                                    _xfer_at_or_below brk1 3
+
+section "drill 96 arm D — _c3_committed_by (brk1's OWN broker.log names canary3 — the #65 committer attribution)"
+eval "$(extract "$SIMDIR/drills/96-mid-flight-chaos.sh" _c3_committed_by)"
+# The oracle's first grep runs INSIDE the container (dexec … sh -c 'grep -ahF "broker: session created" …'),
+# so the stub applies that same filter to the fixture log: what dexec returns is only the commit lines.
+dexec() { printf '%s\n' "$NV_LOG" | grep -aF 'broker: session created'; }
+NV_LOG='time=… msg="broker: session created" sid=canary3 owner_fp=x';   expect T "TRUE  the commit line names canary3" _c3_committed_by brk1
+NV_LOG='time=… msg="broker: session created" sid=canary2 owner_fp=x';   expect F "MUTATION a commit line for a DIFFERENT session → not canary3" _c3_committed_by brk1
+NV_LOG='D4b canary3 written by the drill itself (not a broker line)';   expect F "MUTATION 'canary3' without the commit message → not a commit" _c3_committed_by brk1
+NV_LOG='';                                                             expect F "MUTATION empty log → RED" _c3_committed_by brk1
+
+section "drill 96 arm F — _f_precond_healthy (three voters ∧ agt1 ONLINE ∧ agt2 ONLINE — every conjunct load-bearing)"
+eval "$(extract "$SIMDIR/drills/96-mid-flight-chaos.sh" _f_precond_healthy)"
+_d0_three_voters() { [ "$NV_V" = 1 ]; }; _f_agt1_online() { [ "$NV_A1" = 1 ]; }; _agt_online() { [ "$1" = agt2 ] && [ "$NV_A2" = 1 ]; }
+NV_V=1; NV_A1=1; NV_A2=1; expect T "TRUE  all three hold"                    _f_precond_healthy
+NV_V=0; NV_A1=1; NV_A2=1; expect F "MUTATION voters not 3 → RED"           _f_precond_healthy
+NV_V=1; NV_A1=0; NV_A2=1; expect F "MUTATION agt1 not ONLINE → RED"        _f_precond_healthy
+NV_V=1; NV_A1=1; NV_A2=0; expect F "MUTATION agt2 not ONLINE → RED"        _f_precond_healthy
+
+# `# arms:` reconciliation: every arm-split drill under drills/ must have at least one section per arm in
+# this file, named `drill <NN> arm <ARM>` — a new arm whose oracles were never driven with bad input is the
+# vacuity class this gate exists for (plan §5.5 / §6.3 D-11).
+section "arm-split drills ↔ sections in this file"
+. "$SIMDIR/lib/manifest.sh"
+for _f in "$SIMDIR"/drills/*.sh; do
+    manifest_has "$_f" || continue
+    _n=$(basename "$_f" .sh); _num=${_n%%-*}
+    for _a in $(manifest_arms "$_f"); do
+        if grep -q "^section \"drill $_num arm $_a " "$0"; then
+            PASS=$((PASS+1)); printf '  ok   [T] %s arm %s has a nonvacuity section\n' "$_n" "$_a"
+        else
+            FAIL=$((FAIL+1)); printf '  FAIL %s arm %s has NO section in r9d-nonvacuity.sh (D-11: every arm oracle is proved two-sided)\n' "$_n" "$_a"
+        fi
+    done
+done
+
 printf '\n─────────────────────────────────────────────\nnonvacuity: %s proved, %s FAILED\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

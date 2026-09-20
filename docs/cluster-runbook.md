@@ -182,7 +182,23 @@ leader$ tether cluster status            # the new node walks JOIN_VERIFIED_PEND
 ```
 
 Half-success is visible, never silently forked: if AddVoter fails the node shows
-`VOTER_ADD_FAILED`; if catch-up stalls it stays `CATCHING_UP` with a stall hint.
+`VOTER_ADD_FAILED`; if catch-up stalls it stays `CATCHING_UP` with a stall hint, and past the
+catch-up deadline the join op goes `BLOCKED` (`cluster ops show <op>`; `cluster ops confirm <op>`
+retries it with a fresh window, `cluster ops abort <op>` cancels). `cluster add` itself confirms one
+such op for you when the stall was its own doing: after the `PAUSED at start-joiner` step the joiner's
+daemons only start when you run the printed commands, and if that takes longer than the catch-up
+deadline (2 min from approval, size-scaled) the op is `BLOCKED` before the joiner exists — the
+re-run that resumes the grow re-enters catch-up automatically (gotcha #83). `--auto-confirm-catchup N`
+is a separate budget for a joiner that IS running and not catching up. The pause itself comes in two
+shapes; both begin `PAUSED at start-joiner:` and the SECOND line is the machine-readable discriminator
+(`PAUSE-KIND: start-daemons` / `PAUSE-KIND: booting` — key provisioning or automation on that line, never
+on the first, which the two shapes share; the grow webhook carries the same fact as `daemons_running`):
+"on <joiner>: systemctl restart nats-server && systemctl start tether-broker" (start-daemons) means the
+daemons are not running — start them; "<joiner>'s daemons are running; its broker is not serving cluster
+status yet" (booting) means they are up and the broker is still forming its clustered JetStream meta group
+(slow on a loaded host) — do NOT restart anything there, just re-run `cluster add` once
+`systemctl status tether-broker` on the joiner shows it serving (gotcha #70, G1). Automation that greps only
+the first line and restarts would abort exactly the boot the booting pause asks it to wait for.
 `cluster status` shows the stuck phase + the next command; `cluster doctor` is the
 secrets/preflight check. A new leader runs a
 membership reconciliation pass on startup that forward-completes a mid-add node.

@@ -30,10 +30,46 @@
 #  - moved-exit data plane (B-dp) + auto EFFECT (C-auto) are HARD — RED when they fail, never a warn/NOT-COVERED.
 #    The raw proxy_auto_rebalanced sys.events EVENT is now PINNED too (C-event, via the #30 `admin events` reader).
 #  - the negative control is created + validly homed on a real broker + serving before AND after (no 'single' fallback).
+#
+# arms: SRAB C
+# fixture: SRAB=N3-live C=N3-live
+# grows: SRAB=2 C=2
+# worst: SRAB=1350 C=1350
+# forgoes: SRAB=- C=-
+#
+# ── ARMS (simcluster-speed plan §5.6, 2026-09-19) ────────────────────────────────────────────────────
+# Two units on two fresh clusters. SRAB = the manual path end to end (SKEW-reconstruct → every exit flowing →
+# SKEW kill → RETURN → A default-off → B dry-run/real/move/data-plane/negative-control); C = the automatic
+# path (TETHER_AUTO_REBALANCE=on → skew/return edge → C-auto/C-event/C-move/C-dp/C-negctrl). Until the split
+# C ran AFTER B on the same cluster and inherited two things from it: B's `reg` negative-control expose
+# (NEG_OK) and a distribution that had already been skewed, returned and rebalanced once. C now builds its own
+# `reg` (C-negctrl-fixture, two claims of its own) and starts from the constructed 1/1/1 like SRAB does; the
+# "post-SRAB distribution history" it no longer sees was never a claim — nothing in `# forgoes:` because no
+# registered sensor sampled it (contention-sensors.tsv lists this drill's sensors per arm). The #34 persistent
+# gap is DRILL-LEVEL (it exists to keep 74 from a lucky GREEN while #34 is open) and is counted by BOTH arms
+# through _gap_drill_level (plan X8). Bands move with the arm they pin (X18): `#67@b-negctrl-create` → .SRAB,
+# `#34@c-ss-preflow` → .C, each under an arm-suffixed slug re-calibrated from that unit's own log.
+# Per-arm worst 1350 s each (plan X30): the pre-flow loops (~90 s per exit) and the 240 s eligibility waits
+# are the product's windows, not the harness's, and must not be cut by the unit ceiling.
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"; . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/cluster.sh"
 . "$HERE/drills/lib/ingress.sh"; . "$HERE/drills/lib/proxy.sh"; . "$HERE/drills/lib/dataplane.sh"
+. "$HERE/drills/lib/logs.sh"   # agent slog reader for the negctrl-create evidence dump (one mapping, never inlined)
+
+# _negctrl_create_evidence <tag> <output> — when the negative-control `expose … --name reg` fails, the ctl's
+# text is a generic hint ("the agent couldn't start the local proxy … check the agent log") and the cause
+# lives ONLY in agt1's agent slog (`agent: ExposeAdapter.AddProxy err=…`: the tunnel OpenHome dial, missing
+# home pins, a home epoch race). Solo runs on 2026-09-19 (simcluster-speed 2b, image #10) hit
+# `agent_rejected:frpc_failed` on this line 3 times out of 6 with nothing but the hint to go on. Observation
+# only; no claim.
+_negctrl_create_evidence() {
+    log "74: $1 negative-control expose reg create OUTPUT: $(printf '%s' "$2" | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-500)"
+    log "74: $1 agt1 agent slog, expose/tunnel/home lines (last 60 lines filtered):"
+    sim_agent_slog_tail agt1 60 2>/dev/null | grep -iE 'AddProxy|expose|OpenHome|tunnel|home|pins|epoch' | tail -14 \
+        | while IFS= read -r _l; do log "  agt1 slog| $(printf '%s' "$_l" | cut -c1-300)"; done
+    log "74: $1 leader proxy status (homes) at the failure: $(CTL proxy status --json 2>/dev/null | jq -c '[.nodes[]? | {nid, home_broker, epoch}]' 2>/dev/null | cut -c1-300)"
+}
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
@@ -250,7 +286,9 @@ _reg_serves() { _rp=$(_reg_port); _rh=$(_reg_home); [ -n "$_rp" ] && [ -n "$_rh"
 _reg_ready()    { _rh=$(_reg_home); printf '%s' "$_rh" | grep -qE '^brk[123]$' && _reg_serves; }
 _negctrl_post() { [ "$(_reg_home)" = "${EXH0:-}" ] && [ -n "${EXH0:-}" ] && _reg_serves; }
 
-drill_begin "74-rebalance-on-return (N=3 proxy home rebalance — G7a m11 sim leg)"
+# _gap_drill_level : the DRILL-LEVEL structural gap, counted once by EVERY arm (plan X8 — a gap that belongs to
+# the drill must not depend on which arm ran). ONE literal, ONE site; tests/arm-manifest-lint.sh R7 checks every
+# branch calls it.
 # External review H-1/M2 (ledger-crosscheck): #34 is a CONFIRMED-open defect (docs/deploy-tier-gotchas.md
 # §#34, 已证 A: control-plane home-count drift) that R15 did NOT fix. It reproduces NON-DETERMINISTICALLY, so
 # the conditional B-dp/C-auto/SKEW arms below can all pass on a run where it does not manifest — a lucky-GREEN
@@ -258,9 +296,15 @@ drill_begin "74-rebalance-on-return (N=3 proxy home rebalance — G7a m11 sim le
 # PERSISTENT gap (mirrors 71's persistent #29 gap) keeps 74 from ever landing a false GREEN while #34 is open:
 # it fires on EVERY path, so 74 is deterministically INCOMPLETE and #34 always has a non-GREEN owner cell. It
 # is REMOVED — 74 flips to a plain GREEN regression — the day #34 is fixed.
-not_covered "74 #34 REGISTERED-OPEN: proxy-home one-per-voter stability + auto-rebalance-on-return are NOT verified-fixed (R15 did not fix #34)" \
-    "#34 (proxy home distribution cannot stably hold one-per-voter; non-tunnel-voter proxy-eligibility unstable; auto-rebalance-on-return blocked by the #31 in-flight-op fire-gate) is CONFIRMED-open. The conditional arms in this drill catch it ONLY when it reproduces, so a non-manifesting run would otherwise report a false all-clear. Persistent gap ⇒ deterministic non-GREEN owner for #34 until the product fix lands and this line is removed." gap
+_gap_drill_level() {
+    not_covered "74 #34 REGISTERED-OPEN: the constructed one-per-voter proxy-home spread is NOT verified to STAY put (face 1 reproduced 1/13 concurrent samples on 2026-09-19, unattributed)" \
+        "#34 face 1 (a constructed 1/1/1 spread drifting back onto one broker after a disturbance — 73 @ G1 cap 8; candidate mechanisms: homeReachable miss → dwell → rehome, and the M3 rotate re-minting the home from the agent's NATS server) is OPEN. Faces 2 and 3 of the original heading are NOT what this gap owns any more: the negctrl rc=64 face was #86 (fixed, round 2), and auto-rebalance-on-return DOES fire (C5/C7/C8/C9/C10, lg2, V7: proxy_auto_rebalanced 0→1) — the 'blocked by the #31 fire-gate' story is refuted by every valid C sample. The conditional arms catch face 1 ONLY when it reproduces, so a non-manifesting run would otherwise report a false all-clear. Persistent gap ⇒ deterministic non-GREEN owner for #34 until face 1 is attributed and fixed and this line is removed." gap
+}
+
+drill_begin "74-rebalance-on-return (N=3 proxy home rebalance — G7a m11 sim leg) [arm ${ARM:-?}]"
 "$SIM" nuke >/dev/null 2>&1 || true
+
+# ── COMMON FIXTURE (every arm): N=3 + 3 exits + ingress + the CONSTRUCTED 1/1/1 baseline ─────────────────────
 # R5-M5: run grow_to_3 OUTSIDE assert_ok so GROW-ATTEMPTS + per-attempt grow rc are VISIBLE (assert_ok hides them on success).
 grow_to_3 3 1; _g3rc=$?
 assert_ok "grow_to_3 + 3 agents + ctl (N=3 HA cluster; GROW-ATTEMPTS logged above)"  sh -c "exit $_g3rc"
@@ -291,6 +335,10 @@ poll_until 240 5 ">=3 proxy-eligible voters (all 3 recovered post-grow)" -- _ge3
 assert_ok "SETUP-111 construct one-per-voter via cluster rebalance proxy (spread==0 — the locked 1/1/1 baseline; the non-deterministic initial reconcile can pile exits, so this is CONSTRUCTED not assumed)"  poll_until_fixed 120 5 "spread==0 (1/1/1)" -- _construct_111
 _three_voters || die "74: not 3 voters after 1/1/1 construct"
 log "74: 1/1/1 baseline distribution: $(_dist)"
+
+case "${ARM:?}" in
+SRAB)
+_gap_drill_level
 # R6 finding: the proxy distribution DRIFTS back to piling on the tunnel broker — non-tunnel voters' (brk2/brk3)
 # proxy-home-eligibility is UNSTABLE (gain it → get an exit → lose it → the exit re-piles on brk1). RE-CONSTRUCT
 # 1/1/1 RIGHT before the destructive skew so KTGT is picked from a fresh balanced distribution; RED if it cannot be
@@ -319,12 +367,13 @@ elif [ "$RECON" = 1 ]; then
 else
     RECON_FLOW=0   # RECON already RED above (SKEW-reconstruct) — no extra assertion, avoid double-counting
 fi
+# The destructive arms run ONLY over an established baseline. (This used to be an early `drill_end; exit` — the
+# arm split's lint forbids a bare exit inside the arm case, so the same gate is now the if/else it always was.)
 if [ "$RECON" != 1 ] || [ "$RECON_FLOW" != 1 ]; then
     log "74: post-reconstruct distribution: $(_dist)"
-    not_covered "74 destructive arms (SKEW/RETURN/A/B/C) THIS RUN" "the locked SKEW baseline (1/1/1 + every exit flowing) did NOT establish (RECON=$RECON, RECON_FLOW=$RECON_FLOW; the SKEW-reconstruct/SKEW-flow RED above). Per R7-M1/R8-M1 the destructive kill/rebalance arms are SKIPPED over an invalid/non-flowing baseline — NO misleading PASS lines over a failed foundation. The RED(s) above are the exposed #34 instability." gap
+    not_covered "74 destructive arms (SKEW/RETURN/A/B) THIS RUN" "the locked SKEW baseline (1/1/1 + every exit flowing) did NOT establish (RECON=$RECON, RECON_FLOW=$RECON_FLOW; the SKEW-reconstruct/SKEW-flow RED above). Per R7-M1/R8-M1 the destructive kill/rebalance arms are SKIPPED over an invalid/non-flowing baseline — NO misleading PASS lines over a failed foundation. The RED(s) above are the exposed #34 instability." gap
     ss_down ctl1 2>/dev/null || true
-    drill_end; exit $?
-fi
+else
 # ── Arm SKEW — kill the home-HEAVIEST non-leader broker (quorum kept 2/3) → its exits rehome AWAY ──
 # pick the heaviest so the kill demonstrably moves exits (killing a 0-home broker would make rehome vacuous).
 _pk=$(_pick_ktgt); _kmx=${_pk%%|*}; KTGT=${_pk#*|}   # H11: readable-count-and->=1 selection (see _pick_ktgt)
@@ -420,11 +469,18 @@ else
         fi
         # NEGATIVE CONTROL (R6-M1 non-vacuous + R9-M1 rc-gated): a co-homed ORDINARY expose must NOT be moved by a
         # SUCCESSFUL __proxy__-only rebalance. Created + validly homed on a real broker + SERVING before AND after; the
-        # post-control + NEG_OK for Arm C run ONLY when the negative-control rebalance itself SUCCEEDED (_nrc==0).
+        # post-control runs ONLY when the negative-control rebalance itself SUCCEEDED (_nrc==0). (Arm C used to
+        # inherit this `reg` + NEG_OK; since the split C builds its own — C-negctrl-fixture below.)
         NEG_TOK=$(expose_serve_sentinel agt1 8081); [ -n "$NEG_TOK" ] || die "74: negctrl sentinel empty on agt1"
         "$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1
-        "$SIM" ctl -- expose agt1 --local 8081 --name reg >/dev/null 2>&1; _regrc=$?
+        # The create's output is KEPT and logged on a non-zero rc (simcluster-speed G1, 2026-09-19): both
+        # arms failed this line with rc=64 under the g-curve's contention rounds and the harness could only
+        # say "the evidence was swallowed inside the drill" — 64 is the usage class, which node_offline,
+        # name_taken, port_exhausted and the alert gate's force_single_active all map to, and without the
+        # text they cannot be told apart (nor matched against the #67 band this site carries from the -j6 era).
+        _regout=$("$SIM" ctl -- expose agt1 --local 8081 --name reg 2>&1); _regrc=$?
         log "74: negative-control expose reg create rc=$_regrc"
+        [ "$_regrc" = 0 ] || _negctrl_create_evidence B "$_regout"
         assert_ok "B-negctrl-create ordinary expose reg create command succeeded (rc=0)"  sh -c "[ '$_regrc' = 0 ]"
         if poll_until 30 3 "reg homed+serving" -- _reg_ready; then _regpre=1; else _regpre=0; fi
         assert_ok "B-negctrl-pre reg becomes VALIDLY homed on a real broker + SERVING before the rebalance (POLLED — the data plane takes a few seconds; a NON-VACUOUS negative control, R6-M1: not an empty-explain 'single' compare) — GATES the negative-control transaction (R8-M1)"  sh -c "[ '$_regpre' = 1 ]"
@@ -433,28 +489,52 @@ else
             log "74: negative-control expose reg validly homed on $EXH0 + serving (pre-control ESTABLISHED)"
             _rebal >/dev/null 2>&1; _nrc=$?
             assert_ok "B-negctrl-rc the rebalance command SUCCEEDED (rc=0) so 'reg unchanged' is a REAL negative control, not a no-op (R6-M1)"  sh -c "[ '$_nrc' = 0 ]"
-            # R9-M1: gate the post-control AND NEG_OK (for Arm C) on _nrc==0 — a FAILED negative-control rebalance means an
-            # "unchanged + serving" PASS is NOT evidence that a SUCCESSFUL __proxy__ rebalance IGNORED the ordinary expose.
+            # R9-M1: gate the post-control on _nrc==0 — a FAILED negative-control rebalance means an "unchanged +
+            # serving" PASS is NOT evidence that a SUCCESSFUL __proxy__ rebalance IGNORED the ordinary expose.
             if [ "$_nrc" = 0 ]; then
                 NEG_OK=1
                 assert_ok "B-negctrl the co-homed ORDINARY expose reg is NOT moved by the SUCCESSFUL __proxy__-only rebalance — home STILL $EXH0 AND still SERVING (plan inv-5; RED if it moved or stopped serving)"  poll_until 15 3 "reg still homed $EXH0 + serving" -- _negctrl_post
             else
                 NEG_OK=0
-                not_covered "74 B-negctrl + C-negctrl THIS RUN" "the negative-control rebalance FAILED (rc=$_nrc; the B-negctrl-rc RED above). An 'unchanged + serving' post-control would NOT evidence a SUCCESSFUL __proxy__ rebalance ignoring the ordinary expose (R9-M1). The rebalance-rc RED is the exposure." gap
+                not_covered "74 B-negctrl THIS RUN" "the negative-control rebalance FAILED (rc=$_nrc; the B-negctrl-rc RED above). An 'unchanged + serving' post-control would NOT evidence a SUCCESSFUL __proxy__ rebalance ignoring the ordinary expose (R9-M1). The rebalance-rc RED is the exposure." gap
             fi
         else
             NEG_OK=0
-            not_covered "74 B-negctrl + C-negctrl THIS RUN" "the ordinary-expose PRE-control did NOT establish (create rc=$_regrc, pre-serving=$_regpre, home=[$EXH0]; the B-negctrl-create/pre RED above). A partial/non-serving row must NOT feed the post-control (R8-M1). The pre-control RED is the exposure." gap
+            not_covered "74 B-negctrl THIS RUN" "the ordinary-expose PRE-control did NOT establish (create rc=$_regrc, pre-serving=$_regpre, home=[$EXH0]; the B-negctrl-create/pre RED above). A partial/non-serving row must NOT feed the post-control (R8-M1). The pre-control RED is the exposure." gap
         fi
+        "$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1   # reg served the Arm B negative control; C builds its own
     else
         NEG_OK=0
         assert_ok "B-snapshot the FRESH attribution snapshot adjacent to the injection is VALIDATED (rc=0 + non-empty exact nid=home) — RED + fail-closed skip of the WHOLE B injection when the status is empty/partial/malformed (R10-M1: a _snap_nidhome|tr pipeline previously masked the helper rc; captured WITHOUT a pipeline now)"  sh -c "false"
         not_covered "74 B injection (dry-run / real / B-move / B-dp / negative control) THIS RUN" "the FRESH adjacent VALIDATED snapshot failed (empty/partial status; the B-snapshot RED above). B-dry/B-real are NOT run over an empty attribution baseline (R10-M1); NEG_OK stays 0." gap
     fi
 fi
-# R7-M1: reg (created only inside a valid B injection with NEG_OK=1) is kept alive across Arm C for the __proxy__-only
-# negative control; removed after Arm C. C-negctrl runs only if NEG_OK=1.
-log "74: post-B distribution: $(_dist) ; NEG_OK=$NEG_OK (reg kept for the Arm-C negative control iff NEG_OK=1)"
+log "74: post-B distribution: $(_dist) ; NEG_OK=$NEG_OK"
+fi
+;;
+
+C)
+_gap_drill_level
+# ── C-negctrl-fixture — the __proxy__-only negative control's PRE-control, built by C itself ─────────────────
+# Before the split, C ran after B on the same cluster and inherited B's `reg` expose + NEG_OK. On its own cluster
+# C establishes the same pre-control (created + validly homed on a real broker + SERVING) with the same fail-closed
+# shape: no valid pre-control ⇒ NEG_OK=0 ⇒ C-negctrl is a recorded gap, never a vacuous PASS.
+NEG_OK=0
+NEG_TOK=$(expose_serve_sentinel agt1 8081); [ -n "$NEG_TOK" ] || die "74: negctrl sentinel empty on agt1"
+"$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1
+# Output kept and logged on failure — same reason as the SRAB site (G1 rc=64 with no evidence).
+_regout=$("$SIM" ctl -- expose agt1 --local 8081 --name reg 2>&1); _regrc=$?
+log "74: C negative-control expose reg create rc=$_regrc"
+[ "$_regrc" = 0 ] || _negctrl_create_evidence C "$_regout"
+assert_ok "C-negctrl-fixture ordinary expose reg create command succeeded (rc=0) — the pre-control C builds for itself now that it runs on its own cluster (it used to inherit B's)"  sh -c "[ '$_regrc' = 0 ]"
+if poll_until 30 3 "reg homed+serving" -- _reg_ready; then _regpre=1; else _regpre=0; fi
+assert_ok "C-negctrl-fixture-pre reg becomes VALIDLY homed on a real broker + SERVING before Arm C (POLLED; a NON-VACUOUS negative control, R6-M1) — GATES C-negctrl"  sh -c "[ '$_regpre' = 1 ]"
+EXH0=$(_reg_home)
+if [ "$_regrc" = 0 ] && [ "$_regpre" = 1 ] && printf '%s' "$EXH0" | grep -qE '^brk[123]$'; then
+    NEG_OK=1; log "74: C negative-control expose reg validly homed on $EXH0 + serving (pre-control ESTABLISHED)"
+else
+    not_covered "74 C-negctrl THIS RUN" "the ordinary-expose PRE-control did NOT establish (create rc=$_regrc, pre-serving=$_regpre, home=[$EXH0]; the C-negctrl-fixture RED above). A partial/non-serving row must NOT feed the post-control (R8-M1). The pre-control RED is the exposure." gap
+fi
 
 # ── Arm C — TETHER_AUTO_REBALANCE=on auto path (Stage-C pin-3): returned voter auto-evens WITHOUT the manual verb ──
 # R8-M2: env + SKEW-precond + pre-flow + skew + return are GATES. A failed edge must NOT let _auto_tick (=_spread_le1)
@@ -539,17 +619,43 @@ fi
 # skew+return edge, so any auto fire the C-setup mass-restart produced is in the baseline and the post-return
 # DELTA isolates THIS single return edge (the anti-flap "count==1" the plan wants).
 _PAR_BEFORE=$(_par_count); log "74: [#30] proxy_auto_rebalanced baseline before the Arm-C skew+return edge = ${_PAR_BEFORE:-?}"
+C_BEFORE_AUTO=""
 if [ "$C_EDGE" = 1 ]; then
     if _skew; then _cskew=1; else _cskew=0; C_EDGE=0; fi   # kill KTGT → its homes rehome AWAY (count→0)
     assert_ok "C-skew kill $KTGT → its exits rehome AWAY ($KTGT count→0) — GATES the auto edge (R8-M2)"  sh -c "[ '$_cskew' = 1 ]"
+    # The PRE-AUTO distribution is the post-skew one — taken HERE, before the return, because the auto path may
+    # fire inside the return window itself (see C-still-skewed). A snapshot taken after the return already
+    # contains the auto move and the before/after diff that derives the moved exit reads empty.
+    _cba=$(_snap_nidhome) || _cba=""; C_BEFORE_AUTO=$([ -n "$_cba" ] && printf '%s' "$_cba" | tr '\n' ' ')   # R10-M1: no rc-masking pipeline
 fi
 if [ "$C_EDGE" = 1 ]; then
     if _return; then _cret=1; else _cret=0; C_EDGE=0; fi
     assert_ok "C-return restart $KTGT → rejoins VOTER — GATES the auto edge (R8-M2)"  sh -c "[ '$_cret' = 1 ]"
-    # KTGT must STILL be at 0 homes immediately before the auto window (no manual rebalance ran) — else "auto evened
-    # it" would be certified over an already-non-skewed distribution (R8-M2).
-    if _ktgt_empty; then _cstill0=1; else _cstill0=0; C_EDGE=0; fi
-    assert_ok "C-still-skewed $KTGT is STILL at 0 homes immediately before the auto window (the skew edge held in; no manual verb ran) — GATES the auto EFFECT (R8-M2)"  sh -c "[ '$_cstill0' = 1 ]"
+    # The edge is VALID in exactly two shapes: KTGT is still at 0 homes when we look (the auto window has not
+    # fired yet), or the auto path ALREADY fired during the return itself — provable only by the
+    # proxy_auto_rebalanced counter having advanced past _PAR_BEFORE (a manual verb never emits it, and
+    # C-skew proved KTGT at 0 BEFORE the return, so a home on KTGT now is an automatic move over a real
+    # skew). The first version demanded "still at 0" only and raced the very feature under test: solo runs
+    # on 2026-09-19 (simcluster-speed 2b) saw brk2 rejoin in 7 s and the auto move land before this line ran,
+    # and the drill declared its own edge invalid (R8-M2's non-vacuity intent is kept — a distribution that
+    # evened out WITHOUT the counter moving is still an invalid edge).
+    # The event lands ASYNCHRONOUSLY after the effect (the C-event check below polls 20 s for exactly that
+    # reason); a single read here right after the move would miss it — 74C6 (image #11) saw the home on
+    # KTGT with the counter still at its baseline and declared the edge invalid. Poll the same way.
+    case "${_PAR_BEFORE:-}" in ''|*[!0-9]*) _par_base=-1;; *) _par_base=$_PAR_BEFORE;; esac
+    # _ktgt_empty reads ONE validated snapshot and fails closed (-1 ≠ 0) when `proxy status` does not answer or
+    # answers short; under the V7 -j12 round one such read declared the edge invalid while _dist a second later
+    # showed KTGT at 0. A short poll separates "the read failed" from "KTGT has a home": a valid empty read
+    # inside 15 s is the first shape; an auto move inside that window is caught by the event poll below.
+    if poll_until 15 3 "$KTGT still at 0 homes on a VALIDATED snapshot" -- _ktgt_empty; then _cstill0=1; C_AUTO_EARLY=0
+    elif [ "$_par_base" -ge 0 ] && poll_until 20 2 "proxy_auto_rebalanced event lands after an early auto move" -- _par_landed; then
+        _par_now=$(_par_count); _cstill0=1; C_AUTO_EARLY=1
+        log "74: auto-rebalance ALREADY fired inside the return window (proxy_auto_rebalanced ${_par_base}→${_par_now}); the edge is valid — C-skew proved $KTGT at 0 before the return"
+    else
+        _cstill0=0; C_AUTO_EARLY=0; C_EDGE=0
+        log "74: $KTGT is no longer at 0 homes and NO proxy_auto_rebalanced event landed within 20 s (baseline ${_par_base}, now $(_par_count)) — distribution: $(_dist)"
+    fi
+    assert_ok "C-still-skewed $KTGT is STILL at 0 homes immediately before the auto window, OR the auto path already fired inside the return (proxy_auto_rebalanced advanced past its baseline — no manual verb can emit that) — GATES the auto EFFECT (R8-M2)"  sh -c "[ '$_cstill0' = 1 ]"
 fi
 # C-auto / C-dp run ONLY over a VALID skew+return edge (C_EDGE=1). Over an INVALID edge, _auto_tick (=_spread_le1)
 # could certify an already-even distribution as an "auto effect" WITHOUT any automatic move — so leave them
@@ -566,9 +672,9 @@ fi
 if [ "$C_EDGE" = 1 ]; then
     _ci_ops=$("$SIM" exec "$(sim_leader)" -- runuser -u tether -- env HOME=/var/lib/tether tether cluster ops ls 2>&1 | tr '\n' '|' | head -c 320)
     log "74: C-auto FIRE-GATE DIAGNOSTIC — leader cluster ops ls = [$_ci_ops] (a non-terminal/in-flight op ⇒ the 'no in-flight op' fire-gate is closed ⇒ #31 DEFERS the auto fire; runtime evidence for the C-auto root cause)"
-    # R8-M2/R9-M2: snapshot the pre-auto distribution from a VALIDATED snapshot so the auto-moved exit is derived from
-    # a validated before/after diff (not a transient partial view).
-    _cba=$(_snap_nidhome) || _cba=""; C_BEFORE_AUTO=$([ -n "$_cba" ] && printf '%s' "$_cba" | tr '\n' ' ')   # R10-M1: no rc-masking pipeline
+    # R8-M2/R9-M2: the pre-auto distribution (C_BEFORE_AUTO) was snapshotted right after the skew, before the
+    # return — the auto-moved exit is derived from that validated before/after diff (not a transient partial
+    # view, and not a snapshot the auto move may already have rewritten).
     if poll_until 180 5 "auto-even spread<=1 (locked >=180s)" -- _auto_tick; then C_AUTO=1; else C_AUTO=0; fi
     assert_ok "C-auto [AUTO-EFFECT, HARD] distribution AUTO-evens (spread<=1) within the locked 180s window WITHOUT the manual verb OVER A VALID skew+return edge — TETHER_AUTO_REBALANCE=on MUST auto-rebalance-on-return (locked plan §3-74 Arm C). RED if it does NOT fire = the auto-rebalance gap EXPOSED as release-blocking; likely root = the #31 lingering in-flight op closing the 'no in-flight op' fire-gate (proxy_auto_rebalance.go:57), the same op that blocks drain/upgrade (R6-M1)"  sh -c "[ '$C_AUTO' = 1 ]"
     log "74: Arm-C post-auto distribution: $(_dist)"
@@ -610,11 +716,17 @@ fi
 # R7-M1 + R8-M1: the __proxy__-only NEGATIVE CONTROL across the WHOLE Arm C return transaction (kill+return+auto
 # window) — reg (homed on tunnel broker brk1, never KTGT) must NOT be moved by ANY part of Arm C whether or not the
 # auto path fired. NOT gated on C_AUTO (a control that runs only when the thing it controls fires is not a control),
-# but gated on NEG_OK (no established pre-control ⇒ nothing to negatively-control — already warned at B-negctrl).
+# but gated on NEG_OK (no established pre-control ⇒ nothing to negatively-control — already recorded at C-negctrl-fixture).
 if [ "$NEG_OK" = 1 ]; then
     assert_ok "C-negctrl the co-homed ORDINARY expose reg is NOT moved by the Arm-C return transaction — home STILL $EXH0 AND still SERVING — the __proxy__-only negative control ACROSS THE AUTOMATIC return transaction (R7-M1 unconditional-on-C_AUTO; R8-M1 gated-on-established-pre-control; plan inv-5)"  poll_until 15 3 "reg still homed $EXH0 + serving after Arm C" -- _negctrl_post
 fi
-"$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1   # reg served across the Arm B + Arm C negative controls; remove now
+"$SIM" ctl -- expose rm agt1 --name reg >/dev/null 2>&1   # reg served the Arm C negative control; remove now
+;;
+
+*)
+setup_fail "unknown arm '${ARM}' — this drill's arms are SRAB, C (see its '# arms:' manifest)"
+;;
+esac
 
 # #30 CLOSED: the plan's exact-one proxy_auto_rebalanced count==1 anti-flap EVENT is NO LONGER un-pinnable —
 # `tether admin events` reads sys.events, so when the auto EFFECT fires (C_AUTO=1) the C-event assertion above

@@ -39,6 +39,24 @@ set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"; . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/cluster.sh"; . "$HERE/drills/lib/ingress.sh"
 . "$HERE/drills/lib/proxy.sh"; . "$HERE/drills/lib/dataplane.sh"
+. "$HERE/drills/lib/logs.sh"   # broker slog reader for the #34 drift evidence dump (one mapping, never inlined)
+
+# _drift_evidence — when the constructed spread drifted before the kill (#34), record WHAT moved it: the
+# leader's proxy/rehome events (`admin events`: rehome_* / home_reassign_* / allocated) and the leader
+# broker slog's proxy-reconcile lines. Without these the G1 g-curve (2026-09-19, cap 8) could only say
+# "agt2 is on brk1, not brk2" — not whether the reaper judged brk2 unreachable (an observe-window miss
+# under contention → 3-tick dwell → rehome), the M3 rotate path (agent read as not proxy-ready), or a
+# manual/other write. Observation only; no claim.
+_drift_evidence() {
+    _ldr=$(sim_leader 2>/dev/null || printf brk1)
+    log "73: #34 drift evidence — leader=$_ldr, proxy/rehome events (last 40, newest last):"
+    "$SIM" exec "$_ldr" -- runuser -u tether -- tether admin events -n 200 --json 2>/dev/null \
+        | jq -r '.events[]? | select(.kind|test("rehome|home_reassign|proxy|allocated|freed")) | "\(.ts) \(.kind) \(.body|tostring)"' 2>/dev/null \
+        | tail -40 | while IFS= read -r _l; do log "  events| $(printf '%s' "$_l" | cut -c1-300)"; done
+    log "73: #34 drift evidence — $_ldr broker slog, proxy reconcile / rehome / observe lines (last 30):"
+    sim_broker_slog "$_ldr" 400 2>/dev/null | grep -iE 'rehome|proxy|observe|reachab|unreachable|dwell|rotate' | tail -30 \
+        | while IFS= read -r _l; do log "  $_ldr slog| $(printf '%s' "$_l" | cut -c1-300)"; done
+}
 SIM="${SIM:-$HERE/simcluster}"
 SID=lab; PIN=135790
 CA=/usr/local/share/ca-certificates/tether-sim-ca.crt
@@ -273,8 +291,26 @@ if [ "$_np_running" = 1 ] && [ "$_np_home" = "$NT_HB" ]; then
     assert_ok "REHOME-precond-home $NT_HB STILL homes $NT_A at kill time — the 1/1/1 spread constructed by 'cluster rebalance proxy' HELD long enough to be used (a KEPT invariant, and the causal precondition of every #33 claim below)"  sh -c "[ '$_np_home' = '$NT_HB' ]"
 else
     product_red "#34 proxy home distribution does not STAY put (owner: R8 product side; docs/deploy-tier-gotchas.md:231) — the spread this drill CONSTRUCTED with 'cluster rebalance proxy' had already drifted by kill time: $NT_A is homed on [${_np_home:-none}], not the constructed $NT_HB. Same signature the 2026-07-18 full-suite run recorded (a constructed 1/1/1 collapsing back onto one broker after a disturbance). Operationally: proxy HA capacity spread is not durable — an operator must re-run 'cluster rebalance proxy' after every disturbance or the spread is decorative"
+    _drift_evidence
 fi
 if [ "$REHOME_OK" = 1 ]; then
+# #33 TRACE (simcluster-speed plan §0 D-P, the evidence-flip protocol): WHICH broker holds the exit
+# agent's NATS client connection at kill time is the one fact that separates the two candidate
+# mechanisms — the agent's NATS session being on the crashed broker (a full session rebuild, the #80
+# proxy-lifetime class, since fixed) vs. only its tunnel home dying (ApplyHome→OpenHome redial).
+# Read from nats-server's own /connz on each broker (the authoritative source drill 98 uses), so the
+# sample can be attributed later instead of re-run. Recorded, never asserted.
+_brk_holding_agent() {
+    for _b in brk1 brk2 brk3; do
+        if "$SIM" exec "$_b" -- sh -c 'curl -sf --max-time 2 http://127.0.0.1:8223/connz' 2>/dev/null \
+            | jq -e --arg n "tether-agent:$SID:$1" '.connections[]?|select(.name==$n)' >/dev/null 2>&1; then
+            printf '%s' "$_b"; return 0
+        fi
+    done
+    printf 'none'; return 1
+}
+_agt_conn_pre=$(_brk_holding_agent "$NT_A") || true
+_r33_slog_cursor=$(sim_agent_slog_cursor "$NT_A")   # the session-rebuild line must be written AFTER the kill
 _t_kill=$(date +%s)
 assert_ok "REHOME kill $NT_A's home broker $NT_HB (non-leader; quorum kept 2/3 so the rehome raft-write can commit)"  node_kill "$NT_HB"
 # #33-a (DETERMINISTIC + CAUSAL): the crash severs the tunnel to the dead home → the SAME client that flowed +
@@ -303,8 +339,50 @@ else
     warn "73 gotcha #33 (crash-rehome data plane does NOT auto-recover — OBSERVED + MEASURED, root cause NOT attributed): after a proxy exit's HOME broker is CRASH-killed (quorum kept 2/3), the CONTROL plane rehomes the exit off the dead broker and it reaches proxy-ready at least once, YET its SS DATA plane does NOT auto-recover within 180s — readiness FLAPS and the exit is not rendered in /sub, so no fresh client can egress through it. Recovery today needs a MANUAL 'proxy off; proxy on' (the QUORUM arm below performs exactly that heal + re-establishes the exits). control-plane rehome ≠ data-plane recovery. Do NOT attribute a root cause (the first-round ApplyHome 're-point a dead session' claim was WRONG — tunnel.go:849-963 OpenHome is a blocking dial+REGISTER+yamux+session-install). #33 not #32 — plan §355 reserves #32 (CANDIDATE, stale-listener). FLIPS the day crash-rehome auto-recovers the data plane."
 fi
 ss_down ctl1
-assert_ok "REHOME [#33] crash-rehome DATA-plane auto-recovery MEASURED = $_33auto (control rehomed+ready ≈ $((_t_ready-_t_kill))s after the crash; STRANDED ⇒ the #33 gap, which the QUORUM arm below proves the manual 'proxy off; proxy on' heal recovers) — recorded per-run, never pre-judged or die-masked"  sh -c "[ '$_33auto' = AUTO-RECOVERED ] || [ '$_33auto' = STRANDED ]"
-log "73: #33 TRACE from the $NT_HB crash at t0: control rehomed+ready ≈ $((_t_ready-_t_kill))s ; data-plane auto-recovery = $_33auto (probe ended ≈ $((_t_flow-_t_kill))s)"
+_agt_conn_post=$(_brk_holding_agent "$NT_A") || true
+# #33 FLIPPED (simcluster-speed 2b, 2026-09-19 — plan §0 D-P's evidence-flip protocol, receipts in plan §8.5b′;
+# reshaped by the round-2 review, R6-4 / R3-F13 / R1-F5 / R6-1).
+# History: the assertion that stood here first accepted BOTH outcomes (`[ AUTO-RECOVERED ] || [ STRANDED ]`,
+# a pass that could not fail — six weeks with no non-GREEN owner), then became an explicit not_covered gap
+# whose text carried the measurement (M0). The flip condition was ≥2 samples with the agent's NATS connection
+# on the crashed broker AND AUTO-RECOVERED; 7 of 7 measurable samples on 2026-09-19 (4 solo, cap 0 / cap 5 /
+# live-grow #2) delivered it: agt_conn_on pre==killed broker, post==a survivor, AUTO-RECOVERED 16–29 s after
+# the crash with the data plane ≤1 s behind the control plane.
+#
+# WHAT THE SAMPLES SHOWED, AND WHAT THEY DID NOT. The mechanism they exercised is nats.go's own pool
+# reconnect: the agent's connection moved to a survivor and the agent re-registered there (proxy.go
+# onNATSReconnect → `agent: re-registered after reconnect`). The agent's FULL session rebuild ("rebuilding
+# NATS session on the freshest roster", the stuck-disconnect path on which #80's runCtx decoupling matters)
+# did NOT run in any sample — the first flipped draft asserted that rebuild line and went red on a healthy
+# run (batch21/73flip.log). So the SYMPTOM closure is earned (11 AUTO-RECOVERED samples, none STRANDED) and
+# the mechanism attribution "by #80" is a CANDIDATE, not a receipt; the ledger says so.
+#
+# TWO CLAIMS, NOT ONE. The HARD claim is the product property: the data plane auto-recovers within 90 s (the
+# observed maximum, 29 s, with slack — an OBSERVATION, not an SLA; STRANDED or slow is a real red). The
+# mechanism observation (connection was on the killed broker → it moved to a survivor and re-registered) is
+# asserted ONLY when its precondition held at kill time: conn==home is a fixture correlation (allocation homes
+# an exit on the agent's NATS server; `cluster rebalance proxy` moves homes without moving connections), so a
+# run where the agent's NATS sat on a survivor takes the tunnel-only path (ApplyHome→OpenHome) and recovers
+# just the same — reading that as a broken invariant was the false red R6-4 predicted.
+_r33_recovers_in_bound() {
+    [ "$_33auto" = AUTO-RECOVERED ] || { log "73: #33 — data plane did NOT auto-recover ($_33auto)"; return 1; }
+    [ $((_t_flow-_t_kill)) -le 90 ] || { log "73: #33 — data plane took $((_t_flow-_t_kill))s (> 90 s observed max+slack)"; return 1; }
+}
+_r33_reconnect_observed() {
+    [ -n "$_agt_conn_post" ] && [ "$_agt_conn_post" != "$NT_HB" ] && [ "$_agt_conn_post" != none ] || { log "73: #33 mechanism — post-kill connection reads '$_agt_conn_post'"; return 1; }
+    sim_agent_slog_grep "$NT_A" 'agent: re-registered after reconnect' "$_r33_slog_cursor" \
+        || { log "73: #33 mechanism — $NT_A's slog has no re-register-after-reconnect line after the kill"; return 1; }
+}
+assert_ok "REHOME [#33 FIXED] the SS DATA plane AUTO-recovers from a crash-rehome — the exit via $NT_A flows again within 90 s of killing its home $NT_HB (observed 16–29 s over 7 samples; a bound from observation, not an SLA) with no manual 'proxy off/on'" \
+    _r33_recovers_in_bound
+if [ "$_agt_conn_pre" = "$NT_HB" ]; then
+    assert_ok "REHOME [#33 mechanism: pool reconnect] $NT_A's NATS connection WAS on the killed $NT_HB and moved to a survivor, and its slog shows the re-register after reconnect — the path the 2026-09-19 samples exercised (nats.go pool reconnect + re-register; NOT the stuck-disconnect session rebuild #80 decoupled)" \
+        _r33_reconnect_observed
+else
+    not_covered "REHOME [#33 mechanism] the agent's NATS connection was on a survivor at kill time (pre=${_agt_conn_pre:-none}, killed=$NT_HB)" \
+        "only the tunnel-only path (ApplyHome→OpenHome redial) was exercised this run; the pool-reconnect mechanism the 7 historic samples showed was not sampled. The HARD claim above still holds or fails on its own; this is a coverage note, not a red" gap
+fi
+log "73: #33 TRACE from the $NT_HB crash at t0: control rehomed+ready ≈ $((_t_ready-_t_kill))s ; data-plane auto-recovery = $_33auto (probe ended ≈ $((_t_flow-_t_kill))s) ; agt_conn_on pre=$_agt_conn_pre post=$_agt_conn_post"
 else
     # R9-D: #34 drift skipped the whole REHOME arm. Two things must still be true for the rest of the drill to
     # mean anything, and NEITHER may borrow the REHOME arm's language:
@@ -384,8 +462,18 @@ if [ "$_qld" -eq 0 ] && [ "$_qls" -eq 0 ]; then
     # external-review R5-M6: cross-check the VENDED server matches the broker about to be killed. _agent_homed_on
     # picks by control-plane home_broker; the SS leg egresses via the /sub-vended `server`. If they DISAGREE, a
     # post-kill "leg still serves" would be a STALE/OTHER endpoint, not tunnel survival. Pin them equal FIRST.
+    # The vended endpoint is POLLED into agreement (60 s), not read once: Q-legup-dead accepts a leg that
+    # serves through the exit's PREVIOUS home while the rebalance-committed home is still being re-dialled
+    # (ApplyHome→OpenHome lags the control plane by the directive push + a dial, seconds under load), so a
+    # one-shot read right after the leg flowed saw `vended=brk1 ≠ home=brk3` 3 times in 14 samples
+    # (73r2 solo, S2 -j6, round-2 -j5) and refused the kill as a "R7-M3 endpoint mismatch". Sixty seconds is
+    # far past any legitimate re-dial; a mismatch that outlives it IS the defect face, and the events/slog
+    # transcription below (the same _drift_evidence hook the REHOME arm uses) says what the leader saw.
+    _q_vend_agrees() { _dsrv=$(_sub_server_of "$DEAD_A"); [ "$_dsrv" = "$DEAD_HB" ]; }
+    poll_until 60 5 "dead-homed exit $DEAD_A vends its committed home $DEAD_HB" -- _q_vend_agrees >/dev/null 2>&1 || true
     _dsrv=$(_sub_server_of "$DEAD_A"); log "73: Q dead-homed exit $DEAD_A /sub-vended server=[$_dsrv] (must == DEAD_HB $DEAD_HB)"
-    assert_ok "Q-xcheck the dead-homed exit $DEAD_A's /sub-VENDED server is EXACTLY the broker about to be killed ($DEAD_HB) — control-plane home_broker AND the vended data-plane endpoint AGREE, so a post-kill black-hole is the dead home, not a stale/other endpoint (R5-M6)"  sh -c "[ '$_dsrv' = '$DEAD_HB' ]"
+    [ "$_dsrv" = "$DEAD_HB" ] || { log "73: Q-xcheck mismatch persisted 60 s — transcribing the leader's view:"; _drift_evidence; }
+    assert_ok "Q-xcheck the dead-homed exit $DEAD_A's /sub-VENDED server is EXACTLY the broker about to be killed ($DEAD_HB) — control-plane home_broker AND the vended data-plane endpoint AGREE (polled up to 60 s past the re-dial window), so a post-kill black-hole is the dead home, not a stale/other endpoint (R5-M6)"  sh -c "[ '$_dsrv' = '$DEAD_HB' ]"
     # ── R7-M3: Q-xcheck is the CAUSAL PREREQUISITE and must GATE the kill — NOT merely increment the failure
     #    counter. If the vended data-plane endpoint DISAGREES with the control-plane home, killing $DEAD_HB proves
     #    nothing (the leg vends via $_dsrv, not $DEAD_HB), and the black-hole/separation assertions would be a

@@ -189,6 +189,24 @@ func goldenCases(t *testing.T) []goldenCase {
 			},
 		},
 		{
+			// simcluster-speed H: the reconciler over the shape install.sh writes SINCE the client-liveness
+			// keys. Both must survive the takeover as sorted passthrough — the string quoted, the integer
+			// bare — or every re-render silently reverts the server half of the ping contract to
+			// nats-server's 2-minute default while the agents keep pinging at 20 s.
+			name:     "reconciler-over-racknerd-shape-with-ping",
+			liveConf: racknerdShapeConf + "ping_interval: \"20s\"\nping_max: 2\n",
+			cfg: func(own *Ownership) Config {
+				return Config{
+					Standalone:    true,
+					Local:         Broker{ServerName: "brk-racknerd", NkeyPub: "UBUSNKEYA"},
+					Peers:         []Broker{{ServerName: "brk-racknerd", NkeyPub: "UBUSNKEYA"}},
+					AccountIssuer: acct,
+					JSStoreDir:    own.JSStoreDir(),
+					ClientListen:  own.ClientListen(),
+				}
+			},
+		},
+		{
 			// Offline force-single / --to-standalone: standalone by INTENT over a clustered conf. This is
 			// the destructive transition, and its bytes decide whether the JS store is orphaned.
 			name:     "force-single-over-clustered-shape",

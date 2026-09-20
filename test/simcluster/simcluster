@@ -355,6 +355,17 @@ cmd_grow() {
         # only [env] steps left are provisioning (secrets/first-boot/daemon-start) per Mandate ③. If tether
         # still cannot do a step, `cluster add` FAILS above and this VOTER check goes RED — the honest exposure.
         printf 'GREW-VIA-TETHER-CLUSTER-ADD: %s\n' "$_j"
+        # simcluster-speed E (plan X24): one line per COMPLETED grow into the runner's grow-done sidecar, so
+        # the grow lane can release this unit's slot once its declared `# grows:` are done instead of holding
+        # it for the unit's whole life. Best-effort and observation-only: an unset or unwritable file changes
+        # nothing about the grow, and a failed grow (the else branch) writes nothing — the lane then holds the
+        # slot until the unit exits, which is the conservative direction. The grow FIXTURES (drills/lib/
+        # cluster.sh grow_to_3 / grow_to_2) empty SIM_GROW_DONE_FILE for their own grow calls and write the
+        # lines themselves after their post-check: a per-grow line kept counting across their nuke+retry and
+        # released the slot mid-retry (external review F4). This line is for drills that grow directly.
+        # (an `if`, not `[ … ] && { … }`: this is the branch's LAST command, so an && list would make cmd_grow
+        # return 1 whenever the sidecar is simply not configured — every hand-run grow would read as failed.)
+        if [ -n "${SIM_GROW_DONE_FILE:-}" ]; then printf '%s %s\n' "$(date +%s)" "$_j" >>"$SIM_GROW_DONE_FILE" 2>/dev/null || true; fi
     else
         err "grow: $_j did not reach VOTER via cluster add — check: ./simcluster status ; ./simcluster logs $_j tether-broker"
         # external-review R4 Q5 / R5-M5: this diagnosis MUST be run-mode-aware, NOT an unconditional "concurrency flake".
@@ -690,16 +701,35 @@ cmd_drill() {
     # correctness no longer depends on trusting a forgeable flag. (V6's launch-storm optimization is
     # reverted; the per-drill image check is cheap relative to the drill itself.)
     case "${1:-}" in --image-prechecked) shift 2 2>/dev/null || shift ;; esac
+    # simcluster-speed D: `drill <name> --arm <A>` runs ONE arm of an arm-split drill (the `# arms:`
+    # manifest, lib/manifest.sh — the same parser run-drills.sh and tests/arm-manifest-lint.sh use) on its
+    # own instance drill-<name>-<A>; the drill's `case "${ARM:?}"` selects the branch and drill_end emits
+    # `DRILL-ARM arm=<A> of=<name>` for the runner's cross-check. An arm-split drill WITHOUT --arm is
+    # refused rather than run whole: running every arm on one cluster is exactly what the split removed,
+    # and `${ARM:?}` would otherwise abort the drill with no verdict line (an INFRA-ABORT that looks like
+    # a harness bug). A manifest-free drill refuses --arm for the mirror reason.
+    _arm=""
+    case "${1:-}" in --arm) _arm=${2:?drill: --arm needs an arm name}; shift 2 ;; esac
     _script="$HERE/drills/$_name.sh"
     [ -f "$_script" ] || die "drill: no such drill '$_name' ($_script)"
+    . "$HERE/lib/manifest.sh"
+    if manifest_has "$_script"; then
+        _arms=$(manifest_arms "$_script")
+        [ -n "$_arm" ] || die "drill: $_name is arm-split (arms: $_arms); run one arm at a time: simcluster drill $_name --arm <A>"
+        case " $_arms " in *" $_arm "*) ;; *) die "drill: '$_arm' is not an arm of $_name (arms: $_arms)" ;; esac
+    elif [ -n "$_arm" ]; then
+        die "drill: $_name has no '# arms:' manifest, so --arm $_arm does not apply"
+    fi
     check_image_or_die
-    _inst="drill-$_name"
-    log "drill: $_name on isolated instance '$_inst'"
+    _inst="drill-$_name${_arm:+-$_arm}"
+    log "drill: $_name${_arm:+ --arm $_arm} on isolated instance '$_inst'"
     # M4: under `set -e` a RED/failed drill would abort cmd_drill BEFORE teardown → leaked instance.
     # Guard with `|| _rc=$?` and an INT/TERM trap so the throwaway instance is always reaped.
     _rc=0
     trap 'env INSTANCE="$_inst" "$HERE/simcluster" nuke >/dev/null 2>&1 || true; exit 130' INT TERM
-    env INSTANCE="$_inst" SIM="$HERE/simcluster" HERE="$HERE" IMAGE="$IMAGE" sh "$_script" || _rc=$?
+    # ARM (empty for a manifest-free drill) and SIM_DRILL_NAME reach lib/assert.sh's drill_end, which
+    # writes the DRILL-ARM line from them.
+    env INSTANCE="$_inst" SIM="$HERE/simcluster" HERE="$HERE" IMAGE="$IMAGE" ARM="$_arm" SIM_DRILL_NAME="$_name" sh "$_script" || _rc=$?
     trap - INT TERM
     if [ "${SIM_KEEP:-0}" = 1 ]; then
         warn "drill: SIM_KEEP=1 — leaving instance '$_inst' up for inspection (nuke: INSTANCE=$_inst ./simcluster nuke)"

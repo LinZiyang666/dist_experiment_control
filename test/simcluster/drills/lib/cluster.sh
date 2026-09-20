@@ -19,20 +19,41 @@
 #     the leaked-lock state it needs to pin the upgrade-blocked defect.)
 # grow rc is CAPTURED + logged (never silently `|| true`d away). NB do NOT abort lingering ops or release the
 # grow lock here: drill 30 RELIES on the #31 grow-lock leak to pin the upgrade-blocked defect.
+#
+# THE GROW LANE'S MARKERS ARE THIS FIXTURE'S TO WRITE, ONCE, AFTER ITS POST-CHECK. run-drills.sh releases a
+# grow-lane unit's slot when its `.grow-done` sidecar holds the unit's declared `# grows:` lines (74/96 declare
+# 2 = this fixture's brk2 + brk3). cmd_grow appends one line per grow it completes; under THIS fixture that
+# is the wrong writer, because a nuke+retry repeats the grows and the sidecar kept counting across the
+# generations — attempt 1 grew brk2 (line 1), brk3 failed, nuke, attempt 2 grew brk2 (line 2 ≥ declared 2)
+# and the slot was released while attempt 2's brk3 was still growing (external review F4). Truncating at
+# the nuke would still release between attempt 1's second line and its failed post-check. So the per-grow
+# writes are suppressed for the fixture's own `$SIM grow` calls (SIM_GROW_DONE_FILE emptied for those
+# commands only) and the fixture appends the two lines itself after `_three_voters` — the moment no
+# further grow can follow from it. A fixture that fails writes nothing: the lane holds the slot until the
+# unit exits, the conservative direction. Drills that call `$SIM grow` directly keep cmd_grow's per-grow
+# line (they have no in-unit retry).
+_grow_lane_done() { # _grow_lane_done <sidecar-or-empty> <joiner>... : append one line per joiner, best-effort
+    _gld_f=$1; shift
+    [ -n "$_gld_f" ] || return 0
+    for _gld_j in "$@"; do printf '%s %s\n' "$(date +%s)" "$_gld_j" >>"$_gld_f" 2>/dev/null || true; done
+    return 0
+}
 grow_to_3() {
     _g3_a=${1:-0}; _g3_c=${2:-1}; _g3_retry=${3:-1}; _g3_try=1
+    _g3_done="${SIM_GROW_DONE_FILE:-}"
     if [ "$_g3_retry" = 0 ]; then _g3_max=1; else _g3_max=2; fi
     while [ "$_g3_try" -le "$_g3_max" ]; do
         "$SIM" up --brokers 3 --agents "$_g3_a" --ctl "$_g3_c" || return 1
         "$SIM" init brk1 || return 1
-        "$SIM" grow brk2; _g3_r2=$?
-        "$SIM" grow brk3; _g3_r3=$?
+        SIM_GROW_DONE_FILE= "$SIM" grow brk2; _g3_r2=$?
+        SIM_GROW_DONE_FILE= "$SIM" grow brk3; _g3_r3=$?
         log "grow_to_3: attempt $_g3_try/$_g3_max (retry=$_g3_retry) — grow brk2 rc=$_g3_r2, grow brk3 rc=$_g3_r3 (rc!=0 = that joiner did not reach VOTER)"
         if poll_until 90 3 "N=3 all VOTER" -- _three_voters; then
             # R6 (non-blocking advice): a non-zero `grow brkN` rc that nonetheless reaches VOTER during the extra
             # 90s poll is a LATE-CONVERGENCE / CLI-timeout defect — label it explicitly, never a silent clean GREEN.
             if [ "$_g3_r2" != 0 ] || [ "$_g3_r3" != 0 ]; then warn "grow_to_3: LATE-CONVERGENCE — a \`grow\` CLI returned non-zero (brk2 rc=$_g3_r2, brk3 rc=$_g3_r3) yet N=3 reached VOTER during the extra 90s poll. The grow CLI timed out / returned before convergence though the joiner later converged — a labeled CLI-timeout defect, NOT a clean grow (R6 advice)."; fi
             printf 'GROW-ATTEMPTS: %s (retry=%s)\n' "$_g3_try" "$_g3_retry"   # first-class attempt evidence (R5-M5)
+            _grow_lane_done "$_g3_done" brk2 brk3
             return 0
         fi
         if [ "$_g3_try" -lt "$_g3_max" ]; then
@@ -64,9 +85,11 @@ grow_to_3() {
 # nuke-and-retry would launder exactly the leftover-op state they exist to pin.
 grow_to_2() {
     _g2_a=${1:-0}; _g2_c=${2:-1}
+    _g2_done="${SIM_GROW_DONE_FILE:-}"
     "$SIM" up --brokers 2 --agents "$_g2_a" --ctl "$_g2_c" || return 1
     "$SIM" init brk1 || return 1
-    "$SIM" grow brk2; _g2_r=$?
+    # The lane marker is written below, after BOTH false-green guards, not per grow (see grow_to_3).
+    SIM_GROW_DONE_FILE= "$SIM" grow brk2; _g2_r=$?
     log "grow_to_2: grow brk2 rc=$_g2_r (rc!=0 = that joiner did not reach VOTER)"
     poll_until 90 3 "N=2 all VOTER" -- _two_voters || {
         err "grow_to_2: N=2 not reached (single attempt, no retry — a real short grow, not laundered)"
@@ -79,6 +102,7 @@ grow_to_2() {
     _g2_l=$(sim_leader) || { err "grow_to_2: no leader"; return 1; }
     [ "$_g2_l" = brk1 ] || { err "grow_to_2: leader is $_g2_l, not brk1 — 50's follower arms and 52's control-source legs both require a pinned leader"; return 1; }
     ok "grow_to_2: N=2 VOTER, JS meta formed (size 2), leader=brk1"
+    _grow_lane_done "$_g2_done" brk2
 }
 
 _two_voters() {

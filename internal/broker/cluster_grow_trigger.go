@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
@@ -167,7 +168,7 @@ func (b *Broker) handleGrowTrigger(data []byte, now time.Time) *proto.ClusterGro
 			}
 		}
 		if match != nil {
-			return &proto.ClusterGrowResp{OK: true, OpID: match.OpID, OpState: match.OpState, Terminal: match.Terminal, LastError: match.LastError}
+			return &proto.ClusterGrowResp{OK: true, OpID: match.OpID, OpState: match.OpState, Terminal: match.Terminal, LastError: match.LastError, NonvoterCommitted: joinNonvoterCommitted(match)}
 		}
 		return &proto.ClusterGrowResp{Code: adminsock.CodeNodeUnknown, Error: "no operation for " + req.OpID}
 
@@ -206,6 +207,42 @@ func (b *Broker) handleGrowTrigger(data []byte, now time.Time) *proto.ClusterGro
 	default:
 		return &proto.ClusterGrowResp{Code: adminsock.CodeBadRequest, Error: "unknown op: " + req.Op}
 	}
+}
+
+// joinNonvoterCommitted answers "did this join's AddNonvoter commit" for join-status (gotcha #83): the
+// orchestrator's catch-up barrier must not re-wait two minutes for a state that already happened when the
+// op sits in BLOCKED (catch-up deadline) after being CATCHING_UP a minute ago (simcluster-speed 8.2: drill
+// 42's returning node, whose daemons start only after the resume hint, went BLOCKED every time the boundary
+// wait outlived opCatchupTimeout).
+//
+// Three witnesses, in order of durability, any one of which suffices:
+//  1. the CURRENT state is CATCHING_UP or a later rung of the join ladder — the ladder only enters
+//     CATCHING_UP after AddNonvoter committed, and never goes back;
+//  2. the op is BLOCKED carrying OpBlockedCatchupDeadlineMsg — boundCatchingUp is the only writer of that
+//     message and runs only from CATCHING_UP;
+//  3. the retained timeline has a CATCHING_UP entry.
+//
+// Witness 3 alone was the first implementation and is CAPPED: appendTimeline keeps opTimelineCap (32)
+// entries, recordOpError appends one per last_error CHANGE and topoAdvance per reason change, so a long
+// stall could evict the CATCHING_UP entry and silently flip this to false — a slow, operator-visible
+// regression to the pre-#83 manual `cluster ops confirm` path, never a false "committed", but a regression
+// nobody would attribute (internal review round 1 R2-F5). Witnesses 1 and 2 are read from columns that a
+// timeline trim cannot touch.
+func joinNonvoterCommitted(e *adminsock.ClusterOpEntry) bool {
+	switch e.OpState {
+	case cluster.OpStateCatchingUp, cluster.OpStateNatsRolledOut, cluster.OpStateServing:
+		return true
+	case cluster.OpStateBlocked:
+		if strings.HasPrefix(e.LastError, OpBlockedCatchupDeadlineMsg) {
+			return true
+		}
+	}
+	for _, ev := range e.Timeline {
+		if ev.State == cluster.OpStateCatchingUp {
+			return true
+		}
+	}
+	return false
 }
 
 // meshPeerTriples returns one "server_name,route,bus_nkey" entry per route-mesh broker in the committed

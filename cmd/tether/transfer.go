@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -189,7 +190,351 @@ func runPush(cmd *cobra.Command, home, natsURL, localPath string, spec remoteSpe
 	if tier == "a" {
 		return pushTierA(cmd, nc, id.PublicKey, sid, spec, transferID, abs, force, timeout)
 	}
-	return pushTierB(cmd, nc, id.PublicKey, sid, spec, transferID, abs, st.Size(), force, timeout)
+	return pushTierB(cmd, nc, id.PublicKey, sid, spec, transferID, abs, st.Size(), force,
+		phaseTimeoutFor(cmd, st.Size(), timeout))
+}
+
+// phaseTimeoutFor is the per-phase bound a tier-B transfer of `size` bytes actually gets. The flag's
+// help has always said "derived from the file size"; until simcluster-speed 0a the code said
+// cliTransferTimeoutDefault — the 2 GiB worst case, 37 minutes flat — for every size. Drill 67 measured
+// the consequence: a 12 MB push whose ObjectStore.Put stalled on a degraded JetStream waited out the
+// full 37 minutes per phase, pushing the drill past its 2700 s ceiling into INFRA-ABORT with no
+// verdict at all. The derivation mirrors the broker's own budget for THIS transfer (both legs at the
+// declared size, floor included) plus the same two-minute margin the flat default carried, so the ctl
+// is never tighter than the broker on any size. An explicit --timeout still wins, whatever its value.
+func phaseTimeoutFor(cmd *cobra.Command, size int64, flagValue time.Duration) time.Duration {
+	if f := cmd.Flags().Lookup("timeout"); f != nil && f.Changed {
+		return flagValue
+	}
+	return proto.XferBudget("b", size, proto.XferPushLegs) + 2*time.Minute
+}
+
+// The tier-B Put liveness watchdog (gotcha #84). Three consecutive failed probes 10 s apart = 30 s of a
+// JetStream that answers nothing while chunks are in flight — long enough to ride out a leader election
+// (nats-server's JS meta election completes in seconds), short enough that the operator learns of a
+// lost quorum in half a minute instead of at the end of the size budget.
+const (
+	jsPutProbeInterval = 10 * time.Second
+	jsPutProbeTimeout  = 5 * time.Second
+	jsPutProbeStrikes  = 3
+)
+
+// The tier-B Put bounded retry (gotcha #84, the INSTANT face). A JetStream that has lost its stream
+// leader does not always stall: once the meta layer answers again it refuses each publish within a second
+// ("no responders" from Put's own object lookup, "no response from stream" from the chunk acks). That is
+// the shape of a leader election in progress, so the Put is retried a bounded number of times with a
+// doubling wait — 3 s, 6 s: three attempts inside ≈10 s, the same bounded-retry-of-a-classified-transient
+// design G67 gave the prepare leg — and only then refused with the transient code. The attempt count and
+// window go into the refusal text; that count is the drill-67 non-vacuity tooth for this leg (a re-worded
+// refusal without the retry carries no count).
+const (
+	jsPutRetryAttempts = 3
+	jsPutRetryBackoff  = 3 * time.Second
+)
+
+// jetStreamRefusedError is the bounded retry's verdict: every attempt was answered with a JetStream
+// "not available right now" face, and the attempts are exhausted (or the phase budget ran out first).
+type jetStreamRefusedError struct {
+	attempts int
+	window   time.Duration
+	last     string
+	err      error
+}
+
+func (e *jetStreamRefusedError) Error() string {
+	return fmt.Sprintf("refused %d attempt(s) over %s, last: %s", e.attempts, e.window.Round(time.Second), e.last)
+}
+
+func (e *jetStreamRefusedError) Unwrap() error { return e.err }
+
+// jetStreamUnavailableFace classifies a Put error as one of JetStream's own "not available right now"
+// answers — the faces measured on a 2-node R2 object store after its peer stopped (and for the first
+// minutes after it returned):
+//   - nats.ErrNoResponders: Put's initial object lookup (STREAM.MSG.GET) had no responder — the stream
+//     has no leader;
+//   - jetstream.ErrNoStreamResponse: the chunk publishes were answered with 503/no responders and
+//     nats.go's own two retries were exhausted;
+//   - a JetStream API error with HTTP code 503 (JSClusterNotAvailErr and kin);
+//   - nats.ErrTimeout while OUR context is still alive: an API request inside Put timed out on its own
+//     clock, not on the phase budget. Put maps ITS context's expiry to nats.ErrTimeout too, which is why
+//     the budget case (ctx already done) is excluded — that one is a slow upload, not a refusal;
+//   - the watchdog's stallNoProgress verdict: the stream answers with a leader but accepted none of the
+//     upload — the chunks landed in a leader election and were dropped without a NAK; the stream is
+//     healthy now and a fresh Put lands (drill 67 image #8: 194 ms).
+//
+// Everything else (I/O errors, a cancelled context, a size or ACL problem, and the watchdog's
+// stallNoAnswer — JetStream is down, another 30 s would find it down) is not transient and must not be
+// retried into.
+func jetStreamUnavailableFace(ctx context.Context, err error) (string, bool) {
+	var stall *jetStreamStallError
+	switch {
+	case err == nil:
+		return "", false
+	case errors.As(err, &stall):
+		if stall.kind == stallNoProgress {
+			return stall.Error(), true
+		}
+		return "", false
+	case errors.Is(err, nats.ErrNoResponders):
+		return "no responders for the bucket's stream", true
+	case errors.Is(err, jetstream.ErrNoStreamResponse):
+		return "the stream acknowledged nothing", true
+	case errors.Is(err, nats.ErrTimeout) && ctx.Err() == nil:
+		return "a JetStream API request timed out", true
+	}
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == 503 {
+		return fmt.Sprintf("JetStream answered 503 (%s)", apiErr.Description), true
+	}
+	return "", false
+}
+
+// putWithJSRetry runs `put`; when it fails with a face `face` recognises as JetStream-unavailable, it
+// waits `backoff` (doubling per attempt) and runs it again, up to `attempts` times, and then returns a
+// *jetStreamRefusedError carrying the count, the window and the last face. Any other error is returned
+// as is on the first occurrence — which of the watchdog's two verdicts counts as a face is the
+// classifier's call (jetStreamUnavailableFace: stallNoProgress yes, stallNoAnswer no). `sleep` is
+// injected so the ladder is table-testable in milliseconds; it must honour the context (a cancelled or
+// expired context ends the retry with the refusal, not with more waiting).
+func putWithJSRetry(ctx context.Context, put func(context.Context) error, face func(context.Context, error) (string, bool),
+	attempts int, backoff time.Duration, sleep func(context.Context, time.Duration) error) error {
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		err := put(ctx)
+		if err == nil {
+			return nil
+		}
+		f, transient := face(ctx, err)
+		if !transient {
+			return err
+		}
+		refused := &jetStreamRefusedError{attempts: attempt, window: time.Since(start), last: f, err: err}
+		if attempt >= attempts || ctx.Err() != nil {
+			return refused
+		}
+		if serr := sleep(ctx, backoff<<(attempt-1)); serr != nil {
+			refused.window = time.Since(start)
+			return refused
+		}
+	}
+}
+
+// jsTombstoneTimeout bounds tombstoneUploadedObject. nats.go's ObjectStore.Delete publishes the
+// tombstone and then PURGES the object's chunks — a request the ctl's ACL denies and nats.go holds
+// until the context ends. Three seconds is the finalize budget: the tombstone itself lands in
+// milliseconds, the denied purge is allowed to time out, and the broker's reaper (gotcha #85's
+// chunk sweep) reclaims the chunks.
+const jsTombstoneTimeout = 3 * time.Second
+
+// tombstoneUploadedObject marks an object the push is abandoning as deleted, on its OWN short
+// deadline under the command's context (Ctrl-C still ends it). The first version ran the Delete on
+// the phase-budget context, so on a size mismatch the ctl sat silent — and the broker's slot stayed
+// held — until the ≥5 min budget expired, because the denied trailing purge never returns on its own
+// (round-2 review R2-F5). Best-effort: the reaper owns the bucket either way; this only makes the
+// object disappear from listings sooner.
+func tombstoneUploadedObject(parent context.Context, store jetstream.ObjectStore, name string) {
+	ctx, cancel := context.WithTimeout(parent, jsTombstoneTimeout)
+	defer cancel()
+	_ = store.Delete(ctx, name)
+}
+
+// sleepCtx is putWithJSRetry's production sleeper: a timer that the context can interrupt.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// jetStreamStallKind names WHICH of the watchdog's two questions went unanswered.
+type jetStreamStallKind int
+
+const (
+	// stallNoAnswer: `strikes` consecutive probes failed — the stream's API does not answer, or answers
+	// with no leader. JetStream is down for this bucket; a retry now would only spend another window.
+	stallNoAnswer jetStreamStallKind = iota
+	// stallNoProgress: the probes answer and name a leader, yet the stream's last sequence has not moved
+	// for `strikes` consecutive probes while our chunks are in flight. The upload is not landing. That is
+	// what a Put looks like whose burst of chunk publishes arrived during a leader election: nats-server
+	// drops publishes to a leaderless stream without a NAK, nats.go's async publisher has nothing to retry
+	// on, and once the leader is elected the stream is perfectly healthy — for everybody except this Put,
+	// which waits for acks that will never come until its budget expires (drill 67 CONTROL(after) attempt
+	// 1 on image #8: 92 chunks / 25 MB in during the first 5 s while `leader==""`, `msgs` static for the
+	// next 115 s, next attempt succeeded in 194 ms). The stream is healthy NOW, so this kind is retryable.
+	stallNoProgress
+)
+
+// jetStreamStallError is the watchdog's verdict: the Put was cancelled because, for `strikes` consecutive
+// probes, JetStream either stopped answering (stallNoAnswer) or accepted nothing (stallNoProgress).
+type jetStreamStallError struct {
+	kind    jetStreamStallKind
+	strikes int
+	window  time.Duration
+	last    error  // stallNoAnswer: the last probe error
+	lastSeq uint64 // stallNoProgress: the sequence the stream sat on
+}
+
+func (e *jetStreamStallError) Error() string {
+	if e.kind == stallNoProgress {
+		return fmt.Sprintf("the stream accepted none of the upload for %s (%d probes; leader present, last_seq stuck at %d)",
+			e.window.Round(time.Second), e.strikes, e.lastSeq)
+	}
+	return fmt.Sprintf("%d probes over %s failed, last: %v", e.strikes, e.window.Round(time.Second), e.last)
+}
+
+func (e *jetStreamStallError) Unwrap() error { return e.last }
+
+// putWithJSWatchdog runs `put` and, while it is in flight, calls `probe` every `interval` with its own
+// `probeTimeout`. The probe answers two questions at once — "does the bucket's stream answer with a
+// leader" (an error means no) and "what is its last sequence" — and each question has its own strike
+// count:
+//   - `strikes` consecutive probe FAILURES cancel the put with stallNoAnswer; a success resets the count;
+//   - `strikes` consecutive successful probes whose sequence did not move since the previous reading
+//     (the first reading is taken before the put starts) cancel it with stallNoProgress; a sequence that
+//     moved resets the count. A slow-but-moving upload advances the sequence by one per 128 KiB chunk,
+//     so at the 2 MiB/s admission floor it can never sit still for a whole interval; another writer in
+//     the same session bucket can mask a dead upload (its writes move the sequence too), in which case
+//     the put simply falls back to its size budget — no worse than before the watchdog.
+//
+// The put's own result wins whenever it returns first, so a healthy JetStream never sees the watchdog
+// act. Injected `put` and `probe` make the ladder table-testable without a NATS connection
+// (cmd/tether/transfer_abandon_test.go).
+func putWithJSWatchdog(ctx context.Context, put func(context.Context) error, probe func(context.Context) (uint64, error),
+	interval, probeTimeout time.Duration, strikes int) error {
+	sample := func() (uint64, error) {
+		qctx, qcancel := context.WithTimeout(ctx, probeTimeout)
+		defer qcancel()
+		return probe(qctx)
+	}
+	// The baseline sequence, read before any chunk leaves: the no-progress count is relative to it.
+	lastSeq, err0 := sample()
+	haveSeq := err0 == nil
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- put(pctx) }()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	fails, stuck := 0, 0
+	var last error
+	// cut cancels the put and waits for it to unwind before the store is abandoned — and then reads
+	// what the put itself has to say, because a cancelled Put is not always a stalled one:
+	//
+	//   - nil: the upload was COMPLETE (meta written, every chunk acked) and the Put was sitting in
+	//     nats.go's trailing best-effort PURGE of the object's previous chunk generation — the object
+	//     name already existed from an earlier attempt. The ctl's ACL denies STREAM.PURGE (by design;
+	//     the broker's reaper owns the bucket) and nats.go does not fail a request on a publish
+	//     permissions violation, so that purge waits for the context and the sequence sits still. The
+	//     first version returned the stall verdict here, so every retry after a genuine stall
+	//     re-uploaded the object in full, hung in the same purge, was cut as "no progress" again, and
+	//     the push was refused as jetstream_not_ready while the bucket held a complete, correct object
+	//     (round-2 review R2-F1). A Put that says nil has done its job; the old chunks are the
+	//     reaper's (gotcha #85). The cost that remains is one strike window of latency on that path.
+	//   - the put's OWN error: every Put failure after the first chunk runs nats.go's purgePartial,
+	//     which ends in the same denied PURGE, so a local read error or a chunk-ack "no response from
+	//     stream" is held until the watchdog cuts — and used to be laundered into the no-progress
+	//     face (R2-F3). The put's verdict goes to the classifier instead: a chunk-ack refusal is a
+	//     genuinely retryable instant face, an I/O error is object_put_failed, neither is JetStream.
+	//   - a cancellation artifact (context.Canceled / DeadlineExceeded, or nats.ErrTimeout — what Put
+	//     maps ITS context's expiry to): the put learned nothing on its own; the watchdog's verdict
+	//     stands.
+	cut := func(e *jetStreamStallError) error {
+		cancel()
+		perr := <-done
+		switch {
+		case perr == nil:
+			return nil
+		case errors.Is(perr, context.Canceled), errors.Is(perr, context.DeadlineExceeded), errors.Is(perr, nats.ErrTimeout):
+			return e
+		default:
+			return perr
+		}
+	}
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ticker.C:
+			seq, perr := sample()
+			if perr != nil {
+				fails++
+				last = perr
+				if fails >= strikes {
+					return cut(&jetStreamStallError{kind: stallNoAnswer, strikes: fails, window: time.Duration(fails) * interval, last: last})
+				}
+				continue
+			}
+			fails = 0
+			if haveSeq && seq == lastSeq {
+				stuck++
+			} else {
+				stuck = 0
+			}
+			lastSeq, haveSeq = seq, true
+			if stuck >= strikes {
+				return cut(&jetStreamStallError{kind: stallNoProgress, strikes: stuck, window: time.Duration(stuck) * interval, lastSeq: seq})
+			}
+		}
+	}
+}
+
+// probeJetStreamForBucket is the watchdog's liveness question: can THIS bucket's backing stream
+// (OBJ_<bucket>) take a chunk right now. Two halves, both read from ONE STREAM.INFO round trip:
+//
+//  1. the request is answered at all — a JetStream whose meta group has just lost quorum answers nothing
+//     (drill 67's injection: the R2 stream's peer is stopped; the ctl-side Put sat its whole budget on
+//     images #6/#7, and this probe's failures are what cut it at 30 s on image #9, batch16/67x);
+//  2. the answer names a stream LEADER — a meta layer that answers again but with `cluster.leader == ""`
+//     cannot commit a publish (no ack: "no response from stream" / "no responders"), so an answered
+//     STREAM.INFO with no leader is a probe FAILURE, not health. Recorded evidence for this shape is the
+//     drill-67 /jsz sampler on image #8 (batch14/67v, batch15/67w): `leader:null` in the t+0 sample after
+//     the peer's return, a leader from ≈t+5 s on. The longer "≈40 s no answer, then 2 ms leaderless
+//     answers" sequence that motivated splitting the two halves was seen in an ad-hoc in-process 2-node
+//     run on 2026-09-19 whose transcript was NOT saved (round-2 review R5-F3) — it is a design rationale,
+//     not a receipt; the predicate itself is pinned by TestProbeJetStreamForBucketRejectsALeaderlessStream.
+//     What the same samples ALSO showed is that the post-recovery 120 s stall happened WITH a leader
+//     present — which is why this probe alone could not see it and the no-progress rule
+//     (stallNoProgress) exists.
+//
+// It is deliberately ONLY that call: `$JS.API.STREAM.INFO.OBJ_xfer-<sid>` is in the ctl's per-session ACL
+// (internal/auth/permissions.go), while `$JS.API.INFO` (AccountInfo) is not — the first deploy-tier run of
+// this watchdog probed AccountInfo, every probe was a permissions violation, and a HEALTHY 12 MB push was
+// cut after 30 s as "JetStream stopped answering" (drill 67 CONTROL(after) attempt 1, 2026-09-19). A probe
+// the ctl is not allowed to make is indistinguishable from a dead JetStream; only the permitted one counts.
+// A non-clustered JetStream (single broker) carries no cluster block; there, an answer is health.
+// The returned sequence is the stream's last sequence from the same answer — the watchdog's progress
+// reading (see stallNoProgress).
+func probeJetStreamForBucket(ctx context.Context, js streamLookup, bucket string) (uint64, error) {
+	st, err := js.Stream(ctx, "OBJ_"+bucket)
+	if err != nil {
+		return 0, fmt.Errorf("bucket stream OBJ_%s: %w", bucket, err)
+	}
+	ci := st.CachedInfo()
+	if streamInfoIsLeaderless(ci) {
+		return 0, fmt.Errorf("bucket stream OBJ_%s: no stream leader (the API answers, the stream cannot commit)", bucket)
+	}
+	if ci == nil {
+		return 0, nil
+	}
+	return ci.State.LastSeq, nil
+}
+
+// streamLookup is the ONE JetStream method the probe uses. jetstream.JetStream satisfies it; naming it
+// lets a test hand the probe a stream handle the embedded server cannot produce — a clustered stream
+// with no leader — so the probe's second half is pinned through the probe itself, not only through the
+// predicate below (round-2 review R4-2-F1: disconnecting the two stayed green).
+type streamLookup interface {
+	Stream(ctx context.Context, name string) (jetstream.Stream, error)
+}
+
+// streamInfoIsLeaderless is the probe's second half as a predicate: a clustered stream whose info names no
+// leader. A nil info or a missing cluster block (standalone JetStream) is NOT leaderless.
+func streamInfoIsLeaderless(ci *jetstream.StreamInfo) bool {
+	return ci != nil && ci.Cluster != nil && ci.Cluster.Leader == ""
 }
 
 func pushTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remoteSpec,
@@ -232,6 +577,7 @@ func pushTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 
 func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remoteSpec,
 	transferID, abs string, size int64, force bool, timeout time.Duration) error {
+	startedAt := time.Now().UTC()
 	// Pre-compute sha over the file.
 	f, err := os.Open(abs)
 	if err != nil {
@@ -272,29 +618,103 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 
 	// Step 2: ObjectStore.Put into the per-session bucket xfer-<sid>,
 	// keyed by transferID.
+	//
+	// From here until the commit is sent the broker holds this transfer's slot in the session's
+	// bucket on OUR behalf, and nobody else can end it: the agent has not been told anything yet, and
+	// the broker's watchdog only fires at the full size-derived budget. So every failure path below
+	// tells the broker we gave up (finalize{failed}, best-effort, 3 s) — the same courtesy the pull
+	// side has always paid. Before simcluster-speed 0a a push whose Put failed left the slot held and
+	// the session's next tier-B push refused too_many_in_flight for the rest of the budget (drill 67
+	// CONTROL(after): twelve refusals in a row against a healthy cluster). An old broker refuses the
+	// push finalize with verb_mismatch and nothing changes; that is the N-1 degradation, not a fault.
+	bucket := proto.XferBucketName(sid)
+	abandon := func(code, errMsg string) {
+		failAndFinalize(nc, actor, sid, transferID, "b", code, errMsg, startedAt)
+	}
 	js, err := jetstream.New(nc)
 	if err != nil {
+		abandon("jetstream_unavailable", err.Error())
 		return fmt.Errorf("push (tier B): jetstream new: %w", err)
 	}
-	bucket := proto.XferBucketName(sid)
 	putCtx, putCancel := context.WithTimeout(cmd.Context(), timeout)
 	defer putCancel()
 	store, err := js.ObjectStore(putCtx, bucket)
 	if err != nil {
+		abandon("bucket_bind_failed", err.Error())
 		return fmt.Errorf("push (tier B): bind bucket %s: %w", bucket, err)
 	}
 	uploadFile, err := os.Open(abs)
 	if err != nil {
+		abandon("io_error", err.Error())
 		return fmt.Errorf("push (tier B): reopen local: %w", err)
 	}
 	defer func() { _ = uploadFile.Close() }()
-	info, err := store.Put(putCtx, jetstream.ObjectMeta{Name: transferID},
-		io.LimitReader(uploadFile, size+1))
-	if err != nil {
-		return fmt.Errorf("push (tier B): Put: %w", err)
+	// gotcha #84: a Put on a JetStream that has lost quorum (the peer holding the meta/stream leader is
+	// down) sends its chunks and then waits for acks that never come — for the WHOLE phase budget (≈7 min
+	// for 12 MB after P-b; 37 min before), and what the operator finally reads is a bare `nats: timeout`.
+	// The transient-vs-permanent wording G67 fixed on the prepare leg never reached this leg, because since
+	// 0b204b5 prepare resolves the bucket locally and succeeds without a JetStream round trip. #84 has
+	// THREE faces, and the Put runs under a ladder that answers each with the same transient code + retry
+	// vocabulary the prepare leg uses (jetstream_not_ready, exit 75), the slot released through abandon:
+	//
+	//   1. STALL, no answer — the bucket's stream is probed every jsPutProbeInterval with ONE STREAM.INFO
+	//      (the only call inside the ctl's ACL; probeJetStreamForBucket); jsPutProbeStrikes consecutive
+	//      probes that fail or answer without a stream leader cancel the Put (stallNoAnswer). JetStream is
+	//      down for this bucket; this face is NOT retried into — another window would find it down.
+	//   2. INSTANT refusal — Put fails within a second ("no responders" / "no response from stream" /
+	//      503): a leader election in progress. Retried a bounded number of times (putWithJSRetry) with
+	//      the file rewound per attempt, then refused.
+	//   3. STALL, no progress — the probes answer WITH a leader but the stream's last sequence does not
+	//      move for jsPutProbeStrikes probes: the chunk burst landed during the election and was dropped
+	//      without a NAK, and the stream is healthy for everyone but this Put (drill 67 image #8: 92
+	//      chunks in during the first 5 s, `msgs` static for the next 115 s; the /jsz sampler showed the
+	//      leader back after ≈5 s, which is why face 1 alone could not see it). Cancelled as
+	//      stallNoProgress and retried like face 2 — a fresh Put lands (image #8 attempt 2: 194 ms).
+	//
+	// A healthy JetStream answers every probe and its sequence moves with every chunk, so the watchdog
+	// never touches a slow big file. The stall messages name the face ("N probes over 30s failed" vs
+	// "accepted none of the upload … last_seq stuck at N") because the operator reads them; the
+	// `Permissions Violation for Publish to "$JS.API.STREAM.PURGE…"` line that follows a cut attempt is
+	// nats.go's best-effort purge of the previous chunk generation, denied on purpose (the reaper owns
+	// the bucket) and harmless — see putWithJSWatchdog's cut for the two ways it shapes a retry.
+	var info *jetstream.ObjectInfo
+	attemptPut := func(c context.Context) error {
+		if _, err := uploadFile.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("rewind local file: %w", err)
+		}
+		return putWithJSWatchdog(c, func(c context.Context) error {
+			var perr error
+			info, perr = store.Put(c, jetstream.ObjectMeta{Name: transferID}, io.LimitReader(uploadFile, size+1))
+			return perr
+		}, func(c context.Context) (uint64, error) {
+			return probeJetStreamForBucket(c, js, bucket)
+		}, jsPutProbeInterval, jsPutProbeTimeout, jsPutProbeStrikes)
+	}
+	putErr := putWithJSRetry(putCtx, attemptPut, jetStreamUnavailableFace, jsPutRetryAttempts, jsPutRetryBackoff, sleepCtx)
+	// The refusal is checked BEFORE the stall: a refusal wraps its last attempt's error, and that error can
+	// itself be a (no-progress) stall — matching the stall first would print the wrong face and drop the
+	// attempt count the drill-67 non-vacuity tooth reads.
+	var refused *jetStreamRefusedError
+	if errors.As(putErr, &refused) {
+		abandon("jetstream_not_ready", refused.Error())
+		return transferRefusalErr("jetstream_not_ready",
+			"push (tier B): code=jetstream_not_ready JetStream is not accepting the upload (%s) — a transient condition: the bucket's stream had no leader while a broker was down or restarting; retry shortly, once `tether cluster status` shows JetStream back",
+			refused.Error())
+	}
+	var stall *jetStreamStallError
+	if errors.As(putErr, &stall) {
+		abandon("jetstream_not_ready", stall.Error())
+		return transferRefusalErr("jetstream_not_ready",
+			"push (tier B): code=jetstream_not_ready JetStream stopped answering during the upload (%s) — a transient condition: a broker that held JetStream quorum is down or restarting; retry shortly, once `tether cluster status` shows JetStream back",
+			stall.Error())
+	}
+	if putErr != nil {
+		abandon("object_put_failed", putErr.Error())
+		return fmt.Errorf("push (tier B): Put: %w", putErr)
 	}
 	if int64(info.Size) != size {
-		_ = store.Delete(putCtx, transferID)
+		tombstoneUploadedObject(cmd.Context(), store, transferID)
+		abandon("size_mismatch", fmt.Sprintf("prepared size=%d uploaded=%d", size, info.Size))
 		return fmt.Errorf("local file changed while uploading: prepared size=%d uploaded=%d; retry",
 			size, info.Size)
 	}
@@ -321,13 +741,24 @@ func pushTierB(cmd *cobra.Command, nc *nats.Conn, actor, sid string, spec remote
 	resp, err = nc.RequestWithContext(commitCtx,
 		proto.SubjCmdBy(sid, actor, spec.Node, "push-commit"), body)
 	if err != nil {
+		// A commit whose REPLY was lost is the one case the creator cannot classify: the broker may have
+		// forwarded it (the agent now owns the terminal) or never seen it (the slot is ours to free). The
+		// broker arbitrates — markCommitted runs under the tracker lock before any forward, so this
+		// finalize{failed} is refused verb_mismatch in the first case and frees the slot in the second.
+		// Sending it is therefore always safe, and not sending it left the slot held to the full budget
+		// (internal review round 1 R6-F4 / R2-F3).
+		abandon("commit_lost", err.Error())
 		return fmt.Errorf("push (tier B commit): %w", err)
 	}
 	var cr proto.TransferCommitResp
 	if err := json.Unmarshal(resp.Data, &cr); err != nil {
+		abandon("commit_reply_malformed", err.Error())
 		return fmt.Errorf("push (tier B commit): parse: %w", err)
 	}
 	if !cr.OK {
+		// A refusal is a reply the broker sent INSTEAD of forwarding (gate, tier, ownership): the entry
+		// is not committed, so the abandon frees the slot.
+		abandon(cr.Code, cr.Error)
 		return transferRefusalErr(cr.Code, "push (tier B) commit refused: code=%s %s", cr.Code, cr.Error)
 	}
 
@@ -494,7 +925,10 @@ func runPull(cmd *cobra.Command, home, natsURL string, spec remoteSpec, localPat
 	if pr.Tier == "a" {
 		return finishPullTierA(cmd, nc, id.PublicKey, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
 	}
-	return finishPullTierB(cmd, nc, id.PublicKey, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
+	// The size is only known after prepare on the pull side, so the derivation happens here rather than
+	// up front as on push; the prepare phase above keeps the flag's value.
+	return finishPullTierB(cmd, nc, id.PublicKey, sid, spec, transferID, localAbs, startedAt, pr, force,
+		phaseTimeoutFor(cmd, pr.Size, timeout))
 }
 
 func finishPullTierA(cmd *cobra.Command, nc *nats.Conn, actor, sid string,

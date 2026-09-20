@@ -634,7 +634,13 @@ func (a *Agent) proxyStartLocked(nc *nats.Conn, p *proxyRuntime,
 	// goroutine the instant AddProxy spawns it) is correctly attributed to the
 	// proxy port rather than filtered out. Cleared on teardown / fail-cleanup.
 	a.proxyPublicPort.Store(int64(publicPort))
-	if err := a.cfg.ExposeAdapter.AddProxy(PortToken{
+	// The proxy tunnel's open is bounded by the tunnel client's own lifetime and nothing
+	// else, exactly as before AddProxy took a ctx: this function takes no ctx by design
+	// (see applyProxyDirective; dataplane_lifetime gate), nobody upstream is holding a
+	// request open for the dial, and a session-scoped bound here would put the
+	// 2026-08-21 coupling back one layer down.
+	openCtx := context.Background() // ctx-none: proxyStartLocked must not carry a ctx (gotcha #80); no deadline by design.
+	if err := a.cfg.ExposeAdapter.AddProxy(openCtx, PortToken{
 		Name: proxyTokenName, Port: publicPort, LocalPort: lp, Token: token,
 		HomeBrokerAddr: homeAddr, Epoch: homeEpoch, CertPins: homePins,
 	}); err != nil {
@@ -992,7 +998,14 @@ func (a *Agent) onNATSReconnect(nc *nats.Conn) {
 			a.pubProxyReady(nc, true)
 		}
 	}
-	a.cfg.Logger.Info("agent: re-registered after reconnect")
+	// The same counts the first register prints (DOC-25): the reconnect path is where a broker that was
+	// rolled back / restored answers with drop directives for processes it no longer knows, and a line
+	// without the counts cannot say whether the broker asked for a kill that never happened or never asked
+	// (drill 94 arm B has been unattributable on exactly this since 2026-09-03; simcluster-speed S2 triage).
+	a.cfg.Logger.Info("agent: re-registered after reconnect",
+		"reconciled", len(resp.ReconciledProcesses),
+		"drop_procs", len(resp.DropProcesses),
+		"revoke_ports", len(resp.RevokePorts))
 }
 
 // armFailClosed (B1) starts the fail-closed countdown on NATS disconnect: if

@@ -28,7 +28,7 @@ type failingProxyAdapter struct {
 	healthy  bool
 }
 
-func (f *failingProxyAdapter) AddProxy(PortToken) error {
+func (f *failingProxyAdapter) AddProxy(context.Context, PortToken) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attempts++

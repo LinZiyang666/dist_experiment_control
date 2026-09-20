@@ -145,7 +145,7 @@ func TestRosterRefreshTriggersProactiveRehomeOffALeavingBroker(t *testing.T) {
 			nc, stop := serveRosterRefresh(t, url, a, served)
 			defer stop()
 
-			if !a.refreshRosterOnce(context.Background(), nc) {
+			if !a.refreshRosterOnce(context.Background(), nc, rosterWakeTimer) {
 				t.Fatal("refreshRosterOnce reported failure against a responding broker")
 			}
 

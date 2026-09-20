@@ -24,10 +24,32 @@ type TunnelExposeAdapter struct {
 	client *tunnel.Client
 	logger *slog.Logger
 
-	opMu     sync.Mutex
+	// opSem serialises AddProxy / ApplyHome / RemoveProxy against each other (it was a
+	// sync.Mutex): holding the one token IS holding the adapter's op lock. A channel so
+	// that AddProxy can give up the wait when its caller's deadline passes (external
+	// review F1) — a Mutex has no bounded Lock, and an AddProxy queued behind a slow
+	// rehome would otherwise start its own dial after the budget it was given had
+	// already expired.
+	opSem    chan struct{}
 	mu       sync.RWMutex
 	localFor map[int]int // publicPort → localPort
 }
+
+// acquireOp takes the adapter's op lock or gives up when ctx ends first.
+func (a *TunnelExposeAdapter) acquireOp(ctx context.Context) error {
+	select {
+	case a.opSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("tunnel adapter: waiting for the op lock: %w", ctx.Err())
+	}
+}
+
+// acquireOpBlocking takes the op lock with no bound — for the callers that own their
+// own retry and have nobody upstream holding a request open (ApplyHome, RemoveProxy).
+func (a *TunnelExposeAdapter) acquireOpBlocking() { a.opSem <- struct{}{} }
+
+func (a *TunnelExposeAdapter) releaseOp() { <-a.opSem }
 
 // Compile-time contracts: the production adapter MUST satisfy ExposeAdapter AND the
 // OPTIONAL homeApplier + homeSessionChecker (D6 §7.4 / audit M3). The agent type-asserts
@@ -46,6 +68,7 @@ var (
 func NewTunnelExposeAdapter(brokerAddr, sid, nid string, logger *slog.Logger) *TunnelExposeAdapter {
 	a := &TunnelExposeAdapter{
 		logger:   logger,
+		opSem:    make(chan struct{}, 1),
 		localFor: map[int]int{},
 	}
 	a.client = tunnel.NewClient(brokerAddr, sid, nid, a.lookupLocal, logger)
@@ -79,16 +102,26 @@ func (a *TunnelExposeAdapter) SetSessionStateHook(fn func(publicPort int, up boo
 // AddProxy opens a tunnel session. Failure → caller (agent.handle
 // ExposeForwarded) rolls back state.json + replies frpc_failed to the
 // broker so the SQLite row is freed.
-func (a *TunnelExposeAdapter) AddProxy(p PortToken) error {
-	a.opMu.Lock()
-	defer a.opMu.Unlock()
+//
+// ctx bounds the WHOLE open — the wait for the op lock, the dial, the REGISTER
+// handshake and the install — and nothing after it: the session that a
+// successful AddProxy leaves behind lives on the tunnel client's own ctx. When
+// ctx ends first the open is abandoned wherever it is (a registered-but-not-
+// installed transport is discarded, see tunnel.Client.OpenHome) and the ctx
+// error is returned, so the caller's failure report is never contradicted by a
+// session that landed after it (external review F1).
+func (a *TunnelExposeAdapter) AddProxy(ctx context.Context, p PortToken) error {
+	if err := a.acquireOp(ctx); err != nil {
+		return fmt.Errorf("tunnel adapter AddProxy: %w", err)
+	}
+	defer a.releaseOp()
 
 	a.setLocal(p.Port, p.LocalPort)
 	// D6 §7.5: dial THIS expose's home (p.HomeBrokerAddr, "" ⇒ the Client's single
 	// --tunnel-addr fallback) at its home epoch, pinned by the directive's certs.
 	// A clustered home (non-empty addr) with no pins returns ErrHomePinsRequired;
 	// the caller (replay) defers until a register/expose reply re-delivers them.
-	if err := a.client.OpenHome(p.Port, p.LocalPort, p.Token, p.HomeBrokerAddr, p.Epoch, p.CertPins); err != nil {
+	if err := a.client.OpenHome(ctx, p.Port, p.LocalPort, p.Token, p.HomeBrokerAddr, p.Epoch, p.CertPins); err != nil {
 		a.deleteLocal(p.Port)
 		return fmt.Errorf("tunnel adapter AddProxy: %w", err)
 	}
@@ -101,8 +134,8 @@ func (a *TunnelExposeAdapter) AddProxy(p PortToken) error {
 // the agent type-asserts. A transient home_catching_up surfaces here for the
 // caller (applyReconciliation) to retry.
 func (a *TunnelExposeAdapter) ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error {
-	a.opMu.Lock()
-	defer a.opMu.Unlock()
+	a.acquireOpBlocking()
+	defer a.releaseOp()
 	return a.client.ApplyHome(publicPort, brokerAddr, epoch, certPins)
 }
 
@@ -123,8 +156,8 @@ func (a *TunnelExposeAdapter) HasSession(publicPort int) bool {
 // RemoveProxy closes the tunnel session for publicPort. Name is
 // unused (the broker keys by name, the tunnel keys by port).
 func (a *TunnelExposeAdapter) RemoveProxy(_ string, publicPort int) error {
-	a.opMu.Lock()
-	defer a.opMu.Unlock()
+	a.acquireOpBlocking()
+	defer a.releaseOp()
 
 	a.client.Close(publicPort)
 	a.deleteLocal(publicPort)

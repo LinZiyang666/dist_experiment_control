@@ -16,6 +16,7 @@ runner_world() {
     _w=$1
     mkdir -p "$_w/drills"
     ln -sf "$SIMROOT/run-drills.sh" "$_w/run-drills.sh"
+    ln -sf "$SIMROOT/lib" "$_w/lib"    # the runner sources lib/manifest.sh and refuses to run without it
     cat >"$_w/simcluster" <<'EOF'
 #!/bin/sh
 case "$1" in

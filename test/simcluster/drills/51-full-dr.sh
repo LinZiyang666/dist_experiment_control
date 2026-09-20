@@ -495,6 +495,10 @@ fi
 _dr_step "re-grow the cluster back to N>=2"
 assert_ok "I-prep bring up a second broker container" "$SIM" up --brokers 2 --agents 1 --ctl 1
 _I_OUT=$("$SIM" grow brk2 2>&1); _I_RC=$?
+# The grow's own output is kept IN FULL on every non-success path: the branches below classify it by regex
+# and record a canned string, and on the G1 cap-0 sample (2026-09-19) that left nothing but the branch name
+# to attribute the red with — "grow output not captured" (round-2 review R5-F7).
+[ "$_I_RC" = 0 ] || { log "51 I re-grow rc=$_I_RC — full output follows:"; printf '%s\n' "$_I_OUT" | tr -cd '[:print:]\n' | while IFS= read -r _i_l; do log "  grow| $(printf '%s' "$_i_l" | cut -c1-300)"; done; }
 if [ "$_I_RC" = 0 ] && poll_until 90 3 "N=2 VOTER after the DR re-grow" -- _two_voters_now; then
     _as_pass "I re-grow to N=2 succeeded after the DR"
     assert_ok "I2 the data plane STILL serves the original sentinel after the re-grow" \

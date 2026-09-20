@@ -33,8 +33,8 @@ func newProxyTestAgent(t *testing.T) *Agent {
 
 type noopProxyAdapter struct{}
 
-func (noopProxyAdapter) AddProxy(PortToken) error      { return nil }
-func (noopProxyAdapter) RemoveProxy(string, int) error { return nil }
+func (noopProxyAdapter) AddProxy(context.Context, PortToken) error { return nil }
+func (noopProxyAdapter) RemoveProxy(string, int) error             { return nil }
 
 // applyProxyDirective must be race-free under concurrent enable / keyset-update
 // / disable, and converge to a clean stopped state. The -race detector is the

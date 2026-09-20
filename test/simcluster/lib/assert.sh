@@ -489,6 +489,7 @@ drill_begin() {
     _AS_ORD=0; _AS_FIRST_FAIL_ORD=0; _AS_EV_HOST_DONE=0
     _AS_ARGV=""; _AS_RC=""; _AS_MS=""; _AS_OUT=""
     _AS_FRAME_OPEN=1          # R1: arms the contract-total die() below
+    _AS_T0=$(date +%s)        # simcluster-speed 0b: the drill's own wall clock, reported on the trailer
     log "=== drill: $_AS_DRILL ==="
 }
 
@@ -508,6 +509,15 @@ drill_end() {
     if [ "${_AS_FIRST_FAIL_ORD:-0}" != 0 ] && [ -s "$(_as_ev_file)" ]; then
         printf 'DRILL-EVIDENCE file=%s first_fail_ord=%s\n' "$(_as_ev_file)" "$_AS_FIRST_FAIL_ORD" >&2
     fi
+    # simcluster-speed D: an ARM unit states which branch it ran — its own appended line, for the same
+    # reason as DRILL-EVIDENCE (the DRILL-VERDICT grammar must not grow fields). run-drills.sh requires
+    # exactly one such line naming the arm it asked for (`drill <name> --arm <A>` exports ARM and
+    # SIM_DRILL_NAME); a drill that ran a different branch, or a hand-run arm with no drill name to answer
+    # for, is a CONTRACT-ERROR there, never a verdict of record. A manifest-free drill has no ARM and
+    # prints nothing, so its output stays byte-identical.
+    if [ -n "${ARM:-}" ]; then
+        printf 'DRILL-ARM arm=%s of=%s\n' "$ARM" "${SIM_DRILL_NAME:-?}" >&2
+    fi
     # M3: how much of this drill was spent waiting on the cluster, as opposed to doing anything. Also an
     # appended line, for the same reason as DRILL-EVIDENCE: the DRILL-VERDICT grammar is parsed in three
     # places and must not grow fields.
@@ -515,7 +525,11 @@ drill_end() {
         # "direct" because it covers only top-level poll_until calls, not those nested inside an assert
         # predicate's subshell (see poll_wait_total's LIMIT note). Naming it honestly stops a later phase
         # from tuning against it as if it were the complete wait budget.
-        printf 'DRILL-POLL-WAIT direct_total=%ss\n' "$(poll_wait_total)" >&2
+        # simcluster-speed 0b: the drill's wall time and start epoch ride on the same appended line, so a
+        # sweep can sum "waited" against "took" per drill without a timestamped console. The two fields
+        # are APPENDED after direct_total (nothing parses this line beyond a comment in run-drills.sh);
+        # a parser that pins the old shape by prefix still matches.
+        printf 'DRILL-POLL-WAIT direct_total=%ss wall=%ss t0=%s\n' "$(poll_wait_total)" "$(( $(date +%s) - ${_AS_T0:-$(date +%s)} ))" "${_AS_T0:-0}" >&2
     fi
     if [ "$_de_v" = GREEN ]; then ok "=== $_AS_DRILL: GREEN ($_AS_PASS assertions, 0 gaps) ==="
     else err "=== $_AS_DRILL: $_de_v (pass=$_AS_PASS product-red=$_AS_PRODUCT_RED setup-red=$_AS_SETUP assert-fail=$_AS_FAIL not-covered=$_AS_NC [gap=$_AS_NC_GAP guard=$_AS_NC_GUARD]) ==="; fi

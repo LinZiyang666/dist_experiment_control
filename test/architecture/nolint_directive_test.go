@@ -273,7 +273,11 @@ func TestNolintDirectivesNameEnabledLinters(t *testing.T) {
 	// the host-flock closure (same semantics as the four before it: the closure's error return
 	// carries LOCK failures only, and "no pending marker" means there is nothing to restore).
 	// Enumerated in line2-plan §14.1.
-	const expectedDirectives = 35
+	// 35 → 36: simcluster-speed #83 — resumeBlockedJoinWith's lost join-status reply is swallowed on
+	// purpose (nilerr): the pre-check is best-effort and waitJoinServing owns the retry, so a HALT
+	// there would turn one lost NATS reply into a grow HALT right after the boundary. Enumerated in
+	// docs/reviews/simcluster-speed-plan.md §8.5.
+	const expectedDirectives = 36
 	if scanned != expectedDirectives {
 		t.Errorf("the scan found %d //nolint directive(s), expected exactly %d.\n\n"+
 			"MORE: a new exemption was added. Add it to plan §14.1's enumeration and bump this constant in "+

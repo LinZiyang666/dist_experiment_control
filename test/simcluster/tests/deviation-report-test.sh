@@ -128,7 +128,9 @@ order=$(printf '%s\n' "$out" | sed -n 's/^\[[0-9:]*\] launch \([^ ]*\).*/\1/p' |
     || fail "launch order was [$order], want [d-inc d-band-match d-green ]"
 # The rollup is for humans and stays in the order the caller gave, NOT the launch order — otherwise
 # every rollup silently reorders the day a cost changes.
-rorder=$(cut -f1 "$RT/l3/rollup.tsv" | grep -v '^WAIVER\|^ATTRIBUTION' | tr '\n' ' ')
+# The keyed short rows (WAIVER-USED / ATTRIBUTION / REGIME / ARMS) are not drill rows; a first-column
+# reader must skip them, exactly as the rollup.tsv header says.
+rorder=$(cut -f1 "$RT/l3/rollup.tsv" | grep -v '^WAIVER\|^ATTRIBUTION\|^REGIME\|^ARMS' | tr '\n' ' ')
 [ "$rorder" = "d-green d-inc d-band-match " ] && pass "rollup row order is UNCHANGED by launch ordering" \
     || fail "rollup order was [$rorder]"
 # An unknown drill must sort FIRST at max cost: a new drill is dangerous as a straggler, harmless early.

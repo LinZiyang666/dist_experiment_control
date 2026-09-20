@@ -23,7 +23,11 @@ CTL()    { "$SIM" ctl -- "$@"; }
 ptyrun() { "$SIM" exec ctl1 -- timeout "${PTY_TIMEOUT:-70}" runuser -u sim -- env HOME=/home/sim python3 /opt/sim/pty-run.py "$@"; }
 
 _agt_online()   { "$SIM" ctl -- node ls 2>/dev/null    | grep -qE "^$1[[:space:]].*ONLINE"; }
-_agt2_gone()    { "$SIM" ctl -- node ls -a 2>/dev/null  | grep -qE "^agt2[[:space:]]+(OFFLINE|STALE)"; }
+# `node ls` columns are NODE KIND STATUS … since 1e9d32a (2026-08-19, the KIND column of the cloned-credential
+# increment); this regex read STATUS as the SECOND column and was red on every sweep from that day until the
+# S2 sweep of simcluster-speed triaged it (2026-09-19) — the 2026-09-03 "stale table" note had it down as
+# "J-G.3c-2 首次 post-login node ls -a", unattributed. 00-skeleton was swept for the new column; this was not.
+_agt2_gone()    { "$SIM" ctl -- node ls -a 2>/dev/null  | grep -qE "^agt2[[:space:]]+[^[:space:]]+[[:space:]]+(OFFLINE|STALE)"; }
 _agt2_not_online_default() { ! "$SIM" ctl -- node ls 2>/dev/null | grep -qE "^agt2[[:space:]]"; }
 # broker-authoritative observer (external review MAJOR-1): read brk1's node table DIRECTLY via its admin
 # socket, as the broker's own uid (tether). This does NOT depend on a ctl active-session, so it is valid in

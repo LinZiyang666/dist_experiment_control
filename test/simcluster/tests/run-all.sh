@@ -1,7 +1,8 @@
 #!/bin/sh
-# run-all.sh — the hermetic gate set for test/simcluster/. No docker, no server. About two minutes:
+# run-all.sh — the hermetic gate set for test/simcluster/. No docker, no server. About three minutes:
 # poll-reentrancy / deviation-report / accel-final-review / verdict-contract / poll-mode wait on real
-# timers (~115s of the total, measured 2026-09-01); everything else is sub-second.
+# timers (~115s of the total, measured 2026-09-01), and arm-aggregation-test adds ~50s more (its lane
+# and ceiling cases must let real units run and be killed); everything else is sub-second.
 #
 # WHY THIS EXISTS: every gate below was written because a specific false-green got through. Left as
 # separate scripts they get run individually and unevenly — the install lint in particular shipped with
@@ -28,7 +29,7 @@ run_script() {
         *) sh "$1" ;;
     esac
 }
-for t in poll-reentrancy-test verdict-contract-test validate-verdicts validate-verdicts-selftest deviation-report-test poll-mode-test dns-preflight-test simcluster-accel-external-review-test simcluster-accel-external-rereview-test simcluster-accel-final-review-test remote-fs-oracle-contract-test lint-drills lint-install ledger-crosscheck r9d-nonvacuity teardown-recovery-nonvacuity-test kept-sites-selftest r16-g67-g69-external-review r16-g67-g69-external-rereview s7-s9-external-review; do
+for t in poll-reentrancy-test verdict-contract-test validate-verdicts validate-verdicts-selftest deviation-report-test poll-mode-test dns-preflight-test simcluster-accel-external-review-test simcluster-accel-external-rereview-test simcluster-accel-final-review-test remote-fs-oracle-contract-test lint-drills lint-install arm-manifest-lint arm-manifest-selftest contention-registry-check contention-registry-selftest arm-aggregation-test ledger-crosscheck ledger-crosscheck-selftest r9d-nonvacuity teardown-recovery-nonvacuity-test kept-sites-selftest assert-identity-selftest timeline-test r16-g67-g69-external-review r16-g67-g69-external-rereview s7-s9-external-review; do
     printf '%-40s ' "$t"
     if out=$(run_script "$HERE/$t.sh" 2>&1); then printf 'PASS\n'
     else printf 'FAIL\n'; printf '%s\n' "$out" | tail -5 | sed 's/^/    /'; RC=1; fi
@@ -36,6 +37,11 @@ done
 printf '%-40s ' "kept-sites --check"
 if out=$(sh "$HERE/kept-sites.sh" --check "$HERE/kept-sites.baseline.tsv" 2>&1); then printf 'PASS\n'
 else printf 'FAIL\n'; printf '%s\n' "$out" | tail -5 | sed 's/^/    /'; RC=1; fi
+# simcluster-speed M0: the identity companion of kept-sites — a count-neutral swap of one claim for
+# another is invisible to the count above and red here (testing-standards G4).
+printf '%-40s ' "assert-identity --check"
+if out=$(sh "$HERE/assert-identity.sh" --check "$HERE/assert-identity.baseline.tsv" 2>&1); then printf 'PASS\n'
+else printf 'FAIL\n'; printf '%s\n' "$out" | tail -8 | sed 's/^/    /'; RC=1; fi
 printf -- '--------------------------------------------------------------------------------\n'
 [ "$RC" = 0 ] && echo "simcluster hermetic gates: ALL PASS" || echo "simcluster hermetic gates: FAILURES above" >&2
 exit $RC

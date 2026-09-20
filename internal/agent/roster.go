@@ -329,11 +329,21 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 	defer timer.Stop()
 	silent := 0
 	for {
+		// The wake SOURCE is logged with every refresh. Two sources exist — the jittered timer and the
+		// broker's nats_topology_* nudge (rosterRefreshNow) — and an operator asking "why did this agent
+		// not move to the new voter" needs to know which one ran, and which one was dropped: a nudge that
+		// lands while a reconnect/rebuild is in flight is deliberately discarded below and its work only
+		// happens on the next timer draw, up to a full interval later. Drill 41's fast-path arm reads
+		// exactly this line to tell "the nudge was never delivered" from "it was delivered and dropped".
+		// origin: simcluster-speed plan §5.3 I₁ (research R14: the interval is not compressible until
+		// the two mechanisms are distinguishable in evidence).
+		source := rosterWakeTimer
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
 		case <-a.rosterRefreshNow:
+			source = rosterWakeTopology
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -343,11 +353,17 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 		}
 		// Single-flight: a reconnect/rebuild's own register already refreshes the roster.
 		if a.reconnectInFlight.Load() || a.rebuilding.Load() {
-			timer.Reset(jitterDur(iv))
+			reason := "reconnect_in_flight"
+			if a.rebuilding.Load() {
+				reason = "rebuilding"
+			}
+			next := jitterDur(iv)
+			a.cfg.Logger.Info("agent: roster refresh wake dropped", "source", source, "reason", reason, "next_in", next)
+			timer.Reset(next)
 			continue
 		}
 		next := iv
-		if a.refreshRosterOnce(ctx, nc) {
+		if a.refreshRosterOnce(ctx, nc, source) {
 			silent = 0
 		} else {
 			silent++
@@ -365,7 +381,16 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 
 // refreshRosterOnce sends one roster-only register and adopts the returned roster. Returns false on a
 // failed / empty pull (caller retries on the short backoff). Best-effort — never fatal.
-func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
+// rosterWakeTimer / rosterWakeTopology name the two wake sources of rosterRefreshLoop in its log lines.
+const (
+	rosterWakeTimer    = "timer"
+	rosterWakeTopology = "topology_event"
+)
+
+// refreshRosterOnce runs one roster-only register. source is which wake drove it (rosterWake*), carried
+// into the outcome line so a refresh and the wake that caused it are one record, not two to join.
+func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn, source string) bool {
+	genBefore := a.cachedRosterGen()
 	req := proto.NodeRegisterReq{
 		ProtoVersion:      proto.ProtoVersion,
 		NID:               nidOf(a),
@@ -395,10 +420,15 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn) bool {
 		// at the NATS layer but its broker has entered DRAINING/RETIRING. That leaves the agent on
 		// a stale route island after the broker is removed. Trigger a single session rebuild only
 		// after the signed roster was actually accepted (verified, non-rollback and persisted).
-		if accepted && rosterRequiresReconnect(previous, resp.Roster, nc.ConnectedUrl()) {
+		rehome := accepted && rosterRequiresReconnect(previous, resp.Roster, nc.ConnectedUrl())
+		if rehome {
 			a.requestRosterReconnect()
 		}
+		a.cfg.Logger.Info("agent: roster refreshed", "source", source,
+			"gen_before", genBefore, "gen_after", a.cachedRosterGen(), "accepted", accepted, "rehome", rehome)
+		return true
 	}
+	a.cfg.Logger.Info("agent: roster refreshed", "source", source, "gen_before", genBefore, "gen_after", genBefore, "roster", "none")
 	return true // a single/non-cluster broker (nil roster) is a successful no-op, not a retry
 }
 

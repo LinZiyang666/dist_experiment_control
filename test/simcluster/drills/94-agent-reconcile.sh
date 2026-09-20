@@ -319,7 +319,7 @@ assert_ok "B3-timeout the orphan was KILLED (the broker returned a drop directiv
     poll_until 30 1 "the orphan process is gone" -- _no_orph
 
 # ── B4/B5 — the arm does NOT end at "the process is gone" ───────────────────────────────────────────
-assert_ok "B5 the agent logged the orphan kill (this line IS the evidence the drop directive was received AND acted on; the reconnect path prints no drop_procs count — DOC-25)" \
+assert_ok "B5 the agent logged the orphan kill (this line IS the evidence the drop directive was received AND acted on; DOC-25 closed 2026-09-19 — the reconnect path now prints reconciled/drop_procs/revoke_ports like the first register, which is how #87 was finally attributed)" \
     _agent_slog_after agt1 "$CUR" 'agent: kill orphan'
 assert_ok "B4a G.5: the killed_orphan audit row exists for the orphan's ULID" \
     poll_until 30 3 "the killed_orphan audit row lands" -- _b4_orphan_row

@@ -11,6 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/clusterroster"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // cluster_manifest_test.go (C2) — the security-critical manifest properties: inert in single mode,
@@ -28,7 +29,7 @@ func newManifestTestBroker(t *testing.T) (b *Broker, accountPub string, seed []b
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	testharness.CloseDBOnCleanup(t, db) // file-backed WAL: wait for borrowed connections before TempDir goes
 	if _, err := db.Exec(`INSERT INTO cluster_nodes(node_id,name,node_ident_pub,nats_server_id,raft_addr,nats_route,tunnel_addr,public_host,cert_fp,phase,added_at) VALUES('self','self','p','self','10.0.0.1:7400','nats://10.0.0.1:6222','10.0.0.1:7443','b1.example.com','sha256:s','VOTER','2026-06-24 00:00:00 +0000 UTC')`); err != nil {
 		t.Fatal(err)
 	}

@@ -36,9 +36,38 @@ type AuthCalloutConfig struct {
 // inbox is no longer a plain option append — it is a connect-and-probe (natsinbox.Connect),
 // and only the caller owns the dial.
 func (b *Broker) brokerConnectOptions() ([]nats.Option, string, error) {
+	logger := b.cfg.Logger
 	opts := []nats.Option{
 		nats.Name("tetherd"),
 		nats.MaxReconnects(-1),
+		// THE BROKER NEVER ROAMS OFF ITS OWN NATS SERVER (gotcha #89; simcluster-speed round 2).
+		//
+		// nats.go adds every server the cluster advertises in INFO to the reconnect pool and,
+		// on a disconnect, tries the OTHER pool entries before the one it was on. A broker whose
+		// local nats-server is bounced — the topology reconciler's staggered hard restart for a
+		// non-reloadable route delta, an operator restart, an upgrade — therefore came back on a
+		// PEER's server and stayed there for the rest of its life, silently: its own server was
+		// left with no auth_callout responder and no ctl-queue member (a ctl dialing that server
+		// black-holed on auth — the "minority cannot authenticate, rc=69 50/50" R6 measured), its
+		// forwards and JS calls rode a network path its own server was not on, and drill 96.D's
+		// "isolated minority" premise was false three times under load: the partitioned brk1's
+		// broker was on brk2's NATS, forwarded the ctl's create to the live leader through it,
+		// and logged `session created` while brk1's routes and raft were cut — read as a raft
+		// safety violation (#65) by the committer-attribution probe. The broker's server is the
+		// one clients reach it through; a reconnect anywhere else is not resilience, it is the
+		// broker leaving its post. Ignore the advertised pool and keep dialing the configured
+		// URL(s) in order — MaxReconnects(-1) already retries forever, so a bounced local server
+		// is rejoined the moment it is back.
+		nats.IgnoreDiscoveredServers(),
+		nats.DontRandomize(),
+		// Every disconnect/reconnect is logged WITH the server it landed on: the roam above was
+		// invisible for months because the broker had no reconnect handler at all.
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			logger.Warn("broker: NATS disconnected", "err", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			logger.Info("broker: NATS reconnected", "url", nc.ConnectedUrlRedacted(), "server", nc.ConnectedServerName())
+		}),
 	}
 	if b.cfg.AuthCallout == nil {
 		return opts, "", nil
