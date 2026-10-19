@@ -118,6 +118,8 @@ GPU 备注：8 张 GTX 1080 单卡仅 8 GiB 显存，**不适合**跑 pi0.5 推�
 
 ### 2.2 jupyter-ziyang10 — pi0.5 server（资源受限）
 
+> **2026-10-19 更新**：现在的 jupyter-ziyang10 与 jupyter-ziyang10-02 都是 **H200 NVL 的 MIG 1g.18gb 切片**（18 GB 显存、约 1/7 整卡算力，nvidia-smi 读不到显存），容器 32 GiB 内存、16 核，home 是共享 NFS（两台同一个 /home/ziyang10），**无公网 IP、可外连**，MIG 不支持 EGL（worker 不能放这里）。owner：只当服务机，内网穿透自选、**不准用 tether**；现用 pod → H100（149.165.153.233）或 A100（149.165.152.232）的反向 SSH 隧道（专用受限钥匙），worker 用 A100/timan。随时可能下线，下线就通知 owner 重开。下面是旧记录。
+
 | 项 | 值 |
 |---|---|
 | **角色** | server（运行 pi0.5 模型推理） |
@@ -441,10 +443,11 @@ pi0.5 起到监听约 70 s/replica（带 cache 时更久，每 replica 要读 26
 6. 从别机 freeze 出来的依赖表里会有本机绝对路径（`-e file:///home/weiland/projects/openpi/packages/openpi-client`），
    直接拿去装报 `Distribution not found`，要先改写路径。
 
-### 2.8 a100（新，2026-10-17 到位）—— ⛔ 暂不能加入实验设备
+### 2.8 a100（新，2026-10-17 到位）—— 纯 worker 机，只给 H100 的批次用
 
-> **状态**：owner 2026-10-17 告知新进一台 A100，**公网 IP 149.165.152.232**，**现在还不能加入实验设备**。
-> 在 owner 明确放行之前：不连接、不部署、不探测、不排进任何实验或 worker 池，也不计入容量。
+> **状态（2026-10-19 更新）**：公网 **149.165.152.232**。10-18 owner 放行为**纯 worker 机**（不跑模型）；10-19 起**只给服务在 H100 的批次**派 worker，4090 的批次不派。
+> 实测：A100-SXM4-40GB、32 核、118 GiB 内存；一个 LIBERO worker 稳定约 2 GB 内存，所以上限约 55–63 个（内存是唯一瓶颈）。ssh 22 端口对外可用：jupyter 服务机的反向 SSH 隧道接到这里（`~/.ssh/authorized_keys` 里一条 zl-tunnel-jupyter 受限钥匙，只允许 permitlisten 127.0.0.1:24470–24473，不能登录）。
+> 10-17 原文：owner 告知新进一台 A100，当时还不能加入实验设备。
 > 它和 §2.4 存档的旧 a100（149.165.152.105，已退役）不是同一台。
 
 | 项 | 值 |
