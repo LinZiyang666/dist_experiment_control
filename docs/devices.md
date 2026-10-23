@@ -486,7 +486,7 @@ pi0.5 起到监听约 70 s/replica（带 cache 时更久，每 replica 要读 26
 ### 2.10 h100-sean — 单卡 H100 server（公网直连，2026-10-22 入网）
 
 > owner 10-22：与 h100、h100-temp 同一集群、节点同质；**和 h100 一样是一等公民，我们自由使用**，起到和 h100 相同的角色（模型服务 + 本机渲染 worker）。
-> 用法与 §2.7 h100 相同：公网直连，不 expose、不走 broker。批次用别名环境变量 `R17_H100_NODE=h100-sean R17_H100_HOST=149.165.169.137 R17_DRIVER_PORT=23195` 把「h100」角色落到这台。
+> 用法与 §2.7 h100 相同：公网直连，不 expose、不走 broker。批次用别名环境变量 `R17_H100_NODE=h100-sean R17_H100_HOST=149.165.169.137 R17_DRIVER_PORT=23197` 把「h100」角色落到这台。
 
 | 项 | 值 |
 |---|---|
@@ -499,7 +499,7 @@ pi0.5 起到监听约 70 s/replica（带 cache 时更久，每 replica 要读 26
 | **磁盘** | 系统盘 2 TB（10-22 剩 901 GB）；挂载盘 `/dev/sdb` → `/media/volume/sdb`（1 TB，剩 880 GB）。⛔ 盘上原有 `.cache`、`.conda`、`vllm-omni-profile` 不是我们的，不动。我们的数据在 `/media/volume/sdb/ziyang_r17/data`，`/data` 是指向它的软链（10-22 sudo 建），路径与 h100 一致；另有共享 CephFS `/software`（9.8 T，别人的，不用） |
 | **sudo** | 可用；10-22 做过：建 `/data` 软链、`/home/weiland`、`/scratch`（空目录，同 h100），`ufw allow 23000:24999/tcp` |
 | **防火墙** | ufw **开着**（默认 INPUT DROP）：放行 22 与 **23000–24999/tcp**（实验服务端口段）。h100 的 ufw 是关的，这点不同 |
-| **端口** | 服务端口沿用批次定义（232xx / 231xx / 234xx）；driver 在 weilandserver，sean 队列用单独的 driver 端口 **23195**（h100 队列 23199、h100-temp 23194、pod 23192/23193） |
+| **端口** | 服务端口沿用批次定义（232xx / 231xx / 234xx）；driver 在 weilandserver，sean 队列用单独的 driver 端口 **23197**（h100 队列 23199、h100-temp 23194、pod 23192/23193） |
 | **环境** | 10-22 从 h100 同路径整套复制（h100 上临时只读 rsync daemon 23117，仅允许 149.165.169.137，传完关闭）：`/data/mw_finetune`（不含 eval、xgpu_1017）、`/data/xwam`、`/data/oscl_h100`（不含 runs/generated/mirror/lo_1022）、`/data/ckpt`、`/data/cosmos`、`/data/openpi`、`/data/venvs`、`/data/r17_library`；`/home/exouser/{openpi,gr00t_n15,gr00t_n15_venv,fw_text_tables,.cache/openpi,.cache/huggingface,.local/share/uv/python}`；`/home/weiland/{projects,openpi,zl_bin,.local/share/uv/python}`。拉取脚本与日志 `/home/exouser/zl_pull/` |
 
 ## 3. tmux 会话命名规则
