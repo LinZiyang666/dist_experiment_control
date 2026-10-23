@@ -5,6 +5,7 @@
 > tether 操作细节请参考 `docs/usage.md`（使用者）、`docs/broker-ops.md`（broker 运维）、`docs/cluster.md`（集群 HA）。
 >
 > 更新记录（新→旧）：
+> - 2026-10-22 §2.10 新增 **h100-sean**（公网 **149.165.169.137**，1×H100 80GB HBM3，与 h100 / h100-temp 同一集群、节点同质）。owner：**和 h100 一样是一等公民，自由使用**，角色与 h100 相同（服务机 + 本机渲染 worker）。
 > - 2026-10-18 §2.9 新增 **h100-temp**（借用机，公网 **149.165.172.126**，1×H100 80GB HBM3，用法同 h100；⛔ 别人可能随时杀我们的进程：被杀后**不自动重跑**，推通知给 owner 处理）。
 > - 2026-10-17 §2.8 新到一台 **A100**（公网 **149.165.152.232**），owner：**暂不能加入实验设备**；§2.6 **timan108 已卡死、停用**（10-17 05:43 起离线，owner：回不来，不用管）。
 > - 2026-09-11 §1 **最适拓扑**：h100↔timan108、weilandserver↔timan107，一 server 一车队；worker 数按渲染显存定；env 构建锁。
@@ -20,6 +21,7 @@
 ```
 timan108 (worker) ──公网 117 MB/s──► h100          149.165.153.233:232xx  1×H100 80G
 timan107 (worker) ──公网──────────► weilandserver  ziyanglin.com:231xx    1×4090 49G
+a100 / timan107 / timan1 (worker) ─► h100-sean     149.165.169.137:23xxx  1×H100 80G（10-22 起，与 h100 同角色）
 ```
 
 - **server**：加载 teacher 权重（+ cache 库）对外提供推理，被 worker 调用。
@@ -478,6 +480,27 @@ pi0.5 起到监听约 70 s/replica（带 cache 时更久，每 replica 要读 26
 | **sudo** | 可用；只在必要时用并记录（10-18：`mkdir /data && chown exouser /data`） |
 | **端口** | 服务端口与 h100 相同的段（232xx / 231xx 由批次定义）；driver 在 weilandserver，h100-temp 队列用单独的 driver 端口，避免与 h100 队列冲突 |
 | **当前用途** | R17 Fast-WAM MetaWorld 长段批次（与 h100 同型号，按 H100 定义的批次跑）；环境从 h100 同路径复制（`/data/mw_finetune/envs/fastwam`、`vendor`、`fastwam/mt50_frozen_b128/policy_016001`、`models/fastwam_libero`、`/data/xwam/wan22_5b`、`qualification/python_deps312`），传输用 h100 上临时只读 rsync daemon（23295，仅允许 149.165.172.126），传完关闭 |
+
+---
+
+### 2.10 h100-sean — 单卡 H100 server（公网直连，2026-10-22 入网）
+
+> owner 10-22：与 h100、h100-temp 同一集群、节点同质；**和 h100 一样是一等公民，我们自由使用**，起到和 h100 相同的角色（模型服务 + 本机渲染 worker）。
+> 用法与 §2.7 h100 相同：公网直连，不 expose、不走 broker。批次用别名环境变量 `R17_H100_NODE=h100-sean R17_H100_HOST=149.165.169.137 R17_DRIVER_PORT=23195` 把「h100」角色落到这台。
+
+| 项 | 值 |
+|---|---|
+| **tether 节点** | `h100-sean`（主机名 socially-alive-javelin） |
+| **公网 IP** | **149.165.169.137** |
+| **用户** | `exouser`（与 h100 同名，有 sudo）；home 里有别人的项目（cacheflow-*、cesar-*、PettingLLMs 等），只动自己的目录 |
+| **GPU** | 1 × NVIDIA H100 80GB HBM3（81 559 MiB），驱动 595.99.02 |
+| **CPU / 内存** | 20 核 / 230 GiB |
+| **系统** | Ubuntu 24.04.5 |
+| **磁盘** | 系统盘 2 TB（10-22 剩 901 GB）；挂载盘 `/dev/sdb` → `/media/volume/sdb`（1 TB，剩 880 GB）。⛔ 盘上原有 `.cache`、`.conda`、`vllm-omni-profile` 不是我们的，不动。我们的数据在 `/media/volume/sdb/ziyang_r17/data`，`/data` 是指向它的软链（10-22 sudo 建），路径与 h100 一致；另有共享 CephFS `/software`（9.8 T，别人的，不用） |
+| **sudo** | 可用；10-22 做过：建 `/data` 软链、`/home/weiland`、`/scratch`（空目录，同 h100），`ufw allow 23000:24999/tcp` |
+| **防火墙** | ufw **开着**（默认 INPUT DROP）：放行 22 与 **23000–24999/tcp**（实验服务端口段）。h100 的 ufw 是关的，这点不同 |
+| **端口** | 服务端口沿用批次定义（232xx / 231xx / 234xx）；driver 在 weilandserver，sean 队列用单独的 driver 端口 **23195**（h100 队列 23199、h100-temp 23194、pod 23192/23193） |
+| **环境** | 10-22 从 h100 同路径整套复制（h100 上临时只读 rsync daemon 23117，仅允许 149.165.169.137，传完关闭）：`/data/mw_finetune`（不含 eval、xgpu_1017）、`/data/xwam`、`/data/oscl_h100`（不含 runs/generated/mirror/lo_1022）、`/data/ckpt`、`/data/cosmos`、`/data/openpi`、`/data/venvs`、`/data/r17_library`；`/home/exouser/{openpi,gr00t_n15,gr00t_n15_venv,fw_text_tables,.cache/openpi,.cache/huggingface,.local/share/uv/python}`；`/home/weiland/{projects,openpi,zl_bin,.local/share/uv/python}`。拉取脚本与日志 `/home/exouser/zl_pull/` |
 
 ## 3. tmux 会话命名规则
 
