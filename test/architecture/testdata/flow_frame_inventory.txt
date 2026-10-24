@@ -1,0 +1,134 @@
+# origin: hot-update S5 plan §2 / §10.1 — append-only binary schema.
+authority.key-id.max	128
+authority.secret.max	512
+body.ACK	0
+body.CLOSE	35
+body.CLOSE.Applied0	19	u64be	8
+body.CLOSE.Applied1	27	u64be	8
+body.CLOSE.FinalEnd0	3	u64be	8
+body.CLOSE.FinalEnd1	11	u64be	8
+body.CLOSE.Mode	0	u8	1
+body.CLOSE.Reason	1	u16be	2
+body.DATA	1..32768
+body.FIN	0
+body.OPEN	74
+body.OPEN.BindNonce	56	id16	16
+body.OPEN.EndpointID	0	id16	16
+body.OPEN.Intent	24	digest32	32
+body.OPEN.OpenSeq	16	u64be	8
+body.OPEN.TargetPort	72	u16be	2
+body.OPEN_ACK	75
+body.OPEN_ACK.BindNonce	56	id16	16
+body.OPEN_ACK.EndpointID	0	id16	16
+body.OPEN_ACK.Intent	24	digest32	32
+body.OPEN_ACK.OpenSeq	16	u64be	8
+body.OPEN_ACK.Reason	73	u16be	2
+body.OPEN_ACK.Status	72	u8	1
+body.REJECT	18
+body.REJECT.Reason	16	u16be	2
+body.REJECT.RequestID	0	id16	16
+body.RESUME	prefix=106+ticket+2+entries*106
+body.RESUME.CutID	54	id16	16
+body.RESUME.EndpointID	22	id16	16
+body.RESUME.Entries	108+TicketLen	resume-entry	EntryCount*106
+body.RESUME.EntryCount	106+TicketLen	u16be	2
+body.RESUME.ImageDigest	70	digest32	32
+body.RESUME.Mode	1	u8	1
+body.RESUME.NextOwnerGen	46	u64be	8
+body.RESUME.OwnerGen	38	u64be	8
+body.RESUME.PageCount	4	u16be	2
+body.RESUME.PageIndex	2	u16be	2
+body.RESUME.RequestID	6	id16	16
+body.RESUME.Scope	0	u8	1
+body.RESUME.TargetPort	102	u16be	2
+body.RESUME.Ticket	106	bytes<=512	TicketLen
+body.RESUME.TicketLen	104	u16be	2
+body.RESUME_OK	request+owner+ticket+retirement+entries+authority
+body.RESUME_OK.Authority	141+TicketLen+HoleCount*8+EntryCount*106	authority	variable
+body.RESUME_OK.CarrierGen	40	u64be	8
+body.RESUME_OK.EndpointID	16	id16	16
+body.RESUME_OK.Entries	141+TicketLen+HoleCount*8	resume-entry	EntryCount*106
+body.RESUME_OK.EntryCount	139+TicketLen+HoleCount*8	u16be	2
+body.RESUME_OK.GrantDigest	80	digest32	32
+body.RESUME_OK.HoleCount	137+TicketLen	u16be	2
+body.RESUME_OK.Holes	139+TicketLen	u64be[]	HoleCount*8
+body.RESUME_OK.ImageDigest	48	digest32	32
+body.RESUME_OK.NextOpenSeq	121+TicketLen	u64be	8
+body.RESUME_OK.OwnerGen	32	u64be	8
+body.RESUME_OK.PageCount	119+TicketLen	u16be	2
+body.RESUME_OK.PageIndex	117+TicketLen	u16be	2
+body.RESUME_OK.Reason	113	u16be	2
+body.RESUME_OK.RequestID	0	id16	16
+body.RESUME_OK.RetiredThrough	129+TicketLen	u64be	8
+body.RESUME_OK.Ticket	117	bytes<=512	TicketLen
+body.RESUME_OK.TicketLen	115	u16be	2
+body.RESUME_OK.Verdict	112	u8	1
+body.authority.AppliedRevision	17	u64be	8
+body.authority.Enabled	0	u8	1
+body.authority.Generation	1	nonnegative-i64be	8
+body.authority.KeyCount	25	u16be	2
+body.authority.KeyID	29+previous-keys	UTF8<=128	KeyIDLen
+body.authority.KeyIDLen	27+previous-keys	u16be	2
+body.authority.ProxyEpoch	9	nonnegative-i64be	8
+body.authority.Secret	31+previous-keys+KeyIDLen	bytes<=512	SecretLen
+body.authority.SecretLen	29+previous-keys+KeyIDLen	u16be	2
+body.max	32768
+body.resume-entry.FINFlags	104	u8	1
+body.resume-entry.FlowID	0	id16	16
+body.resume-entry.Intent	24	digest32	32
+body.resume-entry.OpenSeq	16	u64be	8
+body.resume-entry.OpenStatus	105	u8	1
+body.resume-entry.RxApplied	72	u64be	8
+body.resume-entry.RxFIN	96	u64be	8
+body.resume-entry.RxReceived	80	u64be	8
+body.resume-entry.TxBase	56	u64be	8
+body.resume-entry.TxEnd	64	u64be	8
+body.resume-entry.TxFIN	88	u64be	8
+flag.close-receipt	4	CLOSE
+flag.direction	1	all
+flag.fin-receipt	2	ACK
+header.BodyLen	4	u32be	4
+header.CarrierGen	24	u64be	8
+header.Flags	2	u16be	2
+header.FlowID	8	id16	16
+header.Kind	1	u8	1
+header.Offset	32	u64be	8
+header.Version	0	u8	1
+header.bytes	40
+kind.ACK	7
+kind.CLOSE	9
+kind.DATA	6
+kind.FIN	8
+kind.OPEN	1
+kind.OPEN_ACK	2
+kind.REJECT	5
+kind.RESUME	3
+kind.RESUME_OK	4
+reason.capacity	10
+reason.deadline	12
+reason.intent_conflict	4
+reason.io_failure	14
+reason.malformed	1
+reason.nonce_exhausted	15
+reason.offset_expired	3
+reason.offset_gap	2
+reason.owner_conflict	9
+reason.retired	6
+reason.revoked	7
+reason.stale_epoch	8
+reason.state_invalid	16
+reason.unauthorized	11
+reason.unknown_flow	5
+reason.unsupported	13
+resume.aggregate.max	2097152
+resume.mode.abort	5
+resume.mode.activate	4
+resume.mode.bind	6
+resume.mode.initial	1
+resume.mode.prepare	3
+resume.mode.reconnect	2
+resume.pages.max	64
+resume.scope.endpoint	0
+resume.scope.flow	1
+resume.ticket.max	512
+version	1

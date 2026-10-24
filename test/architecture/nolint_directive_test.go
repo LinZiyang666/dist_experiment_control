@@ -277,7 +277,25 @@ func TestNolintDirectivesNameEnabledLinters(t *testing.T) {
 	// purpose (nilerr): the pre-check is best-effort and waitJoinServing owns the retry, so a HALT
 	// there would turn one lost NATS reply into a grow HALT right after the boundary. Enumerated in
 	// docs/reviews/simcluster-speed-plan.md §8.5.
-	const expectedDirectives = 36
+	// origin: hot-update S5 plan §6.1 / T17 / LINT-VET.
+	// 36 → 37: ssproxy.connectActorLocked saves a failed portable dial candidate
+	// and returns nil so the actor loop tries the next candidate under the same
+	// deadline. Returning that dial error would prematurely terminate the actor.
+	// The nilerr directive names the enabled linter and records this retry reason.
+	// 37 → 38: spawnsafe.BuildExecCmd retains the legacy registry-owned child lifetime
+	// after AGENT-SLIM moved command construction out of the agent.
+	// 38 → 39: runLegacyExec explicitly cancels admission before os.Exit (gocritic exitAfterDefer).
+	// 39 → 40: natsinbox.Connect leaves unproved probe failures to legacy caller timeouts (nilerr).
+	// 40 → 42: brokerupgrade (*engine).query reports a failed live observation / changed readback in
+	// View.Code=unsettled while still returning the queryable history (two nilerr, S8 query contract).
+	// 42 → 43: upgradelock TestLockAPIsRejectMissingInputs passes a nil context as the adversarial
+	// input of the missing-context guard (staticcheck SA1012).
+	// origin: hot-update S8 plan §3.2 / §11.2 / LINT
+	// origin: S7 internal review GATES-LEAD F3
+	// 43 → 40: Free/Revoke now share result handling (two dupl directives);
+	// LegacyCommitProof returns a boolean, so its caller no longer swallows
+	// the running-image error (one nilerr directive). The causes moved or ended.
+	const expectedDirectives = 58
 	if scanned != expectedDirectives {
 		t.Errorf("the scan found %d //nolint directive(s), expected exactly %d.\n\n"+
 			"MORE: a new exemption was added. Add it to plan §14.1's enumeration and bump this constant in "+

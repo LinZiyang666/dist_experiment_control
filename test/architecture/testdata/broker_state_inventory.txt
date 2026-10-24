@@ -1,0 +1,111 @@
+# Append-only broker-only private descriptor inventory.
+# record<TAB>kind<TAB>version<TAB>state record<TAB>owner<TAB>reader
+# field<TAB>kind.name<TAB>type<TAB>encoding<TAB>max bytes<TAB>secret<TAB>reader
+# P00 record rows pin ownership; closure requires actual producer field rows.
+record	broker-runtime	1	broker-state-v1	P02	broker-image-v1
+record	control	1	broker-state-v1	P02	broker-image-v1
+record	endpoint	1	broker-tunnel-state-v1	P07	broker-image-v1
+record	fences	1	broker-tunnel-state-v1	P07	broker-image-v1
+record	permit	1	broker-tunnel-state-v1	P07	broker-image-v1
+record	receipt	1	broker-tunnel-state-v1	P07	broker-image-v1
+record	resources	1	broker-state-v1	P02	broker-image-v1
+record	server	1	broker-tunnel-state-v1	P07	broker-image-v1
+record	store	1	broker-state-v1	P03	broker-image-v1
+field	broker-runtime.active	bool	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.args	[]string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.boot_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.candidate_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.config_digest	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.cut_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.exporter_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.generation	uint64	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.instance_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.mode	brokerimage.Mode	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.previous_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.required_domains	[]string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.role	string	canonical-json	16777216	false	broker-image-v1
+field	control.admission_generation	uint64	canonical-json	16777216	false	broker-image-v1
+field	control.auth_ready	bool	canonical-json	16777216	false	broker-image-v1
+field	control.control_ready	bool	canonical-json	16777216	false	broker-image-v1
+field	control.home_baselines	[]brokerimage.HomeBaseline	canonical-json	16777216	false	broker-image-v1
+field	control.maintenance	[]brokermaint.LocalLease	canonical-json	16777216	false	broker-image-v1
+field	control.required_handlers	[]string	canonical-json	16777216	false	broker-image-v1
+field	control.required_loops	[]string	canonical-json	16777216	false	broker-image-v1
+field	endpoint.allocation_epoch	i64	i64be	8	true	broker-image-v1
+field	endpoint.allocation_nid	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.allocation_port	u64	u64be	8	true	broker-image-v1
+field	endpoint.allocation_sid	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.allocation_token_hash	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.carrier_gen	u64	u64be	8	true	broker-image-v1
+field	endpoint.cleanup_pending	bool	boolbe	1	true	broker-image-v1
+field	endpoint.created_unix_ns	i64	i64be	8	true	broker-image-v1
+field	endpoint.deadline_boot_ns	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_allocation	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_port	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_session	i64	i64be	8	true	broker-image-v1
+field	endpoint.fired	bool	boolbe	1	true	broker-image-v1
+field	endpoint.flow_ids	bytes	bytesbe	65536	true	broker-image-v1
+field	endpoint.id	id16	id16be	16	true	broker-image-v1
+field	endpoint.lineage	bytes	bytesbe	32	true	broker-image-v1
+field	endpoint.listener_descriptor	bytes	bytesbe	8192	true	broker-image-v1
+field	endpoint.listener_ref	utf8	utf8be	256	true	broker-image-v1
+field	endpoint.next_seq	u64	u64be	8	true	broker-image-v1
+field	endpoint.owner_gen	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_dev	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_ino	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_ref	utf8	utf8be	256	true	broker-image-v1
+field	endpoint.pending_tuple	bytes	bytesbe	4096	true	broker-image-v1
+field	endpoint.pending_type	u64	u64be	8	true	broker-image-v1
+field	endpoint.phase	u64	u64be	8	true	broker-image-v1
+field	endpoint.target_port	u64	u64be	8	true	broker-image-v1
+field	endpoint.ticket	bytes	bytesbe	8192	true	broker-image-v1
+field	fences.closed_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.forgotten	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.id	id16	id16be	16	true	broker-image-v1
+field	fences.inflight_by_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.inflight_by_sid	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_port	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_session	bytes	bytesbe	1048576	true	broker-image-v1
+field	permit.abort	bool	boolbe	1	true	broker-image-v1
+field	permit.consumed	bool	boolbe	1	true	broker-image-v1
+field	permit.cut_id	id16	id16be	16	true	broker-image-v1
+field	permit.deadline_boot_ns	i64	i64be	8	true	broker-image-v1
+field	permit.id	id16	id16be	16	true	broker-image-v1
+field	permit.image_digest	bytes	bytesbe	32	true	broker-image-v1
+field	permit.next_owner_gen	u64	u64be	8	true	broker-image-v1
+field	permit.owner_gen	u64	u64be	8	true	broker-image-v1
+field	permit.request_id	id16	id16be	16	true	broker-image-v1
+field	receipt.id	id16	id16be	16	true	broker-image-v1
+field	receipt.request	bytes	bytesbe	1048576	true	broker-image-v1
+field	receipt.response	bytes	bytesbe	1048576	true	broker-image-v1
+field	resources.owners	[]brokerimage.ResourceOwnership	canonical-json	16777216	false	broker-image-v1
+field	server.boot_id	utf8	utf8be	4096	true	broker-image-v1
+field	server.control_descriptor	bytes	bytesbe	8192	true	broker-image-v1
+field	server.control_listener	utf8	utf8be	256	true	broker-image-v1
+field	server.flows_digest	bytes	bytesbe	32	true	broker-image-v1
+field	server.generation	u64	u64be	8	true	broker-image-v1
+field	server.id	id16	id16be	16	true	broker-image-v1
+field	server.instance_id	utf8	utf8be	4096	true	broker-image-v1
+field	server.owner_gen	u64	u64be	8	true	broker-image-v1
+field	server.pending_slots	u64	u64be	8	true	broker-image-v1
+field	server.replay_limit	i64	i64be	8	true	broker-image-v1
+field	server.replay_used	i64	i64be	8	true	broker-image-v1
+field	server.sessions	bytes	bytesbe	1048576	true	broker-image-v1
+field	server.ticket_key	bytes	bytesbe	32	true	broker-image-v1
+field	server.waiters	bytes	bytesbe	2048	true	broker-image-v1
+field	store.active_backups	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.active_rpcs	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.bolt	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_busy	int	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_done	int	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_log	int	canonical-json	16777216	false	broker-image-v1
+field	store.driver_readers	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.driver_writers	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.raft	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.read_only	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.role	storage.RoleReceipt	canonical-json	16777216	false	broker-image-v1
+field	store.stamp	storage.StoreStamp	canonical-json	16777216	false	broker-image-v1
+field	store.transport	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.writer	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	control.home_history	[]uint8	canonical-json	16777216	false	broker-image-v1

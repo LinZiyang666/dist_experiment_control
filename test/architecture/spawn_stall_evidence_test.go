@@ -128,6 +128,10 @@ func TestSpawnTimeoutMintSitesNoteEvidence(t *testing.T) {
 		fn  *ast.FuncDecl
 	}
 	var allFuncs []fnDecl
+	// declaredFuncs[pkgDir] holds the receiver-less functions each package declares, so a
+	// bare call to a predeclared name can be told apart from a same-package shadow
+	// (see goBuiltinFuncs).
+	declaredFuncs := map[string]map[string]bool{}
 
 	for _, dir := range []string{"internal", "cmd"} {
 		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
@@ -151,6 +155,13 @@ func TestSpawnTimeoutMintSitesNoteEvidence(t *testing.T) {
 				fn, ok := decl.(*ast.FuncDecl)
 				if !ok || fn.Body == nil {
 					continue
+				}
+				if fn.Recv == nil {
+					pkgDir := filepath.ToSlash(filepath.Dir(rel))
+					if declaredFuncs[pkgDir] == nil {
+						declaredFuncs[pkgDir] = map[string]bool{}
+					}
+					declaredFuncs[pkgDir][fn.Name.Name] = true
 				}
 				if fn.Name.Name == invalidateFn || fn.Name.Name == invalidateExportedFn {
 					invalidateFnDeclared = true
@@ -184,7 +195,7 @@ func TestSpawnTimeoutMintSitesNoteEvidence(t *testing.T) {
 			if invalidating[f.fn.Name.Name] {
 				continue
 			}
-			if callsAnyOf(f.fn.Body, invalidating) {
+			if callsAnyOf(f.fn.Body, invalidating, declaredFuncs[filepath.ToSlash(filepath.Dir(f.rel))]) {
 				invalidating[f.fn.Name.Name] = true
 				changed = true
 			}
@@ -199,7 +210,7 @@ func TestSpawnTimeoutMintSitesNoteEvidence(t *testing.T) {
 		if !strings.HasPrefix(f.rel, "internal/spawnsafe/") {
 			continue
 		}
-		if lockedInvalidateIn(f.fn, invalidating) {
+		if lockedInvalidateInPackage(f.fn, invalidating, declaredFuncs[filepath.ToSlash(filepath.Dir(f.rel))]) {
 			locked = append(locked, lockedInvalidation{file: f.rel, fn: f.fn.Name.Name})
 		}
 	}
@@ -506,6 +517,13 @@ func joinLockState(a, b lockState) lockState {
 // invalidateHealthy takes is Policy.mu, which no other package can hold, and matching
 // any field named `mu` across the tree would flag unrelated critical sections.
 func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
+	return lockedInvalidateInPackage(fn, invalidating, nil)
+}
+
+// lockedInvalidateInPackage is lockedInvalidateIn for a function whose package declares
+// the receiver-less functions in declared (nil: none), which decides whether a bare call
+// to a predeclared name such as close is the builtin or a same-package shadow.
+func lockedInvalidateInPackage(fn *ast.FuncDecl, invalidating, declared map[string]bool) bool {
 	violation := false
 
 	// Refuse two control-flow shapes that the lock-state interpreter below cannot
@@ -523,7 +541,7 @@ func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
 		case *ast.FuncLit:
 			return false // another function's control flow
 		case *ast.DeferStmt:
-			if callsAnyOf(v.Call, invalidating) {
+			if callsAnyOf(v.Call, invalidating, declared) {
 				hasInvalidation = true
 				hasDeferredInvalidation = true
 			}
@@ -542,7 +560,7 @@ func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
 				}
 				hasInvalidation = hasInvalidation || invalidating[f.Sel.Name]
 			case *ast.Ident:
-				hasInvalidation = hasInvalidation || invalidating[f.Name]
+				hasInvalidation = hasInvalidation || bareCallReaches(f.Name, invalidating, declared)
 			}
 		}
 		return true
@@ -584,7 +602,7 @@ func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
 					invalidates = true
 				}
 			case *ast.Ident:
-				if invalidating[f.Name] {
+				if bareCallReaches(f.Name, invalidating, declared) {
 					invalidates = true
 				}
 			}
@@ -640,7 +658,9 @@ func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
 				cur = walk(v.List, cur)
 			case *ast.ForStmt:
 				cur = applyStmt(v.Init, cur)
-				if _, chg, inv := classify(v.Cond); v.Cond != nil {
+				// origin: hot-update S6 plan §9.3; a reaper's for {} has no AST condition.
+				if v.Cond != nil {
+					_, chg, inv := classify(v.Cond)
 					if inv && cur != lockFree {
 						violation = true
 					}
@@ -690,7 +710,30 @@ func lockedInvalidateIn(fn *ast.FuncDecl, invalidating map[string]bool) bool {
 }
 
 // callsAnyOf reports whether n contains a call to any of the named functions.
-func callsAnyOf(n ast.Node, names map[string]bool) bool {
+// goBuiltinFuncs are Go's predeclared functions. A bare call `close(ch)` is the builtin
+// unless the calling package itself declares a function of that name, so the name-keyed
+// closure must not match it against some other package's `close`.
+//
+// origin: hot-update S4 integration 2026-10-02 — internal/terminalio declared a `close`
+// helper that joins the closure by name, and the builtin `close(ch)` that mountHealthy
+// runs under p.mu was reported as a locked invalidation (a false positive on a tree with
+// no spawnsafe change at all).
+var goBuiltinFuncs = map[string]bool{
+	"append": true, "cap": true, "clear": true, "close": true, "complex": true, "copy": true,
+	"delete": true, "imag": true, "len": true, "make": true, "max": true, "min": true,
+	"new": true, "panic": true, "print": true, "println": true, "real": true, "recover": true,
+}
+
+// bareCallReaches reports whether a bare call `name(...)`, made in a package declaring the
+// receiver-less functions in declared, can reach a function in names.
+func bareCallReaches(name string, names, declared map[string]bool) bool {
+	if goBuiltinFuncs[name] && !declared[name] {
+		return false
+	}
+	return names[name]
+}
+
+func callsAnyOf(n ast.Node, names, declared map[string]bool) bool {
 	found := false
 	ast.Inspect(n, func(c ast.Node) bool {
 		if found {
@@ -702,7 +745,7 @@ func callsAnyOf(n ast.Node, names map[string]bool) bool {
 		}
 		switch f := call.Fun.(type) {
 		case *ast.Ident:
-			found = names[f.Name]
+			found = bareCallReaches(f.Name, names, declared)
 		case *ast.SelectorExpr:
 			found = names[f.Sel.Name]
 		}
@@ -1140,6 +1183,9 @@ func (p *Policy) f(n int) error {
 			src           string
 			wantViolation bool
 		}{
+			// origin: hot-update S6 plan §9.3; conditionless loops must still inspect their body.
+			{"unlocked call in a conditionless loop", `func (p *Policy) f() { for { p.invalidateHealthy(); break } }`, false},
+			{"locked call in a conditionless loop", `func (p *Policy) f() { for { p.mu.Lock(); p.invalidateHealthy(); break } }`, true},
 			{"unlocked call is fine", `
 func (p *Policy) f() {
 	p.invalidateHealthy()
@@ -1196,4 +1242,34 @@ func (p *Policy) f() {
 			})
 		}
 	})
+}
+
+// origin: hot-update S4 integration 2026-10-02 — the name-keyed closure matched the builtin
+// close(ch) in mountHealthy against internal/terminalio's own `close` helper. A bare call to
+// a predeclared name is the builtin unless the calling package declares that function; a
+// same-package shadow that reaches the invalidation must still be caught.
+func TestSpawnStallGateResolvesBuiltinNamesPerPackage(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "sample.go", `package sample
+func (p *Policy) f() {
+	p.mu.Lock()
+	close(p.done)
+	p.mu.Unlock()
+}`, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fn := file.Decls[0].(*ast.FuncDecl)
+	names := map[string]bool{invalidateFn: true, "close": true} // some other package's close reaches it
+	if lockedInvalidateInPackage(fn, names, nil) {
+		t.Error("builtin close under p.mu reported as a locked invalidation (name collision with another package)")
+	}
+	if !lockedInvalidateInPackage(fn, names, map[string]bool{"close": true}) {
+		t.Error("a same-package close that reaches the invalidation was not caught under p.mu")
+	}
+	if callsAnyOf(fn.Body, names, nil) {
+		t.Error("closure pass followed the builtin close into another package's helper")
+	}
+	if !callsAnyOf(fn.Body, names, map[string]bool{"close": true}) {
+		t.Error("closure pass missed a same-package close shadow")
+	}
 }

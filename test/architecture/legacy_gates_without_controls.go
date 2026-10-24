@@ -20,18 +20,16 @@ package architecture
 // KEYED by gate FILE — the unit is one anchor per file. Only ever REMOVED; a stale entry (the file
 // gained an anchor, or left the table) FAILS the gate.
 
-const legacyGatesWithoutControlsCap = 12
+// origin: hot-update S4 plan §10 / T47 — layering now has a real predicate control.
+// origin: hot-update S6 plan §9.3 / T53 — structural controls now have an anchor.
+const legacyGatesWithoutControlsCap = 8
 
 var legacyGatesWithoutControls = map[string]bool{
 	"cmd/tether/command_tree_inventory_test.go":      true,
 	"internal/auth/acl_reconcile_test.go":            true,
 	"internal/proto/wire_inventory_test.go":          true,
-	"test/architecture/dataplane_lifetime_test.go":   true,
-	"test/architecture/gate_registry_test.go":        true,
-	"test/architecture/layering_test.go":             true,
 	"test/architecture/spawn_exec_isolation_test.go": true,
 	"test/architecture/spawn_stall_evidence_test.go": true,
-	"test/architecture/structural_budget_test.go":    true,
 	"test/architecture/tls_verify_pairing_test.go":   true,
 	"test/concurrency/helpers_test.go":               true,
 	"test/determinism/enum_switch_default_test.go":   true,

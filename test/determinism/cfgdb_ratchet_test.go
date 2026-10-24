@@ -56,41 +56,37 @@ import (
 //	proxy*.go              — the largest block (P13); single-mode reads and writes, unconverted
 var cfgDBBaseline = map[string]int{
 	"admit.go:admitACL":                      4,
-	"audit.go:reconcileHistoryStreamsOnBoot": 2,
+	"audit.go:reconcileHistoryStreamsOnBoot": 1,
 	"authcallout.go:installAuthCallout":      1,
-	"broker.go:Run":                          5,
+	"broker.go:Run":                          4,
 	"broker.go:handleHeartbeat":              1,
 	"broker.go:handleRegister":               1,
 	"cluster_manifest.go:manifestBytes":      2,
-	"cluster_roster.go:buildSignedRoster":    2,
+	"cluster_roster.go:buildSignedRoster":    1,
 	"clusterwrite.go:allocatePort":           3,
 	"clusterwrite.go:createSession":          1,
 	// refileProc: single-mode-only re-file of an adopted process row. Cluster
 	// mode returns early (see the function) rather than growing a raft verb for
 	// a display-level fix, so this site is unreachable there.
 	"clusterwrite.go:refileProc":           1,
-	"clusterwrite.go:dropSession":          1,
-	"clusterwrite.go:freePortAllocation":   1,
 	"clusterwrite.go:livenessDB":           1,
-	"clusterwrite.go:markProcExited":       1,
 	"clusterwrite.go:readCommittedSession": 1,
 	"clusterwrite.go:recordProc":           1,
 	"clusterwrite.go:registerNode":         1,
-	"clusterwrite.go:revokePortAllocation": 1,
-	"clusterwrite.go:tombstoneSession":     1,
-	"clusterwrite.go:wireClusterLate":      6,
-	"dbrole.go:read":                       1,
-	"dbrole.go:singleWriter":               1,
+	// origin: hot-update S10 lint L3a F044 — three unchanged read sites moved
+	// with their joined services; splitting the identity must not widen the total.
+	"clusterwrite.go:wireClusterLate":      3,
+	"clusterwrite.go:startClusterServices": 3,
+	// origin: hot-update S6 plan §8.1 / T29 — cold/hot binding shares the DB-role owner.
+	"dbrole.go:bindClusterReadDB": 1,
+	"dbrole.go:read":              1,
+	"dbrole.go:singleWriter":      1,
 	// Lowered from 3 / 5 when ps and node.list moved onto admitCtrl (plan §15.2). The ratchet
 	// requires this in the SAME change as the conversion — that is its working mechanism.
 	"exec.go:handleNodeListReq":                          1,
 	"exec.go:handlePsReq":                                2, // -1: h1 A1 ports read → b.read() (counts/list additions all ride b.read too)
 	"expose.go:handleExposeRmReq":                        2,
 	"expose.go:reconcilePorts":                           1,
-	"expose.go:tunnelTokenLookup":                        2,
-	"home.go:homeForExpose":                              1,
-	"home.go:homeForRegister":                            1, // -1: inline read → b.read()
-	"home.go:resolveHomeForAgent":                        1, // -1: inline read → b.read()
 	"metrics_wire.go:metricsSnapshot":                    2,
 	"observability.go:observeOnce":                       1,
 	"proxy.go:activeProxyKeys":                           1,
@@ -102,7 +98,6 @@ var cfgDBBaseline = map[string]int{
 	"proxy.go:handleProxyStatus":                         3, // lowered from 5: now gated by admitACL
 	"proxy.go:handleProxySub":                            1,
 	"proxy.go:proxyActiveOwnerGate":                      2,
-	"proxy.go:proxyDirectiveForRegister":                 7,
 	"proxy.go:proxyStatusNodes":                          1, // -1: inline read → b.read()
 	"proxy.go:proxyStatusNodesCluster":                   3, // -1: inline read → b.read()
 	"proxy.go:pushCurrentKeyset":                         1,
@@ -115,14 +110,6 @@ var cfgDBBaseline = map[string]int{
 	"proxy_cluster_wire.go:handleProxySubCreateCluster":  1,
 	"proxy_cluster_wire.go:handleProxySubRevokeCluster":  2,
 	"proxy_cluster_wire.go:proxyClusterStatusFor":        2,
-	"proxy_rebalance.go:eligibleProxyHomes":              1, // -1: inline read → b.read()
-	"proxy_rebalance.go:moveProxyHomeTo":                 1,
-	"proxy_rebalance.go:rebalanceProxyHomes":             1,
-	"proxy_reconcile.go:pickProxyRehomeTarget":           1, // -2: inline reads → b.read()
-	"proxy_reconcile.go:proxyHomeHealthy":                1,
-	"proxy_reconcile.go:reconcileProxySession":           2,
-	"proxy_reconcile.go:reconcileProxyTeardown":          1, // -1: inline read → b.read()
-	"proxy_reconcile.go:rehomeProxy":                     1,
 	// -1: the port half moved out to reconcilePortsOnRegister (below), which
 	// took its port.ListBySession read with it.
 	"reconcile.go:reconcileOnRegister":            1,
@@ -139,7 +126,7 @@ var cfgDBBaseline = map[string]int{
 // cfgDBBaselineTotal is asserted separately so a wholesale table rewrite still has to move a
 // number a human will look at.
 // 150 at the moment the accessors landed; 144 after ps / node.list / proxy.status moved onto the
-// shared gate; 119 after the INLINE read sweep. It only ever goes down.
+// shared gate; 119 after the INLINE read sweep; 110 after S5 authority snapshots. It only ever goes down.
 //
 // The inline sweep is the correction to a conclusion this batch recorded and got half wrong. The
 // plan's §16.2 said the read-point sweep was not worth doing, because internal/session and friends
@@ -147,9 +134,20 @@ var cfgDBBaseline = map[string]int{
 // that part is true and still is. What it then generalised to "there is nothing to convert" was
 // false: 25 sites consumed the handle INLINE (b.cfg.DB.Query(`SELECT …`) right there, never passing
 // it on), and those become structurally unable to write, because readDB has no Exec/Begin at all.
-// Those 25 are what moved 144 → 119. The remaining 119 are the domain-function calls, and they stay.
-const cfgDBBaselineTotal = 119 // +1: refileProc (single-mode re-file of an adopted proc row); markNodeOfflineOnRelease now goes through livenessDB in both modes
+// Those 25 are what moved 144 → 119. The remaining 119 were domain-function calls;
+// S5 replaced nine register/proxy sites with single-transaction authority readers.
+// The total includes refileProc (single-mode re-file of an adopted proc row);
+// markNodeOfflineOnRelease goes through livenessDB in both modes.
+// origin: hot-update S5 plan §4.3 / §10.2 — register/proxy reads now use
+// authority snapshots through b.read(); the bounded tunnel read does too.
+// origin: hot-update S6 plan §9.3 / T53 — converted home reads and one shared cold/hot binding drain four sites.
+// origin: S7 internal review GATE-CONVERGE-contracts F6 — moved history reads drain one site.
+// origin: S7 GATES-PROD F5 — free/revoke allocation, drop/tombstone session and proc-exit
+// writes now go through named guarded DB roles, draining five sites.
+// origin: S7 BROKER-SLIM-2 — roster/seed signing moved into brokercontrol, draining one site.
+const cfgDBBaselineTotal = 91
 
+// origin: S7 internal review GATE-CONVERGE-contracts F6
 func TestCfgDBDirectAccessRatchet(t *testing.T) {
 	got, files := scanCfgDBSites(t)
 

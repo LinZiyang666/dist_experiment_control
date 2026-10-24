@@ -59,7 +59,6 @@ var legacyMissingGuards = map[string]struct{}{
 	"TestG67TLBucketNotFoundIsTransient":                          {},
 	"TestG67TLEveryTransferRefusalGoesThroughTransferRefusalErr":  {},
 	"TestG67TLPermanent10047RuleIsLoadBearing":                    {},
-	"TestG67TLProbeWarningIsAnnouncedAtBothCallSites":             {},
 	"TestG67TLTierACeilingCallSitesUseTheConnectionMeasurement":   {},
 	"TestG67TLTransientCodeRulesSurviveANeutralDescription":       {},
 	"TestHomeDeliveryVerbIsWireStable":                            {},
@@ -73,7 +72,6 @@ var legacyMissingGuards = map[string]struct{}{
 	"TestSettleReturnsForceSingleImmediately":                     {},
 	"TestSettleReturnsQuorumLostImmediately":                      {},
 	"TestUpgradeHomesConvergedOpIsWireStable":                     {},
-	"TestUpgradeWriteToReadOnlyDirReturnsError":                   {},
 }
 
 // TestPromisedGuardTestsExist is the meta-gate this batch earned the hard way.

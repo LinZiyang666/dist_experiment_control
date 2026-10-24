@@ -4,13 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/parser"
+	"go/printer"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"unicode"
 	"unicode/utf8"
@@ -69,6 +71,9 @@ const testFunctionInventoryFloor = 2800
 var updateTestInventory = flag.Bool("update-test-inventory", false,
 	"append newly discovered test functions to the inventory golden (never removes a line; refuses if any recorded function is missing)")
 
+var updateFullstackInventories = flag.Bool("update-fullstack-inventories", false,
+	"append actual observation fields, enum members and leak assertions (refuses missing or changed recorded rows)")
+
 // isTestFuncName is cmd/go's rule (internal/load/test.go isTest): the prefix, then either nothing or
 // a rune that is not lower-case. `Testify` is NOT a test to the toolchain and must not be pinned.
 func isTestFuncName(name string) bool {
@@ -90,7 +95,7 @@ func isTestFuncName(name string) bool {
 // is not a declaration. Shared by this gate, its self-check and the naming freeze
 // (TestNoNewProcessNamedTestFunctions) so the three cannot drift.
 func testFuncDecls(filename string, src []byte) ([]string, error) {
-	f, err := parser.ParseFile(token.NewFileSet(), filename, src, 0)
+	f, err := fullstackParsedInventoryFile(filename, src)
 	if err != nil {
 		return nil, err
 	}
@@ -224,19 +229,7 @@ func TestTestFunctionInventoryOnlyGrows(t *testing.T) {
 	}
 	golden := readTestFunctionInventory(t, goldenPath)
 
-	var missing, extra []string
-	for k := range golden {
-		if !current[k] {
-			missing = append(missing, k)
-		}
-	}
-	for k := range current {
-		if !golden[k] {
-			extra = append(extra, k)
-		}
-	}
-	sort.Strings(missing)
-	sort.Strings(extra)
+	missing, extra := testInventoryDifference(current, golden)
 
 	if len(missing) > 0 {
 		// Refuse the update path outright. Shrinkage is a decision, and decisions are made by hand in
@@ -328,4 +321,358 @@ func TestTestInventoryExtractorRecognisesTheShapes(t *testing.T) {
 	if _, err := extractTestFunctionKeys("pkg/broken_test.go", []byte("package x\nfunc Test(")); err == nil {
 		t.Fatal("a parse failure must surface, not read as zero functions")
 	}
+}
+
+// One comparison owns both directions. Updating can append discovered tests,
+// but must not turn a missing declaration or inventory row into success.
+// origin: hot-update S6 plan §13 / T54
+func testInventoryDifference(current, golden map[string]bool) (missing, extra []string) {
+	for key := range golden {
+		if !current[key] {
+			missing = append(missing, key)
+		}
+	}
+	for key := range current {
+		if !golden[key] {
+			extra = append(extra, key)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra
+}
+
+// origin: hot-update S6 plan §11 / T54
+func TestBrokerTestInventoryControls(t *testing.T) {
+	const path = "internal/owner/cycle_test.go"
+	keys, err := extractTestFunctionKeys(path, []byte("package owner\nfunc TestOwnedCycles(t *testing.T) {}"))
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("extract: %v, %v", keys, err)
+	}
+	key := keys[0]
+	good := map[string]bool{key: true}
+	if missing, extra := testInventoryDifference(good, good); len(missing)+len(extra) != 0 {
+		t.Fatal(missing, extra)
+	}
+	if missing, extra := testInventoryDifference(good, map[string]bool{}); len(missing) != 0 || len(extra) != 1 || extra[0] != key {
+		t.Fatal("removed test row escaped")
+	}
+	if missing, extra := testInventoryDifference(map[string]bool{}, good); len(missing) != 1 || missing[0] != key || len(extra) != 0 {
+		t.Fatal("removed test declaration escaped")
+	}
+}
+
+// Inventory readers share disk inputs with their controls. In particular, a
+// compiled map cannot prove that a source-scanning gate notices an on-disk
+// deletion from that map. Parse ledgers strictly rather than collapsing duplicate
+// rows into a set and silently signing the damaged input.
+// origin: hot-update S10 plan §12.2 / P29
+func fullstackInventoryRows(root, path, section string) ([]string, error) {
+	raw, err := os.ReadFile(filepath.Join(root, path))
+	if err != nil {
+		return nil, err
+	}
+	active := section == ""
+	seen := map[string]bool{}
+	var rows []string
+	for i, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "# section: ") {
+			active = strings.TrimPrefix(line, "# section: ") == section
+		}
+		if !active || line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if seen[line] {
+			return nil, fmt.Errorf("%s:%d: duplicate inventory row %s", path, i+1, line)
+		}
+		seen[line] = true
+		rows = append(rows, line)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("%s: empty inventory section %q", path, section)
+	}
+	return rows, nil
+}
+
+func fullstackInventoryDifference(label string, actual, recorded []string) error {
+	a, b := map[string]bool{}, map[string]bool{}
+	for _, row := range actual {
+		a[row] = true
+	}
+	for _, row := range recorded {
+		b[row] = true
+	}
+	missing, extra := testInventoryDifference(a, b)
+	if len(missing)+len(extra) != 0 {
+		return fmt.Errorf("%s inventory: dead rows=%v; unrecorded actual union=%v", label, missing, extra)
+	}
+	return nil
+}
+
+// All OS variants are source inputs. Skipping testdata excludes synthetic Go
+// samples; skipping build constraints would hide a moved Linux/Darwin owner.
+var fullstackInventoryASTMemo = struct {
+	sync.Mutex
+	files map[string]*ast.File
+}{files: map[string]*ast.File{}}
+
+func fullstackInventorySources(root string) (map[string]*ast.File, error) {
+	files := map[string]*ast.File{}
+	for _, top := range []string{"internal", "cmd", "test"} {
+		err := filepath.WalkDir(filepath.Join(root, top), func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				switch entry.Name() {
+				case "testdata", "vendor", "node_modules", "__pycache__":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(root, path)
+			if err == nil {
+				file, err := fullstackParsedInventoryFile(filepath.ToSlash(rel), raw)
+				if err != nil {
+					return err
+				}
+				files[filepath.ToSlash(rel)] = file
+			}
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return files, nil
+}
+
+func fullstackInventoryExpr(node ast.Node) string {
+	var text strings.Builder
+	if err := printer.Fprint(&text, token.NewFileSet(), node); err != nil {
+		return ""
+	}
+	return text.String()
+}
+
+func fullstackInventoryMap(file *ast.File, name string) map[string]ast.Expr {
+	rows := map[string]ast.Expr{}
+	if file == nil {
+		return rows
+	}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || vs.Names[0].Name != name || len(vs.Values) != 1 {
+				continue
+			}
+			literal, ok := vs.Values[0].(*ast.CompositeLit)
+			if !ok {
+				continue
+			}
+			for _, element := range literal.Elts {
+				pair, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				if key, err := strconv.Unquote(fullstackInventoryExpr(pair.Key)); err == nil {
+					rows[key] = pair.Value
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// Roots are registered in the scanner that consumes them, not in a parallel
+// S10-only allowlist. Discover the actual final leaf directories independently
+// so a slim move or deleted root cannot be hidden by unchanged code counts.
+// origin: hot-update S10 plan §12.2 / P29
+func fullstackErrorRootInventory(files map[string]*ast.File) error {
+	actual, recorded := map[string]bool{}, map[string]bool{}
+	for path := range files {
+		parts := strings.Split(path, "/")
+		if len(parts) < 3 || parts[0] != "internal" || strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		name := parts[1]
+		if strings.HasPrefix(name, "infra") || strings.HasPrefix(name, "xfer") || strings.Contains(name, "upgrade") || name == "jsstream" {
+			actual["internal/"+name] = true
+		}
+	}
+	file := files["cmd/tether/error_code_coverage_test.go"]
+	if file == nil {
+		return fmt.Errorf("missing actual error scanner root")
+	}
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || vs.Names[0].Name != "fullstackErrorLeafRoots" {
+				continue
+			}
+			ast.Inspect(vs, func(node ast.Node) bool {
+				if literal, ok := node.(*ast.BasicLit); ok && literal.Kind == token.STRING {
+					path, err := strconv.Unquote(literal.Value)
+					if err == nil {
+						recorded[path] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	missing, extra := testInventoryDifference(actual, recorded)
+	if len(actual) == 0 || len(missing)+len(extra) > 0 {
+		return fmt.Errorf("error-root inventory: dead=%v; unrecorded actual leaf roots=%v", missing, extra)
+	}
+	reader, collector := false, false
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fn.Name.Name == "emittedCodeUniverse" {
+			reader = loopContainsCall(fn.Body, "fullstackLeafCodeUniverse")
+		}
+		if fn.Name.Name == "fullstackLeafCodeUniverse" {
+			collector = loopContainsCall(fn.Body, "forEachGoFile") && strings.Contains(fullstackInventoryExpr(fn.Body), "fullstackErrorLeafRoots")
+		}
+	}
+	if reader && collector {
+		return nil
+	}
+	return fmt.Errorf("error-root inventory is disconnected from the actual classifier reader")
+}
+
+const fullstackObservationInventory = "test/architecture/testdata/fullstack_observation.tsv"
+
+// New directories are discovered independently of the ledger: removing all
+// rows for a new struct must not remove that struct from the scan. Upstream
+// private adjunct rows outside these directories remain exact field checks;
+// their complete codec closures belong to the S7/S8/S9 gates and P27 behavior.
+func fullstackObservationFields(files map[string]*ast.File, recorded []string) ([]string, error) {
+	actual := map[string]string{}
+	for path, file := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		for _, decl := range file.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				typ := spec.(*ast.TypeSpec)
+				shape, ok := typ.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				for _, field := range shape.Fields.List {
+					tag := "-"
+					if field.Tag != nil {
+						tag = field.Tag.Value
+					}
+					names := field.Names
+					if len(names) == 0 {
+						name := strings.TrimPrefix(fullstackInventoryExpr(field.Type), "*")
+						if dot := strings.LastIndex(name, "."); dot >= 0 {
+							name = name[dot+1:]
+						}
+						names = []*ast.Ident{{Name: name}}
+					}
+					for _, name := range names {
+						key := path + ":" + typ.Name.Name + "." + name.Name
+						actual[key] = key + "\t" + tag + "\t" + fullstackInventoryExpr(field.Type)
+					}
+				}
+			}
+		}
+	}
+	rows := map[string]bool{}
+	for key, row := range actual {
+		if fullstackObservationRoot(strings.SplitN(key, ":", 2)[0]) {
+			rows[row] = true
+		}
+	}
+	for _, row := range recorded {
+		fields := strings.Split(row, "\t")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("malformed observation field row %q", row)
+		}
+		if got, ok := actual[fields[0]]; ok {
+			rows[got] = true
+		}
+	}
+	var result []string
+	for row := range rows {
+		result = append(result, row)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func fullstackObservationRoot(path string) bool {
+	for _, prefix := range []string{"test/fullstackharness/", "test/hotupdate/acceptance/contract/", "internal/storewitness/"} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return path == "internal/drillobserve/runtime_sample.go" || path == "internal/drillobserve/receipt/runtime.go"
+}
+
+// Keep the section's existing bytes and refuse shrinkage before writing. The
+// updater records declarations, never execution or a synthetic live receipt.
+// origin: hot-update S10 plan §12.2 / P29
+func appendFullstackInventorySection(root, section string, actual []string) error {
+	path := filepath.Join(root, fullstackObservationInventory)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	marker := "# section: " + section + "\n"
+	start := strings.Index(string(raw), marker)
+	end := len(raw)
+	old := map[string]bool{}
+	if start >= 0 {
+		if next := strings.Index(string(raw)[start+len(marker):], "\n# section: "); next >= 0 {
+			end = start + len(marker) + next
+		}
+		for _, row := range strings.Split(string(raw)[start:end], "\n") {
+			if row != "" && !strings.HasPrefix(row, "#") {
+				old[row] = true
+			}
+		}
+	}
+	current := map[string]bool{}
+	for _, row := range actual {
+		current[row] = true
+	}
+	missing, added := testInventoryDifference(current, old)
+	if len(missing) != 0 {
+		return fmt.Errorf("%s updater refuses missing rows: %v", section, missing)
+	}
+	if len(added) == 0 {
+		return nil
+	}
+	addition := "\n"
+	if start < 0 {
+		addition += marker
+	}
+	addition += strings.Join(added, "\n") + "\n"
+	return os.WriteFile(path, append(append([]byte(string(raw[:end])), addition...), raw[end:]...), 0o644)
 }

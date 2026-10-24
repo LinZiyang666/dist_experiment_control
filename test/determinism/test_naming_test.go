@@ -418,7 +418,7 @@ func TestNoNewProcessNamedTestFunctions(t *testing.T) {
 	// 439, not 436: the count rose when the key became site-scoped (review M7). Three names each live in
 	// two packages and the name-keyed map had collapsed each pair into one entry, so the old number was
 	// undercounting present sites, not just permitting future ones. See legacy_process_named_funcs.go.
-	const legacyFuncLedgerCap = 439
+	const legacyFuncLedgerCap = 434
 	if n := len(legacyProcessNamedTestFuncs); n > legacyFuncLedgerCap {
 		t.Errorf("legacyProcessNamedTestFuncs has %d entries, cap is %d.\n\n"+
 			"This ledger only drains. A new process-named test function must be RENAMED, not added here — "+

@@ -18,26 +18,21 @@ package determinism
 //
 // KEYED "<path>: <func>". Only ever REMOVED (legacySleepBarriersCap); a stale entry FAILS the gate.
 
-const legacySleepBarriersCap = 19
+// S6 TESTFIX replaces five startup sleeps with subscription/registration barriers.
+// S7 MAKETEST-TRANSFER replaced three more with real readiness barriers
+// (cli_e2e startBroker, p4 startAgentSecure, p7 startAgent).
+// origin: hot-update S10 lint L3a — the unused upgrade startup helper was removed.
+const legacySleepBarriersCap = 10
 
 var legacySleepBarriers = map[string]bool{
 	"test/chaos/chaos_harness_test.go: startBrokerExplicitCfg": true,
-	"test/cli_e2e/harness_test.go: startBroker":                true,
 	"test/concurrency/helpers_test.go: startBrokerNoTunnel":    true,
 	"test/p10/upgrade_e2e_test.go: startAgentWithUpgrade":      true,
-	"test/p4/exec_authcallout_test.go: startAgentSecure":       true,
 	"test/p4/exec_e2e_test.go: startAgent":                     true,
-	"test/p4/exec_e2e_test.go: startBroker":                    true,
-	"test/p5/run_e2e_test.go: startAgent":                      true,
-	"test/p5/run_e2e_test.go: startBroker":                     true,
-	"test/p6/expose_e2e_test.go: startAgent":                   true,
-	"test/p6/expose_e2e_test.go: startBroker":                  true,
-	"test/p7/audit_e2e_test.go: startAgent":                    true,
 	"test/p7/audit_e2e_test.go: startBroker":                   true,
 	"test/p8/reconcile_e2e_test.go: startAgent":                true,
 	"test/p8/reconcile_e2e_test.go: startAgentManual":          true,
 	"test/p8/reconcile_e2e_test.go: startBroker":               true,
 	"test/p8/reconcile_e2e_test.go: startBrokerManual":         true,
 	"test/p9/admin_e2e_test.go: startAgent":                    true,
-	"test/security/harness_test.go: startAgentForUpgrade":      true,
 }

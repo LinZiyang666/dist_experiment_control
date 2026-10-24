@@ -42,7 +42,10 @@
 #         the command the gate itself tells you to run, permanently removes a 360-line file from the
 #         budget. Parsing imports: same probe, no change.
 #   PI-9  quantisation to 100. Raw is 1160; 1160 rounded down is 1100.
-main-noncli-code-lines cmd/tether 1200
+#   hot-update S5 CMD-SLIM (2026-10-03): S5 wiring pushed raw to 1301; the status-card renderer and the
+#   online doctor diagnostic moved verbatim into internal/cli (raw 1035), so the row tightens 1200 -> 1000.
+# origin: hot-update S6 plan §9.3 / T53 — extracted store/CLI glue measures 876 lines.
+main-noncli-code-lines cmd/tether 800
 # pkg-code-lines: the FOURTH dimension, added during line-2's own review (plan §11 X2 re-adjudicated).
 #
 # X2 had rejected S3's pkg-lines forever, on the condition that it be reopened if someone found a
@@ -105,14 +108,74 @@ main-noncli-code-lines cmd/tether 1200
 # that adds a cmd/tether command splits the alert/cluster-drive helpers out of this
 # package first — they are the non-CLI half that the main-noncli-code-lines row above is
 # separately holding at 1200, and they are why the package is this size.
-pkg-code-lines cmd/tether 12000
+#
+# internal/execsession (new, 2000): hot-update S4 added the second task kind — the
+# reliable PTY — to the one runtime that owns the registry, the shared process table,
+# the replay budget and the image fence (plan §5.1/§6: kind-aware resources, pre-spawn
+# budget reservation, revocation-first activation, ClockUnknown). Splitting PTY tasks
+# into a sibling package would need the fence, registry and budget exported to it,
+# which is exactly the "two owners of one table" the S2/S3 contracts forbid. The PTY
+# state machine itself already lives outside (internal/ptysession); execsession keeps
+# only the per-kind dispatch. Runtime's method count was held at 39 (two S4 helpers
+# written as package functions) so only this dimension grows.
+# DEBT CEILING: S5/S7 add their domains through their own packages and the existing
+# dispatch; neither may grow this entry.
+# origin: hot-update S5 plan §10.2 / §12 — first registrations for the
+# plan-assigned flow journal/pumps/image, broker Endpoint/carrier/resume, and
+# SS actor/nonce/material-history/image state machines. The flow codec/owner
+# remains below tunnel; SS retains its actor/private-state ownership without
+# depending on flow or the parent agent. Neither state machine raises the
+# existing internal/agent or cmd/tether ceilings.
+#
+# The gate's countCodeLines scanner (comments excluded, semicolons skipped)
+# audited every production platform twin in flow, tunnel, agent/ssproxy,
+# rawsocket and sealedstate. tunnel.go and flow_client.go exceeded 700 code
+# lines and were split by responsibility with declarations/comments preserved.
+# After splitting, every production file is <=700 code lines and every type
+# has <100 receiver methods. No package/type split is needed for layering.
+# Values below are package code lines quantised DOWN to 2000, not file limits.
+# DEBT CEILING: future work must stay within these first registrations; file
+# splits do not create slack in the package code-line ratchet.
+pkg-code-lines cmd/tether 10000
 pkg-code-lines internal/agent 6000
-pkg-code-lines internal/broker 16000
+pkg-code-lines internal/agent/ssproxy 2000
+# origin: hot-update S7 plan §8 / S7-GATES lead decision 5 — planned feature owners.
+pkg-code-lines internal/agentimage 2000
+pkg-code-lines internal/broker 14000
+pkg-code-lines internal/brokercontrol 4000
+# origin: hot-update S6 plan §13 — first measured image composition debt; <4000 direct cap remains.
+pkg-code-lines internal/brokerimage 2000
+# origin: hot-update S6 plan §8.2 / §13 — shared absolute-budget admission and observer helpers.
+pkg-code-lines internal/cli 2000
 pkg-code-lines internal/cluster 2000
 pkg-code-lines internal/clusteroffline 2000
+pkg-code-lines internal/execsession 2000
+pkg-code-lines internal/flow 2000
+# origin: hot-update S9 plan §12 P13/P19/P20 — first measured infrastructure owners.
+# Host custody and NATS/Caddy transition journals have separate responsibilities;
+# the host direct cap stays <4000, and the driver records its measured 2000 quantum.
+# No existing package ceiling changes.
+pkg-code-lines internal/infrahost 2000
+pkg-code-lines internal/infraupgrade 2000
+pkg-code-lines internal/jsstream 2000
+pkg-code-lines internal/proto 2000
+pkg-code-lines internal/tunnel 4000
+# origin: hot-update S7 plan §11.1 / §12; ledger pass 4 first registration.
+# Frozen S7 P25 client engine owns same-invocation reconciliation and one-shot legacy adapters; direct seven-file/<3600 cap stays unchanged.
+pkg-code-lines internal/xferclient 2000
+# origin: hot-update S7 plan §11.1 / §12; ledger pass 4 first registration.
+# Frozen S7 P10/P18 sealed worker and tracker codecs own the actual field/resource closure; direct five-file/<2800 cap stays unchanged.
+pkg-code-lines internal/xferimage 2000
+# origin: hot-update S7 plan §11.1 / §12; ledger pass 4 first registration.
+# INTEG-M moved legacy transfer reaping, sizing, directory and audit responsibilities out of broker; the broker raw-code decrease and all legacy file ceilings remain enforced.
+pkg-code-lines internal/xferserve 2000
 pkg-files cmd/tether 57
 pkg-files internal/broker 70
+pkg-files internal/cli 21
 pkg-files internal/cluster 32
-type-methods internal/agent.Agent 127
-type-methods internal/broker.Broker 285
-type-methods internal/broker.ClusterAdmin 86
+# origin: hot-update S6 plan §6.2 / §12 P06/P07 — planned Server image/pause codec leaves.
+# This first file debt does not widen the existing 4000 code-line ceiling.
+pkg-files internal/tunnel 22
+type-methods internal/agent.Agent 125
+type-methods internal/broker.Broker 278
+type-methods internal/brokercontrol.ClusterAdmin 86

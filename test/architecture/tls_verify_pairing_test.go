@@ -59,11 +59,18 @@ import (
 // second InsecureSkipVerify literal added to an already-ledgered function inheriting the exemption —
 // is closed by the exact-count assertion at the end of the test, which reddens on a new site anywhere,
 // paired or not.
+// TUNNEL-SLIM relocates the same exemption; it does not authorize a new fallback.
+// origin: hot-update S6 plan §9.3 / T53
 var unverifiedTLSFallbacks = map[string]string{
-	"internal/tunnel/tls.go:clientTLSConfig": "architecture F.5 / §16.7: the N=1 fallback. With no " +
+	"internal/tunnel/transport/tls.go:ClientTLSConfig": "architecture F.5 / §16.7: the N=1 fallback. With no " +
 		"cluster CA and no cert pins configured there is nothing to verify AGAINST — the broker's cert " +
 		"is self-signed and the operator has not pinned it. Skipping verification is the documented, " +
 		"opt-out-able v1 behaviour; the pinned path (clientTLSConfigPinned) verifies via VerifyConnection.",
+	// origin: hot-update S9 plan §12 P07 / TestIngressSwitchLifecycle
+	"internal/ingressswitch/rules_test.go:exerciseMarkControl": "a NEGATIVE control, not a dialer: the literal is " +
+		"the adversarial input proving DialCanonical refuses an unverified config before any dial " +
+		"(rules_linux.go rejects config.InsecureSkipVerify with ErrProbe). Pairing it with a callback would " +
+		"stop it testing exactly the shape the refusal exists for.",
 }
 
 // valueMaySkipHostname reports whether an expression assigned to InsecureSkipVerify might be true.
@@ -293,7 +300,7 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 			"cluster has never heard of — while looking deliberate to the next reader. If hostname\n"+
 			"verification genuinely cannot be used, supply one of the two callbacks: chain the peer leaf\n"+
 			"to the cluster CA (internal/cluster/transport.go) or check it against pins\n"+
-			"(internal/tunnel/tls.go). If there is genuinely nothing to verify against, the site belongs\n"+
+			"(internal/tunnel/transport/tls.go). If there is genuinely nothing to verify against, the site belongs\n"+
 			"in unverifiedTLSFallbacks WITH a written reason.",
 			len(offenders), strings.Join(offenders, "\n  "))
 	}
@@ -333,7 +340,7 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 	// The five sites, all deliberate and all read by hand — the first four during the gosec G402 review,
 	// the fifth during the 2026-09-02 prerelease audit:
 	//
-	//	internal/tunnel/tls.go        the N=1 unpinned fallback (ledgered) and the pinned path
+	//	internal/tunnel/transport/tls.go the N=1 unpinned fallback (ledgered) and the pinned path
 	//	internal/cluster/transport.go the raft transport's CN-only leaf, paired with verifyChainToCA
 	//	internal/tunnel/register_and_fence_test.go  a test dialling the harness's self-signed listener
 	//	internal/tunnel/register_admission_test.go  admissionTLS, the dial config for the unauthenticated-
@@ -352,8 +359,8 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 	// entirely could still be within one of the target and pass on test files. Naming the production sites
 	// makes "the scanner still sees the code that matters" a separate, non-substitutable assertion.
 	for _, mustSee := range []string{
-		"internal/tunnel/tls.go:clientTLSConfig",
-		"internal/tunnel/tls.go:clientTLSConfigPinned",
+		"internal/tunnel/transport/tls.go:ClientTLSConfig",
+		"internal/tunnel/transport/tls.go:ClientTLSConfigPinned",
 		"internal/cluster/transport.go:clusterTLSConfigs",
 	} {
 		if !seen[mustSee] {
@@ -365,7 +372,8 @@ func TestInsecureSkipVerifyIsAlwaysPairedWithChainVerification(t *testing.T) {
 		}
 	}
 
-	const expectedSkipVerifySites = 5
+	// 5 → 6: the S9 ingressswitch negative control ledgered above (a test literal, no new dialer).
+	const expectedSkipVerifySites = 6
 	if found != expectedSkipVerifySites {
 		t.Errorf("the scan found %d InsecureSkipVerify:true site(s), expected exactly %d.\n\n"+
 			"MORE: a new site appeared. Read it, then either pair it with VerifyPeerCertificate/"+

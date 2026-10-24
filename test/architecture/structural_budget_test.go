@@ -10,10 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/LinZiyang666/tether/internal/agentimage"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/sealedstate"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
 )
 
 // structural_budget_test.go — the structural debt ratchet (S3 G3.2, reshaped by the line-2 plan §4).
@@ -103,6 +110,386 @@ type budgetEntry struct {
 	kind   string // "type-methods" | "pkg-files" | "pkg-code-lines" | "main-noncli-code-lines"
 	entity string
 	value  int
+}
+
+// S7 caps are below the debt-registration thresholds. Keep them independent of
+// the S6 table so its closed namespace and controls do not become allowances for
+// transfer growth. AllOS measurement includes platform twins.
+// origin: hot-update S7 plan §11.1 / T51
+// gate-control: TestTransferOwnershipBudgetControls
+var transferPackageCaps = map[string]struct{ files, code int }{
+	"xfercontract": {3, 1800}, "xfercontract/contractstub": {1, 700},
+	"xferworker": {3, 1800}, "xfersend": {3, 1800}, "xferreceive": {3, 1800},
+	"xfercourier": {3, 1800}, "xferfinal": {3, 1800}, "xferhistory": {3, 1800},
+	"xferbucket": {3, 1800}, "xfergc": {3, 1800}, "xferauth": {3, 1800},
+	"xfertrack": {4, 2400}, "xferledger": {4, 2400}, "xfercontrol": {5, 2800},
+	"xferclient": {7, 3600}, "xferimage": {5, 2800}, "xferbridge": {2, 1200},
+	// The contract's NATS-free value closures (P00fix xferport, s7-p9i xfervalue
+	// split) are first registrations at their measured AllOS size (+1 code line):
+	// splitting a declaration out of xfercontract must not become new headroom.
+	// origin: hot-update S7 plan §8.1 / §11.1 / P00 (s7-p9i R5)
+	"xfercontract/xferport": {1, 95}, "xfercontract/xfervalue": {2, 435},
+}
+
+func checkTransferStructure(result brokerStructure, exact bool) error {
+	if err := checkBrokerStructure(result); err != nil {
+		return err
+	}
+	if result.files["internal/tunnel"] > 22 || result.mainCode >= 900 {
+		return fmt.Errorf("S7 tunnel files/main non-CLI code ceiling exceeded")
+	}
+	if exact && (result.methods["internal/agent.Agent"] != 125 || result.methods["internal/execsession.Runtime"] != 39) {
+		return fmt.Errorf("Agent must have exactly 125 methods; Runtime exactly 39")
+	}
+	for pkg, cap := range transferPackageCaps {
+		if result.files["internal/"+pkg] > cap.files || result.code["internal/"+pkg] >= cap.code {
+			return fmt.Errorf("%s: S7 production files/code exceed %d/<%d", pkg, cap.files, cap.code)
+		}
+	}
+	for key, n := range result.fields {
+		if strings.HasPrefix(key, "internal/xfer") && n >= 100 {
+			return fmt.Errorf("%s: S7 receiver fields must remain below 100", key)
+		}
+	}
+	return nil
+}
+
+// Descriptor ownership is keyed by resource ID/name, not kind alone: worker
+// and tracker each own a sealed state resource in the same codec namespace.
+func checkTransferResourceOwnership(refs, owners map[string]string) error {
+	if len(refs) == 0 || len(owners) == 0 {
+		return fmt.Errorf("empty transfer resource union")
+	}
+	if len(refs) != len(owners) {
+		return fmt.Errorf("transfer descriptor/resource union differs")
+	}
+	for key, kind := range refs {
+		if kind != "xfer-state-v1" && kind != "xfer-source-v1" && kind != "xfer-tmp-v1" && kind != "xfer-parent-v1" {
+			return fmt.Errorf("unknown transfer resource kind %s", kind)
+		}
+		if key == "" || owners[key] == "" {
+			return fmt.Errorf("unowned transfer resource %s", key)
+		}
+	}
+	return nil
+}
+
+func checkTransferResourceRows(all map[string]transferDeclaration, rows [][]string) error {
+	roles := map[string]bool{}
+	refs, owners := map[string]string{}, map[string]string{}
+	for _, row := range rows {
+		if len(row) != 5 || roles[row[0]] || owners[row[1]] != "" {
+			return fmt.Errorf("duplicate resource role/owner %v", row)
+		}
+		roles[row[0]] = true
+		refs[row[1]], owners[row[1]] = row[2], row[3]
+		nodes, err := reachableTransferDeclarations(all, row[4])
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(transferRootTokens(nodes), "literal="+strconv.Quote(row[2])) {
+			return fmt.Errorf("%s: live resource builder does not reference its kind", row[0])
+		}
+	}
+	for _, role := range []string{"worker-state", "tracker-state", "source", "tmp", "parent"} {
+		if !roles[role] {
+			return fmt.Errorf("missing transfer resource role %s", role)
+		}
+	}
+	return checkTransferResourceOwnership(refs, owners)
+}
+
+// origin: hot-update S7 plan §8.3 / §11.1 / T51
+func TestTransferOwnershipAndBudgetsAreClosed(t *testing.T) {
+	root := repoRoot(t)
+	plan, err := os.ReadFile(filepath.Join(root, "docs/reviews/hot-update-transfer-continuation-plan.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTransferFileOwnership(string(plan)); err != nil {
+		t.Error(err)
+	}
+	baselineRows, err := readTransferTSV(root, "test/architecture/testdata/transfer_source_moves.tsv#baseline-files", 1)
+	if err != nil {
+		t.Error(err)
+	} else {
+		baseline := map[string]bool{}
+		for _, row := range baselineRows {
+			baseline[row[0]] = true
+		}
+		if err := checkTransferNewFileLines(root, baseline); err != nil {
+			t.Error(err)
+		}
+	}
+	sources := brokerGateSources(t, root)
+	result := measureBrokerStructure(t, sources)
+	if err := checkTransferStructure(result, true); err != nil {
+		t.Error(err)
+	}
+	initialCaps, err := readTransferTSV(root, "test/architecture/testdata/transfer_source_moves.tsv#existing-package-caps", 3)
+	if err != nil {
+		t.Error(err)
+	} else if err := checkTransferInitialCaps(result, initialCaps); err != nil {
+		t.Error(err)
+	}
+	legacy, err := readLegacyFileCodeCeilings(filepath.Join(root, "test/architecture", legacyFileCodeLedger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerFileCode(result.fileCode, legacy); err != nil {
+		t.Error(err)
+	}
+	for _, path := range brokerSortedSourcePaths(sources) {
+		baseline := legacy[path]
+		t.Logf("raw-file-code\t%s\tbaseline=%d\tafter=%d\tdelta=%+d", path, baseline, result.fileCode[path], result.fileCode[path]-baseline)
+	}
+	// origin: S10 internal review ARCH-REDS R5
+	if err := checkBrokerCodeDecrease(brokerEntryCodeLines, result.code["internal/broker"]); err != nil {
+		t.Error(err)
+	}
+	if agentimage.MaxBundleBytes != 16<<20 || brokerimage.MaxBundleBytes != 16<<20 || sealedstate.MaxStateBytes != 32<<20 || upgradebudget.NodeReplayBytes != 256<<20 {
+		t.Error("S7 cannot create a separate private-state/replay capacity pool")
+	}
+	golden, err := readGolden(t, filepath.Join(root, "test/architecture", structuralBudgetGolden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, cap := range map[string]int{"main-noncli-code-lines cmd/tether": 800, "pkg-code-lines internal/brokerimage": 2000, "pkg-code-lines internal/brokercontrol": 4000} {
+		if golden[key] > cap {
+			t.Errorf("%s golden exceeds frozen S7 ceiling %d", key, cap)
+		}
+	}
+	rows, err := readTransferTSV(root, "test/architecture/testdata/transfer_source_moves.tsv#resource-owners", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := transferDeclarations(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTransferResourceRows(all, rows); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkTransferInitialCaps(result brokerStructure, rows [][]string) error {
+	want := map[string]bool{"internal/jsstream": true, "internal/transferpath": true, "internal/drillobserve": true}
+	for _, row := range rows {
+		if len(row) != 3 || !want[row[0]] {
+			return fmt.Errorf("duplicate/unknown S7 first-registration package %v", row)
+		}
+		files, e1 := strconv.Atoi(row[1])
+		code, e2 := strconv.Atoi(row[2])
+		if e1 != nil || e2 != nil || files <= 0 || code <= 0 || result.files[row[0]] == 0 || result.files[row[0]] > files || result.code[row[0]] >= code {
+			return fmt.Errorf("%s: AllOS first-registration file/code cap exceeded or empty", row[0])
+		}
+		delete(want, row[0])
+	}
+	if len(want) != 0 {
+		return fmt.Errorf("incomplete S7 first-registration package caps")
+	}
+	return nil
+}
+
+// The baseline is the frozen pre-S7 path set, not a list of today's offenders.
+// Production Go already has the stripped per-file ceiling. New tests/scripts
+// use total lines, so comments and semicolon packing cannot buy extra headroom.
+func checkTransferNewFileLines(root string, baseline map[string]bool) error {
+	if len(baseline) == 0 {
+		return fmt.Errorf("empty S7 file baseline")
+	}
+	for _, top := range []string{"internal", "cmd", "test"} {
+		err := filepath.WalkDir(filepath.Join(root, top), func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				if entry.Name() == "testdata" || entry.Name() == "vendor" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if baseline[rel] || !strings.HasSuffix(path, "_test.go") && !strings.HasSuffix(path, ".sh") && !strings.HasSuffix(path, ".py") {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			lines := strings.Count(strings.TrimSuffix(string(raw), "\n"), "\n") + 1
+			if lines > 700 {
+				return fmt.Errorf("%s: new test/script has %d total lines, maximum 700", rel, lines)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkTransferFileOwnership(plan string) error {
+	owners := map[string]string{}
+	packages := map[string]bool{}
+	for _, line := range strings.Split(plan, "\n") {
+		if !regexp.MustCompile(`^\| P[0-9]{2} [^|]+\| (HARD|NORMAL) \|`).MatchString(line) {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		owner := strings.Fields(cells[1])[0]
+		if packages[owner] {
+			return fmt.Errorf("duplicate file ownership package %s", owner)
+		}
+		packages[owner] = true
+		paths := regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(cells[5], -1)
+		if len(paths) == 0 {
+			return fmt.Errorf("empty file ownership package %s", owner)
+		}
+		for _, match := range paths {
+			path := match[1]
+			if owners[path] != "" {
+				return fmt.Errorf("%s: duplicate file owner %s/%s", path, owners[path], owner)
+			}
+			owners[path] = owner
+		}
+	}
+	if len(packages) == 0 {
+		return fmt.Errorf("empty S7 file ownership manifest")
+	}
+	return nil
+}
+
+// origin: hot-update S7 plan §11.1 / T51
+func TestTransferOwnershipBudgetControls(t *testing.T) {
+	initial := brokerStructure{files: map[string]int{}, code: map[string]int{}}
+	var capRows [][]string
+	for _, pkg := range []string{"internal/jsstream", "internal/transferpath", "internal/drillobserve"} {
+		initial.files[pkg] = 1
+		initial.code[pkg] = 1
+		capRows = append(capRows, []string{pkg, "1", "2"})
+	}
+	if err := checkTransferInitialCaps(initial, capRows); err != nil {
+		t.Fatal(err)
+	}
+	initial.code["internal/drillobserve"] = 2
+	if checkTransferInitialCaps(initial, capRows) == nil || checkTransferInitialCaps(initial, capRows[:2]) == nil {
+		t.Fatal("first-registration code cap/missing package escaped")
+	}
+	lineRoot := transferFixtureTree(t, map[string]string{"test/old_test.go": strings.Repeat("// preserved old test\n", 800), "test/new_test.go": strings.Repeat("// new test\n", 700)})
+	if err := checkTransferNewFileLines(lineRoot, map[string]bool{"test/old_test.go": true}); err != nil {
+		t.Fatal(err)
+	}
+	transferWriteFixture(t, lineRoot, "test/new_test.go", strings.Repeat("// new test\n", 701))
+	if checkTransferNewFileLines(lineRoot, map[string]bool{"test/old_test.go": true}) == nil || checkTransferNewFileLines(lineRoot, nil) == nil {
+		t.Fatal("new test line 701/empty baseline escaped")
+	}
+	manifest := "| P00 Contracts | HARD | 1 | — | `internal/xfercontract/contracts.go` |\n| P34 Gates | HARD | 1 | P00 | `test/architecture/transfer_contract_test.go` |\n"
+	if err := checkTransferFileOwnership(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if checkTransferFileOwnership("") == nil || checkTransferFileOwnership(manifest+"| P35 Ledgers | HARD | 1 | P00 | `internal/xfercontract/contracts.go` |\n") == nil {
+		t.Fatal("empty/duplicate file ownership manifest escaped")
+	}
+	frozen := map[string]struct{ files, code int }{
+		"xfercontract": {3, 1800}, "xfercontract/contractstub": {1, 700}, "xferworker": {3, 1800},
+		"xfersend": {3, 1800}, "xferreceive": {3, 1800}, "xfercourier": {3, 1800}, "xferfinal": {3, 1800},
+		"xferhistory": {3, 1800}, "xferbucket": {3, 1800}, "xfergc": {3, 1800}, "xferauth": {3, 1800},
+		"xfertrack": {4, 2400}, "xferledger": {4, 2400}, "xfercontrol": {5, 2800}, "xferclient": {7, 3600},
+		"xferimage": {5, 2800}, "xferbridge": {2, 1200},
+		// Measured first registrations of the contract's value closures (s7-p9i R5);
+		// they add constraints and widen no plan cap.
+		"xfercontract/xferport": {1, 95}, "xfercontract/xfervalue": {2, 435},
+	}
+	if len(frozen) != len(transferPackageCaps) {
+		t.Fatal("S7 leaf cap registry drifted")
+	}
+	for pkg, cap := range frozen {
+		if transferPackageCaps[pkg] != cap {
+			t.Fatalf("S7 frozen package cap changed %s", pkg)
+		}
+	}
+	root := transferFixtureTree(t, map[string]string{
+		"internal/agent/agent.go":         "package agent;type Agent struct{}",
+		"internal/execsession/runtime.go": "package execsession;type Runtime struct{}",
+	})
+	writeMethods := func(path, typ string, count int) {
+		source := "package owner;type " + typ + " struct{}\n"
+		for i := 0; i < count; i++ {
+			source += fmt.Sprintf("func (*%s) Method%d(){}\n", typ, i)
+		}
+		transferWriteFixture(t, root, path, source)
+	}
+	writeMethods("internal/agent/agent.go", "Agent", 125)
+	writeMethods("internal/execsession/runtime.go", "Runtime", 39)
+	measure := func() brokerStructure { return measureBrokerStructure(t, brokerGateSources(t, root)) }
+	if err := checkTransferStructure(measure(), true); err != nil {
+		t.Fatal(err)
+	}
+	for _, count := range []int{124, 126} {
+		writeMethods("internal/agent/agent.go", "Agent", count)
+		if checkTransferStructure(measure(), true) == nil {
+			t.Fatalf("on-disk Agent%d escaped", count)
+		}
+	}
+	writeMethods("internal/agent/agent.go", "Agent", 125)
+	for pkg, cap := range transferPackageCaps {
+		result := measure()
+		result.files["internal/"+pkg] = cap.files + 1
+		if checkTransferStructure(result, true) == nil {
+			t.Fatalf("S7 file cap escaped %s", pkg)
+		}
+		result = measure()
+		result.code["internal/"+pkg] = cap.code
+		if checkTransferStructure(result, true) == nil {
+			t.Fatalf("S7 code cap escaped %s", pkg)
+		}
+	}
+	transferWriteFixture(t, root, "internal/xferimage/state_other.go", "//go:build !linux\npackage state\nvar (\n"+strings.Repeat("_ = 1\n", 698)+")\n")
+	if checkBrokerFileCode(measure().fileCode, nil) == nil {
+		t.Fatal("on-disk inactive OS file at code line 701 escaped")
+	}
+	if checkBrokerFileCode(map[string]int{"internal/old/file.go": 141}, map[string]int{"internal/old/file.go": 140}) == nil {
+		t.Fatal("legacy ceiling+1 escaped")
+	}
+	for i := 0; i < 13; i++ {
+		transferWriteFixture(t, root, fmt.Sprintf("internal/brokerimage/owner%d_other.go", i), "package owner")
+	}
+	if checkTransferStructure(measure(), true) == nil {
+		t.Fatal("on-disk brokerimage thirteenth file escaped")
+	}
+	refs := map[string]string{"worker/state": "xfer-state-v1", "source/source": "xfer-source-v1"}
+	owners := map[string]string{"worker/state": "worker", "source/source": "sender"}
+	if err := checkTransferResourceOwnership(refs, owners); err != nil {
+		t.Fatal(err)
+	}
+	delete(owners, "source/source")
+	if checkTransferResourceOwnership(refs, owners) == nil || checkTransferResourceOwnership(nil, nil) == nil {
+		t.Fatal("missing resource/empty ownership union escaped")
+	}
+	all, err := transferDeclarations(map[string]string{"internal/xferimage/resources.go": "package image;func Export(){resource(\"xfer-state-v1\",\"xfer-source-v1\",\"xfer-tmp-v1\",\"xfer-parent-v1\")}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows [][]string
+	for _, role := range []string{"worker-state", "tracker-state", "source", "tmp", "parent"} {
+		kind := "xfer-" + role + "-v1"
+		if strings.Contains(role, "state") {
+			kind = "xfer-state-v1"
+		}
+		rows = append(rows, []string{role, role + "/state", kind, "owner", "internal/xferimage/resources.go:Export"})
+	}
+	if err := checkTransferResourceRows(all, rows); err != nil {
+		t.Fatal(err)
+	}
+	if checkTransferResourceRows(all, append(rows, rows[0])) == nil || checkTransferResourceRows(all, rows[:4]) == nil {
+		t.Fatal("duplicate owner/missing resource role escaped")
+	}
 }
 
 func (e budgetEntry) key() string { return e.kind + " " + e.entity }
@@ -848,4 +1235,785 @@ func TestUpdateFlagPreservesLedgerJustifications(t *testing.T) {
 				before, after)
 		}
 	})
+}
+
+// Direct S6 caps apply below the debt threshold as well. AllOS counts both
+// platform twins; a Linux-only measurement would silently buy Darwin slack.
+// Keep these separate from the quantized, tighten-only debt ledger.
+// origin: hot-update S6 plan §9.3 / §13 / T53
+// gate-control: TestBrokerStructuralBudgetControls
+var brokerPackageCaps = map[string]struct{ files, code int }{
+	"internal/broker": {70, 18000}, "internal/cluster": {32, 4000},
+	"cmd/tether": {57, 14000}, "internal/agent": {19, 8000},
+	"internal/tunnel": {0, 6000}, "internal/brokerimage": {12, 4000},
+	"internal/brokerimage/contractstub": {1, 700}, "internal/listenerimage": {6, 1200},
+	"internal/brokermaint": {4, 900}, "internal/controlbudget": {4, 500},
+	"internal/clusterio": {4, 900},
+	// origin: hot-update S6 plan §9.3 / CLUSTER-SLIM; first caps for the moved responsibilities.
+	"internal/cluster/state": {15, 1800}, "internal/cluster/storelock": {1, 300},
+	"internal/cluster/logbridge": {1, 200}, "internal/cluster/routecert": {1, 100},
+	// First registration of the observation leaf: 2 files / 148 AllOS code
+	// lines. Moving the source out of custody grants no unmeasured headroom.
+	// origin: S10 internal review MAKETEST-GATES F8 / S7 plan §11.1
+	"internal/drillobserve/infrastructure": {2, 149},
+	// origin: hot-update S6 plan §9.3; first cap for the extracted business control owner.
+	// Seventeen existing responsibilities and the moved drain join stay below 5000 code lines.
+	"internal/brokercontrol": {17, 5000},
+	// origin: hot-update S9 plan §10.1 / S9-SLIM — effective unit policy is a separate leaf.
+	"internal/infrahost": {14, 4000}, "internal/infraunit": {3, 500},
+	// origin: S10 internal review ARCH-REDS R12; extracted clock/cancellation adapter.
+	"internal/infrahost/budgetclock": {1, 44},
+}
+
+type brokerStructure struct {
+	files    map[string]int
+	code     map[string]int
+	methods  map[string]int
+	fields   map[string]int
+	fileCode map[string]int
+	mainCode int
+}
+
+func measureBrokerStructure(t *testing.T, sources map[string]string) brokerStructure {
+	t.Helper()
+	result := brokerStructure{map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}, 0}
+	for _, path := range brokerSortedSourcePaths(sources) {
+		if !isProdGoFile(path) {
+			continue
+		}
+		source := sources[path]
+		file, err := brokerParse(path, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkg := filepath.ToSlash(filepath.Dir(path))
+		result.files[pkg]++
+		lines := countCodeLines(t, path, []byte(source))
+		result.code[pkg] += lines
+		result.fileCode[path] = lines
+		if pkg == "cmd/tether" && !importsCobra(t, path, []byte(source)) {
+			result.mainCode += lines
+		}
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && len(fn.Recv.List) > 0 {
+				result.methods[pkg+"."+receiverTypeName(fn.Recv.List[0].Type)]++
+			}
+			group, ok := decl.(*ast.GenDecl)
+			if !ok || group.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range group.Specs {
+				typ := spec.(*ast.TypeSpec)
+				structure, ok := typ.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				fields := 0
+				for _, field := range structure.Fields.List {
+					n := len(field.Names)
+					if n == 0 {
+						n = 1
+					}
+					fields += n
+				}
+				// Platform variants describe the same type. The largest shape is the cap;
+				// methods, in contrast, remain the historical AllOS declaration union.
+				key := pkg + "." + typ.Name.Name
+				if fields > result.fields[key] {
+					result.fields[key] = fields
+				}
+			}
+		}
+	}
+	return result
+}
+
+func checkBrokerStructure(result brokerStructure) error {
+	for pkg, cap := range brokerPackageCaps {
+		if cap.files > 0 && result.files[pkg] > cap.files {
+			return fmt.Errorf("%s: production files %d exceed %d", pkg, result.files[pkg], cap.files)
+		}
+		if result.code[pkg] >= cap.code {
+			return fmt.Errorf("%s: code %d must be below %d", pkg, result.code[pkg], cap.code)
+		}
+	}
+	for key, cap := range map[string]int{"internal/broker.Broker": 285, "internal/agent.Agent": 125, "internal/execsession.Runtime": 39} {
+		if result.methods[key] > cap {
+			return fmt.Errorf("%s: methods %d exceed %d", key, result.methods[key], cap)
+		}
+	}
+	if result.mainCode >= 1300 {
+		return fmt.Errorf("cmd/tether: non-CLI code %d must be below 1300", result.mainCode)
+	}
+	for key, n := range result.methods {
+		// Existing debt has its exact ratchet above. New types get no blanket
+		// Broker/Agent exception just because they share a package directory.
+		if key == "internal/broker.Broker" || key == "internal/agent.Agent" {
+			continue
+		}
+		if n >= 100 {
+			return fmt.Errorf("%s: receiver methods %d must be below 100", key, n)
+		}
+		for _, pkg := range []string{"internal/brokerimage", "internal/listenerimage", "internal/brokermaint", "internal/controlbudget", "internal/clusterio"} {
+			if strings.HasPrefix(key, pkg+".") && n >= 40 {
+				return fmt.Errorf("%s: image leaf methods %d must be below 40", key, n)
+			}
+		}
+	}
+	for key, n := range result.fields {
+		for _, pkg := range []string{"internal/brokerimage", "internal/listenerimage", "internal/brokermaint", "internal/controlbudget", "internal/clusterio"} {
+			if strings.HasPrefix(key, pkg+".") && n >= 100 {
+				return fmt.Errorf("%s: image fields %d must be below 100", key, n)
+			}
+		}
+	}
+	return nil
+}
+
+const legacyFileCodeLedger = "testdata/legacy_file_code_ceilings.tsv"
+
+// The lead's per-file rule applies 700 to files created after cab90d1.
+// Existing paths have their own decreasing ceiling, including small files;
+// treating every old file as a blanket exemption would allow unbounded growth.
+// Entries were selected with git cat-file -e cab90d1:<path>, then measured
+// with countCodeLines. Removing a file requires removing its dead ledger row.
+// origin: hot-update S6 plan §9.3 / T53 / GATES-S6-E lead decision
+func readLegacyFileCodeCeilings(path string) (map[string]int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	ceilings := map[string]int{}
+	for line, row := range strings.Split(string(raw), "\n") {
+		if row == "" || strings.HasPrefix(row, "#") {
+			continue
+		}
+		fields := strings.Split(row, "\t")
+		if len(fields) != 2 || !isProdGoFile(fields[0]) || filepath.ToSlash(filepath.Clean(fields[0])) != fields[0] ||
+			(!strings.HasPrefix(fields[0], "internal/") && !strings.HasPrefix(fields[0], "cmd/")) {
+			return nil, fmt.Errorf("%s:%d: invalid legacy file row", path, line+1)
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("%s:%d: invalid code ceiling", path, line+1)
+		}
+		if _, duplicate := ceilings[fields[0]]; duplicate {
+			return nil, fmt.Errorf("%s:%d: duplicate legacy path %s", path, line+1, fields[0])
+		}
+		ceilings[fields[0]] = n
+	}
+	if len(ceilings) == 0 {
+		return nil, fmt.Errorf("%s: empty legacy file ledger", path)
+	}
+	return ceilings, nil
+}
+
+// Use the same predicate for the repository and synthetic/on-disk controls.
+// A stale entry is red even if every live file is within its ceiling.
+// origin: hot-update S6 plan §9.3 / T53 / GATES-S6-E lead decision
+func checkBrokerFileCode(actual, legacy map[string]int) error {
+	var failures []string
+	for path, n := range actual {
+		ceiling, old := legacy[path]
+		if !old {
+			ceiling = 700
+		}
+		if n > ceiling {
+			failures = append(failures, fmt.Sprintf("%s: file code %d exceeds %d (legacy=%t)", path, n, ceiling, old))
+		}
+	}
+	for path := range legacy {
+		if _, live := actual[path]; !live {
+			failures = append(failures, path+": stale legacy file ceiling")
+		}
+	}
+	sort.Strings(failures)
+	if len(failures) != 0 {
+		return fmt.Errorf("%s", strings.Join(failures, "\n"))
+	}
+	return nil
+}
+
+// Hard caps cannot be widened by editing the debt golden. Quantized package
+// values retain S5's ceilings even when an updater is used during integration.
+func checkBrokerGoldenCaps(golden map[string]int) error {
+	for key, cap := range map[string]int{
+		"pkg-files internal/broker": 70, "pkg-files internal/cluster": 32, "pkg-files cmd/tether": 57,
+		"type-methods internal/broker.Broker": 285, "type-methods internal/agent.Agent": 125,
+		"pkg-code-lines internal/broker": 16000, "pkg-code-lines internal/agent": 6000,
+		"pkg-code-lines internal/cluster": 2000, "pkg-code-lines internal/tunnel": 4000,
+		"pkg-code-lines cmd/tether": 12000, "main-noncli-code-lines cmd/tether": 1000,
+	} {
+		if n, ok := golden[key]; ok && n > cap {
+			return fmt.Errorf("%s: golden %d exceeds frozen ceiling %d", key, n, cap)
+		}
+	}
+	return nil
+}
+
+// origin: hot-update S6 plan §9.3 / §13 / T53
+func TestBrokerStructuralCapsAllOS(t *testing.T) {
+	root := repoRoot(t)
+	result := measureBrokerStructure(t, brokerGateSources(t, root))
+	for _, pkg := range []string{"internal/broker", "internal/cluster", "cmd/tether"} {
+		if result.files[pkg] != brokerPackageCaps[pkg].files {
+			t.Errorf("%s: frozen production count got %d want %d", pkg, result.files[pkg], brokerPackageCaps[pkg].files)
+		}
+	}
+	if result.methods["internal/agent.Agent"] != 125 || result.methods["internal/execsession.Runtime"] != 39 {
+		t.Error("Agent/Runtime method inventory drifted")
+	}
+	if err := checkBrokerStructure(result); err != nil {
+		t.Error(err)
+	}
+	legacy, err := readLegacyFileCodeCeilings(filepath.Join(root, "test/architecture", legacyFileCodeLedger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerFileCode(result.fileCode, legacy); err != nil {
+		t.Error(err)
+	}
+	golden, err := readGolden(t, filepath.Join(root, "test/architecture", structuralBudgetGolden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerGoldenCaps(golden); err != nil {
+		t.Error(err)
+	}
+	// Print every breached package cap even though the predicate returns one
+	// error. Map iteration must not hide a second owner's integration debt.
+	// origin: hot-update S6 plan §9.3 / T53
+	var breached []string
+	for pkg, cap := range brokerPackageCaps {
+		if cap.files > 0 && result.files[pkg] > cap.files || result.code[pkg] >= cap.code {
+			breached = append(breached, fmt.Sprintf("%s: files=%d/%d code=%d/<%d", pkg, result.files[pkg], cap.files, result.code[pkg], cap.code))
+		}
+	}
+	sort.Strings(breached)
+	for _, row := range breached {
+		t.Log(row)
+	}
+	for _, pkg := range []string{"internal/brokercontrol", "internal/brokerimage", "internal/clusterio"} {
+		t.Logf("%s: files=%d/%d code=%d/<%d", pkg, result.files[pkg], brokerPackageCaps[pkg].files, result.code[pkg], brokerPackageCaps[pkg].code)
+	}
+	t.Logf("AllOS broker=%d files/%d methods/%d code; agent=%d files/%d methods; main=%d non-CLI code", result.files["internal/broker"], result.methods["internal/broker.Broker"], result.code["internal/broker"], result.files["internal/agent"], result.methods["internal/agent.Agent"], result.mainCode)
+}
+
+// origin: hot-update S6 plan §11 / T53
+func TestBrokerStructuralBudgetControls(t *testing.T) {
+
+	frozen := map[string]struct{ files, code int }{
+		"internal/broker": {70, 18000}, "internal/cluster": {32, 4000}, "cmd/tether": {57, 14000}, "internal/agent": {19, 8000}, "internal/tunnel": {0, 6000},
+		"internal/brokerimage": {12, 4000}, "internal/brokerimage/contractstub": {1, 700}, "internal/listenerimage": {6, 1200}, "internal/brokermaint": {4, 900}, "internal/controlbudget": {4, 500}, "internal/clusterio": {4, 900},
+		"internal/brokercontrol": {17, 5000},
+		"internal/infrahost":     {14, 4000}, "internal/infraunit": {3, 500},
+		"internal/infrahost/budgetclock": {1, 44},
+		"internal/cluster/state":         {15, 1800}, "internal/cluster/storelock": {1, 300},
+		"internal/cluster/logbridge": {1, 200}, "internal/cluster/routecert": {1, 100},
+		"internal/drillobserve/infrastructure": {2, 149},
+	}
+	if len(frozen) != len(brokerPackageCaps) {
+		t.Fatal("S6 package cap inventory drifted")
+	}
+	for pkg, cap := range frozen {
+		if brokerPackageCaps[pkg] != cap {
+			t.Fatalf("%s frozen cap widened or changed", pkg)
+		}
+	}
+	sources := map[string]string{"internal/brokerimage/x_linux.go": "//go:build linux\npackage brokerimage; type owner struct{};func(o *owner) Freeze(){}", "internal/brokerimage/x_other.go": "//go:build !linux\npackage brokerimage;func(o *owner) Thaw(){}"}
+	measured := measureBrokerStructure(t, sources)
+	if measured.files["internal/brokerimage"] != 2 || measured.methods["internal/brokerimage.owner"] != 2 {
+		t.Fatal("AllOS union lost excluded files/methods")
+	}
+	if err := checkBrokerStructure(measured); err != nil {
+		t.Fatal(err)
+	}
+	for pkg, cap := range brokerPackageCaps {
+		if cap.files > 0 {
+			old := measured.files[pkg]
+			measured.files[pkg] = cap.files + 1
+			if checkBrokerStructure(measured) == nil {
+				t.Fatalf("file cap escaped %s", pkg)
+			}
+			measured.files[pkg] = old
+		}
+		old := measured.code[pkg]
+		measured.code[pkg] = cap.code
+		if checkBrokerStructure(measured) == nil {
+			t.Fatalf("code cap escaped %s", pkg)
+		}
+		measured.code[pkg] = old
+	}
+	for key, cap := range map[string]int{"internal/agent.Agent": 125, "internal/broker.Broker": 285, "internal/execsession.Runtime": 39, "internal/brokerimage.owner": 39, "internal/x.owner": 99} {
+		old := measured.methods[key]
+		measured.methods[key] = cap + 1
+		if checkBrokerStructure(measured) == nil {
+			t.Fatalf("method cap escaped %s", key)
+		}
+		measured.methods[key] = old
+	}
+	measured.fields["internal/brokerimage.Owner"] = 100
+	if checkBrokerStructure(measured) == nil {
+		t.Fatal("image field cap escaped")
+	}
+	delete(measured.fields, "internal/brokerimage.Owner")
+	measured.mainCode = 1300
+	if checkBrokerStructure(measured) == nil {
+		t.Fatal("main cap escaped")
+	}
+	measured.mainCode = 0
+	measured.fileCode["internal/brokerimage/x_linux.go"] = 701
+	if checkBrokerFileCode(measured.fileCode, nil) == nil {
+		t.Fatal("file code cap escaped")
+	}
+	// Old files may shrink and new files may reach exactly 700. A legacy
+	// path is not permission for a different file to borrow its ceiling.
+	// origin: hot-update S6 plan §9.3 / T53 / GATES-S6-E lead decision
+	legacy := map[string]int{"internal/legacy/owner.go": 750}
+	for _, n := range []int{749, 750} {
+		if err := checkBrokerFileCode(map[string]int{"internal/legacy/owner.go": n, "internal/new/owner.go": 700}, legacy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, actual := range []map[string]int{
+		{"internal/legacy/owner.go": 751},
+		{"internal/legacy/owner.go": 750, "internal/new/owner.go": 701},
+		{"internal/new/owner.go": 700},
+		{"internal/legacy/owner.go": 750, "internal/new/alias.go": 750},
+	} {
+		if checkBrokerFileCode(actual, legacy) == nil {
+			t.Fatalf("legacy/new/stale file code control escaped: %v", actual)
+		}
+	}
+	t.Run("file_code_on_disk", func(t *testing.T) {
+		root := t.TempDir()
+		for _, dir := range []string{"cmd", "internal/legacy", "internal/new"} {
+			if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write := func(path string, lines int) {
+			t.Helper()
+			source := "package owner\nvar (\n" + strings.Repeat("_ = 1\n", lines-3) + ")\n"
+			if err := os.WriteFile(filepath.Join(root, path), []byte(source), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		check := func() error {
+			return checkBrokerFileCode(measureBrokerStructure(t, brokerGateSources(t, root)).fileCode, legacy)
+		}
+		write("internal/legacy/owner.go", 750)
+		write("internal/new/owner.go", 700)
+		if err := check(); err != nil {
+			t.Fatal(err)
+		}
+		write("internal/legacy/owner.go", 751)
+		if check() == nil {
+			t.Fatal("on-disk legacy growth escaped")
+		}
+		write("internal/legacy/owner.go", 749)
+		write("internal/new/owner.go", 701)
+		if check() == nil {
+			t.Fatal("on-disk new file growth escaped")
+		}
+		write("internal/new/owner.go", 700)
+		if err := os.Remove(filepath.Join(root, "internal/legacy/owner.go")); err != nil {
+			t.Fatal(err)
+		}
+		if check() == nil {
+			t.Fatal("on-disk stale legacy entry escaped")
+		}
+		ledger := filepath.Join(root, "ceilings.tsv")
+		for _, raw := range []string{"", "internal/legacy/owner.go\t0\n", "internal/legacy/owner.go\t750\ninternal/legacy/owner.go\t750\n", "../owner.go\t750\n", "test/owner.go\t750\n", "internal-other/owner.go\t750\n", "cmd-other/owner.go\t750\n"} {
+			if err := os.WriteFile(ledger, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readLegacyFileCodeCeilings(ledger); err == nil {
+				t.Fatalf("malformed ledger accepted: %q", raw)
+			}
+		}
+		if err := os.WriteFile(ledger, []byte("# frozen legacy path\ninternal/legacy/owner.go\t750\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if parsed, err := readLegacyFileCodeCeilings(ledger); err != nil || parsed["internal/legacy/owner.go"] != 750 {
+			t.Fatalf("valid ledger: %v %v", parsed, err)
+		}
+	})
+	for key, ceiling := range map[string]int{"pkg-files internal/broker": 70, "pkg-code-lines internal/broker": 16000, "type-methods internal/agent.Agent": 125, "main-noncli-code-lines cmd/tether": 1000} {
+		if checkBrokerGoldenCaps(map[string]int{key: ceiling}) != nil || checkBrokerGoldenCaps(map[string]int{key: ceiling + 1}) == nil {
+			t.Fatalf("golden ceiling control escaped %s", key)
+		}
+	}
+	// Use a real family's copied source plus a disallowed AllOS file on disk.
+	root := t.TempDir()
+	for _, dir := range []string{"internal/brokerimage", "cmd"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "internal/brokerimage/contracts.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 13; i++ {
+		if err := os.WriteFile(filepath.Join(root, "internal/brokerimage", fmt.Sprintf("owner%d_other.go", i)), raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if checkBrokerStructure(measureBrokerStructure(t, brokerGateSources(t, root))) == nil {
+		t.Fatal("on-disk production file growth escaped")
+	}
+}
+
+// Retain the S6 predicate and every legacy ceiling. The S9 leaf ceiling is
+// additional: smaller existing package caps still win, never net package slack.
+// origin: hot-update S9 plan §10.1 / T83
+func checkInfraStructure(result brokerStructure) error {
+	if err := checkBrokerStructure(result); err != nil {
+		return err
+	}
+	for _, leaf := range infraLeafRoots {
+		pkg := "internal/" + leaf
+		ceiling := 2000
+		if leaf == "infrahost" || leaf == "infraupgrade" {
+			ceiling = 4000
+		}
+		if result.files[pkg] > 20 || result.code[pkg] >= ceiling {
+			return fmt.Errorf("%s: S9 leaf files=%d/20 code=%d/<%d", pkg, result.files[pkg], result.code[pkg], ceiling)
+		}
+		for key, n := range result.methods {
+			if strings.HasPrefix(key, pkg+".") && n > 40 {
+				return fmt.Errorf("%s: S9 owner methods=%d/40", key, n)
+			}
+		}
+	}
+	if result.mainCode >= 900 {
+		return fmt.Errorf("cmd/tether: non-CLI code %d crosses frozen 900 boundary", result.mainCode)
+	}
+	if n := result.methods["internal/brokercontrol.ClusterAdmin"]; n > 86 {
+		return fmt.Errorf("ClusterAdmin methods=%d/86", n)
+	}
+	return nil
+}
+
+// origin: hot-update S9 plan §10.1 / T83
+// gate-control: TestInfraStructuralBudgetControls
+func TestInfraStructuralBudgetsAllOS(t *testing.T) {
+	root := repoRoot(t)
+	result := measureBrokerStructure(t, brokerGateSources(t, root))
+	for _, pkg := range []string{"internal/broker", "internal/cluster", "cmd/tether"} {
+		if result.files[pkg] != brokerPackageCaps[pkg].files {
+			t.Errorf("%s exact file inventory drift: %d", pkg, result.files[pkg])
+		}
+	}
+	for key, n := range map[string]int{"internal/agent.Agent": 125, "internal/execsession.Runtime": 39} {
+		if result.methods[key] != n {
+			t.Errorf("%s exact method inventory drift: %d", key, result.methods[key])
+		}
+	}
+	if err := checkInfraStructure(result); err != nil {
+		t.Error(err)
+	}
+	legacy, err := readLegacyFileCodeCeilings(filepath.Join(root, "test/architecture", legacyFileCodeLedger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerFileCode(result.fileCode, legacy); err != nil {
+		t.Error(err)
+	}
+	for _, pkg := range []string{"internal/broker", "internal/agent", "cmd/tether", "internal/cluster", "internal/brokercontrol", "internal/execsession", "internal/tunnel", "internal/cli"} {
+		t.Logf("entry/after: %s files=%d code=%d (P34 changes no production source; delta=0)", pkg, result.files[pkg], result.code[pkg])
+	}
+	golden, err := readGolden(t, filepath.Join(root, "test/architecture", structuralBudgetGolden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerGoldenCaps(golden); err != nil {
+		t.Error(err)
+	}
+	if n := golden["main-noncli-code-lines cmd/tether"]; n > 800 {
+		t.Errorf("non-CLI golden widened to %d", n)
+	}
+}
+
+// origin: hot-update S9 plan §11 / T83 / M31
+func TestInfraStructuralBudgetControls(t *testing.T) {
+	root := transferFixtureTree(t, map[string]string{"internal/infraattach/owner_other.go": "package owner\n"})
+	read := func() brokerStructure { return measureBrokerStructure(t, brokerGateSources(t, root)) }
+	good := read()
+	if err := checkInfraStructure(good); err != nil {
+		t.Fatal(err)
+	}
+	path := "internal/infraattach/owner_other.go"
+	transferWriteFixture(t, root, path, "package owner\n"+strings.Repeat("// harmless comment\n", 800))
+	if read().fileCode[path] != 1 {
+		t.Fatal("comments counted as code")
+	}
+	transferWriteFixture(t, root, path, "package owner\n"+strings.Repeat("var _ = 1\n", 700))
+	measured := read()
+	if measured.fileCode[path] != 701 || checkBrokerFileCode(measured.fileCode, map[string]int{}) == nil {
+		t.Fatal("on-disk 701 code lines escaped")
+	}
+	legacy := map[string]int{path: 700}
+	if checkBrokerFileCode(measured.fileCode, legacy) == nil {
+		t.Fatal("legacy +1 escaped")
+	}
+	for _, leaf := range infraLeafRoots {
+		pkg := "internal/" + leaf
+		before := good.code[pkg]
+		ceiling := 2000
+		if leaf == "infrahost" || leaf == "infraupgrade" {
+			ceiling = 4000
+		}
+		good.code[pkg] = ceiling
+		if checkInfraStructure(good) == nil {
+			t.Fatalf("code ceiling escaped %s", pkg)
+		}
+		good.code[pkg] = before
+		good.files[pkg] = 21
+		if checkInfraStructure(good) == nil {
+			t.Fatalf("file ceiling escaped %s", pkg)
+		}
+		good.files[pkg] = 0
+		good.methods[pkg+".Owner"] = 41
+		if checkInfraStructure(good) == nil {
+			t.Fatalf("owner method ceiling escaped %s", pkg)
+		}
+		delete(good.methods, pkg+".Owner")
+	}
+	good.mainCode = 900
+	if checkInfraStructure(good) == nil {
+		t.Fatal("non-CLI quantum boundary escaped")
+	}
+	// Shared controls retain exact existing counts and every small-file ceiling.
+	t.Run("existing", TestBrokerStructuralBudgetControls)
+}
+
+// S10 first registrations (plan §12.1): AllOS production totals of the new
+// leaves, independent of the S6/S7/S9 tables so none of them becomes headroom
+// for fullstack growth. Most S10 production code lives under test/, which the
+// S6 reader never scans; this gate measures it with the same counter. Every
+// package directory under an S10 root must be registered, or a responsibility
+// moved into a new subdirectory would escape every cap. The existing direct caps
+// (Broker, cluster, cmd/tether, Agent exactly 125, Runtime, legacy per-file
+// ceilings and the tighten-only golden) are re-enabled over the same union.
+// origin: hot-update S10 plan §12.1 / P28
+// gate-control: TestFullstackStructuralBudgetControls
+var fullstackPackageCaps = map[string]struct{ files, code int }{
+	"internal/storewitness":              {2, 1000},
+	"test/hotupdate/acceptance":          {10, 6000},
+	"test/hotupdate/acceptance/contract": {3, 1800},
+	"test/fullstackharness":              {14, 8000},
+}
+
+// Registered S10 packages without a plan-sized total: each file still obeys 700.
+var fullstackUncappedPackages = []string{"test/hotupdate/acceptance/contractstub", "test/hotupdate/evidencecmd", "test/fullstackharness/cmd/supervise"}
+
+// fullstackStructureSources is the S6 production view plus the S10 roots under
+// test/. Other test helpers keep their own history and are not re-sized here.
+func fullstackStructureSources(tree fullstackTree) map[string]string {
+	sources := map[string]string{}
+	for path, source := range fullstackProductionGo(tree) {
+		if strings.HasPrefix(path, "internal/") || strings.HasPrefix(path, "cmd/") || fullstackUnder(path, fullstackRoots...) {
+			sources[path] = source
+		}
+	}
+	return sources
+}
+
+// The method counter keys a method by its receiver's spelled type name. A
+// local alias (type agentView = Agent) is a legal receiver for Agent's own
+// method set, so every method declared through it would vanish from the exact
+// 125 while the real set grows. Capped owners therefore admit no such alias.
+// origin: hot-update S10 plan §12.1 Agent 124/126 / P28
+var fullstackCappedReceivers = map[string]string{"internal/agent": "Agent", "internal/execsession": "Runtime", "internal/broker": "Broker"}
+
+func checkFullstackReceiverAliases(sources map[string]string) error {
+	for _, path := range brokerSortedSourcePaths(sources) {
+		owner, capped := fullstackCappedReceivers[fullstackDir(path)]
+		if !capped || !strings.Contains(sources[path], "= "+owner) && !strings.Contains(sources[path], "= *"+owner) {
+			continue
+		}
+		file, err := brokerParse(path, sources[path])
+		if err != nil {
+			return err
+		}
+		for _, decl := range file.Decls {
+			group, ok := decl.(*ast.GenDecl)
+			if !ok || group.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range group.Specs {
+				alias := spec.(*ast.TypeSpec)
+				if alias.Assign.IsValid() && receiverTypeName(alias.Type) == owner {
+					return fmt.Errorf("%s: alias %s hides %s's method count", path, alias.Name.Name, owner)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func checkFullstackStructure(result brokerStructure) error {
+	if err := checkBrokerStructure(result); err != nil {
+		return err
+	}
+	if n := result.methods["internal/agent.Agent"]; n != 125 {
+		return fmt.Errorf("internal/agent.Agent must keep exactly 125 methods, has %d", n)
+	}
+	for _, pkg := range brokerSortedSourcePaths(fullstackPackageCapsAsPaths()) {
+		cap := fullstackPackageCaps[pkg]
+		if result.files[pkg] == 0 {
+			return fmt.Errorf("%s: empty S10 package root", pkg)
+		}
+		if result.files[pkg] > cap.files || result.code[pkg] >= cap.code {
+			return fmt.Errorf("%s: S10 production files %d/%d, code %d/<%d", pkg, result.files[pkg], cap.files, result.code[pkg], cap.code)
+		}
+	}
+	for _, pkg := range fullstackUncappedPackages {
+		if result.files[pkg] == 0 {
+			return fmt.Errorf("%s: empty S10 package root", pkg)
+		}
+	}
+	for _, pkg := range brokerSortedSourcePaths(fileCountsAsPaths(result.files)) {
+		_, capped := fullstackPackageCaps[pkg]
+		if fullstackUnder(pkg+"/", fullstackRoots...) && !capped && !slices.Contains(fullstackUncappedPackages, pkg) {
+			return fmt.Errorf("%s: unregistered S10 package directory", pkg)
+		}
+	}
+	return nil
+}
+
+func fullstackPackageCapsAsPaths() map[string]string {
+	paths := map[string]string{}
+	for pkg := range fullstackPackageCaps {
+		paths[pkg] = ""
+	}
+	return paths
+}
+
+func fileCountsAsPaths(files map[string]int) map[string]string {
+	paths := map[string]string{}
+	for pkg, n := range files {
+		if n > 0 {
+			paths[pkg] = ""
+		}
+	}
+	return paths
+}
+
+// origin: hot-update S10 plan §12.1 / P28
+func TestFullstackStructuralCapsAllOS(t *testing.T) {
+	tree := fullstackRepoTree(t)
+	sources := fullstackStructureSources(tree)
+	if err := checkFullstackReceiverAliases(sources); err != nil {
+		t.Error(err)
+	}
+	result := measureBrokerStructure(t, sources)
+	if err := checkFullstackStructure(result); err != nil {
+		t.Error(err)
+	}
+	legacy, err := readLegacyFileCodeCeilings(filepath.Join(tree.root, "test/architecture", legacyFileCodeLedger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerFileCode(result.fileCode, legacy); err != nil {
+		t.Error(err)
+	}
+	golden, err := readGolden(t, filepath.Join(tree.root, "test/architecture", structuralBudgetGolden))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerGoldenCaps(golden); err != nil {
+		t.Error(err)
+	}
+	for _, pkg := range brokerSortedSourcePaths(fullstackPackageCapsAsPaths()) {
+		cap := fullstackPackageCaps[pkg]
+		t.Logf("S10 %s: files=%d/%d code=%d/<%d", pkg, result.files[pkg], cap.files, result.code[pkg], cap.code)
+	}
+	for _, pkg := range fullstackUncappedPackages {
+		t.Logf("S10 %s: files=%d code=%d (registered; 700 per file)", pkg, result.files[pkg], result.code[pkg])
+	}
+	t.Logf("AllOS Agent=%d methods/%d files; Runtime=%d; Broker=%d files/%d methods/%d code; main non-CLI=%d",
+		result.methods["internal/agent.Agent"], result.files["internal/agent"], result.methods["internal/execsession.Runtime"],
+		result.files["internal/broker"], result.methods["internal/broker.Broker"], result.code["internal/broker"], result.mainCode)
+}
+
+// Every mutation edits a copied real S10 root (or the synthetic Agent/Runtime
+// owners) on disk and re-measures it with the structural gate's own counter.
+// origin: hot-update S10 plan §10.2 P28 / §12.1
+func TestFullstackStructuralBudgetControls(t *testing.T) {
+	frozen := map[string]struct{ files, code int }{
+		"internal/storewitness": {2, 1000}, "test/hotupdate/acceptance": {10, 6000},
+		"test/hotupdate/acceptance/contract": {3, 1800}, "test/fullstackharness": {14, 8000},
+	}
+	if len(frozen) != len(fullstackPackageCaps) {
+		t.Fatal("S10 package cap registry drifted")
+	}
+	for pkg, cap := range frozen {
+		if fullstackPackageCaps[pkg] != cap {
+			t.Fatalf("%s: frozen S10 cap changed", pkg)
+		}
+	}
+	real := fullstackRepoTree(t)
+	root := fullstackFixture(t, real, fullstackRoots...)
+	legacy, err := readLegacyFileCodeCeilings(filepath.Join(real.root, "test/architecture", legacyFileCodeLedger))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// agent.go carries the exact 125-method inventory and is padded to its real
+	// per-file legacy ceiling, so one more code line is the "legacy +1" defect.
+	agent := "package agent\n\ntype Agent struct{}\n"
+	for i := 0; i < 125; i++ {
+		agent += fmt.Sprintf("func (*Agent) Method%d() {}\n", i)
+	}
+	agent += strings.Repeat("var _ = 1\n", legacy["internal/agent/agent.go"]-127)
+	transferWriteFixture(t, root, "internal/agent/agent.go", agent)
+	transferWriteFixture(t, root, "internal/execsession/runtime.go", "package execsession\n\ntype Runtime struct{}\n")
+	ceilings := map[string]int{"internal/agent/agent.go": legacy["internal/agent/agent.go"]}
+	measure := func() brokerStructure {
+		return measureBrokerStructure(t, fullstackStructureSources(readFullstackTree(t, root)))
+	}
+	check := func() error {
+		if err := checkFullstackReceiverAliases(fullstackStructureSources(readFullstackTree(t, root))); err != nil {
+			return err
+		}
+		result := measure()
+		if err := checkFullstackStructure(result); err != nil {
+			return err
+		}
+		return checkBrokerFileCode(result.fileCode, ceilings)
+	}
+	if got := measure().fileCode["internal/agent/agent.go"]; got != ceilings["internal/agent/agent.go"] {
+		t.Fatalf("agent fixture measures %d code lines, want its ceiling %d", got, ceilings["internal/agent/agent.go"])
+	}
+	// Fill the file caps to their limit: the limit itself is green, one more is red.
+	good := measure()
+	for pkg, cap := range fullstackPackageCaps {
+		for i := good.files[pkg]; i < cap.files; i++ {
+			transferWriteFixture(t, root, fmt.Sprintf("%s/filler%d_other.go", pkg, i), "package "+fullstackBase(pkg)+"\n")
+		}
+	}
+	if err := check(); err != nil {
+		t.Fatalf("S10 caps at their limits refused: %v", err)
+	}
+	full := measure()
+	witnessPad := fullstackPackageCaps["internal/storewitness"].code - full.code["internal/storewitness"]
+	proveFullstackMutations(t, root, check,
+		fullstackMutation{path: "internal/agent/agent.go", old: "func (*Agent) Method124() {}\n", new: "", want: "exactly 125 methods, has 124"},
+		fullstackMutation{path: "internal/agent/agent.go", old: "type Agent struct{}\n", new: "type Agent struct{}\nfunc (*Agent) Method125() {}\n", want: "internal/agent.Agent: methods 126"},
+		// A 126th method declared through an alias receiver must not read as 125.
+		fullstackMutation{path: "internal/agent/view_other.go", new: "package agent\n\ntype agentView = Agent\n\nfunc (*agentView) Hidden() {}\n", want: "alias agentView hides Agent's method count"},
+		fullstackMutation{path: "internal/execsession/runtime.go", new: "\ntype runtimeView = *Runtime\n", want: "alias runtimeView hides Runtime's method count"},
+		fullstackMutation{path: "internal/execsession/runtime.go", new: strings.Repeat("func (*Runtime) M() {}\n", 40), want: "internal/execsession.Runtime: methods 40"},
+		fullstackMutation{path: "internal/storewitness/filler_extra_other.go", new: "package storewitness\n", want: "internal/storewitness: S10 production files 3/2"},
+		fullstackMutation{path: "test/fullstackharness/filler_extra_other.go", new: "package fullstackharness\n", want: "test/fullstackharness: S10 production files 15/14"},
+		fullstackMutation{path: "test/hotupdate/acceptance/filler_extra_other.go", new: "package acceptance\n", want: "test/hotupdate/acceptance: S10 production files 11/10"},
+		fullstackMutation{path: "test/hotupdate/acceptance/contract/filler_extra_other.go", new: "package contract\n", want: "test/hotupdate/acceptance/contract: S10 production files 4/3"},
+		fullstackMutation{path: "internal/storewitness/witness.go", new: strings.Repeat("\nvar _ = 1", witnessPad), want: "internal/storewitness: S10 production files 2/2, code 1000/<1000"},
+		fullstackMutation{path: "test/fullstackharness/relocated/owner.go", new: "package relocated\n", want: "unregistered S10 package directory"},
+		fullstackMutation{path: "test/hotupdate/acceptance/contractstub/stub.go", remove: true, want: "contractstub: empty S10 package root"},
+		fullstackMutation{path: "test/hotupdate/evidencecmd/oversized.go", new: "package main\n" + strings.Repeat("var _ = 1\n", 700), want: "oversized.go: file code 701 exceeds 700"},
+		fullstackMutation{path: "internal/agent/agent.go", new: "var _ = 1\n", want: "agent.go: file code " + strconv.Itoa(ceilings["internal/agent/agent.go"]+1)},
+	)
 }

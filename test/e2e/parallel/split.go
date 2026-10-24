@@ -353,6 +353,32 @@ func splitMatrices(root string) ([]unit, []string, error) {
 		// fallback: not-parsed must mean run-it-whole, for everything.
 		unparsed = append(unparsed, name)
 	}
+	// Top-level serial guards outside the matrix source still need execution.
+	// Schedule their own test bodies directly under race; they are not nested
+	// matrices whose child commands need decomposition. Enumerating declarations
+	// preserves the runner's independent compiled-test coverage reconciliation.
+	// origin: hot-update S5 plan §10.1 / T49 / T50.
+	files, err := filepath.Glob(filepath.Join(root, "test", "e2e", "*_test.go"))
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, source := range files {
+		if source == path {
+			continue
+		}
+		guards, err := parser.ParseFile(fset, source, nil, 0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse %s: %w", source, err)
+		}
+		for _, declaration := range guards.Decls {
+			guard, ok := declaration.(*ast.FuncDecl)
+			if !ok || guard.Recv != nil || guard.Body == nil || !strings.HasPrefix(guard.Name.Name, "Test") {
+				continue
+			}
+			name := guard.Name.Name
+			units = append(units, parseGoTestArgs(name, []string{"go", "test", "-race", "-count=1", "-tags", "e2e_matrix", "-timeout", "90s", "-run", "^" + name + "$", "./test/e2e"})...)
+		}
+	}
 	sort.Slice(units, func(i, j int) bool { return units[i].name < units[j].name })
 	return units, unparsed, nil
 }
@@ -441,13 +467,20 @@ func parseGoTestArgs(matrix string, args []string) []unit {
 	out := make([]unit, 0, len(pkgs))
 	for _, p := range pkgs {
 		short := strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/...")
+		name := strings.TrimSuffix(strings.TrimPrefix(matrix, "Test"), "Matrix") + ":" + short
+		// Exact partitions of one package must have distinct receipt identities;
+		// otherwise reconciliation can confuse one completed test with another.
+		// origin: hot-update S6 FIX-MATRIX / §9.3 / T54.
+		if runf != "" {
+			name += "[" + runf + "]"
+		}
 		out = append(out, unit{
 			matrix: matrix, pkg: p, tags: tags, race: race, timeo: timeo,
 			runFilter: runf,
 			baseArgs:  append([]string(nil), base...),
 			hasRun:    runf != "",
 			extra:     strings.Join(extra, " "),
-			name:      strings.TrimSuffix(strings.TrimPrefix(matrix, "Test"), "Matrix") + ":" + short,
+			name:      name,
 		})
 	}
 	return out

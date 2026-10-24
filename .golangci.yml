@@ -360,7 +360,7 @@ linters:
       #    all of them methods). Anchoring an alternation is only half the job; the other half is knowing
       #    what the tool actually prints.
       - linters: [unparam]
-        text: "^(\\(\\*?\\w+\\)\\.)?(driveAdd|waitOpCatchingUp|renderJoinerClusteredConf|newClusterReconcileNatsCmd|currentLeader|canaryCommandVerCheck|finishPullTierA|finishPullTierB|handleExposeForwarded|handleExposeRmForwarded|handleKillForwarded|handleUpgradeForwarded|rosterForRegister) - \\w+ is unused"
+        text: "^(\\(\\*?\\w+\\)\\.)?(driveAdd|waitOpCatchingUp|renderJoinerClusteredConf|newClusterReconcileNatsCmd|currentLeader|handleExposeForwarded|handleExposeRmForwarded|handleKillForwarded|handleUpgradeForwarded|rosterForRegister) - \\w+ is unused"
       #
       # 2. TEST INJECTION POINTS. Every `X always receives <constant>` report is a parameter that
       #    production calls with one value and a TEST calls with another -- a size limit, a TTL, a
@@ -412,9 +412,15 @@ linters:
       - path: internal/agent/run\.go
         linters: [maintidx]
         text: "Function name: handleRunForwarded,"
-      - path: internal/broker/(broker|cluster_grow_trigger|cluster_upgrade_trigger|clusterstatus)\.go
+      - path: internal/broker/(broker|cluster_grow_trigger|cluster_upgrade_trigger)\.go
         linters: [maintidx]
-        text: "Function name: (Run|handleGrowTrigger|handleUpgradeTrigger|StatusReport),"
+        text: "Function name: (Run|handleGrowTrigger|handleUpgradeTrigger),"
+      # hot-update S6 BROKER-SLIM moved StatusReport verbatim (comments included) from
+      # internal/broker/clusterstatus.go into internal/brokercontrol; the exemption follows the same
+      # function, not a new one — the rule still names exactly one function at exactly one path.
+      - path: internal/brokercontrol/clusterstatus\.go
+        linters: [maintidx]
+        text: "Function name: StatusReport,"
       # simcluster-speed round 2 (2026-09-20): constraint 1 again, twice in one change. pushTierB sat at
       # MI 20 and went to 19 when the #84 rationale above attemptPut was rewritten from the two-face
       # sketch to the three faces the code actually has (round-2 review R6-6); handleExposeReq went

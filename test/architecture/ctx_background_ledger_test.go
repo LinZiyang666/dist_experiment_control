@@ -1,12 +1,14 @@
 package architecture
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -51,6 +53,35 @@ func ctxBackgroundSites(fset *token.FileSet, f *ast.File, src string, rel string
 			}
 		}
 	}
+	// Import identity, not local spelling: aliasing context must not bypass
+	// the annotation rule. A function-value reference is a new root too.
+	// origin: hot-update S6 plan §9.3 / T53.
+	aliases := map[string]bool{}
+	dot := false
+	for _, spec := range f.Imports {
+		path, _ := strconv.Unquote(spec.Path.Value)
+		if path != "context" {
+			continue
+		}
+		name := "context"
+		if spec.Name != nil {
+			name = spec.Name.Name
+		}
+		if name == "." {
+			dot = true
+		} else {
+			aliases[name] = true
+		}
+	}
+	// A dot import exposes an unqualified Background identifier. The Sel of
+	// other.Background is still qualified, and must not become a dot call.
+	qualified := map[*ast.Ident]bool{}
+	ast.Inspect(f, func(node ast.Node) bool {
+		if sel, ok := node.(*ast.SelectorExpr); ok {
+			qualified[sel.Sel] = true
+		}
+		return true
+	})
 	var sites []string
 	var walk func(fn string, n ast.Node)
 	walk = func(fn string, n ast.Node) {
@@ -61,16 +92,20 @@ func ctxBackgroundSites(fset *token.FileSet, f *ast.File, src string, rel string
 					walk(ctxFuncName(v), v.Body)
 				}
 				return false
-			case *ast.CallExpr:
-				sel, ok := v.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "Background" {
+			case *ast.SelectorExpr, *ast.Ident:
+				root := false
+				switch value := m.(type) {
+				case *ast.SelectorExpr:
+					pkg, ok := value.X.(*ast.Ident)
+					root = ok && aliases[pkg.Name] && (value.Sel.Name == "Background" || value.Sel.Name == "TODO")
+				case *ast.Ident:
+					root = dot && !qualified[value] && (value.Name == "Background" || value.Name == "TODO")
+				}
+				if !root {
 					return true
 				}
-				pkg, ok := sel.X.(*ast.Ident)
-				if !ok || pkg.Name != "context" {
-					return true
-				}
-				line := fset.Position(v.Pos()).Line
+
+				line := fset.Position(m.Pos()).Line
 				if sameLine[line] || lineAbove[line-1] {
 					return true
 				}
@@ -224,5 +259,158 @@ func notContext() {
 	want := []string{"synth.go: bare", "synth.go: twoAbove", "synth.go: (*svc).method", "synth.go: trailingMarkerDoesNotLeak"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("ctxBackgroundSites drifted:\n got  %v\n want %v", got, want)
+	}
+}
+
+// origin: hot-update S6 plan §9.3 / §11 / T53
+// gate-control: TestBrokerContextRootControls
+func TestBrokerContextRootControls(t *testing.T) {
+	for _, tc := range []struct {
+		name, source string
+		count        int
+	}{
+		{"alias", "import lifetime \"context\";func root(){_ = lifetime.Background()}", 1},
+		{"dot", "import . \"context\";func root(){_ = Background()}", 1},
+		{"dot-qualified-other", "import . \"context\";func root(){_ = other.Background()}", 0},
+		{"function-value", "import lifetime \"context\";var makeRoot=lifetime.Background", 1},
+		{"annotated-alias", "import lifetime \"context\"\nfunc root(){\n// ctx-root: process loop\n_ = lifetime.Background()\n}", 0},
+		{"annotated-dot", "import . \"context\"\nfunc root(){\n_ = Background() // ctx-none: callback has no ctx\n}", 0},
+		{"wrong-package", "import context \"example.org/other\";func root(){_ = context.Background()}", 0},
+		{"marker-in-string", "import \"context\";func root(){_ = \"ctx-root: not a comment\";_ = context.Background()}", 1},
+		{"two-in-one-site", "import \"context\";func root(){_ = context.Background();_ = context.Background()}", 2},
+		{"trailing-not-next", "import \"context\"\nfunc root(){\n_ = context.Background() // ctx-root: just this statement\n_ = context.Background()\n}", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := "package fixture\n" + tc.source
+			set := token.NewFileSet()
+			file, err := parser.ParseFile(set, "fixture.go", source, parser.ParseComments)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ctxBackgroundSites(set, file, source, "fixture.go")
+			if len(got) != tc.count {
+				t.Fatalf("root annotation discovery got %v want count %d", got, tc.count)
+			}
+		})
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "internal/controlbudget/contracts.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.Replace(string(raw), "package controlbudget", "package controlbudget\nimport lifetime \"context\"", 1) + "\nfunc root(){ _=lifetime.Background() }\n"
+	set := token.NewFileSet()
+	file, err := parser.ParseFile(set, "contracts_other.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ctxBackgroundSites(set, file, source, "internal/controlbudget/contracts_other.go")
+	want := "internal/controlbudget/contracts_other.go: root"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("real-family alias root mutant got %v want %s", got, want)
+	}
+}
+
+// Transfer leaves have no inherited root-context debt. Moving a Background
+// site out of broker/agent cannot carry the old package's exemption with it.
+// origin: hot-update S7 plan §11.2 / T50
+// gate-control: TestTransferContextRootControls
+func TestTransferContextRootsHaveNoLegacyExemptions(t *testing.T) {
+	for path, source := range brokerGateSources(t, repoRoot(t)) {
+		if !strings.HasPrefix(path, "internal/xfer") || strings.Contains(path, "/contractstub/") {
+			continue
+		}
+		set := token.NewFileSet()
+		file, err := parser.ParseFile(set, path, source, parser.ParseComments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bad := ctxBackgroundSites(set, file, source, path); len(bad) > 0 {
+			t.Errorf("unowned transfer context roots: %v", bad)
+		}
+	}
+}
+
+// origin: hot-update S7 plan §11.2 / T50
+func TestTransferContextRootControls(t *testing.T) {
+	root := transferFixtureTree(t, map[string]string{})
+	path := "internal/xferworker/owner_other.go"
+	for _, tc := range []struct {
+		source string
+		bad    bool
+	}{
+		{"package worker;import c \"context\";func Run(){c.Background()}", true},
+		{"package worker;import c \"context\";var root=c.Background", true},
+		{"package worker;import c \"context\";func Run(){\n// ctx-root: explicit worker Stop owns this loop.\nc.Background()}", false},
+	} {
+		transferWriteFixture(t, root, path, tc.source)
+		raw, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		set := token.NewFileSet()
+		file, err := parser.ParseFile(set, path, raw, parser.ParseComments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sites := ctxBackgroundSites(set, file, string(raw), path); (len(sites) > 0) != tc.bad {
+			t.Fatalf("on-disk transfer context root annotation: %v want bad=%t", sites, tc.bad)
+		}
+	}
+}
+
+// New leaves carry no grandfathered root-context debt; TODO is a root too.
+// origin: hot-update S9 plan §10.2 / T83
+func checkInfraContextRoots(sources map[string]string) error {
+	for _, path := range brokerSortedSourcePaths(sources) {
+		if !infraOwner(path) || strings.Contains(path, "/contractstub/") {
+			continue
+		}
+		source := sources[path]
+		set := token.NewFileSet()
+		file, err := parser.ParseFile(set, path, source, parser.ParseComments)
+		if err != nil {
+			return err
+		}
+		if bad := ctxBackgroundSites(set, file, source, path); len(bad) > 0 {
+			return fmt.Errorf("unowned S9 context roots: %v", bad)
+		}
+		for _, group := range file.Comments {
+			for _, comment := range group.List {
+				for _, marker := range ctxAnnotationMarkers {
+					if i := strings.Index(comment.Text, marker); i >= 0 && strings.TrimSpace(comment.Text[i+len(marker):]) == "" {
+						return fmt.Errorf("%s: context annotation has no ownership reason", path)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// origin: hot-update S9 plan §10.2 / T83
+// gate-control: TestInfraContextRootControls
+func TestInfraContextRootsHaveNoLegacyExemptions(t *testing.T) {
+	if err := checkInfraContextRoots(brokerGateSources(t, repoRoot(t))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// origin: hot-update S9 plan §11 / T83 / M31
+func TestInfraContextRootControls(t *testing.T) {
+	root := transferFixtureTree(t, map[string]string{})
+	path := "internal/infratransport/dial_other.go"
+	for _, tc := range []struct {
+		source string
+		bad    bool
+	}{
+		{"package owner;import c \"context\";func Run(){c.Background()}", true},
+		{"package owner;import c \"context\";var root=c.TODO", true},
+		{"package owner;import c \"context\";func Run(){\n// ctx-root:\nc.Background()}", true},
+		{"package owner;import c \"context\";func Run(){\n// ctx-root: the generation Stop joins this worker.\nc.Background()}", false},
+	} {
+		transferWriteFixture(t, root, path, tc.source)
+		if err := checkInfraContextRoots(brokerGateSources(t, root)); (err != nil) != tc.bad {
+			t.Fatalf("on-disk context annotation: %v want bad=%t", err, tc.bad)
+		}
 	}
 }

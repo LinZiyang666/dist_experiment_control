@@ -17,7 +17,7 @@ package determinism
 //
 // KEYED "<path>: <func>". Only ever REMOVED (legacyLeaderPremiseSitesCap); a stale entry FAILS.
 
-const legacyLeaderPremiseSitesCap = 13
+const legacyLeaderPremiseSitesCap = 10
 
 var legacyLeaderPremiseSites = map[string]bool{
 	"internal/broker/reconcile_passes_test.go: legacyReconcileTickOracle":                                    true,
@@ -30,7 +30,4 @@ var legacyLeaderPremiseSites = map[string]bool{
 	"internal/cluster/transport_test.go: waitRealLeader":                                                     true,
 	"test/d5/phasefluidity_rebind_test.go: TestPhaseFluidityMTLSRebind":                                      true,
 	"test/d5/publisher_test.go: TestD5FollowerNeverPublishes":                                                true,
-	"test/d7/integration_test.go: (*d7Cluster).adminForLeader":                                               true,
-	"test/d7/integration_test.go: (*d7Cluster).applyMetaSetOnLeaderAndWaitApplied":                           true,
-	"test/d7/integration_test.go: (*d7Cluster).nudgeLeadershipHome":                                          true,
 }

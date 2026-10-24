@@ -15,47 +15,36 @@ package architecture
 // Rules: an entry is only ever REMOVED (legacyCtxBackgroundSitesCap enforces it); an entry whose site
 // is gone or annotated FAILS the gate until deleted. Drain by annotating the line — one comment.
 
-const legacyCtxBackgroundSitesCap = 40
+// origin: hot-update S4 plan §10 — smokeVersion now marks its root probe context.
+// origin: hot-update S5 plan §10.2 / AGENT-SLIM-S5 — extracted tracker and
+// transfer callbacks now carry their ctx-none annotations at the actual roots.
+// origin: hot-update S6 plan §9.3 / T53 — eight annotated roots drain the ledger.
+// origin: hot-update S7 plan §6.4 / T31 — the session-removal rewrite annotated
+// handleSessionRm's pre-Run fallback root (ctx-none), draining its entry.
+// origin: hot-update S7 plan §11.4 / BROKER-SLIM-2; the moved restart root is annotated.
+// origin: hot-update S10 lint L3a F044 — the moved StreamObserve root is annotated.
+// origin: hot-update S7 plan §11.4 / T50; legacy terminal handlers no longer create root contexts.
+const legacyCtxBackgroundSitesCap = 20
 
 var legacyCtxBackgroundSites = map[string]bool{
-	"cmd/tether/cluster_upgrade_drive.go: notifyMilestone":                     true,
-	"cmd/tether/main.go: main":                                                 true,
-	"cmd/tether/transfer.go: sendFinalize":                                     true,
-	"internal/adminsock/server.go: (*Server).handleAudit":                      true,
-	"internal/adminsock/server.go: (*Server).handleEvents":                     true,
-	"internal/agent/conn_teardown.go: (*connTracker).Dial":                     true,
-	"internal/agent/proxy.go: (*Agent).onNATSReconnect":                        true,
 	"internal/agent/run.go: (*Agent).waitForAttachOnSub":                       true,
 	"internal/agent/ssproxy/server.go: (*Server).Start":                        true,
-	"internal/agent/transfer.go: (*Agent).handlePullForwarded":                 true,
-	"internal/agent/transfer.go: (*Agent).handlePushCommitForwarded":           true,
-	"internal/agent/upgrade.go: smokeVersion":                                  true,
-	"internal/broker/broker.go: (*Broker).publishAudit":                        true,
 	"internal/broker/cluster_forward.go: (*Forwarder).forward":                 true,
-	"internal/broker/cluster_grow_cutover.go: (*Broker).hardRestartNatsServer": true,
 	"internal/broker/clusterbackup.go: (*clusterAdminBackend).handleBackup":    true,
 	"internal/broker/clusterwrite.go: (*Broker).clusterJSPlaceable":            true,
 	"internal/broker/clusterwrite.go: (*Broker).clusterStreamsReady":           true,
-	"internal/broker/clusterwrite.go: (*Broker).wireClusterLate":               true,
 	"internal/broker/incident.go: (*clusterAdminBackend).handleExportIncident": true,
 	"internal/broker/sessions.go: (*Broker).handleSessionCreate":               true,
-	"internal/broker/sessions.go: (*Broker).handleSessionRm":                   true,
 	"internal/broker/transfer.go: (*Broker).finalizeTransfer":                  true,
-	"internal/broker/transfer.go: (*Broker).handleEvTransfer":                  true,
-	"internal/broker/transfer.go: (*Broker).handleFinalizeReq":                 true,
-	"internal/broker/xfer_provision.go: provisionXferBucketWithLimit":          true,
 	"internal/cli/completion.go: CompleteAllocatedExposeNames":                 true,
 	"internal/cli/completion.go: CompleteOnlineNodes":                          true,
 	"internal/cli/completion.go: CompleteOwnedSessions":                        true,
 	"internal/cli/completion.go: CompleteVisibleSessions":                      true,
 	"internal/cluster/node.go: (*Node).ApplyMetaSet":                           true,
 	"internal/cluster/node.go: raftConfig":                                     true,
-	"internal/cluster/snapshot.go: (*fsm).restoreFrom":                         true,
-	"internal/cluster/snapshot.go: (*fsmSnapshot).persist":                     true,
 	"internal/clusteroffline/backup.go: OfflineBackup":                         true,
 	"internal/clusteroffline/doctor.go: DBPreflight":                           true,
 	"internal/clusteroffline/offline.go: dumpTable":                            true,
 	"internal/clusteroffline/offline.go: lookupHostForProbeAdvice":             true,
 	"internal/clusteroffline/offline.go: previewRecoveredRoster":               true,
-	"internal/httplisten/httplisten.go: Serve":                                 true,
 }

@@ -1,6 +1,8 @@
 package architecture
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -156,4 +158,96 @@ func TestNatsServerPinGateSeesADrift(t *testing.T) {
 	if len(seen) != 1 {
 		t.Fatalf("three sources naming the same version were read as %v", agreed)
 	}
+}
+
+// Both adjacent versions are deliberate; the default/module/installer stay
+// 2.14.6. An archive digest cannot be reused as the executable digest.
+// origin: hot-update S9 plan §3.1 / §10.2 / T83
+func checkInfraCatalogPins(raw []byte) error {
+	var entries []struct {
+		Kind                                               uint8
+		Version, GOOS, GOARCH, ArchiveSHA256, BinarySHA256 string
+	}
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return err
+	}
+	want := map[string]bool{"1:2.14.5": true, "1:2.14.6": true, "2:2.7.5": true, "2:2.7.6": true}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Kind != 1 && entry.Kind != 2 {
+			continue
+		}
+		key := fmt.Sprintf("%d:%s", entry.Kind, entry.Version)
+		if !want[key] || seen[key] || entry.GOOS != "linux" || entry.GOARCH != "amd64" {
+			return fmt.Errorf("unsupported/duplicate S9 catalog release %s", key)
+		}
+		if !transferHex(entry.ArchiveSHA256, 64) || !transferHex(entry.BinarySHA256, 64) || entry.ArchiveSHA256 == entry.BinarySHA256 {
+			return fmt.Errorf("S9 catalog confuses archive/executable identity %s", key)
+		}
+		seen[key] = true
+	}
+	for key := range want {
+		if !seen[key] {
+			return fmt.Errorf("missing adjacent S9 catalog release %s", key)
+		}
+	}
+	return nil
+}
+
+// origin: hot-update S9 plan §10.2 / T83
+// gate-control: TestInfraNATSCatalogPinControls
+func TestInfraNATSCatalogKeepsDefaultAndAdjacentPins(t *testing.T) {
+	root := repoRoot(t)
+	for path, pin := range natsServerPins(t, root) {
+		if pin != "v2.14.6" {
+			t.Errorf("%s: S9 default NATS pin=%s", path, pin)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "internal/infraartifact/testdata/catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkInfraCatalogPins(raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// origin: hot-update S9 plan §11 / T83 / M31
+func TestInfraNATSCatalogPinControls(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "internal/infraartifact/testdata/catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := transferFixtureTree(t, map[string]string{})
+	path := "catalog.json"
+	good := string(raw)
+	check := func(source string) error {
+		transferWriteFixture(t, root, path, source)
+		b, e := os.ReadFile(filepath.Join(root, path))
+		if e != nil {
+			t.Fatal(e)
+		}
+		return checkInfraCatalogPins(b)
+	}
+	if err := check(good); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{strings.Replace(good, "2.14.5", "2.14.4", 1), strings.Replace(good, "2.14.6", "2.14.5", 1), strings.Replace(good, "\"amd64\"", "\"arm64\"", 1), "[]"} {
+		if check(bad) == nil {
+			t.Fatal("on-disk adjacent catalog mutation escaped")
+		}
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		t.Fatal(err)
+	}
+	entries[0]["BinarySHA256"] = entries[0]["ArchiveSHA256"]
+	changed, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check(string(changed)) == nil {
+		t.Fatal("on-disk archive-as-executable SHA escaped")
+	}
+	t.Run("existing-default", TestNatsServerPinGateSeesADrift)
 }

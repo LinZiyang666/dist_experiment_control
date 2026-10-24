@@ -1,10 +1,15 @@
 package architecture
 
 import (
+	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -86,6 +91,66 @@ func TestStackharnessIsImportedOnlyFromTests(t *testing.T) {
 	}
 }
 
+// Unlike stackharness, handofftest has no test/ directory exception: its descriptor
+// owners are test fixtures, even when the importing package itself is a test helper.
+// Parse imports so a comment or this gate's own path literal cannot satisfy non-vacuity.
+// origin: hot-update S3 plan §9 (docs/reviews/hot-update-agent-bootstrap-plan.md).
+func TestHandofftestIsImportedOnlyFromTests(t *testing.T) {
+	root := repoRoot(t)
+	const imp = modPrefix + "internal/handoff/handofftest"
+	var offenders []string
+	importers := 0
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), p, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, spec := range file.Imports {
+			path, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return err
+			}
+			if path != imp {
+				continue
+			}
+			if strings.HasSuffix(p, "_test.go") {
+				importers++
+			} else {
+				rel, err := filepath.Rel(root, p)
+				if err != nil {
+					return err
+				}
+				offenders = append(offenders, filepath.ToSlash(rel))
+			}
+			break
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk imports: %v", err)
+	}
+	if len(offenders) > 0 {
+		t.Errorf("%d non-test file(s) import internal/handoff/handofftest:\n  %s\nOnly _test.go importers may own these fixtures.",
+			len(offenders), strings.Join(offenders, "\n  "))
+	}
+	if importers == 0 {
+		t.Fatal("no _test.go file imports internal/handoff/handofftest — the gate is guarding an unused helper")
+	}
+}
+
 // layerRule is one package's boundary.
 //
 // requiredTransitive is not decoration: it is the per-row self-check. `go list -deps` returning an
@@ -103,6 +168,158 @@ type layerRule struct {
 const modPrefix = "github.com/LinZiyang666/tether/"
 
 var layerRules = []layerRule{
+
+	// Extracted cluster responsibilities stay below the runtime and its carriers.
+	// Direct parent bans are exact seams: a transitive parent-prefix ban would also name these leaves.
+	// origin: hot-update S6 plan §9.3 / CLUSTER-SLIM
+	{
+		pkg:                modPrefix + "internal/cluster/state",
+		why:                "literal SQL planning and reads cannot acquire Raft, NATS, carrier or runtime ownership",
+		bannedDirect:       []string{modPrefix + "internal/cluster"},
+		bannedTransitive:   []string{"github.com/hashicorp/raft", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go", "github.com/nats-io/nats-server/v2", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/flow", modPrefix + "internal/brokerimage", modPrefix + "internal/cli"},
+		requiredTransitive: []string{"database/sql", modPrefix + "internal/auth", modPrefix + "internal/brokermaint"},
+	},
+	{
+		pkg:                modPrefix + "internal/cluster/storelock",
+		why:                "original lock OFD custody cannot acquire store, Raft, NATS, carrier or runtime ownership",
+		bannedDirect:       []string{modPrefix + "internal/cluster"},
+		bannedTransitive:   []string{"database/sql", "github.com/hashicorp/raft", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go", modPrefix + "internal/storage", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/flow", modPrefix + "internal/brokerimage"},
+		requiredTransitive: []string{"os", modPrefix + "internal/handoff"},
+	},
+	{
+		pkg:                modPrefix + "internal/cluster/logbridge",
+		why:                "bounded hclog rendering receives plain values without importing the Raft runtime or product owners",
+		bannedTransitive:   []string{modPrefix + "internal", "github.com/hashicorp/raft", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{"log/slog", "github.com/hashicorp/go-hclog"},
+	},
+	{
+		pkg:                modPrefix + "internal/cluster/routecert",
+		why:                "route certificate preflight uses standard x509 verification below cluster and NATS runtime ownership",
+		bannedTransitive:   []string{modPrefix + "internal", "github.com/hashicorp/raft", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{"crypto/x509", "encoding/pem"},
+	},
+	// The tunnel runtime supplies policy while these leaves retain byte and
+	// descriptor responsibility. Direct parent bans preserve the package seam
+	// without banning the legitimate sibling imports under internal/tunnel.
+	// origin: hot-update S6 plan §9.3 / TUNNEL-SLIM
+	{
+		pkg:                modPrefix + "internal/tunnel/flowstate",
+		why:                "flow wire and image codecs validate private values below live carrier and runtime owners",
+		bannedDirect:       []string{modPrefix + "internal/tunnel"},
+		bannedTransitive:   []string{modPrefix + "internal/tunnel/flowcarrier", modPrefix + "internal/tunnel/transport", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/brokerimage", modPrefix + "internal/cluster", modPrefix + "cmd", "github.com/nats-io", "github.com/hashicorp/yamux", "github.com/hashicorp/raft"},
+		requiredTransitive: []string{modPrefix + "internal/flow", modPrefix + "internal/sealedstate", modPrefix + "internal/rawsocket"},
+	},
+	{
+		pkg:                modPrefix + "internal/tunnel/flowcarrier",
+		why:                "replaceable yamux carriers consume flow values and cannot own authorization, listener or broker policy",
+		bannedDirect:       []string{modPrefix + "internal/tunnel"},
+		bannedTransitive:   []string{modPrefix + "internal/tunnel/transport", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/brokerimage", modPrefix + "internal/cluster", modPrefix + "cmd", "github.com/nats-io", "github.com/hashicorp/raft"},
+		requiredTransitive: []string{modPrefix + "internal/tunnel/flowstate", modPrefix + "internal/flow", "github.com/hashicorp/yamux"},
+	},
+	{
+		pkg:                modPrefix + "internal/tunnel/transport",
+		why:                "TLS negotiation, REGISTER byte retention and observations stay below endpoint and client runtimes",
+		bannedDirect:       []string{modPrefix + "internal/tunnel"},
+		bannedTransitive:   []string{modPrefix + "internal/tunnel/flowcarrier", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/brokerimage", modPrefix + "internal/cluster", modPrefix + "cmd", "github.com/nats-io", "github.com/hashicorp/raft"},
+		requiredTransitive: []string{modPrefix + "internal/tunnel/flowstate", "crypto/tls", modPrefix + "internal/drillobserve"},
+	},
+
+	// origin: hot-update S6 plan §9.3 / §12.1 P31 / T53.
+	// Composition is below runtime owners; these bans also apply to AllOS
+	// imports, where a Darwin twin cannot quietly reach back into the broker.
+	{pkg: modPrefix + "internal/brokerimage", requiredTransitive: []string{modPrefix + "internal/brokerimage"}, why: "broker image composition cannot own a broker, CLI or agent runtime", bannedTransitive: []string{modPrefix + "internal/broker", modPrefix + "cmd", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy"}},
+	{pkg: modPrefix + "internal/clusterio", requiredTransitive: []string{modPrefix + "internal/clusterio"}, why: "RPC accounting is a net/io leaf; raft wrappers belong in cluster", bannedTransitive: []string{"github.com/hashicorp/raft", "github.com/nats-io", modPrefix + "internal/cluster", modPrefix + "internal/broker", modPrefix + "cmd"}},
+	{pkg: modPrefix + "internal/brokermaint", requiredTransitive: []string{modPrefix + "internal/brokermaint"}, why: "maintenance values and codecs are neutral leaves", bannedTransitive: []string{"github.com/nats-io", "github.com/hashicorp/raft", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/cluster", modPrefix + "internal/brokerimage", modPrefix + "cmd"}},
+	{pkg: modPrefix + "internal/controlbudget", requiredTransitive: []string{modPrefix + "internal/controlbudget"}, why: "deadlines and attempts cannot depend on a live transport", bannedTransitive: []string{"github.com/nats-io", "github.com/hashicorp/raft", modPrefix + "internal/cli", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/cluster", modPrefix + "internal/brokerimage", modPrefix + "cmd"}},
+	{pkg: modPrefix + "internal/listenerimage", requiredTransitive: []string{modPrefix + "internal/listenerimage"}, why: "listener keepers are below tunnel and runtime owners", bannedTransitive: []string{modPrefix + "internal/tunnel", modPrefix + "internal/brokerimage", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", "github.com/nats-io", "github.com/hashicorp/raft"}},
+	{pkg: modPrefix + "internal/cli", requiredTransitive: []string{modPrefix + "internal/cli"}, why: "CLI invokes product contracts without importing broker image implementation", bannedTransitive: []string{modPrefix + "internal/brokerimage"}},
+
+	// The private codec cannot acquire live runtime or carrier dependencies.
+	// origin: hot-update S5 plan §5.1 / §6.6 / §10.1 / T49
+	{
+		pkg:                modPrefix + "internal/ssstate",
+		why:                "descriptor-validated private SS cuts use only sealed records and proxy metadata below live owners",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", modPrefix + "internal/flow", modPrefix + "internal/tunnel", modPrefix + "internal/execsession", modPrefix + "internal/agentimage", modPrefix + "internal/agentboot", "github.com/nats-io/nats.go", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{modPrefix + "internal/sealedstate", modPrefix + "internal/proxyimage", "encoding/binary"},
+	},
+	// origin: hot-update S5 plan §6.6 / DRILL-OBSERVER.
+	{
+		pkg:                modPrefix + "internal/drillobserve",
+		why:                "private drill custody cannot depend on data-plane or control-plane owners",
+		bannedTransitive:   []string{modPrefix + "internal", "github.com/nats-io/nats.go", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{"encoding/binary", "os"},
+	},
+	// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
+	// The separate SS leaf needs an explicit reverse-edge ban as well as agent.
+	{
+		pkg:                modPrefix + "internal/agentidentity",
+		why:                "process lineage and lease decisions cannot persist identity or depend on a control session",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", modPrefix + "internal/agentstate", modPrefix + "internal/tunnel", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{modPrefix + "internal/proto", "crypto/rand"},
+	},
+
+	// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
+	{
+		pkg:                modPrefix + "internal/agentstate",
+		why:                "durable state and discovery cache cannot depend on daemon or carrier lifetimes",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", modPrefix + "internal/tunnel", "github.com/nats-io/nats.go", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{modPrefix + "internal/proto", "os"},
+	},
+	{
+		pkg:                modPrefix + "internal/filetransfer",
+		why:                "transfer byte work receives admission and cache callbacks without importing their agent owner",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", modPrefix + "internal/cluster", modPrefix + "internal/tunnel", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{modPrefix + "internal/transferpath", modPrefix + "internal/jsstream", "github.com/nats-io/nats.go/jetstream"},
+	},
+	{
+		pkg:                modPrefix + "internal/connrecovery",
+		why:                "raw connection tracking and bounded teardown use standard-library callbacks below all product owners",
+		bannedTransitive:   []string{modPrefix + "internal", "github.com/nats-io/nats.go", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{"net", "context"},
+	},
+
+	// Replay and process actors are shared leaves, never clients of their
+	// carrier adapters. A reverse import couples survival to session teardown.
+	// origin: hot-update S5 plan §10.1 / T49.
+	{
+		pkg:                modPrefix + "internal/workload",
+		why:                "shared replay/process owners cannot depend on their carrier or agent callers",
+		bannedTransitive:   []string{modPrefix + "internal/flow", modPrefix + "internal/tunnel", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{"os"},
+	},
+
+	// origin: hot-update S5 plan §2 / §10.1 — only descriptor and byte owners below carriers.
+	{
+		pkg:                modPrefix + "internal/rawsocket",
+		why:                "original sockets cannot depend on the logical-flow or carrier owners that borrow them",
+		bannedTransitive:   []string{modPrefix + "internal/flow", modPrefix + "internal/tunnel", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{"os", "net/netip"},
+	},
+	{
+		pkg:                modPrefix + "internal/sealedstate",
+		why:                "private sealed cuts hold resources without knowing their flow, SS or carrier runtime",
+		bannedTransitive:   []string{modPrefix + "internal/flow", modPrefix + "internal/tunnel", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{modPrefix + "internal/handoff", modPrefix + "internal/rawsocket"},
+	},
+	{
+		pkg:                modPrefix + "internal/flow",
+		why:                "logical byte accounting and retirement must survive loss of any carrier or control session",
+		bannedTransitive:   []string{modPrefix + "internal/tunnel", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{modPrefix + "internal/rawsocket", modPrefix + "internal/sealedstate", modPrefix + "internal/workload"},
+	},
+	{
+		pkg:                modPrefix + "internal/tunnel",
+		why:                "yamux adapters are above flow owners and cannot reach the agent or broker that configure them",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker"},
+		requiredTransitive: []string{modPrefix + "internal/flow", "github.com/hashicorp/yamux"},
+	},
+	{
+		pkg:                modPrefix + "internal/agent/ssproxy",
+		why:                "SS receives typed binding/revoke adapters and cannot depend on agent or logical-flow runtimes",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/broker", modPrefix + "internal/flow", modPrefix + "internal/tunnel", "github.com/nats-io/nats.go", "github.com/hashicorp/yamux"},
+		requiredTransitive: []string{modPrefix + "internal/rawsocket", modPrefix + "internal/sealedstate"},
+	},
+
 	{
 		pkg: modPrefix + "internal/testharness",
 		why: "harness cycle rule (harness.go header; docs/testing-standards.md §七): fourteen package-broker " +
@@ -112,6 +329,7 @@ var layerRules = []layerRule{
 		bannedTransitive: []string{
 			modPrefix + "internal/broker",
 			modPrefix + "internal/agent",
+			modPrefix + "internal/agent/ssproxy",
 			modPrefix + "internal/session",
 		},
 		requiredTransitive: []string{
@@ -178,6 +396,20 @@ var layerRules = []layerRule{
 		bannedDirect:       []string{"github.com/hashicorp/raft"},
 		requiredTransitive: []string{modPrefix + "internal/cluster"},
 	},
+	// Extracted cluster control services receive broker policy through callbacks;
+	// importing a runtime would turn those adapters into a dependency cycle.
+	// origin: hot-update S6 plan §9.3 / BROKER-SLIM
+	{
+		pkg:          modPrefix + "internal/brokercontrol",
+		why:          "cluster administration, audit and auth barriers stay below the broker runtime; raft is accessed only through cluster.Node.",
+		bannedDirect: []string{"github.com/hashicorp/raft", modPrefix + "internal/tunnel"},
+		bannedTransitive: []string{
+			modPrefix + "internal/broker", modPrefix + "cmd", modPrefix + "internal/agent",
+			modPrefix + "internal/agent/ssproxy", modPrefix + "internal/brokerimage",
+		},
+		requiredTransitive: []string{modPrefix + "internal/cluster"},
+	},
+
 	{
 		pkg: modPrefix + "internal/broker",
 		why: "L-2 confines raft to internal/cluster. cutover.go imports internal/cluster, not raft; the " +
@@ -185,6 +417,97 @@ var layerRules = []layerRule{
 			"same reason as internal/clusteroffline.",
 		bannedDirect:       []string{"github.com/hashicorp/raft"},
 		requiredTransitive: []string{modPrefix + "internal/cluster"},
+	},
+	{
+		pkg: modPrefix + "internal/agentimage",
+		why: "hot-update S2 plan §3 / §6: the composed agent image is a leaf BELOW the agent — the agent " +
+			"implements its courier adapter and calls Freeze/Restore; the image never reaches back into " +
+			"internal/agent, internal/broker or the NATS client, so a bootstrap can run it before any " +
+			"connection exists and its tests never need a carrier.",
+		bannedTransitive: []string{
+			modPrefix + "internal/agent",
+			modPrefix + "internal/broker",
+			"github.com/nats-io/nats.go",
+			"github.com/nats-io/nats-server/v2/server",
+		},
+		requiredTransitive: []string{
+			modPrefix + "internal/handoff",
+			modPrefix + "internal/execsession",
+			modPrefix + "internal/spawnsafe",
+			modPrefix + "internal/workload",
+		},
+	},
+	// origin: hot-update S4 plan §1.2 / §10 / T47.
+	{
+		pkg: modPrefix + "internal/ptysession",
+		why: "the terminal actor owns duplex bytes and kernel state below execsession; it must " +
+			"freeze and restore without an agent, broker or control connection.",
+		bannedTransitive: []string{
+			modPrefix + "internal/agent",
+			modPrefix + "internal/agent/ssproxy",
+			modPrefix + "internal/broker",
+			modPrefix + "internal/execsession",
+			"github.com/nats-io/nats.go",
+			"github.com/nats-io/nats-server/v2",
+		},
+		requiredTransitive: []string{modPrefix + "internal/pty", modPrefix + "internal/workload"},
+	},
+	// origin: hot-update S4 plan §1.2 / §10 / T47.
+	{
+		pkg: modPrefix + "internal/pty",
+		why: "the kernel terminal owner is below the agent and terminal actor; importing either " +
+			"would bind descriptor ownership to a control-plane runtime.",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/ptysession"},
+		requiredTransitive: []string{modPrefix + "internal/workload"},
+	},
+	// origin: hot-update S4 plan §1.2 / §7.3 / §10 / T47.
+	{
+		pkg: modPrefix + "internal/terminalio",
+		why: "local terminal cancellation and termios restoration use structural I/O interfaces; " +
+			"neither network transport nor the agent or execclient may own their lifetime.",
+		bannedTransitive: []string{
+			"net",
+			"github.com/nats-io/nats.go",
+			"github.com/nats-io/nats-server/v2",
+			modPrefix + "internal/agent",
+			modPrefix + "internal/agent/ssproxy",
+			modPrefix + "internal/execclient",
+		},
+		requiredTransitive: []string{"golang.org/x/term", "os"},
+	},
+	// origin: hot-update S3 plan §9 (docs/reviews/hot-update-agent-bootstrap-plan.md).
+	{
+		pkg: modPrefix + "internal/agentboot",
+		why: "the bootstrap holds and restores the image before the agent or any control connection " +
+			"exists; reaching agent, broker or NATS would reverse that ownership boundary.",
+		bannedTransitive: []string{
+			modPrefix + "internal/agent",
+			modPrefix + "internal/broker",
+			"github.com/nats-io/nats.go",
+		},
+		requiredTransitive: []string{modPrefix + "internal/agentimage", modPrefix + "internal/handoff"},
+	},
+	// origin: hot-update S4 plan §10.
+	{
+		pkg:                modPrefix + "internal/binaryupgrade",
+		why:                "durable executable transactions receive image admission callbacks; disk state must not depend on an agent or carrier.",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/broker", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{modPrefix + "internal/agentimage", modPrefix + "internal/agentboot"},
+	},
+	// origin: hot-update S4 plan §10.
+	{
+		pkg:                modPrefix + "internal/transferpath",
+		why:                "filesystem containment and directory-pinned operations must stay independent of agents and transport.",
+		bannedTransitive:   []string{modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/broker", "github.com/nats-io/nats.go"},
+		requiredTransitive: []string{"golang.org/x/sys/unix"},
+	},
+	// origin: hot-update S3 plan §6 / §9 (docs/reviews/hot-update-agent-bootstrap-plan.md).
+	{
+		pkg: modPrefix + "internal/upgradebudget",
+		why: "every layer reads the upgrade budgets, so they must remain a leaf with no dependency " +
+			"back into this module.",
+		bannedTransitive:   []string{strings.TrimSuffix(modPrefix, "/")},
+		requiredTransitive: []string{"time"},
 	},
 }
 
@@ -292,6 +615,7 @@ func cacheKeyBallast(t *testing.T, root string) {
 	}
 }
 
+// gate-control: TestPTYLayeringControls
 func TestPackageLayering(t *testing.T) {
 	root := repoRoot(t)
 	cacheKeyBallast(t, root)
@@ -323,7 +647,17 @@ func TestPackageLayering(t *testing.T) {
 			// the case where the banned path is itself an importable package (internal/broker etc.).
 			for _, banned := range rule.bannedTransitive {
 				for dep := range deps {
-					if dep == banned || strings.HasPrefix(dep, banned+"/") {
+					// go list -deps includes the queried package itself. A module-wide ban
+					// forbids imports, not the package's own existence (upgradebudget).
+					// origin: hot-update S3 plan §9 (docs/reviews/hot-update-agent-bootstrap-plan.md).
+					// The same holds for the package's OWN subtree (a responsibility split such as
+					// drillobserve/receipt): the subpackage path itself is not a foreign owner, and every
+					// import it makes still appears in `deps` and is checked against the ban here.
+					// origin: S7 GATE-CONVERGE slimobs — lead layering decision
+					if dep == rule.pkg || strings.HasPrefix(dep, rule.pkg+"/") {
+						continue
+					}
+					if layerDependencyMatches(dep, banned) {
 						t.Errorf("%s transitively imports %q (via %q) — layering violated.\n%s",
 							rule.pkg, banned, dep, rule.why)
 						break
@@ -378,6 +712,39 @@ func TestPackageLayering(t *testing.T) {
 //
 // The assertion below is ⊇, not equality: adding a NEW ban to a row is an improvement and must not fail.
 var originalUnion = map[string][]string{
+	// CLUSTER-SLIM leaves inherit no deleted regression tests.
+	// origin: hot-update S6 plan §9.3 / CLUSTER-SLIM
+	"internal/cluster/state": {}, "internal/cluster/storelock": {},
+	"internal/cluster/logbridge": {}, "internal/cluster/routecert": {},
+	// origin: hot-update S6 plan §9.3 / TUNNEL-SLIM — new leaves inherit no deleted regression rows.
+	"internal/tunnel/flowstate":   {},
+	"internal/tunnel/flowcarrier": {},
+	"internal/tunnel/transport":   {},
+	// origin: hot-update S6 plan §9.3; extracted control owner adds no inherited boundary.
+	"internal/brokercontrol": {},
+	// S6 leaves inherit no deleted regression tests; their new bans have
+	// same-file controls and the AllOS scan below.
+	// origin: hot-update S6 plan §9.3 / T53.
+	"internal/brokerimage": {}, "internal/clusterio": {},
+	"internal/brokermaint": {}, "internal/controlbudget": {},
+	"internal/listenerimage": {}, "internal/cli": {},
+	"internal/ssstate": {},
+	// Private drill custody inherited no deleted regression rule.
+	"internal/drillobserve":  {},
+	"internal/agentidentity": {},
+	// S5 extractions inherited no deleted layering regression.
+	"internal/agentstate":   {},
+	"internal/filetransfer": {},
+	"internal/connrecovery": {},
+
+	"internal/workload": {},
+	// New S5 owners inherited no deleted regression assertion.
+	"internal/rawsocket":     {},
+	"internal/sealedstate":   {},
+	"internal/flow":          {},
+	"internal/tunnel":        {},
+	"internal/agent/ssproxy": {},
+
 	"internal/cluster": {
 		"github.com/nats-io/nats.go",
 		"github.com/nats-io/nats.go/jetstream",
@@ -400,6 +767,19 @@ var originalUnion = map[string][]string{
 	// the rule lived only in prose (plan §2.3) until then. Empty on purpose — the receipt records
 	// what the four regression files asserted, and they asserted nothing about testharness.
 	"internal/testharness": {},
+	// Added 2026-09-21 (hot-update S2), a new package: inherited from no deleted file, so the
+	// receipt is empty for the same reason as testharness.
+	"internal/agentimage": {},
+	// S4 adds terminal layers; none inherited a deleted regression rule.
+	"internal/ptysession": {},
+	"internal/pty":        {},
+	"internal/terminalio": {},
+	// Added for hot-update S3; neither package inherited a deleted regression rule.
+	"internal/agentboot":     {},
+	"internal/upgradebudget": {},
+	// New S4 filesystem owners inherited no deleted regression rule.
+	"internal/binaryupgrade": {},
+	"internal/transferpath":  {},
 }
 
 func TestLayeringRulesAreWellFormed(t *testing.T) {
@@ -589,4 +969,835 @@ func TestDeletedRegressionTestNamesAreReal(t *testing.T) {
 		t.Errorf("checked %d name→package assertions, expected %d — the map shrank, grew, or a `git show` "+
 			"failed silently above", checked, deletedTestAssertions)
 	}
+}
+
+// layerDependencyMatches shares the module-root predicate with the controls:
+// a ban includes subpackages, but never a merely similar package name.
+func layerDependencyMatches(dep, banned string) bool {
+	// SS is a separate leaf owner despite its historical directory under agent.
+	// Exclude only that exact package: agent itself, other children and any new
+	// ssproxy child still belong to the banned control-plane namespace. Its own
+	// row independently forbids reaching agent, flow, tunnel, yamux or NATS.
+	// origin: hot-update S5 plan §10.1 / P26 / T49.
+	if banned == modPrefix+"internal/agent" && dep == modPrefix+"internal/agent/ssproxy" {
+		return false
+	}
+	return dep == banned || strings.HasPrefix(dep, banned+"/")
+}
+
+// The new rows must retain every promised boundary, even when the current
+// dependency graph does not happen to exercise a missing clause yet.
+// origin: hot-update S4 plan §10 / T47.
+func TestPTYLayeringControls(t *testing.T) {
+	boundaries := map[string][]string{
+		"internal/ptysession": {
+			modPrefix + "internal/agent", modPrefix + "internal/broker", modPrefix + "internal/execsession",
+			"github.com/nats-io/nats.go", "github.com/nats-io/nats-server/v2",
+		},
+		"internal/terminalio": {
+			"net", "github.com/nats-io/nats.go", "github.com/nats-io/nats-server/v2",
+			modPrefix + "internal/agent", modPrefix + "internal/execclient",
+		},
+		"internal/pty":        {modPrefix + "internal/agent", modPrefix + "internal/ptysession"},
+		"internal/agentimage": {modPrefix + "internal/agent"},
+	}
+	for pkg, boundaries := range boundaries {
+		t.Run(pkg, func(t *testing.T) {
+			var row *layerRule
+			for i := range layerRules {
+				if layerRules[i].pkg == modPrefix+pkg {
+					row = &layerRules[i]
+				}
+			}
+			if row == nil {
+				t.Fatal("missing terminal-layer rule")
+			}
+			for _, banned := range boundaries {
+				found := false
+				for _, registered := range row.bannedTransitive {
+					found = found || registered == banned
+				}
+				if !found {
+					t.Errorf("missing transitive ban on %s", banned)
+				}
+				for _, dep := range []string{banned, banned + "/child"} {
+					if !layerDependencyMatches(dep, banned) {
+						t.Errorf("forbidden dependency %s escaped %s", dep, banned)
+					}
+				}
+				if layerDependencyMatches(banned+"neighbor", banned) {
+					t.Errorf("similar package name incorrectly matches %s", banned)
+				}
+				for _, required := range row.requiredTransitive {
+					if layerDependencyMatches(required, banned) {
+						t.Errorf("required dependency %s is also banned by %s", required, banned)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Pin every S5 row and ban individually. The graph may happen to be clean
+// after a clause is deleted; that is why row completeness needs its own gate.
+// origin: hot-update S5 plan §10.1 / T49.
+// gate-control: TestFlowSSLayeringControls
+func TestFlowSSLayeringControls(t *testing.T) {
+	// The leaf's path cannot turn into a blanket exemption for agent children,
+	// nor can it bypass another package's explicit ban on SS itself.
+	ss := modPrefix + "internal/agent/ssproxy"
+	agent := modPrefix + "internal/agent"
+	if layerDependencyMatches(ss, agent) || !layerDependencyMatches(ss, ss) {
+		t.Fatal("SS leaf is confused with its control-plane parent or escapes an explicit SS ban")
+	}
+	for _, dep := range []string{agent, agent + "/courier", ss + "/child", ss + "neighbor"} {
+		if !layerDependencyMatches(dep, agent) {
+			t.Errorf("agent namespace dependency %s escaped", dep)
+		}
+	}
+	// Reclassifying SS as a leaf must not open reverse edges from its own
+	// dependencies or unrelated data-plane owners. Only the image composition,
+	// bootstrap and executable transaction layers may reach that SS owner.
+	// origin: hot-update S5 plan §10.1 / P26 / T49.
+	for _, rule := range layerRules {
+		allowsSS := rule.pkg == ss || rule.pkg == modPrefix+"internal/agentimage" ||
+			rule.pkg == modPrefix+"internal/agentboot" || rule.pkg == modPrefix+"internal/binaryupgrade"
+		bansAgent, bansSS := false, false
+		for _, ban := range rule.bannedTransitive {
+			bansAgent = bansAgent || ban == agent
+			bansSS = bansSS || ban == ss
+		}
+		if bansAgent && !allowsSS && !bansSS {
+			t.Errorf("%s lost its SS reverse-edge ban when the leaf was reclassified", rule.pkg)
+		}
+	}
+	common := []string{modPrefix + "internal/agent", modPrefix + "internal/broker", "github.com/hashicorp/yamux", "github.com/nats-io/nats.go"}
+	boundaries := map[string][]string{
+		"internal/ssstate":       append(append([]string{}, common...), modPrefix+"internal/flow", modPrefix+"internal/tunnel", modPrefix+"internal/agent/ssproxy", modPrefix+"internal/execsession", modPrefix+"internal/agentimage", modPrefix+"internal/agentboot"),
+		"internal/rawsocket":     append(append([]string{}, common...), modPrefix+"internal/flow", modPrefix+"internal/tunnel"),
+		"internal/sealedstate":   append(append([]string{}, common...), modPrefix+"internal/flow", modPrefix+"internal/tunnel"),
+		"internal/workload":      append(append([]string{}, common...), modPrefix+"internal/flow", modPrefix+"internal/tunnel"),
+		"internal/flow":          append(append([]string{}, common...), modPrefix+"internal/tunnel"),
+		"internal/tunnel":        {modPrefix + "internal/agent", modPrefix + "internal/broker"},
+		"internal/agent/ssproxy": append(append([]string{}, common...), modPrefix+"internal/flow", modPrefix+"internal/tunnel"),
+	}
+	for pkg, bans := range boundaries {
+		t.Run(pkg, func(t *testing.T) {
+			var rule *layerRule
+			for i := range layerRules {
+				if layerRules[i].pkg == modPrefix+pkg {
+					rule = &layerRules[i]
+				}
+			}
+			if rule == nil {
+				t.Fatal("missing flow/SS layer rule")
+			}
+			for _, ban := range bans {
+				found := false
+				for _, registered := range rule.bannedTransitive {
+					found = found || registered == ban
+				}
+				if !found {
+					t.Errorf("missing flow/SS transitive ban %s", ban)
+				}
+				for _, dep := range []string{ban, ban + "/child"} {
+					if !layerDependencyMatches(dep, ban) {
+						t.Errorf("reverse import %s escaped", dep)
+					}
+				}
+				if layerDependencyMatches(ban+"neighbor", ban) {
+					t.Errorf("unrelated import matched %s", ban)
+				}
+				for _, required := range rule.requiredTransitive {
+					if layerDependencyMatches(required, ban) {
+						t.Errorf("self-check depends on forbidden %s", required)
+					}
+				}
+			}
+		})
+	}
+}
+
+// The regular go-list gate retains external transitive closure. This companion
+// walks internal source edges without build selection, then applies the same
+// S6 bans. External imports are terminal nodes here, not guessed dependencies.
+// origin: hot-update S6 plan §9.3 / T53
+// gate-control: TestBrokerLayeringControls
+func checkBrokerAllOSLayering(sources map[string]string) error {
+	graph := map[string]map[string]bool{}
+	for path, source := range sources {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		// P00's isolated compile adapter is test-only by construction. Its
+		// production reachability is forbidden by checkBrokerProductionStubs;
+		// counting its fixture import as shipping wiring would reject P00 itself.
+		// origin: hot-update S6 plan §2.1 / T53.
+		if strings.HasPrefix(path, "internal/brokerimage/contractstub/") {
+			continue
+		}
+		// The P00 witness is test scaffolding; shipping reachability is checked
+		// separately and must never acquire this exception.
+		// origin: hot-update S7 plan §8.1 / T50
+		if strings.HasPrefix(path, "internal/xfercontract/contractstub/") {
+			continue
+		}
+
+		file, err := brokerParse(path, source)
+		if err != nil {
+			return err
+		}
+		pkg := modPrefix + filepath.ToSlash(filepath.Dir(path))
+		if graph[pkg] == nil {
+			graph[pkg] = map[string]bool{}
+		}
+		for _, imp := range brokerImports(file) {
+			if imp == modPrefix+"test/clusterharness" || strings.HasPrefix(imp, modPrefix+"test/clusterharness/") {
+				return fmt.Errorf("%s: production imports clusterharness", path)
+			}
+			graph[pkg][imp] = true
+		}
+	}
+	for _, rule := range append(append([]layerRule{}, layerRules...), transferLayerRules()...) {
+		// Apply the existing table to the whole AllOS source union as well:
+		// tunnel and legacy leaves must not hide reverse edges in a twin.
+		// origin: hot-update S6 plan §9.3 / T53.
+		for dep := range graph[rule.pkg] {
+			for _, ban := range rule.bannedDirect {
+				// Direct bans name exact packages, as in TestPackageLayering.
+				// A leaf must reject its runtime parent while retaining sibling imports.
+				// origin: hot-update S6 plan §9.3 / T53
+				if dep == ban {
+					return fmt.Errorf("%s: AllOS direct import %s", rule.pkg, dep)
+				}
+			}
+		}
+		visited := map[string]bool{}
+		var visit func(string) error
+		visit = func(pkg string) error {
+			if visited[pkg] {
+				return nil
+			}
+			visited[pkg] = true
+			for dep := range graph[pkg] {
+				// Match the direct gate's self-subtree rule without skipping the
+				// leaf's imports: a receipt cannot launder a foreign runtime.
+				// origin: S7 internal review GATES-PROD F2 / S7 GATE-CONVERGE
+				owned := dep == rule.pkg || strings.HasPrefix(dep, rule.pkg+"/")
+				for _, ban := range rule.bannedTransitive {
+					if !owned && layerDependencyMatches(dep, ban) {
+						return fmt.Errorf("%s: AllOS layering reaches %s through %s", rule.pkg, dep, pkg)
+					}
+				}
+				if err := visit(dep); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if err := visit(rule.pkg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isBrokerLayerRule(pkg string) bool {
+	for _, name := range []string{"brokerimage", "clusterio", "brokermaint", "controlbudget", "listenerimage", "cli"} {
+		if pkg == modPrefix+"internal/"+name {
+			return true
+		}
+	}
+	return false
+}
+
+// origin: hot-update S6 plan §9.3 / T53
+func TestBrokerLayeringAllOS(t *testing.T) {
+	sources := brokerGateSources(t, repoRoot(t))
+	for _, name := range []string{"brokerimage", "clusterio", "brokermaint", "controlbudget", "listenerimage", "cli"} {
+		exists := false
+		for path := range sources {
+			exists = exists || filepath.ToSlash(filepath.Dir(path)) == "internal/"+name
+		}
+		if !exists {
+			t.Fatalf("no AllOS sources for %s", name)
+		}
+	}
+	if err := checkBrokerAllOSLayering(sources); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// origin: hot-update S6 plan §11 / T53
+func TestBrokerLayeringControls(t *testing.T) {
+
+	required := map[string][]string{
+		"brokerimage":   {modPrefix + "internal/broker", modPrefix + "cmd", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy"},
+		"clusterio":     {"github.com/hashicorp/raft", "github.com/nats-io", modPrefix + "internal/cluster", modPrefix + "internal/broker", modPrefix + "cmd"},
+		"brokermaint":   {"github.com/nats-io", "github.com/hashicorp/raft", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/cluster", modPrefix + "internal/brokerimage", modPrefix + "cmd"},
+		"controlbudget": {"github.com/nats-io", "github.com/hashicorp/raft", modPrefix + "internal/cli", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "internal/tunnel", modPrefix + "internal/cluster", modPrefix + "internal/brokerimage", modPrefix + "cmd"},
+		"listenerimage": {modPrefix + "internal/tunnel", modPrefix + "internal/brokerimage", modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", "github.com/nats-io", "github.com/hashicorp/raft"},
+		"cli":           {modPrefix + "internal/brokerimage"},
+	}
+	for name, bans := range required {
+		found := false
+		for _, rule := range layerRules {
+			if rule.pkg != modPrefix+"internal/"+name {
+				continue
+			}
+			found = true
+			if len(rule.bannedTransitive) != len(bans) {
+				t.Fatalf("%s frozen layering clauses drifted", name)
+			}
+			for _, ban := range bans {
+				present := false
+				for _, actual := range rule.bannedTransitive {
+					present = present || actual == ban
+				}
+				if !present {
+					t.Fatalf("%s lost frozen ban %s", name, ban)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing S6 leaf rule %s", name)
+		}
+	}
+	rows := 0
+	for _, rule := range layerRules {
+		if !isBrokerLayerRule(rule.pkg) {
+			continue
+		}
+		rows++
+		pkg := strings.TrimPrefix(rule.pkg, modPrefix)
+		path := pkg + "/owner_other.go"
+		good := map[string]string{path: "package leaf;import \"io\";var _ io.Reader"}
+		if err := checkBrokerAllOSLayering(good); err != nil {
+			t.Fatal(err)
+		}
+		for _, ban := range rule.bannedTransitive {
+			for _, target := range []string{ban, ban + "/child"} {
+				direct := map[string]string{path: "package leaf;import _ " + strconv.Quote(target)}
+				if checkBrokerAllOSLayering(direct) == nil {
+					t.Fatalf("direct AllOS ban escaped %s -> %s", pkg, target)
+				}
+				indirect := map[string]string{path: "package leaf;import _ " + strconv.Quote(modPrefix+"internal/helper"), "internal/helper/helper.go": "package helper;import _ " + strconv.Quote(target)}
+				if checkBrokerAllOSLayering(indirect) == nil {
+					t.Fatalf("transitive AllOS ban escaped %s -> %s", pkg, target)
+				}
+			}
+		}
+	}
+	// Slim leaves reject their exact runtime parent while permitting the
+	// flowstate sibling. Both OS scans must enforce the same table semantics.
+	// origin: hot-update S6 plan §9.3 / T53
+	for _, leaf := range []string{"flowstate", "flowcarrier", "transport"} {
+		path := "internal/tunnel/" + leaf + "/owner_other.go"
+		if checkBrokerAllOSLayering(map[string]string{path: "package leaf;import _ " + strconv.Quote(modPrefix+"internal/tunnel")}) == nil {
+			t.Fatalf("slim leaf %s imported its runtime parent", leaf)
+		}
+		if leaf != "flowstate" {
+			if err := checkBrokerAllOSLayering(map[string]string{path: "package leaf;import _ " + strconv.Quote(modPrefix+"internal/tunnel/flowstate")}); err != nil {
+				t.Fatalf("slim leaf %s lost its codec dependency: %v", leaf, err)
+			}
+		}
+	}
+	for _, edge := range [][2]string{{"internal/tunnel", modPrefix + "internal/broker"}, {"internal/broker", "github.com/hashicorp/raft"}} {
+		path := edge[0] + "/image_other.go"
+		source := "package owner;import _ " + strconv.Quote(edge[1])
+		if checkBrokerAllOSLayering(map[string]string{path: source}) == nil {
+			t.Fatalf("existing AllOS boundary escaped %v", edge)
+		}
+	}
+	if rows != 6 {
+		t.Fatalf("S6 layering registry: got %d want 6", rows)
+	}
+	for _, suffix := range []string{"", "/private"} {
+		if checkBrokerAllOSLayering(map[string]string{"internal/x/x.go": "package x;import _ " + strconv.Quote(modPrefix+"test/clusterharness"+suffix)}) == nil {
+			t.Fatal("production test helper import escaped")
+		}
+	}
+	if err := checkBrokerAllOSLayering(map[string]string{"internal/x/x_test.go": "package x;import _ " + strconv.Quote(modPrefix+"test/clusterharness")}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "internal/clusterio/contracts.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate a copied real family, on disk, through the source reader.
+	root := t.TempDir()
+	for _, dir := range []string{"internal/clusterio", "cmd"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := strings.Replace(string(raw), "import (", "import (\n_ \"github.com/hashicorp/raft\"", 1)
+	if source == string(raw) {
+		t.Fatal("real import mutation did not apply")
+	}
+	if err := os.WriteFile(filepath.Join(root, "internal/clusterio/contracts_other.go"), []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if checkBrokerAllOSLayering(brokerGateSources(t, root)) == nil {
+		t.Fatal("real-family raft import escaped")
+	}
+}
+
+// Runtime adapters sit above these owners. The bridge may compose brokerimage
+// and transfer leaves, but may never import the broker whose callbacks it binds.
+// origin: hot-update S7 plan §11.1 / T50
+// gate-control: TestTransferLayeringControls
+func transferLayerRules() []layerRule {
+	var rows []layerRule
+	for _, pkg := range transferLeafRoots {
+		rows = append(rows, layerRule{
+			pkg:                modPrefix + "internal/" + pkg,
+			why:                "transfer owners survive outer runtime and transport replacement",
+			requiredTransitive: []string{modPrefix + "internal/" + pkg},
+			bannedDirect:       []string{modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy"},
+			bannedTransitive:   []string{modPrefix + "internal/broker", modPrefix + "internal/agent", modPrefix + "internal/agent/ssproxy", modPrefix + "cmd"},
+		})
+	}
+	for _, pkg := range []string{"proto", "schema", "jsstream", "transferpath", "xferfinal", "xfergc", "xferimage", "xfertrack"} {
+		bans := []string{modPrefix + "internal/xferworker"}
+		if pkg != "xfertrack" {
+			bans = append(bans, modPrefix+"internal/xfertrack")
+		}
+		if pkg == "proto" || pkg == "schema" {
+			bans = append(bans, modPrefix+"internal/xferimage", modPrefix+"internal/agentimage", modPrefix+"internal/brokerimage")
+		}
+		rows = append(rows, layerRule{pkg: modPrefix + "internal/" + pkg, why: "values and port consumers cannot acquire a manager implementation", requiredTransitive: []string{modPrefix + "internal/" + pkg}, bannedTransitive: bans})
+	}
+	return rows
+}
+
+func checkTransferProductionImports(sources map[string]string) error {
+	for path, source := range sources {
+		if strings.HasPrefix(path, "internal/xfercontract/contractstub/") || strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := brokerParse(path, source)
+		if err != nil {
+			return err
+		}
+		for _, imp := range brokerImports(file) {
+			for _, banned := range []string{"internal/xfercontract/contractstub", "internal/testharness", "test/clusterharness", "test/transferharness"} {
+				if layerDependencyMatches(imp, modPrefix+banned) {
+					return fmt.Errorf("%s: shipping code imports test witness %s", path, imp)
+				}
+			}
+			// The contract's own value closures (xferport, split out so transferpath can
+			// name filesystem ports without the jetstream-bearing ports.go, and any later
+			// NATS-free value split of the same kind) are part of the neutral contract:
+			// they may import each other, controlbudget and handoff, and nothing else of
+			// the module. Unlike xfercontract itself — whose ports.go legitimately names
+			// jetstream.JetStream — a value-closure subpackage is neutral only while it
+			// imports no third-party package at all, which is checked here, not assumed.
+			// origin: hot-update S7 plan §8.1 / §11.1 / P00 / T50
+			dir := filepath.Dir(path)
+			subpackage := strings.HasPrefix(dir, "internal/xfercontract/")
+			if (dir == "internal/xfercontract" || subpackage) && strings.HasPrefix(imp, modPrefix) && imp != modPrefix+"internal/controlbudget" && imp != modPrefix+"internal/handoff" && !strings.HasPrefix(imp, modPrefix+"internal/xfercontract/") {
+				return fmt.Errorf("%s: neutral contracts import runtime %s", path, imp)
+			}
+			if subpackage && !strings.HasPrefix(imp, modPrefix) && strings.Contains(strings.SplitN(imp, "/", 2)[0], ".") {
+				return fmt.Errorf("%s: contract value closure imports non-standard %s", path, imp)
+			}
+		}
+	}
+	return nil
+}
+
+// origin: hot-update S7 plan §11.1 / T50
+func TestTransferLayeringAllOS(t *testing.T) {
+	sources := brokerGateSources(t, repoRoot(t))
+	if err := checkTransferProductionImports(sources); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBrokerAllOSLayering(sources); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// origin: hot-update S7 plan §11.1 / T50
+func TestTransferLayeringControls(t *testing.T) {
+	for _, rule := range transferLayerRules() {
+		path := strings.TrimPrefix(rule.pkg, modPrefix) + "/owner_other.go"
+		root := transferFixtureTree(t, map[string]string{path: "package owner;import \"io\";var _ io.Reader"})
+		if err := checkBrokerAllOSLayering(brokerGateSources(t, root)); err != nil {
+			t.Fatal(err)
+		}
+		for _, ban := range rule.bannedTransitive {
+			transferWriteFixture(t, root, path, "package owner;import _ "+strconv.Quote(ban))
+			if checkBrokerAllOSLayering(brokerGateSources(t, root)) == nil {
+				t.Fatalf("on-disk AllOS reverse edge escaped %s -> %s", rule.pkg, ban)
+			}
+		}
+	}
+	for _, helper := range []string{"internal/xfercontract/contractstub", "internal/testharness", "test/clusterharness", "test/transferharness"} {
+		root := transferFixtureTree(t, map[string]string{"internal/xferclient/owner_other.go": "package owner;import _ " + strconv.Quote(modPrefix+helper)})
+		if checkTransferProductionImports(brokerGateSources(t, root)) == nil {
+			t.Fatalf("on-disk production witness import escaped %s", helper)
+		}
+	}
+	// The neutral contract may name its value closures, and nothing else of the
+	// module; a closure may not grow a third-party (NATS) or runtime import.
+	// origin: hot-update S7 plan §8.1 / §11.1 / P00 / T50
+	// Distinct import names: brokerImports keys by name, so two blank imports
+	// would collapse into one and leave the allowance untested.
+	goodNeutral := map[string]string{
+		"internal/xfercontract/contracts.go":       "package xfercontract;import value " + strconv.Quote(modPrefix+"internal/xfercontract/xfervalue") + ";import sdk \"github.com/nats-io/nats.go/jetstream\"",
+		"internal/xfercontract/xferport/port.go":   "package xferport;import _ \"encoding/json\"",
+		"internal/xfercontract/xfervalue/value.go": "package xfervalue;import port " + strconv.Quote(modPrefix+"internal/xfercontract/xferport") + ";import budget " + strconv.Quote(modPrefix+"internal/controlbudget"),
+	}
+	for path, source := range map[string]string{
+		"internal/xfercontract/contracts.go":       "package xfercontract;import _ " + strconv.Quote(modPrefix+"internal/proto"),
+		"internal/xfercontract/xferport/port.go":   "package xferport;import _ \"github.com/nats-io/nats.go/jetstream\"",
+		"internal/xfercontract/xfervalue/value.go": "package xfervalue;import _ " + strconv.Quote(modPrefix+"internal/broker"),
+	} {
+		neutral := transferFixtureTree(t, goodNeutral)
+		if err := checkTransferProductionImports(brokerGateSources(t, neutral)); err != nil {
+			t.Fatalf("std-only contract value closure refused: %v", err)
+		}
+		transferWriteFixture(t, neutral, path, source)
+		if checkTransferProductionImports(brokerGateSources(t, neutral)) == nil {
+			t.Fatalf("on-disk neutral contract import drift escaped: %s", path)
+		}
+	}
+}
+
+// The AllOS import union includes indirect local imports and rejects cycles.
+// Privileged binaries cannot reach business bootstrap even through a new leaf.
+// Neutral DTOs admit only stdlib/controlbudget; witnesses never ship.
+// origin: hot-update S9 plan §10.2 / T83
+func checkInfraLayering(sources map[string]string) error {
+	graph := map[string]map[string]bool{}
+	for _, path := range brokerSortedSourcePaths(sources) {
+		if !isProdGoFile(path) || strings.Contains(path, "/contractstub/") {
+			continue
+		}
+		file, err := brokerParse(path, sources[path])
+		if err != nil {
+			return err
+		}
+		pkg := filepath.ToSlash(filepath.Dir(path))
+		if graph[pkg] == nil {
+			graph[pkg] = map[string]bool{}
+		}
+		for _, imp := range brokerImports(file) {
+			dep := strings.TrimPrefix(imp, modPrefix)
+			graph[pkg][dep] = true
+			if pkg == "internal/infracontract" && strings.Contains(imp, ".") && dep != "internal/controlbudget" {
+				return fmt.Errorf("%s: neutral S9 contract imports %s", path, imp)
+			}
+			if infraOwner(path) {
+				for _, ban := range []string{"internal/agent", "internal/broker", "cmd/tether", "internal/testharness", "test/", "internal/infracontract/contractstub"} {
+					if dep == ban || strings.HasPrefix(dep, ban+"/") || strings.HasSuffix(ban, "/") && strings.HasPrefix(dep, ban) {
+						return fmt.Errorf("%s: infrastructure leaf imports runtime/helper %s", path, imp)
+					}
+				}
+			}
+		}
+	}
+	state := map[string]int{}
+	var visit func(string, bool) error
+	visit = func(pkg string, privileged bool) error {
+		key := fmt.Sprintf("%t:%s", privileged, pkg)
+		if state[key] == 1 {
+			return fmt.Errorf("AllOS package cycle at %s", pkg)
+		}
+		if state[key] == 2 {
+			return nil
+		}
+		state[key] = 1
+		for dep := range graph[pkg] {
+			if privileged {
+				for _, ban := range []string{"internal/agentboot", "internal/broker", "internal/agent", "internal/infraupgrade", "internal/proto", "internal/infraattach", "internal/infraauth", "internal/infratransfer", "internal/testharness", "test/", "github.com/nats-io/nats.go", "github.com/nats-io/nats-server/v2", "github.com/hashicorp/raft", "github.com/hashicorp/yamux"} {
+					if dep == ban || strings.HasPrefix(dep, ban+"/") || strings.HasSuffix(ban, "/") && strings.HasPrefix(dep, ban) {
+						return fmt.Errorf("%s: privileged closure reaches %s", pkg, dep)
+					}
+				}
+			}
+			if strings.HasPrefix(dep, "internal/") || strings.HasPrefix(dep, "cmd/") {
+				if graph[dep] == nil {
+					return fmt.Errorf("%s: missing local dependency source %s", pkg, dep)
+				}
+				if err := visit(dep, privileged); err != nil {
+					return err
+				}
+			}
+		}
+		state[key] = 2
+		return nil
+	}
+	for pkg := range graph {
+		if err := visit(pkg, pkg == "cmd/tether-infra-helper" || pkg == "cmd/tether-infra-launch"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// origin: hot-update S9 plan §10.2 / T83
+// gate-control: TestInfraLayeringControls
+func TestInfraLayeringAllOS(t *testing.T) {
+	sources := brokerGateSources(t, repoRoot(t))
+	for _, path := range []string{"internal/infracontract/types.go", "cmd/tether-infra-helper/main.go", "cmd/tether-infra-launch/main.go"} {
+		if sources[path] == "" {
+			t.Fatalf("empty S9 dependency root %s", path)
+		}
+	}
+	if err := checkInfraLayering(sources); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// origin: hot-update S9 plan §11 / T83 / M31
+func TestInfraLayeringControls(t *testing.T) {
+	good := map[string]string{
+		"cmd/tether-infra-helper/main.go":    `package main;import _ "github.com/LinZiyang666/tether/internal/infrapriv";func main(){}`,
+		"internal/infrapriv/policy_other.go": `package priv;import "io";var _ io.Reader`,
+	}
+	root := transferFixtureTree(t, good)
+	read := func() map[string]string { return brokerGateSources(t, root) }
+	if err := checkInfraLayering(read()); err != nil {
+		t.Fatal(err)
+	}
+	for _, ban := range []string{"internal/agentboot", "internal/infraupgrade", "internal/proto", "internal/testharness", "github.com/nats-io/nats.go", "github.com/nats-io/nats-server/v2"} {
+		imp := ban
+		if strings.HasPrefix(ban, "internal/") {
+			imp = modPrefix + ban
+		}
+		transferWriteFixture(t, root, "internal/infrapriv/policy_other.go", "package priv;import _ "+strconv.Quote(imp))
+		if checkInfraLayering(read()) == nil {
+			t.Fatalf("on-disk indirect root import escaped: %s", ban)
+		}
+	}
+	transferWriteFixture(t, root, "internal/infrapriv/policy_other.go", `package priv;import _ "github.com/LinZiyang666/tether/internal/infrahost"`)
+	transferWriteFixture(t, root, "internal/infrahost/unit.go", `package host;import _ "github.com/LinZiyang666/tether/internal/infrapriv"`)
+	if checkInfraLayering(read()) == nil {
+		t.Fatal("on-disk package cycle escaped")
+	}
+	transferWriteFixture(t, root, "internal/infrapriv/policy_other.go", good["internal/infrapriv/policy_other.go"])
+	for _, imp := range []string{"internal/proto", "internal/infraupgrade", "github.com/nats-io/nats.go"} {
+		if strings.HasPrefix(imp, "internal/") {
+			imp = modPrefix + imp
+		}
+		transferWriteFixture(t, root, "internal/infracontract/types.go", "package contract;import _ "+strconv.Quote(imp))
+		if checkInfraLayering(read()) == nil {
+			t.Fatal("on-disk neutral contract widening escaped")
+		}
+	}
+	transferWriteFixture(t, root, "internal/infracontract/types.go", "package contract;import \"io\";var _ io.Reader")
+	if err := checkInfraLayering(read()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// S10 fullstack owners, on the AllOS import graph (Darwin twins and indirect
+// local edges included). Contracts and pure judges are stdlib-only below every
+// product owner; the single evidence judge never links a runtime or harness; the
+// harness consumes contracts, neutral leaves, testharness and the real CLI but no
+// agent/broker kernel; the store witness sits above storage (the lead's
+// storage→storewitness cycle fix) and below every runtime; product code never
+// imports the test tree. Each layer row is a non-empty actual root.
+// origin: hot-update S10 plan §12.2 layering / P28
+// gate-control: TestFullstackLayeringControls
+type fullstackLayer struct {
+	pkg     string
+	allowed []string // non-nil: the complete non-stdlib direct-import set
+	banned  []string // transitive closure bans (module-relative or third-party roots)
+	why     string
+}
+
+var fullstackKernelBans = []string{
+	"internal/agent", "internal/broker", "internal/brokercontrol", "internal/brokerimage", "internal/agentboot",
+	"internal/agentimage", "internal/execsession", "internal/ptysession", "internal/flow", "internal/tunnel",
+	"cmd", "test/hotupdate/acceptance/contractstub",
+}
+
+var fullstackLayers = []fullstackLayer{
+	{pkg: "test/hotupdate/acceptance/contract", allowed: []string{}, why: "neutral evidence DTOs and schema are stdlib-only"},
+	{pkg: "test/hotupdate/acceptance/contractstub", allowed: []string{"test/hotupdate/acceptance/contract"}, why: "inert stubs name only the contract"},
+	{pkg: "test/hotupdate/acceptance", allowed: []string{"test/hotupdate/acceptance/contract"}, why: "pure judges cannot import a product control implementation"},
+	{pkg: "test/hotupdate/evidencecmd", banned: append([]string{"internal/testharness", "internal/cluster", "test/fullstackharness", "github.com/nats-io", "github.com/hashicorp/raft", "github.com/hashicorp/yamux"}, fullstackKernelBans...), why: "the evidence judge decodes raw evidence and never links a runtime or harness"},
+	{pkg: "test/fullstackharness", banned: fullstackKernelBans, why: "the harness drives real binaries through the CLI and never links an agent/broker kernel"},
+	{pkg: "test/fullstackharness/cmd/supervise", banned: fullstackKernelBans, why: "the supervisor launcher owns only processes"},
+	{pkg: "internal/storewitness", allowed: []string{"internal/drillobserve", "internal/rawsocket", "internal/sealedstate", "internal/storage"}, banned: []string{"internal/broker", "internal/agent", "internal/brokercontrol", "internal/cluster", "cmd", "test", "github.com/nats-io", "github.com/hashicorp/raft", "github.com/hashicorp/yamux"}, why: "the witness observes the current-store RO boundary without owning a store or runtime"},
+}
+
+func fullstackLayerMatch(dep, ban string) bool { return dep == ban || strings.HasPrefix(dep, ban+"/") }
+
+// fullstackImportGraph maps each production package directory to its imports,
+// module-relative for local packages. Local membership is kept separately so a
+// third-party root can never pass for a missing local source.
+func fullstackImportGraph(sources map[string]string) (map[string]map[string]bool, map[string]bool, error) {
+	graph, local := map[string]map[string]bool{}, map[string]bool{}
+	for _, path := range brokerSortedSourcePaths(sources) {
+		if !isProdGoFile(path) {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, sources[path], parser.ImportsOnly)
+		if err != nil {
+			return nil, nil, err
+		}
+		pkg := filepath.ToSlash(filepath.Dir(path))
+		if graph[pkg] == nil {
+			graph[pkg] = map[string]bool{}
+		}
+		for _, spec := range file.Imports {
+			imp, _ := strconv.Unquote(spec.Path.Value)
+			name := strings.TrimPrefix(imp, modPrefix)
+			graph[pkg][name] = true
+			if name != imp {
+				local[name] = true
+				if (strings.HasPrefix(pkg, "internal/") || strings.HasPrefix(pkg, "cmd/")) && fullstackLayerMatch(name, "test") {
+					return nil, nil, fmt.Errorf("%s: product code imports the test tree %s", path, imp)
+				}
+			}
+		}
+	}
+	return graph, local, nil
+}
+
+func checkFullstackLayering(sources map[string]string) error {
+	graph, local, err := fullstackImportGraph(sources)
+	if err != nil {
+		return err
+	}
+	for _, layer := range fullstackLayers {
+		if graph[layer.pkg] == nil {
+			return fmt.Errorf("empty S10 layering root %s", layer.pkg)
+		}
+		for dep := range graph[layer.pkg] {
+			stdlib := !local[dep] && !strings.Contains(strings.Split(dep, "/")[0], ".")
+			if layer.allowed == nil || stdlib || slices.ContainsFunc(layer.allowed, func(allow string) bool { return fullstackLayerMatch(dep, allow) }) {
+				continue
+			}
+			return fmt.Errorf("%s imports %s outside its allowed set: %s", layer.pkg, dep, layer.why)
+		}
+		seen := map[string]bool{layer.pkg: true}
+		queue := []string{layer.pkg}
+		for len(queue) > 0 {
+			pkg := queue[0]
+			queue = queue[1:]
+			for dep := range graph[pkg] {
+				for _, ban := range layer.banned {
+					if fullstackLayerMatch(dep, ban) {
+						return fmt.Errorf("%s reaches %s through %s: %s", layer.pkg, dep, pkg, layer.why)
+					}
+				}
+				if local[dep] && !seen[dep] {
+					if graph[dep] == nil {
+						return fmt.Errorf("%s: missing local dependency source %s", pkg, dep)
+					}
+					seen[dep] = true
+					queue = append(queue, dep)
+				}
+			}
+		}
+	}
+	// Go rejects a cycle per platform; the AllOS union also catches a Darwin-only
+	// back edge, such as storage importing the witness that observes it.
+	state := map[string]int{}
+	var visit func(string) error
+	visit = func(pkg string) error {
+		switch state[pkg] {
+		case 1:
+			return fmt.Errorf("AllOS package cycle through %s", pkg)
+		case 2:
+			return nil
+		}
+		state[pkg] = 1
+		for dep := range graph[pkg] {
+			if local[dep] && graph[dep] != nil {
+				if err := visit(dep); err != nil {
+					return err
+				}
+			}
+		}
+		state[pkg] = 2
+		return nil
+	}
+	for pkg := range graph {
+		if err := visit(pkg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fullstackProductionGo is the AllOS production Go view of one tree.
+func fullstackProductionGo(tree fullstackTree) map[string]string {
+	sources := map[string]string{}
+	for path, source := range tree.files {
+		if isProdGoFile(path) {
+			sources[path] = source
+		}
+	}
+	return sources
+}
+
+// origin: hot-update S10 plan §12.2 layering / P28
+func TestFullstackLayeringAllOS(t *testing.T) {
+	if err := checkFullstackLayering(fullstackProductionGo(fullstackRepoTree(t))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The fixture is the real closure of every S10 layer root, copied to disk; each
+// mutation adds one production file and re-reads the copy with the gate's reader.
+// origin: hot-update S10 plan §10.2 P28 / §12.1 bypass-transitive-layering
+func TestFullstackLayeringControls(t *testing.T) {
+	real := fullstackRepoTree(t)
+	graph, local, err := fullstackImportGraph(fullstackProductionGo(real))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := []string{"internal/storage"}
+	for _, layer := range fullstackLayers {
+		closure = append(closure, layer.pkg)
+	}
+	for i := 0; i < len(closure); i++ {
+		for dep := range graph[closure[i]] {
+			if local[dep] && !slices.Contains(closure, dep) {
+				closure = append(closure, dep)
+			}
+		}
+	}
+	root := t.TempDir()
+	for path, source := range fullstackProductionGo(real) {
+		if slices.Contains(closure, filepath.ToSlash(filepath.Dir(path))) {
+			transferWriteFixture(t, root, path, source)
+		}
+	}
+	check := func() error { return checkFullstackLayering(fullstackProductionGo(readFullstackTree(t, root))) }
+	leaf := func(path, pkg, imp, want string) fullstackMutation {
+		return fullstackMutation{path: path, new: "package " + pkg + "\n\nimport _ " + strconv.Quote(modPrefix+imp) + "\n", want: want}
+	}
+	proveFullstackMutations(t, root, check,
+		leaf("test/hotupdate/acceptance/contract/owner_other.go", "contract", "internal/proto", "outside its allowed set"),
+		fullstackMutation{path: "test/hotupdate/acceptance/contract/owner_other.go", new: "package contract\n\nimport _ \"golang.org/x/sys/unix\"\n", want: "outside its allowed set"},
+		leaf("test/hotupdate/acceptance/contractstub/wire.go", "contractstub", "test/hotupdate/acceptance", "outside its allowed set"),
+		leaf("test/hotupdate/acceptance/control.go", "acceptance", "internal/upgradetx", "outside its allowed set"),
+		leaf("test/hotupdate/evidencecmd/harness.go", "main", "internal/testharness", "reaches internal/testharness"),
+		leaf("test/fullstackharness/kernel_other.go", "fullstackharness", "internal/agent", "reaches internal/agent"),
+		leaf("test/fullstackharness/stub.go", "fullstackharness", "test/hotupdate/acceptance/contractstub", "reaches test/hotupdate/acceptance/contractstub"),
+		leaf("test/fullstackharness/cmd/supervise/kernel.go", "main", "internal/broker", "reaches internal/broker"),
+		leaf("internal/storewitness/runtime_other.go", "storewitness", "internal/broker", "outside its allowed set"),
+		leaf("internal/storage/witness_other.go", "storage", "internal/storewitness", "cycle"),
+		leaf("internal/rawsocket/acceptance.go", "rawsocket", "test/fullstackharness", "imports the test tree"),
+	)
+	// A neutral-looking new leaf cannot launder a kernel edge: the closure walk
+	// reaches through it although the harness's own import names no banned owner.
+	transferWriteFixture(t, root, "internal/neutralleaf/leaf.go", "package neutralleaf\n\nimport _ "+strconv.Quote(modPrefix+"internal/broker")+"\n")
+	transferWriteFixture(t, root, "internal/broker/broker.go", "package broker\n")
+	proveFullstackMutations(t, root, check,
+		leaf("test/fullstackharness/neutral.go", "fullstackharness", "internal/neutralleaf", "reaches internal/broker through internal/neutralleaf"),
+		leaf("test/hotupdate/evidencecmd/neutral.go", "main", "internal/neutralleaf", "reaches internal/broker through internal/neutralleaf"),
+		leaf("internal/storewitness/neutral.go", "storewitness", "internal/neutralleaf", "outside its allowed set"),
+	)
+	// The witness's allowed storage edge still cannot launder a raft owner.
+	proveFullstackMutations(t, root, check,
+		leaf("internal/storage/raft_other.go", "storage", "internal/cluster", "reaches internal/cluster through internal/storage"),
+	)
 }

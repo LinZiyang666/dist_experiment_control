@@ -162,16 +162,18 @@ func main() {
 			fmt.Printf("coverage self-check: %d/%d top-level tests represented\n", len(declared), len(declared))
 		}
 
+		// S5 integration always isolates each test, even when generic sharding is disabled.
+		// origin: hot-update S5 plan §8 / §10.2 / T45.
+		before := len(units)
+		units, err = shardPackages(units, *shards)
+		if err != nil {
+			fatal("shard: %v", err)
+		}
 		if *shards > 1 {
-			before := len(units)
-			units, err = shardPackages(units, *shards)
-			if err != nil {
-				fatal("shard: %v", err)
-			}
 			fmt.Printf("units: %d -> %d (package split, then %d-way name sharding of the dominant packages)\n",
 				before, len(units), *shards)
 		} else {
-			fmt.Printf("units: %d (split by package; %d matrix-level fallback)\n", len(units), len(unparsed))
+			fmt.Printf("units: %d (split by package and S5 integration test; %d matrix-level fallback)\n", len(units), len(unparsed))
 		}
 	} else {
 		tests, err = listTests(*tagsFlag, *runRe)
@@ -525,6 +527,11 @@ func listTests(tags, filter string) ([]string, error) {
 	// limitation: the check made having them impossible. A parser that decides
 	// what the release gate covers is the last thing that should be untestable.
 	cmd := exec.Command("go", "test", "-tags", tags, "-list", ".*", "./test/e2e")
+	root, err := repoRoot()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("%v: %s", err, out)

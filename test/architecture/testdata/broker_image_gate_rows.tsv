@@ -1,0 +1,527 @@
+# test/determinism/testdata/test_function_inventory.txt — 208 added data rows
+cmd/tether/cluster_upgrade_scope_test.go: TestBrokerDaemonRollLeavesAgentUntouched
+cmd/tether/cluster_upgrade_scope_test.go: TestBrokerScopeAndTransfersDeferred
+cmd/tether/cluster_upgrade_scope_test.go: TestBrokerUpgradeSignerValidatesExtensions
+cmd/tether/command_tree_inventory_test.go: TestBrokerCommandSurface
+cmd/tether/ctl_budget_test.go: TestBrokerCommandAdmissionWiring
+cmd/tether/ctl_budget_test.go: TestBrokerCommandLeakCycles
+cmd/tether/ctl_budget_test.go: TestBrokerCommandObserverOwnership
+cmd/tether/ctl_budget_test.go: TestBrokerCommandReadsWithinAdmission
+cmd/tether/ctl_budget_test.go: TestControlResultUnknownNoReplay
+cmd/tether/ctl_budget_test.go: TestRetryAuthReceiptBoundary
+cmd/tether/serve_test.go: TestBrokerPreflightCommandUsesPureServeValidation
+cmd/tether/serve_test.go: TestServeInvalidLoggerDoesNotAcquireStore
+cmd/tether/serve_test.go: TestServeLostDispatchNeverOpensDB
+cmd/tether/serve_test.go: TestServeSingleStoreCleanupOnRunFailure
+internal/adminsock/broker_image_protocol_test.go: TestBrokerAdminImageProtocol
+internal/adminsock/image_test.go: TestAdminImageJoinsAcceptedHandlers
+internal/adminsock/image_test.go: TestBrokerAdminLeakCycles
+internal/adminsock/image_test.go: TestUnixListenerHotNoUnlink
+internal/agent/broker_maintenance_test.go: TestAgentSilenceTwoWakeMaintenance
+internal/agent/broker_maintenance_test.go: TestBrokerAgentHoldLeakCycles
+internal/agent/broker_maintenance_test.go: TestBrokerAgentMaintenanceCapabilityAndDispatch
+internal/agent/broker_maintenance_test.go: TestBrokerAgentMaintenanceIdentityAndRevoke
+internal/agent/broker_maintenance_test.go: TestBrokerAgentMaintenanceRejectsUnsupportedAndLateAck
+internal/agent/broker_maintenance_test.go: TestBrokerAgentMaintenanceSessionWiring
+internal/agentboot/broker_role_test.go: TestBrokerBootLeakCycles
+internal/agentboot/broker_role_test.go: TestBrokerBootRoleOnce
+internal/agentboot/broker_role_test.go: TestBrokerBootWiringControls
+internal/broker/broker_image_authority_test.go: TestBrokerAuthFirstReadyBarrier
+internal/broker/broker_image_authority_test.go: TestBrokerAuthorityLeakCycles
+internal/broker/broker_image_authority_test.go: TestBrokerIssuerAndBudgetPreserved
+internal/broker/broker_image_maintenance_test.go: TestBrokerHomeLeakCycles
+internal/broker/broker_image_maintenance_test.go: TestHomeMaintenanceWiringRejectsIncompleteSources
+internal/broker/broker_image_maintenance_test.go: TestMaintenanceEveryHomeMutator
+internal/broker/broker_image_maintenance_test.go: TestMaintenanceHomeGuardedPlannerIntegration
+internal/broker/broker_image_maintenance_test.go: TestMaintenancePreservesDwellAndReturn
+internal/broker/broker_image_run_test.go: TestBrokerCurrentOwnerSkipsColdCleanup
+test/hotupdate/broker_run_test.go: TestBrokerExecStaysInsideRun
+internal/broker/broker_image_run_test.go: TestBrokerImageStatusReportsRunningArtifact
+internal/broker/broker_image_run_test.go: TestBrokerLoopJoinRequiresActualExit
+internal/broker/broker_image_run_test.go: TestBrokerReloadKeepsAbsoluteBudget
+internal/broker/broker_image_run_test.go: TestBrokerRestoredStoreSkipsColdGeneration
+internal/broker/broker_image_run_test.go: TestBrokerRunLeakCycles
+internal/broker/broker_image_run_test.go: TestBrokerRunningSHAIgnoresStagedReplacement
+internal/broker/broker_image_run_test.go: TestBrokerSingleStoreRequiresProducerAdapters
+internal/broker/broker_image_run_test.go: TestBrokerTransferFenceIncludesProvisionAndLedger
+internal/broker/reexec_test.go: TestBrokerFinalSealRefusesUnknownOwners
+internal/broker/reexec_test.go: TestReloadAllowsSoleVoter
+internal/broker/reexec_test.go: TestReloadSameReleaseRequiresRunningSHA
+internal/broker/upgrade_holder_test.go: TestBrokerHolderLeakCycles
+internal/broker/upgrade_holder_test.go: TestBrokerMaintenanceChallengeBindings
+internal/broker/upgrade_holder_test.go: TestBrokerUpgradeHolderRejectsUnsignedExtension
+internal/broker/upgrade_holder_test.go: TestBrokerUpgradeHolderSignedCAS
+internal/brokerimage/boot_finish_test.go: TestBrokerBootConfigBytesRejectsAmbiguousVectors
+internal/brokerimage/boot_finish_test.go: TestBrokerBootFinishRefusalKeepsActiveOwner
+internal/brokerimage/boot_finish_test.go: TestBrokerBootFinishRejectsForeignPrevious
+internal/brokerimage/boot_finish_test.go: TestBrokerBootFinishUsesSealedArgs
+internal/brokerimage/boot_test.go: TestBrokerActualFDWhitelist
+internal/brokerimage/boot_test.go: TestBrokerBootRoleOnce
+internal/brokerimage/boot_test.go: TestBrokerPreflightNeverOpensStore
+internal/brokerimage/boot_test.go: TestBrokerPreflightPinsMappedReaderSHA
+internal/brokerimage/boot_test.go: TestBrokerPreflightRejectsSchemaAndDeadline
+internal/brokerimage/boot_test.go: TestBrokerProbeInputPreservesExactConfig
+internal/brokerimage/boot_test.go: TestBrokerSecondOpenHelper
+internal/brokerimage/codec_test.go: FuzzBrokerPrivateState
+internal/brokerimage/codec_test.go: TestBrokerCodecRejectsAmbiguousAndOpenState
+internal/brokerimage/codec_test.go: TestBrokerPrivateDescriptorMatchesActualCodec
+internal/brokerimage/codec_test.go: TestBrokerPrivateStateRoundTrip
+internal/brokerimage/codec_test.go: TestBrokerSchemaProofRejectsMissingEarlyRows
+internal/brokerimage/cut_test.go: TestBrokerCutExecCommitSerializesRevoke
+internal/brokerimage/cut_test.go: TestBrokerCutFailureKeepsOwner
+internal/brokerimage/cut_test.go: TestBrokerCutLeakCycles
+internal/brokerimage/cut_test.go: TestBrokerCutObservationsFailClosed
+internal/brokerimage/cut_test.go: TestBrokerCutPartialExportClosesPrivate
+internal/brokerimage/cut_test.go: TestBrokerCutRejectsAliasAndStaleExport
+internal/brokerimage/cut_test.go: TestBrokerPreparedListenerRevokeCannotResurrectEndpoint
+internal/brokerimage/cut_test.go: TestBrokerShutdownReceiptOrder
+internal/brokerimage/import_test.go: TestBrokerActivationOrdersAuthorityBeforeBusiness
+internal/brokerimage/import_test.go: TestBrokerConstructorFailureIsActive
+internal/brokerimage/import_test.go: TestBrokerExpiredImportNeverTakesFiles
+internal/brokerimage/import_test.go: TestBrokerImportLeakCycles
+internal/brokerimage/import_test.go: TestBrokerImportRejectsChangedListenerCookie
+internal/brokerimage/import_test.go: TestBrokerImportRejectsChangedLockFingerprint
+internal/brokerimage/import_test.go: TestBrokerImportRejectsCrossResourceAlias
+internal/brokerimage/import_test.go: TestBrokerImportSalvagesUnexpectedInnerFiles
+internal/brokerimage/import_test.go: TestBrokerMultiFileResourceKeepsMetadata
+internal/brokerimage/import_test.go: TestBrokerPartialDetachErrorKeepsSalvage
+internal/brokerimage/import_test.go: TestBrokerPartialTakeSalvage
+internal/brokerimage/import_test.go: TestBrokerPristineDetachTransfersOwnershipOnce
+internal/brokerimage/maintenance_test.go: FuzzMaintenanceBaselineCanonical
+internal/brokerimage/maintenance_test.go: TestBrokerMaintenanceLeakCycles
+internal/brokerimage/maintenance_test.go: TestMaintenanceCachePreservesExpiryAndBaseline
+internal/brokerimage/maintenance_test.go: TestMaintenanceRecordExactCAS
+internal/brokerimage/maintenance_test.go: TestMaintenanceRequiresEveryObserverWindow
+internal/brokerimage/runtime_test.go: TestBrokerActiveRollbackKeepsNewACK
+internal/brokerimage/runtime_test.go: TestBrokerCurrentRuntimePartialConstructor
+internal/brokerimage/runtime_test.go: TestBrokerCurrentRuntimeReopenStopSerializes
+internal/brokerimage/runtime_test.go: TestBrokerCurrentRuntimeStopRetriesJoin
+internal/brokerimage/runtime_test.go: TestCurrentRuntimeStopAfterExecError
+internal/brokermaint/proof_test.go: FuzzMaintenanceRecordCanonical
+internal/brokermaint/proof_test.go: TestMaintenanceCanonicalAuthority
+internal/brokermaint/proof_test.go: TestMaintenanceFixedCrossClockExpiry
+internal/brokermetrics/image_test.go: TestBrokerMetricsLeakCycles
+internal/cli/cluster_roll_test.go: TestBrokerRollLeakCycles
+internal/cli/cluster_roll_test.go: TestBrokerRollPlanUsesRunningSHA
+internal/cli/cluster_roll_test.go: TestBrokerRollRequiresRunningImage
+internal/cli/cluster_roll_test.go: TestTransferLeaderEveryStep
+internal/cli/retry_test.go: TestAdmissionEntryAndLateSuccess
+internal/cli/retry_test.go: TestAttemptSinkBlockedWriterJoinsAtDeadline
+internal/cli/retry_test.go: TestAttemptSinkCapacityIsExplicit
+internal/cli/retry_test.go: TestAttemptSinkCloseOnExec
+internal/cli/retry_test.go: TestAttemptSinkConcurrentOrdinalsAndWriteFailure
+internal/cli/retry_test.go: TestAttemptSinkConfigurationFailsClosed
+internal/cli/retry_test.go: TestAttemptSinkInheritedPipeUsesPoller
+internal/cli/retry_test.go: TestAttemptSinkRejectsForgeryAndSecretClasses
+internal/cli/retry_test.go: TestBannerSkipsAndSharesAdmission
+internal/cli/retry_test.go: TestBrokerCLIRetryLeakCycles
+internal/cli/retry_test.go: TestConnectWithinUsesRealBudgetedTransport
+internal/cli/retry_test.go: TestHealthProbeDistinguishesDeadlineFromEmptyCluster
+internal/cli/retry_test.go: TestRequestWithinCancellationKeepsConnectionUsable
+internal/cli/retry_test.go: TestRetryAuthorityAndSentBoundary
+internal/cli/retry_test.go: TestRetryUsesRemainingAbsoluteBudget
+internal/cluster/broker_image_test.go: TestBrokerLockHeldAcrossExec
+internal/cluster/broker_image_test.go: TestBrokerNodeCurrentStoreCut
+internal/cluster/broker_image_test.go: TestBrokerNodeLeakCycles
+internal/cluster/broker_image_test.go: TestBrokerPartialCloseBlocksReopen
+internal/cluster/broker_image_test.go: TestBrokerRoleObserverDetectsABA
+internal/cluster/broker_image_test.go: TestRaftSnapshotRPCJoinWithinCut
+internal/cluster/snapshot_image_test.go: FuzzBrokerSnapshotStamp
+internal/cluster/snapshot_image_test.go: TestBrokerRestartSkipsStartupSnapshot
+internal/cluster/snapshot_image_test.go: TestBrokerSnapshotLeakCycles
+internal/cluster/snapshot_image_test.go: TestBrokerSnapshotStageControls
+internal/cluster/snapshot_image_test.go: TestInstallSnapshotCurrentFloor
+internal/cluster/upgrade_holder_test.go: TestBrokerMaintenanceRecordCAS
+internal/cluster/upgrade_holder_test.go: TestUpgradeHolderCAS
+internal/clusterio/transport_test.go: TestBrokerTransportLeakCycles
+internal/clusterio/transport_test.go: TestBrokerTransportUnknownCloseAndReaderJoin
+internal/clustermanifest/image_test.go: TestBrokerManifestLeakCycles
+internal/clusteroffline/image_identity_test.go: TestOfflineCanonicalStoreUsesHeldLock
+internal/clusteroffline/image_identity_test.go: TestOfflineStoreLockBindingBeforeMutation
+internal/clusterupgrade/broker_scope_test.go: TestBrokerPlanScopePreservesAgentPresence
+internal/clusterupgrade/broker_scope_test.go: TestBrokerPlanSoleVoterWriteStall
+internal/controlbudget/observer_test.go: TestAdmissionClockRejectsInvalidAndExpiredDeadlines
+internal/controlbudget/observer_test.go: TestAttemptObserverNoSilentLoss
+internal/execclient/admission_test.go: TestAdmissionProbeTimeoutDoesNotDowngrade
+internal/execclient/admission_test.go: TestBrokerExecClientLeakCycles
+internal/execclient/admission_test.go: TestRetryStableLogicalIdentity
+internal/handoff/image_test.go: TestPreparedBrokerRejectsAliasedOwners
+internal/handoff/image_test.go: TestPreparedFlagRestoreFailureIsReported
+internal/httplisten/image_test.go: TestBrokerHTTPLeakCycles
+internal/httplisten/image_test.go: TestHTTPFreezeJoinsStoreHandlers
+internal/httplisten/image_test.go: TestHTTPImageRefusesHijackedWork
+internal/httplisten/image_test.go: TestHTTPImageRejectsExpiredDeadlineBeforeFence
+internal/httplisten/image_test.go: TestHTTPKeepaliveAdmissionSharesFence
+internal/httplisten/image_test.go: TestHTTPServeJoinsCancellationCallback
+internal/listenerimage/keeper_test.go: TestBrokerListenerLeakCycles
+internal/listenerimage/keeper_test.go: TestListenerKeeperViewPause
+internal/natsinbox/budget_test.go: TestBrokerInboxAbsoluteDeadline
+internal/natsinbox/budget_test.go: TestBrokerInboxLeakCycles
+internal/port/image_guard_test.go: TestBrokerLateCloseDoesNotKillReplacement
+internal/port/image_guard_test.go: TestRehomeFullAllocationCAS
+internal/proto/broker_image_test.go: TestBrokerMaintenanceWireBodies
+internal/proto/broker_image_test.go: TestBrokerUpgradeRejectsAmbiguousSignedIdentifiers
+internal/proto/broker_image_test.go: TestBrokerWireFieldsAndRegistrationGoldens
+internal/proto/broker_image_test.go: TestBrokerWireInventoryControls
+internal/proto/broker_image_test.go: TestBrokerWireNMinusOneQuadrants
+internal/proto/codes_registry_test.go: TestBrokerImageCodeNamespaces
+internal/proxydial/budget_test.go: TestBrokerProxyAbsoluteDeadline
+internal/proxydial/budget_test.go: TestBrokerProxyLeakCycles
+internal/storage/image_test.go: TestBrokerCanonicalStoreLock
+internal/storage/image_test.go: TestBrokerJournalPreserved
+internal/storage/image_test.go: TestBrokerStorageLeakCycles
+internal/storage/image_test.go: TestBrokerWriterRegistryExclusive
+internal/storage/image_test.go: TestOpenCurrentExactSchema
+internal/subhttp/image_test.go: TestBrokerSubHTTPLeakCycles
+internal/subhttp/image_test.go: TestSubHTTPUsesCurrentStoreAfterThaw
+internal/tunnel/flow_endpoint_test.go: TestEndpointResumeWaitsForAdmissionBeforeFreeze
+internal/tunnel/server_image_test.go: FuzzBrokerTunnelPrivateState
+internal/tunnel/server_image_test.go: TestBrokerEndpointFenceRoundTrip
+internal/tunnel/server_image_test.go: TestBrokerLateCloseDoesNotKillReplacement
+internal/tunnel/server_image_test.go: TestBrokerServerImageLeakCycles
+internal/tunnel/server_image_test.go: TestBrokerServerRuntimeImageRoundTrip
+internal/tunnel/server_image_test.go: TestBrokerTunnelPrivateDescriptorClosure
+internal/tunnel/server_pause_test.go: TestBrokerServerPauseLeakCycles
+internal/tunnel/server_pause_test.go: TestEndpointPauseKeepsPendingFIFO
+internal/tunnel/server_pause_test.go: TestEndpointTimerCallbackJoin
+internal/tunnel/server_pause_test.go: TestServerCarrierJoinBeforeRawFreeze
+test/architecture/broker_image_contract_test.go: FuzzBrokerContractSourceParser
+test/architecture/broker_image_contract_test.go: TestBrokerCutUsesActualClosedStoreSeal
+test/architecture/broker_image_contract_test.go: TestBrokerImageContractControls
+test/architecture/broker_image_contract_test.go: TestBrokerImageContracts
+test/architecture/broker_image_contract_test.go: TestBrokerImageRuntimeContractShapes
+test/architecture/broker_image_contract_test.go: TestBrokerStructuralAndLayeringControls
+test/architecture/broker_state_inventory_test.go: TestBrokerImageInventoryControls
+test/architecture/broker_state_inventory_test.go: TestBrokerPrivateStateInventoryAppendOnly
+test/architecture/broker_state_inventory_test.go: TestBrokerPrivateStateInventoryMatchesCodecs
+test/architecture/broker_state_inventory_test.go: TestBrokerPrivateStatePartition
+test/architecture/build_tags_test.go: TestBrokerBuildTagControls
+test/architecture/build_tags_test.go: TestBrokerPlatformSyscallsStayInLeaves
+test/architecture/ctx_background_ledger_test.go: TestBrokerContextRootControls
+test/architecture/dataplane_lifetime_test.go: TestBrokerDataplaneEntryPointsAllOS
+test/architecture/dataplane_lifetime_test.go: TestBrokerDataplaneLifetimeControls
+test/architecture/image_field_inventory_test.go: TestBrokerPublicImageInventoryControls
+test/architecture/layering_test.go: TestBrokerLayeringAllOS
+test/architecture/layering_test.go: TestBrokerLayeringControls
+test/architecture/structural_budget_test.go: TestBrokerStructuralBudgetControls
+test/architecture/structural_budget_test.go: TestBrokerStructuralCapsAllOS
+test/architecture/upgrade_budget_pin_test.go: TestBrokerBudgetControls
+test/architecture/upgrade_budget_pin_test.go: TestBrokerBudgetsKeepFrozenValuesAndDerivation
+
+# test/architecture/testdata/image_field_inventory.txt — 3 added data rows
+adminsock.Response.BrokerImage	json:"broker_image,omitempty"	*proto.BrokerImageStatus
+adminsock.Response.NextGeneration	json:"next_generation,omitempty"	uint64
+adminsock.RuntimeReport.BrokerImage	json:"broker_image,omitempty"	*proto.BrokerImageStatus
+
+# test/architecture/testdata/broker_state_inventory.txt — 97 added data rows
+field	broker-runtime.active	bool	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.args	[]string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.boot_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.candidate_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.config_digest	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.cut_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.exporter_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.generation	uint64	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.instance_id	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.mode	brokerimage.Mode	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.previous_sha256	string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.required_domains	[]string	canonical-json	16777216	false	broker-image-v1
+field	broker-runtime.role	string	canonical-json	16777216	false	broker-image-v1
+field	control.admission_generation	uint64	canonical-json	16777216	false	broker-image-v1
+field	control.auth_ready	bool	canonical-json	16777216	false	broker-image-v1
+field	control.control_ready	bool	canonical-json	16777216	false	broker-image-v1
+field	control.home_baselines	[]brokerimage.HomeBaseline	canonical-json	16777216	false	broker-image-v1
+field	control.maintenance	[]brokermaint.LocalLease	canonical-json	16777216	false	broker-image-v1
+field	control.required_handlers	[]string	canonical-json	16777216	false	broker-image-v1
+field	control.required_loops	[]string	canonical-json	16777216	false	broker-image-v1
+field	endpoint.allocation_epoch	i64	i64be	8	true	broker-image-v1
+field	endpoint.allocation_nid	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.allocation_port	u64	u64be	8	true	broker-image-v1
+field	endpoint.allocation_sid	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.allocation_token_hash	utf8	utf8be	4096	true	broker-image-v1
+field	endpoint.carrier_gen	u64	u64be	8	true	broker-image-v1
+field	endpoint.cleanup_pending	bool	boolbe	1	true	broker-image-v1
+field	endpoint.created_unix_ns	i64	i64be	8	true	broker-image-v1
+field	endpoint.deadline_boot_ns	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_allocation	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_port	i64	i64be	8	true	broker-image-v1
+field	endpoint.fence_session	i64	i64be	8	true	broker-image-v1
+field	endpoint.fired	bool	boolbe	1	true	broker-image-v1
+field	endpoint.flow_ids	bytes	bytesbe	65536	true	broker-image-v1
+field	endpoint.id	id16	id16be	16	true	broker-image-v1
+field	endpoint.lineage	bytes	bytesbe	32	true	broker-image-v1
+field	endpoint.listener_descriptor	bytes	bytesbe	8192	true	broker-image-v1
+field	endpoint.listener_ref	utf8	utf8be	256	true	broker-image-v1
+field	endpoint.next_seq	u64	u64be	8	true	broker-image-v1
+field	endpoint.owner_gen	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_dev	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_ino	u64	u64be	8	true	broker-image-v1
+field	endpoint.pending_ref	utf8	utf8be	256	true	broker-image-v1
+field	endpoint.pending_tuple	bytes	bytesbe	4096	true	broker-image-v1
+field	endpoint.pending_type	u64	u64be	8	true	broker-image-v1
+field	endpoint.phase	u64	u64be	8	true	broker-image-v1
+field	endpoint.target_port	u64	u64be	8	true	broker-image-v1
+field	endpoint.ticket	bytes	bytesbe	8192	true	broker-image-v1
+field	fences.closed_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.forgotten	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.id	id16	id16be	16	true	broker-image-v1
+field	fences.inflight_by_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.inflight_by_sid	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_allocation	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_port	bytes	bytesbe	1048576	true	broker-image-v1
+field	fences.kill_gen_session	bytes	bytesbe	1048576	true	broker-image-v1
+field	permit.abort	bool	boolbe	1	true	broker-image-v1
+field	permit.consumed	bool	boolbe	1	true	broker-image-v1
+field	permit.cut_id	id16	id16be	16	true	broker-image-v1
+field	permit.deadline_boot_ns	i64	i64be	8	true	broker-image-v1
+field	permit.id	id16	id16be	16	true	broker-image-v1
+field	permit.image_digest	bytes	bytesbe	32	true	broker-image-v1
+field	permit.next_owner_gen	u64	u64be	8	true	broker-image-v1
+field	permit.owner_gen	u64	u64be	8	true	broker-image-v1
+field	permit.request_id	id16	id16be	16	true	broker-image-v1
+field	receipt.id	id16	id16be	16	true	broker-image-v1
+field	receipt.request	bytes	bytesbe	1048576	true	broker-image-v1
+field	receipt.response	bytes	bytesbe	1048576	true	broker-image-v1
+field	resources.owners	[]brokerimage.ResourceOwnership	canonical-json	16777216	false	broker-image-v1
+field	server.boot_id	utf8	utf8be	4096	true	broker-image-v1
+field	server.control_descriptor	bytes	bytesbe	8192	true	broker-image-v1
+field	server.control_listener	utf8	utf8be	256	true	broker-image-v1
+field	server.flows_digest	bytes	bytesbe	32	true	broker-image-v1
+field	server.generation	u64	u64be	8	true	broker-image-v1
+field	server.id	id16	id16be	16	true	broker-image-v1
+field	server.instance_id	utf8	utf8be	4096	true	broker-image-v1
+field	server.owner_gen	u64	u64be	8	true	broker-image-v1
+field	server.pending_slots	u64	u64be	8	true	broker-image-v1
+field	server.replay_limit	i64	i64be	8	true	broker-image-v1
+field	server.replay_used	i64	i64be	8	true	broker-image-v1
+field	server.sessions	bytes	bytesbe	1048576	true	broker-image-v1
+field	server.ticket_key	bytes	bytesbe	32	true	broker-image-v1
+field	server.waiters	bytes	bytesbe	2048	true	broker-image-v1
+field	store.active_backups	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.active_rpcs	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.bolt	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_busy	int	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_done	int	canonical-json	16777216	false	broker-image-v1
+field	store.checkpoint_log	int	canonical-json	16777216	false	broker-image-v1
+field	store.driver_readers	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.driver_writers	uint32	canonical-json	16777216	false	broker-image-v1
+field	store.raft	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.read_only	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.role	storage.RoleReceipt	canonical-json	16777216	false	broker-image-v1
+field	store.stamp	storage.StoreStamp	canonical-json	16777216	false	broker-image-v1
+field	store.transport	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+field	store.writer	storage.ClosePhase	canonical-json	16777216	false	broker-image-v1
+
+# test/architecture/testdata/structural_budget_golden.txt — 4 added data rows
+main-noncli-code-lines cmd/tether 800
+pkg-code-lines internal/brokerimage 2000
+pkg-code-lines internal/cli 2000
+pkg-files internal/tunnel 22
+
+# test/determinism/leak_assert_shape_test.go — 60 new site-scoped anchors
+cmd/tether/cluster_upgrade_scope_test.go:TestBrokerScopeAndTransfersDeferred	exerciseBrokerScopeAndTransfers
+cmd/tether/cluster_upgrade_scope_test.go:TestBrokerDaemonRollLeavesAgentUntouched	exerciseBrokerDaemonRoll
+cmd/tether/ctl_budget_test.go:TestControlResultUnknownNoReplay	exerciseControlResultUnknown
+cmd/tether/ctl_budget_test.go:TestBrokerCommandLeakCycles	exerciseCtlAdmissionCancel
+cmd/tether/serve_test.go:TestServeSingleStoreCleanupOnRunFailure	exerciseServeSingleStoreFailure
+internal/adminsock/image_test.go:TestBrokerAdminLeakCycles	exerciseAdminInheritedClose
+internal/agent/broker_maintenance_test.go:TestBrokerAgentHoldLeakCycles	exerciseAgentMaintenanceHold
+internal/agentboot/broker_role_test.go:TestBrokerBootLeakCycles	exerciseBrokerRoleRedispatch
+internal/broker/broker_image_authority_test.go:TestBrokerAuthorityLeakCycles	exerciseAuthorityRebind
+internal/broker/broker_image_maintenance_test.go:TestMaintenanceEveryHomeMutator	exerciseHomeMutationGuard
+internal/broker/broker_image_maintenance_test.go:TestMaintenancePreservesDwellAndReturn	exerciseHomeMaintenanceHistory
+internal/broker/broker_image_maintenance_test.go:TestBrokerHomeLeakCycles	exerciseMaintainedHomeTick
+internal/broker/broker_image_maintenance_test.go:TestMaintenanceHomeGuardedPlannerIntegration	exerciseGuardedHomePlanner
+internal/broker/broker_image_run_test.go:TestBrokerRunLeakCycles	exerciseBrokerExecReturned
+internal/broker/broker_image_run_test.go:TestBrokerTransferFenceIncludesProvisionAndLedger	exerciseBrokerTransferFence
+internal/broker/broker_image_run_test.go:TestBrokerLoopJoinRequiresActualExit	exerciseBrokerLoopJoin
+internal/broker/broker_image_run_test.go:TestBrokerCurrentOwnerSkipsColdCleanup	exerciseBrokerColdCleanup
+internal/broker/broker_image_run_test.go:TestBrokerReloadKeepsAbsoluteBudget	exerciseBrokerReloadBudget
+internal/broker/broker_image_run_test.go:TestBrokerRestoredStoreSkipsColdGeneration	exerciseBrokerRestoredRefusal
+internal/broker/reexec_test.go:TestReloadRefusesOnLeader	exerciseReloadMultipleVoters
+internal/broker/reexec_test.go:TestReloadAllowsSoleVoter	exerciseReloadSoleVoter
+internal/broker/upgrade_holder_test.go:TestBrokerHolderLeakCycles	exerciseHolderLostLease
+internal/brokerimage/boot_finish_test.go:TestBrokerBootFinishRefusalKeepsActiveOwner	exerciseBrokerBootFinishRefusal
+internal/brokerimage/boot_test.go:TestBrokerActualFDWhitelist	exerciseBrokerFDWhitelist
+internal/brokerimage/cut_test.go:TestBrokerCutLeakCycles	exerciseCutFailure
+internal/brokerimage/import_test.go:TestBrokerImportLeakCycles	exerciseBrokerPartialTake
+internal/brokerimage/maintenance_test.go:TestBrokerMaintenanceLeakCycles	exerciseMaintenanceExpiry
+internal/brokerimage/runtime_test.go:TestBrokerCurrentRuntimeReopenStopSerializes	exerciseRuntimeReopenStop
+internal/brokermetrics/image_test.go:TestBrokerMetricsLeakCycles	exerciseMetricsInheritedHTTP
+internal/cli/cluster_roll_test.go:TestBrokerRollLeakCycles	exerciseRollLeaderChanged
+internal/cli/retry_test.go:TestBrokerCLIRetryLeakCycles	exerciseCLIRetryCancel
+internal/cluster/broker_image_test.go:TestBrokerPartialCloseBlocksReopen	exerciseNodeCloseUncertainty
+internal/cluster/broker_image_test.go:TestBrokerRoleObserverDetectsABA	exerciseRoleObserverABA
+internal/cluster/broker_image_test.go:TestBrokerNodeLeakCycles	exerciseNodePartialClose
+internal/cluster/broker_image_test.go:TestRaftSnapshotRPCJoinWithinCut	exerciseSnapshotRPCJoin
+internal/cluster/broker_image_test.go:TestBrokerLockHeldAcrossExec	exerciseLockExec
+internal/cluster/broker_image_test.go:TestBrokerNodeCurrentStoreCut	exerciseNodeCurrentStoreCut
+internal/cluster/snapshot_image_test.go:TestInstallSnapshotCurrentFloor	exerciseSnapshotCurrentFloor
+internal/cluster/snapshot_image_test.go:TestBrokerRestartSkipsStartupSnapshot	exerciseSnapshotRestart
+internal/cluster/snapshot_image_test.go:TestBrokerSnapshotLeakCycles	exerciseSnapshotCancel
+internal/cluster/snapshot_image_test.go:TestBrokerSnapshotStageControls	exerciseSnapshotStageControls
+internal/clusterio/transport_test.go:TestBrokerTransportLeakCycles	exerciseStalledRPC
+internal/clusterio/transport_test.go:TestBrokerTransportUnknownCloseAndReaderJoin	exerciseTransportUnknownClose
+internal/clustermanifest/image_test.go:TestBrokerManifestLeakCycles	exerciseManifestInheritedHTTP
+internal/execclient/admission_test.go:TestAdmissionProbeTimeoutDoesNotDowngrade	exerciseProbeBlackout
+internal/execclient/admission_test.go:TestRetryStableLogicalIdentity	exerciseStableAdmission
+internal/execclient/admission_test.go:TestBrokerExecClientLeakCycles	exerciseAdmissionBlackout
+internal/httplisten/image_test.go:TestBrokerHTTPLeakCycles	exerciseHTTPKeepaliveFreeze
+internal/listenerimage/keeper_test.go:TestBrokerListenerLeakCycles	exerciseKeeperPauseAdopt
+internal/natsinbox/budget_test.go:TestBrokerInboxLeakCycles	exerciseInboxFallbackCancel
+internal/proxydial/budget_test.go:TestBrokerProxyLeakCycles	exerciseProxyDeadlineCancel
+internal/storage/image_test.go:TestBrokerStorageLeakCycles	exerciseStorageCloseFailure
+internal/subhttp/image_test.go:TestBrokerSubHTTPLeakCycles	exerciseSubHTTPInheritedHTTP
+internal/tunnel/flow_endpoint_test.go:TestEndpointResumeWaitsForAdmissionBeforeFreeze	exerciseEndpointResumeAdmission
+internal/tunnel/server_image_test.go:TestBrokerServerImageLeakCycles	exerciseServerPartialImport
+internal/tunnel/server_image_test.go:TestBrokerServerRuntimeImageRoundTrip	exerciseBrokerServerRuntimeImage
+internal/tunnel/server_pause_test.go:TestEndpointPauseKeepsPendingFIFO	exerciseEndpointPauseFIFO
+internal/tunnel/server_pause_test.go:TestEndpointTimerCallbackJoin	exerciseEndpointTimerJoin
+internal/tunnel/server_pause_test.go:TestServerCarrierJoinBeforeRawFreeze	exerciseServerCarrierJoin
+internal/tunnel/server_pause_test.go:TestBrokerServerPauseLeakCycles	exerciseServerPauseFailure
+
+# section: infra-scanner-roots
+# origin: hot-update S9 plan §10.2 / T83; exact root, reachable callee, owning test.
+cmd/tether-infra-helper/main.go:main	cmd/tether-infra-helper:sanitizeInherited	T92
+cmd/tether-infra-helper/main.go:main	internal/infraroot:OpenInstalled	T91
+cmd/tether-infra-launch/main.go:main	internal/infralaunch:Run	T14
+internal/infraroot/bind.go:New	internal/infrahost:NewWorker	T91
+internal/infracontract/codec.go:SigningBytes	internal/infracontract:validateRequest	T02
+internal/infracontract/codec.go:VerifyRequest	crypto/ed25519:Verify	T02
+internal/infraupgrade/nats.go:natsDriver.Advance	internal/infraupgrade:natsDriver.cutover	T29
+internal/infraupgrade/caddy.go:caddyDriver.Advance	internal/infraupgrade:caddyDriver.run	T22
+internal/infratransport/move.go:Move	internal/infratransport:Transport.Interrupt	T32
+internal/infratransport/move.go:Transport.Interrupt	internal/infratransport:Transport.interrupt	T33
+internal/infratransfer/adapter.go:Adapter.Fence	internal/infratransfer:checkpoint	T42
+
+# section: infra-js-producers
+# Actual configuration/asset mutator root, operation, behavioral owner tests.
+# The bounded public reaper delegates the original purge to its joined helper.
+# origin: S7 internal review GATE-SYNC F3 / GATES-PROD F1
+internal/broker/transfer.go:Broker.convergeOversizedXferBucket	UpdateStream	T41/T49
+internal/broker/transfer.go:ensureXferBucketSizedWithLimit	CreateObjectStore	T41/T49
+internal/broker/transfer.go:raiseXferReplicas	UpdateStream	T41/T49
+internal/filetransfer/handler.go:Handler.HandlePushCommitForwarded	Purge	T41/T49
+internal/infrarepair/legacy_streams.go:DeleteLegacyObjectStore	DeleteObjectStore	T41/T49
+internal/infrarepair/legacy_streams.go:EnsureLegacyStream	CreateStream	T41/T49
+internal/infrarepair/legacy_streams.go:reconcileReplicas	UpdateStream	T41/T49
+internal/jsstream/jsstream.go:DeleteHistoryStream	DeleteStream	T41/T49
+internal/jsstream/jsstream.go:ProbeMetaCanPlace	CreateStream	T41/T49
+internal/jsstream/jsstream.go:ProbeMetaCanPlace	DeleteStream	T41/T49
+internal/jsstream/object_cleanup.go:deleteObjectConsumer	DeleteConsumer	T41/T49
+internal/jsstream/object_reader.go:GetTransferObject	CreateConsumer	T41/T49
+internal/jsstream/object_reader.go:transferObjectReader.Close	DeleteConsumer	T41/T49
+internal/jsstream/object_resume.go:transferResumeReader.openConsumer	CreateConsumer	T41/T49
+internal/jsstream/object_writer.go:RetireTransferObjectRecorded	Purge	T41/T49
+internal/xferbucket/config.go:configJS.CreateObjectStore	CreateObjectStore	T41/T49
+internal/xferbucket/config.go:configJS.CreateOrUpdateObjectStore	CreateObjectStore	T41/T49
+internal/xferbucket/config.go:configJS.CreateOrUpdateObjectStore	CreateOrUpdateObjectStore	T41/T49
+internal/xferbucket/config.go:configJS.CreateOrUpdateStream	CreateOrUpdateStream	T41/T49
+internal/xferbucket/config.go:configJS.CreateOrUpdateStream	CreateStream	T41/T49
+internal/xferbucket/config.go:configJS.CreateStream	CreateStream	T41/T49
+internal/xferbucket/config.go:configJS.UpdateObjectStore	UpdateObjectStore	T41/T49
+internal/xferbucket/config.go:configJS.UpdateStream	UpdateStream	T41/T49
+internal/xferbucket/config.go:coordinator.configure	CreateObjectStore	T41/T49
+internal/xferbucket/config.go:coordinator.configure	UpdateStream	T41/T49
+internal/xferfinal/cleanup.go:owner.RetireLegacyOrphan	Purge	T41/T49
+internal/xferserve/directory.go:openDirectory	CreateStream	T41/T49
+internal/xferserve/legacy_gc.go:reapOrphanChunks	Purge	T41/T49
+# section: infra-test-inventory
+# P35 append-only test-function inventory requests (P34 does not edit that ledger).
+test/architecture/broker_image_contract_test.go: TestInfraImageSchemasExcludeLiveOwners
+test/architecture/broker_image_contract_test.go: TestInfraImageStateControls
+test/architecture/build_tags_test.go: TestInfraBuildTagControls
+test/architecture/build_tags_test.go: TestInfraPlatformResponsibilitiesAllOS
+test/architecture/ci_workflow_test.go: TestInfraReleaseArtifactControls
+test/architecture/ci_workflow_test.go: TestInfraReleaseArtifactsUseGuardedCI
+test/architecture/ctx_background_ledger_test.go: TestInfraContextRootControls
+test/architecture/ctx_background_ledger_test.go: TestInfraContextRootsHaveNoLegacyExemptions
+test/architecture/dataplane_lifetime_test.go: TestInfraDataplaneLifetimeControls
+test/architecture/gate_registry_test.go: TestInfraGateRegistryControls
+test/architecture/gate_registry_test.go: TestInfraGateRegistryHasLiveUnfilteredEntries
+test/architecture/infra_contract_test.go: TestInfraContractDeclarationsStayFrozen
+test/architecture/infra_contract_test.go: TestInfraContractGateControls
+test/architecture/infra_contract_test.go: TestInfraDocumentationClaimsNeedReceipts
+test/architecture/infra_contract_test.go: TestInfraDocumentationReceiptControls
+test/architecture/infra_runtime_test.go: TestInfraAssetProducersHaveExactRoots
+test/architecture/infra_runtime_test.go: TestInfraHostCallersBindOwnedAdapters
+test/architecture/infra_runtime_test.go: TestInfraRuntimeGateControls
+test/architecture/infra_runtime_test.go: TestInfraRuntimeScannerRootsAreLive
+test/architecture/infra_supply_test.go: TestInfraInstallerOutputMatchesRuntime
+test/architecture/infra_supply_test.go: TestInfraSupplyControls
+test/architecture/infra_supply_test.go: TestInfraSupplyUsesCompiledArtifactsAndSharedSupervisor
+test/architecture/layering_test.go: TestInfraLayeringAllOS
+test/architecture/layering_test.go: TestInfraLayeringControls
+test/architecture/nats_ping_defaults_test.go: TestInfraDialProfilesKeepPingContract
+test/architecture/nats_ping_defaults_test.go: TestInfraPingProfileControls
+test/architecture/nats_server_pin_test.go: TestInfraNATSCatalogKeepsDefaultAndAdjacentPins
+test/architecture/nats_server_pin_test.go: TestInfraNATSCatalogPinControls
+test/architecture/structural_budget_test.go: TestInfraStructuralBudgetControls
+test/architecture/structural_budget_test.go: TestInfraStructuralBudgetsAllOS
+test/architecture/upgrade_budget_pin_test.go: TestInfraBudgetPinControls
+test/architecture/upgrade_budget_pin_test.go: TestInfraBudgetsUseOneSource
+
+# section: infra-gate-timings
+# Hermetic architecture gates only, candidate 8c3e825 + P34 worktree diff.
+# Native product E1-E5 acceptance is NOT_RUN; these timings were measured concurrently with targeted regressions.
+# test source:symbol, native test result, measured seconds; no new runtime resource/leak rows.
+test/architecture/broker_image_contract_test.go:TestInfraImageSchemasExcludeLiveOwners	pass	3.01
+test/architecture/broker_image_contract_test.go:TestInfraImageStateControls	pass	0.01
+test/architecture/build_tags_test.go:TestInfraPlatformResponsibilitiesAllOS	fail	0.56
+test/architecture/build_tags_test.go:TestInfraBuildTagControls	pass	0.01
+test/architecture/ci_workflow_test.go:TestInfraReleaseArtifactsUseGuardedCI	fail	0
+test/architecture/ci_workflow_test.go:TestInfraReleaseArtifactControls	pass	0.01
+test/architecture/ctx_background_ledger_test.go:TestInfraContextRootsHaveNoLegacyExemptions	pass	0.4
+test/architecture/ctx_background_ledger_test.go:TestInfraContextRootControls	pass	0.01
+test/architecture/dataplane_lifetime_test.go:TestInfraDataplaneLifetimeControls	pass	0.08
+test/architecture/gate_registry_test.go:TestInfraGateRegistryHasLiveUnfilteredEntries	fail	0.01
+test/architecture/gate_registry_test.go:TestInfraGateRegistryControls	pass	0.02
+test/architecture/infra_contract_test.go:TestInfraContractDeclarationsStayFrozen	pass	2.95
+test/architecture/infra_contract_test.go:TestInfraContractGateControls	pass	0.23
+test/architecture/infra_contract_test.go:TestInfraDocumentationClaimsNeedReceipts	fail	0
+test/architecture/infra_contract_test.go:TestInfraDocumentationReceiptControls	pass	0.02
+test/architecture/infra_runtime_test.go:TestInfraHostCallersBindOwnedAdapters	fail	3.24
+test/architecture/infra_runtime_test.go:TestInfraAssetProducersHaveExactRoots	pass	6.7
+test/architecture/infra_runtime_test.go:TestInfraRuntimeScannerRootsAreLive	pass	5.85
+test/architecture/infra_runtime_test.go:TestInfraRuntimeGateControls	pass	0.22
+test/architecture/infra_supply_test.go:TestInfraInstallerOutputMatchesRuntime	fail	2.76
+test/architecture/infra_supply_test.go:TestInfraSupplyUsesCompiledArtifactsAndSharedSupervisor	fail	0.12
+test/architecture/infra_supply_test.go:TestInfraSupplyControls	pass	0.04
+test/architecture/layering_test.go:TestInfraLayeringAllOS	pass	2.59
+test/architecture/layering_test.go:TestInfraLayeringControls	pass	0.02
+test/architecture/nats_ping_defaults_test.go:TestInfraDialProfilesKeepPingContract	fail	12.53
+test/architecture/nats_ping_defaults_test.go:TestInfraPingProfileControls	pass	0
+test/architecture/nats_server_pin_test.go:TestInfraNATSCatalogKeepsDefaultAndAdjacentPins	pass	0.04
+test/architecture/nats_server_pin_test.go:TestInfraNATSCatalogPinControls	pass	0.01
+test/architecture/structural_budget_test.go:TestInfraStructuralBudgetsAllOS	fail	5.18
+test/architecture/structural_budget_test.go:TestInfraStructuralBudgetControls	pass	0.12
+test/architecture/upgrade_budget_pin_test.go:TestInfraBudgetsUseOneSource	fail	0
+test/architecture/upgrade_budget_pin_test.go:TestInfraBudgetPinControls	pass	0
+
+# section: infra-mutation-receipts
+# Each on-disk guard deletion: go test -race -count=1 -timeout 30m ./test/architecture -run ^<test>$ -v
+# Every mutation was restored; final ^TestInfra.*Controls$ returned rc0 (15 top-level tests, no skips).
+# mutation, source:test, observed native rc (1 means assertion-red, never compile-only).
+M31/installer_fields	test/architecture/infra_supply_test.go:TestInfraSupplyControls	1 assertion-red; restored
+M31/installer_renderer	test/architecture/infra_supply_test.go:TestInfraSupplyControls	1 assertion-red; restored
+M31/installer_socket	test/architecture/infra_supply_test.go:TestInfraSupplyControls	1 assertion-red; restored
+M31/asset_producers	test/architecture/infra_runtime_test.go:TestInfraRuntimeGateControls	1 assertion-red; restored
+M31/docs_command	test/architecture/infra_contract_test.go:TestInfraDocumentationReceiptControls	1 assertion-red; restored
+M31/contract	test/architecture/infra_contract_test.go:TestInfraContractGateControls	1 assertion-red; restored
+M31/runtime_call	test/architecture/infra_runtime_test.go:TestInfraRuntimeGateControls	1 assertion-red; restored
+M31/runtime_error	test/architecture/infra_runtime_test.go:TestInfraRuntimeGateControls	1 assertion-red; restored
+M31/host_binding	test/architecture/infra_runtime_test.go:TestInfraRuntimeGateControls	1 assertion-red; restored
+M31/structure	test/architecture/structural_budget_test.go:TestInfraStructuralBudgetControls	1 assertion-red; restored
+M31/root_closure	test/architecture/layering_test.go:TestInfraLayeringControls	1 assertion-red; restored
+M31/ctx	test/architecture/ctx_background_ledger_test.go:TestInfraContextRootControls	1 assertion-red; restored
+M31/lifetime	test/architecture/dataplane_lifetime_test.go:TestInfraDataplaneLifetimeControls	1 assertion-red; restored
+M31/platform_twin	test/architecture/build_tags_test.go:TestInfraBuildTagControls	1 assertion-red; restored
+M31/shell_budget	test/architecture/upgrade_budget_pin_test.go:TestInfraBudgetPinControls	1 assertion-red; restored
+M31/catalog_identity	test/architecture/nats_server_pin_test.go:TestInfraNATSCatalogPinControls	1 assertion-red; restored
+M31/ping	test/architecture/nats_ping_defaults_test.go:TestInfraPingProfileControls	1 assertion-red; restored
+M31/release_supply	test/architecture/infra_supply_test.go:TestInfraSupplyControls	1 assertion-red; restored
+M31/supervisor	test/architecture/infra_supply_test.go:TestInfraSupplyControls	1 assertion-red; restored
+M31/registry	test/architecture/gate_registry_test.go:TestInfraGateRegistryControls	1 assertion-red; restored
+M31/ci_needs	test/architecture/ci_workflow_test.go:TestInfraReleaseArtifactControls	1 assertion-red; restored
+M31/image	test/architecture/broker_image_contract_test.go:TestInfraImageStateControls	1 assertion-red; restored
+M31/docs_receipt	test/architecture/infra_contract_test.go:TestInfraDocumentationReceiptControls	1 assertion-red; restored

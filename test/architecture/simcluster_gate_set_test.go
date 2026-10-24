@@ -1,12 +1,17 @@
 package architecture
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // simcluster_gate_set_test.go — test/simcluster/tests/run-all.sh must run every hermetic script in its
@@ -194,4 +199,334 @@ if out=$(sh "$HERE/tool.sh" --check "$HERE/baseline.tsv" 2>&1); then printf 'PAS
 	if len(stale2) != 1 || !strings.HasPrefix(stale2[0], "alpha.sh") {
 		t.Errorf("excluded-but-run: got %v", stale2)
 	}
+}
+
+// Bind the three broker-specific selftests explicitly, as well as reconciling
+// the directory. Deleting both a script and its run-all word must still fail.
+// origin: hot-update S6 plan §13 / T58
+func brokerHermeticEntryProblem(runAll string, present map[string]bool) bool {
+	loop, explicit := runAllNames(runAll)
+	for _, name := range []string{"hot-update-broker-ledger-test", "hot-update-broker-probe-test", "hot-update-broker-drill-test"} {
+		count := 0
+		for _, entry := range append(loop, explicit...) {
+			if entry == name {
+				count++
+			}
+		}
+		if count != 1 || !present[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// Missing P29/P30 sources are a pending dependency, never an exclusion.
+// origin: hot-update S6 plan §13 / T58
+// gate-control: TestBrokerHermeticGateRegistrationControls
+func TestBrokerHermeticGateRegistration(t *testing.T) {
+	root := filepath.Join(repoRoot(t), simTestsDir)
+	raw, err := os.ReadFile(filepath.Join(root, simRunAll))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := map[string]bool{}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			present[strings.TrimSuffix(entry.Name(), ".sh")] = true
+		}
+	}
+	if brokerHermeticEntryProblem(string(raw), present) {
+		t.Fatal("S6 hermetic sources/entries missing or duplicated (pending P29/P30)")
+	}
+}
+
+// origin: hot-update S6 plan §11 / T58
+func TestBrokerHermeticGateRegistrationControls(t *testing.T) {
+	const good = "for t in hot-update-broker-ledger-test hot-update-broker-probe-test hot-update-broker-drill-test; do\n"
+	present := map[string]bool{"hot-update-broker-ledger-test": true, "hot-update-broker-probe-test": true, "hot-update-broker-drill-test": true}
+	if brokerHermeticEntryProblem(good, present) {
+		t.Fatal("positive entry rejected")
+	}
+	for name := range present {
+		broken := map[string]bool{}
+		for entry, value := range present {
+			if entry != name {
+				broken[entry] = value
+			}
+		}
+		if !brokerHermeticEntryProblem(good, broken) {
+			t.Fatal("removed script accepted")
+		}
+		missing := strings.Replace(good, name, "", 1)
+		if !brokerHermeticEntryProblem(missing, present) || !brokerHermeticEntryProblem(missing, broken) {
+			t.Fatal("removed gate/script pair accepted")
+		}
+		if !brokerHermeticEntryProblem(strings.Replace(good, name, name+" "+name, 1), present) {
+			t.Fatal("duplicate entry accepted")
+		}
+	}
+}
+
+// Pin the S9 sources as well as directory reconciliation. Removing a script
+// together with its dispatcher word must remain red; pending P32 is no waiver.
+// origin: hot-update S9 plan §9.3 / §12 P37 / T87 / M34
+var infraHermeticScripts = []string{
+	"lint-install-selftest", "hot-update-infra-supply-test", "hot-update-infra-drill-test",
+	"hot-update-infra-ledger-test", "hot-update-infra-fixture-test",
+}
+
+func infraHermeticEntryProblem(runAll string, present map[string]bool) bool {
+	loop, explicit := runAllNames(runAll)
+	for _, name := range infraHermeticScripts {
+		count := 0
+		for _, entry := range append(loop, explicit...) {
+			if entry == name {
+				count++
+			}
+		}
+		if count != 1 || !present[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// origin: hot-update S9 plan §12 P37 / T87 / M34
+// gate-control: TestInfraHermeticGateRegistrationControls
+func TestInfraHermeticGateRegistration(t *testing.T) {
+	dir := filepath.Join(repoRoot(t), simTestsDir)
+	raw, err := os.ReadFile(filepath.Join(dir, simRunAll))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := map[string]bool{}
+	for _, name := range infraHermeticScripts {
+		info, err := os.Stat(filepath.Join(dir, name+".sh"))
+		present[name] = err == nil && info.Mode().IsRegular()
+	}
+	if infraHermeticEntryProblem(string(raw), present) {
+		t.Fatal("S9 hermetic source/entry missing or duplicated; NOT_RUN pending P32 if hot-update-infra-fixture-test.sh is absent")
+	}
+}
+
+// The same comparison catches deletion, paired deletion and duplicate entries.
+// origin: hot-update S9 plan §12 P37 / T87 / M34
+func TestInfraHermeticGateRegistrationControls(t *testing.T) {
+	if len(infraHermeticScripts) != 5 {
+		t.Fatal("infra control source set must retain all five owned/prerequisite entries")
+	}
+	good := "for t in " + strings.Join(infraHermeticScripts, " ") + "; do\n"
+	present := map[string]bool{}
+	for _, name := range infraHermeticScripts {
+		present[name] = true
+	}
+	if infraHermeticEntryProblem(good, present) {
+		t.Fatal("positive infra registration rejected")
+	}
+	// Test the real dispatcher membership even while P32's source is pending.
+	// Source existence remains the separate, non-waived registration gate.
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), simTestsDir, simRunAll))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if infraHermeticEntryProblem(string(raw), present) {
+		t.Fatal("real run-all is missing or duplicating an infra control entry")
+	}
+	for _, name := range infraHermeticScripts {
+		t.Run(name, func(t *testing.T) {
+			broken := map[string]bool{}
+			for entry, value := range present {
+				broken[entry] = value && entry != name
+			}
+			missing := strings.Replace(good, name, "", 1)
+			if !infraHermeticEntryProblem(good, broken) || !infraHermeticEntryProblem(missing, present) ||
+				!infraHermeticEntryProblem(missing, broken) {
+				t.Fatal("missing gate or source/gate pair accepted")
+			}
+			if !infraHermeticEntryProblem(strings.Replace(good, name, name+" "+name, 1), present) {
+				t.Fatal("duplicate gate accepted")
+			}
+		})
+	}
+}
+
+// T87 consumes P36's actual ledger through the registered script. Its control
+// archives do not replace the candidate/source/native receipts of check().
+// origin: hot-update S9 plan §9.2 / §12 P37 / T87
+// gate-control: TestInfraLedgerRequiresNativeEvidenceControls
+func TestInfraLedgerRequiresNativeEvidence(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "sh", filepath.Join(repoRoot(t), simTestsDir, "hot-update-infra-ledger-test.sh"), "all")
+	output, err := testharness.CombinedOutput(cmd)
+	if err != nil {
+		t.Fatalf("infra ledger native-evidence check: %v\n%s", err, output)
+	}
+}
+
+// origin: hot-update S9 plan §12 P37 / T87 / M34
+func TestInfraLedgerRequiresNativeEvidenceControls(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "sh", filepath.Join(repoRoot(t), simTestsDir, "hot-update-infra-ledger-test.sh"), "controls")
+	output, err := testharness.CombinedOutput(cmd)
+	if err != nil {
+		t.Fatalf("infra ledger native-evidence controls: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "infra ledger controls: PASS") {
+		t.Fatalf("infra ledger controls did not exercise archives:\n%s", output)
+	}
+}
+
+// Extract only the dispatcher function. Executing run-all would also run the
+// full gate set; these fixtures prove interpreter and supervision semantics.
+// origin: hot-update S9 plan §9.5 / §12 P37 / T88 / M34
+func TestSimclusterGateSetHonorsShebangUnderSupervisor(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, simTestsDir, simRunAll))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := regexp.MustCompile(`(?ms)^run_script\(\) \{\n.*?^}`).FindString(string(raw))
+	if dispatch == "" {
+		t.Fatal("real shebang dispatcher is missing")
+	}
+	dir := t.TempDir()
+	supervisor := filepath.Join(dir, "supervise")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", supervisor, "./test/fullstackharness/cmd/supervise")
+	build.Dir = root
+	if output, err := testharness.CombinedOutput(build); err != nil {
+		t.Fatalf("build shared supervisor: %v\n%s", err, output)
+	}
+	for _, fixture := range []struct {
+		name, source string
+		want         string
+		refuse       bool
+	}{
+		{"posix", "#!/bin/sh\nprintf '%s\\n' \"posix:$1\"\n", "posix:argument", false},
+		{"bash", "#!/usr/bin/env bash\n[[ $1 == argument ]] || exit 99\nprintf 'bash\\n'\n", "bash", false},
+		{"python", "#!/usr/bin/env python3\nimport sys\nassert sys.flags.isolated and sys.flags.dont_write_bytecode\nprint('python:'+sys.argv[1])\n", "python:argument", false},
+		{"custody", "#!/usr/bin/env python3\nimport os\nassert os.readlink('/proc/%d/exe' % os.getppid()) == os.environ['P37_EXPECTED_SUPERVISOR']\nprint('custody')\n", "custody", false},
+		{"unknown", "#!/usr/bin/env false\n", "", true},
+		{"missing", "printf 'must never execute\\n'\n", "", true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			path := filepath.Join(dir, fixture.name+".sh")
+			if err := os.WriteFile(path, []byte(fixture.source), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), "sh", "-c", dispatch+"\nrun_script \"$1\" argument\n", "dispatch-control", path)
+			cmd.Env = append(os.Environ(), "SIM_UPGRADE_SUPERVISOR="+supervisor, "P37_EXPECTED_SUPERVISOR="+supervisor)
+			output, err := testharness.CombinedOutput(cmd)
+			if fixture.refuse {
+				if err == nil || !strings.Contains(string(output), "unsupported or missing shebang") {
+					t.Fatalf("unknown interpreter accepted: %v\n%s", err, output)
+				}
+			} else if err != nil || strings.TrimSpace(string(output)) != fixture.want {
+				t.Fatalf("shebang dispatch: %v\n%s", err, output)
+			}
+		})
+	}
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", dispatch+"\nrun_script \"$1\" argument\n", "dispatch-control", filepath.Join(dir, "posix.sh"))
+	cmd.Env = append(os.Environ(), "SIM_UPGRADE_SUPERVISOR="+filepath.Join(dir, "absent"))
+	output, err := testharness.CombinedOutput(cmd)
+	if err == nil || !strings.Contains(string(output), "shared supervisor is required") {
+		t.Fatalf("missing supervisor accepted: %v\n%s", err, output)
+	}
+}
+
+// S10 hermetic registration, the static half of plan §12.3. run-all invokes each
+// fullstack wrapper exactly once and keeps the installer lint entry; the
+// fullstack wrappers on disk equal the registered set both ways; every
+// discovered S10 Python selftest is declared by a required-test row of P32's
+// runner and no row names a dead file. P32 executes and reconciles receipts; a
+// selftest dropped from both the runner and its declaration stays red here.
+// origin: hot-update S10 plan §12.3 / §10.2 P32 / P28
+// gate-control: TestFullstackHermeticGateRegistrationControls
+var fullstackHermeticScripts = []string{"hot-update-fullstack-test", "hot-update-fullstack-logs-test", "lint-install"}
+
+var fullstackRequiredTestRe = regexp.MustCompile(`(?m)^# required-test (\S+) \S+$`)
+
+func checkFullstackHermetic(tree fullstackTree) (int, error) {
+	runAll := tree.files[simTestsDir+"/"+simRunAll]
+	if runAll == "" {
+		return 0, fmt.Errorf("empty hermetic root %s/%s", simTestsDir, simRunAll)
+	}
+	loop, explicit := runAllNames(runAll)
+	for _, name := range fullstackHermeticScripts {
+		if n := len(slices.DeleteFunc(append(slices.Clone(loop), explicit...), func(entry string) bool { return entry != name })); n != 1 {
+			return 0, fmt.Errorf("run-all must invoke %s exactly once, found %d", name, n)
+		}
+		if tree.files[simTestsDir+"/"+name+".sh"] == "" {
+			return 0, fmt.Errorf("missing S10 hermetic source %s.sh", name)
+		}
+	}
+	declared, discovered := map[string]bool{}, 0
+	for path := range tree.files {
+		dir, base := fullstackDir(path), fullstackBase(path)
+		if dir == simTestsDir && strings.HasSuffix(base, ".sh") && strings.Contains(base, "fullstack") &&
+			!slices.Contains(fullstackHermeticScripts, strings.TrimSuffix(base, ".sh")) {
+			return 0, fmt.Errorf("unregistered S10 hermetic wrapper %s", path)
+		}
+	}
+	for _, m := range fullstackRequiredTestRe.FindAllStringSubmatch(tree.files[simTestsDir+"/hot-update-fullstack-test.sh"], -1) {
+		if tree.files["test/simcluster/"+m[1]] == "" {
+			return 0, fmt.Errorf("dead required-test row names %s", m[1])
+		}
+		declared[m[1]] = true
+	}
+	// The same discovery rule as P32's runner (discovered_selftests).
+	for _, path := range brokerSortedSourcePaths(tree.files) {
+		rel := strings.TrimPrefix(path, "test/simcluster/")
+		base := fullstackBase(rel)
+		if dir := fullstackDir(rel); dir != "drills/lib" && dir != "lib" && dir != "tests" || rel == path {
+			continue
+		}
+		if strings.HasPrefix(base, "fullstack_") && strings.HasSuffix(base, "_test.py") ||
+			strings.HasPrefix(base, "fullstack-") && strings.HasSuffix(base, "-test.py") || base == "hot-update-fullstack-test.py" {
+			discovered++
+			if !declared[rel] {
+				return 0, fmt.Errorf("undeclared S10 Python selftest %s", rel)
+			}
+		}
+	}
+	if discovered == 0 {
+		return 0, fmt.Errorf("empty S10 Python selftest root")
+	}
+	return discovered, nil
+}
+
+// origin: hot-update S10 plan §12.3 / P28
+func TestFullstackHermeticGateRegistration(t *testing.T) {
+	discovered, err := checkFullstackHermetic(fullstackRepoTree(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("S10 Python selftests declared and discovered: %d", discovered)
+}
+
+// Every mutation edits a copied real run-all, wrapper or selftest on disk.
+// origin: hot-update S10 plan §10.2 P28 / §12.3
+func TestFullstackHermeticGateRegistrationControls(t *testing.T) {
+	if !slices.Equal(fullstackHermeticScripts, []string{"hot-update-fullstack-test", "hot-update-fullstack-logs-test", "lint-install"}) {
+		t.Fatal("S10 hermetic entry set drifted")
+	}
+	real := fullstackRepoTree(t)
+	root := fullstackFixture(t, real, simTestsDir, "test/simcluster/drills/lib", "test/simcluster/lib")
+	check := func() error {
+		_, err := checkFullstackHermetic(readFullstackTree(t, root))
+		return err
+	}
+	const runAll, runner = simTestsDir + "/" + simRunAll, simTestsDir + "/hot-update-fullstack-test.sh"
+	proveFullstackMutations(t, root, check,
+		fullstackMutation{path: runAll, old: " hot-update-fullstack-logs-test ", new: " ", want: "hot-update-fullstack-logs-test exactly once, found 0"},
+		fullstackMutation{path: runAll, old: " hot-update-fullstack-test ", new: " hot-update-fullstack-test hot-update-fullstack-test ", want: "hot-update-fullstack-test exactly once, found 2"},
+		fullstackMutation{path: runAll, old: " lint-install lint-install-selftest ", new: " lint-install-selftest ", want: "lint-install exactly once, found 0"},
+		fullstackMutation{path: simTestsDir + "/hot-update-fullstack-logs-test.sh", remove: true, want: "missing S10 hermetic source"},
+		fullstackMutation{path: simTestsDir + "/hot-update-fullstack-extra-test.sh", new: "#!/bin/sh\nexit 0\n", want: "unregistered S10 hermetic wrapper"},
+		fullstackMutation{path: "test/simcluster/drills/lib/fullstack_extra_test.py", new: "#!/usr/bin/env python3\n", want: "undeclared S10 Python selftest drills/lib/fullstack_extra_test.py"},
+		fullstackMutation{path: "test/simcluster/lib/fullstack-extra-test.py", new: "#!/usr/bin/env python3\n", want: "undeclared S10 Python selftest lib/fullstack-extra-test.py"},
+		fullstackMutation{path: runner, new: "# required-test drills/lib/fullstack_missing_test.py MissingTest.test_gone\n", want: "dead required-test row"},
+		fullstackMutation{path: "test/simcluster/drills/lib/fullstack_observation_test.py", remove: true, want: "dead required-test row names drills/lib/fullstack_observation_test.py"},
+	)
 }

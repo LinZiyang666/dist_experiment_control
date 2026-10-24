@@ -1,0 +1,1338 @@
+# S10 observation source inventory; registration is not execution evidence.
+# Sections retain the owning protocol namespace and actual producers/consumers.
+# origin: hot-update S10 plan §5.3 / §12.2 / P29; ledger pass 4
+# section: producer-consumer
+# schema<TAB>field<TAB>producer<TAB>consumer<TAB>owner
+fullstack-log-raw-v1	fence_ns	fullstack_logs.Capture._archive	fullstack_logs.verify	P09
+fullstack-log-raw-v1	sequence	fullstack_logs.Capture._archive	fullstack_logs.verify	P09
+fullstack-log-raw-v1	snapshot.kind	fullstack_logs.FileStream.snapshot/JournalStream.snapshot	fullstack_logs.verify	P09
+fullstack-log-raw-v1	snapshot.parts[].path	fullstack_logs.FileTrack.snapshot	fullstack_logs.verify	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].bytes	fullstack_logs.FileTrack.snapshot	fullstack_logs.position/file_bytes	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].data	fullstack_logs.FileTrack.snapshot	fullstack_logs.file_bytes	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].device	fullstack_logs.FileTrack.snapshot	fullstack_logs.position/verify	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].inode	fullstack_logs.FileTrack.snapshot	fullstack_logs.position/verify	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].rotation	fullstack_logs.FileTrack.snapshot	fullstack_logs.verify	P09
+fullstack-log-raw-v1	snapshot.parts[].segments[].sha	fullstack_logs.FileTrack.snapshot	fullstack_logs.file_bytes	P09
+fullstack-log-raw-v1	snapshot.reader_rc	fullstack_logs.JournalStream.snapshot	fullstack_logs.verify	P09
+fullstack-log-raw-v1	snapshot.rows[].MESSAGE	fullstack_logs.JournalStream.poll	fullstack_logs.JournalStream.poll/verify	P09
+fullstack-log-raw-v1	snapshot.rows[]._BOOT_ID	fullstack_logs.JournalStream.poll	fullstack_logs.JournalStream.poll/verify	P09
+fullstack-log-raw-v1	snapshot.rows[]._SYSTEMD_INVOCATION_ID	fullstack_logs.JournalStream.poll	fullstack_logs.JournalStream.poll/verify	P09
+fullstack-log-raw-v1	snapshot.rows[]._SYSTEMD_UNIT|UNIT	fullstack_logs.JournalStream.poll	fullstack_logs.JournalStream.poll/verify	P09
+fullstack-log-raw-v1	snapshot.rows[].__CURSOR	fullstack_logs.JournalStream.poll	fullstack_logs.position/verify	P09
+fullstack-log-raw-v1	stream	fullstack_logs.Capture._archive	fullstack_logs.verify	P09
+fullstack-log-raw-v1	version	fullstack_logs.Capture._archive	fullstack_logs.raw_document	P09
+runtime-sample-v1	At	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.BootID	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.CutID	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.InstanceID	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.PIDNS	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.ScopeDigest	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Data.Unknown	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Digest	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Nonce	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[0].schema	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[10].courier_pending	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[11].consumer_count	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[12].temp_count	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[13].upgrade_lock_count	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[14].old_owner_count	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[15].sample_sequence	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[1].pid	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[2].start_ticks	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[3].generation	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[4].goroutines	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[5].fd_count	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[6].replay_reserved	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[7].active_exec	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[8].active_pty	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+runtime-sample-v1	Values[9].retained_records	internal/drillobserve/receipt/runtime.go:EncodeRuntimeSample	internal/drillobserve/receipt/runtime.go:DecodeRuntimeSample	P06
+
+# S9 INSTRUMENTS-5: source-pinned deployment schemas; exporters remain separately pending.
+# origin: hot-update S9 plan §9.1 / P35; S9 INSTRUMENTS-5 request 8-9
+infra-deployment-producers-v1	fault_actions	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	fault_events	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	final_sources	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	flow	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	nats_monitors	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	nodes	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	observers	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	phase	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	physical	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	product	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	schema	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	sim	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1	supervisor	deployment owner / infra_deployment_plan.create_plan	infra_deployment_plan.read_plan/validate_plan	S9/P32
+infra-deployment-producers-v1.phase_export	action	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	component	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	context_sha256	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	events	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	hop	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	node	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	phase	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	step	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_export	tx	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.journal_export	revision	separate actual root / transaction readers	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.journal_export	step	separate actual root / transaction readers	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.journal_export	tx	separate actual root / transaction readers	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.started	at_ns	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.started	before	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.started	config	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.started	kind	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.temporary	at_ns	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.temporary	kind	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.temporary	process	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.main_ready	at_ns	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.main_ready	kind	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.main_ready	socket	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.returned	at_ns	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.returned	kind	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.finished	at_ns	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.finished	config	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.phase_event.finished	kind	original product phase exporter	infra_deployment_phase.project	S9/P32
+infra-deployment-producers-v1.fault_export	context_sha256	actual deployment injector	infra_deployment_faults.status	S9/P32
+infra-deployment-producers-v1.fault_export	events	actual deployment injector	infra_deployment_faults.status	S9/P32
+infra-deployment-producers-v1.fault_export	point	actual deployment injector	infra_deployment_faults.status	S9/P32
+infra-deployment-producers-v1.compound_event	effect_ns	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.compound_event	facts	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.compound_event	point	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.compound_event	reply_cut_ns	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.compound_event	request_digest	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.compound_event	sent_ns	actual original relay / process owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.ldm_facts	ldm_applied_ns	actual LDM injector	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	copied_sha256	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	copy_finished_ns	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	copy_started_ns	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	late_write_ns	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	old_writer_exit_ns	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	warm_copy_finished_ns	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.acme_facts	written_sha256	actual ACME syscall observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	controller_death_ns	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	controller_wait	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	main_failure_ns	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	main_wait	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	samples	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_facts	shadow	actual process supervisor / physical observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.native_wait	at_ns	original process wait owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.native_wait	process	original process wait owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.native_wait	reaped	original process wait owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.native_wait	wait_status	original process wait owner	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_sample	at_ns	actual P02 / protocol observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_sample	process	actual P02 / protocol observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.shadow_sample	serving	actual P02 / protocol observer	infra_deployment_faults.compound_status	S9/P32
+infra-deployment-producers-v1.final_sources	business	deployment owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_sources	controls	deployment owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_sources	flow	deployment owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_sources	phase_lanes	deployment owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_flow	custodian	original S5 custody owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_flow	evidence	original S5 custody owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.final_flow	logs	original S5 custody owner	infra_deployment_final.admit/collect	S9/P32
+infra-deployment-producers-v1.control_export	context_sha256	actual control effect exporter	infra_deployment_final.collect	S9/P32
+infra-deployment-producers-v1.control_export	events	actual control effect exporter	infra_deployment_final.collect	S9/P32
+infra-deployment-producers-v1.control_event	at_ns	actual control effect exporter	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_event	facts	actual control effect exporter	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_event	op	actual control effect exporter	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	ack	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	cols	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	observed_cols	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	observed_rows	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	rows	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.resize	seq	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	ack	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	observed_signal	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	observed_target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	seq	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	signal	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.signal	target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.keepalive_lost_ack	effect_ns	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.keepalive_lost_ack	reply_cut_ns	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.keepalive_lost_ack	request_digest	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.keepalive_lost_ack	sent_ns	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.input	applied_bytes	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.input	applied_sha256	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.input	sent_bytes	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.input	sent_sha256	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.output	produced_bytes	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.output	produced_sha256	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.output	received_bytes	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.output	received_sha256	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.ps_victim	observed_target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.ps_victim	observed_task_id	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.ps_victim	target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.ps_victim	task_id	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.kill_victim	exited	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.kill_victim	target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.kill_victim	wait_status	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.kill_victim	waited_target	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.revoke_alice	applied_revision	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.revoke_alice	replayed_bytes	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.revoke_alice	revision	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.control_facts.revoke_alice	revoked	actual target / original native waiter / relay	infra_deployment_final.control	S9/P32
+infra-deployment-producers-v1.raw_log_digest	length	infra_deployment_final.collect	receipt consumer	S9/P32
+infra-deployment-producers-v1.raw_log_digest	sha256	infra_deployment_final.collect	receipt consumer	S9/P32
+infra-config-stage-plan-v1	config_root	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	configs	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	flow	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	nodes	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	observers	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	schema	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	sim	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-config-stage-plan-v1	supervisor	P26 actual deployment / infra_config_stage.create_plan	infra_config_stage.validate_plan/read_plan/stage	S9/P32
+infra-s7-phase-binding	transfer_id	original S7 custodian	infra_s7_lanes / infra_native_targets	S9/P32
+infra-s7-phase-lane	effect	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+infra-s7-phase-lane	events	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+infra-s7-phase-lane	hop	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+infra-s7-phase-lane	lane	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+infra-s7-phase-lane	reply_cut	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+infra-s7-phase-lane	sent	original S7 custodian plus actual lost-ACK injector	infra_s7_lanes / P32	S9/P32
+
+# section: actual-go-fields
+# file:Type.field<TAB>source tag (or -)<TAB>source Go type
+# Exact fields from actual S10 harness/contract, runtime-sample and store-witness
+# declarations, including private memory owners. This is not a sealed-codec claim.
+internal/drillobserve/receipt/runtime.go:RuntimeBinding.Domain	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeBinding.Generation	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeBinding.InstanceID	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.ActiveExec	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.ActivePTY	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.AtBootNS	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Binding	-	RuntimeBinding
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.BootID	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Consumers	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.CourierPending	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.CutID	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.ExeSHA	-	[32]byte
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.FDs	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Goroutines	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Nonce	-	[12]byte
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.OldOwners	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.PID	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.PIDNS	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.ReplayReserved	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.RetainedRecords	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.ScopeDigest	-	string
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Sequence	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.StartTicks	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Temps	-	uint64
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.Unknown	-	uint16
+internal/drillobserve/receipt/runtime.go:RuntimeCounters.UpgradeLocks	-	uint64
+internal/drillobserve/runtime_sample.go:runtimeRequest.at	-	uint64
+internal/drillobserve/runtime_sample.go:runtimeRequest.nonce	-	[12]byte
+internal/drillobserve/runtime_sample.go:runtimeRequest.scope	-	[32]byte
+internal/storewitness/witness.go:Contender.closeOnce	-	sync.Once
+internal/storewitness/witness.go:Contender.done	-	chan struct{}
+internal/storewitness/witness.go:Contender.err	-	error
+internal/storewitness/witness.go:Contender.file	-	*os.File
+internal/storewitness/witness.go:Contender.mu	-	sync.Mutex
+internal/storewitness/witness.go:Contender.path	-	string
+internal/storewitness/witness.go:Contender.receipt	-	LockReceipt
+internal/storewitness/witness.go:Contender.stop	-	chan struct{}
+internal/storewitness/witness.go:LockReceipt.Acquired	-	uint64
+internal/storewitness/witness.go:LockReceipt.Attempts	-	uint64
+internal/storewitness/witness.go:LockReceipt.Device	-	uint64
+internal/storewitness/witness.go:LockReceipt.FirstAcquiredAttempt	-	uint64
+internal/storewitness/witness.go:LockReceipt.Inode	-	uint64
+internal/storewitness/witness.go:Receipt.Nonce	-	[12]byte
+internal/storewitness/witness.go:Receipt.Rows	-	[]Row
+internal/storewitness/witness.go:Receipt.ScopeDigest	-	[32]byte
+internal/storewitness/witness.go:Receipt.Stamp	-	Stamp
+internal/storewitness/witness.go:Registration.Device	-	uint64
+internal/storewitness/witness.go:Registration.Inode	-	uint64
+internal/storewitness/witness.go:Registration.Keys	-	[]string
+internal/storewitness/witness.go:Registration.Nonce	-	[12]byte
+internal/storewitness/witness.go:Registration.ScopeDigest	-	[32]byte
+internal/storewitness/witness.go:Row.Digest	-	[32]byte
+internal/storewitness/witness.go:Row.Key	-	string
+internal/storewitness/witness.go:Row.Null	-	bool
+internal/storewitness/witness.go:Row.Present	-	bool
+internal/storewitness/witness.go:Stamp.AppliedIndex	-	uint64
+internal/storewitness/witness.go:Stamp.AppliedTerm	-	uint64
+internal/storewitness/witness.go:Stamp.Device	-	uint64
+internal/storewitness/witness.go:Stamp.Inode	-	uint64
+internal/storewitness/witness.go:Stamp.Journal	-	string
+internal/storewitness/witness.go:Stamp.Readers	-	uint32
+internal/storewitness/witness.go:Stamp.SchemaDigest	-	[32]byte
+internal/storewitness/witness.go:Stamp.Synchronous	-	int
+internal/storewitness/witness.go:Stamp.Writers	-	uint32
+internal/storewitness/witness.go:Witness.registration	-	Registration
+test/fullstackharness/custody.go:BrokerCustodyOptions.BootNow	-	func() (int64, error)
+test/fullstackharness/custody.go:BrokerCustodyOptions.Current	-	func(context.Context, contract.Key, string) (contract.Stamp, error)
+test/fullstackharness/custody.go:BrokerCustodyOptions.EvidenceRoot	-	string
+test/fullstackharness/custody.go:BrokerCustodyOptions.Owners	-	func(context.Context, contract.Stamp) (contract.Sample, error)
+test/fullstackharness/custody.go:BrokerCustodyOptions.Path	-	string
+test/fullstackharness/custody.go:BrokerCustodyOptions.Peer	-	BrokerPeerReader
+test/fullstackharness/custody.go:CustodyCollector.busy	-	map[contract.Key]bool
+test/fullstackharness/custody.go:CustodyCollector.closeDone	-	chan struct{}
+test/fullstackharness/custody.go:CustodyCollector.closed	-	bool
+test/fullstackharness/custody.go:CustodyCollector.joined	-	bool
+test/fullstackharness/custody.go:CustodyCollector.mu	-	sync.Mutex
+test/fullstackharness/custody.go:CustodyCollector.nonces	-	map[contract.Key]map[string]bool
+test/fullstackharness/custody.go:CustodyCollector.poison	-	error
+test/fullstackharness/custody.go:CustodyCollector.sources	-	map[contract.Key]contract.Snapshotter
+test/fullstackharness/custody.go:brokerCustodyArchive.bytes	-	int64
+test/fullstackharness/custody.go:brokerCustodyArchive.mu	-	sync.Mutex
+test/fullstackharness/custody.go:brokerCustodyArchive.poison	-	bool
+test/fullstackharness/custody.go:brokerCustodyArchive.root	-	string
+test/fullstackharness/custody.go:brokerCustodyEvidence.After	`json:"after"`	json.RawMessage
+test/fullstackharness/custody.go:brokerCustodyEvidence.Before	`json:"before"`	json.RawMessage
+test/fullstackharness/custody.go:brokerCustodyEvidence.Owners	`json:"owners"`	json.RawMessage
+test/fullstackharness/custody.go:brokerCustodyEvidence.PeerPID	`json:"peer_pid"`	int
+test/fullstackharness/custody.go:brokerCustodyEvidence.PeerUID	`json:"peer_uid"`	uint32
+test/fullstackharness/custody.go:brokerCustodyEvidence.ReceivedNS	`json:"received_ns"`	int64
+test/fullstackharness/custody.go:brokerCustodyEvidence.Response	`json:"response_bytes"`	[]byte
+test/fullstackharness/custody.go:brokerCustodyEvidence.ResponseComplete	`json:"response_complete"`	bool
+test/fullstackharness/custody.go:brokerCustodyEvidence.Schema	`json:"schema"`	string
+test/fullstackharness/custody.go:brokerCustodyEvidence.SentNS	`json:"sent_ns"`	int64
+test/fullstackharness/custody.go:brokerCustodyEvidence.SourceKind	`json:"source_kind"`	string
+test/fullstackharness/driver.go:ProductCLICommand.Backup	-	contract.RawRef
+test/fullstackharness/driver.go:ProductCLICommand.BinarySHA	-	contract.Digest
+test/fullstackharness/driver.go:ProductCLICommand.BindingID	-	string
+test/fullstackharness/driver.go:ProductCLICommand.Home	-	string
+test/fullstackharness/driver.go:ProductCLICommand.Stamp	-	func(context.Context, upgradetx.Stamp) (contract.Stamp, error)
+test/fullstackharness/driver.go:ProductCLICommand.Values	-	map[string]string
+test/fullstackharness/driver.go:ProductCLICommand.VerifyBackup	-	func(context.Context, contract.Key, contract.RawRef) error
+test/fullstackharness/driver.go:productBinding.Action	`json:"action"`	string
+test/fullstackharness/driver.go:productBinding.Argv	`json:"argv"`	[]string
+test/fullstackharness/driver.go:productBinding.Help	`json:"help"`	json.RawMessage
+test/fullstackharness/driver.go:productBinding.ID	`json:"id"`	string
+test/fullstackharness/driver.go:productBinding.RawViewSchema	`json:"raw_view_schema"`	string
+test/fullstackharness/driver.go:productBinding.Role	`json:"role"`	string
+test/fullstackharness/driver.go:productBinding.TimeoutNS	`json:"timeout_ns"`	int64
+test/fullstackharness/driver.go:productBindings.Bindings	`json:"bindings"`	[]productBinding
+test/fullstackharness/driver.go:productBindings.Version	`json:"version"`	int
+test/fullstackharness/driver.go:productDriver.bindings	-	map[string]productBinding
+test/fullstackharness/driver.go:productDriver.commands	-	map[string]ProductCLICommand
+test/fullstackharness/driver.go:productDriver.last	-	map[contract.Key]contract.Stamp
+test/fullstackharness/driver.go:productDriver.mu	-	sync.Mutex
+test/fullstackharness/driver.go:productDriver.profile	-	contract.Profile
+test/fullstackharness/driver.go:productDriver.seen	-	map[string]bool
+test/fullstackharness/fixture.go:FixtureStepManifest.Obligations	-	map[string][]string
+test/fullstackharness/fixture.go:FixtureStepManifest.Steps	-	[]contract.Step
+test/fullstackharness/fixture.go:commandFixture.cmd	-	*exec.Cmd
+test/fullstackharness/fixture.go:commandFixture.done	-	chan struct{}
+test/fullstackharness/fixture.go:commandFixture.driver	-	contract.Driver
+test/fullstackharness/fixture.go:commandFixture.failure	-	error
+test/fullstackharness/fixture.go:commandFixture.input	-	io.WriteCloser
+test/fullstackharness/fixture.go:commandFixture.mu	-	sync.Mutex
+test/fullstackharness/fixture.go:commandFixture.output	-	*bufio.Reader
+test/fullstackharness/fixture.go:commandFixture.profile	-	contract.Profile
+test/fullstackharness/fixture.go:commandFixture.sealed	-	[]byte
+test/fullstackharness/fixture.go:commandFixture.seq	-	uint64
+test/fullstackharness/fixture.go:commandFixture.state	-	string
+test/fullstackharness/fixture.go:commandFixture.waitErr	-	error
+test/fullstackharness/identity_linux.go:ExecutableIdentity.Device	`json:"device"`	uint64
+test/fullstackharness/identity_linux.go:ExecutableIdentity.Inode	`json:"inode"`	uint64
+test/fullstackharness/identity_linux.go:ExecutableIdentity.SHA	`json:"sha"`	contract.Digest
+test/fullstackharness/identity_linux.go:ExecutableRead.After	-	contract.Stamp
+test/fullstackharness/identity_linux.go:ExecutableRead.Before	-	contract.Stamp
+test/fullstackharness/identity_linux.go:ExecutableRead.Current	-	ExecutableIdentity
+test/fullstackharness/identity_linux.go:ExecutableRead.Original	-	ExecutableIdentity
+test/fullstackharness/identity_linux.go:ExecutableRead.exe	-	*os.File
+test/fullstackharness/identity_linux.go:ExecutableRead.mu	-	sync.Mutex
+test/fullstackharness/identity_linux.go:ExecutableRead.pidfd	-	*os.File
+test/fullstackharness/identity_linux.go:executableEvidence.Device	`json:"device"`	uint64
+test/fullstackharness/identity_linux.go:executableEvidence.Inode	`json:"inode"`	uint64
+test/fullstackharness/identity_linux.go:executableEvidence.SHA	`json:"sha"`	string
+test/fullstackharness/identity_linux.go:identityEvidence.After	`json:"after"`	json.RawMessage
+test/fullstackharness/identity_linux.go:identityEvidence.Before	`json:"before"`	json.RawMessage
+test/fullstackharness/identity_linux.go:identityEvidence.Current	`json:"current"`	executableEvidence
+test/fullstackharness/identity_linux.go:identityEvidence.Original	`json:"original"`	executableEvidence
+test/fullstackharness/identity_linux.go:identityEvidence.Product	`json:"product"`	json.RawMessage
+test/fullstackharness/identity_linux.go:identityEvidence.Schema	`json:"schema"`	string
+test/fullstackharness/identity_linux.go:kernelSnapshotter.active	-	int
+test/fullstackharness/identity_linux.go:kernelSnapshotter.busy	-	map[contract.Key]bool
+test/fullstackharness/identity_linux.go:kernelSnapshotter.cancel	-	context.CancelFunc
+test/fullstackharness/identity_linux.go:kernelSnapshotter.closeErr	-	error
+test/fullstackharness/identity_linux.go:kernelSnapshotter.closed	-	bool
+test/fullstackharness/identity_linux.go:kernelSnapshotter.ctx	-	context.Context
+test/fullstackharness/identity_linux.go:kernelSnapshotter.joined	-	chan struct{}
+test/fullstackharness/identity_linux.go:kernelSnapshotter.mu	-	sync.Mutex
+test/fullstackharness/identity_linux.go:kernelSnapshotter.pending	-	map[contract.Key]pendingIdentity
+test/fullstackharness/identity_linux.go:kernelSnapshotter.root	-	string
+test/fullstackharness/identity_linux.go:kernelSnapshotter.sources	-	map[contract.Key]SampleSource
+test/fullstackharness/identity_linux.go:pendingIdentity.raw	-	contract.RawRef
+test/fullstackharness/identity_linux.go:pendingIdentity.read	-	*ExecutableRead
+test/fullstackharness/identity_other.go:ExecutableIdentity.Device	`json:"device"`	uint64
+test/fullstackharness/identity_other.go:ExecutableIdentity.Inode	`json:"inode"`	uint64
+test/fullstackharness/identity_other.go:ExecutableIdentity.SHA	`json:"sha"`	contract.Digest
+test/fullstackharness/identity_other.go:ExecutableRead.After	-	contract.Stamp
+test/fullstackharness/identity_other.go:ExecutableRead.Before	-	contract.Stamp
+test/fullstackharness/identity_other.go:ExecutableRead.Current	-	ExecutableIdentity
+test/fullstackharness/identity_other.go:ExecutableRead.Original	-	ExecutableIdentity
+test/fullstackharness/identity_other.go:OFDProof.CurrentFD	-	int
+test/fullstackharness/identity_other.go:OFDProof.Flags	-	uint64
+test/fullstackharness/identity_other.go:OFDProof.OriginalFD	-	int
+test/fullstackharness/identity_other.go:OFDProof.Owner	-	contract.Stamp
+test/fullstackharness/identity_other.go:OFDProof.SocketCookie	-	uint64
+test/fullstackharness/identity_other.go:OFDProof.WitnessFD	-	int
+test/fullstackharness/infra.go:InfraBinding.Leg	-	string
+test/fullstackharness/infra.go:InfraBinding.Original	-	contract.Process
+test/fullstackharness/infra.go:InfraBinding.Participant	-	c.ID
+test/fullstackharness/infra.go:InfraBinding.WorkloadID	-	string
+test/fullstackharness/infra.go:InfraCollector.cancel	-	context.CancelFunc
+test/fullstackharness/infra.go:InfraCollector.closed	-	bool
+test/fullstackharness/infra.go:InfraCollector.ctx	-	context.Context
+test/fullstackharness/infra.go:InfraCollector.failure	-	error
+test/fullstackharness/infra.go:InfraCollector.mu	-	sync.Mutex
+test/fullstackharness/infra.go:InfraCollector.owners	-	[]infraHeldOwner
+test/fullstackharness/infra.go:InfraCollector.read	-	InfraRead
+test/fullstackharness/infra.go:InfraCollector.registry	-	*ingressmove.Registry
+test/fullstackharness/infra.go:InfraCollector.root	-	string
+test/fullstackharness/infra.go:InfraCollector.tier	-	string
+test/fullstackharness/infra.go:InfraCollector.total	-	int64
+test/fullstackharness/infra.go:InfraObservation.Events	-	[]c.Observation
+test/fullstackharness/infra.go:InfraObservation.Outbound	-	[]InfraPhysical
+test/fullstackharness/infra.go:InfraObservation.Physical	-	[]InfraPhysical
+test/fullstackharness/infra.go:InfraObservation.Probes	-	[]InfraProbe
+test/fullstackharness/infra.go:InfraObservation.Raw	-	[]contract.RawRef
+test/fullstackharness/infra.go:InfraObservation.Signals	-	[]InfraSignal
+test/fullstackharness/infra.go:InfraObservation.Stamp	-	contract.Stamp
+test/fullstackharness/infra.go:InfraObservation.Status	-	json.RawMessage
+test/fullstackharness/infra.go:InfraOwner.Process	`json:"process"`	c.Process
+test/fullstackharness/infra.go:InfraOwner.Role	`json:"role"`	string
+test/fullstackharness/infra.go:InfraOwnerExit.Exited	`json:"exited"`	bool
+test/fullstackharness/infra.go:InfraOwnerExit.ObservedBootNS	`json:"observed_boot_ns"`	int64
+test/fullstackharness/infra.go:InfraOwnerExit.Process	`json:"process"`	c.Process
+test/fullstackharness/infra.go:InfraOwnerExit.Role	`json:"role"`	string
+test/fullstackharness/infra.go:InfraOwnerExit.Source	`json:"source"`	string
+test/fullstackharness/infra.go:InfraPhysical.Accepted	`json:"accepted"`	c.Socket
+test/fullstackharness/infra.go:InfraPhysical.Attachment	`json:"attachment"`	c.Attachment
+test/fullstackharness/infra.go:InfraPhysical.CID	`json:"cid"`	uint64
+test/fullstackharness/infra.go:InfraPhysical.Census	`json:"census"`	c.Census
+test/fullstackharness/infra.go:InfraPhysical.ServerAccepted	`json:"server_accepted"`	c.Socket
+test/fullstackharness/infra.go:InfraPhysical.ServerID	`json:"server_id"`	string
+test/fullstackharness/infra.go:InfraPhysical.Translation	`json:"translation"`	*InfraTranslation
+test/fullstackharness/infra.go:InfraPhysical.Upstream	`json:"upstream"`	*c.Socket
+test/fullstackharness/infra.go:InfraProbe.Accepted	`json:"accepted"`	c.Socket
+test/fullstackharness/infra.go:InfraProbe.Attempts	`json:"attempts"`	uint64
+test/fullstackharness/infra.go:InfraProbe.Authenticated	`json:"authenticated"`	bool
+test/fullstackharness/infra.go:InfraProbe.Census	`json:"census"`	c.Census
+test/fullstackharness/infra.go:InfraProbe.CertificateSHA256	`json:"certificate_sha256"`	string
+test/fullstackharness/infra.go:InfraProbe.FinishedBootNS	`json:"finished_boot_ns"`	int64
+test/fullstackharness/infra.go:InfraProbe.Hinted	`json:"hinted"`	bool
+test/fullstackharness/infra.go:InfraProbe.ID	`json:"id"`	string
+test/fullstackharness/infra.go:InfraProbe.Kind	`json:"kind"`	string
+test/fullstackharness/infra.go:InfraProbe.RC	`json:"rc"`	int
+test/fullstackharness/infra.go:InfraProbe.Raw	`json:"raw"`	c.Socket
+test/fullstackharness/infra.go:InfraProbe.RouteGeneration	`json:"route_generation"`	uint64
+test/fullstackharness/infra.go:InfraProbe.StartedBootNS	`json:"started_boot_ns"`	int64
+test/fullstackharness/infra.go:InfraProbe.TLSName	`json:"tls_name"`	string
+test/fullstackharness/infra.go:InfraProbe.Translation	`json:"translation"`	*InfraTranslation
+test/fullstackharness/infra.go:InfraProbe.URL	`json:"url"`	string
+test/fullstackharness/infra.go:InfraSignal.ObservedBootNS	`json:"observed_boot_ns"`	int64
+test/fullstackharness/infra.go:InfraSignal.Receipt	`json:"receipt"`	c.HostReceipt
+test/fullstackharness/infra.go:InfraTranslation.NetNS	`json:"netns"`	uint64
+test/fullstackharness/infra.go:InfraTranslation.OriginalLocal	`json:"original_local"`	string
+test/fullstackharness/infra.go:InfraTranslation.OriginalRemote	`json:"original_remote"`	string
+test/fullstackharness/infra.go:InfraTranslation.Raw	`json:"raw"`	json.RawMessage
+test/fullstackharness/infra.go:InfraTranslation.ReplyLocal	`json:"reply_local"`	string
+test/fullstackharness/infra.go:InfraTranslation.ReplyRemote	`json:"reply_remote"`	string
+test/fullstackharness/infra.go:InfraTranslation.RouteGeneration	`json:"route_generation"`	uint64
+test/fullstackharness/infra.go:InfraTranslation.RulesDigest	`json:"rules_digest"`	string
+test/fullstackharness/infra.go:infraBindingDisk.Leg	`json:"leg"`	string
+test/fullstackharness/infra.go:infraBindingDisk.Original	`json:"original"`	json.RawMessage
+test/fullstackharness/infra.go:infraBindingDisk.Participant	`json:"participant"`	c.ID
+test/fullstackharness/infra.go:infraBindingDisk.WorkloadID	`json:"workload_id"`	string
+test/fullstackharness/infra.go:infraHeldOwner.owner	-	InfraOwner
+test/fullstackharness/infra.go:infraHeldOwner.pin	-	*infrahost.ProcessPin
+test/fullstackharness/infra.go:infraRecord.Attachments	`json:"attachments"`	[]c.Attachment
+test/fullstackharness/infra.go:infraRecord.Bindings	`json:"bindings"`	[]infraBindingDisk
+test/fullstackharness/infra.go:infraRecord.Checkpoint	`json:"checkpoint"`	c.Checkpoint
+test/fullstackharness/infra.go:infraRecord.Events	`json:"events"`	[]c.Observation
+test/fullstackharness/infra.go:infraRecord.Executing	`json:"executing"`	c.Process
+test/fullstackharness/infra.go:infraRecord.Outbound	`json:"outbound"`	[]InfraPhysical
+test/fullstackharness/infra.go:infraRecord.Owners	`json:"owners"`	[]InfraOwnerExit
+test/fullstackharness/infra.go:infraRecord.Physical	`json:"physical"`	[]InfraPhysical
+test/fullstackharness/infra.go:infraRecord.Plan	`json:"plan"`	c.Plan
+test/fullstackharness/infra.go:infraRecord.Probes	`json:"probes"`	[]InfraProbe
+test/fullstackharness/infra.go:infraRecord.Raw	`json:"raw"`	[]json.RawMessage
+test/fullstackharness/infra.go:infraRecord.Schema	`json:"schema"`	string
+test/fullstackharness/infra.go:infraRecord.Signals	`json:"signals"`	[]InfraSignal
+test/fullstackharness/infra.go:infraRecord.Stage	`json:"stage"`	string
+test/fullstackharness/infra.go:infraRecord.Stamp	`json:"stamp"`	json.RawMessage
+test/fullstackharness/infra.go:infraRecord.Status	`json:"status"`	json.RawMessage
+test/fullstackharness/infra.go:infraRecord.Tier	`json:"tier"`	string
+test/fullstackharness/ofd_linux.go:OFDProof.CurrentFD	-	int
+test/fullstackharness/ofd_linux.go:OFDProof.Flags	-	uint64
+test/fullstackharness/ofd_linux.go:OFDProof.OriginalFD	-	int
+test/fullstackharness/ofd_linux.go:OFDProof.Owner	-	contract.Stamp
+test/fullstackharness/ofd_linux.go:OFDProof.SocketCookie	-	uint64
+test/fullstackharness/ofd_linux.go:OFDProof.WitnessFD	-	int
+test/fullstackharness/ofd_linux.go:OFDWitness.bound	-	int
+test/fullstackharness/ofd_linux.go:OFDWitness.cookie	-	uint64
+test/fullstackharness/ofd_linux.go:OFDWitness.file	-	*os.File
+test/fullstackharness/ofd_linux.go:OFDWitness.mu	-	sync.Mutex
+test/fullstackharness/ofd_linux.go:OFDWitness.original	-	int
+test/fullstackharness/ofd_linux.go:OFDWitness.owner	-	contract.Stamp
+test/fullstackharness/ofd_linux.go:OFDWitness.pidfd	-	*os.File
+test/fullstackharness/process.go:LauncherOptions.Cgroup	-	string
+test/fullstackharness/process.go:LauncherOptions.Lease	-	*os.File
+test/fullstackharness/process.go:LauncherOptions.LeaseTimeout	-	time.Duration
+test/fullstackharness/process.go:LauncherOptions.Ready	-	io.Writer
+test/fullstackharness/process.go:ProcessIdentity.Cgroup	`json:"cgroup"`	string
+test/fullstackharness/process.go:ProcessIdentity.PID	`json:"pid"`	int
+test/fullstackharness/process.go:ProcessIdentity.PIDNS	`json:"pid_namespace"`	string
+test/fullstackharness/process.go:ProcessIdentity.StartTicks	`json:"start_ticks"`	uint64
+test/fullstackharness/process.go:ProcessReady.Launcher	`json:"launcher"`	ProcessIdentity
+test/fullstackharness/process.go:ProcessReady.Target	`json:"target"`	ProcessIdentity
+test/fullstackharness/transfer.go:TransferObservation.Raw	-	json.RawMessage
+test/fullstackharness/transfer.go:TransferObservation.Ref	-	contract.RawRef
+test/fullstackharness/transfer.go:TransferObservation.Value	-	xfercontract.Observation
+test/fullstackharness/transfer.go:TransferStatus.Raw	-	json.RawMessage
+test/fullstackharness/transfer.go:TransferStatus.Ref	-	contract.RawRef
+test/fullstackharness/transfer.go:TransferStatus.Value	-	xfercontract.Status
+test/fullstackharness/transfer.go:TransferWorkload.BudgetNS	`json:"budget_ns"`	int64
+test/fullstackharness/transfer.go:TransferWorkload.Cohort	`json:"cohort"`	string
+test/fullstackharness/transfer.go:TransferWorkload.Direction	`json:"direction"`	string
+test/fullstackharness/transfer.go:TransferWorkload.RateLimit	`json:"rate_limit"`	int64
+test/fullstackharness/transfer.go:TransferWorkload.Runtime	`json:"runtime"`	string
+test/fullstackharness/transfer.go:TransferWorkload.Size	`json:"size"`	int64
+test/fullstackharness/transfer.go:TransferWorkload.Tier	`json:"tier"`	string
+test/hotupdate/acceptance/contract/types.go:Artifact.Archive	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.Binary	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.CopyManifest	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.Dirty	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.Domains	-	[]string
+test/hotupdate/acceptance/contract/types.go:Artifact.Epoch	-	uint64
+test/hotupdate/acceptance/contract/types.go:Artifact.Flags	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.ID	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.ImageID	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.ReadEpochs	-	[]uint64
+test/hotupdate/acceptance/contract/types.go:Artifact.Release	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.Role	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.SourceCommit	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.Toolchain	-	string
+test/hotupdate/acceptance/contract/types.go:Artifact.Tree	-	Digest
+test/hotupdate/acceptance/contract/types.go:Artifact.Vendor	-	Digest
+test/hotupdate/acceptance/contract/types.go:Attempt.CallID	-	string
+test/hotupdate/acceptance/contract/types.go:Attempt.Code	-	string
+test/hotupdate/acceptance/contract/types.go:Attempt.Completed	-	bool
+test/hotupdate/acceptance/contract/types.go:Attempt.FinishedNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Attempt.Index	-	uint64
+test/hotupdate/acceptance/contract/types.go:Attempt.Phase	-	string
+test/hotupdate/acceptance/contract/types.go:Attempt.RC	-	int
+test/hotupdate/acceptance/contract/types.go:Attempt.Raw	-	RawRef
+test/hotupdate/acceptance/contract/types.go:Attempt.Sent	-	bool
+test/hotupdate/acceptance/contract/types.go:Attempt.SlotID	-	string
+test/hotupdate/acceptance/contract/types.go:Attempt.StartedNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Distribution.Censored	-	uint64
+test/hotupdate/acceptance/contract/types.go:Distribution.Count	-	uint64
+test/hotupdate/acceptance/contract/types.go:Distribution.Failed	-	uint64
+test/hotupdate/acceptance/contract/types.go:Distribution.MaxNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Distribution.MinNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Distribution.Missing	-	uint64
+test/hotupdate/acceptance/contract/types.go:Distribution.P50NS	-	int64
+test/hotupdate/acceptance/contract/types.go:Distribution.P95NS	-	int64
+test/hotupdate/acceptance/contract/types.go:Distribution.P99NS	-	int64
+test/hotupdate/acceptance/contract/types.go:Evidence.Attempts	-	[]Attempt
+test/hotupdate/acceptance/contract/types.go:Evidence.Intervals	-	[]Interval
+test/hotupdate/acceptance/contract/types.go:Evidence.Profile	-	Profile
+test/hotupdate/acceptance/contract/types.go:Evidence.Raw	-	[]RawRef
+test/hotupdate/acceptance/contract/types.go:Evidence.Samples	-	[]Sample
+test/hotupdate/acceptance/contract/types.go:Evidence.Slots	-	[]Slot
+test/hotupdate/acceptance/contract/types.go:Evidence.Views	-	[]View
+test/hotupdate/acceptance/contract/types.go:Interval.AtNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Interval.Event	-	string
+test/hotupdate/acceptance/contract/types.go:Interval.Raw	-	RawRef
+test/hotupdate/acceptance/contract/types.go:Interval.ResourceID	-	string
+test/hotupdate/acceptance/contract/types.go:Interval.Stamp	-	Stamp
+test/hotupdate/acceptance/contract/types.go:Key.Domain	-	string
+test/hotupdate/acceptance/contract/types.go:Key.Host	-	string
+test/hotupdate/acceptance/contract/types.go:Key.NID	-	string
+test/hotupdate/acceptance/contract/types.go:Key.Role	-	string
+test/hotupdate/acceptance/contract/types.go:Key.SID	-	string
+test/hotupdate/acceptance/contract/types.go:Key.UID	-	uint32
+test/hotupdate/acceptance/contract/types.go:Key.Unit	-	string
+test/hotupdate/acceptance/contract/types.go:Process.BootID	-	string
+test/hotupdate/acceptance/contract/types.go:Process.InstanceID	-	string
+test/hotupdate/acceptance/contract/types.go:Process.Key	-	Key
+test/hotupdate/acceptance/contract/types.go:Process.PID	-	int
+test/hotupdate/acceptance/contract/types.go:Process.PIDNS	-	string
+test/hotupdate/acceptance/contract/types.go:Process.StartTicks	-	uint64
+test/hotupdate/acceptance/contract/types.go:Profile.Artifacts	-	[]Artifact
+test/hotupdate/acceptance/contract/types.go:Profile.BudgetDigest	-	Digest
+test/hotupdate/acceptance/contract/types.go:Profile.CommandBindings	-	RawRef
+test/hotupdate/acceptance/contract/types.go:Profile.EndNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Profile.EvidenceRoot	-	string
+test/hotupdate/acceptance/contract/types.go:Profile.ID	-	string
+test/hotupdate/acceptance/contract/types.go:Profile.ProbeRate	-	int
+test/hotupdate/acceptance/contract/types.go:Profile.Regime	-	string
+test/hotupdate/acceptance/contract/types.go:Profile.Required	-	[]Key
+test/hotupdate/acceptance/contract/types.go:Profile.StartNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Profile.Steps	-	[]Step
+test/hotupdate/acceptance/contract/types.go:Profile.Tier	-	string
+test/hotupdate/acceptance/contract/types.go:Profile.Topology	-	string
+test/hotupdate/acceptance/contract/types.go:Profile.WorkloadDigest	-	Digest
+test/hotupdate/acceptance/contract/types.go:RawRef.Bytes	-	int64
+test/hotupdate/acceptance/contract/types.go:RawRef.Path	-	string
+test/hotupdate/acceptance/contract/types.go:RawRef.SHA	-	Digest
+test/hotupdate/acceptance/contract/types.go:RawRef.Schema	-	string
+test/hotupdate/acceptance/contract/types.go:Receipt.Complete	-	bool
+test/hotupdate/acceptance/contract/types.go:Receipt.Evidence	-	RawRef
+test/hotupdate/acceptance/contract/types.go:Receipt.Kind	-	string
+test/hotupdate/acceptance/contract/types.go:Receipt.Known	-	bool
+test/hotupdate/acceptance/contract/types.go:Receipt.ResourceIDs	-	[]string
+test/hotupdate/acceptance/contract/types.go:Receipt.RunningSHA	-	Digest
+test/hotupdate/acceptance/contract/types.go:Receipt.Stamp	-	Stamp
+test/hotupdate/acceptance/contract/types.go:Resource.Bytes	-	int64
+test/hotupdate/acceptance/contract/types.go:Resource.Domain	-	string
+test/hotupdate/acceptance/contract/types.go:Resource.FD	-	int
+test/hotupdate/acceptance/contract/types.go:Resource.Flags	-	uint64
+test/hotupdate/acceptance/contract/types.go:Resource.ID	-	string
+test/hotupdate/acceptance/contract/types.go:Resource.Kind	-	string
+test/hotupdate/acceptance/contract/types.go:Resource.OFD	-	string
+test/hotupdate/acceptance/contract/types.go:Resource.Owner	-	Stamp
+test/hotupdate/acceptance/contract/types.go:Resource.ReleaseAfterNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Resource.State	-	string
+test/hotupdate/acceptance/contract/types.go:Result.Failures	-	[]string
+test/hotupdate/acceptance/contract/types.go:Result.Inputs	-	[]RawRef
+test/hotupdate/acceptance/contract/types.go:Result.Missing	-	[]string
+test/hotupdate/acceptance/contract/types.go:Result.RC	-	int
+test/hotupdate/acceptance/contract/types.go:Result.Verdict	-	string
+test/hotupdate/acceptance/contract/types.go:Sample.Complete	-	bool
+test/hotupdate/acceptance/contract/types.go:Sample.Consumers	-	[]string
+test/hotupdate/acceptance/contract/types.go:Sample.ExeSHA	-	Digest
+test/hotupdate/acceptance/contract/types.go:Sample.FDs	-	int64
+test/hotupdate/acceptance/contract/types.go:Sample.Goroutines	-	int64
+test/hotupdate/acceptance/contract/types.go:Sample.Locks	-	[]string
+test/hotupdate/acceptance/contract/types.go:Sample.OldImages	-	[]string
+test/hotupdate/acceptance/contract/types.go:Sample.Raw	-	RawRef
+test/hotupdate/acceptance/contract/types.go:Sample.Resources	-	[]Resource
+test/hotupdate/acceptance/contract/types.go:Sample.Stamp	-	Stamp
+test/hotupdate/acceptance/contract/types.go:Sample.Temps	-	[]string
+test/hotupdate/acceptance/contract/types.go:Slot.Class	-	string
+test/hotupdate/acceptance/contract/types.go:Slot.DeadlineNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Slot.ID	-	string
+test/hotupdate/acceptance/contract/types.go:Slot.ScheduledNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Slot.Target	-	Key
+test/hotupdate/acceptance/contract/types.go:Stamp.AtBootNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Stamp.CutID	-	string
+test/hotupdate/acceptance/contract/types.go:Stamp.Direction	-	string
+test/hotupdate/acceptance/contract/types.go:Stamp.Generation	-	uint64
+test/hotupdate/acceptance/contract/types.go:Stamp.Process	-	Process
+test/hotupdate/acceptance/contract/types.go:Stamp.QueryNonce	-	string
+test/hotupdate/acceptance/contract/types.go:Stamp.Revision	-	uint64
+test/hotupdate/acceptance/contract/types.go:Stamp.ScopeDigest	-	string
+test/hotupdate/acceptance/contract/types.go:Stamp.Sequence	-	uint64
+test/hotupdate/acceptance/contract/types.go:Stamp.TxID	-	string
+test/hotupdate/acceptance/contract/types.go:Step.Action	-	string
+test/hotupdate/acceptance/contract/types.go:Step.Cohort	-	string
+test/hotupdate/acceptance/contract/types.go:Step.DeadlineNS	-	int64
+test/hotupdate/acceptance/contract/types.go:Step.DependsOn	-	[]string
+test/hotupdate/acceptance/contract/types.go:Step.Direction	-	string
+test/hotupdate/acceptance/contract/types.go:Step.From	-	string
+test/hotupdate/acceptance/contract/types.go:Step.ID	-	string
+test/hotupdate/acceptance/contract/types.go:Step.Leg	-	string
+test/hotupdate/acceptance/contract/types.go:Step.ParentID	-	string
+test/hotupdate/acceptance/contract/types.go:Step.Target	-	Key
+test/hotupdate/acceptance/contract/types.go:Step.To	-	string
+test/hotupdate/acceptance/contract/types.go:View.Code	-	string
+test/hotupdate/acceptance/contract/types.go:View.Control	-	Receipt
+test/hotupdate/acceptance/contract/types.go:View.Current	-	json.RawMessage
+test/hotupdate/acceptance/contract/types.go:View.Deferred	-	[]string
+test/hotupdate/acceptance/contract/types.go:View.Detail	-	string
+test/hotupdate/acceptance/contract/types.go:View.Historical	-	json.RawMessage
+test/hotupdate/acceptance/contract/types.go:View.Outcome	-	string
+test/hotupdate/acceptance/contract/types.go:View.Phase	-	string
+test/hotupdate/acceptance/contract/types.go:View.Raw	-	RawRef
+test/hotupdate/acceptance/contract/types.go:View.Released	-	Receipt
+test/hotupdate/acceptance/contract/types.go:View.Resources	-	Receipt
+test/hotupdate/acceptance/contract/types.go:View.Stamp	-	Stamp
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Additional	`json:"additionalProperties"`	*bool
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.AllOf	`json:"allOf"`	[]*schemaNode
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Comment	`json:"$comment"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Const	`json:"const"`	json.RawMessage
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Defs	`json:"$defs"`	map[string]*schemaNode
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Enum	`json:"enum"`	[]json.RawMessage
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.GoName	`json:"x-go-name"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.GoType	`json:"x-go-type"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.ID	`json:"$id"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Items	`json:"items"`	*schemaNode
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Maximum	`json:"maximum"`	*json.Number
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.MinItems	`json:"minItems"`	int
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.MinLength	`json:"minLength"`	int
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Minimum	`json:"minimum"`	*json.Number
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.OneOf	`json:"oneOf"`	[]*schemaNode
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Pattern	`json:"pattern"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Properties	`json:"properties"`	map[string]*schemaNode
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Ref	`json:"$ref"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Required	`json:"required"`	[]string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Schema	`json:"$schema"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Type	`json:"type"`	string
+test/hotupdate/acceptance/contract/vocabulary.go:schemaNode.Unique	`json:"uniqueItems"`	bool
+
+# Memory-only infrastructure custody owners, including the MAKETEST-GATES responsibility moves.
+# Registry.{Rows,Broken} is the actual successor of the requested infrastructureSources fields.
+# ControlProof has no predecessor row here; its actual leaf declaration is registered directly.
+# origin: hot-update S9 plan §2.3 / P35; NC-EXPORTS and MAKETEST-GATES request 4
+internal/agentupgradeport/control_wire.go:ControlProof.Generation	`json:"session_generation,omitempty"`	uint64
+internal/agentupgradeport/control_wire.go:ControlProof.InstanceID	`json:"instance_id"`	string
+internal/agentupgradeport/control_wire.go:ControlProof.Nonce	`json:"query_nonce,omitempty"`	string
+internal/drillobserve/infrastructure/observation.go:Registry.Broken	-	bool
+internal/drillobserve/infrastructure/observation.go:Registry.Rows	-	map[[16]byte]func(int64) error
+internal/infraattach/broker.go:Broker.observation	-	*Client
+internal/infraattach/broker.go:Broker.observationNext	-	map[string]uint64
+internal/infraattach/broker_transport.go:authTransport.broker	-	*Broker
+internal/infraattach/broker_transport.go:authTransport.observation	-	*Client
+internal/infrarepair/gate.go:Gate.prefixes	-	[]originalPrefix
+internal/infrarepair/prefix_observation.go:originalPrefix.acks	-	[]ACK
+internal/infrarepair/prefix_observation.go:originalPrefix.expected	-	[]prefixChunk
+internal/infrarepair/prefix_observation.go:prefixChunk.Index	`json:"index"`	uint64
+internal/infrarepair/prefix_observation.go:prefixChunk.Length	`json:"length"`	uint64
+internal/infrarepair/prefix_observation.go:prefixChunk.SHA256	`json:"sha256"`	string
+internal/infrarepair/prefix_observation.go:prefixObservation.Actual	`json:"actual"`	[]prefixChunk
+internal/infrarepair/prefix_observation.go:prefixObservation.AtNS	`json:"at_ns"`	uint64
+internal/infrarepair/prefix_observation.go:prefixObservation.BeforeRepairNS	`json:"before_repair_ns"`	uint64
+internal/infrarepair/prefix_observation.go:prefixObservation.Expected	`json:"expected"`	[]prefixChunk
+internal/infrarepair/prefix_observation.go:prefixObservation.TransferID	`json:"transfer_id"`	string
+internal/infrarepair/receipts.go:ACK.TransferID	-	string
+
+test/fullstackharness/cmd/supervise/inherited_linux.go:inheritedChild.state	-	string
+test/fullstackharness/cmd/supervise/inherited_linux.go:inheritedChild.ticks	-	string
+test/fullstackharness/cmd/supervise/inherited_linux.go:inheritedWaitFailure.error	-	error
+test/fullstackharness/driver.go:productOutput.Buffer	-	bytes.Buffer
+
+# section: kernel-identity
+# schema<TAB>field<TAB>Go type/encoding<TAB>producer/codec<TAB>kernel reader evidence
+fullstack-kernel-identity-v1	after	contract.Stamp	ReadExecutable / contract.EncodeJSON("stamp")	final product stamp
+fullstack-kernel-identity-v1	before	contract.Stamp	ReadExecutable / contract.EncodeJSON("stamp")	initial product stamp
+fullstack-kernel-identity-v1	current.device	uint64	hashExecutable / encodeExecutableIdentity	separate current exe reopen
+fullstack-kernel-identity-v1	current.inode	uint64	hashExecutable / encodeExecutableIdentity	separate current exe reopen
+fullstack-kernel-identity-v1	current.sha	64 lowercase hex	sha256 / encodeExecutableIdentity	separate current exe reopen bytes
+fullstack-kernel-identity-v1	original.device	uint64	hashExecutable / encodeExecutableIdentity	independent exe FD fstat
+fullstack-kernel-identity-v1	original.inode	uint64	hashExecutable / encodeExecutableIdentity	independent exe FD fstat
+fullstack-kernel-identity-v1	original.sha	64 lowercase hex	sha256 / encodeExecutableIdentity	independent exe FD bytes
+fullstack-kernel-identity-v1	product	contract.Sample	SampleSource / contract.EncodeJSON("sample")	original source counters and original native RawRef
+fullstack-kernel-identity-v1	schema	string	kernelSnapshotter.archive / identityEvidence	constant version
+
+# section: infra-custody-protocol
+# schema<TAB>field<TAB>encoding or vocabulary<TAB>actual source<TAB>reader status
+# Private authenticated protocol and public-only custody; no proto/admin/image version change.
+# origin: hot-update S9 plan §2.3 / §9.1 / P35; NC-EXPORTS request
+infra-custody-request-v1	magic	bytes[0:4]=TDI1	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-request-v1	challenge	nonzero bytes[4:16]	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-request-v1	budget_ns	u64le bytes[16:24]; 0<budget<=5s	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-ack-v1	magic	bytes[0:4]=TDIA	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-ack-v1	challenge	original bytes[4:16]	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-ack-v1	sealed_sequence	u64le bytes[16:24]	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-ack-v1	incomplete	u64le bytes[24:32]; nonzero refuses completeness	internal/drillobserve/infrastructure/challenge.go:Request	original deployment custodian (pending)
+infra-custody-fragment-v1	kind/domain	infra-attachment/infra | infra-prefix/store	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Actor	original participant or actual transaction ID	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Digest	SHA256 of complete public JSON row	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Values[0]	zero-based byte offset	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Values[1]	complete public JSON byte length	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Values[2]	actual step; attachment=0	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-fragment-v1	Data	complete contiguous public JSON fragments; MaxData each; total<=4MiB	internal/drillobserve/infrastructure/observation.go:RecordInfrastructure	P32 flow_observation consumer (pending)
+infra-custody-error-v1	ErrInfrastructureObservation	drillobserve: infrastructure observation incomplete	internal/drillobserve/infrastructure/observation.go:ErrInfrastructureObservation	internal/drillobserve infrastructure custody
+
+# section: enum-members
+agent.gateKind	gateExec
+agent.gateKind	gateExpose
+agent.gateKind	gateKinds
+agent.gateKind	gateRun
+agent.gateKind	gateSS
+agent.gateKind	gateTransfer
+agent.gateKind	gateTransferV1
+agent.openOutcome	openPortAbsent
+agent.openOutcome	openStateUnavailable
+agent.openOutcome	openedOK
+agent.reapVerdict	reapConfirm
+agent.reapVerdict	reapNone
+agent.reapVerdict	reapNow
+agent.teardownIntent	teardownRebuild
+agent.teardownIntent	teardownShutdown
+agent.transferMode	modeDisabled
+agent.transferMode	modeNarrow
+agent.transferMode	modeOpen
+authcallout.role	roleAgent
+authcallout.role	roleCtlActivated
+authcallout.role	roleCtlUnactivated
+authcallout.role	roleSessionRemoval
+authcallout.role	roleTransferSettlement
+authcallout.role	roleUnknown
+broker.abandonRefusal	abandonClaimed
+broker.abandonRefusal	abandonCommitted
+broker.abandonRefusal	abandonFinalized
+broker.abandonRefusal	abandonNoEntry
+broker.abandonRefusal	abandonNotPush
+broker.abandonRefusal	abandonTierA
+broker.admitRole	admitMember
+broker.admitRole	admitOwner
+broker.passAuthority	authorityAny
+broker.passAuthority	authorityLeader
+brokerimage.Detail	DetailControlResultUnknown
+brokerimage.Detail	DetailMaintenanceExpired
+brokerimage.Detail	DetailMaintenanceObserverUnsupported
+brokerimage.Detail	DetailStoreCloseUnknown
+brokerimage.Mode	ModeQuorum
+brokerimage.Mode	ModeSingle
+brokerimage.Mode	ModeSoleVoter
+brokermaint.Phase	MaintActive
+brokermaint.Phase	MaintEnded
+brokermaint.Phase	MaintPrepared
+brokerruntime.CutoverAction	CutoverAlreadyClustered
+brokerruntime.CutoverAction	CutoverAwaitRevival
+brokerruntime.CutoverAction	CutoverSIGKILLToRevive
+cli.RetryFamily	RetryReadOnly
+cli.RetryFamily	RetryStableProcess
+cli.RetryFamily	RetryTransfer
+cli.RetryFamily	RetryUnsafe
+cli.Source	SourceDefault
+cli.Source	SourceEnv
+cli.Source	SourceFile
+cli.Source	SourceFlag
+cli.TransferCapsStatus	TransferCapsOK
+cli.TransferCapsStatus	TransferCapsRefused
+cli.TransferCapsStatus	TransferCapsUndetermined
+clusterupgrade.AgentPresence	AgentAbsent
+clusterupgrade.AgentPresence	AgentPresent
+clusterupgrade.AgentPresence	AgentUnknown
+clusterupgrade.PlanScope	ScopeBrokerDaemon
+clusterupgrade.PlanScope	ScopeWholeHost
+connrecovery.Intent	Rebuild
+connrecovery.Intent	Shutdown
+controlbudget.AttemptPhase	PhaseAuth
+controlbudget.AttemptPhase	PhaseBackoff
+controlbudget.AttemptPhase	PhaseBanner
+controlbudget.AttemptPhase	PhaseCancel
+controlbudget.AttemptPhase	PhaseConnect
+controlbudget.AttemptPhase	PhaseCreate
+controlbudget.AttemptPhase	PhaseDNS
+controlbudget.AttemptPhase	PhaseDiscovery
+controlbudget.AttemptPhase	PhaseExec
+controlbudget.AttemptPhase	PhaseFreeze
+controlbudget.AttemptPhase	PhaseImport
+controlbudget.AttemptPhase	PhaseInboxFallback
+controlbudget.AttemptPhase	PhaseInboxProbe
+controlbudget.AttemptPhase	PhaseMaintenance
+controlbudget.AttemptPhase	PhaseProbe
+controlbudget.AttemptPhase	PhaseProxy
+controlbudget.AttemptPhase	PhaseReady
+controlbudget.AttemptPhase	PhaseRequest
+controlbudget.AttemptPhase	PhaseResult
+controlbudget.AttemptPhase	PhaseTLS
+controlbudget.AttemptPhase	PhaseWS
+execclient.ptyPhase	ptyAttached
+execclient.ptyPhase	ptyCreating
+execclient.ptyPhase	ptyDone
+execclient.ptyPhase	ptyProbing
+execclient.ptyPhase	ptySettling
+flow.CloseMode	CloseModeNormal
+flow.CloseMode	CloseModeReadAbort
+flow.CloseMode	CloseModeRevoke
+flow.CloseMode	CloseModeWriteAbort
+flow.Kind	KindACK
+flow.Kind	KindClose
+flow.Kind	KindData
+flow.Kind	KindFIN
+flow.Kind	KindOpen
+flow.Kind	KindOpenACK
+flow.Kind	KindReject
+flow.Kind	KindResume
+flow.Kind	KindResumeOK
+flow.Phase	FlowPhaseActive
+flow.Phase	FlowPhaseConnecting
+flow.Phase	FlowPhaseDraining
+flow.Phase	FlowPhaseOpening
+flow.Phase	FlowPhaseTerminal
+flow.Reason	ReasonCapacity
+flow.Reason	ReasonDeadline
+flow.Reason	ReasonIOFailure
+flow.Reason	ReasonIntentConflict
+flow.Reason	ReasonMalformed
+flow.Reason	ReasonNonceExhausted
+flow.Reason	ReasonOffsetExpired
+flow.Reason	ReasonOffsetGap
+flow.Reason	ReasonOwnerConflict
+flow.Reason	ReasonRetired
+flow.Reason	ReasonRevoked
+flow.Reason	ReasonStaleEpoch
+flow.Reason	ReasonStateInvalid
+flow.Reason	ReasonUnauthorized
+flow.Reason	ReasonUnknownFlow
+flow.Reason	ReasonUnsupported
+flow.ResumeMode	ResumeModeAbort
+flow.ResumeMode	ResumeModeActivate
+flow.ResumeMode	ResumeModeBind
+flow.ResumeMode	ResumeModeInitial
+flow.ResumeMode	ResumeModePrepare
+flow.ResumeMode	ResumeModeReconnect
+flow.ResumeScope	ResumeScopeEndpoint
+flow.ResumeScope	ResumeScopeFlow
+flow.ResumeVerdict	ResumeVerdictAccepted
+flow.ResumeVerdict	ResumeVerdictPending
+flow.ResumeVerdict	ResumeVerdictRejected
+flowstate.EndpointPhase	EndpointPhaseAttached
+flowstate.EndpointPhase	EndpointPhaseBinding
+flowstate.EndpointPhase	EndpointPhaseClosed
+flowstate.EndpointPhase	EndpointPhaseClosing
+flowstate.EndpointPhase	EndpointPhaseDetached
+flowstate.EndpointPhase	EndpointPhasePrepared
+flowstate.TicketPurpose	TicketPurposeCurrentOwner
+flowstate.TicketPurpose	TicketPurposeHandoff
+infraauth.Phase	AuthBinding
+infraauth.Phase	AuthUsable
+infraauth.Phase	BusinessBinding
+infraauth.Phase	ControlReady
+infraauth.Phase	Fenced
+infracontract.HostOp	FenceStart
+infracontract.HostOp	FinalizeStorage
+infracontract.HostOp	Inspect
+infracontract.HostOp	LaunchAck
+infracontract.HostOp	LaunchClaim
+infracontract.HostOp	Promote
+infracontract.HostOp	RecoverHost
+infracontract.HostOp	ReleaseStart
+infracontract.HostOp	RetireWarm
+infracontract.HostOp	RotatePolicy
+infracontract.HostOp	SignalGraceful
+infracontract.HostOp	SignalLDM
+infracontract.HostOp	SignalStop
+infracontract.HostOp	Stage
+infracontract.HostOp	StartWarm
+infracontract.HostOp	SwitchIngress
+infracontract.HostOp	UpdateSupport
+infracontract.HostOp	VerifyIngress
+infracontract.Phase	Completed
+infracontract.Phase	Cutting
+infracontract.Phase	Deferred
+infracontract.Phase	Halted
+infracontract.Phase	Moving
+infracontract.Phase	Prepared
+infracontract.Phase	Ready
+infracontract.Phase	Retiring
+infracontract.Phase	Returning
+infracontract.Phase	Staged
+infracontract.Phase	Verifying
+infraupgrade.caddyCursor	caddyComplete
+infraupgrade.caddyCursor	caddyCut
+infraupgrade.caddyCursor	caddyDrainOld
+infraupgrade.caddyCursor	caddyDrainWarm
+infraupgrade.caddyCursor	caddyFence
+infraupgrade.caddyCursor	caddyFinalizeStorage
+infraupgrade.caddyCursor	caddyFinished
+infraupgrade.caddyCursor	caddyInspect
+infraupgrade.caddyCursor	caddyMainReady
+infraupgrade.caddyCursor	caddyMoveOutbound
+infraupgrade.caddyCursor	caddyMoveReturn
+infraupgrade.caddyCursor	caddyOldExit
+infraupgrade.caddyCursor	caddyPrepareOutbound
+infraupgrade.caddyCursor	caddyPrepareReturn
+infraupgrade.caddyCursor	caddyPromote
+infraupgrade.caddyCursor	caddyRedirectMain
+infraupgrade.caddyCursor	caddyRedirectWarm
+infraupgrade.caddyCursor	caddyReleaseCohort
+infraupgrade.caddyCursor	caddyReleaseStart
+infraupgrade.caddyCursor	caddyRetireWarm
+infraupgrade.caddyCursor	caddySealOutbound
+infraupgrade.caddyCursor	caddySealReturn
+infraupgrade.caddyCursor	caddyStage
+infraupgrade.caddyCursor	caddyStartWarm
+infraupgrade.caddyCursor	caddyValidate
+infraupgrade.caddyCursor	caddyWarmExit
+infraupgrade.caddyCursor	caddyWarmReady
+main.brokerProcState	brokerProcAbsent
+main.brokerProcState	brokerProcPresent
+main.brokerProcState	brokerProcUnknown
+main.natsLocalState	natsLocalClustered
+main.natsLocalState	natsLocalDown
+main.natsLocalState	natsLocalStandalone
+main.natsLocalState	natsLocalUnknown
+natsconf.RenderIntent	IntentForceClustered
+natsconf.RenderIntent	IntentForceStandalone
+natsconf.RenderIntent	IntentPreserve
+natsconf.RenderIntent	IntentStandaloneIfLone
+natsconf.TopoState	TopoBehind
+natsconf.TopoState	TopoConverged
+natsconf.TopoState	TopoHeld
+natsconf.TopoState	TopoStuck
+natsconf.TopoState	TopoUnknownAction
+natsconf.TopoState	TopoUnreported
+natsconf.TopoState	topoStateCount
+proto.BrokerImageMode	BrokerImageModeQuorum
+proto.BrokerImageMode	BrokerImageModeSingle
+proto.BrokerImageMode	BrokerImageModeSoleVoter
+proto.BrokerImagePhase	BrokerImagePhaseAuthUsable
+proto.BrokerImagePhase	BrokerImagePhaseControlReady
+proto.BrokerImagePhase	BrokerImagePhaseFailed
+proto.BrokerImagePhase	BrokerImagePhaseFrozen
+proto.BrokerImagePhase	BrokerImagePhaseImporting
+proto.BrokerImagePhase	BrokerImagePhasePreparing
+proto.BrokerImagePhase	BrokerImagePhaseRollingBack
+proto.BrokerImagePhase	BrokerImagePhaseServing
+ptysession.actorPhase	phaseActive
+ptysession.actorPhase	phaseClosed
+ptysession.actorPhase	phaseFreezing
+ptysession.actorPhase	phaseFrozen
+ptysession.sourcePhase	sourceDiscarding
+ptysession.sourcePhase	sourceEnded
+ptysession.sourcePhase	sourceReading
+rawsocket.ConnectState	ConnectConnected
+rawsocket.ConnectState	ConnectConnecting
+rawsocket.ConnectState	ConnectFailed
+sealedstate.FieldType	FieldBool
+sealedstate.FieldType	FieldBytes
+sealedstate.FieldType	FieldID16
+sealedstate.FieldType	FieldNonce12
+sealedstate.FieldType	FieldNonnegativeI64
+sealedstate.FieldType	FieldSalt32
+sealedstate.FieldType	FieldU64
+sealedstate.FieldType	FieldUTF8
+sealedstate.Kind	KindAuthority
+sealedstate.Kind	KindBinding
+sealedstate.Kind	KindEndpoint
+sealedstate.Kind	KindFlow
+sealedstate.Kind	KindMaterial
+sealedstate.Kind	KindPermit
+sealedstate.Kind	KindReceipt
+sealedstate.Kind	KindRetirement
+sealedstate.Kind	KindSSActor
+sealedstate.Kind	KindSSServer
+sealedstate.Kind	KindSaltRing
+sealedstate.Kind	KindTimer
+spawnsafe.Mode	ModeAuto
+spawnsafe.Mode	ModeOff
+spawnsafe.fsKind	kindAutomount
+spawnsafe.fsKind	kindLocal
+spawnsafe.fsKind	kindRemoteProbe
+spawnsafe.probeState	stHealthy
+spawnsafe.probeState	stUnhealthy
+spawnsafe.probeState	stUnprobed
+ssproxy.AuthorityPhase	AuthorityPhaseAuthorized
+ssproxy.AuthorityPhase	AuthorityPhasePending
+ssproxy.AuthorityPhase	AuthorityPhaseRevoked
+ssproxy.SSPhase	SSPhaseConnecting
+ssproxy.SSPhase	SSPhaseDraining
+ssproxy.SSPhase	SSPhaseLength
+ssproxy.SSPhase	SSPhasePayload
+ssproxy.SSPhase	SSPhaseRelay
+ssproxy.SSPhase	SSPhaseRevoked
+ssproxy.SSPhase	SSPhaseSalt
+ssproxy.SSPhase	SSPhaseTarget
+ssproxy.SSPhase	SSPhaseTerminal
+storage.ClosePhase	CloseClosed
+storage.ClosePhase	CloseOpen
+storage.ClosePhase	CloseStopped
+storage.ClosePhase	CloseUnknown
+xferauth.ConnectionRole	RoleAgent
+xferauth.ConnectionRole	RoleCtlActivated
+xferauth.ConnectionRole	RoleCtlUnactivated
+xferauth.ConnectionRole	RoleSessionRemoval
+xferauth.ConnectionRole	RoleTransferSettlement
+xferauth.ConnectionRole	RoleUnknown
+xfercontract.AccessKind	AccessContinue
+xfercontract.AccessKind	AccessCreate
+xfercontract.AccessKind	AccessSettle
+xfercontract.AccessKind	AccessStatus
+xfercontract.AuditDelivery	DeliveryHistoryConfirmed
+xfercontract.AuditDelivery	DeliveryPending
+xfercontract.AuditDelivery	DeliveryRaftCommitted
+xfercontract.CancelReason	CancelDeadline
+xfercontract.CancelReason	CancelRevoked
+xfercontract.CancelReason	CancelStopped
+xfercontract.CancelReason	CancelUser
+xfercontract.CommitPrimitive	PrimitiveLink
+xfercontract.CommitPrimitive	PrimitiveRename
+xfercontract.ControlKind	ControlCancel
+xfercontract.ControlKind	ControlGrant
+xfercontract.ControlKind	ControlReceipt
+xfercontract.ControlKind	ControlRevoke
+xfercontract.ControlKind	ControlStart
+xfercontract.LedgerMutationKind	MutationAbandon
+xfercontract.LedgerMutationKind	MutationAdmit
+xfercontract.LedgerMutationKind	MutationCleanup
+xfercontract.LedgerMutationKind	MutationDecide
+xfercontract.LedgerMutationKind	MutationHistory
+xfercontract.LedgerMutationKind	MutationReserve
+xfercontract.LedgerMutationKind	MutationSourceSeal
+xfercontract.ObjectWritePhase	WriteFinalized
+xfercontract.ObjectWritePhase	WriteMetadataPending
+xfercontract.ObjectWritePhase	WriteOpen
+xfercontract.ObjectWritePhase	WritePending
+xfercontract.ObjectWritePhase	WriteRetired
+xfercontract.ObjectWritePhase	WriteRetiring
+xfercontract.ObservationKind	ObserveAcknowledge
+xfercontract.ObservationKind	ObserveAppend
+xfercontract.ObservationKind	ObserveAttempt
+xfercontract.ObservationKind	ObserveCallbackEnter
+xfercontract.ObservationKind	ObserveCallbackJoin
+xfercontract.ObservationKind	ObserveControl
+xfercontract.ObservationKind	ObserveDirectorySync
+xfercontract.ObservationKind	ObserveDrain
+xfercontract.ObservationKind	ObserveFetched
+xfercontract.ObservationKind	ObserveFinalize
+xfercontract.ObservationKind	ObserveFinish
+xfercontract.ObservationKind	ObserveFreeze
+xfercontract.ObservationKind	ObserveHistory
+xfercontract.ObservationKind	ObserveImport
+xfercontract.ObservationKind	ObserveInstall
+xfercontract.ObservationKind	ObserveLedgerSync
+xfercontract.ObservationKind	ObservePrimitiveEnter
+xfercontract.ObservationKind	ObservePrimitiveExit
+xfercontract.ObservationKind	ObserveReaderStop
+xfercontract.ObservationKind	ObserveReserve
+xfercontract.ObservationKind	ObserveResolve
+xfercontract.ObservationKind	ObserveRetirement
+xfercontract.ObservationKind	ObserveRollback
+xfercontract.ObservationKind	ObserveSynced
+xfercontract.Operation	OpBucketConfig
+xfercontract.Operation	OpCancel
+xfercontract.Operation	OpCensus
+xfercontract.Operation	OpCommit
+xfercontract.Operation	OpFinalize
+xfercontract.Operation	OpPermit
+xfercontract.Operation	OpPrepare
+xfercontract.Operation	OpProbe
+xfercontract.Operation	OpReserve
+xfercontract.Operation	OpSource
+xfercontract.Operation	OpStatus
+xfercontract.Operation	OpTerminal
+xfercontract.Phase	PhaseCleanupPending
+xfercontract.Phase	PhaseCommitReserved
+xfercontract.Phase	PhaseDecided
+xfercontract.Phase	PhaseHistoryConfirmed
+xfercontract.Phase	PhaseOpen
+xfercontract.Phase	PhasePrepared
+xfercontract.Phase	PhaseReceiving
+xfercontract.Phase	PhaseSending
+xfercontract.Phase	PhaseSettled
+xfercontract.Phase	PhaseTerminalPending
+xfercontract.PrimitiveOutcome	OutcomeInflight
+xfercontract.PrimitiveOutcome	OutcomeLanded
+xfercontract.PrimitiveOutcome	OutcomeNotEntered
+xfercontract.PrincipalRole	RoleAgent
+xfercontract.PrincipalRole	RoleBroker
+xfercontract.PrincipalRole	RoleCTL
+xfercontract.PrincipalRole	RoleSettlement
+xfercontract.ReaderPhase	ReaderDeletePending
+xfercontract.ReaderPhase	ReaderDirty
+xfercontract.ReaderPhase	ReaderFetching
+xfercontract.ReaderPhase	ReaderOpen
+xfercontract.ReaderPhase	ReaderStopped
+xfercontract.StatusState	StatusLive
+xfercontract.StatusState	StatusTerminal
+xfercontract.StatusState	StatusUnknown
+xfercontract.TerminalDisposition	DispositionComplete
+xfercontract.TerminalDisposition	DispositionConflict
+xfercontract.TerminalDisposition	DispositionFailed
+xfercontract.TerminalDisposition	DispositionPending
+xferledger.LegacyDisposition	LegacyLeave
+xferledger.LegacyDisposition	LegacyReplay
+xferledger.LegacyDisposition	LegacySynthesize
+xferledger.LegacySite	LegacySiteOutbox
+xferledger.LegacySite	LegacySitePrimary
+
+infracontract.Action	Recover
+infracontract.Action	Reload
+infracontract.Action	Rollback
+infracontract.Action	Upgrade
+infracontract.ArtifactKind	CaddyBinary
+infracontract.ArtifactKind	HelperBinary
+infracontract.ArtifactKind	LauncherBinary
+infracontract.ArtifactKind	NATSBinary
+infracontract.Component	Caddy
+infracontract.Component	HostSupport
+infracontract.Component	NATS
+infracontract.RouteDirection	RouteOutbound
+infracontract.RouteDirection	RouteReturn
+infracontract.RoutePurpose	RouteBind
+infracontract.RoutePurpose	RoutePrepare
+infrahost.BootstrapStage	EffectiveUnitVerified
+infrahost.BootstrapStage	FilesInstalled
+infrahost.BootstrapStage	HelperVersionVerified
+infrahost.BootstrapStage	RuntimeReady
+infrahost.BootstrapStage	SocketActive
+infrahost.EffectPhase	EffectApplied
+infrahost.EffectPhase	EffectIntent
+infrahost.EffectPhase	EffectNotApplied
+infrahost.EffectPhase	EffectUnknown
+infrapriv.CredentialKind	LocalInfra
+infrapriv.CredentialKind	LocalLaunch
+infrapriv.CredentialKind	SYSRead
+infrapriv.CredentialKind	SYSStep
+infrapriv.Scope	AccountAuthority
+infrapriv.Scope	LaunchAuthority
+infrapriv.Scope	LocalAuthority
+infrapriv.Scope	RootAuthority
+infrareadiness.Identity	ActivatedMember
+infrareadiness.Identity	ProvisionedAgent
+infraunit.UnitTarget	UnitCaddy
+infraunit.UnitTarget	UnitCaddyWarm
+infraunit.UnitTarget	UnitHelperService
+infraunit.UnitTarget	UnitHelperSocket
+infraunit.UnitTarget	UnitNATS
+infraunit.UnitTarget	UnitNATSWarm
+upgradetx.ActionKind	ActionActivate
+upgradetx.ActionKind	ActionControl
+upgradetx.ActionKind	ActionDispatch
+upgradetx.ActionKind	ActionFreeze
+upgradetx.ActionKind	ActionMigrate
+upgradetx.ActionKind	ActionPublish
+upgradetx.ActionKind	ActionRelease
+upgradetx.ActionKind	ActionRetire
+upgradetx.ActionKind	ActionReverse
+upgradetx.ActionKind	ActionSelect
+upgradetx.ActionState	ActionDurable
+upgradetx.ActionState	ActionIntent
+upgradetx.ActionState	ActionObserved
+upgradetx.Component	ComponentAgent
+upgradetx.Component	ComponentBroker
+upgradetx.Component	ComponentCaddy
+upgradetx.Component	ComponentNATS
+upgradetx.CutStage	CutActive
+upgradetx.CutStage	CutNone
+upgradetx.CutStage	CutPartialActive
+upgradetx.CutStage	CutPristine
+upgradetx.CutStage	CutReleased
+upgradetx.CutStage	CutRetiring
+upgradetx.Direction	DirectionForward
+upgradetx.Direction	DirectionReverse
+upgradetx.Domain	DomainAuthority
+upgradetx.Domain	DomainBrokerRuntime
+upgradetx.Domain	DomainBrokerStore
+upgradetx.Domain	DomainControl
+upgradetx.Domain	DomainExec
+upgradetx.Domain	DomainFlow
+upgradetx.Domain	DomainPTY
+upgradetx.Domain	DomainSS
+upgradetx.Domain	DomainTransferTracker
+upgradetx.Domain	DomainTransferWorker
+upgradetx.Domain	DomainUpgrade
+upgradetx.Mode	ModeHot
+upgradetx.Mode	ModeLegacyInterrupting
+upgradetx.Outcome	OutcomeCancelled
+upgradetx.Outcome	OutcomeDeferred
+upgradetx.Outcome	OutcomeLegacyInterrupting
+upgradetx.Outcome	OutcomePending
+upgradetx.Outcome	OutcomeRejected
+upgradetx.Outcome	OutcomeRolledBack
+upgradetx.Outcome	OutcomeSuccess
+upgradetx.Outcome	OutcomeUnknown
+upgradetx.Phase	PhaseAbandoned
+upgradetx.Phase	PhaseActivating
+upgradetx.Phase	PhaseCancelled
+upgradetx.Phase	PhaseCompleted
+upgradetx.Phase	PhaseDeferred
+upgradetx.Phase	PhaseFreezing
+upgradetx.Phase	PhaseMigrating
+upgradetx.Phase	PhasePrepared
+upgradetx.Phase	PhaseReady
+upgradetx.Phase	PhaseRecoveryRequired
+upgradetx.Phase	PhaseRejected
+upgradetx.Phase	PhaseRollbackBlocked
+upgradetx.Phase	PhaseRollbackPending
+upgradetx.Phase	PhaseRolledBack
+upgradetx.Phase	PhaseServingNew
+upgradetx.Phase	PhaseStaged
+upgradetx.ReceiptKind	ReceiptControlReady
+upgradetx.ReceiptKind	ReceiptOldGenerationReleased
+upgradetx.ReceiptKind	ReceiptResourcesMigrated
+upgradetx.StepKind	StepAgentCut
+upgradetx.StepKind	StepBrokerCut
+upgradetx.StepKind	StepHomeConverge
+upgradetx.StepKind	StepRelease
+upgradetx.WindowState	WindowClosed
+upgradetx.WindowState	WindowClosing
+upgradetx.WindowState	WindowOpen
+xferclient.jetStreamStallKind	stallNoAnswer
+xferclient.jetStreamStallKind	stallNoProgress
+xfertrack.abandonRefusal	abandonClaimed
+xfertrack.abandonRefusal	abandonCommitted
+xfertrack.abandonRefusal	abandonFinalized
+xfertrack.abandonRefusal	abandonNoEntry
+xfertrack.abandonRefusal	abandonNotPush
+xfertrack.abandonRefusal	abandonTierA
+
+# section: leak-assertions
+internal/agent/runtime_observation_test.go:TestAgentRuntimeGaugeComesFromObservedProcess	AssertNoFDLeak#1	exerciseAgentRuntimeObservation
+internal/agent/runtime_observation_test.go:TestAgentRuntimeGaugeComesFromObservedProcess	AssertNoFDLeak#2	exerciseAgentRuntimeObservation
+internal/agent/runtime_observation_test.go:TestAgentRuntimeGaugeComesFromObservedProcess	AssertNoGoroutineLeak#1	exerciseAgentRuntimeObservation
+internal/agent/runtime_observation_test.go:TestAgentRuntimeGaugeComesFromObservedProcess	AssertNoGoroutineLeak#2	exerciseAgentRuntimeObservation
+internal/drillobserve/runtime_sample_test.go:TestRuntimeSampleCustodyRejectsPoison	AssertNoFDLeak#1	exerciseRuntimeSampleCustody
+internal/drillobserve/runtime_sample_test.go:TestRuntimeSampleCustodyRejectsPoison	AssertNoGoroutineLeak#1	exerciseRuntimeSampleCustody
+internal/storewitness/witness_test.go:TestStoreWitnessContenderRecordsTransientUnlock	AssertNoFDLeak#1	exerciseStoreWitnessContender
+internal/storewitness/witness_test.go:TestStoreWitnessContenderRecordsTransientUnlock	AssertNoGoroutineLeak#1	exerciseStoreWitnessContender
+internal/storewitness/witness_test.go:TestStoreWitnessRejectsInvalidCustody	AssertNoFDLeak#1	exerciseStoreWitnessCustody
+internal/storewitness/witness_test.go:TestStoreWitnessRejectsInvalidCustody	AssertNoGoroutineLeak#1	exerciseStoreWitnessCustody
+test/fullstackharness/cmd/supervise/dispatch_linux_test.go:TestRunAllBindsFullstackSupervisor	AssertNoFDLeak#1	exerciseRunAllLauncherBinding
+test/fullstackharness/cmd/supervise/dispatch_linux_test.go:TestRunAllBindsFullstackSupervisor	AssertNoGoroutineLeak#1	exerciseRunAllLauncherBinding
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorArtifactFailurePreventsLaunch	AssertNoFDLeak#1	exerciseSupervisorArtifactFailure
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorArtifactFailurePreventsLaunch	AssertNoGoroutineLeak#1	exerciseSupervisorArtifactFailure
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorDiagnosticsDistinguishCommandFailure	AssertNoFDLeak#1	exerciseSupervisorFailureDiagnostic
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorDiagnosticsDistinguishCommandFailure	AssertNoGoroutineLeak#1	exerciseSupervisorFailureDiagnostic
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorLogAndReceiptPreserveChildContract	AssertNoFDLeak#1	exerciseSupervisorEvidence
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorLogAndReceiptPreserveChildContract	AssertNoGoroutineLeak#1	exerciseSupervisorEvidence
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorReceiptIncludesDescendantCleanup	AssertNoFDLeak#1	exerciseSupervisorDescendant
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorReceiptIncludesDescendantCleanup	AssertNoGoroutineLeak#1	exerciseSupervisorDescendant
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorReturnClosesReadyDescriptor	AssertNoFDLeak#1	exerciseSupervisorReturn
+test/fullstackharness/cmd/supervise/main_linux_test.go:TestSupervisorReturnClosesReadyDescriptor	AssertNoGoroutineLeak#1	exerciseSupervisorReturn
+test/fullstackharness/cmd/supervise/signal_linux_test.go:TestSupervisorEscalatesIgnoredSignal	AssertNoFDLeak#1	exerciseSupervisorIgnoredSignal
+test/fullstackharness/cmd/supervise/signal_linux_test.go:TestSupervisorEscalatesIgnoredSignal	AssertNoGoroutineLeak#1	exerciseSupervisorIgnoredSignal
+test/fullstackharness/cmd/supervise/signal_linux_test.go:TestSupervisorForwardsSignalsAndKeepsEscapeFailure	AssertNoFDLeak#1	exerciseSupervisorSignalForwarding
+test/fullstackharness/cmd/supervise/signal_linux_test.go:TestSupervisorForwardsSignalsAndKeepsEscapeFailure	AssertNoGoroutineLeak#1	exerciseSupervisorSignalForwarding
+test/fullstackharness/driver_test.go:TestAssemblyExecutableRequiresCurrentSource	AssertNoFDLeak#1	exerciseAssemblyExecutable
+test/fullstackharness/driver_test.go:TestAssemblyExecutableRequiresCurrentSource	AssertNoGoroutineLeak#1	exerciseAssemblyExecutable
+test/fullstackharness/driver_test.go:TestFullstackDriverNeverRepairsProductState	AssertNoFDLeak#1	exerciseProductDriver
+test/fullstackharness/driver_test.go:TestFullstackDriverNeverRepairsProductState	AssertNoGoroutineLeak#1	exerciseProductDriver
+test/fullstackharness/identity_linux_test.go:TestFullstackExecutableReadRejectsExecABA	AssertNoFDLeak#1	exerciseExecutableRead
+test/fullstackharness/identity_linux_test.go:TestFullstackExecutableReadRejectsExecABA	AssertNoGoroutineLeak#1	exerciseExecutableRead
+test/fullstackharness/identity_ofd_linux_test.go:TestFullstackOFDWitnessRejectsReopen	AssertNoFDLeak#1	exerciseOFDWitness
+test/fullstackharness/identity_ofd_linux_test.go:TestFullstackOFDWitnessRejectsReopen	AssertNoGoroutineLeak#1	exerciseOFDWitness
+test/fullstackharness/ofd_handoff_linux_test.go:TestOFDWitnessFollowsPreparedExec	AssertNoFDLeak#1	exerciseOFDPreparedExec
+test/fullstackharness/ofd_handoff_linux_test.go:TestOFDWitnessFollowsPreparedExec	AssertNoGoroutineLeak#1	exerciseOFDPreparedExec
+test/fullstackharness/ofd_migration_linux_test.go:TestOFDWitnessAcceptsDescriptorMigrationAcrossCut	AssertNoFDLeak#1	exerciseOFDDescriptorMigration
+test/fullstackharness/ofd_migration_linux_test.go:TestOFDWitnessAcceptsDescriptorMigrationAcrossCut	AssertNoGoroutineLeak#1	exerciseOFDDescriptorMigration
+test/fullstackharness/ofd_migration_linux_test.go:TestOFDWitnessRejectsUnprovenDescriptorMigration	AssertNoFDLeak#1	exerciseUnprovenOFDTransition
+test/fullstackharness/ofd_migration_linux_test.go:TestOFDWitnessRejectsUnprovenDescriptorMigration	AssertNoGoroutineLeak#1	exerciseUnprovenOFDTransition
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorReapsAdoptedZombiesWhileTargetLives	AssertNoFDLeak#1	exerciseLauncherAdoptedZombie
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorReapsAdoptedZombiesWhileTargetLives	AssertNoGoroutineLeak#1	exerciseLauncherAdoptedZombie
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorReapsInheritedHeredocWriters	AssertNoFDLeak#1	exerciseLauncherInheritedWriter
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorReapsInheritedHeredocWriters	AssertNoGoroutineLeak#1	exerciseLauncherInheritedWriter
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorRetainsExitDescendantCensus	AssertNoFDLeak#1	exerciseLauncherExitCensus
+test/fullstackharness/process_reaping_linux_test.go:TestFullstackSupervisorRetainsExitDescendantCensus	AssertNoGoroutineLeak#1	exerciseLauncherExitCensus
+test/fullstackharness/process_status_linux_test.go:TestSupervisorFailureOutranksTargetStatus	AssertNoFDLeak#1	exerciseSupervisorStatusPrecedence
+test/fullstackharness/process_status_linux_test.go:TestSupervisorFailureOutranksTargetStatus	AssertNoGoroutineLeak#1	exerciseSupervisorStatusPrecedence
+test/fullstackharness/process_status_linux_test.go:TestSupervisorPreservesCleanupFailureWithFailedTarget	AssertNoFDLeak#1	exerciseSupervisorFailedTarget
+test/fullstackharness/process_status_linux_test.go:TestSupervisorPreservesCleanupFailureWithFailedTarget	AssertNoGoroutineLeak#1	exerciseSupervisorFailedTarget
+test/fullstackharness/process_status_linux_test.go:TestSupervisorReportsAdoptedZombieAsLeak	AssertNoFDLeak#1	exerciseSupervisorZombie
+test/fullstackharness/process_status_linux_test.go:TestSupervisorReportsAdoptedZombieAsLeak	AssertNoGoroutineLeak#1	exerciseSupervisorZombie
+test/fullstackharness/process_test.go:TestFullstackSupervisorReapsOnOwnerDeath	AssertNoFDLeak#1	exerciseSupervisedProcess
+test/fullstackharness/process_test.go:TestFullstackSupervisorReapsOnOwnerDeath	AssertNoGoroutineLeak#1	exerciseSupervisedProcess
+test/hotupdate/fullstack_flow_exec_test.go:TestFullstackFlowCarrierKeepsOriginalDuplex	AssertNoFDLeak#1	exerciseFlowCarrierLifecycle
+test/hotupdate/fullstack_flow_exec_test.go:TestFullstackFlowCarrierKeepsOriginalDuplex	AssertNoGoroutineLeak#1	exerciseFlowCarrierLifecycle
+test/hotupdate/fullstack_flow_exec_test.go:TestFullstackOriginalFlowsUseEveryInfraCut	AssertNoFDLeak#1	exerciseOriginalFlowCut
+test/hotupdate/fullstack_flow_exec_test.go:TestFullstackOriginalFlowsUseEveryInfraCut	AssertNoGoroutineLeak#1	exerciseOriginalFlowCut
+test/hotupdate/fullstack_flow_supply_test.go:TestFullstackFlowSupplyOutlivesSchedule	AssertNoFDLeak#1	exerciseFlowSupply
+test/hotupdate/fullstack_flow_supply_test.go:TestFullstackFlowSupplyOutlivesSchedule	AssertNoGoroutineLeak#1	exerciseFlowSupply
+test/hotupdate/fullstack_incarnation_test.go:TestFullstackIncarnationRejectsLateCleanup	AssertNoFDLeak#1	exerciseIncarnationCut
+test/hotupdate/fullstack_incarnation_test.go:TestFullstackIncarnationRejectsLateCleanup	AssertNoGoroutineLeak#1	exerciseIncarnationCut
+test/hotupdate/fullstack_ownership_test.go:TestFullstackOwnershipIntervalsAreExclusive	AssertNoFDLeak#1	exerciseOwnershipCut
+test/hotupdate/fullstack_ownership_test.go:TestFullstackOwnershipIntervalsAreExclusive	AssertNoGoroutineLeak#1	exerciseOwnershipCut
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackPTYPendingControlAcrossLayers	AssertNoFDLeak#1	exercisePTYPendingControl
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackPTYPendingControlAcrossLayers	AssertNoGoroutineLeak#1	exercisePTYPendingControl
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackPTYZombieTailAndSessionCleanup	AssertNoFDLeak#1	exercisePTYRetirement
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackPTYZombieTailAndSessionCleanup	AssertNoGoroutineLeak#1	exercisePTYRetirement
+test/hotupdate/fullstack_resource_test.go:TestFiveGenerationResourceBaseline	AssertNoFDLeak#1	exerciseGenerationResourceCycle
+test/hotupdate/fullstack_resource_test.go:TestFiveGenerationResourceBaseline	AssertNoGoroutineLeak#1	exerciseGenerationResourceCycle
+test/hotupdate/fullstack_rollout_test.go:TestMixedWorkloadSurvivesFullStackRollout	AssertNoFDLeak#1	exerciseMixedRollout
+test/hotupdate/fullstack_rollout_test.go:TestMixedWorkloadSurvivesFullStackRollout	AssertNoGoroutineLeak#1	exerciseMixedRollout
+test/hotupdate/fullstack_soak_test.go:TestFullstackSoakRejectsOneLeakPerCycle	AssertNoFDLeak#1	exerciseFixedImageCycle
+test/hotupdate/fullstack_soak_test.go:TestFullstackSoakRejectsOneLeakPerCycle	AssertNoGoroutineLeak#1	exerciseFixedImageCycle
+test/hotupdate/fullstack_ss_exec_test.go:TestFullstackSSPrimitiveLedgerUsesActualProduct	AssertNoFDLeak#1	exerciseFullstackSSPrimitive
+test/hotupdate/fullstack_ss_exec_test.go:TestFullstackSSPrimitiveLedgerUsesActualProduct	AssertNoGoroutineLeak#1	exerciseFullstackSSPrimitive
+test/hotupdate/fullstack_ss_exec_test.go:TestFullstackSSStateAcrossInfraRollback	AssertNoFDLeak#1	exerciseSSCut
+test/hotupdate/fullstack_ss_exec_test.go:TestFullstackSSStateAcrossInfraRollback	AssertNoGoroutineLeak#1	exerciseSSCut
+test/hotupdate/fullstack_store_witness_test.go:TestFullstackStoreWitnessPrecedesReplay	AssertNoFDLeak#1	exerciseStoreWitness
+test/hotupdate/fullstack_store_witness_test.go:TestFullstackStoreWitnessPrecedesReplay	AssertNoGoroutineLeak#1	exerciseStoreWitness
+test/hotupdate/fullstack_task_exec_test.go:TestFullstackTasksRetainCurrentRollbackState	AssertNoFDLeak#1	exerciseTaskRollback
+test/hotupdate/fullstack_task_exec_test.go:TestFullstackTasksRetainCurrentRollbackState	AssertNoGoroutineLeak#1	exerciseTaskRollback
+test/hotupdate/fullstack_transaction_test.go:TestFullstackRollbackRequiresFreshCurrentProof	AssertNoFDLeak#1	exerciseCurrentRollback
+test/hotupdate/fullstack_transaction_test.go:TestFullstackRollbackRequiresFreshCurrentProof	AssertNoGoroutineLeak#1	exerciseCurrentRollback
+test/hotupdate/fullstack_transfer_exec_test.go:TestFullstackTransferCohortsRespectOriginalBudget	AssertNoFDLeak#1	exerciseTransferCohort
+test/hotupdate/fullstack_transfer_exec_test.go:TestFullstackTransferCohortsRespectOriginalBudget	AssertNoGoroutineLeak#1	exerciseTransferCohort
+test/hotupdate/fullstack_transfer_exec_test.go:TestFullstackTransferSealsLateTerminal	AssertNoFDLeak#1	exerciseTransferEndSeal
+test/hotupdate/fullstack_transfer_exec_test.go:TestFullstackTransferSealsLateTerminal	AssertNoGoroutineLeak#1	exerciseTransferEndSeal
+
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackSyscallObserverJoinsWithFixture	AssertNoFDLeak#1	exerciseFullstackSyscallObserver
+test/hotupdate/fullstack_pty_exec_test.go:TestFullstackSyscallObserverJoinsWithFixture	AssertNoGoroutineLeak#1	exerciseFullstackSyscallObserver
+test/hotupdate/fullstack_task_exec_test.go:TestFullstackRuntimeSampleUsesProductCustody	AssertNoFDLeak#1	exerciseFullstackRuntimeSample
+test/hotupdate/fullstack_task_exec_test.go:TestFullstackRuntimeSampleUsesProductCustody	AssertNoGoroutineLeak#1	exerciseFullstackRuntimeSample

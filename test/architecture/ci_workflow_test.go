@@ -559,3 +559,73 @@ func namedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Independent root binaries are published by the same release job and the same
+// three hard gates. A separate unguarded publisher cannot sign their archive.
+// origin: hot-update S9 plan §6.5 / §10.2 / T83
+// gate-control: TestInfraReleaseArtifactControls
+func TestInfraReleaseArtifactsUseGuardedCI(t *testing.T) {
+	if problems := infraReleaseChainProblems(readCIWorkflow(t)); len(problems) > 0 {
+		t.Fatalf("infra release chain: %v", problems)
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "build/goreleaser.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkInfraReleaseArtifacts(string(raw)); err != nil {
+		t.Fatalf("NOT_RUN pending P26: %v", err)
+	}
+}
+
+// origin: hot-update S9 plan §11 / T83 / M31
+func TestInfraReleaseArtifactControls(t *testing.T) {
+	root := transferFixtureTree(t, map[string]string{})
+	source := readCIWorkflow(t)
+	path := ".github/workflows/ci.yml"
+	transferWriteFixture(t, root, path, source)
+	if problems := infraReleaseChainProblems(source); len(problems) > 0 {
+		t.Fatalf("current CI positive control: %v", problems)
+	}
+	changed := strings.Replace(source, "needs: [build-test, lint, e2e]", "needs: [build-test]", 1)
+	if changed == source {
+		t.Fatal("release needs mutation did not apply")
+	}
+	transferWriteFixture(t, root, path, changed)
+	raw, err := os.ReadFile(filepath.Join(root, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infraReleaseChainProblems(string(raw))) == 0 {
+		t.Fatal("on-disk infra publisher bypass escaped")
+	}
+	t.Run("release-shapes", TestReleaseChainPredicateSeesEveryBreak)
+}
+
+// Preserve the union of the two existing CI release predicates. Reachability
+// alone does not require all three needs, which this negative control exposed.
+// origin: hot-update S9 plan §10.2 / T83 / M31
+func infraReleaseChainProblems(workflow string) []string {
+	problems := releaseChainProblems(workflow)
+	body := splitJobBlocks(workflow)["release"]
+	match := regexp.MustCompile(`(?m)^\s*needs:\s*\[([^\]]*)\]\s*$`).FindStringSubmatch(body)
+	needs := map[string]bool{}
+	if len(match) == 2 {
+		for _, value := range strings.Split(match[1], ",") {
+			needs[strings.TrimSpace(value)] = true
+		}
+	}
+	for _, name := range []string{"build-test", "lint", "e2e"} {
+		if !needs[name] {
+			problems = append(problems, "infra release omits "+name)
+		}
+	}
+	for _, required := range []string{"refs/tags/v", "github.event_name == 'push'", "goreleaser"} {
+		if !strings.Contains(body, required) {
+			problems = append(problems, "infra release omits "+required)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^\s+contents:\s*write\s*$`).MatchString(body) {
+		problems = append(problems, "infra release lacks job write permission")
+	}
+	return problems
+}

@@ -1,6 +1,8 @@
 SHELL             := /bin/bash
 BIN_DIR           := bin
 BIN               := $(BIN_DIR)/tether
+INFRA_HELPER      := $(BIN_DIR)/tether-infra-helper
+INFRA_LAUNCH      := $(BIN_DIR)/tether-infra-launch
 PKG               := github.com/LinZiyang666/tether
 VERSION           ?= v0.0.0-dev
 LDFLAGS           := -s -w -X $(PKG)/internal/proto.ReleaseVersion=$(VERSION)
@@ -16,8 +18,13 @@ all: build
 build:
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/tether
+	# origin: hot-update S9 plan §6.5 / T55. Support stays Linux-only in release archives.
+	@if [ "$${GOOS:-$$(go env GOOS)}" = linux ]; then \
+	  CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o $(INFRA_HELPER) ./cmd/tether-infra-helper && \
+	  CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o $(INFRA_LAUNCH) ./cmd/tether-infra-launch; \
+	fi
 
-# Every custom build tag in the tree. 23 test files live behind these, and `go test ./...` compiles
+# Every custom build tag in the tree. Integration-tagged test files live behind these, and `go test ./...` compiles
 # NONE of them: a bare run is green while the guard suites it names have not been built at all.
 #
 # This list is NOT trusted on its own. A hand-typed tag list rots silently because Go does not error
@@ -29,11 +36,11 @@ build:
 # that hand-typed command all green. TestBuildTagsAreReconciled (test/architecture) parses this
 # variable and reconciles it against the //go:build lines in the tree, in BOTH directions, so the list
 # cannot drift again.
-ALL_TEST_TAGS := d5_integration,d6_integration,d7_integration,d8_integration,d9_integration,e2e_matrix,phasefluidity_integration
+ALL_TEST_TAGS := d5_integration,d6_integration,d7_integration,d8_integration,d9_integration,e2e_matrix,hotupdate_integration,infrabusiness_integration,infracaddy_integration,infranats_integration,infraprivilege_integration,p13_integration,phasefluidity_integration
 
 # vet-tags compiles what a bare `go test ./...` cannot reach.
 #
-# All seven tags at once rather than one at a time. That is STRICTER, not looser: a symbol collision between
+# All tags at once rather than one at a time. That is STRICTER, not looser: a symbol collision between
 # two tag-gated files fails the combined run and passes both individual ones. No file in this tree needs a
 # second tag to compile, so the combined form loses nothing.
 #
@@ -298,7 +305,13 @@ nats-dev:
 # waiting on real poll timers). It is here because until 2026-09-01 nothing ran it — its own header
 # says "a gate nobody runs is a gate that does not exist" — and it was red on a clean tree. Not piped:
 # a pipe would hand `make` tail's exit code (CLAUDE.md §5, the false-all-green incident).
+# S10 drill declaration ledgers and their same-file controls run in architecture;
+# the existing ledger-crosscheck entry also runs in the hermetic script suite.
+# Missing evidence cannot pass via Skip: TestMissingDependencyNeverSkips and its
+# same-file scanner controls run in the determinism package on the next line.
+# origin: S10 internal review NO-SKIP-AS-PASS F3
 gates: vet-tags
+	# S10 TestFullstackInventoriesCoverActualUnion and its disk controls run in determinism below.
 	go test ./test/architecture/... ./test/determinism/... ./cmd/tether/ ./internal/auth/ ./test/concurrency/ ./internal/proto/ ./internal/spawnexec/ ./test/e2e/parallel/ ./test/stackharness/
 	sh test/simcluster/tests/run-all.sh
 	$(MAKE) lint
